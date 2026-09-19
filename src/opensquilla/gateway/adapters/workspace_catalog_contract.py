@@ -17,6 +17,14 @@ from opensquilla.gateway.adapters.contract_method import (
 
 WORKSPACE_CATALOG_CONTRACT_METHODS: Final = (
     "workspaces.list",
+    "workspaces.git.status",
+    "workspaces.git.diff",
+    "workspaces.git.stage",
+    "workspaces.git.discard",
+    "workspaces.git.commit",
+    "workspaces.git.commitMessage.draft",
+    "workspaces.git.push",
+    "workspaces.git.undoCommit",
     "workspaces.open",
     "workspaces.update",
     "workspaces.pin",

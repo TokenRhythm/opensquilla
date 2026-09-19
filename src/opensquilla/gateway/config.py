@@ -1601,6 +1601,35 @@ class SessionNamingConfig(BaseSettings):
     language: str = "auto"  # follow the conversation language
 
 
+class CommitMessageConfig(BaseSettings):
+    """LLM-drafted commit messages for the workspace review panel.
+
+    The panel's ✨ action sends the staged index diff through the same one-shot
+    auxiliary call the session namer uses, and fills the commit input with the
+    answer; the operator is free to edit it before committing. ``instructions``
+    is the operator's own rule for what a message on this project should say —
+    the generated-message equivalent of ``naming``'s built-in prompt — and is
+    what an application-settings field edits. Drafting a message never touches
+    the repository: only ``workspaces.git.commit`` writes.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMMIT_MESSAGE_")
+
+    enabled: bool = True
+    # None = use the connected deployment's model. Unlike naming, the router's
+    # default tier deliberately does not apply here (see
+    # `resolve_commit_message_target`): a tier id is spelled in its own
+    # provider's catalog and a relay need not serve it.
+    tier: str | None = None
+    model: str | None = None  # None = use the connected deployment's model
+    timeout_seconds: float = 30.0
+    # Room for a subject plus a short body, matching the commit Contract's own
+    # 4096-character message bound with headroom for the longest line.
+    max_chars: int = Field(default=2000, ge=8)
+    language: str = "auto"  # follow the diff's language
+    instructions: str | None = None  # None = use the built-in guidance
+
+
 class MCPServerEntry(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_MCP_SERVER_")
 
@@ -2517,6 +2546,7 @@ class GatewayConfig(BaseSettings):
     agent_token_saving: AgentTokenSavingConfig = Field(default_factory=AgentTokenSavingConfig)
     compaction: CompactionLlmConfig = Field(default_factory=CompactionLlmConfig)
     naming: SessionNamingConfig = Field(default_factory=SessionNamingConfig)
+    commit_message: CommitMessageConfig = Field(default_factory=CommitMessageConfig)
     mcp: MCPConfig = Field(default_factory=MCPConfig)
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
     goal: GoalConfig = Field(default_factory=GoalConfig)

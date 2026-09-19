@@ -5,6 +5,7 @@
     :modal-blocked="surfaceBlocked"
     :aria-label="t('workbench.title')"
     :empty-label="t('workbench.empty')"
+  :empty-dock-label="t('workbench.emptyDock')"
     :open-items-label="t('workbench.openItems')"
     :collapse-label="t('workbench.collapse')"
     :close-item-label="t('workbench.closeItem')"
@@ -214,6 +215,12 @@ import {
   normalizeBrowserUrl,
   type BrowserWorkbenchOpenEventDetail,
 } from '@/workbench/browserItems'
+import {
+  WORKSPACE_CHANGES_OPEN_EVENT,
+  createWorkspaceChangesWorkbenchItem,
+  type WorkspaceChangesOpenEventDetail,
+} from '@/workbench/workspaceChangesItems'
+import { createWorkspaceChangesWorkbenchDefinition } from './workspaceChangesProvider'
 import { artifactFileTitle } from '@/utils/chat/artifacts'
 import { artifactProductClientError } from '@/utils/artifactProductErrors'
 import {
@@ -366,6 +373,19 @@ function onBrowserWorkbenchOpen(event: Event) {
   if (detail && typeof detail.url === 'string') openBrowserUrl(detail.url)
 }
 
+function onWorkspaceChangesOpen(event: Event) {
+  const detail = (event as CustomEvent<WorkspaceChangesOpenEventDetail>).detail
+  if (!detail || typeof detail.workspaceId !== 'string') return
+  const item = createWorkspaceChangesWorkbenchItem({
+    workspaceId: detail.workspaceId,
+    workspaceName: detail.workspaceName,
+  })
+  if (!item) return
+  if (!store.openItem(item)) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
 for (const definition of createArtifactWorkbenchDefinitions({
   artifactContent: artifactWorkbench.content,
   artifactPreviews: artifactWorkbench.previews,
@@ -429,6 +449,9 @@ workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   confirmPermission: confirmWorkbenchPermission,
   openExternal: openExternalUrl,
   platform,
+  t: (key, params) => String(t(key, params || {})),
+}), { replace: true })
+workbenchPanelRegistry.register(createWorkspaceChangesWorkbenchDefinition({
   t: (key, params) => String(t(key, params || {})),
 }), { replace: true })
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
@@ -1154,6 +1177,7 @@ onMounted(() => {
     refreshOpenArtifactDocuments(sessionKey)
   }
   window.addEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
+  window.addEventListener(WORKSPACE_CHANGES_OPEN_EVENT, onWorkspaceChangesOpen)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
   window.addEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
   window.addEventListener(
@@ -1169,6 +1193,7 @@ onBeforeUnmount(() => {
   pageAnnotationSendRetryTimer = null
   pageAnnotationSendFlushRequested = false
   window.removeEventListener(BROWSER_WORKBENCH_OPEN_EVENT, onBrowserWorkbenchOpen)
+  window.removeEventListener(WORKSPACE_CHANGES_OPEN_EVENT, onWorkspaceChangesOpen)
   window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_FOCUS_EVENT, onPromptAnnotationFocus)
   window.removeEventListener(ARTIFACT_PROMPT_ANNOTATION_REUSE_EVENT, onPromptAnnotationReuse)
   window.removeEventListener(

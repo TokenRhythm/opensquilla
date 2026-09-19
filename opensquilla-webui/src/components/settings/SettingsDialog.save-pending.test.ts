@@ -66,7 +66,6 @@ function mockCatalog() {
     providerPanel: ref({ credentialPanel: null, providerSelected: '' }),
     behaviorPanel: ref({
       autoSessionTitles: false,
-      autoSessionTitlesDirty: true,
       statusText: 'Automatic titles are off.',
     }),
     privacyPanel: ref({}),

@@ -6,7 +6,11 @@ from typing import Any
 
 import pytest
 
-from opensquilla.git_runtime import GitCapability, GitCapabilityState
+from opensquilla.git_runtime import (
+    GitCapability,
+    GitCapabilityState,
+    harden_read_only_git_args,
+)
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.integration import configure_runtime, reset_runtime
 from opensquilla.sandbox.permissions import FileSystemPermissionProfile
@@ -44,7 +48,7 @@ def _resolved_git(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_read_only_git_diff_disables_repository_controlled_helpers() -> None:
-    args = git._harden_read_only_git_args(("diff", "--cached"))
+    args = harden_read_only_git_args(("diff", "--cached"))
 
     assert args == (
         "--no-optional-locks",

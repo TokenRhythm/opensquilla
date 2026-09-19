@@ -94,6 +94,7 @@ function i18n() {
           editProject: 'Edit project',
           deleteHistory: 'Delete project task history',
           removeProject: 'Remove project',
+          viewChanges: 'View changes',
           menuDeleteHistory: 'Delete history',
           menuRemove: 'Remove',
           deleteHistoryTitle: 'Delete project task history?',
@@ -111,6 +112,7 @@ async function mountSidebar(
   canManageProjects = true,
   canCreateProjects = canManageProjects,
   sessionOrder: string[] = [],
+  canViewWorkspaceChanges = true,
 ) {
   const sections: SidebarSection[] = [{ family: 'chats', label: 'Tasks', rows }]
   const events = {
@@ -118,6 +120,7 @@ async function mountSidebar(
     newProject: vi.fn(),
     newProjectTask: vi.fn(),
     projectPin: vi.fn(),
+    projectChanges: vi.fn(),
     projectEdit: vi.fn(),
     projectDeleteHistory: vi.fn(),
     projectRemove: vi.fn(),
@@ -136,10 +139,12 @@ async function mountSidebar(
     searchHint: 'Ctrl+K',
     canManageProjects,
     canCreateProjects,
+    canViewWorkspaceChanges,
     onSelect: events.select,
     onNewProject: events.newProject,
     onNewProjectTask: events.newProjectTask,
     onProjectPin: events.projectPin,
+    onProjectChanges: events.projectChanges,
     onProjectEdit: events.projectEdit,
     onProjectDeleteHistory: events.projectDeleteHistory,
     onProjectRemove: events.projectRemove,
@@ -175,6 +180,30 @@ describe('SidebarConversations project workspaces', () => {
 
     expect(events.newProject).toHaveBeenCalledOnce()
     expect(events.newProjectTask).not.toHaveBeenCalled()
+  })
+
+  it('exposes workspace review as a row button instead of a hover-only menu item', async () => {
+    const { host, events } = await mountSidebar([projectRow(), taskRow()])
+    const review = host.querySelector<HTMLButtonElement>('[data-testid="project-workspace-changes"]')
+
+    // A row button is reachable without opening the ⋯ menu, which is the
+    // affordance a user could not find.
+    expect(review?.getAttribute('aria-label')).toBe('View changes')
+    // Unlike its row siblings this entry is not hover-revealed: it is the way
+    // into the changes panel, so it has to be visible on its own.
+    expect(review?.classList.contains('sidebar-project-action')).toBe(true)
+    review?.click()
+    await nextTick()
+
+    expect(events.projectChanges).toHaveBeenCalledWith('project-a')
+    expect(events.newProjectTask).not.toHaveBeenCalled()
+  })
+
+  it('hides workspace review when the workbench cannot render a panel', async () => {
+    const { host } = await mountSidebar([projectRow(), taskRow()], true, true, [], false)
+
+    expect(host.querySelector('[data-testid="project-workspace-changes"]')).toBeNull()
+    expect(host.querySelector('[data-testid="project-workspace-new-task"]')).not.toBeNull()
   })
 
   it('separates project work from ordinary recent tasks', async () => {

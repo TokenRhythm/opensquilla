@@ -544,3 +544,56 @@ async def test_config_patch_safe_rejects_session_title_advanced_paths(tmp_path) 
             {"patches": {"naming.model": "deepseek/deepseek-v4-pro"}},
             ctx,
         )
+
+
+async def test_config_patch_safe_accepts_commit_message_rule(tmp_path) -> None:
+    cfg = GatewayConfig(config_path=str(tmp_path / "config.toml"))
+    ctx = SimpleNamespace(config=cfg)
+
+    res = await _handle_config_patch_safe(
+        {"patches": {"commit_message.instructions": "Use Conventional Commits prefixes."}},
+        ctx,
+    )
+
+    assert res["patched"] == ["commit_message.instructions"]
+    assert res["restartRequired"] is False
+    assert ctx.config.commit_message.instructions == "Use Conventional Commits prefixes."
+    persisted = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert persisted["commit_message"]["instructions"] == "Use Conventional Commits prefixes."
+
+
+async def test_config_patch_safe_accepts_commit_message_toggle(tmp_path) -> None:
+    cfg = GatewayConfig(config_path=str(tmp_path / "config.toml"))
+    ctx = SimpleNamespace(config=cfg)
+
+    res = await _handle_config_patch_safe(
+        {"patches": {"commit_message.enabled": False}},
+        ctx,
+    )
+
+    assert res["patched"] == ["commit_message.enabled"]
+    assert res["restartRequired"] is False
+    assert ctx.config.commit_message.enabled is False
+    persisted = tomllib.loads((tmp_path / "config.toml").read_text())
+    assert persisted["commit_message"]["enabled"] is False
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "commit_message.model",
+        "commit_message.tier",
+        "commit_message.max_chars",
+        "commit_message.language",
+        "commit_message.timeout_seconds",
+    ],
+)
+async def test_config_patch_safe_rejects_commit_message_advanced_paths(
+    tmp_path,
+    path: str,
+) -> None:
+    cfg = GatewayConfig(config_path=str(tmp_path / "config.toml"))
+    ctx = SimpleNamespace(config=cfg)
+
+    with pytest.raises(ValueError, match="not safe for operator.write"):
+        await _handle_config_patch_safe({"patches": {path: "x"}}, ctx)

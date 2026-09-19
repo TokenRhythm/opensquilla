@@ -1452,6 +1452,54 @@
     },
     {
       "lifecycle": "stable",
+      "name": "workspaces.git.commit",
+      "schema": "workspaces/workspaces-git-commit.schema.json",
+      "schemaSha256": "8ac55c3beb00769134fc9811b2e9ed862395f33c8f81a0d7b75e77ad8f4ea839"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.commitMessage.draft",
+      "schema": "workspaces/workspaces-git-commit-message.schema.json",
+      "schemaSha256": "d601b0d607e31d0345a17a3377fc700a7b7ca96f8c0b589bce175484c3e61064"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.diff",
+      "schema": "workspaces/workspaces-git-diff.schema.json",
+      "schemaSha256": "8456fb62af7ccbff351a36aa9084adac6a9da9d076006c0229614da7f902addf"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.discard",
+      "schema": "workspaces/workspaces-git-discard.schema.json",
+      "schemaSha256": "16b17fd087249d355aaf4ae1dc8168eb61bdb6a9171825e01abb7cdfcef66f1c"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.push",
+      "schema": "workspaces/workspaces-git-push.schema.json",
+      "schemaSha256": "1e09ad73c44361f14e8da00a4cf7a862cfbf0a46540adb0f97b34c2c325313ea"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.stage",
+      "schema": "workspaces/workspaces-git-stage.schema.json",
+      "schemaSha256": "0289544fb004cf968fba211fb539e8a3c5558a3d9c85e39c6a15abf942b95ca5"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.status",
+      "schema": "workspaces/workspaces-git-status.schema.json",
+      "schemaSha256": "33d79c9a06de0096dd85f3bb4e295ed48f4ef7d31b536ca9fb19ce900bd03965"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "workspaces.git.undoCommit",
+      "schema": "workspaces/workspaces-git-undo-commit.schema.json",
+      "schemaSha256": "4bc4b0678732d24db8758ff5f364325d64c2bec20fdd7b5b9541d911798c7c9d"
+    },
+    {
+      "lifecycle": "stable",
       "name": "workspaces.history.delete",
       "schema": "workspaces/workspaces-history-delete.schema.json",
       "schemaSha256": "40d9883d69051043212569d4c85ff9de42e84082ceaf4cf3c98c5875e645e091"
@@ -1490,10 +1538,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "825a4861acf919d29c4959935a3c6fbafc1e44673e9f63c1c1de10885a52d504",
-    "methodCount": 219,
-    "schemaCount": 229,
-    "schemaTreeSha256": "25ba5fd16e1a1a31294eb099c4f93d5e3475b7189a53deaf865d91f17f524b69",
+    "generatorSha256": "38c0f424b58cc4aab077e1a183acec417fa44772f1b0cf188d329b0d0b9708a3",
+    "methodCount": 227,
+    "schemaCount": 237,
+    "schemaTreeSha256": "4c84c77f18eb6e351ad21f1b1c7d9f35fef27ff229c10f91145d846455e5d082",
     "toolchains": {
       "legacyTypes": {
         "python": {

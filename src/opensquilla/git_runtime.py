@@ -348,6 +348,28 @@ def resolve_git_capability(
     return capability
 
 
+def harden_read_only_git_args(args: Sequence[str]) -> tuple[str, ...]:
+    """Disable repository-controlled helpers for a read-only Git invocation.
+
+    A repository can ship configuration that makes an apparently read-only
+    command execute a helper it controls (``core.fsmonitor``, an external diff
+    driver, a diff textconv). Every read-only caller — the agent-facing Git
+    tools and the owner-facing workspace inspection alike — must apply the same
+    hardening, so it lives here rather than in either caller.
+    """
+
+    global_options = ("--no-optional-locks", "-c", "core.fsmonitor=false")
+    if args and args[0] == "diff":
+        return (
+            *global_options,
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            *args[1:],
+        )
+    return (*global_options, *args)
+
+
 def _environment_with_resolved_git(
     environment: Mapping[str, str],
     executable: Path,
@@ -515,6 +537,7 @@ __all__ = [
     "GitRunState",
     "clear_git_capability_cache",
     "git_run_mode_scope",
+    "harden_read_only_git_args",
     "probe_git_repository",
     "resolve_git_capability",
     "run_git",

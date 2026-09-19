@@ -63,6 +63,14 @@ EXPECTED_SESSION_CONTROL_METHODS = (
 )
 EXPECTED_WORKSPACE_METHODS = (
     "workspaces.list",
+    "workspaces.git.status",
+    "workspaces.git.diff",
+    "workspaces.git.stage",
+    "workspaces.git.discard",
+    "workspaces.git.commit",
+    "workspaces.git.commitMessage.draft",
+    "workspaces.git.push",
+    "workspaces.git.undoCommit",
     "workspaces.open",
     "workspaces.update",
     "workspaces.pin",
@@ -71,6 +79,16 @@ EXPECTED_WORKSPACE_METHODS = (
     "sandbox.path.list",
     "sandbox.path.create-directory",
     "sandbox.path.pick",
+)
+
+# Workspace-catalog methods that need an exercised Contract binding:
+# `workspaces.list` has its own Contract test, and the `sandbox.path.*` siblings
+# belong to the sandbox surface. Derived rather than sliced, so inserting a
+# method cannot silently shift the covered set.
+EXPECTED_WORKSPACE_BINDING_METHODS = tuple(
+    method
+    for method in EXPECTED_WORKSPACE_METHODS
+    if method.startswith("workspaces.") and method != "workspaces.list"
 )
 EXPECTED_META_RUN_CENTER_METHODS = (
     "meta.list",
@@ -182,6 +200,50 @@ _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
         "status": "ready",
         "dependencies": [],
     },
+    "workspaces.git.status": {
+        "available": True,
+        "availabilityReason": None,
+        "branch": "main",
+        "detached": False,
+        "upstream": None,
+        "ahead": 0,
+        "behind": 0,
+        "totalCount": 0,
+        "truncated": False,
+        "addedLines": 0,
+        "removedLines": 0,
+        "entries": [],
+    },
+    "workspaces.git.stage": {
+        "staged": True,
+        "affectedPaths": ["file.txt"],
+    },
+    "workspaces.git.discard": {
+        "discardedPaths": ["file.txt"],
+    },
+    "workspaces.git.commit": {
+        "sha": "0" * 40,
+        "subject": "synthetic",
+    },
+    "workspaces.git.commitMessage.draft": {
+        "subject": "synthetic",
+        "body": "",
+    },
+    "workspaces.git.push": {
+        "upstream": "origin/main",
+        "output": "Everything up-to-date",
+    },
+    "workspaces.git.undoCommit": {
+        "sha": "0" * 40,
+        "subject": "synthetic",
+    },
+    "workspaces.git.diff": {
+        "path": "file.txt",
+        "staged": False,
+        "text": "",
+        "truncated": False,
+        "binary": False,
+    },
     "workspaces.open": {"workspace": _WORKSPACE},
     "workspaces.update": {"workspace": _WORKSPACE},
     "workspaces.pin": {"workspace": _WORKSPACE},
@@ -239,7 +301,7 @@ _VALID_REGISTRATION_RESULTS: dict[str, dict[str, Any]] = {
 @pytest.mark.parametrize(
     ("methods", "register"),
     (
-        (EXPECTED_WORKSPACE_METHODS[1:6], register_workspace_catalog_contract),
+        (EXPECTED_WORKSPACE_BINDING_METHODS, register_workspace_catalog_contract),
         (EXPECTED_META_RUN_CENTER_METHODS, register_meta_run_center_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
@@ -280,7 +342,7 @@ async def test_final_contract_bindings_call_each_implementation_exactly_once(
 @pytest.mark.parametrize(
     ("methods", "register"),
     (
-        (EXPECTED_WORKSPACE_METHODS[1:6], register_workspace_catalog_contract),
+        (EXPECTED_WORKSPACE_BINDING_METHODS, register_workspace_catalog_contract),
         (EXPECTED_META_RUN_CENTER_METHODS, register_meta_run_center_contract),
         (
             EXPECTED_MIGRATION_OPERATIONS_METHODS,
@@ -314,7 +376,7 @@ async def test_final_contract_bindings_fail_closed_on_invalid_success_payload(
 
 def test_final_contract_bindings_preserve_non_guest_policy() -> None:
     for method in (
-        *EXPECTED_WORKSPACE_METHODS[1:6],
+        *EXPECTED_WORKSPACE_BINDING_METHODS,
         *EXPECTED_META_RUN_CENTER_METHODS,
         *EXPECTED_MIGRATION_OPERATIONS_METHODS,
     ):

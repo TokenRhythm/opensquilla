@@ -7,7 +7,8 @@ import SettingsLanguageControl from '@/components/settings/SettingsLanguageContr
 
 interface BehaviorPanelContract {
   autoSessionTitles: boolean
-  autoSessionTitlesDirty: boolean
+  commitMessageEnabled: boolean
+  commitMessageInstructions: string
   statusText: string
 }
 
@@ -19,6 +20,8 @@ defineProps<{
 
 const emit = defineEmits<{
   updateAutoSessionTitles: [enabled: boolean]
+  updateCommitMessageEnabled: [enabled: boolean]
+  updateCommitMessageInstructions: [value: string]
 }>()
 
 const { t } = useI18n()
@@ -37,6 +40,8 @@ const { t } = useI18n()
       embedded
       :panel="panel"
       @update-auto-session-titles="emit('updateAutoSessionTitles', $event)"
+      @update-commit-message-enabled="emit('updateCommitMessageEnabled', $event)"
+      @update-commit-message-instructions="emit('updateCommitMessageInstructions', $event)"
     />
     <div v-else class="general-loading" role="status">
       <LoadingSpinner />

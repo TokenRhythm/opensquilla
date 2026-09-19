@@ -130,6 +130,58 @@ While it is enabled, the composer shows a `Coding ON` status control that can
 also turn the mode off. The explicit `/coding on`, `/coding off`, and
 `/coding status` forms remain available for compatibility.
 
+## Workspace Changes
+
+A project workspace can be reviewed without leaving the console. Open the
+project's action menu in the sidebar and choose **View changes**; the review
+opens as a Workbench panel titled with the project name.
+
+The panel shows:
+
+- the current branch, and how far it has diverged from its upstream;
+- every changed path, each stamped with its change type (modified, added,
+  deleted, renamed, untracked, conflict) and whether the change is staged,
+  unstaged, or both;
+- the unified diff for the selected file, with the staged or unstaged half
+  chosen to match the entry that was selected.
+
+A file that is not tracked yet has no index entry to diff against, so the panel
+compares it against an empty file and shows the ordinary "new file" diff.
+
+A workspace that is not a Git repository reports that explicitly instead of
+showing an empty change list, and a workspace whose directory is missing or
+untrusted reports why it cannot be read. Large change sets and large diffs are
+bounded and say so when they are.
+
+Git is read with the same read-only hardening as the agent's own Git tools, so a
+repository cannot make this panel run a helper it controls (an external diff
+driver, a diff textconv, or a filesystem monitor hook).
+
+## Staging And Committing
+
+Each row carries its own actions: a path can be staged or unstaged, a tracked
+change can be discarded (which asks first, and is refused for a path Git does
+not track yet, because restoring one of those would delete it), and a section
+offers the same action for every row in it. The commit row at the top writes the
+message and commits the index; push and undo-commit sit on the branch row, next
+to the divergence they depend on.
+
+Undo is a soft reset: the commit goes and its content stays staged. It refuses a
+tip the upstream already has, and the root commit, which has no parent to reset
+to. Push refuses a branch with no upstream rather than guessing one.
+
+A commit message can be drafted from the staged changes with the ✨ action in
+the commit row. The draft is text the operator edits before committing: nothing
+is committed by drafting, and the model never writes to the repository, the
+index, or the working tree. The rule the draft follows is an application
+setting — **Session behavior → Commit message rule** — where the switch that
+offers drafting at all sits beside it. Drafting a message sends the staged patch
+to the configured model; with the switch off, it never leaves the machine.
+
+The actions skip the read-only hardening on purpose: staging, committing and
+undoing are the operations that legitimately take the index lock, and a push is
+the one call allowed to wait on a credential helper.
+
 ## Manual Compaction
 
 Long sessions can be compacted from chat. If no compaction is needed, the UI

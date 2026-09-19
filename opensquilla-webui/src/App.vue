@@ -90,6 +90,7 @@
       :contract-debug-enabled="contractDebugEnabled"
       :search-hint="commandPaletteHint"
       :can-manage-projects="gatewayAccess.canManageProjectWorkspaces"
+      :can-view-workspace-changes="appStore.features.artifactWorkbench === true"
       :can-create-projects="gatewayAccess.canChooseProject"
       @select="switchToSession"
       @refresh="loadSidebarData"
@@ -103,6 +104,7 @@
       @new-project="openProjectCreator"
       @new-project-task="startProjectTask"
       @project-pin="onProjectPin"
+      @project-changes="onProjectChanges"
       @project-edit="openProjectEditor"
       @project-delete-history="onProjectDeleteHistory"
       @project-remove="onProjectRemove"
@@ -261,6 +263,22 @@
           v-if="bgmEnabled"
           :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
         />
+        <button
+          v-if="workbenchToggleVisible"
+          class="btn btn--icon btn--ghost"
+          :title="workbenchToggleTitle"
+          :aria-label="t('chrome.toggleWorkbench')"
+          aria-controls="workbench-panel"
+          :aria-expanded="workbenchStore.expanded"
+          :aria-keyshortcuts="workbenchToggleAriaShortcut"
+          data-testid="workbench-toggle"
+          @click="toggleWorkbench()"
+        >
+          <Icon
+            :name="workbenchStore.expanded ? 'panel-right-close' : 'panel-right-open'"
+            :size="16"
+          />
+        </button>
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -501,6 +519,7 @@ import { useSessionTaskAttention } from './composables/useSessionTaskAttention'
 import { useToasts } from './composables/useToasts'
 import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
+import { requestWorkspaceChangesOpen } from './workbench/workspaceChangesItems'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
@@ -511,6 +530,7 @@ import { reminderToastPreview } from './utils/cron/notifications'
 import { installSessionNavigationDiagConsole, recordSessionNavigationDiag } from './utils/chat/sessionNavigationDiag'
 import { isMacPlatform } from './utils/browser'
 import { useShortcutsStore } from './stores/shortcuts'
+import { useWorkbenchStore } from './workbench/store'
 import { bindingMatches, formatBinding } from './utils/keychord'
 import { SIDEBAR_MIN_WIDTH, type SidebarWidthPreference } from './utils/sidebarLayout'
 import { sidebarSessionOrderKeys } from './utils/sidebarDisplayProjection'
@@ -563,6 +583,7 @@ const injectedCronScheduler = inject(CRON_SCHEDULER_KEY)
 if (!injectedCronScheduler) throw new Error('CronScheduler was not provided')
 const cronScheduler = injectedCronScheduler
 const shortcutsStore = useShortcutsStore()
+const workbenchStore = useWorkbenchStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
@@ -768,10 +789,8 @@ const commandPaletteHint = computed(() =>
   formatBinding(shortcutsStore.effectiveBinding('command-palette'), isMac))
 const newChatHint = computed(() =>
   formatBinding(shortcutsStore.effectiveBinding('new-chat'), isMac))
-const sidebarToggleBinding = computed(() => shortcutsStore.effectiveBinding('toggle-sidebar'))
-const sidebarToggleHint = computed(() => formatBinding(sidebarToggleBinding.value, isMac))
-const sidebarToggleAriaShortcut = computed(() => {
-  const binding = sidebarToggleBinding.value
+/** `aria-keyshortcuts` spelling of a binding (e.g. "Control+B"). */
+function ariaShortcut(binding: ReturnType<typeof shortcutsStore.effectiveBinding>) {
   if (!binding) return undefined
   const parts: string[] = []
   if (binding.primary) parts.push(isMac ? 'Meta' : 'Control')
@@ -779,6 +798,81 @@ const sidebarToggleAriaShortcut = computed(() => {
   if (binding.shift) parts.push('Shift')
   parts.push(binding.key.length === 1 ? binding.key.toUpperCase() : binding.key)
   return parts.join('+')
+}
+
+const sidebarToggleBinding = computed(() => shortcutsStore.effectiveBinding('toggle-sidebar'))
+const sidebarToggleHint = computed(() => formatBinding(sidebarToggleBinding.value, isMac))
+const sidebarToggleAriaShortcut = computed(() => ariaShortcut(sidebarToggleBinding.value))
+
+// The Workbench is a collapsible dock with no always-visible control of its own,
+// so a collapsed panel was only recoverable by opening a new item. This mirrors
+// the sidebar toggle: visible while a panel exists, and bound to a shortcut.
+const workbenchToggleBinding = computed(() => shortcutsStore.effectiveBinding('toggle-workbench'))
+const workbenchToggleHint = computed(() => formatBinding(workbenchToggleBinding.value, isMac))
+const workbenchToggleAriaShortcut = computed(() => ariaShortcut(workbenchToggleBinding.value))
+// A dock toggle stays available while the dock does, even with no panel open:
+// hiding it with the last panel is what made it look like it had vanished.
+const workbenchToggleVisible = computed(() => appStore.features.artifactWorkbench === true)
+const workbenchToggleTitle = computed(() => {
+  const label = t('chrome.toggleWorkbench')
+  return workbenchToggleHint.value ? `${label} (${workbenchToggleHint.value})` : label
+})
+
+// Declared here rather than beside the chat layout that also reads it: anything
+// that watches this value reads it once while the watcher is created, so it has
+// to exist before its first consumer, not merely before the first change.
+const activeProjectDraftId = computed(() =>
+  $route.path === '/chat/new' ? String($route.query.project || '') : '',
+)
+
+/**
+ * The project the dock should review when it has nothing open yet.
+ *
+ * Only the project the current task is actually on. An earlier version fell
+ * back to the single registered project, which meant an empty task could open
+ * a review of a repository nobody had selected: with nothing chosen, the dock
+ * says so instead of answering a question the operator did not ask.
+ */
+const reviewableProject = computed(() => {
+  const selected = activeProjectDraftId.value
+  if (!selected) return null
+  const workspace = projectWorkspaces.byId.value.get(selected)
+  if (!workspace) return null
+  return { workspaceId: workspace.id, workspaceName: workspace.name }
+})
+
+/**
+ * Open the task's project review in a dock that holds nothing, and report
+ * whether it did.
+ *
+ * The rule is the dock's promise — it reviews the project the task is on — and
+ * it has two entry points: the operator opening an empty dock, and the task's
+ * project being chosen while the dock is already open. Living in one predicate
+ * is what keeps those two from disagreeing; when it lived inside the toggle
+ * alone, opening the dock before choosing a project left it claiming there was
+ * nothing to review, with the project selected in the composer beside it.
+ */
+function openReviewInEmptyDock(): boolean {
+  if (workbenchStore.items.length > 0) return false
+  const project = reviewableProject.value
+  if (!project) return false
+  requestWorkspaceChangesOpen(project)
+  return true
+}
+
+function toggleWorkbench() {
+  // Opening an empty dock opens the surface the dock exists for here — the
+  // current project's changes — instead of showing a blank area. The empty
+  // state is only what you get when there is no project to review.
+  if (!workbenchStore.expanded && openReviewInEmptyDock()) return
+  workbenchStore.setExpanded(!workbenchStore.expanded)
+}
+
+// The same rule for a project that arrives second, which is the common order:
+// the dock is open first, then the task is pointed at a repository.
+watch(reviewableProject, () => {
+  if (!workbenchStore.expanded) return
+  openReviewInEmptyDock()
 })
 
 const themeIconName = computed(() => {
@@ -867,9 +961,6 @@ const systemHeaderLayout = useSystemHeaderLayout({
   active: isChatRoute,
   pressureCount: systemHeaderPressureCount,
 })
-const activeProjectDraftId = computed(() =>
-  $route.path === '/chat/new' ? String($route.query.project || '') : '',
-)
 const activeProjectDraftKey = computed(() => {
   const workspaceId = activeProjectDraftId.value
   if (!workspaceId) return ''
@@ -1435,6 +1526,13 @@ function openProjectEditor(workspaceId: string) {
   editingProjectId.value = workspaceId
 }
 
+function onProjectChanges(workspaceId: string) {
+  requestWorkspaceChangesOpen({
+    workspaceId,
+    workspaceName: projectWorkspaces.byId.value.get(workspaceId)?.name || '',
+  })
+}
+
 async function onProjectRename(name: string) {
   if (!gatewayAccess.canManageProjectWorkspaces) return
   const workspaceId = editingProjectId.value
@@ -1772,6 +1870,13 @@ function handleKeydown(e: KeyboardEvent) {
     e.preventDefault()
     if (e.repeat || settingsOverlayOpen.value) return
     toggleDock('shortcut')
+    return
+  }
+  const toggleWorkbenchBinding = shortcutsStore.effectiveBinding('toggle-workbench')
+  if (bindingMatches(e, toggleWorkbenchBinding, isMac)) {
+    e.preventDefault()
+    if (e.repeat || settingsOverlayOpen.value) return
+    if (workbenchToggleVisible.value) toggleWorkbench()
     return
   }
   if (bindingMatches(e, newChatBinding, isMac)) {

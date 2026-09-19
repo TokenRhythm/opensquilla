@@ -79,6 +79,12 @@ const props = withDefaults(defineProps<{
   sessionOrder?: string[]
   canManageProjects?: boolean
   canCreateProjects?: boolean
+  /**
+   * Whether the Workbench can render a panel at all. Workspace review opens as a
+   * Workbench panel, so the entry is hidden rather than left as a dead control
+   * when the Workbench feature is turned off.
+   */
+  canViewWorkspaceChanges?: boolean
 }>(), {
   sessionOrder: () => [],
   loadingMore: false,
@@ -86,6 +92,7 @@ const props = withDefaults(defineProps<{
   hasMore: false,
   canManageProjects: false,
   canCreateProjects: false,
+  canViewWorkspaceChanges: false,
 })
 
 const isDesktop = usePlatform().capabilities.isDesktop
@@ -103,6 +110,7 @@ const emit = defineEmits<{
   (e: 'new-project'): void
   (e: 'new-project-task', workspaceId: string): void
   (e: 'project-pin', payload: { workspaceId: string; pinned: boolean }): void
+  (e: 'project-changes', workspaceId: string): void
   (e: 'project-edit', workspaceId: string): void
   (e: 'project-delete-history', workspaceId: string): void
   (e: 'project-remove', workspaceId: string): void
@@ -778,6 +786,11 @@ function emitProjectPin(row: SidebarConversationItem) {
   })
 }
 
+function emitProjectChanges(row: SidebarConversationItem) {
+  closeMenu()
+  if (row.workspaceId) emit('project-changes', row.workspaceId)
+}
+
 function emitProjectEdit(row: SidebarConversationItem) {
   closeMenu()
   if (row.workspaceId) emit('project-edit', row.workspaceId)
@@ -1119,6 +1132,18 @@ function onSelectRow(row: SidebarConversationItem) {
                       @click.stop="startProjectTask(row)"
                     >
                       <Icon name="plus" :size="13" />
+                    </button>
+                    <button
+                      v-if="props.canViewWorkspaceChanges"
+                      type="button"
+                      class="sidebar-project-action"
+                      data-project-action="changes"
+                      data-testid="project-workspace-changes"
+                      :aria-label="t('workspaces.viewChanges')"
+                      :title="t('workspaces.viewChanges')"
+                      @click.stop="emitProjectChanges(row)"
+                    >
+                      <Icon name="fileCode" :size="13" />
                     </button>
                     <button
                       type="button"

@@ -257,11 +257,20 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     activeSessionId.value = sessionId
   }
 
+  /**
+   * Open or close the dock.
+   *
+   * Opening an empty dock is deliberate: the dock toggle is a dock control (as
+   * in an editor's panel toggle), so it must stay available and operable even
+   * when the last panel was closed, instead of disappearing with its content.
+   */
   function setExpanded(next: boolean) {
     if (expanded.value === next) return
     if (!next && hostAvailable.value) suspendItem(activeItem.value)
-    expanded.value = next && activeItem.value !== null
-    if (expanded.value && hostAvailable.value) resumeItem(activeItem.value)
+    expanded.value = next
+    if (expanded.value && hostAvailable.value && activeItem.value) {
+      resumeItem(activeItem.value)
+    }
   }
 
   function toggleExpanded() {

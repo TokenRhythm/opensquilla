@@ -30,6 +30,19 @@ beforeEach(() => {
 })
 
 describe('workbench store', () => {
+  it('keeps an empty dock openable so its toggle never becomes a dead control', () => {
+    const store = useWorkbenchStore()
+
+    expect(store.items).toEqual([])
+    store.setExpanded(true)
+
+    expect(store.expanded).toBe(true)
+    expect(store.activeItem).toBeNull()
+
+    store.setExpanded(false)
+    expect(store.expanded).toBe(false)
+  })
+
   it('deduplicates resources and activates the existing identity', () => {
     const store = useWorkbenchStore()
     store.openItem(item('a'))

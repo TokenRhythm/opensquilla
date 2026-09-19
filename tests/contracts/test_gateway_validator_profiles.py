@@ -22,16 +22,16 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 201
+    assert len(targets) == 209
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 191,
-        "params": 22,
+        "result": 199,
+        "params": 28,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 886
+    assert sum(len(spec.targets) for spec in specs) == 918
     assert targets[("method", "models.list")] == ("params", "result")
     assert targets[("method", "models.capacity.resolve")] == ("params", "result")
     assert targets[("method", "sessions.executionLog.read")] == ("params", "result")
@@ -41,6 +41,20 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     assert targets[("method", "meta.inspect")] == ("result",)
     assert targets[("method", "telemetry.product_active.record")] == ("result",)
     assert targets[("method", "sessions.messages.snapshot.read")] == ("params", "result")
+    # The workspace Git reads validate only the gateway-to-UI direction.
+    assert targets[("method", "workspaces.git.status")] == ("result",)
+    assert targets[("method", "workspaces.git.diff")] == ("result",)
+    # Every workspace Git write is bidirectional: the request carries the paths
+    # or the message, and the acknowledgement comes back.
+    assert targets[("method", "workspaces.git.stage")] == ("params", "result")
+    assert targets[("method", "workspaces.git.discard")] == ("params", "result")
+    assert targets[("method", "workspaces.git.commit")] == ("params", "result")
+    assert targets[("method", "workspaces.git.commitMessage.draft")] == (
+        "params",
+        "result",
+    )
+    assert targets[("method", "workspaces.git.push")] == ("params", "result")
+    assert targets[("method", "workspaces.git.undoCommit")] == ("params", "result")
     assert targets[("method", "transport.flow.update")] == ("params", "result")
     assert targets[("method", "onboarding.llmProfile.upsertAndActivate")] == (
         "params", "result",

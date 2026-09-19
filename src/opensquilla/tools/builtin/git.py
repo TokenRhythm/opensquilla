@@ -7,7 +7,7 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
-from opensquilla.git_runtime import resolve_git_capability
+from opensquilla.git_runtime import harden_read_only_git_args, resolve_git_capability
 from opensquilla.process_tree import (
     capture_process_tree_owner,
     create_owned_subprocess_exec,
@@ -115,7 +115,7 @@ async def _run_git(*args: str, cwd: str | None = None) -> str:
                     workspace_rw=False,
                     tmp_writable=False,
                 )
-                request_args = _harden_read_only_git_args(args)
+                request_args = harden_read_only_git_args(args)
         result = await run_under_backend(
             build_request_for_git(
                 request_args,
@@ -177,21 +177,6 @@ def _raise_git_command_error(
     raise RuntimeError(
         f"{code}: git {' '.join(args)} failed (exit {returncode}):\n{output}"
     )
-
-
-def _harden_read_only_git_args(args: tuple[str, ...]) -> tuple[str, ...]:
-    """Disable repository-controlled helpers for read-only git execution."""
-
-    global_options = ("--no-optional-locks", "-c", "core.fsmonitor=false")
-    if args and args[0] == "diff":
-        return (
-            *global_options,
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            *args[1:],
-        )
-    return (*global_options, *args)
 
 
 def build_request_for_git(

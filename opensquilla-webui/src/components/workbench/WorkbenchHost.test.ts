@@ -594,4 +594,18 @@ describe('WorkbenchHost', () => {
     expect(workbench.hasAttribute('inert')).toBe(false)
     expect(mounted.store.hostAvailable).toBe(true)
   })
+
+  it('renders an empty dock instead of disappearing with its last panel', async () => {
+    const mounted = await mountHost(1200)
+    mounted.store.openItem(item('one'))
+    await nextTick()
+    mounted.store.closeAllItems()
+    mounted.store.setExpanded(true)
+    await nextTick()
+
+    expect(mounted.store.items).toEqual([])
+    expect(mounted.host.querySelector('[data-workbench-empty-dock]')).not.toBeNull()
+    expect(mounted.host.querySelector('[data-testid="workbench-host"]')).not.toBeNull()
+    expect(mounted.host.querySelector('[role="tablist"]')).toBeNull()
+  })
 })

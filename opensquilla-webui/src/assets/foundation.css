@@ -109,6 +109,10 @@
 
   --track-display: 0;
   --track-tabular: 0.01em;
+  /* The scrollbar base.css draws. Anything that has to line up with the content
+     of a scrolling box needs this width, so it is a token rather than a second
+     6px literal somewhere else. */
+  --scrollbar-width: 6px;
   /* One unified eyebrow idiom (control-panel / control-section / sidebar nav
      groups all read these), and one "quiet" weight for demoted metric labels. */
   --eyebrow-track: 0.02em;

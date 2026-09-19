@@ -125,8 +125,11 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Primary-provider transitions add resetRecommended and upsertAndActivate.
 # Retire the five legacy memory raw-fallback and repair methods.
 # Add metadata-only Skill candidates and the allow-use setting.
-RUNTIME_RPC_METHOD_BASELINE = 295
-RUNTIME_RPC_METHOD_DIGEST = "9325609b3f5a9deb73091c32efdd38f4e68143a9f33e77d7d02c304e48817278"
+# Add the eight workspaces.git.* methods of the project-workspace review
+# surface: status, diff, stage, discard, commit, push, undoCommit, and the
+# commit-message draft.
+RUNTIME_RPC_METHOD_BASELINE = 303
+RUNTIME_RPC_METHOD_DIGEST = "7f5b8e90a257c2b5e12961ac46f7af21da92efe1f4a0b60055102b6895defa81"
 STATIC_RPC_DECORATOR_BASELINE = 72
 
 # Physical lines in the sessions/runtime slice remain tracked for the final

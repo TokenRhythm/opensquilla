@@ -145,6 +145,15 @@ METHOD_SCOPES: dict[str, str] = {
     "sessions.subscribe": READ_SCOPE,
     "sessions.unsubscribe": READ_SCOPE,
     "workspaces.list": READ_SCOPE,  # OpenSquilla-only; owner-guarded local paths.
+    "workspaces.git.status": READ_SCOPE,  # Read-only working-tree inspection.
+    "workspaces.git.diff": READ_SCOPE,  # Read-only working-tree inspection.
+    # Drafts message text from the staged patch; the repository is never written.
+    "workspaces.git.commitMessage.draft": READ_SCOPE,
+    "workspaces.git.stage": WRITE_SCOPE,  # Mutates the workspace index only.
+    "workspaces.git.discard": WRITE_SCOPE,  # Restores worktree content from the index.
+    "workspaces.git.commit": WRITE_SCOPE,  # Commits the index.
+    "workspaces.git.push": WRITE_SCOPE,  # Publishes the current branch upstream.
+    "workspaces.git.undoCommit": WRITE_SCOPE,  # Soft-resets the branch tip one commit.
     "sessions.messages.snapshot": READ_SCOPE,
     "sessions.messages.snapshot.read": READ_SCOPE,
     "transport.flow.update": READ_SCOPE,

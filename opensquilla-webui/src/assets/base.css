@@ -105,7 +105,7 @@ pre {
   overflow-x: auto;
 }
 
-::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar { width: var(--scrollbar-width); height: var(--scrollbar-width); }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; /* radius-allow: scrollbar thumb geometry */ }
 ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }

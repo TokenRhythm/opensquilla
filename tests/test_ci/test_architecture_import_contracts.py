@@ -297,6 +297,16 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("tools", "session"),
     ("tools", "skills"),
     ("uninstall", "gateway"),
+    # The workspace review surface's drafted commit message is a top-level
+    # workspace-domain module, like project_workspaces.py: it reuses the session
+    # namer's target resolution and the provider's auxiliary budget and message
+    # types, and it accounts usage through the engine. Its gateway and engine
+    # imports are function-local, and its only consumer is the workspace RPC
+    # handler, so nothing imports it back and no cycle is added.
+    ("workspace_commit_message.py", "engine"),
+    ("workspace_commit_message.py", "gateway"),
+    ("workspace_commit_message.py", "provider"),
+    ("workspace_commit_message.py", "session"),
 })
 
 APPROVED_CYCLIC_PACKAGES: frozenset[str] = frozenset({

@@ -100,6 +100,16 @@
       }"
       data-testid="workbench-surface"
     >
+      <div
+        v-if="store.items.length === 0"
+        class="workbench-host__panel-layer"
+        role="tabpanel"
+        data-workbench-empty-dock
+      >
+        <slot name="empty-dock">
+          <div class="workbench-host__empty">{{ emptyDockLabel }}</div>
+        </slot>
+      </div>
       <template v-for="item in store.items" :key="item.id">
         <div
           v-if="
@@ -176,6 +186,7 @@ const props = withDefaults(defineProps<{
   coarseOnly?: boolean
   ariaLabel?: string
   emptyLabel?: string
+  emptyDockLabel?: string
   openItemsLabel?: string
   collapseLabel?: string
   closeItemLabel?: string
@@ -190,6 +201,7 @@ const props = withDefaults(defineProps<{
   coarseOnly: undefined,
   ariaLabel: 'Workbench',
   emptyLabel: 'No preview is available for this item.',
+  emptyDockLabel: 'No panel is open.',
   openItemsLabel: 'Open workbench items',
   collapseLabel: 'Collapse workbench',
   closeItemLabel: 'Close tab',
@@ -252,10 +264,14 @@ const hostStyle = computed(() => ({
   )}px`,
   '--workbench-container-height': `${containerRect.value.height}px`,
 }))
+// An expanded dock renders even with no panel open, so the dock toggle never
+// becomes a dead control after the last panel is closed.
 const shouldRender = computed(() =>
-  props.enabled && props.routeActive && store.expanded && store.activeItem !== null)
+  props.enabled && props.routeActive && store.expanded)
+// Mount for an open panel, or for a dock the user deliberately expanded with
+// nothing in it (its own empty state is a legitimate surface).
 const shouldMount = computed(() =>
-  props.enabled && store.activeItem !== null)
+  props.enabled && (store.activeItem !== null || store.expanded))
 const runtimeAvailable = computed(() =>
   props.enabled
   && props.routeActive
@@ -513,8 +529,14 @@ onBeforeUnmount(() => {
   min-width: 0;
   height: 100%;
   overflow: hidden;
-  border-inline-start: 1px solid var(--border);
+  /* The dock is a layer, not a flush slab: the chat pane beside it is a card
+     (border + radius + shadow), and a single hairline on one side left this
+     surface reading as a hard cut out of the page. Same vocabulary, so both
+     side surfaces look inserted rather than truncated. */
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
   background: var(--bg);
+  box-shadow: var(--shadow-sm);
   color: var(--text);
 }
 
@@ -528,6 +550,9 @@ onBeforeUnmount(() => {
 
 .workbench-host--overlay {
   position: fixed;
+  /* Floats above the page instead of sitting in the row, so it takes the
+     overlay elevation rather than the card one. */
+  box-shadow: var(--shadow-lg);
   z-index: 220;
   inset:
     var(--workbench-container-top)
@@ -544,7 +569,10 @@ onBeforeUnmount(() => {
   inset: 0;
   width: 100%;
   height: 100dvh;
-  border-inline-start: 0;
+  /* A full-screen dialog is the page, not a card on it. */
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .workbench-host__chrome {
@@ -705,7 +733,8 @@ onBeforeUnmount(() => {
 
 @media (forced-colors: active) {
   .workbench-host {
-    border-inline-start-color: CanvasText;
+    border-color: CanvasText;
+    box-shadow: none;
   }
 
   .workbench-host__chrome {

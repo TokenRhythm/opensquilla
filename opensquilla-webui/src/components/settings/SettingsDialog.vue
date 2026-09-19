@@ -97,6 +97,8 @@
             :loaded="loaded"
             :is-desktop="isDesktop"
             @update-auto-session-titles="setAutoSessionTitles"
+            @update-commit-message-enabled="setCommitMessageEnabled"
+            @update-commit-message-instructions="setCommitMessageInstructions"
           />
           <SettingsSecurityPrivacyPanel
             v-else-if="section === 'securityPrivacy'"
@@ -293,6 +295,8 @@ const {
   requestAddProvider,
   cancelProviderEdit,
   setAutoSessionTitles,
+  setCommitMessageEnabled,
+  setCommitMessageInstructions,
   setNetworkReportingEnabled,
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,

@@ -107,6 +107,11 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         "llm_ensemble.selection_mode",
         "llm_ensemble.candidates",
         "naming.enabled",
+        # Application setting for the workspace review panel's ✨ draft: the
+        # operator's own rule for what a commit message should say, plus the
+        # switch that offers the action at all.
+        "commit_message.enabled",
+        "commit_message.instructions",
         "privacy.disable_network_observability",
         "control_ui.default_locale",
         "prompt_cache.mode",
