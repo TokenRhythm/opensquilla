@@ -37,6 +37,7 @@
       "include_usage": true
     },
     "temperature": 0.7,
+    "tool_choice": "auto",
     "tools": [
       {
         "function": {
