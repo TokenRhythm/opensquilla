@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "{path} をワークベンチで開く",
+    "actions": "ファイル操作",
+    "copyPath": "相対パスをコピー",
+    "copyLocation": "パスと行番号をコピー",
+    "loading": "ファイルを確認中…",
+    "copied": "コピーしました",
+    "copyFailed": "コピーできませんでした。再試行してください。",
+    "stale": "ファイルが変更されています。再度読み込んで参照を更新してください。",
+    "workspaceMismatch": "このファイルは別のワークスペースに属しています。",
+    "forbidden": "このファイルへのアクセス権がありません。",
+    "missing": "ファイルまたはタスクは利用できなくなりました。",
+    "invalid": "ファイル参照が無効です。",
+    "unsupported": "このファイルはソーステキストとして表示できません。",
+    "unavailable": "ファイルを開けません。接続を確認して再試行してください。",
+    "readonly": "読み取り専用ソース",
+    "refresh": "ファイルを再確認",
+    "lines": "{total} 行中 {start}–{end} 行",
+    "previous": "前の行を表示",
+    "next": "さらに表示"
+  },
   "resourceActions": {
     "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",
     "reveal": "ファイルマネージャーで表示", "revealFinder": "Finder で表示", "revealExplorer": "エクスプローラーで表示",
@@ -3656,6 +3677,18 @@
       "deleted": "削除済み",
       "missing": "セッションは削除されたか存在しません"
     },
+    "sessionReference": {
+      "open": "チャットを開く",
+      "unavailable": "セッションを利用できません",
+      "status": {
+        "queued": "待機中",
+        "running": "実行中",
+        "idle": "アイドル",
+        "failed": "失敗",
+        "missing": "見つかりません",
+        "checking": "確認中…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
       "title": "プロンプトキャッシュの維持",
@@ -3767,6 +3800,8 @@
     "copied": "コピーしました",
     "copy": "コピー",
     "copySessionKey": "セッション ID をコピー",
+    "copySessionAppLink": "アプリケーションリンクをコピー",
+    "copySessionGatewayLink": "Gateway ウェブリンクをコピー",
     "sessionActions": "セッション操作",
     "share": "共有",
     "shareSendFirst": "共有するには、まずメッセージを送信してください",

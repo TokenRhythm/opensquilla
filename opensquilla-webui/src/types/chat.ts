@@ -854,6 +854,8 @@ export interface ChatRenderedMessage {
   /** Explicit placement for successful sessions_spawn cards. An empty array
    *  suppresses the source card after it is rehomed below the parent reply. */
   createdSessionLinks?: ChatCreatedSessionLink[]
+  /** Versioned references returned by a structured session_search result. */
+  sessionReferences?: import('./references').SessionReferenceV1[]
   toolCalls?: ChatToolCall[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]

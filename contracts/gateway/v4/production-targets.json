@@ -909,7 +909,9 @@
     {
       "kind": "method",
       "wireName": "plans.setPresentation",
-      "roles": ["result"]
+      "roles": [
+        "result"
+      ]
     },
     {
       "kind": "method",
@@ -1425,6 +1427,14 @@
       "kind": "method",
       "wireName": "skills.setEnabled",
       "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "workspaces.references.read",
+      "roles": [
+        "params",
         "result"
       ]
     }

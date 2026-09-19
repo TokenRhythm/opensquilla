@@ -3,6 +3,7 @@ import { strict as assert } from 'node:assert'
 import {
   desktopDeepLinkArguments,
   parseDesktopDeepLink,
+  parseDesktopDeepLinkTarget,
 } from '../dist/desktop-deep-link.js'
 
 for (const url of [
@@ -31,6 +32,34 @@ for (const url of [
 
 assert.equal(parseDesktopDeepLink(null), null)
 assert.equal(parseDesktopDeepLink({}), null)
+
+assert.deepEqual(
+  parseDesktopDeepLinkTarget('opensquilla://open/session/agent%3Amain%3Awebchat%3Aabc'),
+  { action: 'open', sessionKey: 'agent:main:webchat:abc' },
+)
+for (const url of [
+  'opensquilla://open/session/a/b',
+  'opensquilla://open/session/a%2Fb',
+  'opensquilla://open/session/%2e%2e',
+  'opensquilla://open/session/.%2e',
+  'opensquilla://open/session/%2e.',
+  'opensquilla://open/session/%2e%2E/../',
+  'opensquilla://open/session/a?',
+  'opensquilla://open/session/a#',
+  'opensquilla://open/session/a\nb',
+  'opensquilla://open/session/a\tb',
+  'opensquilla://open/session/%00',
+  'opensquilla://open/session/a%5Cb',
+  'opensquilla://user:password@open/session/a',
+  'opensquilla://open:1234/session/a',
+  `opensquilla://open/session/${'a'.repeat(513)}`,
+  `opensquilla://open/session/${'%41'.repeat(2049)}`,
+  'opensquilla://open/session/a?query=1',
+  'opensquilla://open/session/a#hash',
+  'opensquilla://open/session/',
+]) {
+  assert.equal(parseDesktopDeepLinkTarget(url), null, url)
+}
 
 assert.deepEqual(
   desktopDeepLinkArguments([

@@ -75,6 +75,7 @@ from opensquilla.tools.source_edit_contract import (
     build_diff_summary,
     build_line_receipt,
     source_revision_for_path,
+    workspace_reference_id,
 )
 from opensquilla.tools.types import (
     PlanAccess,
@@ -1980,13 +1981,20 @@ async def read_source(path: str, start_line: int = 1, end_line: int | None = Non
         if binary_reason:
             raise _binary_file_error(path, p, reason=binary_reason)
     try:
+        context = current_tool_context.get()
+        workspace = _workspace_root()
         receipt = await loop.run_in_executor(
             None,
             lambda: build_line_receipt(
                 p,
                 start_line=start_line,
                 end_line=end_line,
-                display_path=_workspace_display_path(p, path),
+                display_path=_workspace_display_path_for_root(p, path, workspace),
+                session_key=context.session_key if context else None,
+                workspace_id=(
+                    context.workspace_id if context and context.workspace_id
+                    else workspace_reference_id(workspace) if workspace else None
+                ),
             ),
         )
     except UnicodeDecodeError as exc:

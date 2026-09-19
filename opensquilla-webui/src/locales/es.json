@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "Abrir {path} en el banco de trabajo",
+    "actions": "Acciones del archivo",
+    "copyPath": "Copiar ruta relativa",
+    "copyLocation": "Copiar ruta y líneas",
+    "loading": "Comprobando archivo…",
+    "copied": "Copiado",
+    "copyFailed": "No se pudo copiar. Inténtalo de nuevo.",
+    "stale": "El archivo ha cambiado. Vuelve a leerlo para actualizar la referencia.",
+    "workspaceMismatch": "Este archivo pertenece a otro espacio de trabajo.",
+    "forbidden": "No tienes acceso a este archivo.",
+    "missing": "El archivo o su tarea ya no están disponibles.",
+    "invalid": "La referencia al archivo no es válida.",
+    "unsupported": "Este archivo no se puede mostrar como código fuente.",
+    "unavailable": "No se pudo abrir. Comprueba la conexión e inténtalo de nuevo.",
+    "readonly": "Código de solo lectura",
+    "refresh": "Comprobar de nuevo",
+    "lines": "Líneas {start}–{end} de {total}",
+    "previous": "Mostrar líneas anteriores",
+    "next": "Mostrar más líneas"
+  },
   "resourceActions": {
     "more": "Acciones de archivo", "preview": "Vista previa en la aplicación", "openSource": "Abrir con la aplicación predeterminada",
     "reveal": "Mostrar en el gestor de archivos", "revealFinder": "Mostrar en Finder", "revealExplorer": "Mostrar en el Explorador de archivos",
@@ -3656,6 +3677,18 @@
       "deleted": "Eliminado",
       "missing": "La sesión se eliminó o no existe"
     },
+    "sessionReference": {
+      "open": "Abrir chat",
+      "unavailable": "Sesión no disponible",
+      "status": {
+        "queued": "En cola",
+        "running": "En ejecución",
+        "idle": "Inactiva",
+        "failed": "Fallida",
+        "missing": "No encontrada",
+        "checking": "Comprobando…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
       "title": "Mantener caché del prompt",
@@ -3767,6 +3800,8 @@
     "copied": "Copiado",
     "copy": "Copiar",
     "copySessionKey": "Copiar ID de sesión",
+    "copySessionAppLink": "Copiar enlace de la aplicación",
+    "copySessionGatewayLink": "Copiar enlace web del Gateway",
     "sessionActions": "Acciones de la sesión",
     "share": "Compartir",
     "shareSendFirst": "Envía un mensaje primero para compartir",

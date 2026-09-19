@@ -1158,6 +1158,25 @@ def _compact_json_for_tool_result_preview(
             for item in value[:max_list_items]
         ]
     if isinstance(value, dict):
+        if (
+            type(value.get("version")) is int
+            and value["version"] == 1
+            and isinstance(value.get("kind"), str)
+            and value.get("kind") in {
+                "session", "workspace_file", "workspace_directory",
+                "artifact", "document", "external_url",
+            }
+            and isinstance(value.get("id"), str)
+            and isinstance(value.get("label"), str)
+            and isinstance(value.get("scope"), dict)
+            and isinstance(value.get("capabilities"), dict)
+        ):
+            # ReferenceV1 is an actionable identity, not display prose. Keep
+            # the entire object intact: shortening an id, path, scope, or
+            # revision creates a different target. The enclosing preview's
+            # unchanged character budget drops whole list entries (or the
+            # reference altogether) when complete references cannot fit.
+            return value
         return {
             str(key): _compact_json_for_tool_result_preview(
                 item,
@@ -8983,6 +9002,7 @@ class TurnRunner:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
                 )
+                caller_ctx.explicitly_allowed_tools = set(ctx.explicitly_allowed_tools)
                 caller_ctx.denied_tools.clear()
                 caller_ctx.denied_tools.update(ctx.denied_tools)
                 caller_ctx.workspace_write_deny_globs[:] = ctx.workspace_write_deny_globs

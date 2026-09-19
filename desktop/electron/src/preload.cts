@@ -2,6 +2,7 @@ import { contextBridge, ipcRenderer, webUtils } from 'electron'
 
 if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOsLocale: () => ipcRenderer.invoke('desktop:os-locale'),
+  getPendingSessionDeepLink: () => ipcRenderer.invoke('desktop:deep-link-session:get'),
   isAutoUpdateEnabled: () => ipcRenderer.invoke('desktop:update:supported'),
   isDesktopUpdateManaged: () => ipcRenderer.invoke('desktop:update:managed'),
   getUpdateState: () => ipcRenderer.invoke('desktop:update:state'),
@@ -145,6 +146,13 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     const listener = () => callback()
     ipcRenderer.on('desktop:window:hidden', listener)
     return () => ipcRenderer.removeListener('desktop:window:hidden', listener)
+  },
+  onSessionDeepLink: (callback: (sessionKey: string) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => {
+      if (typeof payload === 'string') callback(payload)
+    }
+    ipcRenderer.on('desktop:deep-link-session', listener)
+    return () => ipcRenderer.removeListener('desktop:deep-link-session', listener)
   },
   onWorkbenchSurfaceEvent: (callback: (payload: unknown) => void) => {
     const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)

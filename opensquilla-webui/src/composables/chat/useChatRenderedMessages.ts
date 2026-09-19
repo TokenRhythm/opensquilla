@@ -45,6 +45,7 @@ import type { InterruptClarifyData, InterruptViewState } from '@/types/parts'
 import { toParts, type ToPartsInterrupt } from '@/utils/chat/toParts'
 import { toSources } from '@/utils/chat/toSources'
 import { createdSessionFromToolCall } from '@/utils/chat/createdSessions'
+import { sessionReferencesFromCalls } from '@/utils/chat/sessionReferences'
 import { relativeTime, type TimeTranslator } from '@/utils/messageTime'
 import { normalizeEnsembleMemberRole } from '@/utils/ensembleRoles'
 import {
@@ -630,6 +631,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
         attachments: msg.attachments,
         promptAnnotations: msg.promptAnnotations,
         createdSessionLinks: createdSessionLinksFromCalls(normalizedToolCalls),
+        sessionReferences: sessionReferencesFromCalls(normalizedToolCalls),
         // submit_plan is a transport/control detail. Once a typed immutable
         // plan part exists, the plan card is the authoritative visible item;
         // keep real process tools in the Activity timeline.

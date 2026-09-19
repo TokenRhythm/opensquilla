@@ -151,7 +151,7 @@ import {
 import {
   DESKTOP_DEEP_LINK_SCHEME,
   desktopDeepLinkArguments,
-  parseDesktopDeepLink,
+  parseDesktopDeepLinkTarget,
 } from './desktop-deep-link.js'
 import { projectDirectoryDialogOptions } from './project-directory-picker.js'
 import {
@@ -538,6 +538,7 @@ let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
 let mainWindowClosePrompt: Promise<void> | null = null
 let pendingDesktopDeepLinkOpen = false
+let pendingDesktopSessionKey: string | null = null
 let desktopDeepLinkActivationReady = false
 let desktopPreferencesCache: {
   value: DesktopPreferencesFile
@@ -5066,9 +5067,15 @@ function revealDesktopApp(): void {
   void activateMainWindow('desktop-reveal')
 }
 
+function sendPendingDesktopSessionTarget(): void {
+  const window = currentMainWindow()
+  if (!window || !isCurrentWindowAtDesktopRenderer(window) || !pendingDesktopSessionKey) return
+  window.webContents.send('desktop:deep-link-session', pendingDesktopSessionKey)
+}
+
 function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
-  const action = parseDesktopDeepLink(rawUrl)
-  if (action !== 'open') {
+  const target = parseDesktopDeepLinkTarget(rawUrl)
+  if (!target || target.action !== 'open') {
     // Never persist an untrusted URL: query strings may contain credentials or
     // other private browser state even though this parser rejects them.
     desktopLog('deep_link_ignored', { source })
@@ -5077,15 +5084,22 @@ function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
 
   desktopLog('deep_link_accepted', {
     source,
-    action,
+    action: target.action,
+    hasSessionTarget: Boolean(target.sessionKey),
     activationReady: desktopDeepLinkActivationReady,
   })
+  if (target.sessionKey) pendingDesktopSessionKey = target.sessionKey
   if (!desktopDeepLinkActivationReady) {
     pendingDesktopDeepLinkOpen = true
     return true
   }
 
-  void activateMainWindow(`deep-link:${source}`)
+  void activateMainWindow(`deep-link:${source}`).then(() => {
+    // The renderer consumes this through the preload bridge. Keep the value
+    // pending until it acknowledges it so startup links cannot be lost while
+    // Vue is still mounting.
+    sendPendingDesktopSessionTarget()
+  })
   return true
 }
 
@@ -5101,7 +5115,9 @@ function handleDeepLinksFromCommandLine(
 function activatePendingDesktopDeepLink(): boolean {
   if (!pendingDesktopDeepLinkOpen) return false
   pendingDesktopDeepLinkOpen = false
-  void activateMainWindow('deep-link:pending')
+  void activateMainWindow('deep-link:pending').then(() => {
+    sendPendingDesktopSessionTarget()
+  })
   return true
 }
 
@@ -12117,6 +12133,12 @@ ipcMain.handle('desktop:update:relaunch', async (event) => {
 })
 ipcMain.handle('desktop:update:dismiss', async () => dismissDesktopUpdate())
 ipcMain.handle('desktop:os-locale', () => desktopLocale)
+ipcMain.handle('desktop:deep-link-session:get', (event) => {
+  if (!trustedMainWindowControlIpc(event)) return null
+  const sessionKey = pendingDesktopSessionKey
+  pendingDesktopSessionKey = null
+  return sessionKey
+})
 ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
@@ -15048,7 +15070,7 @@ app.on('will-quit', () => {
 
 configureChromiumKeychainPolicy()
 
-const initialDesktopDeepLinkArguments = process.platform === 'win32'
+const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.platform === 'linux'
   ? desktopDeepLinkArguments(process.argv)
   : []
 
@@ -15075,7 +15097,7 @@ function acquireSingleInstanceLockWithRetry(): boolean {
       })
       return true
     }
-    // A Windows protocol launch targets the current instance and does not need
+    // A Windows/Linux protocol launch targets the current instance and does not need
     // the normal close/relaunch race retry. The failed lock request has already
     // delivered its command line through second-instance; exit the forwarding
     // process immediately instead of sending the same deep link for five seconds.
@@ -15149,9 +15171,7 @@ if (!gotSingleInstanceLock) {
       reason: normalizedCrashFingerprintReason(details.reason),
     })
   })
-  if (process.platform === 'win32') {
-    handleDeepLinksFromCommandLine(process.argv, 'initial-argv')
-  }
+  handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
   app.on('second-instance', (_event, commandLine) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')

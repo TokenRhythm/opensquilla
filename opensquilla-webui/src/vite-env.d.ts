@@ -40,6 +40,8 @@ interface DesktopCleanupReport {
 declare global {
   interface OpenSquillaDesktopApi {
     getOsLocale: () => Promise<string | undefined>
+    getPendingSessionDeepLink?: () => Promise<string | null>
+    onSessionDeepLink?: (callback: (sessionKey: string) => void) => () => void
     isAutoUpdateEnabled: () => Promise<boolean>
     isDesktopUpdateManaged?: () => Promise<boolean>
     getUpdateState?: () => Promise<DesktopUpdateState>

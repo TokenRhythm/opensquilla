@@ -77,7 +77,12 @@ async def test_read_source_records_workspace_read(
     target.parent.mkdir()
     target.write_text("one\ntwo\nthree\n", encoding="utf-8")
 
-    await filesystem.read_source(str(target), start_line=1, end_line=2)
+    result = json.loads(await filesystem.read_source(str(target), start_line=1, end_line=2))
+
+    assert result["reference"]["locator"]["relativePath"] == "src/app.py"
+    assert result["reference"]["scope"]["sessionKey"] == ctx.session_key
+    assert result["reference"]["scope"]["workspaceId"].startswith("workspace_")
+    assert str(workspace) not in str(result["reference"])
 
     assert ctx.workspace_file_reads[-1] == {
         "path": str(target),
@@ -89,6 +94,32 @@ async def test_read_source_records_workspace_read(
         "limit": 2,
         "complete": False,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name == "nt", reason="Windows cannot represent these POSIX filenames")
+@pytest.mark.parametrize("literal_path, other_path", [
+    (" source.py", "source.py"),
+    ("source.py ", "source.py"),
+    (r"src\source.py", "src/source.py"),
+])
+async def test_read_source_does_not_reference_a_different_same_content_file(
+    workspace_context: tuple[Path, ToolContext], literal_path: str, other_path: str,
+) -> None:
+    workspace, _ctx = workspace_context
+    target = workspace / literal_path
+    other = workspace / other_path
+    other.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("same content\n", encoding="utf-8")
+    other.write_bytes(target.read_bytes())
+
+    result = json.loads(await filesystem.read_source(str(target), start_line=1, end_line=1))
+    other_result = json.loads(await filesystem.read_source(str(other), start_line=1, end_line=1))
+
+    assert result["path"] == literal_path
+    assert result["revision"] == other_result["revision"]
+    assert "reference" not in result
+    assert other_result["reference"]["locator"]["relativePath"] == other_path
 
 
 @pytest.mark.asyncio

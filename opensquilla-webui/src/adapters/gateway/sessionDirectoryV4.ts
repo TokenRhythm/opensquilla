@@ -360,6 +360,9 @@ export function createV4SessionDirectory(
           key: result.session_key,
           id: result.session_id,
           ...(result.model !== undefined ? { model: result.model } : {}),
+          ...(typeof result.title === 'string' ? { title: result.title } : {}),
+          ...(typeof result.runStatus === 'string'
+            ? { runStatus: normalizeSessionRunStatus(result.runStatus) } : {}),
         }
       } catch (error) {
         if (isAbort(error, request.signal)) throw error

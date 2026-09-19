@@ -1476,6 +1476,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "workspaces.references.read",
+      "schema": "workspaces/workspaces-references-read.schema.json",
+      "schemaSha256": "63c30e5b3c065913af27f1ce7650ef45a45e5d9c3cd7fabc2f21f90a1c73e93e"
+    },
+    {
+      "lifecycle": "stable",
       "name": "workspaces.remove",
       "schema": "workspaces/workspaces-remove.schema.json",
       "schemaSha256": "39ea25c309221eddf713ace29784017c6986f9d8c84bfec76896dfc4beaf9f8f"
@@ -1490,10 +1496,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "825a4861acf919d29c4959935a3c6fbafc1e44673e9f63c1c1de10885a52d504",
-    "methodCount": 219,
-    "schemaCount": 229,
-    "schemaTreeSha256": "25ba5fd16e1a1a31294eb099c4f93d5e3475b7189a53deaf865d91f17f524b69",
+    "generatorSha256": "57b960851d06362581cf173d8acee15a5b913f8ad341528ce41a1ccd114cb0bd",
+    "methodCount": 220,
+    "schemaCount": 230,
+    "schemaTreeSha256": "0dcef6b8266a2d542570be06be3fddf572b26db7e0cc793cf4e49121812b74d3",
     "toolchains": {
       "legacyTypes": {
         "python": {

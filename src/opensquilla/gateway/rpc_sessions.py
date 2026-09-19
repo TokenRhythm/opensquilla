@@ -37,6 +37,7 @@ from opensquilla.application.session_directory import (
     SessionDirectory,
     SessionSearchProjection,
     _resolve_session_record_for_bootstrap,
+    session_reference_v1,
 )
 from opensquilla.application.session_lifecycle import (
     ForkSessionSpec,
@@ -2606,6 +2607,11 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         )
         row.update(task_summary)
         row.update(view_fields)
+        row["reference"] = session_reference_v1(
+            s.session_key,
+            title=row.get("title") or row.get("display_name"),
+            run_status=row.get("runStatus"),
+        )
         row.update(_workspace_metadata_for_session(s, ctx.config))
         result.append(row)
 
@@ -2671,6 +2677,7 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
             effective_agent_id=view.get("effectiveAgentId"),
             surface=view.get("surface"),
             updated_at=view.get("updatedAt"),
+            run_status=str(view.get("runStatus") or "idle"),
         )
 
     async def read_titles(sessions: Sequence[Any]) -> dict[str, str]:
@@ -2684,6 +2691,16 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
         derive_transcript_title=derive_transcript_title,
         read_transcript_titles=read_titles,
     )
+    keys = list(dict.fromkeys(
+        [hit.key for hit in result.sessions] + [hit.key for hit in result.messages]
+    ))
+    task_rows_by_session = await _list_task_rows_by_session(ctx, storage, keys)
+    run_statuses = {}
+    for key in keys:
+        canonical_key = canonicalize_session_key(key)
+        task_state = _task_state_summary(task_rows_by_session.get(canonical_key, []))
+        await _overlay_runtime_task_snapshot(ctx, canonical_key, task_state)
+        run_statuses[key] = task_state["run_status"]
     return {
         "sessions": [
             {
@@ -2692,6 +2709,12 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
                 "effectiveAgentId": hit.projection.effective_agent_id,
                 "surface": hit.projection.surface,
                 "updatedAt": hit.projection.updated_at,
+                "runStatus": run_statuses[hit.key],
+                "reference": session_reference_v1(
+                    hit.key,
+                    title=hit.projection.title,
+                    run_status=run_statuses[hit.key],
+                ),
             }
             for hit in result.sessions
         ],
@@ -2702,6 +2725,10 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
                 "role": hit.role,
                 "snippet": hit.snippet,
                 "createdAt": hit.created_at,
+                "runStatus": run_statuses[hit.key],
+                "reference": session_reference_v1(
+                    hit.key, title=hit.title, run_status=run_statuses[hit.key],
+                ),
             }
             for hit in result.messages
         ],
@@ -4437,6 +4464,23 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
         raise KeyError("No session storage available")
 
     resolution = await SessionDirectory(storage).resolve(key)
+    session = await storage.get_session(resolution.key)
+    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    titles = await _list_transcript_titles(
+        storage, [session], channel_types=channel_types
+    ) if session else {}
+    tasks = await _list_task_rows(ctx, storage, resolution.key)
+    task_state = _task_state_summary(tasks)
+    await _overlay_runtime_task_snapshot(ctx, resolution.key, task_state)
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=tasks,
+        now_ms=int(time.time() * 1000),
+        transcript_title=titles.get(resolution.session_id, ""),
+        channel_types=channel_types,
+    )
+    title = str(view.get("title") or resolution.key)
 
     return {
         "session_key": resolution.key,
@@ -4448,6 +4492,13 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
         "projectWorkspaceDeferred": bool(resolution.workspace_id),
         "created_at": resolution.created_at,
         "updated_at": resolution.updated_at,
+        "title": title,
+        "runStatus": task_state["run_status"],
+        "reference": session_reference_v1(
+            resolution.key,
+            title=title,
+            run_status=task_state["run_status"],
+        ),
     }
 
 

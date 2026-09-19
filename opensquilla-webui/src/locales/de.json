@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "{path} in der Werkbank öffnen",
+    "actions": "Dateiaktionen",
+    "copyPath": "Relativen Pfad kopieren",
+    "copyLocation": "Pfad und Zeilen kopieren",
+    "loading": "Datei wird geprüft…",
+    "copied": "Kopiert",
+    "copyFailed": "Kopieren fehlgeschlagen. Erneut versuchen.",
+    "stale": "Die Datei hat sich geändert. Erneut lesen, um den Verweis zu aktualisieren.",
+    "workspaceMismatch": "Diese Datei gehört zu einem anderen Arbeitsbereich.",
+    "forbidden": "Kein Zugriff auf diese Datei.",
+    "missing": "Die Datei oder ihre Aufgabe ist nicht mehr verfügbar.",
+    "invalid": "Dieser Dateiverweis ist ungültig.",
+    "unsupported": "Diese Datei kann nicht als Quelltext angezeigt werden.",
+    "unavailable": "Datei nicht verfügbar. Verbindung prüfen und erneut versuchen.",
+    "readonly": "Schreibgeschützter Quelltext",
+    "refresh": "Datei erneut prüfen",
+    "lines": "Zeilen {start}–{end} von {total}",
+    "previous": "Vorherige Zeilen anzeigen",
+    "next": "Weitere Zeilen anzeigen"
+  },
   "resourceActions": {
     "more": "Dateiaktionen", "preview": "Vorschau in der App", "openSource": "Mit Standard-App öffnen",
     "reveal": "Im Dateimanager anzeigen", "revealFinder": "Im Finder anzeigen", "revealExplorer": "Im Datei-Explorer anzeigen",
@@ -3656,6 +3677,18 @@
       "deleted": "Gelöscht",
       "missing": "Die Sitzung wurde gelöscht oder ist nicht vorhanden"
     },
+    "sessionReference": {
+      "open": "Chat öffnen",
+      "unavailable": "Sitzung nicht verfügbar",
+      "status": {
+        "queued": "Wartet",
+        "running": "Läuft",
+        "idle": "Inaktiv",
+        "failed": "Fehlgeschlagen",
+        "missing": "Nicht gefunden",
+        "checking": "Wird geprüft…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "Prompt-Cache aktiv halten",
       "title": "Prompt-Cache aktiv halten",
@@ -3767,6 +3800,8 @@
     "copied": "Kopiert",
     "copy": "Kopieren",
     "copySessionKey": "Sitzungs-ID kopieren",
+    "copySessionAppLink": "Anwendungslink kopieren",
+    "copySessionGatewayLink": "Gateway-Weblink kopieren",
     "sessionActions": "Sitzungsaktionen",
     "share": "Teilen",
     "shareSendFirst": "Senden Sie zuerst eine Nachricht, um zu teilen",

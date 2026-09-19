@@ -620,6 +620,12 @@ export function createDesktopPlatform(): Platform {
       ...(typeof window.opensquillaDesktop?.onWindowHidden === 'function'
         ? { onHidden: (callback) => requireDesktopApi().onWindowHidden!(callback) }
         : {}),
+      ...(typeof window.opensquillaDesktop?.onSessionDeepLink === 'function'
+        ? { onSessionDeepLink: (callback) => requireDesktopApi().onSessionDeepLink!(callback) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.getPendingSessionDeepLink === 'function'
+        ? { getPendingSessionDeepLink: () => requireDesktopApi().getPendingSessionDeepLink!() }
+        : {}),
     },
     files: {
       ...(typeof window.opensquillaDesktop?.chooseAttachments === 'function'

@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "Open {path} in Workbench",
+    "actions": "File actions",
+    "copyPath": "Copy relative path",
+    "copyLocation": "Copy path and lines",
+    "loading": "Checking file…",
+    "copied": "Copied",
+    "copyFailed": "Could not copy. Try again.",
+    "stale": "This file has changed. Read it again to get an updated reference.",
+    "workspaceMismatch": "This file belongs to a different workspace.",
+    "forbidden": "You do not have access to this file.",
+    "missing": "The file or its task is no longer available.",
+    "invalid": "This file reference is invalid.",
+    "unsupported": "This file cannot be displayed as source text.",
+    "unavailable": "Unable to open the file. Check the connection and try again.",
+    "readonly": "Read-only source",
+    "refresh": "Check file again",
+    "lines": "Lines {start}–{end} of {total}",
+    "previous": "Show previous lines",
+    "next": "Show more lines"
+  },
   "resourceActions": {
     "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",
     "reveal": "Show in file manager", "revealFinder": "Reveal in Finder", "revealExplorer": "Show in File Explorer",
@@ -3739,6 +3760,18 @@
       "deleted": "Deleted",
       "missing": "Session was deleted or does not exist"
     },
+    "sessionReference": {
+      "open": "Open chat",
+      "unavailable": "Session unavailable",
+      "status": {
+        "queued": "Queued",
+        "running": "Running",
+        "idle": "Idle",
+        "failed": "Failed",
+        "missing": "Missing",
+        "checking": "Checking…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "Prompt cache keepalive",
       "title": "Prompt cache keepalive",
@@ -3852,6 +3885,8 @@
     "copied": "Copied",
     "copy": "Copy",
     "copySessionKey": "Copy session ID",
+    "copySessionAppLink": "Copy application link",
+    "copySessionGatewayLink": "Copy Gateway web link",
     "sessionActions": "Session actions",
     "share": "Share",
     "shareSendFirst": "Send a message first to share",

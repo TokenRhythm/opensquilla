@@ -324,6 +324,12 @@ class ToolContext:
         default=None, repr=False,
     )
 
+    # Explicit config additions are tracked separately from an unrestricted
+    # allowlist so opting into one default-deny tool does not restrict the
+    # normal catalog or authorize every other default-deny tool. Append to
+    # preserve the positional compatibility of the existing context fields.
+    explicitly_allowed_tools: set[str] = field(default_factory=set)
+
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
     """Return whether ``ctx`` carries authority for a top-level Goal turn.

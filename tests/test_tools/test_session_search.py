@@ -8,7 +8,12 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from opensquilla.session.models import SessionNode, TranscriptEntry
+from opensquilla.session.models import (
+    AgentTaskRecord,
+    AgentTaskStatus,
+    SessionNode,
+    TranscriptEntry,
+)
 from opensquilla.session.storage import SessionStorage
 from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.builtin import session_search
@@ -129,7 +134,10 @@ async def persisted(tmp_path):
     async with SessionStorage(db_path) as storage:
         for name in ("one", "two"):
             await storage.upsert_session(
-                SessionNode(session_key=f"agent:main:webchat:{name}", session_id=name)
+                SessionNode(
+                    session_key=f"agent:main:webchat:{name}", session_id=name,
+                    display_name=f"Session {name}",
+                )
             )
         for timestamp, (name, content) in enumerate(contents, start=1):
             await storage.append_transcript_entry(
@@ -173,11 +181,22 @@ async def test_persisted_matches_and_schema(persisted, query, session_id, limit,
     assert result["result_count"] == len(expected)
     assert {row["created_at"] for row in result["results"]} == expected
     for row in result["results"]:
-        assert set(row) == {"session_key", "role", "snippet", "created_at"}
+        assert set(row) == {
+            "session_key", "role", "snippet", "created_at", "title", "runStatus", "reference",
+        }
         name = "two" if row["created_at"] == 5 else "one"
         assert row["session_key"] == f"agent:main:webchat:{name}"
         assert row["role"] == "assistant"
         assert ">>>" in row["snippet"] and "<<<" in row["snippet"]
+        assert row["reference"] == {
+            "version": 1,
+            "kind": "session",
+            "id": row["session_key"],
+            "label": f"Session {name}",
+            "scope": {"sessionKey": row["session_key"]},
+            "state": {"available": True, "runStatus": "idle"},
+            "capabilities": {"open": True, "copy": True},
+        }
 
 
 @pytest.mark.parametrize("query", ["absent", "未曾记录"], ids=["fts", "like"])
@@ -232,3 +251,41 @@ async def test_dispatch_denies_before_storage(
     assert json.loads(result.content)["error_class"] == error_class
     storage.search_transcript.assert_not_awaited()
     storage.search_transcript_like.assert_not_awaited()
+
+
+@pytest.mark.parametrize("task_status,expected", [
+    (AgentTaskStatus.QUEUED, "queued"),
+    (AgentTaskStatus.RUNNING, "running"),
+    (AgentTaskStatus.FAILED, "failed"),
+    (AgentTaskStatus.SUCCEEDED, "idle"),
+])
+async def test_reference_uses_metadata_and_task_ledger(tmp_path, task_status, expected):
+    key = "agent:main:webchat:reference-target"
+    async with SessionStorage(str(tmp_path / "sessions.db")) as storage:
+        await storage.upsert_session(SessionNode(
+            session_key=key, session_id="target", display_name="Deployment review",
+        ))
+        await storage.append_transcript_entry(TranscriptEntry(
+            session_id="target", session_key=key, role="user", content="reference test",
+        ))
+        await storage.create_agent_task(AgentTaskRecord(session_key=key, status=task_status))
+        _, registered = register(storage)
+        result = json.loads(await registered.handler(query="reference"))
+        row = result["results"][0]
+        assert row["title"] == "Deployment review"
+        assert row["runStatus"] == expected
+        assert row["reference"]["label"] == "Deployment review"
+        assert row["reference"]["state"] == {"available": True, "runStatus": expected}
+
+
+async def test_missing_session_is_not_openable(recorded):
+    storage, _, registered = recorded
+    storage.search_transcript.return_value = [{
+        "session_key": "agent:main:webchat:missing", "role": "user",
+        "snippet": "reference", "created_at": 1,
+    }]
+    storage.get_session = AsyncMock(return_value=None)
+    result = json.loads(await registered.handler(query="reference"))
+    reference = result["results"][0]["reference"]
+    assert reference["state"] == {"available": False, "runStatus": "missing"}
+    assert reference["capabilities"]["open"] is False

@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "在工作台中打开 {path}",
+    "actions": "文件操作",
+    "copyPath": "复制相对路径",
+    "copyLocation": "复制路径与行号",
+    "loading": "正在检查文件…",
+    "copied": "已复制",
+    "copyFailed": "复制失败，请重试。",
+    "stale": "文件已变化，请重新读取以获取最新引用。",
+    "workspaceMismatch": "该文件属于其他工作区。",
+    "forbidden": "你没有访问该文件的权限。",
+    "missing": "文件或所属任务已不可用。",
+    "invalid": "文件引用无效。",
+    "unsupported": "此文件无法以源码文本显示。",
+    "unavailable": "无法打开文件，请检查连接后重试。",
+    "readonly": "只读源码",
+    "refresh": "重新检查文件",
+    "lines": "第 {start}–{end} 行，共 {total} 行",
+    "previous": "显示前面的行",
+    "next": "显示更多行"
+  },
   "resourceActions": {
     "more": "文件操作", "preview": "在应用中预览", "openSource": "用默认应用打开",
     "reveal": "在文件管理器中显示", "revealFinder": "在 Finder 中显示", "revealExplorer": "在文件资源管理器中显示",
@@ -3738,6 +3759,18 @@
       "deleted": "已删除",
       "missing": "会话已删除或不存在"
     },
+    "sessionReference": {
+      "open": "打开会话",
+      "unavailable": "会话不可用",
+      "status": {
+        "queued": "排队中",
+        "running": "运行中",
+        "idle": "空闲",
+        "failed": "失败",
+        "missing": "缺失",
+        "checking": "检查中…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "提示词缓存保活",
       "title": "提示词缓存保活",
@@ -3851,6 +3884,8 @@
     "copied": "已复制",
     "copy": "复制",
     "copySessionKey": "复制会话 ID",
+    "copySessionAppLink": "复制应用链接",
+    "copySessionGatewayLink": "复制 Gateway 网页链接",
     "sessionActions": "会话操作",
     "share": "分享",
     "shareSendFirst": "先发送一条消息才能分享",

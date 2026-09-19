@@ -174,6 +174,9 @@ describe('v4 SessionDirectory Adapter', () => {
     const requestTransport = vi.fn().mockResolvedValue({
       session_key: 'agent:main:webchat:default',
       session_id: 'session-default',
+      model: 'vendor/exact-Model-ID',
+      title: 'Deployment review',
+      runStatus: 'running',
       future: { retained: true },
     })
     const directory = createV4SessionDirectory({
@@ -188,6 +191,9 @@ describe('v4 SessionDirectory Adapter', () => {
     })).resolves.toEqual({
       key: 'agent:main:webchat:default',
       id: 'session-default',
+      model: 'vendor/exact-Model-ID',
+      title: 'Deployment review',
+      runStatus: 'running',
     })
 
     expect(ready).toHaveBeenCalledWith({

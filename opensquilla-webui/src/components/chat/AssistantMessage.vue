@@ -256,6 +256,20 @@
         @open="$emit('openSession', $event)"
       />
 
+      <SessionReferenceCard
+        v-for="link in sessionReferences"
+        :key="`${link.callId}:${link.reference.id}`"
+        :reference="link.reference"
+        :resolve-session-availability="resolveSessionAvailability"
+        @open="$emit('openSession', $event)"
+      />
+
+      <template v-if="sessionKey && workbenchEnabled">
+        <WorkspaceReferenceCard v-for="reference in workspaceReferences"
+          :key="`${reference.id}:${reference.locator.startLine}:${reference.state?.revision}`"
+          :reference="reference" :session-key="sessionKey" />
+      </template>
+
       <div
         class="msg-ai-ending"
         :class="{ 'msg-ai-ending--done': showDoneBlock }"
@@ -484,6 +498,9 @@ import PlanCard from '@/components/chat/PlanCard.vue'
 import ReasoningPart from '@/components/chat/parts/ReasoningPart.vue'
 import ReasoningTimeline from '@/components/chat/ReasoningTimeline.vue'
 import SessionCreatedCard from '@/components/chat/SessionCreatedCard.vue'
+import SessionReferenceCard from '@/components/chat/SessionReferenceCard.vue'
+import WorkspaceReferenceCard from '@/components/chat/WorkspaceReferenceCard.vue'
+import { workspaceReferencesFromMessage } from '@/utils/chat/workspaceReferences'
 import StatusHistoryPart from '@/components/chat/parts/StatusHistoryPart.vue'
 import TextPart from '@/components/chat/parts/TextPart.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
@@ -491,6 +508,7 @@ import { useChatRouteFeedback } from '@/composables/chat/useChatRouteFeedback'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import { createdSessionsFromMessage } from '@/utils/chat/createdSessions'
+import { sessionReferencesFromMessage } from '@/utils/chat/sessionReferences'
 import {
   workspacePreviewOpenAction, workspacePreviewPages, workspacePreviewsFromMessage, type WorkspacePreviewLink,
 } from '@/utils/chat/workspacePreviews'
@@ -900,6 +918,8 @@ function openWorkspacePreview(preview: WorkspacePreviewLink) {
 const createdSessions = computed(() => (
   props.message.createdSessionLinks ?? semanticCreatedSessions.value
 ))
+const sessionReferences = computed(() => sessionReferencesFromMessage(props.message))
+const workspaceReferences = computed(() => workspaceReferencesFromMessage(props.message))
 const createdSessionCallIds = computed(() => new Set(
   semanticCreatedSessions.value.map(createdSession => createdSession.callId),
 ))

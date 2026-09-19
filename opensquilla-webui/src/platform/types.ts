@@ -571,6 +571,8 @@ export interface PlatformMigrationApi {
 
 export interface PlatformWindowApi {
   onHidden?: (callback: () => void) => void | (() => void)
+  onSessionDeepLink?: (callback: (sessionKey: string) => void) => () => void
+  getPendingSessionDeepLink?: () => Promise<string | null>
 }
 
 export interface PlatformUpdatesApi {

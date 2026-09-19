@@ -1126,6 +1126,8 @@ import {
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
+import { sessionApplicationLink, sessionDesktopLink } from '@/types/references'
+import { currentSessionGatewayLink } from '@/utils/chat/sessionLinks'
 import {
   toolCallGroups,
   toolGroupStatusText,
@@ -5461,7 +5463,7 @@ const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResou
 const deliverablesOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'share' | 'copy-session-key',
+  action: 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link',
 ) {
   void nextTick(() => chatRouteHeaderRegistration.focusAction(action))
 }
@@ -6007,6 +6009,31 @@ const {
   }
 })
 
+async function copySessionReference(value: string) {
+  if (!sessionKey.value) return
+  try {
+    await copyTextWithFallback(value)
+    pushToast(t('chat.copied'), { tone: 'ok' })
+  } catch {
+    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
+}
+const copySessionLink = () => copySessionReference(
+  platform.capabilities.isDesktop
+    ? sessionDesktopLink(sessionKey.value)
+    : sessionApplicationLink(sessionKey.value),
+)
+async function copyGatewayLink() {
+  const key = sessionKey.value
+  if (!key) return
+  try {
+    const link = await currentSessionGatewayLink(key, platform)
+    if (sessionKey.value === key) await copySessionReference(link)
+  } catch {
+    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
+}
+
 // App owns the header component. This view registers one stable set of refs and
 // commands; draft materialization only changes those refs and never rebuilds
 // the header subtree. The owner token makes delayed teardown harmless.
@@ -6025,6 +6052,8 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   openDeliverables,
   startShare: startShareMode,
   copySessionKey: onSessionCopyClick,
+  copySessionLink,
+  copyGatewayLink,
   restoreComposerFocus: () => composerRef.value?.focusTextarea(),
 })
 

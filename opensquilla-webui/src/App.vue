@@ -217,6 +217,8 @@
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
           @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
+          @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
+          @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
         />
       </div>
       <div
@@ -503,6 +505,7 @@ import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
+import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
@@ -539,6 +542,7 @@ import {
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
+const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
@@ -1924,8 +1928,27 @@ watch(() => appStore.approvalCount, count => {
 
 useDocumentEvent('keydown', handleKeydown)
 
+let desktopDeepLinkUnsubscribe: (() => void) | null = null
+
 onMounted(() => {
   appAutomaticRpcMounted = true
+  desktopDeepLinkUnsubscribe = bindDesktopSessionDeepLinks({
+    window: platform.window,
+    directory: sessionDirectory,
+    gatewayContext: () => ({
+      endpoint: gatewayAccess.isAvailable ? gatewayAccess.loadConnectionEndpoint() : '',
+      epoch: gatewayAccess.isAvailable ? gatewayAccess.subscriptionEpoch : null,
+      authenticated: gatewayAccess.isAuthenticated,
+    }),
+    onGatewayContextChange: callback => watch(() => [
+      gatewayAccess.isAvailable,
+      gatewayAccess.subscriptionEpoch,
+      gatewayAccess.isAuthenticated,
+      gatewayAccess.loadConnectionEndpoint(),
+    ], callback, { flush: 'sync' }),
+    openSession: key => switchToSession(key, 'desktop.deep_link'),
+    unavailable: () => pushToast(t('chat.sessionReference.unavailable'), { tone: 'danger' }),
+  })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener('focus', markCurrentSessionReadIfVisible)
@@ -1947,6 +1970,8 @@ onUnmounted(() => {
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
+  desktopDeepLinkUnsubscribe?.()
+  desktopDeepLinkUnsubscribe = null
   cronFinishedSubscription?.close()
   cronFinishedSubscription = null
   if (titleDebounce) {
