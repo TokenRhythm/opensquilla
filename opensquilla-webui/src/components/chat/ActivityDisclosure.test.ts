@@ -527,6 +527,40 @@ describe('ActivityDisclosure failure visibility', () => {
   })
 })
 
+describe('ActivityDisclosure ThinkingOrb integration', () => {
+  // In this DOM environment HTMLCanvasElement.getContext('2d') is unavailable,
+  // which is exactly the degraded path: the real ThinkingOrb must report an
+  // error and the header must fall back to the pulsing CSS dot.
+  it('falls back to the pulsing dot when the canvas context is unavailable', async () => {
+    const host = mountDisclosure({
+      lifecycle: 'working',
+      stepCount: 0,
+      failureCount: 0,
+    })
+    await nextTick()
+    await nextTick()
+
+    expect(host.querySelector('.assistant-activity__live-orb')).toBeNull()
+    const dot = host.querySelector('.assistant-activity__live-dot')
+    expect(dot).not.toBeNull()
+    expect(dot?.classList.contains('is-active')).toBe(true)
+    expect(dot?.classList.contains('is-stale')).toBe(false)
+  })
+
+  it('keeps the plain CSS dot for stale headers without touching the orb', async () => {
+    const host = mountDisclosure({
+      lifecycle: 'working',
+      stepCount: 0,
+      failureCount: 0,
+      stale: true,
+    })
+    await nextTick()
+    expect(host.querySelector('.assistant-activity__live-orb')).toBeNull()
+    const dot = host.querySelector('.assistant-activity__live-dot')
+    expect(dot?.classList.contains('is-stale')).toBe(true)
+  })
+})
+
 describe('ActivityDisclosure aria wiring', () => {
   it('links the summary button to the fold body via aria-controls', async () => {
     const host = mountDisclosure({
