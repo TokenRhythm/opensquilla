@@ -2444,7 +2444,8 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/mcp-transports.log
             ${{ runner.temp }}/desktop-recovery-e2e/mcp-frozen.log
             ${{ runner.temp }}/desktop-recovery-e2e/mcp-frozen/build.log
-            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-*.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-build.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-smoke.log
             ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-size-bytes.json
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
