@@ -25,7 +25,10 @@ test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
   assert.ok(result.targets.includes('method:skills.install.status:result'))
-  assert.equal(result.targets.length, 223)
+  assert.equal(result.targets.length, 225)
+  assert.deepEqual(result.targets.filter(target => (
+    target.startsWith('method:workspaces.references.read:')
+  )), ['method:workspaces.references.read:params', 'method:workspaces.references.read:result'])
   assert.deepEqual(result.targets.filter(target => (
     target.startsWith('method:models.list:')
   )), ['method:models.list:params', 'method:models.list:result'])

@@ -20,11 +20,12 @@ _KEY = "agent:main:webchat:source-reference-test"
 
 
 @pytest_asyncio.fixture
-async def source_context(tmp_path: Path):
+async def source_context(tmp_path: Path, request):
     root = tmp_path / "workspace"
     root.mkdir()
     source = root / "src.py"
-    source.write_text("first\nsecond\nthird\n", encoding="utf-8")
+    newline = getattr(request, "param", b"\n")
+    source.write_bytes(newline.join([b"first", b"second", b"third", b""]))
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
     session = SessionNode(
         session_key=_KEY,
@@ -48,6 +49,7 @@ async def source_context(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source_context", [b"\n", b"\r\n"], ids=["lf", "crlf"], indirect=True)
 async def test_reads_scoped_source_and_generated_contract(source_context):
     ctx, params, source = source_context
     response = await get_dispatcher().dispatch(
@@ -55,7 +57,8 @@ async def test_reads_scoped_source_and_generated_contract(source_context):
     )
     assert response.ok, response.error
     result = response.payload
-    assert result["content"] == source.read_text()
+    assert result["content"] == source.read_bytes().decode("utf-8")
+    assert result["revision"] == params["reference"]["state"]["revision"]
     assert (result["startLine"], result["endLine"], result["totalLines"]) == (2, 3, 3)
     assert result["reference"]["scope"] == params["reference"]["scope"]
     assert result["reference"]["capabilities"]["reveal"] is False
@@ -121,6 +124,15 @@ async def test_rejects_stale_revision_without_returning_new_content(source_conte
         await read_workspace_reference(params, ctx)
     assert error.value.code == "STALE_REFERENCE"
     assert "changed" not in str(error.value.details)
+
+
+@pytest.mark.asyncio
+async def test_newline_only_change_invalidates_source_revision(source_context):
+    ctx, params, source = source_context
+    source.write_bytes(source.read_bytes().replace(b"\n", b"\r\n"))
+    with pytest.raises(RpcHandlerError) as error:
+        await read_workspace_reference(params, ctx)
+    assert error.value.code == "STALE_REFERENCE"
 
 
 @pytest.mark.asyncio

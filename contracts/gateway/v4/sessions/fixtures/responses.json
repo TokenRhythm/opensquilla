@@ -310,7 +310,24 @@
                 "taskId": "task-parent",
                 "spawnDepth": 1
               },
-              "cron": null
+              "cron": null,
+              "reference": {
+                "version": 1,
+                "kind": "session",
+                "id": "agent:main:subagent:child",
+                "label": "Inspect checkout failures",
+                "scope": {
+                  "sessionKey": "agent:main:subagent:child"
+                },
+                "state": {
+                  "available": true,
+                  "runStatus": "failed"
+                },
+                "capabilities": {
+                  "open": true,
+                  "copy": true
+                }
+              }
             }
           ],
           "count": 1,

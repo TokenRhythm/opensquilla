@@ -200,7 +200,17 @@ def test_desktop_deep_link_protocol_is_registered_and_safely_activated() -> None
     )
     assert "async function activateMainWindow(" in main_ts
     assert "function handleDeepLink(rawUrl: unknown" in main_ts
-    assert "parseDesktopDeepLink(rawUrl)" in main_ts
+    handler = _section(
+        main_ts,
+        "function handleDeepLink(rawUrl: unknown",
+        "function handleDeepLinksFromCommandLine(",
+    )
+    assert "const target = parseDesktopDeepLinkTarget(rawUrl)" in handler
+    assert "if (!target || target.action !== 'open')" in handler
+    assert "if (target.sessionKey) pendingDesktopSessionKey = target.sessionKey" in handler
+    assert "if (!desktopDeepLinkActivationReady)" in handler
+    assert "pendingDesktopDeepLinkOpen = true" in handler
+    assert "sendPendingDesktopSessionTarget()" in handler
     assert "desktopDeepLinkArguments(commandLine)" in main_ts
     assert "app.setAsDefaultProtocolClient(DESKTOP_DEEP_LINK_SCHEME)" in main_ts
 
@@ -223,15 +233,28 @@ def test_desktop_deep_link_protocol_is_registered_and_safely_activated() -> None
         second_instance
     )
 
-    initial_argv = _section(
+    initial_arguments = _section(
         main_ts,
-        "if (process.platform === 'win32') {\n    handleDeepLinksFromCommandLine",
-        "app.on('second-instance'",
+        "const initialDesktopDeepLinkArguments =",
+        "// Bounded retry for the single-instance lock.",
     )
-    assert "process.argv" in initial_argv
-    assert "'initial-argv'" in initial_argv
+    assert "process.platform === 'win32' || process.platform === 'linux'" in initial_arguments
+    assert "desktopDeepLinkArguments(process.argv)" in initial_arguments
+    assert (
+        "handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')"
+        in main_ts
+    )
     assert "pendingDesktopDeepLinkOpen" in main_ts
     assert "desktopDeepLinkActivationReady" in main_ts
+    pending_ipc = _section(
+        main_ts,
+        "ipcMain.handle('desktop:deep-link-session:get'",
+        "ipcMain.handle('desktop:theme:set'",
+    )
+    assert "if (!trustedMainWindowControlIpc(event)) return null" in pending_ipc
+    assert "const sessionKey = pendingDesktopSessionKey" in pending_ipc
+    assert "pendingDesktopSessionKey = null" in pending_ipc
+    assert "return sessionKey" in pending_ipc
 
 
 def test_desktop_window_close_has_a_visible_background_recovery_surface() -> None:

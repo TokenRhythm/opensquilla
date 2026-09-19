@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from opensquilla.application.session_directory import session_reference_v1
+from opensquilla.resource_references import session_reference_v1
 from opensquilla.tools.registry import ToolRegistry, tool
 from opensquilla.tools.types import PlanAccess, ToolError
 

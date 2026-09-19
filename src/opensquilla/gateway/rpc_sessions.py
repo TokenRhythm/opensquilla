@@ -37,7 +37,6 @@ from opensquilla.application.session_directory import (
     SessionDirectory,
     SessionSearchProjection,
     _resolve_session_record_for_bootstrap,
-    session_reference_v1,
 )
 from opensquilla.application.session_lifecycle import (
     ForkSessionSpec,
@@ -243,6 +242,7 @@ from opensquilla.project_workspaces import (
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
 )
+from opensquilla.resource_references import session_reference_v1
 from opensquilla.run_mode import (
     RunMode,
     config_run_mode,

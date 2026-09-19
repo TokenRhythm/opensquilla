@@ -10,7 +10,6 @@ import pytest
 from opensquilla.application.session_directory import (
     SessionDirectory,
     SessionSearchProjection,
-    session_reference_v1,
 )
 
 
@@ -45,22 +44,6 @@ def session(**overrides: Any) -> SimpleNamespace:
     }
     values.update(overrides)
     return SimpleNamespace(**values)
-
-
-def test_session_reference_v1_has_stable_identity_scope_and_capabilities() -> None:
-    assert session_reference_v1(
-        "webchat:default",
-        title="  Default   chat ",
-        run_status="running",
-    ) == {
-        "version": 1,
-        "kind": "session",
-        "id": "agent:main:webchat:default",
-        "label": "Default chat",
-        "scope": {"sessionKey": "agent:main:webchat:default"},
-        "state": {"available": True, "runStatus": "running"},
-        "capabilities": {"open": True, "copy": True},
-    }
 
 
 @pytest.mark.asyncio

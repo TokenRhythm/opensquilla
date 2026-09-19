@@ -535,7 +535,7 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
 
 
 def test_history_budget_keeps_complete_distinct_session_reference_identities() -> None:
-    from opensquilla.application.session_directory import session_reference_v1
+    from opensquilla.resource_references import session_reference_v1
 
     references = [
         session_reference_v1(
