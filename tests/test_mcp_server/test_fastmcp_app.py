@@ -75,7 +75,7 @@ class FakeBridge:
 def test_create_mcp_server_registers_product_tools_and_resources() -> None:
     app = create_mcp_server(FakeBridge(), fastmcp_cls=FakeFastMCP)
 
-    assert app.kwargs == {"json_response": True}
+    assert app.kwargs == {}
     assert set(app.tools) == {
         "conversations_list",
         "session_resolve",
@@ -102,9 +102,12 @@ def test_create_mcp_server_has_no_benchmark_or_mock_public_tools() -> None:
 
 def test_optional_mcp_dependency_excludes_vulnerable_fastmcp_releases() -> None:
     pyproject = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))
-    mcp_specs = pyproject["project"]["optional-dependencies"]["mcp"]
+    assert pyproject["project"]["optional-dependencies"]["mcp"] == []
+    mcp_specs = pyproject["project"]["dependencies"]
 
     requirement = next(Requirement(spec) for spec in mcp_specs if spec.startswith("mcp"))
-    assert "1.28.1" in requirement.specifier
+    assert "2.2.0" in requirement.specifier
+    assert "3.0.0" not in requirement.specifier
+    assert "1.28.1" not in requirement.specifier
     assert "1.28.0" not in requirement.specifier
     assert "2.0.0" not in requirement.specifier

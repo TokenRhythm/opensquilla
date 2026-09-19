@@ -4,9 +4,9 @@ Speaks the standard stdio transport: newline-delimited JSON-RPC, no
 Content-Length headers.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
-server = FastMCP("stdio-test-server")
+server = MCPServer("stdio-test-server")
 
 
 @server.tool()
