@@ -360,7 +360,8 @@ def test_shared_relay_is_installed_after_clean_environment_and_uses_only_placeho
 
 
 @pytest.mark.parametrize("variant", [
-    "basic", "tools", "replay_off", "model_switch", "repeated", "truncated", "long_reasoning",
+    "basic", "chunked", "tools", "replay_off", "model_switch", "repeated", "truncated",
+    "long_reasoning",
 ])
 def test_compaction_cli_passes_explicit_variant_and_model(monkeypatch, capsys, variant):
     monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-cli-credential")
@@ -1086,3 +1087,92 @@ async def test_gateway_adapter_uses_existing_storage_without_seeding_or_exposing
     assert report["storage"]["duplicate_canonical_ids"] == 0
     assert "private-synthetic-body" not in report_path.read_text()
     assert "synthetic-key" not in report_path.read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recall_result", [
+    "complete", "missing_label", "missing_marker", "missing_summary_label",
+    "missing_persisted_label",
+])
+async def test_chunked_compaction_reports_one_preflight_after_runner_cleanup(
+    tmp_path, monkeypatch, recall_result,
+):
+    label = "qzvxjprt"
+    final_answer = {
+        "missing_label": "COMPACTION_RECALL_OK",
+        "missing_marker": label,
+    }.get(recall_result, f"{label} COMPACTION_RECALL_OK")
+    summary = "Completed archived background. The synthetic memory exercise is complete."
+    if recall_result != "missing_summary_label":
+        summary += f" Retain COMPACTION_LABEL={label} for exact recall."
+    responses = iter([f"COMPACTION_LABEL={label}", summary, summary, final_answer])
+
+    if recall_result == "missing_persisted_label":
+        prepare = harness.SessionManager.prepare_message
+
+        async def drop_label(self, session_key, role, content, **kwargs):
+            if role == "assistant" and label in content:
+                content = content.replace(label, "removed-fixture-label")
+                kwargs["assistant_replay"] = None
+            return await prepare(self, session_key, role, content, **kwargs)
+
+        monkeypatch.setattr(harness.SessionManager, "prepare_message", drop_label)
+
+    async def respond(request):
+        frame = {
+            "choices": [{"index": 0, "delta": {"content": next(responses)},
+                         "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 20},
+        }
+        return httpx.Response(
+            200, request=request, headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(frame)}\n\ndata: [DONE]\n\n".encode(),
+        )
+
+    observer = harness.WireObserver(
+        harness.registry_endpoint("openrouter"), httpx.MockTransport(respond), max_calls=4,
+    )
+    run = harness._run_compaction_case(
+        tmp_path, provider="openrouter", model="deepseek/deepseek-v4-flash",
+        api_key="synthetic-offline-key", observer=observer, thinking="off", variant="chunked",
+    )
+    if recall_result == "complete":
+        report = await run
+        assert report["ok"] is True
+        assert report["preflight_ratio"] == 0.85
+        assert report["compaction_attempted_by_turn"] == [False, True]
+        assert report["summary_call_indexes"] == [1, 2]
+        assert report["coverage"]["observed"]["chunked_summary"] is True
+        assert report["coverage"]["observed"]["single_preflight"] is True
+    else:
+        # Persistence, summary coverage, and answer compliance are separate
+        # failure boundaries; no absent fact may pass through an implication.
+        code = {
+            "missing_summary_label": "summary_generated_fact_missing",
+            "missing_persisted_label": "parent_generated_label_not_persisted",
+        }.get(recall_result, "compaction_memory_recall_mismatch")
+        with pytest.raises(harness.ReplayCheckError, match=f"^{code}$"):
+            await run
+
+    assert not observer.engine_error_codes
+    recall_checks = observer.replay_checks["memory_recall_checks"]
+    if recall_result == "missing_persisted_label":
+        assert len(observer.calls) == 1
+        assert observer.replay_checks["compaction_attempted_by_turn"] == [False]
+        assert recall_checks == []
+        return
+
+    assert len(observer.calls) == 4
+    assert observer.replay_checks["compaction_attempted_by_turn"] == [False, True]
+    assert [event["phase"] for event in observer.replay_checks["compaction_events"]
+            if event.get("status") == "started"] == ["preflight"]
+    if recall_result == "missing_summary_label":
+        assert label in observer.calls[-1].response["content"]
+        assert recall_checks == []
+    else:
+        assert recall_checks == [{
+            "labels_in_summary": [True],
+            "labels_in_answer": [recall_result != "missing_label"],
+            "completion_marker_in_answer": recall_result != "missing_marker",
+        }]
+    assert label not in json.dumps(recall_checks)

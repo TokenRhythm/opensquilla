@@ -456,7 +456,6 @@
     "tests/test_engine/test_subagent_execution_target.py": 0.048,
     "tests/test_engine/test_subagent_run_mode_inheritance.py": 0.01,
     "tests/test_engine/test_subagent_usage_rollup.py": 0.11,
-    "tests/test_engine/test_t3_upgrade_compaction.py": 0.2,
     "tests/test_engine/test_tokenjuice_tool_result_projection.py": 1.636,
     "tests/test_engine/test_tool_activity_heartbeat.py": 0.437,
     "tests/test_engine/test_tool_concurrency.py": 3.935,

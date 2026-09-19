@@ -408,7 +408,6 @@ complaint_upgrade_steps = 1
 complaint_upgrade_max_chars = 160
 require_router_runtime = true
 estimated_output_savings_pct = 0.03
-upgrade_to_c3_compaction_enabled = true
 # What routing does when a tier names a provider other than [llm].provider
 # while cross_provider_tiers is off. "route" (default) preserves the historical
 # behavior: the mismatch is logged but the tier's model runs on the active

@@ -139,8 +139,6 @@ class TurnContext:
     sync_manager: Any = None
 
     # Populated by CompactionAndHistoryStage
-    t3_upgrade_status: str = ""
-    preflight_invoked: bool = False
     loaded_compaction_summary_context: str | None = None
     final_request_context_prompt: str | None = None
 

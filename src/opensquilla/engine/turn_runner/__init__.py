@@ -35,7 +35,6 @@ from opensquilla.engine.turn_runner.compaction_and_history_stage import (
     HistoryLoaderPort,
     PreflightCompactionPort,
     RequestContextPrependPort,
-    T3UpgradeCompactionPort,
 )
 from opensquilla.engine.turn_runner.context import TurnContext, TurnExecutionContext
 from opensquilla.engine.turn_runner.input_stage import (
@@ -141,7 +140,6 @@ __all__ = [
     "StreamConsumerStage",
     "StreamConsumerStageInput",
     "SystemPromptRefreshPort",
-    "T3UpgradeCompactionPort",
     "TimeoutBudgetPort",
     "ToolBuilderPort",
     "TranscriptAppendPort",

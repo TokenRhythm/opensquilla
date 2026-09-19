@@ -128,16 +128,12 @@ def _patch_thinking(runner: TurnRunner) -> None:
 
 
 def _patch_compaction_history(runner: TurnRunner) -> None:
-    async def _t3(self, *_a, **_kw):  # noqa: ARG002
-        return "not_applicable"
-
     async def _preflight(self, *_a, **_kw):  # noqa: ARG002
         return None
 
     async def _load_history(self, *_a, **_kw):  # noqa: ARG002
         return None
 
-    runner._maybe_compact_on_t3_upgrade = _t3.__get__(runner, TurnRunner)
     runner._maybe_preflight_compact = _preflight.__get__(runner, TurnRunner)
     runner._load_history = _load_history.__get__(runner, TurnRunner)
 

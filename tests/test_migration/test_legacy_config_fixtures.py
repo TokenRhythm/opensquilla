@@ -132,6 +132,7 @@ def test_modern_era_configs_strip_retired_skill_filter_and_memory_flush_settings
             "skills.filter_semantic_top_n",
             "skills.filter_strategy",
             "skills.filter_top_k",
+            "squilla_router.upgrade_to_c3_compaction_enabled",
         }
 
 
