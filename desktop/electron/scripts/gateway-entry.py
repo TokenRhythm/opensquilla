@@ -110,7 +110,6 @@ def _run_desktop_mcp_probe(gateway_url: str) -> int:
     """Use real MCP stdio and the production server bridge to the local Gateway."""
     import asyncio
     import json
-    from datetime import timedelta
     from urllib.parse import urlsplit
 
     target = urlsplit(gateway_url)
@@ -119,49 +118,49 @@ def _run_desktop_mcp_probe(gateway_url: str) -> int:
         return 1
 
     async def check() -> dict:
-        from mcp.client.session import ClientSession
-        from mcp.client.stdio import StdioServerParameters, stdio_client
+        from mcp import Client, StdioServerParameters
+        from mcp_types import LATEST_PROTOCOL_VERSION
 
         arguments = [] if getattr(sys, "frozen", False) else [os.path.abspath(__file__)]
         arguments.extend(["mcp-server", "run", "--gateway", gateway_url])
         parameters = StdioServerParameters(
             command=sys.executable, args=arguments, env=dict(os.environ),
         )
-        async with stdio_client(parameters) as (read_stream, write_stream):
-            async with ClientSession(
-                read_stream, write_stream, read_timeout_seconds=timedelta(seconds=20),
-            ) as session:
-                initialized = await session.initialize()
-                if (
-                    initialized.capabilities.tools is None
-                    or initialized.capabilities.resources is None
-                ):
-                    raise ValueError("MCP server capabilities are incomplete")
-                tools = await session.list_tools()
-                names = sorted(tool.name for tool in tools.tools)
-                expected = sorted([
-                    "conversations_list", "session_resolve", "messages_read",
-                    "messages_send", "events_wait", "transcript_export",
-                ])
-                if names != expected:
-                    raise ValueError("MCP product tool registration is incomplete")
-                result = await session.call_tool("conversations_list", {"limit": 3})
-                if result.isError:
-                    raise ValueError("MCP Gateway tool call failed")
-                payload = result.structuredContent
-                if not isinstance(payload, dict):
-                    payload = json.loads(result.content[0].text)
-                if payload.get("sessions") != []:
-                    raise ValueError("The isolated Gateway must start with no sessions")
-                resources = await session.list_resources()
-                uris = sorted(str(resource.uri) for resource in resources.resources)
-                if uris != ["opensquilla://sessions"]:
-                    raise ValueError("MCP session resource registration is incomplete")
-                resource = await session.read_resource("opensquilla://sessions")
-                if json.loads(resource.contents[0].text).get("sessions") != []:
-                    raise ValueError("MCP resource did not read the isolated Gateway")
-                return {"probe": "opensquilla-desktop-mcp", "tools": names,
-                        "sessions": 0, "resources": uris}
+        async with Client(parameters, mode="auto", read_timeout_seconds=20) as client:
+            # Both ends use the bundled SDK and must negotiate its latest protocol.
+            if client.protocol_version != LATEST_PROTOCOL_VERSION:
+                raise ValueError("MCP probe negotiated an outdated protocol")
+            if (
+                client.server_capabilities.tools is None
+                or client.server_capabilities.resources is None
+            ):
+                raise ValueError("MCP server capabilities are incomplete")
+            tools = await client.list_tools()
+            names = sorted(tool.name for tool in tools.tools)
+            expected = sorted([
+                "conversations_list", "session_resolve", "messages_read",
+                "messages_send", "events_wait", "transcript_export",
+            ])
+            if names != expected:
+                raise ValueError("MCP product tool registration is incomplete")
+            result = await client.call_tool("conversations_list", {"limit": 3})
+            if result.is_error:
+                raise ValueError("MCP Gateway tool call failed")
+            payload = result.structured_content
+            if not isinstance(payload, dict):
+                payload = json.loads(result.content[0].text)
+            if payload.get("sessions") != []:
+                raise ValueError("The isolated Gateway must start with no sessions")
+            resources = await client.list_resources()
+            uris = sorted(str(resource.uri) for resource in resources.resources)
+            if uris != ["opensquilla://sessions"]:
+                raise ValueError("MCP session resource registration is incomplete")
+            resource = await client.read_resource("opensquilla://sessions")
+            if json.loads(resource.contents[0].text).get("sessions") != []:
+                raise ValueError("MCP resource did not read the isolated Gateway")
+            return {"probe": "opensquilla-desktop-mcp", "tools": names,
+                    "sessions": 0, "resources": uris,
+                    "protocolVersion": client.protocol_version}
 
     try:
         result = asyncio.run(check())

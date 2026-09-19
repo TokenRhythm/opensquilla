@@ -62,6 +62,9 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     _write(context / "opensquilla-webui/.node-version", "22.12.0\n")
     _write(context / "opensquilla-webui/public/music/local.mp3", "local music\n")
     _write(context / "src/opensquilla/__init__.py")
+    _write(context / "scripts/verify_webui_artifact.py")
+    _write(context / "scripts/freeze_migration_registry.py")
+    _write(context / "scripts/private-build-notes.py")
 
     result = subprocess.run(
         [
@@ -85,6 +88,9 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
     assert (copied / "opensquilla-webui/.node-version").is_file()
     assert (copied / "opensquilla-webui/public/music/local.mp3").is_file()
     assert (copied / "src/opensquilla/__init__.py").is_file()
+    assert (copied / "scripts/verify_webui_artifact.py").is_file()
+    assert (copied / "scripts/freeze_migration_registry.py").is_file()
+    assert not (copied / "scripts/private-build-notes.py").exists()
 
     assert not (copied / ".env").exists()
     assert not (copied / "opensquilla-webui/.env.local").exists()

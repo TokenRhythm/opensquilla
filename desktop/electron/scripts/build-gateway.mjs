@@ -358,6 +358,12 @@ const args = [
   'sqlalchemy',
   '--copy-metadata',
   'websockets',
+  // The MCP SDK's HTTP stack reads distribution versions during import.
+  // OTel entry points are collected by the locked upstream opentelemetry hook.
+  '--copy-metadata',
+  'httpx2',
+  '--copy-metadata',
+  'httpcore2',
   '--hidden-import',
   'joblib',
   '--hidden-import',

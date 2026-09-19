@@ -277,16 +277,22 @@
     },
     "desktop-recovery-e2e": {
       "execution_inputs": [
+        ".dockerignore",
+        "Dockerfile",
         ".github/scripts/verify-windows-native-write-view.mjs",
         ".github/scripts/native-audit-write-view.py",
         "tests/test_ci/test_windows_signed_update_audit.py",
         "desktop/electron/**",
         "opensquilla-webui/**",
+        "src/opensquilla/mcp/**",
+        "src/opensquilla/mcp_server/**",
         "src/opensquilla/gateway/**",
         "src/opensquilla/persistence/**",
         "src/opensquilla/recovery/**",
         "src/opensquilla/session/**",
         "tests/test_desktop/**",
+        "tests/test_mcp/**",
+        "tests/test_mcp_server/**",
         "tests/test_recovery/**"
       ]
     },
