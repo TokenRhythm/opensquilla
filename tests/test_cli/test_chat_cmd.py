@@ -1475,7 +1475,8 @@ class _FakeGatewayClient:
 
     instances: list[_FakeGatewayClient]
 
-    def __init__(self) -> None:
+    def __init__(self, *, structured_user_input: bool = False) -> None:
+        self.structured_user_input = structured_user_input
         self.create_calls: list[dict[str, object]] = []
         self.send_calls: list[dict[str, object]] = []
         self.resolve_calls: list[str] = []
@@ -1643,6 +1644,7 @@ async def test_gateway_chat_forwards_model_to_create_session(monkeypatch) -> Non
     fake = _FakeGatewayClient.instances[-1]
     assert fake.connected is True
     assert fake.closed is True
+    assert fake.structured_user_input is True
     assert fake.create_calls == [
         {
             "agent_id": "main",
@@ -1668,6 +1670,7 @@ async def test_gateway_chat_session_id_skips_create_session(monkeypatch) -> None
     await chat_cmd._gateway_chat(model=None, session_id="agent:main:resumed-key")
 
     fake = _FakeGatewayClient.instances[-1]
+    assert fake.structured_user_input is True
     assert fake.create_calls == []  # MUST NOT create
     assert len(fake.send_calls) == 1
     assert fake.send_calls[0]["session_key"] == "agent:main:resumed-key"
