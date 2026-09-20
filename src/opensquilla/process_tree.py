@@ -402,12 +402,29 @@ def _prepare_private_file_once(path: Path) -> None:
         metadata = os.lstat(path)
     try:
         if os.name == "nt":
-            apply_windows_private_dacl(
-                path,
-                directory=False,
-                expected_device=int(metadata.st_dev),
-                expected_inode=int(metadata.st_ino),
-            )
+            try:
+                apply_windows_private_dacl(
+                    path,
+                    directory=False,
+                    expected_device=int(metadata.st_dev),
+                    expected_inode=int(metadata.st_ino),
+                )
+            except OSError as exc:
+                # Another first writer may replace its newly created file
+                # before the ACL handle is bound. Only a fresh regular file
+                # with a different identity qualifies for the existing retry;
+                # same-object ACL errors and unsafe replacements remain fatal.
+                current = os.lstat(path)
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and bool(metadata.st_ino)
+                    and (int(current.st_dev), int(current.st_ino))
+                    != (int(metadata.st_dev), int(metadata.st_ino))
+                ):
+                    raise _OwnerRegistryFileChangedError(
+                        "task process owner registry changed during privacy hardening"
+                    ) from exc
+                raise
             current = os.lstat(path)
             if (
                 stat.S_ISLNK(current.st_mode)

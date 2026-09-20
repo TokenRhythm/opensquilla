@@ -2084,6 +2084,96 @@ def test_windows_registry_retries_disappearing_main_file(
     assert attempts == 3
 
 
+@pytest.mark.parametrize("preexisting", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_windows_registry_retries_main_file_identity_change_before_acl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+    persistent: bool,
+) -> None:
+    database_path = tmp_path / "synthetic-registry.sqlite3"
+    if preexisting:
+        database_path.write_bytes(b"original")
+    attempts = 0
+    delays: list[float] = []
+
+    def replace_before_bind(
+        path,
+        *,
+        directory: bool,
+        expected_device: int,
+        expected_inode: int,
+    ) -> None:
+        nonlocal attempts
+        if directory:
+            return
+        attempts += 1
+        metadata = os.lstat(path)
+        assert (metadata.st_dev, metadata.st_ino) == (expected_device, expected_inode)
+        if attempts > 1 and not persistent:
+            return
+        # Keep the old file alive so the replacement cannot reuse its identity.
+        path.rename(path.with_name(f"previous-{attempts}.sqlite3"))
+        path.write_bytes(b"replacement")
+        current = os.lstat(path)
+        assert (current.st_dev, current.st_ino) != (expected_device, expected_inode)
+        raise OSError("synthetic bound path changed")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_before_bind)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    if persistent:
+        with pytest.raises(
+            process_tree.ProcessTreeOwnershipError,
+            match="registry changed during privacy hardening",
+        ):
+            process_tree._prepare_private_file(database_path)
+        assert attempts == len(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS) + 1
+        assert delays == list(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS)
+    else:
+        process_tree._prepare_private_file(database_path)
+        assert attempts == 2
+        assert delays == list(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS[:1])
+    assert database_path.read_bytes() == b"replacement"
+    assert (tmp_path / "previous-1.sqlite3").read_bytes() == (
+        b"original" if preexisting else b""
+    )
+
+
+def test_windows_registry_rejects_nonregular_replacement_before_acl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "synthetic-registry.sqlite3"
+    previous = tmp_path / "previous.sqlite3"
+    database_path.write_bytes(b"original")
+    attempts = 0
+    delays: list[float] = []
+
+    def replace_before_bind(path, *, directory: bool, **_kwargs: object) -> None:
+        nonlocal attempts
+        if directory:
+            return
+        attempts += 1
+        path.rename(previous)
+        path.mkdir()
+        raise OSError("synthetic unsafe replacement")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_before_bind)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    with pytest.raises(OSError, match="synthetic unsafe replacement"):
+        process_tree._prepare_private_file(database_path)
+
+    assert attempts == 1
+    assert delays == []
+    assert database_path.is_dir()
+    assert previous.read_bytes() == b"original"
+
+
 def test_windows_registry_main_file_identity_churn_remains_fail_closed(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2316,6 +2406,8 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
     database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
     if preexisting:
         database_path.write_bytes(b"synthetic-existing-registry")
+    attempts = 0
+    delays: list[float] = []
     monkeypatch.setattr(process_tree.os, "name", "nt")
 
     def fail_file_acl(
@@ -2323,7 +2415,9 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
         directory: bool,
         **_kwargs: object,
     ) -> None:
+        nonlocal attempts
         if not directory:
+            attempts += 1
             raise OSError("synthetic ACL failure")
 
     monkeypatch.setattr(
@@ -2331,10 +2425,13 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
         "apply_windows_private_dacl",
         fail_file_acl,
     )
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
 
     with pytest.raises(OSError, match="synthetic ACL failure"):
-        process_tree._prepare_private_file_once(database_path)
+        process_tree._prepare_private_file(database_path)
 
+    assert attempts == 1
+    assert delays == []
     if preexisting:
         assert database_path.read_bytes() == b"synthetic-existing-registry"
     else:
