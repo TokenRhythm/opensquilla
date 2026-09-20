@@ -431,11 +431,16 @@ try {
         && (await readDiagnostics()).some(entry => entry.phase === 'first_successful_rpc'),
       'wake replacement first successful RPC', 15_000)
       const timeline = await readDiagnostics()
-      assert.equal(timeline.filter(entry => entry.phase === 'wake_incident_start').length, 1,
-        'duplicate native resume signals must share one incident')
-      assert.equal(timeline.filter(entry => entry.phase === 'wake_incident_timeout').length, 1)
       const incidentStart = timeline.find(entry => entry.phase === 'wake_incident_start')
-      const incidentEnd = timeline.find(entry => entry.phase === 'wake_incident_timeout')
+      assert.ok(incidentStart, 'wake must start an incident')
+      const incidentEntries = timeline.filter(entry => (
+        entry.wakeIncidentId === incidentStart.wakeIncidentId
+        && entry.generation === incidentStart.generation
+      ))
+      assert.equal(incidentEntries.filter(entry => entry.phase === 'wake_incident_start').length, 1,
+        'duplicate native resume signals must share the first incident')
+      const incidentEnd = incidentEntries.find(entry => entry.phase === 'wake_incident_timeout')
+      assert.ok(incidentEnd, 'first wake incident must reach its timeout')
       assert.equal(incidentStart.topology, 'loopback')
       assert.equal(incidentEnd.wakeIncidentId, incidentStart.wakeIncidentId)
       assert.equal(incidentEnd.wakeIncidentDeadlineAt, incidentStart.wakeIncidentDeadlineAt)

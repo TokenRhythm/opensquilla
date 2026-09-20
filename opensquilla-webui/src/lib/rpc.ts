@@ -446,10 +446,12 @@ export class RpcClient {
     if (current === null || current.generation !== generation) {
       this._beginWakeIncident(generation, now);
       if (!this._autoReconnect || generation !== this._socketGeneration || !this._wakeIncident) return;
-      this._clearWakeProbe();
-      this._suspectAt = null;
-      this._graceUntil = now + WAKE_GRACE_MS;
-      this._setHealth('healthy');
+      if (this._health !== 'suspect') {
+        this._clearWakeProbe();
+        this._graceUntil = now + WAKE_GRACE_MS;
+      }
+      // A wake signal is not a liveness proof. Preserve an existing suspect
+      // state and any armed retry until this generation completes a round trip.
     } else {
       current.signals += 1;
       // Neither the deadline nor the grace period is extended. Keep an armed
@@ -1224,7 +1226,7 @@ export class RpcClient {
       generation,
       startedAt,
       deadlineAt: startedAt + WAKE_INCIDENT_BUDGET_MS,
-      status: 'probing',
+      status: this._health === 'suspect' ? 'suspect' : 'probing',
       signals: 1,
     };
     this._wakeIncident = incident;
@@ -1238,10 +1240,12 @@ export class RpcClient {
       this._suspectAt ??= Date.now();
       incident.status = 'reconnecting';
       this._setHealth('suspect');
+      if (this._wakeIncident !== incident || this._socketGeneration !== generation) return;
       this._emitTransport('wake_incident_timeout', generation, {
         incidentId: incident.id,
         reason: 'wake_incident_timeout',
       });
+      if (this._wakeIncident !== incident || this._socketGeneration !== generation) return;
       this._clearWakeIncident(generation, incident.id);
       this._recycleConnection(
         generation,
@@ -1259,12 +1263,19 @@ export class RpcClient {
     const incident = this._wakeIncident;
     if (!incident || incident.generation !== generation) return;
     incident.status = 'recovered';
+    // Retire ownership before notifying observers: a reentrant wake starts a
+    // new incident and must not be deduplicated into this completed one.
+    this._clearWakeIncident(generation, incident.id);
     this._emitTransport('wake_incident_recovered', generation, {
       incidentId: incident.id,
       reason,
       recoveryMs: Math.max(0, Date.now() - incident.startedAt),
+      wakeIncidentId: incident.id,
+      wakeIncidentStartedAt: incident.startedAt,
+      wakeIncidentDeadlineAt: incident.deadlineAt,
+      wakeIncidentStatus: incident.status,
+      wakeSignalCount: incident.signals,
     });
-    this._clearWakeIncident(generation, incident.id);
   }
 
   private _clearWakeIncident(generation?: number, incidentId?: number): void {
@@ -1306,11 +1317,15 @@ export class RpcClient {
   private _noteRoundTrip(generation: number = this._socketGeneration): void {
     if (generation !== this._socketGeneration) return;
     this._clearWakeProbe();
-    this._completeWakeIncident(generation, 'round_trip');
-    if (generation !== this._socketGeneration) return;
     this._suspectAt = null;
     this._suspectProbes = 0;
-    this._setHealth('healthy');
+    const healthChanged = this._health !== 'healthy';
+    // Commit the complete recovery before emitting either observer callback.
+    // A callback may start a new incident on this same socket.
+    this._health = 'healthy';
+    this._completeWakeIncident(generation, 'round_trip');
+    if (generation !== this._socketGeneration) return;
+    if (healthChanged) this._emitStatus();
   }
 
   private _takePending(id: string, generation?: number): PendingRequest | undefined {

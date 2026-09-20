@@ -43,6 +43,7 @@ class _ScriptedWebSocket:
         self._frames = list(frames)
         self.sent: list[str] = []
         self.close_codes: list[int] = []
+        self.close_reasons: list[str] = []
         self.accepted = False
 
     async def accept(self) -> None:
@@ -56,8 +57,9 @@ class _ScriptedWebSocket:
             raise WebSocketDisconnect(code=1000)
         return self._frames.pop(0)
 
-    async def close(self, code: int = 1000) -> None:
+    async def close(self, code: int = 1000, reason: str = "") -> None:
         self.close_codes.append(code)
+        self.close_reasons.append(reason)
 
     def responses(self) -> list[dict[str, Any]]:
         return [f for f in (json.loads(s) for s in self.sent) if f.get("type") == "res"]
@@ -490,6 +492,7 @@ async def test_unserializable_outbound_frame_closes_connection_not_zombifies() -
         await asyncio.sleep(0.005)
 
     assert ws.close_codes == [1011]
+    assert ws.close_reasons == ["writer_serialize_failed"]
     await conn._stop_writer()
 
 

@@ -1215,22 +1215,11 @@ class WsConnection:
             timeout_seconds=_DIRECT_SEND_TIMEOUT_SECONDS,
         )
 
-        close_task = asyncio.create_task(
-            self.ws.close(code=1011, reason="direct_send_timeout"),
-            name=f"ws-direct-close-{self.conn_id}",
-        )
-        done, _ = await asyncio.wait(
-            {close_task},
-            timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS,
-        )
-        if close_task in done:
-            try:
-                await close_task
-            except Exception:
-                pass
-        else:
-            close_task.cancel()
-            close_task.add_done_callback(self._consume_task_result)
+        # The same bounded coordinator owns queued and direct close paths.
+        # A legacy RPC worker can time out while its reader is still waiting:
+        # abort that handler if close stalls, and keep resistant close tasks
+        # inside the global cap instead of stranding an untracked task.
+        await self.close(code=1011, reason="direct_send_timeout")
         raise TimeoutError("WebSocket direct send timed out")
 
     # ------------------------------------------------------------------
@@ -1390,7 +1379,7 @@ class WsConnection:
             reason=reason,
             handler_cancelled=abortable,
         )
-        if abortable:
+        if abortable and handler is not None:
             if handler is asyncio.current_task():
                 # Inject cancellation before the handler enters its finally.
                 # Queuing self-cancellation would instead interrupt the first
