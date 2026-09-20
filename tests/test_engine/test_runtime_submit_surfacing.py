@@ -15,6 +15,7 @@ from opensquilla.tools.types import CallerKind, ToolContext
 _SCAFFOLD_TOOLS = frozenset(
     {
         "exec_command",
+        "process",
         "read_file",
         "edit_file",
         "write_file",

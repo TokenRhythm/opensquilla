@@ -29,7 +29,7 @@ metadata:
   {
     "opensquilla":
       {
-        "requires_tools": ["background_process", "exec_command", "process"],
+        "requires_tools": ["exec_command", "process"],
       },
     "platform":
       {

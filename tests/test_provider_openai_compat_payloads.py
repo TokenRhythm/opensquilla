@@ -47,6 +47,7 @@ STRICT_SOURCE_EDIT_TOOL_NAMES = {
     "grep_search",
     "glob_search",
     "exec_command",
+    "process",
     "git_status",
     "git_diff",
     "retrieve_tool_result",
@@ -58,6 +59,7 @@ SOURCE_EDIT_V2_TOOL_NAMES = {
     "grep_search",
     "glob_search",
     "exec_command",
+    "process",
     "git_status",
     "git_diff",
     "retrieve_tool_result",
@@ -73,6 +75,7 @@ BALANCED_SOURCE_EDIT_TOOL_NAMES = {
     "glob_search",
     "list_dir",
     "exec_command",
+    "process",
     "git_status",
     "git_diff",
     "retrieve_tool_result",
@@ -80,6 +83,7 @@ BALANCED_SOURCE_EDIT_TOOL_NAMES = {
 PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES = BALANCED_SOURCE_EDIT_TOOL_NAMES | {"apply_patch"}
 SCAFFOLD_EDIT_TOOL_NAMES = {
     "exec_command",
+    "process",
     "read_file",
     "edit_file",
     "write_file",
@@ -99,12 +103,10 @@ STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES = {
     "apply_patch",
     "execute_code",
     "background_process",
-    "process",
     "git_log",
 }
 SCAFFOLD_FORBIDDEN_TOOL_NAMES = {
     "background_process",
-    "process",
     "execute_code",
     "git_log",
     "read_source",

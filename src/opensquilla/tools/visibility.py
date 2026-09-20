@@ -74,11 +74,11 @@ _CHANNEL_DEFAULT_ALLOW: frozenset[str] = frozenset(
 _CHANNEL_HARD_DENY_NON_OWNER: frozenset[str] = frozenset(
     {
         "apply_patch",
-        "background_process",
         "edit_file",
         "exec_command",
         "execute_code",
         "git_commit",
+        "process",
         "write_file",
     }
 )

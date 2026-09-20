@@ -173,6 +173,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "attachment_working_files",
         "persist_attachment_working_files",
         "explicitly_allowed_tools",
+        "process_event_emitter",
     ]
 
     assert ToolContext().skill_install_turn is None

@@ -2774,6 +2774,9 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
 
     for extra in ["recommended", "mcp", "msg", "matrix", "document-extras"]:
         assert f"'{extra}'" in build_gateway
+    assert "const ptyCollectionArgs = process.platform === 'win32'" in build_gateway
+    assert "['--collect-all', 'ptyprocess']" in build_gateway
+    assert "['--collect-all', 'winpty']" in build_gateway
     for module in ["joblib", "sklearn", "lightgbm", "tokenizers", "tiktoken", "onnxruntime", "mcp"]:
         assert f"'{module}'" in build_gateway
     for distribution in ["httpx2", "httpcore2"]:
@@ -2818,6 +2821,9 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     gateway_smoke = _read("desktop/electron/scripts/smoke-gateway.mjs")
     assert "OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT_MS" in gateway_smoke
     assert "'90000'" in gateway_smoke
+    assert "function verifyGatewayPty(gatewayBinary, env)" in gateway_smoke
+    assert "'--_desktop-pty-probe'" in gateway_smoke
+    assert "result.ioMode !== 'pty'" in gateway_smoke
     assert "function smokeEnv(tempHome, config, runtimeGatewayDir)" in gateway_smoke
     assert "OPENSQUILLA_CONTROL_UI_DIST" in gateway_smoke
     assert "OPENSQUILLA_STATE_DIR: tempHome" in gateway_smoke

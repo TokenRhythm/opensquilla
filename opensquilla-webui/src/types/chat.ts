@@ -315,6 +315,7 @@ export interface ToolResultContext {
   section?: 'input' | 'result' | 'error'
   format?: 'diff'
   executionLogHandle?: string
+  executionIo?: import('@/utils/chat/executionIo').ExecutionIoSummary
 }
 
 export interface ChatToolCallGroup {

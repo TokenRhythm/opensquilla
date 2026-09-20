@@ -50,6 +50,10 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
         "list_dir",
         "open_workspace_preview",
         "pdf",
+        # ``process`` is the management half of ``exec_command``.  Keep it
+        # model-visible by default so a command that yields an execution
+        # handle can be observed or controlled in the same turn.
+        "process",
         "publish_artifact",
         "read_file",
         "read_spreadsheet",
@@ -64,12 +68,11 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-CODING_MODE_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
-    {
-        "background_process",
-        "process",
-    }
-)
+CODING_MODE_MODEL_TOOL_NAMES: frozenset[str] = frozenset()
+
+# Kept registered for old RPC/in-process callers, but never projected into a
+# model tool catalog (including progressive disclosure through tool_search).
+_MODEL_HIDDEN_TOOL_NAMES: frozenset[str] = frozenset({"background_process"})
 
 ToolProfile = visibility_policy.ToolProfile
 _CHANNEL_DEFAULT_ALLOW = visibility_policy._CHANNEL_DEFAULT_ALLOW
@@ -371,10 +374,21 @@ class ToolRegistry:
                 from opensquilla.tools.search import ToolSearchIndex
 
                 ctx.authorized_tool_names = frozenset(authorized_by_name)
-                ctx.tool_search_index = ToolSearchIndex.from_definitions(authorized)
+                ctx.tool_search_index = ToolSearchIndex.from_definitions(
+                    [
+                        definition
+                        for definition in authorized
+                        if definition.name not in _MODEL_HIDDEN_TOOL_NAMES
+                    ]
+                )
                 ctx.tool_search_namespaces = {}
-            return authorized
+            return [
+                definition
+                for definition in authorized
+                if definition.name not in _MODEL_HIDDEN_TOOL_NAMES
+            ]
         selected = set(DEFAULT_MODEL_TOOL_NAMES)
+        selected.difference_update(_MODEL_HIDDEN_TOOL_NAMES)
         if ctx is not None:
             if ctx.coding_mode:
                 selected.update(CODING_MODE_MODEL_TOOL_NAMES)
@@ -383,7 +397,13 @@ class ToolRegistry:
             ctx.authorized_tool_names = frozenset(authorized_by_name)
             from opensquilla.tools.search import ToolSearchIndex, tool_namespace
 
-            ctx.tool_search_index = ToolSearchIndex.from_definitions(authorized)
+            ctx.tool_search_index = ToolSearchIndex.from_definitions(
+                [
+                    definition
+                    for definition in authorized
+                    if definition.name not in _MODEL_HIDDEN_TOOL_NAMES
+                ]
+            )
             authorized_namespaces = {
                 tool_namespace(name)
                 for name in authorized_by_name
@@ -406,12 +426,16 @@ class ToolRegistry:
         definitions = [
             definition.model_copy(deep=True)
             for name, definition in sorted(authorized_by_name.items())
-            if name in selected and not name.startswith("mcp__")
+            if name in selected
+            and name not in _MODEL_HIDDEN_TOOL_NAMES
+            and not name.startswith("mcp__")
         ]
         definitions.extend(
             definition.model_copy(deep=True)
             for name, definition in sorted(authorized_by_name.items())
-            if name in selected and name.startswith("mcp__")
+            if name in selected
+            and name not in _MODEL_HIDDEN_TOOL_NAMES
+            and name.startswith("mcp__")
         )
         tool_search_definition = next(
             (definition for definition in definitions if definition.name == "tool_search"),

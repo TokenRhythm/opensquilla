@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -143,6 +144,26 @@ def test_install_scripts_support_optional_extras() -> None:
         assert "matrix-e2e" in script
         assert "document-extras" in script
         assert "msteams" not in script
+
+
+def test_recommended_profile_bundles_platform_pty_and_core_does_not() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    extras = project["optional-dependencies"]
+    recommended = extras["recommended"]
+    pty = extras["pty"]
+
+    assert any(
+        value.startswith("ptyprocess>=0.7,<1;") and "sys_platform != 'win32'" in value
+        for value in recommended
+    )
+    assert any(
+        value.startswith("pywinpty>=2.0,<3;") and "sys_platform == 'win32'" in value
+        for value in recommended
+    )
+    assert not any(
+        value.startswith(("ptyprocess", "pywinpty")) for value in project["dependencies"]
+    )
+    assert set(pty).issubset(set(recommended))
 
 
 def test_windows_installer_bootstraps_vc_redist_for_router_runtime() -> None:

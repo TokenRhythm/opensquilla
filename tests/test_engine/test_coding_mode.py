@@ -164,13 +164,13 @@ class TestRuntimeToolContextCodingMode:
         assert "agents_list" not in channel_names
         assert "subagents" not in channel_admin.denied_tools
         authorized_names = set(channel_admin.authorized_tool_names or frozenset())
-        assert {"exec_command", "background_process", "process"} <= authorized_names
+        assert {"exec_command", "process"} <= authorized_names
         if coding_mode:
             assert coding_mode_denied_tools(True).isdisjoint(authorized_names)
-            assert {"background_process", "process"} <= channel_names
+            assert "process" in channel_names
         else:
             assert "background_process" not in channel_names
-            assert "process" not in channel_names
+            assert "process" in channel_names
 
 
 class TestSkillsFilterGate:
@@ -201,7 +201,7 @@ class TestDirectiveInjection:
             metadata={},
             tool_defs=[
                 SimpleNamespace(name=name)
-                for name in ("background_process", "exec_command", "process")
+                for name in ("exec_command", "process")
             ],
         )
 
@@ -217,7 +217,7 @@ class TestDirectiveInjection:
         assert ctx.metadata["coding_mode"] is True
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("missing_tool", ["background_process", "exec_command", "process"])
+    @pytest.mark.parametrize("missing_tool", ["exec_command", "process"])
     async def test_on_skips_directive_and_pin_without_required_launch_tool(self, missing_tool):
         ctx = self._ctx(True)
         ctx.tool_defs = [tool for tool in ctx.tool_defs if tool.name != missing_tool]
@@ -264,13 +264,13 @@ class TestDirectiveInjection:
         assert "status.json" in low
 
     @pytest.mark.asyncio
-    async def test_directive_mandates_background_not_blocking_exec(self):
+    async def test_directive_uses_unified_exec_handle(self):
         ctx = await enforce_coding_mode(self._ctx(True))
         _, suffix = ctx.system_prompt
         low = suffix.lower()
-        assert "always launch it with background_process" in low
-        assert "do not run code-task with a" in low and "blocking exec_command" in low
-        assert "600s" in suffix
+        assert "exec_command(yield_time_ms=0" in low
+        assert "execution_id" in low
+        assert "background_process" not in low
 
     @pytest.mark.asyncio
     async def test_directive_mandates_task_file_staging(self):
@@ -302,7 +302,7 @@ class TestDirectiveInjection:
         # exec_command(stdin=...) escape hatch that bypasses cmd.exe.
         assert "exec_command" in suffix
         assert "stdin=" in suffix
-        assert "background_process" in suffix
+        assert "background_process" not in suffix
         assert "code-task stage-task-file" in suffix
         # Packaged desktop gateways are not Python interpreters. The staging
         # recipe must therefore be a code-task subcommand, never
@@ -381,11 +381,11 @@ class TestWriteToolDeny:
         assert coding_mode_denied_tools(False) == frozenset()
 
     def test_shell_and_read_tools_kept(self):
-        # shell stays so the agent can still LAUNCH code-task; reads stay.
+        # The unified exec surface stays so the agent can still LAUNCH
+        # code-task; reads stay.
         denied = coding_mode_denied_tools(True)
         for t in (
             "exec_command",
-            "background_process",
             "process",
             "read_file",
             "list_dir",
@@ -424,12 +424,12 @@ class TestWriteToolDenyEnforcement:
         }.isdisjoint(names)
 
     def test_on_keeps_codetask_launch_and_read_tools(self):
-        # shell stays so the agent can still LAUNCH `opensquilla code-task solve`;
+        # The unified exec surface stays so the agent can still LAUNCH
+        # `opensquilla code-task solve`;
         # read-only tools stay so it can understand the repo.
         names = self._surface(coding_mode_denied_tools(True))
         for keep in (
             "exec_command",
-            "background_process",
             "process",
             "read_file",
             "list_dir",

@@ -2679,6 +2679,26 @@ def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
     )[0], "docker-mcp-smoke", "exec")
 
 
+def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> None:
+    job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
+    steps = job["steps"]
+    install = next(step for step in steps if step.get("name") == "Install Python dependencies")
+    probe = next(step for step in steps if step.get("name") == (
+        "Verify recommended PTY and managed execution on the native platform"
+    ))
+    assert "--extra recommended" in install["run"]
+    assert steps.index(install) < steps.index(probe)
+    for shard in ("ownership", "ownership-workbench", "all"):
+        assert f"matrix.shard == '{shard}'" in probe["if"]
+    run = probe["run"]
+    assert "set -euo pipefail" in run
+    assert "gateway-entry.py --_desktop-pty-probe" in run
+    assert "test_unified_exec_real_pty_reports_tty_and_accepts_input" in run
+    assert run.index("--_desktop-pty-probe") < run.index("uv run --no-sync pytest")
+    assert "continue-on-error" not in probe
+    assert "|| true" not in run
+
+
 def test_macos_recovery_planner_inputs_match_workflow_pytest_targets() -> None:
     config = json.loads(Path(".github/ci/suites.v1.json").read_text(encoding="utf-8"))
     expected_targets = {

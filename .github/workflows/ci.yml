@@ -1863,6 +1863,20 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Verify recommended PTY and managed execution on the native platform
+        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # This probe fails when the recommended backend is absent; the
+          # optional-dependency skip in the core pytest suite cannot mask it.
+          uv run --no-sync python desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
+            2>&1 | tee "${CI_REPORT_DIR}/pty-capability.log"
+          uv run --no-sync pytest \
+            tests/test_tools/test_shell_process_isolation.py::test_unified_exec_real_pty_reports_tty_and_accepts_input \
+            -vv --tb=short \
+            2>&1 | tee "${CI_REPORT_DIR}/pty-managed-execution.log"
+
       - name: Verify MCP transports and Desktop bridge on the native platform
         if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
         shell: bash

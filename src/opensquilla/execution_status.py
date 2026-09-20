@@ -182,6 +182,60 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
             return runtime_execution_status("error", reason="runtime_unavailable")
 
     if tool_name == "exec_command":
+        # The unified execution form returns a JSON receipt while the child is
+        # still alive.  Treat that receipt exactly like the legacy process
+        # running state so turn finalization does not claim completion early.
+        if isinstance(shell_payload, dict) and isinstance(shell_payload.get("session"), dict):
+            session = shell_payload["session"]
+            session_status = session.get("status")
+            returncode = _as_exit_code(session.get("returncode"))
+            timed_out = _as_bool(session.get("timed_out"))
+            killed = _as_bool(session.get("killed"))
+            if session_status == "running":
+                return {
+                    "version": 1,
+                    "status": "unknown",
+                    "exit_code": None,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "background_running",
+                    "source": "adapter",
+                    "preservation_class": "ephemeral",
+                }
+            if timed_out or session_status == "timed_out":
+                return {
+                    "version": 1,
+                    "status": "timeout",
+                    "exit_code": returncode,
+                    "timed_out": True,
+                    "truncated": False,
+                    "reason": "tool_timeout",
+                    "source": "adapter",
+                    "preservation_class": "diagnostic",
+                }
+            if killed or session_status == "killed":
+                return {
+                    "version": 1,
+                    "status": "cancelled",
+                    "exit_code": returncode,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "killed",
+                    "source": "adapter",
+                    "preservation_class": "diagnostic",
+                }
+            if returncode is not None:
+                failed = returncode != 0
+                return {
+                    "version": 1,
+                    "status": "error" if failed else "success",
+                    "exit_code": returncode,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "nonzero_exit" if failed else None,
+                    "source": "adapter",
+                    "preservation_class": "diagnostic" if failed else "normal",
+                }
         if content.startswith("[timeout after "):
             return {
                 "version": 1,
@@ -190,6 +244,17 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
                 "timed_out": True,
                 "truncated": False,
                 "reason": "tool_timeout",
+                "source": "adapter",
+                "preservation_class": "diagnostic",
+            }
+        if content.startswith("[error] "):
+            return {
+                "version": 1,
+                "status": "error",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "reason": "runtime_error",
                 "source": "adapter",
                 "preservation_class": "diagnostic",
             }

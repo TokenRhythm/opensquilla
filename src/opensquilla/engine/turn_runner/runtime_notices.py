@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-_UNCONFIRMED_BACKGROUND_TOOL_NAMES = frozenset({"background_process", "process"})
+_UNCONFIRMED_BACKGROUND_TOOL_NAMES = frozenset({"exec_command", "background_process", "process"})
 
 
 def _background_receipt(name: str, result: Any) -> tuple[str | None, bool]:
@@ -23,13 +23,25 @@ def _background_receipt(name: str, result: Any) -> tuple[str | None, bool]:
     if not isinstance(payload, dict) or not isinstance(payload.get("session"), dict):
         return None, False
     session = payload["session"]
-    session_id = session.get("session_id")
+    session_id = payload.get("execution_id") or session.get("session_id")
     if not isinstance(session_id, str) or not session_id.strip():
         return None, False
+    if payload.get("exited") is False:
+        return session_id.strip(), False
     exited = (
         payload.get("exited") is True
         or session.get("status") == "done"
         or type(session.get("returncode")) is int
+        or (
+            # Termination flags are set before cleanup starts. Without an exit
+            # code, require finalization evidence before clearing the notice.
+            session.get("ended_at") is not None
+            and (
+                session.get("status") in ("timed_out", "killed")
+                or session.get("timed_out") is True
+                or session.get("killed") is True
+            )
+        )
     )
     return session_id.strip(), exited
 

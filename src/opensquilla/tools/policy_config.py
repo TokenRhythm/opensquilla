@@ -9,7 +9,10 @@ from fnmatch import fnmatchcase
 from opensquilla.tools.types import ToolContext
 
 _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
-    "group:runtime": frozenset({"exec_command", "background_process"}),
+    # ``process`` is the management half of the unified exec surface.
+    # ``background_process`` remains a compatibility callable but is no
+    # longer granted by model-facing runtime profiles.
+    "group:runtime": frozenset({"exec_command", "process"}),
     "group:fs": frozenset(
         {
             "read_file",
@@ -117,6 +120,7 @@ _REPO_CODING_SOURCE_EDIT_TOOLS: frozenset[str] = frozenset(
         "git_diff",
         "retrieve_tool_result",
         "exec_command",
+        "process",
     }
 )
 
@@ -130,6 +134,7 @@ _REPO_CODING_SOURCE_EDIT_STRICT_TOOLS: frozenset[str] = frozenset(
         "git_diff",
         "retrieve_tool_result",
         "exec_command",
+        "process",
     }
 )
 
@@ -144,6 +149,7 @@ _REPO_CODING_SOURCE_EDIT_V2_TOOLS: frozenset[str] = frozenset(
         "git_diff",
         "retrieve_tool_result",
         "exec_command",
+        "process",
     }
 )
 
@@ -162,6 +168,7 @@ _REPO_CODING_SOURCE_EDIT_BALANCED_TOOLS: frozenset[str] = frozenset(
         "git_diff",
         "retrieve_tool_result",
         "exec_command",
+        "process",
     }
 )
 
@@ -172,6 +179,7 @@ _REPO_CODING_SOURCE_EDIT_PATCH_FALLBACK_TOOLS: frozenset[str] = (
 _REPO_CODING_SCAFFOLD_EDIT_TOOLS: frozenset[str] = frozenset(
     {
         "exec_command",
+        "process",
         "read_file",
         "edit_file",
         "write_file",
@@ -235,8 +243,8 @@ class ToolPolicy:
 # Coding mode (operator toggle): the in-session write tools that let the
 # agent hand-edit a repository. When coding mode is ON these are denied so
 # every code change is forced through the code-task plugin instead. Shell
-# (exec_command/background_process) is intentionally kept so the agent can
-# still LAUNCH code-task.
+# (exec_command) is intentionally kept so the agent can still LAUNCH
+# code-task; ``process`` is its companion for long-running runs.
 CODING_MODE_DENIED_TOOLS: frozenset[str] = frozenset(
     {
         "write_file",

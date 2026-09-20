@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 import os
+import runpy
 import socket
 import sqlite3
 import subprocess
@@ -95,6 +98,75 @@ def test_document_probe_rejects_invalid_pdf(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert result.stdout == ""
     assert "document extraction or image rendering failed" in result.stderr
+
+
+@pytest.mark.platform_pty
+def test_pty_probe_reports_real_tty_when_backend_is_installed(tmp_path: Path) -> None:
+    module_name = "winpty" if os.name == "nt" else "ptyprocess"
+    if importlib.util.find_spec(module_name) is None:
+        pytest.skip(f"{module_name} is not installed in this core test environment")
+
+    result = subprocess.run(
+        [sys.executable, str(ENTRY), "--_desktop-pty-probe"],
+        env=isolated_environment(tmp_path), text=True, capture_output=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "probe": "opensquilla-desktop-pty",
+        "available": True,
+        "ioMode": "pty",
+        "returncode": 0,
+    }
+
+
+@pytest.mark.parametrize("failure", ["read", "timeout", "initialization"])
+def test_pty_probe_cleans_child_after_failure(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], failure: str
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    handle = object()
+    terminated = []
+    waited = []
+
+    def spawn(*args, **kwargs):
+        if failure == "initialization":
+            raise pty_backend.PtyBackendError(
+                "probe initialization failed", started=True, handle=handle
+            )
+        return handle
+
+    async def read(current):
+        assert current is handle
+        if failure == "timeout":
+            await asyncio.Event().wait()
+        raise RuntimeError("probe read failed")
+
+    async def terminate(current):
+        terminated.append(current)
+
+    async def wait(current):
+        waited.append(current)
+        return 0
+
+    monkeypatch.setattr(pty_backend, "spawn_pty", spawn)
+    monkeypatch.setattr(pty_backend, "read_pty", read)
+    monkeypatch.setattr(pty_backend, "terminate_pty", terminate)
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    namespace = runpy.run_path(str(ENTRY))
+    probe = namespace["_run_desktop_pty_probe"]
+    monkeypatch.setitem(probe.__globals__, "_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS", 0.01)
+
+    assert probe() == 1
+    result = json.loads(capsys.readouterr().out)
+    assert result["available"] is False
+    assert result["reason"] == {
+        "read": "probe read failed",
+        "timeout": "PTY probe timed out",
+        "initialization": "probe initialization failed",
+    }[failure]
+    assert terminated == [handle]
+    assert waited == [handle]
 
 
 # Fresh-profile migrations and a real stdio server share the runner's process

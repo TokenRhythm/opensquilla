@@ -13,7 +13,7 @@ metadata:
   {
     "opensquilla":
       {
-        "requires_tools": ["background_process", "exec_command", "process"],
+        "requires_tools": ["exec_command", "process"],
       },
     "openclaw":
       {
@@ -48,7 +48,7 @@ Wrapping CLIs are coding-oriented, but the skill itself is used as
 the generic sub-Agent slot by meta-skill DAGs for any LLM-driven
 sub-task (file edits, document generation, policy review, etc.).
 
-Use opensquilla's `exec_command`, `background_process`, and `process` tools for coding agent work. OpenSquilla does not expose a `bash` tool; do not use the legacy bash tool-call DSL.
+Use OpenSquilla's `exec_command` and `process` tools for coding agent work. `exec_command` starts both short and long commands; use `yield_time_ms=0` for a long run and keep the returned execution handle. OpenSquilla does not expose a `bash` tool; do not use the legacy bash tool-call DSL.
 
 ## Non-Interactive CLI Mode
 
@@ -67,7 +67,7 @@ For **Claude Code** (`claude` CLI), use `--print --permission-mode bypassPermiss
 # ✅ Correct for Claude Code (no PTY needed)
 cd /path/to/project && claude --permission-mode bypassPermissions --print 'Your task'
 
-# For background execution: use background_process
+# For background execution: use exec_command(yield_time_ms=0, ...)
 
 # ❌ Wrong for Claude Code
 exec_command(command="claude --dangerously-skip-permissions 'task'")
@@ -77,8 +77,7 @@ exec_command(command="claude --dangerously-skip-permissions 'task'")
 
 | Tool | Key parameters | Description |
 | ---- | -------------- | ----------- |
-| `exec_command` | `command`, `workdir`, `timeout` | Run a foreground shell command. |
-| `background_process` | `command`, `workdir`, `timeout` | Start a long-running command and return `session_id`. |
+| `exec_command` | `command`, `workdir`, `timeout`, `yield_time_ms` | Start a shell command; use `yield_time_ms=0` for a long run and keep the returned execution handle. |
 | `process` | `action`, `session_id`, `data`, `offset`, `limit` | Poll, log, write to, or stop a background process. |
 
 ### Process Tool Actions (for background sessions)
@@ -112,14 +111,14 @@ exec_command(workdir="~/Projects/myproject", command="codex exec 'Add error hand
 
 ---
 
-## The Pattern: workdir + background_process
+## The Pattern: workdir + exec_command + process
 
-For longer tasks, use `background_process`:
+For longer tasks, use `exec_command(yield_time_ms=0, ...)`:
 
 ```bash
 # Start agent in target directory.
-background_process(workdir="~/project", command="codex exec --full-auto 'Build a snake game'")
-# Returns session_id for tracking
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec --full-auto 'Build a snake game'")
+# Returns an execution handle (the current compatibility field is `session_id`)
 
 # Wait for it to finish — blocks until the process exits (or the timeout
 # elapses, in which case just call wait again). Prefer this over polling in a
@@ -162,7 +161,7 @@ process(action="kill", session_id="XXX")
 exec_command(workdir="~/project", command="codex exec --full-auto 'Build a dark mode toggle'")
 
 # Background for longer work
-background_process(workdir="~/project", command="codex exec --full-auto 'Refactor the auth module'")
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec --full-auto 'Refactor the auth module'")
 ```
 
 ### Reviewing PRs
@@ -190,8 +189,8 @@ exec_command(workdir="/tmp/pr-130-review", command="codex review --base main")
 git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
 
 # Deploy the army - one Codex per PR
-background_process(workdir="~/project", command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'")
-background_process(workdir="~/project", command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'")
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'")
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'")
 
 # Monitor all
 process(action="list")
@@ -209,7 +208,7 @@ gh pr comment <PR#> --body "<review content>"
 exec_command(workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
 
 # Background
-background_process(workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
+exec_command(yield_time_ms=0, workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
 ```
 
 ---
@@ -249,8 +248,8 @@ git worktree add -b fix/issue-78 /tmp/issue-78 main
 git worktree add -b fix/issue-99 /tmp/issue-99 main
 
 # 2. Launch Codex in each
-background_process(workdir="/tmp/issue-78", command="pnpm install && codex exec --full-auto 'Fix issue #78: <description>. Commit and push.'")
-background_process(workdir="/tmp/issue-99", command="pnpm install && codex exec --full-auto 'Fix issue #99 from the approved ticket summary. Implement only the in-scope edits and commit after review.'")
+exec_command(yield_time_ms=0, workdir="/tmp/issue-78", command="pnpm install && codex exec --full-auto 'Fix issue #78: <description>. Commit and push.'")
+exec_command(yield_time_ms=0, workdir="/tmp/issue-99", command="pnpm install && codex exec --full-auto 'Fix issue #99 from the approved ticket summary. Implement only the in-scope edits and commit after review.'")
 
 # 3. Monitor progress
 process(action="list")
@@ -314,7 +313,7 @@ When completely finished, send a brief status update in this session.
 **Example:**
 
 ```bash
-background_process(workdir="~/project", command="codex exec --full-auto 'Build a REST API for todos.
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec --full-auto 'Build a REST API for todos.
 
 When completely finished, print: Done: Built todos REST API with CRUD endpoints'")
 ```

@@ -61,6 +61,55 @@ beforeEach(() => {
 })
 
 describe('ToolResultModal', () => {
+  it('uses context to show a PTY result even when content is a combined detail transcript', async () => {
+    const { app, el } = await mountToolResultModal({
+      content: 'INPUT\n{"io_mode":"pty"}\n\nRESULT\n{"output":"ok"}',
+      context: {
+        toolName: 'exec_command',
+        section: 'result',
+        executionIo: {
+          kind: 'pty',
+          entries: [{ executionId: 'pty-1', requested: 'pty', used: 'pty' }],
+        },
+      },
+    })
+
+    expect(el.querySelector('.tool-sheet__execution-io')?.textContent)
+      .toContain('Real terminal (TTY)')
+    app.unmount()
+  })
+
+  it('does not infer successful TTY from the raw content without execution context', async () => {
+    const { app, el } = await mountToolResultModal({
+      content: 'INPUT\n{"io_mode":"pty"}\n\nRESULT\n{"execution_id":"pty-1","io_mode_used":"pty"}',
+      context: { toolName: 'exec_command', section: 'result' },
+    })
+
+    expect(el.querySelector('.tool-sheet__execution-io')).toBeNull()
+    app.unmount()
+  })
+
+  it('shows the fallback warning and diagnostic from the context projection', async () => {
+    const { app, el } = await mountToolResultModal({
+      content: 'INPUT\n{"io_mode":"pty"}\n\nRESULT\n{"output":"ok"}',
+      context: {
+        toolName: 'exec_command',
+        section: 'result',
+        executionIo: {
+          kind: 'fallback',
+          entries: [{ executionId: 'fallback-1', requested: 'pty', used: 'pipe' }],
+          fallbackReason: 'PTY backend unavailable',
+        },
+      },
+    })
+
+    expect(el.querySelector('.tool-sheet__execution-io')?.textContent)
+      .toContain('TTY unavailable; using a regular pipe')
+    expect(el.querySelector('.tool-sheet__execution-io-reason')?.textContent)
+      .toBe('PTY backend unavailable')
+    app.unmount()
+  })
+
   it('turns a read_file result into a file-aware code viewer', async () => {
     const content = [
       '---',

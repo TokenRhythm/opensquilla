@@ -36,7 +36,10 @@ log = structlog.get_logger(__name__)
 
 _CODE_TASK_PREFLIGHT_TIMEOUT = 15.0
 _PACKAGED_GATEWAY_EXECUTABLES = {"opensquilla-gateway", "opensquilla-gateway.exe"}
-_CODE_TASK_REQUIRED_TOOLS = frozenset({"background_process", "exec_command", "process"})
+# Long code-task runs use the unified execution surface: ``exec_command``
+# starts the run and ``process`` observes it. ``background_process`` is a
+# compatibility wrapper and is not required by Coding Mode.
+_CODE_TASK_REQUIRED_TOOLS = frozenset({"exec_command", "process"})
 
 
 def _runs_code_task(argv: list[str]) -> bool:
@@ -175,12 +178,11 @@ _CODING_MODE_DIRECTIVE_TEMPLATE = (
     "--verification-mode build; code-task edits the existing app in place and "
     "applies the verified change back to the repo so the next edit builds on it.\n"
     "code-task runs for MANY minutes (often 20-40, up to ~90 on a heavy repo "
-    "that must install dependencies), so it is a long-running task: ALWAYS "
-    "launch it with background_process(timeout=5400) and then await it with "
-    'process(action="wait", session_id=..., timeout=5400). Do NOT run '
-    "code-task with a blocking exec_command — exec_command is hard-capped at "
-    "600s (10 min) no matter what timeout you pass, so it would kill "
-    "code-task mid-run and waste the attempt. Do not poll "
+    "that must install dependencies), so it is a long-running task: launch it "
+    "with exec_command(yield_time_ms=0, timeout=5400), keep the returned "
+    "execution_id, and then await it with process(action=\"wait\", "
+    "session_id=..., timeout=5400). Do not run the same command again when "
+    "the first call returns a running handle. Do not poll "
     "process(action=\"poll\") in a loop either — just wait for the result.\n"
     "code-task works in an ISOLATED run directory, NOT in the --repo source you "
     "pass it: that source stays EMPTY until a run finishes and VERIFIES, then "
@@ -224,26 +226,26 @@ _CODING_MODE_DIRECTIVE_TEMPLATE = (
     "spaces / & / non-ASCII in ordinary %TEMP% paths; cmd.exe DOES "
     "still expand %VAR% inside double quotes, but %TEMP% itself is "
     "normally free of '%' so this is robust in practice -- argv "
-    "support in background_process is the long-term airtight fix) or "
+    "support in the unified exec_command surface is the long-term airtight fix) or "
     "shlex.quote(path) on POSIX (defends against $, backticks, and "
     "backslash quirks in $TMPDIR). exec_command's return is formatted "
     "as `exit_code=0\\n<stdout>`; confirm exit_code=0, then take the "
     "final stdout line — the already-shell-quoted path — and paste it "
     "verbatim as the --task-file argument.\n"
-    "    2a. (Case 1, real repo) background_process(\n"
+    "    2a. (Case 1, real repo) exec_command(\n"
     "          command=\"__CODE_TASK_CMD__ solve --repo <url-or-path> "
     "--task-file <quoted-path-from-step-1> --shallow --yes\",\n"
-    "          timeout=5400,\n"
+    "          timeout=5400, yield_time_ms=0,\n"
     "        )\n"
-    "    2b. (Case 2, scratch) background_process(\n"
+    "    2b. (Case 2, scratch) exec_command(\n"
     "          command=\"__CODE_TASK_CMD__ solve --task-file <quoted-"
     "path-from-step-1> --verification-mode scratch --yes\",\n"
-    "          timeout=5400,\n"
+    "          timeout=5400, yield_time_ms=0,\n"
     "        )\n"
-    "    2c. (Case 3, app build from scratch) background_process(\n"
+    "    2c. (Case 3, app build from scratch) exec_command(\n"
     "          command=\"__CODE_TASK_CMD__ solve --task-file <quoted-"
     "path-from-step-1> --verification-mode build --yes\",\n"
-    "          timeout=5400,\n"
+    "          timeout=5400, yield_time_ms=0,\n"
     "        )\n"
     "Why this works: stdin rides through a real OS pipe — neither cmd.exe "
     "nor bash touches its contents. The already-shell-quoted path the "

@@ -103,11 +103,23 @@ recommended = [
     "scikit-learn>=1.9.1",
     "onnxruntime>=1.30.0",
     "tokenizers>=0.23.2",
+    # Standard installations include the managed execution PTY backend.  The
+    # imports remain lazy so ordinary closed/pipe execution keeps its startup
+    # path; the explicit ``pty`` extra below remains for core/minimal callers.
+    "ptyprocess>=0.7,<1; sys_platform != 'win32'",
+    "pywinpty>=2.0,<3; sys_platform == 'win32'",
 ]
 matrix = ["matrix-nio>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
 matrix-e2e = ["matrix-nio[e2e]>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
 document-extras = [
     "weasyprint>=70.0",
+]
+# Keep the explicit extra for core/minimal installations and existing callers;
+# recommended/desktop distributions include the same platform dependencies by
+# default.  The runtime imports these packages lazily.
+pty = [
+    "ptyprocess>=0.7,<1; sys_platform != 'win32'",
+    "pywinpty>=2.0,<3; sys_platform == 'win32'",
 ]
 
 [tool.uv.dependency-groups]
@@ -194,6 +206,8 @@ markers = [
     "live_channel: marks tests that hit a real channel platform (deselect with '-m \"not live_channel\"')",
     "live_search: marks opt-in tests that hit real search providers (deselect with '-m \"not live_search\"')",
     "live_skill_hub: marks opt-in tests that fetch a real Community Skill artifact (deselect with '-m \"not live_skill_hub\"')",
+    "pty: marks optional PTY backend tests",
+    "platform_pty: marks real platform PTY smoke tests",
 ]
 
 [tool.ruff]

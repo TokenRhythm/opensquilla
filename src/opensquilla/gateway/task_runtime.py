@@ -1473,6 +1473,10 @@ class TaskRuntime:
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
         self._last_envelope_task_id_by_session: dict[str, str] = {}
+        # Process completion deduplication is intentionally in-memory. Notices
+        # are owner-routed control input; durable process recovery is out of
+        # scope for the managed execution API.
+        self._process_completion_seen: set[tuple[str, str]] = set()
         self._state_lock = asyncio.Lock()
         # Admission is per session so durable RPC ingress crosses reserve,
         # commit, and activation in order. This prevents resets from overtaking
@@ -4858,12 +4862,91 @@ class TaskRuntime:
                 log.warning("task_runtime.progress_projection_failed", task_id=task.task_id)
             return cast(dict[str, Any], progress)
 
+        async def emit_process_event(event: dict[str, Any]) -> None:
+            payload = dict(event)
+            payload.setdefault("session_key", task.envelope.session_key)
+            payload.setdefault("session_id", task.envelope.session_id)
+            payload.setdefault("session_epoch", task.envelope.session_epoch)
+            payload.setdefault("task_id", task.task_id)
+            await self._emit(
+                task.envelope.session_key,
+                "session.event.process_completed",
+                payload,
+            )
+            if payload.get("notify_on_exit") is not True:
+                return
+            if payload.get("completion_consumed") is True:
+                return
+            execution_id = str(payload.get("execution_id") or payload.get("session_id") or "")
+            if not execution_id:
+                return
+            key = (task.envelope.session_key, execution_id)
+            if key in self._process_completion_seen:
+                return
+            if len(self._process_completion_seen) >= 4096:
+                self._process_completion_seen.clear()
+            self._process_completion_seen.add(key)
+            status = str(payload.get("status") or "done")
+            returncode = payload.get("returncode")
+            tail = str(payload.get("output_tail") or payload.get("output") or "")
+            tail = tail[-2000:]
+            notice = (
+                "[Managed process completed]\n"
+                f"execution_id={execution_id} status={status} returncode={returncode}"
+            )
+            if tail:
+                notice += f"\noutput_tail:\n{tail}"
+            running = self._running_by_session.get(task.envelope.session_key)
+            if running is not None:
+                running.pending_input_provider.append(_SteeredInput(text=notice))
+                return
+            cached_owner = self._last_envelope_by_session.get(task.envelope.session_key)
+            cached_task_id = self._last_envelope_task_id_by_session.get(
+                task.envelope.session_key
+            )
+            if cached_owner is None:
+                log.info(
+                    "task_runtime.process_completion_wake_dropped",
+                    session_key=task.envelope.session_key,
+                    execution_id=execution_id,
+                    reason="session_closed",
+                )
+                return
+            if cached_task_id is not None and cached_task_id != task.task_id:
+                log.info(
+                    "task_runtime.process_completion_wake_dropped",
+                    session_key=task.envelope.session_key,
+                    execution_id=execution_id,
+                    reason="session_owner_replaced",
+                )
+                return
+            try:
+                await self.send(
+                    task.envelope.session_key,
+                    notice,
+                    provenance={
+                        "kind": "process_completed",
+                        "execution_id": execution_id,
+                    },
+                )
+            except Exception:
+                # A closed or owner-replaced session must not receive a late
+                # completion turn. The structured event remains available to
+                # observers for diagnostics and retry policy.
+                log.info(
+                    "task_runtime.process_completion_wake_dropped",
+                    session_key=task.envelope.session_key,
+                    execution_id=execution_id,
+                    exc_info=True,
+                )
+
         runtime_services = {
             **task.envelope.runtime_services,
             "update_progress": update_progress,
             "plan_storage": self._storage,
             "goal_service": self._goal_service,
             "plan_event_emitter": self._emit,
+            "process_event_emitter": emit_process_event,
             "suspend_compute_slot": lambda: self._suspend_compute_slot(task),
         }
         # WebChat has a request-id response RPC and reconnect hydration. Other

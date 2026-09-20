@@ -709,6 +709,7 @@ def tool_context_from_envelope(
         ),
         plan_storage=envelope.runtime_services.get("plan_storage"),
         plan_event_emitter=envelope.runtime_services.get("plan_event_emitter"),
+        process_event_emitter=envelope.runtime_services.get("process_event_emitter"),
         user_input_provider=envelope.runtime_services.get("user_input_provider"),
         suspend_compute_slot=envelope.runtime_services.get("suspend_compute_slot"),
         update_progress=envelope.runtime_services.get("update_progress"),

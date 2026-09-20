@@ -2228,12 +2228,18 @@ memory = [
 msg = [
     { name = "extract-msg" },
 ]
+pty = [
+    { name = "ptyprocess", marker = "sys_platform != 'win32' or (extra == 'group-11-opensquilla-dev' and extra == 'group-11-opensquilla-legacy-contract-codegen')" },
+    { name = "pywinpty", marker = "sys_platform == 'win32' or (extra == 'group-11-opensquilla-dev' and extra == 'group-11-opensquilla-legacy-contract-codegen')" },
+]
 recommended = [
     { name = "jieba" },
     { name = "joblib" },
     { name = "lightgbm" },
     { name = "numpy" },
     { name = "onnxruntime" },
+    { name = "ptyprocess", marker = "sys_platform != 'win32' or (extra == 'group-11-opensquilla-dev' and extra == 'group-11-opensquilla-legacy-contract-codegen')" },
+    { name = "pywinpty", marker = "sys_platform == 'win32' or (extra == 'group-11-opensquilla-dev' and extra == 'group-11-opensquilla-legacy-contract-codegen')" },
     { name = "scikit-learn" },
     { name = "tiktoken" },
     { name = "tokenizers" },
@@ -2295,6 +2301,8 @@ requires-dist = [
     { name = "openpyxl", specifier = ">=3.1.0" },
     { name = "pdfplumber", specifier = ">=0.11.10" },
     { name = "pillow", specifier = ">=12.3.0" },
+    { name = "ptyprocess", marker = "sys_platform != 'win32' and extra == 'pty'", specifier = ">=0.7,<1" },
+    { name = "ptyprocess", marker = "sys_platform != 'win32' and extra == 'recommended'", specifier = ">=0.7,<1" },
     { name = "pydantic", specifier = ">=2.13.5" },
     { name = "pydantic-settings", specifier = ">=2.15.0" },
     { name = "pypdf", specifier = ">=6.18.1" },
@@ -2305,6 +2313,8 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "python-pptx", specifier = ">=1.0.0" },
     { name = "python-telegram-bot", specifier = ">=22.8" },
+    { name = "pywinpty", marker = "sys_platform == 'win32' and extra == 'pty'", specifier = ">=2.0,<3" },
+    { name = "pywinpty", marker = "sys_platform == 'win32' and extra == 'recommended'", specifier = ">=2.0,<3" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "qq-botpy", specifier = ">=1.2.1,<1.3" },
     { name = "questionary", specifier = ">=2.1" },
@@ -2333,7 +2343,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=16.0,<18" },
     { name = "yoyo-migrations", specifier = ">=8.2,<10" },
 ]
-provides-extras = ["dev", "mcp", "msg", "memory", "recommended", "matrix", "matrix-e2e", "document-extras"]
+provides-extras = ["dev", "mcp", "msg", "memory", "recommended", "matrix", "matrix-e2e", "document-extras", "pty"]
 
 [package.metadata.requires-dev]
 desktop-build = [{ name = "pyinstaller", marker = "python_full_version >= '3.12' and python_full_version < '3.16'", specifier = "==6.22.3" }]
@@ -2678,6 +2688,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/9b/ca/25afc144934014700c52e05103c2421997482d561f3101ff352e1292fb81/protobuf-6.33.6-cp39-abi3-manylinux2014_s390x.whl", hash = "sha256:c96c37eec15086b79762ed265d59ab204dabc53056e3443e702d2681f4b39ce3", size = 339381, upload-time = "2026-03-18T19:04:54.616Z" },
     { url = "https://files.pythonhosted.org/packages/16/92/d1e32e3e0d894fe00b15ce28ad4944ab692713f2e7f0a99787405e43533a/protobuf-6.33.6-cp39-abi3-manylinux2014_x86_64.whl", hash = "sha256:e9db7e292e0ab79dd108d7f1a94fe31601ce1ee3f7b79e0692043423020b0593", size = 323436, upload-time = "2026-03-18T19:04:55.768Z" },
     { url = "https://files.pythonhosted.org/packages/c4/72/02445137af02769918a93807b2b7890047c32bfb9f90371cbc12688819eb/protobuf-6.33.6-py3-none-any.whl", hash = "sha256:77179e006c476e69bf8e8ce866640091ec42e1beb80b213c3900006ecfba6901", size = 170656, upload-time = "2026-03-18T19:04:59.826Z" },
+]
+
+[[package]]
+name = "ptyprocess"
+version = "0.7.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/e5/16ff212c1e452235a90aeb09066144d0c5a6a8c0834397e03f5224495c4e/ptyprocess-0.7.0.tar.gz", hash = "sha256:5c5d0a3b48ceee0b48485e0c26037c0acd7d29765ca3fbb5cb3831d347423220", size = 70762, upload-time = "2020-12-28T15:15:30.155Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/22/a6/858897256d0deac81a172289110f31629fc4cee19b6f01283303e18c8db3/ptyprocess-0.7.0-py2.py3-none-any.whl", hash = "sha256:4b41f3967fce3af57cc7e94b888626c18bf37a083e3651ca8feeb66d492fef35", size = 13993, upload-time = "2020-12-28T15:15:28.35Z" },
 ]
 
 [[package]]
@@ -3139,6 +3158,17 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/85/9f/01a1a99704853cb63f253eea009390c88e7131c67e66a0a02099a8c917cb/pywin32-ctypes-0.2.3.tar.gz", hash = "sha256:d162dc04946d704503b2edc4d55f3dba5c1d539ead017afa00142c38b9885755", size = 29471, upload-time = "2024-08-14T10:15:34.626Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/de/3d/8161f7711c017e01ac9f008dfddd9410dff3674334c233bde66e7ba65bbf/pywin32_ctypes-0.2.3-py3-none-any.whl", hash = "sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8", size = 30756, upload-time = "2024-08-14T10:15:33.187Z" },
+]
+
+[[package]]
+name = "pywinpty"
+version = "2.0.15"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2d/7c/917f9c4681bb8d34bfbe0b79d36bbcd902651aeab48790df3d30ba0202fb/pywinpty-2.0.15.tar.gz", hash = "sha256:312cf39153a8736c617d45ce8b6ad6cd2107de121df91c455b10ce6bba7a39b2", size = 29017, upload-time = "2025-02-03T21:53:23.265Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/88/e5/9714def18c3a411809771a3fbcec70bffa764b9675afb00048a620fca604/pywinpty-2.0.15-cp312-cp312-win_amd64.whl", hash = "sha256:83a8f20b430bbc5d8957249f875341a60219a4e971580f2ba694fbfb54a45ebc", size = 1405243, upload-time = "2025-02-03T21:56:52.476Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/16/2ab7b3b7f55f3c6929e5f629e1a68362981e4e5fed592a2ed1cb4b4914a5/pywinpty-2.0.15-cp313-cp313-win_amd64.whl", hash = "sha256:ab5920877dd632c124b4ed17bc6dd6ef3b9f86cd492b963ffdb1a67b85b0f408", size = 1405020, upload-time = "2025-02-03T21:56:04.753Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/16/edef3515dd2030db2795dbfbe392232c7a0f3dc41b98e92b38b42ba497c7/pywinpty-2.0.15-cp313-cp313t-win_amd64.whl", hash = "sha256:a4560ad8c01e537708d2790dbe7da7d986791de805d89dd0d3697ca59e9e4901", size = 1404151, upload-time = "2025-02-03T21:55:53.628Z" },
 ]
 
 [[package]]

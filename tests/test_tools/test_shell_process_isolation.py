@@ -513,6 +513,212 @@ async def test_exec_command_writes_optional_stdin() -> None:
 
 
 @pytest.mark.asyncio
+async def test_exec_command_yield_returns_handle_and_process_waits_for_same_run() -> None:
+    """The unified start path must spawn once and expose its result to process."""
+
+    token = current_tool_context.set(
+        _ctx("agent:main:unified-exec", task_id="task-unified-exec")
+    )
+    try:
+        command = _python_shell_command(
+            "import time; print('started', flush=True); time.sleep(0.2); print('done')"
+        )
+        started = await shell.exec_command(command, timeout=5.0, yield_time_ms=0)
+        payload = json.loads(started)
+        execution_id = payload["execution_id"]
+        assert payload["session"]["status"] == "running"
+
+        waited = json.loads(
+            await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
+        )
+        assert waited["execution_id"] == execution_id
+        assert waited["exited"] is True
+        assert waited["session"]["status"] == "done"
+        assert waited["session"]["returncode"] == 0
+        assert "started" in waited["output"]
+        assert "done" in waited["output"]
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
+    token = current_tool_context.set(
+        _ctx("agent:main:unified-pipe", task_id="task-unified-pipe")
+    )
+    try:
+        command = _python_shell_command(
+            "import sys; print('READY', flush=True); print('INPUT:' + sys.stdin.read())"
+        )
+        started = json.loads(
+            await shell.exec_command(
+                command,
+                timeout=5.0,
+                io_mode="pipe",
+            )
+        )
+        execution_id = started["execution_id"]
+        written = json.loads(
+            await shell.process(
+                action="submit",
+                execution_id=execution_id,
+                data="payload",
+            )
+        )
+        assert written["status"] == "submitted"
+        eof = json.loads(await shell.process(action="eof", execution_id=execution_id))
+        assert eof["status"] == "eof"
+        waited = json.loads(
+            await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
+        )
+        assert waited["session"]["returncode"] == 0
+        assert "INPUT:payload" in waited["output"]
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.platform_pty
+@pytest.mark.asyncio
+async def test_unified_exec_real_pty_reports_tty_and_accepts_input() -> None:
+    """Exercise the platform backend through the same exec/process API as an agent."""
+
+    pytest.importorskip("winpty" if os.name == "nt" else "ptyprocess")
+    token = current_tool_context.set(
+        _ctx("agent:main:unified-pty", task_id="task-unified-pty")
+    )
+    try:
+        command = _python_shell_command(
+            "import os, sys; "
+            "print(f'TTY:{sys.stdin.isatty()}:{sys.stdout.isatty()}', flush=True); "
+            "value = sys.stdin.readline().strip(); print('INPUT:' + value, flush=True); "
+            "size = os.get_terminal_size(0); print(f'SIZE:{size.columns}:{size.lines}')"
+        )
+        started = json.loads(
+            await shell.exec_command(
+                command,
+                timeout=10.0,
+                io_mode="pty",
+            )
+        )
+        assert started["io_mode_requested"] == "pty"
+        assert started["io_mode_used"] == "pty", started
+        execution_id = started["execution_id"]
+        resized = json.loads(await shell.process(
+            "resize", execution_id=execution_id, cols=77, rows=19,
+        ))
+        assert resized["status"] == "resized"
+        written = json.loads(await shell.process(
+            "write", execution_id=execution_id, data="pty-",
+        ))
+        assert written["status"] == "written"
+        submitted = json.loads(
+            await shell.process(
+                action="submit",
+                execution_id=execution_id,
+                data="payload",
+            )
+        )
+        assert submitted["status"] == "submitted"
+        waited = json.loads(
+            await shell.process(action="wait", execution_id=execution_id, timeout=10.0)
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert waited["session"]["returncode"] == 0
+    assert "TTY:True:True" in waited["output"]
+    assert "INPUT:pty-payload" in waited["output"]
+    assert "SIZE:77:19" in waited["output"]
+
+
+@pytest.mark.asyncio
+async def test_unified_exec_emits_process_completion_event() -> None:
+    events: list[dict[str, object]] = []
+    async_events: list[dict[str, object]] = []
+
+    async def emit(event: dict[str, object]) -> None:
+        async_events.append(event)
+
+    context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        session_key="agent:main:completion-event",
+        task_id="task-completion-event",
+        on_runtime_event=events.append,
+        process_event_emitter=emit,
+    )
+    token = current_tool_context.set(context)
+    try:
+        started = json.loads(
+            await shell.exec_command(
+                _python_shell_command("print('complete')"),
+                yield_time_ms=0,
+            )
+        )
+        execution_id = started["execution_id"]
+        waited = json.loads(await shell.process("wait", execution_id=execution_id, timeout=10))
+    finally:
+        current_tool_context.reset(token)
+
+    assert waited["session"]["status"] == "done"
+    completion = [event for event in events if event.get("name") == "process.completed"]
+    assert len(completion) == 1
+    assert completion[0]["execution_id"] == execution_id
+    assert completion[0]["returncode"] == 0
+    assert len(async_events) == 1
+    assert async_events[0]["name"] == "process.completed"
+
+
+@pytest.mark.asyncio
+async def test_process_wait_any_and_all_cover_multiple_unified_executions() -> None:
+    token = current_tool_context.set(
+        _ctx("agent:main:wait-modes", task_id="task-wait-modes")
+    )
+    try:
+        first = json.loads(
+            await shell.exec_command(
+                _python_shell_command("import time; time.sleep(0.1); print('first')"),
+                yield_time_ms=0,
+                timeout=5.0,
+            )
+        )
+        second = json.loads(
+            await shell.exec_command(
+                _python_shell_command("import time; time.sleep(0.8); print('second')"),
+                yield_time_ms=0,
+                timeout=5.0,
+            )
+        )
+        execution_ids = [first["execution_id"], second["execution_id"]]
+        any_result = json.loads(
+            await shell.process(
+                "wait",
+                execution_ids=execution_ids,
+                wait_mode="any",
+                timeout=5.0,
+            )
+        )
+        assert any_result["wait_mode"] == "any"
+        assert any_result["exited"] is True
+        assert any_result["completed_execution_ids"]
+
+        all_result = json.loads(
+            await shell.process(
+                "wait",
+                execution_ids=execution_ids,
+                wait_mode="all",
+                timeout=5.0,
+            )
+        )
+        assert all_result["wait_mode"] == "all"
+        assert all_result["exited"] is True
+        assert set(all_result["completed_execution_ids"]) == set(execution_ids)
+        assert all(item["status"] == "done" for item in all_result["sessions"])
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_write_exec_stdin_waits_until_eof_is_delivered() -> None:
     stdin = _FakeStdin()
     proc = SimpleNamespace(stdin=stdin)

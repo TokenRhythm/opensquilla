@@ -231,6 +231,18 @@ function verifyGatewayToolSearch(gatewayBinary, env) {
   }
 }
 
+function verifyGatewayPty(gatewayBinary, env) {
+  const result = functionalProbe(gatewayBinary, env, ['--_desktop-pty-probe'])
+  if (
+    result.probe !== 'opensquilla-desktop-pty'
+    || result.available !== true
+    || result.ioMode !== 'pty'
+    || result.returncode !== 0
+  ) {
+    throw new Error(`Packaged gateway PTY probe failed: ${JSON.stringify(result)}`)
+  }
+}
+
 function documentFixture() {
   const stream = `BT /F1 24 Tf 72 720 Td (${documentFixtureText}) Tj ET`
   const objects = [
@@ -538,6 +550,7 @@ async function main() {
     const env = smokeEnv(tempHome, config, runtimeGatewayDir)
     verifyGatewayCaStore(gatewayBinary, env)
     verifyGatewayToolSearch(gatewayBinary, env)
+    verifyGatewayPty(gatewayBinary, env)
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
     verifyGatewayDocument(gatewayBinary, env, documentPath)
     await verifyGatewayCodeExecution(gatewayBinary, env, tempHome)

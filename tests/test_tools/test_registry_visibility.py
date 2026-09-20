@@ -113,6 +113,24 @@ def test_default_registry_removes_obsolete_wrapper_tools_but_keeps_canonical_too
     assert registry.get("subagents") is not None
 
 
+def test_model_surface_uses_unified_exec_process_pair() -> None:
+    import opensquilla.tools.builtin  # noqa: F401
+    from opensquilla.tools.registry import get_default_registry
+
+    registry = get_default_registry()
+    ctx = ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
+    authorized = registry.to_tool_definitions(ctx)
+    names = {tool.name for tool in registry.to_model_tool_definitions(authorized, ctx)}
+
+    assert {"exec_command", "process"} <= names
+    assert "background_process" not in names
+    assert ctx.tool_search_index is not None
+    assert all(
+        hit.name != "background_process"
+        for hit in ctx.tool_search_index.search("background_process")
+    )
+
+
 def test_existing_update_plan_selector_allows_the_registered_progress_tool() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.gateway.config import GatewayConfig, ToolsConfig
@@ -264,7 +282,6 @@ def test_verified_channel_admin_profile_exposes_full_runtime_tools() -> None:
 
     assert {
         "exec_command",
-        "background_process",
         "process",
         "write_file",
         "edit_file",

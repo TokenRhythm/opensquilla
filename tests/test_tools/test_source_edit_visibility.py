@@ -17,6 +17,7 @@ LOW_ENTROPY_REPO_CODING_TOOLS = {
     "git_diff",
     "retrieve_tool_result",
     "exec_command",
+    "process",
 }
 HIGH_ENTROPY_EDIT_AND_EXEC_TOOLS = {"execute_code", "write_file", "edit_file"}
 STRICT_SOURCE_EDIT_TOOLS = {
@@ -28,6 +29,7 @@ STRICT_SOURCE_EDIT_TOOLS = {
     "git_diff",
     "retrieve_tool_result",
     "exec_command",
+    "process",
 }
 SOURCE_EDIT_V2_TOOLS = {
     "read_source",
@@ -39,6 +41,7 @@ SOURCE_EDIT_V2_TOOLS = {
     "git_diff",
     "retrieve_tool_result",
     "exec_command",
+    "process",
 }
 BALANCED_SOURCE_EDIT_TOOLS = {
     "read_source",
@@ -54,10 +57,12 @@ BALANCED_SOURCE_EDIT_TOOLS = {
     "git_diff",
     "retrieve_tool_result",
     "exec_command",
+    "process",
 }
 PATCH_FALLBACK_SOURCE_EDIT_TOOLS = BALANCED_SOURCE_EDIT_TOOLS | {"apply_patch"}
 SCAFFOLD_EDIT_TOOLS = {
     "exec_command",
+    "process",
     "read_file",
     "edit_file",
     "write_file",
@@ -77,12 +82,10 @@ STRICT_SOURCE_EDIT_FORBIDDEN_TOOLS = {
     "apply_patch",
     "execute_code",
     "background_process",
-    "process",
     "git_log",
 }
 SCAFFOLD_FORBIDDEN_TOOLS = {
     "background_process",
-    "process",
     "execute_code",
     "git_log",
     "read_source",

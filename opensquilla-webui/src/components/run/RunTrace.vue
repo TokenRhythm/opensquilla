@@ -156,6 +156,11 @@
               aria-hidden="true"
             />
             <span class="tool-row__trailing">
+              <span
+                v-if="executionIoLabel(executionIoForGroup(item.group))"
+                class="tool-row__status tool-row__status--execution-io"
+                :class="`tool-row__status--execution-${executionIoForGroup(item.group).kind}`"
+              >{{ executionIoLabel(executionIoForGroup(item.group)) }}</span>
               <span v-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
               <Icon v-if="presentation !== 'activity' && groupHasDetails(item.group)" class="step-chevron" name="chevronRight" :size="14" />
             </span>
@@ -203,6 +208,11 @@
                   aria-hidden="true"
                 />
                 <span class="tool-row__trailing">
+                  <span
+                    v-if="executionIoLabel(executionIoForCall(call))"
+                    class="tool-row__status tool-row__status--execution-io"
+                    :class="`tool-row__status--execution-${executionIoForCall(call).kind}`"
+                  >{{ executionIoLabel(executionIoForCall(call)) }}</span>
                   <!-- Failure text is plain row content on purpose: it joins the
                        button's accessible name, which screen readers announce when
                        the row is reached. A live region mounted already-populated
@@ -292,6 +302,11 @@
                 aria-hidden="true"
               />
               <span class="tool-row__trailing">
+                <span
+                  v-if="executionIoLabel(executionIoForCall(call))"
+                  class="tool-row__status tool-row__status--execution-io"
+                  :class="`tool-row__status--execution-${executionIoForCall(call).kind}`"
+                >{{ executionIoLabel(executionIoForCall(call)) }}</span>
                 <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
@@ -347,6 +362,11 @@
 import { defineComponent, h, type PropType } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
+import {
+  mergeExecutionIo,
+  projectExecutionIoForCall,
+  type ExecutionIoSummary,
+} from '@/utils/chat/executionIo'
 
 const SECTION_PREVIEW_LIMIT = 200
 const COMPACT_SECTION_CHAR_LIMIT = 360
@@ -499,11 +519,13 @@ function toolResultContext(
   call: ChatToolCallRenderItem,
   section: NonNullable<ToolResultContext['section']>,
 ): ToolResultContext {
+  const executionIo = projectExecutionIoForCall(call)
   return {
     toolName: call.name,
     inputRaw: call.inputRaw || call.inputPreview,
     section,
     executionLogHandle: section === 'input' ? undefined : call.executionLogHandle,
+    ...(executionIo.kind === 'unknown' ? {} : { executionIo }),
   }
 }
 
@@ -542,6 +564,14 @@ function webDiagnosticsSummary(raw: string): string {
   if (returnedChars !== null) parts.push(`${returnedChars} chars`)
   if (truncated) parts.push('truncated')
   return parts.join(' · ')
+}
+
+function executionIoTextKey(summary: ExecutionIoSummary): string {
+  if (summary.kind === 'pty') return 'shared.runTrace.executionIoPty'
+  if (summary.kind === 'fallback') return 'shared.runTrace.executionIoFallback'
+  if (summary.kind === 'pipe') return 'shared.runTrace.executionIoPipe'
+  if (summary.kind === 'mixed') return 'shared.runTrace.executionIoMixed'
+  return 'shared.runTrace.executionIoUnknown'
 }
 
 // Labeled input / result / error sections shown in an expanded row body.
@@ -591,6 +621,15 @@ const ToolRowSections = defineComponent({
         sections.push(h('section', { class: 'tool-row-section' }, [
           h('div', { class: 'tool-row-section__label' }, t('shared.runTrace.sectionDiagnostics')),
           h('pre', { class: 'tool-row-section__pre' }, diagnostics),
+        ]))
+      }
+      const executionIo = projectExecutionIoForCall(call)
+      if (executionIo.kind !== 'unknown') {
+        sections.push(h('section', { class: ['tool-row-section', { 'tool-row-section--warning': executionIo.kind === 'fallback' }] }, [
+          h('div', { class: 'tool-row-section__label' }, t(executionIoTextKey(executionIo))),
+          executionIo.kind === 'fallback' && executionIo.fallbackReason
+            ? h('pre', { class: 'tool-row-section__pre' }, executionIo.fallbackReason)
+            : null,
         ]))
       }
       if (call.result) {
@@ -1318,6 +1357,27 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
   return injected
 }
 
+function executionIoTextKey(summary: ExecutionIoSummary): string {
+  if (summary.kind === 'pty') return 'shared.runTrace.executionIoPty'
+  if (summary.kind === 'fallback') return 'shared.runTrace.executionIoFallback'
+  if (summary.kind === 'pipe') return 'shared.runTrace.executionIoPipe'
+  if (summary.kind === 'mixed') return 'shared.runTrace.executionIoMixed'
+  return 'shared.runTrace.executionIoUnknown'
+}
+
+function executionIoForCall(call: ChatToolCallRenderItem): ExecutionIoSummary {
+  return projectExecutionIoForCall(call)
+}
+
+function executionIoForGroup(group: ChatToolCallGroup): ExecutionIoSummary {
+  return mergeExecutionIo(group.calls.map(executionIoForCall))
+}
+
+function executionIoLabel(summary: ExecutionIoSummary): string {
+  if (summary.kind === 'unknown') return ''
+  return t(executionIoTextKey(summary))
+}
+
 function forwardShowResult(content: string, title: string, context?: ToolResultContext) {
   if (isLegacyDocumentTool(context?.toolName)) return
   emit('showResult', content, title, context)
@@ -1724,6 +1784,17 @@ function fmtTok(n?: number | null): string {
   white-space: nowrap;
 }
 
+.tool-row__status--execution-io {
+  color: var(--text-muted);
+  max-width: min(22rem, 45vw);
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.tool-row__status--execution-fallback {
+  color: var(--warn);
+}
+
 .tool-row__elapsed {
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
@@ -1932,6 +2003,10 @@ function fmtTok(n?: number | null): string {
 }
 
 .tool-timeline--activity .tool-row--error .tool-row__status {
+  color: var(--warn);
+}
+
+.tool-timeline--activity .tool-row__status--execution-fallback {
   color: var(--warn);
 }
 
@@ -2255,6 +2330,11 @@ function fmtTok(n?: number | null): string {
 .tool-row-section--error {
   background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
   border-color: color-mix(in srgb, var(--danger) 30%, var(--border));
+}
+
+.tool-row-section--warning {
+  background: color-mix(in srgb, var(--warn) 8%, var(--bg-surface));
+  border-color: color-mix(in srgb, var(--warn) 30%, var(--border));
 }
 
 .tool-row-section__label {
