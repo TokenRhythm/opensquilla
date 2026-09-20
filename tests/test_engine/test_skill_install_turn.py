@@ -374,18 +374,29 @@ async def test_explicit_turn_deadline_cancels_install_and_preserves_receipt(setu
     async def collect_turn():
         return [event async for event in agent.run_turn("install demo")]
 
-    # Real filesystem setup/settlement shares this watchdog with cancellation.
-    # Keep the integration case out of the saturated parallel Windows phase.
-    # The watchdog uses the real loop; production cancellation and receipts do too.
+    # Preparing a real install performs filesystem and receipt database I/O.
+    # Start the cancellation watchdog only once its fetch prerequisite is ready.
+    # Both watchdogs use the real loop, independent of the controlled deadline.
     turn = asyncio.create_task(collect_turn())
+    preparation = asyncio.create_task(fetch_started.wait())
     try:
+        await asyncio.wait(
+            {turn, preparation}, timeout=30.0, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not fetch_started.is_set():
+            if turn.done():
+                await turn
+                pytest.fail("install turn completed before fetch started")
+            pytest.fail("install preparation did not reach fetch within 30 seconds")
         await asyncio.wait_for(asyncio.shield(turn), timeout=5.0)
     finally:
+        preparation.cancel()
         release_fetch.set()
         if not turn.done():
             turn.cancel()
         await asyncio.wait_for(
-            asyncio.gather(turn, *install_tasks, return_exceptions=True), timeout=5.0,
+            asyncio.gather(turn, preparation, *install_tasks, return_exceptions=True),
+            timeout=5.0,
         )
     assert deadline_budgets == pytest.approx([0.08])
     assert cancelled.is_set()
