@@ -197,7 +197,7 @@ describe('SettingsDialog save-all pending state', () => {
     expect(provider.querySelector('.settings-rail__warn')).toBeNull()
   })
 
-  it('uses quiet dots for optional capabilities and never shows a warning triangle', async () => {
+  it('omits status dots from optional sections and configured providers', async () => {
     mockCatalog()
     catalogApi.sectionDirty = () => false
     catalogApi.sectionStatus = (id: string) => id === 'capabilities'
@@ -206,7 +206,7 @@ describe('SettingsDialog save-all pending state', () => {
     const el = await mountDialog()
     expect(el.querySelector('#settings-rail-provider .settings-rail__dot')).toBeNull()
     expect(el.querySelector('#settings-rail-provider .settings-rail__warn')).toBeNull()
-    expect(el.querySelector('#settings-rail-capabilities .settings-rail__dot.is-muted')).not.toBeNull()
+    expect(el.querySelectorAll('.settings-rail__dot')).toHaveLength(0)
     expect(el.querySelector('#settings-rail-capabilities')?.getAttribute('aria-label')).toContain('Optional')
     expect(el.querySelector('.settings-rail__warn')).toBeNull()
   })

@@ -47,13 +47,6 @@
                 :title="sectionStatus(s.id).label"
                 aria-hidden="true"
               ></span>
-              <span
-                v-else-if="s.id !== 'provider' && !s.client"
-                class="settings-rail__dot"
-                :class="sectionStatus(s.id).tone"
-                :title="sectionStatus(s.id).label"
-                aria-hidden="true"
-              ></span>
             </button>
           </template>
         </nav>

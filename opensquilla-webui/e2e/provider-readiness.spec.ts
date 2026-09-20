@@ -33,7 +33,8 @@ for (const configured of [true, false]) {
     await expect(provider.locator('.settings-rail__warn')).toHaveCount(0)
     await expect(page.locator('.settings-rail__warn')).toHaveCount(0)
     await expect(page.locator('#settings-rail-capabilities')).toHaveAccessibleName('Capabilities: Optional')
-    await expect(page.locator('#settings-rail-capabilities .settings-rail__dot.is-muted')).toHaveCount(1)
+    await expect(page.locator('.settings-rail__dot')).toHaveCount(configured ? 1 : 2)
+    await expect(page.locator('#settings-rail-gateway .settings-rail__dot')).toHaveCount(1)
 
     await page.getByRole('button', { name: 'Close', exact: true }).click()
     await page.locator('.sidebar-foot button').click()
