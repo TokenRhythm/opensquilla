@@ -21,7 +21,7 @@ from opensquilla.telemetry.contracts.manifest import (
 from opensquilla.telemetry.server.collector import create_collector_app
 from opensquilla.telemetry.server.producer_auth import sign_producer_request
 from opensquilla.telemetry.server.settings import CollectorSettings
-from opensquilla.telemetry.server.storage import TelemetryIngestStorage
+from opensquilla.telemetry.server.storage import StorageScopeError, TelemetryIngestStorage
 
 _EVENT_ID = "00000000-0000-4000-8000-000000000011"
 _SESSION_ID = "00000000-0000-4000-8000-000000000012"
@@ -566,3 +566,79 @@ def test_internal_exception_text_is_never_logged_or_echoed(
     assert response.json() == {"ok": False, "error": "internal_error"}
     assert secret not in response.text
     assert secret not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("scenario", "status", "reason"),
+    [
+        ("content_type", 415, "unsupported_media_type"),
+        ("length", 400, "invalid_content_length"),
+        ("size", 413, "body_too_large"),
+        ("signature", 401, "producer_unauthorized"),
+        ("source", 403, "producer_source_mismatch"),
+        ("schema", 422, "schema_invalid"),
+        ("conflict", 409, "identifier_conflict"),
+        ("storage", 500, "internal_error"),
+        ("scope", 500, "internal_error"),
+    ],
+)
+def test_rejection_journal_contains_only_fixed_diagnostics(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: str,
+    status: int,
+    reason: str,
+) -> None:
+    secret = "PRIVATE-WIRE-AND-HEADER-SENTINEL"
+    settings = (
+        _growth_settings(tmp_path) if scenario in {"signature", "source"} else _settings(tmp_path)
+    )
+    payload = _client_growth_batch() if scenario == "source" else _batch()
+    if scenario == "schema":
+        payload["events"][0]["prompt"] = secret  # type: ignore[index]
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + secret,
+        "X-Forwarded-For": "198.51.100.42",
+        "User-Agent": secret,
+    }
+    if scenario == "content_type":
+        headers["Content-Type"] = "text/plain"
+    elif scenario == "length":
+        headers["Content-Length"] = secret
+    elif scenario == "size":
+        headers["Content-Length"] = str(settings.max_body_bytes + 1)
+    elif scenario == "signature":
+        payload = _growth_batch()
+    elif scenario == "source":
+        headers.update(_signed_growth_headers(_body(payload)))
+    elif scenario in {"storage", "scope"}:
+        async def fail_ingest(_storage: TelemetryIngestStorage, _batch: object) -> object:
+            if scenario == "scope":
+                raise StorageScopeError()
+            raise RuntimeError(secret)
+
+        monkeypatch.setattr(TelemetryIngestStorage, "ingest", fail_ingest)
+
+    logger = "opensquilla.telemetry.server.collector"
+    caplog.set_level(logging.WARNING, logger=logger)
+    with TestClient(create_collector_app(settings)) as client:
+        if scenario == "conflict":
+            assert client.post(settings.endpoint_path, json=payload).status_code == 202
+            payload["events"][0]["duration_ms"] = 999  # type: ignore[index]
+        response = client.post(settings.endpoint_path, content=_body(payload), headers=headers)
+
+    assert response.status_code == status
+    records = [record for record in caplog.records if record.name == logger]
+    assert len(records) == 1
+    record = records[0]
+    assert record.getMessage() == (
+        f"collector_rejected scope={settings.scope.value} status={status} reason={reason} "
+        f"protocol={TELEMETRY_PROTOCOL_FINGERPRINT_SHA256}"
+    )
+    assert record.levelno == (logging.ERROR if status >= 500 else logging.WARNING)
+    assert record.exc_info is None
+    assert record.stack_info is None
+    for private in (secret, "198.51.100.42", _EVENT_ID, _BATCH_ID, str(settings.database_path)):
+        assert private not in record.getMessage()
