@@ -104,9 +104,15 @@ async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> No
         session = shell._bg_sessions[execution_id]
         assert session.io_mode_used == "pty", result
         for _ in range(200):
-            if child_pid.exists() and child_pid.read_text():
+            # A child can publish its PID before the parent writes or ConPTY
+            # delivers the TTY proof. Observe both before terminating either.
+            if (
+                child_pid.exists() and child_pid.read_text()
+                and "TTY=True" in shell._bg_rendered_output(session)
+            ):
                 break
             await asyncio.sleep(0.02)
+        assert "TTY=True" in shell._bg_rendered_output(session)
         child_process = int(child_pid.read_text())
         child_identity = _strict_process_start_identity(child_process)
         assert child_identity

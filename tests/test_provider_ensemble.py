@@ -6498,13 +6498,29 @@ async def test_aggregator_no_output_timeout_uses_fixed_aggregator_and_preserves_
     assert usage.missing_usage_entries == 1
 
 
+@pytest.fixture
+def ensemble_clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    clock = [1.0]
+    monkeypatch.setattr(
+        "opensquilla.provider.ensemble.time",
+        SimpleNamespace(
+            monotonic=lambda: clock[0], time=time.time, time_ns=time.time_ns,
+        ),
+    )
+    return clock
+
+
 @pytest.mark.asyncio
 async def test_aggregator_stream_survives_past_timeout_while_events_flow(
     monkeypatch: pytest.MonkeyPatch,
+    ensemble_clock: list[float],
 ) -> None:
     async def slow_steady_aggregator() -> AsyncIterator[StreamEvent]:
         for index in range(6):
-            await asyncio.sleep(0.02)
+            # Exercise the unchanged idle budget without assuming that a busy
+            # runner resumes a 20 ms sleep before the 50 ms deadline.
+            await asyncio.sleep(0)
+            ensemble_clock[0] += 0.02
             yield TextDeltaEvent(text=f"chunk{index}")
         yield DoneEvent(input_tokens=11, output_tokens=5, model="agg")
 
@@ -6521,6 +6537,7 @@ async def test_aggregator_stream_survives_past_timeout_while_events_flow(
 
     events = await _collect(provider)
 
+    assert ensemble_clock[0] - 1.0 > provider.aggregator_timeout_seconds
     assert fallback is not None and fallback.calls == []
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == [
@@ -6534,6 +6551,65 @@ async def test_aggregator_stream_survives_past_timeout_while_events_flow(
     assert done.usage_missing_count == 0
     assert done.ensemble_trace is not None
     assert done.ensemble_trace["llm_request_count"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True], ids=["idle", "cancel"])
+async def test_aggregator_pending_stream_preserves_idle_and_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+    ensemble_clock: list[float],
+    cancel: bool,
+) -> None:
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    release = asyncio.Event()
+
+    async def pending_aggregator() -> AsyncIterator[StreamEvent]:
+        started.set()
+        try:
+            await release.wait()
+            yield DoneEvent(model="agg")
+        finally:
+            closed.set()
+
+    async def successful_fallback() -> AsyncIterator[StreamEvent]:
+        yield TextDeltaEvent(text="fallback")
+        yield DoneEvent(model="fallback")
+
+    provider, _, aggregator, fallback = _aggregator_timeout_harness(
+        monkeypatch,
+        aggregator_stream=pending_aggregator,
+        fallback_stream=successful_fallback,
+        timeout_seconds=0.05,
+    )
+    task = asyncio.create_task(_collect(provider))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert fallback is not None and fallback.calls == []
+        else:
+            # No upstream event completes while the original idle budget
+            # expires. Unlike total stream duration, that must cause takeover.
+            ensemble_clock[0] += 0.06
+            events = await asyncio.wait_for(task, timeout=1)
+            assert fallback is not None and len(fallback.calls) == 1
+            assert not any(isinstance(event, ErrorEvent) for event in events)
+            assert [
+                event.text for event in events if isinstance(event, TextDeltaEvent)
+            ] == ["fallback"]
+            done = next(event for event in events if isinstance(event, DoneEvent))
+            assert done.ensemble_trace is not None
+            assert done.ensemble_trace["fallback_code"] == "ensemble_aggregator_timeout"
+            assert done.ensemble_trace["llm_request_count"] == 3
+        assert len(aggregator.calls) == 1
+        assert closed.is_set()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @pytest.mark.asyncio
