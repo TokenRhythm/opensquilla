@@ -637,17 +637,12 @@ async def test_direct_file_handler_cannot_write_other_session(channel_workspace)
 
 
 @pytest.mark.asyncio
-async def test_get_run_context_binding_fact_is_runtime_only(channel_workspace):
+async def test_get_run_context_binding_fact_is_runtime_only(tmp_path):
     from types import SimpleNamespace
 
-    workspace, _runtime, _backend = channel_workspace
+    prepared = prepare_managed_workspace(tmp_path / "profile")
     node = SimpleNamespace(
-        execution_workspace={
-            "version": 1,
-            "kind": "managed",
-            "id": workspace.name,
-            "root": str(workspace),
-        },
+        execution_workspace=prepared.binding,
         workspace_id=None,
         origin={},
     )
@@ -661,6 +656,7 @@ async def test_get_run_context_binding_fact_is_runtime_only(channel_workspace):
         include_user_grants=False,
     )
     assert context.workspace_binding_kind == "managed"
+    assert context.workspace == prepared.binding["root"]
     assert "workspace_binding_kind" not in context.to_origin_payload()
     node.execution_workspace = None
     node.origin = {
