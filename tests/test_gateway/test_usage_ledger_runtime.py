@@ -656,8 +656,6 @@ async def test_failed_finalize_marks_goal_usage_unknown_without_losing_late_rece
     from tests.test_session.test_goal_storage import (
         SESSION_ID,
         SESSION_KEY,
-        _command,
-        _expected,
         _set_goal,
     )
 
@@ -676,11 +674,6 @@ async def test_failed_finalize_marks_goal_usage_unknown_without_losing_late_rece
                 "usage_coverage = 'partial_history', usage_accounting_started_at_ms = NULL"
             )
             await storage.conn.commit()
-        await storage.edit_goal(
-            session_key=SESSION_KEY, expected=_expected(accepted.goal),
-            objective=accepted.goal.objective, settings={"tokenBudget": 100},
-            command=_command("edit"),
-        )
         call = _call(
             session_id=SESSION_ID, session_epoch=0, turn_id="task-1",
             root_turn_id="task-1", execution_id="task-1",
@@ -708,15 +701,15 @@ async def test_failed_finalize_marks_goal_usage_unknown_without_losing_late_rece
         goal = await storage.get_goal(SESSION_KEY)
         assert goal is not None
         assert (goal.status, goal.pause_reason, goal.usage_coverage) == (
-            "paused", "usage_unknown", "partial_usage",
+            "active", None, "partial_usage",
         )
         monkeypatch.setattr(storage, "finalize_usage_event", original)
         await sink.finalize(call, _result())
         settled = await storage.get_goal(SESSION_KEY)
         assert settled is not None
         assert settled.usage_coverage == ("partial_history" if historical else "complete")
-        assert settled.budget_tokens_used == 16
-        assert settled.status == "paused"
+        assert (settled.input_tokens, settled.output_tokens, settled.total_tokens) == (11, 7, 18)
+        assert (settled.status, settled.pause_reason) == ("active", None)
     finally:
         await sink.close()
         await storage.close()
