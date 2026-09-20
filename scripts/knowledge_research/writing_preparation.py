@@ -7,10 +7,17 @@ from typing import Any
 
 if __package__:
     from .claims import ResearchStateError, sha256_json
-    from .references import source_format
+    from .references import build_bibliography, source_format
 else:  # pragma: no cover - standalone bridge
     from claims import ResearchStateError, sha256_json  # type: ignore[import-not-found,no-redef]
-    from references import source_format  # type: ignore[import-not-found,no-redef]
+    from references import (  # type: ignore[import-not-found,no-redef]
+        build_bibliography,
+        source_format,
+    )
+
+
+MAX_BIBLIOGRAPHY_SOURCES = 30
+MAX_EXPLICIT_READ_SOURCES = 12
 
 
 def scoped_search_count(state: Mapping[str, Any]) -> int:
@@ -51,6 +58,129 @@ def _complete_read_file_ids(state: Mapping[str, Any]) -> set[str]:
         if covered == len(record.get("content", "")):
             completed.add(str(record["fileId"]))
     return completed
+
+
+def bibliography_breadth_target(state: Mapping[str, Any]) -> int:
+    """Return the adaptive number of distinct references expected for deep work."""
+
+    if state.get("mode") != "deep":
+        return 0
+    candidate_count = len(_discovered_file_ids(state))
+    # Small investigations should retain the existing evidence/review flow;
+    # bibliography breadth is a safeguard for genuinely broad corpora.
+    if candidate_count < 10:
+        return 0
+    return min(MAX_BIBLIOGRAPHY_SOURCES, candidate_count)
+
+
+def explicit_read_breadth_target(state: Mapping[str, Any]) -> int:
+    """Require a meaningful core reading set without forcing every candidate open."""
+
+    target = bibliography_breadth_target(state)
+    # Narrow single-file investigations already have the ordinary cited-evidence
+    # gate. The additional core-reading breadth rule is for genuinely broad work.
+    if target < 10:
+        return 0
+    return min(MAX_EXPLICIT_READ_SOURCES, max(3, (target + 1) // 2))
+
+
+def bibliography_breadth_summary(state: Mapping[str, Any]) -> dict[str, Any]:
+    bibliography = build_bibliography(state)
+    candidate_count = len(_discovered_file_ids(state))
+    target = bibliography_breadth_target(state)
+    read_files = _complete_read_file_ids(state)
+    read_target = explicit_read_breadth_target(state)
+    return {
+        "schemaVersion": "research-breadth-audit/1",
+        "status": (
+            "ready"
+            if bibliography["sourceCount"] >= target and len(read_files) >= read_target
+            else "insufficient"
+        ),
+        "candidateSourceFiles": candidate_count,
+        "bibliographyEntries": bibliography["sourceCount"],
+        "citedSourceFiles": bibliography["sourceFileCount"],
+        "explicitlyReadSourceFiles": len(read_files),
+        "minimums": {
+            "bibliographyEntries": target,
+            "explicitlyReadSourceFiles": read_target,
+        },
+    }
+
+
+def bibliography_breadth_check(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Block finalization when a broad corpus was reduced to a tiny citation set."""
+
+    if state.get("mode") != "deep" or not state.get("report", {}).get("items"):
+        return None
+    summary = bibliography_breadth_summary(state)
+    missing_refs = max(
+        0,
+        summary["minimums"]["bibliographyEntries"] - summary["bibliographyEntries"],
+    )
+    missing_reads = max(
+        0,
+        summary["minimums"]["explicitlyReadSourceFiles"] - summary["explicitlyReadSourceFiles"],
+    )
+    if not missing_refs and not missing_reads:
+        return None
+
+    navigation = state.get("extensions", {}).get("navigation", {})
+    cited: set[str] = set()
+    for item in state["report"]["items"]:
+        if item.get("kind") == "claim":
+            cited.update(
+                str(state["ledger"]["evidence"][evidence_id]["fileId"])
+                for evidence_id in item.get("evidenceIds", [])
+            )
+        elif item.get("kind") == "table":
+            table = state["ledger"]["tables"].get(item.get("tableId"), {})
+            if table.get("fileId"):
+                cited.add(str(table["fileId"]))
+    candidate_refs = [
+        str(row["ref"])
+        for file_id, row in navigation.get("files", {}).items()
+        if file_id not in cited and isinstance(row.get("ref"), str)
+    ]
+    completed_files = _complete_read_file_ids(state)
+    unread_cited_refs = [
+        str(row["ref"])
+        for file_id, row in navigation.get("files", {}).items()
+        if file_id in cited and file_id not in completed_files and isinstance(row.get("ref"), str)
+    ]
+    checks: list[str] = []
+    if missing_refs:
+        checks.append(
+            f"cite at least {missing_refs} more independent source file(s) in supported claims"
+        )
+    if missing_reads:
+        checks.append(f"complete explicit reading for {missing_reads} more core source file(s)")
+    check: dict[str, Any] = {
+        "code": "BIBLIOGRAPHY_BREADTH_REQUIRED",
+        "tool": "searchByIds",
+        "arguments": {
+            "researchId": state["researchId"],
+            "query": (
+                "Extract the main finding, assumptions, key numbers, qualifications, "
+                "and contrary evidence relevant to the report question."
+            ),
+        },
+        "required": summary["minimums"],
+        "observed": {
+            "bibliographyEntries": summary["bibliographyEntries"],
+            "explicitlyReadSourceFiles": summary["explicitlyReadSourceFiles"],
+        },
+        "message": (
+            "The discovered corpus is broad but the draft cites too few independent sources. "
+            + "; ".join(checks)
+            + ". Use returned evidenceRefs in substantive claims; do not add a bare or "
+            "unread bibliography list."
+        ),
+    }
+    selection_refs = candidate_refs if missing_refs else unread_cited_refs
+    if selection_refs:
+        check["suggestedSelection"] = {"selection": {"kind": "files", "refs": selection_refs[:20]}}
+    return check
 
 
 def _breadth_checks(state: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -159,6 +289,7 @@ def research_depth_summary(state: Mapping[str, Any]) -> dict[str, Any]:
     discovery_queries = _discovery_query_count(state)
     scoped = scoped_search_count(state)
     read_files = _complete_read_file_ids(state)
+    breadth = bibliography_breadth_summary(state)
     return {
         "schemaVersion": "research-depth-audit/1",
         "status": (
@@ -177,6 +308,7 @@ def research_depth_summary(state: Mapping[str, Any]) -> dict[str, Any]:
             "scopedSearches": required_scoped,
             "explicitlyReadSourceFiles": required_read_files,
         },
+        "bibliographyBreadth": breadth,
     }
 
 

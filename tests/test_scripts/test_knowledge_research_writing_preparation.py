@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 
 from scripts.knowledge_research.navigation import Navigation
+from scripts.knowledge_research.writing_preparation import bibliography_breadth_check
 from tests.test_scripts.test_knowledge_research_navigation import (
     REVISION,
     invoke,
@@ -196,6 +197,31 @@ def test_bibliography_metadata_and_failed_explicit_details_cannot_satisfy_pdf_ga
     upstream.responses.append(result(_details("analysis.pdf")))
     invoke(bridge, check["tool"], check["arguments"])
     assert _write(bridge, rid, _claims(found))[0]["status"] == "accepted"
+
+
+def test_broad_deep_report_requires_independent_bibliography_breadth(tmp_path: Path) -> None:
+    source = _source([f"file-{index}" for index in range(30)])
+    bridge, store, _, rid = setup(tmp_path, [result(source)])
+    found, _ = invoke(bridge, "search", {"researchId": rid, "query": "discovery"})
+    store.add_claims(
+        research_id=rid,
+        claims=[
+            {
+                "claimKey": "one",
+                "section": "Finding",
+                "text": "One source-backed finding.",
+                "evidenceIds": [source["results"][0]["evidenceId"]],
+            }
+        ],
+        batch_key="first",
+    )
+    store.atomic_update(rid, lambda state: state.update(mode="deep"))
+    check = bibliography_breadth_check(store.snapshot(rid))
+    assert check is not None
+    assert check["code"] == "BIBLIOGRAPHY_BREADTH_REQUIRED"
+    assert check["required"]["bibliographyEntries"] == 30
+    assert check["observed"]["bibliographyEntries"] == 1
+    assert check["suggestedSelection"]["selection"]["kind"] == "files"
 
 
 def test_mixed_first_batch_requires_each_cited_excerpt_but_no_uncited_files(tmp_path: Path) -> None:

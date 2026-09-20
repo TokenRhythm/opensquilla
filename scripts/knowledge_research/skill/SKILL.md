@@ -56,10 +56,16 @@ or successful tool calls do not establish research depth.
 Keep a compact working map of questions, evidence, competing views, and open gaps.
 Return to discovery and scoped reading when new facts change that map. Continue
 while an unread important candidate or targeted query could materially change the
-conclusion, mechanism, disagreement, or scenario. Stop at substantive evidence
-saturation, without fixed search, file, citation, word, or table quotas. If focused
-rechecks no longer resolve a material gap, preserve that limit and narrow the
-judgment; do not search indefinitely or manufacture precision.
+conclusion, mechanism, disagreement, or scenario. For a broad corpus with at least
+30 discovered source files, build a bibliography from at least 30 independent
+sources before finalizing; use those sources in substantive claims, comparisons,
+mechanisms, risks, or scenarios. The sidecar blocks finalization below this adaptive
+breadth target and also requires a core set of explicitly read files. Do not pad the
+list with metadata-only or unread sources. Smaller corpora keep the existing
+source-grounded evidence and review requirements without a forced bibliography
+floor. If focused rechecks no longer resolve a
+material gap, preserve that limit and narrow the judgment; do not search indefinitely
+or manufacture precision.
 
 ## Financial reasoning, when relevant
 
