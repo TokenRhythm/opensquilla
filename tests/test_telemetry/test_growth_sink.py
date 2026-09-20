@@ -72,6 +72,9 @@ class CapturingRuntime:
         status = self.statuses.pop(0) if self.statuses else RecordStatus.RECORDED
         return RecordResult(status)
 
+    async def recover_contract_rejection_once(self, event, *, expected_consent_revision):
+        return False
+
 
 def _config(tmp_path, *, enabled: bool | None = True):
     return SimpleNamespace(
@@ -151,6 +154,62 @@ async def test_product_active_counts_each_surface_daily_without_creating_cohort(
     assert not await resumed.record_product_active(surface=ClientSurface.DESKTOP)
     await resumed.close()
     assert len(runtime.events) == 5
+
+
+@pytest.mark.parametrize("close_during_recovery", [False, True])
+async def test_start_rechecks_lifecycle_after_waiting_for_recovery(
+    tmp_path, monkeypatch, close_during_recovery,
+):
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    sink = _sink(CapturingRuntime(), _config(tmp_path))
+
+    async def blocked_recovery():
+        entered.set()
+        await release.wait()
+
+    monkeypatch.setattr(sink, "_recover_rejected_once", blocked_recovery)
+    before = asyncio.all_tasks()
+    starts = [asyncio.create_task(sink.start()) for _ in range(2)]
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        if close_during_recovery:
+            await sink.close()
+        release.set()
+        await asyncio.wait_for(asyncio.gather(*starts), 1)
+        loops = {task for task in asyncio.all_tasks() - before
+                 if task.get_name() == "telemetry-growth-replay"}
+        assert loops == (set() if close_during_recovery else {sink._retry_task})
+    finally:
+        release.set()
+        await sink.close()
+        await asyncio.gather(*starts)
+
+
+async def test_optional_recovery_lock_failure_does_not_block_start_or_new_activity(
+    tmp_path, monkeypatch,
+):
+    from opensquilla.recovery.errors import ProfileLockBusyError
+    from opensquilla.telemetry import growth_sink as sink_module
+
+    config = _config(tmp_path)
+    _activate(config)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, config)
+    original_lock = sink_module.ProfileOperationLock
+
+    def contention(path, **kwargs):
+        if path == sink._client_launch_path:
+            raise ProfileLockBusyError("synthetic contention")
+        return original_lock(path, **kwargs)
+
+    monkeypatch.setattr(sink_module, "ProfileOperationLock", contention)
+    try:
+        await sink.start()
+        assert await sink.record_product_active(surface=ClientSurface.CLI)
+        assert [event.event_name for event in runtime.events] == ["product_active"]
+    finally:
+        await sink.close()
 
 
 async def test_all_usage_events_share_device_across_profiles_and_surfaces(tmp_path) -> None:

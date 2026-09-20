@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
@@ -19,8 +20,20 @@ from opensquilla.telemetry.consent import (
     resolve_scope_consent,
 )
 from opensquilla.telemetry.contracts import TELEMETRY_EVENT_ADAPTER
-from opensquilla.telemetry.contracts.common import ConsentScope
+from opensquilla.telemetry.contracts.common import (
+    ClientEntrypoint,
+    ClientSurface,
+    ConsentScope,
+    ExecutionMode,
+)
 from opensquilla.telemetry.coordination import scope_consent_coordinator_for
+from opensquilla.telemetry.growth.state import growth_cohort_state_path, write_active_growth_cohort
+from opensquilla.telemetry.growth_sink import GrowthEventSink
+from opensquilla.telemetry.identity import (
+    TelemetryIdentityKind,
+    identity_state_path,
+    load_or_create_identity,
+)
 from opensquilla.telemetry.outbox import TelemetryOutbox
 from opensquilla.telemetry.recorder import RecordStatus
 from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
@@ -28,6 +41,159 @@ from opensquilla.telemetry.server.collector import create_collector_app
 from opensquilla.telemetry.server.dashboard_queries import DashboardQueries, UtcCohortWindow
 from opensquilla.telemetry.server.settings import CollectorSettings
 from opensquilla.telemetry.uploader import TelemetryUploader
+
+
+@pytest.mark.parametrize(
+    "entrypoint", ["startup", "activity", "launch", "coding", "rejected_again"],
+)
+async def test_retained_growth_records_recover_after_device_contract_upgrade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str,
+) -> None:
+    occurred = datetime(2026, 9, 2, 1, tzinfo=UTC)
+    now_ms = int(datetime(2026, 9, 3, 1, tzinfo=UTC).timestamp() * 1000)
+    state_dir = tmp_path / "client"
+    config = SimpleNamespace(state_dir=str(state_dir), privacy=PrivacyConfig())
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+    )
+    identity = load_or_create_identity(
+        identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config),
+        TelemetryIdentityKind.ANALYTICS_USER, now=occurred,
+    )
+    write_active_growth_cohort(
+        growth_cohort_state_path(config=config), activated_at_utc="2026-09-02T00:00:00.000Z",
+    )
+    open_outbox = TelemetryOutbox.open
+
+    async def open_with_clock(_cls, path, scope, **kwargs):
+        return await open_outbox(path, scope, clock=lambda: now_ms, **kwargs)
+
+    monkeypatch.setattr(TelemetryOutbox, "open", classmethod(open_with_clock))
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: "a" * 64)
+    settings = CollectorSettings(
+        scope=ConsentScope.GROWTH, database_path=tmp_path / "collector.sqlite3",
+    )
+    app = create_collector_app(settings)
+    reject_device_field = True
+    requests = []
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(transport=httpx.ASGITransport(app=app), trust_env=False) as collector,
+    ):
+        async def transport(request):
+            body = json.loads(request.content)
+            requests.append(body)
+            # The earlier collector's strict schema rejects this additional field.
+            if reject_device_field and any("device_id" in event for event in body["events"]):
+                return httpx.Response(422, json={"ok": False, "error": "schema_invalid"})
+            return await collector.send(request)
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(transport)) as client:
+            monkeypatch.setattr(
+                runtime_module, "TelemetryUploader", partial(TelemetryUploader, http_client=client),
+            )
+
+            def make_runtime():
+                runtime = ScopedTelemetryRuntime(
+                    config=config, base_url="https://collector.invalid", env={},
+                )
+                sink = GrowthEventSink(runtime, config=config, clock=lambda: occurred)
+                return runtime, sink
+
+            runtime, sink = make_runtime()
+            try:
+                assert await sink.record_product_active(surface=ClientSurface.CLI)
+                assert await sink.record_client_launch(
+                    surface=ClientSurface.CLI, entrypoint=ClientEntrypoint.AGENT,
+                    execution_mode=ExecutionMode.ONE_SHOT,
+                )
+                assert await sink.record_metaskill_usage("synthetic-meta-run", occurred)
+                assert await sink.record_coding_mode_usage("synthetic-code-run", occurred)
+                await sink.record_turn_started(occurred)
+                await sink.record_turn_succeeded(occurred)
+                desktop_state = {
+                    "schema_version": 1, "marker_kind": "growth_desktop_milestones",
+                }
+                for number, name in enumerate(("onboarding_result", "first_app_ready"), 100):
+                    payload = _event_payload(number=number, day="2026-09-02")
+                    payload.pop("app_session_id")
+                    payload.pop("failure_stage")
+                    payload.update(
+                        event_name=name, consent_scope="growth", notice_version="growth-v2",
+                        outcome="completed" if name == "onboarding_result" else None,
+                        duration_ms=None, analytics_user_id=identity.value, device_id="a" * 64,
+                    )
+                    if name == "onboarding_result":
+                        payload["flow_version"] = 1
+                    event = TELEMETRY_EVENT_ADAPTER.validate_json(json.dumps(payload), strict=True)
+                    assert (await runtime.record(event)).status is RecordStatus.RECORDED
+                    desktop_state[name] = {"status": "enqueued", "event": payload}
+                desktop_path = state_dir / "telemetry" / "growth_desktop_milestones.json"
+                desktop_path.write_text(json.dumps(desktop_state), encoding="utf-8")
+                await runtime.upload_once(TelemetryScope.GROWTH)
+                outbox = runtime._scopes[TelemetryScope.GROWTH].outbox
+                assert (await outbox.stats()).pending_events == 0
+                assert (await outbox.stats()).rejected_events == 8
+                original = {item["event_id"]: item for item in requests[0]["events"]}
+            finally:
+                await sink.close()
+                await runtime.close(flush=False)
+
+            reject_device_field = entrypoint == "rejected_again"
+            runtime, sink = make_runtime()
+            try:
+                if entrypoint in {"startup", "rejected_again"}:
+                    await sink.start()
+                elif entrypoint == "activity":
+                    assert not await sink.record_product_active(surface=ClientSurface.CLI)
+                elif entrypoint == "launch":
+                    assert not await sink.record_client_launch(
+                        surface=ClientSurface.CLI, entrypoint=ClientEntrypoint.AGENT,
+                        execution_mode=ExecutionMode.ONE_SHOT,
+                    )
+                else:
+                    assert not await sink.record_coding_mode_usage("synthetic-code-run", occurred)
+                await runtime.upload_once(TelemetryScope.GROWTH)
+                outbox = runtime._scopes[TelemetryScope.GROWTH].outbox
+                assert (await outbox.stats()).pending_events == 0
+                assert {item["event_id"]: item for item in requests[1]["events"]} == original
+                if reject_device_field:
+                    assert (await outbox.stats()).rejected_events == 8
+                else:
+                    assert await outbox.list_rejections() == ()
+                    with sqlite3.connect(settings.database_path) as connection:
+                        stored = [json.loads(row[0]) for row in connection.execute(
+                            "SELECT payload_json FROM events"
+                        )]
+                    assert {item["event_id"]: item for item in stored} == original
+                    receipt = await client.post(
+                        "https://collector.invalid" + settings.endpoint_path, json=requests[1],
+                    )
+                    assert receipt.json()["duplicates"] == 8
+                    queries = DashboardQueries(
+                        reliability_db_path=tmp_path / "unused.sqlite3",
+                        growth_db_path=settings.database_path,
+                    )
+                    summary = queries.growth(UtcCohortWindow.from_dates("2026-09-02", "2026-09-02"))
+                    assert summary["productActivity"]["dau"] == 1
+                    assert summary["clientUsage"]["totals"]["cliUsers"] == 1
+                    assert summary["metaskillUsage"]["totalUses"] == 1
+                    assert summary["codingModeUsage"]["totalUses"] == 1
+                    assert queries.growth(UtcCohortWindow.from_dates("2026-09-03", "2026-09-03"))[
+                        "productActivity"
+                    ]["dau"] == 0
+            finally:
+                await sink.close()
+                await runtime.close(flush=False)
+            count = len(requests)
+            runtime, sink = make_runtime()
+            try:
+                await sink.start()
+                await runtime.upload_once(TelemetryScope.GROWTH)
+                assert len(requests) == count
+            finally:
+                await sink.close()
+                await runtime.close(flush=False)
 
 
 def _event_payload(*, number: int, day: str) -> dict[str, object]:
