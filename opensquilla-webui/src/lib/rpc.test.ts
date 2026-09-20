@@ -853,6 +853,24 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
+  it('cancels an advertised read after its local timeout without recycling the shared socket', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { cancellable_request_methods: ['sessions.messages.snapshot.read'] })
+    const generation = client.connectionGeneration
+    const result = client.call('sessions.messages.snapshot.read', { key: 'alpha', sync_revision: 'sync-1' }, {
+      timeoutMs: 15, cancelOnAbort: true,
+    }).catch(error => error)
+    const request = JSON.parse(socket.sent[socket.sent.length - 1])
+    await vi.advanceTimersByTimeAsync(15)
+    expect(await result).toBeInstanceOf(RpcTimeoutError)
+    expect(JSON.parse(socket.sent[socket.sent.length - 1])).toEqual({ type: 'cancel', id: request.id })
+    expect(client.connectionGeneration).toBe(generation)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    client.disconnect()
+  })
+
   it('keeps cancel-on-abort local when an older Gateway does not advertise support', async () => {
     const client = new RpcClient()
     const controller = new AbortController()

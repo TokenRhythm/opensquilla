@@ -1437,6 +1437,22 @@
         "params",
         "result"
       ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.resume",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.snapshot.release",
+      "roles": [
+        "params",
+        "result"
+      ]
     }
   ]
 }

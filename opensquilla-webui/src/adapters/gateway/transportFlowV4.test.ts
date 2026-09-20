@@ -21,7 +21,7 @@ function reply(params: Record<string, unknown>) {
 
 const owners: TransportFlowV4[] = []
 
-function harness() {
+function harness(modern = false) {
   let generation = 7
   const listeners = new Map<string, Set<TransportEventHandler>>()
   const enable = vi.fn()
@@ -34,6 +34,7 @@ function harness() {
     enableConsumptionFlow: enable,
     consumeEvent: consume,
     recoverGap: recover,
+    supportsRecovery: () => modern,
     on(event, handler) {
       let handlers = listeners.get(event)
       if (!handlers) { handlers = new Set(); listeners.set(event, handlers) }
@@ -666,4 +667,134 @@ describe('connection-local consumption flow', () => {
     expect(h.controller.enabled).toBe(false)
     expect(h.consume).not.toHaveBeenCalled()
   })
+})
+
+
+describe('negotiated recovery isolation', () => {
+  it('stages a neutral tombstone without advancing across an ordinary consumer hole', async () => {
+    const h = harness(true)
+    const ordinary = deferred<'applied'>()
+    h.consume.mockReturnValueOnce(ordinary.promise)
+    h.hello()
+    h.deliver(1)
+    h.emit('*', 'transport.flow.dirty', { delivery_epoch: EPOCH, dirty_keys: [], global_dirty: false }, {
+      flow: h.receipt(2),
+    })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.request).toHaveBeenCalledWith(METHOD, {
+      delivery_epoch: EPOCH, ack_delivery_id: 0, staged_delivery_ids: [2],
+    }, expect.anything())
+    expect(h.recover).not.toHaveBeenCalled()
+    expect(h.controller.diagnostics.ackDeliveryId).toBe(0)
+    ordinary.resolve('applied')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.controller.diagnostics.ackDeliveryId).toBe(2)
+  })
+
+  it('allows beta recovery while alpha remains pending, with two bounded jobs', async () => {
+    const h = harness(true)
+    const alpha = deferred<boolean>()
+    h.recover.mockImplementation(async detail => {
+      const scope = detail as { keys: string[] }
+      return scope.keys[0] === 'alpha' ? alpha.promise : true
+    })
+    h.hello()
+    h.dirty(['alpha'])
+    await vi.advanceTimersByTimeAsync(0)
+    h.dirty(['beta'])
+    await vi.advanceTimersByTimeAsync(0)
+    expect(h.recover).toHaveBeenCalledWith({ reason: 'transport_flow_dirty', keys: ['beta'], global: false })
+    expect(h.controller.diagnostics.recoveryInFlight).toBe(true)
+    alpha.resolve(true)
+    await vi.advanceTimersByTimeAsync(0)
+  })
+
+  it('does not mix poisoned dirty intents with legitimate staged credit', async () => {
+    const h = harness(true)
+    h.consume.mockResolvedValueOnce('dirty')
+    h.recover.mockResolvedValue(false)
+    h.request.mockImplementation(async (_method, params = {}) => {
+      if (params.dirty_keys) throw Object.assign(new Error('invalid key'), { code: 'INVALID_REQUEST' })
+      return reply(params)
+    })
+    h.hello()
+    h.deliver(1, 'gone')
+    await vi.advanceTimersByTimeAsync(0)
+    await h.controller.acknowledgeDelivery(h.receipt(2))
+    await vi.advanceTimersByTimeAsync(100)
+    for (const [, params] of h.request.mock.calls) {
+      expect(Boolean(params?.dirty_keys && params?.staged_delivery_ids)).toBe(false)
+      if (params?.staged_delivery_ids) expect(params.staged_delivery_ids).toEqual([2])
+    }
+    expect(h.controller.diagnostics.dirtyKeyCount).toBe(0)
+    expect(h.controller.diagnostics.stagedFrames).toBe(0)
+  })
+
+  it('does not invalidate a snapshot for successfully owned ordinary token progress', async () => {
+    const h = harness(true)
+    h.hello()
+    const version = h.controller.recoveryVersion('alpha')
+    for (let id = 1; id <= 100; id++) h.deliver(id)
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.controller.recoveryVersion('alpha')).toBe(version)
+    expect(h.recover).not.toHaveBeenCalled()
+    h.dirty(['alpha'])
+    expect(h.controller.recoveryVersion('alpha')).not.toBe(version)
+  })
+
+  it.each([false, true])('sends dirty within two batches under continuing credit (rejected=%s)', async rejected => {
+    const h = harness(true)
+    const first = deferred<unknown>()
+    const dirty = deferred<unknown>()
+    h.consume.mockResolvedValueOnce('dirty')
+    h.recover.mockResolvedValue(false)
+    h.request.mockReturnValueOnce(first.promise).mockReturnValueOnce(dirty.promise)
+    h.hello()
+    h.deliver(1, 'alpha')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.request.mock.calls[0][1]).toEqual({ delivery_epoch: EPOCH, ack_delivery_id: 1 })
+    h.deliver(2, 'beta')
+    await vi.advanceTimersByTimeAsync(0)
+    const staged = h.controller.acknowledgeDelivery(h.receipt(3))
+    first.resolve(reply({ delivery_epoch: EPOCH, ack_delivery_id: 1 }))
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.request.mock.calls[1][1]).toEqual({
+      delivery_epoch: EPOCH, ack_delivery_id: 1, dirty_keys: ['alpha'],
+    })
+    h.deliver(4, 'beta')
+    await vi.advanceTimersByTimeAsync(0)
+    if (rejected) dirty.reject(Object.assign(new Error('invalid key'), { code: 'INVALID_REQUEST' }))
+    else dirty.resolve(reply({ delivery_epoch: EPOCH, ack_delivery_id: 1 }))
+    await vi.advanceTimersByTimeAsync(50)
+    await staged
+    expect(h.request.mock.calls[2][1]).toEqual({
+      delivery_epoch: EPOCH, ack_delivery_id: 4, staged_delivery_ids: [3],
+    })
+    expect(h.controller.diagnostics).toMatchObject({ enabled: true, dirtyKeyCount: 0, stagedFrames: 0 })
+  })
+})
+
+it('requires the exact visible replay watermark after its consumers finish', async () => {
+  const h = harness(true)
+  h.hello()
+  await expect(h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'stream-1', fromSeq: 10, toSeq: 12,
+  })).rejects.toMatchObject({ code: 'SNAPSHOT_STALE' })
+  const consumer = deferred<'applied'>()
+  h.consume.mockReturnValueOnce(consumer.promise)
+  h.emit('*', 'session.event.text_delta', { key: 'alpha', stream_generation: 'stream-1', stream_seq: 12, text: 'x' }, {
+    flow: h.receipt(1),
+  })
+  let completed = false
+  const pending = h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'stream-1', fromSeq: 10, toSeq: 12,
+  }).then(() => { completed = true })
+  await vi.advanceTimersByTimeAsync(0)
+  expect(completed).toBe(false)
+  consumer.resolve('applied')
+  await pending
+  expect(completed).toBe(true)
+  await expect(h.controller.waitForConsumption('alpha', {
+    streamGeneration: 'another-stream', fromSeq: 10, toSeq: 12,
+  })).rejects.toMatchObject({ code: 'SNAPSHOT_STALE' })
 })

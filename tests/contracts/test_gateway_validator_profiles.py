@@ -22,16 +22,16 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 202
+    assert len(targets) == 204
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 192,
-        "params": 23,
+        "result": 194,
+        "params": 25,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 890
+    assert sum(len(spec.targets) for spec in specs) == 898
     assert targets[("method", "models.list")] == ("params", "result")
     assert targets[("method", "models.capacity.resolve")] == ("params", "result")
     assert targets[("method", "workspaces.references.read")] == ("params", "result")
@@ -42,6 +42,8 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     assert targets[("method", "meta.inspect")] == ("result",)
     assert targets[("method", "telemetry.product_active.record")] == ("result",)
     assert targets[("method", "sessions.messages.snapshot.read")] == ("params", "result")
+    assert targets[("method", "sessions.messages.resume")] == ("params", "result")
+    assert targets[("method", "sessions.messages.snapshot.release")] == ("params", "result")
     assert targets[("method", "transport.flow.update")] == ("params", "result")
     assert targets[("method", "onboarding.llmProfile.upsertAndActivate")] == (
         "params", "result",

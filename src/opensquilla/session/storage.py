@@ -97,6 +97,11 @@ from opensquilla.session.plans import (
     prepare_plan_revision,
     prepare_plan_run,
 )
+from opensquilla.session.recovery_reads import (
+    ReadCapacityError,
+    RecoveryReadPool,
+    current_read_budget,
+)
 from opensquilla.session.usage_ledger import (
     UsageBackfillBatch,
     UsageBackfillCursor,
@@ -497,6 +502,11 @@ def _serialized_read[**P, R](
     @wraps(method)
     async def _wrapped(self: SessionStorage, *args: P.args, **kwargs: P.kwargs) -> R:
         self._raise_if_poisoned()
+        if current_read_budget() is not None:
+            async def scoped_read(_reader: Any) -> R:
+                return await method(self, *args, **kwargs)
+
+            return await self._run_recovery_read(method.__name__, scoped_read)
         reader = self._transcript_reader
         if reader is not None:
             async def read() -> R:
@@ -1915,6 +1925,7 @@ class SessionStorage:
         self._conn: Any | None = None
         self._connection_generation = 0
         self._transcript_reader: Any | None = None
+        self._recovery_read_pool: RecoveryReadPool | None = None
         self._pending_reader_operations: set[asyncio.Task[Any]] = set()
         self._meta_run_writer = meta_run_writer
         self._operation_lock = asyncio.Lock()
@@ -1985,6 +1996,7 @@ class SessionStorage:
         ):
             await self.close()
         self._poisoned = False
+        self._recovery_read_pool = None
         self._conn = await aiosqlite.connect(
             self._db_path,
             isolation_level=None,
@@ -2028,6 +2040,10 @@ class SessionStorage:
             gc_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await gc_task
+        # Drain before acquiring the writer gate: a serial fallback may still
+        # be waiting for that gate. Pool close prevents new recovery admission.
+        if self._recovery_read_pool is not None:
+            await self._recovery_read_pool.close()
         async with self._operation_lock:
             async with self._transcript_reader_lock:
                 reader, self._transcript_reader = self._transcript_reader, None
@@ -2139,6 +2155,77 @@ class SessionStorage:
             return
         self._transcript_reader = reader
 
+    async def _open_recovery_reader(self) -> Any:
+        """Return a raw reader to its lease before fallible configuration."""
+
+        return await aiosqlite.connect(self._db_path, isolation_level=None)
+
+    async def _initialize_recovery_reader(self, reader: Any) -> None:
+        """Configure an already-owned reader; the pool handles every failure."""
+
+        reader.row_factory = aiosqlite.Row
+        await self._register_sql_functions(reader)
+        async with reader.execute("PRAGMA query_only=ON"):
+            pass
+        async with reader.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}"):
+            pass
+        async with reader.execute("PRAGMA journal_mode") as cursor:
+            row = await cursor.fetchone()
+        if row is None or str(row[0]).lower() != "wal":
+            raise RuntimeError("Recovery reader requires WAL storage")
+
+    async def _run_recovery_read[R](
+        self, operation: str, read: Callable[[Any], Awaitable[R]],
+    ) -> R:
+        budget = current_read_budget()
+        assert budget is not None
+        self._raise_if_poisoned()
+        selected = _READ_CONNECTION.get()
+        if selected is not None and selected[0] is self:
+            budget.check()
+            return await read(selected[1])
+        if self._conn is None:
+            raise RuntimeError("Storage not connected. Call connect() first.")
+        if self._recovery_read_pool is None:
+            if self._transcript_reader is not None:
+                self._recovery_read_pool = RecoveryReadPool(
+                    self._open_recovery_reader, initialize=self._initialize_recovery_reader,
+                )
+            else:
+                async def borrow_writer() -> Any:
+                    self._raise_if_poisoned()
+                    if self._conn is None:
+                        raise RuntimeError("Storage not connected. Call connect() first.")
+                    return self._conn
+
+                def poison_writer() -> None:
+                    self._poisoned = True
+
+                self._recovery_read_pool = RecoveryReadPool(
+                    borrow_writer, shared_lock=self._operation_lock,
+                    on_shared_failure=poison_writer,
+                )
+
+        async def bound_read(reader: Any) -> R:
+            token = _READ_CONNECTION.set((self, reader))
+            try:
+                self._raise_if_poisoned()
+                return await read(reader)
+            finally:
+                _READ_CONNECTION.reset(token)
+
+        started = self._monotonic()
+        try:
+            return await self._recovery_read_pool.run(budget, bound_read)
+        except (ReadCapacityError, TimeoutError) as exc:
+            raise StorageBusyError(
+                operation,
+                waited_ms=max(0, int((self._monotonic() - started) * 1000)),
+                retry_after_ms=_SQLITE_BUSY_TIMEOUT_MS,
+                stage="deadline" if isinstance(exc, TimeoutError) else "permit",
+                resource="session_storage_recovery_read_pool",
+            ) from exc
+
     async def _run_meta_launch_draft_gc(self) -> None:
         """Physically enforce raw-draft retention while the Gateway stays up."""
 
@@ -2204,6 +2291,8 @@ class SessionStorage:
 
     async def _retire_poisoned_connection(self) -> None:
         self._poisoned = True
+        if self._recovery_read_pool is not None:
+            await self._recovery_read_pool.close()
         async with self._transcript_reader_lock:
             reader, self._transcript_reader = self._transcript_reader, None
             conn, self._conn = self._conn, None
@@ -14475,6 +14564,10 @@ class SessionStorage:
 
     @asynccontextmanager
     async def _transcript_reader_access(self) -> AsyncIterator[Any | None]:
+        selected = _READ_CONNECTION.get()
+        if current_read_budget() is not None and selected is not None and selected[0] is self:
+            yield selected[1]
+            return
         acquired = False
         if not _BOUNDED_INTERACTIVE_READS.get():
             await self._transcript_reader_lock.acquire()
@@ -14503,6 +14596,11 @@ class SessionStorage:
     async def _read_transcript_rows(
         self, session_id: str, limit: int | None = None, offset: int = 0
     ) -> list[Any]:
+        if current_read_budget() is not None:
+            return await self._run_recovery_read(
+                "get_transcript",
+                lambda reader: self._fetch_transcript_rows(reader, session_id, limit, offset),
+            )
         async with self._transcript_reader_access() as reader:
             if reader is not None:
                 rows = await self._finish_sqlite_call(
@@ -14535,6 +14633,10 @@ class SessionStorage:
 
     async def _read_history_query(self, sql: str, params: Sequence[Any]) -> list[Any]:
         """Keep single-statement history projections off the shared writer gate."""
+        if current_read_budget() is not None:
+            return await self._run_recovery_read(
+                "get_history", lambda reader: self._fetch_history_query(reader, sql, params),
+            )
         async with self._transcript_reader_access() as reader:
             if reader is not None:
                 return cast(list[Any], await self._finish_sqlite_call(
@@ -14546,7 +14648,17 @@ class SessionStorage:
         self, session_id: str, limit: int | None = None, offset: int = 0
     ) -> list[TranscriptEntry]:
         rows = await self._read_transcript_rows(session_id, limit, offset)
-        return await asyncio.to_thread(_decode_transcript_rows, rows)
+        return await self._decode_read_rows(rows)
+
+    async def _decode_read_rows(self, rows: Sequence[Any]) -> list[TranscriptEntry]:
+        budget = current_read_budget()
+        if budget is None:
+            return await asyncio.to_thread(_decode_transcript_rows, rows)
+        budget.check()
+        task = asyncio.create_task(asyncio.to_thread(_decode_transcript_rows, rows))
+        self._pending_reader_operations.add(task)
+        task.add_done_callback(self._pending_reader_operations.discard)
+        return await budget.wait_for(task)
 
     async def get_canonical_transcript(
         self, session_id: str, limit: int | None = None, offset: int = 0
@@ -14557,6 +14669,14 @@ class SessionStorage:
         for recovery, diagnostics, and future provider-view construction where
         the raw transcript needs to survive destructive compaction rewrites.
         """
+        if current_read_budget() is not None:
+            recovery_rows = await self._run_recovery_read(
+                "get_canonical_transcript",
+                lambda reader: self._fetch_canonical_transcript_rows(
+                    reader, session_id, limit=limit, offset=offset,
+                ),
+            )
+            return await self._decode_read_rows(recovery_rows)
         async with self._transcript_reader_access() as reader:
             rows = (
                 await self._finish_sqlite_call(
@@ -14568,7 +14688,7 @@ class SessionStorage:
             )
         if rows is None:
             rows = await self._fetch_canonical_rows_on_writer(session_id, limit, offset)
-        return await asyncio.to_thread(_decode_transcript_rows, rows)
+        return await self._decode_read_rows(rows)
 
     @_serialized_read
     async def _fetch_canonical_rows_on_writer(
@@ -15330,7 +15450,7 @@ class SessionStorage:
             if page_row is not None:
                 entry_rows.append(payload)
 
-        entries = await asyncio.to_thread(_decode_transcript_rows, entry_rows)
+        entries = await self._decode_read_rows(entry_rows)
         has_more = len(entries) > page_size
         entries = entries[:page_size]
         if not ascending:

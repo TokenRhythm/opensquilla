@@ -491,28 +491,26 @@ export class RpcClient {
       this._pending.set(id, pending);
 
       const terminate = (error: Error, _action: RpcTerminationAction): void => {
+        if (
+          options.cancelOnAbort
+          && requestSent
+          && this._pending.get(id)?.generation === generation
+          && this._isCurrentSocket(socket, generation)
+          && socket.readyState === WebSocket.OPEN
+          && this._cancellableRequestMethods().has(method)
+        ) {
+          try {
+            socket.send(JSON.stringify({ type: 'cancel', id }));
+          } catch {
+            // Cancellation is best-effort. Preserve the existing local abort
+            // behavior if the control frame cannot be sent.
+          }
+        }
         this._rejectPending(id, error, generation);
       };
 
       if (options.signal) {
-        pending.abortHandler = () => {
-          if (
-            options.cancelOnAbort
-            && requestSent
-            && this._pending.get(id)?.generation === generation
-            && this._isCurrentSocket(socket, generation)
-            && socket.readyState === WebSocket.OPEN
-            && this._cancellableRequestMethods().has(method)
-          ) {
-            try {
-              socket.send(JSON.stringify({ type: 'cancel', id }));
-            } catch {
-              // Cancellation is best-effort. Preserve the existing local abort
-              // behavior if the control frame cannot be sent.
-            }
-          }
-          terminate(new RpcAbortError(method), options.abortAction || 'reject');
-        };
+        pending.abortHandler = () => terminate(new RpcAbortError(method), options.abortAction || 'reject');
         options.signal.addEventListener('abort', pending.abortHandler, { once: true });
       }
 
@@ -919,7 +917,7 @@ export class RpcClient {
                     ANSWER_GENERATION_RESET_CAPABILITY,
                     TURN_COMMITTED_CAPABILITY,
                     PROBE_CAPABILITY,
-                    ...(this._consumptionFlowEnabled ? ['transport.flow.v1'] : []),
+                    ...(this._consumptionFlowEnabled ? ['transport.flow.v1', 'transport.recovery.v1'] : []),
                   ],
                   client: { name: 'opensquilla-web' },
                   ...authParams,

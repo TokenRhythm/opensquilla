@@ -101,6 +101,8 @@ class Connection(AbstractAsyncContextManager["Connection"], Protocol):
 
     async def cursor(self) -> Cursor: ...
 
+    async def interrupt(self) -> None: ...
+
     async def enable_load_extension(self, enabled: bool) -> None: ...
 
     async def load_extension(self, path: str) -> None: ...
@@ -314,6 +316,11 @@ class _AsyncConnection:
     async def close(self) -> None:
         async with self._locked:
             await _run_sqlite_call(self._conn.close)
+
+    async def interrupt(self) -> None:
+        # SQLite permits interrupt from another thread. Taking _locked here
+        # would wait for the very native call that cancellation must stop.
+        self._conn.interrupt()
 
     async def cursor(self) -> _AsyncCursor:
         async with self._locked:

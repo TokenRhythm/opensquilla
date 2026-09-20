@@ -869,6 +869,7 @@ jobs:
           composer-paste.spec.ts
           history-hydration.spec.ts
           idle-chat-recovery.spec.ts
+          modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
           router-physical-model.spec.ts
           user-message-newlines.spec.ts
@@ -1710,6 +1711,11 @@ jobs:
             tests/test_gateway/test_task_runtime_wait_slots.py
             tests/test_gateway/test_task_progress_projection.py
             tests/test_gateway/test_usage_ledger_runtime.py
+            tests/test_gateway/test_recovery_gateway.py
+            tests/test_gateway/test_recovery_scheduler.py
+            tests/test_gateway/test_recovery_socket.py
+            tests/test_gateway/test_snapshot_recovery_ownership.py
+            tests/test_session/test_recovery_reads.py
             tests/test_engine/test_plan_run_reconciliation.py
             tests/test_engine/test_goal_context_prompt.py
             tests/test_session/test_goal_storage.py
@@ -2007,6 +2013,20 @@ jobs:
             --project=chromium --workers=1 --retries=0 \
             --grep "@plan-goal-runtime" \
             2>&1 | tee "${CI_REPORT_DIR}/plan-goal-runtime.log"
+
+      - name: Run cross-platform modern session recovery contracts
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        working-directory: opensquilla-webui
+        shell: bash
+        env:
+          OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+          OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+        run: |
+          set -euo pipefail
+          npm run test:e2e -- \
+            modern-session-recovery.spec.ts \
+            --project=chromium --workers=1 --retries=0 \
+            2>&1 | tee "${CI_REPORT_DIR}/modern-session-recovery.log"
 
       - name: Install Desktop workbench browser
         if: ${{ matrix.shard == 'all' || matrix.shard == 'ownership-workbench' || matrix.shard == 'workbench' }}

@@ -278,7 +278,7 @@ test('workspace navigation keeps one transport while the target subscription rec
             bArrivedBeforeUnsubscribeAck = true
             pendingRelease.socket.send(response(
               pendingRelease.frame.id,
-              { subscribed: false },
+              null,
             ))
             held.delete(`sessions.messages.unsubscribe:${SESSION_A}`)
           }

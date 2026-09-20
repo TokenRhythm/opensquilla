@@ -126,8 +126,8 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire the five legacy memory raw-fallback and repair methods.
 # Add metadata-only Skill candidates and the allow-use setting.
 # Add the owner-authorized workspace source reference reader.
-RUNTIME_RPC_METHOD_BASELINE = 296
-RUNTIME_RPC_METHOD_DIGEST = "ae9122b863e989a54dd67c16a6b01340b681676e4164e16c48ebb48bda565ca2"
+RUNTIME_RPC_METHOD_BASELINE = 298
+RUNTIME_RPC_METHOD_DIGEST = "bec25ad65b2122367c833922e3b7057c56f27f7bcef08d0b9fcbcf0cef295363"
 STATIC_RPC_DECORATOR_BASELINE = 72
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1493,6 +1493,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
 
     for method in (
         "sessions.messages.snapshot.read", "transport.flow.update", "sessions.executionLog.read",
+        "sessions.messages.resume", "sessions.messages.snapshot.release",
     ):
         entry = registry.get_entry(method)
         assert entry is not None

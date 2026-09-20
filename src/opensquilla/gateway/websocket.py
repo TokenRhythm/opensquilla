@@ -36,7 +36,15 @@ from opensquilla.gateway.protocol import (
     SnapshotInfo,
     make_error_res,
     make_event,
+    make_ok_res,
     project_session_event_for_client,
+)
+from opensquilla.gateway.recovery_scheduler import (
+    CURRENT_RECOVERY_OPERATION,
+    READ_BUDGET_SECONDS,
+    RECOVERY_CAPABILITY,
+    RecoveryOperation,
+    get_recovery_scheduler,
 )
 from opensquilla.gateway.rpc import RpcContext, RpcDispatcher
 from opensquilla.gateway.rpc.ingress import (
@@ -52,13 +60,14 @@ from opensquilla.gateway.transport_flow import (
     FLOW_WINDOW_BYTES,
     FLOW_WINDOW_FRAMES,
     PROBE_CAPABILITY,
+    BudgetKind,
     FlowWindow,
     get_transport_budget,
 )
 from opensquilla.sandbox.legacy_codec import encode_payload_for_protocol
 
 if TYPE_CHECKING:
-    from opensquilla.gateway.snapshot_transfer import SnapshotTransfer
+    from opensquilla.gateway.snapshot_transfer import SnapshotRegistry, SnapshotTransfer
 
 log = structlog.get_logger(__name__)
 
@@ -96,11 +105,31 @@ _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
 _MAX_ORDINARY_REQUESTS = 8
 _ORDINARY_DRAIN_SECONDS = 0.25
 _CONTROL_RPC_METHODS = frozenset({"transport.flow.update"})
+_RECOVERY_READ_METHODS = frozenset({
+    "chat.history", "sessions.messages.subscribe", "sessions.messages.snapshot",
+    "sessions.messages.snapshot.read", "sessions.messages.hydrate", "sessions.messages.resume",
+})
+_RECOVERY_CONTROL_METHODS = frozenset({
+    "sessions.messages.unsubscribe", "sessions.messages.snapshot.release",
+})
+_SESSION_MUTATION_METHODS = frozenset({
+    "chat.send", "sessions.send", "sessions.steer.v2", "sessions.reset", "sessions.delete",
+    "sessions.truncate", "sessions.contextCompact", "sessions.pending_inputs.enqueue",
+    "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
+})
+_SESSION_IDENTITY_MUTATIONS = frozenset({
+    "sessions.reset", "sessions.delete", "sessions.truncate", "sessions.contextCompact",
+})
 # Running mutations retain their existing completion semantics after a peer
 # leaves. Strong references keep their result supervised until completion.
 _DRAINING_ORDINARY_WORKERS: set[asyncio.Task[None]] = set()
 _ORDINARY_WORKERS: set[asyncio.Task[None]] = set()
 _MAX_ORDINARY_WORKERS = 128
+_WRITER_TASKS: set[asyncio.Task[None]] = set()
+_DRAINING_WRITER_TASKS: set[asyncio.Task[None]] = set()
+_SOCKET_CLOSE_TASKS: set[asyncio.Task[None]] = set()
+_MAX_WRITER_TASKS = 128
+_WRITER_STOP_SECONDS = 2.0
 
 # Sentinel pushed into the outbox by ``_stop_writer`` to wake a writer
 # blocked in ``await self._outbox.get()`` and exit cleanly.
@@ -219,6 +248,19 @@ class _OutboundFrame:
     budget_bytes: int = 0
     delivery_id: int | None = None
     is_control: bool = False
+    budget_kind: BudgetKind = None
+
+
+@dataclass(eq=False, slots=True)
+class MessageSubscriptionIntent:
+    token: str
+    ready: asyncio.Future[bool]
+    closed: bool = False
+
+    def retire(self) -> None:
+        self.closed = True
+        if not self.ready.done():
+            self.ready.set_result(False)
 
 
 def _payload_field(payload: Any, key: str) -> Any:
@@ -277,7 +319,9 @@ class WsConnection:
     )
     _accept_detached_responses: bool = field(default=True, init=False, repr=False)
     _ordinary_queue: (
-        asyncio.Queue[tuple[Coroutine[Any, Any, None], int, object | None]]
+        asyncio.Queue[
+            tuple[Coroutine[Any, Any, None], int, object | None, asyncio.Future[None] | None]
+        ]
         | None
     ) = field(default=None, init=False, repr=False)
     _ordinary_worker: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
@@ -289,10 +333,19 @@ class WsConnection:
     _flow: FlowWindow | None = field(default=None, init=False, repr=False)
     _flow_control_frames: int = field(default=0, init=False, repr=False)
     _flow_control_bytes: int = field(default=0, init=False, repr=False)
-    _flow_dirty_notice_pending: bool = field(default=False, init=False, repr=False)
+    _flow_dirty_notice_pending: _OutboundFrame | None = field(default=None, init=False, repr=False)
     _flow_snapshot_delivery: int | None = field(default=None, init=False, repr=False)
     _subscriptions: Any = field(default=None, init=False, repr=False)
     _snapshot_transfer: SnapshotTransfer | None = field(default=None, init=False, repr=False)
+    _snapshot_registry: SnapshotRegistry | None = field(default=None, init=False, repr=False)
+    _recovery_operations: dict[str, RecoveryOperation] = field(default_factory=dict, init=False)
+    _recovery_enabled: bool = field(default=False, init=False, repr=False)
+    _delivery_timers: dict[int, asyncio.TimerHandle] = field(default_factory=dict, init=False)
+    _transport_kinds: dict[str, int] = field(default_factory=dict, init=False)
+    _recovery_runtime: object | None = field(default=None, init=False, repr=False)
+    _resume_proofs: OrderedDict[str, dict[str, Any]] = field(
+        default_factory=OrderedDict, init=False,
+    )
     _flow_installed: OrderedDict[str, _InstalledFlowReceipt] = field(
         default_factory=OrderedDict, init=False, repr=False
     )
@@ -303,22 +356,74 @@ class WsConnection:
 
     def _enable_flow(self) -> None:
         if self._flow is None:
-            self._flow = FlowWindow(self.reserve_transport_bytes, self.release_transport_bytes)
+            self._flow = FlowWindow(
+                self.reserve_transport_bytes,
+                self.release_transport_bytes,
+                recovery_limit=2 if self._recovery_enabled else 1,
+                reserve_recovery=lambda size: self.reserve_transport_bytes(size, kind="recovery"),
+                release_recovery=lambda size: self.release_transport_bytes(size, kind="recovery"),
+                on_stage=self._snapshot_piece_staged,
+            )
             self.add_transport_cleanup(self._flow.close)
 
+    def snapshot_registry(self) -> SnapshotRegistry:
+        from opensquilla.gateway.snapshot_transfer import SnapshotRegistry
+
+        if self._snapshot_registry is None:
+            self._snapshot_registry = SnapshotRegistry(
+                self.reserve_transport_bytes, self.release_transport_bytes,
+            )
+            self.add_transport_cleanup(self._snapshot_registry.close)
+        return self._snapshot_registry
+
+    def _snapshot_piece_staged(self, delivery: Any) -> None:
+        if delivery.owner is not None and delivery.publication == "original":
+            delivery.owner.stage_piece(delivery.segment_index)
+
+    def _expire_snapshot_credit(self, delivery_id: int) -> None:
+        self._delivery_timers.pop(delivery_id, None)
+        if self._flow is None or self._closing:
+            return
+        delivery = self._flow.deliveries.get(delivery_id)
+        if delivery is None or delivery.acknowledged:
+            return
+        self._closing = True
+        task = asyncio.create_task(self._force_close(reason="recovery_credit_timeout", code=1013))
+        task.add_done_callback(self._consume_task_result)
+
+    def _prune_delivery_timers(self) -> None:
+        for delivery_id, timer in tuple(self._delivery_timers.items()):
+            delivery = self._flow.deliveries.get(delivery_id) if self._flow else None
+            if delivery is None or delivery.acknowledged:
+                timer.cancel()
+                del self._delivery_timers[delivery_id]
+
     def reserve_snapshot_delivery(
-        self, encoded_response_bytes: int, key: str, snapshot_id: str, sync_revision: str
+        self, encoded_response_bytes: int, key: str, snapshot_id: str, sync_revision: str,
+        *, segment_index: int = 0,
     ) -> dict[str, Any]:
-        del snapshot_id, sync_revision  # Installation belongs to the snapshot owner.
         if self._flow is None:
             raise ValueError("Consumption feedback was not negotiated")
-        delivery_id = self._flow.admit(encoded_response_bytes, recovery=True)
+        transfer = (
+            self.snapshot_registry().get(key, sync_revision, snapshot_id)
+            if self._recovery_enabled else None
+        )
+        deadline = min(time.monotonic() + 30.0, transfer.deadline) if transfer else None
+        delivery_id = self._flow.admit(
+            encoded_response_bytes, recovery=True, key=key, owner=transfer,
+            segment_index=segment_index, deadline=deadline,
+        )
         if delivery_id is None:
             from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
 
             raise SnapshotTransferError("SNAPSHOT_BUSY")
         self._flow_installed.pop(key, None)
+        self._resume_proofs.pop(key, None)
         self._flow_snapshot_delivery = delivery_id
+        if deadline is not None:
+            self._delivery_timers[delivery_id] = asyncio.get_running_loop().call_later(
+                max(0.0, deadline - time.monotonic()), self._expire_snapshot_credit, delivery_id,
+            )
         return {"delivery_epoch": self._flow.epoch, "delivery_id": delivery_id}
 
     def cancel_snapshot_delivery(self, receipt: dict[str, Any]) -> None:
@@ -327,11 +432,20 @@ class WsConnection:
         if self._flow is None or receipt.get("delivery_epoch") != self._flow.epoch:
             return
         delivery_id = receipt.get("delivery_id")
+        if not isinstance(delivery_id, int) or isinstance(delivery_id, bool):
+            return
         if delivery_id not in self._flow.deliveries:
+            return
+        if not self._recovery_enabled:
+            self._closing = True
+            task = asyncio.create_task(self._force_close(reason="snapshot_cancelled", code=1013))
+            task.add_done_callback(self._consume_task_result)
+            return
+        if not self._flow.claim(delivery_id, "tombstone"):
             return
         text = make_event(
             "transport.flow.dirty",
-            {"delivery_epoch": self._flow.epoch, "dirty_keys": [], "global_dirty": True},
+            {"delivery_epoch": self._flow.epoch, "dirty_keys": [], "global_dirty": False},
             meta={"flow": receipt},
         ).model_dump_json(exclude={"seq"})
         frame = _OutboundFrame(
@@ -395,6 +509,11 @@ class WsConnection:
             self._flow.global_dirty = False
 
     def _retire_flow_subscription(self, key: str) -> None:
+        self._resume_proofs.pop(key, None)
+        current_operation = CURRENT_RECOVERY_OPERATION.get()
+        for operation in tuple(self._recovery_operations.values()):
+            if operation.key == key and operation is not current_operation:
+                get_recovery_scheduler().cancel(operation)
         if self._flow is None:
             return
         self._flow.dirty.pop(key, None)
@@ -404,9 +523,7 @@ class WsConnection:
     def _queue_flow_dirty_notice(self) -> None:
         if self._flow is None or self._flow_dirty_notice_pending or self._closing:
             return
-        self._flow_dirty_notice_pending = True
-        self._enqueue_frame(
-            _OutboundFrame(
+        frame = _OutboundFrame(
                 kind="event:transport.flow.dirty",
                 classification="control",
                 # The writer refreshes the authoritative keys under a bounded
@@ -420,7 +537,17 @@ class WsConnection:
                 res_frame=None,
                 is_control=True,
             )
-        )
+        self._flow_dirty_notice_pending = frame
+        self._enqueue_frame(frame)
+        if self._closing and self._flow_dirty_notice_pending is frame:
+            self._flow_dirty_notice_pending = None
+
+    def _freeze_pending_dirty_notice(self) -> None:
+        frame = self._flow_dirty_notice_pending
+        if frame is not None:
+            frame.encoded_text = self._encode_flow_dirty_notice(frame)
+            if self._flow_dirty_notice_pending is frame:
+                self._flow_dirty_notice_pending = None
 
     def _flow_install_receipt(self, resume: dict[str, Any]) -> _FlowInstallReceipt:
         if self._subscriptions is None:
@@ -481,6 +608,7 @@ class WsConnection:
         self._flow.acknowledge(params["delivery_epoch"], params["ack_delivery_id"])
         for delivery_id in params.get("staged_delivery_ids", []):
             self._flow.stage(params["delivery_epoch"], delivery_id)
+        self._prune_delivery_timers()
         for key in dirty_keys:
             if key in repeated:
                 # Retrying a successful install may repeat its original
@@ -540,17 +668,24 @@ class WsConnection:
         self._clear_covered_global_flow()
         return self._flow.status()
 
-    def reserve_transport_bytes(self, size: int) -> bool:
+    def reserve_transport_bytes(self, size: int, *, kind: BudgetKind = None) -> bool:
         if not isinstance(size, int) or isinstance(size, bool) or size < 0:
             raise ValueError("transport reservation must be a nonnegative integer")
-        if self._closing or self._transport_bytes + size > CONNECTION_BUFFER_BYTES:
+        kind = (kind or "bulk") if self._recovery_enabled else None
+        headroom = sum(
+            max(0, CONTROL_BUFFER_BYTES - self._transport_kinds.get(other, 0))
+            for other in ("control", "recovery") if other != kind
+        ) if kind is not None else 0
+        if self._closing or self._transport_bytes + size > CONNECTION_BUFFER_BYTES - headroom:
             return False
-        if not get_transport_budget().reserve(size):
+        if not get_transport_budget().reserve(size, kind=kind):
             return False
         self._transport_bytes += size
+        if kind is not None:
+            self._transport_kinds[kind] = self._transport_kinds.get(kind, 0) + size
         return True
 
-    def release_transport_bytes(self, size: int) -> None:
+    def release_transport_bytes(self, size: int, *, kind: BudgetKind = None) -> None:
         if (
             not isinstance(size, int)
             or isinstance(size, bool)
@@ -558,7 +693,10 @@ class WsConnection:
         ):
             raise ValueError("transport release exceeds connection reservation")
         self._transport_bytes -= size
-        get_transport_budget().release(size)
+        kind = (kind or "bulk") if self._recovery_enabled else None
+        if kind is not None:
+            self._transport_kinds[kind] = self._transport_kinds.get(kind, 0) - size
+        get_transport_budget().release(size, kind=kind)
 
     def add_transport_cleanup(self, callback: Callable[[], Any]) -> None:
         if self._closing:
@@ -591,6 +729,11 @@ class WsConnection:
         }
 
     def _cleanup_transport(self) -> None:
+        for timer in self._delivery_timers.values():
+            timer.cancel()
+        self._delivery_timers.clear()
+        for operation in tuple(self._recovery_operations.values()):
+            get_recovery_scheduler().cancel(operation)
         if self._outbox is not None:
             while not self._outbox.empty():
                 item = self._outbox.get_nowait()
@@ -609,6 +752,7 @@ class WsConnection:
         size: int,
         *,
         provider_probe_lease: object | None = None,
+        mutation_completion: asyncio.Future[None] | None = None,
     ) -> bool:
         if self._ordinary_stopped or self._closing:
             return False
@@ -619,7 +763,7 @@ class WsConnection:
             self._ordinary_queue = asyncio.Queue(maxsize=_MAX_ORDINARY_REQUESTS)
         if self._ordinary_queue.full() or not self.reserve_transport_bytes(size):
             return False
-        self._ordinary_queue.put_nowait((request, size, provider_probe_lease))
+        self._ordinary_queue.put_nowait((request, size, provider_probe_lease, mutation_completion))
         if start_worker:
             self._ordinary_worker = asyncio.create_task(
                 self._run_ordinary_requests(), name=f"ws-rpc-worker-{self.conn_id}"
@@ -629,12 +773,272 @@ class WsConnection:
             self._ordinary_worker.add_done_callback(self._consume_task_result)
         return True
 
+    def _try_recovery_request(
+        self, dispatcher: RpcDispatcher, req_id: str, method: str, params: dict[str, Any],
+        ctx: RpcContext, size: int,
+    ) -> bool:
+        from opensquilla.gateway.session_services import get_session_storage
+        from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
+        from opensquilla.session.keys import canonicalize_session_key
+
+        if req_id in self._recovery_operations:
+            return False
+        raw_key = params.get("key", params.get("sessionKey", "agent:main:webchat"))
+        if method == "transport.flow.update":
+            raw_key = params["resume"][0]["key"]
+        key = canonicalize_session_key(raw_key)
+        runtime = get_session_storage(ctx.session_manager) or ctx.session_manager or get_registry()
+        self._recovery_runtime = runtime
+        scheduler = get_recovery_scheduler()
+        predecessors: list[asyncio.Future[Any]] = []
+        tail = scheduler.mutation_tail(runtime, key)
+        if tail is not None:
+            predecessors.append(tail)
+        intent = None
+        created = False
+        transfer_registry = None
+        transfer_created = False
+        if self._subscriptions is not None:
+            intent = self._subscriptions.get_message_intent(self.conn_id, key)
+            if method == "sessions.messages.subscribe":
+                intent, created = self._subscriptions.admit_message_subscription(self.conn_id, key)
+            elif intent is not None and not intent.ready.done():
+                predecessors.append(intent.ready)
+        admitted_at = time.monotonic()
+        read_deadline = admitted_at + READ_BUDGET_SECONDS
+        operation = RecoveryOperation(
+            req_id, self.conn_id, method, key, runtime,
+            admitted_at + (15.0 if method == "sessions.messages.snapshot.read" else
+                           READ_BUDGET_SECONDS),
+            predecessors=tuple(predecessors),
+            subscription_token=intent.token if intent else None,
+            subscription_created=created,
+        )
+
+        def current() -> bool:
+            return not self._closing and get_registry().get(self.conn_id) is self and (
+                intent is None or (
+                    not intent.closed
+                    and self._subscriptions.get_message_intent(self.conn_id, key) is intent
+                )
+            )
+
+        operation.is_current = current
+        if self._recovery_enabled and method in {
+            "sessions.messages.snapshot.read", "sessions.messages.resume",
+        }:
+            try:
+                registry = self.snapshot_registry()
+                if params.get("snapshot_id") is not None:
+                    operation.transfer = registry.get(
+                        key, params["sync_revision"], params["snapshot_id"],
+                    )
+                    if operation.transfer is None and not (
+                        method == "sessions.messages.resume"
+                        and self.installed_snapshot_proof(params)
+                    ):
+                        raise SnapshotTransferError("SNAPSHOT_EXPIRED")
+                else:
+                    existing_transfer = registry.get(key, params["sync_revision"])
+                    operation.transfer = registry.admit(
+                        key, params["sync_revision"], operation.subscription_token,
+                        is_current=current,
+                    )
+                    transfer_registry = registry
+                    transfer_created = existing_transfer is None
+            except SnapshotTransferError as exc:
+                self._enqueue_frame(_OutboundFrame(
+                    "res", "control", None, None,
+                    make_error_res(req_id, exc.code, "Snapshot is no longer available",
+                                   retryable=True, accepted=False),
+                    is_control=True,
+                ))
+                return True
+
+        def release_admitted_transfer() -> None:
+            if transfer_created and transfer_registry is not None:
+                transfer_registry.release(key, params["sync_revision"])
+
+        if not self.reserve_transport_bytes(size):
+            release_admitted_transfer()
+            if created:
+                self._subscriptions.unsubscribe_messages(
+                    self.conn_id, key, expected_token=operation.subscription_token,
+                )
+            return False
+        self._recovery_operations[req_id] = operation
+
+        def finish() -> None:
+            if self._recovery_operations.get(req_id) is operation:
+                del self._recovery_operations[req_id]
+            self.release_transport_bytes(size)
+            if created and intent is not None and not intent.ready.done():
+                self._subscriptions.unsubscribe_messages(
+                    self.conn_id, key, expected_token=intent.token,
+                )
+            if self._flow is not None and operation.transfer is not None:
+                for delivery_id, delivery in tuple(self._flow.deliveries.items()):
+                    if delivery.owner is operation.transfer and delivery.publication == "reserved":
+                        self.cancel_snapshot_delivery({
+                            "delivery_epoch": self._flow.epoch, "delivery_id": delivery_id,
+                        })
+
+        def expire() -> None:
+            if not self._closing:
+                self._enqueue_frame(_OutboundFrame(
+                    "res", "control", None, None,
+                    make_error_res(req_id, "STORAGE_BUSY", "Recovery read deadline exceeded",
+                                   retryable=True, accepted=False),
+                    is_control=True,
+                ))
+
+        async def run() -> None:
+            from opensquilla.session.recovery_reads import ReadCancelToken, recovery_read_scope
+
+            token = ReadCancelToken()
+            operation.cancel_callbacks.append(token.cancel)
+            with recovery_read_scope(
+                key, deadline=read_deadline, cancel_token=token,
+                workload="identity" if method in {
+                    "sessions.messages.resume", "transport.flow.update",
+                } else "bulk",
+            ) as budget:
+                try:
+                    await _dispatch_request(self, dispatcher, req_id, method, params, ctx)
+                finally:
+                    await budget.drain()
+
+        if not scheduler.submit(operation, run, finish=finish, expire=expire):
+            release_admitted_transfer()
+            finish()
+            return False
+        return True
+
+    def retire_snapshot(self, key: str, revision: str, snapshot_id: str | None = None) -> None:
+        proof = self._resume_proofs.get(key)
+        if proof is not None and proof["sync_revision"] == revision and (
+            snapshot_id is None or proof["snapshot_id"] == snapshot_id
+        ):
+            self._resume_proofs.pop(key, None)
+        registry = self._snapshot_registry
+        if registry is None:
+            return
+        transfer = registry.get(key, revision, snapshot_id)
+        if transfer is not None:
+            registry.release(key, revision, snapshot_id)
+            for operation in tuple(self._recovery_operations.values()):
+                if operation.transfer is transfer:
+                    get_recovery_scheduler().cancel(operation)
+
+    def install_snapshot(
+        self, params: dict[str, Any], transfer: Any, dirty_revision: Any,
+    ) -> dict[str, Any]:
+        """Commit a prepared installation and its replay without yielding."""
+        from opensquilla.gateway.session_streams import get_session_streams
+        from opensquilla.gateway.snapshot_transfer import SnapshotTransferError
+
+        flow = self._flow
+        key = params["key"]
+        if (
+            flow is None or self._subscriptions is None or self._closing
+            or transfer.closed or not transfer.matches_install(params)
+            or transfer.lease_token is None
+            or transfer.lease_token != self._subscriptions.get_message_subscription_token(
+                self.conn_id, key,
+            )
+            or flow.dirty_revision(key) != dirty_revision
+        ):
+            raise SnapshotTransferError("SNAPSHOT_STALE")
+        replay = get_session_streams().replay(
+            key, params["stream_seq"], params["stream_generation"],
+        )
+        if (
+            not replay.replay_complete
+            or not 0 <= replay.current_stream_seq - params["stream_seq"] <= FLOW_WINDOW_FRAMES
+            or [event.stream_seq for event in replay.events]
+            != list(range(params["stream_seq"] + 1, replay.current_stream_seq + 1))
+        ):
+            raise SnapshotTransferError("SNAPSHOT_STALE")
+        frames: list[_OutboundFrame] = []
+        total_bytes = 0
+        visible_tail_seq = params["stream_seq"]
+        for event in replay.events:
+            projected = project_session_event_for_client(
+                event.event_name, event.payload, client_caps=self.client_caps,
+            )
+            if projected is None:
+                continue
+            name, payload = projected
+            # Preflight both ledger quota and real shared bytes before any
+            # installed state changes. No producer runs between this and commit.
+            encoded = make_event(name, encode_payload_for_protocol(payload, protocol=self.protocol),
+                                 meta={"replayed": True, "flow": {
+                                     "delivery_epoch": flow.epoch,
+                                     "delivery_id": flow.next_id + len(frames),
+                                 }}).model_dump_json(exclude={"seq"})
+            total_bytes += len(encoded.encode("utf-8")) + 32
+            frames.append(_OutboundFrame(
+                f"event:{name}", "control", payload, name, None, meta={"replayed": True},
+            ))
+            visible_tail_seq = event.stream_seq
+        proof = {
+            **params, "session_id": transfer.identity[0], "session_epoch": transfer.identity[1],
+            "replay_to_seq": visible_tail_seq,
+        }
+        operation = CURRENT_RECOVERY_OPERATION.get()
+        proof_bytes = len(make_ok_res(
+            operation.request_id if operation is not None else "", proof,
+        ).model_dump_json().encode("utf-8"))
+        self._freeze_pending_dirty_notice()
+        ordinary = [delivery for delivery in flow.deliveries.values() if not delivery.recovery]
+        if (
+            self._outbox is None
+            or self._outbox.qsize() + len(frames) + 1 > self._outbox.maxsize
+            or len(ordinary) + len(frames) > FLOW_WINDOW_FRAMES
+            or sum(item.size for item in ordinary) + total_bytes > FLOW_WINDOW_BYTES
+            or self._flow_control_frames >= CONTROL_BUFFER_FRAMES
+            or self._flow_control_bytes + proof_bytes > CONTROL_BUFFER_BYTES
+            or not self.reserve_transport_bytes(total_bytes)
+        ):
+            raise SnapshotTransferError("SNAPSHOT_BUSY")
+        self.release_transport_bytes(total_bytes)
+        if not self.reserve_transport_bytes(proof_bytes, kind="control"):
+            raise SnapshotTransferError("SNAPSHOT_BUSY")
+        self.release_transport_bytes(proof_bytes, kind="control")
+        flow.dirty.pop(key, None)
+        self._subscriptions.set_message_flow_revision(self.conn_id, key, flow.global_revision)
+        for frame in frames:
+            self._enqueue_frame(frame)
+        self._clear_covered_global_flow()
+        self._flow_installed[key] = (*self._flow_install_receipt(params), transfer.identity)
+        self._flow_installed.move_to_end(key)
+        while len(self._flow_installed) > FLOW_WINDOW_FRAMES:
+            self._flow_installed.popitem(last=False)
+        self._resume_proofs[key] = proof
+        self._resume_proofs.move_to_end(key)
+        while len(self._resume_proofs) > FLOW_WINDOW_FRAMES:
+            self._resume_proofs.popitem(last=False)
+        transfer.close()
+        return proof
+
+    def installed_snapshot_proof(self, params: dict[str, Any]) -> dict[str, Any] | None:
+        proof = self._resume_proofs.get(params["key"])
+        installed = self._flow_installed.get(params["key"])
+        if proof is not None and installed is not None and (
+            installed[:-1] == self._flow_install_receipt(params)
+            and all(proof.get(name) == value for name, value in params.items())
+        ):
+            return dict(proof)
+        return None
+
     async def _run_ordinary_requests(self) -> None:
         assert self._ordinary_queue is not None
         # No await on an empty queue: the reader creates the next worker only
         # after admitting another request, so an idle connection has no worker.
         while not self._ordinary_stopped and not self._ordinary_queue.empty():
-            request, size, provider_probe_lease = self._ordinary_queue.get_nowait()
+            request, size, provider_probe_lease, mutation_completion = (
+                self._ordinary_queue.get_nowait()
+            )
             try:
                 await request
             finally:
@@ -643,18 +1047,24 @@ class WsConnection:
                 finally:
                     if provider_probe_lease is not None:
                         _release_provider_probe_lease(provider_probe_lease)
+                    if mutation_completion is not None and not mutation_completion.done():
+                        mutation_completion.set_result(None)
 
     async def _stop_ordinary_requests(self) -> None:
         self._ordinary_stopped = True
         if self._ordinary_queue is not None:
             while not self._ordinary_queue.empty():
-                request, size, provider_probe_lease = self._ordinary_queue.get_nowait()
+                request, size, provider_probe_lease, mutation_completion = (
+                    self._ordinary_queue.get_nowait()
+                )
                 try:
                     request.close()
                     self.release_transport_bytes(size)
                 finally:
                     if provider_probe_lease is not None:
                         _release_provider_probe_lease(provider_probe_lease)
+                    if mutation_completion is not None and not mutation_completion.done():
+                        mutation_completion.set_result(None)
         worker = self._ordinary_worker
         if worker is None:
             return
@@ -858,7 +1268,7 @@ class WsConnection:
                 )
                 await self._send_direct_text(wire.model_dump_json())
 
-    async def send_res(self, frame: ResFrame) -> None:
+    async def send_res(self, frame: ResFrame, *, transport_control: bool = False) -> None:
         if self._closing:
             return
         # RPC responses are always CONTROL: they carry state-bearing payloads
@@ -871,6 +1281,9 @@ class WsConnection:
                 payload=None,
                 event_name=None,
                 res_frame=frame,
+                # Non-droppable response ordering is independent of memory
+                # class: history pages may exceed the small control reserve.
+                is_control=self._recovery_enabled and (transport_control or not frame.ok),
             )
             self._enqueue_frame(outbound)
             return
@@ -909,13 +1322,18 @@ class WsConnection:
 
     async def close(self, code: int = WS_CLOSE_SERVICE_RESTART, reason: str = "") -> None:
         self._closing = True
-        try:
-            if reason:
-                await self.ws.close(code=code, reason=reason)
-            else:
-                await self.ws.close(code=code)
-        except Exception:
-            pass
+        if len(_SOCKET_CLOSE_TASKS) >= _MAX_WRITER_TASKS:
+            return
+        task = asyncio.create_task(
+            self.ws.close(code=code, reason=reason) if reason else self.ws.close(code=code),
+            name="gateway-socket-close",
+        )
+        _SOCKET_CLOSE_TASKS.add(task)
+        task.add_done_callback(_SOCKET_CLOSE_TASKS.discard)
+        task.add_done_callback(self._consume_task_result)
+        done, _ = await asyncio.wait({task}, timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS)
+        if not done:
+            task.cancel()
 
     def _track_detached_request(
         self,
@@ -1010,10 +1428,18 @@ class WsConnection:
         self._writer_queue_maxsize = int(maxsize)
         if not self._queue_enabled:
             return
+        if len(_WRITER_TASKS) >= _MAX_WRITER_TASKS:
+            self._closing = True
+            task = asyncio.create_task(self.close(code=1013, reason="writer_capacity"))
+            task.add_done_callback(self._consume_task_result)
+            return
         self._outbox = asyncio.Queue(maxsize=self._writer_queue_maxsize)
         self._writer_task = asyncio.create_task(
             self._writer_loop(), name=f"ws-writer-{self.conn_id}"
         )
+        _WRITER_TASKS.add(self._writer_task)
+        self._writer_task.add_done_callback(_WRITER_TASKS.discard)
+        self._writer_task.add_done_callback(self._consume_task_result)
         log.debug("gateway.ws_writer_started", conn_id=self.conn_id)
 
     async def _stop_writer(self) -> None:
@@ -1038,18 +1464,10 @@ class WsConnection:
                 pass
         if not task.done():
             task.cancel()
-            # NOTE: ``gather(..., return_exceptions=True)`` deliberately
-            # absorbs the writer's CancelledError as a result *value* so
-            # it does not propagate into this teardown path. Do NOT
-            # replace this with ``await task`` — that re-raises
-            # CancelledError into ``_stop_writer`` and corrupts the
-            # cleanup sequence.
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(task, return_exceptions=True),
-                    timeout=2.0,
-                )
-            except TimeoutError:
+            _DRAINING_WRITER_TASKS.add(task)
+            task.add_done_callback(_DRAINING_WRITER_TASKS.discard)
+            done, _ = await asyncio.wait({task}, timeout=_WRITER_STOP_SECONDS)
+            if not done:
                 log.warning(
                     "gateway.ws_stop_writer_timeout",
                     conn_id=self.conn_id,
@@ -1074,27 +1492,16 @@ class WsConnection:
         self._writer_task = None
         if not task.done():
             task.cancel()
-            # NOTE: ``gather(..., return_exceptions=True)`` deliberately
-            # absorbs the writer's CancelledError as a result *value* so
-            # it does not propagate into this teardown path. Do NOT
-            # replace this with ``await task`` — that re-raises
-            # CancelledError into ``_force_close`` and corrupts the close
-            # sequence.
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(task, return_exceptions=True),
-                    timeout=2.0,
-                )
-            except TimeoutError:
+            _DRAINING_WRITER_TASKS.add(task)
+            task.add_done_callback(_DRAINING_WRITER_TASKS.discard)
+            done, _ = await asyncio.wait({task}, timeout=_WRITER_STOP_SECONDS)
+            if not done:
                 log.warning(
                     "gateway.ws_writer_force_close_timeout",
                     conn_id=self.conn_id,
                     reason=reason,
                 )
-        try:
-            await self.ws.close(code=code, reason=reason)
-        except Exception:
-            pass
+        await self.close(code=code, reason=reason)
 
     # ------------------------------------------------------------------
     # Writer loop and enqueue helper
@@ -1102,7 +1509,7 @@ class WsConnection:
 
     def _release_outbound_budget(self, frame: _OutboundFrame) -> None:
         if frame.budget_bytes:
-            self.release_transport_bytes(frame.budget_bytes)
+            self.release_transport_bytes(frame.budget_bytes, kind=frame.budget_kind)
             if frame.is_control:
                 self._flow_control_bytes -= frame.budget_bytes
                 self._flow_control_frames -= 1
@@ -1140,7 +1547,7 @@ class WsConnection:
             # its session names need many JSON escape bytes.
             if (
                 self._flow_control_bytes + extra <= CONTROL_BUFFER_BYTES - 64 * 1024
-                and self.reserve_transport_bytes(extra)
+                and self.reserve_transport_bytes(extra, kind="control")
             ):
                 frame.budget_bytes += extra
                 self._flow_control_bytes += extra
@@ -1158,7 +1565,18 @@ class WsConnection:
                 frame.payload, "key"
             )
             if is_stream and (key in self._flow.dirty or self._flow_key_needs_global_recovery(key)):
-                self._mark_flow_dirty(frame.payload)
+                # The existing barrier already owns these intentionally
+                # suppressed deltas. Resume proves raw replay coverage; a new
+                # token here would starve installation during a live stream.
+                prior = self._flow.dirty.get(key)
+                sequence = _payload_field(frame.payload, "stream_seq")
+                generation = _payload_field(frame.payload, "stream_generation")
+                if (prior is not None and isinstance(sequence, int)
+                        and not isinstance(sequence, bool)):
+                    self._flow.dirty[key] = (
+                        generation if isinstance(generation, str) else prior[0],
+                        max(prior[1], sequence),
+                    )
                 return False
             meta = dict(frame.meta or {})
             if is_stream:
@@ -1215,9 +1633,11 @@ class WsConnection:
                 if delivery is None or not delivery.recovery:
                     raise ValueError("Snapshot delivery reservation is not current")
                 extra = max(0, size - delivery.size)
-                if extra and not self.reserve_transport_bytes(extra):
+                if extra and not self.reserve_transport_bytes(extra, kind="recovery"):
                     raise ValueError("Snapshot response exceeds the transport budget")
                 delivery.size += extra
+                if self._recovery_enabled and not self._flow.claim(delivery_id, "original"):
+                    return False
                 frame.delivery_id = delivery_id
                 frame.encoded_text = encoded
                 return True
@@ -1235,7 +1655,8 @@ class WsConnection:
             or self._flow_control_bytes + size > CONTROL_BUFFER_BYTES
         ):
             raise ValueError("Control buffer is full")
-        if not self.reserve_transport_bytes(size):
+        frame.budget_kind = "control" if frame.is_control else None
+        if not self.reserve_transport_bytes(size, kind=frame.budget_kind):
             raise ValueError("Connection transport budget is full")
         frame.budget_bytes = size
         if frame.is_control:
@@ -1268,15 +1689,16 @@ class WsConnection:
                     if item.encoded_text is not None:
                         text = item.encoded_text
                         if (
-                            item.event_name == "transport.flow.dirty"
-                            and item.delivery_id is None
+                            self._flow_dirty_notice_pending is item
                             and self._flow is not None
                         ):
-                            text = self._encode_flow_dirty_notice(item)
+                            self._freeze_pending_dirty_notice()
+                            assert item.encoded_text is not None
+                            text = item.encoded_text
                         if item.event_name is not None:
                             text = text[:-1] + f',"seq":{self.next_seq()}' + "}"
                     elif item.event_name is not None:
-                        wire = make_event(
+                        text = make_event(
                             item.event_name,
                             encode_payload_for_protocol(
                                 item.payload,
@@ -1284,18 +1706,16 @@ class WsConnection:
                             ),
                             seq=self.next_seq(),
                             meta=item.meta,
-                        )
-                        text = wire.model_dump_json()
+                        ).model_dump_json()
                     elif item.res_frame is not None:
-                        encoded = item.res_frame.model_copy(
+                        text = item.res_frame.model_copy(
                             update={
                                 "payload": encode_payload_for_protocol(
                                     item.res_frame.payload,
                                     protocol=self.protocol,
                                 )
                             }
-                        )
-                        text = encoded.model_dump_json()
+                        ).model_dump_json()
                     elif item.raw_text is not None:
                         text = item.raw_text
                     else:
@@ -1344,9 +1764,14 @@ class WsConnection:
                         pass
                     return
                 finally:
+                    if self._flow is not None and item.delivery_id is not None:
+                        self._flow.mark_send_finished(item.delivery_id)
                     self._release_outbound_budget(item)
-                    if item.event_name == "transport.flow.dirty":
-                        self._flow_dirty_notice_pending = False
+                    # The next queue wait may last for the connection's entire
+                    # lifetime. Do not retain an uncharged completed frame.
+                    del item, text
+                if self._closing:
+                    return
         except asyncio.CancelledError:
             raise
 
@@ -1512,6 +1937,35 @@ class SubscriptionManager:
         # One token and one recovery revision per existing lease, not a second
         # unbounded set of global-dirty keys or historical ACK tombstones.
         self._message_subscription_tokens: dict[tuple[str, str], tuple[str, int]] = {}
+        self._message_intents: dict[tuple[str, str], MessageSubscriptionIntent] = {}
+
+    def get_message_intent(self, conn_id: str, key: str) -> MessageSubscriptionIntent | None:
+        return self._message_intents.get((conn_id, key))
+
+    def admit_message_subscription(
+        self, conn_id: str, key: str,
+    ) -> tuple[MessageSubscriptionIntent, bool]:
+        existing = self._message_intents.get((conn_id, key))
+        if existing is not None and not existing.closed:
+            return existing, False
+        active_token = self.get_message_subscription_token(conn_id, key)
+        intent = MessageSubscriptionIntent(
+            active_token or uuid.uuid4().hex, asyncio.get_running_loop().create_future(),
+        )
+        if active_token is not None:
+            intent.ready.set_result(True)
+        self._message_intents[(conn_id, key)] = intent
+        return intent, active_token is None
+
+    def activate_message_subscription(self, conn_id: str, key: str, token: object) -> bool:
+        intent = self._message_intents.get((conn_id, key))
+        if intent is None or intent.closed or intent.token != token:
+            return False
+        self._message_subs.setdefault(key, set()).add(conn_id)
+        self._message_subscription_tokens.setdefault((conn_id, key), (intent.token, 0))
+        if not intent.ready.done():
+            intent.ready.set_result(True)
+        return True
 
     def set_message_unsubscribe_listener(self, listener: Any | None) -> None:
         """Install a process-local observer for lost message subscriptions."""
@@ -1571,7 +2025,24 @@ class SubscriptionManager:
             if owner == conn_id
         )
 
-    def unsubscribe_messages(self, conn_id: str, session_key: str) -> None:
+    def unsubscribe_messages(
+        self, conn_id: str, session_key: str, *, expected_token: object | None = None,
+    ) -> None:
+        intent = self._message_intents.get((conn_id, session_key))
+        token = intent.token if intent is not None else self.get_message_subscription_token(
+            conn_id, session_key,
+        )
+        if expected_token is not None and token != expected_token:
+            return
+        if intent is not None:
+            self._message_intents.pop((conn_id, session_key), None)
+            intent.retire()
+        connection = get_registry().get(conn_id)
+        if connection is not None:
+            snapshots = getattr(connection, "_snapshot_registry", None)
+            if snapshots is not None:
+                snapshots.retire_lease(session_key, token)
+            connection._retire_flow_subscription(session_key)
         if session_key in self._message_subs:
             removed = conn_id in self._message_subs[session_key]
             self._message_subs[session_key].discard(conn_id)
@@ -1579,9 +2050,9 @@ class SubscriptionManager:
                 del self._message_subs[session_key]
             if removed:
                 self._message_subscription_tokens.pop((conn_id, session_key), None)
-                connection = get_registry().get(conn_id)
-                if connection is not None:
-                    connection._retire_flow_subscription(session_key)
+                clear_covered = getattr(connection, "_clear_covered_global_flow", None)
+                if clear_covered is not None:
+                    clear_covered()
                 self._notify_message_unsubscribed(conn_id, session_key)
 
     def get_message_subscribers(self, session_key: str) -> set[str]:
@@ -1603,6 +2074,10 @@ class SubscriptionManager:
 
     def remove_connection(self, conn_id: str) -> None:
         """Clean up all subscriptions for a disconnected connection."""
+        for (owner, key), intent in tuple(self._message_intents.items()):
+            if owner == conn_id:
+                intent.retire()
+                del self._message_intents[(owner, key)]
         self._session_subs.discard(conn_id)
         removed_message_sessions: list[str] = []
         for session_key, subs in list(self._message_subs.items()):
@@ -1832,6 +2307,15 @@ async def handle_ws_connection(
         if isinstance(capability, str) and capability and len(capability) <= 128
     )
     conn._subscriptions = subscription_manager
+    conn._recovery_enabled = bool(
+        RECOVERY_CAPABILITY in conn.client_caps
+        and FLOW_CAPABILITY in conn.client_caps
+        and config.ws_transport_flow_enabled
+        and config.ws_writer_queue_enabled
+        and {"sessions.messages.resume", "sessions.messages.snapshot.release"}.issubset(
+            dispatcher.list_methods()
+        )
+    )
     if (
         config.ws_transport_flow_enabled
         and config.ws_writer_queue_enabled
@@ -1868,7 +2352,11 @@ async def handle_ws_connection(
             chat_send_initial_model=True,
             sessions_routing_model_selection=True,
             concurrent_optional_read_methods=sorted(_CONCURRENT_OPTIONAL_READ_METHODS),
-            cancellable_request_methods=sorted(_CANCELLABLE_REQUEST_METHODS),
+            cancellable_request_methods=sorted(
+                _CANCELLABLE_REQUEST_METHODS | (
+                    _RECOVERY_READ_METHODS if conn._recovery_enabled else frozenset()
+                )
+            ),
             provider_probe_modes=list(_PROVIDER_PROBE_MODES),
             agent_stream_heartbeat_interval_ms=int(
                 max(0.0, float(getattr(config, "agent_stream_heartbeat_interval_seconds", 15.0)))
@@ -1950,6 +2438,7 @@ async def handle_ws_connection(
         # Stop admission before draining. A running mutation may finish under
         # supervision; queued work must never begin after the client has left.
         conn._closing = True
+        get_recovery_scheduler().cancel_connection(conn.conn_id)
         await conn._stop_ordinary_requests()
         # Detached optional reads must stop before the writer so a handler that
         # suppresses cancellation cannot enqueue a late response after teardown.
@@ -2029,7 +2518,100 @@ async def _dispatch_request(
     except Exception:
         log.exception("gateway.ws_request_failed", conn_id=conn.conn_id, method=method)
         res = make_error_res(req_id, "INTERNAL_ERROR", "Request failed")
-    await conn.send_res(res)
+    operation = CURRENT_RECOVERY_OPERATION.get()
+    if operation is None or operation.current() or (not res.ok and not operation.closed):
+        await conn.send_res(res, transport_control=(
+            method in _CONTROL_RPC_METHODS or method in _RECOVERY_CONTROL_METHODS
+            or method == "sessions.messages.resume"
+        ))
+
+
+def _authorized_admission_params(
+    dispatcher: RpcDispatcher, method: str, params: Any, ctx: RpcContext,
+) -> dict[str, Any] | None:
+    """Authorize before creating intents or invalidating an existing owner."""
+    from opensquilla.gateway.adapters.connection_recovery_contract import validate_recovery_params
+    from opensquilla.gateway.guest_rpc_policy import GuestRpcPolicy, GuestRpcPolicyError
+    from opensquilla.gateway.scopes import authorize_call
+
+    entry = dispatcher.get_entry(method) if hasattr(dispatcher, "get_entry") else None
+    if entry is None:
+        return None
+    try:
+        params = GuestRpcPolicy.authorize(method, params, ctx)
+    except GuestRpcPolicyError:
+        return None
+    allowed, _ = authorize_call(method, entry.required_scope, ctx.role, ctx.principal.scopes)
+    if not allowed:
+        return None
+    if entry.generated_contract_name is not None:
+        validate_recovery_params(method, params)
+    return params if isinstance(params, dict) else None
+
+
+async def _dispatch_mutation(
+    predecessors: tuple[asyncio.Future[None], ...],
+    conn: WsConnection, dispatcher: RpcDispatcher, req_id: str,
+    method: str, params: Any, ctx: RpcContext,
+) -> None:
+    for predecessor in predecessors:
+        await asyncio.shield(predecessor)
+    await _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
+
+
+def _admit_session_mutation(
+    method: str, params: dict[str, Any], ctx: RpcContext,
+) -> tuple[tuple[asyncio.Future[None], ...], asyncio.Future[None] | None]:
+    from opensquilla.gateway.session_services import get_session_storage
+    from opensquilla.session.keys import canonicalize_session_key
+
+    if method == "sessions.delete" and "keys" in params:
+        raw_keys = params["keys"]
+        if not isinstance(raw_keys, list | tuple) or not all(
+            isinstance(key, str) for key in raw_keys
+        ):
+            return (), None
+    else:
+        raw_keys = [params.get("key", params.get("sessionKey"))]
+    try:
+        keys = {canonicalize_session_key(key) for key in raw_keys if isinstance(key, str)}
+    except ValueError:
+        return (), None
+    if not keys:
+        return (), None
+    runtime = get_session_storage(ctx.session_manager) or ctx.session_manager or get_registry()
+    predecessors = []
+    tails = []
+    scheduler = get_recovery_scheduler()
+    for key in keys:
+        predecessor, tail = scheduler.admit_mutation(runtime, key)
+        if predecessor is not None:
+            predecessors.append(predecessor)
+        tails.append(tail)
+        if method in _SESSION_IDENTITY_MUTATIONS:
+            for affected in get_registry().all():
+                if affected._recovery_runtime is not runtime:
+                    continue
+                affected._resume_proofs.pop(key, None)
+                if affected._snapshot_registry is not None:
+                    lease = affected._subscriptions.get_message_subscription_token(
+                        affected.conn_id, key,
+                    ) if affected._subscriptions is not None else None
+                    affected._snapshot_registry.retire_lease(key, lease)
+                for operation in tuple(affected._recovery_operations.values()):
+                    if operation.key == key:
+                        scheduler.cancel(operation)
+                if affected._flow is not None:
+                    affected._mark_flow_dirty({"session_key": key})
+    completion: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    def complete(_: asyncio.Future[None]) -> None:
+        for tail in tails:
+            if not tail.done():
+                tail.set_result(None)
+
+    completion.add_done_callback(complete)
+    return tuple(predecessors), completion
 
 
 async def _message_loop(
@@ -2063,7 +2645,7 @@ async def _message_loop(
 ) -> None:
     ws = conn.ws
     keepalive_timeout = max(0.0, float(getattr(config, "client_ws_keepalive_timeout_s", 0.0)))
-    while True:
+    while not conn._closing:
         try:
             if keepalive_timeout > 0.0:
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=keepalive_timeout)
@@ -2155,6 +2737,9 @@ async def _message_loop(
             # There is no acknowledgement because the client has already
             # retired the pending request that owned this id.
             conn._cancel_detached_request(request_id)
+            operation = conn._recovery_operations.get(request_id)
+            if operation is not None:
+                get_recovery_scheduler().cancel(operation)
             continue
 
         if frame_type == "ping":
@@ -2236,6 +2821,49 @@ async def _message_loop(
                 memory_retrievers=memory_retrievers or {},
                 artifact_preview_service=artifact_preview_service,
             )
+            mutation_predecessor: tuple[asyncio.Future[None], ...] = ()
+            mutation_completion = None
+            legacy_resume = bool(
+                method == "transport.flow.update" and isinstance(params, dict)
+                and params.get("resume")
+            )
+            if (conn._recovery_enabled and method in (
+                _RECOVERY_READ_METHODS | _RECOVERY_CONTROL_METHODS
+            )) or legacy_resume:
+                try:
+                    admitted_params = _authorized_admission_params(dispatcher, method, params, ctx)
+                except (ValueError, KeyError):
+                    await conn.send_res(make_error_res(
+                        req_id, "INVALID_REQUEST", "Invalid recovery request parameters",
+                        accepted=False,
+                    ))
+                    continue
+                if admitted_params is None:
+                    await _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
+                    continue
+                params = admitted_params
+                if method in _RECOVERY_READ_METHODS or legacy_resume:
+                    if not conn._try_recovery_request(
+                        dispatcher, req_id, method, params, ctx, raw_size,
+                    ):
+                        await conn.send_res(make_error_res(
+                            req_id, "STORAGE_BUSY", "Recovery queue is full",
+                            retryable=True, retry_after_ms=100, accepted=False,
+                        ))
+                    await asyncio.sleep(0)
+                    continue
+                if method in _RECOVERY_CONTROL_METHODS:
+                    await _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
+                    continue
+            if method in _SESSION_MUTATION_METHODS:
+                try:
+                    mutation_params = _authorized_admission_params(dispatcher, method, params, ctx)
+                except (ValueError, KeyError):
+                    mutation_params = None
+                if mutation_params is not None:
+                    mutation_predecessor, mutation_completion = _admit_session_mutation(
+                        method, mutation_params, ctx,
+                    )
             if method in _CONTROL_RPC_METHODS:
                 await _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
                 continue
@@ -2310,7 +2938,12 @@ async def _message_loop(
                         )
                     )
                     continue
-            request = _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
+            request = (
+                _dispatch_mutation(
+                    mutation_predecessor, conn, dispatcher, req_id, method, params, ctx,
+                ) if mutation_completion is not None else
+                _dispatch_request(conn, dispatcher, req_id, method, params, ctx)
+            )
             if method in _DETACHED_READ_METHODS:
                 if conn._try_start_detached_read(request, method=method):
                     # History reads may wait on storage while the client still
@@ -2331,8 +2964,11 @@ async def _message_loop(
                 request,
                 raw_size,
                 provider_probe_lease=provider_probe_lease,
+                mutation_completion=mutation_completion,
             ):
                 request.close()
+                if mutation_completion is not None and not mutation_completion.done():
+                    mutation_completion.set_result(None)
                 if provider_probe_lease is not None:
                     _release_provider_probe_lease(provider_probe_lease)
                 await conn.send_res(
