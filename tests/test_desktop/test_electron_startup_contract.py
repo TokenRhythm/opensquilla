@@ -1589,15 +1589,15 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
     assert "DESKTOP_ENSEMBLE_PROFILES" not in main_ts
 
     expected_models = (
+        "qwen3.7-flash",
         "deepseek-v4-flash-0731",
         "deepseek-v4-pro-0813",
-        "kimi-k2.7-code",
-        "glm-5.2",
+        "glm-5.3",
         "kimi-k2.6",
     )
     for model in expected_models:
         assert model in tokenrhythm_profile
-    assert "ensembleEnabled: true" in tokenrhythm_profile
+    assert "ensembleEnabled: false" in tokenrhythm_profile
     assert "thinkingLevel" not in tokenrhythm_profile
     assert "ensemble_enabled = ${tomlValue(ensembleEnabled)}" in router_config
 

@@ -1117,6 +1117,9 @@ def test_tier_managed_static_b5_keeps_default_gateway_stream_timeouts() -> None:
         },
         llm_ensemble={"enabled": False},
     )
+    # Exercise opt-in C3 fusion independently of the recommended tier defaults.
+    config.squilla_router.preset_binding = "custom"
+    config.squilla_router.tiers["c3"]["ensemble_enabled"] = True
 
     assert config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
     assert "ensemble_selection_mode" not in config.squilla_router.tiers["c3"]

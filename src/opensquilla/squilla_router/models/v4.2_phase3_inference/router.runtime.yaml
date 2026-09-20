@@ -7,31 +7,31 @@ tier_mapping:
   R3: XL
 
 tier_registry:
-  S: [deepseek/deepseek-v4-flash]    # Fast direct-answer tier for trivial turns and short acknowledgements.
-  M: [deepseek/deepseek-v4-pro]      # Default general tier for normal Q&A, editing, and bounded coding tasks.
-  L: [z-ai/glm-5.2]                  # Reasoning tier for debugging, multi-step analysis, and structured planning.
-  XL: [anthropic/claude-opus-4.8]    # Highest Opus tier for architecture, high-risk work, and hard recovery turns.
+  S: [qwen/qwen3.7-flash]                 # Fast direct-answer tier for trivial turns and short acknowledgements.
+  M: [deepseek/deepseek-v4-flash-0731]     # Default general tier for normal Q&A, editing, and bounded coding tasks.
+  L: [deepseek/deepseek-v4-pro-0813]       # Reasoning tier for debugging, multi-step analysis, and structured planning.
+  XL: [z-ai/glm-5.3]                     # Highest GLM tier for architecture, high-risk work, and hard recovery turns.
 
 tier_explanations:
   S:
     route_class: R0
-    model: deepseek/deepseek-v4-flash
+    model: qwen/qwen3.7-flash
     intent: "Fast direct answers for trivial turns, acknowledgements, simple rewrites, and short factual responses."
     expected_controls: "No explicit thinking; P0 prompt hint may shorten responses."
   M:
     route_class: R1
-    model: deepseek/deepseek-v4-pro
+    model: deepseek/deepseek-v4-flash-0731
     intent: "General-purpose default for routine product, coding, writing, and comparison tasks with bounded complexity."
     expected_controls: "Light or default thinking; P1 prompt policy unless the task is clearly trivial or high risk."
   L:
     route_class: R2
-    model: z-ai/glm-5.2
+    model: deepseek/deepseek-v4-pro-0813
     intent: "Reasoning tier for debugging, multi-signal diagnosis, multi-step implementation plans, and non-trivial technical analysis."
     expected_controls: "High thinking; P1/P2 prompt policy depending on flags and difficulty."
   XL:
     route_class: R3
-    model: anthropic/claude-opus-4.8
-    intent: "Highest Opus tier for architecture design, cross-system tradeoffs, high-risk production decisions, and complex recovery turns."
+    model: z-ai/glm-5.3
+    intent: "Highest GLM tier for architecture design, cross-system tradeoffs, high-risk production decisions, and complex recovery turns."
     expected_controls: "High thinking; P1/P2 prompt policy depending on flags and difficulty."
 
 thresholds:

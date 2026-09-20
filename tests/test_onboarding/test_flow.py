@@ -1447,7 +1447,7 @@ def test_router_tier_overrides_edit_only_selected_tiers():
                 assert kwargs.get("default") == "openrouter"
                 return _Answer("openrouter")
             if message == "c2 model":
-                assert kwargs.get("default") == "z-ai/glm-5.2"
+                assert kwargs.get("default") == "deepseek/deepseek-v4-pro-0813"
                 return _Answer("custom/reasoner")
             raise AssertionError(f"unexpected text prompt: {message}")
 
