@@ -7,6 +7,7 @@ import ctypes.wintypes as wintypes
 import json
 import os
 import shlex
+import socket
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -32,10 +33,35 @@ async def test_backend_spawn_exception_is_not_proof_command_never_started(monkey
     Backend.spawn.assert_called_once()
 
 
+@pytest.mark.asyncio
+async def test_windows_pty_reads_ready_bytes_without_executor_capacity(monkeypatch) -> None:
+    reader, writer = socket.socketpair()
+    marker = "final output: 终端".encode()
+    handle = pty_backend.PtyHandle(SimpleNamespace(fileobj=reader), "windows")
+    loop = asyncio.get_running_loop()
+
+    def unavailable_executor(*args, **kwargs):
+        raise AssertionError("ready terminal bytes must not wait for a worker")
+
+    try:
+        writer.sendall(marker)
+        writer.shutdown(socket.SHUT_WR)
+        with monkeypatch.context() as context:
+            context.setattr(loop, "run_in_executor", unavailable_executor)
+            chunks = []
+            while chunk := await asyncio.wait_for(pty_backend.read_pty(handle, 3), timeout=1):
+                chunks.append(chunk)
+        assert b"".join(chunks) == marker
+    finally:
+        reader.close()
+        writer.close()
+
+
 @pytest.mark.platform_pty
 @pytest.mark.asyncio
 @pytest.mark.parametrize("action", ["kill", "timeout", "eof"])
-async def test_real_pty_cleans_descendant_tree(action, tmp_path) -> None:
+@pytest.mark.parametrize("detached", [False, True])
+async def test_real_pty_cleans_descendant_tree(action, detached, tmp_path) -> None:
     from opensquilla.process_tree import _strict_process_start_identity
 
     child_pid = tmp_path / "child.pid"
@@ -46,9 +72,13 @@ async def test_real_pty_cleans_descendant_tree(action, tmp_path) -> None:
         "time.sleep(60)\n", encoding="utf-8",
     )
     parent = tmp_path / "parent.py"
+    child_options = (
+        {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP if detached else 0}
+        if os.name == "nt" else {"start_new_session": detached}
+    )
     parent.write_text(
         "import subprocess, sys, time\n"
-        f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}], **{child_options!r})\n"
         "print('TTY=' + str(sys.stdin.isatty()), flush=True)\n"
         + ("sys.stdin.readline()\n" if action == "eof" else "time.sleep(60)\n"),
         encoding="utf-8",
@@ -95,6 +125,14 @@ async def test_real_pty_cleans_descendant_tree(action, tmp_path) -> None:
         assert "TTY=True" in shell._bg_rendered_output(session)
         assert session.process_tree is not None and session.process_tree.durable
         assert not session.process_tree.is_active()
+        if action == "kill":
+            returncode = session.returncode
+            repeated = json.loads(await shell.process("kill", execution_id=execution_id))
+            assert repeated["status"] == "killed"
+            assert repeated["session"]["status"] == "killed"
+            assert session.done
+            assert repeated["session"]["returncode"] == returncode
+            assert not session.process_tree.is_active()
         if kernel32 is not None:
             assert kernel32.WaitForSingleObject(child_handle, 5000) == 0
         else:

@@ -58,7 +58,7 @@ describe('projectExecutionIo', () => {
       execution_id: 'exec-1',
       io_mode_requested: 'pty',
       io_mode_used: 'pipe',
-      fallback_reason: `failed at /Users/alice/private/project\n${'x'.repeat(400)}`,
+      fallback_reason: `failed at /private/synthetic/project\n${'x'.repeat(400)}`,
     }))
     expect(result.kind).toBe('fallback')
     if (result.kind === 'fallback') {

@@ -881,9 +881,48 @@ def _captured_posix_process_matches(
     )
 
 
+@lru_cache(maxsize=1)
+def _linux_pidfd_libc() -> Any:
+    # Some portable Python builds omit pidfd APIs despite a capable host libc.
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        library.pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+        library.pidfd_open.restype = ctypes.c_int
+        library.pidfd_send_signal.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        library.pidfd_send_signal.restype = ctypes.c_int
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "native pidfd APIs are unavailable") from exc
+    return library
+
+
+def _linux_pidfd_open(pid: int) -> int:
+    opener = getattr(os, "pidfd_open", None)
+    if callable(opener):
+        return int(opener(pid, 0))
+    descriptor = int(_linux_pidfd_libc().pidfd_open(pid, 0))
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def _linux_pidfd_send_signal(descriptor: int, sig: int) -> None:
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if callable(sender):
+        sender(descriptor, sig, None, 0)
+        return
+    if _linux_pidfd_libc().pidfd_send_signal(descriptor, sig, None, 0) < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def _capture_posix_group_descendants(
     pgid: int,
     anchor_pid: int,
+    *,
+    include_anchor_children: bool = False,
 ) -> _PosixDescendantCapture:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
         return _PosixDescendantCapture((), True)
@@ -893,7 +932,7 @@ def _capture_posix_group_descendants(
     anchor = snapshot.get(anchor_pid)
     if anchor is None or anchor.pgid != pgid or anchor.uid != os.geteuid():
         return _PosixDescendantCapture((), False)
-    roots = tuple(
+    roots = (anchor,) if include_anchor_children else tuple(
         info for info in snapshot.values() if info.pgid == pgid and info.pid != anchor_pid
     )
     if not roots:
@@ -918,10 +957,8 @@ def _capture_posix_group_descendants(
                 continue
             depth = parent_depth + 1
             pending.append((child.pid, depth))
-            if child.pgid != pgid:
+            if include_anchor_children or child.pgid != pgid:
                 candidates.append((child, depth))
-    pidfd_open = getattr(os, "pidfd_open", None)
-    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
     captured: list[_CapturedPosixProcess] = []
     for candidate, depth in sorted(candidates, key=lambda item: item[1]):
         current = _posix_process_info(candidate.pid)
@@ -932,28 +969,24 @@ def _capture_posix_group_descendants(
             continue
         pidfd: int | None = None
         if sys.platform.startswith("linux"):
-            if not callable(pidfd_open) or not callable(pidfd_send_signal):
+            try:
+                pidfd = _linux_pidfd_open(candidate.pid)
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    continue
                 complete = False
                 continue
-            else:
-                try:
-                    pidfd = int(pidfd_open(candidate.pid, 0))
-                except OSError as exc:
-                    if exc.errno == errno.ESRCH:
-                        continue
-                    complete = False
-                    continue
-                if pidfd is not None and not _captured_posix_process_matches(
-                    _posix_process_info(candidate.pid),
-                    _CapturedPosixProcess(
-                        pid=candidate.pid,
-                        uid=candidate.uid,
-                        start_identity=candidate.start_identity,
-                        depth=depth,
-                    ),
-                ):
-                    os.close(pidfd)
-                    continue
+            if not _captured_posix_process_matches(
+                _posix_process_info(candidate.pid),
+                _CapturedPosixProcess(
+                    pid=candidate.pid,
+                    uid=candidate.uid,
+                    start_identity=candidate.start_identity,
+                    depth=depth,
+                ),
+            ):
+                os.close(pidfd)
+                continue
         captured.append(
             _CapturedPosixProcess(
                 pid=candidate.pid,
@@ -970,12 +1003,11 @@ def _signal_captured_posix_processes(
     captured: tuple[_CapturedPosixProcess, ...],
     sig: int,
 ) -> bool:
-    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
     complete = True
     for process in captured:
         try:
-            if process.pidfd is not None and callable(pidfd_send_signal):
-                pidfd_send_signal(process.pidfd, sig, None, 0)
+            if process.pidfd is not None:
+                _linux_pidfd_send_signal(process.pidfd, sig)
             elif _captured_posix_process_matches(
                 _posix_process_info(process.pid),
                 process,
@@ -2569,6 +2601,16 @@ def _run_posix_group_anchor(
     output_pipe = output_pipe or sys.stdout.buffer
     target: subprocess.Popen[bytes] | None = None
     target_cleanup_at: float | None = None
+    adopt_children = target_argv is not None and sys.platform.startswith("linux")
+    if adopt_children:
+        # Keep setsid/double-fork children attributable after the PTY shell exits.
+        # This changes only the private PTY anchor, never the Gateway or pipe owners.
+        library = ctypes.CDLL(None, use_errno=True)
+        prctl = library.prctl
+        prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
+        prctl.restype = ctypes.c_int
+        if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            return 125
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, signal.SIG_IGN)
     own_pid = os.getpid()
@@ -2583,11 +2625,14 @@ def _run_posix_group_anchor(
 
     def prepare_capture() -> bytes:
         nonlocal captured, capture_attempted, cleanup_complete
-        if not capture_attempted:
+        if not capture_attempted or adopt_children:
             try:
-                result = _capture_posix_group_descendants(pgid, own_pid)
+                result = _capture_posix_group_descendants(
+                    pgid, own_pid, include_anchor_children=adopt_children,
+                )
             except Exception:
                 result = _PosixDescendantCapture((), False)
+            _close_captured_posix_processes(captured)
             captured = result.processes
             capture_attempted = True
             cleanup_complete = cleanup_complete and result.complete
@@ -2657,17 +2702,35 @@ def _run_posix_group_anchor(
         poll_cap = 0.25 if os.path.isdir("/proc") else 1.0
         empty_confirmations = 0
         while True:
+            children_present = False
+            if adopt_children:
+                # Reap adopted descendants as well as the direct shell. Reaping
+                # the shell here must preserve its exit status for the caller.
+                while True:
+                    try:
+                        reaped_pid, reaped_status = os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    if reaped_pid == 0:
+                        children_present = True
+                        break
+                    if target is not None and reaped_pid == target.pid:
+                        target.returncode = os.waitstatus_to_exitcode(reaped_status)
             target_exited = target is not None and target.poll() is not None
             members = _posix_group_members(pgid)
-            if target_exited and members != (own_pid,):
+            if adopt_children and (target_exited or target_cleanup_at is not None):
+                prepare_capture()
+            captured_alive = children_present or _captured_posix_processes_alive(captured)
+            if (target_exited or target_cleanup_at is not None) and (
+                members != (own_pid,) or captured_alive
+            ):
                 if target_cleanup_at is None:
                     signal_owned(_POSIX_ANCHOR_TERMINATE)
                     target_cleanup_at = time.monotonic() + 0.2
                 elif time.monotonic() >= target_cleanup_at:
                     signal_owned(_POSIX_ANCHOR_KILL)
-            captured_alive = members == (own_pid,) and _captured_posix_processes_alive(
-                captured
-            )
+            if adopt_children and not cleanup_complete:
+                captured_alive = True
             empty_confirmations = _advance_posix_empty_confirmation(
                 empty_confirmations,
                 members,
@@ -2706,9 +2769,17 @@ def _run_posix_group_anchor(
                     stdin_open = False
             if pipe_command == _POSIX_ANCHOR_TERMINATE:
                 signal_owned(pipe_command)
+                if adopt_children:
+                    target_cleanup_at = time.monotonic() + 0.2
                 poll_delay = _POLL_INTERVAL_SECONDS
             elif pipe_command == _POSIX_ANCHOR_KILL:
                 signal_owned(pipe_command)
+                if adopt_children:
+                    # The anchor must survive to adopt/reap children that raced
+                    # the snapshot. SIGKILL is delivered through captured pidfds.
+                    target_cleanup_at = time.monotonic()
+                    poll_delay = _POLL_INTERVAL_SECONDS
+                    continue
                 try:
                     os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
                 except OSError:
@@ -2734,6 +2805,8 @@ def _run_posix_group_anchor(
                         continue
                     if command == _POSIX_ANCHOR_TERMINATE:
                         marker = signal_owned(command)
+                        if adopt_children:
+                            target_cleanup_at = time.monotonic() + 0.2
                         with contextlib.suppress(OSError):
                             connection.sendall(marker)
                         poll_delay = _POLL_INTERVAL_SECONDS
@@ -2741,6 +2814,10 @@ def _run_posix_group_anchor(
                         marker = signal_owned(command)
                         with contextlib.suppress(OSError):
                             connection.sendall(marker)
+                        if adopt_children:
+                            target_cleanup_at = time.monotonic()
+                            poll_delay = _POLL_INTERVAL_SECONDS
+                            continue
                         try:
                             os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
                         except OSError:

@@ -94,7 +94,9 @@ class _Harness:
         )
         await asyncio.wait_for(self.started.wait(), 2)
         if self.process is None:
-            self.process = SimpleNamespace(
+            self.process = shell._BgSession(
+                session_id="process-one", command="synthetic",
+                process=SimpleNamespace(returncode=0), done=True,
                 session_key=SESSION_KEY, task_id=handle.task_id, completion_consumed=False,
             )
             shell._bg_sessions["process-one"] = self.process
@@ -107,17 +109,14 @@ class _Harness:
 
 
 @pytest_asyncio.fixture
-async def harness() -> AsyncIterator[_Harness]:
+async def harness(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[_Harness]:
     harness = _Harness()
-    previous = shell._bg_sessions.pop("process-one", None)
+    monkeypatch.setattr(shell, "_bg_sessions", {})
     try:
         yield harness
     finally:
         harness.finish.set()
         await harness.runtime.shutdown()
-        shell._bg_sessions.pop("process-one", None)
-        if previous is not None:
-            shell._bg_sessions["process-one"] = previous
 
 
 def _event(**overrides: Any) -> dict[str, Any]:
@@ -252,7 +251,9 @@ async def test_manual_consumption_is_rechecked_before_delivery(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, during_owner_read: bool,
 ) -> None:
     handle = await harness.enqueue("launch")
-    process = SimpleNamespace(
+    process = shell._BgSession(
+        session_id="process-one", command="synthetic",
+        process=SimpleNamespace(returncode=0), done=True,
         session_key=SESSION_KEY, task_id=handle.task_id, completion_consumed=False,
     )
     monkeypatch.setitem(shell._bg_sessions, "process-one", process)

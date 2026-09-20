@@ -264,6 +264,16 @@ async def wait_pty(handle: PtyHandle) -> int | None:
 
 
 async def read_pty(handle: PtyHandle, size: int = 8192) -> bytes:
+    stream = getattr(handle.raw, "fileobj", None)
+    if handle.platform == "windows" and isinstance(stream, socket.socket):
+        # pywinpty already copies native output into this socket. Reading it
+        # through the shared executor can miss the post-exit drain deadline
+        # while unrelated workers are busy, even when the bytes are ready.
+        stream.setblocking(False)
+        while True:
+            chunk = await asyncio.get_running_loop().sock_recv(stream, size)
+            if chunk != b"0011Ignore":
+                return chunk
     return await asyncio.to_thread(handle.read, size)
 
 

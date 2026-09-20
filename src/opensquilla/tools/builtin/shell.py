@@ -6117,6 +6117,10 @@ def _session_exited(session: _BgSession) -> bool:
     return session.done or _session_returncode(session) is not None
 
 
+def _session_result_ready(session: _BgSession) -> bool:
+    return session.done or (session.collector_task is None and _session_exited(session))
+
+
 def _bg_session_payload(session: _BgSession) -> dict[str, object]:
     payload: dict[str, object] = {
         "session_id": session.session_id,
@@ -6336,8 +6340,11 @@ async def _start_exec_command_session(
                     asyncio.shield(session.collector_task),
                     timeout=_BACKGROUND_KILL_TIMEOUT,
                 )
-        if not session.done:
+        if not session.done and (
+            session.collector_task is None or session.collector_task.done()
+        ):
             await _finalize_bg_session_async(session)
+    if _session_result_ready(session):
         completed_payload: dict[str, object] = {
             "status": "ok",
             "execution_id": session.session_id,
@@ -6423,42 +6430,21 @@ def _require_bg_session(session_id: str | None) -> _BgSession:
 
 
 async def _read_bg_output(session: _BgSession, process_exited: asyncio.Event) -> None:
-    if session.pty_handle is not None:
-        exited = asyncio.create_task(process_exited.wait())
-        try:
-            while True:
-                reading = asyncio.create_task(read_pty(session.pty_handle))
-                done, _ = await asyncio.wait(
-                    {reading, exited}, return_when=asyncio.FIRST_COMPLETED
-                )
-                if exited in done and not reading.done():
-                    try:
-                        chunk = await asyncio.wait_for(reading, timeout=_BACKGROUND_KILL_TIMEOUT)
-                    except EOFError:
-                        break
-                    except TimeoutError:
-                        reading.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await reading
-                        break
-                else:
-                    try:
-                        chunk = await reading
-                    except EOFError:
-                        break
-                if not chunk:
-                    break
-                await asyncio.to_thread(session.output_capture.feed, chunk)
-        except asyncio.CancelledError:
-            session.output_capture.incomplete_reason = "output drain interrupted"
-            raise
-        except Exception as exc:
-            session.output_capture.incomplete_reason = f"output read failed ({type(exc).__name__})"
-        finally:
-            if not exited.done():
-                exited.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await exited
+    if (handle := session.pty_handle) is not None:
+        class _PtyReader:
+            def __init__(self, pty: PtyHandle) -> None:
+                self.pty = pty
+
+            async def read(self, size: int) -> bytes:
+                try:
+                    return await read_pty(self.pty, size)
+                except EOFError:
+                    return b""
+
+        await session.output_capture.drain(
+            _PtyReader(handle), process_exited=process_exited,
+            idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+        )
         return
     await session.output_capture.drain(
         session.process.stdout, process_exited=process_exited,
@@ -6551,6 +6537,16 @@ async def _wait_bg_process(session: _BgSession, timeout: float) -> bool:
             else session.process.wait()
         )
         await asyncio.wait_for(waiter, timeout=timeout)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _wait_bg_result(session: _BgSession, timeout: float) -> bool:
+    if session.collector_task is None:
+        return await _wait_bg_process(session, timeout)
+    try:
+        await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=timeout)
     except TimeoutError:
         return False
     return True
@@ -8511,7 +8507,7 @@ async def process(
     session = targets[0]
 
     if action == "poll":
-        if _session_exited(session):
+        if _session_result_ready(session):
             session.completion_consumed = True
         poll_payload = _bg_session_payload(session)
         poll_payload["output"] = _bg_rendered_output(session)
@@ -8543,21 +8539,21 @@ async def process(
         precompleted = [
             target
             for target in targets
-            if _session_exited(target)
+            if _session_result_ready(target)
         ]
         try:
             if mode == "one":
-                if not _session_exited(session):
-                    await _wait_bg_process(session, wait_timeout)
+                if not _session_result_ready(session):
+                    await _wait_bg_result(session, wait_timeout)
                 # Let the subprocess transport publish returncode after a waiter
                 # that observed the OS exit completes.  This closes the same
                 # exit-vs-timeout race as the former single-session path.
                 await asyncio.sleep(0)
             elif not (mode == "any" and precompleted):
                 for target in targets:
-                    if _session_exited(target):
+                    if _session_result_ready(target):
                         continue
-                    waiters[asyncio.create_task(_wait_bg_process(target, wait_timeout))] = target
+                    waiters[asyncio.create_task(_wait_bg_result(target, wait_timeout))] = target
             completed: set[asyncio.Task[bool]] = set()
             if waiters:
                 completed, _pending = await asyncio.wait(
@@ -8602,7 +8598,7 @@ async def process(
                 if not waiter.done():
                     waiter.cancel()
             for target, consumed_before_wait in zip(targets, previously_consumed, strict=True):
-                if not delivered or not _session_exited(target):
+                if not delivered or not _session_result_ready(target):
                     target.completion_consumed = consumed_before_wait
             if any(not waiter.done() for waiter in waiters):
                 await asyncio.gather(*waiters, return_exceptions=True)
@@ -8614,10 +8610,10 @@ async def process(
                     await _emit_bg_session_completion(target)
         session_payloads = [_bg_session_payload(target) for target in targets]
         all_exited = all(
-            _session_exited(target) for target in targets
+            _session_result_ready(target) for target in targets
         )
         any_exited = any(
-            _session_exited(target) for target in targets
+            _session_result_ready(target) for target in targets
         )
         payload: dict[str, object] = {
             "status": "ok",
@@ -8635,12 +8631,12 @@ async def process(
             payload["completed_execution_ids"] = [
                 target.session_id
                 for target in targets
-                if _session_exited(target)
+                if _session_result_ready(target)
             ]
         return json.dumps(payload, ensure_ascii=False)
 
     if action == "log":
-        if _session_exited(session):
+        if _session_result_ready(session):
             session.completion_consumed = True
         start = max(0, int(offset or 0))
         requested_limit = 20000 if limit is None else int(limit)

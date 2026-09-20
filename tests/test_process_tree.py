@@ -643,6 +643,42 @@ def test_linux_descendant_capture_does_not_fall_back_to_numeric_pid(
     assert capture.processes == ()
 
 
+def test_linux_adopted_children_use_pidfds_without_python_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    adopted = process_tree._PosixProcessInfo(102, 100, 102, uid, "adopted")
+    unrelated = process_tree._PosixProcessInfo(103, 1, 103, uid, "unrelated")
+    snapshot = {100: anchor, 102: adopted, 103: unrelated}
+    calls = []
+    library = SimpleNamespace(
+        pidfd_open=lambda pid, flags: calls.append(("open", pid, flags)) or 42,
+        pidfd_send_signal=lambda fd, sig, info, flags: (
+            calls.append(("signal", fd, sig, info, flags)) or 0
+        ),
+    )
+    monkeypatch.setattr(process_tree.sys, "platform", "linux")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.delattr(process_tree.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(process_tree.signal, "pidfd_send_signal", raising=False)
+    monkeypatch.setattr(process_tree, "_linux_pidfd_libc", lambda: library)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
+    monkeypatch.setattr(process_tree, "_posix_process_info", snapshot.get)
+    monkeypatch.setattr(
+        process_tree.os, "kill",
+        lambda *_args: pytest.fail("native pidfd support must not use numeric PID signalling"),
+    )
+
+    capture = process_tree._capture_posix_group_descendants(
+        100, 100, include_anchor_children=True,
+    )
+    assert capture.complete
+    assert [(item.pid, item.pidfd) for item in capture.processes] == [(102, 42)]
+    assert process_tree._signal_captured_posix_processes(capture.processes, signal.SIGTERM)
+    assert calls == [("open", 102, 0), ("signal", 42, signal.SIGTERM, None, 0)]
+
+
 def test_other_posix_descendant_capture_preserves_group_only_behavior(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
