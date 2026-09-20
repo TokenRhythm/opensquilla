@@ -3387,11 +3387,11 @@ describe('useChatHistory optimistic local rows', () => {
   it.each([
     [
       'image_input_unsupported',
-      'The selected model cannot process image input. Choose an image-capable model or remove the image.',
+      'This model does not support images.',
     ],
     [
       'ensemble_multimodal_unsupported',
-      "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
+      'This mode does not support images.',
     ],
   ])('restores %s as a localized error card', async (errorClass, expectedText) => {
     const { api, messages } = makeHistory(true, {
@@ -3437,6 +3437,139 @@ describe('useChatHistory optimistic local rows', () => {
       terminalNotice: true,
       text: expectedText,
     })
+  })
+
+  it.each([
+    { errorId: undefined, durable: false },
+    { errorId: 'abcdef01', durable: false },
+    { errorId: undefined, durable: true },
+    { errorId: 'abcdef01', durable: true },
+  ])('restores no_provider without relying on diagnostic persistence: $errorId, durable=$durable', async ({ errorId, durable }) => {
+    const turnId = 'turn-no-provider'
+    const response: SessionReadHistoryPageFixture = {
+      messages: [{
+        id: 'user-no-provider', messageId: 'user-no-provider', role: 'user', text: 'hello',
+        createdAt: '2026-07-07T10:00:00Z', turnContext: { turnId },
+      }, ...(durable ? [{
+        id: 'error-no-provider', messageId: 'error-no-provider', role: 'system',
+        text: 'Error: private upstream diagnostic (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }] : [])],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'failed', errorClass: 'no_provider',
+        terminalMessage: 'No provider available (ref: abcdef01)',
+        outcome: { kind: 'failed', reason: 'no_provider', ...(errorId ? { error_id: errorId } : {}) },
+      }],
+      hasMore: false,
+    }
+    const { api, messages } = makeHistory(true, { response })
+
+    await api.loadHistory()
+    await api.loadHistory()
+
+    const errors = messages.value.filter(message => message.role === 'error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({
+      text: 'No model is available.', errorCode: 'no_provider', turnId, terminalNotice: true,
+      turnOutcome: { status: 'failed', statusSource: 'task', reason: 'no_provider' },
+    })
+    expect(errors[0]?.turnOutcome?.errorId).toBe(errorId)
+    expect(errors[0]?.text).not.toMatch(/private|upstream|abcdef01|ref:/)
+  })
+
+  it('restores an unknown failure using safe local copy and preserves its internal classification', async () => {
+    const turnId = 'turn-unknown-failure'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [{
+        id: 'unknown-error', role: 'system', text: 'Error: Authorization: Bearer private-token (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'failed', errorClass: 'future_internal_failure',
+        terminalMessage: 'Authorization: Bearer private-token (ref: abcdef01)',
+      }],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'error', text: 'The task did not finish. Please try again later.',
+      turnId, errorCode: 'future_internal_failure', terminalNotice: true,
+    })
+  })
+
+  it('does not synthesize a failed turn from recovered provider warning metadata on success', async () => {
+    const turnId = 'turn-recovered'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [{
+        id: 'recovered-answer', role: 'assistant', text: 'Completed answer',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'succeeded', errorClass: '429',
+        outcome: { kind: 'completed', failure_kind: 'rate_limited', error_id: 'abcdef01' },
+      }],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(0)
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([['assistant', 'Completed answer']])
+  })
+
+  it('localizes a legacy terminal system receipt without an Error prefix exactly once', async () => {
+    const turnId = 'turn-legacy-truncated'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [{
+        id: 'legacy-truncated', messageId: 'legacy-truncated', role: 'system',
+        text: 'The provider stopped because the output limit was reached before the task finished. (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'failed', errorClass: 'provider_output_truncated',
+        outcome: { kind: 'partial', reason: 'output_truncated', error_id: 'abcdef01' },
+      }],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      messageId: 'legacy-truncated', role: 'error', terminalNotice: true,
+      text: 'The model response did not finish. Please try again later.',
+      errorCode: 'provider_output_truncated', turnId,
+    })
+    expect(messages.value[0]?.text).not.toContain('abcdef01')
+  })
+
+  it('hides legacy raw Error rows without rewriting ordinary conversation text', async () => {
+    const unrelatedText = 'Ordinary text mentions an Error: example and (ref: abcdef01).'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [
+        { id: 'legacy-error', role: 'system', text: 'Error: raw secret (ref: abcdef01)', createdAt: 1_000 },
+        { id: 'system-note', role: 'system', text: unrelatedText, createdAt: 2_000 },
+        { id: 'user-example', role: 'user', text: 'Error: an example, not an error receipt', createdAt: 3_000 },
+        { id: 'assistant-example', role: 'assistant', text: 'Error: a quoted example', createdAt: 4_000 },
+        {
+          id: 'cron-note', role: 'system', text: 'Error: review incident notes', createdAt: 5_000,
+          provenance: { kind: 'cron', sourceTool: null, sourceSessionKey: null },
+        },
+      ],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(5)
+    expect(messages.value[0]).toMatchObject({
+      role: 'error', terminalNotice: true, text: 'The task did not finish. Please try again later.',
+    })
+    expect(messages.value.slice(1).map(message => [message.role, message.text])).toEqual([
+      ['system', unrelatedText],
+      ['user', 'Error: an example, not an error receipt'],
+      ['assistant', 'Error: a quoted example'],
+      ['system', 'Error: review incident notes'],
+    ])
   })
 
   it('restores a usage barrier retry card when the transcript error row is absent', async () => {
@@ -3745,7 +3878,7 @@ describe('useChatHistory optimistic local rows', () => {
         ['assistant', 'Initial summary.'],
         ['user', 'Include the risks'],
         ['assistant', 'Risk analysis in progress.'],
-        ['error', safeMessage],
+        ['error', 'The model service is busy. Please try again later.'],
       ])
       const notice = messages.value.filter(message => message.role === 'error')
       expect(notice).toHaveLength(1)
@@ -3915,7 +4048,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'retry this turn'],
-      ['error', 'Activation failed; retry this message.'],
+      ['error', 'The task did not finish. Please try again later.'],
     ])
     expect(messages.value[1]).toMatchObject({
       errorCode: 'failed',

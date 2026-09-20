@@ -422,6 +422,12 @@ def _http_error_body_text(body: bytes | str) -> str:
     if isinstance(error, dict):
         message = error.get("message")
         if isinstance(message, str) and message.strip():
+            # A short/localized message may omit the stable provider cause.
+            # Retain its machine code for internal failure classification;
+            # ErrorEvent.code remains the HTTP status for retry machinery.
+            code = error.get("code") or error.get("type")
+            if isinstance(code, str) and code.strip():
+                return f"{code.strip()}: {message.strip()}"
             return message.strip()
     message = payload.get("message") if isinstance(payload, dict) else None
     if isinstance(message, str) and message.strip():

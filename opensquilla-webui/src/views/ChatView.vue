@@ -204,6 +204,7 @@
           :copy-message="copyMessage"
           :download-attachment="downloadAttachment"
           :fork-busy="forkInFlight"
+          :sandbox-resume-turn-id="sandboxResumeTurnId"
           :plan-action-pending="planCardPendingAction"
           :plan-actions-disabled="planActionsDisabled"
           :plan-presentations="planPresentations"
@@ -1153,6 +1154,13 @@ import {
 } from '@/utils/chat/sessionCreationRouterPresentation'
 import { createPendingInputWal } from '@/utils/chat/pendingInputWal'
 import { agentIdFromSessionKey } from '@/utils/chat/sessionKeys'
+import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import {
+  currentSandboxResumeTurnId,
+  isCurrentSandboxResume,
+  sandboxResumeMessageTurnId,
+  type SandboxResumeIdentity,
+} from '@/utils/chat/sandboxResumeGuard'
 import { shouldDisableLandingSuggestions } from '@/utils/chat/landingSuggestions'
 import {
   handoffPlanQuestionnaireTouch,
@@ -5981,19 +5989,62 @@ async function forkConversation(throughTurnId?: string) {
 // Owner recovery for a run paused by the sandbox denial ledger (the terminal
 // error card exposes a Resume button). Clearing the pause lets the next turn
 // proceed; the run itself already ended, so we prompt the user to resend.
-async function resumeSandbox() {
-  const key = sessionKey.value
-  if (!key) return
+const sandboxResumePending = ref(false)
+const resumedSandboxTurn = ref<SandboxResumeIdentity | null>(null)
+const eligibleSandboxResumeTurnId = computed(() => currentSandboxResumeTurnId(
+  renderedMessages.value,
+  {
+    sessionKey: sessionKey.value,
+    taskId: chatTaskId(runStatus.value.task),
+    taskStatus: runStatus.value.status,
+    connectionAvailable: gatewayAccess.isAvailable && gatewayAccess.isAuthenticated
+      && livePhase.value === 'ready',
+    busy: sessionHasActiveWork.value || chatSend.sendPending.value || isStopPending.value,
+    shareMode: shareMode.value,
+    forkPreview: Boolean(forkTransition.value),
+  },
+))
+
+function sandboxResumeIdentity(): SandboxResumeIdentity {
+  return {
+    sessionKey: sessionKey.value,
+    turnId: eligibleSandboxResumeTurnId.value,
+    epoch: currentEpoch.value,
+    viewEpoch: scrollEpoch.value,
+  }
+}
+
+const sandboxResumeTurnId = computed(() => {
+  if (sandboxResumePending.value) return ''
+  if (resumedSandboxTurn.value && isCurrentSandboxResume(resumedSandboxTurn.value, sandboxResumeIdentity())) return ''
+  return eligibleSandboxResumeTurnId.value
+})
+
+async function resumeSandbox(message: ChatRenderedMessage, sourceSessionKey: string) {
+  const captured = sandboxResumeIdentity()
+  if (chatViewDisposed || !sandboxResumeTurnId.value
+    || sourceSessionKey !== captured.sessionKey
+    || sandboxResumeMessageTurnId(message) !== captured.turnId) return
+  sandboxResumePending.value = true
+  const isCurrent = () => !chatViewDisposed && isCurrentSandboxResume(captured, sandboxResumeIdentity())
   try {
-    await sandboxRuntime.resumeSession(key)
+    const result = await sandboxRuntime.resumeSession(captured.sessionKey)
+    if (!isCurrent()) return
+    if (result.sessionKey !== captured.sessionKey || result.autonomousPaused) {
+      pushToast(localizedChatErrorMessage(undefined, ''), { tone: 'danger' })
+      return
+    }
+    resumedSandboxTurn.value = captured
     messages.value.push({
       role: 'system',
       text: t('chat.sandboxResumed'),
       ts: new Date().toISOString(),
     })
   } catch (err) {
-    const detail = err instanceof Error ? err.message : String(err)
-    pushToast(t('chat.sandboxResumeFailed', { error: detail }), { tone: 'danger' })
+    console.warn('Sandbox resume failed:', err)
+    if (isCurrent()) pushToast(localizedChatErrorMessage(undefined, ''), { tone: 'danger' })
+  } finally {
+    sandboxResumePending.value = false
   }
 }
 

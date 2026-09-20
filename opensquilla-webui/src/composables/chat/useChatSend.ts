@@ -56,6 +56,7 @@ import {
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
 import {
   classifyArtifactProductError,
   isKnownArtifactProductErrorCode,
@@ -87,7 +88,6 @@ import {
   FINISHED_STREAM_TASK_ID,
   PENDING_STREAM_TASK_ID,
   STOPPED_STREAM_TASK_ID,
-  taskTerminalMessage,
 } from '@/utils/chat/streamEvents'
 
 /**
@@ -332,7 +332,11 @@ function turnCommandFailure(err: unknown): TurnCommandError | null {
 }
 
 function errorCode(err: unknown): string | undefined {
-  return turnCommandFailure(err)?.failureCode
+  const failure = turnCommandFailure(err)
+  const artifact = failure?.artifactFailure
+  return artifact?.artifactScoped && isKnownArtifactProductErrorCode(artifact.code)
+    ? artifact.code
+    : failure?.failureCode
 }
 
 function sendFailureMessage(err: unknown): string {
@@ -345,7 +349,7 @@ function sendFailureMessage(err: unknown): string {
       ? classified.fallbackMessage
       : translated
   }
-  return localizedChatErrorMessage(code, 'Send failed: ' + errorMessage(err))
+  return localizedChatErrorMessage(code, '')
 }
 
 function shouldRestoreSendAttempt(err: unknown): boolean {
@@ -411,16 +415,13 @@ function terminalResponseStatus(response: TurnSendResponse | null | undefined): 
   return TERMINAL_TASK_STATUSES.has(status) ? status : ''
 }
 
-function terminalReplayMessage(response: TurnSendResponse, status: string): string {
-  const supplied = response.terminalMessage || response.terminalReason || response.reason
-  if (typeof supplied === 'string' && supplied.trim()) return supplied.trim()
-  return taskTerminalMessage(status, {})
-}
-
-function terminalReplayErrorCode(response: TurnSendResponse, status: string): string {
+function terminalReplayErrorCode(response: TurnSendResponse, status: string): string | undefined {
   const reason = response.terminalReason || response.reason
   const normalized = typeof reason === 'string' ? reason.trim().toLowerCase() : ''
-  return /^[a-z][a-z0-9_.-]*$/.test(normalized) ? normalized : status
+  const code = /^[a-z][a-z0-9_.-]*$/.test(normalized) ? normalized : status
+  // A scheduler's generic terminal reason is not a new cause and must not
+  // replace a provider/engine classification already received for this turn.
+  return code === 'error' || code === 'failed' ? undefined : code
 }
 
 function sameSendableAttachments(
@@ -2063,13 +2064,20 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (status !== 'succeeded') {
       const code = terminalReplayErrorCode(response, status)
-      options.messages.value.push({
+      const turnId = acceptedTaskId(response)
+      const reason = response.terminalReason || response.reason
+      const notice: ChatMessage = {
         role: 'error',
-        text: localizedChatErrorMessage(code, terminalReplayMessage(response, status)),
+        text: localizedChatErrorMessage(code, '', false, undefined, status, { reason }),
         errorCode: code,
         terminalNotice: true,
+        ...(turnId ? {
+          turnId,
+          turnOutcome: { turnId, taskId: turnId, status, statusSource: 'task', reason, errorClass: code },
+        } : {}),
         ts: new Date().toISOString(),
-      })
+      }
+      options.messages.value = dedupeTerminalErrorNotices([...options.messages.value, notice])
     }
     options.scheduleHistorySync()
     if (finalizedFreshStream) {

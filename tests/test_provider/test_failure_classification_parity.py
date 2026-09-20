@@ -1,10 +1,9 @@
 """Parity corpus for provider failure classification.
 
-This corpus was written against the branch-based ``classify_provider_error``
-and encodes its exact behavior: every status-code branch, every substring
-trigger, the raw-code text channel, the empty-response exact-match shapes,
-order-dependent combinations, and inputs that must keep falling through to
-UNKNOWN. The table-driven refactor must keep every case green unchanged.
+This corpus covers ``classify_provider_error``: every status-code branch,
+substring trigger, the raw-code text channel, empty-response exact-match
+shapes, order-dependent combinations, and inputs that must fall through to
+UNKNOWN. Bare 403/404 responses deliberately carry no inferred cause.
 
 All strings are synthetic; some mirror generic public provider error
 phrasings because those phrasings are exactly what the classifier matches on.
@@ -80,25 +79,26 @@ _EMPTY_RESPONSE_CASES: list[Case] = [
 
 # --- openai_compat family ---
 _OPENAI_COMPAT_CASES: list[Case] = [
-    # MODEL_NOT_FOUND: status 404 OR any model-unavailable marker.
-    ("openai", 404, "", "", K.MODEL_NOT_FOUND),
+    # MODEL_NOT_FOUND needs model-unavailable evidence, not just a 404.
+    ("openai", 404, "", "", K.UNKNOWN),
+    ("openai", 404, "model_not_found", "", K.MODEL_NOT_FOUND),
     ("openrouter", None, "", "no endpoints found for this model", K.MODEL_NOT_FOUND),
     ("deepseek", None, "", "model not found", K.MODEL_NOT_FOUND),
     ("openai", None, "", "the model is not available right now", K.MODEL_NOT_FOUND),
     ("openrouter", None, "", "model not available", K.MODEL_NOT_FOUND),
     ("openrouter", None, "", "not available in the requested region", K.MODEL_NOT_FOUND),
-    # Model-unavailable marker outranks the 403 auth branch.
+    # Explicit model-unavailable evidence on 403 permits model fallback.
     ("openai", 403, "", "This model is not available in your region.", K.MODEL_NOT_FOUND),
     # TokenRhythm's custom envelope arrives as HTTP 400 with a top-level
     # code + localized message; _http_error_body_text prefixes the code, and
     # either marker (code or Chinese text) must outrank BAD_REQUEST.
     ("tokenrhythm", 400, "", "MODEL_NOT_AVAILABLE: 模型不可用：some-model", K.MODEL_NOT_FOUND),
     ("tokenrhythm", 400, "", "模型不可用：some-model", K.MODEL_NOT_FOUND),
-    # Status 404 outranks the auth substring branch.
-    ("openai", 404, "", "unauthorized", K.MODEL_NOT_FOUND),
-    # AUTH_INVALID: 401/403 OR "invalid api key" / "unauthorized".
+    # A bare 404 cannot override explicit authentication evidence.
+    ("openai", 404, "", "unauthorized", K.AUTH_INVALID),
+    # AUTH_INVALID: 401 OR "invalid api key" / "unauthorized".
     ("openai", 401, "", "", K.AUTH_INVALID),
-    ("openrouter", 403, "", "HTTP 403: forbidden", K.AUTH_INVALID),
+    ("openrouter", 403, "", "HTTP 403: forbidden", K.UNKNOWN),
     ("deepseek", None, "", "invalid api key", K.AUTH_INVALID),
     ("tokenrhythm", 401, "", "UNAUTHORIZED: 未认证或登录已过期", K.AUTH_INVALID),
     ("openai", None, "", "Unauthorized", K.AUTH_INVALID),
@@ -162,12 +162,12 @@ _OPENAI_COMPAT_CASES: list[Case] = [
 
 # --- anthropic family ---
 _ANTHROPIC_CASES: list[Case] = [
-    ("anthropic", 404, "", "", K.MODEL_NOT_FOUND),
-    ("anthropic", None, "not_found_error", "", K.MODEL_NOT_FOUND),
+    ("anthropic", 404, "", "", K.UNKNOWN),
+    ("anthropic", None, "not_found_error", "", K.UNKNOWN),
     ("anthropic", None, "", '{"type":"not_found_error","message":"model: x"}', K.MODEL_NOT_FOUND),
     ("anthropic", None, "", "model not available", K.MODEL_NOT_FOUND),
     ("minimax", 401, "authentication_error", "", K.AUTH_INVALID),
-    ("anthropic", 403, "", "", K.AUTH_INVALID),
+    ("anthropic", 403, "", "", K.UNKNOWN),
     ("anthropic", None, "", "authentication_error: bad key", K.AUTH_INVALID),
     ("anthropic", 402, "", "", K.INSUFFICIENT_CREDITS),
     # "credit balance" outranks everything a 400 could otherwise become.
@@ -204,7 +204,7 @@ _OLLAMA_CASES: list[Case] = [
     # The pull+model conjunction outranks the timeout transport branch.
     ("ollama", None, "", "timeout while pulling model manifest", K.MODEL_NOT_FOUND),
     ("ollama", 401, "", "", K.AUTH_INVALID),
-    ("ollama", 403, "", "", K.AUTH_INVALID),
+    ("ollama", 403, "", "", K.UNKNOWN),
     ("ollama", None, "", "HTTP 401: unauthorized", K.AUTH_INVALID),
     ("ollama", None, "", "connection refused", K.TRANSPORT_TRANSIENT),
     ("ollama", None, "", "connection error while contacting host", K.TRANSPORT_TRANSIENT),

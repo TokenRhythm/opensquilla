@@ -124,8 +124,9 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :resume-available="sandboxResumeAvailable(messages[entry.index])"
           :has-partial-answer="Boolean(messages[entry.index].turnId && visibleAnswerTurns.has(messages[entry.index].turnId!))"
-          @resume="$emit('resumeSandbox')"
+          @resume="forwardSandboxResume"
           @retry="forwardSystemRetry"
         />
         <SkillLoadStatus
@@ -177,6 +178,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
+import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -213,6 +215,7 @@ const props = defineProps<{
   workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
   canReusePromptAnnotations?: boolean
   forkBusy?: boolean
+  sandboxResumeTurnId?: string
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
   planPresentations?: Record<string, PlanPresentationSnapshot>
@@ -259,7 +262,7 @@ const emit = defineEmits<{
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
   clarifyDismiss: []
-  resumeSandbox: []
+  resumeSandbox: [message: ChatRenderedMessage, sourceSessionKey: string]
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
@@ -275,6 +278,17 @@ function forwardSystemRetry(
   settle: (accepted: boolean) => void,
 ) {
   emit('regenerateMessage', message, settle)
+}
+
+function sandboxResumeAvailable(message: ChatRenderedMessage): boolean {
+  return Boolean(props.sessionKey && props.sandboxResumeTurnId
+    && !props.shareMode && !props.forkBusy && !props.isStreaming
+    && sandboxResumeMessageTurnId(message) === props.sandboxResumeTurnId)
+}
+
+function forwardSandboxResume(message: ChatRenderedMessage) {
+  if (!sandboxResumeAvailable(message) || !props.sessionKey) return
+  emit('resumeSandbox', message, props.sessionKey)
 }
 
 const visibleAnswerTurns = computed(() => new Set(props.messages
