@@ -1216,9 +1216,12 @@ const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
 const deliveryIdentity = computed(() => gatewayAccess.deliveryIdentity)
-const gatewayConnectionState = computed(() => gatewayAccess.availability === 'available'
-  ? 'connected'
-  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
+const gatewayConnectionState = computed(() => {
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+  }
+  return gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected'
+})
 const pendingInputQueue = inject(PENDING_INPUT_QUEUE_KEY, null)
 const sessionRouting = inject(SESSION_ROUTING_KEY) as SessionRouting | undefined
 if (!sessionRouting) throw new Error('SessionRouting was not provided')

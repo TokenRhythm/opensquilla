@@ -21,10 +21,12 @@ afterEach(() => {
 async function mountPanel(options: {
   managed?: boolean
   availability?: GatewayAvailability
+  health?: 'healthy' | 'suspect'
   requiresCredential?: boolean
 } = {}) {
   const gatewayAccess = reactive({
     availability: options.availability ?? 'unavailable',
+    connectionHealth: options.health ?? 'healthy',
     isRuntimeStarting: false,
     connectionError: null as string | null,
     requiresCredential: options.requiresCredential ?? false,
@@ -68,6 +70,14 @@ function button(el: HTMLElement, label: string): HTMLButtonElement {
 }
 
 describe('SetupConnectionPanel', () => {
+  it('shows reconnecting instead of connected while transport health is suspect', async () => {
+    const { el, gatewayAccess } = await mountPanel({ availability: 'available', health: 'suspect' })
+    expect(el.querySelector('.conn-status__pill')?.textContent).toContain(i18n.global.t('setup.connection.connecting'))
+    gatewayAccess.connectionHealth = 'healthy'
+    await nextTick()
+    expect(el.querySelector('.conn-status__pill')?.textContent).toContain(i18n.global.t('setup.connection.connected'))
+  })
+
   it.each([
     ['unavailable', 'setup.connection.connect'],
     ['available', 'setup.connection.reconnect'],

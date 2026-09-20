@@ -2,6 +2,7 @@ import type {
   GatewayAccess,
   GatewayAvailability,
   GatewayConnectionSettings,
+  GatewayConnectionHealth,
   GatewayRunModePolicy,
 } from '@/modules/gatewayAccess'
 import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
@@ -14,6 +15,7 @@ const WS_URL_KEY = 'opensquilla.wsUrl'
 
 interface GatewayAccessSource {
   readonly state: 'disconnected' | 'connecting' | 'connected'
+  readonly health: GatewayConnectionHealth
   readonly runtimeStarting?: boolean
   readonly error: string | null
   readonly isLocalOwner: boolean
@@ -143,6 +145,9 @@ export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAcces
     get availability() {
       if (source.runtimeStarting && source.state !== 'connected') return 'preparing'
       return availability(source.state)
+    },
+    get connectionHealth() {
+      return source.health
     },
     get isRuntimeStarting() {
       return source.runtimeStarting === true

@@ -1,6 +1,7 @@
 import type { InjectionKey } from 'vue'
 
 export type GatewayAvailability = 'unavailable' | 'preparing' | 'available'
+export type GatewayConnectionHealth = 'healthy' | 'suspect'
 
 export interface GatewayRunModePolicy {
   readonly allowedRunModes?: unknown
@@ -22,6 +23,8 @@ export interface GatewayConnectionSettings {
  */
 export interface GatewayAccess {
   readonly availability: GatewayAvailability
+  /** Transport health of the current connection; suspect is never user-visible as connected. */
+  readonly connectionHealth: GatewayConnectionHealth
   /** The local supervisor is preparing the runtime; no connection has failed. */
   readonly isRuntimeStarting: boolean
   readonly connectionError: string | null

@@ -31,6 +31,18 @@ export interface SessionNavigationDiagEntry {
   recoveryMs?: number
   loopLagMs?: number
   maxLoopLagMs?: number
+  at?: number
+  topology?: 'loopback' | 'remote' | 'proxy/vpn' | 'unknown'
+  visibility?: 'visible' | 'hidden' | 'unknown'
+  health?: 'healthy' | 'suspect'
+  suspectAt?: number
+  lastRxAt?: number
+  wakeIncidentId?: number
+  wakeIncidentStartedAt?: number
+  wakeIncidentDeadlineAt?: number
+  wakeIncidentStatus?: 'probing' | 'suspect' | 'reconnecting' | 'recovered'
+  wakeSignalCount?: number
+  roundTripMs?: number
 }
 
 export type SessionNavigationDiagData = Omit<SessionNavigationDiagEntry, 't' | 'iso' | 'source'>
@@ -81,10 +93,66 @@ const SAFE_DIAGNOSTIC_REASONS = new Set([
   'wake_probe_send_failure',
   'wake_socket_stale',
   'wake_probe_timeout',
+  'wake_incident_timeout',
+  'socket_not_open',
+  'probe_socket_unavailable',
+  'probe_send_failure',
+  'probe_failed',
+  'control_unconfirmed',
+  'scheduler_lag',
+  'wake_grace',
+  'hello',
+  'round_trip',
+  'direct_send_timeout',
+  'recovery_credit_timeout',
+  'writer_send_failed',
+  'writer_serialize_failed',
+  'writer_capacity',
+  'transport_resource_limit',
   'transport_recovery',
   'peer_close_reason_redacted',
   'reason_redacted',
 ])
+const SAFE_TRANSPORT_PHASES = new Set([
+  'connect_start', 'hello', 'challenge', 'first_successful_rpc', 'close',
+  'watchdog_timeout', 'handshake_invalid', 'wake_incident_timeout',
+  'wake_incident_start', 'wake_incident_recovered', 'retire',
+  'probe_socket_unavailable', 'probe_deferred', 'probe_timeout',
+  'scheduler_lag', 'reconnect_scheduled',
+])
+const TRANSPORT_TIMING_FIELDS = [
+  'at', 'suspectAt', 'lastRxAt', 'wakeIncidentStartedAt',
+  'wakeIncidentDeadlineAt', 'roundTripMs',
+] as const
+
+function safeTransportMetrics(value: Record<string, unknown>): SessionNavigationDiagData {
+  const metrics: SessionNavigationDiagData = {}
+  for (const field of TRANSPORT_TIMING_FIELDS) {
+    const candidate = value[field]
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+      metrics[field] = candidate
+    }
+  }
+  for (const field of ['wakeIncidentId', 'wakeSignalCount'] as const) {
+    const candidate = value[field]
+    if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate >= 0) {
+      metrics[field] = candidate
+    }
+  }
+  if (value.topology === 'loopback' || value.topology === 'remote'
+    || value.topology === 'proxy/vpn' || value.topology === 'unknown') {
+    metrics.topology = value.topology
+  }
+  if (value.visibility === 'visible' || value.visibility === 'hidden' || value.visibility === 'unknown') {
+    metrics.visibility = value.visibility
+  }
+  if (value.health === 'healthy' || value.health === 'suspect') metrics.health = value.health
+  if (value.wakeIncidentStatus === 'probing' || value.wakeIncidentStatus === 'suspect'
+    || value.wakeIncidentStatus === 'reconnecting' || value.wakeIncidentStatus === 'recovered') {
+    metrics.wakeIncidentStatus = value.wakeIncidentStatus
+  }
+  return metrics
+}
 
 function createRendererInstance(): string {
   const randomUuid = globalThis.crypto?.randomUUID?.()
@@ -162,13 +230,14 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
   const generation = typeof value.generation === 'number' && Number.isFinite(value.generation)
     ? value.generation
     : undefined
-  if (!phase || generation === undefined) return null
+  if (!SAFE_TRANSPORT_PHASES.has(phase) || generation === undefined) return null
   const handoff = activeHandoff
   const reason = safeTransportReason(value.reason, phase)
   return recordSessionNavigationDiag('rpc.transport', {
     rendererInstance: sessionNavigationRendererInstance(),
     generation,
     phase,
+    ...safeTransportMetrics(value),
     ...(typeof value.connId === 'string' && value.connId
       ? { connId: value.connId.slice(0, 128) }
       : {}),

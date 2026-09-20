@@ -21,6 +21,7 @@ const ELECTRON_SHUTDOWN_TIMEOUT_MS = 15_000
 const flowControl = process.argv.includes('--flow-control')
 const connectionFaults = process.argv.includes('--connection-faults')
 const idleSend = process.argv.includes('--idle-send')
+const wakeBlackhole = process.argv.includes('--wake-blackhole')
 const backgroundOption = process.argv.find(value => value.startsWith('--background-ms='))
 const backgroundMs = backgroundOption ? Number(backgroundOption.split('=')[1]) : 65_000
 if (!Number.isInteger(backgroundMs) || backgroundMs < 5_000 || backgroundMs > 600_000) {
@@ -89,6 +90,8 @@ let idleRecoveryMs = null
 const idleSendIds = new Set()
 const routedClients = new Set()
 const routedServers = new WeakMap()
+const blackholedClients = new Set()
+let wakeBlackholeEvidence = null
 
 async function startSyntheticProvider() {
   let chatRequests = 0
@@ -305,6 +308,7 @@ try {
         void client.close({ code, reason })
       })
       client.onMessage(message => {
+        if (blackholedClients.has(client)) return
         try {
           const frame = JSON.parse(String(message))
           if (frame.type === 'req' && frame.method === 'chat.send') {
@@ -315,6 +319,7 @@ try {
         server.send(message)
       })
       server.onMessage(message => {
+        if (blackholedClients.has(client)) return
         try {
           const frame = JSON.parse(String(message))
           if (frame?.policy?.transport_flow?.delivery_epoch) negotiatedFlow = true
@@ -347,7 +352,7 @@ try {
   )
   // Fixture setup only: install interception before the measured connection.
   // No reload, refresh or navigation is permitted during fault recovery.
-  if (connectionFaults || idleSend) {
+  if (connectionFaults || idleSend || wakeBlackhole) {
     await installFaultRoute()
     await page.reload({ waitUntil: 'domcontentloaded' })
   }
@@ -399,6 +404,58 @@ try {
   assert.equal(socketsClosed, 0, 'healthy resume must not close a shared WebSocket')
   await page.evaluate(() => window.__stabilityDetachResume())
   await cdp.detach()
+
+  if (wakeBlackhole) {
+    // Application-level frame fault against the source Gateway. This proves
+    // native UI integration, not a kernel TCP blackhole or physical sleep.
+    await waitFor(async () => routedClients.size === 1, 'one wake-fault connection')
+    const acceptedBefore = acceptedSockets
+    for (const client of routedClients) blackholedClients.add(client)
+    const wakeStarted = Date.now()
+    await page.evaluate(() => localStorage.removeItem('opensquilla.chat.sessionNavigationDiag'))
+    await desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') })
+    const duplicateWake = setInterval(() => {
+      void desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') }).catch(() => {})
+    }, 3_000)
+    try {
+      const readDiagnostics = () => page.evaluate(() => JSON.parse(
+        localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]',
+      ).filter(entry => entry.source === 'rpc.transport'))
+      await waitFor(async () => (await readDiagnostics()).some(entry => entry.phase === 'probe_timeout'),
+        'wake suspect diagnostic', 20_000)
+      await waitFor(async () => await page.locator('[data-testid="connection-status"].connecting, [data-testid="chat-system-status-trigger"].connecting').count() > 0,
+        'native suspect UI projection', 3_000)
+      const suspectObservedMs = Date.now() - wakeStarted
+      assert.equal(await composer.inputValue(), draft, 'suspect must preserve draft')
+      await waitFor(async () => acceptedSockets > acceptedBefore
+        && (await readDiagnostics()).some(entry => entry.phase === 'first_successful_rpc'),
+      'wake replacement first successful RPC', 15_000)
+      const timeline = await readDiagnostics()
+      assert.equal(timeline.filter(entry => entry.phase === 'wake_incident_start').length, 1,
+        'duplicate native resume signals must share one incident')
+      assert.equal(timeline.filter(entry => entry.phase === 'wake_incident_timeout').length, 1)
+      const incidentStart = timeline.find(entry => entry.phase === 'wake_incident_start')
+      const incidentEnd = timeline.find(entry => entry.phase === 'wake_incident_timeout')
+      assert.equal(incidentStart.topology, 'loopback')
+      assert.equal(incidentEnd.wakeIncidentId, incidentStart.wakeIncidentId)
+      assert.equal(incidentEnd.wakeIncidentDeadlineAt, incidentStart.wakeIncidentDeadlineAt)
+      assert.ok(incidentEnd.wakeSignalCount > 1, 'duplicate resume signals must be counted')
+      assert.equal(incidentEnd.reason, 'wake_incident_timeout')
+      assert.equal(incidentEnd.health, 'suspect')
+      assert.ok(Date.now() - wakeStarted < 25_000, 'wake recovery should fit the candidate budget plus handshake')
+      assert.equal(page.url(), resumeUrl, 'wake recovery must not reload renderer')
+      assert.equal(await composer.inputValue(), draft)
+      assert.equal(await page.evaluate(() => window.__stabilityComposer === document.querySelector('.chat-textarea')), true)
+      wakeBlackholeEvidence = {
+        topology: 'loopback', faultLayer: 'application-frame-route', physicalSleep: false,
+        suspectObservedMs, recoveredMs: Date.now() - wakeStarted,
+        acceptedReplacements: acceptedSockets - acceptedBefore, timeline,
+      }
+    } finally {
+      clearInterval(duplicateWake)
+      blackholedClients.clear()
+    }
+  }
 
   if (connectionFaults) {
     await waitFor(async () => routedClients.size === 1, 'one measured Gateway connection')
@@ -693,6 +750,7 @@ try {
       openUrlDeepLink: true,
       minimizedRestored: minimized,
       resumeBridgePreservedDraftAndSocket: true,
+      wakeBlackholeEvidence,
       connectionFaults,
       outageMs: connectionFaults ? outageMs : null,
       flowControl,

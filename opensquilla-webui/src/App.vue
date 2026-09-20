@@ -633,9 +633,12 @@ const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 // Localized connection-state label for the topbar pill and its tooltip. The
 // Semantic availability is projected into the existing presentation keys;
 // CSS uppercases the result (a no-op for CJK scripts).
-const connectionState = computed(() => gatewayAccess.availability === 'available'
-  ? 'connected'
-  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
+const connectionState = computed(() => {
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+  }
+  return gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected'
+})
 const effectiveConnectionState = computed(() => effectiveChatConnectionState(
   connectionState.value,
   appStore.chatLivePhase,

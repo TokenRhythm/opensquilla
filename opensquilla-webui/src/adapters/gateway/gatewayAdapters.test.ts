@@ -15,7 +15,8 @@ describe('Gateway Adapter composition', () => {
       options?: RpcCallOptions,
     ) => Promise<T>
     const adapters = createGatewayAdapters({
-      state: 'connected',
+    state: 'connected',
+    health: 'healthy',
       error: null,
       isLocalOwner: true,
       canManageProjectWorkspaces: true,

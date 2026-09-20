@@ -161,6 +161,8 @@ export interface RpcConnectionIntent {
   authentication?: 'guest-allowed' | 'authenticated' | 'owner';
   /** Non-secret target identity (for example Desktop profile and instance). */
   key?: string;
+  /** Optional deployment label; proxy/VPN routing cannot be inferred from a URL. */
+  topology?: 'loopback' | 'remote' | 'proxy/vpn';
 }
 
 export type RpcLifecycle = 'stopped' | 'connecting' | 'connected' | 'recovering' | 'blocked';
@@ -267,6 +269,18 @@ const PROBE_TIMEOUT_MS = 10_000;
 const SUSPECT_WINDOW_MS = 30_000;
 const WAKE_GRACE_MS = 5_000;
 const SCHEDULER_LAG_MS = 5_000;
+// The first wake signal owns a bounded incident window. Later browser wake
+// signals may request another probe but cannot move this deadline forward.
+const WAKE_INCIDENT_BUDGET_MS = 20_000;
+
+interface WakeIncident {
+  id: number;
+  generation: number;
+  startedAt: number;
+  deadlineAt: number;
+  status: 'probing' | 'suspect' | 'reconnecting' | 'recovered';
+  signals: number;
+}
 
 interface PendingRequest {
   resolve: (value: unknown) => void;
@@ -276,6 +290,8 @@ interface PendingRequest {
   timeoutTimer: ReturnType<typeof setTimeout> | null;
   signal: AbortSignal | null;
   abortHandler: (() => void) | null;
+  sentAt: number | null;
+  incidentIdAtSend: number | null;
 }
 
 const GUEST_SESSION_STORAGE_KEY = 'opensquilla.guestSessionKey';
@@ -358,6 +374,10 @@ export class RpcClient {
   private _wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeGeneration: number | null = null;
+  private _wakeIncident: WakeIncident | null = null;
+  private _wakeIncidentTimer: ReturnType<typeof setTimeout> | null = null;
+  private _wakeIncidentCounter = 0;
+  private _firstSuccessfulRpc = false;
   private _challengeWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private _challengeWatchdogGeneration: number | null = null;
   private _helloWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
@@ -420,10 +440,22 @@ export class RpcClient {
 
   notifyResume(): void {
     if (!this._autoReconnect || this._blockedReason) return;
-    this._clearWakeProbe();
-    this._suspectAt = null;
-    this._graceUntil = Date.now() + WAKE_GRACE_MS;
-    this._setHealth('healthy');
+    const now = Date.now();
+    const generation = this._socketGeneration;
+    const current = this._wakeIncident;
+    if (current === null || current.generation !== generation) {
+      this._beginWakeIncident(generation, now);
+      if (!this._autoReconnect || generation !== this._socketGeneration || !this._wakeIncident) return;
+      this._clearWakeProbe();
+      this._suspectAt = null;
+      this._graceUntil = now + WAKE_GRACE_MS;
+      this._setHealth('healthy');
+    } else {
+      current.signals += 1;
+      // Neither the deadline nor the grace period is extended. Keep an armed
+      // probe intact, including its nonce, across all duplicate wake sources.
+      if (this._wakeProbeGeneration !== null || this._health === 'suspect') return;
+    }
     this._scheduleWakeProbe();
   }
 
@@ -432,6 +464,7 @@ export class RpcClient {
     this._blockedReason = null;
     this._recoveryStartedAt = null;
     this._stopLifecycleWatch();
+    this._clearWakeIncident();
     this._clearReconnectTimer();
     this._retireCurrentSocket(
       new RpcTransportError('Disconnected', null),
@@ -458,6 +491,10 @@ export class RpcClient {
           this._recycleConnection(generation, error, 'socket_not_open');
         }
         reject(error);
+        return;
+      }
+      if (this._health === 'suspect') {
+        reject(new RpcTransportError('Connection health is suspect', false));
         return;
       }
       if (options.signal?.aborted) {
@@ -487,6 +524,8 @@ export class RpcClient {
         timeoutTimer: null,
         signal: options.signal || null,
         abortHandler: null,
+        sentAt: null,
+        incidentIdAtSend: null,
       };
       this._pending.set(id, pending);
 
@@ -542,6 +581,8 @@ export class RpcClient {
       try {
         socket.send(frame);
         requestSent = true;
+        pending.sentAt = Date.now();
+        pending.incidentIdAtSend = this._wakeIncident?.id ?? null;
       } catch (error) {
         const sendError = new RpcTransportError(
           error instanceof Error ? error.message : 'Failed to send RPC request',
@@ -746,6 +787,10 @@ export class RpcClient {
     this._lastFrameAt = Date.now();
     this._stopTickWatch();
     const generation = ++this._socketGeneration;
+    this._firstSuccessfulRpc = false;
+    if (this._wakeIncident && this._wakeIncident.generation !== generation) {
+      this._clearWakeIncident();
+    }
     this._emitTransport('connect_start', generation, {
       reason: 'connect_requested',
     });
@@ -826,6 +871,7 @@ export class RpcClient {
           // onmessage is generation/socket fenced above, and _clearWakeProbe
           // refuses to clear a deadline owned by any replacement generation.
           this._clearWakeProbe(generation);
+          this._completeWakeIncident(generation, 'hello');
           this._clearHandshakeWatchdogs(generation);
           const recoveryMs = this._recoveryStartedAt === null
             ? undefined : Math.max(0, Date.now() - this._recoveryStartedAt);
@@ -859,6 +905,10 @@ export class RpcClient {
           // Identity, method capabilities and flow policy must be installed by
           // synchronous owners before consumers observe connection readiness.
           this._emit('_hello', hello);
+          if (!this._isCurrentSocket(socket, generation)) return;
+          // Clear a previous suspect state before publishing connected. A
+          // synchronous state listener may issue its first request immediately.
+          this._setHealth('healthy');
           if (!this._isCurrentSocket(socket, generation)) return;
           this._setState('connected');
           if (!this._isCurrentSocket(socket, generation)) return;
@@ -903,6 +953,8 @@ export class RpcClient {
             timeoutTimer: null,
             signal: null,
             abortHandler: null,
+            sentAt: null,
+            incidentIdAtSend: null,
           });
           try {
             socket.send(
@@ -925,6 +977,11 @@ export class RpcClient {
               })
             );
             handshakeRequestSent = true;
+            const handshakePending = this._pending.get(id);
+            if (handshakePending) {
+              handshakePending.sentAt = Date.now();
+              handshakePending.incidentIdAtSend = this._wakeIncident?.id ?? null;
+            }
             this._armHelloWatchdog(socket, generation);
           } catch (error) {
             const sendError =
@@ -959,8 +1016,22 @@ export class RpcClient {
 
       if (data.type === 'res') {
         const id = data.id ?? '';
-        if (this._pending.get(id)?.generation === generation) this._noteRoundTrip();
+        const pending = this._pending.get(id);
+        if (
+          pending?.generation === generation
+          && (this._wakeIncident === null
+            || pending.incidentIdAtSend === this._wakeIncident.id)
+        ) {
+          this._noteRoundTrip(generation);
+        }
+        if (!this._isCurrentSocket(socket, generation)) return;
         if (data.ok) {
+          if (pending?.generation === generation && this._pending.get(id) === pending && !this._firstSuccessfulRpc) {
+            this._firstSuccessfulRpc = true;
+            this._emitTransport('first_successful_rpc', generation, {
+              roundTripMs: pending.sentAt === null ? null : Math.max(0, Date.now() - pending.sentAt),
+            });
+          }
           if (!this._resolvePending(id, data.payload, generation)) {
             // A request-local timeout/abort can leave a late response carrying
             // connection-owned resources. Adapters alone recognize its schema
@@ -992,6 +1063,7 @@ export class RpcClient {
       this._clearHandshakeWatchdogs(generation);
       ++this._socketGeneration;
       this._clearWakeProbe(generation);
+      this._clearWakeIncident(generation);
       this._stopPing();
       this._stopTickWatch();
       this._clearStableTimer();
@@ -1114,14 +1186,95 @@ export class RpcClient {
     detail: Record<string, unknown> = {}
   ): void {
     this._emit('_transport', {
+      at: Date.now(),
       phase,
       generation,
+      topology: this._transportTopology(),
+      visibility: typeof document === 'undefined' ? 'unknown' : document.visibilityState,
+      health: this._health,
+      suspectAt: this._suspectAt,
       reconnectAttempt: this._reconnectAttempt,
       lastRxAt: this._lastFrameAt,
       loopLagMs: this._lastLoopLagMs,
       maxLoopLagMs: this._maxLoopLagMs,
+      wakeIncidentId: this._wakeIncident?.id ?? null,
+      wakeIncidentStartedAt: this._wakeIncident?.startedAt ?? null,
+      wakeIncidentDeadlineAt: this._wakeIncident?.deadlineAt ?? null,
+      wakeIncidentStatus: this._wakeIncident?.status ?? null,
+      wakeSignalCount: this._wakeIncident?.signals ?? 0,
       ...detail,
     });
+  }
+
+  private _transportTopology(): 'loopback' | 'remote' | 'proxy/vpn' | 'unknown' {
+    if (this._intent.topology) return this._intent.topology;
+    try {
+      const hostname = new URL(this._url).hostname;
+      return hostname === 'localhost' || hostname === '[::1]' || /^127\./.test(hostname)
+        ? 'loopback' : 'remote';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  private _beginWakeIncident(generation: number, startedAt: number): void {
+    this._clearWakeIncident();
+    const incident: WakeIncident = {
+      id: ++this._wakeIncidentCounter,
+      generation,
+      startedAt,
+      deadlineAt: startedAt + WAKE_INCIDENT_BUDGET_MS,
+      status: 'probing',
+      signals: 1,
+    };
+    this._wakeIncident = incident;
+    this._wakeIncidentTimer = setTimeout(() => {
+      if (
+        this._wakeIncident?.id !== incident.id
+        || this._wakeIncident.generation !== generation
+        || this._socketGeneration !== generation
+      ) return;
+      this._wakeIncidentTimer = null;
+      this._suspectAt ??= Date.now();
+      incident.status = 'reconnecting';
+      this._setHealth('suspect');
+      this._emitTransport('wake_incident_timeout', generation, {
+        incidentId: incident.id,
+        reason: 'wake_incident_timeout',
+      });
+      this._clearWakeIncident(generation, incident.id);
+      this._recycleConnection(
+        generation,
+        new Error('Wake incident budget expired'),
+        'wake_incident_timeout',
+      );
+    }, WAKE_INCIDENT_BUDGET_MS);
+    this._emitTransport('wake_incident_start', generation, {
+      incidentId: incident.id,
+      deadlineAt: incident.deadlineAt,
+    });
+  }
+
+  private _completeWakeIncident(generation: number, reason: string): void {
+    const incident = this._wakeIncident;
+    if (!incident || incident.generation !== generation) return;
+    incident.status = 'recovered';
+    this._emitTransport('wake_incident_recovered', generation, {
+      incidentId: incident.id,
+      reason,
+      recoveryMs: Math.max(0, Date.now() - incident.startedAt),
+    });
+    this._clearWakeIncident(generation, incident.id);
+  }
+
+  private _clearWakeIncident(generation?: number, incidentId?: number): void {
+    const incident = this._wakeIncident;
+    if (!incident) return;
+    if (generation !== undefined && incident.generation !== generation) return;
+    if (incidentId !== undefined && incident.id !== incidentId) return;
+    if (this._wakeIncidentTimer !== null) clearTimeout(this._wakeIncidentTimer);
+    this._wakeIncidentTimer = null;
+    this._wakeIncident = null;
   }
 
   private _blockConnection(reason: string): void {
@@ -1150,8 +1303,11 @@ export class RpcClient {
     this._emitStatus();
   }
 
-  private _noteRoundTrip(): void {
+  private _noteRoundTrip(generation: number = this._socketGeneration): void {
+    if (generation !== this._socketGeneration) return;
     this._clearWakeProbe();
+    this._completeWakeIncident(generation, 'round_trip');
+    if (generation !== this._socketGeneration) return;
     this._suspectAt = null;
     this._suspectProbes = 0;
     this._setHealth('healthy');
@@ -1212,6 +1368,7 @@ export class RpcClient {
     this._clearGapRecovery();
     this._clearStableTimer();
     this._clearWakeProbe(generation);
+    this._clearWakeIncident(generation);
     this._clearHandshakeWatchdogs(generation);
     this._emitTransport('retire', generation, { reason });
     // Diagnostic listeners are isolated, but they may still deliberately
@@ -1273,8 +1430,17 @@ export class RpcClient {
 
   private _sendProbe(): void {
     const socket = this._ws;
-    if (!socket || socket.readyState !== WebSocket.OPEN || this._state !== 'connected'
+    if (!socket || this._state !== 'connected'
       || this._wakeProbeGeneration !== null || Date.now() < this._graceUntil) return;
+    if (socket.readyState !== WebSocket.OPEN) {
+      const generation = this._socketGeneration;
+      this._emitTransport('probe_socket_unavailable', generation, {
+        readyState: socket.readyState,
+        reason: 'socket_not_open',
+      });
+      this._recycleConnection(generation, new Error('Probe socket is not open'), 'probe_socket_unavailable');
+      return;
+    }
     if (this._suspectAt !== null && this._suspectProbes >= 2) return;
     const generation = this._socketGeneration;
     this._probeNonce = this._policy?.transport_probe_nonce === true
@@ -1330,6 +1496,7 @@ export class RpcClient {
       this._wakeDebounceTimer = null;
     }
     this._clearWakeProbe();
+    this._clearWakeIncident();
   }
 
   private _scheduleWakeProbe(): void {
@@ -1360,11 +1527,15 @@ export class RpcClient {
       if (!this._isCurrentSocket(socket, generation)) return;
       this._clearWakeProbe(generation);
       if (Date.now() - dueAt > SCHEDULER_LAG_MS || Date.now() < this._graceUntil) {
+        this._emitTransport('probe_deferred', generation, {
+          reason: Date.now() - dueAt > SCHEDULER_LAG_MS ? 'scheduler_lag' : 'wake_grace',
+        });
         this.notifyResume();
         return;
       }
       if (this._suspectAt === null) {
         this._suspectAt = Date.now();
+        if (this._wakeIncident?.generation === generation) this._wakeIncident.status = 'suspect';
         this._suspectProbes = 0;
         this._setHealth('suspect');
         this._emitTransport('probe_timeout', generation, { reason: 'control_unconfirmed' });

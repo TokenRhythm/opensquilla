@@ -86,6 +86,7 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
   app.provide(GATEWAY_ACCESS_KEY, {
     get availability() { return gatewayAvailability.value },
     isRuntimeStarting: false,
+    connectionHealth: 'healthy',
     connectionError: null,
     requiresCredential: false,
     get isAvailable() { return gatewayAvailability.value === 'available' },

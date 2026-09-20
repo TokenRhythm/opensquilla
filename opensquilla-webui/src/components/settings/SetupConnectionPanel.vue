@@ -31,7 +31,9 @@ onMounted(() => {
 
 const statusState = computed(() => {
   if (gatewayAccess.availability === 'preparing') return 'connecting'
-  if (gatewayAccess.availability === 'available') return 'connected'
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+  }
   return 'disconnected'
 })
 
