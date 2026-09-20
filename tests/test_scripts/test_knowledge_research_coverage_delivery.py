@@ -129,6 +129,33 @@ def test_finalize_automatically_renders_coverage_and_records_machine_details(
     assert store.snapshot(rid)["ledger"] == before["ledger"]
 
 
+def test_coverage_overview_and_legacy_extension_are_published(tmp_path: Path) -> None:
+    reading = _reading()
+    reading["summary"] = {
+        "bibliographyEntries": 1,
+        "availableReferences": 1,
+        "unavailableReferences": 0,
+        "returnedSourceChars": 893,
+        "indexedSourceChars": 10_000,
+        "overallPercentage": 8.93,
+        "medianPercentage": 8.93,
+        "below5pctReferences": 0,
+        "below10pctReferences": 1,
+        "fullTextCoverageReferences": 0,
+    }
+    store = KnowledgeResearchStore(
+        workspace=tmp_path,
+        pdf_renderer=lambda *_: b"%PDF-fixture",
+        reading_coverage_resolver=lambda _: copy.deepcopy(reading),
+    )
+    outputs = _outputs(store, store.finalize(research_id=_seed(store)))
+    html = outputs["report.html"].read_text()
+    provenance = json.loads(outputs["provenance.json"].read_text())
+    assert "\u8d44\u6599\u9605\u8bfb\u8986\u76d6\u6982\u89c8" in html
+    assert "\u603b\u4f53\u8986\u76d6\u7387 8.93%" in html
+    assert provenance["extensions"]["bibliographyReadingCoverage"] == reading
+
+
 @pytest.mark.parametrize(
     "value,status",
     [

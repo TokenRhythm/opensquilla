@@ -112,6 +112,22 @@ def test_overlap_partial_and_repeated_projection_are_deduplicated(tmp_path: Path
     assert path.read_bytes() == before
 
 
+def test_summary_reports_overall_median_and_low_coverage_counts(tmp_path: Path) -> None:
+    result = SQLiteReadingCoverage(_db(tmp_path / "knowledge.db"))(_state())
+    assert result["summary"] == {
+        "bibliographyEntries": 1,
+        "availableReferences": 1,
+        "unavailableReferences": 0,
+        "returnedSourceChars": 80,
+        "indexedSourceChars": 200,
+        "overallPercentage": 40.0,
+        "medianPercentage": 40.0,
+        "below5pctReferences": 0,
+        "below10pctReferences": 0,
+        "fullTextCoverageReferences": 0,
+    }
+
+
 def test_review_can_supply_missing_source_range_without_inflating_repeats(tmp_path: Path) -> None:
     path = _db(tmp_path / "knowledge.db")
     state = _state()

@@ -36,6 +36,12 @@ _CJK = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af\uf900-\ufaff\U00020
 _LABELS = {
     "en": {
         "references": "References",
+        "reading_summary": "Reading coverage overview",
+        "reading_summary_unavailable": "Reading coverage could not be calculated for this report.",
+        "reading_summary_meaning": (
+            "This measures source text projected through Knowledge tools; it is not a "
+            "measure of model comprehension."
+        ),
         "coverage": "Coverage: ",
         "coverage_unavailable": "unavailable",
         "notes": "Source Notes",
@@ -53,6 +59,16 @@ _LABELS = {
     },
     "zh-CN": {
         "references": "\u53c2\u8003\u6587\u732e",
+        "reading_summary": "\u8d44\u6599\u9605\u8bfb\u8986\u76d6\u6982\u89c8",
+        "reading_summary_unavailable": (
+            "\u672c\u62a5\u544a\u6682\u65e0\u53ef\u7528\u7684\u9605\u8bfb\u8986\u76d6\u5ea6\u7edf\u8ba1\u3002"
+        ),
+        "reading_summary_meaning": (
+            "\u8be5\u6307\u6807\u53ea\u8868\u793a Knowledge \u5de5\u5177"
+            "\u5b9e\u9645\u6295\u5f71\u7684"
+            "\u6e90\u6587\u672c\u8303\u56f4\uff0c"
+            "\u4e0d\u7b49\u4e8e\u6a21\u578b\u5df2\u7406\u89e3\u7684\u7a0b\u5ea6\u3002"
+        ),
         "coverage": "\u8986\u76d6\u7387\uff1a",
         "coverage_unavailable": "\u672a\u7edf\u8ba1",
         "notes": "\u8d44\u6599\u8bf4\u660e",
@@ -300,6 +316,55 @@ def render_html_report(state: Mapping[str, Any]) -> str:
             label = f"{value:.2f}%"
         return '<span class="reading-coverage">' + labels["coverage"] + label + "</span>"
 
+    def reading_summary() -> str:
+        reading = state.get("readingCoverage")
+        if not isinstance(reading, Mapping):
+            return ""
+        summary = reading.get("summary")
+        if not isinstance(summary, Mapping):
+            return ""
+        total = summary.get("bibliographyEntries")
+        available = summary.get("availableReferences")
+        overall = summary.get("overallPercentage")
+        median_value = summary.get("medianPercentage")
+        low10 = summary.get("below10pctReferences")
+        if not isinstance(total, int) or not isinstance(available, int):
+            return (
+                '<p class="reading-summary-unavailable">'
+                f'{labels["reading_summary_unavailable"]}</p>'
+            )
+        overall_label = (
+            f"{float(overall):.2f}%"
+            if isinstance(overall, int | float) and not isinstance(overall, bool)
+            else labels["coverage_unavailable"]
+        )
+        median_label = (
+            f"{float(median_value):.2f}%"
+            if isinstance(median_value, int | float) and not isinstance(median_value, bool)
+            else labels["coverage_unavailable"]
+        )
+        if language == "zh-CN":
+            body = (
+                f"已统计 {available}/{total} 条参考文献；总体覆盖率 {overall_label}，"
+                f"中位数 {median_label}；低于 10% 的来源 "
+                f"{low10 if isinstance(low10, int) else '未统计'} 条。"
+            )
+        else:
+            body = (
+                f"{available}/{total} references measured; overall {overall_label}, "
+                f"median {median_label}; "
+                f"{low10 if isinstance(low10, int) else 'unknown'} sources below 10%."
+            )
+        return (
+            '<div class="reading-summary"><strong>'
+            + labels["reading_summary"]
+            + "</strong><p>"
+            + body
+            + "</p><p class=\"reading-summary-note\">"
+            + labels["reading_summary_meaning"]
+            + "</p></div>"
+        )
+
     def evidence_citations(evidence_ids: list[str]) -> str:
         citation_labels: list[str] = []
         seen: set[str] = set()
@@ -441,6 +506,10 @@ pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f7f9; padd
 .filename {{ color: #66717c; }}
 .reading-coverage {{ display: inline-block; margin-left: 10px;
   white-space: nowrap; color: #66717c; }}
+.reading-summary {{ margin: 0 0 18px; padding: 12px 14px; border-left: 3px solid #315779;
+  background: #f5f7f9; color: #344454; font-size: 14px; line-height: 1.65; }}
+.reading-summary p {{ margin: 4px 0 0; }}
+.reading-summary-note {{ color: #66717c; font-size: 12px; }}
 .table-quality-note, .table-warning {{ font-size: 13px; color: #7a341b; }}
 @media screen and (max-width: 600px) {{
   body {{ padding: 24px 18px 40px; }}
@@ -469,7 +538,8 @@ pre {{ white-space: pre-wrap; overflow-wrap: anywhere; background: #f5f7f9; padd
 <body>
 <header><h1>{title}</h1>{subtitle_html}</header>
 <main>{section_html}</main>
-<section class="references"><h2>{labels["references"]}</h2><ol>{reference_html}</ol></section>
+<section class="references"><h2>{labels["references"]}</h2>
+{reading_summary()}<ol>{reference_html}</ol></section>
 {quality_note}
 </body>
 </html>

@@ -7,6 +7,7 @@ import time
 from collections import defaultdict
 from collections.abc import Mapping
 from pathlib import Path
+from statistics import median
 from typing import Any
 
 if __package__:
@@ -163,6 +164,18 @@ class SQLiteReadingCoverage:
                     "members": members,
                 }
             )
+        available = [
+            row
+            for row in references
+            if row["status"] == "available"
+            and isinstance(row.get("percentage"), int | float)
+            and not isinstance(row.get("percentage"), bool)
+        ]
+        percentages = [float(row["percentage"]) for row in available]
+        returned = [row["returnedSourceChars"] for row in available]
+        indexed = [row["indexedSourceChars"] for row in available]
+        total_returned = sum(returned)
+        total_indexed = sum(indexed)
         return {
             "schemaVersion": SCHEMA,
             "method": "union_projected_source_chars_over_union_indexed_child_chars",
@@ -170,6 +183,20 @@ class SQLiteReadingCoverage:
                 "Tool-projected text, not proof of model comprehension; table OCR excluded. "
                 "Format variants retain separate coordinate spaces."
             ),
+            "summary": {
+                "bibliographyEntries": len(references),
+                "availableReferences": len(available),
+                "unavailableReferences": len(references) - len(available),
+                "returnedSourceChars": total_returned,
+                "indexedSourceChars": total_indexed,
+                "overallPercentage": round(100 * total_returned / total_indexed, 2)
+                if total_indexed
+                else None,
+                "medianPercentage": round(float(median(percentages)), 2) if percentages else None,
+                "below5pctReferences": sum(value < 5 for value in percentages),
+                "below10pctReferences": sum(value < 10 for value in percentages),
+                "fullTextCoverageReferences": sum(value >= 100 for value in percentages),
+            },
             "references": references,
         }
 

@@ -54,12 +54,19 @@ or successful tool calls do not establish research depth.
    relevant usable tables; do not drop useful evidence to avoid this step.
 
 Keep a compact working map of questions, evidence, competing views, and open gaps.
+For a normal multi-source deep report, cover at least three distinct discovery
+angles, two scoped passes over candidate files, and complete relevant passages
+from at least three independent source files. The server adapts these floors
+downward for a genuinely narrow corpus. A single broad search followed by a
+large bibliography is not deep research. If the first write returns
+`DISCOVERY_BREADTH_REQUIRED`, `SCOPED_READING_BREADTH_REQUIRED`, or
+`SOURCE_READING_BREADTH_REQUIRED`, follow every returned check before retrying;
+these checks are based on observed tool projections, not a model assertion.
 Return to discovery and scoped reading when new facts change that map. Continue
 while an unread important candidate or targeted query could materially change the
 conclusion, mechanism, disagreement, or scenario. Stop at substantive evidence
-saturation, without fixed search, file, citation, word, or table quotas. If focused
-rechecks no longer resolve a material gap, preserve that limit and narrow the
-judgment; do not search indefinitely or manufacture precision.
+saturation. If focused rechecks no longer resolve a material gap, preserve that
+limit and narrow the judgment; do not search indefinitely or manufacture precision.
 
 ## Financial reasoning, when relevant
 
@@ -150,8 +157,11 @@ Publish exactly the finalized manifest's three artifacts, with `bundle="none"`:
 - `provenance.json`: machine evidence, internal IDs, bindings, and hashes.
 
 The sidecar generates the only bibliography from sources actually used, including
-deduplication and honest coverage percentages. Do not author or pad it. Check that
-titles are readable; coverage is not comprehension or a target to inflate.
+deduplication and honest coverage percentages. The report displays both per-source
+coverage and a coverage overview with the measured-source count, overall coverage,
+median coverage, and low-coverage count. These are indexed-text projection
+measurements, not proof of comprehension and not a target to inflate. Do not author
+or pad the bibliography. Check that titles are readable.
 Chat, HTML, and PDF contain no internal IDs/refs, private paths, tool narration, or
 raw provenance. Final chat gives the answer, material limits, and successful links.
 For unused optional parameters use `null` or omit them. First-page cursors and new-item

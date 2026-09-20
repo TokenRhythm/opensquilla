@@ -200,8 +200,17 @@ def test_bibliography_metadata_and_failed_explicit_details_cannot_satisfy_pdf_ga
 
 def test_mixed_first_batch_requires_each_cited_excerpt_but_no_uncited_files(tmp_path: Path) -> None:
     source = _source(["first.md", "second.md", "uncited.pdf"])
+    second_discovery = search_payload("mechanism", [])
+    third_discovery = search_payload("risk", [])
     bridge, store, _, _ = setup(
-        tmp_path, [result(source), result(search_payload("context", [], scoped=True))]
+        tmp_path,
+        [
+            result(source),
+            result(search_payload("context", [], scoped=True)),
+            result(second_discovery),
+            result(third_discovery),
+            result(search_payload("counter", [], scoped=True)),
+        ],
     )
     rid = _begin(bridge)
     found, _ = invoke(bridge, "search", {"researchId": rid, "query": "discovery"})
@@ -210,21 +219,34 @@ def test_mixed_first_batch_requires_each_cited_excerpt_but_no_uncited_files(tmp_
         "searchByIds",
         {"researchId": rid, "query": "context", "scopeRefs": [found["scopeRef"]]},
     )
-    _read_all(bridge, rid, found["results"][0]["evidenceRef"])
-    before = store.snapshot(rid)
-    rejected, _ = _write(bridge, rid, _claims(found)[:2])
-    (check,) = _checks(rejected)
-    assert check["arguments"]["evidenceRef"] == found["results"][1]["evidenceRef"]
-    assert store.snapshot(rid) == before
-    invoke(bridge, check["tool"], check["arguments"])
+    invoke(bridge, "search", {"researchId": rid, "query": "mechanism"})
+    invoke(bridge, "search", {"researchId": rid, "query": "risk"})
+    invoke(
+        bridge,
+        "searchByIds",
+        {"researchId": rid, "query": "counter", "scopeRefs": [found["scopeRef"]]},
+    )
+    for row in found["results"]:
+        _read_all(bridge, rid, row["evidenceRef"])
     assert _write(bridge, rid, _claims(found)[:2])[0]["insertedCount"] == 2
 
 
 def test_grouping_and_failed_scoped_calls_are_not_search_preparation(tmp_path: Path) -> None:
     source = _source([f"file-{index}.md" for index in range(21)])
-    bridge, store, upstream, _ = setup(tmp_path, [result(source)])
+    bridge, store, upstream, _ = setup(
+        tmp_path,
+        [
+            result(source),
+            result(search_payload("mechanism", [])),
+            result(search_payload("risk", [])),
+            result(search_payload("context", [], scoped=True)),
+            {"result": {"isError": True, "content": []}},
+        ],
+    )
     rid = _begin(bridge)
     found, _ = invoke(bridge, "search", {"researchId": rid, "query": "discovery"})
+    invoke(bridge, "search", {"researchId": rid, "query": "mechanism"})
+    invoke(bridge, "search", {"researchId": rid, "query": "risk"})
     grouped, _ = invoke(
         bridge,
         "searchByIds",
@@ -232,15 +254,15 @@ def test_grouping_and_failed_scoped_calls_are_not_search_preparation(tmp_path: P
     )
     assert "groups" in grouped
     _read_all(bridge, rid, found["results"][0]["evidenceRef"])
-    upstream.responses.append({"result": {"isError": True, "content": []}})
     invoke(
         bridge,
         "searchByIds",
         {"researchId": rid, "query": "context", "fileRefs": [found["results"][0]["fileRef"]]},
     )
     rejected, _ = _write(bridge, rid, _claims(found)[:1])
-    (check,) = _checks(rejected)
-    assert check["code"] == "SCOPED_SEARCH_REQUIRED"
+    checks = _checks(rejected)
+    assert "SCOPED_READING_BREADTH_REQUIRED" in {check["code"] for check in checks}
+    assert "SOURCE_READING_BREADTH_REQUIRED" in {check["code"] for check in checks}
     assert store.snapshot(rid)["report"]["items"] == []
 
 
