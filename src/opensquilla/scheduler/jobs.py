@@ -10,7 +10,15 @@ from zoneinfo import ZoneInfo
 
 from .parser import parse_cron
 from .persistence import JobStore
-from .types import CronJob, HandlerResult, JobExecution, JobStatus, ScheduleKind, clear_reservation
+from .types import (
+    CronJob,
+    HandlerResult,
+    JobExecution,
+    JobStatus,
+    ScheduleKind,
+    clear_reservation,
+    is_rescheduled_one_shot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -298,6 +306,21 @@ def _apply_result_state(
 
     Returns True when the job should be deleted.
     """
+    if is_rescheduled_one_shot(job):
+        # Account for the old execution without consuming the replacement or
+        # applying the old occurrence's retry budget to it. Compare instants,
+        # even when the replacement is already due by the time we finish.
+        job.run_count += 1
+        if not execution.success:
+            job.error_count += 1
+        job.last_error = None if execution.success else execution.error
+        job.updated_at = now
+        job.status = JobStatus.PENDING
+        job.consecutive_errors = 0
+        job.backoff_until = None
+        clear_reservation(job)
+        return False
+
     if execution.success:
         job.consecutive_errors = 0
         job.backoff_until = None

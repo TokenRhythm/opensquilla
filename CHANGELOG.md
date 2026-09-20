@@ -99,6 +99,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Rescheduling a one-shot job while it runs now preserves the new occurrence
+  when the old execution finishes. The replacement starts with a fresh retry
+  budget, while the old result remains recorded in execution history.
 - Source clients now report TUI launches and active use through the default
   local Gateway, and short commands attempt a bounded final V2 upload before
   exiting. Standalone CLI/TUI V1 installation reporting is enabled and daily

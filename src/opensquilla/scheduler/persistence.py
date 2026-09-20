@@ -28,6 +28,7 @@ from .types import (
     ReservationRejectionReason,
     ScheduleKind,
     SessionTarget,
+    is_rescheduled_one_shot,
 )
 
 __all__ = ["DeliveryReport", "JobStore"]
@@ -864,11 +865,15 @@ class JobStore:
                 return False
             expected_updated_at = current.updated_at
             if current.status not in (JobStatus.PAUSED, JobStatus.DISABLED):
-                current.status = JobStatus.FAILED
+                if is_rescheduled_one_shot(current):
+                    current.status = JobStatus.PENDING
+                    current.consecutive_errors = 0
+                else:
+                    current.status = JobStatus.FAILED
+                    current.consecutive_errors += 1
+                    current.next_run_at = None
                 current.error_count += 1
-                current.consecutive_errors += 1
                 current.last_error = error
-                current.next_run_at = None
                 current.backoff_until = None
                 current.updated_at = datetime.now(UTC)
             if await self.finalize_reserved_job(current, reservation_token, expected_updated_at):
