@@ -41,6 +41,7 @@ def test_ordinary_default_progress_starts_discoverable_not_surfaced(
     ctx = ToolContext(
         is_owner=True,
         caller_kind=caller_kind,
+        channel_admin_verified=caller_kind is CallerKind.CHANNEL,
         goal_service=object() if has_goal_service else None,
     )
 
