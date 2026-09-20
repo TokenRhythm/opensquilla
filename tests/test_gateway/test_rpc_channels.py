@@ -417,8 +417,9 @@ async def test_channels_get_redacts_configured_secrets() -> None:
 async def test_channels_probe_merges_secrets_and_runs_real_slack_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from contextlib import AsyncExitStack
+
     from aiohttp import ClientSession, web
-    from aiohttp.test_utils import TestServer
     from slack_sdk.web.async_client import AsyncWebClient
 
     from opensquilla.channels import registry as channel_registry
@@ -450,9 +451,15 @@ async def test_channels_probe_merges_secrets_and_runs_real_slack_probe(
     real_build = channel_registry.build_managed_channel
     built_adapters: list[object] = []
 
-    async with TestServer(app) as server, ClientSession() as session:
+    async with AsyncExitStack() as resources:
+        runner = web.AppRunner(app)
+        await runner.setup()
+        resources.push_async_callback(runner.cleanup)
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        api_base = f"http://127.0.0.1:{runner.addresses[0][1]}/api/"
+        session = await resources.enter_async_context(ClientSession())
         monkeypatch.setattr(
-            "opensquilla.channels.slack.SLACK_API_BASE", str(server.make_url("/api/")),
+            "opensquilla.channels.slack.SLACK_API_BASE", api_base,
         )
         monkeypatch.setattr("opensquilla.channels.slack._trust_env", lambda: False)
 
