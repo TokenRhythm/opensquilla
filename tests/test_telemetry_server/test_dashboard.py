@@ -12,7 +12,7 @@ from starlette.requests import Request
 from starlette.testclient import TestClient
 
 from opensquilla.telemetry.contracts import TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
-from opensquilla.telemetry.server.auth import hash_dashboard_password
+from opensquilla.telemetry.server.auth import DashboardAuth, hash_dashboard_password
 from opensquilla.telemetry.server.dashboard import (
     LOGIN_CSRF_COOKIE_NAME,
     SESSION_COOKIE_NAME,
@@ -25,6 +25,12 @@ _CLOCK = datetime(2026, 9, 30, 12, 0, tzinfo=UTC)
 _RAW_EVENT_ID = "00000000-0000-4000-8000-000000000001"
 _RAW_SESSION_ID = "00000000-0000-4000-8000-000000000002"
 _SOURCE_COMMIT_ID = "c" * 40
+_EMBEDDED_FORM_HEADERS = {
+    "origin": "null",
+    "sec-fetch-site": "same-origin",
+    "sec-fetch-mode": "navigate",
+    "sec-fetch-dest": "document",
+}
 
 
 @pytest.fixture(scope="module")
@@ -331,12 +337,7 @@ def test_embedded_same_site_navigation_accepts_signed_login_token(
                 "csrf_token": _csrf(page.text),
                 "password": "preview password",
             },
-            headers={
-                "origin": "null",
-                "sec-fetch-site": "same-origin",
-                "sec-fetch-mode": "navigate",
-                "sec-fetch-dest": "document",
-            },
+            headers=_EMBEDDED_FORM_HEADERS,
             follow_redirects=False,
         )
 
@@ -666,9 +667,20 @@ def test_product_activity_cards_chart_and_api_use_product_wide_distinct_users(
     assert 'id="terminal-user-counts"' in page.text
 
 
+@pytest.mark.parametrize(
+    "headers",
+    [
+        {},
+        {"origin": "https://preview.test"},
+        {"origin": "https://preview.test:443"},
+        _EMBEDDED_FORM_HEADERS,
+    ],
+    ids=["absent-origin", "same-origin", "default-https-port", "embedded-null-origin"],
+)
 def test_logout_requires_session_bound_csrf_and_same_origin(
     tmp_path: Path,
     dashboard_credential: str,
+    headers: dict[str, str],
 ) -> None:
     with TestClient(
         _app(tmp_path, dashboard_credential),
@@ -689,12 +701,14 @@ def test_logout_requires_session_bound_csrf_and_same_origin(
         invalid = client.post(
             f"{_BASE}/logout",
             data={"csrf_token": token + "x"},
+            headers=headers,
         )
         assert invalid.status_code == 403
 
         logged_out = client.post(
             f"{_BASE}/logout",
             data={"csrf_token": token},
+            headers=headers,
             follow_redirects=False,
         )
         deletion = _cookie_header(logged_out, SESSION_COOKIE_NAME)
@@ -706,6 +720,149 @@ def test_logout_requires_session_bound_csrf_and_same_origin(
     assert "HttpOnly" in deletion
     assert "SameSite=strict" in deletion
     assert f"Path={_BASE}" in deletion
+
+
+@pytest.mark.parametrize("action", ["login", "logout"])
+@pytest.mark.parametrize(
+    ("header", "value"),
+    [
+        ("sec-fetch-site", None),
+        ("sec-fetch-mode", None),
+        ("sec-fetch-dest", None),
+        ("sec-fetch-site", "cross-site"),
+        ("sec-fetch-site", "same-site"),
+        ("sec-fetch-mode", "cors"),
+        ("sec-fetch-dest", "iframe"),
+        ("origin", "https://attacker.invalid"),
+        ("origin", "https://preview.test.attacker.invalid"),
+        ("origin", "https://preview.test:444"),
+        ("origin", "https://preview.test/unexpected-path"),
+        ("origin", "not-an-origin"),
+        ("origin", "NULL"),
+    ],
+)
+def test_embedded_forms_reject_invalid_origin_or_navigation_metadata(
+    tmp_path: Path,
+    dashboard_credential: str,
+    action: str,
+    header: str,
+    value: str | None,
+) -> None:
+    headers = dict(_EMBEDDED_FORM_HEADERS)
+    if value is None:
+        headers.pop(header)
+    else:
+        headers[header] = value
+    with TestClient(
+        _app(tmp_path, dashboard_credential),
+        base_url="https://preview.test",
+    ) as client:
+        if action == "logout":
+            _login(client)
+            page = client.get(_BASE)
+        else:
+            page = client.get(f"{_BASE}/login")
+        data = {"csrf_token": _csrf(page.text)}
+        if action == "login":
+            data["password"] = "preview password"
+
+        rejected = client.post(
+            f"{_BASE}/{action}", data=data, headers=headers, follow_redirects=False
+        )
+
+        assert rejected.status_code == 403
+        assert not rejected.headers.get_list("set-cookie")
+        assert client.get(f"{_BASE}/api/summary").status_code == (
+            200 if action == "logout" else 401
+        )
+
+
+@pytest.mark.parametrize("action", ["login", "logout"])
+@pytest.mark.parametrize("csrf", [None, "invalid"])
+def test_embedded_forms_still_require_csrf(
+    tmp_path: Path,
+    dashboard_credential: str,
+    action: str,
+    csrf: str | None,
+) -> None:
+    with TestClient(
+        _app(tmp_path, dashboard_credential),
+        base_url="https://preview.test",
+    ) as client:
+        if action == "logout":
+            _login(client)
+        else:
+            client.get(f"{_BASE}/login")
+        data = {"csrf_token": csrf} if csrf is not None else {}
+        if action == "login":
+            data["password"] = "preview password"
+        rejected = client.post(
+            f"{_BASE}/{action}",
+            data=data,
+            headers=_EMBEDDED_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        assert rejected.status_code == 403
+        assert client.get(f"{_BASE}/api/summary").status_code == (
+            200 if action == "logout" else 401
+        )
+
+
+@pytest.mark.parametrize("mismatch", ["session", "action"])
+def test_embedded_logout_csrf_remains_bound_to_session_and_action(
+    tmp_path: Path,
+    dashboard_credential: str,
+    mismatch: str,
+) -> None:
+    auth = DashboardAuth(
+        credential=dashboard_credential,
+        session_secret=b"h" * 32,
+        clock=lambda: _CLOCK.timestamp(),
+    )
+    with TestClient(
+        _app(tmp_path, dashboard_credential),
+        base_url="https://preview.test",
+    ) as client:
+        _login(client)
+        session = auth.verify_session(
+            auth.issue_session() if mismatch == "session" else client.cookies[SESSION_COOKIE_NAME]
+        )
+        assert session is not None
+        token = auth.session_csrf_token(
+            session, action="refresh" if mismatch == "action" else "logout"
+        )
+        rejected = client.post(
+            f"{_BASE}/logout",
+            data={"csrf_token": token},
+            headers=_EMBEDDED_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        assert rejected.status_code == 403
+        assert client.get(f"{_BASE}/api/summary").status_code == 200
+
+
+@pytest.mark.parametrize("session_cookie", [None, "invalid"])
+def test_embedded_logout_still_requires_a_valid_session(
+    tmp_path: Path,
+    dashboard_credential: str,
+    session_cookie: str | None,
+) -> None:
+    with TestClient(
+        _app(tmp_path, dashboard_credential),
+        base_url="https://preview.test",
+    ) as client:
+        _login(client)
+        token = _csrf(client.get(_BASE).text)
+        client.cookies.clear()
+        if session_cookie is not None:
+            client.cookies.set(SESSION_COOKIE_NAME, session_cookie, path=_BASE)
+        rejected = client.post(
+            f"{_BASE}/logout",
+            data={"csrf_token": token},
+            headers=_EMBEDDED_FORM_HEADERS,
+            follow_redirects=False,
+        )
+        assert rejected.status_code == 401
 
 
 def test_invalid_cohort_and_missing_databases_are_sanitized(
