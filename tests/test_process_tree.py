@@ -334,7 +334,7 @@ async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation
     anchor_process = SimpleNamespace(returncode=None)
     anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
     owner = process_tree.ProcessTreeOwner(
-        process=SimpleNamespace(returncode=7), pid=4242, pgid=4242, posix_anchor=anchor,
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
     )
     anchor.bind(owner)
 
@@ -348,6 +348,7 @@ async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation
             if command == process_tree._POSIX_ANCHOR_TERMINATE:
                 # The group became empty before the stop command arrived.
                 # Its authoritative EMPTY report replaces a signal ACK.
+                owner.process.returncode = 7
                 stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
 
         async def drain(self) -> None:
@@ -376,6 +377,56 @@ async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation
     finally:
         anchor._monitor_task.cancel()
         await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_posix_stop_after_leader_exit_waits_for_pending_empty_report() -> None:
+    commands: list[bytes] = []
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=7), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, command: bytes) -> None:
+            commands.append(command)
+            if command == process_tree._POSIX_ANCHOR_TERMINATE:
+                # Once the root has exited, a fresh descendant capture has no
+                # root from which to establish its identity and fails closed.
+                stream.feed_data(process_tree._POSIX_ANCHOR_INCOMPLETE)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    async def report_empty() -> None:
+        await asyncio.sleep(0)
+        stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    reporter = asyncio.create_task(report_empty())
+    try:
+        assert await owner.terminate(graceful_timeout=0.1, kill_timeout=0.1)
+        assert commands == [process_tree._POSIX_ANCHOR_RELEASE]
+        assert owner.is_active() is False
+    finally:
+        reporter.cancel()
+        anchor._monitor_task.cancel()
+        await asyncio.gather(reporter, anchor._monitor_task, return_exceptions=True)
 
 
 @pytest.mark.asyncio

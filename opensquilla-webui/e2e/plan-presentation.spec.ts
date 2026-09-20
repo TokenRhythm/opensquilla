@@ -122,8 +122,10 @@ for (const width of [1280, 390]) {
       await expect(restore).toBeVisible()
       // Stop remains outside the hidden proposal, including after reload.
       await expect(cancel).toBeVisible()
+      // Visibility precedes the composer's scale-in transition completing.
+      await expect.poll(async () => (await cancel.boundingBox())?.height ?? 0)
+        .toBeGreaterThanOrEqual(44)
       const bounds = await cancel.boundingBox()
-      expect(bounds?.height).toBeGreaterThanOrEqual(44)
       expect((bounds?.x ?? -1) + (bounds?.width ?? 0)).toBeLessThanOrEqual(width)
       await cancel.click()
       await expect.poll(() => mutations.filter(item => item.method === 'plans.cancelRun').length).toBe(1)
