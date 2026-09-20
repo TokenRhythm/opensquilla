@@ -343,8 +343,8 @@ def test_feishu_platform_manifest_derives_from_the_profile() -> None:
                     (),
                 ),
                 ChannelPlatformCategories.MEDIA: (
-                    ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                    (),
+                    ChannelPlatformCapabilityStatus.SUPPORTED,
+                    ("post_group_file", "post_c2c_file"),
                     (),
                 ),
             },
@@ -542,7 +542,7 @@ def test_qq_profile_matches_current_official_bot_adapter_surface() -> None:
     assert not profile.supports(ChannelCapabilities.EDIT)
     assert not profile.supports(ChannelCapabilities.DELETE)
     assert not profile.supports(ChannelCapabilities.NATIVE_FILE_UPLOAD)
-    assert not profile.supports(ChannelCapabilities.MEDIA)
+    assert profile.supports(ChannelCapabilities.MEDIA)
 
 
 def test_group_thread_metadata_builds_thread_session_key() -> None:
@@ -641,6 +641,7 @@ async def test_artifact_delivery_honors_profile_without_native_file_upload(tmp_p
         msg,
         [ref.to_dict()],
         config,
+        expected_session_id="session-1",
     )
 
     assert undelivered == [ref.to_dict()]
@@ -690,6 +691,7 @@ async def test_artifact_delivery_preserves_fallback_on_structured_failure(
         msg,
         [ref.to_dict()],
         config,
+        expected_session_id="session-1",
     )
 
     assert undelivered == [ref.to_dict()]

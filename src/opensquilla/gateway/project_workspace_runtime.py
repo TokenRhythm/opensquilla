@@ -82,6 +82,12 @@ def apply_run_context_route_metadata(
         else []
     )
     route_envelope.metadata["sandbox_run_context"] = run_context_payload
+    # This fact comes only from resolving the durable session binding. Never
+    # serialize it with the RunContext or accept it from channel metadata.
+    route_envelope.runtime_services["execution_workspace_binding_kind"] = (
+        run_context.workspace_binding_kind
+    )
+    route_envelope.runtime_services["execution_workspace_binding_root"] = run_context.workspace
     object.__setattr__(route_envelope, "sandbox_run_context_fresh", True)
     if run_context.run_mode.value == "full" and principal_is_owner:
         route_envelope.metadata["elevated"] = "full"

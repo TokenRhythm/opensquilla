@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
+import hashlib
 import json
-import random
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -14,8 +16,6 @@ from typing import Any, cast
 
 import httpx
 import structlog
-import websockets
-import websockets.asyncio.client
 from pydantic import BaseModel
 
 from opensquilla.channels._attachment_io import (
@@ -45,6 +45,7 @@ from opensquilla.channels.contract import (
 from opensquilla.channels.types import (
     Attachment,
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -107,24 +108,11 @@ class DiscordChannelConfig(BaseModel):
 
 
 @dataclass
-class _GatewayState:
-    session_id: str | None = None
-    sequence: int | None = None
-    resume_url: str | None = None
-    heartbeat_interval_ms: int = 41250
-    last_heartbeat_ack: bool = True
-
-
-class _GatewayHandshakeRetryError(RuntimeError):
-    """The provider requested a fresh handshake before readiness."""
-
-
-@dataclass
 class DiscordChannel:
     """Channel adapter for Discord via Gateway WebSocket and REST API.
 
-    Uses the ``websockets`` library for the gateway connection
-    and ``httpx.AsyncClient`` for REST calls.
+    Uses ``discord.py`` for Gateway authentication, heartbeats and reconnects,
+    retaining ``httpx.AsyncClient`` for the existing REST surface.
     """
 
     config: DiscordChannelConfig
@@ -146,12 +134,14 @@ class DiscordChannel:
     _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
     _connected: bool = field(default=False, init=False, repr=False)
     _last_message_at: datetime | None = field(default=None, init=False, repr=False)
-    _ws: Any = field(default=None, init=False, repr=False)
-    _state: _GatewayState = field(default_factory=_GatewayState, init=False, repr=False)
-    _heartbeat_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _gateway_client: Any = field(default=None, init=False, repr=False)
+    _gateway_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _dispatch_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
-    _reconnect_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
-    _reconnecting: bool = field(default=False, init=False, repr=False)
+    _gateway_ready: asyncio.Event = field(default_factory=asyncio.Event, init=False, repr=False)
+    _gateway_events: asyncio.Queue[tuple[str, dict[str, Any]]] = field(
+        default_factory=asyncio.Queue, init=False, repr=False
+    )
+    _gateway_error: str | None = field(default=None, init=False, repr=False)
     _dedupe: EventDedupeCache = field(
         default_factory=lambda: EventDedupeCache(max_size=10_000),
         init=False,
@@ -233,246 +223,170 @@ class DiscordChannel:
             raise ValueError("discord: bot token is required")
 
     # ------------------------------------------------------------------
-    # Gateway WebSocket helpers
+    # SDK Gateway bridge
     # ------------------------------------------------------------------
 
-    async def _connect_ws(self, url: str) -> Any:
-        ws = await websockets.asyncio.client.connect(url)
-        return ws
+    def _create_gateway_client(self) -> Any:
+        # Keep the SDK (and its optional voice support) out of gateway startup
+        # when this channel is disabled.
+        import discord
 
-    async def _ws_send(self, payload: dict[str, Any]) -> None:
-        if self._ws is not None:
-            await self._ws.send(json.dumps(payload))
+        channel = self
 
-    async def _ws_recv(self) -> dict[str, Any]:
-        ws = self._ws
-        if ws is None:
-            # A concurrent reconnect (e.g. the heartbeat task detected a
-            # missed ACK) tears the socket down before its replacement
-            # exists.  Surface the closed-connection signal callers already
-            # handle instead of dying on ``None.recv()`` with AttributeError.
-            raise websockets.exceptions.ConnectionClosedError(None, None)
-        raw = await ws.recv()
-        return cast(dict[str, Any], json.loads(raw))
+        class GatewayClient(discord.Client):
+            def dispatch(self, event: str, /, *args: Any, **kwargs: Any) -> None:
+                # The raw receive event runs synchronously before discord.py's
+                # cache parsers.  Queue only dispatches; the SDK owns all other
+                # opcodes.  One consumer preserves guild/thread cache ordering
+                # and avoids reordering messages around an interaction defer.
+                if event == "socket_raw_receive" and args:
+                    try:
+                        payload = json.loads(args[0])
+                    except (TypeError, ValueError):
+                        payload = None
+                    if isinstance(payload, dict) and payload.get("op") == 0:
+                        kind, data = payload.get("t"), payload.get("d")
+                        if isinstance(kind, str) and isinstance(data, dict):
+                            channel._gateway_events.put_nowait((kind, data))
+                elif event == "disconnect":
+                    channel._connected = False
+                    channel._gateway_events.put_nowait(("__DISCONNECTED", {}))
+                super().dispatch(event, *args, **kwargs)
 
-    async def _close_ws(self) -> None:
-        if self._ws is not None:
-            try:
-                await self._ws.close()
-            except Exception:
-                pass
-            self._ws = None
+        client = GatewayClient(
+            intents=discord.Intents(self.config.intents),
+            enable_debug_events=True,
+            max_messages=None,
+            member_cache_flags=discord.MemberCacheFlags.none(),
+            chunk_guilds_at_startup=False,
+        )
+        self._configure_sdk_proxy(client)
+        self._configure_sdk_endpoints(client)
+        return client
+
+    @staticmethod
+    def _configure_sdk_proxy(client: Any) -> None:
+        """Resolve opt-in proxies for each SDK REST, Gateway and resume URL."""
+        import aiohttp
+        from yarl import URL
+
+        def proxy_for_url(url: str) -> str | None:
+            if not _trust_env():
+                return None
+            from urllib.request import getproxies, proxy_bypass
+
+            target = URL(url)
+            if target.host is None or proxy_bypass(target.host):
+                return None
+            proxies = getproxies()
+            # Preserve HTTPS_PROXY for secure Gateway connections, as in the
+            # previous websockets transport; aiohttp's trust_env alone only
+            # checks WSS_PROXY for a wss:// URL.
+            protocol = {"wss": "https", "ws": "http"}.get(target.scheme, target.scheme)
+            proxy = proxies.get(target.scheme) or proxies.get(protocol) or proxies.get("all")
+            if proxy and URL(proxy).scheme not in {"http", "https"}:
+                raise ValueError("Discord SDK requires an HTTP(S) environment proxy")
+            return proxy
+
+        request = client.http.request
+        connect = client.http.ws_connect
+
+        async def proxy_request(route: Any, **kwargs: Any) -> Any:
+            kwargs["proxy"] = proxy_for_url(route.url)
+            return await request(route, **kwargs)
+
+        async def proxy_connect(url: str, *, compress: int = 0) -> Any:
+            proxy = proxy_for_url(url)
+            if proxy is None:
+                return await connect(url, compress=compress)
+            # discord.py's ws_connect has no per-call proxy argument. Keep the
+            # only private SDK access here, with an explicit compatibility
+            # failure rather than silently connecting outside the chosen proxy.
+            session = getattr(client.http, "_HTTPClient__session", None)
+            if not isinstance(session, aiohttp.ClientSession):
+                raise RuntimeError("Discord SDK session is unavailable for proxy routing")
+            return await session.ws_connect(
+                url,
+                proxy=proxy,
+                max_msg_size=0,
+                timeout=aiohttp.ClientWSTimeout(ws_close=30.0),
+                autoclose=False,
+                headers={"User-Agent": client.http.user_agent},
+                compress=compress,
+            )
+
+        client.http.request = proxy_request
+        client.http.ws_connect = proxy_connect
+
+    def _configure_sdk_endpoints(self, client: Any) -> None:
+        """Keep configured endpoints scoped to this SDK instance, never globals."""
+
+        if self.config.api_base.rstrip("/") != "https://discord.com/api/v10":
+            request = client.http.request
+            base = self.config.api_base.rstrip("/")
+
+            async def configured_request(route: Any, **kwargs: Any) -> Any:
+                routed = copy.copy(route)
+                routed.url = base + route.url.removeprefix(route.BASE)
+                return await request(routed, **kwargs)
+
+            client.http.request = configured_request
+        if self.config.gateway_url != "wss://gateway.discord.gg/?v=10&encoding=json":
+            from yarl import URL
+
+            connect = client.http.ws_connect
+            configured = URL(self.config.gateway_url)
+
+            async def configured_connect(url: str, **kwargs: Any) -> Any:
+                target = URL(url)
+                # Resume URLs returned by Discord remain under SDK ownership.
+                # Only its initial/default endpoint is replaced; retain the
+                # protocol and compression query that the SDK negotiated.
+                if target.host == "gateway.discord.gg":
+                    url = str(configured.update_query(target.query))
+                return await connect(url, **kwargs)
+
+            client.http.ws_connect = configured_connect
 
     async def _fetch_gateway_url(self) -> str:
+        # The read-only credential probe intentionally does not construct or
+        # log into the SDK, so it cannot start another Gateway session.
         client = self._get_client()
         resp = await client.get("/gateway/bot", headers=self._auth_headers())
         resp.raise_for_status()
         return cast(str, resp.json()["url"]) + "?v=10&encoding=json"
 
-    async def _identify(self) -> None:
-        await self._ws_send(
-            {
-                "op": 2,
-                "d": {
-                    "token": self.config.token,
-                    "intents": self.config.intents,
-                    "properties": {
-                        "os": "linux",
-                        "browser": "opensquilla",
-                        "device": "opensquilla",
-                    },
-                },
-            }
-        )
-
-    # ------------------------------------------------------------------
-    # Heartbeat
-    # ------------------------------------------------------------------
-
-    async def _heartbeat_loop(self) -> None:
-        # Discord requires the first heartbeat after Hello to be jittered by a
-        # random fraction of the negotiated interval.  This also prevents a
-        # fleet of freshly restarted adapters from synchronising heartbeats.
-        interval_s = self._state.heartbeat_interval_ms / 1000.0
-        await asyncio.sleep(random.random() * interval_s)
-        while self._ws is not None:
-            if not self._state.last_heartbeat_ack:
-                log.warning("discord.heartbeat_timeout")
-                await self._reconnect()
-                return
-            self._state.last_heartbeat_ack = False
-            await self._ws_send({"op": 1, "d": self._state.sequence})
-            await asyncio.sleep(interval_s)
-
-    async def _cancel_heartbeat(self) -> None:
-        task = self._heartbeat_task
-        self._heartbeat_task = None
-        if task is not None and task is not asyncio.current_task():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    def _apply_hello(self, payload: dict[str, Any]) -> None:
-        if payload.get("op") != 10:
-            raise RuntimeError("discord gateway did not send Hello")
-        data = payload.get("d")
-        interval = data.get("heartbeat_interval") if isinstance(data, dict) else None
-        if not isinstance(interval, int | float) or interval <= 0:
-            raise RuntimeError("discord gateway Hello omitted heartbeat_interval")
-        self._state.heartbeat_interval_ms = int(interval)
-
-    async def _begin_gateway_session(self, url: str) -> None:
-        self._ws = await self._connect_ws(url)
-        self._apply_hello(await self._ws_recv())
-        self._state.last_heartbeat_ack = True
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
-        if self._state.session_id and self._state.sequence is not None:
-            await self._ws_send(
-                {
-                    "op": 6,
-                    "d": {
-                        "token": self.config.token,
-                        "session_id": self._state.session_id,
-                        "seq": self._state.sequence,
-                    },
-                }
-            )
-        else:
-            await self._identify()
-
-    async def _await_ready_dispatch(self) -> None:
+    async def _consume_gateway_events(self) -> None:
         while True:
-            raw = await self._ws_recv()
-            op = raw.get("op")
-            if op == 0:
-                self._state.sequence = raw.get("s")
-                event_type = raw.get("t")
-                data = raw.get("d", {})
-                if not isinstance(data, dict):
-                    data = {}
-                if event_type == "RESUMED" and not self._state.session_id:
-                    raise RuntimeError("discord gateway resumed without a session")
-                await self._handle_dispatch(event_type, data)
-                if event_type in {"READY", "RESUMED"}:
-                    return
-            elif op == 1:
-                await self._ws_send({"op": 1, "d": self._state.sequence})
-            elif op == 7:
-                raise _GatewayHandshakeRetryError("discord gateway requested reconnect")
-            elif op == 9:
-                if not raw.get("d", False):
-                    self._state.session_id = None
-                    self._state.sequence = None
-                await asyncio.sleep(1 + random.random() * 4)
-                raise _GatewayHandshakeRetryError("discord gateway invalidated the session")
-            elif op == 11:
-                self._state.last_heartbeat_ack = True
-
-    # ------------------------------------------------------------------
-    # Reconnection
-    # ------------------------------------------------------------------
-
-    async def _reconnect(self) -> None:
-        """Re-establish the gateway connection.
-
-        Idempotent under concurrent calls: a second invocation while a
-        first is in flight waits for that attempt instead of starting its
-        own. Without this guard a heartbeat timeout racing an op-7 / op-9
-        in the dispatch loop could trigger two simultaneous IDENTIFY
-        sequences and leave two heartbeat tasks running against the same
-        socket. Waiting (rather than returning immediately) matters for the
-        dispatch loop: the in-flight reconnect owns the socket and may hold
-        ``self._ws = None`` for the whole retry window, so returning early
-        would send the caller straight back into ``_ws_recv`` on a dead
-        socket and spin until the new connection exists.
-        """
-        if self._reconnecting:
-            log.info("discord.reconnect_waiting_for_in_flight")
-            async with self._reconnect_lock:
-                return
-        async with self._reconnect_lock:
-            self._reconnecting = True
-            try:
-                attempts = max(0, int(self.config.reconnect_max_retries)) + 1
-                for attempt in range(attempts):
-                    try:
-                        await self._do_reconnect()
-                        return
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        if attempt + 1 >= attempts:
-                            self._connected = False
-                            log.error(
-                                "discord.reconnect_exhausted",
-                                attempts=attempts,
-                                error=str(exc),
-                            )
-                            raise
-                        delay = min(
-                            self.config.reconnect_base_delay_s * (2**attempt),
-                            30.0,
-                        )
-                        log.warning(
-                            "discord.reconnect_retry",
-                            attempt=attempt + 1,
-                            delay=delay,
-                            error=str(exc),
-                        )
-                        await asyncio.sleep(delay)
-            finally:
-                self._reconnecting = False
-
-    async def _do_reconnect(self) -> None:
-        log.info("discord.reconnecting", session_id=self._state.session_id)
-        await self._cancel_heartbeat()
-        await self._close_ws()
-
-        url = self._state.resume_url or await self._fetch_gateway_url()
-        await self._begin_gateway_session(url)
-
-    # ------------------------------------------------------------------
-    # Dispatch loop
-    # ------------------------------------------------------------------
-
-    async def _dispatch_loop(self) -> None:
-        while self._connected:
-            try:
-                raw = await self._ws_recv()
-            except (
-                websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.ConnectionClosedError,
-                websockets.exceptions.ConnectionClosedOK,
-            ):
-                if self._connected:
-                    await self._reconnect()
+            event_type, data = await self._gateway_events.get()
+            if event_type == "__DISCONNECTED":
+                self._connected = False
                 continue
+            await self._handle_dispatch(event_type, data)
+            if event_type in {"READY", "RESUMED"}:
+                self._connected = True
+                self._gateway_ready.set()
 
-            op = raw.get("op")
-            if op == 0:  # Dispatch
-                self._state.sequence = raw.get("s")
-                event_type = raw.get("t")
-                data = raw.get("d", {})
-                await self._handle_dispatch(event_type, data)
-            elif op == 1:  # Heartbeat request
-                await self._ws_send({"op": 1, "d": self._state.sequence})
-            elif op == 7:  # Reconnect
-                await self._reconnect()
-                continue
-            elif op == 9:  # Invalid Session
-                resumable = raw.get("d", False)
-                if not resumable:
-                    self._state.session_id = None
-                    self._state.sequence = None
-                await asyncio.sleep(1 + random.random() * 4)
-                await self._reconnect()
-                continue
-            elif op == 11:  # Heartbeat ACK
-                self._state.last_heartbeat_ack = True
+    async def _run_gateway(self, client: Any) -> None:
+        try:
+            await client.start(self.config.token, reconnect=True)
+        finally:
+            await client.close()
+
+    def _gateway_worker_finished(self, task: asyncio.Task[None]) -> None:
+        self._connected = False
+        if not task.cancelled():
+            error = task.exception()
+            self._gateway_error = type(error).__name__ if error is not None else "GatewayStopped"
+            log.warning("discord.gateway_worker_stopped", error_type=self._gateway_error)
+        # A failed parser must not leave an authenticated SDK connection
+        # running with no ingress consumer (and vice versa).
+        for worker in (self._gateway_task, self._dispatch_task):
+            if worker is not None and worker is not task and not worker.done():
+                worker.cancel()
 
     async def _handle_dispatch(self, event_type: str | None, data: dict[str, Any]) -> None:
         if event_type == "READY":
-            self._state.session_id = data["session_id"]
-            self._state.resume_url = data.get("resume_gateway_url")
             self.bot_user_id = data["user"]["id"]
             log.info(
                 "discord.ready",
@@ -664,36 +578,36 @@ class DiscordChannel:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Connect to the Discord gateway and begin dispatch/heartbeat loops."""
+        """Start the SDK and wait for an authenticated READY dispatch."""
         self._require_credentials()
-        attempts = max(0, int(self.config.reconnect_max_retries)) + 1
-        for attempt in range(attempts):
-            try:
-                url = (
-                    self.config.gateway_url
-                    if attempt == 0
-                    else self._state.resume_url or await self._fetch_gateway_url()
-                )
-                await self._begin_gateway_session(url)
-                await self._await_ready_dispatch()
-            except asyncio.CancelledError:
-                await self._cancel_heartbeat()
-                await self._close_ws()
-                raise
-            except Exception:
-                await self._cancel_heartbeat()
-                await self._close_ws()
-                if attempt + 1 >= attempts:
-                    self._connected = False
-                    raise
-                delay = min(self.config.reconnect_base_delay_s * (2**attempt), 30.0)
-                await asyncio.sleep(delay)
-                continue
-
-            self._connected = True
-            self._dispatch_task = asyncio.create_task(self._dispatch_loop())
-            log.info("discord.started", bot_user_id=self.bot_user_id)
+        if self._gateway_task is not None and not self._gateway_task.done():
             return
+        self._gateway_ready.clear()
+        self._gateway_events = asyncio.Queue()
+        self._gateway_error = None
+        self._connected = False
+        self._gateway_client = self._create_gateway_client()
+        self._dispatch_task = asyncio.create_task(self._consume_gateway_events())
+        self._gateway_task = asyncio.create_task(self._run_gateway(self._gateway_client))
+        for worker in (self._gateway_task, self._dispatch_task):
+            worker.add_done_callback(self._gateway_worker_finished)
+        ready = asyncio.create_task(self._gateway_ready.wait())
+        try:
+            done, _pending = await asyncio.wait(
+                (ready, self._gateway_task, self._dispatch_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for worker in (self._gateway_task, self._dispatch_task):
+                if worker in done:
+                    await worker
+                    raise RuntimeError("Discord Gateway stopped before readiness")
+            log.info("discord.started", bot_user_id=self.bot_user_id)
+        except BaseException:
+            await self.stop()
+            raise
+        finally:
+            ready.cancel()
+            await asyncio.gather(ready, return_exceptions=True)
 
     async def probe_connection(self) -> dict[str, Any]:
         """Validate the bot token and Gateway availability without connecting."""
@@ -702,37 +616,47 @@ class DiscordChannel:
         return {"authenticated": True, "gateway_url": gateway_url}
 
     async def stop(self) -> None:
-        """Disconnect from gateway and clean up."""
+        """Close the SDK connection and cancel all adapter-owned workers."""
         self._connected = False
-        await self._cancel_heartbeat()
-        dispatch_task = self._dispatch_task
-        self._dispatch_task = None
-        if dispatch_task is not None and dispatch_task is not asyncio.current_task():
-            dispatch_task.cancel()
-            await asyncio.gather(dispatch_task, return_exceptions=True)
-        await self._close_ws()
+        client, self._gateway_client = self._gateway_client, None
+        workers = (self._gateway_task, self._dispatch_task)
+        self._gateway_task = self._dispatch_task = None
+        if client is not None:
+            with contextlib.suppress(Exception):
+                await client.close()
+        for worker in workers:
+            if worker is not None and worker is not asyncio.current_task():
+                worker.cancel()
+        await asyncio.gather(
+            *(
+                worker for worker in workers
+                if worker is not None and worker is not asyncio.current_task()
+            ),
+            return_exceptions=True,
+        )
         if self._client is not None:
             await self._client.aclose()
             self._client = None
         log.info("discord.stopped")
 
     def is_connected(self) -> bool:
-        return self._connected
+        return bool(
+            self._connected
+            and self._gateway_task is not None and not self._gateway_task.done()
+            and self._dispatch_task is not None and not self._dispatch_task.done()
+        )
 
     async def health_check(self) -> ChannelHealth:
-        workers_alive = (
-            self._heartbeat_task is not None
-            and not self._heartbeat_task.done()
-            and self._dispatch_task is not None
-            and not self._dispatch_task.done()
-        )
+        socket = getattr(self._gateway_client, "ws", None)
         return ChannelHealth(
-            connected=self._connected and workers_alive,
+            connected=self.is_connected(),
             bot_user_id=self.bot_user_id,
             last_message_at=self._last_message_at,
             extra={
-                "session_id": self._state.session_id,
-                "sequence": self._state.sequence,
+                "session_id": getattr(socket, "session_id", None),
+                "sequence": getattr(socket, "sequence", None),
+                "gateway_error": self._gateway_error,
+                "gateway_sdk": "discord.py",
             },
         )
 
@@ -971,18 +895,59 @@ class DiscordChannel:
         file_path: str,
         content: str = "",
     ) -> ChannelSendResult:
+        return await self._send_file(channel_id, file_path, content=content)
+
+    async def deliver_artifact(
+        self, request: ChannelArtifactDeliveryRequest
+    ) -> ChannelSendResult:
+        metadata = self.build_reply_message("", request.inbound).metadata
+        return await self._send_file(
+            request.inbound.channel_id,
+            request.file_path,
+            delivery_id=request.delivery_id,
+            reply_message_id=metadata.get("reply_to_message_id"),
+        )
+
+    async def _send_file(
+        self,
+        channel_id: str,
+        file_path: str,
+        *,
+        content: str = "",
+        delivery_id: str | None = None,
+        reply_message_id: str | None = None,
+    ) -> ChannelSendResult:
         channel_id = str(channel_id or "").strip()
         if not channel_id:
             raise ValueError("discord.send_file: channel target is required")
+        payload: dict[str, Any] = {"content": content} if content else {}
+        if delivery_id:
+            # Discord limits a message nonce to 25 characters. The durable
+            # ledger owns retries; the nonce is additional provider deduplication
+            # for its short retention window, never permission to replay unknowns.
+            payload["nonce"] = hashlib.blake2s(delivery_id.encode(), digest_size=12).hexdigest()
+            payload["enforce_nonce"] = True
+        if reply_message_id:
+            payload["message_reference"] = {"message_id": reply_message_id}
+            payload["allowed_mentions"] = {"replied_user": False}
         await self._rate_limiter.acquire()
         client = self._get_client()
         with open(file_path, "rb") as f:
-            resp = await retry_request(
-                client.post,
+            # Multipart upload also creates the message. A timeout or server
+            # error may follow acceptance, so surface it to the outbox without
+            # an internal retry that could silently duplicate the file.
+            resp = await client.post(
                 f"/channels/{channel_id}/messages",
-                data={"content": content} if content else {},
-                files={"file": (Path(file_path).name, f)},
+                data={"payload_json": json.dumps(payload)},
+                files={"files[0]": (Path(file_path).name, f)},
                 headers=self._auth_headers(),
+            )
+        if resp.status_code == 429:
+            return ChannelSendResult.failed(
+                capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+                target_id=channel_id,
+                reason="Discord rejected the file message due to rate limiting",
+                retryable=True,
             )
         resp.raise_for_status()
         data = resp.json()

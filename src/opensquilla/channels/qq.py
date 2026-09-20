@@ -21,24 +21,30 @@ the LLM stream and emits exactly one outbound POST at completion.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import structlog
 from pydantic import BaseModel
 
 from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.contract import (
+    ChannelCapabilities,
     ChannelCapabilityProfile,
     ChannelLengthUnit,
     ChannelPlatformCapability,
     ChannelPlatformCapabilityStatus,
     ChannelPlatformCategories,
     ChannelPlatformManifest,
+    ChannelSendResult,
 )
 from opensquilla.channels.types import (
+    Attachment,
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -70,6 +76,13 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 )
 
 _DEDUPE_SIZE = 4096
+_QQ_MEDIA_TYPES = {
+    "image/png": 1,
+    "image/jpeg": 1,
+    "video/mp4": 2,
+    "audio/silk": 3,
+    "audio/x-silk": 3,
+}
 
 
 class QQChannelConfig(BaseModel):
@@ -188,10 +201,12 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             group_chat=True,
             mentions=True,
             reply=True,
+            media=True,
             transports=("websocket",),
             notes=(
-                "QQ Bot Platform rich-media APIs exist, but this adapter currently "
-                "sends text replies only.",
+                "QQ supports PNG/JPEG, MP4, and SILK media from existing public URLs. "
+                "The SDK does not upload local files; ordinary files are not open on "
+                "the official C2C/group API.",
             ),
         )
 
@@ -203,12 +218,16 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.FILES,
                 status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("QQ official bot file delivery is not implemented in this adapter.",),
+                notes=(
+                    "QQ official C2C/group file_type=4 is not open; local files are not uploaded.",
+                ),
             ),
             ChannelPlatformCapability(
                 category=ChannelPlatformCategories.MEDIA,
-                status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                notes=("QQ official bot rich media is not implemented in this adapter.",),
+                status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                tools=("post_group_file", "post_c2c_file"),
+                mutates=True,
+                notes=("Only public-URL PNG/JPEG, MP4, and SILK attachments are supported.",),
             ),
         )
 
@@ -430,49 +449,109 @@ class QQChannel(_QQClientBase):  # type: ignore[misc, valid-type]
             kwargs["msg_id"] = msg_id
         return kwargs
 
+    @staticmethod
+    def _media_source(attachment: Attachment) -> tuple[int, str]:
+        """Validate the URL-only media forms accepted by the official SDK."""
+        file_type = _QQ_MEDIA_TYPES.get((attachment.mime_type or "").lower())
+        url = attachment.url or ""
+        parsed = urlsplit(url)
+        hostname = parsed.hostname or ""
+        valid = bool(
+            file_type
+            and attachment.data is None
+            and parsed.scheme in {"http", "https"}
+            and hostname
+            and not parsed.username
+            and not parsed.password
+            and hostname.lower() != "localhost"
+            and not hostname.lower().endswith((".localhost", ".local"))
+        )
+        try:
+            address = ipaddress.ip_address(hostname)
+        except ValueError:
+            pass
+        else:
+            valid = valid and address.is_global
+        if not valid:
+            raise UnsupportedChannelOperation(
+                channel="qq",
+                operation="send_media",
+                reason=("QQ accepts only public-URL PNG/JPEG, MP4, or SILK attachments; "
+                        "local bytes and ordinary files are unsupported"),
+            )
+        return cast(int, file_type), url
+
     async def send(self, message: OutgoingMessage) -> None:
-        """Route by ``metadata['chat_type']`` to the right SDK call.
-
-        ``c2c``  → ``self.api.post_c2c_message(openid=..., msg_type=0, ...)``
-        ``group`` → ``self.api.post_group_message(group_openid=..., msg_type=0, ...)``
-
-        ``msg_id`` (when supplied) and a per-inbound-message ``msg_seq`` counter
-        satisfy the QQ API's passive-reply dedup rules.
-        """
+        """Send text or supported URL media as a reply to the original target."""
         meta = message.metadata or {}
         chat_type = meta.get("chat_type", "")
         msg_id = meta.get("msg_id") or meta.get("reply_to_msg_id") or message.reply_to
-
-        api = self.api
         if chat_type == "group":
             target = meta.get("group_openid", "")
-            if not target:
-                raise ValueError("qq.send: metadata['group_openid'] required for group chat_type")
-            seq = self._next_msg_seq(f"group:{msg_id or target}")
-            await api.post_group_message(
-                group_openid=target,
-                msg_type=0,
-                content=message.content,
-                msg_id=msg_id,
-                msg_seq=seq,
-            )
+            target_arg = "group_openid"
+            send_method = self.api.post_group_message
         elif chat_type == "c2c":
             target = meta.get("openid", "") or meta.get("user_openid", "")
-            if not target:
-                raise ValueError("qq.send: metadata['openid'] required for c2c chat_type")
-            seq = self._next_msg_seq(f"c2c:{msg_id or target}")
-            await api.post_c2c_message(
-                openid=target,
+            target_arg = "openid"
+            send_method = self.api.post_c2c_message
+        else:
+            raise ValueError("qq.send: metadata['chat_type'] must be 'c2c' or 'group'")
+        if not target:
+            raise ValueError(f"qq.send: metadata['{target_arg}'] is required")
+
+        # Validate every attachment before any provider mutation, so an
+        # unsupported document is never silently dropped after sending text.
+        media_sources = [self._media_source(item) for item in message.attachments]
+        if not media_sources:
+            await send_method(
+                **{target_arg: target},
                 msg_type=0,
                 content=message.content,
                 msg_id=msg_id,
-                msg_seq=seq,
+                msg_seq=self._next_msg_seq(f"{chat_type}:{msg_id or target}"),
             )
         else:
-            raise ValueError(
-                f"qq.send: metadata['chat_type'] must be 'c2c' or 'group', got {chat_type!r}"
+            upload_method = (
+                self.api.post_group_file if chat_type == "group" else self.api.post_c2c_file
             )
+            for index, (file_type, url) in enumerate(media_sources):
+                uploaded = await upload_method(
+                    **{target_arg: target}, file_type=file_type, url=url, srv_send_msg=False
+                )
+                file_info = uploaded.get("file_info") if isinstance(uploaded, dict) else None
+                if not isinstance(file_info, str) or not file_info:
+                    raise RuntimeError("QQ media upload response missing file_info")
+                await send_method(
+                    **{target_arg: target},
+                    msg_type=7,
+                    content=message.content if index == 0 else "",
+                    media={"file_info": file_info},
+                    msg_id=msg_id,
+                    msg_seq=self._next_msg_seq(f"{chat_type}:{msg_id or target}"),
+                )
         log.debug("qq.outbound_sent", chat_type=chat_type, length=len(message.content))
+
+    async def send_file(
+        self, channel_id: str, file_path: str, content: str = ""
+    ) -> ChannelSendResult:
+        """Local files cannot use the official SDK's URL-only media upload."""
+        return ChannelSendResult.unsupported(
+            capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
+            target_id=channel_id,
+            reason=("QQ official C2C/group APIs do not support ordinary files or "
+                    "local-file uploads; use the existing artifact download surface"),
+        )
+
+    async def deliver_artifact(
+        self, request: ChannelArtifactDeliveryRequest
+    ) -> ChannelSendResult:
+        """Report local artifact limits without publishing its bytes elsewhere."""
+        return ChannelSendResult.unsupported(
+            capability=ChannelCapabilities.ARTIFACT_DELIVERY,
+            target_id=request.inbound.channel_id,
+            reason=("QQ official C2C/group APIs do not support ordinary files or "
+                    "local-file uploads; use the existing artifact download surface"),
+        )
 
     async def edit(self, message_id: str, content: str) -> None:
         """Raise: QQ Bot Platform has no message-edit primitive."""

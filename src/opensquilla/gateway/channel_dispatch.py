@@ -861,6 +861,7 @@ async def run_channel_dispatch(
                             msg,
                             task_runtime,
                             config,
+                            expected_session_id=route_envelope.session_id,
                         )
                         channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
                         if channel_overflow_policy is not None:
@@ -1712,7 +1713,10 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
                 )
             else:
                 assert ingested is not None
-                stream_relay = _RuntimeChannelStreamRelay.maybe_start(channel, msg, task_runtime, config)  # noqa: E501
+                stream_relay = _RuntimeChannelStreamRelay.maybe_start(
+                    channel, msg, task_runtime, config,
+                    expected_session_id=route_envelope.session_id,
+                )
                 channel_overflow_policy = _resolve_channel_overflow_policy(channel, config)
                 if channel_overflow_policy is not None:
                     apply_policy = getattr(task_runtime, "apply_overflow_policy", None)
@@ -2389,15 +2393,18 @@ class _RuntimeChannelStreamRelay:
     the user still sees the rest of the reply.
     """
 
-    def __init__(self, channel: Any, inbound: IncomingMessage, config: Any = None) -> None:
+    def __init__(
+        self, channel: Any, inbound: IncomingMessage, config: Any = None,
+        *, expected_session_id: str | None = None,
+    ) -> None:
         self._channel = channel
         self._inbound = inbound
         self._config = config
+        self._expected_session_id = expected_session_id
         self._queue: asyncio.Queue[str | object] = asyncio.Queue()
         self._artifacts: list[dict[str, Any]] = []
         self.delivered_artifact_keys: set[str] = set()
         self.attempted_artifact_keys: set[str] = set()
-        self._attempted_artifact_ids: set[str] = set()
         self._task: asyncio.Task[Any] | None = None
         self._closed = False
         self._live_preview = _channel_can_replace_streamed_text(channel)
@@ -2424,13 +2431,15 @@ class _RuntimeChannelStreamRelay:
         inbound: IncomingMessage,
         task_runtime: Any,
         config: Any = None,
+        *,
+        expected_session_id: str | None = None,
     ) -> _RuntimeChannelStreamRelay | None:
         if not resolve_channel_stream_policy(channel).relay_stream:
             return None
         enqueue = getattr(task_runtime, "enqueue", None)
         if not callable(enqueue) or not _accepts_keyword_arg(enqueue, "stream_event_sink"):
             return None
-        return cls(channel, inbound, config)
+        return cls(channel, inbound, config, expected_session_id=expected_session_id)
 
     @classmethod
     def maybe_start(
@@ -2439,8 +2448,12 @@ class _RuntimeChannelStreamRelay:
         inbound: IncomingMessage,
         task_runtime: Any,
         config: Any = None,
+        *,
+        expected_session_id: str | None = None,
     ) -> _RuntimeChannelStreamRelay | None:
-        relay = cls.maybe_create(channel, inbound, task_runtime, config)
+        relay = cls.maybe_create(
+            channel, inbound, task_runtime, config, expected_session_id=expected_session_id,
+        )
         if relay is not None:
             relay.start()
         return relay
@@ -2602,9 +2615,6 @@ class _RuntimeChannelStreamRelay:
         return self._terminal_generation_reset
 
     def attempted_artifact(self, artifact: dict[str, Any]) -> bool:
-        artifact_id = artifact.get("id")
-        if isinstance(artifact_id, str) and artifact_id in self._attempted_artifact_ids:
-            return True
         key = _artifact_delivery_key(artifact)
         return bool(key and key in self.attempted_artifact_keys)
 
@@ -2615,7 +2625,10 @@ class _RuntimeChannelStreamRelay:
         artifact_lines = (
             []
             if _can_deliver_channel_files(self._channel)
-            else _artifact_fallback_lines(self._artifacts)
+            else _artifact_fallback_lines(await _deliver_artifacts_as_channel_files(
+                self._channel, self._inbound, self._artifacts, self._config,
+                expected_session_id=self._expected_session_id,
+            ))
         )
         terminal_text = (
             self._done_snapshot_text if self._done_snapshot_present else "".join(self._text_deltas)
@@ -2696,30 +2709,14 @@ class _RuntimeChannelStreamRelay:
                 self._undelivered_index = len(self._yielded_chunks)
 
         if _can_deliver_channel_files(self._channel):
-            self.attempted_artifact_keys.update(
-                key
-                for artifact in self._artifacts
-                if (key := _artifact_delivery_key(artifact))
-            )
-            self._attempted_artifact_ids.update(
-                artifact_id
-                for artifact in self._artifacts
-                if isinstance((artifact_id := artifact.get("id")), str)
-                and artifact_id
-            )
             undelivered = await _deliver_artifacts_as_channel_files(
                 self._channel,
                 self._inbound,
                 self._artifacts,
                 self._config,
-            )
-            undelivered_keys = {
-                key for artifact in undelivered if (key := _artifact_delivery_key(artifact))
-            }
-            self.delivered_artifact_keys.update(
-                key
-                for artifact in self._artifacts
-                if (key := _artifact_delivery_key(artifact)) and key not in undelivered_keys
+                expected_session_id=self._expected_session_id,
+                attempted_keys=self.attempted_artifact_keys,
+                delivered_keys=self.delivered_artifact_keys,
             )
             fallback_lines = _artifact_fallback_lines(undelivered)
             if fallback_lines:
@@ -3494,6 +3491,7 @@ async def _accept_channel_runtime_turn_impl(
         msg,
         task_runtime,
         config,
+        expected_session_id=route_envelope.session_id,
     )
     overflow_policy = _resolve_channel_overflow_policy(channel, config)
     accepted_run_mode_override = _channel_accepted_run_mode_override(route_envelope)
@@ -4054,6 +4052,17 @@ async def _deliver_runtime_channel_reply(
         return
 
     status = _status_value(getattr(record, "status", None))
+    # Task details are written by durable admission, never by an artifact
+    # event. They also retain the original session across task redelivery.
+    expected_session_id = getattr(route_envelope, "session_id", None)
+    task_details = getattr(record, "details", None)
+    task_session_id = task_details.get("session_id") if isinstance(task_details, dict) else None
+    if isinstance(task_session_id, str) and task_session_id:
+        expected_session_id = (
+            task_session_id
+            if expected_session_id in (None, task_session_id)
+            else None
+        )
     if status == "succeeded":
         exact_content = await _replayed_assistant_text(
             session_manager,
@@ -4090,12 +4099,39 @@ async def _deliver_runtime_channel_reply(
                 canonical_artifacts,
             )
             if not _can_deliver_channel_files(channel):
-                fallback_lines = _artifact_fallback_lines(canonical_artifacts)
+                fallback_lines = _artifact_fallback_lines(await _deliver_artifacts_as_channel_files(
+                    channel, inbound, canonical_artifacts, config,
+                    expected_session_id=expected_session_id,
+                ))
                 if fallback_lines:
                     canonical_content = "\n\n".join(
                         part for part in (canonical_content, "\n".join(fallback_lines)) if part
                     )
             if await stream_relay.reconcile_final_text(canonical_content):
+                # The persisted result can contain a valid artifact that did
+                # not appear in the stream. Text reconciliation must not skip
+                # it; only authorized attempts from this relay suppress sends.
+                if _can_deliver_channel_files(channel):
+                    canonical_artifacts = [
+                        artifact for artifact in canonical_artifacts
+                        if not stream_relay.attempted_artifact(artifact)
+                    ]
+                    undelivered = await _deliver_artifacts_as_channel_files(
+                        channel, inbound, canonical_artifacts, config,
+                        expected_session_id=expected_session_id,
+                        attempted_keys=stream_relay.attempted_artifact_keys,
+                        delivered_keys=stream_relay.delivered_artifact_keys,
+                    )
+                    fallback_lines = _artifact_fallback_lines(undelivered)
+                    if fallback_lines:
+                        await _deliver_reply_or_notify(
+                            channel,
+                            _build_runtime_reply_message(
+                                channel, "\n".join(fallback_lines), inbound, route_envelope,
+                            ),
+                            route_envelope=route_envelope,
+                            session_key=session_key,
+                        )
                 return
             stream_relay.stream_error = RuntimeError(
                 "streamed channel reply could not apply persisted terminal text"
@@ -4158,6 +4194,7 @@ async def _deliver_runtime_channel_reply(
                 inbound,
                 artifacts,
                 config,
+                expected_session_id=expected_session_id,
             )
             fallback_lines = _artifact_fallback_lines(undelivered)
             if fallback_lines:
@@ -4173,7 +4210,9 @@ async def _deliver_runtime_channel_reply(
                     session_key=session_key,
                 )
         else:
-            fallback_lines = _artifact_fallback_lines(artifacts)
+            fallback_lines = _artifact_fallback_lines(await _deliver_artifacts_as_channel_files(
+                channel, inbound, artifacts, config, expected_session_id=expected_session_id,
+            ))
             if fallback_lines:
                 content = "\n\n".join(part for part in (content, "\n".join(fallback_lines)) if part)
             if content:
@@ -4405,12 +4444,16 @@ async def _run_turn_batch_path(
         if _can_deliver_channel_files(channel):
             if content:
                 await channel.send(_build_reply_message(channel, content, msg))
-            undelivered = await _deliver_artifacts_as_channel_files(channel, msg, artifacts, config)
+            undelivered = await _deliver_artifacts_as_channel_files(
+                channel, msg, artifacts, config, expected_session_id=expected_session_id,
+            )
             artifact_lines = _artifact_fallback_lines(undelivered)
             if artifact_lines:
                 await channel.send(_build_reply_message(channel, "\n".join(artifact_lines), msg))
         else:
-            artifact_lines = _artifact_fallback_lines(artifacts)
+            artifact_lines = _artifact_fallback_lines(await _deliver_artifacts_as_channel_files(
+                channel, msg, artifacts, config, expected_session_id=expected_session_id,
+            ))
             if artifact_lines:
                 content = "\n\n".join(part for part in (content, "\n".join(artifact_lines)) if part)
             if content:
@@ -4728,10 +4771,9 @@ async def _run_turn_streaming_path(
                 _build_reply_message(channel, stream_error, msg),
             )
     elif artifacts and not terminal_generation_reset:
-        if _can_deliver_channel_files(channel):
-            undelivered = await _deliver_artifacts_as_channel_files(channel, msg, artifacts, config)
-        else:
-            undelivered = artifacts
+        undelivered = await _deliver_artifacts_as_channel_files(
+            channel, msg, artifacts, config, expected_session_id=expected_session_id,
+        )
         fallback_lines = _artifact_fallback_lines(undelivered)
         if fallback_lines:
             await channel.send(

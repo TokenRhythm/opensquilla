@@ -149,7 +149,7 @@ def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() 
     owner_ctx = ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
 
     default_names = {tool.name for tool in registry.to_tool_definitions(owner_ctx)}
-    assert {"create_pptx", "image_generate", "sessions_spawn", "sessions_send"} <= default_names
+    assert {"image_generate", "sessions_spawn", "sessions_send"} <= default_names
     assert "subagents" not in default_names
 
     surfaced_ctx = ToolContext(
@@ -159,7 +159,7 @@ def test_owner_schema_keeps_canonical_tools_and_subagents_stays_explicit_only() 
     )
     surfaced_names = {tool.name for tool in registry.to_tool_definitions(surfaced_ctx)}
     assert "subagents" in surfaced_names
-    assert "create_pptx" in surfaced_names
+    assert "create_pptx" not in surfaced_names
 
 
 def test_node_runtime_stubs_stay_hidden_until_explicitly_surfaced() -> None:
@@ -190,7 +190,7 @@ def test_node_runtime_stubs_stay_hidden_until_explicitly_surfaced() -> None:
     assert "unavailable" in surfaced_tools["canvas"]
 
 
-def test_web_owner_schema_exposes_basic_pptx_fallback_by_default() -> None:
+def test_web_owner_schema_does_not_expose_retired_pptx_fallback() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.tools.registry import get_default_registry
 
@@ -199,7 +199,7 @@ def test_web_owner_schema_exposes_basic_pptx_fallback_by_default() -> None:
 
     names = {tool.name for tool in registry.to_tool_definitions(web_ctx)}
 
-    assert "create_pptx" in names
+    assert "create_pptx" not in names
     assert "execute_code" in names
 
 
@@ -221,7 +221,7 @@ def test_channel_runtime_profile_exposes_publish_artifact() -> None:
     assert "publish_artifact" in names
 
 
-def test_channel_runtime_profile_exposes_safe_structured_file_tools() -> None:
+def test_channel_runtime_profile_does_not_expose_retired_structured_file_tools() -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.tools.registry import filter_by_profile, get_default_registry, resolve_profile
 
@@ -237,7 +237,7 @@ def test_channel_runtime_profile_exposes_safe_structured_file_tools() -> None:
         )
     }
 
-    assert {"create_csv", "create_xlsx", "create_pdf_report", "create_pptx"} <= names
+    assert {"create_csv", "create_xlsx", "create_pdf_report", "create_pptx"}.isdisjoint(names)
     assert "write_file" not in names
     assert "execute_code" not in names
 
@@ -314,7 +314,7 @@ def test_verified_channel_admin_matches_web_owner_runtime_tool_visibility() -> N
     assert {"agents_list", "subagents"}.isdisjoint(channel_admin_ctx.denied_tools)
 
 
-def test_channel_media_policy_surfaces_basic_pptx_fallback_explicitly() -> None:
+def test_channel_media_policy_does_not_surface_retired_pptx_fallback() -> None:
     from opensquilla.tools.policy import apply_tool_policy_from_config
 
     registry = ToolRegistry()
@@ -343,7 +343,7 @@ def test_channel_media_policy_surfaces_basic_pptx_fallback_explicitly() -> None:
 
     names = {tool.name for tool in registry.to_tool_definitions(ctx)}
 
-    assert names == {"session_status", "create_pptx"}
+    assert names == {"session_status"}
 
 
 def test_channel_runtime_profile_exposes_explicit_category_tools_not_host_mutation() -> None:
@@ -357,13 +357,13 @@ def test_channel_runtime_profile_exposes_explicit_category_tools_not_host_mutati
     tools = [
         _spec("vendor_upload_artifact"),
         _spec("write_file"),
-        _spec("create_pptx"),
+        _spec("synthetic_exporter"),
     ]
 
     names = {tool.name for tool in filter_by_profile(tools, resolve_profile(ctx), ctx)}
 
     assert "vendor_upload_artifact" in names
-    assert "create_pptx" in names
+    assert "synthetic_exporter" not in names
     assert "write_file" not in names
 
 
@@ -372,13 +372,13 @@ def test_channel_hidden_tool_visibility_stays_on_channel_profile(
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_TOOL_PROFILE", "owner_full")
     registry = ToolRegistry()
-    registry.register(_spec("create_pptx", default_access="deny"), _handler)
+    registry.register(_spec("synthetic_exporter", default_access="deny"), _handler)
     registry.register(_spec("hidden_authoring", default_access="deny"), _handler)
     channel_ctx = ToolContext(is_owner=False, caller_kind=CallerKind.CHANNEL)
 
     names = {tool.name for tool in registry.to_tool_definitions(channel_ctx)}
 
-    assert "create_pptx" in names
+    assert "synthetic_exporter" not in names
     assert "hidden_authoring" not in names
 
 
@@ -617,7 +617,7 @@ async def test_schema_visibility_and_dispatch_denial_use_same_context() -> None:
 @pytest.mark.asyncio
 async def test_channel_profile_blocks_forced_tool_calls_outside_safe_allowlist() -> None:
     registry = ToolRegistry()
-    registry.register(_spec("create_csv"), _handler)
+    registry.register(_spec("generic_table"), _handler)
     registry.register(_spec("execute_code"), _handler)
     ctx = ToolContext(is_owner=False, caller_kind=CallerKind.CHANNEL)
     handler = build_tool_handler(registry, ctx)
@@ -625,7 +625,7 @@ async def test_channel_profile_blocks_forced_tool_calls_outside_safe_allowlist()
     allowed = await handler(
         ToolCall(
             tool_use_id="tc-safe",
-            tool_name="create_csv",
+            tool_name="generic_table",
             arguments={},
         )
     )
@@ -637,7 +637,9 @@ async def test_channel_profile_blocks_forced_tool_calls_outside_safe_allowlist()
         )
     )
 
-    assert allowed.is_error is False
+    assert allowed.is_error is True
+    allowed_payload = json.loads(allowed.content)
+    assert allowed_payload["error_class"] == "PolicyDenied"
     assert forced.is_error is True
     payload = json.loads(forced.content)
     assert payload["error_class"] == "PolicyDenied"
@@ -646,13 +648,13 @@ async def test_channel_profile_blocks_forced_tool_calls_outside_safe_allowlist()
 @pytest.mark.asyncio
 async def test_channel_profile_allows_explicit_category_tools_not_host_mutation() -> None:
     registry = ToolRegistry()
-    registry.register(_spec("create_pptx"), _handler)
+    registry.register(_spec("synthetic_exporter"), _handler)
     registry.register(_spec("vendor_upload_artifact"), _handler)
     registry.register(_spec("write_file"), _handler)
     ctx = ToolContext(
         is_owner=False,
         caller_kind=CallerKind.CHANNEL,
-        allowed_tools={"create_pptx", "vendor_upload_artifact", "write_file"},
+        allowed_tools={"synthetic_exporter", "vendor_upload_artifact", "write_file"},
     )
     handler = build_tool_handler(registry, ctx)
 

@@ -398,9 +398,7 @@ _IMAGE_GENERATION_TOOL_NAMES: Final[frozenset[str]] = frozenset({"image_generate
 
 
 _ARTIFACT_DELIVERY_FAILURE_MARKER: Final[str] = "File delivery failed:"
-_ARTIFACT_DELIVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset(
-    {"publish_artifact", "create_pptx"}
-)
+_ARTIFACT_DELIVERY_TOOL_NAMES: Final[frozenset[str]] = frozenset({"publish_artifact"})
 _ARTIFACT_DELIVERY_FAILURE_MAX_CHARS: Final[int] = 360
 _HOOKS_FEATURE_ENV: Final[str] = "OPENSQUILLA_HOOKS"
 
@@ -1575,28 +1573,7 @@ def _artifact_delivery_target_keys(
             keys.append(artifact_delivery_name_target_key(artifact_name))
         return tuple(dict.fromkeys(keys))
 
-    effective_name = _artifact_delivery_result_name(event) if not event.is_error else None
-    if effective_name is None:
-        raw_name = arguments.get("name") or "generated.pptx"
-        if not isinstance(raw_name, str):
-            return ()
-        # Match create_pptx's public name normalization: it publishes a basename
-        # and appends .pptx when omitted.
-        effective_name = Path(raw_name).name.strip()
-        if not effective_name or effective_name in {".", ".."}:
-            effective_name = "generated.pptx"
-        if not effective_name.lower().endswith(".pptx"):
-            effective_name = f"{effective_name}.pptx"
-    name_key = artifact_delivery_name_target_key(effective_name)
-    keys = [name_key]
-    if not event.is_error and tool_context is not None and tool_context.workspace_dir:
-        root_path_key = artifact_delivery_publish_target_key(
-            name_key.removeprefix("name:"),
-            workspace_dir=tool_context.workspace_dir,
-        )
-        if root_path_key is not None:
-            keys.append(root_path_key)
-    return tuple(dict.fromkeys(keys))
+    return ()
 
 
 def _artifact_delivery_failure_notice(*, partial: bool = False) -> str:

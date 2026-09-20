@@ -173,6 +173,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "attachment_working_files",
         "persist_attachment_working_files",
         "explicitly_allowed_tools",
+        "sandboxed_workspace_authoring",
     ]
 
     assert ToolContext().skill_install_turn is None
@@ -183,6 +184,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     assert ToolContext().update_progress is None
     assert ToolContext().usage_root_turn_id is None
     assert ToolContext().explicitly_allowed_tools == set()
+    assert ToolContext().sandboxed_workspace_authoring is None
 
 
 def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:

@@ -93,6 +93,7 @@ async def test_contextual_artifact_delivery_is_preferred_and_carries_verified_re
         inbound,
         [ref.to_dict()],
         _config(tmp_path),
+        expected_session_id="session-1",
     )
 
     assert undelivered == []
@@ -126,6 +127,7 @@ async def test_artifact_delivery_keeps_legacy_send_file_signature(tmp_path: Path
         _inbound(),
         [ref.to_dict()],
         _config(tmp_path),
+        expected_session_id="session-1",
     )
 
     assert undelivered == []

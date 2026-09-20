@@ -92,7 +92,6 @@ def test_policy_helpers_delegates_config_policy_to_boundary() -> None:
 def test_policy_config_expands_current_groups_patterns_and_profiles() -> None:
     available = frozenset(
         {
-            "create_pptx",
             "http_request",
             "image_generate",
             "install_skill_deps",
@@ -117,7 +116,6 @@ def test_policy_config_expands_current_groups_patterns_and_profiles() -> None:
         ),
         available,
     ) == {
-        "create_pptx",
         "http_request",
         "image_generate",
         "install_skill_deps",

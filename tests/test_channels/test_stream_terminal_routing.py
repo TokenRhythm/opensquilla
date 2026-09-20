@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 from collections.abc import AsyncIterator
 from types import ModuleType, SimpleNamespace
@@ -12,7 +11,7 @@ import pytest
 from opensquilla.channels.discord import DiscordChannel, DiscordChannelConfig
 from opensquilla.channels.matrix import MatrixChannel, MatrixChannelConfig
 from opensquilla.channels.msteams import MSTeamsChannel, MSTeamsChannelConfig
-from opensquilla.channels.slack import SLACK_API_BASE, SlackChannel
+from opensquilla.channels.slack import SlackChannel
 from opensquilla.channels.types import IncomingMessage
 
 
@@ -24,25 +23,20 @@ async def _one_chunk() -> AsyncIterator[str]:
 async def test_slack_terminal_operations_accept_the_stream_creation_channel() -> None:
     requests: list[tuple[str, dict[str, Any]]] = []
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"ok": True})
+    class Client:
+        async def api_call(self, method: str, *, json: dict[str, Any]) -> dict[str, Any]:
+            requests.append((f"/{method}", json))
+            return {"ok": True}
 
     channel = SlackChannel(
         token="xoxb-dummy",
         slack_channel_id="configured-channel",
     )
-    channel._client = httpx.AsyncClient(
-        base_url=SLACK_API_BASE,
-        transport=httpx.MockTransport(handler),
-    )
-    try:
-        await channel.edit("111.222", "canonical", channel="origin-channel")
-        await channel.delete("111.222", channel="origin-channel")
-    finally:
-        await channel._client.aclose()
+    channel._client = Client()
+    await channel.edit("111.222", "canonical", channel="origin-channel")
+    await channel.delete("111.222", channel="origin-channel")
 
-    assert [(path.removeprefix("/api"), payload) for path, payload in requests] == [
+    assert requests == [
         (
             "/chat.update",
             {"channel": "origin-channel", "ts": "111.222", "text": "canonical"},

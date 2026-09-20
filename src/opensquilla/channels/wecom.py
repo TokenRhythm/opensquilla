@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import mimetypes
 import time
 import xml.etree.ElementTree as ET
@@ -46,6 +45,7 @@ from opensquilla.channels.contract import (
 )
 from opensquilla.channels.types import (
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -131,6 +131,22 @@ class WeComChannelConfig(BaseModel):
     model_config = {}
 
 
+class _WeComSDKLogger:
+    """Keep provider payloads out of logs; adapter callbacks report safe status."""
+
+    def debug(self, *_args: object) -> None:
+        pass
+
+    def info(self, *_args: object) -> None:
+        pass
+
+    def warn(self, *_args: object) -> None:
+        pass
+
+    def error(self, *_args: object) -> None:
+        pass
+
+
 @dataclass
 class _TokenState:
     token: str
@@ -162,12 +178,7 @@ class WeComChannel:
     _token_state: _TokenState | None = field(default=None, init=False, repr=False)
     _token_lock: asyncio.Lock = field(default_factory=asyncio.Lock, init=False, repr=False)
     _refresh_task: asyncio.Task | None = field(default=None, init=False, repr=False)
-    _ws: Any | None = field(default=None, init=False, repr=False)
-    _ws_task: asyncio.Task | None = field(default=None, init=False, repr=False)
-    _ws_heartbeat_task: asyncio.Task | None = field(default=None, init=False, repr=False)
-    _pending_ws_responses: dict[str, asyncio.Future[dict[str, Any]]] = field(
-        default_factory=dict, init=False, repr=False
-    )
+    _ws_sdk: Any | None = field(default=None, init=False, repr=False)
     _reply_req_ids: dict[str, tuple[str, float]] = field(
         default_factory=dict, init=False, repr=False
     )
@@ -202,6 +213,9 @@ class WeComChannel:
                 group_chat=True,
                 mentions=True,
                 reply=True,
+                native_file_upload=True,
+                artifact_delivery=True,
+                media=True,
                 transports=("websocket",),
                 notes=(
                     "WeCom AI Bot long-connection mode uses bot_id/bot_secret "
@@ -226,11 +240,12 @@ class WeComChannel:
         if self.config.connection_mode == "websocket":
             return ChannelPlatformManifest.from_channel_profile(
                 self.capability_profile,
+                has_send_file=True,
             ).with_capabilities(
                 ChannelPlatformCapability(
                     category=ChannelPlatformCategories.FILES,
-                    status=ChannelPlatformCapabilityStatus.UNSUPPORTED,
-                    notes=("WeCom AI Bot websocket media upload is not implemented yet.",),
+                    status=ChannelPlatformCapabilityStatus.SUPPORTED,
+                    notes=("AI Bot SDK uploads media and replies to the original request.",),
                 ),
                 ChannelPlatformCapability(
                     category=ChannelPlatformCategories.ATTACHMENTS,
@@ -386,7 +401,7 @@ class WeComChannel:
 
     async def health_check(self) -> ChannelHealth:
         if self.config.connection_mode == "websocket":
-            transport_alive = self._ws_task is not None and not self._ws_task.done()
+            transport_alive = self._ws_sdk is not None and self._ws_sdk.is_connected
         else:
             transport_alive = self._refresh_task is not None and not self._refresh_task.done()
         return ChannelHealth(
@@ -416,39 +431,6 @@ class WeComChannel:
             return str(headers.get("req_id") or "")
         return ""
 
-    @staticmethod
-    def _parse_ws_json(raw: Any) -> dict[str, Any] | None:
-        if isinstance(raw, bytes):
-            raw = raw.decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(str(raw))
-        except (TypeError, ValueError):
-            return None
-        return payload if isinstance(payload, dict) else None
-
-    async def _connect_websocket(self) -> Any:
-        import websockets
-
-        return await websockets.connect(
-            self.config.websocket_url,
-            # WeCom uses application-level JSON ping/pong. Protocol-level
-            # Ping frames can trigger 1002 "incorrect masking" responses.
-            ping_interval=None,
-        )
-
-    async def _ws_send_json(self, payload: dict[str, Any]) -> None:
-        if self._ws is None:
-            raise RuntimeError("wecom websocket is not connected")
-        await self._ws.send(json.dumps(payload, ensure_ascii=False))
-
-    async def _ws_recv_json(self) -> dict[str, Any]:
-        if self._ws is None:
-            raise RuntimeError("wecom websocket is not connected")
-        while True:
-            payload = self._parse_ws_json(await self._ws.recv())
-            if payload is not None:
-                return payload
-
     @classmethod
     def _response_error(cls, payload: dict[str, Any]) -> tuple[int | None, str]:
         body_raw = payload.get("body")
@@ -461,196 +443,108 @@ class WeComChannel:
         errmsg = str(payload.get("errmsg") or body.get("errmsg") or "")
         return errcode, errmsg
 
-    async def _open_and_authenticate_websocket(self) -> None:
-        self._ws = await self._connect_websocket()
-        req_id = self._new_req_id("subscribe")
-        await self._ws_send_json(
-            {
-                "cmd": _APP_CMD_SUBSCRIBE,
-                "headers": {"req_id": req_id},
-                "body": {
-                    "bot_id": self.config.bot_id,
-                    "secret": self.config.bot_secret,
-                },
-            }
-        )
-        auth_payload = await asyncio.wait_for(
-            self._wait_for_ws_response(req_id), timeout=_WEBSOCKET_HANDSHAKE_TIMEOUT_S
-        )
-        errcode, errmsg = self._response_error(auth_payload)
-        if errcode not in (0, None):
-            raise WeComAuthError(
-                f"aibot_subscribe failed: errcode={errcode} errmsg={errmsg or 'unknown'}"
-            )
-        self._connected = True
-
     async def _start_websocket(self) -> None:
+        """Let the SDK own authentication, heartbeat and reconnect lifecycle."""
         self._require_websocket_credentials()
+        if self._ws_sdk is not None:
+            return
+        from wecom_aibot_sdk import WSClient  # type: ignore[import-untyped]
+
+        ready: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        client = WSClient(
+            bot_id=self.config.bot_id,
+            secret=self.config.bot_secret,
+            ws_url=self.config.websocket_url,
+            heartbeat_interval=int(_WEBSOCKET_APP_PING_INTERVAL_S * 1000),
+            reconnect_interval=int(_WEBSOCKET_RECONNECT_INITIAL_S * 1000),
+            max_reconnect_attempts=-1,
+            request_timeout=int(_WEBSOCKET_REQUEST_TIMEOUT_S * 1000),
+            logger=_WeComSDKLogger(),
+        )
+        self._ws_sdk = client
+
+        def authenticated() -> None:
+            if self._ws_sdk is not client:
+                return
+            self._connected = True
+            if not ready.done():
+                ready.set_result(None)
+
+        def disconnected(*_args: object) -> None:
+            if self._ws_sdk is client:
+                self._connected = False
+
+        def failed(error: Exception) -> None:
+            # SDK error strings can contain provider payloads and secrets.
+            log.warning("wecom.sdk_error", error_type=type(error).__name__)
+            if not ready.done():
+                ready.set_exception(WeComAuthError("WeCom AI Bot SDK connection failed"))
+
+        def received(payload: dict[str, Any]) -> None:
+            if self._ws_sdk is client and self._connected:
+                self._ingest_sdk_message(payload)
+
+        client.on("authenticated", authenticated)
+        client.on("disconnected", disconnected)
+        client.on("reconnecting", disconnected)
+        client.on("error", failed)
+        client.on("message", received)
         try:
-            await self._open_and_authenticate_websocket()
-        except Exception:
-            await self._close_websocket()
+            await asyncio.wait_for(client.connect(), timeout=_WEBSOCKET_HANDSHAKE_TIMEOUT_S)
+            await asyncio.wait_for(ready, timeout=_WEBSOCKET_HANDSHAKE_TIMEOUT_S)
+        except BaseException:
+            await self._stop_websocket()
+            if ready.done() and not ready.cancelled():
+                ready.exception()
             raise
-        self._ws_task = asyncio.create_task(
-            self._websocket_receive_loop(), name=f"wecom-websocket:{self.config.name}"
-        )
-        self._ws_heartbeat_task = asyncio.create_task(
-            self._websocket_heartbeat_loop(), name=f"wecom-websocket-heartbeat:{self.config.name}"
-        )
         log.info("wecom.websocket_started", name=self.config.name)
 
     async def _stop_websocket(self) -> None:
-        if self._ws_heartbeat_task is not None:
-            self._ws_heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._ws_heartbeat_task
-            self._ws_heartbeat_task = None
-        if self._ws_task is not None:
-            self._ws_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._ws_task
-            self._ws_task = None
-        self._fail_pending_ws_responses(asyncio.CancelledError())
-        await self._close_websocket()
-        self._reply_req_ids.clear()
-        self._last_chat_req_ids.clear()
-        if self.config.connection_mode == "websocket":
-            self._connected = False
-
-    async def _close_websocket(self) -> None:
-        ws = self._ws
-        self._ws = None
-        if ws is None:
-            return
-        close = getattr(ws, "close", None)
-        if callable(close):
-            with contextlib.suppress(Exception):
-                await close()
-
-    def _fail_pending_ws_responses(self, exc: BaseException) -> None:
-        for future in list(self._pending_ws_responses.values()):
-            if not future.done():
-                if isinstance(exc, asyncio.CancelledError):
-                    future.cancel()
-                else:
-                    future.set_exception(exc)
-        self._pending_ws_responses.clear()
-
-    async def _wait_for_ws_response(self, req_id: str) -> dict[str, Any]:
-        while True:
-            payload = await self._ws_recv_json()
-            if self._payload_req_id(payload) == req_id:
-                return payload
-            await self._handle_websocket_payload(payload, pre_auth=True)
-
-    async def _websocket_receive_loop(self) -> None:
-        backoff = _WEBSOCKET_RECONNECT_INITIAL_S
-        while True:
-            try:
-                while True:
-                    payload = await self._ws_recv_json()
-                    await self._handle_websocket_payload(payload)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._connected = False
-                self._fail_pending_ws_responses(exc)
-                log.warning("wecom.websocket_error", error=str(exc))
-                await self._close_websocket()
-            await asyncio.sleep(backoff)
-            try:
-                await self._open_and_authenticate_websocket()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._connected = False
-                log.warning("wecom.websocket_reconnect_failed", error=str(exc), backoff_s=backoff)
-                await self._close_websocket()
-                backoff = min(backoff * 2, _WEBSOCKET_RECONNECT_MAX_S)
-                continue
-            log.info("wecom.websocket_reconnected", name=self.config.name)
-            backoff = _WEBSOCKET_RECONNECT_INITIAL_S
-
-    async def _websocket_heartbeat_loop(self) -> None:
+        client, self._ws_sdk = self._ws_sdk, None
+        self._connected = False
         try:
-            while True:
-                await asyncio.sleep(_WEBSOCKET_APP_PING_INTERVAL_S)
-                if not self._connected or self._ws is None:
-                    continue
-                try:
-                    await self._send_ws_request(_APP_CMD_PING, {})
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._connected = False
-                    log.warning("wecom.websocket_heartbeat_failed", error=str(exc))
-                    await self._close_websocket()
-        except asyncio.CancelledError:
-            raise
+            if client is not None:
+                await client.disconnect()
+        finally:
+            self._reply_req_ids.clear()
+            self._last_chat_req_ids.clear()
 
-    async def _handle_websocket_payload(
-        self, payload: dict[str, Any], *, pre_auth: bool = False
-    ) -> None:
-        cmd = str(payload.get("cmd") or "")
-        req_id = self._payload_req_id(payload)
-        if (
-            not pre_auth
-            and req_id in self._pending_ws_responses
-            and cmd not in _MESSAGE_CALLBACK_COMMANDS
-            and cmd != _APP_CMD_EVENT_CALLBACK
-        ):
-            future = self._pending_ws_responses.get(req_id)
-            if future is not None and not future.done():
-                future.set_result(payload)
+    def _ingest_sdk_message(self, payload: dict[str, Any]) -> None:
+        msg = self._parse_inbound_websocket_json(payload)
+        if msg is None:
             return
-        if cmd == _APP_CMD_PING:
-            await self._ws_send_json(
-                {
-                    "cmd": _APP_CMD_PONG,
-                    "headers": {"req_id": req_id or self._new_req_id("pong")},
-                    "body": {},
-                }
-            )
+        msg_id = str(msg.metadata.get("message_id", ""))
+        if msg_id and not self._dedupe.check_and_add(msg_id):
             return
-        if cmd == _APP_CMD_EVENT_CALLBACK:
-            log.info("wecom.websocket_event_ignored", req_id=req_id)
-            return
-        if cmd in _MESSAGE_CALLBACK_COMMANDS:
-            msg = self._parse_inbound_websocket_json(payload)
-            if msg is None:
-                return
-            msg_id = str(msg.metadata.get("message_id", ""))
-            if msg_id and not self._dedupe.check_and_add(msg_id):
-                log.info("wecom.dedup_drop", message_id=msg_id)
-                return
-            self._remember_reply_req_id(msg_id, str(msg.metadata.get("wecom_req_id", "")))
-            self._remember_chat_req_id(
-                str(msg.metadata.get("chat_id", msg.channel_id)),
-                str(msg.metadata.get("wecom_req_id", "")),
-            )
-            self.enqueue(msg)
+        self._remember_reply_req_id(msg_id, str(msg.metadata.get("wecom_req_id", "")))
+        self._remember_chat_req_id(
+            str(msg.metadata.get("chat_id", msg.channel_id)),
+            str(msg.metadata.get("wecom_req_id", "")),
+        )
+        self.enqueue(msg)
 
     async def _send_ws_request(
-        self,
-        cmd: str,
-        body: dict[str, Any],
-        *,
-        req_id: str | None = None,
+        self, cmd: str, body: dict[str, Any], *, req_id: str | None = None,
     ) -> dict[str, Any]:
-        if self._ws is None or not self._connected:
+        client = self._ws_sdk
+        if client is None or not self._connected:
             raise RuntimeError("wecom websocket is not connected")
-        request_id = req_id or self._new_req_id(cmd)
-        future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
-        self._pending_ws_responses[request_id] = future
-        try:
-            await self._ws_send_json({"cmd": cmd, "headers": {"req_id": request_id}, "body": body})
-            response = await asyncio.wait_for(future, timeout=_WEBSOCKET_REQUEST_TIMEOUT_S)
-        finally:
-            self._pending_ws_responses.pop(request_id, None)
+        if cmd == _APP_CMD_RESPONSE and req_id:
+            operation = client.reply({"headers": {"req_id": req_id}}, body)
+        elif cmd == _APP_CMD_SEND:
+            target = str(body.get("chatid") or "").strip()
+            if not target:
+                raise WeComApiError("chatid is required for proactive websocket sends")
+            operation = client.send_message(
+                target, {k: v for k, v in body.items() if k != "chatid"},
+            )
+        else:
+            raise WeComApiError("unsupported websocket operation")
+        response = await asyncio.wait_for(operation, timeout=_WEBSOCKET_REQUEST_TIMEOUT_S)
         errcode, errmsg = self._response_error(response)
         if errcode not in (0, None):
             raise WeComApiError(errmsg or "websocket request failed", code=errcode)
-        return response
+        return dict(response)
 
     def _reply_req_id_expires_at(self) -> float:
         return time.monotonic() + _WEBSOCKET_REPLY_REQ_ID_TTL_S
@@ -1070,11 +964,7 @@ class WeComChannel:
         content: str = "",
     ) -> ChannelSendResult:
         if self.config.connection_mode == "websocket":
-            raise UnsupportedChannelOperation(
-                channel="wecom",
-                operation="send_file",
-                reason="WeCom AI Bot websocket media upload is not implemented yet",
-            )
+            return await self._send_sdk_file(target_id, file_path)
 
         token = await self._get_token()
         client = self._get_client()
@@ -1121,6 +1011,63 @@ class WeComChannel:
             capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
             target_id=str(target_id),
             provider_message_id=str(send_data.get("msgid", "")),
+            provider_file_id=media_id,
+        )
+
+    async def deliver_artifact(
+        self, request: ChannelArtifactDeliveryRequest,
+    ) -> ChannelSendResult:
+        if self.config.connection_mode != "websocket":
+            # The contextual operation already owns the durable delivery ID.
+            # Avoid the instance's legacy send_file outbox wrapper here.
+            return await WeComChannel.send_file(
+                self, request.inbound.sender_id, request.file_path,
+            )
+        return await self._send_sdk_file(
+            request.inbound.channel_id,
+            request.file_path,
+            req_id=self._metadata_reply_req_id(request.inbound.metadata),
+        )
+
+    async def _send_sdk_file(
+        self, target_id: str, file_path: str, *, req_id: str = "",
+    ) -> ChannelSendResult:
+        target_id = str(target_id or "").strip()
+        if not target_id:
+            raise ValueError("wecom file target is required")
+        client = self._ws_sdk
+        if client is None or not self._connected:
+            raise RuntimeError("wecom websocket is not connected")
+        path = Path(file_path)
+        # Bound materialization before handing bytes to the SDK chunk uploader.
+        if not 0 < path.stat().st_size <= 20 * 1024 * 1024:
+            raise ValueError("WeCom artifact must be between 1 byte and 20 MiB")
+
+        def read_bounded() -> bytes:
+            with path.open("rb") as stream:
+                content = stream.read(20 * 1024 * 1024 + 1)
+            if not 0 < len(content) <= 20 * 1024 * 1024:
+                raise ValueError("WeCom artifact size changed before upload")
+            return content
+
+        material = await asyncio.to_thread(read_bounded)
+        media_type = self._wecom_media_type(path)
+        uploaded = await client.upload_media(material, type=media_type, filename=path.name)
+        media_id = str(uploaded.get("media_id") or "")
+        if not media_id:
+            raise WeComApiError("AI Bot upload returned no media_id")
+        if req_id:
+            response = await client.reply_media(
+                {"headers": {"req_id": req_id}}, media_type, media_id,
+            )
+        else:
+            response = await client.send_media_message(target_id, media_type, media_id)
+        errcode, errmsg = self._response_error(response)
+        if errcode not in (0, None):
+            raise WeComApiError(errmsg or "AI Bot file delivery failed", code=errcode)
+        return ChannelSendResult.sent(
+            capability=ChannelCapabilities.ARTIFACT_DELIVERY,
+            target_id=target_id,
             provider_file_id=media_id,
         )
 

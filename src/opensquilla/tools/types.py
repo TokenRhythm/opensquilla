@@ -330,6 +330,12 @@ class ToolContext:
     # preserve the positional compatibility of the existing context fields.
     explicitly_allowed_tools: set[str] = field(default_factory=set)
 
+    # Runtime-attested execution facts. These are populated only by the
+    # trusted gateway route builder; model arguments and channel metadata can
+    # never grant them. They keep tool projection and dispatch on one frozen
+    # per-turn authority snapshot.
+    sandboxed_workspace_authoring: Any | None = field(default=None, repr=False)
+
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
     """Return whether ``ctx`` carries authority for a top-level Goal turn.

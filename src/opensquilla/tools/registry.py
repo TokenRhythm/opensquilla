@@ -33,10 +33,6 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
     {
         "apply_patch",
         "browser",
-        "create_csv",
-        "create_pdf_report",
-        "create_pptx",
-        "create_xlsx",
         "cron",
         "edit_file",
         "exec_command",

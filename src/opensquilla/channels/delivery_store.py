@@ -13,13 +13,14 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import structlog
 
 from opensquilla.channels.contract import (
+    ChannelCapabilities,
     ChannelSendResult,
     channel_capability_profile,
     classify_channel_send_error,
@@ -772,11 +773,34 @@ class ChannelDeliveryStore:
         *,
         capability: str = "message",
     ) -> str:
+        send_id, _inserted = self.begin_send_once(
+            channel_name,
+            message,
+            capability=capability,
+        )
+        return send_id
+
+    def begin_send_once(
+        self,
+        channel_name: str,
+        message: OutgoingMessage,
+        *,
+        capability: str = "message",
+    ) -> tuple[str, bool]:
+        """Persist a send intent and report whether this call created it.
+
+        Contextual artifact delivery uses the caller-provided ``delivery_id``
+        as an idempotency key.  ``INSERT OR IGNORE`` already prevents a second
+        row, but callers need to know whether they own the first attempt before
+        invoking a provider API (otherwise a retry can send the same file
+        twice).  Existing callers of :meth:`begin_send` keep its original
+        string-only contract.
+        """
         send_id = str(message.metadata.get("delivery_id") or uuid.uuid4().hex)
         now = time.time()
         target_id = str(message.reply_to or message.metadata.get("channel") or "")
         with self._lock:
-            self._conn.execute(
+            cursor = self._conn.execute(
                 "INSERT OR IGNORE INTO channel_outbox "
                 "(send_id, channel_name, target_id, message_json, content_sha256, "
                 "state, capability, created_at, updated_at) "
@@ -793,7 +817,41 @@ class ChannelDeliveryStore:
                 ),
             )
             self._conn.commit()
-        return send_id
+        return send_id, cursor.rowcount == 1
+
+    def send_record(self, send_id: str) -> sqlite3.Row | None:
+        """Return one durable outbound record for idempotent replay checks."""
+
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT send_id, channel_name, target_id, message_json, state, capability, "
+                "provider_message_id, provider_file_id, error_message "
+                "FROM channel_outbox WHERE send_id = ?",
+                (send_id,),
+            ).fetchone()
+            return cast(sqlite3.Row | None, row)
+
+    def claim_failed_artifact_retry(
+        self,
+        send_id: str,
+        channel_name: str,
+        intent: OutgoingMessage,
+    ) -> bool:
+        """Retry only an explicit provider rejection with an unchanged binding.
+
+        A transport exception, interrupted attempt or missing receipt is never
+        eligible.  The conditional update also serializes concurrent retries.
+        """
+
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE channel_outbox SET state = 'pending', retryable = 0, updated_at = ? "
+                "WHERE send_id = ? AND channel_name = ? AND message_json = ? "
+                "AND state = 'failed' AND retryable = 1",
+                (time.time(), send_id, channel_name, _safe_message_json(intent)),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def complete_send(
         self,
@@ -1085,6 +1143,8 @@ def _operation_message(
     operation: str,
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
+    *,
+    channel_name: str = "",
 ) -> OutgoingMessage:
     """Build a secret-free durable intent for a non-``send`` mutation."""
     artifact_request = _artifact_request_from_operation(operation, args, kwargs)
@@ -1112,8 +1172,18 @@ def _operation_message(
         value = kwargs.get("content", args[2] if len(args) > 2 else "")
         content = str(value or "")
 
+    binding = (
+        _artifact_delivery_binding(channel_name, artifact_request)
+        if artifact_request is not None
+        else ""
+    )
+    delivery_id = (
+        artifact_request.delivery_id or binding
+        if artifact_request is not None
+        else uuid.uuid4().hex
+    )
     metadata: dict[str, Any] = {
-        "delivery_id": uuid.uuid4().hex,
+        "delivery_id": delivery_id,
         "outbox_operation": operation,
     }
     if artifact_request is not None:
@@ -1123,6 +1193,7 @@ def _operation_message(
                 "artifact_name": ntpath.basename(artifact_request.name),
                 "artifact_mime_type": artifact_request.mime_type,
                 "artifact_size": artifact_request.size,
+                "artifact_binding": binding,
             }
         )
 
@@ -1131,6 +1202,43 @@ def _operation_message(
         reply_to=target or None,
         metadata=metadata,
     )
+
+
+def _artifact_delivery_binding(
+    channel_name: str,
+    request: ChannelArtifactDeliveryRequest,
+) -> str:
+    """Bind an artifact identity to its session, account and original reply route.
+
+    Only a digest is journaled: no prompt, arbitrary inbound metadata, source
+    path or provider credentials enter the artifact outbox record.
+    """
+
+    inbound = request.inbound
+    route_fields = (
+        "native_chat_id", "native_message_id", "native_thread_id", "native_parent_id",
+        "native_parent_channel_id", "native_root_id", "reply_target_id", "thread_ts",
+        "thread_id", "message_thread_id", "reply_message_id", "conversation_kind",
+        "is_group", "conversation_id", "conversation_type", "sender_staff_id",
+        "wecom_req_id",
+    )
+    payload = {
+        "channel_name": channel_name,
+        "provider": inbound.provenance.provider,
+        "account_id": inbound.provenance.account_id,
+        "event_key": inbound_event_key(channel_name, inbound),
+        "sender_id": inbound.sender_id,
+        "channel_id": inbound.channel_id,
+        "route": {key: inbound.metadata.get(key) for key in route_fields},
+        "session_id": request.session_id,
+        "artifact_id": request.artifact_id,
+        "name": ntpath.basename(request.name),
+        "mime_type": request.mime_type,
+        "size": request.size,
+    }
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode()
+    ).hexdigest()
 
 
 def _artifact_request_from_operation(
@@ -1152,6 +1260,57 @@ def _redact_operation_error(
     return f"{type(error).__name__}: contextual artifact delivery failed"
 
 
+def _replay_artifact_delivery(
+    record: sqlite3.Row | None,
+    *,
+    request: ChannelArtifactDeliveryRequest,
+    send_id: str,
+    channel_name: str,
+    intent: OutgoingMessage,
+) -> ChannelSendResult:
+    """Return a durable result without invoking a provider a second time."""
+
+    capability = ChannelCapabilities.ARTIFACT_DELIVERY
+    target_id = request.inbound.channel_id
+    if record is None:
+        return ChannelSendResult.failed(
+            capability=capability,
+            target_id=target_id,
+            reason="artifact delivery record disappeared before retry",
+        )
+    if (
+        record["channel_name"] != channel_name
+        or record["target_id"] != target_id
+        or record["message_json"] != _safe_message_json(intent)
+    ):
+        return ChannelSendResult.failed(
+            capability=capability,
+            target_id=target_id,
+            reason="artifact delivery identity does not match its original session and route",
+        )
+    state = str(record["state"] or "unknown")
+    if state == "sent":
+        return ChannelSendResult.sent(
+            capability=str(record["capability"] or capability),
+            target_id=str(record["target_id"] or target_id),
+            provider_message_id=str(record["provider_message_id"] or ""),
+            provider_file_id=str(record["provider_file_id"] or ""),
+        )
+    # ``pending``, ``unknown`` and ``sent_unconfirmed`` all mean that a
+    # provider outcome cannot be safely replayed.  Returning a non-retryable
+    # result lets the caller surface its existing task/download fallback while
+    # avoiding a second visible upload.
+    return ChannelSendResult.failed(
+        capability=str(record["capability"] or capability),
+        target_id=str(record["target_id"] or target_id),
+        reason=(
+            f"artifact delivery {send_id} has durable outcome {state}; "
+            "manual reconciliation is required before retry"
+        ),
+        retryable=False,
+    )
+
+
 async def deliver_operation_with_outbox(
     channel: Any,
     operation: str,
@@ -1162,14 +1321,37 @@ async def deliver_operation_with_outbox(
     """Persist one declared mutating operation and its terminal outcome."""
     store = getattr(channel, "_delivery_store", None)
     channel_name = str(getattr(channel, "_delivery_channel_name", "") or "")
-    if not isinstance(store, ChannelDeliveryStore) or not channel_name:
-        return await raw_operation(*args, **kwargs)
-
-    intent = _operation_message(operation, args, kwargs)
     contextual_artifact_operation = operation == "deliver_artifact"
-    send_id = store.begin_send(channel_name, intent, capability=operation)
+    request = _artifact_request_from_operation(operation, args, kwargs)
+    intent = _operation_message(operation, args, kwargs, channel_name=channel_name)
+    send_id = str(intent.metadata["delivery_id"])
+    operation_args = args
+    operation_kwargs = kwargs
+    if contextual_artifact_operation and request is not None:
+        # The outbox is the source of truth for a request without an explicit
+        # provider id.  Pass the exact ledger key to the adapter so provider
+        # retries can reuse it for their own idempotency parameter.
+        if request.delivery_id != send_id:
+            request = replace(request, delivery_id=send_id)
+        if kwargs.get("request") is not None:
+            operation_kwargs = dict(kwargs)
+            operation_kwargs["request"] = request
+        elif args and args[0] is not None:
+            operation_args = (request, *args[1:])
+    if not isinstance(store, ChannelDeliveryStore) or not channel_name:
+        return await raw_operation(*operation_args, **operation_kwargs)
+    send_id, inserted = store.begin_send_once(channel_name, intent, capability=operation)
+    if contextual_artifact_operation and not inserted and request is not None:
+        if not store.claim_failed_artifact_retry(send_id, channel_name, intent):
+            return _replay_artifact_delivery(
+                store.send_record(send_id),
+                request=request,
+                send_id=send_id,
+                channel_name=channel_name,
+                intent=intent,
+            )
     try:
-        result = await raw_operation(*args, **kwargs)
+        result = await raw_operation(*operation_args, **operation_kwargs)
     except BaseException as exc:
         if contextual_artifact_operation:
             store.fail_send(

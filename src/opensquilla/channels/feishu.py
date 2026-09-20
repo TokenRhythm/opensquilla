@@ -51,6 +51,7 @@ from opensquilla.channels.transports import InboundEventEnvelope, InboundEventHa
 from opensquilla.channels.types import (
     Attachment,
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -1778,14 +1779,12 @@ class FeishuChannel:
             "receive_id": chat_id,
             "msg_type": "text",
             "content": json.dumps({"text": _normalize_outbound_text(content)}),
+            "uuid": _feishu_delivery_uuid(request_uuid),
         }
         resp = await retry_request(
             client.post,
             "/im/v1/messages",
-            params={
-                "receive_id_type": receive_id_type,
-                "uuid": _feishu_delivery_uuid(request_uuid),
-            },
+            params={"receive_id_type": receive_id_type},
             json=payload,
             headers=headers,
         )
@@ -1808,10 +1807,10 @@ class FeishuChannel:
         resp = await retry_request(
             client.post,
             f"/im/v1/messages/{message_id}/reply",
-            params={"uuid": _feishu_delivery_uuid(request_uuid)},
             json={
                 "msg_type": "text",
                 "content": json.dumps({"text": _normalize_outbound_text(content)}),
+                "uuid": _feishu_delivery_uuid(request_uuid),
             },
             headers=headers,
         )
@@ -1861,16 +1860,14 @@ class FeishuChannel:
                 "receive_id": chat_id,
                 "msg_type": "text",
                 "content": json.dumps({"text": _normalize_outbound_text(message.content)}),
+                "uuid": request_uuid,
             }
             payload["msg_type"] = "interactive"
             payload["content"] = json.dumps(message.metadata["card"])
             resp = await retry_request(
                 client.post,
                 "/im/v1/messages",
-                params={
-                    "receive_id_type": receive_id_type,
-                    "uuid": request_uuid,
-                },
+                params={"receive_id_type": receive_id_type},
                 json=payload,
                 headers=headers,
             )
@@ -1885,13 +1882,17 @@ class FeishuChannel:
             )
         log.debug("feishu.send", chat_id=chat_id)
 
-    async def send_file(
+    async def _send_file(
         self,
         chat_id: str,
         file_path: str,
         file_type: str = "file",
+        *,
+        request_uuid: str | None = None,
+        reply_message_id: str | None = None,
+        reply_in_thread: bool = False,
     ) -> ChannelSendResult:
-        """Upload and send a file to a Feishu chat."""
+        """Upload and send a file, reusing a provider request UUID on retry."""
         chat_id = str(chat_id or "").strip()
         if not chat_id:
             raise ValueError("feishu.send_file: chat target is required")
@@ -1934,19 +1935,24 @@ class FeishuChannel:
             message_type = "file"
             content = {"file_key": key}
 
-        receive_id_type = _feishu_receive_id_type(chat_id)
-        payload = {
-            "receive_id": chat_id,
+        payload: dict[str, Any] = {
             "msg_type": message_type,
             "content": json.dumps(content),
+            "uuid": _feishu_delivery_uuid(request_uuid),
         }
+        params: dict[str, str] = {}
+        if reply_message_id:
+            endpoint = f"/im/v1/messages/{reply_message_id}/reply"
+            if reply_in_thread:
+                payload["reply_in_thread"] = True
+        else:
+            endpoint = "/im/v1/messages"
+            payload["receive_id"] = chat_id
+            params["receive_id_type"] = _feishu_receive_id_type(chat_id)
         resp = await retry_request(
             client.post,
-            "/im/v1/messages",
-            params={
-                "receive_id_type": receive_id_type,
-                "uuid": _feishu_delivery_uuid(),
-            },
+            endpoint,
+            params=params,
             json=payload,
             headers=headers,
         )
@@ -1959,6 +1965,37 @@ class FeishuChannel:
             target_id=chat_id,
             provider_message_id=message_id,
             provider_file_id=provider_file_id,
+        )
+
+    async def send_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        file_type: str = "file",
+    ) -> ChannelSendResult:
+        """Upload and send a file to a Feishu chat.
+
+        Keep the legacy signature for direct callers.  Contextual artifact
+        delivery uses :meth:`deliver_artifact` so the durable outbox identity
+        can reach Feishu's provider-level ``uuid`` parameter.
+        """
+
+        return await self._send_file(chat_id, file_path, file_type=file_type)
+
+    async def deliver_artifact(
+        self,
+        request: ChannelArtifactDeliveryRequest,
+    ) -> ChannelSendResult:
+        """Deliver an artifact to the exact chat that originated the request."""
+
+        metadata = self.build_reply_message("", request.inbound).metadata
+        reply_message_id = metadata.get("reply_message_id")
+        return await self._send_file(
+            request.inbound.channel_id,
+            request.file_path,
+            request_uuid=request.delivery_id,
+            reply_message_id=reply_message_id if isinstance(reply_message_id, str) else None,
+            reply_in_thread=bool(metadata.get("native_thread_id")),
         )
 
     async def edit(self, message_id: str, content: str) -> None:

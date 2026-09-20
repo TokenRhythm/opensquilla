@@ -519,10 +519,6 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "gemini": OpenAICompatPolicy(
         display_name="Gemini",
         official_host="generativelanguage.googleapis.com",
-        tool_schema_string_item_fallback_tools=frozenset({"create_csv"}),
-        tool_schema_string_item_fallback_api_root=(
-            "https://generativelanguage.googleapis.com/v1beta/openai"
-        ),
     ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",
