@@ -38,6 +38,7 @@ function mainStartupHarness() {
   const context = createContext({
     Error,
     isQuitting: false,
+    appExitPhase: 'running',
     gatewayProcess: null,
     gatewayProfileKey: 'synthetic-profile',
     forceOnboardingOnNextStartup: false,
@@ -117,6 +118,160 @@ async function runWarmExternalGatewayReuseCase() {
   for (const descriptor of [...harness.calls.rendered, ...harness.calls.published]) {
     assert.equal(descriptor.status, 'ready', 'warm launch must not publish a spurious startup transition')
   }
+}
+
+function mainExitHarness() {
+  const child = { pid: 1234 }
+  const previewCleanup = deferred()
+  const drainRequested = deferred()
+  const drainResult = deferred()
+  const calls = { published: [], order: [], refreshes: 0, exits: [], errors: [], resumedQuits: 0 }
+  let beforeQuit
+  const context = createContext({
+    appExitPhase: 'running', isQuitting: false, process: { platform: 'win32' },
+    gatewayProcess: child,
+    gatewayProcessOwnershipContexts: new Map([[child, { nonce: 'synthetic-owner' }]]),
+    desktopGatewayAuthToken: nonce => `auth-${nonce}`,
+    activeDesktopProfile: () => ({ home: 'synthetic-profile' }),
+    desktopProfileFingerprint: () => 'synthetic-fingerprint',
+    currentMainWindow: () => ({ webContents: {
+      getURL: () => 'opensquilla-app://desktop/chat',
+      send: (channel, descriptor) => {
+        assert.equal(channel, 'gateway:connection-changed')
+        calls.published.push(descriptor)
+        calls.order.push(`descriptor:${descriptor.status}`)
+      },
+    } }),
+    isDesktopRendererDocumentUrl: () => true,
+    refreshSandboxUpgradeReport: () => { calls.refreshes += 1 },
+    desktopLog() {}, rebuildWindowsTrayMenu() {},
+    app: {
+      on: (event, handler) => { assert.equal(event, 'before-quit'); beforeQuit = handler },
+      exit: code => calls.exits.push(code),
+      quit: () => { calls.resumedQuits += 1 },
+    },
+    desktopUpdateCheckScheduler: { stop() {} },
+    systemSessionEnding: false, updateApplying: false, updateInstallHandoffReady: false,
+    quitRequestedDuringUpdateDrain: false, quitGatewayDrainPromise: null,
+    quitDeferredForDesktopWriters: false, quitWriterAdmission: null,
+    desktopWriters: { activeCount: 0, close: () => Symbol('quit'), reopen() {} },
+    desktopReliabilityTelemetry: { finishSession() {} },
+    artifactPreviewLeaseBroker: {
+      clear() {},
+      revokeAll: () => { calls.order.push('preview-cleanup'); return previewCleanup.promise },
+    },
+    nativeWorkbenchSurfaces: { destroyAll: async () => {} },
+    desktopBrowser: { close: async () => {} },
+    destroyWindowsTray() {}, stopGateway() {},
+    hasGatewayProcessExited: () => false,
+    liveLifecycleOwnedGatewayProcesses: () => [child],
+    drainOwnedGatewayForQuit: (process, url, requestShutdown) => {
+      assert.equal(process, child)
+      assert.equal(url, 'http://127.0.0.1:8765', 'shutdown retains the internal Gateway URL')
+      assert.equal(requestShutdown, true)
+      calls.order.push('gateway-shutdown')
+      drainRequested.resolve()
+      return drainResult.promise
+    },
+    dialog: { showErrorBox: (...args) => calls.errors.push(args) },
+    desktopUpdateInstallMode: () => 'manual',
+    createWindowsTray() {}, createApplicationMenu() {}, setDesktopUpdateState() {},
+    setImmediate: callback => { calls.resumeQuit = callback },
+  })
+  runInContext([
+    mainSection('let desktopOpenFlowRevision =', 'function beginDesktopWriterOperation('),
+    mainSection('const gatewayState =', 'let sandboxUpgradeRefreshInFlight ='),
+    mainSection('function publishGatewayConnection(', 'const artifactPreviewLeaseBroker ='),
+    mainSection('function setAppExitPhase(', 'function destroyWindowsTray('),
+    mainSection('function restoreDownloadedUpdateRetryState(', 'async function stopOwnedGatewaysForUpdate('),
+    mainSection("app.on('before-quit',", 'function shutdownFromSignal('),
+    "Object.assign(gatewayState, { status: 'ready', url: 'http://127.0.0.1:8765', port: 8765, owned: true })",
+  ].join('\n'), context)
+  return {
+    context, calls, previewCleanup, drainRequested: drainRequested.promise, drainResult,
+    snapshot: () => runInContext('desktopGatewayConnectionSnapshot()', context),
+    phase: value => runInContext(`setAppExitPhase('${value}', 'synthetic lifecycle')`, context),
+    quit: () => beforeQuit({ preventDefault() {} }),
+  }
+}
+
+function assertRendererStopped(descriptor) {
+  assert.equal(descriptor.status, 'stopped', 'shutdown must revoke renderer reconnect admission')
+  assert.equal(descriptor.wsUrl, null)
+  assert.equal(descriptor.authToken, null)
+}
+
+function runExitDescriptorCase() {
+  const harness = mainExitHarness()
+  const ready = harness.snapshot()
+  assert.equal(ready.status, 'ready')
+  assert.equal(ready.authToken, 'auth-synthetic-owner')
+  harness.phase('deferred')
+  assert.equal(harness.snapshot().status, 'ready', 'waiting for writers must not disconnect the renderer')
+  assert.equal(harness.calls.published.length, 0)
+
+  harness.phase('draining')
+  assertRendererStopped(harness.snapshot())
+  assertRendererStopped(harness.calls.published.at(-1))
+  assert.equal(harness.calls.published.at(-1).revision, ready.revision + 1)
+  assert.equal(runInContext('gatewayState.status', harness.context), 'ready', 'internal drain authority stays intact')
+  assert.equal(harness.calls.refreshes, 0, 'drain publication must not start an optional HTTP diagnostic')
+  harness.phase('committed')
+  assertRendererStopped(harness.snapshot())
+  assert.equal(harness.calls.published.length, 1, 'already stopped phase changes do not republish admission')
+  runInContext("transitionGatewayConnection({ status: 'ready' })", harness.context)
+  assertRendererStopped(harness.calls.published.at(-1))
+  assert.equal(harness.calls.refreshes, 0, 'late ready notifications remain fenced during exit')
+
+  harness.phase('running')
+  const restored = harness.calls.published.at(-1)
+  assert.equal(restored.status, 'ready', 'abandoned exit restores renderer admission')
+  assert.equal(restored.wsUrl, ready.wsUrl)
+  assert.equal(restored.authToken, ready.authToken)
+  assert.equal(harness.calls.refreshes, 1)
+
+  const directExit = mainExitHarness()
+  directExit.phase('committed')
+  assertRendererStopped(directExit.calls.published.at(-1))
+}
+
+async function runQuitDrainDescriptorCase(exited) {
+  const harness = mainExitHarness()
+  harness.quit()
+  assertRendererStopped(harness.calls.published.at(-1))
+  assert.deepEqual(harness.calls.order, ['descriptor:stopped', 'preview-cleanup'])
+  harness.previewCleanup.resolve()
+  await harness.drainRequested
+  assert.deepEqual(harness.calls.order, ['descriptor:stopped', 'preview-cleanup', 'gateway-shutdown'])
+  const drain = runInContext('quitGatewayDrainPromise', harness.context)
+  harness.drainResult.resolve(exited)
+  await drain
+  if (exited) {
+    assertRendererStopped(harness.snapshot())
+    assert.deepEqual(harness.calls.exits, [0])
+  } else {
+    assert.equal(harness.calls.published.at(-1).status, 'ready', 'failed quit restores the live renderer')
+    assert.equal(harness.calls.errors.length, 1)
+    assert.deepEqual(harness.calls.exits, [])
+  }
+}
+
+function runUpdateDrainRepeatedQuitCase() {
+  const harness = mainExitHarness()
+  runInContext('updateApplying = true', harness.context)
+  harness.phase('deferred')
+  harness.quit()
+  assert.equal(harness.snapshot().status, 'ready')
+  harness.phase('draining')
+  harness.quit()
+  assertRendererStopped(harness.snapshot())
+  assert.equal(runInContext('appExitPhase', harness.context), 'draining', 'repeat Quit cannot reopen update drain admission')
+  assert.equal(harness.calls.published.length, 1)
+  runInContext('restoreDownloadedUpdateRetryState(null)', harness.context)
+  assert.equal(harness.calls.published.at(-1).status, 'ready', 'failed update handoff restores admission')
+  assert.equal(runInContext('appExitPhase', harness.context), 'running')
+  harness.calls.resumeQuit()
+  assert.equal(harness.calls.resumedQuits, 1, 'the deferred user quit is still resumed')
 }
 
 function fakeClock() {
@@ -370,6 +525,10 @@ async function runSlowColdStartReadinessCase() {
 
 await runColdStartDescriptorCase()
 await runWarmExternalGatewayReuseCase()
+runExitDescriptorCase()
+await runQuitDrainDescriptorCase(true)
+await runQuitDrainDescriptorCase(false)
+runUpdateDrainRepeatedQuitCase()
 await runStoppingSetOnlyCase()
 await runCurrentPlusStoppingCase()
 await runLatePublishedChildCase()

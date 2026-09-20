@@ -863,15 +863,22 @@ const gatewayState: GatewayState = {
   sandboxUpgrade: null,
 }
 
+function desktopGatewayConnectionSuspendedForExit(): boolean {
+  return appExitPhase === 'draining' || appExitPhase === 'committed'
+}
+
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
-  const ready = gatewayState.status === 'ready' && Boolean(gatewayState.url)
+  // Retain internal ownership and readiness for the authenticated drain, while
+  // withdrawing renderer reconnect admission before shutdown closes sockets.
+  const status = desktopGatewayConnectionSuspendedForExit() ? 'stopped' : gatewayState.status
+  const ready = status === 'ready' && Boolean(gatewayState.url)
   const authToken = ready && gatewayState.owned && gatewayProcess
     ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce ?? null
     : null
   return {
     schemaVersion: 1,
     revision: gatewayConnectionRevision,
-    status: gatewayState.status,
+    status,
     instanceId: gatewayConnectionInstanceId,
     profileFingerprint: desktopProfileFingerprint(activeDesktopProfile().home),
     httpUrl: gatewayState.url || null,
@@ -915,8 +922,9 @@ function publishGatewayConnection(): void {
   if (gatewayState.status !== 'ready') gatewayState.sandboxUpgrade = null
   const window = currentMainWindow()
   if (!window || !isDesktopRendererDocumentUrl(window.webContents.getURL())) return
-  window.webContents.send('gateway:connection-changed', desktopGatewayConnectionSnapshot())
-  if (gatewayState.status === 'ready' && gatewayState.sandboxUpgrade === null) {
+  const snapshot = desktopGatewayConnectionSnapshot()
+  window.webContents.send('gateway:connection-changed', snapshot)
+  if (snapshot.status === 'ready' && gatewayState.sandboxUpgrade === null) {
     void refreshSandboxUpgradeReport()
   }
 }
@@ -4937,8 +4945,12 @@ function focusMainWindow(): boolean {
 
 function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
   if (appExitPhase === next) return
+  const connectionWasSuspended = desktopGatewayConnectionSuspendedForExit()
   desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
   appExitPhase = next
+  if (connectionWasSuspended !== desktopGatewayConnectionSuspendedForExit()) {
+    publishGatewayConnection()
+  }
   rebuildWindowsTrayMenu()
 }
 
@@ -12148,10 +12160,11 @@ ipcMain.handle('gateway:connection', (event) => {
   if (!trustedMainWindowControlIpc(event)) {
     throw new Error('Untrusted Gateway connection request.')
   }
-  if (gatewayState.status === 'ready' && gatewayState.sandboxUpgrade === null) {
+  const snapshot = desktopGatewayConnectionSnapshot()
+  if (snapshot.status === 'ready' && gatewayState.sandboxUpgrade === null) {
     void refreshSandboxUpgradeReport()
   }
-  return desktopGatewayConnectionSnapshot()
+  return snapshot
 })
 ipcMain.handle('gateway:cli-invocation', async () => {
   const runtime = await resolveGatewayRuntime()
@@ -14941,7 +14954,9 @@ app.on('before-quit', (event) => {
       return
     }
     event.preventDefault()
-    setAppExitPhase('deferred', 'waiting for desktop update handoff')
+    if (!desktopGatewayConnectionSuspendedForExit()) {
+      setAppExitPhase('deferred', 'waiting for desktop update handoff')
+    }
     quitRequestedDuringUpdateDrain = true
     desktopLog('quit_deferred_for_update_drain')
     return

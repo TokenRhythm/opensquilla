@@ -25,7 +25,7 @@ const names = [
   'clearWindowsUpdateCache', 'publishVerifiedWindowsInstaller', 'restoreWindowsUpdateCache',
   'revalidateReadyWindowsInstaller', 'restoreDownloadedUpdateRetryState',
   'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage', 'applyWindowsInstaller',
-  'downloadDesktopUpdate', 'showUpdateError', 'handleMainWindowClose',
+  'downloadDesktopUpdate', 'showUpdateError', 'handleMainWindowClose', 'desktopGatewayConnectionSuspendedForExit',
 ]
 const declarations = new Map(parsed.statements.filter(ts.isFunctionDeclaration)
   .filter((statement) => statement.name).map((statement) => [statement.name.text, statement]))
@@ -491,6 +491,7 @@ for (const code of ['signature_invalid', 'signature_unavailable']) {
   assert.equal(f.closeWindow().defaultPrevented, true)
   assert.equal(f.requestQuit().defaultPrevented, true)
   assert.equal(f.requestQuit().defaultPrevented, true)
+  assert.equal(f.context.appExitPhase, 'draining', 'repeated Quit must not reopen renderer connections during the update drain')
   assert.equal(f.closeWindow().defaultPrevented, true)
   await f.subject.applyWindowsInstaller()
   assert.equal(f.calls.stops, 1)
