@@ -57,7 +57,12 @@ Consult `TOOLS.md` for exact schemas, cursors, grouping, retries, and recovery.
 Keep a compact map of claims, supporting and opposing evidence, open gaps, and
 the time boundary. Continue targeted discovery until another relevant source
 could no longer materially change the conclusion; if a gap remains unresolved,
-narrow the judgment and state the limit.
+narrow the judgment and state the limit. For a broad corpus with at least 30
+discovered source files, use at least 30 independent sources in substantive
+claims before finalization. The sidecar enforces this adaptive breadth target
+and a core explicitly-read set; do not pad the bibliography with metadata-only
+or unread sources. Smaller investigations keep the ordinary source-grounded
+review requirements without a forced bibliography floor.
 
 ## Drafting discipline
 
