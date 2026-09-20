@@ -318,9 +318,9 @@ for (const locale of ['en', 'zh-Hans'] as const) {
       await gateway.start()
       const label = page.locator('.assistant-activity--live .assistant-activity__live-label')
       gateway.activity('requesting', 'initial')
-      // The disclosure header intentionally stays at the current lifecycle;
-      // recovery details belong to its expandable, localized activity rows.
-      await expect(label).toHaveText(copy[locale].working)
+      // Wait for the requesting event to reach the current phase header;
+      // the generic working label is only the state before that event arrives.
+      await expect(label).toHaveText(copy[locale].waiting)
       await expect(page.locator('.msg-error')).toHaveCount(0)
       const disclosure = page.locator('.assistant-activity--live .assistant-activity__live-head')
       if (await disclosure.getAttribute('aria-expanded') !== 'true') await disclosure.click()
