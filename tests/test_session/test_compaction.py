@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
+from opensquilla.paths import native_io_path
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.attachment_manifest import (
     extract_attachment_occurrences_from_envelope,
@@ -419,7 +420,7 @@ async def test_compaction_preserves_only_verified_readable_image_paths(
         assert len(paths) == 1
         path = paths[0]
         assert path.startswith(f".opensquilla/attachments/{session_id}/")
-        assert (workspace / path).read_bytes() == payload
+        assert native_io_path(workspace / path).read_bytes() == payload
         assert path in compaction_replay_summary(result)
         if use_llm:
             assert path in received[0]
@@ -485,7 +486,7 @@ async def test_compaction_keeps_original_document_path_when_images_are_not_retai
     assert len(paths) == 1
     path = paths[0]
     assert path.startswith(".opensquilla/attachments/file-session/")
-    assert (workspace / path).read_bytes() == payload
+    assert native_io_path(workspace / path).read_bytes() == payload
     assert path in seen[0]
     assert path in compaction_replay_summary(result)
     assert not list(workspace.rglob("*.png"))
@@ -574,7 +575,7 @@ async def test_compaction_preserves_verified_tool_image_path(
         assert len(paths) == 1
         path = paths[0]
         assert path.startswith(".opensquilla/attachments/tool-image-session/")
-        assert (workspace / path).read_bytes() == payload
+        assert native_io_path(workspace / path).read_bytes() == payload
         second = await compact_context(CompactionRequest(
             session_id="tool-image-session",
             entries=[*first.kept_entries,
@@ -660,7 +661,7 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
     assert second.summary_payload is not None
     assert path in [item["path"] for item in second.summary_payload["files_and_artifacts"]]
     assert path in compaction_replay_summary(second)
-    assert (workspace / path).read_bytes() == payload
+    assert native_io_path(workspace / path).read_bytes() == payload
 
 
 @pytest.mark.asyncio

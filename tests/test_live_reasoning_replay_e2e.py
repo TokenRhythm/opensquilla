@@ -299,7 +299,11 @@ def test_live_cli_suppresses_provider_output_and_restores_environment(monkeypatc
     import sqlite3
     from pathlib import Path
 
-    from opensquilla.application.approval_queue import get_approval_queue
+    from opensquilla.application import approval_queue
+
+    # Exercise cleanup of a queue created by this invocation, regardless of
+    # whether an earlier test has already initialized the process singleton.
+    monkeypatch.setattr(approval_queue, "_queue", None)
 
     secret = "synthetic-cli-credential"
     monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
@@ -313,7 +317,7 @@ def test_live_cli_suppresses_provider_output_and_restores_environment(monkeypatc
         assert kwargs["api_key"] == secret
         if os.name == "nt":
             assert Path.home().is_relative_to(root)
-        queues.append(get_approval_queue())
+        queues.append(approval_queue.get_approval_queue())
         print(secret)
         print("opaque-provider-signature")
         return {"ok": True, "provider": "deepseek"}

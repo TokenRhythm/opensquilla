@@ -852,7 +852,10 @@ test.describe('Live assistant activity lifecycle', () => {
       retry_attempt: 7,
       retry_limit: 0,
     })
-    await expect(liveActivity.getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
+    await expect(liveActivity.locator('.assistant-activity__live-label'))
+      .toHaveText('Retrying · attempt 7')
+    await expect(liveActivity.getByTestId('assistant-unified-activity-timeline')
+      .getByText('Retrying · attempt 7', { exact: true })).toBeVisible()
     await expect(liveActivity).not.toContainText('7/0')
     await expect(page.locator('.msg-error')).toHaveCount(0)
 
@@ -969,13 +972,16 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(liveSummary).toHaveAttribute('aria-expanded', 'true')
     const liveStatus = liveActivity.locator('.assistant-activity__live-label')
     await expect(liveStatus).toHaveText('Working')
-    await expect(liveStatus).toHaveAttribute('role', 'status')
-    await expect(liveStatus).toHaveAttribute('aria-live', 'polite')
-    await expect(liveStatus).toHaveAttribute('aria-atomic', 'true')
+    const liveAnnouncement = liveActivity.locator('.assistant-activity__live-announcement')
+    await expect(liveAnnouncement).toHaveAttribute('role', 'status')
+    await expect(liveAnnouncement).toHaveAttribute('aria-live', 'polite')
+    await expect(liveAnnouncement).toHaveAttribute('aria-atomic', 'true')
     await expect(liveActivity.getByText('Working', { exact: true })).toHaveCount(1)
-    // The phase label is the only polite live region; tool details must not
-    // add duplicate announcements.
+    // The phase announcement is the only polite live region; timers and tool
+    // details must not add duplicate announcements.
     await expect(liveActivity.locator('[role="status"]')).toHaveCount(1)
+    await expect(liveActivity.locator('.assistant-activity__live-elapsed'))
+      .toHaveAttribute('aria-hidden', 'true')
     await expect(liveActivity.locator('.assistant-activity__live-failure')).toHaveCount(0)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(0)
     const liveMotion = await liveActivity.evaluate((element) => ({
@@ -1005,10 +1011,11 @@ test.describe('Live assistant activity lifecycle', () => {
     await expect(inspectPath).toHaveText('…/chat.ts')
     await expect(inspectPath).not.toHaveAttribute('role', 'button')
     await expect(liveActivity).not.toContainText('/private/project/chat.ts')
-    await expect(liveStatus).toHaveText('Working')
+    await expect(liveStatus).toHaveText('Inspecting files')
     // A cluster still in flight reads in the present tense; it settles into
     // the past tense once its result lands.
-    await expect(liveActivity.getByText('Inspecting files', { exact: true })).toHaveCount(1)
+    const liveTimeline = liveActivity.getByTestId('assistant-unified-activity-timeline')
+    await expect(liveTimeline.getByText('Inspecting files', { exact: true })).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-inspect',
@@ -1025,11 +1032,11 @@ test.describe('Live assistant activity lifecycle', () => {
     expect(await draftCandidate.evaluate(element =>
       element.closest('.assistant-activity') === null,
     )).toBe(true)
-    // The parent remains a turn-wide working indicator while only the child
-    // phase changes as the model moves from tools into answer composition.
-    await expect(liveStatus).toHaveText('Working')
+    // The header and timeline both identify the active operation; the header
+    // additionally retains total and current-step elapsed times.
+    await expect(liveStatus).toHaveText('Writing the answer')
     await expect(
-      liveActivity.getByText('Writing the answer', { exact: true }),
+      liveTimeline.getByText('Writing the answer', { exact: true }),
     ).toHaveCount(1)
     await expect(liveActivity.locator('.assistant-activity-status__row')).toHaveCount(1)
 
@@ -1040,8 +1047,8 @@ test.describe('Live assistant activity lifecycle', () => {
     })
     await expect(liveActivity.getByText('Draft candidate.', { exact: true })).toBeVisible()
     await expect(liveActivity.locator('.tool-row[data-op="command.run"]')).toBeVisible()
-    await expect(liveStatus).toHaveText('Working')
-    await expect(liveActivity.getByText('Running commands', { exact: true })).toHaveCount(1)
+    await expect(liveStatus).toHaveText('Running commands')
+    await expect(liveTimeline.getByText('Running commands', { exact: true })).toHaveCount(1)
 
     lifecycle.emit('session.event.tool_result', {
       tool_use_id: 'activity-verify',
