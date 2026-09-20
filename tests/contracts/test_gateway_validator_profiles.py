@@ -22,16 +22,18 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 204
+    assert len(targets) == 207
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 194,
-        "params": 25,
+        "result": 197,
+        "params": 28,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 898
+    assert sum(len(spec.targets) for spec in specs) == 910
+    for method in ("sessions.processes.list", "sessions.processes.log", "sessions.processes.stop"):
+        assert targets[("method", method)] == ("params", "result")
     assert targets[("method", "models.list")] == ("params", "result")
     assert targets[("method", "models.capacity.resolve")] == ("params", "result")
     assert targets[("method", "workspaces.references.read")] == ("params", "result")

@@ -109,7 +109,7 @@ for (const width of [1280, 390]) {
       const { mutations } = gateway
       await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
       const card = page.locator(`[data-plan-revision-id="${REVISION}"]`)
-      const cancel = page.locator('.plan-run__cancel')
+      const cancel = page.getByRole('button', { name: 'End plan execution', exact: true })
       await expect(card).toBeVisible()
       await expect(cancel).toBeVisible()
       await expect(page.locator('.plan-run__popover')).toHaveCount(0)

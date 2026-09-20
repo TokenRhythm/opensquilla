@@ -282,7 +282,7 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
     ("routed_tier", "expected_model", "expect_ensemble"),
     [
         ("c0", "qwen3.7-flash", False),
-        ("c1", "deepseek-v4-flash-0731", False),
+        ("c1", "deepseek-flash", False),
         ("c2", "deepseek-v4-pro-0813", False),
         # Shared C3 triggers the global plan without replacing the configured
         # direct/fallback selector head.

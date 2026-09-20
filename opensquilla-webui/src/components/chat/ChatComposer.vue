@@ -460,7 +460,9 @@
                 <button
                   v-if="canStop && !showSkillQueueSend"
                   key="stop"
-                  class="btn btn--icon btn--danger chat-send-btn"
+                  class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
+                  :disabled="stopPending"
+                  :aria-busy="stopPending || undefined"
                   :title="stopTargetsPlanRun
                     ? t('chat.planRun.stopExecutionEsc')
                     : t('chat.stopResponseEsc')"
@@ -560,6 +562,7 @@ const props = withDefaults(defineProps<{
   isStreaming: boolean
   canStop: boolean
   stopTargetsPlanRun?: boolean
+  stopPending?: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
@@ -2112,6 +2115,11 @@ button.attachment-chip__primary:focus-visible {
   background: var(--bg-hover);
   color: var(--text-dim);
   border-color: var(--bg-hover);
+}
+
+.chat-stop-btn {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .chat-send-control {

@@ -820,7 +820,7 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   padding: 2px 10px 10px;
 }
 
-#app .chat .chat-input-panel .btn--icon {
+#app .chat .chat-input-panel .btn--icon:not(.chat-stop-btn) {
   height: 32px;
   min-height: 32px;
   min-width: 32px;

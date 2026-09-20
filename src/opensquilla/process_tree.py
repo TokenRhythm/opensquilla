@@ -1739,6 +1739,10 @@ class _PosixGroupAnchor:
                 continue
             if marker == _POSIX_ANCHOR_EMPTY:
                 self.empty = True
+                # Natural completion can win the race with a stop request.
+                # EMPTY is authoritative even if no signal ACK will follow.
+                self._term_reports.put_nowait(True)
+                self._kill_reports.put_nowait(True)
                 owner = self._owner
                 if owner is not None:
                     await owner._close_empty_posix_owner()
@@ -1763,6 +1767,7 @@ class _PosixGroupAnchor:
         if command not in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
             raise ValueError("invalid POSIX anchor signal command")
         if stdin is None or stdin.is_closing() or not self.alive:
+            await self.settle(_CONTROL_READY_TIMEOUT_SECONDS)
             if not self.empty and not self._kill_reported:
                 self.cleanup_incomplete = True
             return False
@@ -1778,7 +1783,11 @@ class _PosixGroupAnchor:
             stdin.write(command)
             await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
-            self.cleanup_incomplete = True
+            # Drain the status pipe before classifying a closed control pipe:
+            # the anchor may already have reported an empty process group.
+            await self.settle(_CONTROL_READY_TIMEOUT_SECONDS)
+            if not self.empty and not self._kill_reported:
+                self.cleanup_incomplete = True
             return False
         if self._monitor_task is not None:
             try:

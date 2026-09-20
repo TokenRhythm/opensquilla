@@ -326,6 +326,59 @@ async def test_posix_anchor_owns_signalling_and_closes_with_its_lifecycle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_during_drain", [False, True])
+async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation(
+    exit_during_drain: bool,
+) -> None:
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=7), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            if command == process_tree._POSIX_ANCHOR_TERMINATE:
+                # The group became empty before the stop command arrived.
+                # Its authoritative EMPTY report replaces a signal ACK.
+                stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+
+        async def drain(self) -> None:
+            if exit_during_drain:
+                anchor_process.returncode = 0
+                raise BrokenPipeError
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert await asyncio.wait_for(
+            owner.terminate(graceful_timeout=0.1, kill_timeout=0.1), timeout=0.5,
+        )
+        assert anchor.empty is True
+        assert anchor.cleanup_incomplete is False
+        assert owner.is_active() is False
+        assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0)
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_posix_incomplete_cleanup_remains_failed_after_anchor_exit() -> None:
     anchor = process_tree._PosixGroupAnchor(
         process=SimpleNamespace(returncode=0),

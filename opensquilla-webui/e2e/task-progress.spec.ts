@@ -180,11 +180,11 @@ for (const width of [1280, 390]) {
   })
 }
 
-test('Default progress Cancel stops its ordinary task without a Plan mutation', { tag: '@plan-goal-runtime' }, async ({ page }) => {
+test('Composer Stop stops its ordinary task without a Plan mutation', { tag: '@plan-goal-runtime' }, async ({ page }) => {
   const gateway = await installGateway(page)
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
   const dock = page.locator(`[data-task-progress-id="${TASK}"]`)
-  const cancel = dock.getByRole('button', { name: 'Cancel', exact: true })
+  const cancel = page.getByRole('button', { name: 'Stop current response', exact: true })
   await expect(cancel).toBeEnabled()
   await cancel.click()
   await expect.poll(() => gateway.cancellations).toEqual([{
