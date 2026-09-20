@@ -479,6 +479,41 @@ async def test_resume_does_not_clear_barrier_without_control_proof_capacity(conn
         connection.release_transport_bytes(reserved, kind="control")
 
 
+@pytest.mark.parametrize("failure", ["transport_budget", "scheduler"])
+async def test_rejected_recovery_admission_releases_new_transfer(connection, monkeypatch, failure):
+    import opensquilla.gateway.websocket as websocket
+
+    key = f"agent:main:rejected-{failure}"
+    subscribe(connection, key)
+
+    if failure == "transport_budget":
+        monkeypatch.setattr(
+            connection, "reserve_transport_bytes", lambda *_args, **_kwargs: False,
+        )
+    else:
+        class RejectingScheduler:
+            def mutation_tail(self, *_args):
+                return None
+
+            def submit(self, *_args, **_kwargs):
+                return False
+
+        monkeypatch.setattr(websocket, "get_recovery_scheduler", lambda: RejectingScheduler())
+
+    context = RpcContext(
+        conn_id=connection.conn_id,
+        principal=connection.principal,
+        subscription_manager=connection._subscriptions,
+    )
+    accepted = connection._try_recovery_request(
+        get_dispatcher(), f"rejected-{failure}", "sessions.messages.snapshot.read",
+        {"key": key, "sync_revision": "one"}, context, 128,
+    )
+
+    assert not accepted
+    assert connection.snapshot_registry().get(key, "one") is None
+
+
 async def test_large_modern_read_response_uses_bulk_without_closing(connection):
     from opensquilla.gateway.rpc import RpcDispatcher
     from opensquilla.gateway.websocket import _dispatch_request

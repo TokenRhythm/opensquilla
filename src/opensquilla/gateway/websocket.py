@@ -796,6 +796,8 @@ class WsConnection:
             predecessors.append(tail)
         intent = None
         created = False
+        transfer_registry = None
+        transfer_created = False
         if self._subscriptions is not None:
             intent = self._subscriptions.get_message_intent(self.conn_id, key)
             if method == "sessions.messages.subscribe":
@@ -837,10 +839,13 @@ class WsConnection:
                     ):
                         raise SnapshotTransferError("SNAPSHOT_EXPIRED")
                 else:
+                    existing_transfer = registry.get(key, params["sync_revision"])
                     operation.transfer = registry.admit(
                         key, params["sync_revision"], operation.subscription_token,
                         is_current=current,
                     )
+                    transfer_registry = registry
+                    transfer_created = existing_transfer is None
             except SnapshotTransferError as exc:
                 self._enqueue_frame(_OutboundFrame(
                     "res", "control", None, None,
@@ -849,7 +854,13 @@ class WsConnection:
                     is_control=True,
                 ))
                 return True
+
+        def release_admitted_transfer() -> None:
+            if transfer_created and transfer_registry is not None:
+                transfer_registry.release(key, params["sync_revision"])
+
         if not self.reserve_transport_bytes(size):
+            release_admitted_transfer()
             if created:
                 self._subscriptions.unsubscribe_messages(
                     self.conn_id, key, expected_token=operation.subscription_token,
@@ -898,6 +909,7 @@ class WsConnection:
                     await budget.drain()
 
         if not scheduler.submit(operation, run, finish=finish, expire=expire):
+            release_admitted_transfer()
             finish()
             return False
         return True
