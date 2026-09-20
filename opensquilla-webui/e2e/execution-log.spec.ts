@@ -93,7 +93,12 @@ test('execution logs are fetched by page independently of the model result previ
   await expect(visible).toContainText(MIDDLE)
   expect(Array.from(await visible.textContent() || '').length).toBe(12000)
   await modal.getByRole('button', { name: 'Copy this page', exact: true }).click()
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await visible.textContent())
+  const visibleText = await visible.textContent() || ''
+  // Windows' native clipboard represents line breaks as CRLF. Keep the
+  // returned bytes exact; only the expected platform representation changes.
+  const windowsClipboard = await page.evaluate(() => navigator.platform.startsWith('Win'))
+  const expectedClipboard = windowsClipboard ? visibleText.replace(/\r?\n/g, '\r\n') : visibleText
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expectedClipboard)
   await modal.getByRole('button', { name: 'Next', exact: true }).click()
   await expect(visible).not.toContainText(MIDDLE)
   await expect(modal.getByRole('button', { name: 'Next', exact: true })).toBeDisabled()

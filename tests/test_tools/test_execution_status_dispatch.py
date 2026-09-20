@@ -240,6 +240,81 @@ async def test_background_process_terminal_nonzero_is_error() -> None:
     assert result.execution_status["reason"] == "nonzero_exit"
 
 
+@pytest.mark.parametrize("wait_mode", ["any", "all"])
+@pytest.mark.parametrize(
+    "second,status,reason,is_error",
+    [
+        ({"status": "done", "returncode": 0}, "success", None, False),
+        ({"status": "running", "returncode": None}, "unknown", "background_running", False),
+        ({"status": "done", "returncode": 7}, "error", "nonzero_exit", True),
+        ({"status": "timed_out", "returncode": -15}, "timeout", "tool_timeout", True),
+        ({"status": "killed", "returncode": -9}, "cancelled", "killed", True),
+    ],
+)
+async def test_multi_execution_wait_has_trusted_aggregate_status(
+    wait_mode, second, status, reason, is_error,
+) -> None:
+    content = json.dumps({
+        "status": "ok", "action": "wait", "wait_mode": wait_mode,
+        "exited": wait_mode == "any" or second["status"] != "running",
+        "sessions": [
+            {"session_id": "first", "status": "done", "returncode": 0},
+            {"session_id": "second", **second},
+        ],
+    })
+    handler = build_tool_handler(_registry("process", content))
+
+    result = await handler(ToolCall("call_multi_wait", "process", {}))
+
+    assert result.content == content
+    assert result.is_error is is_error
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == status
+    assert result.execution_status["reason"] == reason
+    assert result.execution_status["timed_out"] is (status == "timeout")
+
+
+@pytest.mark.parametrize("wait_mode", ["any", "all"])
+async def test_multi_execution_wait_reports_failure_while_another_process_runs(wait_mode) -> None:
+    content = json.dumps({
+        "status": "ok", "action": "wait", "wait_mode": wait_mode,
+        "exited": wait_mode == "any",
+        "sessions": [
+            {"session_id": "running", "status": "running", "returncode": None},
+            {"session_id": "failed", "status": "done", "returncode": 8},
+        ],
+    })
+    handler = build_tool_handler(_registry("process", content))
+
+    result = await handler(ToolCall("call_multi_failure", "process", {}))
+
+    assert result.is_error is True
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "error"
+    assert result.execution_status["exit_code"] == 8
+
+
+@pytest.mark.parametrize("tool_name", ["exec_command", "background_process"])
+async def test_started_pty_initialization_failure_is_a_trusted_tool_error(tool_name: str) -> None:
+    content = json.dumps({
+        "status": "capability_error",
+        "reason": "pty_started_but_handle_initialization_failed",
+        "io_mode_requested": "pty",
+        "fallback_reason": "synthetic resize failure after spawn",
+    })
+    handler = build_tool_handler(_registry(tool_name, content))
+
+    result = await handler(ToolCall("call_pty_initialization_failed", tool_name, {}))
+
+    assert result.content == content
+    assert result.is_error is True
+    assert result.execution_status is not None
+    assert result.execution_status["status"] == "error"
+    assert result.execution_status["reason"] == "pty_started_but_handle_initialization_failed"
+    assert result.execution_status["exit_code"] is None
+    assert result.execution_status["preservation_class"] == "diagnostic"
+
+
 @pytest.mark.asyncio
 async def test_approval_denial_preserves_approval_denied_reason() -> None:
     handler = build_tool_handler(

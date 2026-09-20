@@ -9,7 +9,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-from dataclasses import dataclass
+import socket
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
 from typing import Any
 
 
@@ -35,6 +39,7 @@ class PtyHandle:
     raw: Any
     platform: str
     _returncode: int | None = None
+    _wait_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     @property
     def pid(self) -> int | None:
@@ -60,10 +65,13 @@ class PtyHandle:
     def write(self, data: bytes) -> None:
         value: str | bytes = data
         if self.platform == "windows":
+            # ConPTY consumes terminal keystrokes: Enter is CR, while a bare
+            # LF merely echoes and leaves console readline waiting forever.
             value = data.decode("utf-8", errors="replace")
+            value = value.replace("\r\n", "\n").replace("\n", "\r")
         try:
             self.raw.write(value)
-        except (BrokenPipeError, ConnectionResetError, OSError, ValueError) as exc:
+        except (BrokenPipeError, ConnectionResetError, OSError, ValueError, EOFError) as exc:
             raise PtyBackendError("PTY input is closed", started=True) from exc
 
     def resize(self, cols: int, rows: int) -> None:
@@ -81,7 +89,10 @@ class PtyHandle:
 
     def eof(self) -> None:
         try:
-            if hasattr(self.raw, "sendeof"):
+            if self.platform == "windows":
+                # ConPTY uses Windows console input; Ctrl-D is ordinary input.
+                self.raw.write("\x1a\r\n")
+            elif hasattr(self.raw, "sendeof"):
                 self.raw.sendeof()
             elif hasattr(self.raw, "sendcontrol"):
                 self.raw.sendcontrol("d")
@@ -102,14 +113,70 @@ class PtyHandle:
         except (OSError, ValueError, EOFError) as exc:
             raise PtyBackendError("PTY termination failed", started=True) from exc
 
+    def close_reader(self) -> None:
+        if self.platform == "windows":
+            # pywinpty's isalive() sets closed before close() can release its
+            # sockets. Wake blocked recv threads even after the Job has exited.
+            stream = getattr(self.raw, "fileobj", None)
+            if stream is not None:
+                try:
+                    stream.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                stream.close()
+            server = getattr(self.raw, "_server", None)
+            if server is not None:
+                server.close()
+        elif hasattr(self.raw, "close"):
+            self.raw.close(force=False)
+
     def wait(self) -> int | None:
-        try:
-            value = self.raw.wait()
-        except (EOFError, OSError, ValueError):
-            value = getattr(self.raw, "exitstatus", None)
-        if isinstance(value, int):
-            self._returncode = value
+        with self._wait_lock:
+            try:
+                value = self.raw.wait()
+            except (EOFError, OSError, ValueError):
+                value = getattr(self.raw, "exitstatus", None)
+            if isinstance(value, int):
+                self._returncode = value
         return self.returncode
+
+
+class _OwnedPtyProcess:
+    """Provide the existing tree launcher with a Popen-shaped PTY handle."""
+
+    def __init__(self, raw: Any) -> None:
+        self.raw = raw
+        self._poll_lock = threading.RLock()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.raw, name)
+
+    @property
+    def returncode(self) -> int | None:
+        with self._poll_lock:
+            if self.raw.isalive():
+                return None
+            status = self.raw.exitstatus
+            signalstatus = getattr(self.raw, "signalstatus", None)
+            return status if status is not None else (-signalstatus if signalstatus else None)
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while (status := self.returncode) is None:
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired("PTY helper", float(timeout or 0))
+            time.sleep(0.01)
+        return status
+
+    def terminate(self, *, force: bool = True) -> None:
+        with self._poll_lock:
+            self.raw.terminate(force=force)
+
+    def kill(self) -> None:
+        self.terminate()
 
 
 def _shell_argv(command: str) -> list[str]:
@@ -132,13 +199,30 @@ def spawn_pty(
         raise PtyBackendError("PTY dimensions must be positive")
     if os.name == "nt":
         try:
-            from winpty import PtyProcess  # type: ignore[import-not-found]
+            from winpty import PtyProcess  # type: ignore[import-not-found,import-untyped]
         except ImportError as exc:
             raise PtyBackendError(
                 "Windows PTY support is unavailable in this runtime"
             ) from exc
         try:
-            raw = PtyProcess.spawn(_shell_argv(command), cwd=cwd, env=env)
+            from opensquilla.process_tree import create_owned_popen
+
+            def spawn(argv: list[str], **kwargs: Any) -> _OwnedPtyProcess:
+                kwargs.pop("creationflags", None)
+                job = kwargs.pop("owner_job")
+
+                class _JobPtyProcess(PtyProcess):  # type: ignore[misc]
+                    def __init__(self, native: Any) -> None:
+                        job.assign_pid(int(native.pid))
+                        super().__init__(native)
+
+                return _OwnedPtyProcess(_JobPtyProcess.spawn(
+                    list(argv), dimensions=(rows, cols), backend="0", **kwargs,
+                ))
+
+            raw = create_owned_popen(
+                _shell_argv(command), process_factory=spawn, cwd=cwd, env=env,
+            )
             handle = PtyHandle(raw, "windows")
             try:
                 if hasattr(raw, "setwinsize"):
@@ -153,19 +237,26 @@ def spawn_pty(
         except PtyBackendError:
             raise
         except Exception as exc:
-            raise PtyBackendError(f"Windows PTY spawn failed: {exc}", started=False) from exc
+            # Backend constructors can fail after CreateProcess. Never replay
+            # an uncertain launch through pipes, even without a returned handle.
+            raise PtyBackendError(f"Windows PTY spawn failed: {exc}", started=True) from exc
 
     try:
         from ptyprocess import PtyProcess  # type: ignore[import-not-found,import-untyped]
     except ImportError as exc:
         raise PtyBackendError("POSIX PTY support is unavailable in this runtime") from exc
     try:
-        raw = PtyProcess.spawn(_shell_argv(command), cwd=cwd, env=env, dimensions=(rows, cols))
+        from opensquilla.process_tree import create_owned_posix_pty
+
+        def spawn(argv: list[str], **kwargs: Any) -> _OwnedPtyProcess:
+            return _OwnedPtyProcess(PtyProcess.spawn(argv, **kwargs))
+
+        raw = create_owned_posix_pty(
+            _shell_argv(command), spawn, cwd=cwd, env=env, dimensions=(rows, cols),
+        )
         return PtyHandle(raw, "posix")
     except Exception as exc:
-        # ptyprocess raises before returning a handle when fork/exec did not
-        # start.  Callers may safely fall back to pipes in that case.
-        raise PtyBackendError(f"POSIX PTY spawn failed: {exc}", started=False) from exc
+        raise PtyBackendError(f"POSIX PTY spawn failed: {exc}", started=True) from exc
 
 
 async def wait_pty(handle: PtyHandle) -> int | None:
@@ -188,5 +279,12 @@ async def eof_pty(handle: PtyHandle) -> None:
     await asyncio.to_thread(handle.eof)
 
 
-async def terminate_pty(handle: PtyHandle) -> None:
-    await asyncio.to_thread(handle.terminate)
+async def terminate_pty(handle: PtyHandle, *, close_reader: bool = True) -> None:
+    owner = getattr(handle.raw, "_opensquilla_process_tree_owner", None)
+    if owner is not None:
+        if not await owner.terminate(graceful_timeout=0.2, kill_timeout=2.0):
+            raise PtyBackendError("PTY process tree did not stop", started=True, handle=handle)
+    else:
+        await asyncio.to_thread(handle.terminate)
+    if close_reader:
+        await asyncio.to_thread(handle.close_reader)

@@ -591,7 +591,7 @@ async def test_unified_exec_real_pty_reports_tty_and_accepts_input() -> None:
             "import os, sys; "
             "print(f'TTY:{sys.stdin.isatty()}:{sys.stdout.isatty()}', flush=True); "
             "value = sys.stdin.readline().strip(); print('INPUT:' + value, flush=True); "
-            "size = os.get_terminal_size(0); print(f'SIZE:{size.columns}:{size.lines}')"
+            "size = os.get_terminal_size(1); print(f'SIZE:{size.columns}:{size.lines}')"
         )
         started = json.loads(
             await shell.exec_command(

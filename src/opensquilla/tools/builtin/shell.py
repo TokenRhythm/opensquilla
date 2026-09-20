@@ -6434,7 +6434,9 @@ async def _read_bg_output(session: _BgSession, process_exited: asyncio.Event) ->
                 if exited in done and not reading.done():
                     try:
                         chunk = await asyncio.wait_for(reading, timeout=_BACKGROUND_KILL_TIMEOUT)
-                    except (TimeoutError, EOFError):
+                    except EOFError:
+                        break
+                    except TimeoutError:
                         reading.cancel()
                         with contextlib.suppress(asyncio.CancelledError):
                             await reading
@@ -6498,6 +6500,15 @@ async def _finalize_bg_session_async(session: _BgSession) -> None:
     await session.output_capture.finish_async()
     session.output_capture.release_preview()
     _finalize_bg_session(session)
+    await _emit_bg_session_completion(session)
+    callbacks = list(session.async_cleanup_callbacks)
+    session.async_cleanup_callbacks.clear()
+    for cleanup_callback in callbacks:
+        with contextlib.suppress(Exception):
+            await cleanup_callback()
+
+
+async def _emit_bg_session_completion(session: _BgSession) -> None:
     event = {
         "feature": "process_execution",
         "name": "process.completed",
@@ -6530,11 +6541,6 @@ async def _finalize_bg_session_async(session: _BgSession) -> None:
     if async_callback is not None:
         with contextlib.suppress(Exception):
             await async_callback(event)
-    callbacks = list(session.async_cleanup_callbacks)
-    session.async_cleanup_callbacks.clear()
-    for cleanup_callback in callbacks:
-        with contextlib.suppress(Exception):
-            await cleanup_callback()
 
 
 async def _wait_bg_process(session: _BgSession, timeout: float) -> bool:
@@ -6552,9 +6558,8 @@ async def _wait_bg_process(session: _BgSession, timeout: float) -> bool:
 
 async def _terminate_bg_session(session: _BgSession) -> bool:
     if session.pty_handle is not None:
-        with contextlib.suppress(Exception):
-            await terminate_pty(session.pty_handle)
         try:
+            await terminate_pty(session.pty_handle)
             await asyncio.wait_for(wait_pty(session.pty_handle), timeout=_BACKGROUND_KILL_TIMEOUT)
         except Exception:
             return False
@@ -6606,6 +6611,20 @@ async def cancel_background_processes_for_task(session_key: str, task_id: str) -
     # Keep owned cleanup alive if that deadline cancels this waiter.
     await asyncio.shield(cleanup)
     return len(sessions)
+
+
+def is_background_process_completion_consumed(
+    execution_id: str, *, session_key: str, task_id: str,
+) -> bool:
+    """Recheck manual consumption while a completion notification is retried."""
+    session = _bg_sessions.get(execution_id)
+    # A removed execution no longer grants a pending callback authority.
+    return (
+        session is None
+        or session.session_key != session_key
+        or session.task_id != task_id
+        or session.completion_consumed
+    )
 
 
 def active_background_process_task_owners() -> tuple[tuple[str, str], ...]:
@@ -7655,8 +7674,12 @@ async def _start_host_background_process(
     process_tree = capture_process_tree_owner(proc, isolated=True)
     try:
         output_capture = await BoundedOutputCapture.create("background_process")
-    except asyncio.CancelledError:
-        await asyncio.shield(_terminate_exec_process_tree(proc, process_tree))
+    except BaseException:
+        cleanup = (
+            terminate_pty(pty_handle) if pty_handle is not None
+            else _terminate_exec_process_tree(proc, process_tree)
+        )
+        await asyncio.shield(cleanup)
         raise
 
     ctx = current_tool_context.get()
@@ -7698,11 +7721,17 @@ async def _start_host_background_process(
                 session.timed_out = True
                 await _terminate_bg_session(session)
                 session.output_lines.append(f"[timeout after {effective_timeout}s]\n")
+            elif pty_handle is not None:
+                # EOF/leader exit must not strand descendants that inherited
+                # the terminal. Keep ownership until the full tree is empty.
+                await terminate_pty(pty_handle, close_reader=False)
         finally:
             process_exited.set()
             try:
                 await output_task
             finally:
+                if pty_handle is not None:
+                    await asyncio.to_thread(pty_handle.close_reader)
                 await _finalize_bg_session_async(session)
 
     session.collector_task = asyncio.create_task(_collect_host())
@@ -8498,8 +8527,6 @@ async def process(
         )
 
     if action == "wait":
-        for target in targets:
-            target.completion_consumed = True
         mode = wait_mode or ("one" if len(targets) == 1 else "all")
         if mode not in {"one", "any", "all"}:
             return json.dumps({"status": "invalid_request", "reason": "invalid_wait_mode"})
@@ -8508,26 +8535,30 @@ async def process(
                 {"status": "invalid_request", "reason": "one_wait_requires_one_execution"}
             )
         wait_timeout = _resolve_process_wait_timeout(timeout)
+        previously_consumed = [target.completion_consumed for target in targets]
+        for target in targets:
+            target.completion_consumed = True
+        delivered = False
         waiters: dict[asyncio.Task[bool], _BgSession] = {}
         precompleted = [
             target
             for target in targets
             if _session_exited(target)
         ]
-        if mode == "one":
-            if not _session_exited(session):
-                await _wait_bg_process(session, wait_timeout)
-            # Let the subprocess transport publish returncode after a waiter
-            # that observed the OS exit completes.  This closes the same
-            # exit-vs-timeout race as the former single-session path.
-            await asyncio.sleep(0)
-        elif not (mode == "any" and precompleted):
-            for target in targets:
-                if _session_exited(target):
-                    continue
-                waiters[asyncio.create_task(_wait_bg_process(target, wait_timeout))] = target
-        completed: set[asyncio.Task[bool]] = set()
         try:
+            if mode == "one":
+                if not _session_exited(session):
+                    await _wait_bg_process(session, wait_timeout)
+                # Let the subprocess transport publish returncode after a waiter
+                # that observed the OS exit completes.  This closes the same
+                # exit-vs-timeout race as the former single-session path.
+                await asyncio.sleep(0)
+            elif not (mode == "any" and precompleted):
+                for target in targets:
+                    if _session_exited(target):
+                        continue
+                    waiters[asyncio.create_task(_wait_bg_process(target, wait_timeout))] = target
+            completed: set[asyncio.Task[bool]] = set()
             if waiters:
                 completed, _pending = await asyncio.wait(
                     waiters,
@@ -8560,15 +8591,27 @@ async def process(
                         target.collector_task is None or target.collector_task.done()
                     ):
                         await _finalize_bg_session_async(target)
-        finally:
             for waiter in waiters:
                 if not waiter.done():
                     waiter.cancel()
             if waiters:
                 await asyncio.gather(*waiters, return_exceptions=True)
-        for target in targets:
-            if not _session_exited(target):
-                target.completion_consumed = False
+            delivered = True
+        finally:
+            for waiter in waiters:
+                if not waiter.done():
+                    waiter.cancel()
+            for target, consumed_before_wait in zip(targets, previously_consumed, strict=True):
+                if not delivered or not _session_exited(target):
+                    target.completion_consumed = consumed_before_wait
+            if any(not waiter.done() for waiter in waiters):
+                await asyncio.gather(*waiters, return_exceptions=True)
+            for target in targets:
+                if not delivered and target.done and not target.completion_consumed:
+                    # The collector may have suppressed the completion while
+                    # this wait owned consumption. A cancelled wait returns
+                    # no result, so hand the notice back to its normal emitter.
+                    await _emit_bg_session_completion(target)
         session_payloads = [_bg_session_payload(target) for target in targets]
         all_exited = all(
             _session_exited(target) for target in targets

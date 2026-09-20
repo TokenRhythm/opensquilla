@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import ctypes
+import ctypes.wintypes as wintypes
 import json
 import os
 import shlex
 import subprocess
 import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -13,6 +17,104 @@ import pytest
 from opensquilla.tools import pty_backend
 from opensquilla.tools.builtin import shell
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
+
+
+@pytest.mark.asyncio
+async def test_backend_spawn_exception_is_not_proof_command_never_started(monkeypatch) -> None:
+    class Backend:
+        spawn = Mock(side_effect=OSError("post-spawn reader initialization failed"))
+
+    backend = SimpleNamespace(PtyProcess=Backend)
+    monkeypatch.setitem(sys.modules, "winpty" if os.name == "nt" else "ptyprocess", backend)
+    with pytest.raises(pty_backend.PtyBackendError) as error:
+        pty_backend.spawn_pty("echo only-once", cwd=None, env=None)
+    assert error.value.started is True
+    Backend.spawn.assert_called_once()
+
+
+@pytest.mark.platform_pty
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["kill", "timeout", "eof"])
+async def test_real_pty_cleans_descendant_tree(action, tmp_path) -> None:
+    from opensquilla.process_tree import _strict_process_start_identity
+
+    child_pid = tmp_path / "child.pid"
+    child = tmp_path / "child.py"
+    child.write_text(
+        "import os, pathlib, time\n"
+        f"pathlib.Path({str(child_pid)!r}).write_text(str(os.getpid()))\n"
+        "time.sleep(60)\n", encoding="utf-8",
+    )
+    parent = tmp_path / "parent.py"
+    parent.write_text(
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, {str(child)!r}])\n"
+        "print('TTY=' + str(sys.stdin.isatty()), flush=True)\n"
+        + ("sys.stdin.readline()\n" if action == "eof" else "time.sleep(60)\n"),
+        encoding="utf-8",
+    )
+    argv = [sys.executable, str(parent)]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    token = current_tool_context.set(ToolContext(
+        is_owner=True, caller_kind=CallerKind.CLI, session_key="test:pty-tree",
+        task_id=f"pty-{action}",
+    ))
+    session = None
+    child_process = None
+    child_identity = None
+    child_handle = None
+    kernel32 = None
+    try:
+        result = await shell._start_host_background_process(
+            command, cwd=str(tmp_path), effective_timeout=3 if action == "timeout" else 30,
+            runtime=None, io_mode="pty",
+        )
+        execution_id = shell._session_id_from_start_result(result)
+        assert execution_id, result
+        session = shell._bg_sessions[execution_id]
+        assert session.io_mode_used == "pty", result
+        for _ in range(200):
+            if child_pid.exists() and child_pid.read_text():
+                break
+            await asyncio.sleep(0.02)
+        child_process = int(child_pid.read_text())
+        child_identity = _strict_process_start_identity(child_process)
+        assert child_identity
+        if os.name == "nt":
+            kernel32 = getattr(ctypes, "WinDLL")("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            child_handle = kernel32.OpenProcess(0x00100000, False, child_process)
+            assert child_handle
+        if action != "timeout":
+            await shell.process(action, execution_id=execution_id)
+        await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=10)
+        assert "TTY=True" in shell._bg_rendered_output(session)
+        assert session.process_tree is not None and session.process_tree.durable
+        assert not session.process_tree.is_active()
+        if kernel32 is not None:
+            assert kernel32.WaitForSingleObject(child_handle, 5000) == 0
+        else:
+            assert _strict_process_start_identity(child_process) != child_identity
+    finally:
+        if session is not None:
+            await shell._terminate_bg_session(session)
+            if session.collector_task is not None:
+                await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=5)
+            shell._bg_sessions.pop(session.session_id, None)
+        if (
+            child_process is not None
+            and _strict_process_start_identity(child_process) == child_identity
+        ):
+            import signal
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(child_process, signal.SIGTERM)
+        if kernel32 is not None and child_handle is not None:
+            kernel32.CloseHandle(child_handle)
+        current_tool_context.reset(token)
 
 
 class _RawPty:
@@ -45,6 +147,35 @@ class _RawPty:
         return 0
 
 
+@pytest.mark.platform_pty
+@pytest.mark.asyncio
+async def test_real_pty_drains_tail_before_closing_reader(tmp_path) -> None:
+    child = tmp_path / "tail.py"
+    child.write_text(
+        "import sys\nsys.stdout.write('x' * 65536 + '\\nFINAL-PTY-TAIL-MARKER\\n')\n"
+        "sys.stdout.flush()\n", encoding="utf-8",
+    )
+    argv = [sys.executable, str(child)]
+    command = subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+    session = None
+    try:
+        result = await shell._start_host_background_process(
+            command, cwd=str(tmp_path), effective_timeout=15, runtime=None, io_mode="pty",
+        )
+        execution_id = shell._session_id_from_start_result(result)
+        assert execution_id, result
+        session = shell._bg_sessions[execution_id]
+        assert session.io_mode_used == "pty"
+        await asyncio.wait_for(asyncio.shield(session.collector_task), timeout=20)
+        assert session.returncode == 0, shell._bg_rendered_output(session)[-2000:]
+        assert "FINAL-PTY-TAIL-MARKER" in shell._bg_rendered_output(session)
+        assert session.output_capture.incomplete_reason is None
+    finally:
+        if session is not None:
+            await shell._terminate_bg_session(session)
+            shell._bg_sessions.pop(session.session_id, None)
+
+
 @pytest.mark.pty
 @pytest.mark.asyncio
 async def test_pty_handle_lifecycle_preserves_utf8_and_dimensions() -> None:
@@ -56,7 +187,7 @@ async def test_pty_handle_lifecycle_preserves_utf8_and_dimensions() -> None:
     await pty_backend.resize_pty(handle, 77, 19)
     await pty_backend.eof_pty(handle)
     await pty_backend.terminate_pty(handle)
-    assert raw.writes == ["输入"]
+    assert raw.writes == ["输入", "\x1a\r\n"]
     assert raw.sizes == [(19, 77)]
     assert await pty_backend.wait_pty(handle) == 0
 

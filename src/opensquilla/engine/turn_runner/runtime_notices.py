@@ -3,26 +3,48 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
+
+from opensquilla.execution_status import execution_status_for_process_session
 
 _UNCONFIRMED_BACKGROUND_TOOL_NAMES = frozenset({"exec_command", "background_process", "process"})
 
 
-def _background_receipt(name: str, result: Any) -> tuple[str | None, bool]:
+def _background_receipts(
+    name: str, result: Any, execution_status: Mapping[str, Any],
+) -> list[tuple[str | None, bool, Mapping[str, Any] | None]]:
     if not isinstance(result, str):
-        return None, False
+        return [(None, False, execution_status)]
     if name == "background_process":
         first_line = result.partition("\n")[0]
         if first_line.startswith("session_id="):
-            return first_line.removeprefix("session_id=").strip() or None, False
-        return None, False
+            session_id = first_line.removeprefix("session_id=").strip() or None
+            return [(session_id, False, execution_status)]
+        return [(None, False, execution_status)]
     try:
         payload = json.loads(result)
     except (TypeError, ValueError):
-        return None, False
-    if not isinstance(payload, dict) or not isinstance(payload.get("session"), dict):
-        return None, False
-    session = payload["session"]
+        return [(None, False, execution_status)]
+    if not isinstance(payload, dict):
+        return [(None, False, execution_status)]
+    session = payload.get("session")
+    if isinstance(session, dict):
+        session_id, exited = _session_receipt(session, payload)
+        return [(session_id, exited, execution_status)]
+    if name == "process" and payload.get("action") == "wait":
+        sessions = payload.get("sessions")
+        if isinstance(sessions, list) and sessions:
+            return [
+                (*_session_receipt(item, {}), execution_status_for_process_session(item))
+                for item in sessions if isinstance(item, dict)
+            ]
+    return [(None, False, execution_status)]
+
+
+def _session_receipt(
+    session: dict[str, Any], payload: dict[str, Any],
+) -> tuple[str | None, bool]:
     session_id = payload.get("execution_id") or session.get("session_id")
     if not isinstance(session_id, str) or not session_id.strip():
         return None, False
@@ -60,21 +82,25 @@ def _unconfirmed_background_tool_names(
         execution_status = segment.get("execution_status")
         if not isinstance(execution_status, dict):
             continue
-        session_id, exited = _background_receipt(name, segment.get("result"))
-        if (
-            execution_status.get("status") == "unknown"
-            and execution_status.get("reason") == "background_running"
+        for session_id, exited, receipt_status in _background_receipts(
+            name, segment.get("result"), execution_status,
         ):
-            if session_id is not None:
-                pending[session_id] = name
-            else:
-                unidentified.append(name)
-        elif session_id is not None and exited and execution_status.get("status") in {
-            "success", "error", "timeout", "cancelled",
-        }:
-            # A later receipt settles only the process it identifies. Tool
-            # failure is a confirmed end too, not an unknown running action.
-            pending.pop(session_id, None)
+            if receipt_status is None:
+                continue
+            if (
+                receipt_status.get("status") == "unknown"
+                and receipt_status.get("reason") == "background_running"
+            ):
+                if session_id is not None:
+                    pending[session_id] = name
+                else:
+                    unidentified.append(name)
+            elif session_id is not None and exited and receipt_status.get("status") in {
+                "success", "error", "timeout", "cancelled",
+            }:
+                # Aggregate wait(any/all) completion does not describe each
+                # child. Settle only the independently confirmed execution.
+                pending.pop(session_id, None)
     return [*unidentified, *pending.values()]
 
 

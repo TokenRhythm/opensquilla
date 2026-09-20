@@ -11,6 +11,7 @@ from opensquilla.engine.turn_runner.runtime_notices import (
     unconfirmed_action_notice,
     with_unconfirmed_action_notice,
 )
+from opensquilla.execution_status import execution_status_for_tool_result
 
 
 def _started(session_id: str = "process-a") -> dict[str, Any]:
@@ -212,3 +213,54 @@ def test_done_status_without_returncode_or_timestamp_clears_notice() -> None:
     })
 
     assert unconfirmed_action_notice("", [_unified_started(), receipt]) is None
+
+
+def _multi_receipt(wait_mode: str, sessions: list[dict[str, Any]]) -> dict[str, Any]:
+    completed = [session["session_id"] for session in sessions if session["status"] != "running"]
+    result = json.dumps({
+        "status": "ok", "action": "wait", "wait_mode": wait_mode,
+        "sessions": sessions, "completed_execution_ids": completed,
+        "exited": bool(completed) if wait_mode == "any" else len(completed) == len(sessions),
+    })
+    return {
+        "type": "tool_result", "name": "process", "result": result,
+        "execution_status": execution_status_for_tool_result("process", result),
+    }
+
+
+@pytest.mark.parametrize("wait_mode", ["any", "all"])
+@pytest.mark.parametrize("status,returncode", [
+    ("done", 0), ("done", 7), ("timed_out", -15), ("killed", -9),
+])
+def test_multi_wait_settles_each_terminal_process_notice(wait_mode, status, returncode) -> None:
+    receipt = _multi_receipt(wait_mode, [
+        {"session_id": "process-a", "status": "done", "returncode": 0},
+        {"session_id": "process-b", "status": status, "returncode": returncode},
+    ])
+
+    assert unconfirmed_action_notice(
+        "Finished.", [_unified_started(), _unified_started("process-b"), receipt],
+    ) is None
+
+
+@pytest.mark.parametrize("wait_mode", ["any", "all"])
+@pytest.mark.parametrize("returncode", [0, 7])
+def test_multi_wait_partial_completion_tracks_only_remaining_process(wait_mode, returncode) -> None:
+    receipt = _multi_receipt(wait_mode, [
+        {"session_id": "process-a", "status": "done", "returncode": returncode},
+        {"session_id": "process-b", "status": "running", "returncode": None},
+    ])
+    segments = [_unified_started(), _unified_started("process-b"), receipt]
+
+    assert unconfirmed_action_notice("", segments) is not None
+    assert unconfirmed_action_notice("", [*segments, _receipt("success", "process-b")]) is None
+
+
+@pytest.mark.parametrize("wait_mode", ["any", "all"])
+def test_multi_wait_running_receipt_without_start_still_requires_notice(wait_mode) -> None:
+    receipt = _multi_receipt(wait_mode, [
+        {"session_id": "process-a", "status": "done", "returncode": 7},
+        {"session_id": "process-b", "status": "running", "returncode": None},
+    ])
+
+    assert unconfirmed_action_notice("", [receipt]) is not None
