@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import stat
 import threading
 from contextlib import contextmanager
@@ -29,6 +30,7 @@ from opensquilla.gateway.desktop_ownership import (
     desktop_gateway_auth_token,
     release_active_desktop_gateway_ownership,
 )
+from opensquilla.recovery.atomic import _native_io_path
 from opensquilla.recovery.locking import profile_lock_key
 
 _NONCE = "n" * 43
@@ -96,6 +98,100 @@ def test_desktop_ownership_record_is_profile_scoped_private_and_path_free(
 
     assert not record_path.exists()
     assert (owner.state_dir / DESKTOP_GATEWAY_OWNERSHIP_LOCK_FILENAME).is_file()
+
+
+@pytest.fixture(
+    params=[267, 340],
+    ids=["temporary-only-over-max-path", "record-and-lock-over-max-path"],
+)
+def windows_long_ownership(tmp_path: Path, monkeypatch, request: pytest.FixtureRequest):
+    if os.name != "nt":
+        pytest.skip("Windows extended-length ownership path contract")
+    root = tmp_path / "ownership"
+    profile = tmp_path / "profile"
+    fingerprint = profile_lock_key(profile)
+    temporary_name = f".{DESKTOP_GATEWAY_OWNERSHIP_FILENAME}.{os.getpid()}.{'0' * 16}.tmp"
+    padding = request.param - len(str(root / fingerprint / temporary_name)) - 1
+    assert 1 <= padding <= 255, "Test needs a shorter temporary base directory"
+    control_dir = root / ("x" * padding) / fingerprint
+    assert len(str(control_dir / temporary_name)) == request.param
+
+    def cleanup() -> None:
+        native_root = _native_io_path(root)
+        if os.path.exists(native_root):
+            shutil.rmtree(native_root)
+
+    request.addfinalizer(cleanup)
+    monkeypatch.setenv("OPENSQUILLA_DESKTOP", "1")
+    monkeypatch.setenv(DESKTOP_GATEWAY_INSTANCE_NONCE_ENV, _NONCE)
+    monkeypatch.setenv(DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV, str(control_dir))
+    owner = DesktopGatewayOwnership.from_environment(profile_home=profile, port=18791)
+    assert owner is not None
+    assert owner.state_dir == control_dir
+    assert owner.profile_fingerprint == fingerprint
+    assert not str(owner.path).startswith("\\\\?\\")
+    lock_path = control_dir / DESKTOP_GATEWAY_OWNERSHIP_LOCK_FILENAME
+    if request.param == 267:
+        assert max(len(str(owner.path)), len(str(lock_path))) < 260
+    else:
+        assert min(len(str(owner.path)), len(str(lock_path))) > 260
+    return owner, lock_path
+
+
+def test_desktop_ownership_windows_long_path_lifecycle(windows_long_ownership) -> None:
+    owner, lock_path = windows_long_ownership
+    successor = DesktopGatewayOwnership(
+        state_dir=owner.state_dir,
+        profile_fingerprint=owner.profile_fingerprint,
+        port=owner.port,
+        instance_nonce="s" * 43,
+    )
+
+    def read_record():
+        with open(_native_io_path(owner.path), encoding="utf-8") as stream:
+            return json.load(stream)
+
+    try:
+        owner.acquire()
+        lock_identity = os.stat(_native_io_path(lock_path)).st_ino
+        assert read_record() == owner.record
+        successor.acquire()
+        owner.release()
+        assert read_record() == successor.record
+        successor.release()
+        assert not os.path.exists(_native_io_path(owner.path))
+
+        # A later launch must reuse the permanent lock and clean its own record.
+        owner.acquire()
+        assert read_record() == owner.record
+        owner.release()
+        assert not os.path.exists(_native_io_path(owner.path))
+        assert os.stat(_native_io_path(lock_path)).st_ino == lock_identity
+        assert os.listdir(_native_io_path(owner.state_dir)) == [lock_path.name]
+    finally:
+        owner.release()
+        successor.release()
+
+
+def test_desktop_ownership_windows_long_path_failed_replace_cleanup(
+    windows_long_ownership, monkeypatch,
+) -> None:
+    from opensquilla.gateway import desktop_ownership
+
+    owner, lock_path = windows_long_ownership
+
+    def fail_replace(_source, _destination):
+        raise OSError("injected ownership replace failure")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(desktop_ownership.os, "replace", fail_replace)
+        with pytest.raises(OSError, match="injected ownership replace failure"):
+            owner.acquire()
+    assert not os.path.exists(_native_io_path(owner.path))
+    assert os.listdir(_native_io_path(owner.state_dir)) == [lock_path.name]
+    owner.acquire()
+    owner.release()
+    assert not os.path.exists(_native_io_path(owner.path))
 
 
 def test_desktop_ownership_release_does_not_remove_a_successor_record(
