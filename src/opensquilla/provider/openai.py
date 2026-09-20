@@ -105,6 +105,7 @@ from .tokenrhythm_correlation import (
     tokenrhythm_correlation_headers,
     tokenrhythm_install_id_headers,
 )
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -120,8 +121,10 @@ from .types import (
     ProviderMessageLimitProof,
     ProviderReplayState,
     ReasoningDeltaEvent,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
@@ -1573,12 +1576,24 @@ class _UsageSnapshotAccumulator:
     cache_write_tokens: int = 0
     raw_billed_cost: Any = None
     billed_cost_present: bool = False
+    input_tokens_present: bool = False
+    output_tokens_present: bool = False
+
+    @property
+    def token_usage_present(self) -> bool:
+        return self.input_tokens_present or self.output_tokens_present
 
     def update(self, usage: Mapping[str, Any]) -> None:
         if "prompt_tokens" in usage:
             self.input_tokens = _coerce_int(usage["prompt_tokens"])
+            self.input_tokens_present = (
+                type(usage["prompt_tokens"]) is int and usage["prompt_tokens"] >= 0
+            )
         if "completion_tokens" in usage:
             self.output_tokens = _coerce_int(usage["completion_tokens"])
+            self.output_tokens_present = (
+                type(usage["completion_tokens"]) is int and usage["completion_tokens"] >= 0
+            )
 
         completion_details_raw = usage.get("completion_tokens_details")
         completion_details = (
@@ -2200,6 +2215,11 @@ def _text_tool_rejection_error(
     phase: str,
     cache_shape: Mapping[str, Any],
     trace: LLMTraceRecorder,
+    events: list[TextDeltaEvent | ToolUseStartEvent | ToolUseEndEvent],
+    terminal_reason: str | None,
+    native_calls: tuple[RejectedToolArguments, ...] = (),
+    native_identity_valid: bool = True,
+    usage: DoneEvent | None = None,
 ) -> ErrorEvent | None:
     """Convert rejected text-tool output into a payload-free terminal error."""
 
@@ -2224,12 +2244,76 @@ def _text_tool_rejection_error(
             "call_count": call_count,
         },
     )
+    # The normalizer currently retains the batch reason, not the position of
+    # each invalid call. Only a single rejected text call proves which call
+    # needs correction; do not guess about a collapsed mixed text batch.
+    starts = [event for event in events if isinstance(event, ToolUseStartEvent)]
+    if (
+        terminal_reason is not None
+        and terminal_reason in _SUCCESSFUL_TEXT_TOOL_FINISH_REASONS
+        and native_identity_valid
+        and len({call.tool_call_id for call in native_calls}) == len(native_calls)
+        and call_count == 1
+        and len(starts) == 1
+        and set(reasons) <= {"text_schema_invalid", "dsml_schema_invalid"}
+    ):
+        return rejected_tool_arguments_error(
+            ToolArgumentRejection(
+                calls=(
+                    *native_calls,
+                    RejectedToolArguments(
+                        tool_call_id=starts[0].tool_use_id,
+                        tool_name=starts[0].tool_name,
+                        reason="schema_invalid",
+                    ),
+                ),
+                terminal_reason=terminal_reason,
+            ),
+            usage=usage,
+        )
     return ErrorEvent(
         message=(
             f"{display_name} returned an invalid text-encoded tool call; "
             "no text-encoded tools were executed"
         ),
         code="incomplete_tool_call",
+    )
+
+
+def _rejected_generation_usage(
+    *,
+    usage: _UsageSnapshotAccumulator,
+    billing: _ProviderBillingAccumulator,
+    provider_kind: str,
+    provider: str,
+    base_url: str,
+    model: str,
+    actual_model: str,
+    stop_reason: str,
+) -> DoneEvent | None:
+    """Retain observed usage without turning absent counters into zero usage."""
+    billed_cost, cost_source, receipt = _billing_result(
+        provider_kind=provider_kind,
+        base_url=base_url,
+        usage=usage,
+        billing=billing,
+        model=model,
+    )
+    if not usage.token_usage_present and receipt is None and cost_source == "none":
+        return None
+    return DoneEvent(
+        stop_reason=stop_reason,
+        input_tokens=usage.input_tokens,
+        output_tokens=usage.output_tokens,
+        reasoning_tokens=usage.reasoning_tokens,
+        cached_tokens=usage.cached_tokens,
+        cache_write_tokens=usage.cache_write_tokens,
+        billed_cost=billed_cost,
+        cost_source=cost_source,
+        billing_receipt=receipt,
+        provider=provider,
+        model=actual_model,
+        usage_missing_count=int(not (usage.input_tokens_present and usage.output_tokens_present)),
     )
 
 
@@ -4653,6 +4737,11 @@ class OpenAIProvider:
                                         reason="invalid_tool_call_index",
                                     )
                                 wire_id = tc.get("id")
+                                if (
+                                    (wire_id is not None and not isinstance(wire_id, str))
+                                    or tc.get("type") not in (None, "function")
+                                ):
+                                    invalid_native_structure += 1
                                 wire_id = wire_id if isinstance(wire_id, str) else ""
                                 existing_wire_id = native_wire_ids.get(idx, "")
                                 if (
@@ -4680,7 +4769,9 @@ class OpenAIProvider:
                                 is_new_native_key = not tools_acc.has_key(idx)
                                 if is_new_native_key:
                                     native_key_order.append(idx)
-                                raw_function = tc.get("function", {}) or {}
+                                raw_function = tc.get("function")
+                                if raw_function is None:
+                                    raw_function = {}
                                 if not isinstance(raw_function, Mapping):
                                     invalid_native_structure += 1
                                     log.warning(
@@ -4692,6 +4783,8 @@ class OpenAIProvider:
                                     raw_function = {}
                                 function = raw_function
                                 raw_tool_name = function.get("name")
+                                if raw_tool_name is not None and not isinstance(raw_tool_name, str):
+                                    invalid_native_structure += 1
                                 tool_name = (
                                     raw_tool_name if isinstance(raw_tool_name, str) else ""
                                 )
@@ -5039,6 +5132,8 @@ class OpenAIProvider:
                     native_calls: list[tuple[str, dict[str, Any]]] = []
                     pending_native_finishes: list[tuple[Any, dict[str, Any]]] = []
                     invalid_native_arguments = invalid_native_structure
+                    native_argument_rejections: list[RejectedToolArguments] = []
+                    native_identity_valid = invalid_native_structure == 0
                     for key, tool_use_id, tool_name, raw_arguments in (
                         tools_acc.pending_raw_arguments()
                     ):
@@ -5061,6 +5156,20 @@ class OpenAIProvider:
                             }
                         )
                         tool_name_valid = bool(tool_name.strip())
+                        native_identity_valid &= (
+                            bool(native_wire_ids.get(key, "").strip())
+                            and native_wire_ids.get(key) == tool_use_id
+                            and tool_name in tools_by_name
+                        )
+                        native_argument_rejections.append(
+                            RejectedToolArguments(
+                                tool_call_id=tool_use_id,
+                                tool_name=tool_name,
+                                reason=(
+                                    "batch_not_executed" if arguments_valid else "invalid_json"
+                                ),
+                            )
+                        )
                         if not tool_name_valid:
                             log.warning(
                                 "provider.native_tool_call_invalid",
@@ -5076,10 +5185,11 @@ class OpenAIProvider:
                         pending_native_finishes.append((key, args))
 
                     if invalid_native_arguments:
+                        rejected_segments = text_tool_normalizer.finish(
+                            successful_text_tool_terminal=False,
+                        )
                         for event in _segment_text_tool_events(
-                            text_tool_normalizer.finish(
-                                successful_text_tool_terminal=False,
-                            ),
+                            rejected_segments,
                             provider_kind=self._provider_kind,
                             model=self._model,
                         ):
@@ -5103,6 +5213,32 @@ class OpenAIProvider:
                                 "invalid_call_count": invalid_native_arguments,
                             },
                         )
+                        if (
+                            native_identity_valid
+                            and native_argument_rejections
+                            and terminal_finish_reason is not None
+                            and terminal_finish_reason in _SUCCESSFUL_TEXT_TOOL_FINISH_REASONS
+                            and len({call.tool_call_id for call in native_argument_rejections})
+                            == len(native_argument_rejections)
+                            and not _text_tool_rejection_details(rejected_segments)
+                        ):
+                            yield rejected_tool_arguments_error(
+                                ToolArgumentRejection(
+                                    calls=tuple(native_argument_rejections),
+                                    terminal_reason=terminal_finish_reason,
+                                ),
+                                usage=_rejected_generation_usage(
+                                    usage=usage_accumulator,
+                                    billing=billing_accumulator,
+                                    provider_kind=self._provider_kind,
+                                    provider=self.provider_id,
+                                    base_url=self._base_url,
+                                    model=self._model,
+                                    actual_model=actual_model,
+                                    stop_reason=stop_reason,
+                                ),
+                            )
+                            return
                         yield ErrorEvent(
                             message=(
                                 f"{self._compat.display_name} returned invalid "
@@ -5112,17 +5248,14 @@ class OpenAIProvider:
                         )
                         return
 
-                    for key, args in pending_native_finishes:
-                        for tool_event in tools_acc.finish_with_arguments(key, args):
-                            emitted_stream_event = True
-                            if text_tool_normalizer.native_lifecycle_deferred:
-                                deferred_native_events.append(tool_event)
-                            else:
-                                yield tool_event
-
                     normalized_segments = text_tool_normalizer.finish(
                         successful_text_tool_terminal=successful_text_tool_terminal,
                         native_calls=native_calls,
+                    )
+                    normalized_events = _segment_text_tool_events(
+                        normalized_segments,
+                        provider_kind=self._provider_kind,
+                        model=self._model,
                     )
                     rejection_error = _text_tool_rejection_error(
                         normalized_segments,
@@ -5132,13 +5265,30 @@ class OpenAIProvider:
                         phase="stream",
                         cache_shape=cache_shape,
                         trace=trace,
+                        events=normalized_events,
+                        terminal_reason=terminal_finish_reason,
+                        native_calls=tuple(native_argument_rejections),
+                        native_identity_valid=native_identity_valid,
+                        usage=(
+                            _rejected_generation_usage(
+                                usage=usage_accumulator,
+                                billing=billing_accumulator,
+                                provider_kind=self._provider_kind,
+                                provider=self.provider_id,
+                                base_url=self._base_url,
+                                model=self._model,
+                                actual_model=actual_model,
+                                stop_reason=stop_reason,
+                            )
+                            if _text_tool_rejection_details(normalized_segments)
+                            else None
+                        ),
                     )
                     if rejection_error is not None:
-                        for event in _segment_text_tool_events(
-                            normalized_segments,
-                            provider_kind=self._provider_kind,
-                            model=self._model,
-                        ):
+                        for deferred_event in deferred_native_events:
+                            yield deferred_event
+                        deferred_native_events.clear()
+                        for event in normalized_events:
                             if isinstance(event, ToolUseEndEvent):
                                 raise AssertionError(
                                     "rejected text tool output produced a completed call"
@@ -5149,11 +5299,14 @@ class OpenAIProvider:
                             yield event
                         yield rejection_error
                         return
-                    for event in _segment_text_tool_events(
-                        normalized_segments,
-                        provider_kind=self._provider_kind,
-                        model=self._model,
-                    ):
+                    for key, args in pending_native_finishes:
+                        for tool_event in tools_acc.finish_with_arguments(key, args):
+                            emitted_stream_event = True
+                            if text_tool_normalizer.native_lifecycle_deferred:
+                                deferred_native_events.append(tool_event)
+                            else:
+                                yield tool_event
+                    for event in normalized_events:
                         emitted_stream_event = True
                         if isinstance(event, TextDeltaEvent):
                             visible_assistant_text_parts.append(event.text)
@@ -5863,6 +6016,8 @@ class OpenAIProvider:
         pending_native_finishes: list[tuple[Any, dict[str, Any]]] = []
         deferred_native_events = _DeferredStreamEventBuffer()
         invalid_native_arguments = 0
+        native_identity_valid = True
+        native_argument_rejections: list[RejectedToolArguments] = []
 
         for choice in choices:
             if choice.get("finish_reason"):
@@ -5918,6 +6073,7 @@ class OpenAIProvider:
                     text_tool_normalizer.observe_native_tool_start("")
                 else:
                     invalid_native_arguments += 1
+                    native_identity_valid = False
                     log.warning(
                         "provider.native_tool_call_invalid",
                         provider=self._provider_kind,
@@ -5936,6 +6092,7 @@ class OpenAIProvider:
                         text_tool_normalizer.observe_native_tool_start("")
                     else:
                         invalid_native_arguments += 1
+                        native_identity_valid = False
                         log.warning(
                             "provider.native_tool_call_invalid",
                             provider=self._provider_kind,
@@ -5970,9 +6127,12 @@ class OpenAIProvider:
                     )
                     text_tool_normalizer.observe_native_tool_start("")
                     continue
-                raw_function = tc.get("function") or {}
+                raw_function = tc.get("function")
+                if raw_function is None:
+                    raw_function = {}
                 if not isinstance(raw_function, Mapping):
                     invalid_native_arguments += 1
+                    native_identity_valid = False
                     log.warning(
                         "provider.native_tool_call_invalid",
                         provider=self._provider_kind,
@@ -5990,6 +6150,12 @@ class OpenAIProvider:
                 raw_tool_name = function.get("name")
                 tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
                 tool_name_valid = bool(tool_name.strip())
+                native_identity_valid &= (
+                    isinstance(raw_tool_use_id, str)
+                    and bool(raw_tool_use_id.strip())
+                    and tool_name in tools_by_name
+                    and tc.get("type") in (None, "function")
+                )
                 call_key = tools_acc.next_int_key()
                 for pending_event in _segment_text_tool_events(
                     text_tool_normalizer.observe_native_tool_start(tool_name),
@@ -6014,6 +6180,7 @@ class OpenAIProvider:
                     arguments_text = raw_arguments_text
                 else:
                     invalid_native_arguments += 1
+                    native_identity_valid = False
                     log.warning(
                         "provider.native_tool_call_invalid",
                         provider=self._provider_kind,
@@ -6037,6 +6204,13 @@ class OpenAIProvider:
                     tool_use_id=tool_use_id,
                     raw_text=arguments_text,
                     tools_by_name=tools_by_name,
+                )
+                native_argument_rejections.append(
+                    RejectedToolArguments(
+                        tool_call_id=tool_use_id,
+                        tool_name=tool_name,
+                        reason="batch_not_executed" if arguments_valid else "invalid_json",
+                    )
                 )
                 trace_tool_calls.append(
                     {
@@ -6103,6 +6277,7 @@ class OpenAIProvider:
             > _MAX_DEFERRED_NATIVE_ARGUMENT_CHARS
         ):
             invalid_native_arguments += 1
+            native_identity_valid = False
             log.warning(
                 "provider.deferred_native_queue_oversized",
                 provider=self._provider_kind,
@@ -6166,6 +6341,31 @@ class OpenAIProvider:
                     "invalid_call_count": invalid_native_arguments,
                 },
             )
+            if (
+                native_identity_valid
+                and native_argument_rejections
+                and stop_reason in _SUCCESSFUL_TEXT_TOOL_FINISH_REASONS
+                and len({call.tool_call_id for call in native_argument_rejections})
+                == len(native_argument_rejections)
+                and not _text_tool_rejection_details(normalized_segments)
+            ):
+                yield rejected_tool_arguments_error(
+                    ToolArgumentRejection(
+                        calls=tuple(native_argument_rejections),
+                        terminal_reason=stop_reason,
+                    ),
+                    usage=_rejected_generation_usage(
+                        usage=usage_accumulator,
+                        billing=billing_accumulator,
+                        provider_kind=self._provider_kind,
+                        provider=self.provider_id,
+                        base_url=self._base_url,
+                        model=self._model,
+                        actual_model=actual_model,
+                        stop_reason=stop_reason,
+                    ),
+                )
+                return
             yield ErrorEvent(
                 message=(
                     f"{self._compat.display_name} returned invalid native tool arguments"
@@ -6174,13 +6374,14 @@ class OpenAIProvider:
             )
             return
 
-        for call_key, arguments in pending_native_finishes:
-            for tool_event in tools_acc.finish_with_arguments(call_key, arguments):
-                deferred_native_events.append(tool_event)
-
         normalized_segments = text_tool_normalizer.finish(
             successful_text_tool_terminal=successful_text_tool_terminal,
             native_calls=native_calls,
+        )
+        normalized_events = _segment_text_tool_events(
+            normalized_segments,
+            provider_kind=self._provider_kind,
+            model=self._model,
         )
         rejection_error = _text_tool_rejection_error(
             normalized_segments,
@@ -6190,13 +6391,30 @@ class OpenAIProvider:
             phase="non_stream",
             cache_shape=cache_shape,
             trace=trace,
+            events=normalized_events,
+            terminal_reason=stop_reason if finish_reasons else None,
+            native_calls=tuple(native_argument_rejections),
+            native_identity_valid=native_identity_valid,
+            usage=(
+                _rejected_generation_usage(
+                    usage=usage_accumulator,
+                    billing=billing_accumulator,
+                    provider_kind=self._provider_kind,
+                    provider=self.provider_id,
+                    base_url=self._base_url,
+                    model=self._model,
+                    actual_model=actual_model,
+                    stop_reason=stop_reason,
+                )
+                if _text_tool_rejection_details(normalized_segments)
+                else None
+            ),
         )
         if rejection_error is not None:
-            for event in _segment_text_tool_events(
-                normalized_segments,
-                provider_kind=self._provider_kind,
-                model=self._model,
-            ):
+            for deferred_event in deferred_native_events:
+                if isinstance(deferred_event, ToolUseStartEvent):
+                    yield deferred_event
+            for event in normalized_events:
                 if isinstance(event, ToolUseEndEvent):
                     raise AssertionError(
                         "rejected text tool output produced a completed call"
@@ -6206,11 +6424,10 @@ class OpenAIProvider:
                 yield event
             yield rejection_error
             return
-        for event in _segment_text_tool_events(
-            normalized_segments,
-            provider_kind=self._provider_kind,
-            model=self._model,
-        ):
+        for call_key, arguments in pending_native_finishes:
+            for tool_event in tools_acc.finish_with_arguments(call_key, arguments):
+                deferred_native_events.append(tool_event)
+        for event in normalized_events:
             if isinstance(event, TextDeltaEvent):
                 visible_assistant_text_parts.append(event.text)
             elif isinstance(event, ToolUseEndEvent):

@@ -32,6 +32,7 @@ from .stream_assembly import (
     ToolStreamAccumulator,
     ToolStreamProtocolError,
 )
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -41,8 +42,10 @@ from .types import (
     ModelInfo,
     ProviderFinalRequestProjection,
     ProviderReplayState,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolUseEndEvent,
 )
@@ -635,6 +638,7 @@ class AnthropicProvider:
         output_tokens = 0
         cached_tokens = 0
         cache_creation_tokens = 0
+        usage_known = False
         reasoning = ReasoningAccumulator()
         native_blocks: dict[int, dict[str, Any]] = {}
         native_open_blocks: set[int] = set()
@@ -646,6 +650,9 @@ class AnthropicProvider:
         message_terminal_seen = False
         deferred_tool_ends: list[tuple[ToolUseEndEvent, str]] = []
         invalid_tool_call_ids: set[str] = set()
+        invalid_argument_ids: set[str] = set()
+        rejection_call_identities: dict[Any, tuple[str, str]] = {}
+        tool_protocol_invalid = False
         candidate_open_blocks: set[Any] = set()
         candidate_closed_blocks: set[Any] = set()
         candidate_argument_content_blocks: set[Any] = set()
@@ -779,6 +786,10 @@ class AnthropicProvider:
                             if isinstance(message_id, str) and message_id:
                                 response_ids.add(message_id)
                             usage = event.get("message", {}).get("usage", {})
+                            usage_known |= isinstance(usage, dict) and any(
+                                type(usage.get(key)) is int and usage[key] >= 0
+                                for key in ("input_tokens", "output_tokens")
+                            )
                             base_input_tokens = _coerce_int(usage.get("input_tokens"))
                             (
                                 input_tokens,
@@ -862,6 +873,7 @@ class AnthropicProvider:
                                         tool_name=tool_name,
                                     )
                                 except ToolStreamProtocolError as exc:
+                                    tool_protocol_invalid = True
                                     invalid_tool_call_ids.add(exc.tool_use_id)
                                     log.warning(
                                         "provider.tool_stream_protocol_error",
@@ -873,10 +885,21 @@ class AnthropicProvider:
                                     continue
                                 for tool_event in tool_events:
                                     yield tool_event
+                                rejection_call_identities[index] = (block["id"], tool_name)
                                 initial_input = block.get("input")
                                 if initial_input not in (None, {}):
                                     if not _is_finite_json_object(initial_input):
                                         invalid_tool_call_ids.add(str(block.get("id", "")))
+                                        invalid_argument_ids.add(str(block.get("id", "")))
+                                        # Even invalid initial arguments must
+                                        # fit the response-local assembly bounds.
+                                        try:
+                                            tools_acc.append(
+                                                index,
+                                                json.dumps(initial_input, ensure_ascii=False),
+                                            )
+                                        except (ToolStreamProtocolError, TypeError, ValueError):
+                                            tool_protocol_invalid = True
                                     else:
                                         for tool_event in tools_acc.append(
                                             index, json.dumps(initial_input, ensure_ascii=False)
@@ -951,6 +974,7 @@ class AnthropicProvider:
                                 try:
                                     tool_events = tools_acc.append(index, fragment)
                                 except ToolStreamProtocolError as exc:
+                                    tool_protocol_invalid = True
                                     invalid_tool_call_ids.add(exc.tool_use_id)
                                     log.warning(
                                         "provider.tool_stream_protocol_error",
@@ -1036,6 +1060,7 @@ class AnthropicProvider:
                                         index, arguments
                                     )
                                 except ToolStreamProtocolError as exc:
+                                    tool_protocol_invalid = True
                                     invalid_tool_call_ids.add(exc.tool_use_id)
                                     log.warning(
                                         "provider.tool_stream_protocol_error",
@@ -1050,6 +1075,8 @@ class AnthropicProvider:
                                         deferred_tool_ends.append((tool_event, raw))
                             else:
                                 invalid_tool_call_ids.add(tool_use_id)
+                                if identity_valid:
+                                    invalid_argument_ids.add(tool_use_id)
 
                         elif etype == "message_delta":
                             # The Messages stream may carry more than one
@@ -1061,6 +1088,19 @@ class AnthropicProvider:
                             # mutation stays rejected by the post-terminal
                             # frame-order guard above.
                             usage = event.get("usage") or {}
+                            usage_known |= isinstance(usage, dict) and any(
+                                type(usage.get(key)) is int and usage[key] >= 0
+                                for key in ("input_tokens", "output_tokens")
+                            )
+                            if isinstance(usage.get("iterations"), list):
+                                usage_known |= any(
+                                    isinstance(iteration, dict)
+                                    and any(
+                                        type(iteration.get(key)) is int and iteration[key] >= 0
+                                        for key in ("input_tokens", "output_tokens")
+                                    )
+                                    for iteration in usage["iterations"]
+                                )
                             (
                                 iteration_input_tokens,
                                 iteration_output_tokens,
@@ -1142,7 +1182,55 @@ class AnthropicProvider:
                     ):
                         message = "Anthropic response ended with an incomplete tool call"
                         trace.record_error(code="incomplete_tool_call", message=message)
-                        yield ErrorEvent(message=message, code="incomplete_tool_call")
+                        # A closed response and closed content blocks distinguish
+                        # rejected arguments from an interrupted or ambiguous call.
+                        if (
+                            candidate_artifact is None
+                            and stop_reason == "tool_use"
+                            and message_terminal_seen
+                            and invalid_argument_ids
+                            and invalid_tool_call_ids <= invalid_argument_ids
+                            and not tool_protocol_invalid
+                            and not native_capture_invalid
+                            and not native_open_blocks
+                            and all(
+                                call_id in invalid_argument_ids
+                                for _, call_id, _, _ in pending_tool_calls
+                            )
+                            and rejection_call_identities
+                            and all(
+                                call_id.strip() and name.strip()
+                                for call_id, name in rejection_call_identities.values()
+                            )
+                        ):
+                            yield rejected_tool_arguments_error(
+                                ToolArgumentRejection(
+                                    calls=tuple(
+                                        RejectedToolArguments(
+                                            tool_call_id=call_id,
+                                            tool_name=name,
+                                            reason=(
+                                                "invalid_json" if call_id in invalid_argument_ids
+                                                else "batch_not_executed"
+                                            ),
+                                        )
+                                        for call_id, name in rejection_call_identities.values()
+                                    ),
+                                    terminal_reason=stop_reason,
+                                ),
+                                usage=(
+                                    DoneEvent(
+                                        input_tokens=input_tokens,
+                                        output_tokens=output_tokens,
+                                        cached_tokens=cached_tokens,
+                                        cache_write_tokens=cache_creation_tokens,
+                                        model=self._model,
+                                        provider=self.provider_id,
+                                    ) if usage_known else None
+                                ),
+                            )
+                        else:
+                            yield ErrorEvent(message=message, code="incomplete_tool_call")
                         return
 
                     if native_capture_invalid or native_open_blocks:

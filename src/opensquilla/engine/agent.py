@@ -63,6 +63,7 @@ from opensquilla.engine.history import (
     repair_tool_pairing,
 )
 from opensquilla.engine.prompt_cache_keepalive import PromptCacheKeepaliveCandidate
+from opensquilla.engine.provider_usage_delta import ProviderUsageDelta
 from opensquilla.engine.repetition_guard import (
     MODEL_REPETITION_LOOP_CODE,
     MODEL_REPETITION_LOOP_MESSAGE,
@@ -94,6 +95,11 @@ from opensquilla.engine.session_sanitize import (
 )
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
+from opensquilla.engine.tool_argument_recovery import (
+    MAX_TOOL_ARGUMENT_CORRECTIONS,
+    append_tool_argument_feedback,
+    valid_tool_argument_rejection,
+)
 from opensquilla.engine.tool_failure_recovery import (
     FAILURE_RECOVERY_CODE,
     FAILURE_RECOVERY_INSTRUCTION,
@@ -6349,6 +6355,8 @@ class Agent:
         )
         turn_llm_calls = 0
         turn_tool_errors = 0
+        tool_argument_corrections = 0
+        provider_usage_delta = ProviderUsageDelta()
         tool_failure_recovery = ToolFailureRecovery()
         tool_failure_finalization_pending = False
         # Whole-turn replay is safe only while no provider admission has
@@ -7045,6 +7053,7 @@ class Agent:
                 while _retry_attempt <= _fallback.max_retries:
                     provider_error = None
                     assistant_text_parts = []
+                    attempt_reasoning_parts: list[str] = []
                     tool_calls = []
                     pending_tools = {}
                     pending_tool_events = []
@@ -7834,6 +7843,7 @@ class Agent:
                                 generation_epoch = reset_event.new_generation_epoch
                                 last_provider_sequence = reset_event.sequence
                                 assistant_text_parts.clear()
+                                attempt_reasoning_parts.clear()
                                 final_text_parts.clear()
                                 tool_calls.clear()
                                 pending_tools.clear()
@@ -7854,6 +7864,7 @@ class Agent:
                                 provider_error_for_log = None
                                 yield reset_event
                                 if raw_ev.terminal:
+                                    raw_ev = provider_usage_delta.consume(raw_ev)
                                     terminal_generation_reset_event = reset_event
                                     terminal_model = str(self.config.model_id or "")
                                     terminal_usage = normalize_provider_usage(
@@ -7996,7 +8007,10 @@ class Agent:
                                 ):
                                     continue
 
-                            if not isinstance(raw_ev, ProviderErrorEvent):
+                            if (
+                                not isinstance(raw_ev, ProviderErrorEvent)
+                                or raw_ev.tool_argument_rejection is not None
+                            ):
                                 # Provider.chat commonly returns an async
                                 # generator before it performs network I/O.
                                 # Confirm application only once the request
@@ -8087,6 +8101,7 @@ class Agent:
                                 # still arrives via DoneEvent.reasoning_content.
                                 if not raw_ev.text:
                                     continue
+                                attempt_reasoning_parts.append(raw_ev.text)
                                 if not router_model_call_id:
                                     router_model_call_id = call_id
                                     router_iteration = iterations
@@ -8363,6 +8378,7 @@ class Agent:
                                     # duplicate either legacy or ledger totals.
                                     continue
                                 provider_done_for_log = raw_ev
+                                raw_ev = provider_usage_delta.consume(raw_ev)
                                 self._current_request_execution = execution_from_evidence(
                                     {
                                         "model": raw_ev.model,
@@ -8655,6 +8671,7 @@ class Agent:
                                         ensemble_continuation_provider = self.provider
 
                             elif isinstance(raw_ev, ProviderErrorEvent):
+                                raw_ev = provider_usage_delta.consume(raw_ev)
                                 provider_error_for_log = raw_ev
                                 ensemble_trace = getattr(raw_ev, "ensemble_trace", None)
                                 if isinstance(ensemble_trace, dict):
@@ -8752,6 +8769,16 @@ class Agent:
                                         last_actual_provider = usage_default_provider
                                     cost_receipt_counted = True
                                     turn_has_error_usage_receipt = True
+                                elif (
+                                    raw_ev.tool_argument_rejection is not None
+                                    and not known_usage_receipt
+                                ):
+                                    # This completed, rejected generation is still
+                                    # a physical request with unknown cost. Keep
+                                    # that gap after a later correction succeeds.
+                                    total_missing_cost_entries += max(
+                                        1, raw_ev.usage_missing_count,
+                                    )
                                 provider_error = raw_ev
                                 _got_error = True
                                 break  # break stream loop
@@ -8779,7 +8806,10 @@ class Agent:
                                 )
                         reasoning_end = _finish_reasoning_block(
                             "completed"
-                            if _got_done_event
+                            if _got_done_event or (
+                                provider_error is not None
+                                and provider_error.tool_argument_rejection is not None
+                            )
                             else "error"
                             if provider_error is not None
                             else "interrupted"
@@ -9016,14 +9046,35 @@ class Agent:
                             generation_epoch=(terminal_generation_reset_event.new_generation_epoch),
                         )
                         break
-                    terminal_error = (
-                        _turn_budget_error()
+                    response_text = "".join(assistant_text_parts)
+                    rejection = (
+                        provider_error.tool_argument_rejection
+                        if provider_error is not None else None
                     )
+                    if rejection is not None and not valid_tool_argument_rejection(
+                        rejection,
+                        tool_names={tool.name for tool in provider_tools_for_call or []},
+                    ):
+                        rejection = None
+                    if rejection is not None:
+                        iter_reasoning_content = (
+                            iter_reasoning_content or "".join(attempt_reasoning_parts) or None
+                        )
+                        # Preserve the completed response before budget checks:
+                        # accounting may stop continuation, but must not erase it.
+                        append_tool_argument_feedback(
+                            turn_messages, rejection, visible_text=response_text,
+                            reasoning_content=iter_reasoning_content,
+                        )
+                        if response_text:
+                            final_text_parts.append(response_text)
+                        if iter_reasoning_content:
+                            final_reasoning_parts.append(iter_reasoning_content)
+                    terminal_error = _turn_budget_error()
                     if terminal_error is not None:
                         yield self._transition(AgentState.ERROR)
                         yield terminal_error
                         break
-                    response_text = "".join(assistant_text_parts)
                     if tool_failure_finalization_pending and (
                         _got_error or not _got_done_event or not response_text.strip()
                     ):
@@ -9905,6 +9956,43 @@ class Agent:
                         continue
 
                     if provider_error is not None:
+                        if rejection is not None:
+                            # This is a new model correction with explicit evidence,
+                            # not transport replay. The batch never crossed the
+                            # transactional tool-publication boundary. Keep prior
+                            # visible text and results rather than replacing them.
+                            if tool_argument_corrections >= MAX_TOOL_ARGUMENT_CORRECTIONS:
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    code=FAILURE_RECOVERY_CODE,
+                                    message=(
+                                        "Tool arguments remained invalid after two correction "
+                                        "attempts. The rejected batches were not executed."
+                                    ),
+                                )
+                                yield terminal_error
+                                break
+                            tool_argument_corrections += 1
+                            self._write_turn_call_log(
+                                "tool_argument_correction",
+                                attempt=tool_argument_corrections,
+                                limit=MAX_TOOL_ARGUMENT_CORRECTIONS,
+                                calls=len(rejection.calls),
+                                terminal_reason=rejection.terminal_reason,
+                                execution_started=False,
+                            )
+                            next_provider_activity_reason = "invalid_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="invalid_response",
+                                retry_attempt=tool_argument_corrections,
+                                retry_limit=MAX_TOOL_ARGUMENT_CORRECTIONS,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            _call_attempt += 1
+                            continue
                         provider_error_status_code = (
                             int(provider_error.code) if str(provider_error.code).isdigit() else None
                         )

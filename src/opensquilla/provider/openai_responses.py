@@ -44,6 +44,7 @@ from .request_proof import (
     provider_request_token_budget,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -56,8 +57,10 @@ from .types import (
     Message,
     ModelInfo,
     ProviderFinalRequestProjection,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolUseStartEvent,
 )
@@ -572,6 +575,10 @@ class OpenAIResponsesProvider:
         recognized_tools_acc = ToolStreamAccumulator()
         validated_message_text: dict[int, list[str]] = {}
         invalid_tool_call_count = 0
+        rejected_argument_indexes: set[int] = set()
+        rejection_call_identities: dict[int, tuple[str, str]] = {}
+        rejection_identity_keys: set[str] = set()
+        rejection_protocol_invalid = False
         invalid_output_shape = False
         for item_index, item in enumerate(output_items):
             if not isinstance(item, dict):
@@ -662,8 +669,14 @@ class OpenAIResponsesProvider:
                 continue
             if not response_completed:
                 continue
+            if item.get("status") not in (None, "completed"):
+                rejection_protocol_invalid = True
             raw_call_id = item.get("call_id")
             raw_item_id = item.get("id")
+            if raw_call_id is None and raw_item_id is None:
+                # A locally generated identity cannot establish the provider's
+                # complete rejected batch, even if normal compatibility allows it.
+                rejection_protocol_invalid = True
             if (
                 raw_call_id is not None
                 and (not isinstance(raw_call_id, str) or not raw_call_id.strip())
@@ -679,6 +692,9 @@ class OpenAIResponsesProvider:
                 continue
             call_id = raw_call_id or raw_item_id or f"call_{uuid4().hex[:12]}"
             key = raw_item_id or call_id
+            if key in rejection_identity_keys:
+                rejection_protocol_invalid = True
+            rejection_identity_keys.add(key)
             try:
                 recognized_tool_starts[item_index] = [
                     event
@@ -695,11 +711,22 @@ class OpenAIResponsesProvider:
                 # exposing a synthetic lifecycle.
                 invalid_tool_call_count += 1
                 continue
+            rejection_call_identities[item_index] = (call_id, tool_name)
             raw_arguments = item.get("arguments")
             if raw_arguments is None:
+                rejection_protocol_invalid = True
                 raw_arguments = ""
             if not isinstance(raw_arguments, str):
                 invalid_tool_call_count += 1
+                rejection_protocol_invalid = True
+                continue
+            try:
+                # Enforce raw argument and batch bounds before a rejection
+                # proof; malformed JSON must not bypass the stream limits.
+                recognized_tools_acc.append(key, raw_arguments)
+            except ToolStreamProtocolError:
+                invalid_tool_call_count += 1
+                rejection_protocol_invalid = True
                 continue
             try:
                 arguments = (
@@ -719,14 +746,17 @@ class OpenAIResponsesProvider:
                 ValueError,
             ):
                 invalid_tool_call_count += 1
+                rejected_argument_indexes.add(item_index)
                 continue
             if not isinstance(arguments, dict):
                 invalid_tool_call_count += 1
+                rejected_argument_indexes.add(item_index)
                 continue
             try:
                 json.dumps(arguments, allow_nan=False)
             except (RecursionError, TypeError, ValueError):
                 invalid_tool_call_count += 1
+                rejected_argument_indexes.add(item_index)
                 continue
             parsed_tool_arguments[item_index] = (
                 call_id,
@@ -762,7 +792,47 @@ class OpenAIResponsesProvider:
                     yield TextDeltaEvent(text=text)
                 for start_event in recognized_tool_starts.get(item_index, []):
                     yield start_event
-            yield ErrorEvent(message=message, code="incomplete_tool_call")
+            if (
+                rejected_argument_indexes
+                and len(rejected_argument_indexes) == invalid_tool_call_count
+                and not rejection_protocol_invalid
+                and data.get("incomplete_details") is None
+            ):
+                input_tokens, output_tokens, reasoning_tokens, cached_tokens = _usage_fields(
+                    data.get("usage")
+                )
+                yield rejected_tool_arguments_error(
+                    ToolArgumentRejection(
+                        calls=tuple(
+                            RejectedToolArguments(
+                                tool_call_id=call_id,
+                                tool_name=name,
+                                reason=(
+                                    "invalid_json" if index in rejected_argument_indexes
+                                    else "batch_not_executed"
+                                ),
+                            )
+                            for index, (call_id, name) in rejection_call_identities.items()
+                        ),
+                        terminal_reason="completed",
+                    ),
+                    usage=(
+                        DoneEvent(
+                            input_tokens=input_tokens,
+                            output_tokens=output_tokens,
+                            reasoning_tokens=reasoning_tokens,
+                            cached_tokens=cached_tokens,
+                            model=data.get("model") or self._model,
+                            provider=self.provider_id,
+                        )
+                        if isinstance(data.get("usage"), dict) and any(
+                            type(data["usage"].get(key)) is int and data["usage"][key] >= 0
+                            for key in ("input_tokens", "output_tokens")
+                        ) else None
+                    ),
+                )
+            else:
+                yield ErrorEvent(message=message, code="incomplete_tool_call")
             return
 
         tools_acc = ToolStreamAccumulator()

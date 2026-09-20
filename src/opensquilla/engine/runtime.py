@@ -2351,7 +2351,8 @@ class _SelectorFallbackProvider:
                         yield event
                         continue
                     can_retry = (
-                        not content_started()
+                        event.tool_argument_rejection is None
+                        and not content_started()
                         and getattr(provider, "retry_failed_call_safe", True) is not False
                         and (physical_limit == 0 or attempts < physical_limit)
                     )
@@ -3824,6 +3825,13 @@ class _SelectorFallbackProvider:
                     yield event
                     continue
                 if isinstance(event, ProviderErrorEvent):
+                    if event.tool_argument_rejection is not None:
+                        # A completed, rejected tool batch belongs to Agent's
+                        # correction loop, not transport retry or model fallback.
+                        # Its provisional tool frames must never be committed.
+                        pre_text_buffer.drain(successful_leg=False)
+                        yield event
+                        return
                     _report_credential_pool_failure(
                         self.provider_name,
                         self._turn_metadata,
@@ -4230,6 +4238,10 @@ class _SelectorFallbackProvider:
                                 yield fallback_event
                                 continue
                             if isinstance(fallback_event, ProviderErrorEvent):
+                                if fallback_event.tool_argument_rejection is not None:
+                                    fallback_buffer.drain(successful_leg=False)
+                                    yield fallback_event
+                                    return
                                 _report_credential_pool_failure(
                                     self.provider_name,
                                     self._turn_metadata,

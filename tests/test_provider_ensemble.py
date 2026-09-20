@@ -68,6 +68,7 @@ from opensquilla.provider.tokenrhythm_catalog import (
     parse_tokenrhythm_declared,
     tokenrhythm_authority_identity,
 )
+from opensquilla.provider.tool_argument_rejection import rejected_tool_arguments_error
 from opensquilla.provider.types import (
     ContentBlockImage,
     EnsembleProgressEvent,
@@ -77,7 +78,9 @@ from opensquilla.provider.types import (
     ProviderFinalRequestProjection,
     ProviderMessageCountProjection,
     ProviderMessageLimitProof,
+    RejectedToolArguments,
     StreamEvent,
+    ToolArgumentRejection,
 )
 
 
@@ -382,6 +385,47 @@ async def test_single_physical_attempt_uses_current_final_provider_only(
     assert ledger.attempt_indices == [0]
     assert ledger.request_starts == 1
     assert len(ledger.outcomes) == 1
+
+
+@pytest.mark.parametrize("active_role", ["initial", "primary", "fixed"])
+async def test_single_attempt_preserves_rejected_arguments_and_receipt(
+    monkeypatch: pytest.MonkeyPatch, active_role: str,
+) -> None:
+    rejected = rejected_tool_arguments_error(
+        ToolArgumentRejection(
+            calls=(RejectedToolArguments("bad-call", "lookup", "invalid_json"),),
+            terminal_reason="tool_calls",
+        ),
+        usage=DoneEvent(input_tokens=7, output_tokens=11, model="answer-model"),
+    )
+    registry = _FakeRegistry({
+        "agg": _FakePlan([ReasoningDeltaEvent(text="Need a lookup"), rejected]),
+        "fixed": _FakePlan([ReasoningDeltaEvent(text="Need a lookup"), rejected]),
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = EnsembleProvider(
+        profile_name="single-rejected", proposers=[_member("draft")], aggregator=_member("agg"),
+        fallback_provider=registry.provider_for(ProviderConfig("fake", "fixed")),
+        fallback_provider_name="fake", fallback_model="fixed",
+    )
+    if active_role == "primary":
+        provider._primary_takeover_active = True
+        provider._primary_provider = registry.provider_for(ProviderConfig("fake", "agg"))
+    elif active_role == "fixed":
+        provider._fixed_takeover_active = True
+        provider._fixed_takeover_role = "fixed_direct"
+    events = [event async for event in provider.chat(
+        [Message(role="user", content="answer this")], tools=[_tool()],
+        config=ChatConfig(physical_attempt_limit=1),
+    )]
+    assert [call["model"] for call in registry.calls] == [
+        "fixed" if active_role == "fixed" else "agg"
+    ]
+    terminal = next(event for event in events if isinstance(event, ErrorEvent))
+    assert terminal.tool_argument_rejection == rejected.tool_argument_rejection
+    assert terminal.model_usage_breakdown == rejected.model_usage_breakdown
+    assert terminal.cumulative_usage_id == ""
+    assert not any(isinstance(event, (DoneEvent, ProviderGenerationResetEvent)) for event in events)
 
 
 @pytest.mark.parametrize("fixed_role", ["fixed_direct", "fixed_aggregator"])
@@ -1432,7 +1476,8 @@ async def test_tokenrhythm_b5_explicit_quorum_uses_fixed_fallback_when_unmet(
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.billing_receipt is None
     assert done.cost_source == "provider_billed"
-    assert done.usage_missing_count == 0
+    # p4 started but produced no receipt; fixed success must retain that gap.
+    assert done.usage_missing_count == 1
     assert [row["role"] for row in done.model_usage_breakdown] == [
         "proposer",
         "proposer",
@@ -1462,7 +1507,7 @@ async def test_tokenrhythm_b5_explicit_quorum_uses_fixed_fallback_when_unmet(
         completed_at_ms=1234,
     )
     assert len(result.items) == 4
-    assert result.missing_usage_entries == 0
+    assert result.missing_usage_entries == 1
     assert result.cost_source == "provider_billed"
     assert result.billed_cost_nanos == 40_000
     assert result.estimated_cost_nanos == 0
@@ -3180,6 +3225,8 @@ async def test_tool_continuation_keeps_one_public_aggregator_role(
         event for event in continuation_events if isinstance(event, DoneEvent)
     )
     assert first_done.stop_reason == "tool_use"
+    assert first_done.cumulative_usage_id
+    assert continuation_done.cumulative_usage_id == first_done.cumulative_usage_id
     assert continuation_done.ensemble_trace is not None
     assert continuation_done.ensemble_trace["final_request_role"] == "aggregator"
     assert continuation_done.ensemble_trace["final_request"]["role"] == "aggregator"
@@ -5264,6 +5311,8 @@ async def test_fallback_stream_without_done_returns_terminal_reset(
         if isinstance(event, ProviderGenerationResetEvent) and event.terminal
     )
     assert terminal.terminal_error_code == "ensemble_fixed_incomplete"
+    assert terminal.cumulative_usage_id
+    assert terminal.ensemble_trace["usage_scope_id"] == terminal.cumulative_usage_id
     assert terminal.terminal_text_snapshot == ENSEMBLE_FIXED_TERMINAL_MESSAGE
     assert [row["model"] for row in terminal.model_usage_breakdown] == [
         "p1",
@@ -5645,6 +5694,147 @@ def _aggregator_done_with_receipt(
         stop_reason=stop_reason,
         model="agg",
     )
+
+
+@pytest.mark.asyncio
+async def test_fresh_ensemble_generations_use_distinct_cumulative_receipt_scopes(monkeypatch):
+    registry = _FakeRegistry({
+        "p1": _FakePlan([TextDeltaEvent(text="draft"), DoneEvent(input_tokens=3)]),
+        "agg": _FakePlan([TextDeltaEvent(text="final"), DoneEvent(input_tokens=7)]),
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    provider = _retry_test_provider()
+    first = next(event for event in await _collect(provider) if isinstance(event, DoneEvent))
+    second = next(event for event in await _collect(provider) if isinstance(event, DoneEvent))
+    assert first.cumulative_usage_id
+    assert second.cumulative_usage_id
+    assert first.cumulative_usage_id != second.cumulative_usage_id
+    assert first.input_tokens == second.input_tokens == 10
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["aggregator", "fixed_aggregator", "fixed_direct"])
+@pytest.mark.parametrize("rebuild", [False, True])
+@pytest.mark.parametrize("with_receipt", [False, True])
+async def test_rejected_arguments_continue_same_role_without_replaying_proposers(
+    monkeypatch: pytest.MonkeyPatch, role: str, rebuild: bool, with_receipt: bool,
+) -> None:
+    model = "agg" if role == "aggregator" else "fixed"
+    receipt = replace(_aggregator_done_with_receipt(scale=1, stop_reason="tool_calls"), model=model)
+    rejected = rejected_tool_arguments_error(
+        ToolArgumentRejection(
+            calls=(RejectedToolArguments("bad-call", "lookup", "invalid_json"),),
+            terminal_reason="tool_calls",
+        ),
+        usage=receipt if with_receipt else None,
+    )
+    # The typed fact owns recovery even if incidental text looks retryable.
+    rejected.code = "429"
+    rejected.message = "rate limit"
+    rejection_plan = _FakePlan([
+        TextDeltaEvent(text="I will look this up."),
+        ReasoningDeltaEvent(text="Need a lookup."),
+        ToolUseStartEvent(tool_use_id="bad-call", tool_name="lookup"),
+        ToolUseDeltaEvent(tool_use_id="bad-call", json_fragment='{"q":'),
+        rejected,
+    ])
+    success_plan = _FakePlan([
+        TextDeltaEvent(text="Corrected answer"),
+        replace(_aggregator_done_with_receipt(scale=2, stop_reason="stop"), model=model),
+    ])
+    registry = _AttemptRegistry({
+        "p1": [_FakePlan(
+            [ErrorEvent(message="unauthorized", code="401")]
+            if role == "fixed_direct"
+            else [TextDeltaEvent(text="draft"), DoneEvent(input_tokens=3, model="p1")]
+        )],
+        "agg": [rejection_plan, success_plan] if role == "aggregator" else [
+            _FakePlan([ErrorEvent(message="unauthorized", code="401")])
+        ],
+        "fixed": [rejection_plan, success_plan],
+    })
+    monkeypatch.setattr("opensquilla.provider.ensemble._build_provider", registry.provider_for)
+    credential_failures: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        EnsembleProvider, "_report_member_credential_failure",
+        lambda self, member, **kwargs: credential_failures.append(kwargs),
+    )
+
+    def build() -> EnsembleProvider:
+        return EnsembleProvider(
+            profile_name="rejected-arguments",
+            proposers=[_member("p1")], aggregator=_member("agg"),
+            fallback_provider=registry.provider_for(ProviderConfig("fake", "fixed")),
+            fallback_provider_name="fake", fallback_model="fixed",
+            min_successful_proposers=1, shuffle_candidates=False,
+        )
+
+    provider = build()
+    context = TurnExecutionContext.create(
+        TurnIdentity("rejected-turn", "rejected-answer", "agent:main:rejected")
+    )
+    config = ChatConfig(max_tokens=99, thinking=False)
+    sink = _RecordingUsageSink()
+    with bind_usage_accounting_scope(_usage_scope(sink)):
+        events = [event async for event in provider.chat(
+            [Message(role="user", content="answer this")], tools=[_tool()],
+            config=config, execution_context=context,
+        )]
+        expected_calls = ["p1", "agg"] if role == "aggregator" else (
+            ["p1", "agg", "fixed"] if role == "fixed_aggregator" else ["p1", "fixed"]
+        )
+        assert [call["model"] for call in registry.calls] == expected_calls
+        terminal = next(event for event in events if isinstance(event, ErrorEvent))
+        assert terminal.tool_argument_rejection == rejected.tool_argument_rejection
+        assert terminal.cumulative_usage_id
+        assert not any(isinstance(event, DoneEvent) for event in events)
+        assert not any(
+            isinstance(event, ProviderGenerationResetEvent) and event.terminal
+            for event in events
+        )
+        assert all(failure["code"] != "429" for failure in credential_failures)
+        rejected_row = terminal.model_usage_breakdown[-1]
+        assert rejected_row["role"] == role
+        assert rejected_row["model"] == model
+        assert rejected_row["usage_receipt_missing"] is not with_receipt
+        assert rejected_row.get("billing_receipt") == (
+            receipt.billing_receipt if with_receipt else None
+        )
+        prior_missing = int(role != "aggregator")
+        assert terminal.usage_missing_count == prior_missing + int(not with_receipt)
+        snapshot = context.ensemble_continuation_snapshot
+        assert snapshot is not None
+        assert snapshot.ensemble_trace["usage_scope_id"] == terminal.cumulative_usage_id
+        assert snapshot.physical_request_count == len(expected_calls)
+        # A proposer without a receipt may have only the missing-usage count.
+        expected_prior_rows = len(expected_calls) - int(role == "fixed_direct")
+        assert len(snapshot.prior_rows) == expected_prior_rows
+
+        if rebuild:
+            provider = build()
+        continued = [event async for event in provider.chat(
+            [Message(role="user", content="Correct the rejected lookup arguments.")],
+            tools=[_tool()], config=config, execution_context=context,
+        )]
+
+    assert [call["model"] for call in registry.calls] == [*expected_calls, model]
+    assert "Correct the rejected lookup arguments." in str(registry.calls[-1]["messages"])
+    done = next(event for event in continued if isinstance(event, DoneEvent))
+    assert done.cumulative_usage_id == terminal.cumulative_usage_id
+    assert len(done.model_usage_breakdown) == expected_prior_rows + 1
+    assert [row["role"] for row in done.model_usage_breakdown[-2:]] == [role, role]
+    assert done.input_tokens == (
+        (0 if role == "fixed_direct" else 3) + 20 + (10 if with_receipt else 0)
+    )
+    assert done.output_tokens == 40 + (20 if with_receipt else 0)
+    assert done.billed_cost == pytest.approx(0.02 + (0.01 if with_receipt else 0))
+    assert done.usage_missing_count == prior_missing + int(not with_receipt)
+    assert done.ensemble_trace is not None
+    assert done.ensemble_trace["llm_request_count"] == len(expected_calls) + 1
+    # Physical accounting records each receipt once, including the rejected call.
+    assert len(sink.started) == len(expected_calls) + 1
+    assert len(sink.unknown) == prior_missing + int(not with_receipt)
+    assert sum(result.input_tokens for _, result in sink.finalized) == done.input_tokens
 
 
 @pytest.mark.asyncio

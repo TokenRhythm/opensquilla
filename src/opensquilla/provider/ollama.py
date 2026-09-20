@@ -33,6 +33,7 @@ from .request_proof import (
     provider_request_token_budget,
 )
 from .stream_assembly import ToolStreamAccumulator, ToolStreamProtocolError
+from .tool_argument_rejection import rejected_tool_arguments_error
 from .trace_recorder import LLMTraceRecorder
 from .types import (
     ChatConfig,
@@ -41,8 +42,10 @@ from .types import (
     Message,
     ModelInfo,
     ProviderFinalRequestProjection,
+    RejectedToolArguments,
     StreamEvent,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolUseStartEvent,
 )
@@ -381,6 +384,7 @@ class OllamaProvider:
         prepared_tool_events: list[StreamEvent] = []
         prepared_tool_calls: list[dict[str, Any]] = []
         recognized_tool_starts: list[ToolUseStartEvent] = []
+        rejected_argument_ids: set[str] = set()
         candidate_call_key = 0
         saw_done = False
 
@@ -618,7 +622,9 @@ class OllamaProvider:
                                 if isinstance(event, ToolUseStartEvent)
                             )
                             try:
-                                arguments_json = json.dumps(arguments, allow_nan=False)
+                                # Bound the full representation before strict
+                                # finite-object validation, including NaN values.
+                                arguments_json = json.dumps(arguments)
                                 call_events = [
                                     *start_events,
                                     *tools_acc.append(key, arguments_json),
@@ -631,6 +637,17 @@ class OllamaProvider:
                                 ValueError,
                                 ToolStreamProtocolError,
                             ) as exc:
+                                # Argument rejection is recoverable only after
+                                # done=true. Keep reading so EOF, transport errors,
+                                # and later identity conflicts cannot authorize it.
+                                if (
+                                    isinstance(tool_name, str)
+                                    and bool(tool_name.strip())
+                                    and isinstance(exc, ToolStreamProtocolError)
+                                    and exc.reason == "invalid_tool_arguments"
+                                ):
+                                    rejected_argument_ids.add(tool_use_id)
+                                    continue
                                 message = (
                                     "Ollama response contained an invalid tool lifecycle"
                                 )
@@ -675,6 +692,47 @@ class OllamaProvider:
                             metadata={"phase": "stream", "terminal_field": "done"},
                         )
                         yield ErrorEvent(message=message, code="incomplete_stream")
+                        return
+
+                    if rejected_argument_ids:
+                        for start_event in recognized_tool_starts:
+                            yield start_event
+                        if chunk.get("done_reason") in (None, "stop"):
+                            yield rejected_tool_arguments_error(
+                                ToolArgumentRejection(
+                                    calls=tuple(
+                                        RejectedToolArguments(
+                                            tool_call_id=event.tool_use_id,
+                                            tool_name=event.tool_name,
+                                            reason=(
+                                                "invalid_json"
+                                                if event.tool_use_id in rejected_argument_ids
+                                                else "batch_not_executed"
+                                            ),
+                                        )
+                                        for event in recognized_tool_starts
+                                    ),
+                                    terminal_reason="done",
+                                ),
+                                usage=(
+                                    DoneEvent(
+                                        input_tokens=input_tokens,
+                                        output_tokens=output_tokens,
+                                        model=self._model,
+                                        provider=self.provider_id,
+                                    )
+                                    if any(
+                                        type(chunk.get(key)) is int and chunk[key] >= 0
+                                        for key in ("prompt_eval_count", "eval_count")
+                                    )
+                                    else None
+                                ),
+                            )
+                        else:
+                            yield ErrorEvent(
+                                message="Ollama response ended with invalid tool arguments",
+                                code="incomplete_tool_call",
+                            )
                         return
 
                     # Commit the already-validated lifecycle only after the

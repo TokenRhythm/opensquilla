@@ -14,6 +14,7 @@ from opensquilla.engine.runtime import _SelectorFallbackProvider
 from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+from opensquilla.provider.tool_argument_rejection import rejected_tool_arguments_error
 from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
@@ -22,9 +23,12 @@ from opensquilla.provider.types import (
     Message,
     ModelCapabilities,
     ReasoningDeltaEvent,
+    RejectedToolArguments,
     TextDeltaEvent,
+    ToolArgumentRejection,
     ToolDefinition,
     ToolInputSchema,
+    ToolUseDeltaEvent,
     ToolUseStartEvent,
 )
 
@@ -80,6 +84,58 @@ def _agent(provider, **config):
     return Agent(provider, AgentConfig(
         retry_base_backoff_ms=0, retry_max_backoff_ms=0, **config
     ))
+
+
+@pytest.mark.parametrize("visible", [None, "text", "reasoning"])
+@pytest.mark.parametrize("use_fallback", [False, True])
+async def test_tool_argument_rejection_preserves_authority_without_retry(
+    monkeypatch, visible, use_fallback,
+):
+    rejection = rejected_tool_arguments_error(
+        ToolArgumentRejection(
+            calls=(RejectedToolArguments("bad-call", "write_file", "invalid_json"),),
+            terminal_reason="tool_calls",
+        ),
+        usage=DoneEvent(model="primary", input_tokens=7, output_tokens=11),
+    )
+    # The typed fact, not incidental error prose/code, owns recovery.
+    rejection.code = "429"
+    rejection.message = "rate limit"
+    prefix = (
+        [TextDeltaEvent(text="I will write it.")] if visible == "text" else
+        [ReasoningDeltaEvent(text="Preparing the file.")] if visible == "reasoning" else []
+    )
+    rejected_stream = [
+        *prefix,
+        ToolUseStartEvent(tool_use_id="bad-call", tool_name="write_file"),
+        ToolUseDeltaEvent(tool_use_id="bad-call", json_fragment='{"path":'),
+        rejection,
+    ]
+    streams = {
+        "primary": [[ErrorEvent(message="unavailable", code="503")]] if use_fallback
+        else [rejected_stream],
+        "secondary": [rejected_stream] if use_fallback else [_success()],
+    }
+    wrapper, health, calls = _wrapper(monkeypatch, streams)
+    pool_failures = []
+    monkeypatch.setattr(
+        "opensquilla.engine.runtime._report_credential_pool_failure",
+        lambda _provider, _metadata, event: pool_failures.append(event),
+    )
+
+    events = [event async for event in wrapper.chat([Message(role="user", content="write it")])]
+
+    assert calls == (["primary", "secondary"] if use_fallback else ["primary"])
+    assert events[-1] is rejection
+    assert rejection not in pool_failures
+    assert not health.is_benched("openai", "secondary" if use_fallback else "primary")
+    assert events[-1].model_usage_breakdown[0]["input_tokens"] == 7
+    if visible is None:
+        assert not any(
+            isinstance(event, (ToolUseStartEvent, ToolUseDeltaEvent)) for event in events
+        )
+    else:
+        assert any(isinstance(event, (TextDeltaEvent, ReasoningDeltaEvent)) for event in events)
 
 
 class _InterruptedOpenAIStream(httpx.AsyncByteStream):
