@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,18 +21,9 @@ def _mk(**kwargs: Any) -> SlackChannel:
     return ch
 
 
-class _FakeResp:
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self._payload = payload
-
-    def raise_for_status(self) -> None:
-        return None
-
-    def json(self) -> dict[str, Any]:
-        return self._payload
-
-
 class _FakeClient:
+    session = None
+
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, Any] | None, Any]] = []
         self.socket_open_payload: dict[str, Any] = {
@@ -38,15 +31,41 @@ class _FakeClient:
             "url": "wss://socket.slack.test/session",
         }
 
-    async def post(
-        self, path: str, json: dict[str, Any] | None = None, headers: Any = None
-    ) -> _FakeResp:
-        self.calls.append((path, json, headers))
-        if path == "/auth.test":
-            return _FakeResp({"ok": True, "user_id": "UBOT"})
-        if path == "/apps.connections.open":
-            return _FakeResp(self.socket_open_payload)
-        return _FakeResp({"ok": True, "ts": "1700000000.000100"})
+    async def api_call(self, method: str, json: dict[str, Any] | None = None) -> dict[str, Any]:
+        self.calls.append((f"/{method}", json, None))
+        if method == "auth.test":
+            return {"ok": True, "user_id": "UBOT"}
+        return {"ok": True, "ts": "1700000000.000100"}
+
+    async def apps_connections_open(self, *, app_token: str) -> dict[str, Any]:
+        self.calls.append(
+            ("/apps.connections.open", None, {"Authorization": f"Bearer {app_token}"})
+        )
+        return self.socket_open_payload
+
+
+class _FakeSocketClient:
+    def __init__(self) -> None:
+        self.wss_uri: str | None = None
+        self.connected_urls: list[str | None] = []
+        self.closed = False
+        self.stale = False
+        self.current_session = SimpleNamespace(closed=True)
+        self.sent: list[dict[str, Any]] = []
+
+    async def connect(self) -> None:
+        self.connected_urls.append(self.wss_uri)
+        self.current_session.closed = False
+
+    async def close(self) -> None:
+        self.closed = True
+        self.current_session.closed = True
+
+    async def is_connected(self) -> bool:
+        return not self.closed and not self.stale and not self.current_session.closed
+
+    async def send_socket_mode_response(self, response: Any) -> None:
+        self.sent.append(response.to_dict())
 
 
 def test_transport_name_follows_connection_mode() -> None:
@@ -78,28 +97,30 @@ async def test_socket_mode_validates_app_token_before_reporting_started() -> Non
     fake = _FakeClient()
     fake.socket_open_payload = {"ok": False, "error": "invalid_auth"}
     ch._get_client = lambda: fake  # type: ignore[method-assign]
-    with pytest.raises(SlackAuthError, match="apps.connections.open failed"):
+    socket = _FakeSocketClient()
+    ch._create_socket_client = lambda: socket  # type: ignore[method-assign]
+    with pytest.raises(SlackAuthError, match="invalid_auth"):
         await ch.start()
     assert ch.is_connected() is False
+    assert socket.closed is True
+    assert ch._socket_client is None
 
 
-async def test_socket_mode_start_passes_opened_url_to_background_loop() -> None:
+async def test_socket_mode_start_delegates_lifecycle_to_sdk() -> None:
     ch = _mk(connection_mode="socket", app_token="xapp-valid")
     fake = _FakeClient()
-    seen: list[str | None] = []
-
-    async def _fake_socket_loop(initial_socket_url: str | None = None) -> None:
-        seen.append(initial_socket_url)
-        await ch._socket_stop.wait()  # type: ignore[union-attr]
-
+    socket = _FakeSocketClient()
     ch._get_client = lambda: fake  # type: ignore[method-assign]
-    ch._run_socket_loop = _fake_socket_loop  # type: ignore[method-assign]
+    ch._create_socket_client = lambda: socket  # type: ignore[method-assign]
 
     await ch.start()
-    await asyncio.sleep(0)
+    assert ch.is_connected() is True
+    assert (await ch.health_check()).connected is True
     await ch.stop()
 
-    assert seen == ["wss://socket.slack.test/session"]
+    assert socket.connected_urls == ["wss://socket.slack.test/session"]
+    assert socket.closed is True
+    assert ch.is_connected() is False
     open_call = next(c for c in fake.calls if c[0] == "/apps.connections.open")
     assert open_call[2] == {"Authorization": "Bearer xapp-valid"}
 
@@ -202,41 +223,39 @@ def test_ingest_dedupes_app_mention_and_message_pair() -> None:
     assert ch._queue.qsize() == 1
 
 
-class _FakeSocket:
-    def __init__(self) -> None:
-        self.sent: list[str] = []
-        self.closed = False
-
-    async def send(self, payload: str) -> None:
-        self.sent.append(payload)
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-async def test_socket_frame_acks_and_dispatches_events_api_payload() -> None:
+async def test_socket_request_acks_and_dispatches_verified_events() -> None:
     ch = _mk()
-    ws = _FakeSocket()
-    await ch._handle_socket_frame(
-        ws,
-        (
-            '{"envelope_id":"env-1","type":"events_api","payload":'
-            '{"type":"event_callback","event_id":"Ev1","event":'
-            '{"type":"message","user":"UUSER","channel":"D123","text":"hi","ts":"1.1"}}}'
-        ),
+    socket = _FakeSocketClient()
+    request = SimpleNamespace(
+        envelope_id="env-1",
+        type="events_api",
+        payload={
+            "type": "event_callback",
+            "event_id": "Ev1",
+            "event": {
+                "type": "message", "user": "UUSER", "channel": "D123", "text": "hi", "ts": "1.1"
+            },
+        },
+    )
+    await ch._handle_socket_request(socket, request)
+
+    assert socket.sent == [{"envelope_id": "env-1"}]
+    assert ch._queue.qsize() == 1
+    incoming = ch._queue.get_nowait()
+    assert incoming.provenance is not None
+    assert incoming.provenance.authenticated is True
+
+
+async def test_socket_request_acks_non_event_without_ingesting() -> None:
+    ch = _mk()
+    socket = _FakeSocketClient()
+    await ch._handle_socket_request(
+        socket,
+        SimpleNamespace(envelope_id="env-2", type="interactive", payload={}),
     )
 
-    assert ws.sent == ['{"envelope_id": "env-1"}']
-    assert ch._queue.qsize() == 1
-
-
-async def test_socket_frame_disconnect_closes_socket_after_ack() -> None:
-    ch = _mk()
-    ws = _FakeSocket()
-    await ch._handle_socket_frame(ws, '{"envelope_id":"env-2","type":"disconnect"}')
-
-    assert ws.sent == ['{"envelope_id": "env-2"}']
-    assert ws.closed is True
+    assert socket.sent == [{"envelope_id": "env-2"}]
+    assert ch._queue.empty()
 
 
 async def test_send_auto_targets_reply_conversation() -> None:
@@ -337,3 +356,187 @@ def test_channel_manager_skips_webhook_route_for_slack_socket_mode() -> None:
     routes = manager.collect_webhook_routes()
 
     assert [route.path for route in routes] == ["/slack/events"]
+
+
+async def test_socket_start_failure_closes_sdk_resources() -> None:
+    ch = _mk(connection_mode="socket", app_token="xapp-valid")
+    fake = _FakeClient()
+    socket = _FakeSocketClient()
+
+    async def fail_connect() -> None:
+        raise OSError("synthetic connection failure")
+
+    socket.connect = fail_connect  # type: ignore[method-assign]
+    ch._get_client = lambda: fake  # type: ignore[method-assign]
+    ch._create_socket_client = lambda: socket  # type: ignore[method-assign]
+    with pytest.raises(OSError, match="synthetic"):
+        await ch.start()
+    assert socket.closed is True
+    assert ch._socket_client is None
+    assert ch.is_connected() is False
+
+
+async def test_socket_start_cancellation_closes_sdk_resources() -> None:
+    ch = _mk(connection_mode="socket", app_token="xapp-valid")
+    fake = _FakeClient()
+    socket = _FakeSocketClient()
+    connecting = asyncio.Event()
+
+    async def pending_connect() -> None:
+        connecting.set()
+        await asyncio.Event().wait()
+
+    socket.connect = pending_connect  # type: ignore[method-assign]
+    ch._get_client = lambda: fake  # type: ignore[method-assign]
+    ch._create_socket_client = lambda: socket  # type: ignore[method-assign]
+    task = asyncio.create_task(ch.start())
+    await connecting.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert socket.closed is True
+    assert ch.is_connected() is False
+
+
+async def test_sdk_client_retains_proxy_policy_and_disables_implicit_mutation_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from slack_sdk.web.async_client import AsyncWebClient
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://synthetic-proxy.example:8080")
+    monkeypatch.setattr("opensquilla.channels.slack._trust_env", lambda: False)
+    ch = _mk()
+    client = ch._get_client()
+    assert isinstance(client, AsyncWebClient)
+    assert client.proxy is None
+    assert client.trust_env_in_session is False
+    assert client.retry_handlers == []
+    await ch.close()
+
+
+@pytest.mark.parametrize("operation", ["message", "file", "probe"])
+@pytest.mark.parametrize(
+    ("status", "code", "headers", "classification", "retry_after"),
+    [
+        (429, "ratelimited", {"Retry-After": "17"}, "rate_limited", 17),
+        (200, "invalid_auth", {}, "auth_invalid", None),
+        (403, "unrecognized-provider-detail", {}, "auth_invalid", None),
+    ],
+)
+async def test_sdk_errors_preserve_safe_classification_without_mutation_retry(
+    operation: str, status: int, code: str, headers: dict[str, str],
+    classification: str, retry_after: int | None,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from slack_sdk.errors import SlackApiError
+    from slack_sdk.web.async_slack_response import AsyncSlackResponse
+
+    from opensquilla.channels.contract import classify_channel_send_error
+    from opensquilla.channels.slack import SlackAPIError
+
+    response = AsyncSlackResponse(
+        client=None, http_verb="POST", api_url="https://slack.com/api/test",
+        req_args={"headers": {"Authorization": "synthetic-sensitive-value"}},
+        data={"ok": False, "error": code, "request_secret": "synthetic-sensitive-value"},
+        headers=headers, status_code=status,
+    )
+    rejected = AsyncMock(side_effect=SlackApiError("synthetic-sensitive-value", response))
+    ch = _mk()
+    ch._client = SimpleNamespace(api_call=rejected, files_upload_v2=rejected)
+    with pytest.raises((SlackAPIError, SlackAuthError)) as caught:
+        if operation == "file":
+            await ch.send_file("C-target", "report.pdf")
+        elif operation == "probe":
+            await ch.probe_connection()
+        else:
+            await ch.send(OutgoingMessage(content="hello", metadata={"channel": "C-target"}))
+
+    error = caught.value
+    assert classify_channel_send_error(error) == classification
+    assert rejected.await_count == 1
+    assert "synthetic-sensitive-value" not in str(error)
+    assert "unrecognized-provider-detail" not in str(error)
+    assert not hasattr(error, "response")
+    if isinstance(error, SlackAPIError):
+        assert error.status_code == status
+        assert error.retry_after == retry_after
+
+
+async def test_artifact_upload_pins_original_thread_and_channel(tmp_path: Path) -> None:
+    from opensquilla.channels.types import ChannelArtifactDeliveryRequest
+
+    ch = _mk(slack_channel_id="C-default", reply_in_thread=True)
+    path = tmp_path / "report.txt"
+    path.write_text("synthetic report", encoding="utf-8")
+    uploads: list[dict[str, Any]] = []
+
+    class Client:
+        async def files_upload_v2(self, **kwargs: Any) -> dict[str, Any]:
+            uploads.append(kwargs)
+            return {"ok": True, "file": {"id": "F1"}}
+
+    ch._client = Client()
+    ch._last_thread_ts = "unrelated-thread"
+    result = await ch.deliver_artifact(
+        ChannelArtifactDeliveryRequest(
+            inbound=IncomingMessage(
+                sender_id="U-user",
+                channel_id="C-origin",
+                content="make a report",
+                metadata={"thread_ts": "123.456", "ts": "123.789"},
+            ),
+            artifact_id="artifact-1",
+            file_path=str(path),
+            name=path.name,
+            mime_type="text/plain",
+            size=path.stat().st_size,
+        )
+    )
+
+    assert uploads[0]["channel"] == "C-origin"
+    assert uploads[0]["thread_ts"] == "123.456"
+    assert result.provider_file_id == "F1"
+
+
+async def test_sdk_reactions_disable_missing_scope_without_failing_turn() -> None:
+    ch = _mk(status_reactions_enabled=True)
+
+    class Client:
+        async def api_call(self, method: str, **_kwargs: object) -> dict[str, Any]:
+            assert method == "reactions.add"
+            return {"ok": False, "error": "missing_scope"}
+
+    ch._client = Client()
+    await ch.status_reactor.received(
+        IncomingMessage(
+            sender_id="U-user", channel_id="C-origin", content="hi", metadata={"ts": "1"}
+        )
+    )
+    assert ch.status_reactor._disabled is True
+
+
+async def test_sdk_socket_client_owns_reconnect_and_is_closed_on_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from slack_sdk.socket_mode.aiohttp import SocketModeClient
+
+    monkeypatch.setattr("opensquilla.channels.slack._trust_env", lambda: False)
+    ch = _mk(connection_mode="socket", app_token="xapp-synthetic")
+    client = ch._create_socket_client()
+    ch._socket_client = client
+    try:
+        assert isinstance(client, SocketModeClient)
+        assert client.auto_reconnect_enabled is True
+        assert client.proxy is None
+        assert ch._handle_socket_request in client.socket_mode_request_listeners
+    finally:
+        await ch.stop()
+    assert client.closed is True
+    assert client.aiohttp_client_session.closed is True
+
+
+@pytest.mark.parametrize("body,timestamp", [(b"\xff", "1"), (b"{}", "1.5")])
+def test_webhook_signature_rejects_malformed_input(body: bytes, timestamp: str) -> None:
+    ch = _mk(signing_secret="synthetic-secret")
+    assert ch._verify_signature(body, timestamp, "v0=invalid") is False

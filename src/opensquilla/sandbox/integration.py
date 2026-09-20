@@ -374,6 +374,12 @@ def active_file_system_profile(
     from opensquilla.tools.types import current_tool_context
 
     tool_context = current_tool_context.get()
+    if tool_context is not None and tool_context.sandboxed_workspace_authoring is not None:
+        from opensquilla.tools.workspace_authoring import channel_workspace_file_system
+
+        # A scoped authoring proof supersedes the host-readable Safe default
+        # and cannot be widened by a mutable per-tool profile override.
+        return channel_workspace_file_system(tool_context)
     override = (
         tool_context.sandbox_file_system_profile
         if tool_context is not None

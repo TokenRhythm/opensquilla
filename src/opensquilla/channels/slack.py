@@ -3,9 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import hashlib
-import hmac
 import json
 import re
 import time
@@ -15,7 +12,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-import httpx
 import structlog
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
@@ -40,6 +36,7 @@ from opensquilla.channels.contract import (
 )
 from opensquilla.channels.types import (
     AuthenticatedPrincipal,
+    ChannelArtifactDeliveryRequest,
     ChannelHealth,
     IncomingMessage,
     IngressProvenance,
@@ -78,6 +75,49 @@ FATAL_ERROR_CLASSES: tuple[str, ...] = (
 class SlackAuthError(Exception):
     """Raised when Slack token validation fails."""
 
+    error_class = "auth_invalid"
+
+
+_SLACK_ERROR_CLASSES = {
+    **dict.fromkeys(
+        ("invalid_auth", "not_authed", "token_revoked", "account_inactive",
+         "not_allowed_token_type", "missing_scope", "restricted_action"),
+        "auth_invalid",
+    ),
+    **dict.fromkeys(
+        ("channel_not_found", "is_archived", "not_in_channel", "user_not_found"),
+        "target_missing",
+    ),
+    **dict.fromkeys(
+        ("invalid_arguments", "invalid_arg_name", "invalid_form_data", "no_text",
+         "msg_too_long", "invalid_blocks", "invalid_blocks_format", "file_too_large"),
+        "payload_rejected",
+    ),
+    "ratelimited": "rate_limited",
+    "rate_limited": "rate_limited",
+}
+
+
+class SlackAPIError(RuntimeError):
+    """Keep retry classification without retaining SDK request/response payloads."""
+
+    def __init__(self, response: Any) -> None:
+        code = response.get("error", "unknown")
+        self.code = code if isinstance(code, str) and code in _SLACK_ERROR_CLASSES else "unknown"
+        self.error_class = _SLACK_ERROR_CLASSES.get(self.code, "")
+        status = getattr(response, "status_code", None)
+        self.status_code = status if type(status) is int and 100 <= status <= 599 else None
+        headers = getattr(response, "headers", None) or {}
+        raw_retry = headers.get("Retry-After", headers.get("retry-after", ""))
+        self.retry_after: int | None = None
+        try:
+            retry = int(raw_retry)
+            if retry >= 0:
+                self.retry_after = retry
+        except (TypeError, ValueError, OverflowError):
+            pass
+        super().__init__(f"Slack API error: {self.code}")
+
 
 @dataclass
 class SlackChannel:
@@ -86,7 +126,7 @@ class SlackChannel:
     Inbound messages are delivered via ``enqueue`` (populated by a Slack
     Events API webhook handler or socket-mode listener).
 
-    Outbound messages use ``chat.postMessage`` via httpx.
+    The official Slack SDK owns Web API requests and Socket Mode lifecycle.
     """
 
     token: str
@@ -117,7 +157,8 @@ class SlackChannel:
     _queue: asyncio.Queue[IncomingMessage] = field(
         default_factory=asyncio.Queue, init=False, repr=False
     )
-    _client: httpx.AsyncClient | None = field(default=None, init=False, repr=False)
+    _client: Any = field(default=None, init=False, repr=False)
+    _socket_client: Any = field(default=None, init=False, repr=False)
     _connected: bool = field(default=False, init=False, repr=False)
     _last_thread_ts: str | None = field(default=None, init=False, repr=False)
     _last_message_at: datetime | None = field(default=None, init=False, repr=False)
@@ -126,8 +167,6 @@ class SlackChannel:
         init=False,
         repr=False,
     )
-    _socket_task: asyncio.Task | None = field(default=None, init=False, repr=False)
-    _socket_stop: asyncio.Event | None = field(default=None, init=False, repr=False)
     supports_slash_commands: bool = True
 
     @property
@@ -189,15 +228,46 @@ class SlackChannel:
     def capabilities(self) -> frozenset[str]:
         return self.capability_profile.capability_tags()
 
-    def _get_client(self) -> httpx.AsyncClient:
+    def _get_client(self) -> Any:
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            from slack_sdk.web.async_client import AsyncWebClient
+
+            self._client = AsyncWebClient(
+                token=self.token,
                 base_url=SLACK_API_BASE,
-                headers={"Authorization": f"Bearer {self.token}"},
-                timeout=30.0,
-                trust_env=_trust_env(),
+                timeout=30,
+                trust_env_in_session=_trust_env(),
+                # The outbox owns retries of outbound mutations. An automatic
+                # SDK transport retry could send an ambiguous request twice.
+                retry_handlers=[],
             )
+            if not _trust_env():
+                self._client.proxy = None
         return self._client
+
+    async def _api_call(self, method: str, payload: dict[str, Any] | None = None) -> Any:
+        from slack_sdk.errors import SlackApiError
+
+        try:
+            data = await self._get_client().api_call(method, json=payload)
+        except SlackApiError as exc:
+            raise SlackAPIError(exc.response) from None
+        if not data.get("ok"):
+            raise SlackAPIError(data)
+        return data
+
+    def _create_socket_client(self) -> Any:
+        from slack_sdk.socket_mode.aiohttp import SocketModeClient
+
+        client = SocketModeClient(
+            app_token=self.app_token,
+            web_client=self._get_client(),
+            auto_reconnect_enabled=True,
+        )
+        if not _trust_env():
+            client.proxy = None
+        client.socket_mode_request_listeners.append(self._handle_socket_request)
+        return client
 
     @property
     def status_reactor(self) -> Any:
@@ -208,10 +278,8 @@ class SlackChannel:
         return reactor
 
     async def close(self) -> None:
-        """Close the underlying httpx client."""
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        """Close SDK-owned sockets and any supplied persistent HTTP session."""
+        await self.stop()
 
     # ------------------------------------------------------------------
     # Inbound
@@ -348,15 +416,12 @@ class SlackChannel:
                 continue
             payload[key] = value
 
-        client = self._get_client()
         # Slack rejects text longer than 40000 chars; split so the full answer
         # is delivered across sequential messages instead of being dropped.
         chunks = split_text_for_channel(message.content, _SLACK_MAX_MESSAGE_CHARS)
         for chunk in chunks:
             payload["text"] = chunk
-            resp = await client.post("/chat.postMessage", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+            data = await self._api_call("chat.postMessage", payload)
             if not data.get("ok"):
                 log.error("slack.send_failed", channel=channel, error=data.get("error"))
                 raise RuntimeError(f"Slack API error: {data.get('error')}")
@@ -368,40 +433,50 @@ class SlackChannel:
         file_path: str,
         content: str = "",
     ) -> ChannelSendResult:
-        """Upload a local file to Slack using the external upload flow."""
+        """Upload a local file using the SDK's supported external upload flow."""
+        return await self._upload_file(channel_id, file_path, content=content)
+
+    async def deliver_artifact(
+        self, request: ChannelArtifactDeliveryRequest
+    ) -> ChannelSendResult:
+        """Pin file delivery to the originating conversation and thread."""
+        return await self._upload_file(
+            request.inbound.channel_id,
+            request.file_path,
+            thread_ts=self._reply_thread_ts(request.inbound),
+        )
+
+    async def _upload_file(
+        self,
+        channel_id: str,
+        file_path: str,
+        *,
+        content: str = "",
+        thread_ts: str | None = None,
+    ) -> ChannelSendResult:
+        from slack_sdk.errors import SlackApiError
+
         path = Path(file_path)
-        client = self._get_client()
-        start_resp = await client.post(
-            "/files.getUploadURLExternal",
-            json={"filename": path.name, "length": path.stat().st_size},
-        )
-        start_resp.raise_for_status()
-        start_data = start_resp.json()
-        if not start_data.get("ok"):
-            raise RuntimeError(f"Slack file upload init error: {start_data.get('error')}")
-        upload_url = str(start_data.get("upload_url", ""))
-        file_id = str(start_data.get("file_id", ""))
-        if not upload_url or not file_id:
-            raise RuntimeError("Slack file upload init response missing upload_url/file_id")
-
-        with path.open("rb") as f:
-            upload_resp = await client.post(upload_url, files={"file": (path.name, f)})
-        upload_resp.raise_for_status()
-
-        complete_payload: dict[str, Any] = {
-            "files": [{"id": file_id, "title": path.name}],
-            "channel_id": channel_id,
+        kwargs: dict[str, Any] = {
+            "file": str(path),
+            "filename": path.name,
+            "title": path.name,
+            "channel": channel_id,
+            "initial_comment": content or None,
         }
-        if content:
-            complete_payload["initial_comment"] = content
-        complete_resp = await client.post(
-            "/files.completeUploadExternal",
-            json=complete_payload,
-        )
-        complete_resp.raise_for_status()
-        complete_data = complete_resp.json()
-        if not complete_data.get("ok"):
-            raise RuntimeError(f"Slack file upload complete error: {complete_data.get('error')}")
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        try:
+            data = await self._get_client().files_upload_v2(**kwargs)
+        except SlackApiError as exc:
+            raise SlackAPIError(exc.response) from None
+        if not data.get("ok"):
+            raise SlackAPIError(data)
+        files = data.get("files") or []
+        file_data = data.get("file") or (files[0] if files else {})
+        file_id = str(file_data.get("id") or "")
+        if not file_id:
+            raise RuntimeError("Slack file upload response missing file id")
         return ChannelSendResult.sent(
             capability=ChannelCapabilities.NATIVE_FILE_UPLOAD,
             target_id=channel_id,
@@ -429,10 +504,7 @@ class SlackChannel:
             "ts": message_id,
             "text": content,
         }
-        client = self._get_client()
-        resp = await client.post("/chat.update", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._api_call("chat.update", payload)
         if not data.get("ok"):
             log.error("slack.edit_failed", error=data.get("error"), message_id=message_id)
             raise RuntimeError(f"Slack API error: {data.get('error')}")
@@ -452,10 +524,7 @@ class SlackChannel:
             "channel": target,
             "ts": message_id,
         }
-        client = self._get_client()
-        resp = await client.post("/chat.delete", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
+        data = await self._api_call("chat.delete", payload)
         if not data.get("ok"):
             log.error("slack.delete_failed", error=data.get("error"), message_id=message_id)
             raise RuntimeError(f"Slack API error: {data.get('error')}")
@@ -484,7 +553,6 @@ class SlackChannel:
         concurrent ``chat.update`` calls and a single network failure
         does not lose accumulated text.
         """
-        client = self._get_client()
         target = channel or self.slack_channel_id
         if not target:
             log.error("slack.stream_failed", channel="", error="no_target_channel")
@@ -500,25 +568,21 @@ class SlackChannel:
             }
             if thread_ts:
                 payload["thread_ts"] = thread_ts
-            resp = await client.post("/chat.postMessage", json=payload)
-            resp.raise_for_status()
-            data = resp.json()
+            data = await self._api_call("chat.postMessage", payload)
             if not data.get("ok"):
                 raise RuntimeError(f"Slack API error: {data.get('error')}")
             message_ts = data["ts"]
             log.debug("slack.stream_start", ts=message_ts)
 
         async def _edit(text: str) -> None:
-            resp = await client.post(
-                "/chat.update",
-                json={
+            data = await self._api_call(
+                "chat.update",
+                {
                     "channel": target,
                     "ts": message_ts,
                     "text": text,
                 },
             )
-            resp.raise_for_status()
-            data = resp.json()
             # Slack signals errors (e.g. msg_too_long) as HTTP 200 + ok:false;
             # check the envelope like _post so a rejected update surfaces and
             # the stream relay can fall back instead of silently truncating.
@@ -567,39 +631,69 @@ class SlackChannel:
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Validate the bot token, store ``bot_user_id``, and - in Socket Mode -
-        open the Slack Socket Mode long-connection."""
+        """Authenticate before starting the SDK-managed Socket Mode transport."""
+        if self.is_connected():
+            return
+        if self._socket_client is not None:
+            await self.stop()
         if self.connection_mode == "webhook" and not (self.signing_secret or "").strip():
             raise SlackAuthError(
                 "connection_mode='webhook' requires signing_secret for request verification"
             )
-        client = self._get_client()
-        resp = await client.post("/auth.test")
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            raise SlackAuthError(data.get("error", "unknown auth error"))
-        self.bot_user_id = data["user_id"]
-        if self.connection_mode == "socket":
-            if not self.app_token:
-                raise SlackAuthError(
-                    "connection_mode='socket' requires app_token (an xapp- App-Level Token)"
-                )
-            initial_socket_url = await self._open_socket_connection()
-            self._socket_stop = asyncio.Event()
-            self._socket_task = asyncio.create_task(
-                self._run_socket_loop(initial_socket_url), name="slack-socket-mode"
+        if self.connection_mode == "socket" and not self.app_token:
+            raise SlackAuthError(
+                "connection_mode='socket' requires app_token (an xapp- App-Level Token)"
             )
-        self._connected = True
+        try:
+            try:
+                data = await self._api_call("auth.test")
+            except SlackAPIError as exc:
+                if exc.error_class == "auth_invalid":
+                    raise SlackAuthError(str(exc)) from None
+                raise
+            self.bot_user_id = data["user_id"]
+            if self.connection_mode == "socket":
+                from slack_sdk.errors import SlackApiError
+
+                client = self._create_socket_client()
+                self._socket_client = client
+                try:
+                    # Validate the app token outside the SDK's reconnect loop:
+                    # invalid credentials must fail startup instead of retrying forever.
+                    opened = await self._get_client().apps_connections_open(
+                        app_token=self.app_token,
+                    )
+                    if not opened.get("ok"):
+                        raise SlackAPIError(opened)
+                    if not opened.get("url"):
+                        raise RuntimeError("Slack Socket Mode response missing connection URL")
+                    client.wss_uri = str(opened["url"])
+                    await asyncio.wait_for(client.connect(), timeout=30)
+                    if not await client.is_connected():
+                        raise RuntimeError("Slack Socket Mode connection did not become ready")
+                except SlackApiError as exc:
+                    safe_error = SlackAPIError(exc.response)
+                    if safe_error.error_class == "auth_invalid":
+                        raise SlackAuthError(str(safe_error)) from None
+                    raise safe_error from None
+                except SlackAPIError as exc:
+                    if exc.error_class == "auth_invalid":
+                        raise SlackAuthError(str(exc)) from None
+                    raise
+            self._connected = True
+        except BaseException:
+            await self.stop()
+            raise
         log.info("slack.started", bot_user_id=self.bot_user_id, mode=self.connection_mode)
 
     async def probe_connection(self) -> dict[str, Any]:
         """Validate bot credentials without opening or mutating a transport."""
-        response = await self._get_client().post("/auth.test")
-        response.raise_for_status()
-        data = response.json()
-        if not data.get("ok"):
-            raise SlackAuthError(data.get("error", "unknown auth error"))
+        try:
+            data = await self._api_call("auth.test")
+        except SlackAPIError as exc:
+            if exc.error_class == "auth_invalid":
+                raise SlackAuthError(str(exc)) from None
+            raise
         return {
             "authenticated": True,
             "bot_user_id": str(data.get("user_id") or ""),
@@ -607,101 +701,57 @@ class SlackChannel:
         }
 
     async def stop(self) -> None:
-        """Gracefully shut down the channel adapter."""
-        if self._socket_stop is not None:
-            self._socket_stop.set()
-        if self._socket_task is not None:
-            self._socket_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._socket_task
-            self._socket_task = None
-        if self._client is not None:
-            await self._client.aclose()
-            self._client = None
+        """Gracefully shut down SDK connection tasks and HTTP resources."""
         self._connected = False
+        socket_client, self._socket_client = self._socket_client, None
+        try:
+            if socket_client is not None:
+                await socket_client.close()
+        finally:
+            client, self._client = self._client, None
+            session = getattr(client, "session", None)
+            if session is not None and not session.closed:
+                await session.close()
         log.info("slack.stopped")
 
     # ------------------------------------------------------------------
     # Socket Mode transport (no public Request URL required)
     # ------------------------------------------------------------------
 
-    async def _open_socket_connection(self) -> str:
-        """Open a Socket Mode session and return the issued ``wss://`` url."""
-        client = self._get_client()
-        resp = await client.post(
-            "/apps.connections.open",
-            headers={"Authorization": f"Bearer {self.app_token}"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        if not data.get("ok"):
-            raise SlackAuthError(f"apps.connections.open failed: {data.get('error')}")
-        return str(data["url"])
 
-    async def _run_socket_loop(self, initial_socket_url: str | None = None) -> None:
-        """Maintain the Socket Mode websocket, reconnecting with backoff."""
-        import websockets
+    async def _handle_socket_request(self, client: Any, request: Any) -> None:
+        """Acknowledge SDK requests and hand verified events to central admission."""
+        from slack_sdk.socket_mode.response import SocketModeResponse
 
-        backoff = 1.0
-        stop = self._socket_stop
-        next_socket_url = initial_socket_url
-        while stop is None or not stop.is_set():
-            try:
-                ws_url = next_socket_url or await self._open_socket_connection()
-                next_socket_url = None
-                async with websockets.connect(
-                    ws_url, ping_interval=30, ping_timeout=20, max_size=None
-                ) as ws:
-                    self._connected = True
-                    backoff = 1.0
-                    log.info("slack.socket_mode.connected")
-                    async for raw in ws:
-                        if stop is not None and stop.is_set():
-                            break
-                        await self._handle_socket_frame(ws, raw)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                next_socket_url = None
-                self._connected = False
-                log.warning("slack.socket_mode.reconnect", error=str(exc), backoff=backoff)
-                if stop is None:
-                    break
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(stop.wait(), timeout=backoff)
-                if stop.is_set():
-                    break
-                backoff = min(backoff * 2, 30.0)
-
-    async def _handle_socket_frame(self, ws: Any, raw: str | bytes) -> None:
-        """Ack and dispatch a single Socket Mode frame."""
-        try:
-            msg = json.loads(raw)
-        except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-            return
-        # Slack requires an ack (echo the envelope id) within 3 seconds.
-        envelope_id = msg.get("envelope_id")
-        if envelope_id:
-            with contextlib.suppress(Exception):
-                await ws.send(json.dumps({"envelope_id": envelope_id}))
-        mtype = msg.get("type")
-        if mtype == "disconnect":
-            # Slack rotates connections periodically; close so the loop reconnects.
-            with contextlib.suppress(Exception):
-                await ws.close()
-            return
-        if mtype != "events_api":
-            return
-        payload = msg.get("payload")
-        if isinstance(payload, dict) and payload.get("type") == "event_callback":
+        if request.envelope_id:
+            await client.send_socket_mode_response(
+                SocketModeResponse(envelope_id=request.envelope_id)
+            )
+        payload = request.payload
+        if (
+            request.type == "events_api"
+            and isinstance(payload, dict)
+            and payload.get("type") == "event_callback"
+        ):
             self._ingest_event_callback(
                 payload,
                 verification=IngressVerification.SDK_SESSION,
             )
 
     def is_connected(self) -> bool:
-        """Return whether the adapter has been started and is connected."""
-        return self._connected
+        """Return the current SDK transport state without creating a connection."""
+        if self.connection_mode != "socket":
+            return self._connected
+        client = self._socket_client
+        session = getattr(client, "current_session", None)
+        return bool(
+            self._connected
+            and client is not None
+            and not client.closed
+            and not client.stale
+            and session is not None
+            and not session.closed
+        )
 
     # ------------------------------------------------------------------
     # Gateway Webhook (T012)
@@ -789,31 +839,31 @@ class SlackChannel:
         return bool(self.bot_user_id and event.get("user") == self.bot_user_id)
 
     def _verify_signature(self, body: bytes, timestamp: str, signature: str) -> bool:
-        """Verify Slack request signature using HMAC-SHA256."""
+        """Verify Slack's timestamped request signature with the official SDK."""
+        from slack_sdk.signature import SignatureVerifier
+
         if self.signing_secret is None:
             return False
-        sig_basestring = f"v0:{timestamp}:{body.decode()}"
-        expected = (
-            "v0="
-            + hmac.HMAC(
-                self.signing_secret.encode(),
-                sig_basestring.encode(),
-                hashlib.sha256,
-            ).hexdigest()
-        )
-        return hmac.compare_digest(expected, signature)
+        try:
+            return SignatureVerifier(self.signing_secret).is_valid(body, timestamp, signature)
+        except (ValueError, UnicodeError):
+            return False
 
     # ------------------------------------------------------------------
     # Health Check (T014)
     # ------------------------------------------------------------------
 
     async def health_check(self) -> ChannelHealth:
-        """Return current health status of the Slack adapter."""
-        socket_alive = self.connection_mode != "socket" or (
-            self._socket_task is not None and not self._socket_task.done()
-        )
+        """Return SDK connection liveness, including Socket Mode ping/pong health."""
+        connected = self._connected
+        if self.connection_mode == "socket":
+            connected = bool(
+                connected
+                and self._socket_client is not None
+                and await self._socket_client.is_connected()
+            )
         return ChannelHealth(
-            connected=self._connected and socket_alive,
+            connected=connected,
             bot_user_id=self.bot_user_id,
             last_message_at=self._last_message_at,
         )

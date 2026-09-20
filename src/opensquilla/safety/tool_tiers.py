@@ -5,9 +5,9 @@ Every tool that goes through the dispatch pipeline has exactly one
 :attr:`RiskTier.ADMIN_ONLY` regardless of any :func:`declare_tier`
 override:
 
-* ``shell_exec`` / ``exec_command`` / ``background_process`` / ``execute_code``
+* ``shell_exec`` / ``exec_command`` / ``background_process``
 * ``file_write`` / ``write_file`` / ``edit_file`` / ``apply_patch``
-* ``git_push``
+  / ``execute_code`` / ``git_push``
 * ``channel_send_as_admin``
 
 Tier semantics (enforced upstream in the engine / dispatch layer):
@@ -16,6 +16,8 @@ Tier semantics (enforced upstream in the engine / dispatch layer):
 * :attr:`RiskTier.CONFIRM` — blocks on ACK gate; resumes on ack.
 * :attr:`RiskTier.ADMIN_ONLY` — rejects unless an operator-role
   principal is present.
+* :attr:`RiskTier.WORKSPACE_AUTHORING` — available to an ordinary channel
+  only when the trusted gateway has attested a managed sandbox workspace.
 
 Default resolution: :func:`get_tier` returns :attr:`RiskTier.CONFIRM`
 for any tool that has not been explicitly declared — this is the
@@ -34,6 +36,7 @@ class RiskTier(StrEnum):
     SAFE = "safe"
     CONFIRM = "confirm"
     ADMIN_ONLY = "admin_only"
+    WORKSPACE_AUTHORING = "workspace_authoring"
 
 
 # The tools whose tier is not negotiable. These names are enforced
@@ -46,17 +49,26 @@ HARDCODED_ADMIN_ONLY: Final[frozenset[str]] = frozenset(
         "shell_exec",
         "exec_command",
         "background_process",
-        "execute_code",
         "file_write",
         "write_file",
         "edit_file",
         "apply_patch",
+        "execute_code",
+        "git_commit",
         "git_push",
         "channel_send_as_admin",
     }
 )
 
 _DECLARATIONS: dict[str, RiskTier] = {}
+
+# These tools remain privileged by default, but may be admitted to an ordinary
+# channel when the per-turn workspace attestation is true.  Keep the set here
+# rather than changing ``HARDCODED_ADMIN_ONLY`` so existing callers that
+# inspect that compatibility constant retain its meaning.
+WORKSPACE_AUTHORING_TOOLS: Final[frozenset[str]] = frozenset(
+    {"read_file", "write_file", "edit_file", "apply_patch", "execute_code"}
+)
 
 
 def declare_tier(tool_name: str, tier: RiskTier) -> None:
@@ -94,6 +106,24 @@ def get_tier(tool_name: str, default: RiskTier = RiskTier.CONFIRM) -> RiskTier:
     return default
 
 
+def tier_for_context(
+    tool_name: str,
+    *,
+    workspace_authoring_attested: bool = False,
+    default: RiskTier = RiskTier.CONFIRM,
+) -> RiskTier:
+    """Resolve a tool tier with the bounded workspace exception.
+
+    The exception is an explicit input from the trusted ``ToolContext``; it is
+    never inferred from tool arguments.  Without it, file/code mutation keeps
+    the historical admin-only tier.
+    """
+
+    if workspace_authoring_attested and tool_name in WORKSPACE_AUTHORING_TOOLS:
+        return RiskTier.WORKSPACE_AUTHORING
+    return get_tier(tool_name, default)
+
+
 def reset_declarations() -> None:
     """Clear all runtime-declared tiers. Intended for tests only."""
 
@@ -103,7 +133,9 @@ def reset_declarations() -> None:
 __all__ = [
     "HARDCODED_ADMIN_ONLY",
     "RiskTier",
+    "WORKSPACE_AUTHORING_TOOLS",
     "declare_tier",
     "get_tier",
     "reset_declarations",
+    "tier_for_context",
 ]

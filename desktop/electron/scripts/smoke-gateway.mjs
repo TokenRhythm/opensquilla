@@ -293,6 +293,8 @@ async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
   ]), {
     probe: 'opensquilla-desktop-code-execution', frozen: true,
     pythonExit: 0, errorExit: 7, pages: 1, title: 'Packaged Python tool smoke',
+    documents: { csvRows: 2, xlsxValue: 42, pdfText: '中文文件验收 样本 42' },
+    published: 4,
   })
 }
 

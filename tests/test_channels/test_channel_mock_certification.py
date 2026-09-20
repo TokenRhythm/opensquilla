@@ -371,22 +371,15 @@ async def test_safe_probes_do_not_start_ingress_or_mutate_provider_state(
         "telegram": [],
     }
 
-    class SlackResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, Any]:
-            return {"ok": True, "user_id": "B1", "team_id": "T1"}
-
     class SlackClient:
-        async def post(self, path: str) -> SlackResponse:
-            calls["slack"].append(path)
-            return SlackResponse()
+        async def api_call(self, method: str, **_kwargs: Any) -> dict[str, Any]:
+            calls["slack"].append(method)
+            return {"ok": True, "user_id": "B1", "team_id": "T1"}
 
     slack = SlackChannel("token", "C1", signing_secret="secret")
     monkeypatch.setattr(slack, "_get_client", lambda: SlackClient())
     assert (await slack.probe_connection())["authenticated"] is True
-    assert calls["slack"] == ["/auth.test"]
+    assert calls["slack"] == ["auth.test"]
     assert slack.is_connected() is False
 
     discord = DiscordChannel(DiscordChannelConfig(token="token"))
@@ -398,7 +391,7 @@ async def test_safe_probes_do_not_start_ingress_or_mutate_provider_state(
     monkeypatch.setattr(discord, "_fetch_gateway_url", fetch_gateway)
     assert (await discord.probe_connection())["authenticated"] is True
     assert calls["discord"] == ["gateway/bot"]
-    assert discord._ws is None
+    assert discord._gateway_client is None
 
     feishu = FeishuChannel(
         FeishuChannelConfig(
@@ -453,11 +446,11 @@ async def test_missing_credentials_fail_before_transport_or_http_client_creation
     discord = DiscordChannel(DiscordChannelConfig(token=""))
     discord_transport_calls = 0
 
-    async def discord_connect(_url: str) -> None:
+    def discord_connect() -> None:
         nonlocal discord_transport_calls
         discord_transport_calls += 1
 
-    monkeypatch.setattr(discord, "_connect_ws", discord_connect)
+    monkeypatch.setattr(discord, "_create_gateway_client", discord_connect)
     with pytest.raises(ValueError, match="bot token is required"):
         await discord.start()
     assert discord_transport_calls == 0
@@ -525,14 +518,14 @@ async def test_empty_targets_fail_before_provider_client_creation(
 async def test_dead_dispatch_and_poll_workers_make_health_unhealthy() -> None:
     discord = DiscordChannel(DiscordChannelConfig(token="token"))
     discord._connected = True
-    discord._heartbeat_task = asyncio.create_task(asyncio.sleep(60))
+    discord._gateway_task = asyncio.create_task(asyncio.sleep(60))
     discord._dispatch_task = asyncio.create_task(asyncio.sleep(0))
     await discord._dispatch_task
     try:
         assert (await discord.health_check()).connected is False
     finally:
-        discord._heartbeat_task.cancel()
-        await asyncio.gather(discord._heartbeat_task, return_exceptions=True)
+        discord._gateway_task.cancel()
+        await asyncio.gather(discord._gateway_task, return_exceptions=True)
 
     telegram = TelegramChannel(
         TelegramChannelConfig(token="token", transport_name="polling")

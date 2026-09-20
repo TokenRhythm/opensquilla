@@ -73,12 +73,13 @@ class SlackStatusReactor(_BaseStatusReactor):
         payload = {"channel": message.channel_id, "timestamp": ts, "name": SLACK_STATUS_EMOJI[state]}
         return payload if await self._post("/reactions.add", payload) else None
     async def _post(self, path: str, payload: dict[str, str]) -> bool:
-        resp = await self._channel._get_client().post(path, json=payload)
-        if resp.status_code == 403: self._disable("missing_oauth_scope"); return False
-        resp.raise_for_status(); data = resp.json()
-        if data.get("ok"): return True
-        if data.get("error") in {"missing_scope", "not_allowed_token_type"}: self._disable("missing_oauth_scope"); return False
-        raise RuntimeError(f"Slack API error: {data.get('error')}")
+        try:
+            await self._channel._api_call(path.lstrip("/"), payload)
+        except RuntimeError as exc:
+            if str(exc) in {"Slack API error: missing_scope", "Slack API error: not_allowed_token_type"}:
+                self._disable("missing_oauth_scope"); return False
+            raise
+        return True
 
 class FeishuStatusReactor(_BaseStatusReactor):
     def __init__(self, channel: Any, logger: Any) -> None:

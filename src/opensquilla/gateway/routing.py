@@ -583,6 +583,12 @@ def tool_context_from_envelope(
         )
     source_kind = envelope.metadata.get("tool_source_kind") or envelope.source_kind.value
     source_name = envelope.metadata.get("tool_source_name") or envelope.source_name
+    if caller_kind is CallerKind.CHANNEL:
+        # Adapter metadata describes platform messages, never the trusted
+        # execution surface. In particular it cannot opt into the WebUI
+        # permission matrix or bypass bounded channel handlers.
+        source_kind = envelope.source_kind.value
+        source_name = envelope.source_name
     legacy_elevated = envelope.metadata.get("elevated")
     elevated = None
     run_mode_value = envelope.metadata.get("run_mode")
@@ -746,6 +752,15 @@ def tool_context_from_envelope(
         # never from mutable metadata. Execution-time workspace validation is
         # the only ingress that sets this field for ordinary turns.
         setattr(ctx, "_sandbox_run_context_fresh", True)
+    if caller_kind is CallerKind.CHANNEL and not channel_admin_verified:
+        from opensquilla.tools.workspace_authoring import attest_channel_workspace
+
+        attest_channel_workspace(
+            ctx,
+            binding_kind=envelope.runtime_services.get("execution_workspace_binding_kind"),
+            binding_root=envelope.runtime_services.get("execution_workspace_binding_root"),
+            fresh=sandbox_run_context_fresh,
+        )
     if caller_kind is CallerKind.CRON:
         if not cron_trusted:
             ctx = apply_tool_policy_layer(

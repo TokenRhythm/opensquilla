@@ -512,19 +512,6 @@ class _RetryPublishProvider(_FailedPublishProvider):
         yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
 
 
-class _FailedCreatePptxProvider(_FailedPublishProvider):
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            yield ProviderToolUseStart(tool_use_id="create-1", tool_name="create_pptx")
-            yield ProviderToolUseEnd(
-                tool_use_id="create-1",
-                tool_name="create_pptx",
-                arguments={"name": "report.pptx", "slides": [{"title": "Report"}]},
-            )
-            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text="Report file is ready for download.")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _OmittedPublishProvider:
@@ -1042,28 +1029,6 @@ def _retry_publish_registry() -> ToolRegistry:
     return registry
 
 
-def _failed_create_pptx_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-
-    async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> str:
-        raise RetryableToolInputError("The PPTX was not attached; regenerate it.")
-
-    registry.register(
-        ToolSpec(
-            name="create_pptx",
-            description="Create a presentation",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "slides": {"type": "array", "items": {"type": "object"}},
-                },
-                "required": ["slides"],
-            },
-        ),
-        create_pptx,
-    )
-    return registry
 
 
 def _publish_then_forbidden_tool_registry() -> tuple[ToolRegistry, list[str]]:
@@ -3289,45 +3254,6 @@ async def test_turn_runner_clears_delivery_failure_after_same_target_retry_succe
         await storage.close()
 
 
-@pytest.mark.asyncio
-async def test_turn_runner_marks_failed_create_pptx_delivery_in_final_text(tmp_path) -> None:
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage)
-    session_key = "agent:main:webchat:create-pptx-failed"
-    await manager.create(session_key)
-    runner = TurnRunner(
-        provider_selector=_ProviderSelector(_FailedCreatePptxProvider()),
-        tool_registry=_failed_create_pptx_registry(),
-        session_manager=manager,
-        config=GatewayConfig(
-            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            squilla_router=SquillaRouterConfig(enabled=False),
-        ),
-    )
-    tool_context = ToolContext(
-        is_owner=True,
-        caller_kind=CallerKind.WEB,
-        workspace_dir=str(tmp_path),
-    )
-
-    try:
-        events = [
-            event
-            async for event in runner.run(
-                "make report",
-                session_key,
-                tool_context=tool_context,
-                history_has_persisted_user=False,
-                no_memory_capture=True,
-            )
-        ]
-        done = next(event for event in events if isinstance(event, DoneEvent))
-        assert [event for event in events if isinstance(event, ArtifactEvent)] == []
-        assert "File delivery failed:" in done.text
-        assert "correct or regenerate it" in done.text
-    finally:
-        await storage.close()
 
 
 class _GoalArtifactTopologySelector:

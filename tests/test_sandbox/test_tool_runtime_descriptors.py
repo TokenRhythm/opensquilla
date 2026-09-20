@@ -120,10 +120,6 @@ def test_builtin_local_artifact_and_media_tools_have_explicit_descriptors() -> N
 
     expected = {
         "publish_artifact": ("artifact", "artifact.publish"),
-        "create_csv": ("artifact", "artifact.create_csv"),
-        "create_xlsx": ("artifact", "artifact.create_xlsx"),
-        "create_pptx": ("artifact", "artifact.create_pptx"),
-        "create_pdf_report": ("artifact", "artifact.create_pdf_report"),
         "image": ("media", "media.analyze"),
         "image_generate": ("media", "media.generate_image"),
         "pdf": ("media", "media.read_pdf"),

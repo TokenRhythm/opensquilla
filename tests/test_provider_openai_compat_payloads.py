@@ -1889,33 +1889,17 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
-def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
-    monkeypatch: Any,
-) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+def test_gemini_does_not_project_retired_csv_schema(monkeypatch: Any) -> None:
+    tool = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
-    original_definition = create_csv.model_copy(deep=True)
-    assert create_csv.allow_string_item_schema_projection is True
-    assert "allow_string_item_schema_projection" not in create_csv.model_dump()
-    assert (
-        "allow_string_item_schema_projection"
-        not in ToolDefinition.model_json_schema()["properties"]
-    )
-    assert create_csv.model_copy(deep=True).allow_string_item_schema_projection is True
-    assert (
-        ToolDefinition.model_validate(create_csv.model_dump())
-        .allow_string_item_schema_projection
-        is False
-    )
-    assert create_csv.input_schema.properties["rows"]["items"] == {"type": "array"}
-    assert _tool_schema_accepts_arguments(
-        create_csv,
-        {"rows": [["text", 1, True, None, {"x": 1}, ["nested"]]]},
-    )
-
+    tool._enable_string_item_schema_projection()
+    original_definition = tool.model_copy(deep=True)
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
     provider = OpenAIProvider(
@@ -1924,20 +1908,20 @@ def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         provider_kind="gemini",
     )
-    _collect_events(provider, ChatConfig(), tools=[create_csv])
+    _collect_events(provider, ChatConfig(), tools=[tool])
 
     wire_rows = captured["payload"]["tools"][0]["function"]["parameters"][
         "properties"
     ]["rows"]
-    assert wire_rows["items"] == {"type": "array", "items": {"type": "string"}}
-    assert create_csv == original_definition
+    assert wire_rows["items"] == {"type": "array"}
+    assert tool == original_definition
 
 
 @pytest.mark.parametrize(
     ("base_url", "tool_name"),
     [
-        ("https://relay.example/v1", "create_csv"),
-        ("https://openrouter.ai/api/v1", "create_csv"),
+        ("https://relay.example/v1", "generic_table"),
+        ("https://openrouter.ai/api/v1", "generic_table"),
         ("https://generativelanguage.googleapis.com/v1beta/openai", "mcp_csv"),
     ],
 )
@@ -1948,7 +1932,7 @@ def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
 ) -> None:
     tool = ToolDefinition(
         name=tool_name,
-        description="Create a CSV-like artifact.",
+        description="Process a generic table.",
         input_schema=ToolInputSchema(
             properties={"rows": {"type": "array", "items": {"type": "array"}}},
             required=["rows"],
@@ -1974,7 +1958,7 @@ def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
 def test_gemini_does_not_project_an_untrusted_same_named_tool(monkeypatch: Any) -> None:
     tool = ToolDefinition.model_validate(
         {
-            "name": "create_csv",
+            "name": "generic_table",
             "description": "Third-party tool with unrelated row semantics.",
             "input_schema": {
                 "properties": {
@@ -2028,10 +2012,13 @@ def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
     monkeypatch: Any,
     base_url: str,
 ) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+    create_csv = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
@@ -2053,8 +2040,8 @@ def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
 def test_string_item_projection_preserves_schema_shaped_literals() -> None:
     literal = {"type": "array"}
     tool = ToolDefinition(
-        name="create_csv",
-        description="Create a CSV file.",
+        name="generic_table",
+        description="Process a generic table.",
         input_schema=ToolInputSchema(
             properties={
                 "value": {
@@ -2081,13 +2068,14 @@ def test_string_item_projection_preserves_schema_shaped_literals() -> None:
     assert tool == original_definition
 
 
-def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
-    monkeypatch: Any,
-) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+def test_string_item_projection_traverses_composed_schemas_without_mutating_source() -> None:
+    create_csv = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
     tool = create_csv.model_copy(
         deep=True,
@@ -2111,20 +2099,11 @@ def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
         },
     )
     original_definition = tool.model_copy(deep=True)
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="gemini-2.5-flash",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        provider_kind="gemini",
+    payload = _build_openai_tool(
+        tool,
+        complete_itemless_arrays_with_string_items=True,
     )
-
-    _collect_events(provider, ChatConfig(), tools=[tool])
-
-    properties = captured["payload"]["tools"][0]["function"]["parameters"][
-        "properties"
-    ]
+    properties = payload["function"]["parameters"]["properties"]
     assert properties["all_of"]["allOf"][0]["items"] == {"type": "string"}
     assert properties["any_of"]["anyOf"][0]["items"] == {"type": "string"}
     assert properties["one_of"]["oneOf"][0]["items"] == {"type": "string"}
