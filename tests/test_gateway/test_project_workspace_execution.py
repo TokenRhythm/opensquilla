@@ -1923,9 +1923,6 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
                 )
             finally:
                 current_tool_context.reset(token)
-            if index == 0:
-                first_started.set()
-                await release_first.wait()
             yield DoneEvent()
 
     config = GatewayConfig(
@@ -1944,6 +1941,12 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
             turn_runner=Runner(),
             event_emitter=AsyncMock(),
         )
+        if run.message == "first":
+            # Keep the runtime task and its session lane occupied while the
+            # test updates SQLite and queues a follow-up. This fixture wait
+            # is outside the event stream, whose idle watchdog remains real.
+            first_started.set()
+            await release_first.wait()
 
     runtime = TaskRuntime(
         storage=storage,
@@ -1963,12 +1966,17 @@ async def test_runtime_send_rehydrates_unbound_session_before_real_enforcement(
     try:
         first = await runtime.enqueue(envelope, "first")
         await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        assert (await runtime.status(first.task_id)).status == "running"
+        assert len(observations) == 1
         cached_after_first = runtime._last_envelope_by_session[key]
         await manager.update(
             key,
             origin={RUN_CONTEXT_ORIGIN_KEY: standard_context.to_origin_payload()},
         )
         followup = await runtime.send(key, "followup")
+        assert (await runtime.status(first.task_id)).status == "running"
+        assert (await runtime.status(followup.task_id)).status == "queued"
+        assert len(observations) == 1
         release_first.set()
         assert (await runtime.wait(first.task_id, timeout=2.0)).status == "succeeded"
         assert (await runtime.wait(followup.task_id, timeout=2.0)).status == "succeeded"
