@@ -679,6 +679,63 @@ def test_linux_adopted_children_use_pidfds_without_python_bindings(
     assert calls == [("open", 102, 0), ("signal", 42, signal.SIGTERM, None, 0)]
 
 
+@pytest.mark.asyncio
+async def test_pty_control_pipe_reads_ready_bytes_without_executor(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    pipe = process_tree._PtyControlPipe(read_fd, "rb")
+    loop = asyncio.get_running_loop()
+    registered = {}
+
+    def add_reader(descriptor, callback):
+        registered[descriptor] = callback
+        loop.call_soon(callback)
+
+    monkeypatch.setattr(loop, "add_reader", add_reader)
+    monkeypatch.setattr(loop, "remove_reader", lambda descriptor: registered.pop(descriptor))
+    monkeypatch.setattr(
+        loop, "run_in_executor",
+        lambda *_args: pytest.fail("ownership control must not consume a shared worker"),
+    )
+    try:
+        os.write(write_fd, b"E")
+        assert await asyncio.wait_for(pipe.read(1), 1) == b"E"
+        assert not registered
+        os.close(write_fd)
+        write_fd = -1
+        assert await asyncio.wait_for(pipe.read(1), 1) == b""
+        assert not registered
+    finally:
+        pipe.close()
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pty_control_pipe_unregisters_reader(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    pipe = process_tree._PtyControlPipe(read_fd, "rb")
+    loop = asyncio.get_running_loop()
+    registered = {}
+    monkeypatch.setattr(
+        loop, "add_reader", lambda descriptor, callback: registered.update({descriptor: callback}),
+    )
+    monkeypatch.setattr(loop, "remove_reader", lambda descriptor: registered.pop(descriptor))
+    reading = asyncio.create_task(pipe.read(1))
+    try:
+        await asyncio.sleep(0)
+        callback = registered[read_fd]
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        assert not registered
+        os.write(write_fd, b"E")
+        callback()  # A readiness callback queued before cancellation must not consume data.
+        assert os.read(read_fd, 1) == b"E"
+    finally:
+        pipe.close()
+        os.close(write_fd)
+
+
 def test_other_posix_descendant_capture_preserves_group_only_behavior(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

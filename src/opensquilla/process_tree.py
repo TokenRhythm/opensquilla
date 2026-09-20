@@ -2405,7 +2405,25 @@ class _PtyControlPipe:
         self.file = os.fdopen(fd, mode, buffering=0)
 
     async def read(self, size: int) -> bytes:
-        return await asyncio.to_thread(self.file.read, size)
+        # The anchor waits for our RELEASE before exiting. A blocking worker
+        # here can starve the terminal reader/waiter that must reach that point.
+        loop = asyncio.get_running_loop()
+        descriptor = self.file.fileno()
+        ready: asyncio.Future[bytes] = loop.create_future()
+
+        def read_ready() -> None:
+            if ready.done():
+                return
+            try:
+                ready.set_result(os.read(descriptor, size))
+            except OSError as exc:
+                ready.set_exception(exc)
+
+        loop.add_reader(descriptor, read_ready)
+        try:
+            return await ready
+        finally:
+            loop.remove_reader(descriptor)
 
     async def readexactly(self, size: int) -> bytes:
         value = await self.read(size)

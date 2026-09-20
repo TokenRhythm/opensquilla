@@ -190,7 +190,14 @@ class _RawPty:
 async def test_real_pty_drains_tail_before_closing_reader(tmp_path) -> None:
     child = tmp_path / "tail.py"
     child.write_text(
-        "import sys\nsys.stdout.write('x' * 65536 + '\\nFINAL-PTY-TAIL-MARKER\\n')\n"
+        # Unbuffered Windows console writes may accept only part of a buffer.
+        # Account for that in the producer so this checks the PTY reader's tail.
+        "import sys\npayload = b'x' * 65536 + b'\\nFINAL-PTY-TAIL-MARKER\\n'\n"
+        "offset = 0\n"
+        "while offset < len(payload):\n"
+        "    written = sys.stdout.buffer.write(payload[offset:])\n"
+        "    assert written and written > 0, written\n"
+        "    offset += written\n"
         "sys.stdout.flush()\n", encoding="utf-8",
     )
     argv = [sys.executable, str(child)]
