@@ -47,7 +47,13 @@
                 :title="sectionStatus(s.id).label"
                 aria-hidden="true"
               ></span>
-              <span v-else-if="s.id !== 'provider' && !s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
+              <span
+                v-else-if="s.id !== 'provider' && !s.client"
+                class="settings-rail__dot"
+                :class="sectionStatus(s.id).tone"
+                :title="sectionStatus(s.id).label"
+                aria-hidden="true"
+              ></span>
             </button>
           </template>
         </nav>
@@ -1027,22 +1033,6 @@ onUnmounted(() => {
 .settings-rail__dot.is-danger { background: var(--danger); }
 .settings-rail__dot.is-warn { background: var(--warn-fill); }
 .settings-rail__dot.is-muted { background: var(--text-dim); opacity: 0.5; }
-
-.settings-rail__warn {
-  align-items: center;
-  background: var(--warn-fill);
-  clip-path: polygon(50% 0, 100% 100%, 0 100%);
-  color: var(--bg);
-  display: inline-flex;
-  flex-shrink: 0;
-  font-size: 7px;
-  font-weight: 700;
-  height: 11px;
-  justify-content: center;
-  line-height: 1;
-  padding-top: 3px;
-  width: 12px;
-}
 
 .settings-rail__dirty {
   background: var(--accent);
