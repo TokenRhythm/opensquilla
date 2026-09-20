@@ -53,6 +53,8 @@ export interface UseChatSessionSubscriptionOptions {
   reconcileHistory?: () => Promise<SessionPhaseResult | void>
   resetStreamIdleTimer: () => void
   resetStreamLiveTurnState: () => void
+  /** Retire maintenance owned by a replaced process before replaying its successor. */
+  onStreamGenerationReset?: () => void
   onLiveSnapshot?: (snapshot: SessionReadSnapshot) => void
   onReadStarted?: () => void
   onSnapshotInstalled?: () => void
@@ -388,6 +390,14 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         live.assertInstalledCurrent?.()
         if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
       }
+      if (live.reloadRequired === 'generationChanged') {
+        // The replacement can be idle and have no event carrying its new
+        // generation. Explicitly retire old owners before installing any new
+        // snapshot; otherwise its maintenance would remain busy indefinitely.
+        options.onStreamGenerationReset?.()
+        syncCursor(conversationRuntime.reset(cursor()))
+        options.resetStreamLiveTurnState()
+      }
       let snapshotTaskLive = false
       const snapshot = live.snapshot
       if (snapshot?.sessionKey === key) {
@@ -399,10 +409,6 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         snapshotTaskLive = Boolean(snapshotTaskId) && !settledSnapshot
       }
       if (live.reloadRequired) {
-        if (live.reloadRequired === 'generationChanged') {
-          syncCursor(conversationRuntime.reset(cursor()))
-          options.resetStreamLiveTurnState()
-        }
         if (!reconciliation) void options.loadHistory()
       }
       // A live snapshot cannot recover a terminal answer whose streaming

@@ -24,6 +24,51 @@ describe('useChatCompaction replay compatibility', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
+  it('releases interrupted maintenance after a Gateway generation replacement', () => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({
+        status: 'started', source: 'manual', compaction_id: 'old-process-op', sequence: 1,
+      })
+      h.api.handleStreamGenerationChange('process-b', 'process-a')
+
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.api.compactStatus.value).toMatchObject({
+        status: 'failed', isBusy: false, compactionId: 'old-process-op',
+        reason: 'gateway_restarted',
+      })
+      expect(h.popAllPendingIntoComposer).toHaveBeenCalledOnce()
+      h.api.showCompactionToast({
+        status: 'started', source: 'manual', compaction_id: 'old-process-op', sequence: 2,
+      })
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('keeps same-generation reconnect pending until its terminal replay arrives', () => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({
+        status: 'started', source: 'manual', compaction_id: 'live-op', sequence: 1,
+      })
+      h.api.handleStreamGenerationChange('process-a', '')
+      h.api.handleStreamGenerationChange('process-a', 'process-a')
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(true)
+      h.api.showCompactionToast({
+        status: 'failed', source: 'manual', compaction_id: 'live-op', sequence: 2,
+        reason: 'compaction_deadline_exceeded',
+      }, { replayed: true })
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.popAllPendingIntoComposer).toHaveBeenCalledOnce()
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
   it('ignores replayed progress so it cannot resurrect a stale busy indicator', () => {
     const h = createHarness()
     try {
@@ -74,7 +119,7 @@ describe('useChatCompaction replay compatibility', () => {
       vetoed.api.showCompactionToast({
         status: 'skipped',
         source: 'manual',
-        reason: 'no_safe_turn_boundary',
+        reason: 'non_history_envelope_exhausts_budget',
       })
 
       expect(benign.api.compactStatus.value).toMatchObject({
@@ -87,7 +132,7 @@ describe('useChatCompaction replay compatibility', () => {
         status: 'skipped',
         tone: 'warn',
         message: 'Context organization was not applied',
-        reason: 'no_safe_turn_boundary',
+        reason: 'non_history_envelope_exhausts_budget',
       })
     } finally {
       benign.api.cleanup()
@@ -131,6 +176,18 @@ describe('useChatCompaction replay compatibility', () => {
       h.stop()
     }
   })
+
+  it.each(['non_history_envelope_exhausts_budget', 'summary_does_not_fit', 'unknown_skip_reason'])(
+    'does not label %s as a safe no-op', reason => {
+      const h = createHarness()
+      try {
+        h.api.showCompactionToast({ source: 'manual', status: 'skipped', reason })
+        expect(h.api.compactStatus.value).toMatchObject({
+          tone: 'warn', message: 'Context organization was not applied',
+        })
+      } finally { h.api.cleanup(); h.stop() }
+    },
+  )
 
   it('treats a replayed stale outcome as terminal and resumes the pending drain', () => {
     const h = createHarness()
@@ -203,10 +260,72 @@ describe('useChatCompaction replay compatibility', () => {
     }
   })
 
+  it.each(['failed', 'error'])('recovers pending input after %s unless the server blocks sending', status => {
+    const retryable = createHarness()
+    const blocked = createHarness()
+    try {
+      retryable.api.showCompactionToast({ status: 'started', source: 'manual' })
+      retryable.api.showCompactionToast({
+        status,
+        source: 'manual',
+        reason: 'summary_does_not_fit',
+      })
+      expect(retryable.popAllPendingIntoComposer).toHaveBeenCalledOnce()
+      expect(retryable.api.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(retryable.api.compactStatus.value).toMatchObject({
+        status: 'failed',
+        isBusy: false,
+      })
+
+      blocked.api.showCompactionToast({ status: 'started', source: 'manual' })
+      blocked.api.showCompactionToast({
+        status,
+        source: 'manual',
+        refused: true,
+        reason: 'no_safe_turn_boundary',
+      })
+      expect(blocked.popAllPendingIntoComposer).not.toHaveBeenCalled()
+      expect(blocked.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+      expect(blocked.api.isCompactInFlightForCurrentSession()).toBe(false)
+    } finally {
+      retryable.api.cleanup()
+      retryable.stop()
+      blocked.api.cleanup()
+      blocked.stop()
+    }
+  })
+
+  it.each([
+    ['summary_replay_incomplete', 'The summary did not pass the completeness check', true],
+    ['quality_gate_failed', 'The summary did not pass the completeness check', true],
+    ['summary_does_not_fit', "The summary does not fit the current model's context", true],
+    ['summary_target_unavailable', 'The summarization model is unavailable', false],
+    ['summary_failed', 'The model could not generate a usable summary', false],
+    ['compaction_deadline_exceeded', 'Context organization timed out', false],
+    ['unknown_private_provider_error', 'Context organization failed', false],
+  ])('explains manual failure %s without exposing raw provider details', (reason, message, preserved) => {
+    const h = createHarness()
+    try {
+      h.api.showCompactionToast({ status: 'started', source: 'manual', compaction_id: 'cmp-reason' })
+      h.api.showCompactionToast({
+        status: 'failed', source: 'manual', compaction_id: 'cmp-reason',
+        reason, detail: 'private provider response and prompt data',
+      })
+      expect(h.api.compactStatus.value.message).toBe(message)
+      expect(h.api.compactStatus.value.detail).toContain('diagnostic ID')
+      expect(h.api.compactStatus.value.detail.includes('original context is preserved')).toBe(preserved)
+      expect(h.api.compactStatus.value.detail).not.toContain('private provider')
+      expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
   it.each([false, true])('settles emergency_ephemeral truthfully after replay=%s', replayed => {
     const h = createHarness()
     try {
-      h.api.showCompactionToast({ status: 'started', source: 'manual', compaction_id: 'cmp-temporary' })
+      h.api.showCompactionToast({ status: 'started', source: 'automatic', compaction_id: 'cmp-temporary' })
       h.api.showCompactionToast({
         status: 'emergency_ephemeral',
         source: 'automatic',
@@ -223,21 +342,21 @@ describe('useChatCompaction replay compatibility', () => {
         isBusy: false,
       })
       expect(h.api.isCompactInFlightForCurrentSession()).toBe(false)
-      expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+      expect(h.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
     } finally {
       h.api.cleanup()
       h.stop()
     }
   })
 
-  it('labels a committed summary as saved', () => {
+  it('labels completed compaction as organized', () => {
     const h = createHarness()
     try {
       h.api.showCompactionToast({ status: 'started', source: 'manual' })
       h.api.showCompactionToast({ status: 'completed', source: 'manual', durability: 'durable' })
 
       expect(h.api.compactStatus.value).toMatchObject({
-        message: 'Summary saved',
+        message: 'Context organized',
         status: 'completed',
         durability: 'durable',
         isBusy: false,
@@ -290,6 +409,39 @@ describe('useChatCompaction replay compatibility', () => {
 
       expect(h.api.isCompactInFlightForCurrentSession()).toBe(true)
       expect(h.api.compactStatus.value.status).toBe('started')
+    } finally {
+      h.api.cleanup()
+      h.stop()
+    }
+  })
+
+  it('keeps metadata for progress within an operation but resets it for a new operation', () => {
+    const h = createHarness()
+    try {
+      h.api.showCompactStatus('started', 'Compacting', {
+        source: 'manual',
+        compactionId: 'cmp-first',
+        durability: 'request_scoped',
+        reason: 'first-operation',
+      })
+      h.api.showCompactStatus('started', 'Compacting', { detail: 'Summarizing' })
+      expect(h.api.compactStatus.value).toMatchObject({
+        compactionId: 'cmp-first',
+        source: 'manual',
+        durability: 'request_scoped',
+        reason: 'first-operation',
+      })
+
+      h.api.showCompactStatus('started', 'Compacting', {
+        source: 'automatic',
+        compactionId: 'cmp-second',
+      })
+      expect(h.api.compactStatus.value).toMatchObject({
+        compactionId: 'cmp-second',
+        source: 'automatic',
+        durability: '',
+        reason: '',
+      })
     } finally {
       h.api.cleanup()
       h.stop()

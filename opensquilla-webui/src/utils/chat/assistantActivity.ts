@@ -27,6 +27,7 @@ export type AssistantActivityClusterState =
 export type AssistantActivityLifecycleCode =
   | 'chat.activity.lifecycle.working'
   | 'chat.activity.lifecycle.answering'
+  | 'chat.activity.lifecycle.preparingToolCall'
   | 'chat.activity.lifecycle.answerPrepared'
   | 'chat.activity.lifecycle.settled'
   | 'chat.activity.lifecycle.interrupted'
@@ -123,9 +124,10 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
-  | 'chat.compact.summarySaved'
   | 'chat.compact.temporarilyReduced'
   | 'chat.compact.withinBudget'
+  | 'chat.compact.noSafeHistory'
+  | 'chat.compact.alreadyConcise'
   | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
   | 'chat.compact.failed'
@@ -863,6 +865,9 @@ function statusLabelFor(
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
+  if (normalized === 'preparing tool call') {
+    return codeDescriptor('chat.activity.lifecycle.preparingToolCall')
+  }
   if (normalized.startsWith('provider:')) {
     const [, phase = '', first = '0', second = '0'] = normalized.split(':')
     if (phase === 'requesting') {

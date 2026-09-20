@@ -748,6 +748,7 @@ class AgentConfig:
     # skill context in history so provider KV-cache prefixes stay stable.
     skills_context_prompt: str | None = None
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
+    compaction_trigger_ratio: float = 0.85
     compaction_protected_recent_messages: int = 0
     compaction_total_timeout_seconds: float = 120.0
     compaction_heartbeat_interval_seconds: float = 15.0

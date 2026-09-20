@@ -2215,6 +2215,10 @@ def main(argv: list[str] | None = None) -> int:
         "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT": args.layout,
         **relay_environment,
     }
+    if os.name == "nt":
+        # Path.home() is used by log redaction during Gateway boot. Keep it
+        # resolvable without inheriting the operator's actual Windows profile.
+        env["USERPROFILE"] = str(root / "user-state")
     observed_providers = set(args.observe_provider or ()) | {args.provider}
     if relay_environment and observed_providers != {"tokenrhythm"}:
         print(json.dumps({"ok": False, "status": "relay_provider_mismatch"}))
@@ -2249,17 +2253,43 @@ def main(argv: list[str] | None = None) -> int:
             contextlib.redirect_stderr(io.StringIO()),
             contextlib.ExitStack() as live_stack,
         ):
+            from opensquilla.application import approval_queue
+
+            # Tool turns open the process-local approval SQLite connection.
+            # An embedded caller may already own the singleton. Never reset
+            # it: reset also unlinks its database, which can be outside root.
+            previous_queue = approval_queue._queue
+
+            def close_test_queue() -> None:
+                queue = approval_queue._queue
+                if queue is None or queue is previous_queue:
+                    return
+                if not queue._db_path.resolve().is_relative_to(root.resolve()):
+                    return
+                queue.close()
+                if approval_queue._queue is queue:
+                    approval_queue._queue = None
+
+            # Close only a new, owned handle before Windows tree cleanup;
+            # deletion remains the responsibility of the existing root scanner.
+            live_stack.callback(close_test_queue)
             if relay_environment:
                 from scripts.live_tokenrhythm_transport import install_from_env
 
                 live_stack.callback(install_from_env())
             logging.disable(logging.CRITICAL)
             if args.serve_gateway:
+                from opensquilla.gateway import control_ui
                 from scripts.live_compaction_gateway import (
                     public_execution_overlay,
                     serve_compaction_gateway,
                 )
 
+                # TurnRunner imports this module before the isolated env is
+                # installed; override its cached artifact for this serve only.
+                live_stack.enter_context(patch.object(
+                    control_ui, "_DIST_DIR", args.ui_dist.resolve(),
+                ))
                 overlay = (
                     public_execution_overlay(json.loads(args.execution_config.read_text()))
                     if args.execution_config else None

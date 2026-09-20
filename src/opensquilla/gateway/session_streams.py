@@ -79,6 +79,10 @@ class SessionStreamRegistry:
         self._seq_by_session: dict[str, int] = {}
         self._events_by_session: dict[str, deque[BufferedSessionEvent]] = {}
         self._live_events_by_session: dict[str, list[BufferedSessionEvent]] = {}
+        self._manual_compactions_by_session: dict[
+            str, dict[str, list[BufferedSessionEvent]]
+        ] = {}
+        self._session_epochs: dict[str, int] = {}
         self._live_task_by_session: dict[str, str | None] = {}
         self._live_generation_epoch_by_session: dict[str, int | None] = {}
         # A done/error frame clears the active snapshot before TaskRuntime
@@ -295,6 +299,8 @@ class SessionStreamRegistry:
         self._seq_by_session.pop(session_key, None)
         self._events_by_session.pop(session_key, None)
         self._clear_live_state(session_key)
+        self._manual_compactions_by_session.pop(session_key, None)
+        self._session_epochs.pop(session_key, None)
         self._completed_events_by_session.pop(session_key, None)
         self._reset_stream_seqs_by_session.pop(session_key, None)
         self._reset_events_by_session.pop(session_key, None)
@@ -334,6 +340,13 @@ class SessionStreamRegistry:
     def current_seq(self, session_key: str) -> int:
         return self._seq_by_session.get(session_key, 0)
 
+    def advance_session_epoch(self, session_key: str, epoch: int) -> None:
+        """Retire maintenance snapshots when the durable session is reset."""
+        if epoch <= self._session_epochs.get(session_key, -1):
+            return
+        self._session_epochs[session_key] = epoch
+        self._manual_compactions_by_session.pop(session_key, None)
+
     def promote_legacy_cursor(self, session_key: str, since_stream_seq: int | None) -> bool:
         """Keep pre-generation clients receiving events after a Gateway restart.
 
@@ -368,6 +381,20 @@ class SessionStreamRegistry:
         enriched["stream_generation"] = self.stream_generation
         enriched["stream_seq"] = stream_seq
         enriched["emitted_at"] = _epoch_time_ms()
+
+        epoch = enriched.get("epoch")
+        if isinstance(epoch, int) and not isinstance(epoch, bool) and epoch >= 0:
+            self.advance_session_epoch(session_key, epoch)
+        if (
+            event_name == "session.event.compaction"
+            and str(enriched.get("source") or "").lower() == "manual"
+            and session_key in self._session_epochs
+            and (isinstance(epoch, bool) or not isinstance(epoch, int)
+                 or epoch < self._session_epochs[session_key])
+        ):
+            # Do not let a delayed old-epoch progress frame rebuild a retired
+            # maintenance snapshot. Clients also fence broadcast frames by epoch.
+            return enriched
 
         event = BufferedSessionEvent(event_name=event_name, payload=enriched, stream_seq=stream_seq)
         events = self._events_by_session.setdefault(session_key, deque())
@@ -558,6 +585,30 @@ class SessionStreamRegistry:
         session_key: str,
         event: BufferedSessionEvent,
     ) -> None:
+        if (
+            event.event_name == "session.event.compaction"
+            and str(event.payload.get("source") or "").lower() == "manual"
+        ):
+            operation_id = self._identity_value(event.payload, "compaction_id", "compactionId")
+            if operation_id is None:
+                return
+            status = str(event.payload.get("status") or "").lower()
+            operations = self._manual_compactions_by_session.setdefault(session_key, {})
+            if status in {"started", "observed", "running"}:
+                progress = operations.setdefault(operation_id, [])
+                # Preserve admission's started event and only the latest pulse.
+                # Turn completion must not erase maintenance waiting on its lock.
+                if progress and progress[0].payload.get("status") == "started":
+                    progress[1:] = [event]
+                else:
+                    progress[:] = [event]
+                while len(operations) > max(1, self._max_events_per_session):
+                    operations.pop(next(iter(operations)))
+            else:
+                operations.pop(operation_id, None)
+                if not operations:
+                    self._manual_compactions_by_session.pop(session_key, None)
+            return
         task_id = self._task_id(event.payload)
         current_task_id = self._live_task_by_session.get(session_key)
 
@@ -715,7 +766,16 @@ class SessionStreamRegistry:
                     payload=dict(event.payload),
                     stream_seq=event.stream_seq,
                 )
-                for event in self._live_events_by_session.get(session_key, ())
+                for event in [
+                    *self._live_events_by_session.get(session_key, ()),
+                    *(
+                        event
+                        for progress in self._manual_compactions_by_session.get(
+                            session_key, {},
+                        ).values()
+                        for event in progress
+                    ),
+                ]
             ],
             key=lambda item: item.stream_seq,
         )

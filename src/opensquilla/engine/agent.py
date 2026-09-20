@@ -245,13 +245,18 @@ from opensquilla.session.compaction import (
     compact_context,
     compaction_prompt_layout,
     compaction_replay_summary,
+    effective_protected_recent_messages,
+)
+from opensquilla.session.compaction_budget import (
+    CompactionBudget,
+    history_capacity_from_proof,
+    resolve_compaction_budget,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_SUMMARY_VERIFIED_EVENT,
     COMPACTION_TRIGGERED_EVENT,
     CompactionTimeoutError,
-    ConsumerAdmissionStaleError,
     compaction_effect_payload,
     compaction_lifecycle_payload,
     compaction_result_payload,
@@ -3230,6 +3235,7 @@ class Agent:
         bound_user_message_id: str | None,
         attachment_messages: list[Message] | None,
         runtime_context_message: Message,
+        include_active_user: bool = True,
     ) -> list[Message] | None:
         history = self._history_messages_for_compaction_admission(
             kept_entries,
@@ -3247,9 +3253,9 @@ class Agent:
         request_context_insert_index = len(turn_messages)
         runtime_context_insert_index = len(turn_messages)
         turn_messages.extend(self._request_image_context)
-        if attachment_messages:
+        if include_active_user and attachment_messages:
             turn_messages.extend(attachment_messages)
-        elif active_user_message:
+        elif include_active_user and active_user_message:
             turn_messages.append(Message(role="user", content=active_user_message))
 
         summary_context = (
@@ -3288,6 +3294,7 @@ class Agent:
         consumer_model_id: str | None = None,
         consumer_model_capabilities: ModelCapabilities | None = None,
         consumer_provider_request_max_chars: int | None = None,
+        include_active_user: bool = True,
     ) -> Any | None:
         request_messages = self._assemble_compaction_consumer_request(
             replay_summary=replay_summary,
@@ -3297,6 +3304,7 @@ class Agent:
             bound_user_message_id=bound_user_message_id,
             attachment_messages=attachment_messages,
             runtime_context_message=runtime_context_message,
+            include_active_user=include_active_user,
         )
         if request_messages is None:
             return None
@@ -3316,7 +3324,7 @@ class Agent:
             request_messages,
             current_user_text=active_user_message,
         )
-        if active_user_message and active_user_index is None:
+        if include_active_user and active_user_message and active_user_index is None:
             return None
         if active_user_index is not None:
             chat_config = chat_config.model_copy(
@@ -3346,130 +3354,84 @@ class Agent:
         Callable[[str, list[dict[str, Any]]], bool],
         str,
     ]:
-        """Freeze a pure final-envelope gate and its singleflight identity."""
-
-        runtime_context_message = self._freeze_preflight_runtime_context_message()
-        template_summary = "[candidate checkpoint]"
-        template_projection = self._project_compaction_consumer_request(
+        """Compatibility projection of the common compaction consumer budget."""
+        budget = self.resolve_compaction_budget(
             consumer_provider=consumer_provider,
-            replay_summary=template_summary,
-            kept_entries=[],
             active_user_message=active_user_message,
-            active_user_in_history=False,
-            bound_user_message_id=None,
+            active_user_in_history=active_user_in_history,
+            bound_user_message_id=bound_user_message_id,
             attachment_messages=attachment_messages,
-            runtime_context_message=runtime_context_message,
             context_window_tokens=context_window_tokens,
             max_output_tokens=max_output_tokens,
             consumer_model_id=consumer_model_id,
             consumer_model_capabilities=consumer_model_capabilities,
-            consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+            consumer_provider_request_max_chars=consumer_provider_request_max_chars,
         )
+        return budget.consumer_admission, budget.consumer_admission_fingerprint
+
+    def resolve_compaction_budget(
+        self,
+        *,
+        consumer_provider: Any,
+        active_user_message: str,
+        active_user_in_history: bool,
+        bound_user_message_id: str | None,
+        attachment_messages: list[Message] | None,
+        context_window_tokens: int,
+        max_output_tokens: int | None = None,
+        consumer_model_id: str | None = None,
+        consumer_model_capabilities: ModelCapabilities | None = None,
+        consumer_provider_request_max_chars: int | None = None,
+        trigger_ratio: float = 0.85,
+        retained_tail_messages: int = 0,
+        summary_output_tokens: int = 1024,
+        history_limit_tokens: int | None = None,
+        envelope_reserve_tokens: int = 0,
+        envelope_reserve_chars: int = 0,
+        consumer_deployment_fingerprint: str = "",
+    ) -> CompactionBudget:
+        """Freeze the live prompt, tools and media against the shared resolver."""
+        runtime_context_message = self._freeze_preflight_runtime_context_message()
+
+        def project(
+            summary: str, kept: list[dict[str, Any]], *, include_active_user: bool = True,
+        ) -> Any:
+            return self._project_compaction_consumer_request(
+                consumer_provider=consumer_provider,
+                replay_summary=summary, kept_entries=kept,
+                active_user_message=active_user_message,
+                active_user_in_history=active_user_in_history if kept else False,
+                bound_user_message_id=bound_user_message_id if kept else None,
+                attachment_messages=attachment_messages,
+                runtime_context_message=runtime_context_message,
+                context_window_tokens=context_window_tokens,
+                max_output_tokens=max_output_tokens,
+                consumer_model_id=consumer_model_id,
+                consumer_model_capabilities=consumer_model_capabilities,
+                consumer_provider_request_max_chars=consumer_provider_request_max_chars,
+                include_active_user=include_active_user,
+            )
+
+        def capacity_project(summary: str, kept: list[dict[str, Any]]) -> Any:
+            return project(summary, kept, include_active_user=False)
+
         metadata = provider_metadata(consumer_provider)
-        fingerprint_payload = {
-            "provider": metadata.provider_id or metadata.provider_kind,
-            "model": metadata.model,
-            "consumer_model_id": consumer_model_id or metadata.model,
-            "context_window_tokens": int(context_window_tokens),
-            "max_output_tokens": int(max_output_tokens or self.config.max_tokens or 0),
-            "system_sha256": hashlib.sha256(
-                (self.config.system_prompt or "").encode("utf-8")
-            ).hexdigest(),
-            "tools_sha256": hashlib.sha256(
-                json.dumps(
-                    self._live_request_jsonable(self.tool_definitions),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest(),
-            "active_user_sha256": hashlib.sha256(active_user_message.encode("utf-8")).hexdigest(),
-            "attachments_sha256": hashlib.sha256(
-                json.dumps(
-                    self._live_request_jsonable(attachment_messages or []),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest(),
-            "request_context_sha256": hashlib.sha256(
-                (self.config.request_context_prompt or "").encode("utf-8")
-            ).hexdigest(),
-            "runtime_context_sha256": hashlib.sha256(
-                json.dumps(
-                    self._live_request_jsonable(runtime_context_message),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest(),
-            "template_payload_sha256": (
-                hashlib.sha256(
-                    json.dumps(
-                        template_projection.payload,
-                        ensure_ascii=False,
-                        sort_keys=True,
-                        separators=(",", ":"),
-                    ).encode("utf-8")
-                ).hexdigest()
-                if template_projection is not None
-                else "projection_unavailable"
+        return resolve_compaction_budget(
+            project=project,
+            capacity_project=capacity_project if active_user_in_history else None,
+            physical_context_window_tokens=context_window_tokens,
+            generation_reserve_tokens=int(max_output_tokens or self.config.max_tokens or 0),
+            provider_identity=(
+                f"{metadata.provider_id or metadata.provider_kind}/"
+                f"{consumer_model_id or metadata.model}:{consumer_deployment_fingerprint}"
             ),
-        }
-        fingerprint = hashlib.sha256(
-            json.dumps(
-                fingerprint_payload,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
-
-        def _consumer_admission(
-            replay_summary: str,
-            kept_entries: list[dict[str, Any]],
-        ) -> bool:
-            current_template = self._project_compaction_consumer_request(
-                consumer_provider=consumer_provider,
-                replay_summary=template_summary,
-                kept_entries=[],
-                active_user_message=active_user_message,
-                active_user_in_history=False,
-                bound_user_message_id=None,
-                attachment_messages=attachment_messages,
-                runtime_context_message=runtime_context_message,
-                context_window_tokens=context_window_tokens,
-                max_output_tokens=max_output_tokens,
-                consumer_model_id=consumer_model_id,
-                consumer_model_capabilities=consumer_model_capabilities,
-                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
-            )
-            current_template_hash = (
-                hashlib.sha256(json.dumps(
-                    current_template.payload, ensure_ascii=False, sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")).hexdigest()
-                if current_template is not None else "projection_unavailable"
-            )
-            if current_template_hash != fingerprint_payload["template_payload_sha256"]:
-                raise ConsumerAdmissionStaleError("compaction consumer request changed")
-            projection = self._project_compaction_consumer_request(
-                consumer_provider=consumer_provider,
-                replay_summary=replay_summary,
-                kept_entries=kept_entries,
-                active_user_message=active_user_message,
-                active_user_in_history=active_user_in_history,
-                bound_user_message_id=bound_user_message_id,
-                attachment_messages=attachment_messages,
-                runtime_context_message=runtime_context_message,
-                context_window_tokens=context_window_tokens,
-                max_output_tokens=max_output_tokens,
-                consumer_model_id=consumer_model_id,
-                consumer_model_capabilities=consumer_model_capabilities,
-                consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
-            )
-            return bool(projection is not None and projection.fits)
-
-        return _consumer_admission, fingerprint
+            history_limit_tokens=history_limit_tokens,
+            envelope_reserve_tokens=envelope_reserve_tokens,
+            envelope_reserve_chars=envelope_reserve_chars,
+            trigger_ratio=trigger_ratio,
+            retained_tail_messages=retained_tail_messages,
+            summary_output_tokens=summary_output_tokens,
+        )
 
     def preflight_history_capacity(
         self,
@@ -3511,6 +3473,7 @@ class Agent:
                 consumer_model_id=consumer_model_id,
                 consumer_model_capabilities=consumer_model_capabilities,
                 consumer_provider_request_max_chars=(consumer_provider_request_max_chars),
+                include_active_user=not active_user_in_history,
             )
             if projection is not None:
                 proof = projection.proof
@@ -3521,18 +3484,7 @@ class Agent:
                     "estimated_chars",
                 }
                 if required_budget_fields.issubset(proof):
-                    return (
-                        max(
-                            0,
-                            int(proof["effective_proof_token_budget"] or 0)
-                            - int(proof["estimated_tokens"] or 0),
-                        ),
-                        max(
-                            0,
-                            int(proof["effective_proof_budget"] or 0)
-                            - int(proof["estimated_chars"] or 0),
-                        ),
-                    )
+                    return history_capacity_from_proof(proof)
 
         fixed_messages: list[Message] = []
         skills_message = self._skills_context_message()
@@ -3612,20 +3564,7 @@ class Agent:
             )
         except ProviderRequestBudgetExceededError as exc:
             proof = exc.proof
-        effective_token_budget = max(
-            0,
-            int(proof.get("effective_proof_token_budget", 0) or 0),
-        )
-        fixed_tokens = max(0, int(proof.get("estimated_tokens", 0) or 0))
-        effective_char_budget = max(
-            0,
-            int(proof.get("effective_proof_budget", 0) or 0),
-        )
-        fixed_chars = max(0, int(proof.get("estimated_chars", 0) or 0))
-        return (
-            max(0, effective_token_budget - fixed_tokens),
-            max(0, effective_char_budget - fixed_chars),
-        )
+        return history_capacity_from_proof(proof)
 
     def preflight_history_capacity_tokens(
         self,
@@ -10485,6 +10424,10 @@ class Agent:
                                 estimated_context_chars=provider_estimated_chars,
                                 durable_consumer_overflow_proven=(durable_consumer_overflow_proven),
                                 provider_overflow=True,
+                                consumer_chat_config=call_chat_cfg,
+                                request_suffix_messages=request_suffix_messages,
+                                request_context_message=request_context_message,
+                                runtime_context_message=runtime_context_message,
                             )
                             if overflow_outcome is None:
                                 yield self._transition(AgentState.ERROR)
@@ -10518,7 +10461,7 @@ class Agent:
                                 if rebuild_deadline is None:
                                     next_request_messages = (
                                         await self._provider_request_messages_async(
-                                            overflow_outcome.messages,
+                                            [*overflow_outcome.messages, *request_suffix_messages],
                                             request_context_message=(request_context_message),
                                             request_context_insert_index=(
                                                 next_request_context_insert_index
@@ -10533,7 +10476,10 @@ class Agent:
                                     async with asyncio.timeout_at(rebuild_deadline):
                                         next_request_messages = (
                                             await self._provider_request_messages_async(
-                                                overflow_outcome.messages,
+                                                [
+                                                    *overflow_outcome.messages,
+                                                    *request_suffix_messages,
+                                                ],
                                                 request_context_message=(request_context_message),
                                                 request_context_insert_index=(
                                                     next_request_context_insert_index
@@ -10690,6 +10636,10 @@ class Agent:
                                                     runtime_context_insert_index=(
                                                         stable_source_runtime_index
                                                     ),
+                                                    consumer_chat_config=next_chat_cfg,
+                                                    request_suffix_messages=request_suffix_messages,
+                                                    request_context_message=request_context_message,
+                                                    runtime_context_message=runtime_context_message,
                                                     shared_compaction_config=(
                                                         overflow_outcome.runtime_compaction_config
                                                     ),
@@ -10722,7 +10672,10 @@ class Agent:
                                         )
                                         stable_live_request_messages = (
                                             await self._provider_request_messages_async(
-                                                stable_live_recovery.messages,
+                                                [
+                                                    *stable_live_recovery.messages,
+                                                    *request_suffix_messages,
+                                                ],
                                                 request_context_message=(request_context_message),
                                                 request_context_insert_index=(
                                                     stable_live_request_index
@@ -13666,6 +13619,85 @@ class Agent:
     def _message_count_headroom(limit: int) -> int:
         return min(16, max(2, math.ceil(limit * 0.10)))
 
+    def _resolve_in_turn_compaction_budget(
+        self,
+        *,
+        config: CompactionConfig,
+        project_messages: Callable[
+            [str, list[dict[str, Any]]], tuple[list[Message], int, int]
+        ],
+        consumer_provider: Any | None = None,
+        chat_config: ChatConfig | None = None,
+        request_context_message: Message | None = None,
+        runtime_context_message: Message | None = None,
+    ) -> CompactionBudget:
+        """Budget the exact request view installed by in-turn recovery.
+
+        These callers retain native messages and replay a summary prefix. The
+        shared resolver still owns capacity/trigger/admission arithmetic, while
+        this adapter preserves their different wire envelope and insertion sites.
+        """
+        provider = consumer_provider if consumer_provider is not None else self.provider
+        if chat_config is None:
+            chat_config = (
+                self._compaction_request_context.chat_config
+                if self._compaction_request_context is not None
+                else self._provider_admission_chat_config(
+                    getattr(self, "_current_turn_message", "") or "",
+                    context_window_tokens=self.config.context_window_tokens,
+                )
+            )
+        if request_context_message is None:
+            request_context_message = self._request_context_message(
+                self.config.request_context_prompt,
+            )
+        if runtime_context_message is None:
+            runtime_context_message = self._freeze_preflight_runtime_context_message()
+        tools = (
+            list(self._compaction_request_context.tools or ())
+            if self._compaction_request_context is not None
+            else self.tool_definitions
+        )
+
+        def project(summary: str, kept: list[dict[str, Any]]) -> Any:
+            messages, request_index, runtime_index = project_messages(summary, kept)
+            request_messages = self._provider_request_messages_for_count_projection(
+                messages,
+                request_context_message=request_context_message,
+                request_context_insert_index=request_index,
+                runtime_context_message=runtime_context_message,
+                runtime_context_insert_index=runtime_index,
+            )
+            active_index = _active_user_message_index_for_request(
+                request_messages,
+                current_user_text=getattr(self, "_current_turn_message", "") or "",
+            )
+            candidate_config = chat_config.model_copy(
+                update={"active_user_message_index": active_index},
+            )
+            return project_provider_final_request(
+                provider, request_messages, tools, candidate_config,
+            )
+
+        metadata = provider_metadata(provider)
+        budget = resolve_compaction_budget(
+            project=project,
+            physical_context_window_tokens=chat_config.provider_context_window_tokens,
+            generation_reserve_tokens=chat_config.max_tokens,
+            provider_identity=f"{metadata.provider_id or metadata.provider_kind}/{metadata.model}:",
+            trigger_ratio=self.config.compaction_trigger_ratio,
+            # A reused operation config can carry the previous request view's
+            # budget. Recompute retention from this view's explicit policy.
+            retained_tail_messages=effective_protected_recent_messages(
+                replace(config, budget=None),
+            ),
+            summary_output_tokens=(
+                config.llm_plan.primary.max_output_tokens if config.llm_plan else 1024
+            ),
+        )
+        config.budget = budget
+        return budget
+
     @staticmethod
     def _adjust_index_after_prefix_summary(original_index: int, cut: int) -> int:
         return 2 + max(0, original_index - cut)
@@ -14053,6 +14085,10 @@ class Agent:
         request_context_insert_index: int | None,
         runtime_context_insert_index: int | None,
         shared_compaction_config: CompactionConfig | None = None,
+        consumer_chat_config: ChatConfig | None = None,
+        request_suffix_messages: list[Message] | None = None,
+        request_context_message: Message | None = None,
+        runtime_context_message: Message | None = None,
     ) -> CompactionOutcome | None:
         """Summarize completed live rounds into an ephemeral provider view."""
 
@@ -14062,6 +14098,10 @@ class Agent:
                 protected_turn_start_index=protected_turn_start_index,
                 request_context_insert_index=request_context_insert_index,
                 runtime_context_insert_index=runtime_context_insert_index,
+                config=consumer_chat_config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
                 input_budget_tokens=context_window_tokens,
                 input_budget_chars=context_window_chars,
                 reason="already_attempted_this_turn",
@@ -14097,17 +14137,56 @@ class Agent:
         if shared_compaction_config is None:
             arm_compaction_deadline(config, operation_id=compaction_id)
         original_protect_semantic_tail = config.protect_semantic_tail
+        original_protect_profile_tail = config.protect_profile_tail
         original_protected_recent_messages = config.protected_recent_messages
         config.protect_semantic_tail = False
+        config.protect_profile_tail = False
         config.protected_recent_messages = 0
+        mapped_request_index = self._live_turn_mapped_index(
+            request_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+        mapped_runtime_index = self._live_turn_mapped_index(
+            runtime_context_insert_index,
+            protected_start=protected_start,
+            active_user_index=active_user_index,
+            keep_start=keep_start,
+            active_prefix_count=len(active_prefix),
+        )
+
+        def project_messages(summary: str, kept: list[dict[str, Any]]) -> tuple[
+            list[Message], int, int
+        ]:
+            return ([
+                Message(role="user", content=(
+                    "[Context summary]\nCompleted work from this still-active request:\n"
+                    f"{summary}"
+                )),
+                Message(role="assistant", content="Understood. Continuing the active request."),
+                *active_prefix,
+                *(summary_messages[-len(kept):] if kept else []),
+                *raw_tail,
+                *(request_suffix_messages or []),
+            ], int(mapped_request_index or 0), int(mapped_runtime_index or 0))
+
         try:
+            budget = self._resolve_in_turn_compaction_budget(
+                config=config, project_messages=project_messages,
+                chat_config=consumer_chat_config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+            )
             result = await compact_context(
                 CompactionRequest(
                     session_id="agent-live-turn-request-view",
                     entries=self._message_count_compaction_entries(summary_messages),
-                    context_window_tokens=context_window_tokens,
-                    context_window_chars=context_window_chars,
+                    context_window_tokens=budget.history_capacity_tokens,
+                    context_window_chars=budget.history_capacity_chars,
                     config=config,
+                    consumer_admission=budget.consumer_admission,
                     forced_prefix_cut=len(summary_messages),
                     trigger="message_count",
                     reason="live_turn_request_overflow",
@@ -14128,11 +14207,16 @@ class Agent:
                 protected_turn_start_index=protected_start,
                 request_context_insert_index=request_context_insert_index,
                 runtime_context_insert_index=runtime_context_insert_index,
+                config=consumer_chat_config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
                 input_budget_tokens=context_window_tokens,
                 input_budget_chars=context_window_chars,
                 compaction_config=config,
             )
         finally:
+            config.protect_profile_tail = original_protect_profile_tail
             if shared_compaction_config is not None:
                 config.protect_semantic_tail = original_protect_semantic_tail
                 config.protected_recent_messages = original_protected_recent_messages
@@ -14151,6 +14235,10 @@ class Agent:
                 protected_turn_start_index=protected_start,
                 request_context_insert_index=request_context_insert_index,
                 runtime_context_insert_index=runtime_context_insert_index,
+                config=consumer_chat_config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
                 reason=str(getattr(result, "skip_reason", None) or "summary_failed"),
                 input_budget_tokens=context_window_tokens,
                 input_budget_chars=context_window_chars,
@@ -14180,20 +14268,6 @@ class Agent:
         if repair_tool_pairing(projected) != projected:
             return None
 
-        mapped_request_index = self._live_turn_mapped_index(
-            request_context_insert_index,
-            protected_start=protected_start,
-            active_user_index=active_user_index,
-            keep_start=keep_start,
-            active_prefix_count=len(active_prefix),
-        )
-        mapped_runtime_index = self._live_turn_mapped_index(
-            runtime_context_insert_index,
-            protected_start=protected_start,
-            active_user_index=active_user_index,
-            keep_start=keep_start,
-            active_prefix_count=len(active_prefix),
-        )
         if self._session_key:
             notify_compaction(
                 self._session_key,
@@ -14258,6 +14332,10 @@ class Agent:
                 context_window_tokens=self.config.context_window_tokens,
                 request_context_insert_index=request_context_insert_index,
                 runtime_context_insert_index=runtime_context_insert_index,
+                consumer_chat_config=config,
+                request_suffix_messages=request_suffix_messages,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
             )
         except asyncio.CancelledError:
             raise
@@ -14462,11 +14540,32 @@ class Agent:
             int(compaction_config.protected_recent_messages or 0),
             protected_tail_count,
         )
+
+        def project_messages(summary: str, kept: list[dict[str, Any]]) -> tuple[
+            list[Message], int, int
+        ]:
+            cut = len(messages) - len(kept)
+            return ([
+                Message(role="user", content=f"[Context summary]\n{summary}"),
+                summary_ack,
+                *messages[cut:],
+                *request_suffix_messages,
+            ], self._adjust_index_after_prefix_summary(request_context_insert_index, cut),
+                self._adjust_index_after_prefix_summary(runtime_context_insert_index, cut))
+
+        budget = self._resolve_in_turn_compaction_budget(
+            config=compaction_config, project_messages=project_messages,
+            chat_config=config,
+            request_context_message=request_context_message,
+            runtime_context_message=runtime_context_message,
+        )
         request = CompactionRequest(
             session_id="agent-turn-message-count",
             entries=self._message_count_compaction_entries(messages),
-            context_window_tokens=self.config.context_window_tokens,
+            context_window_tokens=budget.history_capacity_tokens,
+            context_window_chars=budget.history_capacity_chars,
             config=compaction_config,
+            consumer_admission=budget.consumer_admission,
             forced_prefix_cut=selected_cut,
             trigger="message_count",
             reason="provider_request_message_limit",
@@ -14950,6 +15049,10 @@ class Agent:
         estimated_context_chars: int | None = None,
         durable_consumer_overflow_proven: bool | None = None,
         provider_overflow: bool = False,
+        consumer_chat_config: ChatConfig | None = None,
+        request_suffix_messages: list[Message] | None = None,
+        request_context_message: Message | None = None,
+        runtime_context_message: Message | None = None,
     ) -> CompactionOutcome | None:
         """Check if estimated live context tokens exceed the overflow threshold.
 
@@ -14958,9 +15061,9 @@ class Agent:
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
         pressure_window_tokens = request_window_tokens or window_tokens
-        threshold = self.config.context_overflow_threshold * pressure_window_tokens
+        threshold = self.config.compaction_trigger_ratio * pressure_window_tokens
         char_threshold = (
-            self.config.context_overflow_threshold * request_window_chars
+            self.config.compaction_trigger_ratio * request_window_chars
             if request_window_chars is not None
             else None
         )
@@ -14995,6 +15098,10 @@ class Agent:
                 protected_turn_start_index=boundary,
                 request_context_insert_index=request_context_insert_index,
                 runtime_context_insert_index=runtime_context_insert_index,
+                config=consumer_chat_config,
+                request_context_message=request_context_message,
+                runtime_context_message=runtime_context_message,
+                request_suffix_messages=request_suffix_messages,
                 input_budget_tokens=pressure_window_tokens,
                 input_budget_chars=request_window_chars,
                 allow_unchanged=not provider_overflow and not (
@@ -15049,6 +15156,10 @@ class Agent:
                         context_window_chars=request_window_chars,
                         request_context_insert_index=request_context_insert_index,
                         runtime_context_insert_index=runtime_context_insert_index,
+                        consumer_chat_config=consumer_chat_config,
+                        request_context_message=request_context_message,
+                        runtime_context_message=runtime_context_message,
+                        request_suffix_messages=request_suffix_messages,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -15095,6 +15206,10 @@ class Agent:
                         context_window_chars=request_window_chars,
                         request_context_insert_index=request_context_insert_index,
                         runtime_context_insert_index=runtime_context_insert_index,
+                        consumer_chat_config=consumer_chat_config,
+                        request_context_message=request_context_message,
+                        runtime_context_message=runtime_context_message,
+                        request_suffix_messages=request_suffix_messages,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -15119,32 +15234,6 @@ class Agent:
                 )
                 return _local_after_failure("provider_recent_tail_too_large")
 
-        history_window_tokens = window_tokens
-        history_window_chars: int | None = None
-        if durable_consumer_overflow_proven is True and (
-            request_window_tokens is not None or request_window_chars is not None
-        ):
-            # The core compacts history, whereas the overflow proof includes
-            # the complete request. Reserve the stable consumer's fixed
-            # envelope and generation budget before selecting its history.
-            # A routed member's smaller request cap must not rewrite durable
-            # history. The active user/tool tail already belongs to entries.
-            history_window_tokens, history_window_chars = self.preflight_history_capacity(
-                active_user_message="",
-                active_user_in_history=False,
-                context_window_tokens=self._durable_consumer_window_tokens,
-                consumer_provider=self._durable_consumer_provider,
-                consumer_max_output_tokens=self._durable_consumer_max_output_tokens,
-                consumer_model_id=self._durable_consumer_model_id,
-                consumer_model_capabilities=self._durable_consumer_model_capabilities,
-                consumer_provider_request_max_chars=(
-                    self._durable_consumer_provider_request_max_chars
-                ),
-            )
-            if history_window_tokens <= 0 or history_window_chars <= 0:
-                self._last_compaction_refusal_reason = "provider_request_budget_exhausted"
-                return _local_after_failure("provider_request_budget_exhausted")
-
         protected_start: int | None = None
         compaction_id = new_compaction_id()
         compaction_config = self._build_compaction_config()
@@ -15159,6 +15248,49 @@ class Agent:
                 int(compaction_config.protected_recent_messages or 0),
                 len(messages) - protected_start,
             )
+
+        def project_messages(summary: str, kept: list[dict[str, Any]]) -> tuple[
+            list[Message], int, int
+        ]:
+            cut = len(messages) - len(kept)
+            return ([
+                Message(role="user", content=f"[Context summary]\n{summary}"),
+                Message(role="assistant", content="Understood. Continuing from summary."),
+                *messages[cut:],
+                *(request_suffix_messages or []),
+            ], int((
+                self._adjust_index_after_prefix_compaction(
+                    request_context_insert_index, cut, summary_present=True,
+                ) if request_context_insert_index is not None else 2 + len(kept)
+            ) or 0), int((
+                self._adjust_index_after_prefix_compaction(
+                    runtime_context_insert_index, cut, summary_present=True,
+                ) if runtime_context_insert_index is not None else 2 + len(kept)
+            ) or 0))
+
+        consumer_provider = None
+        consumer_config = consumer_chat_config
+        if durable_consumer_overflow_proven is True:
+            # A routed member's smaller envelope must not rewrite durable
+            # history. Resolve the physical stable consumer, never the input
+            # budget whose generation reserve has already been deducted.
+            consumer_provider = self._durable_consumer_provider
+            consumer_config = self._provider_admission_chat_config(
+                getattr(self, "_current_turn_message", "") or "",
+                context_window_tokens=self._durable_consumer_window_tokens,
+                context_window_known=self._durable_consumer_window_known,
+                max_output_tokens=self._durable_consumer_max_output_tokens,
+                model_capabilities=self._durable_consumer_model_capabilities,
+                provider_request_proof_max_chars=(
+                    self._durable_consumer_provider_request_max_chars
+                ),
+            )
+        budget = self._resolve_in_turn_compaction_budget(
+            config=compaction_config, project_messages=project_messages,
+            consumer_provider=consumer_provider, chat_config=consumer_config,
+            request_context_message=request_context_message,
+            runtime_context_message=runtime_context_message,
+        )
         arm_compaction_deadline(compaction_config, operation_id=compaction_id)
         if self._session_key:
             notify_compaction(
@@ -15174,7 +15306,7 @@ class Agent:
                 request_chars=estimated_context_chars,
                 threshold=threshold,
                 char_threshold=char_threshold,
-                ratio=self.config.context_overflow_threshold,
+                ratio=self.config.compaction_trigger_ratio,
                 heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
                 **compaction_effect_payload(status="started"),
                 **compaction_lifecycle_payload(
@@ -15190,9 +15322,10 @@ class Agent:
         request = CompactionRequest(
             session_id="agent-turn",
             entries=entries,
-            context_window_tokens=history_window_tokens,
-            context_window_chars=history_window_chars,
+            context_window_tokens=budget.history_capacity_tokens,
+            context_window_chars=budget.history_capacity_chars,
             config=compaction_config,
+            consumer_admission=budget.consumer_admission,
             provider_request_correlation=derive_provider_request_correlation(
                 self._provider_request_correlation,
                 execution_id=uuid.uuid4().hex,
@@ -17515,6 +17648,7 @@ class Agent:
             context_window_known=child_target.context_window_known,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
             compaction_profile=self.config.compaction_profile,
+            compaction_trigger_ratio=self.config.compaction_trigger_ratio,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,
             compaction_heartbeat_interval_seconds=(

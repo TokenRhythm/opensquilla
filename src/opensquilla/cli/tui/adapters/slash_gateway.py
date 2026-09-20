@@ -26,10 +26,10 @@ from opensquilla.cli.gateway_client import (
 )
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
-    compact_skipped_line,
     compact_success_line,
     compact_summary_stats,
     compact_token_stats,
+    compact_unapplied_line,
     dispatch_theme_command,
     output_supports_host_ui,
     record_turn,
@@ -1033,7 +1033,11 @@ async def _dispatch_gateway_slash_command(
             )
             console.print(compact_success_line(token_stats))
         else:
-            console.print(compact_skipped_line())
+            console.print(compact_unapplied_line(
+                status=payload.get("status"),
+                reason=payload.get("reason") or payload.get("skip_reason"),
+                compaction_id=payload.get("compaction_id"),
+            ))
         return True
 
     if parts := _slash_parts(cmd, "/models"):

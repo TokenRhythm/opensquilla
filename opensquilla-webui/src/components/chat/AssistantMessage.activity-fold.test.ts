@@ -789,7 +789,7 @@ describe('AssistantMessage activity disclosure', () => {
 
   it.each([
     ['request_scoped', 'History temporarily reduced; continuing'],
-    ['durable', 'Summary saved'],
+    ['durable', 'Context organized'],
   ])('keeps %s wording in the folded activity summary', async (durability, label) => {
     const el = mountMessage(baseMessage({
       timelineItems: [],
@@ -803,7 +803,7 @@ describe('AssistantMessage activity disclosure', () => {
 
     const summary = el.querySelector('.assistant-activity__summary')
     expect(summary?.textContent).toContain(label)
-    if (durability === 'request_scoped') expect(summary?.textContent).not.toContain('Summary saved')
+    if (durability === 'request_scoped') expect(summary?.textContent).not.toContain('Context organized')
   })
 
   it('restores routine phase rows and reopens settled reasoning content', async () => {

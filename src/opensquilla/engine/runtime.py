@@ -294,6 +294,7 @@ from opensquilla.runtime_packs import runtime_pack_state_scope
 from opensquilla.safety import injection_guard, permission_matrix, sandbox, tool_tiers
 from opensquilla.sandbox.integration import sandbox_policy_scope
 from opensquilla.sandbox.policy_models import SandboxPolicy as StoredSandboxPolicy
+from opensquilla.session.compaction_budget import CompactionBudget, named_auth_profile_fingerprint
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
     COMPACTION_PERSISTED_EVENT,
@@ -4903,6 +4904,33 @@ class TurnRunner:
             ),
         )
 
+    def prepare_manual_compaction_envelope(
+        self,
+        session: Any,
+        *,
+        provider: Any,
+        context_window_tokens: int,
+        max_output_tokens: int,
+        context_window_known: bool,
+        provider_request_max_chars: int,
+        workspace_dir: str | None,
+        caller_tool_context: ToolContext | None = None,
+    ) -> Agent:
+        """Build idle-session prompt/tools for projection without starting a turn."""
+        from opensquilla.engine.compaction_envelope import prepare_manual_compaction_envelope
+
+        return prepare_manual_compaction_envelope(
+            self,
+            session,
+            provider=provider,
+            context_window_tokens=context_window_tokens,
+            max_output_tokens=max_output_tokens,
+            context_window_known=context_window_known,
+            provider_request_max_chars=provider_request_max_chars,
+            workspace_dir=workspace_dir,
+            caller_tool_context=caller_tool_context,
+        )
+
     def _turn_config(self) -> Any:
         """Return live config with this turn's accepted routing values overlaid."""
 
@@ -6745,6 +6773,7 @@ class TurnRunner:
             )
 
             previous_deployment_identities: list[CompactionDeploymentIdentity] = []
+            compaction_session = None
             if self._session_manager is not None:
                 try:
                     compaction_session = await self._session_manager.get_session(session_key)
@@ -7021,6 +7050,16 @@ class TurnRunner:
                 )
             agent.config.compaction_execution_plan = compaction_plan
             agent.config.compaction_execution_plan_factory = _refresh_compaction_plan_for_operation
+            agent.config.compaction_trigger_ratio = self._preflight_compact_ratio()
+            from opensquilla.session.compaction import (
+                CompactionConfig,
+                effective_protected_recent_messages,
+            )
+
+            retained_tail_messages = effective_protected_recent_messages(CompactionConfig(
+                compaction_profile=agent.config.compaction_profile,
+                protected_recent_messages=agent.config.compaction_protected_recent_messages,
+            ))
             history_capacity_tokens = max(
                 1,
                 int(compaction_context_window_tokens),
@@ -7028,6 +7067,7 @@ class TurnRunner:
             history_capacity_chars = history_capacity_tokens * 4
             consumer_admission = None
             consumer_admission_fingerprint = ""
+            compaction_budget = None
             preflight_history_capacity = getattr(
                 agent,
                 "preflight_history_capacity",
@@ -7038,37 +7078,66 @@ class TurnRunner:
                 "build_compaction_consumer_admission",
                 None,
             )
+            resolve_budget = getattr(agent, "resolve_compaction_budget", None)
             if callable(preflight_history_capacity) and callable(build_consumer_admission):
-                (
-                    history_capacity_tokens,
-                    history_capacity_chars,
-                ) = preflight_history_capacity(
-                    active_user_message=effective_runtime_message,
-                    active_user_in_history=history_has_persisted_user,
-                    attachments=attachments,
-                    attachment_messages=extra_msgs,
-                    context_window_tokens=compaction_context_window_tokens,
-                    consumer_provider=durable_base_consumer_provider,
-                    consumer_max_output_tokens=(stable_consumer_max_output_tokens),
-                    consumer_model_id=stable_consumer_model_id,
-                    consumer_model_capabilities=stable_consumer_capabilities,
-                    consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
-                )
-                (
-                    consumer_admission,
-                    consumer_admission_fingerprint,
-                ) = build_consumer_admission(
-                    consumer_provider=durable_base_consumer_provider,
-                    active_user_message=effective_runtime_message,
-                    active_user_in_history=history_has_persisted_user,
-                    bound_user_message_id=bound_user_message_id,
-                    attachment_messages=extra_msgs,
-                    context_window_tokens=compaction_context_window_tokens,
-                    max_output_tokens=stable_consumer_max_output_tokens,
-                    consumer_model_id=stable_consumer_model_id,
-                    consumer_model_capabilities=stable_consumer_capabilities,
-                    consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
-                )
+                if callable(resolve_budget):
+                    compaction_budget = resolve_budget(
+                        consumer_provider=durable_base_consumer_provider,
+                        active_user_message=effective_runtime_message,
+                        active_user_in_history=history_has_persisted_user,
+                        bound_user_message_id=bound_user_message_id,
+                        attachment_messages=extra_msgs,
+                        context_window_tokens=compaction_context_window_tokens,
+                        max_output_tokens=stable_consumer_max_output_tokens,
+                        consumer_model_id=stable_consumer_model_id,
+                        consumer_model_capabilities=stable_consumer_capabilities,
+                        consumer_provider_request_max_chars=stable_consumer_proof_max_chars,
+                        consumer_deployment_fingerprint=named_auth_profile_fingerprint(
+                            getattr(compaction_session, "auth_profile_override", None),
+                        ),
+                        trigger_ratio=self._preflight_compact_ratio(),
+                        retained_tail_messages=retained_tail_messages,
+                        summary_output_tokens=(
+                            compaction_plan.primary.max_output_tokens if compaction_plan else 1024
+                        ),
+                    )
+                    history_capacity_tokens = compaction_budget.history_capacity_tokens
+                    history_capacity_chars = compaction_budget.history_capacity_chars
+                    consumer_admission = compaction_budget.consumer_admission
+                    consumer_admission_fingerprint = (
+                        compaction_budget.consumer_admission_fingerprint
+                    )
+                else:
+                    (
+                        history_capacity_tokens,
+                        history_capacity_chars,
+                    ) = preflight_history_capacity(
+                        active_user_message=effective_runtime_message,
+                        active_user_in_history=history_has_persisted_user,
+                        attachments=attachments,
+                        attachment_messages=extra_msgs,
+                        context_window_tokens=compaction_context_window_tokens,
+                        consumer_provider=durable_base_consumer_provider,
+                        consumer_max_output_tokens=(stable_consumer_max_output_tokens),
+                        consumer_model_id=stable_consumer_model_id,
+                        consumer_model_capabilities=stable_consumer_capabilities,
+                        consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
+                    )
+                    (
+                        consumer_admission,
+                        consumer_admission_fingerprint,
+                    ) = build_consumer_admission(
+                        consumer_provider=durable_base_consumer_provider,
+                        active_user_message=effective_runtime_message,
+                        active_user_in_history=history_has_persisted_user,
+                        bound_user_message_id=bound_user_message_id,
+                        attachment_messages=extra_msgs,
+                        context_window_tokens=compaction_context_window_tokens,
+                        max_output_tokens=stable_consumer_max_output_tokens,
+                        consumer_model_id=stable_consumer_model_id,
+                        consumer_model_capabilities=stable_consumer_capabilities,
+                        consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
+                    )
                 if turn.metadata.get("large_context_capacity_retry_pending") is True:
                     # A summary must fit both the durable session consumer and
                     # this turn's provisionally bound physical deployment.
@@ -7114,6 +7183,21 @@ class TurnRunner:
                     ).hexdigest()
                     history_capacity_tokens = min(history_capacity_tokens, routed_tokens)
                     history_capacity_chars = min(history_capacity_chars, routed_chars)
+                    if compaction_budget is not None:
+                        compaction_budget = replace(
+                            compaction_budget,
+                            history_capacity_tokens=history_capacity_tokens,
+                            history_capacity_chars=history_capacity_chars,
+                            auto_trigger_tokens=int(
+                                history_capacity_tokens * self._preflight_compact_ratio()
+                            ),
+                            auto_trigger_chars=int(
+                                history_capacity_chars * self._preflight_compact_ratio()
+                            ),
+                            retained_tail_tokens=history_capacity_tokens // 5,
+                            consumer_admission=consumer_admission,
+                            consumer_admission_fingerprint=consumer_admission_fingerprint,
+                        )
             else:
                 log.debug(
                     "compaction.consumer_admission_compatibility_fallback",
@@ -7171,6 +7255,7 @@ class TurnRunner:
                         compaction_model=compaction_model,
                         compaction_plan=compaction_plan,
                         compaction_request_context=compaction_request_context,
+                        compaction_budget=compaction_budget,
                         history_capacity_tokens=history_capacity_tokens,
                         history_capacity_chars=history_capacity_chars,
                         session_key=session_key,
@@ -8450,29 +8535,9 @@ class TurnRunner:
         else:
             transcript_message = f"Error: {append_error_ref(message, error_id)}"
         try:
-            if (
-                event_code == "current_turn_context_exhausted"
-                and expected_session_id is None
-                and expected_session_epoch is None
-            ):
-                compact = getattr(self._session_manager, "compact", None)
-                if callable(compact):
-                    budget = int(
-                        getattr(self._config, "context_budget_tokens", None)
-                        or getattr(self._config, "context_window_tokens", None)
-                        or 100_000
-                    )
-                    try:
-                        maybe_summary = compact(session_key, budget)
-                        if inspect.isawaitable(maybe_summary):
-                            await maybe_summary
-                    except Exception as exc:  # noqa: BLE001 - error append must still run
-                        log.warning(
-                            "turn_runner.error_compaction_failed",
-                            session_key=session_key,
-                            code=event_code,
-                            error=str(exc),
-                        )
+            # Error persistence never rewrites history. Context exhaustion is
+            # normalized to provider_request_too_large above; recovery belongs
+            # to the request owner or an explicit manual compaction.
             append_kwargs: dict[str, Any] = {
                 "role": "system",
                 "content": transcript_message,
@@ -12189,6 +12254,7 @@ class TurnRunner:
         compaction_model: str | None = None,
         compaction_plan: Any | None = None,
         compaction_request_context: Any | None = None,
+        compaction_budget: CompactionBudget | None = None,
         attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
@@ -12203,12 +12269,17 @@ class TurnRunner:
     ) -> None:
         """Compact proactively if session history exceeds token budget.
 
-        Called before _load_history(). Uses SessionManager.compact() directly
-        because no Agent state exists yet — the DB is the sole source of truth.
-        Safe to re-compact from DB at this point (no double-compaction risk).
+        Called before _load_history(). Uses the prepared consumer envelope and
+        SessionManager.compact_with_result() to summarize and atomically commit
+        the frozen durable transcript before the agent begins streaming.
         """
         if self._session_manager is None:
             return
+        if compaction_budget is not None:
+            history_capacity_tokens = compaction_budget.history_capacity_tokens
+            history_capacity_chars = compaction_budget.history_capacity_chars
+            consumer_admission = compaction_budget.consumer_admission
+            consumer_admission_fingerprint = compaction_budget.consumer_admission_fingerprint
         history_window_tokens = int(context_window_tokens)
         if history_capacity_tokens is not None:
             history_window_tokens = min(
@@ -12253,7 +12324,10 @@ class TurnRunner:
         )
 
         configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if compaction_provider is not None or compaction_model or configured_compaction is not None:
+        if (
+            compaction_provider is not None or compaction_model
+            or compaction_plan is not None or configured_compaction is not None
+        ):
             compaction_config = build_compaction_config_from_provider(
                 compaction_provider,
                 model_override=compaction_model,
@@ -12264,6 +12338,7 @@ class TurnRunner:
         else:
             compaction_config = CompactionConfig()
         compaction_config.request_context = compaction_request_context
+        compaction_config.budget = compaction_budget
         compaction_config.attachment_path_resolver = attachment_path_resolver
         if self.has_attempted_compaction_this_turn(session_key):
             log.info(
@@ -12332,10 +12407,21 @@ class TurnRunner:
         durable_history_tokens = checkpoint_tokens + sum(entry_tokens[:durable_prefix_end])
         durable_history_chars = checkpoint_chars + prefix_chars
         ratio = self._preflight_compact_ratio()
-        threshold = int(history_window_tokens * ratio)
+        threshold = (
+            compaction_budget.auto_trigger_tokens if compaction_budget is not None
+            else int(history_window_tokens * ratio)
+        )
         char_threshold = (
+            compaction_budget.auto_trigger_chars if compaction_budget is not None else
             int(int(history_capacity_chars) * ratio) if history_capacity_chars is not None else None
         )
+        if compaction_budget is not None and protected_suffix_count:
+            # The common budget covers the complete source, including a
+            # persisted current turn. Compare the removable prefix against
+            # the remaining threshold without reserving that tail twice.
+            threshold = max(0, threshold - sum(entry_tokens[durable_prefix_end:]))
+            if char_threshold is not None:
+                char_threshold = max(0, char_threshold - (replay_chars - prefix_chars))
         durable_token_pressure = durable_history_tokens > threshold
         durable_char_pressure = bool(
             char_threshold is not None and durable_history_chars > char_threshold

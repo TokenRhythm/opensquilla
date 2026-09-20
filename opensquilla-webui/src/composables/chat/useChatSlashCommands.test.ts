@@ -1,8 +1,9 @@
-import { nextTick, ref } from 'vue'
+import { nextTick, ref, watch } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 import i18n, { loadLocaleMessages } from '@/i18n'
 
 import { parseMetaCommandInvocation, useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
+import { useChatCompaction } from './useChatCompaction'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { RpcCallOptions } from '@/lib/rpc'
@@ -149,6 +150,64 @@ function harness(
     setCodingModeEnabled,
   }
 }
+
+describe('useChatSlashCommands compaction lifecycle', () => {
+  it('keeps a failed receipt terminal when a second manual compaction starts', async () => {
+    const sessionKey = ref('agent:main:webchat:test')
+    const compaction = useChatCompaction({
+      sessionKey,
+      schedulePendingDrainAfterTerminal: vi.fn(),
+      popAllPendingIntoComposer: vi.fn(() => true),
+    })
+    const receipts = new Map<string, string>()
+    const stop = watch(compaction.compactStatus, status => {
+      if (status.visible && status.compactionId) {
+        receipts.set(status.compactionId, status.status)
+      }
+    }, { flush: 'sync' })
+    try {
+      compaction.showCompactionToast({
+        key: sessionKey.value,
+        source: 'manual',
+        compaction_id: 'cmp-failed',
+        status: 'failed',
+      })
+      const { api, sessionMaintenance } = harness(false, [], Promise.resolve(), undefined, {
+        sessionKey,
+        setCompactInFlight: compaction.setCompactInFlight,
+        showCompactStatus: compaction.showCompactStatus,
+        showCompactionToast: compaction.showCompactionToast,
+      })
+      api.selectSlashCmd({ name: '/compact', cmd: '/compact', label: 'Compact', desc: '', aliases: [] })
+
+      expect(compaction.compactStatus.value).toMatchObject({
+        status: 'started',
+        compactionId: '',
+        source: 'manual',
+      })
+      expect(receipts.get('cmp-failed')).toBe('failed')
+
+      await Promise.resolve()
+      expect(sessionMaintenance.compact).toHaveBeenCalledWith({ key: sessionKey.value, wait: false })
+      expect(receipts).toEqual(new Map([
+        ['cmp-failed', 'failed'],
+        ['cmp-test', 'started'],
+      ]))
+      compaction.showCompactionToast({
+        key: sessionKey.value,
+        source: 'manual',
+        compaction_id: 'cmp-test',
+        status: 'completed',
+      })
+      expect(receipts.get('cmp-failed')).toBe('failed')
+      expect(receipts.get('cmp-test')).toBe('completed')
+      expect(compaction.isCompactInFlightForCurrentSession()).toBe(false)
+    } finally {
+      stop()
+      compaction.cleanup()
+    }
+  })
+})
 
 describe('useChatSlashCommands plan compatibility', () => {
   it('allows command completion with skill tags but blocks direct menu execution', async () => {

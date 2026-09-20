@@ -186,9 +186,8 @@ describe('ChatMessageList history anchors', () => {
       durability: 'durable',
       placement: 'transcript',
     })
-    expect(event?.textContent).toContain(
-      'Earlier context summarized; original messages remain available in history',
-    )
+    expect(event?.textContent).toBe('Context organizedjust now')
+    expect(event?.querySelector('details')).toBeNull()
     const events = host.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
     expect(events[1]?.textContent).toContain(
       'Earlier context summarized; some original messages are unavailable',
@@ -221,7 +220,8 @@ describe('ChatMessageList history anchors', () => {
     const app = createApp(ChatMessageList, {
       messages: [
         makeMessage('cmp-within', 'within_compaction_budget'),
-        makeMessage('cmp-vetoed', 'no_safe_turn_boundary'),
+        makeMessage('cmp-no-history', 'no_safe_turn_boundary'),
+        makeMessage('cmp-vetoed', 'non_history_envelope_exhausts_budget'),
       ],
       shareMode: false,
       selectedMessageIds: new Set<string>(),
@@ -245,6 +245,7 @@ describe('ChatMessageList history anchors', () => {
 
     const events = host.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
     expect(events[0]?.textContent).toContain('No organization needed; context has enough space')
-    expect(events[1]?.textContent).toContain('Context organization was not applied')
+    expect(events[1]?.textContent).toContain('There is currently no history that can be safely organized')
+    expect(events[2]?.textContent).toContain('Context organization was not applied')
   })
 })

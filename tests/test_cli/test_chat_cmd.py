@@ -635,6 +635,13 @@ class _FakeCompactionProvider:
     def model(self) -> str:
         return self._model
 
+    def project_final_request(self, messages, tools, config, *, message_limit=None):
+        from opensquilla.provider.openai import OpenAIProvider
+
+        return OpenAIProvider(
+            api_key=self._api_key, model=self._model, base_url=self._base_url,
+        ).project_final_request(messages, tools, config, message_limit=message_limit)
+
 
 class _FakeProviderSelector:
     def __init__(self, provider: _FakeCompactionProvider | None = None) -> None:
@@ -1337,8 +1344,11 @@ async def test_standalone_slash_compact_uses_selected_physical_deployment(monkey
     assert len(services.session_manager.compact_calls) == 1
     session_key, context_window, config = services.session_manager.compact_calls[0]
     assert session_key == "standalone:test"
-    assert context_window == 1234
     assert isinstance(config, CompactionConfig)
+    assert config.budget is not None
+    assert config.budget.physical_context_window_tokens == 200_000
+    assert context_window == config.budget.history_capacity_tokens
+    assert 1234 < context_window < 200_000
     assert config.api_key == "cli-provider-key"
     assert config.model == "provider/model"
     assert config.base_url == "https://openrouter.ai/api/v1"
@@ -1456,7 +1466,11 @@ async def test_standalone_slash_compact_keeps_legacy_compact_manager_compatible(
         timeout=7.25,
     )
 
-    assert services.session_manager.compact_calls == [("standalone:test", 1234, None)]
+    assert len(services.session_manager.compact_calls) == 1
+    session_key, history_capacity, config = services.session_manager.compact_calls[0]
+    assert session_key == "standalone:test"
+    assert 1234 < history_capacity < 200_000
+    assert config is None
 
 
 # ---------------------------------------------------------------------------
@@ -1959,14 +1973,33 @@ async def test_gateway_slash_compact_calls_session_rpc(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_gateway_slash_compact_skipped_uses_context_budget_wording(monkeypatch) -> None:
+@pytest.mark.parametrize(("status", "reason", "outcome"), [
+    (None, None, "compact skipped"),
+    ("skipped", "within_compaction_budget", "compact skipped"),
+    ("skipped", "no_compression_benefit", "compact skipped"),
+    (None, "no_compression_benefit", "compact skipped"),
+    ("skipped", "protected_tail_exhausts_compaction_window", "compact skipped"),
+    ("skipped", "stale_preimage", "compact skipped"),
+    ("failed", "summary_failed", "compact failed"),
+    ("failed", "quality_gate_failed", "compact failed"),
+    ("failed", "summary_does_not_fit", "compact failed"),
+    ("failed", "non_history_envelope_exhausts_budget", "compact failed"),
+    (None, "summary_failed", "compact failed"),
+    ("started", None, "compact in progress"),
+])
+async def test_gateway_slash_compact_reports_actual_unapplied_outcome(
+    monkeypatch, status, reason, outcome,
+) -> None:
     _FakeGatewayClient.instances.clear()
     monkeypatch.setattr("opensquilla.cli.gateway_client.GatewayClient", _FakeGatewayClient)
     fake = _FakeGatewayClient()
 
     async def compact_skipped(session_key: str) -> dict[str, object]:
         fake.compact_calls.append({"session_key": session_key})
-        return {"key": session_key, "compacted": False}
+        return {
+            "key": session_key, "compacted": False, "status": status, "reason": reason,
+            "compaction_id": "cmp_cli_outcome",
+        }
 
     fake.compact_session = compact_skipped
     state = ChatSessionState(session_key="agent:main:abc123", model="openai/test")
@@ -1982,8 +2015,19 @@ async def test_gateway_slash_compact_skipped_uses_context_budget_wording(monkeyp
     assert handled is True
     assert fake.compact_calls == [{"session_key": "agent:main:abc123"}]
     output = buffer.getvalue()
-    assert "compact skipped" in output
-    assert "already within context budget; no compact was applied" in output
+    assert outcome in output
+    assert "cmp_cli_outcome" in output
+    if reason == "within_compaction_budget":
+        assert "already within context budget; no compact was applied" in output
+    elif reason == "no_compression_benefit":
+        assert "context is already compact" in output
+        assert "compact failed" not in output
+    else:
+        assert "already within context budget" not in output
+        if reason:
+            assert reason in output
+    if outcome != "compact skipped":
+        assert "compact skipped" not in output
 
 
 @pytest.mark.asyncio

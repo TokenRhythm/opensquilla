@@ -3888,7 +3888,6 @@
     "thinkingForSeconds": "Razonando · {seconds} s",
     "thoughtForSeconds": "Razonó durante {seconds} s",
     "thoughtForMinutes": "Razonó durante {minutes} min {seconds} s",
-    "activityTechnicalDetails": "Detalles técnicos",
     "toolResult": "Resultado de la herramienta",
     "subagentPrefix": "Subagente: ",
     "subagentCompletion": "Finalización del subagente",
@@ -4035,6 +4034,7 @@
       "lifecycle": {
         "working": "En curso",
         "answering": "Redactando la respuesta",
+        "preparingToolCall": "Preparando llamada a herramienta",
         "answerPrepared": "Preparación de la respuesta",
         "settled": "Completado",
         "interrupted": "Interrumpido",
@@ -4084,6 +4084,7 @@
       "more": "{count} más",
       "stale": "Sigue trabajando — sin señal reciente",
       "liveStep": "paso {n}",
+      "phaseElapsed": "Paso actual: {duration}",
       "recordIncomplete": "El registro de actividad está incompleto; se muestra la vista de historial compatible."
     },
     "suggestedTasks": "Tareas sugeridas",
@@ -4516,6 +4517,14 @@
       "launchFailed": "La cadena de herramientas se instaló, pero no se pudo iniciar la MetaSkill."
     },
     "compact": {
+      "failureIntegrity": "El resumen no superó la comprobación de integridad",
+      "failureCapacity": "El resumen supera la capacidad de contexto del modelo actual",
+      "failureUnavailable": "El modelo de resumen no está disponible",
+      "failureProvider": "El modelo no pudo generar un resumen utilizable",
+      "failureTimeout": "La organización del contexto agotó el tiempo de espera",
+      "failureRejectedDetail": "El resumen no se aplicó; el contexto original se conserva. Inténtalo de nuevo o copia el identificador de diagnóstico si vuelve a fallar.",
+      "failureUnavailableDetail": "Comprueba la configuración del modelo y la conexión y vuelve a intentarlo. Puedes copiar el identificador de diagnóstico.",
+      "failureRetryDetail": "Puedes volver a organizar el contexto. Si vuelve a fallar, copia el identificador de diagnóstico.",
       "compacting": "Compactando el contexto",
       "compacted": "Contexto compactado",
       "temporarilyReduced": "Historial reducido temporalmente; continuando",
@@ -4525,6 +4534,8 @@
       "historySummarized": "Contexto anterior resumido",
       "failed": "Error al compactar",
       "withinBudget": "Contexto dentro del presupuesto.",
+      "noSafeHistory": "Actualmente no hay historial que se pueda resumir de forma segura",
+      "alreadyConcise": "El contexto actual ya es suficientemente conciso",
       "skipped": "No se aplicó la compactación del contexto.",
       "cancelled": "Compactación cancelada",
       "requestScoped": "Solo para esta solicitud; no se reescribió el historial de la sesión"

@@ -648,6 +648,13 @@ class _FakeCompactionProvider:
     def model(self) -> str:
         return self._model
 
+    def project_final_request(self, messages, tools, config, *, message_limit=None):
+        from opensquilla.provider.openai import OpenAIProvider
+
+        return OpenAIProvider(
+            api_key=self._api_key, model=self._model, base_url=self._base_url,
+        ).project_final_request(messages, tools, config, message_limit=message_limit)
+
 
 class _FakeSelectorClone:
     def __init__(self, provider: _FakeCompactionProvider) -> None:
@@ -7676,6 +7683,7 @@ class TestSessionsContextCompact:
     async def test_context_compact_summarizes_instead_of_truncating(
         self, dispatcher, ctx_with_sessions, session
     ):
+        ctx_with_sessions.provider_selector = _FakeProviderSelector()
         res = await dispatcher.dispatch(
             "r1",
             "sessions.contextCompact",
@@ -7753,8 +7761,12 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert res.payload["context_window_tokens"] == 4096
-        assert manager.compact_calls[0][:2] == (session.session_key, 4096)
+        _, history_capacity, compaction_config = manager.compact_calls[0]
+        assert compaction_config.budget.physical_context_window_tokens == 4096
+        assert history_capacity == compaction_config.budget.history_capacity_tokens
+        assert 0 < history_capacity < 4096 - 512
+        assert res.payload["context_window_tokens"] == history_capacity
+        assert manager.compact_calls[0][0] == session.session_key
         compact_kwargs = manager.compact_kwargs[0]
         assert compact_kwargs["context_window_chars"] > 0
         assert callable(compact_kwargs["consumer_admission"])
@@ -7884,11 +7896,11 @@ class TestSessionsContextCompact:
 
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "cancelled",
+            "failed",
         ]
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
-            "cancelled",
+            "failed",
         ]
         assert manager.compact_calls == []
 
@@ -7943,7 +7955,7 @@ class TestSessionsContextCompact:
         ]
         assert [payload["status"] for payload in compaction_events] == [
             "started",
-            "cancelled",
+            "failed",
         ]
         assert {payload["compaction_id"] for payload in compaction_events} == {
             compaction_id
@@ -8031,9 +8043,9 @@ class TestSessionsContextCompact:
             ]
             assert [payload["status"] for payload in operation_events] == [
                 "started",
-                "cancelled",
+                "failed",
             ]
-            assert [payload["status"] for payload in terminal_events] == ["cancelled"]
+            assert [payload["status"] for payload in terminal_events] == ["failed"]
             assert manager.started.is_set() is False
             assert manager.compact_calls == []
 
@@ -8046,7 +8058,7 @@ class TestSessionsContextCompact:
                 and event.payload.get("status")
                 in {"completed", "skipped", "failed", "cancelled", "timed_out"}
             ]
-            assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+            assert [payload["status"] for payload in replayed_terminals] == ["failed"]
         finally:
             release_started_broadcast.set()
             manager.release.set()
@@ -8222,8 +8234,8 @@ class TestSessionsContextCompact:
             and event.payload.get("status")
             in {"completed", "skipped", "failed", "cancelled", "timed_out"}
         ]
-        assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
-        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "cancelled"
+        assert [payload["status"] for payload in replayed_terminals] == ["failed"]
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "failed"
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_failed_when_summary_is_empty(
@@ -8355,11 +8367,11 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert res.payload["status"] == "stale"
+        assert res.payload["status"] == "skipped"
         assert res.payload["reason"] == stale_reason
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "stale",
+            "skipped",
         ]
 
     @pytest.mark.asyncio
@@ -8401,7 +8413,7 @@ class TestSessionsContextCompact:
         assert res.error.code == "COMPACTION_TIMEOUT"
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "timed_out",
+            "failed",
         ]
 
     @pytest.mark.asyncio
@@ -8471,10 +8483,11 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert ctx.session_manager.compact_calls[0][:2] == (
-            session.session_key,
-            ctx.config.context_budget_tokens,
-        )
+        compact_key, history_capacity, compaction_config = ctx.session_manager.compact_calls[0]
+        assert compact_key == session.session_key
+        assert history_capacity == compaction_config.budget.history_capacity_tokens
+        # This scope-only fixture has no provider proof; capacity remains zero.
+        assert history_capacity == 0
 
     @pytest.mark.asyncio
     async def test_context_compact_passes_provider_config(self, dispatcher):

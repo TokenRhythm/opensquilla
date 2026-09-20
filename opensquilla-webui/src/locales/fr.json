@@ -3888,7 +3888,6 @@
     "thinkingForSeconds": "Réflexion · {seconds} s",
     "thoughtForSeconds": "A réfléchi pendant {seconds} s",
     "thoughtForMinutes": "A réfléchi pendant {minutes} min {seconds} s",
-    "activityTechnicalDetails": "Détails techniques",
     "toolResult": "Résultat de l'outil",
     "subagentPrefix": "Sous-agent : ",
     "subagentCompletion": "Achèvement du sous-agent",
@@ -4035,6 +4034,7 @@
       "lifecycle": {
         "working": "En cours",
         "answering": "Rédaction de la réponse",
+        "preparingToolCall": "Préparation de l’appel d’outil",
         "answerPrepared": "Préparation de la réponse",
         "settled": "Terminé",
         "interrupted": "Interrompu",
@@ -4084,6 +4084,7 @@
       "more": "{count} de plus",
       "stale": "Toujours en cours — aucun signal récent",
       "liveStep": "étape {n}",
+      "phaseElapsed": "Étape actuelle : {duration}",
       "recordIncomplete": "L’historique d’activité est incomplet ; affichage de la vue compatible."
     },
     "suggestedTasks": "Tâches suggérées",
@@ -4516,6 +4517,14 @@
       "launchFailed": "La chaîne d’outils est installée, mais la MetaSkill n’a pas pu démarrer."
     },
     "compact": {
+      "failureIntegrity": "Le résumé n’a pas passé le contrôle d’intégralité",
+      "failureCapacity": "Le résumé dépasse la capacité de contexte du modèle actuel",
+      "failureUnavailable": "Le modèle de résumé est indisponible",
+      "failureProvider": "Le modèle n’a pas pu générer de résumé utilisable",
+      "failureTimeout": "L’organisation du contexte a dépassé le délai",
+      "failureRejectedDetail": "Le résumé n’a pas été appliqué ; votre contexte initial est conservé. Réessayez ou copiez l’identifiant de diagnostic si l’échec se répète.",
+      "failureUnavailableDetail": "Vérifiez la configuration du modèle et la connexion, puis réessayez. Vous pouvez copier l’identifiant de diagnostic.",
+      "failureRetryDetail": "Vous pouvez relancer l’organisation du contexte. En cas de nouvel échec, copiez l’identifiant de diagnostic.",
       "compacting": "Compactage du contexte",
       "compacted": "Contexte compacté",
       "temporarilyReduced": "Historique temporairement réduit ; traitement en cours",
@@ -4525,6 +4534,8 @@
       "historySummarized": "Contexte antérieur résumé",
       "failed": "Échec du compactage",
       "withinBudget": "Contexte dans les limites du budget.",
+      "noSafeHistory": "Aucun historique ne peut actuellement être résumé en toute sécurité",
+      "alreadyConcise": "Le contexte actuel est déjà suffisamment concis",
       "skipped": "Le compactage du contexte n’a pas été appliqué.",
       "cancelled": "Compactage annulé",
       "requestScoped": "Limité à cette requête ; l’historique de session n’a pas été réécrit"

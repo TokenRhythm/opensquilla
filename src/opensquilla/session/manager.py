@@ -635,6 +635,7 @@ def _frozen_compaction_prefix_hash(
     custom_instructions: str | None,
     config: CompactionConfig,
     consumer_admission_fingerprint: str = "",
+    force: bool = False,
 ) -> str:
     """Hash the frozen source plus output- and persistence-affecting settings."""
 
@@ -660,6 +661,19 @@ def _frozen_compaction_prefix_hash(
         "compaction_profile": config.compaction_profile,
         "protected_recent_messages": config.protected_recent_messages,
         "consumer_admission_fingerprint": consumer_admission_fingerprint,
+        "force": force,
+        "retained_tail_tokens": (
+            config.budget.retained_tail_tokens if config.budget is not None else None
+        ),
+        "retained_tail_messages": (
+            config.budget.retained_tail_messages if config.budget is not None else None
+        ),
+        "auto_trigger_tokens": (
+            config.budget.auto_trigger_tokens if config.budget is not None else None
+        ),
+        "auto_trigger_chars": (
+            config.budget.auto_trigger_chars if config.budget is not None else None
+        ),
         "prompt_layout": compaction_prompt_layout(),
         "request_context": (
             {
@@ -3324,6 +3338,12 @@ class SessionManager:
         # callers may reuse a config object, so isolate it before arming; a
         # concurrent waiter must never reset the owner's deadline or call cap.
         effective_config = replace(config) if config is not None else CompactionConfig()
+        if effective_config.budget is not None:
+            budget = effective_config.budget
+            context_window_tokens = budget.history_capacity_tokens
+            context_window_chars = budget.history_capacity_chars
+            consumer_admission = budget.consumer_admission
+            consumer_admission_fingerprint = budget.consumer_admission_fingerprint
         if effective_config.request_context is not None:
             effective_config.request_context = deepcopy(effective_config.request_context)
         persisted_compaction_id = compaction_id or new_compaction_id()
@@ -3423,6 +3443,7 @@ class SessionManager:
                 custom_instructions=custom_instructions,
                 config=effective_config,
                 consumer_admission_fingerprint=consumer_admission_fingerprint,
+                force=trigger_reason == "manual",
             ),
             target_fingerprint=_compaction_target_fingerprint(effective_config),
         )
@@ -3510,6 +3531,7 @@ class SessionManager:
                 summary_replay_renderer=_durable_summary_replay,
                 consumer_admission=consumer_admission,
                 provider_request_correlation=provider_request_correlation,
+                force=trigger_reason == "manual",
             )
         )
 
@@ -4065,12 +4087,22 @@ class SessionManager:
             context_states=[*prior_states, candidate_state],
             summaries=[*prior_summaries, summary_record],
         )
-        expected_replay = [render_structured_summary(context_state.payload)]
-        if not replaces_prior_context:
-            expected_replay.extend(record.text for record in prior_records)
-        if not compaction_replay_is_complete(
-            expected_replay,
-            format_compaction_summary_context([record.text for record in candidate_records]),
+        expected_replay = [] if replaces_prior_context else [
+            record.text for record in prior_records
+        ]
+        expected_replay.append(render_structured_summary(context_state.payload))
+        candidate_replay = [record.text for record in candidate_records]
+        # The selector orders structured states before legacy summary fallbacks;
+        # mixed storage therefore need not be an append-only textual order.
+        # Verify every expected body first, then validate the exact wrapper in
+        # that authoritative order. Whitespace/identical duplicates normalize
+        # exactly as replay does; missing or unexpected checkpoints still fail.
+        if (
+            {text.strip() for text in candidate_replay if text.strip()}
+            != {text.strip() for text in expected_replay if text.strip()}
+            or not compaction_replay_is_complete(
+                candidate_replay, format_compaction_summary_context(candidate_replay),
+            )
         ):
             _log.warning(
                 "persist_compaction.invalid_summary_not_persisted",

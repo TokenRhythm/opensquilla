@@ -6,6 +6,7 @@ import {
   type UseChatPendingQueueOptions,
 } from './useChatPendingQueue'
 import { useChatAttachments } from './useChatAttachments'
+import { useChatCompaction } from './useChatCompaction'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
@@ -97,6 +98,33 @@ function pendingUiId(
   expect(id).toBeTruthy()
   return id!
 }
+
+describe('manual compaction with the real pending composer queue', () => {
+  it.each(['summary_replay_incomplete', 'summary_does_not_fit', 'cancelled', 'compaction_deadline_exceeded', 'gateway_restarted'])(
+    'returns queued drafts to the composer after %s without sending them', async reason => {
+      let compact: ReturnType<typeof useChatCompaction> | undefined
+      const h = makeQueue(undefined, () => compact?.isCompactInFlightForCurrentSession() ?? false)
+      compact = useChatCompaction({
+        sessionKey: h.sessionKey,
+        schedulePendingDrainAfterTerminal: h.queue.schedulePendingDrainAfterTerminal,
+        popAllPendingIntoComposer: h.queue.popAllPendingIntoComposer,
+      })
+      try {
+        compact.showCompactionToast({ source: 'manual', status: 'started', compaction_id: 'cmp-draft' })
+        h.inputText.value = 'Queued follow-up'
+        expect(await h.queue.enqueuePendingInput(h.inputText.value)).toBe(true)
+        h.inputText.value = 'Still editing'
+        expect(h.queue.pendingQueue.value).toHaveLength(1)
+        compact.showCompactionToast({ source: 'manual', status: 'failed', reason, compaction_id: 'cmp-draft' })
+        await nextTick()
+        expect(compact.isCompactInFlightForCurrentSession()).toBe(false)
+        await vi.waitFor(() => expect(h.queue.pendingQueue.value).toEqual([]))
+        expect(h.inputText.value).toBe('Still editing\nQueued follow-up')
+        expect(h.sendCurrentInput).not.toHaveBeenCalled()
+      } finally { compact.cleanup(); h.queue.cleanup() }
+    },
+  )
+})
 
 function memoryWal(initial: PendingInputWalRecord[] = []) {
   const records = new Map(initial.map(record => [record.pendingInputId, record]))

@@ -3973,7 +3973,6 @@
     "thinkingForSeconds": "Thinking · {seconds}s",
     "thoughtForSeconds": "Thought for {seconds}s",
     "thoughtForMinutes": "Thought for {minutes}m {seconds}s",
-    "activityTechnicalDetails": "Technical details",
     "toolResult": "Tool Result",
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent completion",
@@ -4120,6 +4119,7 @@
       "lifecycle": {
         "working": "Working",
         "answering": "Writing the answer",
+        "preparingToolCall": "Preparing tool call",
         "answerPrepared": "Answer composition",
         "settled": "Completed",
         "interrupted": "Interrupted",
@@ -4169,6 +4169,7 @@
       "more": "{count} more",
       "stale": "Still working — no recent signal",
       "liveStep": "step {n}",
+      "phaseElapsed": "Current step {duration}",
       "recordIncomplete": "Activity record incomplete; showing the compatible history view."
     },
     "suggestedTasks": "Suggested tasks",
@@ -4601,6 +4602,14 @@
       "launchFailed": "The toolchain was installed, but the MetaSkill could not be started."
     },
     "compact": {
+      "failureIntegrity": "The summary did not pass the completeness check",
+      "failureCapacity": "The summary does not fit the current model's context",
+      "failureUnavailable": "The summarization model is unavailable",
+      "failureProvider": "The model could not generate a usable summary",
+      "failureTimeout": "Context organization timed out",
+      "failureRejectedDetail": "The summary was not applied; your original context is preserved. Retry, or copy the diagnostic ID for troubleshooting if it fails again.",
+      "failureUnavailableDetail": "Check the model configuration and connection, then retry. You can copy the diagnostic ID for troubleshooting.",
+      "failureRetryDetail": "You can retry context organization. If it fails again, copy the diagnostic ID for troubleshooting.",
       "compacting": "Organizing context…",
       "compacted": "Context organized",
       "temporarilyReduced": "History temporarily reduced; continuing",
@@ -4610,6 +4619,8 @@
       "historySummarized": "Earlier context summarized",
       "failed": "Context organization failed",
       "withinBudget": "No organization needed; context has enough space",
+      "noSafeHistory": "There is currently no history that can be safely organized",
+      "alreadyConcise": "The current context is already concise",
       "skipped": "Context organization was not applied",
       "cancelled": "Context organization cancelled",
       "requestScoped": "Request-scoped; session history was not rewritten"

@@ -117,10 +117,10 @@ describe('AssistantActivityTimeline', () => {
     const events = root.querySelectorAll<HTMLElement>('[data-testid="compaction-event"]')
     expect(events).toHaveLength(2)
     expect(events[0]?.textContent).toContain('History temporarily reduced; continuing')
-    expect(events[0]?.textContent).not.toContain('Summary saved')
+    expect(events[0]?.textContent).not.toContain('Context organized')
     expect(events[0]?.dataset.status).toBe('completed')
     expect(events[0]?.dataset.durability).toBe('request_scoped')
-    expect(events[1]?.textContent).toContain('Summary saved')
+    expect(events[1]?.textContent).toContain('Context organized')
     expect(root.querySelector('.assistant-activity-status__row--current')).toBeNull()
   })
 

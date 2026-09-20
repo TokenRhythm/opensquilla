@@ -3888,7 +3888,6 @@
     "thinkingForSeconds": "Denkt nach · {seconds}s",
     "thoughtForSeconds": "{seconds}s nachgedacht",
     "thoughtForMinutes": "{minutes}min {seconds}s nachgedacht",
-    "activityTechnicalDetails": "Technische Details",
     "toolResult": "Werkzeugergebnis",
     "subagentPrefix": "Subagent: ",
     "subagentCompletion": "Subagent-Abschluss",
@@ -4035,6 +4034,7 @@
       "lifecycle": {
         "working": "In Arbeit",
         "answering": "Antwort wird verfasst",
+        "preparingToolCall": "Werkzeugaufruf wird vorbereitet",
         "answerPrepared": "Antwortformulierung",
         "settled": "Abgeschlossen",
         "interrupted": "Unterbrochen",
@@ -4084,6 +4084,7 @@
       "more": "{count} weitere",
       "stale": "Arbeitet weiter — kein aktuelles Signal",
       "liveStep": "Schritt {n}",
+      "phaseElapsed": "Aktueller Schritt: {duration}",
       "recordIncomplete": "Aktivitätsprotokoll unvollständig; kompatible Verlaufsansicht wird angezeigt."
     },
     "suggestedTasks": "Vorgeschlagene Aufgaben",
@@ -4516,6 +4517,14 @@
       "launchFailed": "Die Toolchain wurde installiert, der Meta-Skill konnte jedoch nicht gestartet werden."
     },
     "compact": {
+      "failureIntegrity": "Die Zusammenfassung hat die Vollständigkeitsprüfung nicht bestanden",
+      "failureCapacity": "Die Zusammenfassung überschreitet das Kontextlimit des aktuellen Modells",
+      "failureUnavailable": "Das Modell für die Zusammenfassung ist nicht verfügbar",
+      "failureProvider": "Das Modell konnte keine verwendbare Zusammenfassung erstellen",
+      "failureTimeout": "Die Kontextorganisation hat das Zeitlimit überschritten",
+      "failureRejectedDetail": "Die Zusammenfassung wurde nicht angewendet; der ursprüngliche Kontext bleibt erhalten. Versuchen Sie es erneut oder kopieren Sie bei erneutem Fehler die Diagnose-ID.",
+      "failureUnavailableDetail": "Prüfen Sie die Modellkonfiguration und Verbindung und versuchen Sie es erneut. Sie können die Diagnose-ID zur Fehleranalyse kopieren.",
+      "failureRetryDetail": "Sie können die Kontextorganisation erneut starten. Kopieren Sie bei erneutem Fehler die Diagnose-ID zur Fehleranalyse.",
       "compacting": "Kontext wird verdichtet",
       "compacted": "Kontext verdichtet",
       "temporarilyReduced": "Verlauf vorübergehend gekürzt; Verarbeitung wird fortgesetzt",
@@ -4525,6 +4534,8 @@
       "historySummarized": "Früherer Kontext zusammengefasst",
       "failed": "Verdichtung fehlgeschlagen",
       "withinBudget": "Kontext innerhalb des Budgets.",
+      "noSafeHistory": "Derzeit gibt es keinen Verlauf, der sicher zusammengefasst werden kann",
+      "alreadyConcise": "Der aktuelle Kontext ist bereits ausreichend kompakt",
       "skipped": "Die Kontextverdichtung wurde nicht angewendet.",
       "cancelled": "Verdichtung abgebrochen",
       "requestScoped": "Nur für diese Anfrage; der Sitzungsverlauf wurde nicht neu geschrieben"

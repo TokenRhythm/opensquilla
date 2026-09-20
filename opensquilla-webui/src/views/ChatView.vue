@@ -337,6 +337,7 @@
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
               :elapsed-label="streamTurnElapsed"
+              :phase-elapsed-label="liveActivityElapsedLabel"
               :stale="streamActivityStale"
             >
               <UnifiedAssistantActivityTimeline
@@ -426,7 +427,7 @@
               />
             </div>
             <span
-              v-if="liveAnswerPart && !streamActivityStale"
+              v-if="liveAnswerPart && !streamActivityStale && liveCurrentPhaseCode === 'chat.activity.lifecycle.answering'"
               class="stream-caret"
               aria-hidden="true"
             />
@@ -2157,6 +2158,7 @@ const {
   hideCompactStatus,
   showCompactStatus,
   showCompactionToast,
+  handleStreamGenerationChange: handleCompactionStreamGenerationChange,
   cleanup: cleanupCompaction,
 } = chatCompaction
 isCompactInFlightForCurrentSession = chatCompaction.isCompactInFlightForCurrentSession
@@ -2797,6 +2799,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
+  onStreamGenerationReset: chatCompaction.handleGatewayRestart,
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
   onReadStarted: () => {
     conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
@@ -2868,6 +2871,9 @@ const {
   streamGeneration,
   observeStreamGeneration,
 } = chatSessionSubscription
+watch(streamGeneration, (generation, previousGeneration) => {
+  handleCompactionStreamGenerationChange(generation, previousGeneration)
+}, { flush: 'sync' })
 applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
@@ -4284,8 +4290,21 @@ const liveActivityProjection = computed(() =>
     })
   },
 )
+const liveCurrentActivityTool = computed(() => liveActivityProjection.value.activityClusters.find(
+  cluster => cluster.key === liveActivityProjection.value.currentClusterKey,
+))
 const liveActivityPhaseLabel = computed(() => {
-  return String(t('chat.activity.lifecycle.working'))
+  if (runStatus.value.status === 'queued') return String(t('chat.status.queued'))
+  if (runStatus.value.status === 'approval_pending') return String(t('chat.status.approvalPending'))
+  const currentPhase = [...liveActivityProjection.value.statusSteps].reverse()
+    .find(step => step.isCurrent)
+  const label = liveCurrentActivityTool.value?.purpose || currentPhase?.label
+  return label ? String(t(label.code, label.params)) : String(t('chat.activity.lifecycle.working'))
+})
+const liveActivityElapsedLabel = computed(() => {
+  if (streamActivityStale.value || ['queued', 'approval_pending'].includes(runStatus.value.status)) return ''
+  const runningCall = liveCurrentActivityTool.value?.calls.find(call => call.isRunning)
+  return runningCall ? liveToolElapsedText(runningCall) : streamPhaseElapsed.value
 })
 const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.statusSteps]
   .reverse()

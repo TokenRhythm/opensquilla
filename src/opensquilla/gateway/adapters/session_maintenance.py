@@ -49,7 +49,7 @@ from opensquilla.engine.cache_break_monitor import (
 from opensquilla.engine.usage_accounting import bind_usage_accounting_scope
 from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
-    build_gateway_consumer_admission,
+    build_gateway_compaction_budget,
     effective_session_model,
     limit_gateway_consumer_budget,
     resolve_gateway_compaction_target,
@@ -78,6 +78,7 @@ from opensquilla.session.compaction import (
     await_compaction_phase,
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
+    effective_protected_recent_messages,
 )
 from opensquilla.session.compaction_lifecycle import (
     COMPACTION_CHUNK_SUMMARIZED_EVENT,
@@ -91,6 +92,7 @@ from opensquilla.session.compaction_lifecycle import (
 )
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.models import SessionNode
+from opensquilla.tools.types import CallerKind, ToolContext
 
 log = structlog.get_logger(__name__)
 
@@ -178,20 +180,6 @@ class GatewaySessionMaintenancePorts(
             heartbeat_interval_seconds=max(0.1, heartbeat),
         )
 
-    def default_context_window_tokens(self) -> int:
-        raw = getattr(self._context.config, "context_budget_tokens", 100_000)
-        if isinstance(raw, bool):
-            raise ValueError("contextWindowTokens must be a positive integer")
-        try:
-            value = int(raw)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "contextWindowTokens must be a positive integer"
-            ) from exc
-        if value <= 0:
-            raise ValueError("contextWindowTokens must be a positive integer")
-        return value
-
     async def load_session(self, session_key: str) -> SessionCompactionSession | None:
         if self._manager is None:
             raise SessionCompactionUnavailableError
@@ -248,25 +236,27 @@ class GatewaySessionMaintenancePorts(
     def _consumer_budget(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> GatewayConsumerBudget:
         raw_session = session.runtime_value if session is not None else None
-        return limit_gateway_consumer_budget(
-            resolve_gateway_consumer_budget(self._context, raw_session),
-            requested_tokens,
+        budget = resolve_gateway_consumer_budget(self._context, raw_session)
+        return (
+            limit_gateway_consumer_budget(budget, requested_tokens)
+            if requested_tokens is not None
+            else budget
         )
 
     def resolve_context_window_tokens(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> int:
         return self._consumer_budget(session, requested_tokens).context_window_tokens
 
     def build_plan(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
         compaction_id: str,
         operation_deadline: float,
     ) -> SessionCompactionPlan:
@@ -283,10 +273,49 @@ class GatewaySessionMaintenancePorts(
             ),
             compaction_plan=target.plan,
         )
-        config.deadline_at_monotonic = operation_deadline
-        arm_compaction_deadline(config, operation_id=compaction_id)
         session_id = session.session_id if session is not None else None
         workspace_dir = self._attachment_workspace_dirs.get(session_id or "")
+        prepare_envelope = getattr(
+            self._context.turn_runner, "prepare_manual_compaction_envelope", None,
+        )
+        consumer_agent = None
+        if callable(prepare_envelope) and raw_session is not None and budget.provider is not None:
+            consumer_agent = prepare_envelope(
+                raw_session,
+                provider=budget.provider,
+                context_window_tokens=(
+                    budget.physical_context_window_tokens or budget.context_window_tokens
+                ),
+                max_output_tokens=budget.max_output_tokens,
+                context_window_known=budget.context_window_known,
+                provider_request_max_chars=budget.provider_request_max_chars,
+                workspace_dir=str(workspace_dir) if workspace_dir else None,
+                caller_tool_context=ToolContext(
+                    is_owner=self._context.principal.is_owner,
+                    caller_kind=CallerKind.WEB,
+                    session_key=str(getattr(raw_session, "session_key", "")),
+                    agent_id=session.agent_id if session else "main",
+                    workspace_dir=str(workspace_dir) if workspace_dir else None,
+                    collaboration_mode=str(
+                        getattr(raw_session, "collaboration_mode", "default"),
+                    ),
+                    collaboration_revision=int(
+                        getattr(raw_session, "collaboration_revision", 0),
+                    ),
+                    active_plan_revision_id=getattr(
+                        raw_session, "active_plan_revision_id", None,
+                    ),
+                ),
+            )
+        config.budget = build_gateway_compaction_budget(
+            budget,
+            consumer_agent=consumer_agent,
+            trigger_ratio=float(getattr(self._context.config, "preflight_compact_ratio", 0.85)),
+            retained_tail_messages=effective_protected_recent_messages(config),
+            summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 1024),
+        )
+        config.deadline_at_monotonic = operation_deadline
+        arm_compaction_deadline(config, operation_id=compaction_id)
         if (
             workspace_dir is not None and session_id
             and getattr(
@@ -320,7 +349,7 @@ class GatewaySessionMaintenancePorts(
             compaction_correlation=compaction_correlation,
         )
         return SessionCompactionPlan(
-            context_window_tokens=budget.context_window_tokens,
+            context_window_tokens=config.budget.history_capacity_tokens,
             runtime_value=runtime,
         )
 
@@ -352,14 +381,19 @@ class GatewaySessionMaintenancePorts(
                 "compaction_id": runtime.config.operation_id,
                 "trigger_reason": "manual",
                 "provider_request_correlation": runtime.compaction_correlation,
-                "context_window_chars": runtime.budget.provider_request_max_chars,
+                "context_window_chars": (
+                    runtime.config.budget.history_capacity_chars
+                    if runtime.config.budget else runtime.budget.provider_request_max_chars
+                ),
             }
             for name, value in optional.items():
                 if value is not None and _accepts_keyword_arg(compact_with_result, name):
                     kwargs[name] = value
-            consumer_admission, consumer_admission_fingerprint = (
-                build_gateway_consumer_admission(runtime.budget)
+            consumer_budget = runtime.config.budget or build_gateway_compaction_budget(
+                runtime.budget,
             )
+            consumer_admission = consumer_budget.consumer_admission
+            consumer_admission_fingerprint = consumer_budget.consumer_admission_fingerprint
             if _accepts_keyword_arg(compact_with_result, "consumer_admission"):
                 kwargs["consumer_admission"] = consumer_admission
             if _accepts_keyword_arg(

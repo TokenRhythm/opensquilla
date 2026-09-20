@@ -13,10 +13,13 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from rich.markup import escape
+
 from opensquilla.cli.chat.session_state import ChatSessionState, messages_to_markdown
 from opensquilla.cli.chat.turn import TurnResult
 from opensquilla.cli.tui.backend.contracts import TuiOutputHandle
 from opensquilla.cli.ui import ACCENT
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.engine.commands import DEFAULT_REGISTRY, Surface
 
 
@@ -97,6 +100,36 @@ def compact_skipped_line() -> str:
     )
 
 
+def compact_unapplied_line(
+    *, status: str | None = None, reason: str | None = None,
+    compaction_id: str | None = None,
+) -> str:
+    """Keep failed summaries distinct from benign no-op results on both CLIs."""
+    cause = str(reason or "").strip()
+    outcome = str(status or "").strip().lower()
+    if not outcome:
+        outcome = compaction_failure_status(cause) if cause else "skipped"
+    if outcome in {"started", "observed"}:
+        line = f"[{ACCENT}]compact in progress[/]"
+    elif outcome in {"skipped", "stale"}:
+        detail = (
+            "context is already compact; replacement would not reduce its size"
+            if cause == "no_compression_benefit"
+            else escape(cause or "no compact was applied")
+        )
+        line = (
+            compact_skipped_line()
+            if cause in {"within_budget", "within_compaction_budget"}
+            else f"[{ACCENT}]compact skipped[/] [dim]{detail}[/dim]"
+        )
+    else:
+        detail = cause or outcome or "compaction did not complete"
+        line = f"[red]compact failed[/] [dim]{escape(detail)}[/dim]"
+    if compaction_id:
+        line += f" [dim]({escape(str(compaction_id))})[/dim]"
+    return line
+
+
 def default_transcript_path(session_key: str) -> Path:
     suffix = session_key.replace(":", "-")
     return Path(f"opensquilla-chat-{suffix}.md")
@@ -149,6 +182,7 @@ def transcript_messages_to_markdown(messages: Iterable[Any]) -> str:
 
 __all__ = [
     "compact_skipped_line",
+    "compact_unapplied_line",
     "compact_success_line",
     "compact_summary_stats",
     "compact_token_stats",

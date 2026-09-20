@@ -265,7 +265,41 @@ class _FailingTurnCompactionMarker:
 
 
 def _cfg(policy: ContextOverflowPolicy, budget: int = 20) -> GatewayConfig:
-    return GatewayConfig(context_overflow_policy=policy, context_budget_tokens=budget)
+    return GatewayConfig(context_overflow_policy=policy, llm={"context_window_tokens": budget})
+
+
+@pytest.mark.asyncio
+async def test_default_budget_uses_configured_provider_model_catalog(monkeypatch) -> None:
+    class Catalog:
+        def resolve_context_window(self, model_id, provider=""):
+            assert (model_id, provider) == ("current-model", "openai")
+            return 500_000
+
+    monkeypatch.setattr(context_overflow, "shared_catalog", lambda: Catalog())
+    config = GatewayConfig(
+        context_budget_tokens=1,
+        llm={"provider": "openai", "model": "current-model"},
+    )
+    outcome = await apply_context_overflow_policy(
+        config=config, message="hello", transcript=[], session_key="catalog-budget",
+    )
+    assert outcome.budget_tokens == 500_000
+    assert not outcome.over_budget
+
+
+@pytest.mark.asyncio
+async def test_explicit_overflow_budget_override_bypasses_catalog(monkeypatch) -> None:
+    def unexpected_catalog():
+        raise AssertionError("explicit overflow budget must remain authoritative")
+
+    monkeypatch.setattr(context_overflow, "shared_catalog", unexpected_catalog)
+    outcome = await apply_context_overflow_policy(
+        config=GatewayConfig(context_overflow_policy=ContextOverflowPolicy.REFUSE),
+        message="hello" * 100, transcript=[], session_key="explicit-budget",
+        budget_override=5,
+    )
+    assert outcome.budget_tokens == 5
+    assert outcome.over_budget
 
 
 def _history(n_entries: int, chars_per_entry: int) -> list[_FakeEntry]:
@@ -350,7 +384,7 @@ async def test_gateway_context_overflow_counts_tool_call_arguments() -> None:
 
     assert outcome.over_budget is True
     assert outcome.refusal is not None
-    assert outcome.estimated_tokens > cfg.context_budget_tokens
+    assert outcome.estimated_tokens > outcome.budget_tokens
 
 
 @pytest.mark.asyncio
@@ -373,7 +407,7 @@ async def test_gateway_context_overflow_counts_reasoning_content() -> None:
 
     assert outcome.over_budget is True
     assert outcome.refusal is not None
-    assert outcome.estimated_tokens > cfg.context_budget_tokens
+    assert outcome.estimated_tokens > outcome.budget_tokens
 
 
 @pytest.mark.asyncio

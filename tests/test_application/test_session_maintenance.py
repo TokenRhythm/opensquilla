@@ -56,6 +56,7 @@ class _Ports:
         )
         self.execution_error: BaseException | None = None
         self.cancel_observed_broadcast = False
+        self.cancel_completed_prepare = False
         self.executor_gate: asyncio.Event | None = None
         self.background_task: asyncio.Task[object] | None = None
 
@@ -64,9 +65,6 @@ class _Ports:
             total_timeout_seconds=5.0,
             heartbeat_interval_seconds=10.0,
         )
-
-    def default_context_window_tokens(self) -> int:
-        return 100_000
 
     async def load_session(self, session_key: str) -> SessionCompactionSession | None:
         self.calls.append(f"session.load:{session_key}")
@@ -78,15 +76,15 @@ class _Ports:
     def resolve_context_window_tokens(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> int:
         self.calls.append("budget.resolve")
-        return min(requested_tokens, 8_192)
+        return min(requested_tokens, 8_192) if requested_tokens is not None else 8_192
 
     def build_plan(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
         compaction_id: str,
         operation_deadline: float,
     ) -> SessionCompactionPlan:
@@ -110,6 +108,9 @@ class _Ports:
 
     async def prepare(self, event: SessionCompactionEvent) -> object:
         self.calls.append(f"event.prepare:{event.status}")
+        if self.cancel_completed_prepare and event.status == "completed":
+            self.cancel_completed_prepare = False
+            raise asyncio.CancelledError
         return event
 
     def claim_and_buffer(
@@ -200,7 +201,9 @@ async def test_timeout_claims_one_terminal_result() -> None:
         await _application(ports).compact(CompactSession("agent:main:webchat:one"))
 
     assert raised.value.phase == "summarizing"
-    assert [event.status for event in ports.events if event.terminal] == ["timed_out"]
+    assert [event.status for event in ports.events if event.terminal] == ["failed"]
+    assert ports.events[-1].reason == "compaction_deadline_exceeded"
+    assert {event.compaction_id for event in ports.events} == {"compact-1"}
 
 
 async def test_cancel_after_commit_reconciles_exactly_one_completed_terminal() -> None:
@@ -238,6 +241,22 @@ async def test_background_owner_is_registered_before_started_event() -> None:
     assert [event.status for event in ports.events if event.terminal] == ["completed"]
 
 
+async def test_cancel_during_completed_preparation_preserves_durable_terminal() -> None:
+    ports = _Ports()
+    ports.cancel_completed_prepare = True
+
+    with pytest.raises(asyncio.CancelledError):
+        await _application(ports).compact(CompactSession("agent:main:webchat:one"))
+
+    terminals = [event for event in ports.events if event.terminal]
+    assert len(terminals) == 1
+    assert terminals[0].status == "completed"
+    assert terminals[0].cancellation_reconciled is True
+    assert terminals[0].result is not None
+    assert terminals[0].result.applied is True
+    assert {event.compaction_id for event in ports.events} == {"compact-1"}
+
+
 async def test_invalid_compaction_budget_never_loads_session() -> None:
     ports = _Ports()
 
@@ -253,13 +272,15 @@ async def test_invalid_compaction_budget_never_loads_session() -> None:
     ("reason", "status"),
     [
         ("within_compaction_budget", "skipped"),
+        ("no_compression_benefit", "skipped"),
         ("no_safe_turn_boundary", "skipped"),
-        ("stale_preimage", "stale"),
-        ("stale_context_state", "stale"),
-        ("consumer_admission_stale", "stale"),
+        ("stale_preimage", "skipped"),
+        ("stale_context_state", "skipped"),
+        ("consumer_admission_stale", "skipped"),
         ("consumer_admission_failed", "failed"),
         ("summary_target_unavailable", "failed"),
         ("coverage_blocked", "failed"),
+        ("quality_gate_failed", "failed"),
         ("summary_replay_incomplete", "failed"),
         ("invalid_source_boundary", "failed"),
         (None, "failed"),
@@ -281,3 +302,33 @@ async def test_manual_compaction_classifies_unapplied_candidates(reason, status)
     assert len(terminal) == 1
     assert terminal[0].status == status
     assert terminal[0].reason == result.reason
+    assert {event.compaction_id for event in ports.events} == {result.compaction_id}
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_cancel_before_commit_closes_same_manual_operation(background: bool) -> None:
+    ports = _Ports()
+    ports.executor_gate = asyncio.Event()
+    application = _application(ports)
+    if background:
+        result = await application.compact(
+            CompactSession("agent:main:webchat:one", wait=False),
+        )
+        task = ports.background_task
+        assert result.compaction_id == "compact-1"
+        assert task is not None
+    else:
+        task = asyncio.create_task(application.compact(
+            CompactSession("agent:main:webchat:one"),
+        ))
+        while not ports.events:
+            await asyncio.sleep(0)
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert {event.compaction_id for event in ports.events} == {"compact-1"}
+    terminals = [event for event in ports.events if event.terminal]
+    assert len(terminals) == 1
+    assert terminals[0].status == "failed"
+    assert terminals[0].reason == "cancelled"

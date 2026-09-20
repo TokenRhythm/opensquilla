@@ -473,6 +473,18 @@ describe('useChatStream render coalescing', () => {
     api.cleanup()
   })
 
+  it('keeps one preparation clock while tool argument progress clears a stale warning', () => {
+    const { api } = makeStream()
+    api.recordActivityPhase('Preparing tool call')
+    vi.advanceTimersByTime(21_000)
+    expect(api.streamActivityStale.value).toBe(true)
+    api.recordActivityPhase('Preparing tool call')
+    expect(api.streamActivityStale.value).toBe(false)
+    expect(api.streamPhaseElapsed.value).toBe('21s')
+    expect(api.foldedTurn.value.toolCalls).toEqual([])
+    api.cleanup()
+  })
+
   it('does not parse the growing answer in the production reducer path', () => {
     const { api, renderMarkdown } = makeStream()
     for (let index = 0; index < 2_048; index += 1) api.appendDelta('x')
