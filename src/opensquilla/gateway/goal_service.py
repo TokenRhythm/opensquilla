@@ -24,6 +24,7 @@ from opensquilla.gateway.routing import (
 )
 from opensquilla.gateway.session_lifecycle import TaskLifecycleEvent
 from opensquilla.gateway.turn_ingress import complete_durable_ingress
+from opensquilla.gateway.user_input_broker import connection_supports_user_input
 from opensquilla.sandbox.run_mode_policy import principal_has_host_execute
 from opensquilla.session.goals import (
     ExpectedGoal,
@@ -88,6 +89,7 @@ class GoalExecutionLease:
     output_surface: str
     continuity_token: str = ""
     principal: Any = None
+    structured_user_input: bool = False
 
 
 @dataclass(slots=True)
@@ -282,6 +284,7 @@ class GoalService:
             output_surface=f"{source_kind}:{ctx.conn_id}",
             continuity_token=continuity_token or secrets.token_urlsafe(32),
             principal=ctx.principal,
+            structured_user_input=connection_supports_user_input(ctx.conn_id),
         )
         self._empty_automatic_turns.pop(goal.goal_id, None)
         self._leases[goal.session_key] = lease
@@ -592,6 +595,7 @@ class GoalService:
                 principal_is_owner=bool(getattr(principal, "is_owner", False)),
                 principal_host_execute=principal_has_host_execute(principal),
             )
+            envelope.metadata["structured_user_input"] = lease.structured_user_input
         else:
             envelope = build_web_route_envelope(
                 session_key=goal.session_key,
@@ -829,6 +833,7 @@ class GoalService:
             source_kind=source_kind,
             agent_id=str(getattr(session, "agent_id", "main") or "main"),
             output_surface=f"{source_kind}:{ctx.conn_id}",
+            structured_user_input=connection_supports_user_input(ctx.conn_id),
         )
         envelope = self._route_for(
             lease=provisional,

@@ -25,6 +25,7 @@ from opensquilla.contracts.attachments import (
     normalize_attachment_mime,
 )
 from opensquilla.contracts.image_validation import validate_image_bytes
+from opensquilla.paths import native_io_path
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._@+=, -]+")
 _WHITESPACE = re.compile(r"\s+")
@@ -129,7 +130,7 @@ class AttachmentWorkspaceMaterializer:
     def _current_usage_bytes(self) -> int:
         if self._usage_bytes is None:
             total = 0
-            root = self._attachments_root()
+            root = native_io_path(self._attachments_root())
             if root.is_dir():
                 for path in root.rglob("*"):
                     try:
@@ -334,7 +335,7 @@ class AttachmentWorkspaceMaterializer:
         _assert_relative_to(target.resolve(strict=False), root)
         if self._authorize_write is not None:
             self._authorize_write(target)
-        target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        native_io_path(target_dir).mkdir(parents=True, exist_ok=True, mode=0o700)
         return target
 
     def _write_or_reuse(
@@ -345,12 +346,13 @@ class AttachmentWorkspaceMaterializer:
         sha: str,
         size: int,
     ) -> None:
-        if target.is_symlink():
+        io_target = native_io_path(target)
+        if io_target.is_symlink():
             raise AttachmentWorkspaceConflictError("immutable attachment conflicts with a symlink")
-        if target.exists():
-            if not target.is_file():
+        if io_target.exists():
+            if not io_target.is_file():
                 raise AttachmentWorkspaceConflictError("immutable attachment is not a regular file")
-            existing = target.read_bytes()
+            existing = io_target.read_bytes()
             if len(existing) == size and hashlib.sha256(existing).hexdigest() == sha:
                 return
             raise AttachmentWorkspaceConflictError(
@@ -365,7 +367,7 @@ class AttachmentWorkspaceMaterializer:
                     "delete finished sessions or raise "
                     "attachments.workspace_attachment_disk_budget_bytes"
                 )
-        tmp_path = target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp")
+        tmp_path = native_io_path(target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp"))
         try:
             with open(tmp_path, "wb") as handle:
                 handle.write(payload)
@@ -375,11 +377,11 @@ class AttachmentWorkspaceMaterializer:
             # Publish without replacing a file that appeared during materialization.
             # Hard links are atomic on the supported local filesystems (including NTFS).
             try:
-                os.link(tmp_path, target)
+                os.link(tmp_path, io_target)
             except FileExistsError:
-                if target.is_symlink() or not target.is_file():
+                if io_target.is_symlink() or not io_target.is_file():
                     raise AttachmentWorkspaceConflictError("immutable attachment target conflict")
-                existing = target.read_bytes()
+                existing = io_target.read_bytes()
                 if len(existing) != size or hashlib.sha256(existing).hexdigest() != sha:
                     raise AttachmentWorkspaceConflictError(
                         "immutable attachment content conflict; existing file was preserved"
@@ -389,8 +391,10 @@ class AttachmentWorkspaceMaterializer:
                 tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
-        _assert_relative_to(target.resolve(strict=True), self._workspace_root.resolve())
-        written = target.read_bytes()
+        _assert_relative_to(
+            io_target.resolve(strict=True), native_io_path(self._workspace_root).resolve(),
+        )
+        written = io_target.read_bytes()
         if len(written) != size or hashlib.sha256(written).hexdigest() != sha:
             raise ValueError("workspace material hash mismatch")
         if self._usage_bytes is not None:

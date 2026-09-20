@@ -4126,16 +4126,7 @@ def _build_session_read_application(
     async def read_pending_inputs(
         session_key: str,
     ) -> Sequence[Mapping[str, Any]]:
-        getter = getattr(
-            getattr(ctx, "task_runtime", None),
-            "pending_user_inputs",
-            None,
-        )
-        if not callable(getter):
-            return ()
-        candidate = getter(session_key)
-        result = await candidate if inspect.isawaitable(candidate) else candidate
-        return cast(Sequence[Mapping[str, Any]], result)
+        return await _read_pending_user_inputs(ctx, session_key)
 
     async def read_routing(session_key: str) -> Mapping[str, Any]:
         return await _resolve_session_routing_snapshot(ctx, session_key)
@@ -5585,6 +5576,17 @@ _handle_plans_capabilities_contract = register_plans_capabilities_contract(
 )
 
 
+async def _read_pending_user_inputs(
+    ctx: RpcContext, session_key: str,
+) -> Sequence[Mapping[str, Any]]:
+    getter = getattr(getattr(ctx, "task_runtime", None), "pending_user_inputs", None)
+    if not callable(getter):
+        return ()
+    candidate = getter(session_key)
+    result = await candidate if inspect.isawaitable(candidate) else candidate
+    return cast(Sequence[Mapping[str, Any]], result)
+
+
 @_d.method("sessions.bootstrap", scope="operator.read")
 async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> dict:
     """Return the canonical startup snapshot for an interactive session client.
@@ -5697,6 +5699,7 @@ async def _handle_sessions_bootstrap(params: dict | None, ctx: RpcContext) -> di
         "updated_at": session.updated_at,
         "display_name": getattr(session, "display_name", None),
         "queue_mode": getattr(session, "queue_mode", None),
+        "pendingUserInputs": list(await _read_pending_user_inputs(ctx, session_key)),
         **_derive_source_metadata(session),
     }
     if not guest_safe:

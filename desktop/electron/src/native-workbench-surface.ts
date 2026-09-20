@@ -234,6 +234,34 @@ const NATIVE_WORKBENCH_ANNOTATION_HIGHLIGHT_CONFIG = Object.freeze({
   marginColor: { r: 25, g: 118, b: 255, a: 0.08 },
 })
 
+// Chromium may select generated content or a node inside a component rather
+// than a document element. Keep the retained selection on a real document
+// element so its locator and subsequent geometry reads refer to the same node.
+const NATIVE_WORKBENCH_ANNOTATION_NORMALIZE_FUNCTION = `function () {
+  if (window.top !== window) return null
+  let selected = this
+  for (let depth = 0; depth < 128; depth++) {
+    if (typeof CSSPseudoElement !== 'undefined' && selected instanceof CSSPseudoElement) {
+      selected = selected.element
+      continue
+    }
+    if (!(selected instanceof Node) || !selected.isConnected || selected.ownerDocument !== document) return null
+    if (selected instanceof Element) {
+      if (selected.localName.startsWith('::')) {
+        selected = selected.parentElement
+        continue
+      }
+      const root = selected.getRootNode()
+      if (root === document) return selected
+      if (!(root instanceof ShadowRoot)) return null
+      selected = root.host
+      continue
+    }
+    selected = selected instanceof ShadowRoot ? selected.host : selected.parentElement
+  }
+  return null
+}`
+
 // Inspect the selected node in an isolated world; page content remains untrusted context.
 const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
   const selected = this
@@ -248,7 +276,7 @@ const NATIVE_WORKBENCH_ANNOTATION_INSPECT_FUNCTION = `function () {
   const locatorHint = segments.join(' > ')
   const rect = selected.getBoundingClientRect()
   const viewport = window.visualViewport
-  return { ok: true, tagName: selected.localName, elementPath: locatorHint, locatorHint,
+  return { ok: true, tagName: selected.localName.toLowerCase(), elementPath: locatorHint, locatorHint,
     selectionText: (selected.innerText || selected.textContent || '').slice(0,4096),
     rect: {x:rect.x,y:rect.y,width:rect.width,height:rect.height},
     viewportWidth: viewport ? viewport.width : window.innerWidth,
@@ -2228,9 +2256,27 @@ export class NativeWorkbenchSurfaceManager {
         executionContextId: world.executionContextId,
         objectGroup,
       }) as { object?: { objectId?: unknown } }
-      const objectId = resolved.object?.objectId
-      if (typeof objectId !== 'string' || objectId.length === 0) {
+      const selectedObjectId = resolved.object?.objectId
+      if (typeof selectedObjectId !== 'string' || selectedObjectId.length === 0) {
         throw new Error('The selected preview node is unavailable.')
+      }
+      const normalized = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
+        objectId: selectedObjectId,
+        objectGroup,
+        functionDeclaration: NATIVE_WORKBENCH_ANNOTATION_NORMALIZE_FUNCTION,
+        returnByValue: false,
+        silent: true,
+      }) as {
+        exceptionDetails?: unknown
+        result?: { objectId?: unknown }
+      }
+      const objectId = normalized.result?.objectId
+      if (
+        normalized.exceptionDetails
+        || typeof objectId !== 'string'
+        || objectId.length === 0
+      ) {
+        throw new Error('The selected preview node has no document element.')
       }
       const inspected = await this.cdpCommand(record, 'Runtime.callFunctionOn', {
         objectId,
@@ -2306,11 +2352,10 @@ export class NativeWorkbenchSurfaceManager {
         action: 'annotation-picker',
         reason: errorMessage(error).slice(0, 200),
       })
-      // Chromium inspect mode is one-shot: even an unsupported node (for
-      // example a page-wide CSS pseudo-element) consumes searchForNode before
-      // the isolated inspector can reject it. Keep the user's annotation
-      // intent alive by installing a fresh picker, fenced to this exact
-      // surface generation. A concurrent Stop, navigation, hide, or replace
+      // Chromium inspect mode is one-shot: even a stale or unsupported node
+      // consumes searchForNode before the isolated inspector can reject it.
+      // Keep the user's annotation intent alive by installing a fresh picker,
+      // fenced to this exact surface generation. A concurrent Stop, navigation, hide, or replace
       // advances the epoch and prevents this recovery from reactivating it.
       const rearmEpoch = ++record.annotationPickerEpoch
       const rearmed = await this.armAnnotationPicker(record, rearmEpoch, generation, null)

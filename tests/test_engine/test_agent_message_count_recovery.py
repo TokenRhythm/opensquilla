@@ -1234,7 +1234,9 @@ async def test_failed_summary_blocks_other_compaction_entries_until_turn_closes(
         ])
     before = [message.model_copy(deep=True) for message in messages]
     agent._current_turn_message = "continue the synthetic task"
-    chat_config = ChatConfig(max_tokens=4096)
+    chat_config = agent._provider_admission_chat_config(
+        agent._current_turn_message, context_window_tokens=64_000, max_output_tokens=4096,
+    )
     runtime_context = Message(role="user", content="Synthetic runtime context")
     projection = agent._project_provider_request_message_count(
         messages, config=chat_config, request_context_message=None,

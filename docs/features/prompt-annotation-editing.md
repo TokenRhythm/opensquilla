@@ -2,8 +2,14 @@
 
 HTML previews support selecting a region and adding a request to the normal chat
 composer. The request includes a page reference, an optional document reference,
-and a short selection description. A captured preview image uses the same upload
-and attachment pipeline as a reference image added by the user.
+and a short selection description. Selecting an element does not capture or
+attach a screenshot. Users can add a reference image through the normal chat
+attachment controls when visual context helps. Restored annotation drafts ignore
+automatic screenshots saved by older clients.
+
+Empty annotations remain editable and do not block sending text, attachments,
+or completed annotations. Only annotations with instructions are included in a
+send; an empty annotation alone does not create a message.
 
 Annotations do not change the Agent's tool permissions, history, workspace,
 skills, routing, or iteration policy. The shared Agent decides whether to read

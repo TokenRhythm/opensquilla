@@ -27,6 +27,7 @@ from opensquilla.application.session_reset import (
     SessionResetStorePort,
     SessionResetUnavailableError,
 )
+from opensquilla.engine.cache_break_monitor import cancel_active_compactions
 from opensquilla.engine.steps.router_decision_record import (
     drain_pending_flushes_for_sessions,
 )
@@ -41,6 +42,7 @@ from opensquilla.gateway.session_services import (
     get_session_storage,
     set_session_epoch,
 )
+from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.gateway.subagent_announce import quiesce_background_completion_sessions
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.models import SessionIntent
@@ -117,6 +119,15 @@ class GatewaySessionResetPorts(
 
     @asynccontextmanager
     async def quiesce(self, session_key: str) -> AsyncIterator[None]:
+        compactions = cancel_active_compactions(session_key)
+        if compactions:
+            _done, pending = await asyncio.wait(
+                compactions, timeout=_RESET_RUNTIME_CANCEL_DRAIN_SECONDS,
+            )
+            if pending:
+                raise self._session_reset_busy(
+                    session_key, "compaction_drain", TimeoutError("compaction is still stopping"),
+                )
         task_runtime = getattr(self._context, "task_runtime", None)
         if task_runtime is not None:
             try:
@@ -302,6 +313,7 @@ class GatewaySessionResetPorts(
 
     def update_cache(self, session_key: str, epoch: int) -> None:
         set_session_epoch(self._manager, session_key, epoch)
+        get_session_streams().advance_session_epoch(session_key, epoch)
 
     async def publish(self, session_key: str, epoch: int) -> None:
         try:

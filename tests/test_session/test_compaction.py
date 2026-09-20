@@ -4,11 +4,13 @@ import asyncio
 import base64
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from opensquilla.attachment_workspace import AttachmentWorkspaceMaterializer
+from opensquilla.paths import native_io_path
 from opensquilla.provider.types import ProviderRequestCorrelation
 from opensquilla.session.attachment_manifest import (
     extract_attachment_occurrences_from_envelope,
@@ -26,10 +28,12 @@ from opensquilla.session.compaction import (
     compact_context,
     compaction_remaining_seconds,
     compaction_replay_summary,
+    effective_protected_recent_messages,
     estimate_entries_model_replay_chars,
     estimate_entry_model_replay_tokens,
     estimate_entry_replay_tokens,
 )
+from opensquilla.session.compaction_budget import CompactionBudget
 from opensquilla.session.compaction_lifecycle import (
     CompactionTimeoutError,
     compaction_effect_payload,
@@ -416,7 +420,7 @@ async def test_compaction_preserves_only_verified_readable_image_paths(
         assert len(paths) == 1
         path = paths[0]
         assert path.startswith(f".opensquilla/attachments/{session_id}/")
-        assert (workspace / path).read_bytes() == payload
+        assert native_io_path(workspace / path).read_bytes() == payload
         assert path in compaction_replay_summary(result)
         if use_llm:
             assert path in received[0]
@@ -482,7 +486,7 @@ async def test_compaction_keeps_original_document_path_when_images_are_not_retai
     assert len(paths) == 1
     path = paths[0]
     assert path.startswith(".opensquilla/attachments/file-session/")
-    assert (workspace / path).read_bytes() == payload
+    assert native_io_path(workspace / path).read_bytes() == payload
     assert path in seen[0]
     assert path in compaction_replay_summary(result)
     assert not list(workspace.rglob("*.png"))
@@ -571,7 +575,7 @@ async def test_compaction_preserves_verified_tool_image_path(
         assert len(paths) == 1
         path = paths[0]
         assert path.startswith(".opensquilla/attachments/tool-image-session/")
-        assert (workspace / path).read_bytes() == payload
+        assert native_io_path(workspace / path).read_bytes() == payload
         second = await compact_context(CompactionRequest(
             session_id="tool-image-session",
             entries=[*first.kept_entries,
@@ -657,7 +661,7 @@ async def test_repeated_compaction_preserves_image_path_without_active_image_env
     assert second.summary_payload is not None
     assert path in [item["path"] for item in second.summary_payload["files_and_artifacts"]]
     assert path in compaction_replay_summary(second)
-    assert (workspace / path).read_bytes() == payload
+    assert native_io_path(workspace / path).read_bytes() == payload
 
 
 @pytest.mark.asyncio
@@ -921,6 +925,111 @@ async def test_no_compaction_needed_small_context():
 
 
 @pytest.mark.asyncio
+async def test_manual_compaction_below_threshold_preserves_protected_tail_and_reduces_context():
+    entries = _make_entries(12, tokens_each=250)
+    config = synthetic_compaction_config(protected_recent_messages=2)
+    assert config.llm_plan is not None
+    provider = config.llm_plan.primary.provider
+    automatic = await compact_context(CompactionRequest(
+        session_id="low-pressure", entries=entries, context_window_tokens=100_000,
+        config=config,
+    ))
+    assert automatic.skip_reason == "within_compaction_budget"
+    assert provider.calls == []
+
+    manual = await compact_context(CompactionRequest(
+        session_id="low-pressure", entries=entries, context_window_tokens=100_000,
+        config=config, force=True,
+    ))
+    assert provider.calls
+    assert manual.removed_count > 0
+    assert manual.kept_start_index == manual.removed_count
+    assert manual.kept_entries == entries[manual.removed_count:]
+    assert manual.kept_entries[-2:] == entries[-2:]
+    assert manual.tokens_after < manual.tokens_before
+    assert manual.quality_report["protected_tail_preserved"] is True
+    assert manual.quality_report["passes_structural_gate"] is True
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_without_safe_range_never_calls_model():
+    entries = _make_entries(2, tokens_each=250)
+    config = synthetic_compaction_config(protected_recent_messages=2)
+    assert config.llm_plan is not None
+    provider = config.llm_plan.primary.provider
+    result = await compact_context(CompactionRequest(
+        session_id="protected-only", entries=entries, context_window_tokens=100_000,
+        config=config, force=True,
+    ))
+    assert provider.calls == []
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.skip_reason == "protected_tail_exhausts_compaction_window"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pressure", ["tokens", "chars", "none"])
+async def test_shared_budget_controls_automatic_trigger_and_preserves_retained_tail(pressure):
+    entries = _make_entries(12, tokens_each=250)
+    budget = CompactionBudget(
+        physical_context_window_tokens=128_000, generation_reserve_tokens=8_000,
+        history_capacity_tokens=100_000, history_capacity_chars=400_000,
+        auto_trigger_tokens=0 if pressure == "tokens" else 100_000,
+        auto_trigger_chars=0 if pressure == "chars" else 400_000,
+        retained_tail_tokens=1, retained_tail_messages=4,
+        summary_output_tokens=4096, provider_request_max_chars=480_000,
+        consumer_admission_fingerprint="synthetic-proof",
+        consumer_admission=lambda summary, kept: True,
+    )
+    # Legacy safety_margin would trigger in all cases; the shared budget owns
+    # the trigger when present. Its smaller tail cannot reduce profile safety.
+    config = synthetic_compaction_config(
+        budget=budget, safety_margin=100, protected_recent_messages=2,
+    )
+    assert effective_protected_recent_messages(replace(
+        config, protected_recent_messages=0, compaction_profile="coding",
+    )) == 12
+    assert config.llm_plan is not None
+    provider = config.llm_plan.primary.provider
+    result = await compact_context(CompactionRequest(
+        session_id="shared-budget", entries=entries, config=config,
+        context_window_tokens=budget.history_capacity_tokens,
+        context_window_chars=budget.history_capacity_chars,
+    ))
+    if pressure == "none":
+        assert provider.calls == []
+        assert result.skip_reason == "within_compaction_budget"
+    else:
+        assert provider.calls
+        assert result.removed_count == 8
+        assert result.kept_entries == entries[-4:]
+        assert result.quality_report["protected_tail_preserved"] is True
+        assert result.quality_report["passes_structural_gate"] is True
+        assert result.quality_report["pressure_released"] is False
+    assert result.quality_report["history_capacity_tokens"] == 100_000
+    assert result.quality_report["auto_trigger_tokens"] == budget.auto_trigger_tokens
+    assert "consumer_admission" not in result.quality_report
+    assert "consumer_admission_fingerprint" not in result.quality_report
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tokens,chars", [(0, 10_000), (10_000, 0)])
+async def test_exhausted_history_capacity_never_calls_model_even_when_forced(tokens, chars):
+    entries = _make_entries(12, tokens_each=250)
+    config = synthetic_compaction_config(protected_recent_messages=2)
+    assert config.llm_plan is not None
+    provider = config.llm_plan.primary.provider
+    result = await compact_context(CompactionRequest(
+        session_id="exhausted-budget", entries=entries, context_window_tokens=tokens,
+        context_window_chars=chars, config=config, force=True,
+    ))
+    assert provider.calls == []
+    assert result.removed_count == 0
+    assert result.kept_entries == entries
+    assert result.skip_reason == "non_history_envelope_exhausts_budget"
+
+
+@pytest.mark.asyncio
 async def test_message_count_compaction_uses_exact_forced_prefix_within_token_budget(
     monkeypatch,
 ):
@@ -1082,7 +1191,7 @@ async def test_token_trigger_still_rejects_forced_summary_that_does_not_reduce_t
     assert result.removed_count == 0
     assert result.kept_start_index == 0
     assert result.kept_entries == entries
-    assert result.skip_reason == "quality_gate_failed"
+    assert result.skip_reason == "no_compression_benefit"
     assert result.quality_report["fits_context_window"] is True
     assert result.quality_report["passes_structural_gate"] is False
 

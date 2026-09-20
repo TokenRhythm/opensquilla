@@ -540,7 +540,6 @@ describe('ArtifactDocumentPanel', () => {
         annotationId: 'annotation-1',
         body: 'Initial draft',
         reason: 'overlay-crashed',
-        screenshotUrl: 'blob:frozen-preview',
       },
       onWorkbenchEvent,
     })
@@ -549,7 +548,7 @@ describe('ArtifactDocumentPanel', () => {
     const dialog = mounted.element.querySelector('[role="dialog"]')
     const input = dialog?.querySelector<HTMLTextAreaElement>('textarea')
     expect(dialog?.textContent).toContain('Continue annotation')
-    expect(dialog?.querySelector<HTMLImageElement>('img')?.src).toContain('blob:frozen-preview')
+    expect(dialog?.querySelector('img')).toBeNull()
     expect(input?.value).toBe('Initial draft')
     expect(dialog?.textContent).toContain('Shift + Enter for a new line')
     if (input) {
@@ -603,7 +602,6 @@ describe('ArtifactDocumentPanel', () => {
         annotationId: 'annotation-mac',
         body: '',
         reason: 'overlay-crashed',
-        screenshotUrl: '',
       },
     })
     await nextTick()

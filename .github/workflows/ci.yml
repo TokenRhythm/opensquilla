@@ -1241,14 +1241,19 @@ jobs:
               tests/test_gateway/test_channel_turn_ingress.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
+              tests/test_gateway/test_task_runtime_wait_slots.py
               tests/test_gateway/test_goal_turn_authority.py
               tests/test_gateway/test_task_progress_projection.py
               tests/functional/test_gateway_silent_reply_process_e2e.py
             )
           elif [[ "${{ matrix.shard }}" == "recovery-migration" ]]; then
-            regression_args+=(tests/test_sandbox/test_windows_shell_process_runtime.py)
+            regression_args+=(
+              tests/test_sandbox/test_windows_shell_process_runtime.py
+              tests/test_live_long_task_case_driver.py
+            )
           elif [[ "${{ matrix.shard }}" == "core" ]]; then
             regression_args+=(
+              tests/test_cli/test_chat_cmd.py
               tests/test_engine/test_cancelled_turn_segments.py
               tests/test_tools/test_shell_workdir.py
               tests/test_sandbox/test_shell_code_network_hints.py
@@ -1518,14 +1523,19 @@ jobs:
               tests/test_gateway/test_channel_turn_ingress.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
+              tests/test_gateway/test_task_runtime_wait_slots.py
               tests/test_gateway/test_goal_turn_authority.py
               tests/test_gateway/test_task_progress_projection.py
               tests/functional/test_gateway_silent_reply_process_e2e.py
             )
           elif [[ "${family}" == "recovery-migration" ]]; then
-            regression_args+=(tests/test_sandbox/test_windows_shell_process_runtime.py)
+            regression_args+=(
+              tests/test_sandbox/test_windows_shell_process_runtime.py
+              tests/test_live_long_task_case_driver.py
+            )
           elif [[ "${family}" == "core" ]]; then
             regression_args+=(
+              tests/test_cli/test_chat_cmd.py
               tests/test_ci/test_windows_signatures.py
               tests/test_tools/test_shell_process_isolation.py
               tests/test_engine/test_cancelled_turn_segments.py

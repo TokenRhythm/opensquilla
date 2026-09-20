@@ -9,9 +9,33 @@ active-session continuity tool.
 
 ## What Compaction Does
 
-When session history approaches the configured context budget, OpenSquilla can
+When session history approaches the current model's available input capacity, OpenSquilla can
 compact older transcript entries into a durable summary and keep the recent
 tail active.
+
+Manual and automatic compaction share the same budget resolver, recent-tail
+policy, summary output limit, request-fit checks, and durable commit gate.
+The budget accounts for the physical provider/model deployment, generation,
+system instructions, tools, and the active request and attachments. Idle manual
+compaction includes known instructions and tools and reserves space for the
+next request; that request is checked again when it arrives.
+
+Automatic preflight uses `preflight_compact_ratio` (default `0.85`) against the
+available history capacity. Manual compaction bypasses this trigger and can
+compact useful older history even below it. It still skips when there is no
+safe, useful range, and never bypasses request-fit or persistence checks.
+
+`context_budget_tokens` is deprecated and ignored. Existing configurations
+still load and produce one migration warning per process when this field is
+explicitly present. Remove the field; capacity is derived from the model and
+request envelope. The `contextWindowTokens` manual RPC argument remains an
+optional history-capacity ceiling. It cannot enlarge model capacity or change
+the output reservation.
+
+Model request replay keeps each checkpoint complete, including its preserved
+facts. There is no separate fixed 16,000-character cutoff: the shared consumer
+budget and final provider request check decide whether the complete checkpoint
+fits. Explicitly bounded legacy previews cannot authorize replacing history.
 
 The goal is to preserve:
 
@@ -35,13 +59,11 @@ Depending on surface and trigger, users may see:
 - compaction completed;
 - compaction failed.
 
-When no compaction is needed, OpenSquilla uses this stable message:
-
-```text
-Already within context budget; no compact was applied
-```
-
-That message is a no-op, not a failure.
+Manual compaction appears as a maintenance operation, with one operation ID
+from start to its `completed`, `skipped`, or `failed` terminal event. It does not
+create an assistant response. A skipped operation leaves history unchanged;
+its reason distinguishes an empty session, a protected range, or an unhelpful
+summary. Cancellation and timeouts are failures with their original reasons.
 
 ## When to Compact Manually
 
@@ -53,7 +75,7 @@ Manual compaction is useful when:
 - you want the next answer to focus on the current state rather than the whole
   transcript.
 
-Avoid compact loops when the runtime says the session is already within budget.
+Avoid repeated attempts when the remaining history has no safe range to compact.
 
 ## Passive Compaction
 
@@ -99,7 +121,7 @@ opensquilla diagnostics on
 - Use memory for durable preferences and reusable project facts.
 - Use session export for exact old transcripts.
 - Use manual compaction before a new phase in a very long session.
-- Do not repeatedly compact a short or already-within-budget session.
+- Do not repeatedly compact a short session with no useful older history.
 
 ---
 

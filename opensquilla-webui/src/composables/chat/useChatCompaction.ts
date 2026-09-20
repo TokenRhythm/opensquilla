@@ -2,6 +2,7 @@ import { ref, type Ref } from 'vue'
 import i18n from '@/i18n'
 import {
   compactionCompletedLabelCode,
+  compactionFailurePresentation,
   compactionSkippedLabelCode,
   compactionSkipIsInformational,
 } from '@/utils/chat/compactionStatus'
@@ -155,9 +156,12 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     clearDismissTimer()
     const previous = compactStatus.value
     const isBusy = status === 'started'
-    // Lifecycle refinements may omit identity metadata. Keep it stable while
-    // the same standalone row is being updated.
+    // Lifecycle refinements may omit identity metadata, but a new optimistic
+    // start must not revive the previous terminal receipt under its old id.
     const carryMetadata = previous.visible
+      && !(isBusy && !previous.isBusy)
+      && (statusOptions.compactionId === undefined
+        || statusOptions.compactionId === previous.compactionId)
     compactStatus.value = {
       visible: true,
       message,
@@ -186,6 +190,9 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
   }
 
   function settleCompactInFlight(payload: ChatCompactPayload = {}, settleOptions: SettleCompactOptions = {}) {
+    // Automatic compaction belongs to its turn and cannot release a queued or
+    // running manual maintenance operation in the same session.
+    if (payload.source && String(payload.source).toLowerCase() !== 'manual') return false
     const key = String(payload.key || compactInFlightKey.value || options.sessionKey.value || '')
     if (!compactInFlight.value || (compactInFlightKey.value && key && key !== compactInFlightKey.value)) return false
     setCompactInFlight(false)
@@ -250,11 +257,13 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     if (payloadKey && payloadKey !== options.sessionKey.value) return false
     const incomingId = payloadCompactionId(payload)
     const terminal = isCompactionTerminalStatus(status)
+    const source = String(payload.source || '').toLowerCase()
+    const manual = source === 'manual' || (!source && compactInFlight.value)
     // The wait:false RPC acknowledgement can race a very fast terminal event.
     // Once an operation is terminal, its delayed "started" acknowledgement
     // must not resurrect the busy indicator.
     if (!terminal && incomingId && terminalCompactionIds.has(incomingId)) return false
-    if (terminal && incomingId && activeCompactionId.value && incomingId !== activeCompactionId.value) {
+    if (manual && terminal && incomingId && activeCompactionId.value && incomingId !== activeCompactionId.value) {
       return false
     }
     // A reconnect terminal is authoritative even while an optimistic
@@ -268,10 +277,10 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
       if (sequence <= previous) return false
       lastSequenceById.set(incomingId, sequence)
     }
-    if (status === 'started' && incomingId) activeCompactionId.value = incomingId
+    if (manual && status === 'started' && incomingId) activeCompactionId.value = incomingId
     if (terminal) {
       if (incomingId) rememberTerminalCompactionId(incomingId)
-      activeCompactionId.value = ''
+      if (manual) activeCompactionId.value = ''
     }
     return true
   }
@@ -289,7 +298,7 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     // Capture the active id before a terminal event settles it. Legacy id-less
     // lifecycles still get one stable slot per source.
     const placementKey = compactionId
-      || activeCompactionId.value
+      || (source === 'manual' ? activeCompactionId.value : '')
       || `legacy:${source || 'automatic'}`
     const terminal = isCompactionTerminalStatus(status)
     const requestedPlacement: ChatCompactionPlacement = meta.placement === 'activity'
@@ -406,12 +415,19 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     }
     if (status === 'failed' || status === 'error') {
       const preservePending = compactFailureBlocksPending(payload || {})
-      settleCompactInFlight(payload || {}, { preservePending })
+      settleCompactInFlight(payload || {}, {
+        preservePending,
+        recoverPending: !preservePending,
+      })
       if (inActivity) return placement
-      showCompactStatus('failed', i18n.global.t('chat.compact.failed'), {
-        tone: 'err',
+      const reason = String(payload.reason || payload.skip_reason || payload.error_reason || '')
+      const failure = compactionFailurePresentation(reason)
+      showCompactStatus('failed', i18n.global.t(failure.title), {
+        tone: failure.warning ? 'warn' : 'err',
+        detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,
+        reason,
       })
       return placement
     }
@@ -422,10 +438,13 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
         recoverPending: !preservePending,
       })
       if (inActivity) return placement
-      showCompactStatus('timed_out', i18n.global.t('chat.compact.failed'), {
+      const failure = compactionFailurePresentation('timed_out')
+      showCompactStatus('timed_out', i18n.global.t(failure.title), {
         tone: 'warn',
+        detail: source === 'manual' ? i18n.global.t(failure.detail) : '',
         source,
         compactionId,
+        reason: 'compaction_deadline_exceeded',
       })
       return placement
     }
@@ -467,6 +486,24 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     return false
   }
 
+  function handleStreamGenerationChange(generation: string | null, previousGeneration: string | null) {
+    if (!generation || !previousGeneration || generation === previousGeneration) return
+    handleGatewayRestart()
+  }
+
+  function handleGatewayRestart() {
+    if (!isCompactInFlightForCurrentSession()) return
+    // A replacement Gateway cannot own the old process's maintenance task.
+    // It has no terminal event to replay, so release its UI owner explicitly.
+    showCompactionToast({
+      key: options.sessionKey.value,
+      source: 'manual',
+      status: 'failed',
+      compaction_id: activeCompactionId.value || compactStatus.value.compactionId,
+      reason: 'gateway_restarted',
+    })
+  }
+
   function cleanup() {
     clearDismissTimer()
     activeCompactionId.value = ''
@@ -483,6 +520,8 @@ export function useChatCompaction(options: UseChatCompactionOptions) {
     hideCompactStatus,
     showCompactStatus,
     showCompactionToast,
+    handleStreamGenerationChange,
+    handleGatewayRestart,
     cleanup,
   }
 }

@@ -11,10 +11,22 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from opensquilla.contracts.gateway_transport import STRUCTURED_USER_INPUT_CAPABILITY
 from opensquilla.session.keys import canonicalize_session_key
 
 _MAX_COMPLETED_REQUESTS = 256
 _MAX_STRING_CHARS = 2_000
+
+
+def connection_supports_user_input(conn_id: str) -> bool:
+    """Opt CLI clients into waiting only when their reply transport is ready."""
+    from opensquilla.gateway.websocket import get_registry
+
+    connection = get_registry().get(conn_id)
+    return (
+        connection is not None
+        and STRUCTURED_USER_INPUT_CAPABILITY in connection.client_caps
+    )
 
 
 class UserInputRequestError(ValueError):

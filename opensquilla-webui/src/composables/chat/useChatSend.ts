@@ -516,7 +516,6 @@ export interface UseChatSendOptions {
   pendingForkBeforeMessageId: Ref<string | null>
   draftIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
-  annotationAttachments?: (ids: readonly string[]) => Attachment[]
   acknowledgePromptAnnotations?: (
     snapshots: readonly PromptAnnotationSnapshot[],
     sessionKey: string,
@@ -736,11 +735,8 @@ export function useChatSend(options: UseChatSendOptions) {
       : null
   }
 
-  function composerAttachments(ids = currentAnnotationDraftIds()): Attachment[] {
-    const attachments = [
-      ...options.pendingAttachments.value,
-      ...(options.annotationAttachments?.(ids) || []),
-    ]
+  function composerAttachments(): Attachment[] {
+    const attachments = options.pendingAttachments.value
     return attachments.filter((item, index) => attachments.findIndex(candidate => (
       candidate.local_id === item.local_id
       || (item.file_uuid && candidate.file_uuid === item.file_uuid)
@@ -2919,7 +2915,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (!preDispatchAllowed()) return 'not_sent'
     let preserveComposer = sendOpts.preserveComposer === true
     const sourceAttachments = sendOpts.payload?.attachments
-      ?? composerAttachments(sendOpts.draftIds ? [...sendOpts.draftIds] : undefined)
+      ?? composerAttachments()
     const intent = sendOpts.payload
       ? sendOpts.payload.intent
       : options.pendingSessionIntent.value

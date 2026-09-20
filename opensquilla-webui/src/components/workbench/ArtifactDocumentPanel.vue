@@ -61,12 +61,6 @@
           {{ t('workbench.artifactAnnotation.fallbackTitle') }}
         </strong>
         <p>{{ t('workbench.artifactAnnotation.fallbackDetail') }}</p>
-        <img
-          v-if="annotationFallback.screenshotUrl"
-          class="artifact-document__annotation-fallback-screenshot"
-          :src="annotationFallback.screenshotUrl"
-          :alt="t('workbench.artifactAnnotation.frozenPreview')"
-        />
         <textarea
           ref="annotationFallbackInput"
           v-model="annotationFallbackBody"
@@ -321,7 +315,6 @@ const props = withDefaults(defineProps<{
     annotationId: string
     body: string
     reason?: string
-    screenshotUrl?: string
   } | null
 }>(), {
   documentSnapshot: () => ({
@@ -722,16 +715,6 @@ defineExpose({ beforeClose, reload })
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.5;
-}
-
-.artifact-document__annotation-fallback-screenshot {
-  display: block;
-  width: 100%;
-  max-height: 180px;
-  object-fit: contain;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  background: var(--bg);
 }
 
 .artifact-document__annotation-fallback-card textarea {

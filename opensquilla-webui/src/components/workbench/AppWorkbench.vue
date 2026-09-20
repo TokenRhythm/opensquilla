@@ -383,7 +383,6 @@ for (const definition of createArtifactWorkbenchDefinitions({
   artifactDocuments,
   promptAnnotations: props.promptAnnotationsEnabled ? {
     create: request => artifactPromptAnnotations.create(request),
-    setScreenshot: (annotationId, attachment) => artifactPromptAnnotations.setScreenshot(annotationId, attachment),
     update: (annotationId, body) => artifactPromptAnnotations.update(annotationId, body),
     discard: annotationId => artifactPromptAnnotations.discard(annotationId),
     beginOverlayEdit: (annotationId, sessionKey) => {

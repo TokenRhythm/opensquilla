@@ -88,6 +88,22 @@ _LEGACY_CONTROL_UI_FRONTEND_WARNING = (
     "it to 'vue'."
 )
 
+# The compatibility field must not make every default construction noisy.
+_CONTEXT_BUDGET_WARNING_LOCK = threading.Lock()
+_CONTEXT_BUDGET_WARNING_EMITTED = False
+
+
+def _warn_deprecated_context_budget_once() -> None:
+    global _CONTEXT_BUDGET_WARNING_EMITTED
+    with _CONTEXT_BUDGET_WARNING_LOCK:
+        if _CONTEXT_BUDGET_WARNING_EMITTED:
+            return
+        _CONTEXT_BUDGET_WARNING_EMITTED = True
+    logger.warning(
+        "GatewayConfig.context_budget_tokens is deprecated and ignored; "
+        "use the configured provider/model context window instead."
+    )
+
 
 class _SettingsSourceWithoutFields(PydanticBaseSettingsSource):
     """Filter local-TOML-only fields from any external settings source."""
@@ -2817,10 +2833,13 @@ class GatewayConfig(BaseSettings):
         return self
 
     # --- Context overflow policy -----------------------------------------
-    # Budget and policy consulted in gateway/rpc_chat.py before dispatching
-    # a turn. ``context_budget_tokens`` is a soft cap: when an estimated
-    # turn payload exceeds this, the policy branch fires.
-    context_budget_tokens: int = 100_000
+    # Deprecated compatibility field: physical provider/model capacity now
+    # owns context admission. Preserve old configurations without using this
+    # former global soft cap to trigger or constrain compaction.
+    context_budget_tokens: int = Field(
+        default=100_000,
+        json_schema_extra={"deprecated": True},
+    )
     context_overflow_policy: ContextOverflowPolicy = ContextOverflowPolicy.AUTO_SUMMARIZE
     preflight_compact_ratio: float = Field(default=0.85, gt=0.0, le=1.0)
 
@@ -2934,6 +2953,8 @@ class GatewayConfig(BaseSettings):
         # Capture input provenance before profile-path normalization assigns
         # workspace_dir and adds it to Pydantic's mutable model_fields_set.
         self._workspace_dir_explicit = "workspace_dir" in self.model_fields_set
+        if "context_budget_tokens" in self.model_fields_set:
+            _warn_deprecated_context_budget_once()
         handle_deprecated_skill_filter_env()
         self._apply_concurrency_env_overrides()
 

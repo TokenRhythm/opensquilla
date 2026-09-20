@@ -3129,6 +3129,8 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
     if job_name in {"ubuntu-full", "windows-full"}:
         expected_preflight_files.update({
             "tests/test_ci/test_architecture_import_contracts.py",
+            "tests/test_cli/test_chat_cmd.py",
+            "tests/test_live_long_task_case_driver.py",
             "tests/test_engine/turn_runner/test_stage_test_boundaries.py",
             "tests/test_engine/test_runtime_artifacts.py",
             "tests/test_engine/test_tokenjuice_tool_result_projection.py",
@@ -3139,6 +3141,7 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
             "tests/test_gateway/test_channel_turn_ingress.py",
             "tests/test_gateway/test_goal_registry_cleanup.py",
             "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
+            "tests/test_gateway/test_task_runtime_wait_slots.py",
             "tests/test_gateway/test_goal_turn_authority.py",
             "tests/test_gateway/test_task_progress_projection.py",
             "tests/functional/test_gateway_silent_reply_process_e2e.py",
@@ -3172,8 +3175,11 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
 
 @pytest.mark.parametrize(("family", "expected_file"), [
     ("core", "tests/test_ci/test_windows_signatures.py"),
+    ("core", "tests/test_cli/test_chat_cmd.py"),
     ("gateway-sqlite", "tests/test_gateway/test_goal_registry_cleanup.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_task_runtime_wait_slots.py"),
     ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
+    ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
     ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
 ])
 def test_windows_preflight_selects_regressions_for_physical_partitions(family, expected_file):

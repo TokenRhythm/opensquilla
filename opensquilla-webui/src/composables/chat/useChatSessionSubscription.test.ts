@@ -7,6 +7,7 @@ import {
 } from './useChatSessionSubscription'
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
 import { useChatHistory } from './useChatHistory'
+import { useChatCompaction } from './useChatCompaction'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import {
   createSessionReadLifecycle,
@@ -169,6 +170,7 @@ interface HarnessOptions {
   reconcileStreamTaskClock?: UseChatSessionSubscriptionOptions['reconcileStreamTaskClock']
   loadHistory?: UseChatSessionSubscriptionOptions['loadHistory']
   resetStreamLiveTurnState?: UseChatSessionSubscriptionOptions['resetStreamLiveTurnState']
+  onStreamGenerationReset?: UseChatSessionSubscriptionOptions['onStreamGenerationReset']
   onLiveSnapshot?: UseChatSessionSubscriptionOptions['onLiveSnapshot']
   onAuthoritativeIdle?: UseChatSessionSubscriptionOptions['onAuthoritativeIdle']
   onRunModeLock?: UseChatSessionSubscriptionOptions['onRunModeLock']
@@ -223,6 +225,7 @@ function harness(
     loadHistory,
     resetStreamIdleTimer: vi.fn(),
     resetStreamLiveTurnState,
+    onStreamGenerationReset: options.onStreamGenerationReset,
     onLiveSnapshot: options.onLiveSnapshot,
     onAuthoritativeIdle,
     onRunModeLock: options.onRunModeLock,
@@ -824,5 +827,55 @@ describe('useChatSessionSubscription domain lease', () => {
     expect(replaySeq.value).toBe(42)
     expect(replayGap.resetStreamLiveTurnState).not.toHaveBeenCalled()
     expect(replayGap.loadHistory).toHaveBeenCalledOnce()
+  })
+
+  it.each(['generationChanged', 'replayGap', null] as const)(
+    'reconciles an idle %s response with manual maintenance even without a new generation event', async reloadRequired => {
+      const sessionKey = ref(KEY)
+      const recoverPending = vi.fn(() => true)
+      const compact = useChatCompaction({ sessionKey,
+        schedulePendingDrainAfterTerminal: vi.fn(), popAllPendingIntoComposer: recoverPending })
+      const subject = harness(leaseFixture({ live: live({ reloadRequired }) }).lease, {
+        sessionKey, onStreamGenerationReset: compact.handleGatewayRestart,
+      })
+      try {
+        compact.showCompactionToast({ key: KEY, source: 'manual', status: 'started', compaction_id: 'cmp-old' })
+        expect(subject.api.streamGeneration.value).toBeNull()
+        await subject.api.subscribeSession()
+        expect(compact.isCompactInFlightForCurrentSession()).toBe(reloadRequired !== 'generationChanged')
+        expect(subject.isStreaming.value).toBe(false)
+        expect(recoverPending).toHaveBeenCalledTimes(reloadRequired === 'generationChanged' ? 1 : 0)
+        if (reloadRequired === 'generationChanged') {
+          expect(compact.compactStatus.value).toMatchObject({ status: 'failed', reason: 'gateway_restarted' })
+          expect(compact.showCompactionToast({ source: 'manual', status: 'started', compaction_id: 'cmp-old' })).toBe(false)
+        }
+      } finally { compact.cleanup() }
+    },
+  )
+
+  it('retires previous process maintenance before installing new process live maintenance', async () => {
+    const sessionKey = ref(KEY)
+    const compact = useChatCompaction({ sessionKey,
+      schedulePendingDrainAfterTerminal: vi.fn(), popAllPendingIntoComposer: vi.fn(() => true) })
+    const fresh = { key: KEY, source: 'manual', status: 'started', compaction_id: 'cmp-new' }
+    const subject = harness(leaseFixture({ live: live({
+      reloadRequired: 'generationChanged',
+      snapshot: { sessionKey: KEY, taskId: null, events: [{ semanticKind: 'compaction-progress', payload: fresh }] },
+    }) }).lease, {
+      sessionKey, onStreamGenerationReset: compact.handleGatewayRestart,
+      onLiveSnapshot: snapshot => snapshot.events.forEach(entry => compact.showCompactionToast({
+        key: entry.payload.key,
+        source: String(entry.payload.source),
+        status: String(entry.payload.status),
+        compaction_id: entry.payload.compaction_id,
+      }, { authoritativeLive: true })),
+    })
+    try {
+      compact.showCompactionToast({ ...fresh, compaction_id: 'cmp-old' })
+      await subject.api.subscribeSession()
+      expect(compact.compactStatus.value).toMatchObject({ compactionId: 'cmp-new', isBusy: true })
+      expect(compact.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(subject.isStreaming.value).toBe(false)
+    } finally { compact.cleanup() }
   })
 })

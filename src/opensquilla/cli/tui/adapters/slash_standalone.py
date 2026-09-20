@@ -19,10 +19,10 @@ from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
 from opensquilla.cli.tui.adapters.commands import render_help_table, render_keys_table
 from opensquilla.cli.tui.adapters.slash_common import (
-    compact_skipped_line,
     compact_success_line,
     compact_summary_stats,
     compact_token_stats,
+    compact_unapplied_line,
     dispatch_theme_command,
     output_supports_host_ui,
     record_turn,
@@ -47,6 +47,7 @@ from opensquilla.provider.types import (
 from opensquilla.session.compaction import (
     build_compaction_config_from_provider,
     call_compact_with_optional_config,
+    effective_protected_recent_messages,
 )
 from opensquilla.session.compaction_lifecycle import (
     durable_receipt_allows_destructive_compaction,
@@ -500,9 +501,6 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     )
     console.print(f"[{ACCENT}]compacting context...[/]")
     config = slash_services.config
-    configured_context_cap = (
-        getattr(config, "context_budget_tokens", 100_000) if config is not None else 100_000
-    )
     session = None
     if slash_services.get_session is not None:
         try:
@@ -520,8 +518,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
             provider_override=None,
         )
     from opensquilla.gateway.compaction_target import (
-        build_gateway_consumer_admission,
-        limit_gateway_consumer_budget,
+        build_gateway_compaction_budget,
         resolve_gateway_compaction_target,
         resolve_gateway_consumer_budget,
     )
@@ -533,14 +530,6 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     consumer_budget = resolve_gateway_consumer_budget(
         gateway_context,
         session,
-    )
-    consumer_budget = limit_gateway_consumer_budget(
-        consumer_budget,
-        max(1, int(configured_context_cap or 1)),
-    )
-    context_window = consumer_budget.context_window_tokens
-    consumer_admission, consumer_admission_fingerprint = (
-        build_gateway_consumer_admission(consumer_budget)
     )
     target = resolve_gateway_compaction_target(
         gateway_context,
@@ -557,8 +546,39 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
         model_override=target.model or context.model,
         compaction_config=getattr(config, "compaction", None),
         compaction_plan=target.plan,
-        context_window_tokens=context_window,
     )
+    prepare_envelope = getattr(context.turn_runner, "prepare_manual_compaction_envelope", None)
+    consumer_agent = None
+    if callable(prepare_envelope) and consumer_budget.provider is not None:
+        from opensquilla.tools.types import ToolContext
+
+        consumer_agent = prepare_envelope(
+            session,
+            provider=consumer_budget.provider,
+            context_window_tokens=(
+                consumer_budget.physical_context_window_tokens
+                or consumer_budget.context_window_tokens
+            ),
+            max_output_tokens=consumer_budget.max_output_tokens,
+            context_window_known=consumer_budget.context_window_known,
+            provider_request_max_chars=consumer_budget.provider_request_max_chars,
+            workspace_dir=getattr(context.tool_ctx, "workspace_dir", None),
+            caller_tool_context=(
+                context.tool_ctx if isinstance(context.tool_ctx, ToolContext) else None
+            ),
+        )
+    resolved_budget = build_gateway_compaction_budget(
+        consumer_budget,
+        consumer_agent=consumer_agent,
+        trigger_ratio=float(getattr(config, "preflight_compact_ratio", 0.85)),
+        retained_tail_messages=effective_protected_recent_messages(compaction_config),
+        summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 1024),
+    )
+    context_window = resolved_budget.history_capacity_tokens
+    consumer_admission = resolved_budget.consumer_admission
+    consumer_admission_fingerprint = resolved_budget.consumer_admission_fingerprint
+    compaction_config.budget = resolved_budget
+    unapplied_reason = None
     try:
         if compact_with_result is not None:
             compact_kwargs: dict[str, Any] = {}
@@ -595,7 +615,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 for parameter in parameters
             ):
                 compact_kwargs["context_window_chars"] = (
-                    consumer_budget.provider_request_max_chars
+                    resolved_budget.history_capacity_chars
                 )
             if any(
                 parameter.kind is inspect.Parameter.VAR_KEYWORD
@@ -618,6 +638,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
                 **compact_kwargs,
             )
             summary = getattr(result, "summary", "") or ""
+            unapplied_reason = getattr(result, "skip_reason", None)
             token_stats = compact_token_stats(
                 getattr(result, "tokens_before", 0),
                 getattr(result, "tokens_after", 0),
@@ -643,7 +664,9 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     if summary:
         console.print(compact_success_line(token_stats))
     else:
-        console.print(compact_skipped_line())
+        console.print(compact_unapplied_line(
+            reason=unapplied_reason, compaction_id=compaction_id,
+        ))
 
 
 async def handle_standalone_slash_command(

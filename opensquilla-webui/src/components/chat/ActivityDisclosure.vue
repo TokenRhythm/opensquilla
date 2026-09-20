@@ -27,13 +27,17 @@
         aria-hidden="true"
       />
       <span
-        class="assistant-activity__live-label"
-        :class="{ 'is-stale': stale }"
+        class="assistant-activity__live-announcement"
         role="status"
         aria-live="polite"
         aria-atomic="true"
       >
-        {{ liveStatusLabel }}
+        <span class="assistant-activity__live-label" :class="{ 'is-stale': stale }">
+          {{ liveStatusLabel }}
+        </span>
+        <span v-if="stale" class="assistant-activity__sr-only">
+          {{ t('chat.activity.stale') }}
+        </span>
       </span>
       <span
         v-if="elapsedLabel"
@@ -71,6 +75,19 @@
       />
     </button>
     <div
+      v-if="isLive && (phaseElapsedLabel || stale)"
+      class="assistant-activity__live-detail"
+    >
+      <span
+        v-if="phaseElapsedLabel"
+        class="assistant-activity__phase-elapsed"
+        aria-hidden="true"
+      >{{ t('chat.activity.phaseElapsed', { duration: phaseElapsedLabel }) }}</span>
+      <span v-if="stale" class="assistant-activity__stale-note" aria-hidden="true">
+        {{ t('chat.activity.stale') }}
+      </span>
+    </div>
+    <div
       :id="bodyId"
       class="assistant-activity__body"
       :aria-hidden="!open"
@@ -107,6 +124,7 @@ const props = withDefaults(defineProps<{
   detailLabel?: string
   phaseLabel?: string
   elapsedLabel?: string
+  phaseElapsedLabel?: string
   stale?: boolean
   defaultOpen?: boolean
   stateKey?: string
@@ -119,6 +137,7 @@ const props = withDefaults(defineProps<{
   detailLabel: '',
   phaseLabel: '',
   elapsedLabel: '',
+  phaseElapsedLabel: '',
   stale: false,
   defaultOpen: false,
   stateKey: '',
@@ -247,7 +266,12 @@ const resolvedSummaryLabel = computed(() => {
   background: var(--warn-fill);
 }
 
+.assistant-activity__live-announcement {
+  min-width: 0;
+}
+
 .assistant-activity__live-label {
+  display: block;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -256,6 +280,37 @@ const resolvedSummaryLabel = computed(() => {
 
 .assistant-activity__live-label.is-stale {
   color: var(--warn);
+}
+
+.assistant-activity__live-detail {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.25rem 0.625rem;
+  padding-left: 1.1875rem;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  line-height: 1.5;
+}
+
+.assistant-activity__phase-elapsed {
+  font-variant-numeric: tabular-nums;
+}
+
+.assistant-activity__stale-note {
+  color: var(--warn);
+}
+
+.assistant-activity__sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .assistant-activity__live-elapsed {
@@ -435,8 +490,14 @@ const resolvedSummaryLabel = computed(() => {
 
 @keyframes assistant-activity-pulse {
   0%,
-  100% { opacity: 0.45; }
-  50% { opacity: 1; }
+  100% {
+    opacity: 0.7;
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+  50% {
+    opacity: 1;
+    box-shadow: 0 0 0 0.1875rem color-mix(in srgb, var(--accent) 8%, transparent);
+  }
 }
 
 @keyframes assistant-activity-item-enter {

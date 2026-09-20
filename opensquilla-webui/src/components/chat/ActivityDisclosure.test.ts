@@ -24,6 +24,8 @@ const i18n = createI18n({
         workedForMinutes: 'Worked for {minutes}m {seconds}s',
         activity: {
           liveStep: 'step {n}',
+          phaseElapsed: 'Current step {duration}',
+          stale: 'Still working — no recent signal',
         },
       },
     },
@@ -479,6 +481,34 @@ describe('ActivityDisclosure live header', () => {
     expect(host.querySelector('.assistant-activity__sep')).toBeNull()
     expect(host.querySelector('.assistant-activity__live-failure')).toBeNull()
   })
+
+  it('keeps the current phase timer separate from the total and live announcement', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 2,
+      failureCount: 0,
+      phaseLabel: 'Running commands',
+      elapsedLabel: '42s',
+      phaseElapsedLabel: '12s',
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+
+    const announcement = host.querySelector('[role="status"]')
+    const timer = host.querySelector('.assistant-activity__phase-elapsed')
+    expect(host.querySelector('.assistant-activity__live-elapsed')?.textContent?.trim()).toBe('· 42s')
+    expect(timer?.textContent).toBe('Current step 12s')
+    expect(timer?.getAttribute('aria-hidden')).toBe('true')
+    expect(timer?.closest('[aria-live]')).toBeNull()
+    expect(announcement?.textContent?.trim()).toBe('Running commands')
+
+    props.elapsedLabel = '43s'
+    props.phaseElapsedLabel = '13s'
+    await nextTick()
+    expect(timer?.textContent).toBe('Current step 13s')
+    expect(announcement?.textContent?.trim()).toBe('Running commands')
+    expect(host.querySelectorAll('[aria-live]')).toHaveLength(1)
+  })
 })
 
 describe('ActivityDisclosure stale state', () => {
@@ -494,9 +524,9 @@ describe('ActivityDisclosure stale state', () => {
     const dot = host.querySelector('.assistant-activity__live-dot')
     const label = host.querySelector('.assistant-activity__live-label')
 
-    // The stale copy itself is owned upstream (the stream module passes it in
-    // as phaseLabel); this component only carries the visual half.
     expect(label?.textContent?.trim()).toBe('Working')
+    expect(host.querySelector('.assistant-activity__stale-note')?.textContent?.trim())
+      .toBe('Still working — no recent signal')
     expect(dot?.classList.contains('is-active')).toBe(false)
     expect(dot?.classList.contains('is-stale')).toBe(true)
     expect(label?.classList.contains('is-stale')).toBe(true)
@@ -520,6 +550,36 @@ describe('ActivityDisclosure stale state', () => {
 
     expect(host.querySelector('.assistant-activity__live-label')?.textContent?.trim())
       .toBe('Running commands')
+    expect(host.querySelector('[role="status"]')?.textContent)
+      .toContain('Still working — no recent signal')
+    expect(host.querySelector('.assistant-activity__stale-note')?.getAttribute('aria-hidden'))
+      .toBe('true')
+  })
+
+  it('removes the stale explanation and resumes the running indicator on progress', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 1,
+      failureCount: 0,
+      phaseLabel: 'Running commands',
+      phaseElapsedLabel: '24s',
+      stale: true,
+      defaultOpen: true,
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    expect(host.querySelector('.assistant-activity__stale-note')).not.toBeNull()
+
+    props.stale = false
+    props.phaseLabel = 'Waiting for model'
+    props.phaseElapsedLabel = '0s'
+    await nextTick()
+
+    expect(host.querySelector('.assistant-activity__stale-note')).toBeNull()
+    expect(host.querySelector('[role="status"]')?.textContent?.trim()).toBe('Waiting for model')
+    expect(host.querySelector('.assistant-activity__live-dot')?.classList.contains('is-active')).toBe(true)
+    expect(host.querySelector('.assistant-activity__phase-elapsed')?.textContent).toBe('Current step 0s')
+    expect(host.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded')).toBe('true')
   })
 
   it('shows the working copy with the pulsing dot when live and not stale', async () => {

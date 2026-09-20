@@ -38,7 +38,7 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
-describe('ActivityNarration progressive disclosure', () => {
+describe('ActivityNarration visible commentary', () => {
   it('keeps a short readable update directly visible', () => {
     const host = mount('Checked the project and found the routing delay.')
 
@@ -47,28 +47,21 @@ describe('ActivityNarration progressive disclosure', () => {
       .toContain('Checked the project')
   })
 
-  it('summarizes a long update and keeps its full body collapsed', () => {
-    const host = mount(
-      'I checked the project flow and verified the current session ownership. '.repeat(8),
-    )
-    const fold = host.querySelector<HTMLDetailsElement>('details.activity-narration')
+  it('keeps the full update visible regardless of length or line count', () => {
+    const text = Array(8).fill('I checked the project flow and verified the current session ownership.').join('\n')
+    const host = mount(text)
 
-    expect(fold).not.toBeNull()
-    expect(fold?.open).toBe(false)
-    expect(fold?.querySelector('.activity-narration__summary-text')?.textContent)
-      .toMatch(/I checked the project flow/)
-    expect(fold?.querySelector('.activity-narration__hint')?.textContent)
-      .toContain('view details')
+    expect(host.querySelector('details')).toBeNull()
+    expect(host.querySelector('.activity-narration')?.textContent).toBe(text)
   })
 
-  it('replaces command and error prose with a plain technical-details label', () => {
-    const technical = 'code-task failed with exit_code=1 and stderr=permission denied'
-    const host = mount(technical)
-    const fold = host.querySelector<HTMLDetailsElement>('details.activity-narration--technical')
+  it.each([
+    'code-task failed with exit_code=1 and stderr=permission denied',
+    '当前环境没有 `nano-banana` skill，因此无法调用 nano-banana CLI。我会用已有的 SVG + cairosvg 生成信息图，全部保存到 `outputs/T1/`。',
+  ])('keeps assistant explanations visible when they mention technical terms: %s', (text) => {
+    const host = mount(text)
 
-    expect(fold).not.toBeNull()
-    expect(fold?.open).toBe(false)
-    expect(fold?.querySelector('summary')?.textContent).toContain('Technical details')
-    expect(fold?.querySelector('summary')?.textContent).not.toContain('exit_code')
+    expect(host.querySelector('details')).toBeNull()
+    expect(host.querySelector('.activity-narration')?.textContent).toBe(text)
   })
 })

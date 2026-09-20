@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { effectScope, nextTick, ref } from 'vue'
 import { useChatRpcEventHandlers, type ChatRpcStreamApi } from './useChatRpcEventHandlers'
 import { useChatRouterDecisionRuntime } from './useChatRouterDecisionRuntime'
@@ -22,6 +22,8 @@ import type { ConversationCursorSignal } from '@/modules/conversationRuntime'
 import { steerUnavailableReason } from '@/utils/chat/steerAvailability'
 import { useChatTaskOwnership, type ChatTaskOwnershipApi } from './useChatTaskOwnership'
 import { useChatPlans } from './useChatPlans'
+import { useChatCompaction } from './useChatCompaction'
+import { useChatStream } from './useChatStream'
 import type { SkillLoadReceipt } from '@/types/skillLoads'
 
 function createHarness(options: {
@@ -49,6 +51,7 @@ function createHarness(options: {
   taskOwnership?: ChatTaskOwnershipApi
   onLiveToolResult?: (payload: ConversationToolContent) => void
   onSkillLoad?: (receipt: SkillLoadReceipt, turnId: string) => void
+  withCompactionRuntime?: boolean
 } = {}) {
   const messages = ref<ChatMessage[]>(options.messages ?? [])
   const sessionKey = ref('agent:main:test')
@@ -59,7 +62,19 @@ function createHarness(options: {
   const activeStreamTaskId = ref('')
   const pendingQueue = ref<ChatPendingItem[]>(options.pendingQueue ?? [])
   const applySessionRunState = vi.fn()
-  const stream: ChatRpcStreamApi = options.stream || {
+  const streamRuntime = options.withCompactionRuntime ? useChatStream({
+    messages,
+    lastHeaderRole: ref(''),
+    aborted: ref(false),
+    autoScroll: ref(false),
+    runStatus: ref<ChatRunStatus>({ status: 'idle', label: '', task: null }),
+    applySessionRunState,
+    renderMarkdown: text => text,
+    stripDirectiveTags: text => text,
+    stripGeneratedArtifactMarkers: text => text,
+    scrollToBottom: vi.fn(),
+  }) : undefined
+  const stream: ChatRpcStreamApi = options.stream || streamRuntime || {
     isStreaming: ref(true),
     streamBubble: ref(true),
     streamHasVisibleOutput: ref(false),
@@ -104,7 +119,11 @@ function createHarness(options: {
   const queueRouterDecision = vi.fn(routerRuntime?.queueRouterDecision)
   const schedulePendingDrainAfterTerminal = vi.fn()
   const scheduleHistorySync = vi.fn()
-  const showCompactionToast = vi.fn()
+  const popAllPendingIntoComposer = vi.fn(() => true)
+  const compaction = options.withCompactionRuntime ? useChatCompaction({
+    sessionKey, schedulePendingDrainAfterTerminal, popAllPendingIntoComposer,
+  }) : undefined
+  const showCompactionToast = vi.fn(compaction?.showCompactionToast)
   const showWarningToast = vi.fn()
   const subscribeSession = vi.fn(options.subscribeSession || (() => undefined))
   const onSessionSubscribed = vi.fn(options.onSessionSubscribed || (() => undefined))
@@ -154,7 +173,8 @@ function createHarness(options: {
     handleRouterControlReplay: vi.fn(routerRuntime?.handleRouterControlReplay),
     resetRouterReplayCursor: vi.fn(routerRuntime?.resetRouterReplayCursor),
     showCompactionToast,
-    getCompactionPlacement: options.getCompactionPlacement,
+    getCompactionPlacement: options.getCompactionPlacement
+      ?? (compaction ? id => compaction.getCompactionPlacement(id) ?? undefined : undefined),
     showWarningToast,
     supportsTurnCommitted: () => options.supportsTurnCommitted === true,
     scheduleHistorySync,
@@ -200,6 +220,9 @@ function createHarness(options: {
     currentEpoch,
     onTaskSettled,
     stream,
+    streamRuntime,
+    compaction,
+    popAllPendingIntoComposer,
     activeTaskGroups,
     activeStreamTaskId,
     pendingQueue,
@@ -218,7 +241,7 @@ function createHarness(options: {
     loadCurrentSessionUsage,
     refreshRunModePreference,
     restoreSteerIntoComposer,
-    stop: () => { detach(); scope.stop() },
+    stop: () => { detach(); scope.stop(); compaction?.cleanup(); streamRuntime?.cleanup() },
   }
 }
 
@@ -1645,6 +1668,46 @@ describe('useChatRpcEventHandlers live snapshot restoration', () => {
     }
   })
 
+  it.each(['started', 'failed', 'completed', 'skipped'])(
+    'restores a manual %s compaction snapshot without creating an assistant turn',
+    (status) => {
+      const { api, lastStreamSeq, stream, showCompactionToast, stop } = createHarness()
+      try {
+        stream.isStreaming.value = false
+        vi.mocked(stream.startStreaming).mockImplementation(() => {
+          stream.isStreaming.value = true
+        })
+        api.restoreLiveTurnSnapshot({
+          sessionKey: 'agent:main:test',
+          taskId: null,
+          currentStreamSeq: 42,
+          events: [{
+            semanticKind: 'compaction-progress',
+            payload: {
+              key: 'agent:main:test',
+              source: 'manual',
+              status,
+              compaction_id: 'cmp-manual',
+              sequence: 1,
+              stream_seq: 42,
+            },
+          }],
+        })
+
+        expect(showCompactionToast).toHaveBeenCalledWith(
+          expect.objectContaining({ status, compaction_id: 'cmp-manual' }),
+          expect.objectContaining({ placement: 'standalone', authoritativeLive: true }),
+        )
+        expect(stream.startStreaming).not.toHaveBeenCalled()
+        expect(stream.recordCompactionActivity).not.toHaveBeenCalled()
+        expect(stream.isStreaming.value).toBe(false)
+        expect(lastStreamSeq.value).toBe(42)
+      } finally {
+        stop()
+      }
+    },
+  )
+
   it('restores an active compaction from the authoritative live snapshot', () => {
     const {
       api,
@@ -1731,6 +1794,144 @@ describe('useChatRpcEventHandlers stream generation', () => {
       harness.stop()
     }
   })
+})
+
+describe('compaction wire events through the live stream and maintenance runtime', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1))
+    vi.stubGlobal('cancelAnimationFrame', vi.fn())
+  })
+  afterEach(() => {
+    vi.unstubAllGlobals()
+    vi.useRealTimers()
+  })
+
+  it.each([
+    ['completed', '', true],
+    ['skipped', 'no_entries', true],
+    ['skipped', 'no_safe_turn_boundary', true],
+    ['skipped', 'protected_tail_exhausts_compaction_window', true],
+    ['skipped', 'no_compression_benefit', true],
+    ['failed', 'quality_gate_failed', false],
+    ['failed', 'summary_replay_incomplete', false],
+    ['failed', 'summary_does_not_fit', false],
+    ['failed', 'summary_failed', false],
+    ['failed', 'cancelled', false],
+    ['failed', 'compaction_deadline_exceeded', false],
+  ] as const)('settles manual %s/%s once, restores input and permits retry without an assistant bubble', (status, reason, drain) => {
+    const h = createHarness({ withCompactionRuntime: true })
+    const payload = {
+      key: h.sessionKey.value, source: 'manual', compaction_id: 'cmp-first', epoch: 0,
+    }
+    try {
+      h.api.handlers.onWireEventFixture('session.event.compaction', {
+        ...payload, status: 'started', sequence: 1, stream_seq: 1,
+      })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.stream.isStreaming.value).toBe(false)
+
+      const terminal = { ...payload, status, reason, sequence: 2, stream_seq: 2 }
+      h.api.handlers.onWireEventFixture('session.event.compaction', terminal)
+      // Reconnect may repeat the transport frame and the wait:false RPC may
+      // return its start acknowledgement after the real operation has ended.
+      h.api.handlers.onWireEventFixture('session.event.compaction', terminal)
+      h.compaction!.showCompactionToast({ ...payload, status: 'started', sequence: 1 })
+      expect(h.compaction!.compactStatus.value).toMatchObject({ status, compactionId: 'cmp-first', isBusy: false })
+      if (status === 'skipped') {
+        expect(h.compaction!.compactStatus.value).toMatchObject({
+          tone: 'info', message: reason === 'no_compression_benefit'
+            ? 'The current context is already concise'
+            : 'There is currently no history that can be safely organized',
+        })
+      }
+      if (reason === 'quality_gate_failed') {
+        expect(h.compaction!.compactStatus.value).toMatchObject({
+          tone: 'err', message: 'The summary did not pass the completeness check',
+        })
+      }
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledTimes(drain ? 1 : 0)
+      expect(h.popAllPendingIntoComposer).toHaveBeenCalledTimes(drain ? 0 : 1)
+      expect(h.stream.isStreaming.value).toBe(false)
+      expect(h.messages.value.filter(message => message.role === 'assistant')).toEqual([])
+      expect(h.streamRuntime!.foldedTurn.value.statusHistory).toEqual([])
+
+      h.api.handlers.onWireEventFixture('session.event.compaction', {
+        ...payload, compaction_id: 'cmp-retry', status: 'started', sequence: 1, stream_seq: 3,
+      })
+      h.api.handlers.onWireEventFixture('session.event.compaction', { ...terminal, stream_seq: 4 })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.compaction!.compactStatus.value.compactionId).toBe('cmp-retry')
+      h.api.handlers.onWireEventFixture('session.event.compaction', {
+        ...payload, compaction_id: 'cmp-retry', status: 'completed', sequence: 2, stream_seq: 5,
+      })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.stream.isStreaming.value).toBe(false)
+      expect(h.scheduleHistorySync).toHaveBeenCalledTimes(status === 'completed' ? 2 : 1)
+    } finally { h.stop() }
+  })
+
+  it('restores an active manual snapshot and settles its replayed terminal without opening a turn', () => {
+    const h = createHarness({ withCompactionRuntime: true })
+    const payload = { key: h.sessionKey.value, source: 'manual', compaction_id: 'cmp-reconnect' }
+    try {
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: h.sessionKey.value, taskId: null, currentStreamSeq: 12,
+        events: [
+          { semanticKind: 'compaction-progress', payload: { ...payload, status: 'started', sequence: 1, stream_seq: 10 } },
+          { semanticKind: 'compaction-progress', payload: { ...payload, status: 'observed', sequence: 2, stream_seq: 12 } },
+        ],
+      })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+      expect(h.compaction!.compactStatus.value.compactionId).toBe('cmp-reconnect')
+      expect(h.stream.isStreaming.value).toBe(false)
+      h.api.handlers.onCompaction({ ...payload, status: 'failed', reason: 'cancelled', sequence: 3, stream_seq: 13 }, { replayed: true })
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.popAllPendingIntoComposer).toHaveBeenCalledOnce()
+      h.api.restoreLiveTurnSnapshot({
+        sessionKey: h.sessionKey.value, taskId: null, currentStreamSeq: 13,
+        events: [{ semanticKind: 'compaction-progress', payload: { ...payload, status: 'started', sequence: 1 } }],
+      })
+      expect(h.compaction!.compactStatus.value.status).toBe('failed')
+      expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+      expect(h.stream.isStreaming.value).toBe(false)
+    } finally { h.stop() }
+  })
+
+  it.each(['manual', 'automatic'] as const)(
+    'keeps manual maintenance independent when %s compaction starts first', firstSource => {
+      const h = createHarness({ withCompactionRuntime: true })
+      let streamSeq = 0
+      const deliver = (source: string, status: string, sequence: number) => {
+        h.api.handlers.onWireEventFixture('session.event.compaction', {
+          key: h.sessionKey.value, source, status, sequence,
+          compaction_id: `cmp-${source}`, stream_seq: ++streamSeq,
+          ...(source === 'automatic' ? { task_id: 'turn-current' } : {}),
+        })
+      }
+      try {
+        h.activeStreamTaskId.value = 'turn-current'
+        h.stream.startStreaming()
+        deliver(firstSource, 'started', 1)
+        deliver(firstSource === 'manual' ? 'automatic' : 'manual', 'started', 1)
+        deliver('automatic', 'completed', 2)
+
+        expect(h.streamRuntime!.foldedTurn.value.statusHistory).toContainEqual(
+          expect.objectContaining({ id: 'cmp-automatic', state: 'completed' }),
+        )
+        expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(true)
+        expect(h.compaction!.compactStatus.value).toMatchObject({
+          compactionId: 'cmp-manual', source: 'manual', isBusy: true,
+        })
+        expect(h.schedulePendingDrainAfterTerminal).not.toHaveBeenCalled()
+        deliver('manual', 'completed', 2)
+        expect(h.compaction!.isCompactInFlightForCurrentSession()).toBe(false)
+        expect(h.schedulePendingDrainAfterTerminal).toHaveBeenCalledOnce()
+        expect(h.streamRuntime!.foldedTurn.value.statusHistory.filter(entry => entry.id)).toHaveLength(1)
+      } finally { h.stop() }
+    },
+  )
 })
 
 describe('useChatRpcEventHandlers compaction ownership', () => {
@@ -3349,7 +3550,7 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
     }
   })
 
-  it('treats every run heartbeat as transport liveness without replacing the phase', () => {
+  it('treats periodic run heartbeats as transport liveness without replacing the phase', () => {
     const { api, stream, stop } = createHarness()
 
     try {
@@ -3357,10 +3558,30 @@ describe('useChatRpcEventHandlers ensemble activity', () => {
       api.handlers.onRunHeartbeat({ stream_seq: 2, phase: 'channel' })
       api.handlers.onRunHeartbeat({ stream_seq: 3, phase: 'ensemble_aggregator_stream' })
       api.handlers.onRunHeartbeat({ stream_seq: 4, phase: 'provider_wait' })
+      api.handlers.onRunHeartbeat({ stream_seq: 5, phase: 'tool' })
 
       expect(stream.setStreamActivity).not.toHaveBeenCalled()
-      expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(4)
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledTimes(5)
       expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith({ progress: false })
+    } finally {
+      stop()
+    }
+  })
+
+  it('shows buffered tool argument progress without claiming tool execution', () => {
+    const { api, stream, stop } = createHarness()
+    try {
+      api.handlers.onWireEventFixture('session.event.run_heartbeat', {
+        stream_seq: 1, phase: 'llm_tool_arguments',
+      })
+      expect(stream.setStreamActivity).toHaveBeenCalledWith('Preparing tool call', 'Preparing tool call')
+      expect(stream.resetStreamIdleTimer).toHaveBeenCalledWith()
+      expect(stream.appendToolCall).not.toHaveBeenCalled()
+      expect(stream.appendToolDelta).not.toHaveBeenCalled()
+      expect(stream.appendToolResult).not.toHaveBeenCalled()
+
+      api.handlers.onRunHeartbeat({ stream_seq: 1, phase: 'llm_tool_arguments' })
+      expect(stream.setStreamActivity).toHaveBeenCalledTimes(1)
     } finally {
       stop()
     }

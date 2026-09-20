@@ -36,6 +36,7 @@ from opensquilla.gateway.config import (
 )
 from opensquilla.gateway.goal_service import GoalService
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
+from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.routing import build_web_route_envelope
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, RpcRegistry
 from opensquilla.gateway.rpc_goals import (
@@ -56,6 +57,7 @@ from opensquilla.gateway.rpc_sessions import (
     _handle_sessions_reset,
     _handle_sessions_send_contract,
 )
+from opensquilla.gateway.session_model_routing import capture_accepted_model_routing_config
 from opensquilla.gateway.session_streams import SessionStreamRegistry
 from opensquilla.gateway.task_runtime import (
     PendingOverflowPolicy,
@@ -2366,6 +2368,114 @@ async def test_post_driver_idle_starts_exactly_one_system_event_continuation(
         assert settled.turns_started == 2
         assert settled.turns_settled == 2
         assert len(runs) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("continuation_mode", ["direct", "router", "ensemble"])
+async def test_goal_continuation_accepts_current_session_model_routing(
+    tmp_path: Path,
+    continuation_mode: str,
+) -> None:
+    runs: list[TaskRun] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
+
+    async def handler(run: TaskRun) -> None:
+        runs.append(run)
+        if len(runs) == 1:
+            first_started.set()
+            await release_first.wait()
+            return
+        continuation_started.set()
+        await release_continuation.wait()
+        assert run.goal_context is not None
+        await stack.service.commit_model_status(
+            run.goal_context,
+            status="complete",
+            reason=None,
+        )
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "goal-session-routing.sqlite",
+        handler=handler,
+        wire_lifecycle=True,
+    ) as stack:
+        config = stack.context.config
+        assert config is not None
+        config.squilla_router.enabled = True
+        config.squilla_router.rollout_phase = "full"
+        config.llm_ensemble.enabled = False
+
+        async def accepted_config_provider(*, session_key: str, run_kind: str) -> Any:
+            return await capture_accepted_model_routing_config(
+                config,
+                stack.manager,
+                session_key=session_key,
+                run_kind=run_kind,
+            )
+
+        stack.runtime._accepted_config_provider = accepted_config_provider
+        # Give the session an explicit user choice and a nonzero revision.
+        await stack.manager.set_session_routing(SOURCE_KEY, "router", expected_revision=0)
+        initial_routing = await stack.manager.set_session_routing(
+            SOURCE_KEY, "direct", expected_revision=1,
+        )
+        assert initial_routing["revision"] == 2
+
+        created = await _handle_goals_set(_set_params(), stack.context)
+        await asyncio.wait_for(first_started.wait(), timeout=2.0)
+        first_task = await stack.storage.get_agent_task(created["taskId"])
+        assert first_task is not None
+        first_audit = dict(first_task.details["accepted_model_routing"])
+        assert first_audit["scope"] == "session"
+        assert first_audit["source"] == "session"
+        assert first_audit["effective_mode"] == "direct"
+        assert first_audit["session_revision"] == initial_routing["revision"]
+        assert model_routing_snapshot(runs[0].accepted_config)["mode"] == "direct"
+
+        next_routing = initial_routing
+        if continuation_mode != "direct":
+            next_routing = await stack.manager.set_session_routing(
+                SOURCE_KEY,
+                continuation_mode,
+                expected_revision=initial_routing["revision"],
+            )
+            assert next_routing["revision"] == initial_routing["revision"] + 1
+        # A user change applies to the next accepted task, never the running one.
+        assert model_routing_snapshot(runs[0].accepted_config)["mode"] == "direct"
+        release_first.set()
+        await asyncio.wait_for(continuation_started.wait(), timeout=2.0)
+
+        assert len(runs) == 2
+        automatic = runs[1]
+        assert automatic.run_kind == "goal"
+        assert automatic.goal_context is not None
+        assert automatic.goal_context["automatic"] is True
+        assert automatic.goal_context["continuationSeq"] == 1
+        automatic_task = await stack.storage.get_agent_task(automatic.task_id)
+        assert automatic_task is not None
+        audit = automatic_task.details["accepted_model_routing"]
+        assert audit["run_kind"] == "goal"
+        assert audit["scope"] == "session"
+        assert audit["source"] == "session"
+        assert audit["session_mode"] == continuation_mode
+        assert audit["effective_mode"] == continuation_mode
+        assert audit["session_revision"] == next_routing["revision"]
+        assert model_routing_snapshot(automatic.accepted_config)["mode"] == continuation_mode
+        assert model_routing_snapshot(config)["mode"] == "router"
+        settled_first = await stack.storage.get_agent_task(created["taskId"])
+        assert settled_first is not None
+        assert settled_first.details["accepted_model_routing"] == first_audit
+
+        release_continuation.set()
+        await stack.runtime.wait(automatic.task_id, timeout=2.0)
+        settled_goal = await _wait_for_goal(
+            stack.storage,
+            lambda goal: goal.status == "complete" and goal.active_task_id is None,
+        )
+        assert settled_goal.turns_started == settled_goal.turns_settled == 2
 
 
 @pytest.mark.asyncio

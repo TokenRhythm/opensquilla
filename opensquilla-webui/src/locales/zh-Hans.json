@@ -3972,7 +3972,6 @@
     "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "思考了 {seconds} 秒",
     "thoughtForMinutes": "思考了 {minutes} 分 {seconds} 秒",
-    "activityTechnicalDetails": "技术细节",
     "toolResult": "工具结果",
     "subagentPrefix": "子智能体：",
     "subagentCompletion": "子智能体完成",
@@ -4119,6 +4118,7 @@
       "lifecycle": {
         "working": "正在工作",
         "answering": "正在组织回答",
+        "preparingToolCall": "正在准备工具调用",
         "answerPrepared": "组织回答",
         "settled": "已完成",
         "interrupted": "已中断",
@@ -4168,6 +4168,7 @@
       "more": "另有 {count} 项",
       "stale": "仍在工作 —— 暂无新信号",
       "liveStep": "第 {n} 步",
+      "phaseElapsed": "当前步骤 {duration}",
       "recordIncomplete": "活动记录不完整，已显示兼容历史视图。"
     },
     "suggestedTasks": "推荐任务",
@@ -4600,6 +4601,14 @@
       "launchFailed": "工具链已安装，但未能启动此 MetaSkill。"
     },
     "compact": {
+      "failureIntegrity": "摘要未通过完整性校验",
+      "failureCapacity": "摘要超出当前模型可容纳的上下文范围",
+      "failureUnavailable": "用于整理上下文的模型不可用",
+      "failureProvider": "模型未能生成可用的摘要",
+      "failureTimeout": "上下文整理超时",
+      "failureRejectedDetail": "本次摘要未应用，原上下文已保留。可以重试；若仍失败，请复制诊断编号协助排查。",
+      "failureUnavailableDetail": "请检查模型配置和连接后重试；可复制诊断编号协助排查。",
+      "failureRetryDetail": "可以重新发起上下文整理；若仍失败，请复制诊断编号协助排查。",
       "compacting": "正在整理上下文…",
       "compacted": "上下文已整理",
       "temporarilyReduced": "已临时精简历史，继续处理",
@@ -4609,6 +4618,8 @@
       "historySummarized": "更早的上下文已汇总",
       "failed": "上下文整理失败",
       "withinBudget": "无需整理，上下文空间充足",
+      "noSafeHistory": "当前没有可安全整理的历史",
+      "alreadyConcise": "当前上下文已足够精简",
       "skipped": "未能应用上下文整理",
       "cancelled": "上下文整理已取消",
       "requestScoped": "仅对本次请求生效；会话历史未被重写"

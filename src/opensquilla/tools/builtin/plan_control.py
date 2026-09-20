@@ -341,9 +341,14 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
 @tool(
     name="update_plan",
     description=(
-        "Replace the optional progress list for this task. Add, remove, reorder or "
-        "reopen steps as the work changes. Progress describes actual work and does "
-        "not control tool permissions, execution order or task completion."
+        "Replace the optional progress list for this task. Use only when a concise "
+        "progress view helps with substantive multi-step work. Skip simple questions "
+        "and single-step tasks. Update only when steps or their status materially "
+        "change; batch related changes instead of updating after every tool call, "
+        "and do not resend an unchanged list. Add, remove, reorder or reopen steps "
+        "as the work changes. This does not enter Plan mode or create a Goal. "
+        "Progress describes actual work and does not control tool permissions, "
+        "execution order or task completion."
     ),
     params={
         "steps": {

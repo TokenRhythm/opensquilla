@@ -589,6 +589,10 @@ def build_terminal_activity_snapshot(
             continue
 
         if suffix == "compaction":
+            # Manual maintenance has its own operation identity and UI record,
+            # even when its admission is queued behind this assistant turn.
+            if str(payload.get("source") or "").lower() == "manual":
+                continue
             compaction_id = _safe_text(
                 payload.get("compaction_id", payload.get("compactionId")), maximum=200
             )

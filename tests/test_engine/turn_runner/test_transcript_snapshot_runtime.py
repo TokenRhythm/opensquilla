@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -697,6 +698,16 @@ async def test_preflight_invalidates_snapshot_only_when_transcript_rows_change(
     ) -> None:
         kwargs["history_capacity_tokens"] = 64
         kwargs["history_capacity_chars"] = 256
+        # The common budget is authoritative; overriding only the legacy
+        # capacity arguments no longer drives this snapshot-invalidation test.
+        kwargs["compaction_budget"] = replace(
+            kwargs["compaction_budget"],
+            history_capacity_tokens=64,
+            history_capacity_chars=256,
+            auto_trigger_tokens=54,
+            auto_trigger_chars=217,
+            retained_tail_tokens=12,
+        )
         await original_preflight(key, 64, **kwargs)
 
     async def _checkpoint_succeeds(*args: Any, **kwargs: Any) -> bool:

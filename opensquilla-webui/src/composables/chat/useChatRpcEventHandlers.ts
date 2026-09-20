@@ -946,7 +946,16 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     // its accepted activity-order context; doing that from the first event
     // handler would therefore erase that frame's stream_seq and force the
     // entire restored turn onto the legacy reordered renderer.
-    if (replayEntries.length > 0 && !stream.isStreaming.value) {
+    // Manual maintenance owns its standalone receipt, not an assistant turn.
+    // A maintenance-only snapshot must not open an empty running bubble that
+    // its compaction terminal cannot close.
+    const hasTurnActivity = replayEntries.some(entry =>
+      entry.kind === 'stream' && (
+        entry.event !== 'compaction-progress'
+        || String(entry.payload.source || '').toLowerCase() !== 'manual'
+      ),
+    )
+    if (hasTurnActivity && !stream.isStreaming.value) {
       stream.startStreaming(restoredStartedAt, false)
     }
     for (const entry of replayEntries) {
@@ -1686,9 +1695,15 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (!isCurrentGenerationPayload(payload)) return
     if (!acceptStreamSeq(payload)) return
     if (!stream.isStreaming.value) stream.startStreaming()
-    // Transport heartbeat proves liveness only. It must neither replace the
-    // current structured provider phase nor postpone the 20s no-progress UI.
-    stream.resetStreamIdleTimer({ progress: false })
+    // This phase is emitted only when buffered tool arguments grow by 4096 characters.
+    // It proves model output progress, but not a committed/executing tool call.
+    // All periodic heartbeats remain transport liveness only.
+    if (payload.phase === 'llm_tool_arguments') {
+      recordActivityPhase('Preparing tool call')
+      stream.resetStreamIdleTimer()
+    } else {
+      stream.resetStreamIdleTimer({ progress: false })
+    }
     if (!stream.streamBubble.value) {
       stream.showThinkingIndicator()
     }

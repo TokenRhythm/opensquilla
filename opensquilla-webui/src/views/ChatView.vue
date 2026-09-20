@@ -337,6 +337,7 @@
               :failure-count="liveActivityFailureCount"
               :phase-label="liveActivityPhaseLabel"
               :elapsed-label="streamTurnElapsed"
+              :phase-elapsed-label="liveActivityElapsedLabel"
               :stale="streamActivityStale"
             >
               <UnifiedAssistantActivityTimeline
@@ -426,7 +427,7 @@
               />
             </div>
             <span
-              v-if="liveAnswerPart && !streamActivityStale"
+              v-if="liveAnswerPart && !streamActivityStale && liveCurrentPhaseCode === 'chat.activity.lifecycle.answering'"
               class="stream-caret"
               aria-hidden="true"
             />
@@ -537,13 +538,22 @@
     </Transition>
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
-    <div
-      v-if="ordinaryTaskProgress && !executionDockRun && !activeGoalRun"
-      class="task-progress-dock"
-      :data-task-progress-id="taskProgress.taskId.value"
-    >
-      <ExecutionProgress :progress="ordinaryTaskProgress" />
-    </div>
+    <Transition name="plan-run-dock">
+      <div
+        v-if="ordinaryTaskProgress?.steps.length && !executionDockRun && !activeGoalRun && !shareMode"
+        class="plan-run-dock"
+        :data-task-progress-id="taskProgress.taskId.value"
+      >
+        <TaskProgressRibbon
+          :task-id="taskProgress.taskId.value"
+          :progress="ordinaryTaskProgress"
+          :cancel-busy="isStopPending"
+          :disabled="!canStop"
+          @cancel="onStop"
+          @focus-return="focusComposerAfterPlanRun"
+        />
+      </div>
+    </Transition>
     <details v-if="goalDraftArmed && !shareMode && (goalTokenBudgetSupported || goalBackgroundExecutionSupported)" class="goal-draft-settings">
       <summary>{{ t('chat.goal.settings') }}</summary>
       <GoalExecutionSettings
@@ -858,7 +868,7 @@ import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
 import GoalExecutionSettings from '@/components/chat/GoalExecutionSettings.vue'
-import ExecutionProgress from '@/components/chat/ExecutionProgress.vue'
+import TaskProgressRibbon from '@/components/chat/TaskProgressRibbon.vue'
 import { useChatTaskProgress } from '@/composables/chat/useChatTaskProgress'
 import type { GoalExecutionOptions } from '@/modules/goalCenter'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
@@ -1460,7 +1470,6 @@ function promptAnnotationBlockedMessage(): string {
   if (!promptAnnotationsEnabled.value) return ''
   const reason = artifactPromptAnnotationsStore.sendBlockedReason(sessionKey.value)
   if (reason === 'editing') return t('chat.promptAnnotations.editingBlocked')
-  if (reason === 'empty') return t('chat.promptAnnotations.emptyBlocked')
   if (reason === 'too-long') return t('chat.promptAnnotations.tooLongBlocked')
   return ''
 }
@@ -2157,6 +2166,7 @@ const {
   hideCompactStatus,
   showCompactStatus,
   showCompactionToast,
+  handleStreamGenerationChange: handleCompactionStreamGenerationChange,
   cleanup: cleanupCompaction,
 } = chatCompaction
 isCompactInFlightForCurrentSession = chatCompaction.isCompactInFlightForCurrentSession
@@ -2797,6 +2807,7 @@ const chatSessionSubscription = useChatSessionSubscription({
   loadHistory,
   resetStreamIdleTimer,
   resetStreamLiveTurnState,
+  onStreamGenerationReset: chatCompaction.handleGatewayRestart,
   onLiveSnapshot: snapshot => restoreLiveTurnSnapshot(snapshot),
   onReadStarted: () => {
     conversationSessionRuntime.events.invalidateConsumption(sessionKey.value)
@@ -2868,6 +2879,9 @@ const {
   streamGeneration,
   observeStreamGeneration,
 } = chatSessionSubscription
+watch(streamGeneration, (generation, previousGeneration) => {
+  handleCompactionStreamGenerationChange(generation, previousGeneration)
+}, { flush: 'sync' })
 applySessionRunState = chatSessionSubscription.applySessionRunState
 
 const chatSessionBootstrap = useChatSessionBootstrap({
@@ -3694,7 +3708,6 @@ const chatSend = useChatSend({
     return prepared && (prepareOptions?.isCurrent?.() ?? true)
   },
   promptAnnotationSnapshots: ids => artifactPromptAnnotationsStore.snapshotsForIds(ids),
-  annotationAttachments: ids => artifactPromptAnnotationsStore.attachmentsForIds(ids),
   acknowledgePromptAnnotations: (snapshots, acceptedSessionKey, requestSessionKey) => {
     let removedIds: string[]
     try {
@@ -4284,8 +4297,21 @@ const liveActivityProjection = computed(() =>
     })
   },
 )
+const liveCurrentActivityTool = computed(() => liveActivityProjection.value.activityClusters.find(
+  cluster => cluster.key === liveActivityProjection.value.currentClusterKey,
+))
 const liveActivityPhaseLabel = computed(() => {
-  return String(t('chat.activity.lifecycle.working'))
+  if (runStatus.value.status === 'queued') return String(t('chat.status.queued'))
+  if (runStatus.value.status === 'approval_pending') return String(t('chat.status.approvalPending'))
+  const currentPhase = [...liveActivityProjection.value.statusSteps].reverse()
+    .find(step => step.isCurrent)
+  const label = liveCurrentActivityTool.value?.purpose || currentPhase?.label
+  return label ? String(t(label.code, label.params)) : String(t('chat.activity.lifecycle.working'))
+})
+const liveActivityElapsedLabel = computed(() => {
+  if (streamActivityStale.value || ['queued', 'approval_pending'].includes(runStatus.value.status)) return ''
+  const runningCall = liveCurrentActivityTool.value?.calls.find(call => call.isRunning)
+  return runningCall ? liveToolElapsedText(runningCall) : streamPhaseElapsed.value
 })
 const liveCurrentPhaseCode = computed(() => [...liveActivityProjection.value.statusSteps]
   .reverse()
@@ -4785,7 +4811,7 @@ const composerPlaceholder = computed(() => {
 const hasSendContent = computed(() => {
   return inputText.value.trim().length > 0
     || pendingAttachments.value.some(isSendableAttachment)
-    || activePromptAnnotations.value.length > 0
+    || sendableAnnotationDraftIds.value.length > 0
 })
 const composerHasSendContent = computed(() =>
   replanActive.value ? inputText.value.trim().length > 0 : hasSendContent.value,
@@ -4892,10 +4918,7 @@ const queuedImageSendBlockedMessage = computed(() => {
 })
 
 const modelImageSendBlockedMessage = computed(() => {
-  return hasModelInputImageAttachment([
-    ...pendingAttachments.value,
-    ...artifactPromptAnnotationsStore.attachmentsForIds(sendableAnnotationDraftIds.value),
-  ])
+  return hasModelInputImageAttachment(pendingAttachments.value)
     ? queuedImageSendBlockedMessage.value
     : ''
 })
@@ -7813,12 +7836,6 @@ watch(
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>
-.task-progress-dock {
-  width: var(--chat-col, min(calc(100% - 48px), 980px));
-  margin: var(--sp-2) auto;
-  font-size: var(--fs-xs);
-}
-
 .goal-draft-settings {
   width: var(--chat-col, min(calc(100% - 48px), 980px));
   max-width: 100%;

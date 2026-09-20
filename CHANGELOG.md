@@ -99,9 +99,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Ordinary task progress now uses the same compact ribbon as Plan execution and
+  disappears when the task ends, including after reconnecting or refreshing.
+  The optional `update_plan` tool is discovered on demand in ordinary Default
+  tasks, with guidance to skip simple work and avoid redundant updates.
 - Rescheduling a one-shot job while it runs now preserves the new occurrence
   when the old execution finishes. The replacement starts with a fresh retry
   budget, while the old result remains recorded in execution history.
+- Interactive Gateway CLI questions now wait for an answer in the same task,
+  preventing unanswered questions from starting extra Goal turns. Pending
+  questions recover on reconnect, and replies support safe retries and cancellation.
+  Ordinary Goal continuations also respect the session's selected model-routing mode.
 - Source clients now report TUI launches and active use through the default
   local Gateway, and short commands attempt a bounded final V2 upload before
   exiting. Standalone CLI/TUI V1 installation reporting is enabled and daily

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import cast
@@ -13,8 +14,38 @@ from opensquilla.application.session_reset import (
     SessionResetResult,
     SessionResetUnavailableError,
 )
-from opensquilla.gateway.adapters.session_reset import GatewaySessionResetAdapter
+from opensquilla.gateway.adapters.session_reset import (
+    GatewaySessionResetAdapter,
+    GatewaySessionResetPorts,
+)
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError
+
+
+async def test_reset_drains_compaction_before_rotating_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine import cache_break_monitor
+
+    key = "agent:main:reset-maintenance"
+    stopped = asyncio.Event()
+
+    async def owner() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    task = asyncio.create_task(owner())
+    await asyncio.sleep(0)
+    monkeypatch.setattr(cache_break_monitor, "_active_compaction_tasks", {(key, "old"): task})
+    context = cast(RpcContext, SimpleNamespace(
+        session_manager=None, task_runtime=None, turn_runner=None,
+    ))
+    ports = GatewaySessionResetPorts(context)
+
+    async with ports.quiesce(key):
+        assert stopped.is_set()
+        assert task.done()
 
 
 @dataclass

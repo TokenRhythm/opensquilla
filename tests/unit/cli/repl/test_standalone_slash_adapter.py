@@ -317,12 +317,62 @@ async def test_standalone_slash_adapter_compact_uses_typed_compact_handles() -> 
     assert len(harness.compact_calls) == 1
     compact_session_key, context_window, compaction_config = harness.compact_calls[0]
     assert compact_session_key == session_key
-    assert context_window == 4321
+    # This typed-handle fixture has no provider: no request proof means no
+    # invented history capacity, regardless of the obsolete soft-cap field.
+    assert context_window == 0
     assert compaction_config is not None
+    assert compaction_config.budget.history_capacity_tokens == 0
 
 
 @pytest.mark.asyncio
-async def test_standalone_compact_caps_configured_budget_to_consumer_window() -> None:
+@pytest.mark.parametrize(("reason", "outcome"), [
+    ("summary_failed", "compact failed"),
+    ("quality_gate_failed", "compact failed"),
+    ("no_compression_benefit", "compact skipped"),
+    ("summary_does_not_fit", "compact failed"),
+    ("non_history_envelope_exhausts_budget", "compact failed"),
+    ("protected_tail_exhausts_compaction_window", "compact skipped"),
+    ("stale_preimage", "compact skipped"),
+    ("within_compaction_budget", "compact skipped"),
+])
+async def test_standalone_compact_reports_actual_unapplied_outcome(capsys, reason, outcome):
+    from opensquilla.cli.repl.standalone_slash_adapter import (
+        StandaloneSlashContext,
+        StandaloneSlashServices,
+        handle_standalone_slash_command,
+    )
+
+    async def compact(*args, **kwargs):
+        assert kwargs["trigger_reason"] == "manual"
+        return SimpleNamespace(summary="", skip_reason=reason)
+
+    state = ChatSessionState(session_key="agent:main:standalone:outcome", model=None)
+    context = StandaloneSlashContext(
+        state=state, session_key=state.session_key, model=None, tool_ctx=object(),
+        slash_services=StandaloneSlashServices(compact_with_result=compact),
+        turn_runner=object(), build_tool_ctx=lambda _key: object(),
+        replace_session=lambda **_updates: None,
+    )
+
+    assert await handle_standalone_slash_command("/compact", context) is True
+
+    output = capsys.readouterr().out
+    assert outcome in output
+    assert "cmp_" in output
+    if reason == "within_compaction_budget":
+        assert "already within context budget" in output
+    elif reason == "no_compression_benefit":
+        assert "context is already compact" in output
+        assert "compact failed" not in output
+    else:
+        assert "already within context budget" not in output
+        assert reason in output
+    if outcome != "compact skipped":
+        assert "compact skipped" not in output
+
+
+@pytest.mark.asyncio
+async def test_standalone_compact_uses_history_capacity_inside_consumer_window() -> None:
     from opensquilla.cli.repl.standalone_slash_adapter import (
         StandaloneSlashContext,
         StandaloneSlashServices,
@@ -377,7 +427,10 @@ async def test_standalone_compact_caps_configured_budget_to_consumer_window() ->
     )
 
     assert await handle_standalone_slash_command("/compact", context) is True
-    assert harness.compact_calls[0][1] == 4096
+    _, history_capacity, compaction_config = harness.compact_calls[0]
+    assert compaction_config.budget.physical_context_window_tokens == 4096
+    assert history_capacity == compaction_config.budget.history_capacity_tokens
+    assert 0 < history_capacity < 4096 - 512
 
 
 @pytest.mark.asyncio
@@ -515,7 +568,8 @@ async def test_standalone_compact_correlates_compaction_to_durable_session() -> 
     )
     assert compact_correlation.session_id == "durable-session-1"
     assert compact_kwargs["compaction_id"] == compact_correlation.turn_id
-    assert int(compact_kwargs["context_window_chars"]) > 0
+    assert int(compact_kwargs["context_window_chars"]) == 0
     assert callable(compact_kwargs["consumer_admission"])
+    assert compact_kwargs["consumer_admission"]("checkpoint", []) is False
     assert len(str(compact_kwargs["consumer_admission_fingerprint"])) == 64
     assert compact_correlation.call_kind == "auxiliary.compaction"

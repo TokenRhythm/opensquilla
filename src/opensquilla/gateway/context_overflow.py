@@ -31,6 +31,7 @@ import structlog
 
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
+from opensquilla.provider.model_catalog import resolve_effective_context_window, shared_catalog
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
 )
@@ -255,8 +256,9 @@ async def apply_context_overflow_policy(
     Parameters
     ----------
     config:
-        The gateway config. ``config.context_overflow_policy`` and
-        ``config.context_budget_tokens`` provide defaults.
+        The gateway config. Policy comes from ``context_overflow_policy``;
+        absent an explicit budget override, provider/model metadata and
+        ``llm.context_window_tokens`` supply the effective context window.
     message:
         The new user message.
     transcript:
@@ -286,7 +288,15 @@ async def apply_context_overflow_policy(
     """
 
     policy = policy_override or config.context_overflow_policy
-    budget = budget_override if budget_override is not None else config.context_budget_tokens
+    if budget_override is not None:
+        budget = budget_override
+    else:
+        budget, _ = resolve_effective_context_window(
+            shared_catalog(),
+            config.llm.model,
+            provider=config.llm.provider,
+            global_override=config.llm.context_window_tokens,
+        )
     estimated = _estimate_payload_tokens(message, transcript)
 
     outcome = OverflowOutcome(

@@ -92,9 +92,7 @@ export function runtimeArtifactHttpBaseOrigin(): string {
 }
 
 export function runtimeAttachmentHttpBaseOrigin(): string {
-  return typeof window !== 'undefined' && window.location?.origin
-    ? window.location.origin
-    : DEFAULT_BASE_ORIGIN
+  return runtimeArtifactHttpBaseOrigin()
 }
 
 function urlsShareArtifactOrigin(candidate: URL, base: URL): boolean {
@@ -222,7 +220,7 @@ export function artifactHttpAttachmentUrl(raw: unknown, baseOrigin: string): str
   try {
     const base = new URL(baseOrigin)
     const url = new URL(raw, base)
-    if ((url.protocol !== 'http:' && url.protocol !== 'https:') || url.origin !== base.origin) {
+    if (!trustedOrigin(url.href, baseOrigin)) {
       return ''
     }
     if (url.username || url.password) return ''

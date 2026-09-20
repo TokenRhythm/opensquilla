@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import base64
 import io
-from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 
 from opensquilla import token_estimation
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.provider.openai import OpenAIProvider
 from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
 from opensquilla.session.compaction import CompactionConfig, CompactionRequest, CompactionResult
 
@@ -59,7 +59,7 @@ async def test_inline_compaction_reduces_old_text_while_preserving_current_image
         "opensquilla.session.compaction.call_compaction_llm", synthetic_summary,
     )
     agent = Agent(
-        provider=SimpleNamespace(provider_name="synthetic"),
+        provider=OpenAIProvider(api_key="synthetic-offline", model="synthetic-model"),
         config=AgentConfig(
             # Leave input space for the current image after reserving the
             # complete output cap; the default 8k output fills this window.

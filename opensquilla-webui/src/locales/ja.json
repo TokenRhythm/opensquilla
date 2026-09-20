@@ -3888,7 +3888,6 @@
     "thinkingForSeconds": "思考中 · {seconds} 秒",
     "thoughtForSeconds": "{seconds} 秒間思考",
     "thoughtForMinutes": "{minutes} 分 {seconds} 秒間思考",
-    "activityTechnicalDetails": "技術的な詳細",
     "toolResult": "ツールの結果",
     "subagentPrefix": "サブエージェント: ",
     "subagentCompletion": "サブエージェントの完了",
@@ -4035,6 +4034,7 @@
       "lifecycle": {
         "working": "作業中",
         "answering": "回答を作成中",
+        "preparingToolCall": "ツール呼び出しを準備中",
         "answerPrepared": "回答の構成",
         "settled": "完了",
         "interrupted": "中断",
@@ -4084,6 +4084,7 @@
       "more": "ほか {count} 項目",
       "stale": "処理を継続中 — 最近の信号はありません",
       "liveStep": "ステップ {n}",
+      "phaseElapsed": "現在のステップ：{duration}",
       "recordIncomplete": "アクティビティ記録が不完全なため、互換履歴ビューを表示しています。"
     },
     "suggestedTasks": "おすすめのタスク",
@@ -4516,6 +4517,14 @@
       "launchFailed": "ツールチェーンはインストールされましたが、MetaSkill を開始できませんでした。"
     },
     "compact": {
+      "failureIntegrity": "要約が完全性の検証を通過しませんでした",
+      "failureCapacity": "要約が現在のモデルのコンテキスト容量を超えています",
+      "failureUnavailable": "要約用モデルを利用できません",
+      "failureProvider": "モデルが使用可能な要約を生成できませんでした",
+      "failureTimeout": "コンテキスト整理がタイムアウトしました",
+      "failureRejectedDetail": "要約は適用されず、元のコンテキストは保持されています。再試行し、再び失敗した場合は診断IDをコピーして調査にお使いください。",
+      "failureUnavailableDetail": "モデル設定と接続を確認して再試行してください。調査用に診断IDをコピーできます。",
+      "failureRetryDetail": "コンテキスト整理を再試行できます。再び失敗した場合は診断IDをコピーして調査にお使いください。",
       "compacting": "コンテキストを圧縮中",
       "compacted": "コンテキストを圧縮しました",
       "temporarilyReduced": "履歴を一時的に短縮して処理を続けています",
@@ -4525,6 +4534,8 @@
       "historySummarized": "以前のコンテキストを要約しました",
       "failed": "圧縮に失敗しました",
       "withinBudget": "コンテキストは予算内です。",
+      "noSafeHistory": "現在、安全に整理できる履歴はありません",
+      "alreadyConcise": "現在のコンテキストはすでに十分に簡潔です",
       "skipped": "コンテキストの圧縮は適用されませんでした。",
       "cancelled": "圧縮をキャンセルしました",
       "requestScoped": "このリクエストにのみ適用され、セッション履歴は書き換えられていません"
