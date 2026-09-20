@@ -1,4 +1,18 @@
 {
+  "imageClipboard": {
+    "copyImage": "复制图片",
+    "copySource": "复制 SVG 源码",
+    "imageDescription": "以原始尺寸复制为 PNG；动图会变成静态图片。",
+    "copying": "正在复制…",
+    "copiedImage": "图片已复制",
+    "copiedSource": "SVG 源码已复制",
+    "unsupported": "当前环境不支持图片复制，请下载原文件。",
+    "failed": "复制失败，请重试或下载原文件。",
+    "invalidImage": "无法解码这张图片，请下载原文件。",
+    "invalidSvg": "文件不是有效的 SVG，或缺少可用尺寸，请下载原文件。",
+    "tooLarge": "文件超过复制上限，请下载原文件以保留完整质量。",
+    "timedOut": "准备剪贴板内容超时，请重试或下载原文件。"
+  },
   "workspaceReference": {
     "open": "在工作台中打开 {path}",
     "actions": "文件操作",

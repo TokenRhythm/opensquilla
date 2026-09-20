@@ -124,11 +124,13 @@ export interface ArtifactAccessRequest {
   readonly sessionKey?: string
   readonly signal?: AbortSignal
   readonly requireSameOrigin?: boolean
+  /** Optional byte ceiling for explicit consumers such as clipboard conversion. */
+  readonly maxBytes?: number
 }
 
 export type ArtifactFetchResult =
   | { readonly ok: true; readonly status: number; readonly url: string; readonly blob: Blob }
-  | { readonly ok: false; readonly status: number; readonly url: string; readonly message: string }
+  | { readonly ok: false; readonly status: number; readonly url: string; readonly message: string; readonly errorCode?: 'too_large' }
 
 export type ArtifactOpenResult =
   | { readonly ok: true; readonly status: number; readonly url: string; readonly objectUrl?: string }
@@ -146,9 +148,10 @@ export type AttachmentFetchResult =
   | {
       readonly ok: false
       readonly status: number
-      readonly source: 'none' | 'inline' | 'staged'
+      readonly source: 'none' | 'local-file' | 'inline' | 'staged'
       readonly url: string
       readonly message: string
+      readonly errorCode?: 'too_large'
     }
 
 export interface AttachmentUploadReceipt {
@@ -163,6 +166,8 @@ export interface WorkingFileRequest {
   documentId: string
   pagePath?: string
   signal?: AbortSignal
+  /** Optional content byte ceiling; excess content throws an Error with code 'too_large'. */
+  maxBytes?: number
 }
 
 export interface WorkingFileMetadata {

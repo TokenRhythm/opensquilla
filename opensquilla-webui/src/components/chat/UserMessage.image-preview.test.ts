@@ -93,6 +93,17 @@ describe('UserMessage uploaded image preview', () => {
     expect(previewImage).toHaveBeenCalledExactlyOnceWith(attachment)
     expect(downloadAttachment).not.toHaveBeenCalled()
     expect(toggleShare).not.toHaveBeenCalled()
+    expect(host.querySelector('[data-testid="copy-image"]')).toBeNull()
+  })
+
+  it('offers image and source copy for SVG text attachments without enabling inline preview', async () => {
+    const { host, previewImage } = await mountAttachment(imageAttachment({ name: 'drawing.svg', mime: 'text/plain' }))
+    expect(host.querySelector('.msg-thumb')).toBeNull()
+    expect(host.querySelector('[data-testid="copy-image"]')).not.toBeNull()
+    host.querySelector<HTMLButtonElement>('[data-testid="image-copy-more"]')!.click()
+    await nextTick()
+    expect(document.querySelector('[data-testid="copy-svg-source"]')).not.toBeNull()
+    expect(previewImage).not.toHaveBeenCalled()
   })
 
   it.each([

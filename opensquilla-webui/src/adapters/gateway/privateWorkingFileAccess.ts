@@ -1,11 +1,16 @@
 import type { ArtifactContentAccess, WorkingFileRequest, WorkingFileMetadata } from '@/modules/artifactWorkbench'
 import { isPreviewPagePath } from '@/utils/workbench/previewPagePath'
 import { HttpTransportError } from './privateHttpTransport'
+import { assertBinaryReadActive, readBinaryBlob, type ReadableBinaryBody } from './boundedBinaryBody'
 
 interface WorkingFileTransport {
   requestBinary(endpoint: string, options: {
     sessionKey: string; signal?: AbortSignal; timeoutMs?: number
-  }): Promise<{ blob(): Promise<Blob> }>
+  }): Promise<{
+    metadata?: ReadableBinaryBody['metadata']
+    stream?(): ReadableStream<Uint8Array> | null
+    blob(): Promise<Blob>
+  }>
 }
 
 function endpoint(request: WorkingFileRequest, format: 'content' | 'metadata'): string {
@@ -44,10 +49,16 @@ export function createWorkingFileAccess(
       }
     },
     async fetchWorkingFile(request) {
+      assertBinaryReadActive(request.signal)
       const response = await http.requestBinary(endpoint(request, 'content'), {
         sessionKey: request.sessionKey, signal: request.signal, timeoutMs: 0,
       })
-      return response.blob()
+      if (request.maxBytes === undefined) return response.blob()
+      return readBinaryBlob({
+        metadata: response.metadata || {},
+        stream: () => response.stream?.() ?? null,
+        blob: () => response.blob(),
+      }, { maxBytes: request.maxBytes, signal: request.signal })
     },
   }
 }

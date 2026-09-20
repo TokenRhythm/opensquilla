@@ -1,4 +1,18 @@
 {
+  "imageClipboard": {
+    "copyImage": "Bild kopieren",
+    "copySource": "SVG-Quelltext kopieren",
+    "imageDescription": "Als PNG in Originalgröße kopieren. Animierte Bilder werden zu Standbildern.",
+    "copying": "Wird kopiert…",
+    "copiedImage": "Bild kopiert",
+    "copiedSource": "SVG-Quelltext kopiert",
+    "unsupported": "Bilder können in dieser Umgebung nicht kopiert werden. Laden Sie die Originaldatei herunter.",
+    "failed": "Kopieren fehlgeschlagen. Versuchen Sie es erneut oder laden Sie die Originaldatei herunter.",
+    "invalidImage": "Dieses Bild kann nicht dekodiert werden. Laden Sie die Originaldatei herunter.",
+    "invalidSvg": "Die SVG-Datei ist ungültig oder hat keine verwendbaren Abmessungen. Laden Sie die Originaldatei herunter.",
+    "tooLarge": "Diese Datei überschreitet die Kopiergrenze. Laden Sie das Original herunter, um die volle Qualität zu erhalten.",
+    "timedOut": "Die Vorbereitung hat zu lange gedauert. Versuchen Sie es erneut oder laden Sie die Originaldatei herunter."
+  },
   "workspaceReference": {
     "open": "{path} in der Werkbank öffnen",
     "actions": "Dateiaktionen",

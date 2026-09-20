@@ -1,4 +1,18 @@
 {
+  "imageClipboard": {
+    "copyImage": "Copy image",
+    "copySource": "Copy SVG source",
+    "imageDescription": "Copy at original size as PNG. Animated images become a still image.",
+    "copying": "Copying…",
+    "copiedImage": "Image copied",
+    "copiedSource": "SVG source copied",
+    "unsupported": "Image copying is unavailable in this environment. Download the original file instead.",
+    "failed": "Could not copy. Try again or download the original file.",
+    "invalidImage": "This image cannot be decoded. Download the original file instead.",
+    "invalidSvg": "This file is not valid SVG or has no usable dimensions. Download the original file instead.",
+    "tooLarge": "This file exceeds the copy limit. Download the original file to keep its full quality.",
+    "timedOut": "Preparing the clipboard took too long. Try again or download the original file."
+  },
   "workspaceReference": {
     "open": "Open {path} in Workbench",
     "actions": "File actions",

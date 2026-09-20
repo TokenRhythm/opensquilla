@@ -1,4 +1,18 @@
 {
+  "imageClipboard": {
+    "copyImage": "Copier l’image",
+    "copySource": "Copier le code SVG",
+    "imageDescription": "Copier en PNG à la taille d’origine. Les images animées deviennent fixes.",
+    "copying": "Copie en cours…",
+    "copiedImage": "Image copiée",
+    "copiedSource": "Code SVG copié",
+    "unsupported": "La copie d’images est indisponible dans cet environnement. Téléchargez le fichier original.",
+    "failed": "Échec de la copie. Réessayez ou téléchargez le fichier original.",
+    "invalidImage": "Cette image ne peut pas être décodée. Téléchargez le fichier original.",
+    "invalidSvg": "Ce fichier SVG est invalide ou sans dimensions utilisables. Téléchargez le fichier original.",
+    "tooLarge": "Ce fichier dépasse la limite de copie. Téléchargez l’original pour conserver sa qualité.",
+    "timedOut": "La préparation de la copie a expiré. Réessayez ou téléchargez le fichier original."
+  },
   "workspaceReference": {
     "open": "Ouvrir {path} dans l’atelier",
     "actions": "Actions du fichier",

@@ -115,6 +115,7 @@
               />
             </button>
             <span v-if="!shareMode" class="msg-file-resource__actions">
+              <ImageCopyActions :source="{ kind: 'attachment', attachment }" :session-key="sessionKey" />
               <button
                 type="button"
                 :title="attachmentDownloadLabel(attachment)"
@@ -155,9 +156,11 @@
               </span>
             </component>
             <span
-              v-if="!attachment.workspaceFile && (isImageDisplayAttachment(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
+              v-if="!attachment.workspaceFile && (isImageDisplayAttachment(attachment) || isClipboardImageCandidate(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
               class="msg-file-resource__actions"
             >
+              <ImageCopyActions v-if="isClipboardImageCandidate(attachment)"
+                :source="{ kind: 'attachment', attachment }" :session-key="sessionKey" />
               <button
                 v-if="isImageDisplayAttachment(attachment) || attachmentCanOpen(attachment)"
                 type="button"
@@ -238,6 +241,8 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
+import ImageCopyActions from '@/components/ImageCopyActions.vue'
+import { isClipboardImageCandidate } from '@/composables/useImageClipboard'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import type {
   ChatRenderedMessage,
@@ -262,6 +267,7 @@ const { t } = useI18n()
 
 const props = defineProps<{
   message: ChatRenderedMessage
+  sessionKey?: string
   shareMode: boolean
   shareSelected: boolean
   shareMessageId: string

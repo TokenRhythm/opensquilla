@@ -47,6 +47,7 @@
           :strip-time-prefix="stripTimePrefix"
           :copy-message="copyMessage"
           :download-attachment="downloadAttachment"
+          :session-key="sessionKey"
           :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :is-streaming="isStreaming"
           :is-goal-source="isGoalSource(messages[entry.index])"

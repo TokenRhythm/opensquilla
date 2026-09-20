@@ -63,9 +63,37 @@ afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('shared resource actions', () => {
+  it('copies original SVG source through the shared async clipboard path', async () => {
+    const text = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 8">\n<!-- unchanged -->\n</svg>'
+    const copied: Blob[] = []
+    class ClipboardItemMock {
+      constructor(readonly items: Record<string, Promise<Blob>>) {}
+    }
+    vi.stubGlobal('ClipboardItem', ClipboardItemMock)
+    const write = vi.fn(async (items: ClipboardItems) => {
+      copied.push(await (items[0] as unknown as ClipboardItemMock).items['text/plain']!)
+    })
+    vi.spyOn(navigator.clipboard, 'write').mockImplementation(write)
+    const f = await mount({ id: 'vector', name: 'vector.svg', mime: 'image/svg+xml' })
+    f.content.fetchArtifact.mockResolvedValue({ ok: true, blob: new Blob([text], { type: 'image/svg+xml' }) })
+    await f.open()
+    expect(item('resourceActions.copyContents')).toBeUndefined()
+    item('imageClipboard.copySource')!.click()
+    // Clipboard write starts during the click, before fetching the bytes.
+    expect(write).toHaveBeenCalledOnce()
+    expect(f.content.fetchArtifact).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(copied).toHaveLength(1))
+    expect(await copied[0]!.text()).toBe(text)
+    expect(copied[0]!.type).toBe('text/plain')
+    expect(f.content.fetchArtifact).toHaveBeenCalledWith(expect.objectContaining({ id: 'vector' }),
+      expect.objectContaining({ sessionKey: f.props.sessionKey, maxBytes: 1024 * 1024 }))
+    expect(mocks.download).not.toHaveBeenCalled()
+  })
+
   it('keeps the specific HTML page and session for preview and current download without copy options', async () => {
     const f = await mount()
     await f.open()

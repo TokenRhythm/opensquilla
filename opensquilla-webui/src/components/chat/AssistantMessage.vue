@@ -281,6 +281,7 @@
           :navigation-artifacts="artifactNavigationItems"
           :session-key="sessionKey"
           :prefer-workbench="workbenchEnabled"
+          :share-mode="shareMode"
           @download="$emit('downloadArtifact', $event)"
           @open="$emit('openArtifact', $event)"
         />
