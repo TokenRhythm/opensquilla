@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { createContext, runInContext } from 'node:vm'
 
 import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
@@ -6,6 +8,116 @@ import {
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from '../dist/gateway-lifecycle.js'
+
+// Run the actual main-process startup wiring with profile inspection held open.
+// Readiness helpers alone do not cover the descriptor seen by the first renderer.
+const main = readFileSync(new URL('../dist/main.js', import.meta.url), 'utf8')
+function mainSection(start, end) {
+  const from = main.indexOf(start)
+  assert.notEqual(from, -1, start)
+  const to = main.indexOf(end, from)
+  assert.notEqual(to, -1, end)
+  return main.slice(from, to)
+}
+
+function deferred() {
+  let resolve
+  let reject
+  const promise = new Promise((accept, decline) => {
+    resolve = accept
+    reject = decline
+  })
+  return { promise, resolve, reject }
+}
+
+function mainStartupHarness() {
+  const inspection = deferred()
+  const inspectionStarted = deferred()
+  const calls = { rendered: [], published: [], readiness: [], starts: 0, successes: 0, failures: [] }
+  const snapshot = () => runInContext('desktopGatewayConnectionSnapshot()', context)
+  const context = createContext({
+    Error,
+    isQuitting: false,
+    gatewayProcess: null,
+    gatewayProfileKey: 'synthetic-profile',
+    forceOnboardingOnNextStartup: false,
+    activeDesktopProfile: () => ({ home: 'synthetic-profile' }),
+    desktopProfileFingerprint: () => 'synthetic-fingerprint',
+    desktopProfileKey: () => 'synthetic-profile',
+    cancelGatewayUnexpectedExitRestart() {},
+    createMainWindow: async () => { calls.rendered.push(snapshot()) },
+    focusMainWindow() {},
+    inspectActiveProfileBeforeStartup: () => {
+      inspectionStarted.resolve()
+      return inspection.promise
+    },
+    syncDesktopConsentMirror: async () => {},
+    desktopTelemetryRuntimeGate: { close() {} },
+    desktopLog() {},
+    loadDesktopRendererIntoCurrentWindow: async () => { calls.rendered.push(snapshot()) },
+    beginGatewayStartTelemetry() {},
+    readinessCheck: async (url) => {
+      calls.readiness.push(url)
+      return true
+    },
+    ensureGatewayStarted: async () => {
+      calls.starts += 1
+      throw new Error('Unexpected Gateway start')
+    },
+    publishGatewayConnection: () => { calls.published.push(snapshot()) },
+    sendBootStatus() {},
+    finishAppStartSuccess: () => { calls.successes += 1 },
+    finishAppStartFailure: (error) => { calls.failures.push(error.message) },
+    currentMainWindow: () => null,
+  })
+  runInContext([
+    mainSection('let desktopOpenFlowRevision =', 'function beginDesktopWriterOperation('),
+    mainSection('const gatewayState =', 'let sandboxUpgradeRefreshInFlight ='),
+    mainSection('function transitionGatewayConnection(', 'const artifactPreviewLeaseBroker ='),
+    mainSection('async function reuseHealthyGatewayState(', 'async function verifyOwnedGatewayLaunch('),
+    mainSection('async function openOrResumeDesktopApp(', '// SIGKILL deadline'),
+  ].join('\n'), context)
+  return { context, calls, snapshot, inspection, inspectionStarted: inspectionStarted.promise }
+}
+
+async function runColdStartDescriptorCase() {
+  const harness = mainStartupHarness()
+  const opening = runInContext('openOrResumeDesktopApp()', harness.context)
+  await harness.inspectionStarted
+
+  for (const descriptor of [...harness.calls.rendered, harness.snapshot()]) {
+    assert.equal(descriptor.status, 'starting', 'profile preflight is part of startup')
+    assert.equal(descriptor.wsUrl, null, 'startup must not grant WebSocket access before readiness')
+    assert.equal(descriptor.authToken, null)
+    assert.equal(descriptor.error, null)
+  }
+  assert.equal(harness.calls.rendered.length, 1, 'renderer loads before profile preflight completes')
+
+  harness.inspection.reject(new Error('Synthetic profile inspection failure'))
+  await opening
+  assert.equal(harness.snapshot().status, 'error', 'real startup failures remain actionable')
+  assert.equal(harness.calls.published.at(-1).error, 'Synthetic profile inspection failure')
+  assert.deepEqual(harness.calls.failures, ['Synthetic profile inspection failure'])
+}
+
+async function runWarmExternalGatewayReuseCase() {
+  const harness = mainStartupHarness()
+  const url = 'http://127.0.0.1:8765'
+  runInContext(`Object.assign(gatewayState, { status: 'ready', url: '${url}', port: 8765 })`, harness.context)
+  const opening = runInContext('openOrResumeDesktopApp()', harness.context)
+  await harness.inspectionStarted
+  assert.equal(harness.snapshot().status, 'ready', 'warm profile preflight preserves the healthy connection')
+  harness.inspection.resolve(true)
+  await opening
+
+  assert.deepEqual(harness.calls.readiness, [url], 'warm launch validates and reuses the external Gateway')
+  assert.equal(harness.calls.starts, 0)
+  assert.equal(harness.calls.successes, 1)
+  assert.deepEqual(harness.calls.failures, [])
+  for (const descriptor of [...harness.calls.rendered, ...harness.calls.published]) {
+    assert.equal(descriptor.status, 'ready', 'warm launch must not publish a spurious startup transition')
+  }
+}
 
 function fakeClock() {
   let current = 0
@@ -256,6 +368,8 @@ async function runSlowColdStartReadinessCase() {
   assert.ok(probes > 1)
 }
 
+await runColdStartDescriptorCase()
+await runWarmExternalGatewayReuseCase()
 await runStoppingSetOnlyCase()
 await runCurrentPlusStoppingCase()
 await runLatePublishedChildCase()
