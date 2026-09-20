@@ -31,7 +31,9 @@ for (const configured of [true, false]) {
     await expect(provider).toHaveAccessibleName(configured ? /^Model Service: Ready/ : /^Model Service: Needs action/)
     await expect(provider.locator('.settings-rail__dot.is-danger')).toHaveCount(configured ? 0 : 1)
     await expect(provider.locator('.settings-rail__warn')).toHaveCount(0)
-    await expect(page.locator('#settings-rail-capabilities .settings-rail__warn')).toHaveCount(1)
+    await expect(page.locator('.settings-rail__warn')).toHaveCount(0)
+    await expect(page.locator('#settings-rail-capabilities')).toHaveAccessibleName('Capabilities: Optional')
+    await expect(page.locator('#settings-rail-capabilities .settings-rail__dot.is-muted')).toHaveCount(1)
 
     await page.getByRole('button', { name: 'Close', exact: true }).click()
     await page.locator('.sidebar-foot button').click()
