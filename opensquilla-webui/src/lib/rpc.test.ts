@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { markRaw, ref } from 'vue'
 import {
   isHelloOkFrame,
   RpcAbortError,
@@ -1706,8 +1707,9 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('keeps a new wake incident started by a synchronous recovery observer', async () => {
-    const client = new RpcClient()
+  it.each([false, true])('keeps a new wake incident started by a synchronous recovery observer (reactive=%s)', async reactive => {
+    const instance = new RpcClient()
+    const client = reactive ? ref(instance).value as RpcClient : instance
     const diagnostics: Array<Record<string, unknown>> = []
     client.on('_transport', detail => {
       const entry = detail as Record<string, unknown>
@@ -1715,7 +1717,7 @@ describe('RpcClient', () => {
       if (entry.phase === 'wake_incident_recovered') client.notifyResume()
     })
     client.connect('ws://rpc.test')
-    const socket = MockWebSocket.instances[0]
+    const socket = markRaw(MockWebSocket.instances[0])
     establishConnection(socket, { transport_probe_nonce: true })
     client.notifyResume()
     await vi.advanceTimersByTimeAsync(5_000)
@@ -1739,10 +1741,11 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('does not retire an incident recovered inside a synchronous timeout observer', async () => {
-    const client = new RpcClient()
+  it.each([false, true])('does not retire an incident recovered inside a synchronous timeout observer (reactive=%s)', async reactive => {
+    const instance = new RpcClient()
+    const client = reactive ? ref(instance).value as RpcClient : instance
     client.connect('ws://rpc.test')
-    const socket = MockWebSocket.instances[0]
+    const socket = markRaw(MockWebSocket.instances[0])
     establishConnection(socket, { transport_probe_nonce: true })
     client.on('_transport', detail => {
       if ((detail as { phase: string }).phase !== 'wake_incident_timeout') return
@@ -1756,6 +1759,42 @@ describe('RpcClient', () => {
     expect(client.state).toBe('connected')
     expect(socket.readyState).toBe(MockWebSocket.OPEN)
     expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('retires a Vue ref-owned wake incident at its first deadline and makes the replacement usable', async () => {
+    const client = ref(new RpcClient()).value as RpcClient
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    // Native WebSocket objects are not Vue-reactive; preserve that property in
+    // the plain class mock while allowing the client's incident to be proxied.
+    const socket = markRaw(MockWebSocket.instances[0])
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    const started = diagnostics.find(item => item.phase === 'wake_incident_start')!
+    const duplicates = setInterval(() => client.notifyResume(), 3_000)
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(client.health).toBe('suspect')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(1)
+    clearInterval(duplicates)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_timeout',
+      wakeIncidentId: started.wakeIncidentId,
+      wakeIncidentDeadlineAt: started.wakeIncidentDeadlineAt,
+      wakeSignalCount: 7,
+    }))
+    await vi.advanceTimersByTimeAsync(500)
+    const replacement = markRaw(MockWebSocket.instances[1])
+    establishConnection(replacement, { transport_probe_nonce: true })
+    const request = client.call('sessions.list')
+    const id = JSON.parse(replacement.sent[replacement.sent.length - 1]).id
+    replacement.receive({ type: 'res', id, ok: true, payload: { sessions: [] } })
+    await expect(request).resolves.toEqual({ sessions: [] })
+    expect(client.health).toBe('healthy')
+    expect(diagnostics.filter(item => item.phase === 'first_successful_rpc')).toHaveLength(1)
     client.disconnect()
   })
 

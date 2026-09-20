@@ -44,6 +44,7 @@ const outputDir = process.env.OSQ_WAKE_EVIDENCE_DIR
   : fs.mkdtempSync(path.join(os.tmpdir(), 'opensquilla-gateway-wake-'));
 const loops = Math.max(1, Number.parseInt(process.env.OSQ_WAKE_LOOPS || '30', 10));
 const concurrency = Math.max(1, Number.parseInt(process.env.OSQ_WAKE_CONCURRENCY || '30', 10));
+const vueProxy = process.env.OSQ_WAKE_CLIENT_MODE === 'vue';
 const variantFilter = process.env.OSQ_WAKE_VARIANTS?.split(',');
 const scenarioFilter = process.env.OSQ_WAKE_SCENARIOS?.split(',');
 if (fs.existsSync(outputDir) && (!fs.statSync(outputDir).isDirectory() || fs.readdirSync(outputDir).length)) {
@@ -166,8 +167,9 @@ async function runTrial(browser, variant, scenario, repetition) {
   let healingTimer;
   try {
     await page.setContent('<!doctype html><title>gateway wake real clock</title>');
+    if (vueProxy) await page.addScriptTag({ path: path.join(repo, 'opensquilla-webui/node_modules/vue/dist/vue.global.prod.js') });
     await page.addScriptTag({ content: `var exports = {};\n${variant.code}\nwindow.AuditRpcClient = exports.RpcClient;` });
-    await page.evaluate((url) => {
+    await page.evaluate(({ url, vueProxy }) => {
       const base = performance.now();
       const events = [];
       const record = (event, detail = {}) => events.push({ ...detail,
@@ -178,8 +180,9 @@ async function runTrial(browser, variant, scenario, repetition) {
         record('socket_close_called', { code: args[0] ?? null, reason: args[1] ?? null });
         return Reflect.apply(nativeClose, this, args);
       };
-      const rpc = new window.AuditRpcClient();
-      window.audit = { rpc, events, base, hello: 0, usable: 0, ready: false };
+      const rawRpc = new window.AuditRpcClient();
+      const rpc = vueProxy ? window.Vue.ref(rawRpc).value : rawRpc;
+      window.audit = { rpc, events, base, hello: 0, usable: 0, ready: false, vueProxy };
       rpc.on('_transport', (detail) => record('transport', detail));
       rpc.on('_state', (state) => record('state', { state }));
       rpc.on('_status', (status) => record('status', status));
@@ -193,7 +196,7 @@ async function runTrial(browser, variant, scenario, repetition) {
         }, 0);
       });
       rpc.connect(url);
-    }, relay.url);
+    }, { url: relay.url, vueProxy });
     const connected = await page.waitForFunction(() => window.audit.ready, null, { timeout: 10000 }).then(() => true).catch(() => false);
     if (!connected) {
       const diagnostic = await page.evaluate(() => ({ state: window.audit.rpc.state, health: window.audit.rpc.health, events: window.audit.events }));
@@ -204,10 +207,12 @@ async function runTrial(browser, variant, scenario, repetition) {
     await page.evaluate((repeatMs) => {
       window.audit.faultAt = performance.now() - window.audit.base;
       window.audit.events.push({ event: 'fault_injected', at: window.audit.faultAt });
-      window.dispatchEvent(new Event('pageshow'));
+      if (window.audit.vueProxy) window.audit.rpc.notifyResume();
+      else window.dispatchEvent(new Event('pageshow'));
       if (repeatMs) window.audit.repeatTimer = setInterval(() => {
         window.audit.events.push({ event: 'wake_signal', at: performance.now() - window.audit.base });
-        window.dispatchEvent(new Event('pageshow'));
+        if (window.audit.vueProxy) window.audit.rpc.notifyResume();
+        else window.dispatchEvent(new Event('pageshow'));
       }, repeatMs);
     }, scenario.repeatMs);
     if (scenario.healMs !== null) healingTimer = setTimeout(async () => {
@@ -284,6 +289,9 @@ function summarize(results) {
 }
 
 async function main() {
+  const harnessPath = fileURLToPath(import.meta.url);
+  const harnessSha = sha256(harnessPath);
+  const packageLockSha = sha256(path.join(repo, 'opensquilla-webui/package-lock.json'));
   const currentSource = fs.readFileSync(sourcePath, 'utf8');
   const baselineSource = execFileSync('git', ['show', `${baselineSha}:opensquilla-webui/src/lib/rpc.ts`], { cwd: repo, encoding: 'utf8' });
   const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: repo, encoding: 'utf8' }).trim();
@@ -349,9 +357,12 @@ async function main() {
   const evidence = {
     schema: 'opensquilla.gateway.wake-real-clock.v1', startedAt, generatedAt: new Date().toISOString(),
     gitHead: head, baselineSha, gitStatus: status,
-    harness: { file: path.relative(repo, fileURLToPath(import.meta.url)), sha256: sha256(fileURLToPath(import.meta.url)),
+    harness: { file: path.relative(repo, harnessPath), sha256: harnessSha,
+      unchangedAtEnd: harnessSha === sha256(harnessPath),
       node: process.version, chromium: browserVersion, typescript: ts.version, platform: process.platform,
-      loops, concurrency, packageLockSha256: sha256(path.join(repo, 'opensquilla-webui/package-lock.json')) },
+      loops, concurrency, clientMode: vueProxy ? 'vue-ref-resume' : 'raw-pageshow',
+      vueBundleSha256: vueProxy ? sha256(path.join(repo, 'opensquilla-webui/node_modules/vue/dist/vue.global.prod.js')) : null,
+      packageLockSha256: packageLockSha },
     topology: 'loopback real Chromium/native WebSocket + TCP byte relay + synthetic contract upstream; old connection black-holed, replacement healthy',
     physicalCoverage: { windowsSleepResume: false, wifiChange: false, vpnOrRemoteNic: false, packagedElectron: false },
     scopeLimitations: [

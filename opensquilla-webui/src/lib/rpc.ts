@@ -1240,12 +1240,22 @@ export class RpcClient {
       this._suspectAt ??= Date.now();
       incident.status = 'reconnecting';
       this._setHealth('suspect');
-      if (this._wakeIncident !== incident || this._socketGeneration !== generation) return;
+      // Store owners may proxy this client and its incident through Vue ref().
+      // Stable IDs preserve the reentrancy fence across raw/proxied access.
+      if (
+        this._wakeIncident?.id !== incident.id
+        || this._wakeIncident.generation !== generation
+        || this._socketGeneration !== generation
+      ) return;
       this._emitTransport('wake_incident_timeout', generation, {
         incidentId: incident.id,
         reason: 'wake_incident_timeout',
       });
-      if (this._wakeIncident !== incident || this._socketGeneration !== generation) return;
+      if (
+        this._wakeIncident?.id !== incident.id
+        || this._wakeIncident.generation !== generation
+        || this._socketGeneration !== generation
+      ) return;
       this._clearWakeIncident(generation, incident.id);
       this._recycleConnection(
         generation,

@@ -92,6 +92,7 @@ const routedClients = new Set()
 const routedServers = new WeakMap()
 const blackholedClients = new Set()
 let wakeBlackholeEvidence = null
+let wakeBlackholeFailure = null
 
 async function startSyntheticProvider() {
   let chatRequests = 0
@@ -221,6 +222,46 @@ async function readContinuityObservation(page, app) {
     renderer: await page?.evaluate(() => window.__stabilityContinuityObservation?.read()).catch(() => null),
     window: await app?.evaluate(() => globalThis.__stabilityWindowObservation?.read()).catch(() => null),
   }
+}
+
+async function readRpcTransportObservation(page) {
+  return await page?.evaluate(() => {
+    const phases = new Set([
+      'connect_start', 'hello', 'challenge', 'first_successful_rpc', 'close',
+      'watchdog_timeout', 'handshake_invalid', 'wake_incident_timeout',
+      'wake_incident_start', 'wake_incident_recovered', 'retire',
+      'probe_socket_unavailable', 'probe_deferred', 'probe_timeout',
+      'scheduler_lag', 'reconnect_scheduled',
+    ])
+    const numericFields = [
+      'at', 'generation', 'suspectAt', 'lastRxAt', 'wakeIncidentId',
+      'wakeIncidentStartedAt', 'wakeIncidentDeadlineAt', 'wakeSignalCount',
+      'roundTripMs', 'reconnectAttempt', 'recoveryMs', 'loopLagMs', 'maxLoopLagMs',
+      'closeCode', 'delayMs',
+    ]
+    const enums = {
+      health: ['healthy', 'suspect'],
+      topology: ['loopback', 'remote', 'proxy/vpn', 'unknown'],
+      visibility: ['visible', 'hidden', 'unknown'],
+      wakeIncidentStatus: ['probing', 'suspect', 'reconnecting', 'recovered'],
+    }
+    let entries
+    try { entries = JSON.parse(localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]') }
+    catch { return { unreadable: true, records: [] } }
+    if (!Array.isArray(entries)) return { unreadable: true, records: [] }
+    const transport = entries.filter(entry => entry?.source === 'rpc.transport' && phases.has(entry.phase))
+    const records = transport.slice(0, 96).reverse().map(entry => {
+      const record = { phase: entry.phase }
+      for (const field of numericFields) {
+        if (typeof entry[field] === 'number' && Number.isFinite(entry[field])) record[field] = entry[field]
+      }
+      for (const [field, values] of Object.entries(enums)) {
+        if (values.includes(entry[field])) record[field] = entry[field]
+      }
+      return record
+    })
+    return { records, dropped: Math.max(0, transport.length - records.length) }
+  }).catch(() => ({ unavailable: true, records: [] }))
 }
 
 try {
@@ -410,6 +451,7 @@ try {
     // native UI integration, not a kernel TCP blackhole or physical sleep.
     await waitFor(async () => routedClients.size === 1, 'one wake-fault connection')
     const acceptedBefore = acceptedSockets
+    const precedingTransport = await readRpcTransportObservation(page)
     for (const client of routedClients) blackholedClients.add(client)
     const wakeStarted = Date.now()
     await page.evaluate(() => localStorage.removeItem('opensquilla.chat.sessionNavigationDiag'))
@@ -456,6 +498,18 @@ try {
         suspectObservedMs, recoveredMs: Date.now() - wakeStarted,
         acceptedReplacements: acceptedSockets - acceptedBefore, timeline,
       }
+    } catch (error) {
+      // Capture before removing the fault so a late response cannot obscure
+      // the failure. Only bounded timing/state fields leave the test profile.
+      wakeBlackholeFailure = {
+        elapsedMs: Date.now() - wakeStarted,
+        acceptedBefore,
+        acceptedSockets,
+        routedConnectionCount: routedClients.size,
+        precedingTransport,
+        faultTransport: await readRpcTransportObservation(page),
+      }
+      throw error
     } finally {
       clearInterval(duplicateWake)
       blackholedClients.clear()
@@ -797,6 +851,8 @@ try {
     idleSendReceipt,
     syntheticProviderRequests: syntheticProvider?.chatRequests() ?? null,
     continuityDiagnostics,
+    wakeBlackholeFailure,
+    rpcTransport: await readRpcTransportObservation(continuityPage),
     windows,
     desktopLog,
   }, null, 2))
