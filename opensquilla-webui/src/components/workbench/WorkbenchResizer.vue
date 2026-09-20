@@ -3,7 +3,7 @@
     v-if="enabled"
     ref="handleRef"
     class="workbench-resizer"
-    :class="{ 'is-dragging': drag.active }"
+    :class="{ 'is-dragging': drag.active, 'is-pointer-focused': pointerFocused }"
     role="separator"
     tabindex="0"
     :aria-label="ariaLabel"
@@ -69,6 +69,7 @@ const emit = defineEmits<{
 }>()
 
 const handleRef = ref<HTMLElement | null>(null)
+const pointerFocused = ref(false)
 const previewWidth = ref<number | null>(null)
 const announcement = ref('')
 const drag = reactive({
@@ -146,6 +147,7 @@ function onPointerDown(event: PointerEvent) {
   const target = event.currentTarget
   if (!(target instanceof HTMLElement)) return
   event.preventDefault()
+  pointerFocused.value = true
   drag.active = true
   drag.moved = false
   drag.pointerId = event.pointerId
@@ -235,6 +237,7 @@ function onLostPointerCapture(event: PointerEvent) {
 }
 
 function onBlur() {
+  pointerFocused.value = false
   if (drag.active) rollback()
 }
 
@@ -265,6 +268,7 @@ function resetToDefault(event: MouseEvent) {
 }
 
 function onKeydown(event: KeyboardEvent) {
+  pointerFocused.value = false
   if (event.key === 'Escape' && drag.active) {
     event.preventDefault()
     rollback()
@@ -282,7 +286,10 @@ function onKeydown(event: KeyboardEvent) {
 }
 
 watch(() => props.enabled, enabled => {
-  if (!enabled) rollback()
+  if (!enabled) {
+    pointerFocused.value = false
+    rollback()
+  }
 })
 
 watch([() => props.min, () => props.max], () => {
@@ -342,6 +349,11 @@ defineExpose({ cancel: rollback })
 .workbench-resizer:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: -3px;
+}
+
+/* Pointer focus outlives the drag; keyboard interaction restores the ring. */
+.workbench-resizer.is-pointer-focused {
+  outline: none;
 }
 
 .workbench-resizer__status {
