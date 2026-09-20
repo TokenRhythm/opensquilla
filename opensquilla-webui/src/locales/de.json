@@ -4807,15 +4807,6 @@
       "bulkDeletePartial": "{count} Sitzungen konnten nicht gelöscht werden",
       "bulkDeleteFailed": "Ausgewählte Sitzungen konnten nicht gelöscht werden"
     },
-    "setupBanner": {
-      "ariaLabel": "Gateway-Einrichtung erforderlich",
-      "title": "Einrichtung erforderlich",
-      "dismiss": "Schließen",
-      "dismissNotice": "Einrichtungshinweis schließen",
-      "hint": "Das Gateway ist noch nicht einsatzbereit.",
-      "finishSetup": "Einrichtung abschließen",
-      "viewReadiness": "Bereitschaft anzeigen"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Seitenleiste umschalten",

@@ -40,7 +40,7 @@ import {
   useSetupModelStrategyForm,
   type ModelStrategy,
 } from '@/composables/setup/useSetupModelStrategyForm'
-import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
+import { invalidateReadiness } from '@/composables/setup/readinessInvalidation'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
@@ -2301,7 +2301,7 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
     return { label: t('setup.connection.disconnected'), tone: 'is-warn' }
   }
   if (sectionId === 'provider') {
-    if (status.value.llmConfigured === false || providerEnvMissing.value) return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
+    if (status.value.llmConfigured === false || status.value.llmSource === 'missing_env') return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
     return detailStepStatus((status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider)
   }
   // General/Security/Advanced are always-valid preference toggles, not

@@ -4807,15 +4807,6 @@
       "bulkDeletePartial": "{count} sessions n'ont pas pu être supprimées",
       "bulkDeleteFailed": "Impossible de supprimer les sessions sélectionnées"
     },
-    "setupBanner": {
-      "ariaLabel": "Configuration de la passerelle requise",
-      "title": "Configuration requise",
-      "dismiss": "Ignorer",
-      "dismissNotice": "Ignorer l'avis de configuration",
-      "hint": "La passerelle n'est pas encore prête à fonctionner.",
-      "finishSetup": "Terminer la configuration",
-      "viewReadiness": "Voir la préparation"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Afficher ou masquer la barre latérale",

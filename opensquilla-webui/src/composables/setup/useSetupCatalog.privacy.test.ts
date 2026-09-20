@@ -411,6 +411,94 @@ afterEach(() => {
   document.body.innerHTML = ''
 })
 
+describe('provider readiness indicator', () => {
+  function mockReadiness(snapshot: Record<string, unknown>, save?: () => void) {
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog') return {
+        providers: ['tokenrhythm', 'openai'].map(providerId => ({
+          providerId, label: providerId, runtimeSupported: true, requiresApiKey: true,
+          fields: [
+            { name: 'model', label: 'Model', required: true, default: 'test-model' },
+            { name: 'api_key', label: 'API key', secret: true },
+          ],
+        })),
+      }
+      if (method === 'onboarding.status') return structuredClone(snapshot)
+      if (method === 'config.get') return { llm: { provider: 'tokenrhythm', model: 'test-model' } }
+      if (method === 'config.effective') return { fields: { 'llm.provider': { source: 'config', value: 'tokenrhythm' } } }
+      if (method === 'onboarding.provider.configure') { save?.(); return {} }
+      if (method === 'channels.status') return { channels: [] }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+  }
+
+  const optionalMissing = { status: 'missing', required: false, optional: true, blocking: false, actionRequired: true }
+
+  it.each(['explicit', 'env', 'not_required'])('keeps a configured primary ready with optional failures and no connection test (%s)', async source => {
+    mockReadiness({
+      hasConfig: true, llmConfigured: true, needsOnboarding: false, llmSource: source,
+      sectionDetails: {
+        llm: { status: 'ok', blocking: false, actionRequired: false },
+        search: optionalMissing, audio: optionalMissing, image_generation: optionalMissing,
+      },
+    })
+    const { api, app } = await mountCatalog()
+    try {
+      expect(api.sectionStatus('provider').tone).toBe('is-ok')
+      expect(api.sectionStatus('capabilities').tone).toBe('is-warn')
+      api.selectProvider('openai')
+      api.onProviderChange()
+      api.updateProviderField('api_key', '')
+      expect(api.sectionStatus('provider').tone).toBe('is-ok')
+      expect(rpcCall.mock.calls.some(([method]) => method.includes('.probe'))).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('keeps a saved missing environment credential visible while editing another provider', async () => {
+    mockReadiness({ hasConfig: true, llmSource: 'missing_env' })
+    const { api, app } = await mountCatalog()
+    try {
+      api.selectProvider('openai')
+      api.onProviderChange()
+      expect(api.sectionStatus('provider').tone).toBe('is-warn')
+    } finally { app.unmount() }
+  })
+
+  it('clears missing-primary readiness after saving and keeps it clear on reopen despite missing search', async () => {
+    const snapshot = {
+      hasConfig: false, llmConfigured: false, needsOnboarding: true, llmSource: 'missing_env',
+      sectionDetails: { llm: { status: 'missing', blocking: true, actionRequired: true }, search: optionalMissing },
+    }
+    mockReadiness(snapshot, () => {
+      Object.assign(snapshot, { hasConfig: true, llmConfigured: true, needsOnboarding: false, llmSource: 'explicit' })
+      snapshot.sectionDetails.llm = { status: 'ok', blocking: false, actionRequired: false }
+    })
+    const { api, app } = await mountCatalog()
+    try {
+      expect(api.sectionStatus('provider').tone).toBe('is-warn')
+      api.selectProvider('tokenrhythm')
+      api.onProviderChange()
+      api.updateProviderField('api_key', 'synthetic-test-key')
+      expect(await api.saveProvider()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({ providerId: 'tokenrhythm' }))
+      expect(api.sectionStatus('provider').tone).toBe('is-ok')
+      expect(api.sectionStatus('capabilities').tone).toBe('is-warn')
+    } finally { app.unmount() }
+    const reopened = await mountCatalog()
+    try { expect(reopened.api.sectionStatus('provider').tone).toBe('is-ok') }
+    finally { reopened.app.unmount() }
+  })
+
+  it('does not interpret an unavailable status query as a missing provider', async () => {
+    rpcCall.mockRejectedValue(new Error('connection closed'))
+    const { api, app } = await mountCatalog()
+    try {
+      expect(api.loaded.value).toBe(false)
+      expect(api.sectionStatus('provider').tone).toBe('is-muted')
+    } finally { app.unmount() }
+  })
+})
+
 describe('useSetupCatalog initial connection readiness', () => {
   it('waits for the Gateway before loading a cold settings route', async () => {
     const availability = ref<GatewayAvailability>('preparing')

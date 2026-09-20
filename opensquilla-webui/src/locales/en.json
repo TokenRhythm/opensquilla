@@ -4892,15 +4892,6 @@
       "bulkDeletePartial": "{count} tasks failed to delete",
       "bulkDeleteFailed": "Failed to delete selected tasks"
     },
-    "setupBanner": {
-      "ariaLabel": "Gateway setup needed",
-      "title": "Setup needed",
-      "dismiss": "Dismiss",
-      "dismissNotice": "Dismiss setup notice",
-      "hint": "The gateway isn't ready to run yet.",
-      "finishSetup": "Finish setup",
-      "viewReadiness": "View readiness"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Toggle sidebar",

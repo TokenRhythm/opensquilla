@@ -31,7 +31,7 @@ type RpcFrame = {
 }
 
 /** Synthetic, offline gateway shared by interaction tests and visual checks. */
-export async function installSidebarFixture(page: Page) {
+export async function installSidebarFixture(page: Page, rpcPayloads: Record<string, unknown> = {}) {
   await page.addInitScript(() => {
     localStorage.setItem('opensquilla-locale', 'en')
   })
@@ -105,7 +105,7 @@ export async function installSidebarFixture(page: Page) {
         type: 'res',
         id: frame.id,
         ok: true,
-        payload: payloads[String(frame.method)] ?? {},
+        payload: rpcPayloads[String(frame.method)] ?? payloads[String(frame.method)] ?? {},
       }))
     })
   })

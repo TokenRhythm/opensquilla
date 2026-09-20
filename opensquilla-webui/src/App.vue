@@ -75,7 +75,6 @@
       </router-link>
     </div>
 
-    <SidebarSetupBanner />
 
     <!-- Recent conversations -->
     <SidebarConversations
@@ -476,7 +475,6 @@ import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
-import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'

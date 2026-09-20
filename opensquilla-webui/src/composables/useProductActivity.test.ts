@@ -3,7 +3,7 @@ import { createApp, defineComponent, nextTick, reactive } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ProductActivityError, type ProductActivity } from '@/modules/productActivity'
 import { useProductActivity } from './useProductActivity'
-import { invalidateReadiness } from './setup/useReadinessSummary'
+import { invalidateReadiness } from './setup/readinessInvalidation'
 
 const platform = vi.hoisted(() => ({ capabilities: { isDesktop: false } }))
 vi.mock('@/platform', () => ({ getPlatform: () => platform }))

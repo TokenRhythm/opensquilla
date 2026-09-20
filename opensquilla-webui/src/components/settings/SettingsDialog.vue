@@ -41,7 +41,13 @@
               <span class="settings-rail__label">{{ t('settings.rail.' + s.id) }}</span>
               <span v-if="sectionDirty(s.id)" class="settings-rail__dirty" aria-hidden="true"></span>
               <span v-if="s.id === 'gateway'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
-              <span v-else-if="!s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
+              <span
+                v-else-if="s.id === 'provider' && loaded && sectionStatus(s.id).tone === 'is-warn'"
+                class="settings-rail__dot is-danger"
+                :title="sectionStatus(s.id).label"
+                aria-hidden="true"
+              ></span>
+              <span v-else-if="s.id !== 'provider' && !s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
             </button>
           </template>
         </nav>
@@ -1018,6 +1024,7 @@ onUnmounted(() => {
 }
 
 .settings-rail__dot.is-ok { background: var(--ok); }
+.settings-rail__dot.is-danger { background: var(--danger); }
 .settings-rail__dot.is-warn { background: var(--warn-fill); }
 .settings-rail__dot.is-muted { background: var(--text-dim); opacity: 0.5; }
 

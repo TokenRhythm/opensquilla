@@ -4807,15 +4807,6 @@
       "bulkDeletePartial": "{count} 件のセッションを削除できませんでした",
       "bulkDeleteFailed": "選択したセッションを削除できませんでした"
     },
-    "setupBanner": {
-      "ariaLabel": "ゲートウェイのセットアップが必要です",
-      "title": "セットアップが必要です",
-      "dismiss": "閉じる",
-      "dismissNotice": "セットアップ通知を閉じる",
-      "hint": "ゲートウェイはまだ実行する準備ができていません。",
-      "finishSetup": "セットアップを完了",
-      "viewReadiness": "準備状況を表示"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "サイドバーを切り替え",

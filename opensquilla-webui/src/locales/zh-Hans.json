@@ -4891,15 +4891,6 @@
       "bulkDeletePartial": "{count} 个任务删除失败",
       "bulkDeleteFailed": "删除已选任务失败"
     },
-    "setupBanner": {
-      "ariaLabel": "需要设置网关",
-      "title": "需要设置",
-      "dismiss": "关闭",
-      "dismissNotice": "关闭设置提示",
-      "hint": "网关尚未就绪，无法运行。",
-      "finishSetup": "完成设置",
-      "viewReadiness": "查看就绪状态"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "切换侧边栏",

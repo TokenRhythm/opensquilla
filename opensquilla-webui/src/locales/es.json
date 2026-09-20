@@ -4807,15 +4807,6 @@
       "bulkDeletePartial": "No se pudieron eliminar {count} sesiones",
       "bulkDeleteFailed": "No se pudieron eliminar las sesiones seleccionadas"
     },
-    "setupBanner": {
-      "ariaLabel": "Es necesaria la configuración de la puerta de enlace",
-      "title": "Es necesaria la configuración",
-      "dismiss": "Descartar",
-      "dismissNotice": "Descartar el aviso de configuración",
-      "hint": "La puerta de enlace aún no está lista para ejecutarse.",
-      "finishSetup": "Finalizar configuración",
-      "viewReadiness": "Ver preparación"
-    },
     "shortcuts": {
       "toggleSidebar": {
         "label": "Alternar barra lateral",
