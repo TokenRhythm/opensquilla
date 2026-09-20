@@ -28,7 +28,6 @@ from .types import (
     ReservationRejectionReason,
     ScheduleKind,
     SessionTarget,
-    clear_reservation,
 )
 
 __all__ = ["DeliveryReport", "JobStore"]
@@ -811,25 +810,69 @@ class JobStore:
             message="Job could not be reserved",
         )
 
+    async def finalize_reserved_job(
+        self,
+        job: CronJob,
+        reservation_token: str,
+        expected_updated_at: datetime,
+        *,
+        delete: bool = False,
+    ) -> bool:
+        """Commit a result only if its reservation and input snapshot still match.
+
+        A concurrent edit requires the caller to reload and recompute the result.
+        Never upsert here: a deleted job must stay deleted.
+        """
+        predicate = (job.id, reservation_token, expected_updated_at.isoformat())
+        if delete:
+            cur = await self._db().execute(
+                """DELETE FROM scheduler_jobs
+                   WHERE id = ? AND reservation_token = ? AND updated_at = ?""",
+                predicate,
+            )
+        else:
+            cur = await self._db().execute(
+                """
+                UPDATE scheduler_jobs
+                SET status = ?, enabled = ?, next_run_at = ?,
+                    run_count = ?, error_count = ?, last_error = ?,
+                    consecutive_errors = ?, backoff_until = ?,
+                    updated_at = MAX(updated_at, ?),
+                    reservation_token = '', reserved_at = NULL, reserved_by = '',
+                    reservation_source = '', scheduled_run_at = NULL
+                WHERE id = ? AND reservation_token = ? AND updated_at = ?
+                """,
+                (
+                    job.status.value, int(job.enabled), self._iso(job.next_run_at),
+                    job.run_count, job.error_count, job.last_error,
+                    job.consecutive_errors, self._iso(job.backoff_until),
+                    job.updated_at.isoformat(), *predicate,
+                ),
+            )
+        await self._db().commit()
+        return cur.rowcount == 1
+
     async def finalize_reserved_missing_handler(
         self,
         job_id: str,
         reservation_token: str,
         error: str,
     ) -> bool:
-        current = await self.get(job_id)
-        if current is None or current.reservation_token != reservation_token:
-            return False
-        current.status = JobStatus.FAILED
-        current.error_count += 1
-        current.consecutive_errors += 1
-        current.last_error = error
-        current.next_run_at = None
-        current.backoff_until = None
-        current.updated_at = datetime.now(UTC)
-        clear_reservation(current)
-        await self.save(current)
-        return True
+        while True:
+            current = await self.get(job_id)
+            if current is None or current.reservation_token != reservation_token:
+                return False
+            expected_updated_at = current.updated_at
+            if current.status not in (JobStatus.PAUSED, JobStatus.DISABLED):
+                current.status = JobStatus.FAILED
+                current.error_count += 1
+                current.consecutive_errors += 1
+                current.last_error = error
+                current.next_run_at = None
+                current.backoff_until = None
+                current.updated_at = datetime.now(UTC)
+            if await self.finalize_reserved_job(current, reservation_token, expected_updated_at):
+                return True
 
     async def release_reservation(
         self,
