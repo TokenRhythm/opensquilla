@@ -73,8 +73,9 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
 @tool(
     name="submit_plan",
     description=(
-        "Submit the complete structured plan for the current Plan turn. "
-        "This creates a new immutable revision and ends the turn."
+        "Submit the complete structured plan for user review in the current Plan turn. "
+        "This creates a new immutable revision and ends the planning turn; "
+        "it does not authorize or start implementation."
     ),
     params={
         "title": {

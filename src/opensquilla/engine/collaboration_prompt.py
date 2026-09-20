@@ -28,9 +28,14 @@ def collaboration_instructions(ctx: ToolContext | None) -> str:
             "Clarify only material decisions you cannot discover. Ordinary discussion can "
             "end with a direct answer. "
             + (
-                "When a complete proposal is ready, call submit_plan with the full replacement "
-                "title, Markdown and suggested steps; this ends the planning turn. "
-                "The proposal records intent and does not constrain later implementation."
+                "For a user-requested plan, complete the necessary investigation before "
+                "finalizing; announcing intended investigation is not completion. When the "
+                "proposal is ready, call submit_plan with the full replacement title, "
+                "Markdown and suggested steps, without asking whether to submit it. "
+                "Respect explicit requests to keep discussing or leave a draft unsubmitted. "
+                "Submission saves a proposal for review and ends the planning turn; "
+                "it does not authorize or start implementation. The proposal records "
+                "intent and does not constrain later implementation."
                 if main else
                 "Return investigation findings to the parent. The parent owns formal "
                 "proposal submission and Goal controls."
