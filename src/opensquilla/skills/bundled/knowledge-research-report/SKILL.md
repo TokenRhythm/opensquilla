@@ -27,7 +27,10 @@ Add useful exhibits through `mcp_researchAddTable` in the section whose argument
 they support. Captions must identify the comparison, period/units, analytical
 significance, and any limit. The sidecar requires usable complete table text and
 the original PDF crop; it does not treat crop availability as proof of visual
-inspection.
+inspection. The final report shows per-source reading coverage and a coverage
+overview with the measured-source count, overall coverage, median coverage, and
+low-coverage count. These are indexed-text projection measurements, not proof
+of model comprehension or a target to inflate.
 
 ## Review and finalization
 

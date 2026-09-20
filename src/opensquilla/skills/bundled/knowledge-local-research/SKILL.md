@@ -55,9 +55,17 @@ Consult `TOOLS.md` for exact schemas, cursors, grouping, retries, and recovery.
    skill. Do not let a review metadata lookup stand in for source inspection.
 
 Keep a compact map of claims, supporting and opposing evidence, open gaps, and
-the time boundary. Continue targeted discovery until another relevant source
-could no longer materially change the conclusion; if a gap remains unresolved,
-narrow the judgment and state the limit.
+the time boundary. For a normal multi-source deep report, cover at least three
+distinct discovery angles, two scoped passes over candidate files, and complete
+relevant passages from at least three independent source files. The server
+adapts these floors downward for a genuinely narrow corpus. A single broad
+search followed by a large bibliography is not deep research. If the first
+write returns `DISCOVERY_BREADTH_REQUIRED`, `SCOPED_READING_BREADTH_REQUIRED`,
+or `SOURCE_READING_BREADTH_REQUIRED`, follow every returned check before
+retrying; these checks are based on observed tool projections, not a model
+assertion. Continue targeted discovery until another relevant source could no
+longer materially change the conclusion; if a gap remains unresolved, narrow
+the judgment and state the limit.
 
 ## Drafting discipline
 
