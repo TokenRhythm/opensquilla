@@ -401,7 +401,39 @@ describe('ConversationMinimap', () => {
     expect(markers(host)[3].getAttribute('aria-current')).toBe('location')
 
     thread.container.dispatchEvent(new Event('scrollend'))
-    await vi.waitFor(() => expect(markers(host)[1].getAttribute('aria-current')).toBe('location'))
+    await vi.waitFor(() => expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(true))
+    await vi.waitFor(() => expect(markers(host)[3].getAttribute('aria-current')).toBe('location'))
+  })
+
+  it('snaps a stale landing back onto the requested prompt before navigateEnd', async () => {
+    const onNavigateEnd = vi.fn()
+    const { host, thread } = await mountMinimap(8, { onNavigateEnd })
+    markers(host)[3].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    expect(thread.scrollTo).toHaveBeenCalledWith({ top: thread.offsets[3] - 16, behavior: 'smooth' })
+
+    // A row above the target re-measures taller mid-scroll: the smooth scroll
+    // completes at its requested offset, but the anchor has since moved down.
+    const anchor = thread.container.querySelector<HTMLElement>('[data-chat-turn-key="user-3"]')!
+    anchor.getBoundingClientRect = () => rect(thread.offsets[3] + 300 - thread.container.scrollTop, 80)
+
+    thread.container.dispatchEvent(new Event('scrollend'))
+    await vi.waitFor(() => expect(onNavigateEnd).toHaveBeenCalledOnce())
+    // The residual was corrected with an instant, application-owned snap.
+    expect(thread.scrollTo).toHaveBeenCalledTimes(1)
+    expect(thread.container.scrollTop).toBe(thread.offsets[3] + 300 - 16)
+    expect(anchor.classList.contains('is-history-target')).toBe(true)
+  })
+
+  it('marks a source-less cancellation as reader-owned without correcting', async () => {
+    const onNavigateEnd = vi.fn()
+    const { host, thread, instance } = await mountMinimap(8, { onNavigateEnd })
+    markers(host)[3].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    thread.container.scrollTop = 400
+
+    instance.cancelNavigation()
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    thread.container.dispatchEvent(new Event('scrollend'))
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
     expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(false)
   })
 

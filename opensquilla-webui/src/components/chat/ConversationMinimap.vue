@@ -82,6 +82,7 @@ import {
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 
 const MIN_TURNS = 8
 const ENTER_SCROLL_RANGE_RATIO = 1.5
@@ -100,6 +101,10 @@ const ENTER_INLINE_SIZE = 1120
 const EXIT_INLINE_SIZE = 1104
 const ARRIVAL_HIGHLIGHT_MS = 650
 const ARRIVAL_TOLERANCE_PX = 4
+// Bounded post-scroll convergence: at most two corrective snaps, 120ms apart
+// (240ms of the ≤300ms re-measure budget requested for issue 1447).
+const NAVIGATION_CORRECTION_MAX = 2
+const NAVIGATION_CORRECTION_DELAY_MS = 120
 const MAX_PREVIEW_LENGTH = 220
 const LENS_SIGMA = 1.15
 const MIN_LINE_SCALE_X = 4 / 15
@@ -168,9 +173,9 @@ let navigationPending = false
 let navigationContainer: HTMLElement | null = null
 let navigationEndTimer = 0
 let navigationTarget: HTMLElement | null = null
-let navigationTargetTop = 0
 let navigationTargetSourceIndex: number | null = null
 let navigationGeneration = 0
+let navigationCorrections = 0
 let arrivalElement: HTMLElement | null = null
 let arrivalTimer = 0
 let lastAnchorElement: HTMLElement | null = null
@@ -544,27 +549,67 @@ function showArrivalHighlight(target: HTMLElement) {
   arrivalTimer = window.setTimeout(clearArrivalHighlight, ARRIVAL_HIGHLIGHT_MS)
 }
 
+function measuredAnchorTop(container: HTMLElement, anchor: HTMLElement): number | null {
+  const containerRect = container.getBoundingClientRect()
+  const top = anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+  return Number.isFinite(top) ? top : null
+}
+
+function clampNavigationTarget(container: HTMLElement, anchorTop: number): number {
+  return Math.min(
+    Math.max(0, container.scrollHeight - container.clientHeight),
+    Math.max(0, anchorTop - 16),
+  )
+}
+
 function settleNavigation(showArrival: boolean) {
   if (!navigationPending) return
   const target = navigationTarget
-  const container = navigationContainer
   const sourceIndex = navigationTargetSourceIndex
-  const arrived = showArrival
-    && Boolean(container)
-    && Math.abs((container?.scrollTop || 0) - navigationTargetTop) <= ARRIVAL_TOLERANCE_PX
   navigationPending = false
   navigationTarget = null
-  navigationTargetTop = 0
   navigationTargetSourceIndex = null
   clearNavigationEnd()
-  if (target && arrived) showArrivalHighlight(target)
+  if (target && showArrival) showArrivalHighlight(target)
   if (sourceIndex !== null) props.releaseEnsuredMessage?.(sourceIndex)
   scheduleActiveUpdate()
   emit('navigateEnd')
 }
 
+// Rows that re-measure while a smooth scroll runs leave the landing off by
+// their height delta, so the scrollend position can miss the requested prompt.
+// Re-measure against live layout and snap the residual within a short bounded
+// budget before navigateEnd, so the arrival highlight and the reconciled
+// active marker match the clicked marker (issue 1447).
 function finishNavigation() {
-  settleNavigation(true)
+  if (!navigationPending) return
+  const container = navigationContainer
+  const anchor = navigationTarget
+  const anchorTop = container && anchor && anchor.isConnected
+    ? measuredAnchorTop(container, anchor)
+    : null
+  const target = anchorTop === null ? null : clampNavigationTarget(container!, anchorTop)
+  const residual = target === null
+    ? Number.POSITIVE_INFINITY
+    : Math.abs((container!.scrollTop || 0) - target)
+  if (residual <= ARRIVAL_TOLERANCE_PX) {
+    settleNavigation(true)
+    return
+  }
+  if (
+    anchor === null
+    || container === null
+    || target === null
+    || navigationCorrections >= NAVIGATION_CORRECTION_MAX
+  ) {
+    settleNavigation(false)
+    return
+  }
+  navigationCorrections += 1
+  applyProgrammaticScroll(container, () => {
+    container.scrollTop = target
+  })
+  navigationEndTimer = window.setTimeout(finishNavigation, NAVIGATION_CORRECTION_DELAY_MS)
 }
 
 function cancelNavigation() {
@@ -582,6 +627,7 @@ defineExpose({ cancelNavigation })
 function armNavigationEnd(container: HTMLElement, smooth: boolean) {
   navigationPending = true
   navigationContainer = container
+  navigationCorrections = 0
   container.addEventListener('scrollend', finishNavigation, { once: true })
   // scrollend is not universal yet. The safety net is deliberately longer
   // than a long native smooth scroll so slower engines cannot settle early.
@@ -622,19 +668,15 @@ async function navigateTo(index: number, focusTarget = false) {
     props.releaseEnsuredMessage?.(turn.sourceIndex)
     return
   }
-  const containerRect = container.getBoundingClientRect()
   const anchorTop = anchor
-    ? anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
+    ? measuredAnchorTop(container, anchor)
     : props.messageOffset?.(turn.sourceIndex)
   if (anchorTop === null || anchorTop === undefined || !Number.isFinite(anchorTop)) {
     props.releaseEnsuredMessage?.(turn.sourceIndex)
     settleNavigation(false)
     return
   }
-  const targetTop = Math.min(
-    Math.max(0, container.scrollHeight - container.clientHeight),
-    Math.max(0, anchorTop - 16),
-  )
+  const targetTop = clampNavigationTarget(container, anchorTop)
   const distance = Math.abs(targetTop - container.scrollTop)
   const reduceMotion = typeof window !== 'undefined'
     && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
@@ -652,7 +694,6 @@ async function navigateTo(index: number, focusTarget = false) {
     return
   }
   navigationTarget = anchor
-  navigationTargetTop = targetTop
   navigationTargetSourceIndex = turn.sourceIndex
   armNavigationEnd(container, smooth)
   container.scrollTo({ top: targetTop, behavior: smooth ? 'smooth' : 'auto' })
