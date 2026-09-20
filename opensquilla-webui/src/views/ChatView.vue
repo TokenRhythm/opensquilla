@@ -648,6 +648,8 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :show-image-input-warning="!forkTransition && !modelRoutingMutationBusy
+        && imageInputAdmission === 'blocked' && Boolean(modelImageSendBlockedMessage)"
       :input-disabled="Boolean(dockedPlanQuestionnaire)
         || Boolean(forkTransition)
         || historyState.sessionMissing"

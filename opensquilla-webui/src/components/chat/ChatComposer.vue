@@ -168,7 +168,7 @@
             :disabled="inputDisabled"
             maxlength="100000"
             :aria-label="t('chat.messageToSend')"
-            :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
+            :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
             @beforeinput="emit('expand'); emit('beforeinput', $event)"
             @input="onTextareaInput"
             @keydown="emit('keydown', $event)"
@@ -441,55 +441,61 @@
             >
               <Icon name="stop" :size="16" />
             </button>
-            <Transition name="composer-ctl" mode="out-in">
-              <button
-                v-if="canStop && !showSkillQueueSend"
-                key="stop"
-                class="btn btn--icon btn--danger chat-send-btn"
-                :title="stopTargetsPlanRun
-                  ? t('chat.planRun.stopExecutionEsc')
-                  : t('chat.stopResponseEsc')"
-                :aria-label="stopTargetsPlanRun
-                  ? t('chat.planRun.stopExecution')
-                  : t('chat.stopResponse')"
-                @click="emit('stop')"
-              >
-                <Icon name="stop" :size="16" />
-              </button>
-              <button
-                v-else
-                key="send"
-                class="btn btn--icon btn--primary chat-send-btn"
-                :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
-                :title="sendBlockedMessage
-                  || (sessionRoutingBusy ? t('chat.composer.routingUpdateBlocked')
-                    : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle)"
-                :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
-                :aria-describedby="sendBlockedMessage ? 'chat-composer-send-status' : undefined"
-                :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
-                :disabled="sendPending || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
-                @click="emit('send')"
-              >
-                <LoadingSpinner v-if="sendPending" />
-                <Icon v-else name="arrowUp" :size="17" />
-              </button>
-            </Transition>
+            <span
+              ref="sendControlEl"
+              class="chat-send-control"
+              :class="{ 'is-hint-dismissed': sendHintDismissed }"
+              :tabindex="sendControlHint ? 0 : undefined"
+              :role="sendControlHint ? 'group' : undefined"
+              :aria-label="sendControlHint ? t('chat.send') : undefined"
+              :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+              @mouseenter="sendHintDismissed = false"
+              @focusin="sendHintDismissed = false"
+              @pointerdown="focusSendHint"
+              @keydown.esc="dismissSendHint"
+            >
+              <Transition name="composer-ctl" mode="out-in">
+                <button
+                  v-if="canStop && !showSkillQueueSend"
+                  key="stop"
+                  class="btn btn--icon btn--danger chat-send-btn"
+                  :title="stopTargetsPlanRun
+                    ? t('chat.planRun.stopExecutionEsc')
+                    : t('chat.stopResponseEsc')"
+                  :aria-label="stopTargetsPlanRun
+                    ? t('chat.planRun.stopExecution')
+                    : t('chat.stopResponse')"
+                  @click="emit('stop')"
+                >
+                  <Icon name="stop" :size="16" />
+                </button>
+                <button
+                  v-else
+                  key="send"
+                  class="btn btn--icon btn--primary chat-send-btn"
+                  :class="{ 'is-ready': hasSendContent && !sendBlockedMessage && !inputDisabled }"
+                  :title="sendBlockedMessage || sendPending || sessionRoutingBusy || inputDisabled ? undefined
+                    : showSkillQueueSend ? t('chat.sendQueues') : sendButtonTitle"
+                  :aria-label="replanActive ? t('chat.plan.reviseSend') : t('chat.send')"
+                  :aria-describedby="sendControlHint ? 'chat-composer-send-tooltip' : undefined"
+                  :aria-busy="sendPending || sessionRoutingBusy ? 'true' : 'false'"
+                  :disabled="sendPending || Boolean(sendBlockedMessage) || sessionRoutingBusy || inputDisabled"
+                  @click="emit('send')"
+                >
+                  <LoadingSpinner v-if="sendPending" />
+                  <Icon v-else name="arrowUp" :size="17" />
+                </button>
+              </Transition>
+              <span
+                v-if="sendControlHint"
+                id="chat-composer-send-tooltip"
+                class="chat-send-tooltip"
+                role="tooltip"
+              >{{ sendControlHint }}</span>
+            </span>
           </div>
           </div>
         </div>
-      </div>
-      <div v-if="sendPending" class="chat-composer-send-pending">
-        <LoadingSpinner aria-hidden="true" />
-        <span role="status" aria-live="polite">{{ t('chat.sendPending') }}</span>
-      </div>
-      <div v-if="sendBlockedMessage" class="chat-collapse-region">
-        <p
-          id="chat-composer-send-status"
-          class="chat-composer-send-status"
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-        >{{ sendBlockedMessage }}</p>
       </div>
       <div class="chat-collapse-region chat-collapse-region--disclaimer">
         <p class="chat-ai-disclaimer" role="note">{{ t('chat.aiDisclaimer') }}</p>
@@ -520,6 +526,7 @@ import ChatComposerRunMode from '@/components/chat/ChatComposerRunMode.vue'
 import type { Attachment } from '@/types/chat'
 import type { ModelDescriptor, ProviderListError } from '@/modules/providerConfiguration'
 import { useDialogLayer } from '@/composables/useDialogA11y'
+import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import type { ModelRoutingMode } from '@/types/modelRouting'
 import type { SandboxRunMode } from '@/types/sandbox'
 import type { CollaborationMode } from '@/types/plans'
@@ -555,6 +562,7 @@ const props = withDefaults(defineProps<{
   placeholder: string
   sendButtonTitle: string
   sendBlockedMessage?: string
+  showImageInputWarning?: boolean
   inputDisabled?: boolean
   runMode: SandboxRunMode
   allowedRunModes: SandboxRunMode[]
@@ -665,6 +673,39 @@ const showSkillQueueSend = computed(() => props.canStop
   && !props.replanActive
   && props.selectedSkills.length > 0
   && props.hasSendContent)
+
+const sendControlHint = computed(() => props.showImageInputWarning
+  && (!props.canStop || showSkillQueueSend.value)
+  ? props.sendBlockedMessage || '' : '')
+const sendHintDismissed = ref(false)
+const sendControlEl = ref<HTMLElement | null>(null)
+
+function focusSendHint(event: PointerEvent) {
+  if (!sendControlHint.value || (props.canStop && !showSkillQueueSend.value)) return
+  // Disabled buttons cannot receive focus; their wrapper also supports touch.
+  if (event.currentTarget instanceof HTMLElement) {
+    event.preventDefault()
+    sendHintDismissed.value = false
+    event.currentTarget.focus()
+  }
+}
+
+function dismissSendHint(event: KeyboardEvent) {
+  if (!sendControlHint.value || sendHintDismissed.value) return
+  sendHintDismissed.value = true
+  // Stop can coexist with skill queue Send; preserve its document shortcut.
+  if (props.canStop) return
+  event.preventDefault()
+  event.stopPropagation()
+}
+
+useDocumentEvent('keydown', event => {
+  if (event.key !== 'Escape') return
+  const hint = sendControlEl.value?.querySelector<HTMLElement>('.chat-send-tooltip')
+  // Hover does not move focus out of the editor. Close its visible hint before
+  // Escape reaches the editor's clear-draft shortcut; Stop keeps its shortcut.
+  if (hint && getComputedStyle(hint).visibility === 'visible') dismissSendHint(event)
+}, { capture: true })
 
 const inputText = defineModel<string>({ required: true })
 const composerEl = ref<HTMLElement | null>(null)
@@ -1210,14 +1251,6 @@ defineExpose<ChatComposerExpose>({
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
-}
-
-.chat-composer-send-status {
-  margin: 0.5rem 0 0;
-  color: var(--warning, var(--text-muted));
-  font-size: var(--fs-sm);
-  line-height: 1.5;
-  text-align: center;
 }
 
 .chat-attachments {
@@ -2047,16 +2080,61 @@ button.attachment-chip__primary:focus-visible {
   border-color: var(--bg-hover);
 }
 
-.chat-composer-send-pending {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2);
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
+.chat-send-control {
+  position: relative;
+  display: inline-flex;
+  border-radius: var(--radius-full);
 }
 
-.chat-composer-send-pending .loading-spinner,
+.chat-send-control:focus-visible {
+  outline: 0;
+  box-shadow: var(--focus-ring);
+}
+
+.chat-send-control > .chat-send-btn:disabled {
+  pointer-events: none;
+}
+
+.chat-send-tooltip {
+  position: absolute;
+  bottom: calc(100% + 0.5rem);
+  right: 0;
+  z-index: 220;
+  width: max-content;
+  max-width: min(320px, calc(100vw - 64px));
+  padding: 0.5rem 0.625rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--text);
+  box-shadow: var(--shadow-md);
+  font-size: var(--fs-xs);
+  line-height: 1.5;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  visibility: hidden;
+}
+
+/* Keep the hint open while moving the pointer from the button to its text. */
+.chat-send-tooltip::after {
+  content: "";
+  position: absolute;
+  top: 100%;
+  inset-inline: 0;
+  height: 0.5rem;
+}
+
+.chat-send-control:not(.is-hint-dismissed):hover > .chat-send-tooltip,
+.chat-send-control:not(.is-hint-dismissed):focus-within > .chat-send-tooltip {
+  visibility: visible;
+}
+
+@media (hover: none) {
+  .chat-send-tooltip {
+    pointer-events: none;
+  }
+}
+
 .chat-send-btn .loading-spinner {
   width: 14px;
   height: 14px;

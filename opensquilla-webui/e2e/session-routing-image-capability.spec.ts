@@ -30,10 +30,19 @@ function response(id: string, payload: unknown) {
   return JSON.stringify({ type: 'res', id, ok: true, payload })
 }
 
-async function installGateway(page: Page) {
+async function installGateway(page: Page, ensembleImageBlockReason = 'ensemble_mode_unsupported') {
   const methods: string[] = []
   const routingSets: Array<Record<string, unknown>> = []
   const chatSends: Array<Record<string, unknown>> = []
+  const capabilitiesByMode = {
+    ...CAPABILITIES_BY_MODE,
+    ensemble: {
+      image_input: {
+        ...CAPABILITIES_BY_MODE.ensemble.image_input,
+        reason: ensembleImageBlockReason,
+      },
+    },
+  }
   const sessionRouting = {
     sessionKey: SESSION_KEY,
     mode: 'ensemble',
@@ -143,8 +152,8 @@ async function installGateway(page: Page) {
         'models.routing.get': {
           mode: 'ensemble',
           selection_mode: 'static_openrouter_b5',
-          image_input: CAPABILITIES_BY_MODE.ensemble.image_input,
-          capabilities_by_mode: CAPABILITIES_BY_MODE,
+          image_input: capabilitiesByMode.ensemble.image_input,
+          capabilities_by_mode: capabilitiesByMode,
         },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
@@ -165,50 +174,77 @@ async function installGateway(page: Page) {
   return { chatSends, methods, routingSets }
 }
 
-test('session Router capability overrides the blocked global Ensemble scalar for images', async ({
-  page,
-}) => {
-  const gateway = await installGateway(page)
-  await page.goto(CONTROL_URL + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
-  await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
-  await expect(page.locator('.msg-user')).toHaveCount(2)
-  await expect.poll(() => gateway.methods.filter(method => method === 'sessions.routing.get').length)
-    .toBeGreaterThan(0)
+for (const scenario of [
+  {
+    name: 'session Router capability overrides the blocked global Ensemble scalar for images',
+    reason: 'ensemble_mode_unsupported',
+    hardBlocked: false,
+  },
+  {
+    name: 'hard image admission block appears in the send tooltip until the session switches to Router',
+    reason: 'attachment_policy_denied',
+    hardBlocked: true,
+  },
+]) {
+  test(scenario.name, async ({
+    page,
+  }) => {
+    const gateway = await installGateway(page, scenario.reason)
+    await page.goto(CONTROL_URL + encodeURIComponent(SESSION_KEY))
+    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.chat-textarea')).toBeEditable({ timeout: 10_000 })
+    await expect(page.locator('.msg-user')).toHaveCount(2)
+    await expect.poll(() => gateway.methods.filter(method => method === 'sessions.routing.get').length)
+      .toBeGreaterThan(0)
 
-  const routingButton = page.getByRole('button', {
-    name: "Models & routing",
-    exact: true,
+    const routingButton = page.getByRole('button', {
+      name: "Models & routing",
+      exact: true,
+    })
+    await expect(routingButton).toHaveClass(/chat-model-routing-btn--llm_ensemble/)
+    await page.locator('input[type="file"]').setInputFiles({
+      name: 'router-capable.png',
+      mimeType: 'image/png',
+      buffer: PNG_DATA,
+    })
+    await page.locator('.chat-textarea').fill('Describe this image once.')
+    await expect(page.locator('.attachment-chip')).toContainText('router-capable.png')
+    const sendButton = page.locator('.chat-send-btn[aria-label="Send"]')
+    const sendTooltip = page.locator('.chat-send-tooltip')
+    await expect(page.locator('.chat-composer-send-status')).toHaveCount(0)
+    if (scenario.hardBlocked) {
+      await expect(sendButton).toBeDisabled()
+      await expect(sendTooltip).toBeHidden()
+      await page.locator('.chat-send-control').hover()
+      await expect(sendTooltip).toBeVisible()
+      await expect(sendTooltip).toContainText('image input')
+    } else {
+      await expect(sendTooltip).toHaveCount(0)
+      await expect(sendButton).toBeEnabled()
+    }
+    expect(gateway.chatSends).toHaveLength(0)
+    await routingButton.click()
+    await page.getByRole('menuitemradio', { name: 'Intelligent model routing', exact: true }).click()
+
+    await expect.poll(() => gateway.routingSets).toEqual([{
+      sessionKey: SESSION_KEY,
+      mode: 'router',
+      expectedRevision: 2,
+    }])
+    await expect(routingButton).toHaveClass(/chat-model-routing-btn--squilla_router/)
+
+    await expect(page.locator('.chat-composer-send-status')).toHaveCount(0)
+    await expect(sendTooltip).toHaveCount(0)
+
+    await expect(sendButton).toBeEnabled()
+    await sendButton.click()
+
+    await expect.poll(() => gateway.chatSends.length).toBe(1)
+    expect(gateway.chatSends[0]?.message).toBe('Describe this image once.')
+    expect(gateway.chatSends[0]?.attachments).toEqual([
+      expect.objectContaining({ name: 'router-capable.png', mime: 'image/png' }),
+    ])
+    expect(gateway.methods).not.toContain('models.routing.set')
+    expect(gateway.routingSets).toHaveLength(1)
   })
-  await expect(routingButton).toHaveClass(/chat-model-routing-btn--llm_ensemble/)
-  await routingButton.click()
-  await page.getByRole('menuitemradio', { name: 'Intelligent model routing', exact: true }).click()
-
-  await expect.poll(() => gateway.routingSets).toEqual([{
-    sessionKey: SESSION_KEY,
-    mode: 'router',
-    expectedRevision: 2,
-  }])
-  await expect(routingButton).toHaveClass(/chat-model-routing-btn--squilla_router/)
-
-  await page.locator('input[type="file"]').setInputFiles({
-    name: 'router-capable.png',
-    mimeType: 'image/png',
-    buffer: PNG_DATA,
-  })
-  await page.locator('.chat-textarea').fill('Describe this image once.')
-  await expect(page.locator('.attachment-chip')).toContainText('router-capable.png')
-  await expect(page.locator('.chat-composer-send-status')).toHaveCount(0)
-
-  const sendButton = page.locator('.chat-send-btn[aria-label="Send"]')
-  await expect(sendButton).toBeEnabled()
-  await sendButton.click()
-
-  await expect.poll(() => gateway.chatSends.length).toBe(1)
-  expect(gateway.chatSends[0]?.message).toBe('Describe this image once.')
-  expect(gateway.chatSends[0]?.attachments).toEqual([
-    expect.objectContaining({ name: 'router-capable.png', mime: 'image/png' }),
-  ])
-  expect(gateway.methods).not.toContain('models.routing.set')
-  expect(gateway.routingSets).toHaveLength(1)
-})
+}
