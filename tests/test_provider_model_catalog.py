@@ -135,6 +135,45 @@ def test_openrouter_public_physical_limits_are_available_offline(
     assert entry.supports_reasoning is True
 
 
+@pytest.mark.parametrize(
+    ("provider", "expected_limits"),
+    [
+        ("openrouter", [(1_000_000, 65_536), (1_048_576, 943_718),
+                        (1_024_000, 384_000), (1_048_576, 131_072)]),
+        ("tokenrhythm", [(1_000_000, 65_536), (1_000_000, 384_000),
+                         (1_000_000, 384_000), (1_048_576, 131_072)]),
+    ],
+)
+def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
+    provider: str, expected_limits: list[tuple[int, int]],
+) -> None:
+    """Cold catalog boots must admit the shipped tiers with definite facts."""
+    from opensquilla.provider.preset_registry import get_preset
+
+    catalog = ModelCatalog()
+    preset = get_preset(provider)
+    assert preset is not None
+    for tier, (window, output) in zip(("c0", "c1", "c2", "c3"), expected_limits, strict=True):
+        model = preset.tiers[tier]["model"]
+        limits = catalog.resolve_deployment_limits(model, provider=provider)
+        assert (limits.context_window, limits.max_output_tokens) == (window, output)
+        assert limits.context_window_known is True
+        assert limits.max_output_tokens_known is True
+        assert catalog.resolve_context_window_with_source(model, provider) == (window, "catalog")
+        assert catalog.resolve_max_tokens_with_source(model, provider=provider) == (
+            output, "catalog"
+        )
+        assert catalog.resolve_vision_support(model, provider_name=provider) == (
+            "supported" if tier == "c0" else "unsupported"
+        )
+        capabilities = catalog.get_capabilities(model, provider_name=provider)
+        assert capabilities.supports_tools is True
+        assert capabilities.supports_reasoning is (provider == "openrouter")
+        assert capabilities.reasoning_format == (
+            "openrouter" if provider == "openrouter" else "none"
+        )
+
+
 @pytest.mark.parametrize("top_window", [None, -1, 100_000, 250_000])
 def test_openrouter_live_context_respects_the_smaller_positive_top_provider_limit(
     top_window: int | None,

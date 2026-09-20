@@ -14,13 +14,23 @@ import { prepareDesktopPrimaryProviderChange } from '../dist/desktop-primary-pro
 import { parse, stringify } from 'smol-toml'
 
 const defaults = {
-  c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731' },
-  c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
-  c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code' },
-  c3: { provider: 'tokenrhythm', model: 'glm-5.2', ensembleEnabled: true },
+  c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash' },
+  c1: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731' },
+  c2: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
+  c3: { provider: 'tokenrhythm', model: 'glm-5.3', ensembleEnabled: false },
 }
 assert.equal(defaultRouterTiers('openrouter', 'recommended').c1.provider, 'openrouter')
-assert.equal(defaultRouterTiers('tokenrhythm', 'recommended').c3.ensembleEnabled, true)
+assert.equal(defaultRouterTiers('tokenrhythm', 'recommended').c3.ensembleEnabled, false)
+const textTiers = ['c0', 'c1', 'c2', 'c3']
+for (const [provider, models] of Object.entries({
+  openrouter: ['qwen/qwen3.7-flash', 'deepseek/deepseek-v4-flash-0731', 'deepseek/deepseek-v4-pro-0813', 'z-ai/glm-5.3'],
+  tokenrhythm: Object.values(defaults).map(tier => tier.model),
+})) {
+  const profile = defaultRouterTiers(provider, 'recommended')
+  assert.deepEqual(textTiers.map(tier => profile[tier].model), models)
+  assert.ok(textTiers.every(tier => profile[tier].provider === provider))
+  assert.ok(textTiers.every(tier => profile[tier].thinkingLevel === (provider === 'openrouter' ? 'high' : undefined)))
+}
 const mutableDefaults = defaultRouterTiers('openrouter', 'recommended')
 mutableDefaults.c1.model = 'caller-edit'
 assert.notEqual(defaultRouterTiers('openrouter', 'recommended').c1.model, 'caller-edit')
@@ -32,6 +42,16 @@ function update(payload = {}, existing = legacy, extra = {}) {
     defaultTiers: defaults, freshConfig: false, ...extra,
   })
 }
+
+const savedFusion = {
+  ...legacy,
+  routerTiers: { ...defaults, c3: { provider: 'tokenrhythm', model: 'glm-5.2', ensembleEnabled: true } },
+}
+assert.equal(update({}, savedFusion).routerTiers.c3.ensembleEnabled, true)
+assert.equal(update({}, savedFusion).routerTiers.c3.model, 'glm-5.2')
+const resetFusion = update({ routerResetToRecommended: true }, savedFusion)
+assert.equal(resetFusion.routerTiers.c3.ensembleEnabled, false)
+assert.equal(resetFusion.routerTiers.c3.model, 'glm-5.3')
 
 for (const invalid of [undefined, null, '', 'recommended', 'FOLLOW_PRIMARY', {}, true]) {
   assert.equal(normalizeRouterPresetBinding(invalid), undefined)
@@ -82,7 +102,7 @@ for (const routerPresetBinding of [undefined, 'follow_primary', 'custom']) {
   const disabled = update({}, existing, { routerMode: 'disabled' })
   assert.equal(disabled.writeIntent, 'toggle')
   assert.equal(disabled.routerPresetBinding, routerPresetBinding)
-  assert.equal(disabled.routerTiers.c3.ensembleEnabled, true)
+  assert.equal(disabled.routerTiers.c3.ensembleEnabled, false)
   const enabled = update({}, disabled, { routerMode: 'recommended' })
   assert.equal(enabled.routerPresetBinding, routerPresetBinding)
   assert.deepEqual(enabled.routerTiers, disabled.routerTiers)
@@ -200,7 +220,7 @@ for (const enabled of [true, false]) {
     assert.equal(router.confidence_threshold, 0.8)
     assert.ok(Object.values(router.tiers).every(tier => tier.provider === 'tokenrhythm'))
     assert.equal(result.router.routerTiers.c1.model, defaults.c1.model)
-    assert.equal(result.router.routerTiers.c3.ensembleEnabled, true)
+    assert.equal(result.router.routerTiers.c3.ensembleEnabled, false)
     assert.deepEqual(parse(result.ensembleLines.join('\n')).llm_ensemble, saved.llm_ensemble)
     assert.deepEqual(saved, original)
     assert.equal(result.modelRoutingMode, ensembleEnabled ? 'llm_ensemble' : enabled ? 'squilla_router' : 'direct')

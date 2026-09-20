@@ -29,17 +29,17 @@ function minimaxRouterProfile(provider: string): Record<string, RouterTier> {
 
 export const ROUTER_PROFILES: Record<string, Record<string, RouterTier>> = {
   tokenrhythm: {
-    c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Fast DeepSeek V4 Flash 0731 route for simple work' },
-    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Default DeepSeek V4 Pro 0813 route for normal agent work' },
-    c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code', description: 'Strong Kimi 2.7 Code route for harder coding and analysis' },
-    c3: { provider: 'tokenrhythm', model: 'glm-5.2', description: 'Highest tier: shared B5 fusion; GLM 5.2 is retained for single-model C3 mode', ensembleEnabled: true },
+    c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash', description: 'Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding' },
+    c1: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', description: 'Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis' },
+    c2: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813', description: 'Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis' },
+    c3: { provider: 'tokenrhythm', model: 'glm-5.3', description: 'Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis', ensembleEnabled: false },
     image_model: { provider: 'tokenrhythm', model: 'kimi-k2.6', description: 'Vision route for image attachments', imageOnly: true },
   },
   openrouter: {
-    c0: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash', description: 'Fast everyday work', thinkingLevel: 'high' },
-    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro', description: 'Balanced agent work', thinkingLevel: 'high' },
-    c2: { provider: 'openrouter', model: 'z-ai/glm-5.2', description: 'Complex reasoning', thinkingLevel: 'high' },
-    c3: { provider: 'openrouter', model: 'anthropic/claude-opus-4.8', description: 'Highest quality review and planning', thinkingLevel: 'high' },
+    c0: { provider: 'openrouter', model: 'qwen/qwen3.7-flash', description: 'Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding', thinkingLevel: 'high' },
+    c1: { provider: 'openrouter', model: 'deepseek/deepseek-v4-flash-0731', description: 'Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis', thinkingLevel: 'high' },
+    c2: { provider: 'openrouter', model: 'deepseek/deepseek-v4-pro-0813', description: 'Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis', thinkingLevel: 'high' },
+    c3: { provider: 'openrouter', model: 'z-ai/glm-5.3', description: 'Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis', thinkingLevel: 'high' },
     image_model: { provider: 'openrouter', model: 'moonshotai/kimi-k2.6', description: 'Vision route for image attachments', imageOnly: true, thinkingLevel: 'medium' },
   },
   openai: {

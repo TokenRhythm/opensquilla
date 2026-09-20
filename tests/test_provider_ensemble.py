@@ -8448,6 +8448,9 @@ def test_static_b5_credential_gate_agrees_with_config_side_floor_gate(
         },
         llm_ensemble={"enabled": False},
     )
+    tier_managed.squilla_router.preset_binding = "custom"
+    tier_managed.squilla_router.tiers["c3"]["ensemble_enabled"] = True
+    tier_managed.llm_ensemble.selection_mode = "static_tokenrhythm_b5"
     assert static_b5_ensemble_enabled(tier_managed) is True
     assert static_b5_ensemble_active(tier_managed) is True
 
@@ -8457,6 +8460,9 @@ def test_ensemble_runtime_status_counts_static_custom_and_dynamic() -> None:
         llm={"provider": "tokenrhythm", "api_key": "sk_tr_abcdefghijklmnop"},
         llm_ensemble={"enabled": False},
     )
+    tier_managed_cfg.squilla_router.preset_binding = "custom"
+    tier_managed_cfg.squilla_router.tiers["c3"]["ensemble_enabled"] = True
+    tier_managed_cfg.llm_ensemble.selection_mode = "static_tokenrhythm_b5"
     tier_managed_status = ensemble_runtime_status(tier_managed_cfg)
     assert tier_managed_status["enabled"] is True
     assert tier_managed_status["globalEnabled"] is False

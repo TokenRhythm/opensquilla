@@ -584,6 +584,8 @@ def test_text_tool_profile_is_provider_and_model_scoped(
         ("deepseek", "deepseek-v4-flash-0731"),
         ("tokenrhythm", "tokenrhythm/deepseek-v4-pro"),
         ("openrouter", "deepseek/deepseek-v4-flash"),
+        ("openrouter", "deepseek/deepseek-v4-flash-0731"),
+        ("openrouter", "deepseek/deepseek-v4-pro-0813"),
     ],
 )
 def test_dsml_executes_only_for_exact_packaged_provider_model_pairs(

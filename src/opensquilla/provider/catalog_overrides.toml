@@ -186,6 +186,41 @@ max_output_tokens = 128000
 context_window = 262144
 max_output_tokens = 235929
 
+# Recommended C0-C3 deployments. Official https://openrouter.ai/api/v1/models,
+# verified 2026-09-21. Context uses the smaller positive catalog/top-provider
+# limit; output uses top_provider.max_completion_tokens. Live data wins.
+[openrouter."qwen/qwen3.7-flash"]
+context_window = 1000000
+max_output_tokens = 65536
+supports_reasoning = true
+supports_tools = true
+supports_vision = true
+reasoning_format = "openrouter"
+
+[openrouter."deepseek/deepseek-v4-flash-0731"]
+context_window = 1048576
+max_output_tokens = 943718
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "openrouter"
+
+[openrouter."deepseek/deepseek-v4-pro-0813"]
+context_window = 1024000
+max_output_tokens = 384000
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "openrouter"
+
+[openrouter."z-ai/glm-5.3"]
+context_window = 1048576
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "openrouter"
+
 # --- capability ladder migration (transcribed from get_capabilities) ---
 #
 # Rows below carry the per-provider capability ladder that used to live as
@@ -898,6 +933,16 @@ reasoning_format = "none"
 input_cost_per_mtok = 1.1469534050179212
 output_cost_per_mtok = 4.014336917562724
 cache_read_cost_per_mtok = 0.2867383512544803
+
+# Official https://tokenrhythm.studio/api/models, verified 2026-09-21.
+# Keep the relay's neutral request dialect while publishing its exact limits.
+[tokenrhythm."glm-5.3"]
+context_window = 1048576
+max_output_tokens = 131072
+supports_reasoning = true
+supports_tools = true
+supports_vision = false
+reasoning_format = "none"
 
 # minimax/mimo publish near-window output caps (input + output share the
 # window). These rows preserve those public values exactly; ModelCatalog's
