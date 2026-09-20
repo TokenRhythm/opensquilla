@@ -1791,7 +1791,7 @@ describe('useChatSend attachment payloads', () => {
       }))
       await expect(api.dispatchHiddenSend('/meta test', '/meta test', 'artifact-rejected-id'))
         .resolves.toMatchObject({ status: 'rejected', reason: 'send_rejected' })
-      expect(options.messages.value.at(-1)).toMatchObject({
+      expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
         role: 'error', errorCode: 'DOCUMENT_CHANGED',
         text: 'The page changed. Refresh it before trying again.',
       })
