@@ -296,6 +296,7 @@ async def test_run_preserves_configured_wall_timeout(monkeypatch, tmp_path):
     async def spawn(*args, **kwargs):
         return Process()
 
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
     monkeypatch.setattr(seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/sandbox-exec")
     monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", spawn)
     monkeypatch.setattr(seatbelt_mod.asyncio, "wait", wait_with_timeout)
@@ -326,6 +327,7 @@ async def test_run_cancel_during_timeout_output_cleanup_propagates(monkeypatch, 
         cleanup_started.set()
         return await original_finish(task)
 
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
     monkeypatch.setattr(seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/sandbox-exec")
     monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", spawn)
     monkeypatch.setattr(seatbelt_mod, "_terminate_process_group", terminate)
