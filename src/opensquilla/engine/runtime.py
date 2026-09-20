@@ -8945,7 +8945,15 @@ class TurnRunner:
             ):
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
-                controls = {"update_plan", "request_user_input"}
+                controls = {"request_user_input"}
+                if attached_plan_run or is_goal_owned_main_default_turn(ctx):
+                    controls.add("update_plan")
+                else:
+                    # Ordinary task progress is available through tool_search,
+                    # without encouraging a checklist on every initial turn.
+                    # Normal allow/deny/profile policy still applies below.
+                    ctx.surfaced_tools.discard("update_plan")
+                    ctx.explicitly_allowed_tools.add("update_plan")
                 if attached_plan_run:
                     controls.add("plan_run_checkpoint")
                 if ctx.goal_service is not None or is_goal_owned_main_default_turn(ctx):

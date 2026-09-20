@@ -537,13 +537,22 @@
     </Transition>
     <!-- Long-running goal progress lives in the same dock as plan execution so
          the active objective stays visible above the composer across turns. -->
-    <div
-      v-if="ordinaryTaskProgress && !executionDockRun && !activeGoalRun"
-      class="task-progress-dock"
-      :data-task-progress-id="taskProgress.taskId.value"
-    >
-      <ExecutionProgress :progress="ordinaryTaskProgress" />
-    </div>
+    <Transition name="plan-run-dock">
+      <div
+        v-if="ordinaryTaskProgress?.steps.length && !executionDockRun && !activeGoalRun && !shareMode"
+        class="plan-run-dock"
+        :data-task-progress-id="taskProgress.taskId.value"
+      >
+        <TaskProgressRibbon
+          :task-id="taskProgress.taskId.value"
+          :progress="ordinaryTaskProgress"
+          :cancel-busy="isStopPending"
+          :disabled="!canStop"
+          @cancel="onStop"
+          @focus-return="focusComposerAfterPlanRun"
+        />
+      </div>
+    </Transition>
     <details v-if="goalDraftArmed && !shareMode && (goalTokenBudgetSupported || goalBackgroundExecutionSupported)" class="goal-draft-settings">
       <summary>{{ t('chat.goal.settings') }}</summary>
       <GoalExecutionSettings
@@ -858,7 +867,7 @@ import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
 import GoalExecutionSettings from '@/components/chat/GoalExecutionSettings.vue'
-import ExecutionProgress from '@/components/chat/ExecutionProgress.vue'
+import TaskProgressRibbon from '@/components/chat/TaskProgressRibbon.vue'
 import { useChatTaskProgress } from '@/composables/chat/useChatTaskProgress'
 import type { GoalExecutionOptions } from '@/modules/goalCenter'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
@@ -7813,12 +7822,6 @@ watch(
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>
-.task-progress-dock {
-  width: var(--chat-col, min(calc(100% - 48px), 980px));
-  margin: var(--sp-2) auto;
-  font-size: var(--fs-xs);
-}
-
 .goal-draft-settings {
   width: var(--chat-col, min(calc(100% - 48px), 980px));
   max-width: 100%;

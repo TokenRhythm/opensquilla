@@ -7,7 +7,7 @@ import { useChatPlans } from '@/composables/chat/useChatPlans'
 import type { PlanRunSnapshot, PlanRunStatus } from '@/types/plans'
 import executionTodoMarkerSource from './ExecutionTodoMarker.vue?raw'
 import PlanRunRibbon from './PlanRunRibbon.vue'
-import planRunRibbonSource from './PlanRunRibbon.vue?raw'
+import planRunRibbonSource from './ExecutionProgressRibbon.vue?raw'
 import chatViewSource from '@/views/ChatView.vue?raw'
 
 const mountedApps: ReturnType<typeof createApp>[] = []
