@@ -264,6 +264,75 @@ async def test_agent_retries_same_deployment_provider_overload(
 
 
 @pytest.mark.asyncio
+async def test_agent_retries_overload_529_with_backoff_and_reports_progress(
+    retry_sleeps: list[float],
+) -> None:
+    """A 529 overload must auto-retry with visible progress, not fail silently (issue 1295)."""
+    provider = _SequenceProvider(
+        [
+            [ErrorEvent(message="synthetic upstream overloaded", code="529")],
+            [ErrorEvent(message="synthetic upstream overloaded", code="529")],
+            [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=2,
+            retry_base_backoff_ms=1_000,
+            retry_max_backoff_ms=30_000,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+    activity = [event for event in events if isinstance(event, ProviderActivityEvent)]
+
+    assert provider.calls == 3
+    assert [event.phase for event in activity].count("retry_wait") == 2
+    assert [event.phase for event in activity].count("retrying") == 2
+    waits = [event for event in activity if event.phase == "retry_wait"]
+    assert all(event.reason == ProviderFailureKind.PROVIDER_OVERLOADED.value for event in waits)
+    assert [event.retry_attempt for event in waits] == [1, 2]
+    # Backoff grows per attempt (1s base then 2s, plus up to 0.5s jitter) —
+    # no provider retry-after hint was given.
+    assert len(retry_sleeps) == 2
+    assert 1.0 <= retry_sleeps[0] <= 1.5
+    assert 2.0 <= retry_sleeps[1] <= 2.5
+    assert not any(isinstance(event, EngineErrorEvent) for event in events)
+    assert not any("synthetic upstream overloaded" in repr(event) for event in activity)
+
+
+@pytest.mark.asyncio
+async def test_agent_reports_actionable_terminal_error_when_overload_retries_exhaust(
+    retry_sleeps: list[float],
+) -> None:
+    provider = _SequenceProvider(
+        [[ErrorEvent(message="synthetic upstream overloaded", code="529")]] * 3
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=2,
+            retry_base_backoff_ms=1_000,
+            retry_max_backoff_ms=1_000,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert provider.calls == 3
+    terminal = [event for event in events if isinstance(event, EngineErrorEvent)]
+    assert len(terminal) == 1
+    # The terminal message is the stable, actionable overload guidance — not
+    # upstream prose — and carries the stable numeric failure code.
+    assert terminal[0].message == (
+        "The model provider is temporarily overloaded. Try again later."
+    )
+    assert terminal[0].code == "529"
+    assert terminal[0].failure_kind == ProviderFailureKind.PROVIDER_OVERLOADED.value
+
+
+@pytest.mark.asyncio
 async def test_agent_normalizes_untrusted_provider_activity_fields() -> None:
     raw_id_marker = "RAW_PROVIDER_ACTIVITY_ID_MUST_NOT_ESCAPE"
     raw_phase_marker = "RAW_PROVIDER_ACTIVITY_PHASE_MUST_NOT_ESCAPE"
