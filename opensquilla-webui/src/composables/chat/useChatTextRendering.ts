@@ -5,6 +5,7 @@ import katex from 'katex'
 import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
 import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentinels'
 import { strictStrikethrough } from '@/utils/markdown/strikethrough'
+import { workspaceFilePath } from '@/utils/chat/workspaceFiles'
 
 const DIRECTIVE_TAG_RE = /\[\[\s*(?:reply_to_current|reply_to\s*:\s*[^\]\n]+)\s*\]\]\s*/g
 const GENERATED_ARTIFACT_MARKER_RE = /(?:^|\s*)\[generated artifact omitted:\s*[^\]\n]+?\]\s*/gi
@@ -51,6 +52,12 @@ function escapeHtml(text: string): string {
 
 marked.use(strictStrikethrough, {
   renderer: {
+    link(token: Tokens.Link): string | false {
+      const path = workspaceFilePath(token.href, true)
+      if (!path) return false
+      // Local references remain inert until the session file API confirms access.
+      return `<a data-workspace-path="${escapeHtml(path)}">${this.parser.parseInline(token.tokens)}</a>`
+    },
     code({ text, lang }: Tokens.Code): string {
       const language = (lang || '').trim().split(/\s+/)[0].toLowerCase()
       const canHighlight =
@@ -200,7 +207,7 @@ function sanitizeMarkdownHtml(rawHtml: string, allowKatex = false): string {
       // `align` carries GFM table column alignment; `type`/`checked`/`disabled`
       // are the (disabled) task-list checkbox attributes. No script vectors.
       ALLOWED_ATTR: [
-        'href', 'title', 'alt', 'target', 'rel', 'class', 'align', 'type',
+        'href', 'title', 'alt', 'target', 'rel', 'class', 'align', 'type', 'data-workspace-path',
         'checked', 'disabled', ...(allowKatex ? ['style', 'aria-hidden'] : []),
       ],
       // `align`/`type` carry inert presentational values, not URIs; mark them

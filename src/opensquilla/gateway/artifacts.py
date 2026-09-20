@@ -58,6 +58,10 @@ def register_artifact_routes(
 ) -> None:
     """Register GET /api/v1/artifacts/{artifact_id} on the given Starlette app."""
 
+    from opensquilla.gateway.workspace_files import register_workspace_file_routes
+
+    register_workspace_file_routes(app, config=config, session_manager=session_manager)
+
     content_port = GatewayArtifactContentPort(config, session_manager=session_manager)
     content = ArtifactContentApplication(content_port)
     native_open = NativeArtifactOpenApplication(
