@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from opensquilla.sandbox import integration, setup_runtime
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
@@ -116,6 +117,28 @@ def test_deferred_runtime_does_not_check_or_select_backend(monkeypatch):
 
 def test_sandbox_settings_no_longer_exposes_auto_setup() -> None:
     assert "auto_setup" not in SandboxSettings.model_fields
+
+
+@pytest.mark.parametrize("auto_setup", [True, False, "true", "false"])
+@pytest.mark.parametrize("run_mode", ["safe", "full"])
+def test_retired_auto_setup_is_ignored_without_changing_run_mode(auto_setup, run_mode):
+    settings = SandboxSettings(auto_setup=auto_setup, run_mode=run_mode, cpu_seconds=31)
+
+    assert settings.run_mode == run_mode
+    assert settings.sandbox is (run_mode == "safe")
+    assert settings.security_grading is (run_mode == "safe")
+    assert settings.cpu_seconds == 31
+    assert "auto_setup" not in settings.model_fields_set
+    assert "auto_setup" not in settings.model_dump()
+
+
+def test_retired_auto_setup_does_not_hide_unknown_sandbox_settings():
+    with pytest.raises(ValidationError) as error:
+        SandboxSettings(auto_setup=False, unexpected_setting=True)
+
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        (("unexpected_setting",), "extra_forbidden"),
+    ]
 
 
 async def test_initialized_status_is_cached_without_rechecking_host(monkeypatch):
