@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
 import opensquilla.gateway.rpc_channels  # noqa: F401  ensures registration
@@ -418,6 +417,11 @@ async def test_channels_get_redacts_configured_secrets() -> None:
 async def test_channels_probe_merges_secrets_and_runs_real_slack_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from contextlib import AsyncExitStack
+
+    from aiohttp import ClientSession, web
+    from slack_sdk.web.async_client import AsyncWebClient
+
     from opensquilla.channels import registry as channel_registry
 
     token = "xoxb-stored-probe-secret"
@@ -434,61 +438,73 @@ async def test_channels_probe_merges_secrets_and_runs_real_slack_probe(
     )
     ctx.config = result.config
 
-    def handle_auth_test(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/auth.test"
-        assert request.headers["Authorization"] == f"Bearer {token}"
-        return httpx.Response(
-            200,
-            json={"ok": True, "user_id": "U1", "team_id": "T1"},
-        )
+    requests: list[str] = []
 
-    client = httpx.AsyncClient(
-        base_url="https://slack.test/api",
-        headers={"Authorization": f"Bearer {token}"},
-        transport=httpx.MockTransport(handle_auth_test),
-    )
+    async def handle_auth_test(request: web.Request) -> web.Response:
+        assert request.path == "/api/auth.test"
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        requests.append(request.path)
+        return web.json_response({"ok": True, "user_id": "U1", "team_id": "T1"})
+
+    app = web.Application()
+    app.router.add_post("/api/auth.test", handle_auth_test)
     real_build = channel_registry.build_managed_channel
     built_adapters: list[object] = []
 
-    def build_with_mock_transport(entry):
-        assert entry.token == token
-        assert entry.signing_secret == signing_secret
-        adapter = real_build(entry)
-        assert adapter is not None
-        adapter._client = client
-        built_adapters.append(adapter)
-        return adapter
+    async with AsyncExitStack() as resources:
+        runner = web.AppRunner(app)
+        await runner.setup()
+        resources.push_async_callback(runner.cleanup)
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        api_base = f"http://127.0.0.1:{runner.addresses[0][1]}/api/"
+        session = await resources.enter_async_context(ClientSession())
+        monkeypatch.setattr(
+            "opensquilla.channels.slack.SLACK_API_BASE", api_base,
+        )
+        monkeypatch.setattr("opensquilla.channels.slack._trust_env", lambda: False)
 
-    monkeypatch.setattr(channel_registry, "build_managed_channel", build_with_mock_transport)
+        def build_with_local_transport(entry):
+            assert entry.token == token
+            assert entry.signing_secret == signing_secret
+            adapter = real_build(entry)
+            assert adapter is not None
+            client = adapter._get_client()
+            assert isinstance(client, AsyncWebClient)
+            client.session = session
+            built_adapters.append(adapter)
+            return adapter
 
-    rpc_res = await get_dispatcher().dispatch(
-        "r-probe",
-        "channels.probe",
-        {
-            "entry": {
-                "type": "slack",
-                "name": "work",
-                "token": "",
-                "signing_secret": "",
-            }
-        },
-        ctx,
-    )
+        monkeypatch.setattr(channel_registry, "build_managed_channel", build_with_local_transport)
 
-    assert rpc_res.error is None, rpc_res.error
-    assert rpc_res.payload["status"] == "verified"
-    assert rpc_res.payload["connected"] is True
-    assert isinstance(rpc_res.payload["latencyMs"], int)
-    assert rpc_res.payload["result"] == {
-        "authenticated": True,
-        "bot_user_id": "U1",
-        "team_id": "T1",
-    }
-    assert token not in repr(rpc_res.payload)
-    assert signing_secret not in repr(rpc_res.payload)
-    assert len(built_adapters) == 1
-    assert client.is_closed is True
-    assert built_adapters[0]._client is None
+        rpc_res = await get_dispatcher().dispatch(
+            "r-probe",
+            "channels.probe",
+            {
+                "entry": {
+                    "type": "slack",
+                    "name": "work",
+                    "token": "",
+                    "signing_secret": "",
+                }
+            },
+            ctx,
+        )
+
+        assert rpc_res.error is None, rpc_res.error
+        assert rpc_res.payload["status"] == "verified"
+        assert rpc_res.payload["connected"] is True
+        assert isinstance(rpc_res.payload["latencyMs"], int)
+        assert rpc_res.payload["result"] == {
+            "authenticated": True,
+            "bot_user_id": "U1",
+            "team_id": "T1",
+        }
+        assert token not in repr(rpc_res.payload)
+        assert signing_secret not in repr(rpc_res.payload)
+        assert requests == ["/api/auth.test"]
+        assert len(built_adapters) == 1
+        assert session.closed is True
+        assert built_adapters[0]._client is None
 
 
 @pytest.mark.asyncio

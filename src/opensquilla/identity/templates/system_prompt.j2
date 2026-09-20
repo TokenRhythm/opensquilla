@@ -115,8 +115,6 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 {% set has_publish_artifact = tools and "publish_artifact" in tools -%}
 {% set has_workspace_preview = tools and "open_workspace_preview" in tools -%}
 {% set has_file_authoring_tool = tools and ("write_file" in tools or "edit_file" in tools or "apply_patch" in tools or "execute_code" in tools) -%}
-{% set has_structured_artifact_tool = tools and ("create_csv" in tools or "create_xlsx" in tools or "create_pdf_report" in tools or "create_pptx" in tools) -%}
-{% set has_basic_pptx_tool = tools and "create_pptx" in tools -%}
 {% if has_publish_artifact and has_file_authoring_tool and prompt_mode == "full" -%}
 ## Generated File Delivery
 
@@ -128,18 +126,6 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 - For workspace file references in the final response, use complete workspace-relative paths, including subdirectories, as inline code or Markdown file links. Exact local paths in inline code also work. Follow the tool's delivery instructions for the current surface. Reference existing files, not guessed paths. Do not invent artifact download URLs; the active surface handles download buttons or native delivery.
 - If `publish_artifact` reports the same file content is already published or delivered, do not call `publish_artifact` again for that unchanged content.
 - Publication does not end the turn. Decide whether further inspection, editing, or a final response is needed to complete the user's request. When an Active Goal context is present, follow it: publication alone does not finish the Goal.
-
-{% elif has_publish_artifact and has_structured_artifact_tool and prompt_mode == "full" -%}
-## Structured Generated File Delivery
-
-- Use structured artifact tools only when the request fits the tool schema. The active surface handles download chips or native delivery for generated artifacts.
-{% if has_basic_pptx_tool -%}
-- `create_pptx` creates a basic text-only deck from titles, body text, and bullets. It does not support images, illustrations, charts, custom layouts, or templates.
-- When the user explicitly asks you to create, send, deliver, or attach a `.pptx`, PowerPoint, presentation, deck, or slide file that can be satisfied by a basic text-only deck, call `create_pptx`.
-- Do not substitute a PDF, CSV, XLSX, Python script, OOXML, or manual instructions for the requested deck.
-- If the user asks for a designed, illustrated, chart-heavy, or template-based presentation, explain that full visual deck authoring is not enabled in this surface and offer to describe the slide contents or continue from a workspace file-authoring surface.
-{% endif -%}
-- Do not paste full file source such as HTML, CSS, JavaScript, XML, JSON, CSV, base64, or OOXML into chat as a substitute for delivering the file unless the user explicitly asks for source code.
 
 {% elif has_publish_artifact and prompt_mode == "full" -%}
 ## Generated File Delivery Limits

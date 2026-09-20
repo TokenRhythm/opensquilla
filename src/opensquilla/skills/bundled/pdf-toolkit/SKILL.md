@@ -42,6 +42,13 @@ work where you know exactly what you want done. For a natural-language rewrite,
 first draft the replacement content with ordinary reasoning, then use the
 explicit extract/generate/merge operations here to create the final PDF.
 
+Use the inline Python examples with `execute_code` in a restricted channel.
+Keep files in the active workspace and call `publish_artifact` with the
+finished PDF. Shell commands below require an available `exec_command`;
+they are optional shortcuts, not a reason to request host execution. If the
+sandbox or a required library is unavailable, report the limitation rather
+than retrying outside the sandbox.
+
 ## Decide the operation
 
 | Goal | Script |
@@ -171,6 +178,25 @@ c.drawString(72, 696, "Revenue grew 18% year over year.")
 c.showPage()
 c.save()
 ```
+
+For Chinese text, register a CJK font instead of Helvetica. ReportLab's CID
+font works without downloading fonts or reading a user font directory:
+
+```python
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfgen import canvas
+
+pdfmetrics.registerFont(UnicodeCIDFont("STSong-Light"))
+c = canvas.Canvas("report.pdf")
+c.setFont("STSong-Light", 14)
+c.drawString(72, 760, "季度报告：收入增长")
+c.save()
+```
+
+CID fonts rely on PDF reader CJK support. When an embedded font is required,
+use a licensed font already available inside the workspace or permitted system
+font roots. Validate the text with `pypdf` before publishing.
 
 For tables, headers/footers, and multi-column layouts, switch to
 `reportlab.platypus` (`SimpleDocTemplate`, `Paragraph`, `Table`,

@@ -48,10 +48,6 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
     ),
     "channel:media": frozenset(
         {
-            "create_csv",
-            "create_pdf_report",
-            "create_pptx",
-            "create_xlsx",
             "image",
             "image_generate",
             "audio_provider_capabilities",
@@ -70,7 +66,6 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
     ),
     "channel:doc": frozenset(
         {
-            "create_pdf_report",
             "web_discover",
             "web_fetch",
             "web_search",
@@ -83,14 +78,7 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
             "web_search",
         }
     ),
-    "channel:drive": frozenset(
-        {
-            "create_csv",
-            "create_pdf_report",
-            "create_pptx",
-            "create_xlsx",
-        }
-    ),
+    "channel:drive": frozenset(),
     "channel:scopes": frozenset(),
     "channel:perm": frozenset(),
     # Trusted host/gateway tools intentionally do not imply OS sandbox
@@ -252,10 +240,6 @@ CODING_MODE_DENIED_TOOLS: frozenset[str] = frozenset(
         "apply_patch",
         "execute_code",
         "git_commit",
-        "create_csv",
-        "create_pdf_report",
-        "create_pptx",
-        "create_xlsx",
     }
 )
 

@@ -282,18 +282,17 @@ async def test_permission_matrix_allows_authenticated_channel_admin_context() ->
 
 
 @pytest.mark.asyncio
-async def test_permission_matrix_uses_webui_source_for_owner_admin_tools() -> None:
+async def test_authenticated_webui_owner_uses_web_caller_kind() -> None:
     """Authenticated Web UI turns should use the Web UI permission surface.
 
-    Webchat sessions carry ``channel_kind='webchat'`` for display/routing,
-    while the trusted surface is recorded as ``source_kind='webui'``. The
-    permission matrix must not collapse those turns to the DM surface or
-    admin-only workspace tools are denied even for authenticated operators.
+    Webchat sessions carry ``channel_kind='webchat'`` for display/routing.
+    Their trusted CallerKind.WEB distinguishes them from external channels;
+    source_kind metadata alone must never promote an external caller.
     """
     handler = build_tool_handler(_registry_with("write_file"))
     ctx = ToolContext(
         is_owner=True,
-        caller_kind=CallerKind.CHANNEL,
+        caller_kind=CallerKind.WEB,
         interaction_mode=InteractionMode.INTERACTIVE,
         agent_id="main",
         session_key="agent:main:webchat:hardening",

@@ -13,7 +13,6 @@ _NAMES = [
     "artifacts",
     "browser",
     "code_exec",
-    "file_authoring",
     "filesystem",
     "git",
     "goal_control",

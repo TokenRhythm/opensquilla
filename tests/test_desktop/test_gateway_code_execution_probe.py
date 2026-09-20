@@ -45,6 +45,8 @@ def test_code_execution_probe_runs_the_real_tool_through_the_gateway_entry(tmp_p
     assert json.loads(result.stdout) == {
         "probe": "opensquilla-desktop-code-execution", "frozen": False,
         "pythonExit": 0, "errorExit": 7, "pages": 1, "title": "Packaged Python tool smoke",
+        "documents": {"csvRows": 2, "xlsxValue": 42, "pdfText": "中文文件验收 样本 42"},
+        "published": 4,
     }
     artifact = profile / "workspace" / "code-execution" / "python-tool-smoke.pptx"
     with ZipFile(artifact) as archive:

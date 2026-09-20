@@ -173,6 +173,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "attachment_working_files",
         "persist_attachment_working_files",
         "explicitly_allowed_tools",
+        "sandboxed_workspace_authoring",
         "process_event_emitter",
     ]
 
@@ -184,6 +185,22 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     assert ToolContext().update_progress is None
     assert ToolContext().usage_root_turn_id is None
     assert ToolContext().explicitly_allowed_tools == set()
+    assert ToolContext().sandboxed_workspace_authoring is None
+    assert ToolContext().process_event_emitter is None
+
+
+def test_tool_context_preserves_workspace_authoring_positional_constructor() -> None:
+    defaults = ToolContext()
+    published_fields = fields(ToolContext)[:123]
+    assert published_fields[-1].name == "sandboxed_workspace_authoring"
+    published_values = [getattr(defaults, item.name) for item in published_fields]
+    authoring_facts = object()
+    published_values[-1] = authoring_facts
+
+    context = ToolContext(*published_values)
+
+    assert context.sandboxed_workspace_authoring is authoring_facts
+    assert context.process_event_emitter is None
 
 
 def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:

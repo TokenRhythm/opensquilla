@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
-from opensquilla.safety.tool_tiers import RiskTier, get_tier
+from opensquilla.safety.tool_tiers import RiskTier, tier_for_context
 
 CHANNEL_WEBUI: Final[str] = "webui"
 CHANNEL_DM: Final[str] = "dm"
@@ -83,6 +83,8 @@ def is_tool_allowed(
     tool_name: str,
     channel_kind: str,
     principal: Principal | None = None,
+    *,
+    workspace_authoring_attested: bool = False,
 ) -> PermissionDecision:
     """Decide whether ``tool_name`` is invocable from ``channel_kind``.
 
@@ -97,10 +99,18 @@ def is_tool_allowed(
       ``admin_only_denied_in_<channel_kind>`` or ``tier_denied``.
     """
 
-    tier = get_tier(tool_name)
+    tier = tier_for_context(
+        tool_name,
+        workspace_authoring_attested=workspace_authoring_attested,
+    )
     normalised = _normalise_channel_kind(channel_kind)
     channel_id = principal.channel_id if principal else None
     allowed_tiers = _allowed_tiers_for(normalised, channel_id)
+
+    if tier is RiskTier.WORKSPACE_AUTHORING:
+        if workspace_authoring_attested and normalised in {CHANNEL_DM, CHANNEL_GROUP}:
+            return PermissionDecision(True, "workspace_authoring_attested")
+        return PermissionDecision(False, "workspace_authoring_unattested")
 
     if tier in allowed_tiers:
         return PermissionDecision(True, "tier_allowed")

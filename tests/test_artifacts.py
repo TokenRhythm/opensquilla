@@ -680,7 +680,7 @@ def test_artifact_store_finds_existing_session_deliverable_by_name_and_sha(
         session_key="agent:main:webchat:session-1",
         name="brief.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        source="create_pptx",
+        source="publish_artifact",
     )
 
     found = store.find_existing_ref(
@@ -714,7 +714,7 @@ def test_artifact_store_skips_existing_deliverable_with_bad_material(
         session_key="agent:main:webchat:session-1",
         name="brief.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        source="create_pptx",
+        source="publish_artifact",
     )
     store.path_for(ref).write_bytes(b"corrupt")
 

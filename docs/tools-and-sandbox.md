@@ -98,6 +98,28 @@ opensquilla sandbox reset
 Sandbox behavior is platform-dependent. Treat `sandbox status` and `doctor` as
 the source of truth for the current machine.
 
+### Ordinary channel sessions
+
+Admitting a sender or a group does not grant host execution. The Gateway
+enables `read_file`, `write_file`, `edit_file`, `apply_patch`, and `execute_code`
+only after attesting a managed session workspace and an available sandbox.
+The same turn-local proof controls tool discovery, dispatch, and the handlers.
+It cannot be supplied through a message, model argument, or channel metadata.
+
+The workspace must have strict containment, no additional mounts, and validated
+directory ownership and identity. Configured project directories, shared roots,
+and old sessions without a valid managed binding do not qualify. Python runs
+with an allowlisted environment and no network, using installed libraries.
+Sandbox startup or execution failure is terminal; execution never retries on
+the host. Ineligible sessions retain their existing limited tool surface.
+
+This capability currently supports Linux Bubblewrap and macOS Seatbelt.
+Windows remains unavailable for ordinary channel authoring until its backend
+can enforce the required read isolation. `exec_command`, background processes,
+Git mutations, and elevation remain unavailable to ordinary channel callers.
+Verified channel administrators, Web UI, and CLI retain their existing policy
+semantics. Group sessions default to per-sender isolation.
+
 ## Recommended Patterns
 
 | Task | Recommended posture |

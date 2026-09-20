@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from opensquilla.channels.discord import DiscordChannel, DiscordChannelConfig
-from opensquilla.channels.slack import SLACK_API_BASE, SlackChannel
+from opensquilla.channels.slack import SlackChannel
 
 
 async def _two_chunks() -> AsyncIterator[str]:
@@ -36,16 +36,12 @@ async def test_discord_send_streaming_surfaces_rejected_edit() -> None:
 async def test_slack_send_streaming_surfaces_edit_api_error() -> None:
     channel = SlackChannel(token="xoxb-dummy", slack_channel_id="C123")
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/chat.postMessage"):
-            return httpx.Response(200, json={"ok": True, "ts": "111.222"})
-        return httpx.Response(200, json={"ok": False, "error": "msg_too_long"})
+    class Client:
+        async def api_call(self, method: str, **_kwargs: object) -> dict[str, object]:
+            if method == "chat.postMessage":
+                return {"ok": True, "ts": "111.222"}
+            return {"ok": False, "error": "msg_too_long"}
 
-    channel._client = httpx.AsyncClient(
-        base_url=SLACK_API_BASE, transport=httpx.MockTransport(handler)
-    )
-    try:
-        with pytest.raises(RuntimeError, match="msg_too_long"):
-            await channel.send_streaming(_two_chunks(), update_interval_ms=0)
-    finally:
-        await channel._client.aclose()
+    channel._client = Client()
+    with pytest.raises(RuntimeError, match="msg_too_long"):
+        await channel.send_streaming(_two_chunks(), update_interval_ms=0)
