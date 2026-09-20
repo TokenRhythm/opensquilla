@@ -541,7 +541,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reused-windows-upgrade-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
-          path: ${{ runner.temp }}/opensquilla-release-preservation-reused-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/*.log
+          path: ${{ runner.temp }}/opensquilla-release-preservation-reused-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/**
           if-no-files-found: ignore
           retention-days: 7
 

@@ -1697,6 +1697,15 @@ jobs:
             -InstallMode $env:INSTALL_MODE `
             -BaselineVersion $env:BASELINE_VERSION
 
+      - name: Retain internal Windows upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: internal-windows-upgrade-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          path: ${{ runner.temp }}/opensquilla-release-preservation-internal-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/**
+          if-no-files-found: warn
+          retention-days: 14
+
   internal-windows-candidate-probes:
     if: ${{ always() && github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' && needs.build-desktop-windows.outputs.candidate_artifact_id != '' }}
     needs: [build-control-ui, build-desktop-windows]
