@@ -2334,7 +2334,7 @@ async def test_system_event_runtime_notice_overrides_suppressed_model_delivery()
         "DoneEvent",
     ]
     notice = yielded[0].text
-    assert "could not confirm" in notice
+    assert "A running process was reported" in notice
     done = yielded[1]
     assert isinstance(done, DoneEvent)
     assert done.text == notice

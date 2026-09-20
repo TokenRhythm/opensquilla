@@ -64,7 +64,12 @@ def test_terminal_receipt_clears_running_notice(status: str) -> None:
 def test_unified_exec_running_receipt_is_unconfirmed() -> None:
     segments = [_unified_started()]
 
-    assert "exec_command" in (unconfirmed_action_notice("", segments) or "")
+    notice = unconfirmed_action_notice("", segments) or ""
+    assert "exec_command" in notice
+    assert "execution_id=process-a" in notice
+    assert "could not confirm the action completed" not in notice
+    assert "A running process was reported" in notice
+    assert "no exit result was recorded in this turn" in notice
 
 
 def test_unified_exec_receipt_is_cleared_by_process_completion() -> None:
@@ -109,8 +114,39 @@ def test_unidentified_legacy_running_result_remains_unconfirmed() -> None:
 def test_repeated_running_receipts_emit_one_notice() -> None:
     notice = with_unconfirmed_action_notice("Waiting.", [_started(), _receipt("unknown")])
 
-    assert notice.count("could not confirm") == 1
+    assert notice.count("A running process was reported") == 1
     assert with_unconfirmed_action_notice(notice, [_started()]) == notice
+
+
+def test_service_health_check_does_not_fabricate_a_process_exit() -> None:
+    segments = [_unified_started(), {
+        "type": "tool_result",
+        "name": "exec_command",
+        "result": json.dumps({"returncode": 0, "stdout": "health: ok"}),
+        "execution_status": {"status": "success"},
+    }]
+
+    text = with_unconfirmed_action_notice("The service health check passed.", segments)
+
+    assert text.startswith("The service health check passed.")
+    assert "execution_id=process-a" in text
+    assert "A running process was reported" in text
+    assert "could not confirm the action completed" not in text
+
+
+def test_similar_assistant_prose_does_not_suppress_process_receipt() -> None:
+    text = with_unconfirmed_action_notice("No exit status is available yet.", [_started()])
+
+    assert "execution_id=process-a" in text
+
+
+def test_only_outstanding_execution_ids_are_reported() -> None:
+    segments = [_unified_started(), _unified_started("process-b"), _receipt("success")]
+
+    notice = unconfirmed_action_notice("", segments) or ""
+
+    assert "process-a" not in notice
+    assert "execution_id=process-b" in notice
 
 
 @pytest.mark.parametrize("status", ["error", "timeout", "cancelled"])

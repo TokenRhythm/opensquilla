@@ -4952,6 +4952,7 @@ class TaskRuntime:
                 session_key=task.envelope.session_key,
                 session_id=task.envelope.session_id,
                 session_epoch=task.envelope.session_epoch,
+                epoch=task.envelope.session_epoch,
                 task_id=task.task_id,
                 execution_id=execution_id,
             )

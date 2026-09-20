@@ -68,11 +68,13 @@ def _session_receipt(
     return session_id.strip(), exited
 
 
-def _unconfirmed_background_tool_names(
+def _unconfirmed_background_tools(
     turn_segments: list[dict[str, Any]],
-) -> list[str]:
-    pending: dict[str, str] = {}
-    unidentified: list[str] = []
+) -> list[tuple[str, str | None]]:
+    """Return background processes without a terminal receipt in this turn."""
+
+    pending: dict[str, tuple[str, str | None]] = {}
+    unidentified: list[tuple[str, str | None]] = []
     for segment in turn_segments:
         if not isinstance(segment, dict) or segment.get("type") != "tool_result":
             continue
@@ -91,10 +93,11 @@ def _unconfirmed_background_tool_names(
                 receipt_status.get("status") == "unknown"
                 and receipt_status.get("reason") == "background_running"
             ):
+                entry = (name, session_id)
                 if session_id is not None:
-                    pending[session_id] = name
+                    pending.setdefault(session_id, entry)
                 else:
-                    unidentified.append(name)
+                    unidentified.append(entry)
             elif session_id is not None and exited and receipt_status.get("status") in {
                 "success", "error", "timeout", "cancelled",
             }:
@@ -108,16 +111,20 @@ def unconfirmed_action_notice(
     final_text: str,
     turn_segments: list[dict[str, Any]],
 ) -> str | None:
-    """Return the deterministic visibility guard for an unfinished action."""
+    """Report outstanding process receipts without judging task completion."""
 
-    tool_names = _unconfirmed_background_tool_names(turn_segments)
-    if not tool_names or "could not confirm" in final_text.lower():
+    tools = _unconfirmed_background_tools(turn_segments)
+    if not tools:
         return None
-    tools = ", ".join(dict.fromkeys(tool_names))
-    return (
-        f"Note: I started {tools}, but the tool reported that it was still "
-        "running, so I could not confirm the action completed."
+    descriptions = ", ".join(
+        f"{name} (execution_id={session_id})" if session_id else name
+        for name, session_id in tools
     )
+    notice = (
+        f"Background process status: {descriptions}. "
+        "A running process was reported; no exit result was recorded in this turn."
+    )
+    return None if notice in final_text else notice
 
 
 def with_unconfirmed_action_notice(

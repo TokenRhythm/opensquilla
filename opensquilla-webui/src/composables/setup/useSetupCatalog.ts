@@ -75,19 +75,6 @@ import { PROVIDER_CONFIGURATION_KEY, ProviderConfigurationError, type ProviderCo
 export { SETTINGS_SECTIONS } from '@/composables/setup/settingsSections'
 export type { SettingsSectionId } from '@/composables/setup/settingsSections'
 
-const READINESS_KEYS: Record<string, string> = {
-  ok: 'setup.readiness.ready',
-  optional: 'setup.readiness.optional',
-  missing: 'setup.readiness.missing',
-  degraded: 'setup.readiness.needsAction',
-  unknown: 'setup.readiness.check',
-}
-
-function readinessLabel(status: string): string {
-  const key = READINESS_KEYS[status]
-  return key ? i18n.global.t(key) : ''
-}
-
 // The gateway's image_generation section detail is a backend-built English
 // sentence (onboarding/status.py, onboarding/next_steps.py) rendered verbatim
 // in an otherwise fully localized panel. Until the backend ships a structured
@@ -2301,8 +2288,14 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
     return { label: t('setup.connection.disconnected'), tone: 'is-warn' }
   }
   if (sectionId === 'provider') {
+    // Saved primary configuration owns this indicator. Optional capabilities,
+    // probes, and older detail snapshots must not override a configured LLM.
+    if (status.value.llmConfigured === true) return { label: t('setup.readiness.ready'), tone: 'is-ok' }
     if (status.value.llmConfigured === false || status.value.llmSource === 'missing_env') return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
-    return detailStepStatus((status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider)
+    const detail = (status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider
+    if (detail?.status === 'missing') return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
+    if (detail?.status === 'ok') return { label: t('setup.readiness.ready'), tone: 'is-ok' }
+    return { label: t('setup.status.review'), tone: 'is-muted' }
   }
   // General/Security/Advanced are always-valid preference toggles, not
   // readiness milestones — a neutral dot (rather than a green "Live" that
@@ -2326,20 +2319,12 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
   return { label: t('setup.status.review'), tone: 'is-muted' }
 }
 
-function detailStepStatus(detail?: SectionDetail): { label: string; tone: string } {
-  if (!detail) return { label: t('setup.status.review'), tone: 'is-muted' }
-  if (stepDetailNeedsAction(detail)) return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
-  if (detail.status === 'ok') return { label: t('setup.readiness.ready'), tone: 'is-ok' }
-  return { label: readinessLabel(detail.status || '') || t('setup.readiness.optional'), tone: 'is-muted' }
-}
-
 function aggregateStepStatus(sectionNames: string[]): { label: string; tone: string } {
   const details = status.value.sectionDetails || {}
   const entries = sectionNames.map(name => details[name]).filter(Boolean) as SectionDetail[]
-  if (entries.some(detail => stepDetailNeedsAction(detail))) {
-    return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
-  }
-  if (entries.length && entries.every(detail => detail.status === 'ok')) {
+  // Optional features keep their diagnostics inside their panels. The rail
+  // stays quiet until the user chooses to configure them.
+  if (entries.length && entries.every(detail => detail.status === 'ok' && !stepDetailNeedsAction(detail))) {
     return { label: t('setup.readiness.ready'), tone: 'is-ok' }
   }
   return { label: t('setup.readiness.optional'), tone: 'is-muted' }

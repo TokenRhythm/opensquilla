@@ -388,6 +388,19 @@ function projectKnownConversationContent(
   semanticKind: Exclude<ConversationSemanticEventKind, 'unknown'>,
   rawPayload: unknown,
 ): ConversationContentProjection {
+  if (semanticKind === 'process-completed') {
+    const raw = object(rawPayload)
+    if (typeof raw.execution_id !== 'string' || !raw.execution_id
+      || typeof raw.session_id !== 'string' || !raw.session_id
+      || typeof raw.session_epoch !== 'number' || !Number.isInteger(raw.session_epoch) || raw.session_epoch < 0
+      || !['done', 'killed', 'timed_out'].includes(String(raw.status))
+      || (raw.returncode !== null && (typeof raw.returncode !== 'number' || !Number.isInteger(raw.returncode)))) {
+      throw new ConversationEventContractError('Invalid process completion receipt')
+    }
+    return { kind: 'known', semanticKind, payload: { executionId: raw.execution_id,
+      status: raw.status as 'done' | 'killed' | 'timed_out', returncode: raw.returncode as number | null,
+      sessionId: raw.session_id, sessionEpoch: raw.session_epoch } }
+  }
   if (semanticKind === 'execution-progress') {
     const progress = normalizeTaskProgress(object(rawPayload).progress)
     return { kind: 'known', semanticKind, payload: {

@@ -445,13 +445,26 @@ describe('provider readiness indicator', () => {
     const { api, app } = await mountCatalog()
     try {
       expect(api.sectionStatus('provider').tone).toBe('is-ok')
-      expect(api.sectionStatus('capabilities').tone).toBe('is-warn')
+      expect(api.sectionStatus('capabilities')).toEqual({ label: 'Optional', tone: 'is-muted' })
       api.selectProvider('openai')
       api.onProviderChange()
       api.updateProviderField('api_key', '')
       expect(api.sectionStatus('provider').tone).toBe('is-ok')
       expect(rpcCall.mock.calls.some(([method]) => method.includes('.probe'))).toBe(false)
     } finally { app.unmount() }
+  })
+
+  it.each(['missing', 'degraded'])('trusts a configured primary over a stale %s detail', async detailStatus => {
+    mockReadiness({
+      hasConfig: true, llmConfigured: true, llmSource: 'explicit',
+      sectionDetails: {
+        llm: { status: detailStatus, blocking: true, actionRequired: true },
+        search: optionalMissing,
+      },
+    })
+    const { api, app } = await mountCatalog()
+    try { expect(api.sectionStatus('provider')).toEqual({ label: 'Ready', tone: 'is-ok' }) }
+    finally { app.unmount() }
   })
 
   it('keeps a saved missing environment credential visible while editing another provider', async () => {
@@ -482,7 +495,7 @@ describe('provider readiness indicator', () => {
       expect(await api.saveProvider()).toBe(true)
       expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.objectContaining({ providerId: 'tokenrhythm' }))
       expect(api.sectionStatus('provider').tone).toBe('is-ok')
-      expect(api.sectionStatus('capabilities').tone).toBe('is-warn')
+      expect(api.sectionStatus('capabilities')).toEqual({ label: 'Optional', tone: 'is-muted' })
     } finally { app.unmount() }
     const reopened = await mountCatalog()
     try { expect(reopened.api.sectionStatus('provider').tone).toBe('is-ok') }
@@ -2053,7 +2066,7 @@ describe('useSetupCatalog model strategy IA', () => {
     const { api, app } = await mountCatalog()
 
     expect(api.actionItems.value).toContainEqual({ label: 'Router setup needed', section: 'modelStrategy' })
-    expect(api.sectionStatus('modelStrategy')).toEqual({ label: 'Needs action', tone: 'is-warn' })
+    expect(api.sectionStatus('modelStrategy')).toEqual({ label: 'Optional', tone: 'is-muted' })
     app.unmount()
   })
 
@@ -2143,7 +2156,7 @@ describe('useSetupCatalog model strategy IA', () => {
     app.unmount()
   })
 
-  it('reports Model Strategy needs action when ensemble detail needs action', async () => {
+  it('keeps the Model Strategy rail quiet when ensemble detail needs action', async () => {
     rpcCall.mockImplementation(async (method: string) => {
       if (method === 'onboarding.catalog') return {}
       if (method === 'onboarding.status') {
@@ -2165,7 +2178,7 @@ describe('useSetupCatalog model strategy IA', () => {
     })
     const { api, app } = await mountCatalog()
 
-    expect(api.sectionStatus('modelStrategy')).toEqual({ label: 'Needs action', tone: 'is-warn' })
+    expect(api.sectionStatus('modelStrategy')).toEqual({ label: 'Optional', tone: 'is-muted' })
     app.unmount()
   })
 

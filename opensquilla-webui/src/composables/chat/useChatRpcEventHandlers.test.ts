@@ -951,6 +951,22 @@ describe('useChatRpcEventHandlers route-card ownership', () => {
 })
 
 describe('useChatRpcEventHandlers decoded conversation ingress', () => {
+  it.each(['current-turn', 'old-turn'])('never lets process completion for %s settle the agent turn', taskId => {
+    const h = createHarness()
+    h.activeStreamTaskId.value = 'current-turn'
+    try {
+      h.api.handlers.onWireEventFixture('session.event.process_completed', {
+        session_key: h.sessionKey.value, session_id: 'durable-session', session_epoch: 0,
+        execution_id: 'process-1', task_id: taskId, status: 'done', returncode: 0,
+      })
+      expect(h.applySessionRunState).not.toHaveBeenCalled()
+      expect(h.stream.endStreaming).not.toHaveBeenCalled()
+      expect(h.stream.startStreaming).not.toHaveBeenCalled()
+      expect(h.onTaskSettled).not.toHaveBeenCalled()
+      expect(h.activeStreamTaskId.value).toBe('current-turn')
+    } finally { h.stop() }
+  })
+
   it('rejects invalid receipts and unknown additive frames before cursor or task mutation', () => {
     const harness = createHarness({ supportsTurnCommitted: true })
     let receive!: TransportEventHandler

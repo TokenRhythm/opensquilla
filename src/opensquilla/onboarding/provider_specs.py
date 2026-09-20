@@ -227,9 +227,7 @@ def _default_direct_model(provider_id: str) -> str:
             return preset.default_model
         return ""
     if _has_curated_router_ladder(provider_id):
-        tiers = preset.tier_defaults()
-        tier = tiers.get("c1") or tiers.get("c0") or {}
-        return str(tier.get("model") or "")
+        return preset.default_model
     if provider_id in _INLINE_ROUTER_SUPPORTED_PROVIDER_IDS:
         return preset.default_model
     return ""

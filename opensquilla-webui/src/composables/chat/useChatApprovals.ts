@@ -811,6 +811,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       }
       if (message.kind !== 'conversation' || message.event.kind !== 'known') return
       const event = message.event
+      if (event.semanticKind === 'process-completed') return
       const terminal = CLARIFY_TERMINAL_EVENTS.has(event.semanticKind)
       if (event.semanticKind !== 'tool-result' && event.semanticKind !== 'session-epoch-changed' && !terminal) return
       if (!acceptClarifyContext(event.payload, event.semanticKind === 'session-epoch-changed')) return

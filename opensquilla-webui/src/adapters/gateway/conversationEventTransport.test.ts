@@ -29,6 +29,33 @@ function harness() {
 }
 
 describe('conversation event transport adapter', () => {
+  it('projects process completion with distinct durable owner and execution identities', () => {
+    const { rpc, transport } = harness()
+    const observed = vi.fn<(event: ConversationEvent) => void>()
+    transport.subscribe({ onEvent: observed })
+    rpc.emit('*', 'session.event.process_completed', {
+      session_key: 'alpha', session_id: 'durable-alpha', session_epoch: 3,
+      execution_id: 'process-1', task_id: 'old-turn', status: 'done', returncode: 0,
+    })
+    expect(observed).toHaveBeenCalledWith(expect.objectContaining({ kind: 'conversation', event: expect.objectContaining({
+      kind: 'known', semanticKind: 'process-completed', sessionKey: 'alpha', taskId: 'old-turn',
+      payload: { executionId: 'process-1', sessionId: 'durable-alpha', sessionEpoch: 3, status: 'done', returncode: 0 },
+    }) }))
+  })
+
+  it('rejects malformed process completion instead of presenting terminal state', () => {
+    const { rpc, transport } = harness()
+    const observed = vi.fn<(event: ConversationEvent) => void>()
+    const onDecodeError = vi.fn()
+    transport.subscribe({ onEvent: observed, onDecodeError })
+    rpc.emit('*', 'session.event.process_completed', {
+      session_key: 'alpha', session_id: 'durable-alpha', session_epoch: 3,
+      execution_id: 'process-1', status: 'running', returncode: 0,
+    })
+    expect(observed).toHaveBeenCalledWith(expect.objectContaining({ kind: 'invalid' }))
+    expect(onDecodeError).toHaveBeenCalledOnce()
+  })
+
   it('preserves physical model transitions through live, replay, and snapshot ingress', () => {
     const { rpc, transport } = harness()
     const observed = vi.fn<(event: ConversationEvent) => void>()

@@ -33,6 +33,7 @@ import { ROUTE_FEEDBACK_KEY } from './modules/routeFeedback'
 import { PROMPT_CACHE_LEASE_KEY } from './modules/promptCacheLease'
 import { CLARIFICATION_SUBMISSION_KEY } from './modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY } from './modules/sessionMaintenance'
+import { SESSION_PROCESSES_KEY } from './modules/sessionProcesses'
 import { OBSERVABILITY_KEY } from './modules/observability'
 import { SKILL_CATALOG_KEY } from './modules/skillCatalog'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
@@ -116,6 +117,7 @@ app.provide(ROUTE_FEEDBACK_KEY, gatewayAdapters.routeFeedback)
 app.provide(PROMPT_CACHE_LEASE_KEY, gatewayAdapters.promptCacheLease)
 app.provide(CLARIFICATION_SUBMISSION_KEY, gatewayAdapters.clarificationSubmission)
 app.provide(SESSION_MAINTENANCE_KEY, gatewayAdapters.sessionMaintenance)
+app.provide(SESSION_PROCESSES_KEY, gatewayAdapters.sessionProcesses)
 app.provide(OBSERVABILITY_KEY, gatewayAdapters.observability)
 app.provide(SKILL_CATALOG_KEY, gatewayAdapters.skillCatalog)
 app.provide(AGENT_CATALOG_KEY, gatewayAdapters.agentCatalog)

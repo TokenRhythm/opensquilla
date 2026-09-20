@@ -1577,6 +1577,8 @@ class _BgSession:
     async_cleanup_callbacks: list[Callable[[], Awaitable[None]]] = field(default_factory=list)
     runtime_event_callback: Callable[[dict[str, Any]], None] | None = None
     process_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None
+    owner_session_id: str | None = None
+    owner_session_epoch: int | None = None
 
 
 @dataclass(frozen=True)
@@ -6503,6 +6505,9 @@ async def _emit_bg_session_completion(session: _BgSession) -> None:
         "execution_id": session.session_id,
         "session_id": session.session_id,
         "status": _bg_status(session),
+        "command": session.command,
+        "started_at": session.started_at,
+        "ended_at": session.ended_at,
         "returncode": session.returncode,
         "timed_out": session.timed_out,
         "killed": session.killed,
@@ -6607,6 +6612,107 @@ async def cancel_background_processes_for_task(session_key: str, task_id: str) -
     # Keep owned cleanup alive if that deadline cancels this waiter.
     await asyncio.shield(cleanup)
     return len(sessions)
+
+
+def _session_process_owned(
+    session: _BgSession, *, session_key: str, session_id: str, session_epoch: int,
+) -> bool:
+    return (
+        session.session_key == session_key
+        and session.owner_session_id == session_id
+        and session.owner_session_epoch == session_epoch
+    )
+
+
+def _session_process_snapshot(session: _BgSession) -> dict[str, Any]:
+    tree_active = bool(session.process_tree is not None and session.process_tree.is_active())
+    running = tree_active or not _session_exited(session)
+    return {
+        "execution_id": session.session_id,
+        "task_id": session.task_id,
+        "command": session.command,
+        "status": "running" if running else _bg_status(session),
+        "returncode": session.returncode,
+        "started_at": session.started_at,
+        "ended_at": None if running else session.ended_at,
+    }
+
+
+def list_session_processes(
+    *, session_key: str, session_id: str, session_epoch: int,
+) -> list[dict[str, Any]]:
+    """Snapshot all live processes plus the newest 50 terminal records for this owner."""
+    snapshots = [
+        _session_process_snapshot(session)
+        for session in tuple(_bg_sessions.values())
+        if _session_process_owned(
+            session, session_key=session_key, session_id=session_id, session_epoch=session_epoch,
+        )
+    ]
+    snapshots.sort(key=lambda item: item["started_at"], reverse=True)
+    live = [item for item in snapshots if item["status"] == "running"]
+    completed = [item for item in snapshots if item["status"] != "running"]
+    return live + completed[:50]
+
+
+def _require_session_process(
+    execution_id: str, *, session_key: str, session_id: str, session_epoch: int,
+) -> _BgSession:
+    session = _bg_sessions.get(execution_id)
+    if session is None or not _session_process_owned(
+        session, session_key=session_key, session_id=session_id, session_epoch=session_epoch,
+    ):
+        raise LookupError("Managed process not found")
+    return session
+
+
+async def read_session_process_log(
+    execution_id: str, *, session_key: str, session_id: str, session_epoch: int,
+    limit: int = 12000,
+) -> dict[str, Any]:
+    """Read a bounded preview without consuming model completion notifications."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 12000:
+        raise ValueError("Process preview limit must be between 1 and 12000")
+    session = _require_session_process(
+        execution_id, session_key=session_key, session_id=session_id, session_epoch=session_epoch,
+    )
+    output = await session.output_capture.preview_async() + "".join(session.output_lines)
+    capture = session.output_capture.describe()
+    return {
+        "execution_id": execution_id,
+        "status": _session_process_snapshot(session)["status"],
+        "output": output[-limit:],
+        "truncated": bool(
+            len(output) > limit or capture["preview_omitted_bytes"]
+            or capture.get("incomplete_reason") or capture.get("storage_error")
+        ),
+    }
+
+
+async def _stop_bg_session(session: _BgSession) -> None:
+    tree_active = bool(session.process_tree is not None and session.process_tree.is_active())
+    if tree_active or not _session_exited(session):
+        session.killed = True
+        if not await _terminate_bg_session(session):
+            raise ToolError(f"Managed process did not stop: {session.session_id}")
+    if session.collector_task is not None and not session.collector_task.done():
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(session.collector_task), timeout=_BACKGROUND_KILL_TIMEOUT,
+            )
+    if not session.done and (session.collector_task is None or session.collector_task.done()):
+        await _finalize_bg_session_async(session)
+
+
+async def stop_session_process(
+    execution_id: str, *, session_key: str, session_id: str, session_epoch: int,
+) -> dict[str, Any]:
+    """Stop one owned process tree, preserving cleanup if the caller disconnects."""
+    session = _require_session_process(
+        execution_id, session_key=session_key, session_id=session_id, session_epoch=session_epoch,
+    )
+    await asyncio.shield(_stop_bg_session(session))
+    return _session_process_snapshot(session)
 
 
 def is_background_process_completion_consumed(
@@ -7690,6 +7796,11 @@ async def _start_host_background_process(
         notify_on_exit=notify_on_exit,
         process_tree=process_tree,
         session_key=ctx.session_key if ctx is not None else None,
+        owner_session_id=(
+            ctx.artifact_session_id or ctx.tool_result_store_session_id
+            if ctx is not None else None
+        ),
+        owner_session_epoch=ctx.session_epoch if ctx is not None else None,
         task_id=ctx.task_id if ctx is not None else None,
         agent_id=ctx.agent_id if ctx is not None else None,
         is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
@@ -8105,6 +8216,11 @@ async def background_process(
                 notify_on_exit=notify_on_exit,
                 process_tree=spawned.process_tree,
                 session_key=ctx.session_key if ctx is not None else None,
+                owner_session_id=(
+                    ctx.artifact_session_id or ctx.tool_result_store_session_id
+                    if ctx is not None else None
+                ),
+                owner_session_epoch=ctx.session_epoch if ctx is not None else None,
                 task_id=ctx.task_id if ctx is not None else None,
                 agent_id=ctx.agent_id if ctx is not None else None,
                 is_owner_run=bool(ctx.is_owner) if ctx is not None else False,
@@ -8703,42 +8819,7 @@ async def process(
         })
 
     if action == "kill":
-        tree_active = bool(
-            session.process_tree is not None and session.process_tree.is_active()
-        )
-        if not tree_active and _session_exited(session):
-            if session.collector_task is not None and not session.collector_task.done():
-                with contextlib.suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        asyncio.shield(session.collector_task),
-                        timeout=_BACKGROUND_KILL_TIMEOUT,
-                    )
-            if not session.done and (
-                session.collector_task is None or session.collector_task.done()
-            ):
-                await _finalize_bg_session_async(session)
-            status = _bg_status(session)
-            return json.dumps(
-                {
-                    "status": status,
-                    "action": action,
-                    "session_id": session.session_id,
-                    "session": _bg_session_payload(session),
-                }
-            )
-
-        session.killed = True
-        await _terminate_bg_session(session)
-        if session.collector_task is not None:
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.shield(session.collector_task),
-                    timeout=_BACKGROUND_KILL_TIMEOUT,
-                )
-        if not session.done and (
-            session.collector_task is None or session.collector_task.done()
-        ):
-            await _finalize_bg_session_async(session)
+        await _stop_bg_session(session)
         status = _bg_status(session)
         return json.dumps(
             {

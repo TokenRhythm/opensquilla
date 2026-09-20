@@ -1,4 +1,23 @@
 {
+  "processes": {
+    "title": "Hintergrundprozesse",
+    "runningCount": "{count} aktiv",
+    "refresh": "Aktualisieren",
+    "logs": "Protokoll",
+    "stop": "Stoppen",
+    "close": "Schließen",
+    "loading": "Wird geladen…",
+    "loadError": "Prozesse konnten nicht aktualisiert werden. Erneut versuchen.",
+    "stopError": "Prozess konnte nicht gestoppt werden. Aktualisieren und erneut versuchen.",
+    "logError": "Ausgabe konnte nicht geladen werden. Erneut versuchen.",
+    "emptyLog": "Noch keine Ausgabe.",
+    "truncated": "Begrenzte Vorschau der Ausgabe.",
+    "running": "Aktiv",
+    "done": "Beendet (0)",
+    "failed": "Beendet ({code})",
+    "killed": "Gestoppt",
+    "timed_out": "Zeitüberschreitung"
+  },
   "imageClipboard": {
     "copyImage": "Bild kopieren",
     "copySource": "SVG-Quelltext kopieren",
