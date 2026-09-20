@@ -1,9 +1,20 @@
+import type { GatewayModelRoutingMode } from '@/types/modelRouting'
+
+export interface HiddenControlInitialSettings {
+  intent: 'new_chat'
+  initialRoutingMode?: GatewayModelRoutingMode
+  initialModel?: string
+  initialProvider?: string
+}
+
 export interface HiddenControlOutboxItem {
   sessionKey: string
   clientRequestId: string
   providerText: string
   displayText: string
   createdAtMs: number
+  /** Absent on legacy records; null freezes an existing-session control. */
+  initialSettings?: HiddenControlInitialSettings | null
 }
 
 export type HiddenControlStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
@@ -51,7 +62,29 @@ function normalizeItem(value: unknown, nowMs = Date.now()): HiddenControlOutboxI
     || createdAtMs > nowMs
     || nowMs - createdAtMs > MAX_AGE_MS
   ) return null
-  return { sessionKey, clientRequestId, providerText, displayText, createdAtMs }
+  let initialSettings: HiddenControlInitialSettings | null | undefined
+  if (candidate.initialSettings === null) initialSettings = null
+  else if (candidate.initialSettings !== undefined) {
+    const initial = candidate.initialSettings
+    if (!initial || typeof initial !== 'object' || initial.intent !== 'new_chat') return null
+    if (initial.initialRoutingMode !== undefined
+      && !['direct', 'router', 'ensemble'].includes(initial.initialRoutingMode)) return null
+    for (const value of [initial.initialModel, initial.initialProvider]) {
+      if (value !== undefined && (typeof value !== 'string' || !value.trim()
+        || value.length > 512 || value !== value.trim() || /[\u0000-\u001f\u007f]/.test(value))) return null
+    }
+    if (initial.initialProvider && !initial.initialModel) return null
+    if (initial.initialModel && initial.initialRoutingMode && initial.initialRoutingMode !== 'direct') return null
+    initialSettings = {
+      intent: 'new_chat',
+      ...(initial.initialRoutingMode ? { initialRoutingMode: initial.initialRoutingMode } : {}),
+      ...(initial.initialModel ? { initialModel: initial.initialModel } : {}),
+      ...(initial.initialProvider ? { initialProvider: initial.initialProvider } : {}),
+    }
+  }
+  return { sessionKey, clientRequestId, providerText, displayText, createdAtMs,
+    ...(initialSettings !== undefined ? { initialSettings } : {}) }
+
 }
 
 function readResult(
@@ -108,6 +141,7 @@ export function persistHiddenControlResult(
     // conflict (or a different hidden action).
     return existing.providerText === normalized.providerText
       && existing.displayText === normalized.displayText
+      && JSON.stringify(existing.initialSettings) === JSON.stringify(normalized.initialSettings)
       ? 'matched'
       : 'conflict'
   }
@@ -140,8 +174,9 @@ export function listHiddenControls(
   sessionKey: string,
   storage: HiddenControlStorage | null = defaultStorage(),
 ): HiddenControlOutboxItem[] {
-  const items = read(storage)
+  const state = readResult(storage)
   // Also rewrite after validation so expired/corrupt entries cannot accumulate.
-  write(storage, items)
-  return items.filter(candidate => candidate.sessionKey === sessionKey)
+  // A failed read is not evidence that the durable outbox is empty.
+  if (state.ok) write(storage, state.items)
+  return state.items.filter(candidate => candidate.sessionKey === sessionKey)
 }

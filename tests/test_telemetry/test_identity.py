@@ -4,6 +4,8 @@ import json
 import os
 import socket
 import stat
+import subprocess
+import sys
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta, timezone
@@ -11,6 +13,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from opensquilla.telemetry import device_identity
 from opensquilla.telemetry.identity import (
     IDENTITY_SCHEMA_VERSION,
     IdentityStateError,
@@ -21,6 +24,131 @@ from opensquilla.telemetry.identity import (
     load_or_create_identity,
     read_identity,
 )
+
+
+@pytest.mark.parametrize("platform", ["macos", "windows", "linux"])
+def test_device_identity_normalizes_machine_uuid_and_separates_platforms(platform) -> None:
+    first = device_identity.derive_device_id(platform, " 00112233-4455-6677-8899-AABBCCDDEEFF\n")
+    second = device_identity.derive_device_id(platform, "00112233445566778899aabbccddeeff")
+    assert first == second
+    assert first is not None and len(first) == 64
+    assert first != device_identity.derive_device_id(platform, "112233445566778899aabbccddeeff00")
+    assert len({
+        device_identity.derive_device_id(os_name, "00112233445566778899aabbccddeeff")
+        for os_name in ("macos", "windows", "linux")
+    }) == 3
+
+
+@pytest.mark.parametrize("machine_id", ["", "0" * 32, "f" * 32, "host-name", "00:11:22:33:44:55"])
+def test_device_identity_rejects_missing_or_untrustworthy_values(machine_id) -> None:
+    assert device_identity.derive_device_id("macos", machine_id) is None
+    assert device_identity.derive_device_id("unknown", "00112233445566778899aabbccddeeff") is None
+
+
+def test_macos_identity_uses_bounded_fixed_command(monkeypatch) -> None:
+    def run(command, **kwargs):
+        assert command == ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"]
+        assert kwargs["timeout"] == 1.0
+        assert kwargs["stderr"] == subprocess.DEVNULL
+        assert kwargs.get("shell", False) is False
+        return SimpleNamespace(stdout='"IOPlatformUUID" = "00112233-4455-6677-8899-AABBCCDDEEFF"')
+
+    monkeypatch.setattr(device_identity.subprocess, "run", run)
+    assert device_identity._macos_machine_id() == "00112233-4455-6677-8899-AABBCCDDEEFF"
+
+
+def test_windows_identity_reads_machine_registry_in_64_bit_view(monkeypatch) -> None:
+    from contextlib import nullcontext
+
+    monkeypatch.setattr(device_identity.sys, "platform", "win32")
+    fake_key = object()
+    def open_key(root, name, reserved, access):
+        assert root == "machine"
+        assert name == r"SOFTWARE\Microsoft\Cryptography"
+        assert reserved == 0 and access == 3
+        return nullcontext(fake_key)
+
+    def query_value(key, name):
+        assert key is fake_key and name == "MachineGuid"
+        return "00112233-4455-6677-8899-aabbccddeeff", 1
+
+    monkeypatch.setitem(sys.modules, "winreg", SimpleNamespace(
+        OpenKey=open_key, QueryValueEx=query_value, HKEY_LOCAL_MACHINE="machine",
+        KEY_READ=1, KEY_WOW64_64KEY=2, REG_SZ=1,
+    ))
+    assert device_identity._windows_machine_id() == "00112233-4455-6677-8899-aabbccddeeff"
+
+
+def test_device_identity_linux_fallback_and_process_cache(monkeypatch) -> None:
+    paths = []
+    def read(path):
+        paths.append(path.as_posix())
+        return None if path.as_posix() == "/etc/machine-id" else "00112233445566778899aabbccddeeff"
+
+    monkeypatch.setattr(device_identity.sys, "platform", "linux")
+    monkeypatch.setattr(device_identity, "_read_machine_id_file", read)
+    device_identity.get_device_id.cache_clear()
+    try:
+        first = device_identity.get_device_id()
+        assert first == device_identity.derive_device_id(
+            "linux", "00112233445566778899aabbccddeeff"
+        )
+        assert device_identity.get_device_id() == first
+        assert paths == ["/etc/machine-id", "/var/lib/dbus/machine-id"]
+    finally:
+        device_identity.get_device_id.cache_clear()
+
+
+def test_machine_id_file_read_is_bounded(tmp_path) -> None:
+    path = tmp_path / "machine-id"
+    path.write_text("00112233445566778899aabbccddeeff\n")
+    assert device_identity._read_machine_id_file(path) == "00112233445566778899aabbccddeeff\n"
+    path.write_text("a" * 129)
+    assert device_identity._read_machine_id_file(path) is None
+    path.write_bytes(b"\xff")
+    assert device_identity._read_machine_id_file(path) is None
+
+
+def test_device_identity_lookup_failure_never_uses_network_or_random_fallback(monkeypatch) -> None:
+    def unavailable():
+        raise subprocess.TimeoutExpired("ioreg", 1)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("device identity must not use network or random identity")
+
+    monkeypatch.setattr(device_identity.sys, "platform", "darwin")
+    monkeypatch.setattr(device_identity, "_macos_machine_id", unavailable)
+    monkeypatch.setattr(uuid, "uuid4", forbidden)
+    monkeypatch.setattr(uuid, "getnode", forbidden)
+    monkeypatch.setattr(socket, "gethostname", forbidden)
+    device_identity.get_device_id.cache_clear()
+    try:
+        assert device_identity.get_device_id() is None
+    finally:
+        device_identity.get_device_id.cache_clear()
+
+
+def test_runtime_device_identity_is_gated_by_upload_policy(tmp_path, monkeypatch) -> None:
+    from opensquilla.telemetry.consent import TelemetryScope
+    from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
+
+    calls = []
+    monkeypatch.setattr(
+        "opensquilla.telemetry.runtime.get_device_id", lambda: calls.append(1) or "a" * 64
+    )
+    config = SimpleNamespace(state_dir=str(tmp_path), privacy=SimpleNamespace(
+        disable_network_observability=True,
+    ))
+    runtime = ScopedTelemetryRuntime(config=config, env={})
+    assert runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+    assert runtime.device_id_for(TelemetryScope.GROWTH) is None
+    assert calls == []
+    config.privacy.disable_network_observability = False
+    assert runtime.device_id_for(TelemetryScope.RELIABILITY) == "a" * 64
+    assert calls == [1]
+    ci_runtime = ScopedTelemetryRuntime(config=config, env={"CI": "1"})
+    assert ci_runtime.device_id_for(TelemetryScope.RELIABILITY) is None
+    assert calls == [1]
 
 UUID_ONE = uuid.UUID("123e4567-e89b-42d3-a456-426614174000")
 UUID_TWO = uuid.UUID("123e4567-e89b-42d3-b456-426614174000")

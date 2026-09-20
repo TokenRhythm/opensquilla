@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
+from opensquilla import token_estimation
 from opensquilla.engine import Agent, AgentConfig
 from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
 from opensquilla.session.compaction import CompactionConfig, CompactionRequest, CompactionResult
@@ -33,11 +34,16 @@ def test_live_compaction_entry_budget_is_independent_of_png_compression() -> Non
 
 
 @pytest.mark.parametrize("compression", [0, 9])
+@pytest.mark.parametrize("force_tokenizer_fallback", [False, True], ids=["default", "fallback"])
 async def test_inline_compaction_reduces_old_text_while_preserving_current_image(
-    monkeypatch: pytest.MonkeyPatch, compression: int,
+    monkeypatch: pytest.MonkeyPatch, compression: int, force_tokenizer_fallback: bool,
 ) -> None:
     import opensquilla.engine.agent as agent_module
 
+    if force_tokenizer_fallback:
+        monkeypatch.setattr(
+            token_estimation, "_encoding", token_estimation._ENCODING_UNAVAILABLE,
+        )
     requests: list[CompactionRequest] = []
     compact_context = agent_module.compact_context
 
@@ -67,7 +73,9 @@ async def test_inline_compaction_reduces_old_text_while_preserving_current_image
     messages: list[Message] = []
     for index in range(20):
         messages.extend([
-            Message(role="user", content=f"Archived batch {index}. " + "completed detail " * 200),
+            # Short words overflow the history window with either estimator
+            # while keeping the prefix within the two-call summary budget.
+            Message(role="user", content=f"Archived batch {index}. " + "a b c d e f g h " * 50),
             Message(role="assistant", content=f"Batch {index} is complete."),
         ])
     current = _image_message(compression)

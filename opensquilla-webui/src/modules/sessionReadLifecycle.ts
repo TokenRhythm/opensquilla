@@ -81,6 +81,7 @@ export interface SessionReadLive {
   readonly reloadRequired: SessionReadReloadReason | null
   /** Call only after the full projection has been installed by its current owner. */
   readonly confirmInstalled?: () => Promise<void>
+  readonly assertInstalledCurrent?: () => void
 }
 
 export interface SessionReadMessageProvenance {
@@ -301,7 +302,7 @@ export class SessionReadContractError extends Error {
   }
 }
 
-export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large'
+export type SessionReadFailureKind = 'aborted' | 'timeout' | 'busy' | 'unavailable' | 'too-large' | 'budget-exhausted'
 
 /** Recoverable read failure projected by a transport Adapter. */
 export class SessionReadFailure extends Error {
@@ -516,9 +517,22 @@ export function createSessionReadLifecycle(
         snapshot: value.snapshot,
         confirmInstalled: value.confirmInstalled ? async () => {
           assertCurrent(state, options.subscriptions)
-          state.cursor = replay.cursor
           await value.confirmInstalled!()
+          assertCurrent(state, options.subscriptions)
+          // A later consumer may already have advanced the same generation.
+          // Installation never restores an older cursor over that progress.
+          const signal = {
+            sessionKey, sessionEpoch: replay.cursor.sessionEpoch,
+            streamGeneration: replay.cursor.streamGeneration, currentStreamSeq: replay.cursor.streamSeq,
+            replayComplete: true,
+          }
+          const current = options.runtime.observeGeneration(state.cursor, signal)
+          state.cursor = options.runtime.applyReplayCursor(current.cursor, signal, current.reset).cursor
         } : undefined,
+        assertInstalledCurrent: () => {
+          assertCurrent(state, options.subscriptions)
+          value.assertInstalledCurrent?.()
+        },
         reloadRequired: replay.requiresHistory
           ? (generation.reset ? 'generationChanged' : 'replayGap')
           : null,
@@ -667,7 +681,7 @@ export function createSessionReadLifecycle(
       if (error instanceof SessionReadSessionMissingError) await Promise.resolve()
       // A request-level read failure does not revoke a subscription that may
       // already be active on the healthy socket. Reconcile owns its recovery.
-      if (!(error instanceof SessionReadFailure && (error.retryable || error.kind === 'too-large')) && !state.closedReason) {
+      if (!(error instanceof SessionReadFailure && (error.retryable || error.kind === 'too-large' || error.kind === 'budget-exhausted')) && !state.closedReason) {
         await closeState('closed').catch(() => {})
       }
     })

@@ -45,7 +45,6 @@ from opensquilla.engine.turn_runner.compaction_and_history_stage import (
     HistoryLoaderPort,
     PreflightCompactionPort,
     RequestContextPrependPort,
-    T3UpgradeCompactionPort,
 )
 from opensquilla.engine.turn_runner.input_stage import ExtraContextResolver
 from opensquilla.engine.turn_runner.prompt_assembler_stage import (
@@ -170,6 +169,32 @@ class _TurnRunnerProviderResolverAdapter(ProviderResolverPort):
     def resolve_provider(self) -> tuple[Any | None, Any | None]:
         return self._runner._resolve_provider()
 
+    async def resolve_session_provider(
+        self, session_key: str,
+    ) -> tuple[Any | None, Any | None, dict[str, Any]]:
+        if not self._runner._session_model_pin_applies():
+            return (*self.resolve_provider(), {})
+        resolver = self._runner._session_deployment_resolver
+        manager = self._runner._session_manager
+        get_session = getattr(manager, "get_session", None)
+        if resolver is None or not callable(get_session):
+            return (*self.resolve_provider(), {})
+        session = await get_session(session_key)
+        if session is None:
+            return (*self.resolve_provider(), {})
+        selector = self._runner._provider_selector
+        inherited = getattr(selector, "current_config", None)
+        metadata: dict[str, Any] = {}
+        deployment = resolver(session, inherited, metadata)
+        if deployment is None:
+            return (*self.resolve_provider(), {})
+        # Keep pool provenance separate from router metadata: a subsequent
+        # routed leg must never park the session deployment's credential.
+        provider_metadata = {"session_provider_applied": deployment.provider}
+        if isinstance(metadata.get("credential_pool"), dict):
+            provider_metadata["session_credential_pool"] = metadata["credential_pool"]
+        return (*self._runner._resolve_provider(deployment=deployment), provider_metadata)
+
 
 class _TurnRunnerSkillCatalogResolverAdapter(SkillCatalogResolverPort):
     """Refresh and pin one immutable skill catalog for the turn."""
@@ -281,6 +306,7 @@ class _TurnRunnerPipelineExecutionAdapter(PipelineExecutionPort):
         kwargs: dict[str, Any] = {
             "semantic_message": request.semantic_message,
             "routing_hint": request.routing_hint,
+            "additional_request_context_tokens": request.additional_request_context_tokens,
             "ingress_pipeline_steps": request.ingress_pipeline_steps,
             "prev_assistant_text": request.prev_assistant_text,
             "prev_assistant_usage": request.prev_assistant_usage,
@@ -1008,6 +1034,8 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
                 execution_id=execution_id,
                 agent_run_id=execution_id,
                 turn_id=turn_id or None,
+                root_turn_id=getattr(tool_context, "usage_root_turn_id", None) or turn_id or None,
+                parent_turn_id=getattr(tool_context, "parent_task_id", None),
                 session_id=session_id,
                 session_epoch=max(0, int(session_epoch)),
                 agent_id=agent_id,
@@ -1035,120 +1063,11 @@ class _TurnRunnerAgentFactoryAdapter(AgentFactoryPort):
 # Compaction/history stage adapters
 # ---------------------------------------------------------------------------
 
-class _TurnRunnerT3UpgradeCompactionAdapter(T3UpgradeCompactionPort):
-    """Bind ``TurnRunner._maybe_compact_on_t3_upgrade`` as a Protocol port.
-
-    Forwards positional + keyword arguments verbatim. The helper
-    handles its own ``asyncio.CancelledError`` re-raise and the
-    log-and-record swallow for other exceptions; the adapter preserves
-    that contract by not adding any try/except.
-    """
-
-    def __init__(self, runner: TurnRunner) -> None:
-        self._runner = runner
-
-    async def maybe_compact(
-        self,
-        *,
-        session_key: str,
-        turn: Any,
-        context_window_tokens: int,
-        compaction_provider: Any | None,
-        compaction_model: str | None,
-        compaction_plan: Any | None = None,
-        compaction_request_context: Any | None = None,
-        history_capacity_tokens: int | None = None,
-        history_capacity_chars: int | None = None,
-        history_has_persisted_user: bool = False,
-        bound_user_message_id: str | None = None,
-        provider_request_correlation: Any | None = None,
-        consumer_admission: Any | None = None,
-        consumer_admission_fingerprint: str = "",
-        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
-        transcript_snapshot: Any | None = None,
-        expected_session_id: str | None = None,
-        expected_session_epoch: int | None = None,
-    ) -> str:
-        from opensquilla.engine.runtime import _accepts_keyword_arg
-
-        correlation_kwargs: dict[str, Any] = {}
-        if compaction_request_context is not None and _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade, "compaction_request_context"
-        ):
-            correlation_kwargs["compaction_request_context"] = compaction_request_context
-        if attachment_path_resolver is not None and _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "attachment_path_resolver",
-        ):
-            correlation_kwargs["attachment_path_resolver"] = attachment_path_resolver
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "provider_request_correlation",
-        ):
-            correlation_kwargs["provider_request_correlation"] = (
-                provider_request_correlation
-            )
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "history_has_persisted_user",
-        ):
-            correlation_kwargs["history_has_persisted_user"] = (
-                history_has_persisted_user
-            )
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "bound_user_message_id",
-        ):
-            correlation_kwargs["bound_user_message_id"] = bound_user_message_id
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "compaction_plan",
-        ):
-            correlation_kwargs["compaction_plan"] = compaction_plan
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "history_capacity_tokens",
-        ):
-            correlation_kwargs["history_capacity_tokens"] = history_capacity_tokens
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "history_capacity_chars",
-        ):
-            correlation_kwargs["history_capacity_chars"] = history_capacity_chars
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "consumer_admission",
-        ):
-            correlation_kwargs["consumer_admission"] = consumer_admission
-        if _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "consumer_admission_fingerprint",
-        ):
-            correlation_kwargs["consumer_admission_fingerprint"] = (
-                consumer_admission_fingerprint
-            )
-        if transcript_snapshot is not None and _accepts_keyword_arg(
-            self._runner._maybe_compact_on_t3_upgrade,
-            "transcript_snapshot",
-        ):
-            correlation_kwargs["transcript_snapshot"] = transcript_snapshot
-        if expected_session_id is not None or expected_session_epoch is not None:
-            correlation_kwargs["expected_session_id"] = expected_session_id
-            correlation_kwargs["expected_session_epoch"] = expected_session_epoch
-        return await self._runner._maybe_compact_on_t3_upgrade(
-            session_key,
-            turn,
-            context_window_tokens,
-            compaction_provider=compaction_provider,
-            compaction_model=compaction_model,
-            **correlation_kwargs,
-        )
-
 class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
     """Bind ``TurnRunner._maybe_preflight_compact`` as a Protocol port.
 
     Forwards positional + keyword arguments verbatim. Same exception
-    contract as the T3 adapter.
+    contract as the runtime helper.
     """
 
     def __init__(self, runner: TurnRunner) -> None:
@@ -1623,8 +1542,11 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         session_id: str | None = None,
         persist_image_material: bool | None = None,
         image_workspace_dir: str | Path | None = None,
+        working_files: dict[str, dict[str, Any]] | None = None,
     ) -> list[Any] | None:
         image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
+        if working_files is not None:
+            image_kwargs["working_files"] = working_files
         return self._runner._build_attachment_messages(
             message,
             attachments,
@@ -1668,8 +1590,11 @@ class _TurnRunnerAttachmentMessageBuilderAdapter(AttachmentMessageBuilderPort):
         file_parse_fact_sink: Callable[[Any], object] | None = None,
         persist_image_material: bool | None = None,
         image_workspace_dir: str | Path | None = None,
+        working_files: dict[str, dict[str, Any]] | None = None,
     ) -> list[Any] | None:
         image_kwargs = self._image_material_kwargs(persist_image_material, image_workspace_dir)
+        if working_files is not None:
+            image_kwargs["working_files"] = working_files
         return self._runner._build_attachment_messages(
             message,
             attachments,

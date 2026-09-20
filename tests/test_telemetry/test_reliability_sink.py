@@ -41,6 +41,9 @@ class CapturingRuntime:
     def record_background(self, event, *, priority=None) -> None:
         self.events.append(event)
 
+    def device_id_for(self, scope) -> None:
+        return None
+
 
 @dataclass(frozen=True)
 class TurnFacts:
@@ -106,6 +109,29 @@ def test_gateway_start_facts_match_collector_wire_contract(
     assert event.error_code == error_code
     assert event.failure_stage == failure_stage
     assert event.app_session_id == sink.app_session_id
+
+
+def test_reliability_operations_share_the_allowed_device_identifier() -> None:
+    class DeviceRuntime(CapturingRuntime):
+        def device_id_for(self, scope):
+            assert scope.value == "reliability"
+            return "1" * 64
+
+    runtime = DeviceRuntime()
+    sink = _sink(runtime)
+    sink.observe_gateway_start(
+        outcome=ResultOutcome.SUCCESS, error_code=None, failure_stage=None, duration_ms=10,
+    )
+    sink.observe_turn(TurnFacts(ResultOutcome.SUCCESS, None, None, 10, 2, 0))
+    sink.observe_tool_call(ToolFacts(ToolOutcome.SUCCESS, None, 3, ToolCategory.SHELL, 0))
+    assert len(runtime.events) == 3
+    assert {event.device_id for event in runtime.events} == {"1" * 64}
+    assert len({event.event_id for event in runtime.events}) == 3
+    for event in runtime.events:
+        parsed = parse_telemetry_wire(
+            event.model_dump_json(), target=TelemetryWireTarget.RELIABILITY_EVENT
+        )
+        assert parsed.device_id == "1" * 64
 
 
 def test_turn_facts_become_one_closed_contract_event() -> None:

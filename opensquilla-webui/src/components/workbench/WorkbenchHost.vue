@@ -84,9 +84,10 @@
           class="workbench-host__icon-button"
           type="button"
           :aria-label="collapseLabel"
+          :title="collapseLabel"
           @click="collapseWorkbench"
         >
-          <Icon name="x" :size="17" aria-hidden="true" />
+          <Icon name="panel-right-close" :size="17" aria-hidden="true" />
         </button>
       </div>
     </header>
@@ -656,6 +657,24 @@ onBeforeUnmount(() => {
   flex: 0 0 auto;
   align-items: center;
   gap: var(--sp-1);
+}
+
+@container (max-width: 560px) {
+  .workbench-host__chrome:has(.workbench-host__tabs) {
+    flex-wrap: wrap;
+    gap: 0;
+  }
+
+  .workbench-host__tabs {
+    flex-basis: 100%;
+    min-height: 44px;
+  }
+
+  .workbench-host__chrome:has(.workbench-host__tabs) .workbench-host__actions {
+    width: 100%;
+    min-height: 44px;
+    justify-content: flex-end;
+  }
 }
 
 .workbench-host__surface {

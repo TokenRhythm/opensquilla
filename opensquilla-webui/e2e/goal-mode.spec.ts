@@ -913,7 +913,7 @@ test('Session model routing stays above active Goal progress across responsive l
   await expect(goalDock).toBeVisible()
 
   const routingButton = page.getByRole('button', {
-    name: "This chat's model routing",
+    name: "Models & routing",
     exact: true,
   })
   const routingPanel = page.locator('.composer-model-routing')

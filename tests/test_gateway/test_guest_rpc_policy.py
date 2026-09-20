@@ -487,3 +487,17 @@ async def test_guest_sessions_list_clamps_limit(requested: int, expected: int) -
     )
 
     assert storage.last_limit == expected
+
+
+@pytest.mark.parametrize("method", ["chat.send", "sessions.pending_inputs.enqueue"])
+def test_guest_cannot_pin_initial_model_or_provider(method) -> None:
+    ctx = _ctx()
+    owned = guest_owned_session_key(ctx.principal.guest_owner_id, "mine")
+    normalized = GuestRpcPolicy.authorize(method, {
+        "sessionKey" if method == "chat.send" else "key": owned,
+        "message": "hello", "intent": "new_chat",
+        "initialModel": "model", "initial_model": "other",
+        "initialProvider": "openai", "initial_provider": "anthropic",
+    }, ctx)
+    for name in ("initialModel", "initial_model", "initialProvider", "initial_provider"):
+        assert name not in normalized

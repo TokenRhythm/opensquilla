@@ -13,10 +13,14 @@ import pytest
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.engine.capacity_admission import (
     LargeContextCapacityError,
+    assess_model_request_capacity,
     model_has_request_capacity,
 )
 from opensquilla.engine.routing import RoutingDecision
-from opensquilla.engine.selector_override import apply_model_override
+from opensquilla.engine.selector_override import (
+    apply_model_override,
+    require_current_selector_capacity,
+)
 from opensquilla.engine.steps.squilla_router import (
     _apply_provider_mismatch_veto,
     _flag_tier_provider_mismatch,
@@ -873,6 +877,87 @@ def test_complete_request_capacity_boundary_and_unknown_model_fail_closed(
         request_input_tokens=1,
         thinking_budget_tokens=0,
     )
+
+
+def test_capacity_assessment_distinguishes_unknown_from_recoverable_pressure(monkeypatch) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/known": {"context_window": 32_000, "max_output_tokens": 4_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    known = assess_model_request_capacity(
+        provider="openai", model="known", material_tokens=1,
+        request_input_tokens=100_000, thinking_budget_tokens=0,
+        provider_request_proof_max_chars=10,
+    )
+    unknown = assess_model_request_capacity(
+        provider="custom", model="not-catalogued", material_tokens=1,
+        request_input_tokens=100_000, thinking_budget_tokens=0,
+    )
+    assert known.status == "known_capacity_request_too_large"
+    assert known.safe_input_tokens is not None and known.safe_input_tokens > 10_000
+    assert unknown.status == "capacity_unknown"
+    assert unknown.safe_input_tokens is None
+
+
+@pytest.mark.parametrize("changed_field", [None, "model", "base_url", "api_key", "extra_body"])
+@pytest.mark.parametrize("explicit_override", [False, True])
+def test_attachment_capacity_retry_pins_deployment_and_blocks_execution_until_readmitted(
+    monkeypatch, changed_field: str | None, explicit_override: bool,
+) -> None:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/known": {"context_window": 32_000, "max_output_tokens": 4_000},
+        "openai/other": {"context_window": 128_000, "max_output_tokens": 4_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    selector = ModelSelector(SelectorConfig(
+        primary=ProviderConfig("openai", "known", api_key="synthetic-key"),
+        fallbacks=[ProviderConfig("openai", "other", api_key="synthetic-key")],
+    ))
+    metadata = {
+        "routing_applied": True,
+        "routed_model": "known",
+        "router_fallback_chain": [{"tier": "c1", "model": "other"}],
+        "large_context_capacity_required": True,
+        "large_context_request_input_tokens": 50_000,
+        "large_context_history_tokens": 49_000,
+        "large_context_thinking_budget_tokens": 0,
+        "large_context_capacity_retry_pending": True,
+        "large_context_capacity_provisional_provider": "openai",
+        "large_context_capacity_provisional_model": "known",
+    }
+    apply_model_override(selector, "known", turn_metadata=metadata, realign_routed_model=False)
+    assert metadata["large_context_capacity_provisional_bound"] is True
+    assert len(selector.remaining_chain()) == 1
+    pending_metadata = dict(metadata)
+    with pytest.raises(LargeContextCapacityError):
+        require_current_selector_capacity(selector, pending_metadata, reason="Still pending.")
+
+    metadata["large_context_capacity_retry_pending"] = False
+    metadata["large_context_capacity_retry_attempted"] = True
+    metadata["large_context_request_input_tokens"] = 1_000
+
+    def readmit() -> None:
+        if explicit_override:
+            apply_model_override(
+                selector, selector.current_config.model, turn_metadata=metadata,
+                realign_routed_model=True, explicit_capacity_override=True,
+            )
+        else:
+            require_current_selector_capacity(
+                selector, metadata, reason="Must fit after compaction.",
+            )
+
+    if changed_field is not None:
+        setattr(selector.current_config, changed_field, {
+            "model": "other", "base_url": "https://other.example/v1",
+            "api_key": "different-synthetic-key", "extra_body": {"deployment": "other"},
+        }[changed_field])
+        with pytest.raises(LargeContextCapacityError):
+            readmit()
+    else:
+        readmit()
 
 
 def test_complete_attachment_request_filters_every_fallback_without_large_floor(

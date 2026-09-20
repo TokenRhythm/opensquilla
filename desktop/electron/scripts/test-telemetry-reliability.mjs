@@ -108,6 +108,7 @@ function telemetry(options) {
     nowMs: options.clock.nowMs,
     nowDate: options.clock.nowDate,
     randomId: options.randomId,
+    deviceId: options.deviceId ?? (() => 'a'.repeat(64)),
     env: {},
   }
   if (options.telemetryAppVersion !== undefined) {
@@ -124,10 +125,12 @@ try {
     const disabledPaths = paths(disabledRoot)
     await writeReliabilityConsent(disabledPaths.consentMirrorPath, false)
     const fakeClock = clock()
+    let deviceReads = 0
     const runtime = telemetry({
       clock: fakeClock,
       appSessionId: uuid(1),
       randomId: deterministicIds(10),
+      deviceId: () => { deviceReads += 1; return 'a'.repeat(64) },
     })
     runtime.synchronize(disabledPaths)
     runtime.recordAppStartResult({
@@ -137,6 +140,7 @@ try {
       errorCode: null,
     })
     assert.equal(existsSync(disabledPaths.spoolRoot), false)
+    assert.equal(deviceReads, 0)
 
     await writeReliabilityConsent(disabledPaths.consentMirrorPath, true)
     const closedGate = new DesktopTelemetryRuntimeGate()
@@ -145,6 +149,7 @@ try {
       runtimeGate: closedGate,
       appSessionId: uuid(2),
       randomId: deterministicIds(20),
+      deviceId: () => { deviceReads += 1; return 'a'.repeat(64) },
     })
     closedRuntime.synchronize(disabledPaths)
     closedRuntime.recordCrash({
@@ -153,15 +158,52 @@ try {
       reason: 'uncaught_exception',
     })
     assert.equal(existsSync(disabledPaths.spoolRoot), false)
+    assert.equal(deviceReads, 0)
   }
 
-  // Telemetry-only filesystem failure closes the local gate but never replaces
+  // Recovery keeps the original device identity even if a profile moves to another machine.
+  {
+    const identityRoot = join(root, 'device-identity-recovery')
+    const identityPaths = paths(identityRoot)
+    await writeReliabilityConsent(identityPaths.consentMirrorPath, true)
+    const fakeClock = clock()
+    const first = telemetry({ clock: fakeClock, appSessionId: uuid(7000),
+      randomId: deterministicIds(7100), deviceId: () => 'a'.repeat(64) })
+    first.synchronize(identityPaths)
+    fakeClock.advance(10)
+    first.recordCrash({ component: 'desktop_renderer', errorCode: 'renderer_crashed',
+      reason: 'renderer_crashed' })
+    const second = telemetry({ clock: fakeClock, appSessionId: uuid(7001),
+      randomId: deterministicIds(7200), deviceId: () => 'b'.repeat(64) })
+    second.synchronize(identityPaths)
+    const recovered = readyEvents(identityRoot).filter((event) => event.app_session_id === uuid(7000))
+    assert.equal(recovered.length, 3)
+    assert.equal(recovered.every((event) => event.device_id === 'a'.repeat(64)), true)
+    second.recordGatewayStartResult({ outcome: 'success', durationMs: 10, failureStage: null,
+      errorCode: null, startupMode: 'spawned' })
+    const current = readyEvents(identityRoot).find((event) => event.event_name === 'gateway_start_result')
+    assert.equal(current.device_id, 'b'.repeat(64))
+    second.finishSession()
+
+    const unknownRoot = join(root, 'device-identity-unavailable')
+    const unknownPaths = paths(unknownRoot)
+    await writeReliabilityConsent(unknownPaths.consentMirrorPath, true)
+    const unknown = telemetry({ clock: fakeClock, appSessionId: uuid(7002),
+      randomId: deterministicIds(7300), deviceId: () => null })
+    unknown.synchronize(unknownPaths)
+    unknown.recordAppStartResult({ outcome: 'success', durationMs: 10, failureStage: null,
+      errorCode: null })
+    assert.equal(Object.hasOwn(readyEvents(unknownRoot)[0], 'device_id'), false)
+    unknown.finishSession()
+  }
+
+  // Statistics-only filesystem failure closes the local gate but never replaces
   // the surrounding settings/onboarding operation's outcome.
   {
     const gate = openGate()
     let failureObserved = false
     const completed = await runTelemetrySideEffectFailOpen(
-      async () => { throw new Error('synthetic local telemetry I/O failure') },
+      async () => { throw new Error('synthetic local statistics I/O failure') },
       () => {
         failureObserved = true
         gate.close()
@@ -393,7 +435,7 @@ try {
     for (const forbidden of [
       'prompt', 'response', 'message', 'stack', 'path', 'payload_json', 'user_id', 'analytics_user_id',
     ]) {
-      assert.equal(serialized.includes(forbidden), false, `forbidden telemetry field: ${forbidden}`)
+      assert.equal(serialized.includes(forbidden), false, `forbidden event field: ${forbidden}`)
     }
   }
 
@@ -438,6 +480,7 @@ try {
     const markerPath = join(previousPaths.spoolRoot, 'reliability', '.desktop-reliability-session.tmp')
     const marker = JSON.parse(readFileSync(markerPath, 'utf8'))
     marker.schema_version = 2
+    delete marker.device_id
     delete marker.consent_generation
     delete marker.gateway_turn_counts_applied
     writeFileSync(markerPath, JSON.stringify(marker))
@@ -447,6 +490,7 @@ try {
     assert.equal(summary.app_session_id, uuid(160))
     assert.equal(summary.summary_kind, 'recovered_abnormal')
     assert.equal(summary.turn_count, 0)
+    assert.equal(Object.hasOwn(summary, 'device_id'), false)
     second.finishSession()
   }
 
@@ -566,6 +610,7 @@ try {
       'app_start_result_emitted',
       'consent_generation',
       'gateway_turn_counts_applied',
+      'device_id',
     ]) delete marker[field]
     marker.schema_version = 1
     writeFileSync(sessionPath, `${JSON.stringify(marker)}\n`)
@@ -745,6 +790,7 @@ try {
       'app_start_result_emitted',
       'consent_generation',
       'gateway_turn_counts_applied',
+      'device_id',
     ]) delete template[field]
     template.schema_version = 1
     template.clean_exit = false
@@ -801,6 +847,12 @@ try {
     })
     oldRuntime.synchronize(updatePaths)
     assert.equal(oldRuntime.markUpdateHandoff('0.5.4'), true)
+    // Recover a transition written before device identity was part of its schema.
+    const transitionPath = join(updatePaths.spoolRoot, 'reliability', '.desktop-update-transition.tmp')
+    const transition = JSON.parse(readFileSync(transitionPath, 'utf8'))
+    transition.schema_version = 1
+    delete transition.device_id
+    writeFileSync(transitionPath, JSON.stringify(transition))
     fakeClock.advance(2_000)
     oldRuntime.finishSession()
 
@@ -828,9 +880,11 @@ try {
     assert.equal(install?.old_version, '0.5.3')
     assert.equal(install?.new_version, '0.5.4')
     assert.equal(install?.app_version, SOURCE_VERSION_054)
+    assert.equal(Object.hasOwn(install, 'device_id'), false)
     assert.equal(restart?.outcome, 'success')
     assert.equal(restart?.app_session_id, uuid(500))
     assert.equal(restart?.app_version, SOURCE_VERSION_054)
+    assert.equal(Object.hasOwn(restart, 'device_id'), false)
     assert.equal(
       existsSync(join(updatePaths.spoolRoot, 'reliability', '.desktop-update-transition.tmp')),
       false,
@@ -1098,7 +1152,7 @@ try {
         < saveCredential.indexOf('await applyDesktopSettingsPair(')
         && saveCredential.indexOf('await applyDesktopSettingsPair(')
           < saveCredential.indexOf("'post_commit'"),
-      'telemetry I/O must remain fail-open on both sides of the settings transaction',
+      'statistics I/O must remain fail-open on both sides of the settings transaction',
     )
     const saveImported = mainSource.slice(
       mainSource.indexOf('async function saveImportedDesktopCredential'),
@@ -1109,7 +1163,7 @@ try {
         < saveImported.indexOf('const inspection = await preflightDesktopConfigWrite')
         && saveImported.indexOf('const inspection = await preflightDesktopConfigWrite')
           < saveImported.indexOf("'post_commit'"),
-      'import adoption must keep telemetry I/O outside its authoritative outcome',
+      'import adoption must keep statistics I/O outside its authoritative outcome',
     )
     const crashSignatureNormalizer = mainSource.slice(
       mainSource.indexOf('function normalizedCrashFingerprintSignature'),
@@ -1118,7 +1172,7 @@ try {
     assert.doesNotMatch(crashSignatureNormalizer, /\.message|\.stack|String\(error\)/)
   }
 
-  console.log('Desktop reliability telemetry tests passed.')
+  console.log('Desktop reliability statistics tests passed.')
 } finally {
   rmSync(root, { recursive: true, force: true })
 }

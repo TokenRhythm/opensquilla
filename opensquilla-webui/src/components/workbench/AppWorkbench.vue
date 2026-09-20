@@ -260,6 +260,9 @@ import type {
 import { createArtifactWorkbenchDefinitions } from './artifactWorkbenchProvider'
 import { createBrowserWorkbenchDefinition } from './browserWorkbenchProvider'
 import { createWorkbenchResourceCollectionDefinition } from './workbenchResourceCollectionProvider'
+import { WORKSPACE_REFERENCES_KEY } from '@/modules/workspaceReferences'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { createWorkspaceFileDefinition } from './workspaceFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
 import { downloadBlob } from '@/utils/browser'
 
@@ -284,6 +287,14 @@ const { confirm } = useConfirm()
 const { pushToast } = useToasts()
 const platform = usePlatform()
 const store = useWorkbenchStore()
+const workspaceReferences = inject(WORKSPACE_REFERENCES_KEY, null)
+const referenceGateway = inject(GATEWAY_ACCESS_KEY, null)
+watch(() => [referenceGateway?.subscriptionEpoch, referenceGateway?.availability, referenceGateway?.isLocalOwner], () => {
+  // A filesystem snapshot is valid only for the connection that authorized it.
+  for (const item of [...store.items]) {
+    if (item.kind === 'file') store.closeItem(item.id, 'scope-changed')
+  }
+})
 const injectedArtifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!injectedArtifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const artifactWorkbench = injectedArtifactWorkbench
@@ -431,6 +442,9 @@ workbenchPanelRegistry.register(createBrowserWorkbenchDefinition({
   platform,
   t: (key, params) => String(t(key, params || {})),
 }), { replace: true })
+if (workspaceReferences) {
+  workbenchPanelRegistry.register(createWorkspaceFileDefinition(workspaceReferences, key => String(t(key))), { replace: true })
+}
 detachRuntime = attachWorkbenchRuntime(store, runtimeManager)
 const pageAnnotationSendQueue = new PageAnnotationSendQueue()
 let pageAnnotationSendFlush: Promise<void> | null = null

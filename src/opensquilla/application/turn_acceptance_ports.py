@@ -347,6 +347,8 @@ class AdmissionSessions(Protocol):
         workspace_id: str | None = None,
         origin: AdmissionProjectOrigin | None = None,
         model_routing_mode: str | None = None,
+        model: str | None = None,
+        provider_override: str | None = None,
     ) -> PreparedAdmissionIntent: ...
 
     async def apply_intent(
@@ -359,6 +361,8 @@ class AdmissionSessions(Protocol):
         workspace_id: str | None = None,
         origin: AdmissionProjectOrigin | None = None,
         model_routing_mode: str | None = None,
+        model: str | None = None,
+        provider_override: str | None = None,
     ) -> tuple[SessionIdentity, bool]: ...
 
     async def prepare_prefix_branch(
@@ -442,6 +446,10 @@ class AdmissionPrimitives(Protocol):
 
 
     def validate_initial_routing(self, mode: str) -> None: ...
+
+    def validate_initial_model(
+        self, *, session_key: str, model: str, provider: str | None, routing_mode: str | None
+    ) -> None: ...
 
     async def accepted_response(
         self,
@@ -559,6 +567,7 @@ class AdmissionPrimitives(Protocol):
         persist_enabled: bool,
         disk_budget_bytes: int | None,
         page_context: dict[str, Any] | None = None,
+        workspace_files: list[dict[str, Any]] | None = None,
         selected_skills: list[dict[str, str]] | None = None,
     ) -> tuple[str, Sequence[object]]: ...
 

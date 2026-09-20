@@ -501,6 +501,13 @@ export function createDesktopPlatform(): Platform {
       return managedUpdateCapability(api)
     },
     gateway: {
+      async getAttachmentBinding() {
+        const api = requireDesktopApi()
+        if (typeof api.getGatewayConnection !== 'function') return null
+        const connection = normalizeDesktopGatewayConnection(await api.getGatewayConnection())
+        if (connection.status !== 'ready' || !connection.instanceId || !connection.authToken) return null
+        return { instanceId: connection.instanceId, profileFingerprint: connection.profileFingerprint }
+      },
       ...(typeof desktopApi.onSystemResume === 'function'
         ? { onResume: (callback: () => void) => desktopApi.onSystemResume!(callback) }
         : {}),
@@ -613,8 +620,22 @@ export function createDesktopPlatform(): Platform {
       ...(typeof window.opensquillaDesktop?.onWindowHidden === 'function'
         ? { onHidden: (callback) => requireDesktopApi().onWindowHidden!(callback) }
         : {}),
+      ...(typeof window.opensquillaDesktop?.onSessionDeepLink === 'function'
+        ? { onSessionDeepLink: (callback) => requireDesktopApi().onSessionDeepLink!(callback) }
+        : {}),
+      ...(typeof window.opensquillaDesktop?.getPendingSessionDeepLink === 'function'
+        ? { getPendingSessionDeepLink: () => requireDesktopApi().getPendingSessionDeepLink!() }
+        : {}),
     },
     files: {
+      ...(typeof window.opensquillaDesktop?.chooseAttachments === 'function'
+        ? { chooseAttachments: request => requireDesktopApi().chooseAttachments!(request) } : {}),
+      ...(typeof window.opensquillaDesktop?.selectAttachmentFile === 'function'
+        ? { selectAttachmentFile: (request, file) => requireDesktopApi().selectAttachmentFile!(request, file) } : {}),
+      ...(typeof window.opensquillaDesktop?.importAttachmentSelection === 'function'
+        ? { importAttachmentSelection: (request, token) => requireDesktopApi().importAttachmentSelection!(request, token) } : {}),
+      ...(typeof window.opensquillaDesktop?.cancelAttachmentSelections === 'function'
+        ? { cancelAttachmentSelections: () => requireDesktopApi().cancelAttachmentSelections!() } : {}),
       ...(typeof window.opensquillaDesktop?.saveArtifact === 'function'
         ? { saveArtifact: payload => requireDesktopApi().saveArtifact!(payload) } : {}),
       ...(typeof window.opensquillaDesktop?.sourceFileAction === 'function'

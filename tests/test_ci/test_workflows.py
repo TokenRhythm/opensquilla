@@ -38,6 +38,34 @@ def _workflow_texts() -> list[str]:
     return [path.read_text(encoding="utf-8") for path in WORKFLOW_DIR.glob("*.yml")]
 
 
+def test_release_jobs_cannot_write_shared_caches() -> None:
+    workflow = _workflow("wheelhouse-release.yml")
+    assert workflow["cache-mode"] == "read"
+    assert all("cache-mode" not in job for job in workflow["jobs"].values())
+
+
+def test_release_cache_mode_lint_exception_is_narrow() -> None:
+    config = yaml.safe_load(Path(".github/actionlint.yaml").read_text(encoding="utf-8"))
+    assert set(config) == {"paths"}
+    assert set(config["paths"]) == {".github/workflows/wheelhouse-release.yml"}
+    rule = config["paths"][".github/workflows/wheelhouse-release.yml"]
+    assert set(rule) == {"ignore"}
+    assert len(rule["ignore"]) == 1
+    pattern = re.compile(rule["ignore"][0])
+    message = (
+        'unexpected key "cache-mode" for "workflow" section. expected one of '
+        '"concurrency", "defaults", "env", "jobs", "name", "on", "permissions", "run-name"'
+    )
+    assert pattern.fullmatch(message)
+    for other in (
+        message.replace('"cache-mode"', '"cache-modes"'),
+        message.replace('"workflow"', '"job"'),
+        'invalid value "write" for cache-mode',
+        'shellcheck reported issue in this script: SC2086',
+    ):
+        assert pattern.search(other) is None
+
+
 def test_only_diagnostic_uploads_can_fail_without_failing_ci() -> None:
     expected = {
         "webui-chat-recovery": {"chat-traces"},
@@ -2411,6 +2439,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "goal-mode.spec.ts",
         "history-hydration.spec.ts",
         "idle-chat-recovery.spec.ts",
+        "modern-session-recovery.spec.ts",
         "new-task-ensemble-race.spec.ts",
         "plan-questionnaire-lifecycle.spec.ts",
         "plan-presentation.spec.ts",
@@ -2605,6 +2634,49 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     assert "--reruns" not in serialized
     assert "pytest-rerunfailures" not in serialized
     assert "|| true" not in test_step["run"]
+
+
+def test_native_desktop_cells_run_source_and_frozen_mcp_probes() -> None:
+    job = _workflow("ci.yml")["jobs"]["desktop-recovery-e2e"]
+    steps = job["steps"]
+    source = next(step for step in steps if step.get("name") == (
+        "Verify MCP transports and Desktop bridge on the native platform"
+    ))
+    frozen = next(step for step in steps if step.get("name") == (
+        "Verify the frozen production MCP probe and bridge"
+    ))
+    assert source["if"] == frozen["if"]
+    for shard in ("ownership", "ownership-workbench", "all"):
+        assert f"matrix.shard == '{shard}'" in source["if"]
+    for target in ("tests/test_mcp", "tests/test_mcp_server",
+                   "tests/test_desktop/test_gateway_functional_probes.py::"
+                   "test_mcp_probe_uses_real_stdio_server_and_gateway"):
+        assert target in source["run"]
+    assert "--group desktop-build --frozen" in frozen["run"]
+    assert "desktop/electron/scripts/verify-mcp-frozen.py" in frozen["run"]
+    assert "set -euo pipefail" in source["run"]
+    assert "set -euo pipefail" in frozen["run"]
+    assert steps.index(source) < steps.index(frozen)
+    container = next(step for step in steps if step.get("name") == (
+        "Build production Docker image and verify MCP"
+    ))
+    assert "runner.os == 'Linux'" in container["if"]
+    for shard in ("ownership", "ownership-workbench", "all"):
+        assert f"matrix.shard == '{shard}'" in container["if"]
+    assert 'git lfs pull --include="src/opensquilla/squilla_router/models/' in container["run"]
+    assert "docker build --file Dockerfile" in container["run"]
+    assert "docker run --rm -i --entrypoint python" in container["run"]
+    assert "readonly" in container["run"]
+    assert "docker image inspect --format '{{json .Size}}'" in container["run"]
+    assert 'sdk_version == "2.2.0"' in container["run"]
+    assert "create_mcp_server()" in container["run"]
+    assert "MCPStdioClient(MCPServerConfig(" in container["run"]
+    assert "set -euo pipefail" in container["run"]
+    assert "docker push" not in container["run"]
+    assert "--push" not in container["run"]
+    compile(container["run"].split("<<'PY'", 1)[1].split("\n", 1)[1].rsplit(
+        "\nPY", 1
+    )[0], "docker-mcp-smoke", "exec")
 
 
 def test_macos_recovery_planner_inputs_match_workflow_pytest_targets() -> None:
@@ -3018,6 +3090,7 @@ def test_desktop_cleanup_flow_allows_windows_helper_release_latency() -> None:
 ])
 def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_name):
     steps = _workflow("ci.yml")["jobs"][job_name]["steps"]
+    faulthandler_timeout = 0 if job_name == "windows-full" else 60
     preflight = next(step for step in steps if step.get("name") == (
         "Preflight offline test environment"
     ))
@@ -3059,7 +3132,7 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         assert f'{selector} == "desktop-installer-contracts"' in preflight["run"]
         assert f'{selector} == "gateway-sqlite"' in preflight["run"]
         assert '"${regression_args[@]}"' in preflight["run"]
-        assert "-o faulthandler_timeout=60" in preflight["run"]
+        assert f"-o faulthandler_timeout={faulthandler_timeout}" in preflight["run"]
     if job_name == "windows-full":
         expected_preflight_files.update({
             "tests/test_ci/test_windows_signatures.py",
@@ -3070,7 +3143,9 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
         expected_preflight_files
     )
     assert "-vv --tb=short" in preflight["run"]
-    assert "-o faulthandler_timeout=60" in main["run"]
+    assert f"-o faulthandler_timeout={faulthandler_timeout}" in main["run"]
+    assert "no:faulthandler" not in preflight["run"]
+    assert "no:faulthandler" not in main["run"]
     assert "--showlocals" not in preflight["run"]
     assert "--showlocals" not in main["run"]
 

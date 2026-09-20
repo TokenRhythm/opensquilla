@@ -61,37 +61,16 @@ from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
 )
 from opensquilla.contracts.attachments import (
-    DOCX_MIME as _DOCX_MIME,
-)
-from opensquilla.contracts.attachments import (
-    EMAIL_ATTACHMENT_MIMES as _EMAIL_ATTACHMENT_MIMES,
-)
-from opensquilla.contracts.attachments import (
     IMAGE_ATTACHMENT_MIMES as _IMAGE_ATTACHMENT_MIMES,
 )
 from opensquilla.contracts.attachments import (
     MAX_ATTACHMENTS as _MAX_ATTACHMENT_COUNT,
 )
 from opensquilla.contracts.attachments import (
-    MBOX_MIME as _MBOX_MIME,
-)
-from opensquilla.contracts.attachments import (
-    MSG_MIME as _MSG_MIME,
-)
-from opensquilla.contracts.attachments import (
-    OFFICE_ATTACHMENT_MIMES as _OFFICE_ATTACHMENT_MIMES,
-)
-from opensquilla.contracts.attachments import (
     OPAQUE_MIME as _OPAQUE_MIME,
 )
 from opensquilla.contracts.attachments import (
-    PPTX_MIME as _PPTX_MIME,
-)
-from opensquilla.contracts.attachments import (
     TEXT_ATTACHMENT_MIMES as _ENGINE_TEXT_FAMILY_MIMES,
-)
-from opensquilla.contracts.attachments import (
-    XLSX_MIME as _XLSX_MIME,
 )
 from opensquilla.contracts.attachments import (
     attachment_size_limit_for_mime as _attachment_size_limit_for_mime,
@@ -143,9 +122,6 @@ from opensquilla.engine.turn_runner import (
     TurnTranscriptSnapshot,
     rebind_attachment_prompt,
 )
-from opensquilla.engine.turn_runner.attachment_stage import (
-    _AttachmentPreparationCancelledError,
-)
 from opensquilla.engine.turn_runner.context import (
     control_terminal_event_for_context,
     set_execution_deadline_if_missing,
@@ -175,7 +151,6 @@ from opensquilla.engine.turn_runner.harness import (
     _TurnRunnerSessionTotalsAdapter,
     _TurnRunnerSkillCatalogResolverAdapter,
     _TurnRunnerSystemPromptRefreshAdapter,
-    _TurnRunnerT3UpgradeCompactionAdapter,
     _TurnRunnerTimeoutBudgetAdapter,
     _TurnRunnerToolBuilderAdapter,
     _TurnRunnerTranscriptAppendAdapter,
@@ -308,13 +283,11 @@ from opensquilla.router_control import (
 )
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
-    HIGHEST_TEXT_TIER,
     ROUTER_DYNAMIC_SELECTION_MODE,
     effective_ensemble_selection_mode,
     normalize_text_tier,
     static_b5_profile,
     tier_ensemble_execution,
-    tier_index,
 )
 from opensquilla.run_mode import RunMode, display_name, execution_target, normalize_run_mode
 from opensquilla.runtime_packs import runtime_pack_state_scope
@@ -366,15 +339,12 @@ from opensquilla.telemetry.contracts.common import (
     ResultOutcome,
 )
 from opensquilla.telemetry.contracts.reliability import (
-    FileParseErrorCode,
     TurnErrorCode,
     TurnFailureStage,
 )
 from opensquilla.telemetry.file_parse_facts import (
     FileParseReliabilityFacts,
     FileParseReliabilitySink,
-    file_size_bucket,
-    file_type_for_media_type,
 )
 from opensquilla.telemetry.runtime_facts import (
     GrowthMilestoneSink,
@@ -424,9 +394,6 @@ _CONTEXT_SUMMARY_MARKER: Final[str] = "[Context Summary]"
 _DEFAULT_PREFLIGHT_COMPACT_RATIO: Final[float] = 0.85
 _COMPACTION_FAILURE_LIMIT: Final[int] = 3
 _COMPACTION_CIRCUIT_COOLDOWN_SECONDS: Final[float] = 300.0
-_T3_NOT_APPLICABLE: Final[str] = "not_applicable"
-_T3_HANDLED: Final[str] = "handled"
-_T3_COMPACT_FAILED: Final[str] = "compact_failed"
 _IMAGE_GENERATION_TOOL_NAMES: Final[frozenset[str]] = frozenset({"image_generate"})
 
 
@@ -1185,6 +1152,25 @@ def _compact_json_for_tool_result_preview(
             for item in value[:max_list_items]
         ]
     if isinstance(value, dict):
+        if (
+            type(value.get("version")) is int
+            and value["version"] == 1
+            and isinstance(value.get("kind"), str)
+            and value.get("kind") in {
+                "session", "workspace_file", "workspace_directory",
+                "artifact", "document", "external_url",
+            }
+            and isinstance(value.get("id"), str)
+            and isinstance(value.get("label"), str)
+            and isinstance(value.get("scope"), dict)
+            and isinstance(value.get("capabilities"), dict)
+        ):
+            # ReferenceV1 is an actionable identity, not display prose. Keep
+            # the entire object intact: shortening an id, path, scope, or
+            # revision creates a different target. The enclosing preview's
+            # unchanged character budget drops whole list entries (or the
+            # reference altogether) when complete references cannot fit.
+            return value
         return {
             str(key): _compact_json_for_tool_result_preview(
                 item,
@@ -1714,12 +1700,24 @@ def _report_credential_pool_failure(
     if not turn_metadata:
         return
     pool_info = turn_metadata.get("credential_pool")
+    active_provider = str(turn_metadata.get("executed_provider") or "")
+    applied_provider = str(turn_metadata.get("routed_provider_applied") or "")
+    session_realign = (
+        turn_metadata.get("routed_provider_fallback_reason") == "explicit_model_override"
+        and isinstance(turn_metadata.get("session_credential_pool"), dict)
+    )
+    if (
+        session_realign or not isinstance(pool_info, dict)
+        or pool_info.get("provider") != applied_provider
+    ):
+        pool_info = turn_metadata.get("session_credential_pool")
+        applied_provider = str(turn_metadata.get("session_provider_applied") or "")
     if not isinstance(pool_info, dict):
         return
     pool_provider = str(pool_info.get("provider") or "")
-    if not pool_provider:
+    if not pool_provider or pool_provider != applied_provider:
         return
-    if str(turn_metadata.get("routed_provider_applied") or "") != pool_provider:
+    if active_provider and active_provider != pool_provider:
         return
     try:
         kind = classify_provider_error(
@@ -4426,8 +4424,6 @@ class BootstrapSnapshot:
     report: list[BootstrapFileReport] = field(default_factory=list)
 
 
-_PDF_ATTACHMENT_TEXT_LIMIT = 200_000
-_TEXT_ATTACHMENT_TEXT_LIMIT = 200_000
 _PREVIEW_ONLY_TEXT_ATTACHMENT_CHARS = 4_000
 _PREVIEW_ONLY_TEXT_ATTACHMENT_LINES = 80
 
@@ -4485,12 +4481,6 @@ def _render_file_context_block(filename: str, mime: str, content: str) -> str:
     safe_mime = _xml_escape_attr(mime)
     safe_content = _escape_file_block_content(content)
     return f'<file name="{safe_name}" mime="{safe_mime}">\n{safe_content}\n</file>'
-
-
-def _truncate_attachment_text(text: str, *, limit: int = _PDF_ATTACHMENT_TEXT_LIMIT) -> str:
-    if len(text) <= limit:
-        return text
-    return text[:limit] + f"\n\n[attachment text truncated: {len(text)} chars total]"
 
 
 def _preview_attachment_text(
@@ -4573,456 +4563,6 @@ def _render_preview_only_attachment_text(
         f"{preview}"
         f"{truncation}"
     )
-
-
-def _publish_file_parse_fact(
-    sink: Callable[[FileParseReliabilityFacts], object] | None,
-    *,
-    media_type: str,
-    size_bytes: int,
-    started_at: float,
-    error_code: FileParseErrorCode | None = None,
-    outcome: ResultOutcome | None = None,
-) -> None:
-    if sink is None:
-        return
-    file_type = file_type_for_media_type(media_type)
-    if file_type is None:
-        return
-    resolved_outcome = outcome or (
-        ResultOutcome.SUCCESS if error_code is None else ResultOutcome.FAIL
-    )
-    facts = FileParseReliabilityFacts(
-        file_type=file_type,
-        size_bucket=file_size_bucket(size_bytes),
-        outcome=resolved_outcome,
-        error_code=error_code,
-        duration_ms=max(0, int((time.monotonic() - started_at) * 1000)),
-    )
-    try:
-        sink(facts)
-    except BaseException:
-        return
-
-
-def _pdf_parse_error_code(error: ValueError) -> FileParseErrorCode:
-    local_reason = str(error).casefold()
-    if "requires" in local_reason or "dependency" in local_reason:
-        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
-    if "no extractable text" in local_reason:
-        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
-    return FileParseErrorCode.MALFORMED_PDF
-
-
-def _office_parse_error_code(error: ValueError) -> FileParseErrorCode:
-    local_reason = str(error).casefold()
-    if "decompresses beyond" in local_reason:
-        return FileParseErrorCode.DECOMPRESSION_LIMIT
-    if "missing dependency" in local_reason or "requires" in local_reason:
-        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
-    if "no extractable text" in local_reason:
-        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
-    return FileParseErrorCode.INVALID_OFFICE_CONTAINER
-
-
-def _email_parse_error_code(error: ValueError) -> FileParseErrorCode:
-    local_reason = str(error).casefold()
-    if "optional 'extract-msg'" in local_reason or "requires" in local_reason:
-        return FileParseErrorCode.PARSER_DEPENDENCY_MISSING
-    if "no extractable text" in local_reason:
-        return FileParseErrorCode.NO_EXTRACTABLE_TEXT
-    return FileParseErrorCode.INTERNAL_ERROR
-
-
-def _extract_pdf_attachment_text(
-    raw_bytes: bytes,
-    filename: str,
-    *,
-    cancel_check: Callable[[], None] | None = None,
-) -> str:
-    """Extract text from a PDF attachment before it reaches any provider.
-
-    PDFs are converted into plain text context so provider-specific document
-    block handling cannot silently drop files that an adapter does not know how
-    to encode.
-    """
-
-    import io
-
-    try:
-        import pdfplumber
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError("PDF text extraction requires pdfplumber") from exc
-
-    try:
-        page_texts: list[str] = []
-        with pdfplumber.open(io.BytesIO(raw_bytes)) as doc:
-            for index, page in enumerate(doc.pages, start=1):
-                if cancel_check is not None:
-                    cancel_check()
-                page_text = page.extract_text() or ""
-                if page_text.strip():
-                    page_texts.append(f"--- Page {index} ---\n{page_text}")
-    except (_AttachmentPreparationCancelledError, TimeoutError):
-        raise
-    except Exception as exc:  # noqa: BLE001 - pdfplumber raises several parser errors
-        raise ValueError(f"PDF attachment {filename!r} could not be read: {exc}") from exc
-
-    extracted = "\n\n".join(page_texts).strip()
-    if not extracted:
-        raise ValueError(f"PDF attachment {filename!r} has no extractable text")
-    return _truncate_attachment_text(extracted)
-
-
-# Office documents are zip containers. Guard against decompression bombs by
-# rejecting archives whose declared uncompressed payload is implausibly large
-# before handing the bytes to a parser.
-_OFFICE_DECOMPRESSED_LIMIT = 200 * 1024 * 1024
-_XLSX_MAX_ROWS_PER_SHEET = 1000
-_XLSX_MAX_COLS = 64
-
-
-def _office_zip_guard(
-    raw_bytes: bytes,
-    filename: str,
-    *,
-    decompressed_limit: int | None = None,
-    batch_decompressed_budget: list[int] | None = None,
-    cancel_check: Callable[[], None] | None = None,
-) -> int:
-    # Measure the *actual* inflated size by streaming each member, not the
-    # central-directory ``file_size`` (which the uploader controls and can lie
-    # about). Reads in bounded chunks and aborts as soon as the running total
-    # crosses the limit, so a decompression bomb never inflates past the cap.
-    import io
-    import zipfile
-
-    chunk_size = 1024 * 1024
-    effective_limit = (
-        decompressed_limit
-        if isinstance(decompressed_limit, int) and decompressed_limit > 0
-        else _OFFICE_DECOMPRESSED_LIMIT
-    )
-    try:
-        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
-            total = 0
-            for info in archive.infolist():
-                if cancel_check is not None:
-                    cancel_check()
-                with archive.open(info) as member:
-                    while True:
-                        if cancel_check is not None:
-                            cancel_check()
-                        block = member.read(chunk_size)
-                        if not block:
-                            break
-                        total += len(block)
-                        if batch_decompressed_budget is not None:
-                            batch_decompressed_budget[0] -= len(block)
-                        if total > effective_limit:
-                            raise ValueError(
-                                f"office attachment {filename!r} decompresses beyond "
-                                f"the {effective_limit} byte remaining batch safety limit"
-                            )
-                        if (
-                            batch_decompressed_budget is not None
-                            and batch_decompressed_budget[0] < 0
-                        ):
-                            raise ValueError(
-                                f"office attachment batch containing {filename!r} "
-                                f"decompresses beyond the {_OFFICE_DECOMPRESSED_LIMIT} "
-                                "byte safety limit"
-                            )
-            return total
-    except (ValueError, _AttachmentPreparationCancelledError, TimeoutError):
-        raise
-    except Exception as exc:  # noqa: BLE001 - zipfile raises several error types
-        raise ValueError(
-            f"office attachment {filename!r} is not a readable OOXML container: {exc}"
-        ) from exc
-
-
-def _extract_docx_text(raw_bytes: bytes) -> str:
-    import io
-
-    from docx import Document
-
-    document = Document(io.BytesIO(raw_bytes))
-    parts: list[str] = []
-    for paragraph in document.paragraphs:
-        text = paragraph.text.strip()
-        if text:
-            parts.append(text)
-    for table in document.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if any(cells):
-                parts.append(" | ".join(cells))
-    return "\n".join(parts).strip()
-
-
-def _extract_xlsx_text(raw_bytes: bytes) -> str:
-    import io
-
-    from openpyxl import load_workbook  # type: ignore[import-untyped]
-
-    workbook = load_workbook(io.BytesIO(raw_bytes), read_only=True, data_only=True)
-    try:
-        sheet_blocks: list[str] = []
-        for sheet in workbook.worksheets:
-            rows: list[str] = []
-            for row_index, row in enumerate(sheet.iter_rows(values_only=True)):
-                if row_index >= _XLSX_MAX_ROWS_PER_SHEET:
-                    rows.append(f"[sheet truncated at {_XLSX_MAX_ROWS_PER_SHEET} rows]")
-                    break
-                cells = ["" if value is None else str(value) for value in row[:_XLSX_MAX_COLS]]
-                if any(cells):
-                    rows.append(",".join(cells))
-            if rows:
-                sheet_blocks.append(f"=== Sheet: {sheet.title} ===\n" + "\n".join(rows))
-        return "\n\n".join(sheet_blocks).strip()
-    finally:
-        workbook.close()
-
-
-def _extract_pptx_text(raw_bytes: bytes) -> str:
-    import io
-
-    from pptx import Presentation
-
-    presentation = Presentation(io.BytesIO(raw_bytes))
-    slide_blocks: list[str] = []
-    for index, slide in enumerate(presentation.slides, start=1):
-        lines: list[str] = []
-        for shape in slide.shapes:
-            if not getattr(shape, "has_text_frame", False):
-                continue
-            for paragraph in shape.text_frame.paragraphs:
-                text = "".join(run.text for run in paragraph.runs).strip()
-                if text:
-                    lines.append(text)
-        notes = ""
-        if slide.has_notes_slide:
-            notes_frame = slide.notes_slide.notes_text_frame
-            if notes_frame is not None:
-                notes = notes_frame.text.strip()
-        block = f"--- Slide {index} ---"
-        if lines:
-            block += "\n" + "\n".join(lines)
-        if notes:
-            block += f"\n[Notes]\n{notes}"
-        slide_blocks.append(block)
-    return "\n\n".join(slide_blocks).strip()
-
-
-_OFFICE_EXTRACTORS: dict[str, Callable[[bytes], str]] = {
-    _DOCX_MIME: _extract_docx_text,
-    _XLSX_MIME: _extract_xlsx_text,
-    _PPTX_MIME: _extract_pptx_text,
-}
-
-
-def _extract_office_attachment_text(
-    raw_bytes: bytes,
-    filename: str,
-    media_type: str,
-    *,
-    decompressed_limit: int | None = None,
-    batch_decompressed_budget: list[int] | None = None,
-    cancel_check: Callable[[], None] | None = None,
-) -> str:
-    """Extract text from an OOXML office attachment before it reaches any provider.
-
-    docx/xlsx/pptx are zip containers that no provider adapter can encode, so they
-    are converted to bounded plain-text context, mirroring the PDF path.
-    """
-
-    extractor = _OFFICE_EXTRACTORS.get(media_type)
-    if extractor is None:  # pragma: no cover - guarded by the allow-list
-        raise ValueError(f"unsupported office media type {media_type!r}")
-    _office_zip_guard(
-        raw_bytes,
-        filename,
-        decompressed_limit=decompressed_limit,
-        batch_decompressed_budget=batch_decompressed_budget,
-        cancel_check=cancel_check,
-    )
-    if cancel_check is not None:
-        cancel_check()
-    try:
-        extracted = extractor(raw_bytes).strip()
-    except (ValueError, _AttachmentPreparationCancelledError, TimeoutError):
-        raise
-    except ImportError as exc:  # pragma: no cover - dependency is declared
-        raise ValueError(f"office text extraction requires a missing dependency: {exc}") from exc
-    except Exception as exc:  # noqa: BLE001 - parsers raise many error types
-        raise ValueError(f"office attachment {filename!r} could not be read: {exc}") from exc
-    if not extracted:
-        raise ValueError(f"office attachment {filename!r} has no extractable text")
-    if cancel_check is not None:
-        cancel_check()
-    return _truncate_attachment_text(extracted)
-
-
-_EMAIL_MAX_MESSAGES = 50
-
-
-def _strip_html_to_text(html: str) -> str:
-    """Conservative HTML -> text for email bodies.
-
-    Drops script/style/head blocks entirely (no execution, no leakage), turns
-    block tags into newlines, strips remaining tags, and unescapes entities.
-    """
-
-    import html as _html_mod
-    import re
-
-    hidden_block_re = re.compile(
-        r"(?is)<(script|style|head)\b(?:[^>]*>.*?(?:</\s*\1\s*>|$)|[^>]*$)"
-    )
-    cleaned = hidden_block_re.sub(" ", html)
-    cleaned = re.sub(r"(?i)<\s*(br|/p|/div|/tr|/li|/h[1-6])\s*>", "\n", cleaned)
-    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
-    cleaned = _html_mod.unescape(cleaned)
-    lines = [line.strip() for line in cleaned.splitlines()]
-    return "\n".join(line for line in lines if line)
-
-
-def _render_one_email(message: Any) -> str:
-    headers: list[str] = []
-    for label in ("From", "To", "Cc", "Subject", "Date"):
-        value = message.get(label)
-        if value:
-            headers.append(f"{label}: {value}")
-
-    body_text = ""
-    try:
-        body_part = message.get_body(preferencelist=("plain", "html"))
-    except Exception:  # noqa: BLE001 - defensive against malformed parts
-        body_part = None
-    if body_part is not None:
-        try:
-            content = body_part.get_content()
-        except Exception:  # noqa: BLE001
-            content = ""
-        if not isinstance(content, str):
-            content = ""
-        if body_part.get_content_type() == "text/html":
-            body_text = _strip_html_to_text(content)
-        else:
-            body_text = content
-
-    attachment_lines: list[str] = []
-    try:
-        for part in message.iter_attachments():
-            name = part.get_filename() or "(unnamed)"
-            attachment_lines.append(f"  - {name} ({part.get_content_type()})")
-    except Exception:  # noqa: BLE001
-        pass
-
-    rendered = "\n".join(headers)
-    if body_text.strip():
-        rendered += "\n\n" + body_text.strip()
-    if attachment_lines:
-        rendered += "\n\n[attachments]\n" + "\n".join(attachment_lines)
-    return rendered.strip()
-
-
-def _extract_email_text(raw_bytes: bytes, media_type: str) -> str:
-    import email
-    import re
-    from email import policy
-
-    # Trust the resolved media type: the gateway sniffer/guard already settle
-    # eml-vs-mbox, so a .eml whose body happens to start with "From " is not
-    # mis-routed through the mbox splitter.
-    is_mbox = media_type == _MBOX_MIME
-    if is_mbox:
-        chunks = re.split(rb"(?m)^From .*\n", raw_bytes)
-        messages = [chunk for chunk in chunks if chunk.strip()][:_EMAIL_MAX_MESSAGES]
-        rendered: list[str] = []
-        for index, chunk in enumerate(messages, start=1):
-            message = email.message_from_bytes(chunk, policy=policy.default)
-            rendered.append(f"--- Message {index} ---\n{_render_one_email(message)}")
-        return "\n\n".join(rendered).strip()
-
-    message = email.message_from_bytes(raw_bytes, policy=policy.default)
-    return _render_one_email(message)
-
-
-def _extract_msg_text(raw_bytes: bytes) -> str:
-    import io
-
-    try:
-        import extract_msg
-    except ImportError as exc:
-        raise ValueError(
-            "Outlook .msg extraction requires the optional 'extract-msg' package "
-            "(install opensquilla[msg])"
-        ) from exc
-
-    message = extract_msg.openMsg(io.BytesIO(raw_bytes))
-    try:
-        headers: list[str] = []
-        for label, value in (
-            ("From", getattr(message, "sender", None)),
-            ("To", getattr(message, "to", None)),
-            ("Cc", getattr(message, "cc", None)),
-            ("Subject", getattr(message, "subject", None)),
-            ("Date", getattr(message, "date", None)),
-        ):
-            if value:
-                headers.append(f"{label}: {value}")
-
-        body = getattr(message, "body", None) or ""
-        if not body:
-            html_body = getattr(message, "htmlBody", None)
-            if isinstance(html_body, bytes):
-                html_body = html_body.decode("utf-8", "replace")
-            if isinstance(html_body, str) and html_body:
-                body = _strip_html_to_text(html_body)
-
-        attachment_lines: list[str] = []
-        for part in getattr(message, "attachments", None) or []:
-            name = (
-                getattr(part, "longFilename", None)
-                or getattr(part, "shortFilename", None)
-                or "(unnamed)"
-            )
-            attachment_lines.append(f"  - {name}")
-    finally:
-        try:
-            message.close()
-        except Exception:  # noqa: BLE001
-            pass
-
-    rendered = "\n".join(headers)
-    if isinstance(body, str) and body.strip():
-        rendered += "\n\n" + body.strip()
-    if attachment_lines:
-        rendered += "\n\n[attachments]\n" + "\n".join(attachment_lines)
-    return rendered.strip()
-
-
-def _extract_email_attachment_text(raw_bytes: bytes, filename: str, media_type: str) -> str:
-    """Extract text from an email attachment.
-
-    .eml/.mbox use the stdlib email/mailbox parsers (zero dependency); .msg uses
-    the optional extract-msg package and degrades gracefully if it is absent.
-    """
-
-    try:
-        if media_type == _MSG_MIME:
-            extracted = _extract_msg_text(raw_bytes).strip()
-        else:
-            extracted = _extract_email_text(raw_bytes, media_type).strip()
-    except ValueError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - email parsers raise many error types
-        raise ValueError(f"email attachment {filename!r} could not be read: {exc}") from exc
-    if not extracted:
-        raise ValueError(f"email attachment {filename!r} has no extractable text")
-    return _truncate_attachment_text(extracted)
 
 
 # Strong past-tense / perfect-aspect phrases that signal the model is claiming
@@ -5204,9 +4744,13 @@ class TurnRunner:
         turn_growth_started_sink: GrowthMilestoneSink | None = None,
         turn_growth_succeeded_sink: GrowthMilestoneSink | None = None,
         growth_event_sink: Any | None = None,
+        session_deployment_resolver: (
+            Callable[[object, object | None, dict[str, Any]], Any | None] | None
+        ) = None,
         usage_telemetry: UsageTelemetryPort | None = None,
     ) -> None:
         self._provider_selector = provider_selector
+        self._session_deployment_resolver = session_deployment_resolver
         self._tool_registry = tool_registry
         self._session_manager = session_manager
         self._skill_loader = skill_loader
@@ -5312,7 +4856,6 @@ class TurnRunner:
         # TurnRunner stage decomposition CompactionAndHistoryStage instance. Holds no
         # per-turn state. Active unconditionally as of.
         self._compaction_and_history_stage = CompactionAndHistoryStage(
-            t3_upgrade=_TurnRunnerT3UpgradeCompactionAdapter(self),
             preflight=_TurnRunnerPreflightCompactionAdapter(self),
             history_loader=_TurnRunnerHistoryLoaderAdapter(self),
             request_context_prepender=_RequestContextPrependAdapter(),
@@ -5372,6 +4915,12 @@ class TurnRunner:
         # Compatibility for direct callers that still install a complete
         # config object in accepted_turn_config_scope().
         return accepted
+
+    def _session_model_pin_applies(self) -> bool:
+        """A saved single-model choice must not override a routed session turn."""
+        return getattr(_ACCEPTED_TURN_CONFIG.get(), "session_mode", None) not in {
+            "router", "ensemble",
+        }
 
     @property
     def router_control_hold_store(self) -> RouterControlHoldStore:
@@ -5512,6 +5061,51 @@ class TurnRunner:
         with_source_paths = getattr(adopter, "with_source_paths", None)
         if callable(with_source_paths):
             adopter = with_source_paths(source_paths)
+        working_files: dict[str, dict[str, Any]] = {}
+        persist_working_files: Callable[[], Awaitable[None]] | None = None
+        get_session = getattr(self._session_manager, "get_session", None)
+        update_session = getattr(self._session_manager, "update", None)
+        # The fallback artifact label above is not a durable session owner.
+        # Legacy callers without one must not receive a persistence callback.
+        if session_epoch is not None and callable(get_session) and callable(update_session):
+            session = await get_session(session_key)
+            if session is not None:
+                if session.session_id != session_id or session.epoch != session_epoch:
+                    raise StaleEpochError(
+                        "Session owner changed before attachment workfile binding"
+                    )
+                origin = getattr(session, "origin", None)
+                stored_files = (
+                    origin.get("attachment_working_files") if isinstance(origin, dict) else None
+                )
+                if isinstance(stored_files, dict):
+                    working_files = {
+                        path: dict(record) for path, record in stored_files.items()
+                        if isinstance(path, str) and isinstance(record, dict)
+                    }
+                persist_lock = asyncio.Lock()
+
+                async def persist_working_files() -> None:
+                    async with persist_lock:
+                        current = await get_session(session_key)
+                        if (
+                            current is None or current.session_id != session_id
+                            or current.epoch != session_epoch
+                        ):
+                            raise StaleEpochError(
+                                "Session owner changed before attachment workfile save"
+                            )
+                        current_origin = dict(current.origin or {})
+                        persisted_files = dict(current_origin.get("attachment_working_files") or {})
+                        persisted_files.update({
+                            path: dict(record) for path, record in working_files.items()
+                        })
+                        current_origin["attachment_working_files"] = persisted_files
+                        await update_session(
+                            session_key, origin=current_origin,
+                            expected_session_id=session_id,
+                            expected_session_epoch=session_epoch,
+                        )
         return replace(
             tool_context,
             session_key=session_key,
@@ -5527,6 +5121,8 @@ class TurnRunner:
             artifact_source_paths=source_paths,
             generated_artifact_adopter=adopter,
             workspace_file_writes=[],
+            attachment_working_files=working_files,
+            persist_attachment_working_files=persist_working_files,
             artifact_max_bytes=getattr(attachments_cfg, "artifact_max_bytes", None),
             artifact_disk_budget_bytes=getattr(
                 attachments_cfg,
@@ -5534,6 +5130,141 @@ class TurnRunner:
                 None,
             ),
         )
+
+    async def _workspace_file_input_blocks(
+        self, tool_context: ToolContext | None,
+    ) -> tuple[list[Any], list[dict[str, Any]]]:
+        """Project current live files through the same read boundary as file tools."""
+        refs = getattr(tool_context, "workspace_files", None)
+        if not refs:
+            return [], []
+        if tool_context is None or self._session_manager is None:
+            raise ValueError("Workspace files require an active session and tool context")
+        from opensquilla.provider.types import ContentBlockImage, ContentBlockText
+        from opensquilla.tools.builtin.filesystem import read_file
+        from opensquilla.tools.types import current_tool_context
+        from opensquilla.workspace_files import validate_workspace_files
+
+        session = await self._session_manager.get_session(tool_context.session_key)
+        if (
+            session is None or session.session_id != tool_context.artifact_session_id
+            or session.epoch != tool_context.session_epoch
+        ):
+            raise StaleEpochError("Session owner changed before workspace file input")
+        resolved = await validate_workspace_files(
+            refs, session=session, storage=self._session_manager.storage,
+            tool_context=tool_context,
+        )
+        blocks: list[Any] = []
+        descriptors: list[dict[str, Any]] = []
+        token = current_tool_context.set(tool_context)
+        try:
+            for item in resolved:
+                ref = item.ref
+                mime = str(ref["mime"])
+                if mime.startswith("image/"):
+                    read_id = f"workspace-input-{uuid.uuid4().hex}"
+                    try:
+                        await read_file(str(item.path), _tool_use_id=read_id)
+                        images = tool_context.tool_result_media.pop(read_id, [])
+                    finally:
+                        tool_context.tool_result_media.pop(read_id, None)
+                    if len(images) != 1:
+                        raise ValueError("Workspace image could not be read by the file tool")
+                    image = images[0]
+                    mime = str(image["mime"])
+                    blocks.append(ContentBlockImage(
+                        media_type=mime, data=str(image["data"]), durable_retained=False,
+                    ))
+                marker = (
+                    "[live project file: "
+                    + json.dumps({
+                        "workspaceId": ref["workspaceId"], "path": ref["relativePath"],
+                        "name": ref["name"], "mime": mime,
+                    }, ensure_ascii=False)
+                    + "; use this project path for reads and edits under current tool permissions. "
+                    "This is the current file, not a retained snapshot.]"
+                )
+                blocks.append(ContentBlockText(text=marker))
+                descriptors.append({"type": mime, "name": ref["name"]})
+        finally:
+            current_tool_context.reset(token)
+        return blocks, descriptors
+
+    @staticmethod
+    def _append_workspace_file_blocks(
+        messages: list[Any] | None, prompt: str, blocks: list[Any],
+    ) -> list[Any] | None:
+        if not blocks:
+            return messages
+        from opensquilla.provider.types import ContentBlockText, Message
+
+        if not messages:
+            return [Message(role="user", content=[ContentBlockText(text=prompt), *blocks])]
+        first = messages[0]
+        return [first.model_copy(update={"content": [*first.content, *blocks]}), *messages[1:]]
+
+    async def _workspace_file_history_projection(
+        self, entries: Sequence[Any], tool_context: ToolContext | None, session_key: str,
+    ) -> list[Any]:
+        """Check retained live references without changing their canonical envelopes."""
+        from opensquilla.workspace_files import normalize_workspace_files, validate_workspace_files
+
+        projected: list[Any] = []
+        checked: dict[tuple[str, str], bool] = {}
+        session = None
+        for entry in entries:
+            if getattr(entry, "role", "") != "user":
+                projected.append(entry)
+                continue
+            try:
+                envelope = json.loads(getattr(entry, "content", "") or "")
+                refs = normalize_workspace_files(
+                    envelope.get("workspace_files") if isinstance(envelope, dict) else None
+                )
+            except (ValueError, TypeError):
+                projected.append(entry)
+                continue
+            if not refs:
+                projected.append(entry)
+                continue
+            markers: list[str] = []
+            for ref in refs:
+                key = (str(ref["workspaceId"]), str(ref["relativePath"]))
+                if key not in checked:
+                    try:
+                        if tool_context is None or self._session_manager is None:
+                            raise ValueError("Workspace context is unavailable")
+                        if session is None:
+                            session = await self._session_manager.get_session(session_key)
+                        if (
+                            session is None
+                            or session.session_id != tool_context.artifact_session_id
+                            or session.epoch != tool_context.session_epoch
+                        ):
+                            raise StaleEpochError("Session owner changed before workspace replay")
+                        await validate_workspace_files(
+                            [ref], session=session, storage=self._session_manager.storage,
+                            tool_context=tool_context,
+                        )
+                        checked[key] = True
+                    except StaleEpochError:
+                        raise
+                    except Exception:  # noqa: BLE001 - failed old references stay unavailable
+                        checked[key] = False
+                status = "available" if checked[key] else "unavailable"
+                markers.append(
+                    f"[live project file {status}: "
+                    + json.dumps(ref, ensure_ascii=False)
+                    + "; current file only; historical contents were not retained. "
+                    "File tools recheck current permissions before reading or editing.]"
+                )
+            prepared = copy.copy(entry)
+            prepared.content = json.dumps({
+                **envelope, "_workspace_file_markers": markers,
+            }, ensure_ascii=False)
+            projected.append(prepared)
+        return projected
 
     async def _capture_turn_memory(
         self,
@@ -6032,6 +5763,8 @@ class TurnRunner:
             raise ValueError(
                 "expected_session_id and expected_session_epoch must form a valid pair"
             )
+        if not self._session_model_pin_applies():
+            model = None
         normalized_input_provenance = self._normalize_input_provenance(input_provenance)
         lock = self.get_session_lock(session_key)
         effective_tool_context = replace(
@@ -6553,6 +6286,7 @@ class TurnRunner:
             # or ensemble wrapping changes ``provider`` for this one turn.
             durable_base_consumer_provider = provider
             cloned_selector = pt_out.cloned_selector
+            capacity_initial_provider_config = getattr(cloned_selector, "current_config", None)
             tool_defs = pt_out.tool_defs
             tool_handler = pt_out.tool_handler
             tool_context = pt_out.effective_tool_context
@@ -6596,12 +6330,30 @@ class TurnRunner:
                     persist_image_material=persist_image_material,
                     image_workspace_dir=image_workspace_dir,
                     failure_cleanup=image_failure_cleanup,
+                    working_files=getattr(tool_context, "attachment_working_files", None),
                 )
             )
             attachment_cleanup = image_failure_cleanup
             if attachment_cleanup is not None and tool_context is not None:
                 tool_context.turn_cleanup_callbacks.append(attachment_cleanup)
             att_out = att_outcome.require_output()
+            workspace_blocks, workspace_descriptors = await self._workspace_file_input_blocks(
+                tool_context,
+            )
+            routing_attachments = [*attachments, *workspace_descriptors]
+            attachment_stats = att_out.stats
+            if workspace_blocks:
+                from opensquilla.engine.turn_runner.attachment_stage import _materialization_stats
+
+                attachment_stats = _materialization_stats(
+                    self._append_workspace_file_blocks(
+                        att_out.extra_messages, runtime_message, workspace_blocks,
+                    ),
+                    attachments=routing_attachments,
+                    generated_normalization_attachment_count=(
+                        generated_normalization_attachment_count
+                    ),
+                )
             file_parse_sink = getattr(self, "_file_parse_reliability_sink", None)
             if file_parse_sink is not None:
                 for file_parse_facts in att_out.file_parse_facts:
@@ -6654,11 +6406,12 @@ class TurnRunner:
                         tool_defs=tool_defs,
                         effective_tool_context=tool_context,
                         tool_metadata=tool_metadata,
+                        provider_metadata=pt_out.provider_metadata,
                         session_key=session_key,
                         agent_id=agent_id,
                         turn_id=turn_id,
-                        attachments=attachments,
-                        attachment_materialization=att_out.stats,
+                        attachments=routing_attachments,
+                        attachment_materialization=attachment_stats,
                         bootstrap_context_mode=bootstrap_context_mode,
                         model=model,
                         history_has_persisted_user=history_has_persisted_user,
@@ -6736,6 +6489,9 @@ class TurnRunner:
                     ],
                     durable_retained=durable_retained,
                 )
+            extra_msgs = self._append_workspace_file_blocks(
+                extra_msgs, effective_runtime_message, workspace_blocks,
+            )
             attachment_turn_input = (
                 effective_runtime_message if extra_msgs is None else ""
             )
@@ -6942,9 +6698,9 @@ class TurnRunner:
             # must never suppress compaction; the physical request is shaped
             # to text later at the shared provider boundary.
             image_input_preflight_blocked = False
-            # 6. Compaction (t3 + preflight) + history load + request-context
-            # prepend. CompactionAndHistoryStage owns the four-call sequence
-            # (t3_upgrade → preflight → load_history → prepend_request_context_prompt).
+            # 6. Before-turn preflight compaction + history load + request-context
+            # prepend. CompactionAndHistoryStage owns the three-call sequence
+            # (preflight → load_history → prepend_request_context_prompt).
             compaction_model = resolved_model
             compaction_context_window_tokens = agent_config.context_window_tokens
             if model:
@@ -7313,6 +7069,51 @@ class TurnRunner:
                     consumer_model_capabilities=stable_consumer_capabilities,
                     consumer_provider_request_max_chars=(stable_consumer_proof_max_chars),
                 )
+                if turn.metadata.get("large_context_capacity_retry_pending") is True:
+                    # A summary must fit both the durable session consumer and
+                    # this turn's provisionally bound physical deployment.
+                    # Do not change durable ownership to the routed model.
+                    routed_tokens, routed_chars = preflight_history_capacity(
+                        active_user_message=effective_runtime_message,
+                        active_user_in_history=history_has_persisted_user,
+                        attachments=attachments,
+                        attachment_messages=extra_msgs,
+                        context_window_tokens=agent.config.context_window_tokens,
+                        consumer_provider=provider,
+                        consumer_max_output_tokens=agent.config.max_tokens,
+                        consumer_model_id=agent.config.model_id,
+                        consumer_model_capabilities=agent.config.model_capabilities,
+                        consumer_provider_request_max_chars=(
+                            agent.config.provider_request_proof_max_chars
+                        ),
+                    )
+                    routed_admission, routed_fingerprint = build_consumer_admission(
+                        consumer_provider=provider,
+                        active_user_message=effective_runtime_message,
+                        active_user_in_history=history_has_persisted_user,
+                        bound_user_message_id=bound_user_message_id,
+                        attachment_messages=extra_msgs,
+                        context_window_tokens=agent.config.context_window_tokens,
+                        max_output_tokens=agent.config.max_tokens,
+                        consumer_model_id=agent.config.model_id,
+                        consumer_model_capabilities=agent.config.model_capabilities,
+                        consumer_provider_request_max_chars=(
+                            agent.config.provider_request_proof_max_chars
+                        ),
+                    )
+                    stable_admission = consumer_admission
+
+                    def admit_both_consumers(summary: str, kept: list[dict[str, Any]]) -> bool:
+                        return bool(
+                            stable_admission(summary, kept) and routed_admission(summary, kept)
+                        )
+
+                    consumer_admission = admit_both_consumers
+                    consumer_admission_fingerprint = hashlib.sha256(
+                        f"{consumer_admission_fingerprint}:{routed_fingerprint}".encode()
+                    ).hexdigest()
+                    history_capacity_tokens = min(history_capacity_tokens, routed_tokens)
+                    history_capacity_chars = min(history_capacity_chars, routed_chars)
             else:
                 log.debug(
                     "compaction.consumer_admission_compatibility_fallback",
@@ -7328,7 +7129,7 @@ class TurnRunner:
             )
             attachment_path_resolver = None
             compaction_workspace = getattr(tool_context, "workspace_dir", None)
-            if persist_image_material and compaction_workspace and tool_context is not None:
+            if compaction_workspace and tool_context is not None:
                 from opensquilla.tools.write_policy import attachment_workspace_write_authorizer
 
                 compaction_materializer = AttachmentWorkspaceMaterializer(
@@ -7336,8 +7137,17 @@ class TurnRunner:
                     workspace_dir=compaction_workspace,
                     disk_budget_bytes=workspace_attachment_budget_from_config(self._config),
                     authorize_write=attachment_workspace_write_authorizer(tool_context),
+                    working_files=tool_context.attachment_working_files,
                 )
-                attachment_path_resolver = compaction_materializer.materialize_image_path
+                def resolve_retained_attachment(
+                    attachment: dict[str, Any], scope: str,
+                ) -> str | None:
+                    mime = str(attachment.get("mime") or attachment.get("type") or "")
+                    if mime.startswith("image/") and not persist_image_material:
+                        return None
+                    return compaction_materializer.materialize_attachment_path(attachment, scope)
+
+                attachment_path_resolver = resolve_retained_attachment
             build_compaction_context = getattr(agent, "build_compaction_request_context", None)
             compaction_request_context = (
                 build_compaction_context(effective_runtime_message)
@@ -7363,7 +7173,6 @@ class TurnRunner:
                         compaction_request_context=compaction_request_context,
                         history_capacity_tokens=history_capacity_tokens,
                         history_capacity_chars=history_capacity_chars,
-                        turn=turn,
                         session_key=session_key,
                         agent_id=agent_id,
                         history_has_persisted_user=history_has_persisted_user,
@@ -7385,6 +7194,20 @@ class TurnRunner:
                 session_key in self._turn_compaction_failed_sessions
             )
             agent.config.request_context_prompt = ch_out.final_request_context_prompt
+
+            if turn.metadata.get("large_context_capacity_retry_pending") is True:
+                await self._readmit_attachment_capacity(
+                    turn,
+                    cloned_selector,
+                    RouterHistoryReplayRequest(
+                        exclude_last_user=history_has_persisted_user,
+                        bound_user_message_id=bound_user_message_id,
+                        transcript_snapshot=transcript_snapshot,
+                        expected_session_id=expected_session_id,
+                        expected_session_epoch=expected_session_epoch,
+                    ),
+                    initial_provider_config=capacity_initial_provider_config,
+                )
 
             compaction_source_entries: tuple[Any, ...] | None = None
             compaction_source_preimage: tuple[tuple[Any, ...], ...] | None = None
@@ -8125,6 +7948,8 @@ class TurnRunner:
                 if control_event is not None:
                     yield control_event
                 return
+            from opensquilla.engine.capacity_admission import LargeContextCapacityError
+
             error_code, error_message = sanitize_agent_error(
                 {
                     "status": "failed",
@@ -8142,6 +7967,11 @@ class TurnRunner:
                 )
                 error_code = event_code
                 error_message = safe_provider_failure_message(provider_boundary_failure_kind)
+            elif isinstance(exc, LargeContextCapacityError):
+                event_code = error_code = exc.code
+                error_message = build_terminal_reply({
+                    "status": "failed", "error_class": exc.code,
+                })
             elif isinstance(exc, UsageAccountingUnavailableError):
                 event_code = str(
                     getattr(exc, "code", UsageAccountingUnavailableError.code)
@@ -8439,7 +8269,9 @@ class TurnRunner:
         )
         return session_id
 
-    def _resolve_provider(self) -> tuple[Any | None, Any | None]:
+    def _resolve_provider(
+        self, *, deployment: Any | None = None,
+    ) -> tuple[Any | None, Any | None]:
         """Clone the selector and resolve provider (no shared state mutation)."""
         if self._provider_selector is None:
             return None, None
@@ -8447,9 +8279,13 @@ class TurnRunner:
         # (no API key configured); treat it like "no provider" so the turn
         # fails with the same clean no_provider error instead of raising.
         # getattr default True keeps duck-typed test selectors working.
-        if not getattr(self._provider_selector, "is_configured", True):
+        if deployment is None and not getattr(self._provider_selector, "is_configured", True):
             return None, None
         cloned = self._provider_selector.clone()
+        if deployment is not None:
+            # An explicit session deployment must never inherit another
+            # provider's fallback credentials or silently use the default.
+            cloned.pin_provider_config(deployment)
         return cloned.resolve(), cloned
 
     def _handle_runtime_warning(self, event: WarningEvent) -> WarningEvent:
@@ -9158,6 +8994,7 @@ class TurnRunner:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
                 )
+                caller_ctx.explicitly_allowed_tools = set(ctx.explicitly_allowed_tools)
                 caller_ctx.denied_tools.clear()
                 caller_ctx.denied_tools.update(ctx.denied_tools)
                 caller_ctx.workspace_write_deny_globs[:] = ctx.workspace_write_deny_globs
@@ -9984,6 +9821,7 @@ class TurnRunner:
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
+        additional_request_context_tokens: int = 0,
     ) -> tuple[Any, Any]:
         """Run the pre-turn pipeline and re-resolve provider if model changed.
 
@@ -10010,21 +9848,37 @@ class TurnRunner:
         )
         from opensquilla.engine.steps.squilla_router import (
             commit_deferred_router_history,
+            prepare_model_routing_runtime,
         )
 
         router_cfg = getattr(self._turn_config(), "squilla_router", None)
         router_timeout = float(getattr(router_cfg, "routing_timeout_seconds", 5.0) or 5.0)
 
         def _copy_router_turn(turn: TurnContext) -> TurnContext:
-            metadata: dict[str, Any] = {}
-            for key, value in turn.metadata.items():
-                try:
-                    metadata[key] = copy.deepcopy(value)
-                except Exception:
-                    metadata[key] = value
-            pipeline_steps = metadata.get("pipeline_steps")
-            if isinstance(pipeline_steps, list):
-                metadata["pipeline_steps"] = list(pipeline_steps)
+            # Detach mutable per-turn facts, but retain opaque runtime services.
+            # In particular deepcopy(bound_method) clones its owner, traversing
+            # live gateways, locks, SQLite connections and even event loops.
+            # The worker only reads these service capabilities; it must never
+            # construct partial copies or spend its routing budget cloning them.
+            memo: dict[int, Any] = {}
+            visited: set[int] = set()
+
+            def retain_runtime_values(value: Any) -> None:
+                identity = id(value)
+                if identity in visited:
+                    return
+                visited.add(identity)
+                if type(value) is dict:
+                    for child in (*value.keys(), *value.values()):
+                        retain_runtime_values(child)
+                elif type(value) in (list, tuple, set, frozenset):
+                    for child in value:
+                        retain_runtime_values(child)
+                elif type(value) not in (str, bytes, int, float, bool, type(None)):
+                    memo[identity] = value
+
+            retain_runtime_values(turn.metadata)
+            metadata = copy.deepcopy(turn.metadata, memo)
             metadata["_defer_squilla_router_history"] = True
             return replace(
                 turn,
@@ -10034,6 +9888,10 @@ class TurnRunner:
             )
 
         async def _bounded_apply_squilla_router(turn: TurnContext) -> TurnContext:
+            # Cold readiness belongs to the actual routing consumer, before
+            # its classification deadline and using the accepted turn config.
+            await prepare_model_routing_runtime(turn.config, session_key=turn.session_key)
+
             def _run_router_step_sync() -> TurnContext:
                 return asyncio.run(apply_squilla_router(_copy_router_turn(turn)))
 
@@ -10280,6 +10138,9 @@ class TurnRunner:
             0,
             int(history_capacity_estimated_tokens),
         )
+        initial_metadata["routing_additional_request_context_tokens"] = max(
+            0, int(additional_request_context_tokens),
+        )
         initial_metadata["routing_history_capacity_message_count"] = max(
             0,
             int(history_capacity_message_count),
@@ -10416,7 +10277,21 @@ class TurnRunner:
         # prompt/tool boundary outside the generic fail-open pipeline wrapper.
         # An unexpected estimator failure must stop the turn rather than leave
         # an attachment route with unbounded selector fallbacks.
-        turn = await finalize_squilla_router_capacity(turn)
+        turn = await finalize_squilla_router_capacity(
+            turn,
+            allow_compaction_retry=(
+                self._session_manager is not None
+                and cloned_selector is not None
+                and router_history_replay_request is not None
+            ),
+        )
+        if turn.metadata.get("large_context_capacity_blocked") is True:
+            from opensquilla.engine.selector_override import require_current_selector_capacity
+
+            require_current_selector_capacity(
+                cloned_selector, turn.metadata,
+                reason="Attachment request capacity could not be established.",
+            )
 
         # Image routing is a capability boundary, not an Ensemble activation.
         # This applies to the dedicated image row and to any text tier selected
@@ -11238,6 +11113,52 @@ class TurnRunner:
             trim_last_user=trim_last_user,
             bound_slice_applied=bound_slice_applied,
             entry_projector=_entry_projector,
+        )
+
+    async def _readmit_attachment_capacity(
+        self,
+        turn: TurnContext,
+        selector: Any,
+        request: RouterHistoryReplayRequest,
+        *,
+        initial_provider_config: Any,
+    ) -> None:
+        """Re-read committed history and admit the pinned deployment once.
+
+        Compaction may fail, be skipped, or change the transcript. None of
+        those outcomes is permission to execute a provisional provider route.
+        """
+        from opensquilla.engine.selector_override import require_current_selector_capacity
+        from opensquilla.engine.steps.squilla_router import finalize_squilla_router_capacity
+
+        if request.transcript_snapshot is not None:
+            request.transcript_snapshot.invalidate()
+        history_capacity = await self._router_history_capacity_for_request(
+            turn.session_key,
+            request,
+            max_history_turns=0,
+            preserve_image_attachments=(
+                turn.metadata.get("image_route_reason") in {"current_turn", "history_context"}
+            ),
+            reachable_provider_kinds=self._route_capacity_provider_kinds(
+                turn, initial_provider_config=initial_provider_config,
+            ),
+        )
+        turn.metadata.update({
+            "routing_history_capacity_estimated_tokens": max(
+                0, int(history_capacity.get("history_capacity_estimated_tokens") or 0),
+            ),
+            "routing_history_capacity_message_count": max(
+                0, int(history_capacity.get("history_capacity_message_count") or 0),
+            ),
+            "routing_history_capacity_estimate_complete": (
+                history_capacity.get("history_capacity_estimate_complete") is True
+            ),
+        })
+        await finalize_squilla_router_capacity(turn, retry_after_compaction=True)
+        require_current_selector_capacity(
+            selector, turn.metadata,
+            reason="Attachment request did not pass capacity admission after compaction.",
         )
 
     async def _router_history_capacity_for_request(
@@ -12267,634 +12188,6 @@ class TurnRunner:
         if not rendered:
             return (0, 0)
         return (estimate_tokens(rendered), len(rendered))
-
-    async def _maybe_compact_on_t3_upgrade(
-        self,
-        session_key: str,
-        turn: TurnContext,
-        context_window_tokens: int,
-        *,
-        compaction_provider: Any | None = None,
-        compaction_model: str | None = None,
-        compaction_plan: Any | None = None,
-        compaction_request_context: Any | None = None,
-        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
-        history_capacity_tokens: int | None = None,
-        history_capacity_chars: int | None = None,
-        history_has_persisted_user: bool = False,
-        bound_user_message_id: str | None = None,
-        provider_request_correlation: ProviderRequestCorrelation | None = None,
-        consumer_admission: Any | None = None,
-        consumer_admission_fingerprint: str = "",
-        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
-        expected_session_id: str | None = None,
-        expected_session_epoch: int | None = None,
-    ) -> str:
-        """Checkpoint and compact transcript when the router upgrades into t3.
-
-        Returns a status string so the caller can distinguish non-applicable
-        routes and compaction failures that should trip the circuit without retrying.
-        """
-        router_cfg = getattr(self._turn_config(), "squilla_router", None)
-        upgrade_compaction_enabled = getattr(
-            router_cfg,
-            "upgrade_to_c3_compaction_enabled",
-            getattr(router_cfg, "upgrade_to_t3_compaction_enabled", False),
-        )
-        if not upgrade_compaction_enabled:
-            return _T3_NOT_APPLICABLE
-
-        routed_tier = normalize_text_tier(turn.metadata.get("routed_tier"))
-        if routed_tier != HIGHEST_TEXT_TIER:
-            return _T3_NOT_APPLICABLE
-
-        if not turn.metadata.get("routing_applied", False):
-            return _T3_NOT_APPLICABLE
-
-        routing_extra = turn.metadata.get("routing_extra", {})
-        previous = normalize_text_tier(routing_extra.get("previous_tier"))
-        if previous is None:
-            final = normalize_text_tier(routing_extra.get("final_tier"))
-            base = normalize_text_tier(routing_extra.get("base_tier"))
-            if final == HIGHEST_TEXT_TIER and tier_index(base) in {0, 1, 2}:
-                previous = base
-            else:
-                return _T3_NOT_APPLICABLE
-
-        if tier_index(previous) not in {0, 1, 2}:
-            return _T3_NOT_APPLICABLE
-
-        if session_key.startswith(("cron:", "subagent:")):
-            return _T3_NOT_APPLICABLE
-
-        if self._session_manager is None:
-            return _T3_NOT_APPLICABLE
-        history_window_tokens = int(context_window_tokens)
-        if history_capacity_tokens is not None:
-            history_window_tokens = min(
-                history_window_tokens,
-                max(0, int(history_capacity_tokens)),
-            )
-            if history_window_tokens <= 0:
-                log.info(
-                    "t3_upgrade_compaction.skipped",
-                    session_key=session_key,
-                    reason="non_history_envelope_exhausts_budget",
-                    context_window_tokens=context_window_tokens,
-                    history_capacity_tokens=history_capacity_tokens,
-                )
-                return _T3_HANDLED
-        if history_capacity_chars is not None and int(history_capacity_chars) <= 0:
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="non_history_envelope_exhausts_char_budget",
-                context_window_tokens=context_window_tokens,
-                history_capacity_chars=history_capacity_chars,
-            )
-            return _T3_HANDLED
-
-        if self.has_compacted_this_turn(session_key):
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="already_compacted_this_turn",
-            )
-            return _T3_HANDLED
-        if self.has_attempted_compaction_this_turn(session_key):
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="already_attempted_this_turn",
-            )
-            return _T3_HANDLED
-
-        try:
-            if transcript_snapshot is not None:
-                transcript = list(await transcript_snapshot.get_entries())
-            else:
-                get_transcript = self._session_manager.get_transcript
-                transcript_kwargs: dict[str, Any] = {}
-                if expected_session_id is not None or expected_session_epoch is not None:
-                    supports_exact_owner = all(
-                        _accepts_explicit_keyword_arg(get_transcript, name)
-                        for name in ("expected_session_id", "expected_session_epoch")
-                    )
-                    if supports_exact_owner:
-                        transcript_kwargs["expected_session_id"] = expected_session_id
-                        transcript_kwargs["expected_session_epoch"] = expected_session_epoch
-                    elif _has_session_storage(self._session_manager):
-                        raise RuntimeError(
-                            "session transcript reader does not support exact ownership"
-                        )
-                transcript = await get_transcript(session_key, **transcript_kwargs)
-        except KeyError:
-            return _T3_HANDLED
-        (
-            checkpoint_tokens,
-            checkpoint_chars,
-        ) = await self._durable_compaction_context_measure(
-            session_key,
-            expected_session_id=expected_session_id,
-            expected_session_epoch=expected_session_epoch,
-        )
-        if not transcript and checkpoint_tokens <= 0 and checkpoint_chars <= 0:
-            return _T3_HANDLED
-        protected_suffix_count = self._protected_current_turn_suffix_count(
-            transcript,
-            history_has_persisted_user=history_has_persisted_user,
-            bound_user_message_id=bound_user_message_id,
-        )
-
-        compaction_config = None
-        configured_compaction = getattr(getattr(self, "_config", None), "compaction", None)
-        if compaction_provider is not None or compaction_model or configured_compaction is not None:
-            from opensquilla.session.compaction import build_compaction_config_from_provider
-
-            compaction_config = build_compaction_config_from_provider(
-                compaction_provider,
-                model_override=compaction_model,
-                compaction_config=configured_compaction,
-                compaction_plan=compaction_plan,
-                context_window_tokens=context_window_tokens,
-            )
-
-        from opensquilla.session.compaction import (
-            CompactionConfig,
-            arm_compaction_deadline,
-            await_compaction_phase,
-            effective_protected_recent_messages,
-            estimate_entries_model_replay_chars,
-            estimate_entry_model_replay_chars,
-            estimate_entry_model_replay_tokens,
-        )
-
-        # Measure what the model actually replays (full tool_calls JSON), the
-        # same estimator preflight uses. The summarized estimator undercounts
-        # tool-heavy transcripts, so a within-budget "handled" verdict computed
-        # from it would suppress the correct-estimator preflight fallback.
-        total_tokens = checkpoint_tokens + sum(
-            estimate_entry_model_replay_tokens(e) for e in transcript
-        )
-        total_chars = checkpoint_chars + estimate_entries_model_replay_chars(transcript)
-        durable_prefix_end = len(transcript) - protected_suffix_count
-        durable_history_tokens = checkpoint_tokens + sum(
-            estimate_entry_model_replay_tokens(entry) for entry in transcript[:durable_prefix_end]
-        )
-        durable_history_chars = checkpoint_chars + estimate_entries_model_replay_chars(
-            transcript[:durable_prefix_end]
-        )
-        safety_margin = float(
-            getattr(compaction_config or CompactionConfig(), "safety_margin", 1 / 0.85) or 1 / 0.85
-        )
-        trigger_ratio = self._preflight_compact_ratio()
-        durable_tokens_within_budget = bool(
-            durable_history_tokens < history_window_tokens * trigger_ratio
-        )
-        durable_chars_within_budget = bool(
-            history_capacity_chars is None
-            or durable_history_chars < int(history_capacity_chars) * trigger_ratio
-        )
-        if durable_tokens_within_budget and durable_chars_within_budget:
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="durable_history_within_budget",
-                total_tokens=total_tokens,
-                total_chars=total_chars,
-                durable_history_tokens=durable_history_tokens,
-                durable_history_chars=durable_history_chars,
-                checkpoint_tokens=checkpoint_tokens,
-                checkpoint_chars=checkpoint_chars,
-                context_window_tokens=context_window_tokens,
-                history_capacity_tokens=history_window_tokens,
-                history_capacity_chars=history_capacity_chars,
-                safety_margin=safety_margin,
-            )
-            return _T3_HANDLED
-        if transcript and protected_suffix_count >= len(transcript):
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="current_request_only",
-                protected_recent_messages=protected_suffix_count,
-            )
-            return _T3_HANDLED
-        active_user_index = self._active_persisted_user_index(
-            transcript,
-            history_has_persisted_user=history_has_persisted_user,
-            bound_user_message_id=bound_user_message_id,
-        )
-        protected_request_tokens = (
-            estimate_entry_model_replay_tokens(transcript[active_user_index])
-            if active_user_index is not None
-            else 0
-        )
-        protected_request_chars = (
-            estimate_entry_model_replay_chars(transcript[active_user_index])
-            if active_user_index is not None
-            else 0
-        )
-        if (
-            protected_request_tokens > 0
-            and protected_request_tokens * safety_margin > history_window_tokens
-        ) or (
-            history_capacity_chars is not None
-            and protected_request_chars > 0
-            and protected_request_chars * safety_margin > int(history_capacity_chars)
-        ):
-            log.info(
-                "t3_upgrade_compaction.skipped",
-                session_key=session_key,
-                reason="current_request_too_large",
-                protected_request_tokens=protected_request_tokens,
-                protected_request_chars=protected_request_chars,
-                context_window_tokens=context_window_tokens,
-                history_capacity_tokens=history_window_tokens,
-                history_capacity_chars=history_capacity_chars,
-                safety_margin=safety_margin,
-            )
-            return _T3_HANDLED
-        compaction_config = compaction_config or CompactionConfig()
-        compaction_config.request_context = compaction_request_context
-        compaction_config.attachment_path_resolver = attachment_path_resolver
-        compaction_config.protected_recent_messages = max(
-            effective_protected_recent_messages(compaction_config),
-            protected_suffix_count,
-        )
-        if self._compaction_circuit_open(session_key):
-            self.mark_compaction_attempted_this_turn(session_key)
-            await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                history_window_tokens,
-                attachment_path_resolver=attachment_path_resolver,
-                compaction_id=new_compaction_id(),
-                phase="t3_upgrade",
-                reason="durable_compaction_circuit_open",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            return _T3_HANDLED
-        if protected_suffix_count and not self._durable_compaction_accepts_config():
-            self.mark_compaction_attempted_this_turn(session_key)
-            await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                history_window_tokens,
-                attachment_path_resolver=attachment_path_resolver,
-                compaction_id=new_compaction_id(),
-                phase="t3_upgrade",
-                reason="protected_history_boundary_unsupported",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            return _T3_HANDLED
-
-        log.info(
-            "t3_upgrade_compaction.triggered",
-            session_key=session_key,
-            previous_tier=previous,
-            final_tier=HIGHEST_TEXT_TIER,
-            context_window_tokens=context_window_tokens,
-        )
-        self.mark_compaction_attempted_this_turn(session_key)
-        compaction_id = new_compaction_id()
-        arm_compaction_deadline(compaction_config, operation_id=compaction_id)
-        notify_compaction(
-            session_key,
-            source="automatic",
-            phase="t3_upgrade",
-            status="started",
-            previous_tier=previous,
-            context_window_tokens=context_window_tokens,
-            heartbeat_interval_seconds=compaction_config.heartbeat_interval_seconds,
-            **compaction_effect_payload(status="started"),
-            **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-        )
-
-        try:
-            await self._record_checkpoint_before_compaction(
-                session_key,
-                transcript,
-                turn_id=compaction_id,
-                source="t3_upgrade_compaction",
-                compaction_config=compaction_config,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-            )
-        except asyncio.CancelledError:
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="t3_upgrade",
-                status="cancelled",
-                reason="cancelled",
-                **compaction_effect_payload(status="cancelled"),
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
-            raise
-        except CompactionTimeoutError as exc:
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase=exc.phase,
-                status="timed_out",
-                reason="compaction_deadline_exceeded",
-                **compaction_effect_payload(status="timed_out"),
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
-            await self._record_emergency_ephemeral_compaction(
-                session_key, transcript, history_window_tokens,
-                compaction_id=compaction_id, phase="t3_upgrade",
-                reason="compaction_deadline_exceeded",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            return _T3_COMPACT_FAILED
-        except Exception as exc:
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="checkpointing",
-                status="failed",
-                reason="checkpoint_failed",
-                message=str(exc),
-                **compaction_effect_payload(status="failed"),
-                **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
-            )
-            raise
-
-        try:
-            from opensquilla.session.compaction import call_compact_with_optional_config
-
-            compaction_result = None
-            compact_with_result = getattr(type(self._session_manager), "compact_with_result", None)
-            if callable(compact_with_result):
-                compact_method = self._session_manager.compact_with_result
-                compact_kwargs: dict[str, Any] = {}
-                if _accepts_keyword_arg(compact_method, "compaction_id"):
-                    compact_kwargs["compaction_id"] = compaction_id
-                if _accepts_keyword_arg(compact_method, "trigger_reason"):
-                    compact_kwargs["trigger_reason"] = "t3_upgrade"
-                if _accepts_keyword_arg(compact_method, "mutation_context"):
-                    compact_kwargs["mutation_context"] = self._session_write_context_factory(
-                        session_key
-                    )
-                if _accepts_keyword_arg(compact_method, "context_window_chars"):
-                    compact_kwargs["context_window_chars"] = history_capacity_chars
-                if expected_session_id is not None or expected_session_epoch is not None:
-                    supports_exact_owner = all(
-                        _accepts_explicit_keyword_arg(compact_method, name)
-                        for name in ("expected_session_id", "expected_session_epoch")
-                    )
-                    if supports_exact_owner:
-                        compact_kwargs["expected_session_id"] = expected_session_id
-                        compact_kwargs["expected_session_epoch"] = expected_session_epoch
-                    elif _has_session_storage(self._session_manager):
-                        raise RuntimeError(
-                            "session compactor does not support exact ownership"
-                        )
-                if provider_request_correlation is not None and _accepts_keyword_arg(
-                    compact_method,
-                    "provider_request_correlation",
-                ):
-                    compact_kwargs["provider_request_correlation"] = provider_request_correlation
-                if _accepts_keyword_arg(compact_method, "consumer_admission"):
-                    compact_kwargs["consumer_admission"] = consumer_admission
-                if _accepts_keyword_arg(
-                    compact_method,
-                    "consumer_admission_fingerprint",
-                ):
-                    compact_kwargs["consumer_admission_fingerprint"] = (
-                        consumer_admission_fingerprint
-                    )
-                if (
-                    history_has_persisted_user
-                    and bound_user_message_id is not None
-                    and _accepts_keyword_arg(
-                        compact_method,
-                        "protected_boundary_message_id",
-                    )
-                ):
-                    compact_kwargs["protected_boundary_message_id"] = bound_user_message_id
-                compaction_result = await await_compaction_phase(
-                    self._session_manager.compact_with_result(
-                        session_key,
-                        history_window_tokens,
-                        compaction_config,
-                        **compact_kwargs,
-                    ),
-                    compaction_config,
-                    phase="summarizing",
-                )
-                result = getattr(compaction_result, "summary", "") or ""
-                if not (int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                        or getattr(compaction_result, "replaced_previous_summary", False)):
-                    result = ""
-            else:
-                compact_call_kwargs: dict[str, Any] = {}
-                if (
-                    expected_session_id is not None
-                    or expected_session_epoch is not None
-                ) and _has_session_storage(self._session_manager):
-                    raise RuntimeError(
-                        "session compactor does not support exact ownership"
-                    )
-                if provider_request_correlation is not None:
-                    compact_call_kwargs["provider_request_correlation"] = (
-                        provider_request_correlation
-                    )
-                result = await await_compaction_phase(
-                    call_compact_with_optional_config(
-                        self._session_manager.compact,
-                        session_key,
-                        history_window_tokens,
-                        compaction_config,
-                        **compact_call_kwargs,
-                    ),
-                    compaction_config,
-                    phase="summarizing",
-                )
-            if (
-                compaction_result is not None
-                and int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                and bool(getattr(compaction_result, "summary", "") or "")
-            ):
-                for event in (
-                    COMPACTION_CHUNK_SUMMARIZED_EVENT,
-                    COMPACTION_SUMMARY_VERIFIED_EVENT,
-                ):
-                    observed_payload = compaction_lifecycle_payload(compaction_id, event)
-                    observed_payload.update(compaction_result_payload(compaction_result))
-                    notify_compaction(
-                        session_key,
-                        source="automatic",
-                        phase="t3_upgrade",
-                        status="observed",
-                        context_window_tokens=context_window_tokens,
-                        **compaction_effect_payload(status="observed"),
-                        **observed_payload,
-                    )
-            if result:
-                durable_transcript_changed = compaction_result is None or (
-                    int(getattr(compaction_result, "removed_count", 0) or 0) > 0
-                    and bool(getattr(compaction_result, "summary", "") or "")
-                )
-                if durable_transcript_changed and transcript_snapshot is not None:
-                    transcript_snapshot.invalidate()
-                self.mark_compacted_this_turn(session_key)
-                self._record_compaction_success(session_key)
-                completed_payload = {"summary_len": len(result)}
-                if compaction_result is not None:
-                    completed_payload.update(compaction_result_payload(compaction_result))
-                notify_compaction(
-                    session_key,
-                    source="automatic",
-                    phase="t3_upgrade",
-                    status="completed",
-                    context_window_tokens=context_window_tokens,
-                    **compaction_effect_payload(status="completed"),
-                    **completed_payload,
-                    **compaction_lifecycle_payload(compaction_id, COMPACTION_PERSISTED_EVENT),
-                )
-            else:
-                skip_reason = str(
-                    getattr(compaction_result, "skip_reason", None) or "empty_summary"
-                )
-                outcome_status = compaction_failure_status(skip_reason)
-                if outcome_status == "failed":
-                    self._record_compaction_failure(session_key)
-                    emergency_applied = await self._record_emergency_ephemeral_compaction(
-                        session_key,
-                        transcript,
-                        history_window_tokens,
-                        attachment_path_resolver=attachment_path_resolver,
-                        compaction_id=compaction_id,
-                        phase="t3_upgrade",
-                        reason=skip_reason,
-                        protected_recent_messages=protected_suffix_count,
-                        history_capacity_chars=history_capacity_chars,
-                        expected_session_id=expected_session_id,
-                        expected_session_epoch=expected_session_epoch,
-                        consumer_admission=consumer_admission,
-                    )
-                    if emergency_applied:
-                        return _T3_HANDLED
-                notify_compaction(
-                    session_key,
-                    source="automatic",
-                    phase="t3_upgrade",
-                    status=outcome_status,
-                    reason=skip_reason,
-                    context_window_tokens=context_window_tokens,
-                    **compaction_effect_payload(
-                        status=outcome_status,
-                        reason=skip_reason,
-                    ),
-                    **compaction_lifecycle_payload(
-                        compaction_id,
-                        COMPACTION_TRIGGERED_EVENT,
-                    ),
-                )
-            log.info(
-                "t3_upgrade_compaction.compact_done",
-                session_key=session_key,
-                summary_produced=bool(result),
-                summary_length=len(result) if result else 0,
-            )
-        except asyncio.CancelledError:
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="t3_upgrade",
-                status="cancelled",
-                reason="cancelled",
-                **compaction_effect_payload(status="cancelled"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-            raise
-        except CompactionTimeoutError as exc:
-            log.warning(
-                "t3_upgrade_compaction.timed_out",
-                session_key=session_key,
-                phase=exc.phase,
-            )
-            self._record_compaction_failure(session_key)
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase=exc.phase,
-                status="timed_out",
-                reason="compaction_deadline_exceeded",
-                **compaction_effect_payload(status="timed_out"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-            await self._record_emergency_ephemeral_compaction(
-                session_key, transcript, history_window_tokens,
-                compaction_id=compaction_id, phase="t3_upgrade",
-                reason="compaction_deadline_exceeded",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            return _T3_COMPACT_FAILED
-        except Exception as exc:  # noqa: BLE001
-            log.warning(
-                "t3_upgrade_compaction.compact_failed",
-                session_key=session_key,
-                error=str(exc),
-            )
-            self._record_compaction_failure(session_key)
-            emergency_applied = await self._record_emergency_ephemeral_compaction(
-                session_key,
-                transcript,
-                history_window_tokens,
-                attachment_path_resolver=attachment_path_resolver,
-                compaction_id=compaction_id,
-                phase="t3_upgrade",
-                reason="compact_failed",
-                protected_recent_messages=protected_suffix_count,
-                history_capacity_chars=history_capacity_chars,
-                expected_session_id=expected_session_id,
-                expected_session_epoch=expected_session_epoch,
-                consumer_admission=consumer_admission,
-            )
-            if emergency_applied:
-                return _T3_COMPACT_FAILED
-            notify_compaction(
-                session_key,
-                source="automatic",
-                phase="t3_upgrade",
-                status="failed",
-                message=str(exc),
-                context_window_tokens=context_window_tokens,
-                **compaction_effect_payload(status="failed"),
-                **compaction_lifecycle_payload(
-                    compaction_id,
-                    COMPACTION_TRIGGERED_EVENT,
-                ),
-            )
-            return _T3_COMPACT_FAILED
-
-        return _T3_HANDLED
 
     async def _maybe_preflight_compact(
         self,
@@ -14148,6 +13441,9 @@ class TurnRunner:
             else:
                 emergency_override = None
 
+        transcript = await self._workspace_file_history_projection(
+            transcript, getattr(agent, "_tool_context", None), session_key,
+        )
         # Resolve the id-bound slice (see method docstring). Only active when we
         # would otherwise trim positionally.
         bound_index: int | None = None
@@ -14473,6 +13769,7 @@ class TurnRunner:
                     attachment_workspace_write_authorizer(history_tool_context)
                     if history_tool_context is not None else None
                 ),
+                working_files=getattr(history_tool_context, "attachment_working_files", None),
             )
         # For a durable exact-owner turn, validate the owner before replay can
         # materialize transcript attachments into the shared workspace.  The
@@ -15067,6 +14364,23 @@ class TurnRunner:
             annotation_context = None
         if annotation_context:
             text = "\n\n".join(part for part in (text, annotation_context) if part)
+        if parsed.get("workspace_files"):
+            from opensquilla.workspace_files import normalize_workspace_files
+
+            try:
+                refs = normalize_workspace_files(parsed["workspace_files"])
+            except ValueError:
+                refs = []
+            markers = parsed.get("_workspace_file_markers")
+            if not isinstance(markers, list) or not all(isinstance(item, str) for item in markers):
+                markers = [
+                    "[live project file reference: " + json.dumps(ref, ensure_ascii=False)
+                    + "; current file only, historical contents are not retained; "
+                    "availability must be checked against the current workspace "
+                    "and tool permissions.]"
+                    for ref in refs
+                ]
+            text = "\n".join([text, *markers])
         atts = parsed.get("attachments") or []
         if not isinstance(atts, list) or not atts:
             return text
@@ -15384,6 +14698,7 @@ class TurnRunner:
         | None = None,
         persist_image_material: bool = True,
         image_workspace_dir: str | Path | None = None,
+        working_files: dict[str, dict[str, Any]] | None = None,
     ) -> list | None:
         """Build a multimodal user message that carries the attachments.
 
@@ -15392,11 +14707,12 @@ class TurnRunner:
 
           * ``image/*``           -> ``ContentBlockImage`` plus a workspace
                                      marker when a workspace is available
-          * ``application/pdf``   -> local text extraction, then ``ContentBlockText``
-          * text-family / json    -> ``ContentBlockText`` wrapped in an
-                                     ``<file name="…" mime="…">…</file>``
-                                     envelope with escaped filename and content
-                                     boundaries.
+          * ordinary files       -> metadata and a controlled workspace path;
+                                     tools read or parse content on demand
+          * generated long text  -> its existing bounded text preview
+
+        File acceptance never invokes PDF, Office or email parsers. The image
+        representation and durable attachment identity are unchanged.
         """
 
         if not attachments:
@@ -15414,7 +14730,6 @@ class TurnRunner:
 
         prompt_block = ContentBlockText(text=message)
         attachment_blocks: list[Any] = []
-        office_batch_decompressed_budget = [_OFFICE_DECOMPRESSED_LIMIT]
         turn_materializer: AttachmentWorkspaceMaterializer | None = None
         image_materializer = (
             AttachmentWorkspaceMaterializer(
@@ -15432,6 +14747,7 @@ class TurnRunner:
                 workspace_dir=workspace_dir,
                 materializable_mimes=None,
                 disk_budget_bytes=workspace_attachment_budget_bytes,
+                working_files=working_files,
             )
         for index, att in enumerate(attachments, start=1):
             if cancel_check is not None:
@@ -15465,7 +14781,10 @@ class TurnRunner:
                 except ValueError as exc:
                     raw_bytes = b""
                     missing_ref_marker = f"[attachment unavailable: {exc}]"
-                data = base64.b64encode(raw_bytes).decode("ascii") if raw_bytes else ""
+                data = (
+                    base64.b64encode(raw_bytes).decode("ascii")
+                    if raw_bytes and media_type in _IMAGE_ATTACHMENT_MIMES else ""
+                )
             else:
                 missing_ref_marker = ""
                 data_raw = att.get("data")
@@ -15540,213 +14859,47 @@ class TurnRunner:
                 )
                 if material_marker:
                     attachment_blocks.append(ContentBlockText(text=material_marker))
-            elif media_type == "application/pdf":
-                parse_started_at = time.monotonic()
-                try:
-                    extracted_pdf_text = _extract_pdf_attachment_text(
-                        raw_bytes,
-                        filename,
-                        cancel_check=cancel_check,
-                    )
-                except ValueError as exc:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=_pdf_parse_error_code(exc),
-                    )
-                    extracted_pdf_text = (
-                        f"[attachment unavailable: PDF text could not be extracted: {exc}]"
-                    )
-                except _AttachmentPreparationCancelledError:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=FileParseErrorCode.CANCELLED,
-                        outcome=ResultOutcome.CANCEL,
-                    )
-                    raise
-                except TimeoutError:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=FileParseErrorCode.PARSE_TIMEOUT,
-                        outcome=ResultOutcome.TIMEOUT,
-                    )
-                    raise
-                else:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                    )
-                if material_marker:
-                    extracted_pdf_text = "\n\n".join(
-                        [
-                            extracted_pdf_text,
-                            material_marker,
-                            (
-                                "[attachment note: use the workspace path for PDF "
-                                "layout, images, colors, or edits; extracted text is "
-                                "only a preview.]"
-                            ),
-                        ]
-                    )
-                wrapped = _render_file_context_block(filename, media_type, extracted_pdf_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            elif media_type in _OFFICE_ATTACHMENT_MIMES:
-                parse_started_at = time.monotonic()
-                try:
-                    extracted_office_text = _extract_office_attachment_text(
-                        raw_bytes,
-                        filename,
-                        media_type,
-                        batch_decompressed_budget=office_batch_decompressed_budget,
-                        cancel_check=cancel_check,
-                    )
-                except ValueError as exc:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=_office_parse_error_code(exc),
-                    )
-                    extracted_office_text = (
-                        f"[attachment unavailable: document text could not be extracted: {exc}]"
-                    )
-                except _AttachmentPreparationCancelledError:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=FileParseErrorCode.CANCELLED,
-                        outcome=ResultOutcome.CANCEL,
-                    )
-                    raise
-                except TimeoutError:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=FileParseErrorCode.PARSE_TIMEOUT,
-                        outcome=ResultOutcome.TIMEOUT,
-                    )
-                    raise
-                else:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                    )
-                if material_marker:
-                    extracted_office_text = "\n\n".join([extracted_office_text, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, extracted_office_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            elif media_type in _EMAIL_ATTACHMENT_MIMES:
-                parse_started_at = time.monotonic()
-                try:
-                    extracted_email_text = _extract_email_attachment_text(
-                        raw_bytes, filename, media_type
-                    )
-                except ValueError as exc:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                        error_code=_email_parse_error_code(exc),
-                    )
-                    extracted_email_text = (
-                        f"[attachment unavailable: email could not be extracted: {exc}]"
-                    )
-                else:
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                    )
-                if material_marker:
-                    extracted_email_text = "\n\n".join([extracted_email_text, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, extracted_email_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            elif media_type in _ENGINE_TEXT_FAMILY_MIMES:
-                parse_started_at = time.monotonic()
-                if (
-                    is_attachment_ref(att)
-                    and att.get("_provider_inline_policy") == "preview_only"
-                ):
-                    decoded_text = _render_preview_only_attachment_text(
-                        att,
-                        filename=filename,
-                        mime=media_type,
-                        raw_bytes=raw_bytes,
-                        media_root=media_root,
-                    )
-                else:
-                    try:
-                        decoded_text = _truncate_attachment_text(
-                            raw_bytes.decode("utf-8"),
-                            limit=_TEXT_ATTACHMENT_TEXT_LIMIT,
-                        )
-                    except UnicodeDecodeError:
-                        _publish_file_parse_fact(
-                            file_parse_fact_sink,
-                            media_type=media_type,
-                            size_bytes=len(raw_bytes),
-                            started_at=parse_started_at,
-                            error_code=FileParseErrorCode.INVALID_UTF8,
-                        )
-                        decoded_text = (
-                            "[attachment unavailable: declared text content is not valid UTF-8]"
-                        )
-                    else:
-                        _publish_file_parse_fact(
-                            file_parse_fact_sink,
-                            media_type=media_type,
-                            size_bytes=len(raw_bytes),
-                            started_at=parse_started_at,
-                        )
-                if (
-                    is_attachment_ref(att)
-                    and att.get("_provider_inline_policy") == "preview_only"
-                ):
-                    _publish_file_parse_fact(
-                        file_parse_fact_sink,
-                        media_type=media_type,
-                        size_bytes=len(raw_bytes),
-                        started_at=parse_started_at,
-                    )
-                if material_marker:
-                    decoded_text = "\n\n".join([decoded_text, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, decoded_text)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
-            else:
-                # Opaque attachment: the raw bytes never reach the provider.
-                # The model gets an escaped metadata envelope plus the
-                # workspace marker so it can act on the file with tools.
-                sha = att.get("sha256") or att.get("sha256_ref")
-                details = f"[opaque attachment: {media_type}, {len(raw_bytes)} bytes"
-                if isinstance(sha, str) and sha:
-                    details += f", sha256 {sha}"
-                details += (
-                    "; content is not inlined. Inspect or convert the workspace "
-                    "copy with filesystem, shell, or code tools.]"
+            elif (
+                media_type in _ENGINE_TEXT_FAMILY_MIMES
+                and is_attachment_ref(att)
+                and att.get("_provider_inline_policy") == "preview_only"
+                and att.get("source") == "input_normalization"
+                and att.get("_generated_by") == "input_normalization"
+            ):
+                # Long pasted text is already an explicit text input. Preserve
+                # its bounded preview without making uploaded documents eager.
+                preview = _render_preview_only_attachment_text(
+                    att,
+                    filename=filename,
+                    mime=media_type,
+                    raw_bytes=raw_bytes,
+                    media_root=media_root,
                 )
                 if material_marker:
-                    details = "\n\n".join([details, material_marker])
-                wrapped = _render_file_context_block(filename, media_type, details)
-                attachment_blocks.append(ContentBlockText(text=wrapped))
+                    preview = "\n\n".join([preview, material_marker])
+                attachment_blocks.append(ContentBlockText(
+                    text=_render_file_context_block(filename, media_type, preview),
+                ))
+            else:
+                # Upload admission establishes a file, not permission to inject
+                # its complete semantic contents into every model request. Keep
+                # originals available to tools and let the task choose what to
+                # read, parse or render, under the ordinary tool budgets.
+                details = (
+                    f"[file attachment: {media_type}, {len(raw_bytes)} bytes; "
+                    "content has not been read. Use the available file path with "
+                    "filesystem, shell or document tools as needed.]"
+                )
+                if not material_marker:
+                    material_marker = (
+                        "[attachment unavailable: no workspace is available "
+                        "for file access]"
+                    )
+                attachment_blocks.append(ContentBlockText(
+                    text=_render_file_context_block(
+                        filename, media_type, "\n\n".join([details, material_marker]),
+                    ),
+                ))
 
             if cancel_check is not None:
                 cancel_check()

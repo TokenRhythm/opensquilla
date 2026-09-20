@@ -10101,6 +10101,15 @@ class TestSessionsSearchRpc:
         keys = [row["key"] for row in res.payload["sessions"]]
         assert keys == ["agent:main:s1"]
         assert res.payload["sessions"][0]["title"] == "Deploy planning"
+        assert res.payload["sessions"][0]["reference"] == {
+            "version": 1,
+            "kind": "session",
+            "id": "agent:main:s1",
+            "label": "Deploy planning",
+            "scope": {"sessionKey": "agent:main:s1"},
+            "state": {"available": True, "runStatus": "idle"},
+            "capabilities": {"open": True, "copy": True},
+        }
         # No transcript rows configured -> no content hits.
         assert res.payload["messages"] == []
 
@@ -10126,6 +10135,8 @@ class TestSessionsSearchRpc:
         assert hit["title"] == "Grocery list"  # joined from the session metadata
         assert hit["snippet"] == "buy >>>milk<<< today"
         assert hit["role"] == "user"
+        assert hit["reference"]["id"] == "agent:main:s2"
+        assert hit["reference"]["label"] == "Grocery list"
         # The FTS hook received the raw query and the clamped limit.
         assert manager._storage.search_calls == [("milk", None, 5)]
 
@@ -10534,6 +10545,53 @@ class TestSessionsPreview:
 
 
 class TestSessionsResolve:
+    @pytest.mark.asyncio
+    async def test_resolve_reference_recovers_custom_channel_title_from_canonical_history(
+        self, dispatcher,
+    ):
+        session = FakeSession(
+            session_key="custom-channel-reference", channel="team-chat",
+            derived_title="I cannot assist with that request",
+        )
+        manager = FakeSessionManager([session])
+        canonical = AsyncMock(return_value={session.session_id: ["Original request"]})
+        manager._storage.list_canonical_user_transcript_content_batch = canonical
+        manager._storage.list_user_transcript_content_batch = AsyncMock(
+            return_value={session.session_id: ["Unrelated active tail"]},
+        )
+        config = GatewayConfig(channels={"channels": [{
+            "type": "feishu", "name": "team-chat", "app_id": "cli_dummy",
+            "app_secret": "dummy",
+        }]})
+        ctx = make_ctx(session_manager=manager, config=config)
+
+        result = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": session.session_key}, ctx,
+        )
+
+        assert result.ok, result.error
+        assert result.payload["reference"]["label"] == "Original request"
+        canonical.assert_awaited_once_with([session.session_id], limit_per_session=3)
+
+    @pytest.mark.asyncio
+    async def test_resolve_reference_has_title_and_runtime_state(self, dispatcher):
+        session = FakeSession(
+            session_key="agent:main:webchat:reference",
+            display_name="Deployment review", status="active",
+        )
+        ctx = make_ctx(session_manager=FakeSessionManager([session]))
+        ctx.task_runtime = SimpleNamespace(session_task_snapshot=AsyncMock(
+            return_value=SimpleNamespace(running_task_id="task-1", queued_task_ids=()),
+        ))
+        res = await dispatcher.dispatch(
+            "r1", "sessions.resolve", {"key": session.session_key}, ctx,
+        )
+        assert res.ok is True
+        assert res.payload["title"] == "Deployment review"
+        assert res.payload["runStatus"] == "running"
+        assert res.payload["reference"]["label"] == "Deployment review"
+        assert res.payload["reference"]["state"]["runStatus"] == "running"
+
     @pytest.mark.asyncio
     async def test_resolve_valid(self, dispatcher, ctx_with_sessions, session):
         res = await dispatcher.dispatch(

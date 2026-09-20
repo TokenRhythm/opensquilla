@@ -9,11 +9,30 @@ UI, CLI, channels, and gateway control console.
 
 ## Requirements
 
-Install OpenSquilla with the MCP extra when you need this bridge:
+The SDK 2.x implementation described here is included in this source checkout's
+base installation. Install from source, or use an OpenSquilla release that
+includes the SDK 2.x migration; check its release notes before installing.
+Upgrading only the MCP SDK in an older OpenSquilla installation does not migrate
+the application.
+
+Packaged installations use the MCP implementation shipped in the
+[release wheel](https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl).
+For a source installation, follow [Install from source](../README.md#install-from-source).
+From the prepared checkout, install the core profile on macOS/Linux:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended,mcp] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+bash scripts/install_source.sh --profile core
 ```
+
+On Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ./scripts/install_source.ps1 -Profile core
+```
+
+The recommended profile includes MCP as well. In this source version, existing
+installation commands that include the `mcp` extra remain accepted; the extra
+is a compatibility alias and adds no dependencies.
 
 Start the OpenSquilla gateway:
 
@@ -65,8 +84,8 @@ opensquilla gateway status
 opensquilla doctor
 ```
 
-If the command reports that MCP dependencies are missing, reinstall with the
-`mcp` extra.
+If the command reports that MCP dependencies are missing, repair or reinstall
+OpenSquilla with its dependencies using the source installation steps above.
 
 Read next:
 

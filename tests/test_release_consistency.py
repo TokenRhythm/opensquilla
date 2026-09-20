@@ -1097,12 +1097,12 @@ def test_privacy_docs_describe_network_observability_controls() -> None:
     assert "The current UTC day is excluded until it ends." in normalized_privacy
     assert "`X-OpenSquilla-Install-Id` provider header remains retired" in normalized_privacy
     assert (
-        "`OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for V1 and V2 telemetry"
+        "`OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for V1 and V2 statistics"
     ) in normalized_privacy
     assert (
         "`OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and, "
         "for compatibility with V1, installation and daily usage uploads; "
-        "it does not disable V2 telemetry"
+        "it does not disable V2 statistics"
     ) in normalized_privacy
     assert "passive update checks" in privacy
     assert "automatic desktop update checks at startup" in privacy

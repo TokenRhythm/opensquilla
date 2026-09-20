@@ -63,6 +63,7 @@ function harness(directory, {
   const gate = new DesktopTelemetryRuntimeGate()
   const growth = new DesktopGrowthTelemetry({
     runtimeGate: gate, appVersion: () => '0.5.4', platform, env, nowDate: () => new TestDate(),
+    deviceId: () => 'a'.repeat(64),
   })
   growth.observeProfileInspection({ profileKey: profile.home, stableCode, importedOrMigrated })
   const startupResults = []
@@ -262,4 +263,4 @@ try {
   rmSync(root, { recursive: true, force: true })
 }
 
-console.log('telemetry growth lifecycle and restart tests passed')
+console.log('Usage statistics lifecycle and restart tests passed')

@@ -415,6 +415,7 @@ def migrate_config_payload(
         emit_diagnostics=emit_diagnostics,
     )
     _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
+    _strip_removed_router_compaction_fields(builder)
     _normalize_telemetry_upload_preference(builder)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
@@ -461,6 +462,28 @@ def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
         if name in privacy:
             privacy.pop(name)
             builder.removed_fields.append(f"privacy.{name}")
+
+
+def _strip_removed_router_compaction_fields(builder: _MigrationBuilder) -> None:
+    """Always-run: discard the retired C3/T3 compaction switches."""
+    router = builder.payload.get("squilla_router")
+    if not isinstance(router, dict):
+        return
+    for leaf in ("upgrade_to_c3_compaction_enabled", "upgrade_to_t3_compaction_enabled"):
+        if leaf in router:
+            router.pop(leaf)
+            builder.removed_fields.append(f"squilla_router.{leaf}")
+    if any(
+        field in builder.removed_fields
+        for field in (
+            "squilla_router.upgrade_to_c3_compaction_enabled",
+            "squilla_router.upgrade_to_t3_compaction_enabled",
+        )
+    ):
+        builder.warnings.append(
+            "squilla_router upgrade compaction switches were removed; "
+            "all before-turn compaction now uses the target-budget preflight"
+        )
 
 
 def _payload_config_version(payload: dict[str, Any]) -> int:

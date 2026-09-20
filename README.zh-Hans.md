@@ -359,7 +359,11 @@ OpenSquilla 也可能执行被动更新检查，包括桌面启动时以及应�
 `install_id` 是一个本地单向 SHA-256 摘要，由可用的 MAC 地址派生；无 MAC 时使用本地 IP
 地址，并以一个随机持久化值兜底。原始 MAC/IP 值不会被上传。
 
-上述安装标识仅用于 V1 统计，与 V2 的独立随机标识分开。
+上述安装标识仅用于 V1 统计。V2 应用事件使用独立的 `device_id`：在本地对操作系统的
+机器标识做 OpenSquilla 专用的单向 SHA-256 摘要，原始值不上传。日活、月活和功能使用
+设备数按此标识跨 profile、跨客户端去重；执行次数和成功率仍按实际操作计算。无法读取
+机器标识或没有设备字段的旧事件不计入设备数。设备口径是操作系统安装实例，重装系统
+或克隆虚拟机可能改变或复制此标识，详情见 [`PRIVACY.md`](PRIVACY.md)。
 `X-OpenSquilla-Install-Id` 提供商请求头仍处于停用状态，不向模型提供商附加此安装标识。
 
 不发送的内容:用户名、主机名、路径、API key、提供商配置、聊天/会话/记忆/Agent 内容、
@@ -392,10 +396,10 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-旧遥测退出开关同时关闭 V1 和 V2。旧更新检查退出开关继续按 V1 兼容规则关闭安装／每日
+旧统计退出开关同时关闭 V1 和 V2。旧更新检查退出开关继续按 V1 兼容规则关闭安装／每日
 用量上传，但不关闭 V2。完整的数据处理规则见 [`PRIVACY.md`](PRIVACY.md)。
 
-进阶部署可以使用自己的安装遥测端点:
+进阶部署可以使用自己的安装统计端点:
 
 ```sh
 OPENSQUILLA_TELEMETRY_ENDPOINT=https://example.com/v1/install

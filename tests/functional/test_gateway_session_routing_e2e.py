@@ -271,6 +271,7 @@ async def test_real_gateway_websocket_session_routing_contract(
             "source": "session",
             "initialized": False,
             "appliesTo": "next_accepted_turn",
+            "modelSelection": None,
         }
 
         changed_global = await client.set_model_routing("router")
@@ -346,6 +347,7 @@ async def test_real_gateway_websocket_session_routing_contract(
                 "source": "session",
                 "initialized": False,
                 "appliesTo": "next_accepted_turn",
+                "modelSelection": None,
             }
             first_turn_routing = _routing(
                 await client.get_session_routing(first_turn_session)

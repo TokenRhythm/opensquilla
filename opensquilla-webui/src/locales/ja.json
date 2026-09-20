@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "{path} をワークベンチで開く",
+    "actions": "ファイル操作",
+    "copyPath": "相対パスをコピー",
+    "copyLocation": "パスと行番号をコピー",
+    "loading": "ファイルを確認中…",
+    "copied": "コピーしました",
+    "copyFailed": "コピーできませんでした。再試行してください。",
+    "stale": "ファイルが変更されています。再度読み込んで参照を更新してください。",
+    "workspaceMismatch": "このファイルは別のワークスペースに属しています。",
+    "forbidden": "このファイルへのアクセス権がありません。",
+    "missing": "ファイルまたはタスクは利用できなくなりました。",
+    "invalid": "ファイル参照が無効です。",
+    "unsupported": "このファイルはソーステキストとして表示できません。",
+    "unavailable": "ファイルを開けません。接続を確認して再試行してください。",
+    "readonly": "読み取り専用ソース",
+    "refresh": "ファイルを再確認",
+    "lines": "{total} 行中 {start}–{end} 行",
+    "previous": "前の行を表示",
+    "next": "さらに表示"
+  },
   "resourceActions": {
     "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",
     "reveal": "ファイルマネージャーで表示", "revealFinder": "Finder で表示", "revealExplorer": "エクスプローラーで表示",
@@ -140,6 +161,8 @@
     }
   },
   "common": {
+    "more": "その他",
+    "saving": "保存中…",
     "close": "閉じる",
     "save": "保存",
     "discard": "破棄",
@@ -400,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "設定を検索",
+      "results": "設定の検索結果",
+      "empty": "一致する設定がありません",
+      "defaultModel": "既定のモデル",
+      "permissions": "権限"
+    },
     "appearance": {
       "title": "インターフェース",
       "desc": "このブラウザーのテーマとローカルの表示設定です。プリセットは即時に反映され、カスタム幅は「適用」で確定します。",
@@ -734,7 +764,7 @@
       "customAnthropic": "カスタム · Anthropic 互換",
       "partialSaved": "保存済み：{saved}。未保存：{pending}。未保存の入力は保持されています。",
       "providerPartialSaved": "プロバイダーは保存されました。モデル上限は保存されていません。入力は保持されています。",
-      "backToRouting": "スマートルーティングに戻る",
+      "backToRouting": "インテリジェントモデルルーティングに戻る",
       "editSharedEnsemble": "共有アンサンブルを編集",
       "sharedEnsemble": "C3 とモデル融合はこの構成を共有します。",
       "title": "モデル設定",
@@ -847,7 +877,7 @@
       "profileStatusUnavailable": "状態を取得できません",
       "emptyTitle": "最初のモデルプロバイダーを追加",
       "configuredEmpty": "プロバイダーを接続すると、認証情報を検証して利用可能なモデルを選べます。",
-      "emptyRoutingHint": "接続後はインテリジェントルーティングを設定できます。単一プロバイダーでも複数モデル間をルーティングできます。",
+      "emptyRoutingHint": "接続後はインテリジェントモデルルーティングを設定できます。単一プロバイダーでも複数モデル間をルーティングできます。",
       "addProvider": "プロバイダーを追加",
       "catalogTitle": "プロバイダーを追加",
       "catalogDesc": "プロバイダーを選ぶと、その設定がすぐ下に開きます。",
@@ -885,10 +915,10 @@
       "openModelRouting": "モデルルーティングを開く →",
       "modelUsageTitle": "モデルの使い方",
       "modelUsageRouter": "インテリジェントモデルルーティング",
-      "modelUsageEnsemble": "複数モデル連携",
+      "modelUsageEnsemble": "モデルアンサンブル",
       "modelUsageFixed": "固定モデル",
       "modelUsageRouterDesc": "リクエストごとに適切な設定済みモデルを 1 つ選びます。",
-      "modelUsageEnsembleDesc": "複数モデルで生成し、その結果を 1 つにまとめます。",
+      "modelUsageEnsembleDesc": "候補モデルが並列で回答し、1 つの集約モデルがそれらを最終回答にまとめます。",
       "modelUsageFixedDesc": "すべてのリクエストを現在の直接利用モデルへ送信します。",
       "crossProviderActive": "プロバイダー横断ルーティングを含む",
       "configureModelRouting": "モデルルーティングを設定",
@@ -962,7 +992,7 @@
       "choose": "プロバイダーを選択",
       "chooseProviderShort": "プロバイダーを選択",
       "routerTiers": "モデルルーティング",
-      "routingDesc": "ティア、アンサンブル、単一モデルの動作はモデルルーティングで設定します。",
+      "routingDesc": "ティア、アンサンブル、固定モデルの動作はモデルルーティングで設定します。",
       "routerReady": "SquillaRouter 準備完了",
       "directOnly": "ダイレクトのみ",
       "chooseToSeeFields": "必須項目を表示するにはプロバイダーを選択してください。",
@@ -993,7 +1023,7 @@
       "configuredModelFallbackLabel": "フォールバックモデル",
       "configuredModelDescFixed": "固定モデルモード：すべてのリクエストが下記のモデルを使用します。",
       "configuredModelDescRouter": "インテリジェントモデルルーティングモード：リクエストごとに適切なモデルへ振り分け、ルーティングが利用できない場合は下記のモデルにフォールバックします。",
-      "configuredModelDescEnsemble": "複数モデル連携モード：複数のモデルで生成し、完了できない場合は下記のモデルにフォールバックします。",
+      "configuredModelDescEnsemble": "モデルアンサンブル: 候補モデルが並列で回答し、1 つの集約モデルがそれらを最終回答にまとめます。アンサンブル処理を完了できない場合は、下記のモデルにフォールバックします。",
       "defaultModelDesc": "直接リクエストと主要なフォールバックに使われます。ルーティング対象のモデルはモデルルーティングで設定します。",
       "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
       "profileModelTitle": "{provider} の直接／フォールバックモデル",
@@ -1205,7 +1235,7 @@
         }
       },
       "routerDependency": "リクエストレベルごとにモデルを選択します。1 つのプロバイダーで全レベルをまかなえます。",
-      "ensembleTitle": "複数モデルの協調",
+      "ensembleTitle": "モデルアンサンブル",
       "ensembleDependency": "{provider} の認証情報を使用します。プロバイダーの既定モデルは {model} です。",
       "ensembleMinimum": "集約ルーティングの効果を得るには、候補モデルを少なくとももう 1 つ追加してください。",
       "ensembleFailure": "融合を完了できない場合は「固定・フォールバックモデル」を使用します：{provider} · {model}。",
@@ -1302,12 +1332,12 @@
     "router": {
       "title": "モデル階層",
       "mode": "モード",
-      "modeModelRouting": "AI 単一モデルルーティング",
+      "modeModelRouting": "インテリジェントモデルルーティング",
       "modeSingleModel": "オフ",
       "modeRecommended": "現在のプロバイダー階層に従う",
       "modeDisabled": "オフ",
-      "routingDisabledHint": "AI 単一モデルルーティングをオンにするとモデル階層を編集できます。",
-      "routingEnsembleReadOnlyHint": "AI 集約ルーティングが有効です。通常のモデル階層設定は一時的に無効です。",
+      "routingDisabledHint": "インテリジェントモデルルーティングをオンにするとモデル階層を編集できます。",
+      "routingEnsembleReadOnlyHint": "モデルアンサンブルが有効です。通常のモデル階層設定は一時的に無効です。",
       "defaultTextModel": "既定のモデル階層",
       "panelLabel": "モデル階層表",
       "panelDesc": "階層表のモデルは各行のプロバイダーから送信されるため、すべてのプロバイダーが同じルーティング表の構造を使います。",
@@ -1357,9 +1387,9 @@
       "save": "ルーターを保存",
       "chooseProviderFirst": "まずプロバイダーを選択してください",
       "summaryDisabled": "オフ",
-      "summaryEnsemble": "AI 集約ルーティング",
-      "ensembleProfileTitle": "AI 集約ルーティング",
-      "ensembleProfileDesc": "モデル階層表は AI 集約ルーティングの候補モデルを提供します。",
+      "summaryEnsemble": "モデルアンサンブル",
+      "ensembleProfileTitle": "モデルアンサンブル",
+      "ensembleProfileDesc": "モデル階層表はモデルアンサンブルの候補モデルを提供します。",
       "visualMode": {
         "real_candidates": "実際のルーティング候補",
         "legacy_grid": "3 ティアのビジュアルパネル"
@@ -1374,8 +1404,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "AI 集約ルーティングはオンです。複数のモデルが回答し、1つのモデルが最終応答を統合します。",
-      "statusOff": "AI 集約ルーティングはオフです。",
+      "statusOn": "モデルアンサンブルはオンです。候補モデルが並列で回答し、1 つの集約モデルがそれらを最終回答にまとめます。",
+      "statusOff": "モデルアンサンブルはオフです。",
       "allFailedFallback": "単一モデルにフォールバック",
       "allFailedError": "停止してエラーを報告"
     },
@@ -2937,6 +2967,9 @@
       ,"workspaceOptionalHint": "任意。一般的なタスクは「プロジェクトワークスペースなし」を選び、ファイルが必要な場合はプロジェクトを選択します。"
     },
     "form": {
+      "invalidTimezone": "Asia/Tokyo などの有効なタイムゾーンを入力してください。",
+      "discardBody": "未保存の変更は失われます。キャンセルすると編集を続けられます。",
+      "discardTitle": "スケジュールの変更を破棄しますか？",
       "cronPreviewPlaceholder": "プレビューするには 5 フィールドの cron 式を入力してください",
       "cronParseError": "式を解析できませんでした — 5 フィールド（分 時 日 月 曜日）が必要です。",
       "cronCustomCadence": "カスタムの周期に一致",
@@ -3155,6 +3188,9 @@
       "add": "追加"
     },
     "skillDetail": {
+      "useUnavailable": "このスキルは新しいタスクで使用できません。状態を確認して再試行してください。",
+      "useInTaskHint": "このスキルを使う下書きを作成します。送信するまで実行されません。",
+      "useInTask": "新しいタスクで使用",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -3656,6 +3692,18 @@
       "deleted": "削除済み",
       "missing": "セッションは削除されたか存在しません"
     },
+    "sessionReference": {
+      "open": "チャットを開く",
+      "unavailable": "セッションを利用できません",
+      "status": {
+        "queued": "待機中",
+        "running": "実行中",
+        "idle": "アイドル",
+        "failed": "失敗",
+        "missing": "見つかりません",
+        "checking": "確認中…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "プロンプトキャッシュの維持",
       "title": "プロンプトキャッシュの維持",
@@ -3709,6 +3757,10 @@
     "aiGeneratedLabel": "AI により生成された内容です。参考情報としてご利用ください。",
     "removeAttachment": "添付を削除",
     "remove": "削除",
+    "projectFileTarget": "プロジェクトファイル: {path}",
+    "importedFileTarget": "読み込みコピー",
+    "projectFileLiveTarget": "現在のプロジェクトファイル: {path}",
+    "importedFileWorkingTarget": "読み込みファイル。編集には作業用コピーを使用",
     "fileLabel": "ファイル",
     "add": "追加",
     "attachFiles": "ファイルを添付",
@@ -3763,6 +3815,8 @@
     "copied": "コピーしました",
     "copy": "コピー",
     "copySessionKey": "セッション ID をコピー",
+    "copySessionAppLink": "アプリケーションリンクをコピー",
+    "copySessionGatewayLink": "Gateway ウェブリンクをコピー",
     "sessionActions": "セッション操作",
     "share": "共有",
     "shareSendFirst": "共有するには、まずメッセージを送信してください",
@@ -3903,16 +3957,16 @@
     },
     "addToShare": "共有画像に追加",
     "removeFromShare": "共有画像から削除",
-    "aiModelRouter": "AI モデルルーター",
-    "aiModelEnsembleRouter": "AI モデル集約ルーター",
+    "aiModelRouter": "インテリジェントモデルルーティング",
+    "aiModelEnsembleRouter": "モデルアンサンブル",
     "routerFx": {
       "selectedModel": "ルーターが {model} を選択しました",
       "executionModel": "現在の実行モデル：{model}",
       "executionModelCompleted": "実際に実行したモデル：{model}",
-      "ensembleModel": "マルチモデル融合",
-      "ensembleSelecting": "AI モデル集約ルーター · 候補を選択中",
-      "ensembleHandedOff": "AI モデル集約ルーター · エージェントへ引き継ぎ済み",
-      "ensembleRunning": "AI モデル集約ルーター · {count} 件の候補を統合中",
+      "ensembleModel": "モデルアンサンブル",
+      "ensembleSelecting": "モデルアンサンブル · 候補を選択中",
+      "ensembleHandedOff": "モデルアンサンブル · エージェントへ引き継ぎ済み",
+      "ensembleRunning": "モデルアンサンブル · {count} 件の候補を統合中",
       "ensembleDone": "{count} 件の候補を統合済み",
       "ensembleMode": "アンサンブル",
       "ensembleViewTrace": "trace を表示",
@@ -4288,6 +4342,8 @@
       "disableLabel": "Coding mode を無効にする"
     },
     "composer": {
+      "workStyleGroup": "作業方法",
+      "contentGroup": "コンテンツ",
       "executionMode": "実行モード",
       "ownerOnlyUnavailable": "オーナー専用モードはこのブラウザーセッションでは利用できません。",
       "enabled": "有効",
@@ -4297,16 +4353,16 @@
       "modelRouting": "モデルルーティング",
       "sessionModelRouting": "このチャットのモデルルーティング",
       "modelRoutingSessionScope": "変更はこのチャットにのみ適用されます。実行中のターンは現在のモードを維持します。",
-      "ensembleImageUnsupported": "Ensemble はまだ画像入力に対応していません。「モデルルーティング」で、画像モデルを設定した「AI搭載シングルモデルルーター」、または「オフ」と画像対応モデルを選択してください。",
+      "ensembleImageUnsupported": "モデルアンサンブルはまだ画像入力に対応していません。「モデルルーティング」で、画像対応モデルを設定した「インテリジェントモデルルーティング」、または画像対応モデルを指定した「固定モデル」を選択してください。",
       "imageInputUnsupported": "選択したモデルは画像を処理できません。画像対応モデルを選択するか、画像を削除してください。",
       "routingUpdateBlocked": "モデルルーティングを更新しています。送信する前にお待ちください。",
       "routingUpdateImageBlocked": "モデルルーティングを更新しています。画像を送信する前にお待ちください。",
-      "modelRoutingOff": "オフ",
+      "modelRoutingOff": "固定モデル",
       "modelRoutingOffDesc": "各ターンを選択中のモデルへ送信します。",
-      "modelRoutingSquillaRouter": "AI搭載シングルモデルルーター",
+      "modelRoutingSquillaRouter": "インテリジェントモデルルーティング",
       "modelRoutingSquillaRouterDesc": "AI が各ターンで適したモデルを1つ選び、コストを優先的に抑えます。",
-      "modelRoutingEnsemble": "AI搭載アンサンブルルーター",
-      "modelRoutingEnsembleDesc": "AI が複数のモデルを連携させ、複雑なタスクでの能力向上を優先します。現在、画像入力には対応していません。",
+      "modelRoutingEnsemble": "モデルアンサンブル",
+      "modelRoutingEnsembleDesc": "候補モデルが並列で回答し、1 つの集約モデルがそれらを最終回答にまとめます。現在、画像入力には対応していません。",
       "runMode": "実行モード",
       "runModeSafe": "安全モード",
       "runModeSafeDesc": "サンドボックスと設定したファイル、コマンド、ネットワーク規則を使用します。",
@@ -4586,9 +4642,35 @@
       "usageIncompleteUnknown": "不完全 · 正確な使用量合計は不明",
       "unknownProviderCalls": "{count} 件のプロバイダー呼び出しの使用量が不明"
     },
+    "newTaskModel": {
+      "showAll": "すべてのモデルを表示",
+      "title": "新しいタスクのモデル",
+      "catalog": "ゲートウェイのモデル一覧",
+      "gatewayDefault": "既定のモデル",
+      "gatewayDefaultHint": "モデル設定の既定値を使用",
+      "defaultBadge": "既定",
+      "search": "モデルやプロバイダーを検索…",
+      "loading": "モデルを読み込み中…",
+      "empty": "一致するモデルがありません",
+      "retry": "再試行",
+      "scope": "新しいタスクにのみ適用されます。全体の設定は変更しません。",
+      "partialFailure": "一部のプロバイダーを読み込めませんでした：{providers}",
+      "routingConflict": "モデルの指定には「固定モデル」モードが必要です。指定を解除するか、「固定モデル」を選択してください。",
+      "unavailable": "この接続ではモデルを選択できません。再接続するか、モデルの指定を解除してください。"
+    },
     "modelRouting": {
       "updateFailed": "モデルルーティングを切り替えられず、元に戻しました。この変更は一時的に利用できません。",
-      "sessionUpdateFailed": "このチャットのモデルルーティングを更新できませんでした: {error}"
+      "sessionUpdateFailed": "このチャットのモデルルーティングを更新できませんでした: {error}",
+      "manage": "モデルとルーティングの設定",
+      "back": "ルーティングモードに戻る",
+      "title": "モデルとルーティング",
+      "direct": "固定モデル",
+      "sessionModelFallback": "このタスクのモデルを使用",
+      "sessionModelTitle": "現在の会話のモデル",
+      "sessionModelHint": "次のターンから適用されます。会話履歴とグローバル設定は変更されません。",
+      "sessionModelBusy": "現在の応答が完了してからモデルを変更できます。",
+      "router": "インテリジェントモデルルーティング",
+      "ensemble": "モデルアンサンブル"
     },
     "routeFeedback": {
       "up": "このターンのモデル選択は適切だった",
@@ -4632,6 +4714,13 @@
       "retry": "再試行"
     },
     "sidebar": {
+      "moveDown": "下へ移動",
+      "moveUp": "上へ移動",
+      "subtasksAttention": "{count} 件要確認",
+      "subtasksRunning": "{count} 件実行中",
+      "subtaskCount": "サブタスク {count} 件",
+      "collapseSubtasks": "「{title}」のサブタスクを隠す",
+      "expandSubtasks": "「{title}」のサブタスクを表示",
       "recentConversations": "最近のタスク",
       "recents": "最近",
       "pinned": "ピン留め",

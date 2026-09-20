@@ -57,7 +57,7 @@ async function clickMoreAction(el: HTMLElement, label: string) {
 }
 
 function expectPopover(el: HTMLElement, selector: string, visible: boolean) {
-  expect(Boolean(el.querySelector(selector))).toBe(visible)
+  expect(Boolean((selector === '.composer-model-routing' ? document.body : el).querySelector(selector))).toBe(visible)
 }
 
 beforeEach(() => {
@@ -66,6 +66,74 @@ beforeEach(() => {
 })
 
 describe('ChatComposer popovers', () => {
+  it.each([
+    { mode: 'off', pin: null, defaultModel: { model: 'base', provider: 'provider-a' }, label: 'Base model', badge: true },
+    { mode: 'off', pin: { model: 'base', provider: 'provider-a' }, defaultModel: { model: 'base', provider: 'provider-a' }, label: 'Base model', badge: false },
+    { mode: 'squilla_router', pin: null, defaultModel: { model: 'base', provider: 'provider-a' }, label: 'Intelligent model routing', badge: false },
+    { mode: 'llm_ensemble', pin: null, defaultModel: { model: 'base', provider: 'provider-a' }, label: 'Model ensemble', badge: false },
+    { mode: 'off', pin: null, defaultModel: null, label: 'Fixed model', badge: true },
+  ])('shows the active selection without confusing defaults and pins: $mode / $label / $badge', async ({ mode, pin, defaultModel, label, badge }) => {
+    const { app, el } = await mountComposer({
+      modelSelectionAvailable: true,
+      availableModels: [{ id: 'base', provider: 'provider-a', name: 'Base model' }],
+      modelSelection: pin,
+      defaultModel: defaultModel,
+      sessionRoutingMode: mode,
+    })
+    expect(el.querySelector('.chat-model-routing-btn__label')?.textContent).toBe(label)
+    expect(Boolean(el.querySelector('.chat-model-routing-btn__default'))).toBe(badge)
+    app.unmount()
+  })
+  it.each([
+    ['safe', 'Safe'],
+    ['full', 'Full Access'],
+  ])('shows the current %s execution permission before opening its menu', async (runMode, label) => {
+    const { app, el } = await mountComposer({ runMode })
+    const trigger = el.querySelector<HTMLButtonElement>('.chat-run-mode-btn')!
+    expect(trigger.textContent?.trim()).toBe(label)
+    expect(trigger.getAttribute('aria-label')).toBe(`Execution mode: ${label}`)
+    expect(trigger.getAttribute('aria-haspopup')).toBe('dialog')
+    trigger.click()
+    await nextTick()
+    expect(el.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain(label)
+    app.unmount()
+  })
+
+  it('shows a persisted session model without a default badge or new-task selector', async () => {
+    const { app, el } = await mountComposer({ modelSelectionAvailable: false, sessionModelName: 'bound-model' })
+    expect(el.querySelector('.chat-model-routing-btn__label')?.textContent).toBe('bound-model')
+    expect(el.querySelector('.chat-model-routing-btn__default')).toBeNull()
+    await clickButton(el, 'Models & routing')
+    expect(document.body.querySelector('.routing-mode__model-name')?.textContent).toBe('bound-model')
+    expect(document.body.querySelector('[aria-haspopup="listbox"]')).toBeNull()
+    app.unmount()
+  })
+  it('forwards a model change for an existing conversation through the unified menu', async () => {
+    const selected = vi.fn(), refresh = vi.fn()
+    const { app, el } = await mountComposer({
+      isNewTask: false,
+      modelSelectionAvailable: true,
+      modelSelection: { model: 'base', provider: 'provider-a' },
+      availableModels: [
+        { id: 'base', provider: 'provider-a', name: 'Base model' },
+        { id: 'next', provider: 'provider-b', name: 'Next model' },
+      ],
+      onSelectModel: selected,
+      onRefreshModels: refresh,
+    })
+    await clickButton(el, 'Models & routing')
+    expect(refresh).toHaveBeenCalledOnce()
+    document.body.querySelector<HTMLButtonElement>('[data-mode="off"]')!.click()
+    await nextTick()
+    expect(document.body.querySelector('.new-task-model-menu strong')?.textContent).toBe('Conversation model')
+    const nextModel = Array.from(document.body.querySelectorAll<HTMLButtonElement>('[role="option"]'))
+      .find(row => row.textContent?.includes('Next model'))!
+    nextModel.click()
+    expect(selected).toHaveBeenCalledWith({ model: 'next', provider: 'provider-b' })
+    await nextTick()
+    expect(document.body.querySelector('.composer-model-routing')).toBeNull()
+    app.unmount()
+  })
   it('keeps the focused routing option mounted while a mutation is busy', async () => {
     const setMode = vi.fn()
     const props = reactive({
@@ -80,7 +148,7 @@ describe('ChatComposer popovers', () => {
     app.mount(el)
     await nextTick()
 
-    const selected = el.querySelector<HTMLButtonElement>('[role="radio"][aria-checked="true"]')
+    const selected = document.body.querySelector<HTMLButtonElement>('[role="menuitemradio"][aria-checked="true"]')
     expect(selected).toBeTruthy()
     selected?.focus()
     props.busy = true
@@ -216,8 +284,8 @@ describe('ChatComposer popovers', () => {
   })
 
   it.each([
-    ["This chat's model routing", '.composer-model-routing'],
-    ['Execution mode', '.composer-run-mode'],
+    ["Models & routing", '.composer-model-routing'],
+    ['Execution mode: Safe', '.composer-run-mode'],
   ])('closes %s on outside pointerdown', async (label, selector) => {
     const { app, el } = await mountComposer()
 
@@ -248,10 +316,10 @@ describe('ChatComposer popovers', () => {
 
     await clickButton(el, 'More')
     expectPopover(el, '.chat-more-actions-menu', true)
-    await clickButton(el, "This chat's model routing")
+    await clickButton(el, "Models & routing")
     expectPopover(el, '.chat-more-actions-menu', false)
     expectPopover(el, '.composer-model-routing', true)
-    await clickButton(el, 'Execution mode')
+    await clickButton(el, 'Execution mode: Safe')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
 
@@ -265,8 +333,8 @@ describe('ChatComposer popovers', () => {
       onSetSessionRoutingMode: setMode,
     })
 
-    await clickButton(el, "This chat's model routing")
-    const option = el.querySelector<HTMLButtonElement>('[role="radio"]')
+    await clickButton(el, "Models & routing")
+    const option = document.body.querySelector<HTMLButtonElement>('[role="menuitemradio"]')
     expect(option?.getAttribute('aria-disabled')).toBe('true')
     option?.click()
     await nextTick()
@@ -311,8 +379,8 @@ describe('ChatComposer popovers', () => {
     const popovers = [
       ['Add', '.composer-add-menu'],
       ['More', '.chat-more-actions-menu'],
-      ["This chat's model routing", '.composer-model-routing'],
-      ['Execution mode', '.composer-run-mode'],
+      ["Models & routing", '.composer-model-routing'],
+      ['Execution mode: Safe', '.composer-run-mode'],
     ] as const
     for (const [label, selector] of popovers) {
       props.collapsed = false
@@ -340,7 +408,7 @@ describe('ChatComposer popovers', () => {
       runModeLockMessage: lockMessage,
     })
     const button = el.querySelector<HTMLButtonElement>(
-      'button[aria-label="Execution mode"]',
+      'button[aria-label="Execution mode: Safe"]',
     )
     const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')
 

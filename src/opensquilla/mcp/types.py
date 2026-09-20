@@ -13,7 +13,7 @@ class MCPServerConfig:
     command: str | None = None  # for stdio
     args: list[str] = field(default_factory=list)  # for stdio
     url: str | None = None  # for sse
-    message_endpoint: str | None = None  # for sse, default "/message"
+    message_endpoint: str | None = None  # legacy SSE override; non-None is rejected
     env: dict[str, str] = field(default_factory=dict)
     tool_timeout_seconds: float = 30.0
     description: str = ""

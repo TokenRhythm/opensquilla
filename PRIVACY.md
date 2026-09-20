@@ -46,12 +46,12 @@ corresponding feature is enabled by configuration or user action.
 OpenSquilla uses one **Network reporting** control for V1 installation and daily
 usage statistics, V2 Reliability diagnostics, and V2 Product and growth analytics,
 following the existing opt-out policy.
-Reporting is enabled by default; there are no separate telemetry choices or
+Reporting is enabled by default; there are no separate statistics choices or
 consent popups during onboarding. A notice-version update does not require a
 new choice or create a consent timestamp. An explicit decline saved under either
 of the former per-scope controls is migrated to the unified control being off.
 
-The control below disables all telemetry streams, passive update checks, and
+The control below disables all statistics uploads, passive update checks, and
 automatic desktop update checks:
 
 ```sh
@@ -73,9 +73,9 @@ OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
 `OPENSQUILLA_TELEMETRY_DISABLED=true` remains a hard veto for V1 and V2
-telemetry. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and,
+statistics. `OPENSQUILLA_UPDATE_CHECK_DISABLED=true` disables update checks and,
 for compatibility with V1, installation and daily usage uploads; it does not
-disable V2 telemetry.
+disable V2 statistics.
 
 Manual user-initiated actions may still contact network services after user
 intent, including release downloads and configured providers, search, channels,
@@ -83,7 +83,7 @@ automation, or integrations. Update-availability checks, including
 `opensquilla version --check` and the desktop manual check, do not bypass the
 unified or legacy opt-out controls.
 
-## Optional Telemetry
+## Optional Usage Statistics
 
 ### Reliability diagnostics
 
@@ -91,7 +91,8 @@ While unified reporting is enabled, OpenSquilla may record the
 result, bounded duration, enumerated error code, and other closed attributes
 for app startup, Gateway startup, detected crashes, AI turns, tool calls, file
 parsing, updates, and session performance. Reliability uses a random
-`app_session_id`; it does not use an account identifier. Crash events contain
+`app_session_id` for operation/session metrics and the device token described
+below for device counts; it does not use an account identifier. Crash events contain
 only a one-way error fingerprint, component, version, and bounded runtime facts.
 Complete exception messages and stacks remain local.
 
@@ -101,17 +102,38 @@ While unified reporting is enabled, OpenSquilla may record client launches,
 actual MetaSkill and Coding Mode executions, and
 one-time funnel milestones for acquisition, onboarding completion, first app
 readiness, registration, first turn start, and first successful response.
-Product activity is recorded at most once per analytics identity, surface, and
-UTC day to calculate daily active users and rolling 30-day monthly active users
-across Desktop, Web, TUI, and CLI. All surfaces within the same local profile
-reuse its random analytics identity. It includes only the surface and common telemetry fields, not activity
-content; merely running a background Gateway does not count as product activity.
+Product activity is recorded at most once per device, local profile, surface, and
+UTC day. The server calculates daily active devices and rolling 30-day monthly
+active devices by deduplicating the device token across Desktop, Web, TUI, CLI,
+and all profiles on the same OS device. It includes only the surface and common
+event fields, not activity content; merely running a background Gateway does not
+count as product activity.
 Client first-use milestones require fresh-install eligibility; enabling
 reporting on an existing installation does not backfill those milestones.
 Growth uses random, purpose-specific `acquisition_id` and
 `analytics_user_id` values. The analytics user ID is not a raw account ID or a
-hash of one and is not shared with Reliability. Repeatable usage counts do not
+hash of one and is not shared with Reliability. It is retained for legacy
+cohort/queue compatibility, not used as a substitute for a device count.
+Repeatable usage counts do not
 require the installation to qualify as a newly activated user.
+
+Application events in both scopes may include `device_id`: a one-way SHA-256
+digest with an OpenSquilla-specific domain, OS type, and OS machine identifier
+(macOS IOPlatformUUID, Windows MachineGuid, or Linux machine-id). The raw OS
+identifier never leaves the device. No account, MAC address, IP address, or
+profile path is used to derive this token. It is resolved only when reporting
+is allowed and is stable across profiles and application upgrades. Reinstalling
+an OS or cloning a VM can change or duplicate the OS identity; a device here
+means an OS installation, not a guaranteed physical person or chassis.
+If the OS identifier cannot be read, the field is omitted and the event is
+excluded from device counts; random/profile IDs are never substituted.
+Legacy events without a device token are not included in device counts.
+Feature run counts and reliability success rates still count actual operations.
+Gateway-observed activity and runtime features identify the execution host;
+remote Web/TUI connections to one Gateway count as that one device, not as
+separate browser machines. Native Desktop events identify the Desktop host.
+Website acquisition journeys retain their own journey counts because a website
+cannot access the application's OS device identifier.
 
 Website, CDN, and account-service milestones must be emitted by those services
 at their authoritative transaction boundary. They use independent server-side
@@ -128,12 +150,13 @@ to separate bounded local SQLite queues and upload batches to separate routes:
 local collection and again immediately before network upload. Offline retries
 reuse `event_id` for deduplication. Growth events are not sampled.
 
-V2 telemetry payloads never include prompts, responses, provider configuration,
+V2 statistics payloads never include prompts, responses, provider configuration,
 agent configuration, tool arguments, task parameters, file names, file paths,
 file contents, raw exception messages, complete stacks, usernames, hostnames,
-API keys, raw account IDs, order data, IP addresses, MAC addresses, or device
-fingerprints. Source IP addresses may be visible to network servers at the
-transport layer, but are not telemetry fields and are never used to join
+API keys, raw account IDs, order data, IP addresses, MAC addresses, or raw OS
+machine identifiers. The only device token is the purpose-specific digest
+described above. Source IP addresses may be visible to network servers at the
+transport layer, but are not event fields and are never used to join
 website and client identities.
 
 CI, test, and `DO_NOT_TRACK` environments fail closed for both streams. Disabling
@@ -172,7 +195,7 @@ from V2 identities and is not attached to provider requests; the
 `X-OpenSquilla-Install-Id` provider header remains retired. V1 payloads contain
 no prompts, responses, file contents, tool arguments, credentials, or account IDs.
 
-The unified opt-out, either previously saved scope decline, the legacy telemetry
+The unified opt-out, either previously saved scope decline, the legacy statistics
 opt-out, the product-analytics environment veto, and CI/test/`DO_NOT_TRACK`
 suppression apply before V1 collection and again before upload. Pausing V1 keeps
 existing installation state and pending daily counters. Endpoint overrides remain

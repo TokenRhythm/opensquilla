@@ -43,6 +43,7 @@ function requestSessionKey(
 }
 
 function basePayload(method: string, sessionKey = SESSION_KEY): unknown {
+  if (method === 'sessions.messages.unsubscribe') return null
   const payloads: Record<string, unknown> = {
     'agents.list': { agents: [] },
     'commands.list_for_surface': { commands: [] },
@@ -454,8 +455,9 @@ test('recovers initial history failure automatically without stealing draft focu
   await expect(loadState).toContainText(
     'Conversation history is temporarily unavailable.',
   )
-  await expect(loadState).toHaveAttribute('role', 'status')
-  await expect(loadState.getByRole('button')).toHaveCount(0)
+  await expect(loadState).toHaveAttribute('role', 'alert')
+  await expect(loadState.getByTestId('chat-session-recovery-retry')).toBeEnabled()
+  await expect(loadState.getByTestId('chat-session-recovery-dismiss')).toBeVisible()
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeEditable()
   await expect(page.locator('.chat-empty')).toHaveCount(0)
@@ -737,7 +739,9 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
 
   const recoveryNotice = page.getByTestId('chat-session-recovery-status')
   await expect(recoveryNotice).toBeVisible()
-  await expect(recoveryNotice).toHaveAttribute('role', 'status')
+  await expect(recoveryNotice).toHaveAttribute('role', 'alert')
+  await expect(recoveryNotice.getByTestId('chat-session-recovery-retry')).toBeEnabled()
+  await expect(recoveryNotice.getByTestId('chat-session-recovery-dismiss')).toBeVisible()
   await expect(thread).toHaveAttribute('aria-busy', 'false')
   await expect(composer).toBeEditable()
   await expect(composer).toHaveValue('Keep this draft through timeout and reconnect.')
@@ -1088,11 +1092,11 @@ test.describe('Automation conversation continuation', () => {
           'sessions.messages.subscribe': sessionMessagesSubscribePayload(sessionKey),
           'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
           'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
-          'sessions.messages.unsubscribe': { subscribed: false },
+          'sessions.messages.unsubscribe': null,
           'sessions.subscribe': { subscribed: true },
           'usage.status': { sessions: [] },
         }
-        respond(frame.id, payloads[method] ?? {})
+        respond(frame.id, Object.hasOwn(payloads, method) ? payloads[method] : {})
       })
     })
     return requests

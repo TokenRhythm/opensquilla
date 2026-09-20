@@ -69,6 +69,69 @@ opensquilla configure provider --provider openrouter --api-key-env OPENROUTER_AP
 Avoid committing raw API keys to TOML files, shell history, examples, or issue
 reports.
 
+## External MCP Servers
+
+The current source includes an MCP client for external tools. See the
+[MCP installation requirements](mcp-server.md#requirements) for SDK 2.x source
+and release installation options. Enable it and configure each server in
+`config.toml`. Supported transports are `stdio` and the legacy HTTP/SSE transport
+named `sse`.
+MCP is disabled by default. With no enabled, configured servers, the gateway
+does not import the SDK or start MCP connection tasks. No installation extra is
+required; `opensquilla[mcp]` remains a compatible installation spelling.
+
+For a local server, replace the example script path with your server's entry
+point. The configured command must be available to the gateway process:
+
+```toml
+[mcp]
+enabled = true
+connect_timeout_seconds = 5.0
+
+[[mcp.servers]]
+name = "local-tools"
+transport = "stdio"
+command = "python"
+args = ["/path/to/your/mcp_server.py"]
+tool_timeout_seconds = 30.0
+```
+
+The child process inherits the gateway's environment. An optional `env` table
+overrides individual values; its values are literal strings. Supply credentials
+through the gateway's environment rather than committing them to TOML.
+
+For an existing HTTP/SSE server, add another entry:
+
+```toml
+[[mcp.servers]]
+name = "remote-tools"
+transport = "sse"
+url = "http://127.0.0.1:8000/sse"
+tool_timeout_seconds = 30.0
+```
+
+Use the server's SSE URL. Its endpoint event supplies the URL for outgoing MCP
+messages. Restart the gateway after changing these settings. To expose
+OpenSquilla itself to another MCP client, see [MCP Server Bridge](mcp-server.md).
+
+The client uses official MCP SDK 2.x protocol negotiation, including older
+servers. Local stdio messages retain a 16 MiB limit before JSON parsing,
+excluding the final LF byte; exceeding it closes the connection. SSE servers
+must publish their message endpoint: OpenSquilla no longer guesses `/message`
+or accepts a `message_endpoint` override. The SDK requires matching URL scheme
+and authority for endpoint events, including explicit ports (`host` and
+`host:443` differ). Redirects must stay on the same origin or upgrade HTTP to
+HTTPS on the same host with default ports; message POST redirects must also
+preserve the method (307/308).
+
+Tool discovery reads every page at gateway startup within the configured
+connection timeout. Tool errors and invalid output schemas remain failures.
+Text blocks are joined in order; structured-only results become JSON text, and
+unsupported non-text-only results report an error. Tools requiring interactive
+input fail without automatically retrying the operation. Streamable HTTP,
+OAuth, automatic reconnection, live tool-list updates, and consuming external
+resources/prompts are not supported by this client.
+
 ## First-Run Wizard
 
 ```sh
@@ -260,11 +323,12 @@ See [`channels.md`](channels.md) for details.
 
 ## Attachments
 
-Attachment ingestion accepts **any file type**. Rendered families (images,
-PDF, text, Office documents, email) are extracted or inlined for the model;
-everything else is an *opaque* attachment: the bytes are staged into the agent
-workspace for tool access and are never parsed, decompressed, or inlined into
-a provider prompt.
+Attachment ingestion accepts **any file type**. Images use the selected model's
+image capability. Other files are preserved in the session's attachment workspace;
+the model receives their names, types, sizes and tool-access paths. Text, PDF,
+Office and email content is read through bounded file tools rather than inserted
+in full into every prompt. Archives, binaries and unknown formats remain opaque
+until an appropriate tool inspects or converts them.
 
 ```toml
 [attachments]
@@ -274,7 +338,7 @@ a provider prompt.
 accept_opaque = true
 # Per-file ceiling for opaque attachments (bytes).
 opaque_max_bytes = 31457280            # 30 MiB
-# Aggregate RAM ceiling for the in-memory staged-upload store. When reached,
+# Aggregate byte ceiling for the disk-backed staged-upload store. When reached,
 # new uploads get HTTP 507 UPLOAD_STORE_FULL (retryable; staged entries
 # expire within the 10-minute TTL); a payload larger than the cap itself is a
 # permanent 413. Non-positive or invalid values fall back to the default —
@@ -297,21 +361,42 @@ Env overrides use the `OPENSQUILLA_ATTACHMENTS_` prefix
 (`OPENSQUILLA_ATTACHMENTS_ACCEPT_OPAQUE`, `OPENSQUILLA_ATTACHMENTS_OPAQUE_MAX_BYTES`, …).
 
 Size policy at a glance: inline attachments up to 2 MB ride the RPC message;
-larger files stage through `POST /api/v1/files/upload` (10-minute TTL) up to
-30 MiB per file for text (whole-payload UTF-8 proven), PDF, Office, and opaque
-types. Email is always capped at the 2 MB text limit and never stages. Per
-turn: at most 10 attachments and 60 MiB total.
+larger files stage through `POST /api/v1/files/upload`. Staged text (validated as
+whole-payload UTF-8), PDF, Office and opaque files allow up to 30 MiB each; images
+allow 5 MiB and email retains its 2 MB limit. Each turn accepts at most 10 uploaded
+attachments and 60 MiB total. Staged uploads are stored on disk with their hashes
+and survive a Gateway restart within their original 10-minute lifetime.
 
 Behavior notes:
 
-- With `accept_opaque = true` (the default), the upload endpoint no longer
-  returns HTTP 415 `UNSUPPORTED_MEDIA_TYPE` for unrendered types, and
-  `sessions.send` no longer rejects them; strict deployments that disable the
-  flag keep the legacy errors and codes unchanged.
-- Opaque files reach the model only as an escaped metadata envelope plus a
-  workspace path marker; the agent inspects or converts them with filesystem,
-  shell, or code tools under the active safety tier and approval policy. On
-  platforms without a sandbox backend those tool actions rely on approvals.
+- With `accept_opaque = true` (the default), unknown file types can be uploaded
+  and sent. Disabling it rejects those types at admission.
+- File reads, conversions and edits use the active workspace and sandbox policy.
+  Document readers expose bounded pages, slides, paragraphs or sheet ranges;
+  large files may require several reads. Scanned PDF pages require rendering and
+  image-capable processing; a text extraction does not imply OCR was performed.
+- Uploaded originals are immutable. The first supported edit creates a separate
+  session-owned working file, which subsequent reads and edits reuse after
+  compaction or restart. A fork copies the current edited bytes when policy allows
+  both the source read and destination write. Missing, changed or denied working
+  files remain explicitly unavailable; the original is not silently substituted.
+- Desktop project-file references point to the current project file rather than
+  an uploaded snapshot. Every use, including queued execution, checks the current
+  workspace binding and file permissions. Selecting a file grants no extra access.
+- When known context capacity is exhausted by older history, attachment admission
+  can compact that history once and retry with a fresh budget, including images.
+  Unknown capacity, a failed compaction, or new material that cannot fit still
+  produces an explicit admission failure.
+
+The WebUI and Desktop composer can recover unsent attachments from local browser
+storage when IndexedDB is available. Drafts are scoped to the authenticated
+Gateway/account or verified Desktop profile and conversation. They expire 24 hours
+after their latest save and allow at most 10 items and 60 MiB per draft, with a
+120 MiB aggregate limit across at most 20 drafts. Storage or quota failures are
+reported in the composer. An expired staged upload can be re-uploaded only when
+the draft retained its file bytes; otherwise the user must select it again.
+Native file-selection capabilities are never saved in drafts. Removing a draft
+only removes the unsent selection, not accepted or queued attachment material.
 
 ## Memory Configuration
 

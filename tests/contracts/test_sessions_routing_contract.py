@@ -76,3 +76,19 @@ def test_schema_metadata_is_language_neutral() -> None:
         document = json.loads((CONTRACTS / name).read_text(encoding="utf-8"))
         metadata = document["x-opensquilla-method"]
         assert (metadata["name"], metadata["kind"], metadata["scope"]) == (method, kind, scope)
+
+
+def test_model_selection_pair_and_default_have_distinct_wire_shapes() -> None:
+    for selection in ({"model": "chosen", "provider": "deepseek"}, None):
+        frame = SetRequest.model_validate({
+            "type": "req", "id": "model-change", "method": "sessions.routing.set",
+            "params": {"sessionKey": "agent:main:webchat:a", "mode": "direct",
+                       "expectedRevision": 4, "modelSelection": selection},
+        })
+        serialized = frame.model_dump(mode="json", exclude_unset=True)
+        assert serialized["params"]["modelSelection"] == selection
+    result = GetResult.model_validate({
+        "mode": "direct", "revision": 5, "source": "session", "initialized": False,
+        "appliesTo": "next_accepted_turn", "modelSelection": {"model": "legacy", "provider": None},
+    })
+    assert result.model_dump(mode="json")["modelSelection"] == {"model": "legacy", "provider": None}

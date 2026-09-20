@@ -10,6 +10,7 @@ from uuid import UUID
 
 from opensquilla import __version__
 from opensquilla.telemetry.build_identity import reliability_app_version
+from opensquilla.telemetry.consent import TelemetryScope
 from opensquilla.telemetry.contracts import CURRENT_NOTICE_VERSION_BY_SCOPE
 from opensquilla.telemetry.contracts.common import (
     ConsentScope,
@@ -148,6 +149,7 @@ class ReliabilityEventSink:
             notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
             sample_rate=1.0,
             app_session_id=self._app_session_id,
+            device_id=self._runtime.device_id_for(TelemetryScope.RELIABILITY),
             failure_stage=failure_stage,
             startup_mode=GatewayStartupMode.SPAWNED,
         )
@@ -173,6 +175,7 @@ class ReliabilityEventSink:
                 notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
                 sample_rate=1.0,
                 app_session_id=self._app_session_id,
+                device_id=self._runtime.device_id_for(TelemetryScope.RELIABILITY),
                 ttft_ms=facts.ttft_ms,
                 stall_count=facts.stall_count,
                 stall_threshold_ms=15_000,
@@ -207,6 +210,7 @@ class ReliabilityEventSink:
                     notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
                     sample_rate=1.0,
                     app_session_id=self._app_session_id,
+                    device_id=self._runtime.device_id_for(TelemetryScope.RELIABILITY),
                     tool_category=facts.tool_category,
                     retry_count=facts.retry_count,
                 )
@@ -226,6 +230,7 @@ class ReliabilityEventSink:
                     notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
                     sample_rate=1.0,
                     app_session_id=self._app_session_id,
+                    device_id=self._runtime.device_id_for(TelemetryScope.RELIABILITY),
                     tool_category=facts.tool_category,
                     retry_count=facts.retry_count,
                     surface=dimensions.surface,
@@ -259,6 +264,7 @@ class ReliabilityEventSink:
                     notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
                     sample_rate=1.0,
                     app_session_id=self._app_session_id,
+                    device_id=self._runtime.device_id_for(TelemetryScope.RELIABILITY),
                     file_type=facts.file_type,
                     size_bucket=facts.size_bucket,
                 )
@@ -278,6 +284,7 @@ class ReliabilityEventSink:
                     notice_version=CURRENT_NOTICE_VERSION_BY_SCOPE["reliability"],
                     sample_rate=1.0,
                     app_session_id=self._app_session_id,
+                    device_id=self._runtime.device_id_for(TelemetryScope.RELIABILITY),
                     file_type=facts.file_type,
                     size_bucket=facts.size_bucket,
                     surface=dimensions.surface,

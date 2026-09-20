@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { createApp, h, type App } from 'vue'
 import SidebarSessionHoverCard, {
+  canShowSessionPreview,
   fitSessionPreviewPosition,
   sessionPreviewPosition,
 } from './SidebarSessionHoverCard.vue'
@@ -34,6 +35,12 @@ afterEach(() => {
 })
 
 describe('SidebarSessionHoverCard', () => {
+  it('disables the fixed preview when the viewport is narrow', () => {
+    expect(canShowSessionPreview(769)).toBe(true)
+    expect(canShowSessionPreview(768)).toBe(false)
+    expect(canShowSessionPreview(548)).toBe(false)
+  })
+
   it('shows the full title, relative time, and resolved project name', () => {
     const host = mountCard({
       title: 'Investigate interrupted task',

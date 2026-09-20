@@ -51,13 +51,16 @@ import {
 import { useI18n } from 'vue-i18n'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
+import SidebarSessionDragPreview from './SidebarSessionDragPreview.vue'
 import SidebarSessionHoverCard, {
+  canShowSessionPreview,
   sessionPreviewPosition,
 } from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { usePlatform } from '@/platform'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
+import { buildSidebarTaskHierarchy } from '@/utils/sidebarTaskHierarchy'
 import {
   buildSidebarDisplayProjection,
   isSidebarSessionOrderable,
@@ -127,6 +130,7 @@ function maybeLoadMore() {
 }
 
 function onHistoryScroll() {
+  updateRowDropTarget()
   maybeLoadMore()
 }
 
@@ -274,6 +278,62 @@ const displayProjection = computed(() =>
   buildSidebarDisplayProjection(filteredSections.value, props.sessionOrder),
 )
 
+const taskHierarchy = computed(() => buildSidebarTaskHierarchy(displayProjection.value.allRows))
+
+function taskCollapseKey(key: string): string {
+  return `task:${key}`
+}
+
+function isTaskCollapsed(key: string): boolean {
+  const saved = collapsed.value[taskCollapseKey(key)]
+  return typeof saved === 'boolean'
+    ? saved
+    : taskHierarchy.value.summaries.get(key)?.allFinished === true
+}
+
+function toggleTask(row: SidebarDisplayRow) {
+  closeSessionPreview()
+  const next = { ...collapsed.value, [taskCollapseKey(row.key)]: !isTaskCollapsed(row.key) }
+  collapsed.value = next
+  writeSidebarCollapsedState(next)
+}
+
+function filterCollapsedTaskRows<T extends SidebarDisplayRow>(rows: T[]): T[] {
+  return rows.filter(row => row.pinned || !(taskHierarchy.value.ancestors.get(row.key) ?? [])
+    .some(isTaskCollapsed))
+}
+
+function subtaskSummaryLabel(key: string): string {
+  const summary = taskHierarchy.value.summaries.get(key)
+  if (!summary) return ''
+  const labels = [t('shared.sidebar.subtaskCount', { count: summary.count })]
+  if (summary.running) labels.push(t('shared.sidebar.subtasksRunning', { count: summary.running }))
+  if (summary.attention) labels.push(t('shared.sidebar.subtasksAttention', { count: summary.attention }))
+  return labels.join(' · ')
+}
+
+// Route navigation and newly loaded lineage reveal the selected task. Explicit
+// manual collapse remains possible until the user navigates to another task.
+watch(
+  () => {
+    const row = findSessionRow(props.currentKey)
+    return [props.currentKey, row?.workspaceId, row?.displayFamily,
+      ...(taskHierarchy.value.ancestors.get(props.currentKey) ?? [])].join('\u0000')
+  },
+  () => {
+    const row = findSessionRow(props.currentKey)
+    if (!row) return
+    const next = { ...collapsed.value, [row.displayFamily]: false }
+    for (const ancestor of taskHierarchy.value.ancestors.get(row.key) ?? []) {
+      next[taskCollapseKey(ancestor)] = false
+    }
+    if (row.workspaceId) next[projectCollapseKey(row.workspaceId)] = false
+    collapsed.value = next
+    writeSidebarCollapsedState(next)
+  },
+  { immediate: true },
+)
+
 interface SidebarDisplayBlock {
   key: string
   zone: SidebarDisplayZone
@@ -305,7 +365,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
       zone: 'projects',
       label: t('workspaces.projects'),
       count: projection.projectCount,
-      rows: filterCollapsedProjectRows(projection.projects),
+      rows: filterCollapsedTaskRows(filterCollapsedProjectRows(projection.projects)),
       showHeading: true,
     })
   }
@@ -325,7 +385,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
         zone: 'recents',
         label: t('shared.sidebar.recents'),
         count: projection.recentCount,
-        rows: section.rows,
+        rows: filterCollapsedTaskRows(section.rows),
         showHeading: index === 0,
         family: section.family,
         familyLabel: section.label,
@@ -358,17 +418,27 @@ const hasFilterMatches = computed(() =>
 /* ── Session drag ordering ────────────────────────────────────────── */
 
 const draggedRowKey = ref('')
-const draggedRowScope = ref('')
 const dropTargetKey = ref('')
 const dropPosition = ref<'before' | 'after'>('before')
 const pointerDrag = ref<{
   key: string
+  title: string
   scope: string
+  pointerId: number
+  source: HTMLElement
   startX: number
   startY: number
+  clientX: number
+  clientY: number
+  width: number
+  height: number
   active: boolean
 } | null>(null)
 const suppressSelectKey = ref('')
+const settlingRowKey = ref('')
+let dragScrollFrame = 0
+let dragScrollTime = 0
+let settlingRowTimer: ReturnType<typeof setTimeout> | undefined
 
 function reorderScope(row: SidebarDisplayRow): string {
   if (row.pinned) return 'pinned'
@@ -383,11 +453,45 @@ function canDragRow(row: SidebarDisplayRow): boolean {
     && renamingKey.value !== row.key
 }
 
+function keyboardReorderTarget(row: SidebarDisplayRow, direction: 'up' | 'down'): SidebarDisplayRow | undefined {
+  if (!canDragRow(row)) return undefined
+  const siblings = displayBlocks.value.flatMap(block => block.rows)
+    .filter(item => canDragRow(item) && reorderScope(item) === reorderScope(row))
+  const index = siblings.findIndex(item => item.key === row.key)
+  return index < 0 ? undefined : siblings[index + (direction === 'up' ? -1 : 1)]
+}
+
+function reorderFromMenu(row: SidebarDisplayRow, direction: 'up' | 'down') {
+  const target = keyboardReorderTarget(row, direction)
+  if (!target) return
+  const trigger = menuTriggerEl.value
+  closeMenu()
+  settleRow(row.key)
+  emit('reorder', { draggedKey: row.key, targetKey: target.key, position: direction === 'up' ? 'before' : 'after' })
+  nextTick(() => trigger?.focus())
+}
+
 function clearRowDrag() {
+  const drag = pointerDrag.value
+  if (drag?.active) suppressSelectKey.value = drag.key
+  if (dragScrollFrame) cancelAnimationFrame(dragScrollFrame)
+  dragScrollFrame = 0
+  dragScrollTime = 0
   draggedRowKey.value = ''
-  draggedRowScope.value = ''
   dropTargetKey.value = ''
   pointerDrag.value = null
+  if (drag?.source.hasPointerCapture?.(drag.pointerId)) {
+    drag.source.releasePointerCapture(drag.pointerId)
+  }
+}
+
+function settleRow(key: string) {
+  settlingRowKey.value = key
+  if (settlingRowTimer) clearTimeout(settlingRowTimer)
+  settlingRowTimer = setTimeout(() => {
+    if (settlingRowKey.value === key) settlingRowKey.value = ''
+    settlingRowTimer = undefined
+  }, 360)
 }
 
 function findSessionRow(key: string): SidebarDisplayRow | undefined {
@@ -395,47 +499,104 @@ function findSessionRow(key: string): SidebarDisplayRow | undefined {
 }
 
 function onRowPointerDown(row: SidebarDisplayRow, event: PointerEvent) {
-  if (event.button !== 0 || !canDragRow(row)) return
+  if (pointerDrag.value) return
+  // A new gesture (including a touch tap) cannot be the click left by a drag.
+  suppressSelectKey.value = ''
+  // Touch belongs to the scroll container; a swipe must never reorder a task.
+  if (event.button !== 0 || event.pointerType === 'touch' || !canDragRow(row)) return
   const target = event.target
-  if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge')) return
+  if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge, .sidebar-task-disclosure')) return
+  const source = event.currentTarget
+  if (!(source instanceof HTMLElement)) return
+  const rect = source.getBoundingClientRect()
   pointerDrag.value = {
     key: row.key,
+    title: row.title,
     scope: reorderScope(row),
+    pointerId: event.pointerId,
+    source,
     startX: event.clientX,
     startY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    width: rect.width,
+    height: rect.height,
     active: false,
   }
 }
 
-useDocumentEvent('pointermove', (event) => {
+function updateRowDropTarget() {
   const drag = pointerDrag.value
-  if (!drag) return
-  if (!drag.active) {
-    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return
-    drag.active = true
-    draggedRowKey.value = drag.key
-    draggedRowScope.value = drag.scope
-  }
-  event.preventDefault()
-  const target = document.elementFromPoint(event.clientX, event.clientY)
+  if (!drag?.active) return
+  const sourceRow = findSessionRow(drag.key)
+  const target = document.elementFromPoint(drag.clientX, drag.clientY)
     ?.closest<HTMLElement>('.sidebar-history-row[data-session-key]')
   const targetKey = target?.dataset.sessionKey || ''
   const row = findSessionRow(targetKey)
-  if (!target || !row || row.key === drag.key || !canDragRow(row) || reorderScope(row) !== drag.scope) {
+  if (
+    !sourceRow || !canDragRow(sourceRow) || reorderScope(sourceRow) !== drag.scope
+    || !historyList.value?.contains(drag.source)
+    || !target || !historyList.value?.contains(target) || !row
+    || row.key === drag.key || !canDragRow(row) || reorderScope(row) !== drag.scope
+  ) {
     dropTargetKey.value = ''
     return
   }
   const rect = target.getBoundingClientRect()
   dropTargetKey.value = row.key
-  dropPosition.value = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+  dropPosition.value = drag.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+}
+
+function scrollDuringRowDrag(time: number) {
+  const drag = pointerDrag.value
+  const list = historyList.value
+  if (!drag?.active || !list) return
+  const elapsed = dragScrollTime ? Math.min(time - dragScrollTime, 32) : 16
+  dragScrollTime = time
+  const rect = list.getBoundingClientRect()
+  const edge = Math.min(48, rect.height / 4)
+  if (edge > 0 && drag.clientX >= rect.left && drag.clientX <= rect.right) {
+    const up = Math.max(0, Math.min(1, (rect.top + edge - drag.clientY) / edge))
+    const down = Math.max(0, Math.min(1, (drag.clientY - rect.bottom + edge) / edge))
+    const before = list.scrollTop
+    list.scrollTop += (down - up) * elapsed * 0.5
+    if (list.scrollTop !== before) updateRowDropTarget()
+  }
+  dragScrollFrame = requestAnimationFrame(scrollDuringRowDrag)
+}
+
+useDocumentEvent('pointermove', (event) => {
+  const drag = pointerDrag.value
+  if (!drag || event.pointerId !== drag.pointerId) return
+  if (!historyList.value?.contains(drag.source)) {
+    clearRowDrag()
+    return
+  }
+  drag.clientX = event.clientX
+  drag.clientY = event.clientY
+  if (!drag.active) {
+    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return
+    drag.active = true
+    draggedRowKey.value = drag.key
+    closeSessionPreview()
+    closeMenu()
+    // Capturing keeps release/cancellation reliable outside the sidebar.
+    if (Number.isFinite(drag.pointerId)) drag.source.setPointerCapture?.(drag.pointerId)
+    dragScrollFrame = requestAnimationFrame(scrollDuringRowDrag)
+  }
+  event.preventDefault()
+  updateRowDropTarget()
 }, { passive: false })
 
-useDocumentEvent('pointerup', () => {
+useDocumentEvent('pointerup', (event) => {
   const drag = pointerDrag.value
-  if (!drag) return
+  if (!drag || event.pointerId !== drag.pointerId) return
   if (drag.active) {
-    suppressSelectKey.value = drag.key
+    drag.clientX = event.clientX
+    drag.clientY = event.clientY
+    updateRowDropTarget()
     if (dropTargetKey.value) {
+      settleRow(drag.key)
       emit('reorder', {
         draggedKey: drag.key,
         targetKey: dropTargetKey.value,
@@ -446,7 +607,23 @@ useDocumentEvent('pointerup', () => {
   clearRowDrag()
 })
 
-useDocumentEvent('pointercancel', clearRowDrag)
+useDocumentEvent('pointercancel', (event) => {
+  if (event.pointerId === pointerDrag.value?.pointerId) clearRowDrag()
+})
+useDocumentEvent('lostpointercapture', (event) => {
+  if (event.pointerId === pointerDrag.value?.pointerId) clearRowDrag()
+})
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || !pointerDrag.value) return
+  event.preventDefault()
+  clearRowDrag()
+})
+onMounted(() => window.addEventListener('blur', clearRowDrag))
+onUnmounted(() => {
+  window.removeEventListener('blur', clearRowDrag)
+  if (settlingRowTimer) clearTimeout(settlingRowTimer)
+  clearRowDrag()
+})
 
 /* ── Bulk selection ───────────────────────────────────────────────── */
 
@@ -652,9 +829,16 @@ function openSessionPreview(row: SidebarDisplayRow, event: Event) {
   if (
     row.rowKind !== 'session'
     || selectionMode.value
+    || draggedRowKey.value
     || openMenuKey.value
     || renamingKey.value === row.key
   ) return
+  // On narrow/mobile layouts the sidebar fills the viewport. A fixed preview
+  // would cover neighboring rows and make the list hard to operate.
+  if (!canShowSessionPreview(window.innerWidth)) {
+    closeSessionPreview()
+    return
+  }
   const anchor = event.currentTarget
   if (!(anchor instanceof HTMLElement)) return
   sessionPreview.value = {
@@ -808,11 +992,13 @@ function emitSessionPin(row: SidebarConversationItem) {
   if (row.rowKind === 'session') emit('session-pin', { key: row.key, pinned: !row.pinned })
 }
 
-function onSelectRow(row: SidebarConversationItem) {
+function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
   if (row.rowKind !== 'session') return
   if (suppressSelectKey.value === row.key) {
     suppressSelectKey.value = ''
-    return
+    // Keyboard and assistive activation have no pointer click count. Pointer
+    // capture can send the preceding drag click to the row wrapper instead.
+    if (event.detail !== 0) return
   }
   if (row.provisional) return
   if (renamingKey.value === row.key) return
@@ -838,6 +1024,7 @@ function onSelectRow(row: SidebarConversationItem) {
     class="sidebar-section sidebar-history"
     :class="{
       'is-selecting': selectionMode,
+      'is-reordering': Boolean(draggedRowKey),
       'has-projects': displayProjection.projectCount > 0,
     }"
     :aria-label="t('shared.sidebar.recentConversations')"
@@ -1038,7 +1225,7 @@ function onSelectRow(row: SidebarConversationItem) {
             :id="`sidebar-group-${block.key}`"
             class="sidebar-group__body"
           >
-            <div class="sidebar-group__content">
+            <TransitionGroup name="sidebar-row" tag="div" class="sidebar-group__content">
               <div
                 v-for="row in block.rows"
                 :key="row.key"
@@ -1047,11 +1234,14 @@ function onSelectRow(row: SidebarConversationItem) {
                   'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
                   'sidebar-history-row--workspace': row.rowKind === 'workspace',
                   'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
+                  'sidebar-history-row--subtask': (taskHierarchy.ancestors.get(row.key)?.length ?? 0) > 0,
                   'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
                   'is-reorderable': canDragRow(row),
                   'is-dragging': draggedRowKey === row.key,
+                  'is-settling': settlingRowKey === row.key,
                   'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
                   'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
+                  'has-subtasks': taskHierarchy.summaries.has(row.key),
                 }"
                 :data-family="row.displayFamily"
                 :data-sidebar-zone="row.displayZone"
@@ -1148,6 +1338,17 @@ function onSelectRow(row: SidebarConversationItem) {
                   {{ row.title }}
                 </div>
 
+                <button
+                  v-if="row.rowKind === 'session' && taskHierarchy.summaries.has(row.key)"
+                  type="button"
+                  class="sidebar-task-disclosure"
+                  :aria-expanded="!isTaskCollapsed(row.key)"
+                  :aria-label="t(isTaskCollapsed(row.key) ? 'shared.sidebar.expandSubtasks' : 'shared.sidebar.collapseSubtasks', { title: row.title })"
+                  @click.stop="toggleTask(row)"
+                >
+                  <Icon name="chevronRight" :size="12" />
+                </button>
+
                 <!-- Inline rename input replaces the row button while editing -->
                 <input
                   v-if="row.rowKind === 'session' && renamingKey === row.key"
@@ -1165,9 +1366,10 @@ function onSelectRow(row: SidebarConversationItem) {
                   v-else-if="row.rowKind === 'session'"
                   class="sidebar-history-item"
                   :class="{ 'is-current': row.key === currentKey }"
+                  :aria-current="row.key === currentKey ? 'page' : undefined"
                   :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
                   :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
-                  @click="onSelectRow(row)"
+                  @click="onSelectRow(row, $event)"
                   @contextmenu="openSessionContextMenu(row, $event)"
                 >
                   <span
@@ -1178,7 +1380,35 @@ function onSelectRow(row: SidebarConversationItem) {
                   >
                     <Icon v-if="isRowSelected(row.key)" name="check" :size="11" />
                   </span>
-                  <span class="sidebar-history-title">{{ row.title }}</span>
+                  <span class="sidebar-history-main">
+                    <span class="sidebar-history-title">{{ row.title }}</span>
+                    <span
+                      v-if="taskHierarchy.summaries.has(row.key) && !selectionMode"
+                      class="sidebar-subtask-summary"
+                      :class="{ 'has-attention': taskHierarchy.summaries.get(row.key)?.attention }"
+                      :title="subtaskSummaryLabel(row.key)"
+                    >
+                      <span class="sidebar-subtask-count">{{ t('shared.sidebar.subtaskCount', { count: taskHierarchy.summaries.get(row.key)?.count }) }}</span>
+                      <span
+                        v-if="taskHierarchy.summaries.get(row.key)?.attention"
+                        class="sidebar-subtask-status sidebar-subtask-status--attention"
+                        role="img"
+                        :aria-label="t('shared.sidebar.subtasksAttention', { count: taskHierarchy.summaries.get(row.key)?.attention })"
+                      >
+                        <Icon name="info" :size="11" aria-hidden="true" />
+                        <span aria-hidden="true">{{ taskHierarchy.summaries.get(row.key)?.attention }}</span>
+                      </span>
+                      <span
+                        v-if="taskHierarchy.summaries.get(row.key)?.running"
+                        class="sidebar-subtask-status"
+                        role="img"
+                        :aria-label="t('shared.sidebar.subtasksRunning', { count: taskHierarchy.summaries.get(row.key)?.running })"
+                      >
+                        <Icon name="refresh" :size="11" aria-hidden="true" />
+                        <span aria-hidden="true">{{ taskHierarchy.summaries.get(row.key)?.running }}</span>
+                      </span>
+                    </span>
+                  </span>
                   <Icon
                     v-if="row.pinned"
                     class="sidebar-history-pin"
@@ -1298,6 +1528,28 @@ function onSelectRow(row: SidebarConversationItem) {
                       <span>{{ row.pinned ? t('shared.sidebar.unpinTask') : t('shared.sidebar.pinTask') }}</span>
                     </button>
                     <button
+                      v-if="keyboardReorderTarget(row, 'up')"
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      data-session-action="move-up"
+                      @click.stop="reorderFromMenu(row, 'up')"
+                    >
+                      <Icon name="arrowUp" :size="14" />
+                      <span>{{ t('shared.sidebar.moveUp') }}</span>
+                    </button>
+                    <button
+                      v-if="keyboardReorderTarget(row, 'down')"
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      data-session-action="move-down"
+                      @click.stop="reorderFromMenu(row, 'down')"
+                    >
+                      <Icon class="sidebar-move-down" name="arrowUp" :size="14" />
+                      <span>{{ t('shared.sidebar.moveDown') }}</span>
+                    </button>
+                    <button
                       type="button"
                       class="sidebar-row-menu__item"
                       role="menuitem"
@@ -1339,7 +1591,7 @@ function onSelectRow(row: SidebarConversationItem) {
                   {{ agentInitial(row.agentName) }}
                 </button>
               </div>
-            </div>
+            </TransitionGroup>
           </div>
         </Transition>
         <div
@@ -1367,6 +1619,7 @@ function onSelectRow(row: SidebarConversationItem) {
       </div>
     </div>
     <Teleport to="body">
+      <SidebarSessionDragPreview v-if="pointerDrag?.active" :drag="pointerDrag" />
       <SidebarSessionHoverCard
         v-if="sessionPreview"
         :title="sessionPreview.row.title"
@@ -1377,3 +1630,94 @@ function onSelectRow(row: SidebarConversationItem) {
     </Teleport>
   </div>
 </template>
+
+<style scoped>
+.sidebar-move-down {
+  transform: rotate(180deg);
+}
+
+.sidebar-history-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sidebar-subtask-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--sidebar-text-soft);
+  font-size: 0.6875rem;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.sidebar-subtask-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-subtask-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.sidebar-subtask-status--attention {
+  color: var(--warn);
+}
+
+.sidebar-task-disclosure {
+  position: absolute;
+  z-index: 1;
+  left: calc(var(--row-depth, 0) * 14px);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+}
+
+.sidebar-task-disclosure:hover {
+  color: var(--sidebar-text-strong);
+  background: var(--sidebar-item-hover);
+}
+
+.sidebar-task-disclosure:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sidebar-task-disclosure[aria-expanded='true'] :deep(svg) {
+  transform: rotate(90deg);
+}
+
+.has-subtasks:has(.sidebar-task-disclosure) .sidebar-history-item,
+.sidebar-history-row--subtask .sidebar-history-item {
+  padding-left: 28px;
+}
+
+@media (pointer: coarse) {
+  .sidebar-task-disclosure {
+    width: 32px;
+    height: 44px;
+  }
+
+  .has-subtasks:has(.sidebar-task-disclosure) .sidebar-history-item,
+  .sidebar-history-row--subtask .sidebar-history-item {
+    min-height: 48px;
+    padding-left: 34px;
+  }
+}
+</style>

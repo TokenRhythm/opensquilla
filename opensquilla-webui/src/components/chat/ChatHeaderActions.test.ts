@@ -6,7 +6,7 @@ import { createI18n } from 'vue-i18n'
 import ChatHeaderActions from './ChatHeaderActions.vue'
 
 type LayoutName = 'wide' | 'compact' | 'tight'
-type Action = 'deliverables' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link'
 
 type HeaderInstance = ComponentPublicInstance & {
   focusAction: (action: Action) => boolean
@@ -27,6 +27,8 @@ const messages = {
   chat: {
     copied: 'Copied',
     copySessionKey: 'Copy session ID',
+    copySessionAppLink: 'Copy application link',
+    copySessionGatewayLink: 'Copy Gateway web link',
     deliverables: 'Deliverables',
     deliverablesCount: 'Deliverables ({count})',
     sessionActions: 'Session actions',
@@ -126,6 +128,8 @@ async function mountHeader(
     deliverables: vi.fn(),
     share: vi.fn(),
     copy: vi.fn(),
+    copyLink: vi.fn(),
+    copyGatewayLink: vi.fn(),
   }
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -135,6 +139,8 @@ async function mountHeader(
     onOpenDeliverables: handlers.deliverables,
     onStartShare: handlers.share,
     onCopySessionKey: handlers.copy,
+    onCopySessionLink: handlers.copyLink,
+    onCopyGatewayLink: handlers.copyGatewayLink,
   })
   app.use(createI18n({
     legacy: false,
@@ -159,13 +165,12 @@ async function openMenu(el: HTMLElement) {
 
 function renderedActions(el: HTMLElement): string[] {
   const actions: string[] = []
-  if (el.querySelector('.chat-header__copy')) actions.push('copy-session-key')
   for (const node of el.querySelectorAll<HTMLElement>('[data-action]')) {
     actions.push(node.dataset.action!)
   }
   for (const node of el.querySelectorAll<HTMLElement>('[data-testid^="chat-session-action-"]')) {
     const action = node.dataset.testid!.replace('chat-session-action-', '')
-    actions.push(action === 'copy' ? 'copy-session-key' : action)
+    actions.push(action === 'copy' ? 'copy-session-key' : action === 'copy-app-link' ? 'copy-session-link' : action)
   }
   return actions
 }
@@ -178,6 +183,8 @@ function expectedActions({
   if (deliverableCount > 0) actions.push('deliverables')
   if (!shareMode) actions.push('share')
   actions.push('copy-session-key')
+  actions.push('copy-session-link')
+  actions.push('copy-gateway-link')
   return actions
 }
 
@@ -263,17 +270,19 @@ afterEach(() => {
 })
 
 describe('ChatHeaderActions', () => {
-  it('keeps the copy control in the title group and exposes the full title as its tooltip', async () => {
+  it('exposes the full title and provides the same session menu in wide layouts', async () => {
     const fullTitle = 'A complete session title that may be visually truncated'
     const { el } = await mountHeader(800, { title: fullTitle })
     const identity = el.querySelector<HTMLElement>('.chat-header__identity')!
     const title = identity.querySelector<HTMLHeadingElement>('.chat-header__title')!
-    const copy = identity.querySelector<HTMLButtonElement>('.chat-header__copy')!
     const spacer = el.querySelector<HTMLElement>('.chat-header__spacer')!
 
     expect(title.textContent).toBe(fullTitle)
     expect(title.title).toBe(fullTitle)
-    expect(title.nextElementSibling).toBe(copy)
+    expect(trigger(el).getAttribute('aria-haspopup')).toBe('menu')
+    await openMenu(el)
+    expect(Array.from(el.querySelectorAll('[role="menuitem"]')).map(item => item.textContent?.trim()))
+      .toEqual(['Copy application link', 'Copy Gateway web link', 'Copy session ID'])
     expect(identity.nextElementSibling).toBe(spacer)
     expect(spacer.nextElementSibling?.classList.contains('chat-header__actions')).toBe(true)
   })
@@ -384,8 +393,7 @@ describe('ChatHeaderActions', () => {
   it('keeps focus reachable and closes the menu across wide, compact, tight, and wide', async () => {
     const { el, observer } = await mountHeader(800)
     const header = el.querySelector<HTMLElement>('[data-testid="chat-header-actions"]')!
-    const wideCopy = el.querySelector<HTMLButtonElement>('.chat-header__copy')!
-    wideCopy.focus()
+    trigger(el).focus()
 
     resizeHeader(543, observer)
     await flushAnimationFrame()
@@ -405,9 +413,7 @@ describe('ChatHeaderActions', () => {
     resizeHeader(576, observer)
     await flushAnimationFrame()
     expect(header.dataset.layout).toBe('wide')
-    expect(document.activeElement).toBe(
-      el.querySelector<HTMLButtonElement>('[data-testid="chat-session-action-deliverables"]'),
-    )
+    expect(document.activeElement).toBe(trigger(el))
   })
 
   it('disconnects observers, media listeners, and a pending frame on unmount', async () => {
@@ -446,7 +452,7 @@ describe('ChatHeaderActions', () => {
       const primary = el.querySelector<HTMLElement>('[data-action]')
       expect(primary?.dataset.action ?? null).toBe(expectedPrimary)
 
-      if (layout !== 'wide') await openMenu(el)
+      await openMenu(el)
 
       const expected = expectedActions(state)
       const actions = renderedActions(el)
@@ -456,7 +462,7 @@ describe('ChatHeaderActions', () => {
       const menuActions = layout === 'wide'
         ? []
         : expected.filter(action => action !== expectedPrimary)
-      expect(Boolean(el.querySelector('[role="separator"]'))).toBe(menuActions.length > 1)
+      expect(Boolean(el.querySelector('[role="separator"]'))).toBe(menuActions.some(action => action === 'share' || action === 'deliverables'))
 
       const tightBadge = layout === 'wide'
         ? null
@@ -563,8 +569,8 @@ describe('ChatHeaderActions', () => {
     }
   })
 
-  it('supports menu arrow navigation and restores trigger focus on Escape', async () => {
-    const { el } = await mountHeader(400)
+  it.each(LAYOUT_CASES)('supports keyboard navigation and restores trigger focus in $layout', async ({ width, layout }) => {
+    const { el } = await mountHeader(width)
     const menuTrigger = trigger(el)
     menuTrigger.dispatchEvent(new KeyboardEvent('keydown', {
       key: 'ArrowDown',
@@ -573,7 +579,7 @@ describe('ChatHeaderActions', () => {
     await flush()
 
     const items = Array.from(el.querySelectorAll<HTMLButtonElement>('[role="menuitem"]'))
-    expect(items).toHaveLength(2)
+    expect(items).toHaveLength(layout === 'wide' ? 3 : layout === 'tight' ? 5 : 4)
     expect(el.querySelector('[data-chat-topbar-popover="session-actions"]')).toBeTruthy()
     expect(document.activeElement).toBe(items[0])
 
@@ -581,9 +587,9 @@ describe('ChatHeaderActions', () => {
     expect(document.activeElement).toBe(items[1])
 
     items[1]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'End', bubbles: true }))
-    expect(document.activeElement).toBe(items[1])
+    expect(document.activeElement).toBe(items[items.length - 1])
 
-    items[1]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    items[items.length - 1]!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
     await flush()
     expect(el.querySelector('[role="menu"]')).toBeNull()
     expect(menuTrigger.getAttribute('aria-expanded')).toBe('false')
@@ -620,15 +626,19 @@ describe('ChatHeaderActions', () => {
     expect(trigger(el).getAttribute('aria-expanded')).toBe('true')
   })
 
-  it('emits each action once from compact primary and menu controls', async () => {
-    const { el, handlers } = await mountHeader(400)
+  it.each(LAYOUT_CASES)('emits each action once from $layout controls', async ({ width, layout }) => {
+    const { el, handlers } = await mountHeader(width)
 
-    el.querySelector<HTMLButtonElement>('[data-action="deliverables"]')!.click()
+    if (layout === 'tight') await openMenu(el)
+    el.querySelector<HTMLButtonElement>('[data-action="deliverables"], [data-testid="chat-session-action-deliverables"]')!.click()
+    await flush()
     expect(handlers.deliverables).toHaveBeenCalledTimes(1)
 
     for (const [testId, handler] of [
-      ['chat-session-action-share', handlers.share],
+      ...(layout === 'wide' ? [] : [['chat-session-action-share', handlers.share]] as const),
       ['chat-session-action-copy', handlers.copy],
+      ['chat-session-action-copy-app-link', handlers.copyLink],
+      ['chat-session-action-copy-gateway-link', handlers.copyGatewayLink],
     ] as const) {
       await openMenu(el)
       el.querySelector<HTMLButtonElement>(`[data-testid="${testId}"]`)!.click()
@@ -637,9 +647,22 @@ describe('ChatHeaderActions', () => {
       expect(el.querySelector('[role="menu"]')).toBeNull()
     }
 
+    if (layout === 'wide') {
+      el.querySelector<HTMLButtonElement>('[data-testid="chat-session-action-share"]')!.click()
+    }
     expect(handlers.deliverables).toHaveBeenCalledTimes(1)
     expect(handlers.share).toHaveBeenCalledTimes(1)
     expect(handlers.copy).toHaveBeenCalledTimes(1)
+    expect(handlers.copyLink).toHaveBeenCalledTimes(1)
+    expect(handlers.copyGatewayLink).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(LAYOUT_CASES)('keeps all copy actions reachable in $layout', async ({ width }) => {
+    const { el, instance } = await mountHeader(width)
+    for (const action of ['copy-session-key', 'copy-session-link', 'copy-gateway-link'] as const) {
+      expect(instance.focusAction(action)).toBe(true)
+      expect(document.activeElement).toBe(trigger(el))
+    }
   })
 
   it('focusAction targets direct controls and falls back to the compact menu trigger', async () => {

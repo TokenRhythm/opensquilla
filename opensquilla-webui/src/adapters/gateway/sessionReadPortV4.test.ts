@@ -1179,6 +1179,37 @@ describe('v4 SessionReadPort Adapter', () => {
     expect(replaced.calls.some(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD))
       .toBe(false)
   })
+
+  it('keeps a late malformed unsubscribe reply local after its successor has subscribed', async () => {
+    const h = makeHarness()
+    const failProtocol = vi.fn()
+    const port = createV4SessionReadPort({ ...h.rpc, failProtocol })
+    const prior = port.open(openRequest())
+    await prior.live
+    const oldReply = deferred<unknown>()
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, oldReply.promise)
+    await prior.close()
+    const successor = port.open(openRequest())
+    await successor.live
+    oldReply.resolve({ subscribed: false })
+    await flushAsyncWork()
+    expect(failProtocol).not.toHaveBeenCalled()
+    await expect(successor.reconcile()).resolves.toMatchObject({ sessionKey: 'alpha' })
+    h.results.set(SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD, null)
+    await successor.close()
+  })
+
+  it('still rejects an invalid cleanup result when no send receipt settled the close', async () => {
+    const h = makeHarness()
+    const original = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation((method, params, options) => (
+      method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD
+        ? Promise.resolve({ subscribed: false }) : original(method, params, options)
+    ))
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    await lease.live
+    await expect(lease.close()).rejects.toBeInstanceOf(SessionReadContractError)
+  })
 })
 
 function deadlineHarness(options: {

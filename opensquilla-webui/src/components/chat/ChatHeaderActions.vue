@@ -7,18 +7,6 @@
   >
     <div class="chat-header__identity">
       <h1 class="chat-header__title chat-label" :title="title">{{ title }}</h1>
-      <button
-        v-if="layout === 'wide'"
-        ref="wideCopyRef"
-        type="button"
-        class="chat-header__copy"
-        :class="{ 'is-success': copyState === 'ok' }"
-        :title="copyLabel"
-        :aria-label="copyLabel"
-        @click="emit('copy-session-key')"
-      >
-        <Icon :name="copyIcon" :size="14" />
-      </button>
       <span class="chat-header__copy-live" aria-live="polite">{{ copyLiveText }}</span>
     </div>
 
@@ -62,7 +50,7 @@
       </button>
     </div>
 
-    <div v-else ref="compactActionsRef" class="chat-header__actions chat-header__actions--compact">
+    <div ref="menuActionsRef" class="chat-header__actions chat-header__actions--compact">
       <button
         v-if="primaryAction"
         ref="primaryActionRef"
@@ -157,10 +145,30 @@
           </span>
         </button>
         <div
-          v-if="menuActions.length > 1"
+          v-if="menuActions.length > 0"
           class="chat-header__menu-divider"
           role="separator"
         ></div>
+        <button
+          type="button"
+          class="chat-header__menu-item"
+          role="menuitem"
+          data-testid="chat-session-action-copy-app-link"
+          @click="invoke('copy-session-link', true)"
+        >
+          <Icon name="externalLink" :size="16" />
+          <span>{{ t('chat.copySessionAppLink') }}</span>
+        </button>
+        <button
+          type="button"
+          class="chat-header__menu-item"
+          role="menuitem"
+          data-testid="chat-session-action-copy-gateway-link"
+          @click="invoke('copy-gateway-link', true)"
+        >
+          <Icon name="externalLink" :size="16" />
+          <span>{{ t('chat.copySessionGatewayLink') }}</span>
+        </button>
         <button
           type="button"
           class="chat-header__menu-item"
@@ -189,7 +197,7 @@ import {
 } from '@/utils/headerLayout'
 import type { IconName } from '@/utils/icons'
 
-type Action = 'deliverables' | 'share' | 'copy-session-key'
+type Action = 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link'
 
 const COARSE_POINTER_QUERY = '(pointer: coarse)'
 
@@ -208,17 +216,18 @@ const emit = defineEmits<{
   'open-deliverables': []
   'start-share': []
   'copy-session-key': []
+  'copy-session-link': []
+  'copy-gateway-link': []
 }>()
 
 const { t } = useI18n()
 const rootRef = ref<HTMLDivElement | null>(null)
-const compactActionsRef = ref<HTMLDivElement | null>(null)
+const menuActionsRef = ref<HTMLDivElement | null>(null)
 const menuTriggerRef = ref<HTMLButtonElement | null>(null)
 const menuRef = ref<HTMLDivElement | null>(null)
 const primaryActionRef = ref<HTMLButtonElement | null>(null)
 const wideDeliverablesRef = ref<HTMLButtonElement | null>(null)
 const wideShareRef = ref<HTMLButtonElement | null>(null)
-const wideCopyRef = ref<HTMLButtonElement | null>(null)
 const layout = ref<SessionHeaderLayout>('wide')
 const menuOpen = ref(false)
 useChatTopbarPopoverCoordination('session-actions', menuOpen)
@@ -245,7 +254,7 @@ const shareAriaLabel = computed(() => !canShare.value
   : t('chat.share'))
 
 const primaryAction = computed<Action | null>(() => {
-  if (layout.value === 'tight') return null
+  if (layout.value !== 'compact') return null
   if (props.deliverableCount > 0) return 'deliverables'
   if (!props.shareMode && canShare.value) return 'share'
   return null
@@ -262,9 +271,9 @@ const primaryActionIcon = computed<IconName>(() => {
 
 const menuActions = computed<Action[]>(() => {
   const actions: Action[] = []
+  if (layout.value === 'wide') return actions
   if (props.deliverableCount > 0 && primaryAction.value !== 'deliverables') actions.push('deliverables')
   if (!props.shareMode && primaryAction.value !== 'share') actions.push('share')
-  actions.push('copy-session-key')
   return actions
 })
 
@@ -275,20 +284,22 @@ function isVisible(element: HTMLElement | null): element is HTMLElement {
 function actionForElement(element: Element | null): Action | null {
   if (element === wideDeliverablesRef.value) return 'deliverables'
   if (element === wideShareRef.value) return 'share'
-  if (element === wideCopyRef.value) return 'copy-session-key'
+  if (element === menuTriggerRef.value) return 'copy-session-key'
   if (element === primaryActionRef.value) return primaryAction.value
   if (!(element instanceof HTMLElement)) return null
   const testId = element.dataset.testid
   if (testId === 'chat-session-action-deliverables') return 'deliverables'
   if (testId === 'chat-session-action-share') return 'share'
   if (testId === 'chat-session-action-copy') return 'copy-session-key'
+  if (testId === 'chat-session-action-copy-app-link') return 'copy-session-link'
+  if (testId === 'chat-session-action-copy-gateway-link') return 'copy-gateway-link'
   return null
 }
 
 function focusWideFallback() {
   const fallback = wideDeliverablesRef.value
     || wideShareRef.value
-    || wideCopyRef.value
+    || menuTriggerRef.value
   fallback?.focus()
 }
 
@@ -363,6 +374,8 @@ function invoke(action: Action, fromMenu = false) {
   if (action === 'deliverables') emit('open-deliverables')
   if (action === 'share') emit('start-share')
   if (action === 'copy-session-key') emit('copy-session-key')
+  if (action === 'copy-session-link') emit('copy-session-link')
+  if (action === 'copy-gateway-link') emit('copy-gateway-link')
 }
 
 function onMenuKeydown(event: KeyboardEvent) {
@@ -393,7 +406,7 @@ function focusAction(action: Action): boolean {
     ? wideDeliverablesRef.value
     : action === 'share'
       ? wideShareRef.value
-      : wideCopyRef.value
+      : menuTriggerRef.value
   if (isVisible(direct)) {
     direct.focus()
     return true
@@ -411,7 +424,7 @@ function focusAction(action: Action): boolean {
 
 useDocumentEvent('click', (event) => {
   if (!menuOpen.value) return
-  if (event.target instanceof Node && !compactActionsRef.value?.contains(event.target)) {
+  if (event.target instanceof Node && !menuActionsRef.value?.contains(event.target)) {
     menuOpen.value = false
   }
 })
@@ -493,29 +506,6 @@ defineExpose({ focusAction, closeMenu })
 .chat-header__spacer {
   flex: 1 1 auto;
   min-width: 0;
-}
-
-.chat-header__copy {
-  align-items: center;
-  background: none;
-  border: 0;
-  color: var(--text-muted);
-  cursor: pointer;
-  display: inline-flex;
-  flex: 0 0 auto;
-  justify-content: center;
-  min-height: 30px;
-  min-width: 30px;
-  padding: 4px;
-}
-
-.chat-header__copy:hover,
-.chat-header__copy:focus-visible {
-  color: var(--text);
-}
-
-.chat-header__copy.is-success {
-  color: var(--ok);
 }
 
 .chat-header__copy-live {

@@ -1819,6 +1819,14 @@ def plan_changes(
             reasons.add("unknown_dependency_manifest")
             continue
 
+        if path.startswith(("src/opensquilla/mcp/", "src/opensquilla/mcp_server/",
+                            "tests/test_mcp/", "tests/test_mcp_server/")):
+            suites.update({"desktop-recovery-e2e", "frontend-artifact"})
+            desktop_cells.update(_desktop_cells(
+                groups={"ownership"}, os_scope=set(), config=config,
+            ))
+            reasons.add("mcp_native_transport_changed")
+
         if _is_webui_boundary_input(path):
             suites.add("python-targeted")
             targets.update(_WEBUI_ARCHITECTURE_TEST_TARGETS)

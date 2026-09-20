@@ -42,4 +42,4 @@ for (const [eventName, scope] of Object.entries(DESKTOP_EARLY_EVENT_SCOPES)) {
   })
 }
 
-console.log('telemetry protocol manifest parity passed')
+console.log('Event protocol manifest parity passed')

@@ -119,6 +119,7 @@ function createParams(request: SessionCreateRequest | undefined): SessionsCreate
   if (request.title !== undefined) params.displayName = request.title
   if (request.message !== undefined) params.message = request.message
   if (request.model !== undefined) params.model = request.model
+  if (request.provider !== undefined) params.provider = request.provider
   return params
 }
 

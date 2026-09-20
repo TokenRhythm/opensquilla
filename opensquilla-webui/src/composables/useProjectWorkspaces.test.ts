@@ -48,6 +48,7 @@ function catalogFromRpc(rpc: ReturnType<typeof useRpcStore>): WorkspaceCatalog {
 function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
   return {
     get availability() { return rpc.isConnected ? 'available' : 'unavailable' },
+    isRuntimeStarting: false,
     get connectionError() { return rpc.error },
     requiresCredential: false,
     get isAvailable() { return rpc.isConnected },
@@ -60,6 +61,8 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
     runModePolicy: null,
     streamIdleTimeoutMs: null,
     concurrentHistoryReads: false,
+    chatSendInitialModel: false,
+    sessionsRoutingModelSelection: false,
     detachedSessionHydration: false,
     turnCommittedEvents: false,
     subscriptionEpoch: 0,

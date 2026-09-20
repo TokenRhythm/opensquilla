@@ -87,10 +87,11 @@ TOKENRHYTHM_TOOL_REASONING_MODELS = frozenset(
 )
 THINKING_CHOICES = ("default", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
 COMPACTION_VARIANTS = (
-    "basic", "tools", "replay_off", "model_switch", "repeated", "truncated", "long_reasoning",
+    "basic", "chunked", "tools", "replay_off", "model_switch", "repeated", "truncated",
+    "long_reasoning",
 )
 COMPACTION_CALL_LIMITS = {
-    "basic": 3, "tools": 4, "replay_off": 4, "model_switch": 3,
+    "basic": 3, "chunked": 4, "tools": 4, "replay_off": 4, "model_switch": 3,
     "repeated": 7, "truncated": 3, "long_reasoning": 3,
 }
 COMPACTION_FIRST_PROMPT = (
@@ -1159,6 +1160,8 @@ def _compaction_coverage(variant: str) -> dict[str, Any]:
         expected.extend(("native_parent_state", "replay_disabled"))
     if variant == "model_switch":
         expected.append("model_switch")
+    if variant == "chunked":
+        expected.extend(("chunked_summary", "single_preflight"))
     if variant == "repeated":
         expected.extend(("repeated_compaction", "cumulative_memory"))
     if variant == "long_reasoning":
@@ -1212,8 +1215,10 @@ async def _run_compaction_case(
         provider, model, api_key, endpoint, config.llm.context_window_tokens,
     )
     fact_checks: list[dict[str, Any]] = []
+    recall_checks: list[dict[str, Any]] = []
     pressure_checks: list[dict[str, Any]] = []
     observer.replay_checks["critical_fact_checks"] = fact_checks
+    observer.replay_checks["memory_recall_checks"] = recall_checks
     observer.replay_checks["pressure_checks"] = pressure_checks
     catalog = _Catalog()
     catalog_loaded = False
@@ -1258,6 +1263,11 @@ async def _run_compaction_case(
     # tokens per repetition). Physical request limits remain unchanged.
     seed_repetitions = 16 if conservative_estimate else 45
     seed_padding = " log 17;" if options.native_pressure else COMPACTION_PADDING
+    if variant == "chunked":
+        # Exceed the normal preflight threshold and one summary chunk, without
+        # letting long prose exhaust the independent character budget first.
+        seed_padding = " log 17;"
+        seed_repetitions = max(1, 14_000 // (5 * estimate_tokens_with_source(seed_padding)[0]))
     if options.native_pressure:
         from opensquilla.context_budget import ContextBudgetGovernor
         from opensquilla.token_estimation import estimate_tokens
@@ -1415,7 +1425,11 @@ async def _run_compaction_case(
                     _require(restored == previous_canonical, "database_reopen_state_mismatch")
                     config.compaction.enabled = True
                     config.llm.context_window_tokens = options.context_window_tokens or 20_000
-                    if options.preflight_ratio is None and not options.native_pressure:
+                    if (
+                        options.preflight_ratio is None
+                        and not options.native_pressure
+                        and variant != "chunked"
+                    ):
                         # Small protocol cases exercise a deliberate early trigger.
                         # Native-pressure cases retain the production threshold.
                         config.preflight_compact_ratio = 0.2 if conservative_estimate else 0.1
@@ -1457,6 +1471,7 @@ async def _run_compaction_case(
                 }
                 call_start = len(observer.calls)
                 user = await manager.append_message(key, "user", prompt)
+                compaction_event_start = len(compaction_events)
                 events = [
                     event
                     async for event in runner.run(
@@ -1466,7 +1481,13 @@ async def _run_compaction_case(
                         tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
                     )
                 ]
-                attempted_by_turn.append(runner.has_attempted_compaction_this_turn(key))
+                # run() clears its per-turn flags in finally. Retain the actual
+                # lifecycle evidence instead of sampling those cleared flags.
+                started_phases = [
+                    event.get("phase") for event in compaction_events[compaction_event_start:]
+                    if event.get("status") == "started"
+                ]
+                attempted_by_turn.append(bool(started_phases))
                 observer.engine_error_codes.extend(
                     safe_provider_failure_code(
                         getattr(event, "code", None), getattr(event, "failure_kind", None)
@@ -1498,6 +1519,15 @@ async def _run_compaction_case(
                     _require(generated_label is not None, "parent_generated_label_missing")
                     assert generated_label is not None
                     labels.append(generated_label)
+                    first_turn_entries = await manager.get_transcript(key)
+                    _require(
+                        any(
+                            entry.role == "assistant"
+                            and generated_label in str(entry.content or "")
+                            for entry in first_turn_entries
+                        ),
+                        "parent_generated_label_not_persisted",
+                    )
                     _require(
                         all(
                             generated_label not in json.dumps(call.request)
@@ -1551,9 +1581,12 @@ async def _run_compaction_case(
                         _require(observed["source_preserved"], "truncated_summary_deleted_source")
                         _require(observed["no_summary_committed"], "truncated_summary_committed")
                     break
+                expected_summary_calls = (
+                    {2} if variant == "chunked" else {1, 2} if options.native_pressure else {1}
+                )
                 _require(
                     compact is not None
-                    and len(summary_calls) in ({1, 2} if options.native_pressure else {1})
+                    and len(summary_calls) in expected_summary_calls
                     and len(stage_calls) == len(summary_calls) + 1
                     and not _is_compaction_wire_call(stage_calls[-1]),
                     "compaction_live_not_covered",
@@ -1597,6 +1630,9 @@ async def _run_compaction_case(
                     "compaction_source_entry_missing",
                 )
                 source_entry_marker_counts.append(len(source_entry_markers))
+                # A generated label that remains in the protected active suffix
+                # is intentionally absent from the compaction source. Only
+                # labels belonging to removed history need source coverage.
                 removed_text = "\n".join(
                     str(entry.content or "") for entry in before_entries
                     if entry.message_id in removed_ids
@@ -1682,8 +1718,15 @@ async def _run_compaction_case(
                     "same_payload_scope": False,
                     "note": "parent_and_continuation_have_different_current_turns",
                 })
+                recall_check = {
+                    "labels_in_summary": [label in summary_text for label in labels],
+                    "labels_in_answer": [label in answer for label in labels],
+                    "completion_marker_in_answer": "COMPACTION_RECALL_OK" in answer,
+                }
+                recall_checks.append(recall_check)
                 _require(
-                    all(label in answer for label in labels) and "COMPACTION_RECALL_OK" in answer,
+                    all(recall_check["labels_in_answer"])
+                    and recall_check["completion_marker_in_answer"],
                     "compaction_memory_recall_mismatch",
                 )
                 _require(
@@ -1784,6 +1827,9 @@ async def _run_compaction_case(
                         "model"
                     ) and compact.request.get("model") == resumed.request.get("model")
                     _require(observed["model_switch"], "compaction_used_previous_model")
+                if variant == "chunked":
+                    observed["chunked_summary"] = len(summary_calls) == latest.chunk_count == 2
+                    observed["single_preflight"] = started_phases == ["preflight"]
                 if variant == "long_reasoning":
                     reasoning = _usage_report([compact])["reasoning_tokens_by_call"][0]
                     observed["reasoning_over_1024"] = reasoning is not None and reasoning > 1024
@@ -2037,6 +2083,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--comparison-history-tokens", type=int)
     parser.add_argument("--comparison-history-chars", type=int)
     parser.add_argument("--serve-gateway", action="store_true")
+    parser.add_argument("--max-calls", type=int, default=60)
+    parser.add_argument("--relay-ready", type=Path)
     parser.add_argument("--gateway-read-files", action="store_true")
     parser.add_argument("--gateway-root", type=Path)
     parser.add_argument("--gateway-port", type=int, default=18799)
@@ -2051,6 +2099,28 @@ def main(argv: list[str] | None = None) -> int:
     if not args.live:
         print(json.dumps({"ok": False, "status": "live_opt_in_required"}))
         return 2
+    if not 1 <= args.max_calls <= 60:
+        print(json.dumps({"ok": False, "status": "invalid_physical_call_limit"}))
+        return 2
+    relay_environment: dict[str, str] = {}
+    if args.relay_ready:
+        from scripts.live_tokenrhythm_transport import RelayTarget
+
+        try:
+            ready = json.loads(require_temporary_report_path(args.relay_ready).read_text())
+            _require(args.provider == "tokenrhythm", "relay_requires_tokenrhythm")
+            _require(ready.get("enabled") is True and ready.get("mode") == "functional",
+                     "functional_relay_required")
+            target = RelayTarget(str(ready["base_url"]), str(ready["client_key"]))
+            relay_environment = {
+                "TOKENRHYTHM_API_KEY": target.client_key,
+                "OPENSQUILLA_LIVE_TRANSPORT": "1",
+                "OPENSQUILLA_LIVE_RELAY_URL": str(target.url),
+                "OPENSQUILLA_LIVE_RELAY_CLIENT_KEY": target.client_key,
+            }
+        except Exception:
+            print(json.dumps({"ok": False, "status": "invalid_functional_relay"}))
+            return 2
     if args.report:
         require_temporary_report_path(args.report)
     if args.comparison_snapshot_in:
@@ -2106,7 +2176,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"ok": False, "status": str(exc)}))
         return 2
     spec = get_provider_spec(args.provider)
-    api_key = os.environ.get(spec.env_key, "")
+    api_key = relay_environment.get(spec.env_key) or os.environ.get(spec.env_key, "")
     model = (
         args.model
         or os.environ.get(f"{args.provider.upper()}_MODEL")
@@ -2143,11 +2213,16 @@ def main(argv: list[str] | None = None) -> int:
         "OPENSQUILLA_LIVE_DISABLE_DOTENV": "1",
         "OPENSQUILLA_OPENROUTER_LIVE_PRICING": "0",
         "OPENSQUILLA_COMPACTION_PROMPT_LAYOUT": args.layout,
+        **relay_environment,
     }
     observed_providers = set(args.observe_provider or ()) | {args.provider}
+    if relay_environment and observed_providers != {"tokenrhythm"}:
+        print(json.dumps({"ok": False, "status": "relay_provider_mismatch"}))
+        return 2
     endpoints = {provider: registry_endpoint(provider) for provider in observed_providers}
     keys = {get_provider_spec(provider).env_key:
-            os.environ.get(get_provider_spec(provider).env_key, "")
+            relay_environment.get(get_provider_spec(provider).env_key)
+            or os.environ.get(get_provider_spec(provider).env_key, "")
             for provider in observed_providers}
     env.update({key: value for key, value in keys.items() if value})
     if args.serve_gateway:
@@ -2162,8 +2237,9 @@ def main(argv: list[str] | None = None) -> int:
     observer = WireObserver(
         registry_endpoint(args.provider),
         endpoints=endpoints,
-        max_calls=COMPACTION_CALL_LIMITS[args.compaction_variant] + int(args.native_pressure)
-        if args.scenario == "compaction" and not args.serve_gateway else None,
+        max_calls=min(args.max_calls, COMPACTION_CALL_LIMITS[args.compaction_variant]
+                      + int(args.native_pressure))
+        if args.scenario == "compaction" and not args.serve_gateway else args.max_calls,
         summary_fault=summary_fault if args.serve_gateway else None,
     )
     try:
@@ -2171,7 +2247,12 @@ def main(argv: list[str] | None = None) -> int:
             patch.dict(os.environ, env, clear=True),
             contextlib.redirect_stdout(io.StringIO()),
             contextlib.redirect_stderr(io.StringIO()),
+            contextlib.ExitStack() as live_stack,
         ):
+            if relay_environment:
+                from scripts.live_tokenrhythm_transport import install_from_env
+
+                live_stack.callback(install_from_env())
             logging.disable(logging.CRITICAL)
             if args.serve_gateway:
                 from scripts.live_compaction_gateway import (

@@ -17,9 +17,13 @@ been verified as an accurate source of user-selectable model ids.
 from __future__ import annotations
 
 import asyncio
+import copy
+import hmac
 import inspect
 import os
+import secrets
 import time
+import weakref
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Literal, cast
@@ -627,6 +631,96 @@ class ProviderModelsDiscoverResult:
         }
 
 
+@dataclass
+class _SavedDiscovery:
+    result: ProviderModelsDiscoverResult
+    checked_at: float
+    last_good: ProviderModelsDiscoverResult | None = None
+    last_good_at: float = 0
+
+
+# Only saved connections enter this cache. Draft discovery remains isolated,
+# and TokenRhythm keeps its existing entitlement-aware persistent coordinator.
+# Process-keyed fingerprints cannot be used to cheaply guess credentials from
+# cache keys; this cache has no cross-process persistence requirement.
+_SAVED_DISCOVERY_KEY = secrets.token_bytes(32)
+_saved_discoveries: dict[str, _SavedDiscovery] = {}
+_saved_discovery_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+_DISCOVERY_SUCCESS_TTL = 300.0
+_DISCOVERY_FAILURE_TTL = 15.0
+_DISCOVERY_LAST_GOOD_TTL = 3600.0
+TRANSIENT_MODEL_DISCOVERY_FAILURES = frozenset({
+    "transport_transient", "provider_overloaded", "rate_limited", "probe_timeout",
+})
+
+
+async def _discover_saved_or_draft_models(
+    *, saved: bool, force: bool, **kwargs: Any,
+) -> ProviderModelsDiscoverResult:
+    if not saved:
+        return await discover_provider_models(**kwargs)
+    spec = get_provider_spec(kwargs["provider_id"])
+    # Resolve environment values before fingerprinting: rotating an env-backed
+    # credential must not reuse the previous account's catalog.
+    key, _ = _resolve_probe_api_key(
+        kwargs.get("api_key", ""), kwargs.get("api_key_env", ""),
+        spec.env_key if kwargs.get("allow_default_api_key_env", True) else "",
+    )
+    kwargs = {**kwargs, "api_key": key, "api_key_env": "", "allow_default_api_key_env": False}
+    fingerprint = hmac.new(
+        _SAVED_DISCOVERY_KEY,
+        repr((spec.provider_id, kwargs.get("base_url") or spec.default_base_url,
+              key, kwargs.get("proxy", ""))).encode(),
+        "sha256",
+    ).hexdigest()
+    lock = _saved_discovery_locks.get(fingerprint)
+    if lock is None:
+        lock = asyncio.Lock()
+        _saved_discovery_locks[fingerprint] = lock
+    # Force refresh is serialized after any older request for this identity.
+    # A slow menu request cannot overwrite a newer explicit auth/empty result.
+    async with lock:
+        return await _refresh_saved_discovery(fingerprint, kwargs, force=force)
+
+
+async def _refresh_saved_discovery(
+    fingerprint: str, kwargs: dict[str, Any], *, force: bool,
+) -> ProviderModelsDiscoverResult:
+    previous = _saved_discoveries.get(fingerprint)
+    now = time.monotonic()
+    if previous is not None and not force:
+        ttl = _DISCOVERY_SUCCESS_TTL if previous.result.ok else _DISCOVERY_FAILURE_TTL
+        if now - previous.checked_at < ttl:
+            return copy.deepcopy(previous.result)
+    result = await discover_provider_models(**kwargs)
+    now = time.monotonic()
+    last_good = result if result.ok and result.source == "live" else None
+    last_good_at = now if last_good is not None else 0
+    if (
+        not result.ok and result.failure_kind in TRANSIENT_MODEL_DISCOVERY_FAILURES
+        and previous is not None and previous.last_good is not None
+        and now - previous.last_good_at < _DISCOVERY_LAST_GOOD_TTL
+    ):
+        last_good, last_good_at = previous.last_good, previous.last_good_at
+        # Retain the failure as a failure; consumers can use the same-identity
+        # rows without mistaking a stale catalog for a successful auth check.
+        result = ProviderModelsDiscoverResult(
+            ok=False, provider_id=result.provider_id, failure_kind=result.failure_kind,
+            detail=result.detail, source=last_good.source,
+            models=copy.deepcopy(last_good.models), catalog=result.catalog,
+        )
+    # Auth/permission failures discard LKG. Bound memory for rotated accounts.
+    _saved_discoveries.pop(fingerprint, None)
+    if len(_saved_discoveries) >= 64:
+        _saved_discoveries.pop(next(iter(_saved_discoveries)))
+    _saved_discoveries[fingerprint] = _SavedDiscovery(
+        copy.deepcopy(result), now, copy.deepcopy(last_good), last_good_at,
+    )
+    return result
+
+
 def _provider_metadata_wire(
     info: ModelInfo,
     provider_id: str,
@@ -910,7 +1004,8 @@ async def discover_selectable_provider_models(
         from opensquilla.provider.model_catalog import shared_catalog
 
         identity = custom_capacity_identity(catalog_config, provider_id)
-        result = await discover_provider_models(
+        result = await _discover_saved_or_draft_models(
+            saved=persist_catalog, force=force_refresh,
             provider_id=provider_id,
             api_key=api_key,
             api_key_env=api_key_env,
@@ -1009,7 +1104,9 @@ async def discover_selectable_provider_models(
     }
     if not allow_default_api_key_env:
         discover_kwargs["allow_default_api_key_env"] = False
-    result = await discover_provider_models(**discover_kwargs)
+    result = await _discover_saved_or_draft_models(
+        saved=persist_catalog, force=force_refresh, **discover_kwargs,
+    )
     if result.provider_id == provider_id:
         return result
     return ProviderModelsDiscoverResult(

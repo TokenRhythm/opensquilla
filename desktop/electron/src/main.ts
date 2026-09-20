@@ -8,6 +8,7 @@ import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
+import { NativeAttachmentSelections } from './native-attachments.js'
 import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
@@ -150,7 +151,7 @@ import {
 import {
   DESKTOP_DEEP_LINK_SCHEME,
   desktopDeepLinkArguments,
-  parseDesktopDeepLink,
+  parseDesktopDeepLinkTarget,
 } from './desktop-deep-link.js'
 import { projectDirectoryDialogOptions } from './project-directory-picker.js'
 import {
@@ -537,6 +538,7 @@ let windowsSessionEndPreviousPhase: DesktopExitPhase | null = null
 let windowsSessionEndResetTimer: NodeJS.Timeout | null = null
 let mainWindowClosePrompt: Promise<void> | null = null
 let pendingDesktopDeepLinkOpen = false
+let pendingDesktopSessionKey: string | null = null
 let desktopDeepLinkActivationReady = false
 let desktopPreferencesCache: {
   value: DesktopPreferencesFile
@@ -855,7 +857,8 @@ const gatewayState: GatewayState = {
   url: '',
   port: 0,
   owned: false,
-  status: 'stopped',
+  // The first renderer loads while profile preflight is still preparing the runtime.
+  status: 'starting',
   logPath: '',
   sandboxUpgrade: null,
 }
@@ -5065,9 +5068,15 @@ function revealDesktopApp(): void {
   void activateMainWindow('desktop-reveal')
 }
 
+function sendPendingDesktopSessionTarget(): void {
+  const window = currentMainWindow()
+  if (!window || !isCurrentWindowAtDesktopRenderer(window) || !pendingDesktopSessionKey) return
+  window.webContents.send('desktop:deep-link-session', pendingDesktopSessionKey)
+}
+
 function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
-  const action = parseDesktopDeepLink(rawUrl)
-  if (action !== 'open') {
+  const target = parseDesktopDeepLinkTarget(rawUrl)
+  if (!target || target.action !== 'open') {
     // Never persist an untrusted URL: query strings may contain credentials or
     // other private browser state even though this parser rejects them.
     desktopLog('deep_link_ignored', { source })
@@ -5076,15 +5085,22 @@ function handleDeepLink(rawUrl: unknown, source = 'unknown'): boolean {
 
   desktopLog('deep_link_accepted', {
     source,
-    action,
+    action: target.action,
+    hasSessionTarget: Boolean(target.sessionKey),
     activationReady: desktopDeepLinkActivationReady,
   })
+  if (target.sessionKey) pendingDesktopSessionKey = target.sessionKey
   if (!desktopDeepLinkActivationReady) {
     pendingDesktopDeepLinkOpen = true
     return true
   }
 
-  void activateMainWindow(`deep-link:${source}`)
+  void activateMainWindow(`deep-link:${source}`).then(() => {
+    // The renderer consumes this through the preload bridge. Keep the value
+    // pending until it acknowledges it so startup links cannot be lost while
+    // Vue is still mounting.
+    sendPendingDesktopSessionTarget()
+  })
   return true
 }
 
@@ -5100,7 +5116,9 @@ function handleDeepLinksFromCommandLine(
 function activatePendingDesktopDeepLink(): boolean {
   if (!pendingDesktopDeepLinkOpen) return false
   pendingDesktopDeepLinkOpen = false
-  void activateMainWindow('deep-link:pending')
+  void activateMainWindow('deep-link:pending').then(() => {
+    sendPendingDesktopSessionTarget()
+  })
   return true
 }
 
@@ -9022,6 +9040,7 @@ async function startGateway(): Promise<GatewayState> {
     ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
     ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
+    OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
     ...browserEnvironment,
     OPENSQUILLA_CONTROL_UI_DIST: desktopRendererDistPath(),
@@ -12115,6 +12134,12 @@ ipcMain.handle('desktop:update:relaunch', async (event) => {
 })
 ipcMain.handle('desktop:update:dismiss', async () => dismissDesktopUpdate())
 ipcMain.handle('desktop:os-locale', () => desktopLocale)
+ipcMain.handle('desktop:deep-link-session:get', (event) => {
+  if (!trustedMainWindowControlIpc(event)) return null
+  const sessionKey = pendingDesktopSessionKey
+  pendingDesktopSessionKey = null
+  return sessionKey
+})
 ipcMain.handle('desktop:theme:set', (_event, payload: unknown) => (
   applyDesktopNativeTheme(normalizeDesktopNativeThemeSource(payload))
 ))
@@ -12191,6 +12216,56 @@ ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileAc
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
   })
+})
+// File paths enter this broker only from the native picker or isolated preload's
+// webUtils.getPathForFile(File); renderer-facing calls never accept a path string.
+const nativeAttachmentWindows = new Map<number, {
+  event: Electron.IpcMainInvokeEvent
+  selections: NativeAttachmentSelections
+}>()
+function nativeAttachmentsFor(event: Electron.IpcMainInvokeEvent): NativeAttachmentSelections {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted attachment request')
+  const senderId = event.sender.id
+  let entry = nativeAttachmentWindows.get(senderId)
+  if (!entry) {
+    const selections = new NativeAttachmentSelections({ connection: () => {
+      const current = nativeAttachmentWindows.get(senderId)
+      if (!current || !trustedControlUiIpc(current.event) || gatewayState.status !== 'ready' || !gatewayProcess) return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    } })
+    entry = { event, selections }
+    nativeAttachmentWindows.set(senderId, entry)
+    event.sender.on('did-start-navigation', (_event, _url, inPlace, mainFrame) => {
+      if (mainFrame && !inPlace) selections.cancel(senderId)
+    })
+    event.sender.once('destroyed', () => {
+      selections.cancel(senderId)
+      nativeAttachmentWindows.delete(senderId)
+    })
+  }
+  entry.event = event
+  return entry.selections
+}
+ipcMain.handle('desktop:attachments:choose', (event, request: unknown) => (
+  nativeAttachmentsFor(event).choose(event.sender.id, request, async () => {
+    const choice = await dialog.showOpenDialog(currentMainWindow()!, {
+      properties: ['openFile', 'multiSelections'],
+    })
+    return choice.canceled ? [] : choice.filePaths
+  })
+))
+ipcMain.handle('desktop:attachments:select-file', (event, request: unknown, selectedPath: unknown) => (
+  nativeAttachmentsFor(event).select(event.sender.id, request, selectedPath)
+))
+ipcMain.handle('desktop:attachments:import', (event, request: unknown, token: unknown) => (
+  nativeAttachmentsFor(event).import(event.sender.id, request, token)
+))
+ipcMain.handle('desktop:attachments:cancel', event => {
+  nativeAttachmentsFor(event).cancel(event.sender.id)
 })
 ipcMain.handle('desktop:workspace:choose-directory', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) return null
@@ -14996,7 +15071,7 @@ app.on('will-quit', () => {
 
 configureChromiumKeychainPolicy()
 
-const initialDesktopDeepLinkArguments = process.platform === 'win32'
+const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.platform === 'linux'
   ? desktopDeepLinkArguments(process.argv)
   : []
 
@@ -15023,7 +15098,7 @@ function acquireSingleInstanceLockWithRetry(): boolean {
       })
       return true
     }
-    // A Windows protocol launch targets the current instance and does not need
+    // A Windows/Linux protocol launch targets the current instance and does not need
     // the normal close/relaunch race retry. The failed lock request has already
     // delivered its command line through second-instance; exit the forwarding
     // process immediately instead of sending the same deep link for five seconds.
@@ -15097,9 +15172,7 @@ if (!gotSingleInstanceLock) {
       reason: normalizedCrashFingerprintReason(details.reason),
     })
   })
-  if (process.platform === 'win32') {
-    handleDeepLinksFromCommandLine(process.argv, 'initial-argv')
-  }
+  handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
   app.on('second-instance', (_event, commandLine) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')

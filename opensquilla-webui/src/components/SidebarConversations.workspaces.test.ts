@@ -396,6 +396,27 @@ describe('SidebarConversations project workspaces', () => {
     expect(row?.querySelector('.sidebar-history-item')?.getAttribute('title')).toBeNull()
   })
 
+  it('does not mount the hover card when the sidebar fills a narrow viewport', async () => {
+    const previousWidth = window.innerWidth
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 548 })
+    try {
+      const { host } = await mountSidebar([projectRow(), taskRow()])
+      const row = host.querySelector<HTMLElement>(
+        '[data-session-key="agent:main:webchat:task-a"]',
+      )
+      Object.defineProperty(row, 'getBoundingClientRect', {
+        value: () => ({ left: 12, right: 280, top: 40 }),
+      })
+
+      row?.dispatchEvent(new MouseEvent('mouseenter'))
+      await nextTick()
+
+      expect(document.body.querySelector('.sidebar-session-preview')).toBeNull()
+    } finally {
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: previousWidth })
+    }
+  })
+
   it('keeps a long mixed-language title and tooltip relationship intact', async () => {
     const title = '请执行一项 Deep Research 任务：分析 Fortinet 的长期经营表现与竞争格局'
     const { host } = await mountSidebar([projectRow(), taskRow({ title })])

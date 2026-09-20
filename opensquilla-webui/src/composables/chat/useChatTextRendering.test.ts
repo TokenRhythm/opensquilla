@@ -4,6 +4,10 @@ import { describe, expect, it } from 'vitest'
 
 import { useChatTextRendering } from './useChatTextRendering'
 
+// URI sanitizer regressions run against the real browser DOM in
+// e2e/markdown-reference-safety.spec.ts; happy-dom's Node.prototype.nodeName
+// getter does not implement the browser semantics required by DOMPurify.
+
 describe('useChatTextRendering math', () => {
   it('renders inline and display LaTeX with KaTeX', () => {
     const { renderMarkdown } = useChatTextRendering()

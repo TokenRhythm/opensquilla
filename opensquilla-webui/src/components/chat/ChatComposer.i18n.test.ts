@@ -52,6 +52,13 @@ describe('ChatComposer attachment localization', () => {
         name: '无类型附件',
         mime: '',
       },
+      {
+        kind: 'uploading',
+        local_id: 3,
+        name: 'sample.xlsx',
+        mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        size: 2048,
+      },
     ]
     const el = document.createElement('div')
     document.body.appendChild(el)
@@ -69,6 +76,8 @@ describe('ChatComposer attachment localization', () => {
     expect(retry?.title).toBe('重新上传')
     expect(retry?.getAttribute('aria-label')).toBe('重新上传')
     expect(chips[1]?.querySelector('.attachment-chip__meta')?.textContent).toBe('文件')
+    expect(chips[2]?.querySelector('.attachment-chip__meta')?.textContent).toBe('XLSX · 2 KB')
+    expect(chips[2]?.classList.contains('attachment-chip--busy')).toBe(true)
 
     app.unmount()
   })

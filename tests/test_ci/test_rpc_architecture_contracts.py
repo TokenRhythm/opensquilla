@@ -125,8 +125,9 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Primary-provider transitions add resetRecommended and upsertAndActivate.
 # Retire the five legacy memory raw-fallback and repair methods.
 # Add metadata-only Skill candidates and the allow-use setting.
-RUNTIME_RPC_METHOD_BASELINE = 295
-RUNTIME_RPC_METHOD_DIGEST = "9325609b3f5a9deb73091c32efdd38f4e68143a9f33e77d7d02c304e48817278"
+# Add the owner-authorized workspace source reference reader.
+RUNTIME_RPC_METHOD_BASELINE = 298
+RUNTIME_RPC_METHOD_DIGEST = "bec25ad65b2122367c833922e3b7057c56f27f7bcef08d0b9fcbcf0cef295363"
 STATIC_RPC_DECORATOR_BASELINE = 72
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1424,6 +1425,13 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     digest = hashlib.sha256(("\n".join(sorted(methods)) + "\n").encode()).hexdigest()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
 
+    source_entry = registry.get_entry("workspaces.references.read")
+    assert source_entry is not None
+    assert source_entry.required_scope == "operator.read"
+    assert source_entry.generated_contract_name == "workspaces.references.read"
+    assert source_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+    assert source_entry.handler.__name__ == "handle_contract_method"
+
     entry = registry.get_entry(SESSIONS_LIST_METHOD)
     assert entry is not None
     assert entry.name == SESSIONS_LIST_METHOD
@@ -1485,6 +1493,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
 
     for method in (
         "sessions.messages.snapshot.read", "transport.flow.update", "sessions.executionLog.read",
+        "sessions.messages.resume", "sessions.messages.snapshot.release",
     ):
         entry = registry.get_entry(method)
         assert entry is not None

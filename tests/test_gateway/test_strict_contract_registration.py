@@ -71,6 +71,7 @@ EXPECTED_WORKSPACE_METHODS = (
     "sandbox.path.list",
     "sandbox.path.create-directory",
     "sandbox.path.pick",
+    "workspaces.references.read",
 )
 EXPECTED_META_RUN_CENTER_METHODS = (
     "meta.list",

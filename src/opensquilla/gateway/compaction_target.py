@@ -897,6 +897,7 @@ def _resolve_named_auth_profile_deployment(
     model: str,
     session_key: str,
     credential_pool_acquirer: Callable[[str, list[str], str], Any | None] | None = None,
+    turn_metadata: dict[str, Any] | None = None,
 ) -> _NamedAuthProfileDeployment:
     """Resolve exactly one named profile without ambient credential fallback.
 
@@ -1034,6 +1035,7 @@ def _resolve_named_auth_profile_deployment(
         model_id,
         inherited_provider_config=None,
         session_key=pool_session_key,
+        turn_metadata=turn_metadata,
         replay_provider_state=False,
         credential_pool_acquirer=credential_pool_acquirer,
         environment_reader=read_named_profile_environment,
@@ -1059,6 +1061,62 @@ def _resolve_named_auth_profile_deployment(
         model=model_id,
         profile_fingerprint=profile_fingerprint,
     )
+
+
+def resolve_gateway_session_turn_deployment(
+    gateway_config: object | None,
+    session: object,
+    inherited: ProviderConfig | None,
+    turn_metadata: dict[str, Any] | None = None,
+) -> ProviderConfig | None:
+    """Resolve an explicit session pin before any turn pipeline provider call.
+
+    No pin leaves the engine's normal provider path unchanged. A selected
+    deployment cannot borrow credentials or fall back to the gateway default.
+    """
+    provider = _text(getattr(session, "provider_override", None)).lower()
+    model = _text(getattr(session, "model", None))
+    auth_profile = _text(getattr(session, "auth_profile_override", None))
+    if not provider and not auth_profile:
+        # Legacy model-only pins use the normal selector/model-override path,
+        # preserving configured fallbacks and provider-state continuity.
+        return None
+    session_key = _text(getattr(session, "session_key", None))
+    if auth_profile:
+        named = _resolve_named_auth_profile_deployment(
+            gateway_config, auth_profile, expected_provider=provider,
+            model=model, session_key=session_key, turn_metadata=turn_metadata,
+        )
+        if named.blocked_reason or named.provider_config is None:
+            raise ValueError(
+                "Session deployment unavailable: "
+                + (named.blocked_reason or "named_auth_profile_unavailable")
+            )
+        return named.provider_config
+    from opensquilla.engine.selector_override import acquire_profile_credential
+
+    resolution = resolve_provider_deployment(
+        gateway_config, provider, model,
+        inherited_provider_config=inherited,
+        session_key=session_key,
+        turn_metadata=turn_metadata,
+        replay_provider_state=False,
+        credential_pool_acquirer=acquire_profile_credential,
+    )
+    if not resolution.ready or resolution.provider_config is None:
+        raise ValueError(
+            "Session deployment unavailable: " + (resolution.reason or "deployment_unresolved")
+        )
+    if provider == _text(getattr(inherited, "provider", None)).lower():
+        # A model pin on the active deployment retains its explicit request
+        # options; credentials/endpoints still come from the shared resolver.
+        from copy import deepcopy
+
+        return replace(
+            resolution.provider_config,
+            extra_body=deepcopy(getattr(inherited, "extra_body", {}) or {}),
+        )
+    return resolution.provider_config
 
 
 def validate_gateway_session_deployment_override(

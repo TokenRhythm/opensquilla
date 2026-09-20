@@ -1,4 +1,4 @@
-"""FastMCP server factory for exposing OpenSquilla session workflows."""
+"""MCP server factory for exposing OpenSquilla session workflows."""
 
 from __future__ import annotations
 
@@ -13,19 +13,19 @@ def create_mcp_server(
     name: str = "OpenSquilla",
     fastmcp_cls: type[Any] | None = None,
 ) -> Any:
-    """Create a FastMCP app with product-oriented OpenSquilla tools/resources."""
+    """Create an SDK server with product-oriented OpenSquilla tools/resources."""
 
     if fastmcp_cls is None:
         try:
-            from mcp.server.fastmcp import FastMCP  # type: ignore[import-not-found]
+            from mcp.server import MCPServer
         except ImportError as exc:  # pragma: no cover - exercised through CLI behavior.
             raise RuntimeError(
-                "The MCP server requires the optional dependency: install opensquilla[mcp]."
+                "The MCP server requires MCP SDK 2.2 or newer; reinstall OpenSquilla."
             ) from exc
-        fastmcp_cls = FastMCP
+        fastmcp_cls = MCPServer
 
     bridge = bridge or OpenSquillaMCPBridge()
-    mcp = fastmcp_cls(name, json_response=True)
+    mcp = fastmcp_cls(name)
 
     @mcp.tool(name="conversations_list")
     async def conversations_list(limit: int = 50) -> dict[str, Any]:

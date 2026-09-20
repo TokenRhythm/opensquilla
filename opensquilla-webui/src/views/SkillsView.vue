@@ -39,7 +39,7 @@
 
     <Transition name="modal">
       <div v-if="skillsOverviewOpen" class="sk-overview-modal" role="dialog" aria-modal="true" aria-labelledby="skills-overview-title" @click.self="skillsOverviewOpen = false">
-        <section class="sk-overview-modal__panel">
+        <section ref="skillsOverviewPanelRef" class="sk-overview-modal__panel">
           <header class="sk-overview-modal__head">
             <div><span class="sk-overview-modal__eyebrow">SKILLS OVERVIEW</span><h2 id="skills-overview-title">{{ t('cronSkills.skillsView.overviewTitle') }}</h2><p>{{ t('cronSkills.skillsView.overviewDesc') }}</p></div>
             <div class="sk-overview-modal__actions">
@@ -187,20 +187,22 @@
       :install-feedback="installFeedback"
       :installing-deps-id="installingDepsId"
       :uninstalling-name="uninstallingName"
-      :mutation-disabled="mutationBusy"
+      :mutation-disabled="mutationBusy || skillLaunchPending"
       :can-set-enabled="skillCatalog.supportsSetEnabled?.() ?? false"
       :setting-enabled="settingEnabled"
+      :can-use-in-task="canUseSelectedSkillInTask"
       @close="closeDialog"
       @install-deps="installDepsAndMaybeClose"
       @uninstall="uninstallSkillAndClose"
       @set-enabled="setSkillEnabled"
+      @use-in-task="useSkillInTask"
     />
   </div>
 </template>
 
 <script setup lang="ts">
-import { inject, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, inject, nextTick, onActivated, onDeactivated, onUnmounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
@@ -212,21 +214,27 @@ import SkillsAddDrawer from '@/components/skills/SkillsAddDrawer.vue'
 import SkillsStats from '@/components/skills/SkillsStats.vue'
 import { useSkillProposals } from '@/composables/skills/useSkillProposals'
 import { useSkillDetailController } from '@/composables/skills/useSkillDetailController'
+import { isSkillTaskEligible, prepareSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { createSkillMutationGate } from '@/composables/skills/useSkillMutationGate'
 import { useSkillRegistry } from '@/composables/skills/useSkillRegistry'
-import { skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
+import { isMetaSkill, skillLayerHelp, skillLayerLabel, useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
 import { useToasts } from '@/composables/useToasts'
+import { useDialogA11y } from '@/composables/useDialogA11y'
 import type { Proposal, Skill } from '@/types/skills'
 import { SKILL_CATALOG_KEY, type SkillReloadResult } from '@/modules/skillCatalog'
 
 const { t } = useI18n()
 const route = useRoute()
+const router = useRouter()
 const skillsOverviewOpen = ref(false)
+const skillsOverviewPanelRef = ref<HTMLElement | null>(null)
 const { pushToast } = useToasts()
 const injectedSkillCatalog = inject(SKILL_CATALOG_KEY)
 if (!injectedSkillCatalog) throw new Error('SkillCatalog was not provided')
 const skillCatalog = injectedSkillCatalog
 const addSkillOpen = ref(false)
+
+useDialogA11y(skillsOverviewPanelRef, skillsOverviewOpen, () => { skillsOverviewOpen.value = false })
 const reloading = ref(false)
 const settingEnabled = ref(false)
 const selectedProposal = ref<Proposal | null>(null)
@@ -355,6 +363,41 @@ const {
   closeSkill,
   installCurrentDependencies,
 } = skillDetail
+
+const skillLaunchPending = ref(false)
+const canUseSelectedSkillInTask = computed(() => {
+  const skill = selectedSkill.value
+  if (!skill || !isSkillTaskEligible(skill)) return false
+  return isMetaSkill(skill) || Boolean(skillCatalog.supportsCandidates?.())
+})
+
+async function useSkillInTask(skill: Skill) {
+  if (skillLaunchPending.value || mutationBusy.value || selectedSkill.value !== skill) return
+  skillLaunchPending.value = true
+  try {
+    const candidates = isMetaSkill(skill) ? [] : (await skillCatalog.listCandidates()).candidates
+    // Closing the dialog or selecting another skill retires an in-flight read.
+    if (selectedSkill.value !== skill) return
+    const prefill = prepareSkillTaskPrefill(skill, candidates)
+    if (!prefill) {
+      pushToast(t('cronSkills.skillDetail.useUnavailable'), { tone: 'warn' })
+      return
+    }
+    await router.push({
+      path: '/chat/new',
+      query: { agent: 'main' },
+      state: {
+        prefill: prefill.prefill,
+        autosend: false,
+        selectedSkillPrefill: prefill.selectedSkillPrefill.map(({ name, instanceId, digest }) => ({ name, instanceId, digest })),
+      },
+    })
+  } catch (error) {
+    if (selectedSkill.value === skill) pushToast(String(error instanceof Error ? error.message : error), { tone: 'danger' })
+  } finally {
+    skillLaunchPending.value = false
+  }
+}
 
 async function setSkillEnabled(name: string, enabled: boolean) {
   if (!skillCatalog.supportsSetEnabled?.() || !mutationGate.acquire('allow_use')) return

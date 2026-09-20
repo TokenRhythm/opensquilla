@@ -8,6 +8,7 @@ import {
   conversationSemanticEventKind,
   CONVERSATION_EVENT_WIRE_NAMES,
   decodeConversationEvent,
+  isConversationEventName,
 } from './conversationEventsV4'
 import type { TransportEventHandler, TransportConsumptionHandler, TransportGapHandler } from './transportTypes'
 import { projectConversationContent, projectConversationEvent } from './conversationContentV4'
@@ -85,13 +86,16 @@ export function createConversationEventTransport(events: ConversationEventWireSo
         })
       }
 
+      // The shared wildcard also carries transport heartbeats and other domains.
+      // Only a Conversation frame can invalidate this lane's current snapshot.
+      if (!isConversationEventName(eventName)) return
+
       let projected: ConversationEventProjection
       try {
         projected = projectConversationEvent(decodeConversationEvent(eventName, rawPayload, rawMeta))
       } catch (error) {
-        // A malformed or unrelated frame must not take down the shared event
-        // stream. Preserve the old wildcard observation path through the
-        // `invalid` message and report the contract violation for diagnostics.
+        // Preserve malformed Conversation frames as recovery evidence and
+        // report the contract violation without taking down the shared stream.
         const result = handlers.onEvent?.({
           kind: 'invalid',
           error,

@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>OpenSquilla 埋点 V2 预览面板登录</title>
+    <title>OpenSquilla 设备统计 V2 预览面板登录</title>
     <style nonce="{{ csp_nonce }}">
       body { font: 16px system-ui, sans-serif; max-width: 34rem; margin: 10vh auto; padding: 1rem; color: #172033; }
       main { border: 1px solid #ccd3df; border-radius: .75rem; padding: 1.5rem; }
@@ -14,7 +14,7 @@
   </head>
   <body>
     <main>
-      <h1>OpenSquilla 埋点 V2 预览</h1>
+      <h1>OpenSquilla 设备统计 V2 预览</h1>
       <p>此隔离预览仅展示稳定性与用户增长的汇总指标。</p>
       {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
       <form method="post" action="{{ base_path }}/login">

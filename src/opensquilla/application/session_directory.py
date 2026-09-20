@@ -60,6 +60,7 @@ class SessionSearchProjection:
     effective_agent_id: str | None = None
     surface: str | None = None
     updated_at: int | None = None
+    run_status: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

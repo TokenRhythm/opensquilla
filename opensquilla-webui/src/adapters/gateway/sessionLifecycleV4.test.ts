@@ -50,6 +50,7 @@ describe('v4 SessionLifecycle Adapter', () => {
       title: 'Draft',
       message: 'hello',
       model: 'openai/gpt-test',
+      provider: 'openai',
     })).resolves.toEqual({
       key: 'agent:main:webchat:abc123',
       sessionId: 'abc123',
@@ -64,6 +65,7 @@ describe('v4 SessionLifecycle Adapter', () => {
         displayName: 'Draft',
         message: 'hello',
         model: 'openai/gpt-test',
+        provider: 'openai',
       },
       undefined,
     )

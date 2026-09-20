@@ -67,6 +67,15 @@ function rpc() {
 }
 
 describe('Platform configuration adapters', () => {
+  it('requests configured model scope explicitly while preserving default catalog requests', async () => {
+    const source = rpc()
+    const providers = createV4ProviderConfiguration(source, { subscribe: () => ({ close() {} }) })
+    await providers.list()
+    expect(source.request).toHaveBeenLastCalledWith('models.list', undefined, expect.any(Object))
+    await providers.list({ scope: 'configured' })
+    expect(source.request).toHaveBeenLastCalledWith('models.list', { scope: 'configured' }, expect.any(Object))
+  })
+
   it('maps config operations to AppSettings domain values', async () => {
     const source = rpc()
     const settings = createV4AppSettings(source)

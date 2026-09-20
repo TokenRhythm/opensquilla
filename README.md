@@ -388,11 +388,11 @@ full reference.
 
 ---
 
-## Telemetry Privacy
+## Usage Statistics and Privacy
 
 OpenSquilla uses the existing **Network reporting** switch for V1 statistics and
-both V2 telemetry streams. Reporting is enabled by default and can be turned off in Privacy
-settings, without separate onboarding choices or consent popups:
+both V2 statistics streams. Reporting is enabled by default and can be turned off
+in Privacy settings, without separate onboarding choices or consent popups:
 
 - **Reliability diagnostics** records bounded operation results for app and
   Gateway startup, crashes, turns, tools, file parsing, updates, and session
@@ -402,15 +402,21 @@ settings, without separate onboarding choices or consent popups:
   app-readiness, registration, and first-successful-turn milestones. Existing
   installations do not become new-user cohorts just by enabling reporting.
 
-The streams retain separate purpose-specific identifiers, durable queues,
+The streams retain separate session/journey identifiers, durable queues,
 upload endpoints, and retention policies. Reliability events
 go to `/v1/reliability/events`; growth events go to `/v1/growth/events`.
 Retries reuse `event_id` for server-side deduplication, and growth events are
 not sampled.
 
-V2 telemetry never includes prompts, responses, file names, file paths, file
+Application events also carry a one-way, application-specific `device_id`
+derived locally from the OS machine identifier when available. Daily/monthly
+activity and feature device counts deduplicate this token across profiles and
+client surfaces. Legacy events without it are excluded from device counts;
+operation totals and success rates still count actual operations.
+
+V2 statistics never include prompts, responses, file names, file paths, file
 contents, tool arguments, task parameters, provider configuration, raw account
-IDs, order data, MAC addresses, IP addresses, or device fingerprints. Complete
+IDs, order data, MAC addresses, IP addresses, or raw OS machine identifiers. Complete
 crash stacks stay local unless the user explicitly prepares and shares a
 support bundle.
 
@@ -436,12 +442,12 @@ or set:
 disable_network_observability = true
 ```
 
-This is a hard veto over V1 and both V2 telemetry scopes, passive update checks, and
+This is a hard veto over V1 and both V2 statistics streams, passive update checks, and
 automatic desktop update checks. Disabling Network reporting pauses pending uploads and
-stops collection without deleting local telemetry state. Previously saved
+stops collection without deleting local statistics state. Previously saved
 per-scope declines are migrated to the unified switch being off; users can
 then change that one setting. CI, test, and `DO_NOT_TRACK` environments
-also fail closed for telemetry. Other user-initiated actions may still contact
+also fail closed for statistics uploads. Other user-initiated actions may still contact
 configured providers, search services, channels, or release hosts.
 Explicit update-availability checks remain disabled while the unified or
 legacy update opt-out controls are active.
@@ -453,7 +459,7 @@ OPENSQUILLA_TELEMETRY_DISABLED=true
 OPENSQUILLA_UPDATE_CHECK_DISABLED=true
 ```
 
-The legacy telemetry variable disables V1 and V2 reporting. The legacy update
+The legacy statistics variable disables V1 and V2 reporting. The legacy update
 variable also suppresses V1 uploads for compatibility, but does not disable V2.
 See [`PRIVACY.md`](PRIVACY.md) for the complete data, reporting, deletion, update,
 and external-producer rules.
@@ -691,7 +697,7 @@ Per-version highlights live in [`CHANGELOG.md`](CHANGELOG.md) and
 | **Token-efficient routing** | `SquillaRouter` — a local LightGBM + ONNX classifier in the `recommended` extra — scores each turn on length, language, code, keywords, and semantic embeddings, then routes it across four tiers (C0–C3; legacy T0–T3 names are aliases) to the cheapest capable model. Classification runs on-device; your prompt never leaves the machine to make that decision. |
 | **Adaptive reasoning and prompts** | OpenSquilla requests extended reasoning only for turns the router scores as complex, and the system prompt scales with task complexity — lightweight for trivial turns, full instructions for complex ones. |
 | **20+ LLM providers** | The provider registry targets 20+ LLM backends — TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini, DashScope/Qwen, Moonshot, Mistral, Groq, Zhipu, SiliconFlow, vLLM, LM Studio, and more, with primary-plus-fallback selection; first-run onboarding exposes the verified subset. |
-| **On-demand skills and MCP** | 15 bundled skills (coding, GitHub, cron, pptx/docx/xlsx/pdf, summarization, tmux, weather, and more) load only when the task needs them. OpenSquilla is an MCP client, and can also run as an MCP server — `opensquilla mcp-server run` needs the `mcp` extra (install `opensquilla[recommended,mcp]`). Skills can be authored, installed, and published from the CLI. |
+| **On-demand skills and MCP** | 15 bundled skills (coding, GitHub, cron, pptx/docx/xlsx/pdf, summarization, tmux, weather, and more) load only when the task needs them. The current source includes MCP client and server support; see [MCP setup](docs/mcp-server.md#requirements) for SDK 2.x installation, then run `opensquilla mcp-server run` to expose session workflows to another MCP client. Skills can be authored, installed, and published from the CLI. |
 | **Persistent local memory** | A curated `MEMORY.md` plus dated Markdown notes, searched with SQLite full-text keyword search and `sqlite-vec` semantic recall. Embeddings run on-device via bundled ONNX, or swap to OpenAI/Ollama. Optional exponential decay and opt-in "dream" consolidation are available. |
 | **Layered security sandbox** | Three policy tiers (Standard / Strict / Locked) on a permission matrix. Bubblewrap isolates code execution on Linux; macOS runs commands through Seatbelt (`sandbox-exec`) with generated SBPL profiles; Windows uses the native `windows_default` backend after setup readiness checks. A denial ledger auto-pauses autonomous runs after repeated denials, rejected outputs are purged, and skill metadata and tool results are XML-escaped against prompt injection. |
 | **Built-in tools** | File read/write/edit, shell and background processes, git, web search (DuckDuckGo, Bocha, Brave, IQS, Tavily, or Exa) and fetch behind an SSRF guard, spreadsheet/PPTX/PDF authoring, image generation, and text-to-speech. |

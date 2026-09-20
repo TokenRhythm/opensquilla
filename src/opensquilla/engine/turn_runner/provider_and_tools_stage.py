@@ -141,6 +141,7 @@ class ProviderAndToolsStageOutput:
     effective_tool_context: ToolContext | None
     tool_metadata: dict[str, Any] = field(default_factory=dict)
     skill_catalog: Any | None = None
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
 # ---------------------------------------------------------------------------
 # Stage
@@ -195,7 +196,13 @@ class ProviderAndToolsStage:
             skill_catalog = await self._skill_catalog_resolver.resolve_skill_catalog()
 
         # 2. Resolve provider (clone to avoid shared state race)
-        provider, cloned_selector = self._provider_resolver.resolve_provider()
+        resolve_session = getattr(self._provider_resolver, "resolve_session_provider", None)
+        if callable(resolve_session):
+            provider, cloned_selector, provider_metadata = await resolve_session(inp.session_key)
+        else:
+            # Existing extension ports retain their no-argument contract.
+            provider, cloned_selector = self._provider_resolver.resolve_provider()
+            provider_metadata = {}
         if provider is None:
             # Construct the same ErrorEvent shape the original inline body
             # produces. The harness emits the turn_error trace + persists
@@ -241,6 +248,7 @@ class ProviderAndToolsStage:
                 tool_handler=tool_handler,
                 effective_tool_context=effective_ctx,
                 tool_metadata=tool_metadata,
+                provider_metadata=provider_metadata,
                 skill_catalog=skill_catalog,
             )
         )

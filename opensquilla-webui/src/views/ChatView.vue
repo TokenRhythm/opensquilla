@@ -139,9 +139,12 @@
           </div>
         </template>
         <ChatSessionRecoveryStatus
-          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState"
+          v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState && !chatSessionBootstrap.noticeDismissed.value"
           :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
+          :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
+          :busy="chatSessionBootstrap.retryBusy.value"
+          @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
           @retry="recoveryNoticeState.startsWith('live-') ? retryLive() : retryHistory()"
         />
         <div
@@ -645,6 +648,8 @@
       :placeholder="composerPlaceholder"
       :send-button-title="sendButtonTitle"
       :send-blocked-message="composerSendBlockedMessage"
+      :show-image-input-warning="!forkTransition && !modelRoutingMutationBusy
+        && imageInputAdmission === 'blocked' && Boolean(modelImageSendBlockedMessage)"
       :input-disabled="Boolean(dockedPlanQuestionnaire)
         || Boolean(forkTransition)
         || historyState.sessionMissing"
@@ -654,9 +659,19 @@
       :run-mode-locked="runModeLocked"
       :run-mode-lock-message="t('chat.composer.runModeLocked')"
       :session-routing-mode="modelRoutingMode"
-      :session-routing-busy="modelRoutingSettingsBusy"
-      :session-routing-control-blocked="goalBusy"
+      :session-routing-busy="modelRoutingMutationBusy"
+      :session-routing-control-blocked="goalBusy || modelRoutingSettingsBusy"
       :session-routing-available="sessionRoutingAvailable"
+      :session-model-name="sessionModelName"
+      :is-new-task="isProvisionalDraftSession()"
+      :model-selection-available="composerModelSelectionAvailable"
+      :available-models="newTaskModels"
+      :model-selection="composerModelSelection"
+      :default-model="composerDefaultModel"
+      :models-loading="newTaskModelsLoading"
+      :models-error="newTaskModelsError"
+      :model-provider-errors="newTaskModelsProviderErrors"
+      :model-selection-disabled-reason="composerModelDisabledReason"
       :coding-mode-enabled="codingModeEnabled"
       :coding-mode-settings-busy="codingModeSettingsBusy"
       :goal-draft-armed="goalDraftArmed"
@@ -689,6 +704,7 @@
       @expand="expandComposer"
       @composition-change="composing = $event; !$event && handleSlashInput()"
       @beforeinput="onTextareaBeforeInput"
+      :choose-attachments="chooseAttachments"
       @file-change="onFileInputChange"
       @input="onTextareaInput"
       @keydown="onTextareaKeydown"
@@ -699,6 +715,9 @@
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
       @set-session-routing-mode="setComposerSessionRoutingMode"
+      @select-model="setComposerModel"
+      @refresh-models="refreshComposerModels"
+      @open-model-settings="openComposerModelSettings"
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
@@ -869,6 +888,7 @@ import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersiste
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
+import { useNewTaskModelSelection, type NewTaskModelSelection } from '@/composables/chat/useNewTaskModelSelection'
 import { SESSION_ROUTING_KEY, type SessionRouting } from '@/modules/sessionRouting'
 import { USAGE_REPORTING_KEY, type UsageReporting } from '@/modules/usageReporting'
 import SkillLoadStatus from '@/components/chat/SkillLoadStatus.vue'
@@ -877,6 +897,7 @@ import ChatSlashPalette from '@/components/chat/ChatSlashPalette.vue'
 import SkillWorkflowRequestDialog from '@/components/chat/SkillWorkflowRequestDialog.vue'
 import { SKILL_CATALOG_KEY } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { readSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
 import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
 import {
@@ -980,6 +1001,7 @@ import { useChatStream } from '@/composables/chat/useChatStream'
 import { useComposerFloatingPreference } from '@/composables/useComposerFloatingPreference'
 import { useChatTextRendering } from '@/composables/chat/useChatTextRendering'
 import { useChatUsageWidget } from '@/composables/chat/useChatUsageWidget'
+import { useChatSessionModel } from '@/composables/chat/useChatSessionModel'
 import { useSessionArtifacts } from '@/composables/chat/useSessionArtifacts'
 import { useVoiceInput } from '@/composables/chat/useVoiceInput'
 import { AUDIO_TRANSCRIPTION_KEY } from '@/modules/audioTranscription'
@@ -1110,6 +1132,8 @@ import {
 import { copyTextWithFallback, copyImageToClipboard, downloadBlob, shareCopyImageSupported } from '@/utils/browser'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
 import { recordSessionNavigationDiag } from '@/utils/chat/sessionNavigationDiag'
+import { sessionApplicationLink, sessionDesktopLink } from '@/types/references'
+import { currentSessionGatewayLink } from '@/utils/chat/sessionLinks'
 import {
   toolCallGroups,
   toolGroupStatusText,
@@ -1863,11 +1887,58 @@ watch(
   available => setStreamConnectionAvailable(available),
   { immediate: true },
 )
-const chatAttachments = useChatAttachments(artifactWorkbench.content)
+const nativeAttachmentSession = ref<{ key: string; epoch: number } | null>(null)
+watch(sessionKey, () => { nativeAttachmentSession.value = null }, { flush: 'sync' })
+const attachmentDraftIdentity = ref<string | null>(null)
+const attachmentDraftIdentityPending = ref(false)
+watch(() => gatewayAccess.deliveryIdentity, async (identity, _previous, onCleanup) => {
+  let current = true
+  onCleanup(() => { current = false })
+  attachmentDraftIdentity.value = null
+  attachmentDraftIdentityPending.value = false
+  if (!identity) return
+  if (platform.id !== 'desktop') { attachmentDraftIdentity.value = identity; return }
+  attachmentDraftIdentityPending.value = true
+  try {
+    const connection = await platform.gateway.getAttachmentBinding?.()
+    if (!current || !gatewayAccess.isLocalOwner || !connection?.profileFingerprint) return
+    // A verified owned profile remains the same draft owner across desktop
+    // restarts; the per-launch native selection secret never enters IndexedDB.
+    attachmentDraftIdentity.value = JSON.stringify(['desktop-profile-v1', connection.profileFingerprint, 'owner'])
+  } catch { /* Identity remains unproven until the next connection update. */ }
+  finally { if (current) attachmentDraftIdentityPending.value = false }
+}, { immediate: true })
+const chatAttachments = useChatAttachments(artifactWorkbench.content, {
+  draftOwnerState: () => [inputText.value, selectedSkills.value],
+  draftScopePending: () => attachmentDraftIdentityPending.value,
+  draftScope: () => attachmentDraftIdentity.value && sessionKey.value
+    ? { identity: attachmentDraftIdentity.value, sessionKey: sessionKey.value } : null,
+  native: platform.files,
+  nativeIsCurrent: context => context.sessionKey === sessionKey.value
+    && nativeAttachmentSession.value?.epoch === context.sessionEpoch,
+  nativeContext: async () => {
+    const targetSession = sessionKey.value
+    const binding = nativeAttachmentSession.value
+    const identity = gatewayAccess.deliveryIdentity
+    // A new task has no durable session identity yet. Its ordinary file input
+    // and byte upload path remain available without minting native authority.
+    if (!targetSession || !binding || binding.key !== targetSession || !platform.gateway.getAttachmentBinding) return null
+    const connection = await platform.gateway.getAttachmentBinding()
+    if (!connection) return null
+    const resolved = await sessionDirectory.resolve({ key: targetSession })
+    if (sessionKey.value !== targetSession || nativeAttachmentSession.value?.epoch !== binding.epoch
+      || gatewayAccess.deliveryIdentity !== identity || resolved.key !== targetSession) {
+      throw new Error('Session changed; select the file again')
+    }
+    return { gatewayInstanceId: connection.instanceId, sessionKey: targetSession,
+      sessionId: resolved.id, sessionEpoch: binding.epoch }
+  },
+})
 const {
   pendingAttachments,
   attachmentWorkBusy,
   onFileInputChange,
+  chooseAttachments,
   addAttachments,
   removeAttachment,
   retireAttachments,
@@ -2162,6 +2233,8 @@ const chatFeatureToggles = useChatFeatureToggles({
   appSettings: injectedAppSettings,
   modelRouting: injectedProviderConfiguration,
   readOptions: optionalSessionReadOptions,
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  connectionAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -2177,10 +2250,24 @@ const {
   codingModeEnabled,
   codingModeSettingsBusy,
   routerTierConfigs,
+  defaultModelForAgent,
   loadFeatureToggles,
   setCodingModeEnabled,
   bindFeatureRefresh,
 } = chatFeatureToggles
+
+const composerDefaultModel = computed(() => defaultModelForAgent(
+  isProvisionalDraftSession() ? draftAgentId() : agentIdFromSessionKey(sessionKey.value),
+))
+
+const chatSessionModel = useChatSessionModel({
+  directory: sessionDirectory,
+  sessionKey,
+  isDraft: isDraftSurface,
+  available: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+})
+const { modelName: storedSessionModelName } = chatSessionModel
 
 const sessionRoutingAvailable = computed(() => {
   return gatewayAccess.isAvailable
@@ -2190,6 +2277,8 @@ const sessionRoutingAvailable = computed(() => {
 const chatSessionRouting = useChatSessionRouting({
   routing: sessionRouting,
   sessionKey,
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  modelSelectionCapable: computed(() => gatewayAccess.sessionsRoutingModelSelection && sessionRoutingAvailable.value),
   globalMode: globalModelRoutingMode,
   globalImageInputAdmission,
   globalImageInputAdmissionReason,
@@ -2205,22 +2294,85 @@ const chatSessionRouting = useChatSessionRouting({
 const {
   mode: modelRoutingMode,
   busy: modelRoutingSettingsBusy,
+  mutationBusy: modelRoutingMutationBusy,
   initialRoutingMode,
-  imageInputAdmission,
+  imageInputAdmission: sessionImageInputAdmission,
   imageInputAdmissionReason,
 } = chatSessionRouting
+const newTaskModel = useNewTaskModelSelection({
+  catalog: injectedProviderConfiguration,
+  catalogAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated
+    && (gatewayAccess.chatSendInitialModel || chatSessionRouting.modelSelectionSupported.value)),
+  sessionKey,
+  isDraft: isProvisionalDraftSession,
+  capable: computed(() => gatewayAccess.chatSendInitialModel
+    && gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
+  connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  routingMode: modelRoutingMode,
+  busy: computed(() => isStreaming.value || modelRoutingSettingsBusy.value
+    || acceptanceStopPending.value || acceptanceRecoveryPending.value),
+})
+const {
+  available: newTaskModelAvailable,
+  selection: newTaskModelSelection,
+  models: newTaskModels,
+  loading: newTaskModelsLoading,
+  error: newTaskModelsError,
+  providerErrors: newTaskModelsProviderErrors,
+  disabledReason: newTaskModelDisabledReason,
+} = newTaskModel
+const composerModelSelectionAvailable = computed(() => isProvisionalDraftSession()
+  ? newTaskModelAvailable.value
+  : sessionRoutingAvailable.value && chatSessionRouting.modelSelectionSupported.value)
+const composerModelSelection = computed(() => isProvisionalDraftSession()
+  ? newTaskModelSelection.value : chatSessionRouting.modelSelection.value)
+const sessionModelName = computed(() => chatSessionRouting.modelSelectionSupported.value
+  ? chatSessionRouting.modelSelection.value?.model ?? null : storedSessionModelName.value)
+const composerModelDisabledReason = computed(() => {
+  if (isProvisionalDraftSession()) return newTaskModelDisabledReason.value
+  if (!composerModelSelectionAvailable.value) return 'unavailable' as const
+  return isStreaming.value || modelRoutingMutationBusy.value
+    || acceptanceStopPending.value || acceptanceRecoveryPending.value ? 'busy' as const : null
+})
+watch(
+  [newTaskModelSelection, sessionRoutingAvailable],
+  ([selection, available]) => {
+    // A recovered draft pin was an explicit single-model choice. Reapply its
+    // local strategy before sending, without changing the gateway default.
+    if (selection && available && isProvisionalDraftSession() && initialRoutingMode.value === null) {
+      void chatSessionRouting.setMode('off')
+    }
+  },
+  { immediate: true },
+)
+// The routing capability snapshot describes the default model. An explicit
+// draft pin must not inherit that model's image restriction. Unknown model
+// capabilities remain a gateway admission decision.
+const imageInputAdmission = computed(() => {
+  const selected = composerModelSelection.value
+  if (!selected || modelRoutingMode.value !== 'off') return sessionImageInputAdmission.value
+  const descriptor = newTaskModels.value.find(model => (
+    model.id === selected.model && model.provider === selected.provider
+  ))
+  return descriptor?.capabilities.includes('vision') ? 'allowed' as const : 'unknown' as const
+})
+const newTaskModelSendBlockedReason = computed(() => {
+  const conflict = newTaskModel.conflict.value
+  return conflict === 'routing' ? t('chat.newTaskModel.routingConflict')
+    : conflict === 'unavailable' ? t('chat.newTaskModel.unavailable') : null
+})
 const sessionRoutingSendBlockedReason = computed(() => (
-  modelRoutingSettingsBusy.value ? t('chat.composer.routingUpdateBlocked') : ''
+  modelRoutingMutationBusy.value ? t('chat.composer.routingUpdateBlocked') : ''
 ))
 isQueuedDeliveryBlocked = () => (
-  modelRoutingSettingsBusy.value
+  modelRoutingMutationBusy.value
   || (
     hasModelInputImageAttachment(pendingQueue.value[0]?.attachments || [])
     && imageInputAdmission.value === 'blocked'
   )
 )
 watch(
-  [imageInputAdmission, modelRoutingSettingsBusy],
+  [imageInputAdmission, modelRoutingMutationBusy],
   ([admission, busy], [previousAdmission, wasBusy]) => {
     const routingUnblocked = (
       (previousAdmission === 'blocked' && admission !== 'blocked')
@@ -2689,6 +2841,10 @@ const chatSessionSubscription = useChatSessionSubscription({
   },
   onSessionMissing: markSessionMissing,
   onSnapshot: snapshot => {
+    if (snapshot.sessionKey === sessionKey.value) {
+      nativeAttachmentSession.value = typeof snapshot.epoch === 'number' && Number.isSafeInteger(snapshot.epoch)
+        && snapshot.epoch >= 0 ? { key: snapshot.sessionKey, epoch: snapshot.epoch } : null
+    }
     chatSessionRouting.applyBootstrap(snapshot)
     chatPlans.applyBootstrap(snapshot)
     taskProgress.applySnapshot(snapshot)
@@ -2718,6 +2874,8 @@ const chatSessionBootstrap = useChatSessionBootstrap({
   reconcileSession,
   connectionState: gatewayConnectionState,
   metadataRecoveryError: chatSessionSubscription.metadataRecoveryError,
+  retryMetadata: () => retrySessionMetadata(),
+  incidentScope: () => deliveryIdentity.value ?? '',
   cancelHistory: cancelActiveHistory,
   cancelSubscription: cancelActiveSubscription,
 })
@@ -2854,8 +3012,8 @@ function retryHistory() {
   return retryHistoryCoordinator()
 }
 
-function retryLive() {
-  return retryLiveCoordinator()
+function retryLive(explicit = true) {
+  return retryLiveCoordinator(explicit)
 }
 
 function cancelSessionBootstrap(unsubscribe = true) {
@@ -2921,6 +3079,7 @@ const deliveryBlockedReason = computed<string | null>(() => (
 const effectiveSendBlockedReason = computed<string | null>(() => (
   (projectBindingBusy.value ? t('workspaces.activeProjectResolving') : null)
   || deliveryBlockedReason.value || promptAnnotationSendBlockedReason.value
+  || newTaskModelSendBlockedReason.value
 ))
 const provenSessionDelivery = ref<{
   key: string; identity: string; withoutProject: boolean
@@ -3217,11 +3376,13 @@ const chatGoals = useChatGoals({
     const sourceKey = sessionKey.value
     const sourceIntent = pendingSessionIntent.value
     const workspaceId = pendingWorkspaceId.value
-    const draftInitialRoutingMode = initialRoutingMode.value
+    const draftInitialModel = newTaskModelSelection.value
+    const draftInitialRoutingMode = initialRoutingMode.value ?? (draftInitialModel ? 'direct' : null)
     const created = await sessionLifecycle.create({
       agentId: agentIdFromSessionKey(sourceKey),
       kind: 'webchat',
       ...(workspaceId ? { workspaceId } : {}),
+      ...(draftInitialModel ? { model: draftInitialModel.model, provider: draftInitialModel.provider } : {}),
     })
     const key = created.key.trim()
     if (!key) throw new Error('failed to create a session for the goal')
@@ -3231,6 +3392,7 @@ const chatGoals = useChatGoals({
       sessionKey.value !== sourceKey
       || pendingSessionIntent.value !== sourceIntent
       || pendingWorkspaceId.value !== workspaceId
+      || newTaskModelSelection.value !== draftInitialModel
     ) return ''
     if (draftInitialRoutingMode) {
       await sessionRouting.set({
@@ -3242,6 +3404,7 @@ const chatGoals = useChatGoals({
         sessionKey.value !== sourceKey
         || pendingSessionIntent.value !== sourceIntent
         || pendingWorkspaceId.value !== workspaceId
+        || newTaskModelSelection.value !== draftInitialModel
       ) return ''
     }
     if (workspaceId) freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
@@ -3473,6 +3636,7 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 const chatSend = useChatSend({
   selectedSkills,
   consumeAcceptedDraft: draftPersistence.consumeAcceptedDraft,
+  captureAttachmentDraftConsumption: chatAttachments.captureDraftConsumption,
   metaRunCenter,
   turnCommands: {
     send(request, options) {
@@ -3496,9 +3660,12 @@ const chatSend = useChatSend({
   pendingInputWal,
   busySendMode,
   modelRoutingMode,
-  modelRoutingSettingsBusy,
+  modelRoutingSettingsBusy: modelRoutingMutationBusy,
   imageInputAdmission,
   initialRoutingMode,
+  initialModel: newTaskModel.initialModel,
+  initialProvider: newTaskModel.initialProvider,
+  restoreInitialModel: newTaskModel.restore,
   elevatedMode,
   runMode,
   pendingAttachments,
@@ -3547,6 +3714,10 @@ const chatSend = useChatSend({
     const bootstrap = startSessionBootstrap({ includeHistory: false, force: true })
     void bootstrap.live.then(outcome => {
       if (outcome.authoritative && sessionKey.value === key) {
+        // A provisional snapshot may have completed before the first send
+        // materialized this same key. Re-read after the durable subscription
+        // if its routing projection did not replace that draft snapshot.
+        if (!chatSessionRouting.hasAuthoritativeSnapshot.value) void chatSessionRouting.load()
         void handleAuthoritativeSessionSubscription(key)
       }
     })
@@ -3822,7 +3993,7 @@ async function onComposerSend() {
   if (composerSendBlockedMessage.value) return
   // Serialize session-routing and plan mutations before accepting another
   // composer turn, so the send cannot race either CAS update.
-  if (modelRoutingSettingsBusy.value || planModeBusy.value) return
+  if (modelRoutingMutationBusy.value || planModeBusy.value) return
   // Goal draft mode: the composer text is the durable objective and the set
   // mutation atomically accepts its first ordinary user turn.
   if (goalDraftArmed.value) {
@@ -4303,26 +4474,22 @@ const chatRpcSubscriptions = useChatRpcSubscriptions({
   runtime: conversationSessionRuntime,
 })
 
-let currentSessionRecovery: Promise<boolean> | null = null
+const sessionRecoveries = new WeakMap<NonNullable<ReturnType<typeof sessionReadLifecycle.current>>, Promise<boolean>>()
 function recoverCurrentSession(scope?: { readonly keys: readonly string[], readonly global: boolean }): Promise<boolean> {
   if (scope && (scope.global || scope.keys.length === 0 || scope.keys.some(key => key !== sessionKey.value))) {
     return Promise.resolve(false)
   }
-  if (currentSessionRecovery) return currentSessionRecovery
   const key = sessionKey.value
   const lease = sessionReadLifecycle.current()
-  const pending = retryLive().then(result => key === sessionKey.value && (
-    result.authoritative
-    // The current owner remains fenced and owns bounded automatic retries (or
-    // a truthful local stale state for an oversized snapshot). A read failure
-    // is not evidence that the shared transport must be recycled.
-    || (lease !== null && sessionReadLifecycle.current() === lease && !result.sessionMissing)
-  ))
-    .catch(() => false)
+  if (!lease) return Promise.resolve(false)
+  const prior = sessionRecoveries.get(lease)
+  if (prior) return prior
+  const pending = retryLive(false).then(result => key === sessionKey.value
+    && sessionReadLifecycle.current() === lease && result.authoritative).catch(() => false)
   const observed = pending.finally(() => {
-    if (currentSessionRecovery === observed) currentSessionRecovery = null
+    if (sessionRecoveries.get(lease) === observed) sessionRecoveries.delete(lease)
   })
-  currentSessionRecovery = observed
+  sessionRecoveries.set(lease, observed)
   return observed
 }
 
@@ -4434,6 +4601,7 @@ let unsubs: (() => void)[] = []
 let chatViewDisposed = false
 let composerDockResizeObserver: ResizeObserver | null = null
 let composerDockPinFrame: number | null = null
+let composerDockSettleFrame: number | null = null
 let lastComposerDockHeight = -1
 let tailResizeObserver: ResizeObserver | null = null
 let tailMutationObserver: MutationObserver | null = null
@@ -4585,7 +4753,10 @@ const liveRecoveryState = computed(() => {
 const recoveryNoticeState = computed(() => historyState.value.sessionMissing
   ? 'session-missing' as const
   : liveRecoveryState.value ?? visibleHistoryRecoveryState.value)
-const recoveryNoticeVisible = useChatRecoveryNotice(recoveryNoticeState)
+const recoveryNoticeVisible = useChatRecoveryNotice(
+  recoveryNoticeState,
+  computed(() => gatewayAccess.isRuntimeStarting),
+)
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
   isDraftLanding: isNewChatLanding.value,
@@ -4703,7 +4874,7 @@ const landingSuggestionsDisabled = computed(() => shouldDisableLandingSuggestion
 }))
 
 const queuedImageSendBlockedMessage = computed(() => {
-  if (modelRoutingSettingsBusy.value) {
+  if (modelRoutingMutationBusy.value) {
     return t('chat.composer.routingUpdateImageBlocked')
   }
   if (imageInputAdmission.value !== 'blocked') return ''
@@ -4926,7 +5097,27 @@ function runComposerSandboxSetupInBackground(): void {
 
 async function setComposerSessionRoutingMode(mode: ModelRoutingMode) {
   if (goalBusy.value) return
-  await chatSessionRouting.setMode(mode)
+  await newTaskModel.selectRoutingMode(mode, chatSessionRouting.setMode)
+}
+
+async function setComposerModel(selection: NewTaskModelSelection | null) {
+  if (goalBusy.value || composerModelDisabledReason.value === 'busy') return
+  if (isProvisionalDraftSession()) {
+    await newTaskModel.selectWithRouting(selection, chatSessionRouting.setMode)
+  } else {
+    await chatSessionRouting.setModel(selection)
+  }
+}
+
+async function refreshComposerModels() {
+  await Promise.allSettled([
+    newTaskModel.refresh(), loadFeatureToggles(), chatSessionModel.refresh(),
+    chatSessionRouting.load(),
+  ])
+}
+
+function openComposerModelSettings() {
+  void router.push('/settings/modelStrategy').catch(() => {})
 }
 
 async function setComposerCodingModeEnabled(enabled: boolean) {
@@ -5279,7 +5470,7 @@ const attachmentWorkbenchResources = computed<ReadonlyMap<string, WorkbenchResou
 const deliverablesOpen = ref(false)
 
 function focusHeaderAction(
-  action: 'deliverables' | 'share' | 'copy-session-key',
+  action: 'deliverables' | 'share' | 'copy-session-key' | 'copy-session-link' | 'copy-gateway-link',
 ) {
   void nextTick(() => chatRouteHeaderRegistration.focusAction(action))
 }
@@ -5825,6 +6016,31 @@ const {
   }
 })
 
+async function copySessionReference(value: string) {
+  if (!sessionKey.value) return
+  try {
+    await copyTextWithFallback(value)
+    pushToast(t('chat.copied'), { tone: 'ok' })
+  } catch {
+    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
+}
+const copySessionLink = () => copySessionReference(
+  platform.capabilities.isDesktop
+    ? sessionDesktopLink(sessionKey.value)
+    : sessionApplicationLink(sessionKey.value),
+)
+async function copyGatewayLink() {
+  const key = sessionKey.value
+  if (!key) return
+  try {
+    const link = await currentSessionGatewayLink(key, platform)
+    if (sessionKey.value === key) await copySessionReference(link)
+  } catch {
+    pushToast(t('chat.toast.copyFailed'), { tone: 'danger' })
+  }
+}
+
 // App owns the header component. This view registers one stable set of refs and
 // commands; draft materialization only changes those refs and never rebuilds
 // the header subtree. The owner token makes delayed teardown harmless.
@@ -5843,6 +6059,8 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   openDeliverables,
   startShare: startShareMode,
   copySessionKey: onSessionCopyClick,
+  copySessionLink,
+  copyGatewayLink,
   restoreComposerFocus: () => composerRef.value?.focusTextarea(),
 })
 
@@ -6054,6 +6272,9 @@ function onThreadScroll() {
       }
     }
     sessionScrollBaseline = metrics
+    // Landing samples still establish the floating composer's position. The
+    // first reader gesture may arrive before another programmatic event.
+    composerRetraction.syncBaseline(currentScrollTop)
     recordChatScrollDiagnostic(
       scrollMutation?.matched ? 'programmatic' : 'session-switch',
       scrollMutation?.matched ? 'applyProgrammaticScroll' : 'browser-or-user',
@@ -6064,6 +6285,9 @@ function onThreadScroll() {
   }
   const previousScrollTop = scrollMutation?.expectedScrollTop
     ?? lastObservedThreadScrollTop
+  // Chromium may coalesce the application's pin and the first reader scroll.
+  // Use the recorded application position before measuring that gesture.
+  if (scrollMutation) composerRetraction.syncBaseline(scrollMutation.expectedScrollTop)
   lastObservedThreadScrollTop = currentScrollTop
   const gap = el.scrollHeight - el.scrollTop - el.clientHeight
   // Native scrollbar drags and middle-button auto-scroll can produce only a
@@ -6586,17 +6810,23 @@ function onDocumentKeydown(e: KeyboardEvent) {
 function consumeDraftPrefill() {
   const state = window.history.state as Record<string, unknown> | null
   const prefill = typeof state?.prefill === 'string' ? state.prefill : ''
-  if (!prefill) return
+  const skills = readSkillTaskPrefill(state)
+  if (!prefill && !skills.length) return
   inputText.value = prefill
+  if (skills.length) {
+    selectedSkills.value = skills
+    markProvisionalDraftUsed()
+    persistDraftHistoryState()
+  }
   landingPrefilled.value = true
   // A Sessions Hub "Start task" hand-off also asks the draft to send the
   // prefill in one step; the actual flush waits for the subscription in onMounted.
-  if (state?.autosend === true) {
+  if (state?.autosend === true && !skills.length) {
     pendingAutoSend.value = prefill
     pendingAutoSendSessionKey.value = sessionKey.value
   }
   try {
-    window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined }, '')
+    window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined, selectedSkillPrefill: undefined }, '')
   } catch { /* ignore */ }
 }
 
@@ -6612,6 +6842,7 @@ function scopedDraftFromHistoryState(
     sessionKey: state.draftSessionKey,
     agentId: state.draftAgentId,
     projectId: state.draftProjectId,
+    hasAttachments: state.draftHasAttachments === true,
   }
 }
 
@@ -6621,16 +6852,19 @@ function persistDraftHistoryState() {
     const state = window.history.state as Record<string, unknown> | null
     const agentId = draftAgentId()
     const projectId = readProjectFromUrl()
+    const hasAttachments = pendingAttachments.value.length > 0
     if (
       state?.draftSessionKey === sessionKey.value
       && state.draftAgentId === agentId
       && state.draftProjectId === projectId
+      && state.draftHasAttachments === hasAttachments
     ) return
     window.history.replaceState({
       ...state,
       draftSessionKey: sessionKey.value,
       draftAgentId: agentId,
       draftProjectId: projectId,
+      draftHasAttachments: hasAttachments,
     }, '')
   } catch { /* ignore */ }
 }
@@ -6927,8 +7161,8 @@ onMounted(async () => {
   bindBottomIntersectionObserver()
   const initialRouteFullPath = route.fullPath
   const initialHistoryState = window.history.state as Record<string, unknown> | null
-  const hasExplicitDraftPrefill = typeof initialHistoryState?.prefill === 'string'
-    && initialHistoryState.prefill.length > 0
+  const hasExplicitDraftPrefill = (typeof initialHistoryState?.prefill === 'string'
+    && initialHistoryState.prefill.length > 0) || readSkillTaskPrefill(initialHistoryState).length > 0
   const scopedDraft = scopedDraftFromHistoryState(initialHistoryState)
   const canRecoverDraft = !hasLegacyNewChatQuery() && !hasExplicitDraftPrefill
   const initialSession = resolveInitialSession({
@@ -7029,9 +7263,10 @@ onMounted(async () => {
   // exactly enough clearance for the floating surface.
   const composerDock = composerRef.value?.composerElement()?.parentElement ?? null
   if (composerDock && typeof ResizeObserver !== 'undefined') {
+    let reservedHeight = -1
     const publishComposerDockHeight = () => {
       const height = Math.ceil(composerDock.getBoundingClientRect().height)
-      if (height === lastComposerDockHeight) return
+      if (height === lastComposerDockHeight && height === reservedHeight) return
       // Chromium applies a ResizeObserver-driven custom property on the next
       // layout cycle. During expansion, reserve one measured growth step ahead
       // so the dock cannot outgrow the viewport clearance before that cycle.
@@ -7040,7 +7275,17 @@ onMounted(async () => {
         ? 0
         : Math.max(0, height - lastComposerDockHeight)
       lastComposerDockHeight = height
-      chatRootRef.value?.style.setProperty('--composer-dock-h', `${height + growth}px`)
+      reservedHeight = height + growth
+      chatRootRef.value?.style.setProperty('--composer-dock-h', `${reservedHeight}px`)
+      // A batch of attachments can grow the dock in a single layout. Recheck
+      // next frame even if ResizeObserver has no further size change to report,
+      // so the temporary expansion guard does not become a permanent gap.
+      if (growth > 0 && composerDockSettleFrame === null) {
+        composerDockSettleFrame = requestAnimationFrame(() => {
+          composerDockSettleFrame = null
+          publishComposerDockHeight()
+        })
+      }
       if (autoScroll.value && composerDockPinFrame === null) {
         const epoch = scrollEpoch.value
         const key = sessionKey.value
@@ -7178,6 +7423,10 @@ onUnmounted(() => {
     cancelAnimationFrame(composerDockPinFrame)
     composerDockPinFrame = null
   }
+  if (composerDockSettleFrame !== null) {
+    cancelAnimationFrame(composerDockSettleFrame)
+    composerDockSettleFrame = null
+  }
   cancelInitialSessionPin()
   cancelTailLayoutPin()
   tailResizeObserver?.disconnect()
@@ -7305,6 +7554,7 @@ watch(inputText, (value) => {
 
 watch(() => pendingAttachments.value.length, (count) => {
   if (count > 0) markProvisionalDraftUsed()
+  persistDraftHistoryState()
 }, { flush: 'sync' })
 
 watch(() => pendingQueue.value.length, (count) => {

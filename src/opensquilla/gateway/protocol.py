@@ -383,6 +383,8 @@ class PolicyInfo(BaseModel):
     max_buffered_bytes: int = MAX_BUFFERED_BYTES
     tick_interval_ms: int = TICK_INTERVAL_MS
     concurrent_history_reads: bool = False
+    chat_send_initial_model: bool = False
+    sessions_routing_model_selection: bool = False
     concurrent_optional_read_methods: list[str] = []
     cancellable_request_methods: list[str] = []
     provider_probe_modes: list[str] = []

@@ -203,7 +203,7 @@ class AttachmentsConfig(BaseSettings):
     # tool access only. False restores the rendered-types-only admission gate.
     accept_opaque: bool = True
     opaque_max_bytes: int = 30 * 1024 * 1024
-    # Aggregate RAM ceiling for the in-memory staged-upload store. When
+    # Aggregate byte ceiling for the temporary staged-upload store. When
     # reached, new uploads are rejected (HTTP 507 UPLOAD_STORE_FULL) instead
     # of evicting staged entries, preserving the file_uuid TTL promise.
     # Applied at gateway construction; changing it requires a restart.
@@ -1414,7 +1414,6 @@ class SquillaRouterConfig(BaseSettings):
     # rollback-tolerant).
     budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
     estimated_output_savings_pct: float = 0.03
-    upgrade_to_c3_compaction_enabled: bool = True
     self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
     # Deprecated compatibility fields: active history is retained until compaction;
     # image routing no longer imposes a separate turn window.
@@ -1447,13 +1446,6 @@ class SquillaRouterConfig(BaseSettings):
         if not isinstance(values, dict):
             return values
         values = dict(values)
-        if (
-            "upgrade_to_c3_compaction_enabled" not in values
-            and "upgrade_to_t3_compaction_enabled" in values
-        ):
-            values["upgrade_to_c3_compaction_enabled"] = values[
-                "upgrade_to_t3_compaction_enabled"
-            ]
         if "default_tier" in values:
             values["default_tier"] = normalize_text_tier(values.get("default_tier")) or values.get(
                 "default_tier"

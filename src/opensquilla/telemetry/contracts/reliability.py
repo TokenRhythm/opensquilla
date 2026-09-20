@@ -1,4 +1,4 @@
-"""Strict contracts for product-reliability telemetry events."""
+"""Strict contracts for product-reliability metrics events."""
 
 from __future__ import annotations
 

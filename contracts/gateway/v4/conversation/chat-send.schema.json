@@ -279,6 +279,42 @@
             "null"
           ]
         },
+        "initialModel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "initial_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "initialProvider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "initial_provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
         "forkBeforeMessageId": {
           "type": [
             "string",
@@ -327,6 +363,13 @@
           "maxItems": 16,
           "items": {
             "$ref": "#/$defs/SelectedSkillRef"
+          }
+        },
+        "workspaceFiles": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/WorkspaceFileReference"
           }
         }
       }
@@ -529,6 +572,25 @@
           },
           "description": "Legacy accepted-receipt replay only. New turns do not create or consume annotation IDs.",
           "deprecated": true
+        },
+        "acceptedModel": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "provider": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "model",
+            "provider"
+          ]
         }
       }
     },
@@ -731,6 +793,42 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 512
+        }
+      }
+    },
+    "WorkspaceFileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "relativePath",
+        "name",
+        "mime"
+      ],
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "relativePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "mime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
         }
       }
     }

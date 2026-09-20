@@ -162,7 +162,7 @@ describe('RouterFxStrip model selection motion', () => {
       winnerIdx: 1,
     }))
 
-    expect(el.textContent).toContain('Multi-model fusion')
+    expect(el.textContent).toContain('Model ensemble')
     expect(el.textContent).not.toContain('claude-opus-4.8')
     app.unmount()
   })
@@ -410,7 +410,7 @@ describe('RouterFxStrip model selection motion', () => {
     await nextTick()
 
     expect(root?.dataset.phase).toBe('locked')
-    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Multi-model fusion')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Model ensemble')
     expect(el.querySelector('[data-testid="router-ensemble-handoff"]')).toBeTruthy()
     expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeTruthy()
     expect(el.querySelector('.router-fx-ensemble__dot')).toBeTruthy()
@@ -424,7 +424,7 @@ describe('RouterFxStrip model selection motion', () => {
     const { app, el } = await mountStrip(combinedStrip())
 
     expect(el.querySelector<HTMLElement>('.router-fx')?.dataset.phase).toBe('static')
-    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Multi-model fusion')
+    expect(el.querySelector<HTMLElement>('.router-fx-cell.win')?.textContent).toContain('Model ensemble')
     expect(el.querySelector('[data-testid="router-ensemble-stage"]')).toBeTruthy()
     expect(vi.getTimerCount()).toBe(0)
     app.unmount()

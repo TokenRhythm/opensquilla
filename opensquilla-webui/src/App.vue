@@ -217,6 +217,8 @@
           @open-deliverables="chatRouteHeader.invoke('openDeliverables')"
           @start-share="chatRouteHeader.invoke('startShare')"
           @copy-session-key="chatRouteHeader.invoke('copySessionKey')"
+          @copy-session-link="chatRouteHeader.invoke('copySessionLink')"
+          @copy-gateway-link="chatRouteHeader.invoke('copyGatewayLink')"
         />
       </div>
       <div
@@ -318,7 +320,8 @@
         id="content"
       >
         <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
-          <router-view v-slot="{ Component, route }">
+          <SettingsBackgroundRoute :route="settingsContentRoute">
+          <router-view :route="settingsContentRoute" v-slot="{ Component, route }">
             <!-- out-in: one view in the DOM at a time, so pages never overlap (no
                  double-exposure, and never two composers/textareas mid-swap).
                  Console views are kept-alive, so the entering page is instant —
@@ -336,6 +339,8 @@
               <component v-else :is="Component" :key="route.meta.viewKey || route.name" />
             </Transition>
           </router-view>
+          </SettingsBackgroundRoute>
+          <router-view v-if="settingsBackgroundRoute" />
         </ErrorBoundary>
       </main>
       <AppWorkbench
@@ -440,6 +445,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { SettingsBackgroundRoute, useSettingsRouteOverlay } from './router/settingsRouteOverlay'
 import { useI18n } from 'vue-i18n'
 import { routeTitle } from './router'
 import { getPlatform } from '@/platform'
@@ -499,6 +505,7 @@ import { useConfirm } from './composables/useConfirm'
 import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
+import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
 import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
@@ -535,6 +542,7 @@ import {
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
+const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
@@ -562,10 +570,12 @@ const shortcutsStore = useShortcutsStore()
 const artifactImageLightbox = provideArtifactImageLightbox()
 const { t } = useI18n()
 const $route = useRoute()
+const router = useRouter()
+const { backgroundRoute: settingsBackgroundRoute, contentRoute: settingsContentRoute } = useSettingsRouteOverlay(router)
 // Every transient control in the global topbar shares one active owner. The
 // controls render on chat and non-chat routes, so route-scoped coordination
 // would allow sibling menus such as Language and Theme to overlap.
-const isChatRoute = computed(() => $route.path === '/chat' || $route.path === '/chat/new')
+const isChatRoute = computed(() => settingsContentRoute.value.path === '/chat' || settingsContentRoute.value.path === '/chat/new')
 const topbarPopoverCoordinationEnabled = ref(true)
 const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
@@ -634,8 +644,6 @@ const effectiveConnectionState = computed(() => effectiveChatConnectionState(
 const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewayAccess.requiresCredential
   ? t('setup.connection.tokenRequired')
   : t(`chrome.connectionState.${effectiveConnectionState.value}`))
-const router = useRouter()
-
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
@@ -1528,14 +1536,15 @@ function onPaletteSelectSession(key: string) {
   switchToSession(key, 'command_palette.select_session')
 }
 
-function switchToSession(key: string, source = 'app.switchToSession') {
+async function switchToSession(key: string, source = 'app.switchToSession') {
   if (!key) return
   sessionTaskAttention.markRead(key)
   recordSessionNavigationDiag(source, {
     from: currentSessionKey.value,
     to: key,
   })
-  router.push({ path: '/chat', query: { session: key } })
+  await router.push({ path: '/chat', query: { session: key } })
+  if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
 // Optimistic rename: show the new title immediately, then persist through the
@@ -1920,8 +1929,27 @@ watch(() => appStore.approvalCount, count => {
 
 useDocumentEvent('keydown', handleKeydown)
 
+let desktopDeepLinkUnsubscribe: (() => void) | null = null
+
 onMounted(() => {
   appAutomaticRpcMounted = true
+  desktopDeepLinkUnsubscribe = bindDesktopSessionDeepLinks({
+    window: platform.window,
+    directory: sessionDirectory,
+    gatewayContext: () => ({
+      endpoint: gatewayAccess.isAvailable ? gatewayAccess.loadConnectionEndpoint() : '',
+      epoch: gatewayAccess.isAvailable ? gatewayAccess.subscriptionEpoch : null,
+      authenticated: gatewayAccess.isAuthenticated,
+    }),
+    onGatewayContextChange: callback => watch(() => [
+      gatewayAccess.isAvailable,
+      gatewayAccess.subscriptionEpoch,
+      gatewayAccess.isAuthenticated,
+      gatewayAccess.loadConnectionEndpoint(),
+    ], callback, { flush: 'sync' }),
+    openSession: key => switchToSession(key, 'desktop.deep_link'),
+    unavailable: () => pushToast(t('chat.sessionReference.unavailable'), { tone: 'danger' }),
+  })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
   window.addEventListener('focus', markCurrentSessionReadIfVisible)
@@ -1943,6 +1971,8 @@ onUnmounted(() => {
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()
+  desktopDeepLinkUnsubscribe?.()
+  desktopDeepLinkUnsubscribe = null
   cronFinishedSubscription?.close()
   cronFinishedSubscription = null
   if (titleDebounce) {

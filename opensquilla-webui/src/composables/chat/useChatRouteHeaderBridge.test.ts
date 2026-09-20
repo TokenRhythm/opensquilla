@@ -53,6 +53,8 @@ function owner(title: string): {
       openDeliverables: vi.fn(),
       startShare: vi.fn(),
       copySessionKey: vi.fn(),
+      copySessionLink: vi.fn(),
+      copyGatewayLink: vi.fn(),
       restoreComposerFocus: vi.fn(),
     },
   }
@@ -73,6 +75,20 @@ describe('chat route header bridge', () => {
     bridge.invoke('startShare')
     expect(second.commands.startShare).toHaveBeenCalledOnce()
     expect(first.commands.startShare).not.toHaveBeenCalled()
+  })
+
+  it('routes all three copy actions to the active session owner', () => {
+    const bridge = createBridge()
+    const previous = owner('previous')
+    const current = owner('current')
+    bridge.register(previous.model, previous.commands)
+    bridge.register(current.model, current.commands)
+
+    for (const command of ['copySessionKey', 'copySessionLink', 'copyGatewayLink'] as const) {
+      bridge.invoke(command)
+      expect(current.commands[command]).toHaveBeenCalledOnce()
+      expect(previous.commands[command]).not.toHaveBeenCalled()
+    }
   })
 
   it('closes host state and hides the model when the active owner clears', () => {

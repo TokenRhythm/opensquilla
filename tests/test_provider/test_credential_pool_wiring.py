@@ -561,3 +561,81 @@ def test_rc1_rollback_tolerates_pool_field_on_load() -> None:
     )
     assert profile.api_key_env == _ENV_A
     assert "api_key_env_pool" not in profile.model_dump()
+
+
+@pytest.mark.parametrize("named", [False, True])
+def test_session_pin_pool_failure_parks_its_credential(pool_env, named):
+    from types import SimpleNamespace
+
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+    from opensquilla.provider.selector import ProviderConfig
+
+    profile = LlmProviderProfile(model="chosen", api_key_env_pool=[_ENV_A, _ENV_B])
+    cfg = _config(profile)
+    if named:
+        cfg.llm_profiles = {"openai:work": profile}
+    session = SimpleNamespace(
+        session_key="session-pin", model="chosen", provider_override="openai",
+        auth_profile_override="openai:work" if named else None,
+    )
+    inherited = ProviderConfig(provider="ollama", model="default")
+    metadata = {}
+    first = resolve_gateway_session_turn_deployment(cfg, session, inherited, metadata)
+    assert metadata["credential_pool"]["provider"] == "openai"
+    assert _SECRET_A not in str(metadata) and _SECRET_B not in str(metadata)
+    _report_credential_pool_failure("openai", {
+        "session_credential_pool": metadata["credential_pool"],
+        "session_provider_applied": "openai", "executed_provider": "openai",
+    }, ErrorEvent(message="invalid key", code="401"))
+    second = resolve_gateway_session_turn_deployment(cfg, session, inherited, {})
+    assert first.api_key != second.api_key
+
+
+def test_session_pin_pool_is_not_parked_for_a_different_active_provider(pool_env):
+    from types import SimpleNamespace
+
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+    from opensquilla.provider.selector import ProviderConfig
+
+    cfg = _config(LlmProviderProfile(model="chosen", api_key_env_pool=[_ENV_A, _ENV_B]))
+    session = SimpleNamespace(session_key="pin-routed", model="chosen", provider_override="openai")
+    inherited = ProviderConfig(provider="ollama", model="default")
+    metadata = {}
+    first = resolve_gateway_session_turn_deployment(cfg, session, inherited, metadata)
+    _report_credential_pool_failure("anthropic", {
+        "session_credential_pool": metadata["credential_pool"],
+        "session_provider_applied": "openai", "executed_provider": "anthropic",
+    }, ErrorEvent(message="rate limited", code="429"))
+    second = resolve_gateway_session_turn_deployment(cfg, session, inherited, {})
+    assert first.api_key == second.api_key
+
+
+def test_named_session_pin_realignment_parks_named_pool_not_router_default(pool_env):
+    from types import SimpleNamespace
+
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+    from opensquilla.provider.selector import ProviderConfig
+
+    profile = LlmProviderProfile(model="chosen", api_key_env_pool=[_ENV_A, _ENV_B])
+    cfg = _config(profile)
+    cfg.llm_profiles["openai:work"] = profile
+    routed_metadata = {}
+    routed_first = _resolve(cfg, "same-provider-router", routed_metadata)
+    session = SimpleNamespace(
+        session_key="named-after-router", model="chosen", provider_override="openai",
+        auth_profile_override="openai:work",
+    )
+    inherited = ProviderConfig(provider="ollama", model="default")
+    metadata = {}
+    named_first = resolve_gateway_session_turn_deployment(cfg, session, inherited, metadata)
+    _report_credential_pool_failure("openai", {
+        **routed_metadata, "routed_provider_applied": "openai",
+        "routed_provider_fallback_reason": "explicit_model_override",
+        "session_credential_pool": metadata["credential_pool"],
+        "session_provider_applied": "openai", "executed_provider": "openai",
+    }, ErrorEvent(message="rate limited", code="429"))
+    named_second = resolve_gateway_session_turn_deployment(cfg, session, inherited, {})
+    assert named_first.api_key != named_second.api_key
+    # Pool failure bookkeeping is provider-scoped, but the active named
+    # profile's session must have moved off its failed credential.
+    assert routed_first is not None

@@ -30,6 +30,9 @@ export interface RpcTransport {
   markUnsupported(method: string): void
   acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
+  recoveryVersion?(key: string): string
+  waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
+  failProtocol?(generation: number): void
   readonly generation: number
 }
 
@@ -56,22 +59,16 @@ export interface GatewayTransports {
   readonly events: EventTransport
 }
 
-interface RpcStoreTransportSource {
-  readonly policy?: Record<string, unknown> | null
+interface RpcStoreTransportSource extends Pick<RpcTransport, 'policy' | 'acknowledgeDelivery' | 'resumeFlow'> {
   readonly connectionGeneration: number
-  call<T = unknown>(
-    method: string,
-    params?: Record<string, unknown>,
-    options?: TransportCallOptions,
-  ): Promise<T>
+  call: RpcTransport['request']
   on(event: string, handler: TransportEventHandler): () => void
   onConsumedEvent?(event: string, handler: TransportConsumptionHandler): () => void
   onGap?(handler: TransportGapHandler): () => void
-  acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
-  resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
   enableConsumptionFlow?(): void
   consumeEvent?(event: string, payload: unknown, meta: Record<string, unknown>): Promise<'applied' | 'dirty'>
   recoverGap?(detail: unknown): Promise<boolean>
+  recoverConnectionGeneration?(generation: number, reason?: string): boolean
   hasRpcMethod(method: string): boolean
   hasRpcEvent(event: string): boolean
   rememberUnsupportedMethod(method: string): void
@@ -94,6 +91,10 @@ function consumptionFlow(source: RpcStoreTransportSource): TransportFlowV4 | und
       enableConsumptionFlow: () => source.enableConsumptionFlow!(),
       consumeEvent: (event, payload, meta) => source.consumeEvent!(event, payload, meta),
       recoverGap: detail => source.recoverGap!(detail),
+      supportsRecovery: () => owner?.enabled === true
+        && source.hasRpcMethod('sessions.messages.resume')
+        && source.hasRpcMethod('sessions.messages.snapshot.release'),
+      failProtocol: generation => { source.recoverConnectionGeneration?.(generation, 'Invalid recovery credit') },
       get connectionGeneration() { return source.connectionGeneration },
     })
     flowOwners.set(source, owner)
@@ -121,16 +122,14 @@ export function createPrivateGatewayTransports(
   source: RpcStoreTransportSource,
 ): GatewayTransports {
   const flow = consumptionFlow(source)
+  const deliveryOwner = flow ?? source
   return {
     rpc: {
-      ...(flow || source.acknowledgeDelivery ? {
-        acknowledgeDelivery: (receipt: TransportDeliveryReceipt) => flow
-          ? flow.acknowledgeDelivery(receipt) : source.acknowledgeDelivery!(receipt),
-      } : {}),
-      ...(flow || source.resumeFlow ? {
-        resumeFlow: (receipt: TransportInstalledReceipt) => flow
-          ? flow.resumeFlow(receipt) : source.resumeFlow!(receipt),
-      } : {}),
+      recoveryVersion: key => flow?.recoveryVersion(key) ?? String(source.connectionGeneration),
+      waitForConsumption: (key, cursor) => flow?.waitForConsumption(key, cursor) ?? Promise.resolve(),
+      failProtocol: generation => { source.recoverConnectionGeneration?.(generation, 'Invalid snapshot recovery contract') },
+      acknowledgeDelivery: deliveryOwner.acknowledgeDelivery?.bind(deliveryOwner),
+      resumeFlow: deliveryOwner.resumeFlow?.bind(deliveryOwner),
       request(method, params, options) {
         return source.call(method, params, options)
       },
@@ -145,6 +144,8 @@ export function createPrivateGatewayTransports(
         )
       },
       supports(method) {
+        if ((method === 'sessions.messages.resume' || method === 'sessions.messages.snapshot.release')
+          && !flow?.enabled) return false
         return source.hasRpcMethod(method)
       },
       get policy() { return source.policy },

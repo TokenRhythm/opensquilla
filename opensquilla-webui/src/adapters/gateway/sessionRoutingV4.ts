@@ -82,6 +82,12 @@ function snapshot(value: unknown): SessionRoutingSnapshot | null {
   } as Record<string, SessionRoutingSnapshot['mode']>)[rawMode]
   const revision = number(route.revision, route.routingRevision, route.routing_revision)
   if (!key || !mode || revision === null) return null
+  const modelSelection = route.modelSelection
+  const storedSelection = objectValue(modelSelection)
+  if (Object.prototype.hasOwnProperty.call(route, 'modelSelection')
+    && modelSelection !== null
+    && (!storedSelection || !text(storedSelection.model)
+      || !(storedSelection.provider === null || text(storedSelection.provider)))) return null
   return {
     key,
     mode,
@@ -89,6 +95,12 @@ function snapshot(value: unknown): SessionRoutingSnapshot | null {
     source: text(route.source) || 'session',
     initialized: route.initialized === true,
     appliesTo: text(route.appliesTo, route.applies_to) || 'next_accepted_turn',
+    ...(Object.prototype.hasOwnProperty.call(route, 'modelSelection') ? {
+      modelSelection: storedSelection ? {
+        model: text(storedSelection.model),
+        provider: storedSelection.provider === null ? null : text(storedSelection.provider),
+      } : null,
+    } : {}),
   }
 }
 
@@ -116,6 +128,7 @@ function mapError(error: unknown): SessionRoutingError {
   if (code === 'METHOD_NOT_FOUND' || code === 'UNSUPPORTED') return new SessionRoutingError('unsupported', message, { details, cause: error })
   if (code === 'UNAUTHORIZED' || code === 'FORBIDDEN') return new SessionRoutingError('forbidden', message, { details, cause: error })
   if (code === 'SESSION_ROUTING_CHANGED' || code === 'CONFLICT') return new SessionRoutingError('conflict', message, { details, retryable: true, cause: error })
+  if (code === 'SESSION_MODEL_BUSY') return new SessionRoutingError('busy', message, { details, retryable: true, cause: error })
   if (code === 'INVALID_REQUEST' || code === 'INVALID_PARAMS') return new SessionRoutingError('invalid', message, { details, cause: error })
   return new SessionRoutingError('unavailable', message, { details, cause: error })
 }
@@ -169,6 +182,7 @@ export function createV4SessionRouting(
         sessionKey: input.sessionKey,
         mode: input.mode,
         expectedRevision: input.expectedRevision,
+        ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
       }, requestOptionsFor(requestOptions?.signal))
       if (!validateSetResult(value)) {
         throw new Error('sessions.routing.set returned an invalid snapshot')

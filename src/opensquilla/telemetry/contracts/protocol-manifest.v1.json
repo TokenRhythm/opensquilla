@@ -33,7 +33,14 @@
     { "event_name": "coding_mode_usage", "event_version": 1, "scope": "growth" },
     { "event_name": "product_active", "event_version": 1, "scope": "growth" }
   ],
-  "manifest_version": 1,
+  "manifest_version": 2,
+  "device_identity": {
+    "field": "device_id",
+    "format": "sha256-lowercase-hex",
+    "optional": true,
+    "scope": "application-events",
+    "deduplication_unit": "device"
+  },
   "notice_versions": { "growth": "growth-v2", "reliability": "reliability-v1" },
   "wire_limits": { "max_event_bytes": 16384, "max_nesting_depth": 16 }
 }

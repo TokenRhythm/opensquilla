@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "Ouvrir {path} dans l’atelier",
+    "actions": "Actions du fichier",
+    "copyPath": "Copier le chemin relatif",
+    "copyLocation": "Copier le chemin et les lignes",
+    "loading": "Vérification du fichier…",
+    "copied": "Copié",
+    "copyFailed": "Échec de la copie. Réessayez.",
+    "stale": "Le fichier a changé. Relisez-le pour actualiser la référence.",
+    "workspaceMismatch": "Ce fichier appartient à un autre espace de travail.",
+    "forbidden": "Vous n’avez pas accès à ce fichier.",
+    "missing": "Le fichier ou sa tâche n’est plus disponible.",
+    "invalid": "Cette référence de fichier est invalide.",
+    "unsupported": "Ce fichier ne peut pas être affiché comme code source.",
+    "unavailable": "Impossible d’ouvrir le fichier. Vérifiez la connexion et réessayez.",
+    "readonly": "Source en lecture seule",
+    "refresh": "Vérifier à nouveau",
+    "lines": "Lignes {start}–{end} sur {total}",
+    "previous": "Afficher les lignes précédentes",
+    "next": "Afficher plus de lignes"
+  },
   "resourceActions": {
     "more": "Actions du fichier", "preview": "Aperçu dans l’application", "openSource": "Ouvrir avec l’application par défaut",
     "reveal": "Afficher dans le gestionnaire de fichiers", "revealFinder": "Afficher dans le Finder", "revealExplorer": "Afficher dans l’Explorateur de fichiers",
@@ -140,6 +161,8 @@
     }
   },
   "common": {
+    "more": "Plus",
+    "saving": "Enregistrement…",
     "close": "Fermer",
     "save": "Enregistrer",
     "discard": "Abandonner",
@@ -400,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Rechercher un paramètre",
+      "results": "Résultats des paramètres",
+      "empty": "Aucun paramètre correspondant",
+      "defaultModel": "Modèle par défaut",
+      "permissions": "Autorisations"
+    },
     "appearance": {
       "title": "Interface",
       "desc": "Thème et préférences d'interface locales à ce navigateur. Les préréglages s'appliquent immédiatement ; utilisez Appliquer pour une largeur personnalisée.",
@@ -734,7 +764,7 @@
       "customAnthropic": "Personnalisé · compatible Anthropic",
       "partialSaved": "Enregistré : {saved}. Non enregistré : {pending}. Les valeurs non enregistrées sont conservées.",
       "providerPartialSaved": "Le fournisseur a été enregistré. Les limites du modèle n’ont pas été enregistrées ; vos saisies sont conservées.",
-      "backToRouting": "Retour au routage intelligent",
+      "backToRouting": "Retour au routage intelligent des modèles",
       "editSharedEnsemble": "Modifier l’ensemble partagé",
       "sharedEnsemble": "C3 et la fusion de modèles partagent cet ensemble.",
       "title": "Paramètres du modèle",
@@ -847,7 +877,7 @@
       "profileStatusUnavailable": "État indisponible",
       "emptyTitle": "Ajoutez votre premier fournisseur de modèles",
       "configuredEmpty": "Connectez un fournisseur pour vérifier les identifiants et choisir les modèles disponibles.",
-      "emptyRoutingHint": "Vous pourrez ensuite configurer le routage intelligent ; un seul fournisseur peut aussi router entre plusieurs modèles.",
+      "emptyRoutingHint": "Vous pourrez ensuite configurer le routage intelligent des modèles ; un seul fournisseur peut aussi router entre plusieurs modèles.",
       "addProvider": "Ajouter un fournisseur",
       "catalogTitle": "Ajouter un fournisseur",
       "catalogDesc": "Choisissez un fournisseur. Sa configuration s’ouvrira juste en dessous.",
@@ -885,10 +915,10 @@
       "openModelRouting": "Ouvrir Routage des modèles →",
       "modelUsageTitle": "Utilisation des modèles",
       "modelUsageRouter": "Routage intelligent des modèles",
-      "modelUsageEnsemble": "Collaboration multimodèle",
+      "modelUsageEnsemble": "Ensemble de modèles",
       "modelUsageFixed": "Modèle fixe",
       "modelUsageRouterDesc": "Choisit un modèle configuré adapté à chaque requête.",
-      "modelUsageEnsembleDesc": "Génère avec plusieurs modèles, puis combine leurs résultats.",
+      "modelUsageEnsembleDesc": "Les modèles candidats répondent en parallèle, puis un modèle agrégateur combine leurs réponses pour produire la réponse finale.",
       "modelUsageFixedDesc": "Envoie chaque requête au modèle direct actuel.",
       "crossProviderActive": "Routage inter-fournisseurs inclus",
       "configureModelRouting": "Configurer le routage",
@@ -962,7 +992,7 @@
       "choose": "Choisir un fournisseur",
       "chooseProviderShort": "choisir un fournisseur",
       "routerTiers": "Routage des modèles",
-      "routingDesc": "Configurez les niveaux, l'ensemble et le modèle unique dans le routage des modèles.",
+      "routingDesc": "Configurez les niveaux, l'ensemble et le modèle fixe dans le routage des modèles.",
       "routerReady": "SquillaRouter prêt",
       "directOnly": "Direct uniquement",
       "chooseToSeeFields": "Choisissez un fournisseur pour voir les champs requis.",
@@ -993,7 +1023,7 @@
       "configuredModelFallbackLabel": "Modèle de repli",
       "configuredModelDescFixed": "Mode modèle fixe : chaque requête utilise le modèle ci-dessous.",
       "configuredModelDescRouter": "Mode routage intelligent des modèles : chaque requête est dirigée vers un modèle adapté et revient au modèle ci-dessous si le routage est indisponible.",
-      "configuredModelDescEnsemble": "Mode collaboration multimodèle : plusieurs modèles génèrent ensemble, avec repli sur le modèle ci-dessous si l’ensemble ne peut pas aboutir.",
+      "configuredModelDescEnsemble": "Ensemble de modèles: Les modèles candidats répondent en parallèle, puis un modèle agrégateur combine leurs réponses pour produire la réponse finale. Si l’ensemble ne peut pas aboutir, le modèle ci-dessous sert de solution de repli.",
       "defaultModelDesc": "Utilisé pour les requêtes directes et le repli principal. Les modèles routés se configurent dans Routage des modèles.",
       "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
       "profileModelTitle": "Modèle direct et de repli pour {provider}",
@@ -1205,7 +1235,7 @@
         }
       },
       "routerDependency": "Choisissez un modèle par niveau de requête. Un seul fournisseur peut tous les couvrir.",
-      "ensembleTitle": "Collaboration multimodèle",
+      "ensembleTitle": "Ensemble de modèles",
       "ensembleDependency": "Utilise les identifiants {provider} ; le modèle par défaut du fournisseur est {model}.",
       "ensembleMinimum": "Ajoutez au moins un autre candidat pour bénéficier du routage agrégé.",
       "ensembleFailure": "Si la fusion ne peut pas aboutir, utilise le modèle fixe et de repli : {provider} · {model}.",
@@ -1302,12 +1332,12 @@
     "router": {
       "title": "Niveaux de modèle",
       "mode": "Mode",
-      "modeModelRouting": "Routage IA à modèle unique",
+      "modeModelRouting": "Routage intelligent des modèles",
       "modeSingleModel": "Désactivé",
       "modeRecommended": "Suivre les niveaux du fournisseur actuel",
       "modeDisabled": "Désactivé",
-      "routingDisabledHint": "Activez le routage IA à modèle unique pour modifier les niveaux de modèle.",
-      "routingEnsembleReadOnlyHint": "Le routage IA agrégé est actif. Les paramètres standard des niveaux de modèle sont temporairement inactifs.",
+      "routingDisabledHint": "Activez le mode « Routage intelligent des modèles » pour modifier les niveaux de modèle.",
+      "routingEnsembleReadOnlyHint": "Le mode « Ensemble de modèles » est actif. Les paramètres standard des niveaux de modèle sont temporairement inactifs.",
       "defaultTextModel": "Niveau de modèle par défaut",
       "panelLabel": "Table des niveaux de modèle",
       "panelDesc": "Les modèles du tableau des niveaux passent par le fournisseur de chaque ligne, afin que chaque fournisseur utilise la même structure de table de routage.",
@@ -1357,9 +1387,9 @@
       "save": "Enregistrer le routeur",
       "chooseProviderFirst": "choisissez d'abord un fournisseur",
       "summaryDisabled": "désactivé",
-      "summaryEnsemble": "Routage IA agrégé",
-      "ensembleProfileTitle": "Routage IA agrégé",
-      "ensembleProfileDesc": "Le tableau des niveaux de modèle fournit les modèles candidats au routage IA agrégé.",
+      "summaryEnsemble": "Ensemble de modèles",
+      "ensembleProfileTitle": "Ensemble de modèles",
+      "ensembleProfileDesc": "Le tableau des niveaux de modèle fournit les modèles candidats pour le mode « Ensemble de modèles ».",
       "visualMode": {
         "real_candidates": "Candidats de routage réels",
         "legacy_grid": "Panneau visuel à trois niveaux"
@@ -1374,8 +1404,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "Le routage IA agrégé est actif : plusieurs modèles répondent et un modèle synthétise la réponse finale.",
-      "statusOff": "Le routage IA agrégé est désactivé.",
+      "statusOn": "Le mode « Ensemble de modèles » est actif. Les modèles candidats répondent en parallèle, puis un modèle agrégateur combine leurs réponses pour produire la réponse finale.",
+      "statusOff": "Le mode « Ensemble de modèles » est désactivé.",
       "allFailedFallback": "Revenir à un modèle unique",
       "allFailedError": "Arrêter et signaler une erreur"
     },
@@ -2937,6 +2967,9 @@
       ,"workspaceOptionalHint": "Facultatif. Choisissez « Aucun espace de projet » pour une tâche générale, ou un projet si ses fichiers sont nécessaires."
     },
     "form": {
+      "invalidTimezone": "Saisissez un fuseau horaire valide, par exemple Europe/Paris.",
+      "discardBody": "Les modifications non enregistrées seront perdues. Annulez pour continuer à modifier.",
+      "discardTitle": "Abandonner les modifications ?",
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
       "cronParseError": "Impossible d'analyser l'expression — 5 champs attendus (m h jdm mois jds).",
       "cronCustomCadence": "correspond à une cadence personnalisée",
@@ -3155,6 +3188,9 @@
       "add": "Ajouter"
     },
     "skillDetail": {
+      "useUnavailable": "Cette compétence ne peut pas être utilisée dans une nouvelle tâche. Vérifiez son état puis réessayez.",
+      "useInTaskHint": "Préparez un brouillon avec cette compétence. Rien ne sera envoyé sans votre action.",
+      "useInTask": "Utiliser dans une nouvelle tâche",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -3656,6 +3692,18 @@
       "deleted": "Supprimée",
       "missing": "La session a été supprimée ou n’existe pas"
     },
+    "sessionReference": {
+      "open": "Ouvrir le chat",
+      "unavailable": "Session indisponible",
+      "status": {
+        "queued": "En attente",
+        "running": "En cours",
+        "idle": "Inactive",
+        "failed": "Échec",
+        "missing": "Introuvable",
+        "checking": "Vérification…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "Maintien du cache de prompt",
       "title": "Maintien du cache de prompt",
@@ -3709,6 +3757,10 @@
     "aiGeneratedLabel": "Contenu généré par l’IA, fourni à titre indicatif.",
     "removeAttachment": "Supprimer la pièce jointe",
     "remove": "Supprimer",
+    "projectFileTarget": "Fichier du projet : {path}",
+    "importedFileTarget": "Copie importée",
+    "projectFileLiveTarget": "Fichier actuel du projet : {path}",
+    "importedFileWorkingTarget": "Fichier importé ; modifications dans une copie de travail",
     "fileLabel": "Fichier",
     "add": "Ajouter",
     "attachFiles": "Joindre des fichiers",
@@ -3763,6 +3815,8 @@
     "copied": "Copié",
     "copy": "Copier",
     "copySessionKey": "Copier l’ID de session",
+    "copySessionAppLink": "Copier le lien de l’application",
+    "copySessionGatewayLink": "Copier le lien web du Gateway",
     "sessionActions": "Actions de la session",
     "share": "Partager",
     "shareSendFirst": "Envoyez d'abord un message pour partager",
@@ -3903,16 +3957,16 @@
     },
     "addToShare": "Ajouter à l'image de partage",
     "removeFromShare": "Retirer de l'image de partage",
-    "aiModelRouter": "Routeur de modèle IA",
-    "aiModelEnsembleRouter": "Routeur agrégé de modèles IA",
+    "aiModelRouter": "Routage intelligent des modèles",
+    "aiModelEnsembleRouter": "Ensemble de modèles",
     "routerFx": {
       "selectedModel": "Le routeur a sélectionné {model}",
       "executionModel": "Modèle en cours d’exécution : {model}",
       "executionModelCompleted": "Exécuté par {model}",
-      "ensembleModel": "Fusion multimodèle",
-      "ensembleSelecting": "Routeur agrégé de modèles IA · sélection des candidats",
-      "ensembleHandedOff": "Routeur agrégé de modèles IA · transmis à l'agent",
-      "ensembleRunning": "Routeur agrégé de modèles IA · {count} candidats en synthèse",
+      "ensembleModel": "Ensemble de modèles",
+      "ensembleSelecting": "Ensemble de modèles · sélection des candidats",
+      "ensembleHandedOff": "Ensemble de modèles · transmis à l'agent",
+      "ensembleRunning": "Ensemble de modèles · {count} candidats en synthèse",
       "ensembleDone": "{count} candidats synthétisés",
       "ensembleMode": "ensemble",
       "ensembleViewTrace": "voir trace",
@@ -4288,6 +4342,8 @@
       "disableLabel": "Désactiver Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Méthode de travail",
+      "contentGroup": "Contenu",
       "executionMode": "Mode d'exécution",
       "ownerOnlyUnavailable": "Le mode propriétaire uniquement est indisponible pour cette session de navigateur.",
       "enabled": "Activé",
@@ -4297,16 +4353,16 @@
       "modelRouting": "Routage des modèles",
       "sessionModelRouting": "Routage des modèles de ce chat",
       "modelRoutingSessionScope": "Les changements ne s’appliquent qu’à ce chat. Un tour en cours conserve son mode actuel.",
-      "ensembleImageUnsupported": "Ensemble ne prend pas encore en charge les images en entrée. Dans « Routage des modèles », utilisez « Routeur mono-modèle avec IA » configuré pour les images ou « Désactivé » avec un modèle compatible avec les images en entrée.",
+      "ensembleImageUnsupported": "Le mode « Ensemble de modèles » ne prend pas encore en charge les images en entrée. Dans « Routage des modèles », choisissez « Routage intelligent des modèles » avec un niveau compatible avec les images, ou « Modèle fixe » avec un modèle compatible.",
       "imageInputUnsupported": "Le modèle sélectionné ne peut pas traiter les images. Choisissez un modèle compatible ou retirez l’image.",
       "routingUpdateBlocked": "Le routage des modèles est en cours de mise à jour. Attendez avant d’envoyer.",
       "routingUpdateImageBlocked": "Le routage des modèles est en cours de mise à jour. Attendez avant d’envoyer des images.",
-      "modelRoutingOff": "Désactivé",
+      "modelRoutingOff": "Modèle fixe",
       "modelRoutingOffDesc": "Envoie chaque tour au modèle sélectionné.",
-      "modelRoutingSquillaRouter": "Routeur mono-modèle avec IA",
+      "modelRoutingSquillaRouter": "Routage intelligent des modèles",
       "modelRoutingSquillaRouterDesc": "L'IA choisit un modèle adapté à chaque tour pour réduire le coût.",
-      "modelRoutingEnsemble": "Routeur d'ensemble avec IA",
-      "modelRoutingEnsembleDesc": "L'IA coordonne plusieurs modèles pour améliorer les capacités sur les tâches complexes. Les images en entrée ne sont pas encore prises en charge.",
+      "modelRoutingEnsemble": "Ensemble de modèles",
+      "modelRoutingEnsembleDesc": "Les modèles candidats répondent en parallèle, puis un modèle agrégateur combine leurs réponses pour produire la réponse finale. Les images en entrée ne sont pas encore prises en charge.",
       "runMode": "Mode d'exécution",
       "runModeSafe": "Sûr",
       "runModeSafeDesc": "Utilise le bac à sable et vos règles de fichiers, commandes et réseau.",
@@ -4586,9 +4642,35 @@
       "usageIncompleteUnknown": "Incomplet · total d’utilisation exact indisponible",
       "unknownProviderCalls": "{count} appel fournisseur a une utilisation inconnue | {count} appels fournisseur ont une utilisation inconnue"
     },
+    "newTaskModel": {
+      "showAll": "Afficher tous les modèles",
+      "title": "Modèle de la nouvelle tâche",
+      "catalog": "Catalogue de la passerelle",
+      "gatewayDefault": "Modèle par défaut",
+      "gatewayDefaultHint": "Utiliser le modèle par défaut des paramètres",
+      "defaultBadge": "Par défaut",
+      "search": "Rechercher un modèle ou fournisseur…",
+      "loading": "Chargement des modèles…",
+      "empty": "Aucun modèle correspondant",
+      "retry": "Réessayer",
+      "scope": "Uniquement pour cette nouvelle tâche. Les paramètres globaux restent inchangés.",
+      "partialFailure": "Certains fournisseurs sont indisponibles : {providers}",
+      "routingConflict": "Un modèle précis nécessite le mode « Modèle fixe ». Effacez ce choix ou sélectionnez « Modèle fixe ».",
+      "unavailable": "La sélection est indisponible sur cette connexion. Reconnectez-vous ou effacez le modèle choisi."
+    },
     "modelRouting": {
       "updateFailed": "Impossible de changer le routage des modèles — rétabli. La modification est temporairement indisponible.",
-      "sessionUpdateFailed": "Impossible de mettre à jour le routage des modèles de ce chat : {error}"
+      "sessionUpdateFailed": "Impossible de mettre à jour le routage des modèles de ce chat : {error}",
+      "manage": "Paramètres des modèles et du routage",
+      "back": "Retour aux modes de routage",
+      "title": "Modèles et routage",
+      "direct": "Modèle fixe",
+      "sessionModelFallback": "Utiliser le modèle de cette tâche",
+      "sessionModelTitle": "Modèle de cette conversation",
+      "sessionModelHint": "S’applique au prochain tour. L’historique et les paramètres globaux sont conservés.",
+      "sessionModelBusy": "Vous pourrez changer de modèle une fois la réponse en cours terminée.",
+      "router": "Routage intelligent des modèles",
+      "ensemble": "Ensemble de modèles"
     },
     "routeFeedback": {
       "up": "Bon choix de modèle pour ce tour",
@@ -4632,6 +4714,13 @@
       "retry": "Réessayer"
     },
     "sidebar": {
+      "moveDown": "Déplacer vers le bas",
+      "moveUp": "Déplacer vers le haut",
+      "subtasksAttention": "{count} à vérifier",
+      "subtasksRunning": "{count} en cours",
+      "subtaskCount": "{count} sous-tâches",
+      "collapseSubtasks": "Masquer les sous-tâches de {title}",
+      "expandSubtasks": "Afficher les sous-tâches de {title}",
       "recentConversations": "Tâches récentes",
       "recents": "Récentes",
       "pinned": "Épinglées",

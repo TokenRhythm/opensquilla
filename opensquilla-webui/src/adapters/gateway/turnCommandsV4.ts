@@ -346,9 +346,12 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     workspaceId,
     collaborationMode,
     initialRoutingMode,
+    initialModel,
+    initialProvider,
     forkBeforeMessageId,
     displayText,
     attachments,
+    workspaceFiles,
     queueMode,
     // Legacy aliases can exist in handoff WAL records written by an older
     // client. They are removed when a canonical value is present below, but
@@ -364,6 +367,8 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     workspace_id: legacyWorkspaceId,
     collaboration_mode: legacyCollaborationMode,
     initial_routing_mode: legacyInitialRoutingMode,
+    initial_model: legacyInitialModel,
+    initial_provider: legacyInitialProvider,
     fork_before_message_id: legacyForkBeforeMessageId,
     display_text: legacyDisplayText,
     ...extensions
@@ -421,6 +426,12 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
       : legacyInitialRoutingMode !== undefined
         ? { initial_routing_mode: legacyInitialRoutingMode }
         : {}),
+    ...(initialModel !== undefined
+      ? { initialModel }
+      : legacyInitialModel !== undefined ? { initial_model: legacyInitialModel } : {}),
+    ...(initialProvider !== undefined
+      ? { initialProvider }
+      : legacyInitialProvider !== undefined ? { initial_provider: legacyInitialProvider } : {}),
     ...(forkBeforeMessageId !== undefined
       ? { forkBeforeMessageId }
       : legacyForkBeforeMessageId !== undefined
@@ -432,6 +443,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
         ? { display_text: legacyDisplayText }
         : {}),
     ...(attachments !== undefined ? { attachments } : {}),
+    ...(workspaceFiles !== undefined ? { workspaceFiles } : {}),
     ...(queueMode !== undefined ? { queueMode } : {}),
   }
 }

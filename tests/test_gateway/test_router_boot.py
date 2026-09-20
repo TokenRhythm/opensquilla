@@ -2775,13 +2775,19 @@ async def test_task_runtime_turn_rejects_unavailable_bound_project_kinds(
 
 
 @pytest.mark.asyncio
-async def test_task_runtime_turn_uses_acceptance_time_model_routing_config() -> None:
+@pytest.mark.parametrize("accepted_mode", ["direct", "router"])
+async def test_task_runtime_turn_uses_acceptance_time_model_routing_config(
+    accepted_mode: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     live_config = GatewayConfig(
         squilla_router={"enabled": False, "rollout_phase": "observe"},
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,
     )
-    accepted_config = capture_model_routing_config(live_config)
+    accepted_config = capture_model_routing_config(
+        live_config, session_mode=accepted_mode
+    )
     live_config.llm_ensemble.enabled = True
     live_config.squilla_router.enabled = True
     live_config.squilla_router.rollout_phase = "full"
@@ -2789,6 +2795,11 @@ async def test_task_runtime_turn_uses_acceptance_time_model_routing_config() -> 
     probe = TurnRunner.__new__(TurnRunner)
     probe._config = live_config
     observed: list[str] = []
+    preloads: list[Any] = []
+    monkeypatch.setattr(
+        "opensquilla.engine.steps.squilla_router.preload_strategy",
+        lambda config: preloads.append(config),
+    )
 
     class RecordingTurnRunner:
         async def run(self, message: str, session_key: str, **kwargs: Any):
@@ -2825,7 +2836,8 @@ async def test_task_runtime_turn_uses_acceptance_time_model_routing_config() -> 
         event_emitter=emit,
     )
 
-    assert observed == ["direct"]
+    assert observed == [accepted_mode]
+    assert preloads == []  # Generic dispatch does not own classifier readiness.
     assert model_routing_snapshot(live_config)["mode"] == "ensemble"
 
 

@@ -316,6 +316,20 @@ class ToolContext:
         default=None, repr=False,
     )
 
+    # Durable, session-owned original -> editable file relationships. Append
+    # after every published field, including fields declared below methods.
+    workspace_files: list[dict[str, Any]] = field(default_factory=list)
+    attachment_working_files: dict[str, dict[str, Any]] = field(default_factory=dict)
+    persist_attachment_working_files: Callable[[], Awaitable[None]] | None = field(
+        default=None, repr=False,
+    )
+
+    # Explicit config additions are tracked separately from an unrestricted
+    # allowlist so opting into one default-deny tool does not restrict the
+    # normal catalog or authorize every other default-deny tool. Append to
+    # preserve the positional compatibility of the existing context fields.
+    explicitly_allowed_tools: set[str] = field(default_factory=set)
+
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
     """Return whether ``ctx`` carries authority for a top-level Goal turn.

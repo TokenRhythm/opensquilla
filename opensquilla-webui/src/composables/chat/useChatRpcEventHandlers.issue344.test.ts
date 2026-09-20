@@ -449,20 +449,23 @@ describe('issue #344 — live stream is bound to a single task', () => {
     i18n.global.locale.value = 'zh-Hans'
     const { api, messages, scope } = makeHarness('task-B')
 
-    api.handlers.onWireEventFixture('task.failed', {
-      task_id: 'task-B',
-      session_key: SESSION,
-      code: 'ensemble_multimodal_unsupported',
-      terminal_message: 'server fallback text',
-    })
+    try {
+      api.handlers.onWireEventFixture('task.failed', {
+        task_id: 'task-B',
+        session_key: SESSION,
+        code: 'ensemble_multimodal_unsupported',
+        terminal_message: 'server fallback text',
+      })
 
-    expect(messages.value[messages.value.length - 1]).toMatchObject({
-      role: 'error',
-      errorCode: 'ensemble_multimodal_unsupported',
-      text: '多模型融合暂不支持图片输入。请在“模型路由”中选择已配置图片模型的“AI 智能单模型路由”，或选择“关”并使用支持图片的模型。',
-    })
-    scope.stop()
-    i18n.global.locale.value = 'en'
+      expect(messages.value[messages.value.length - 1]).toMatchObject({
+        role: 'error',
+        errorCode: 'ensemble_multimodal_unsupported',
+        text: '多模型融合暂不支持图片输入。请在“模型路由”中选择已配置图片模型的“智能模型路由”，或选择“固定模型”并使用支持图片的模型。',
+      })
+    } finally {
+      scope.stop()
+      i18n.global.locale.value = 'en'
+    }
   })
 
   it('keeps a rich usage barrier error when task.failed follows it', () => {

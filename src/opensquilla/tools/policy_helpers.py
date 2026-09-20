@@ -39,12 +39,14 @@ def apply_tool_policy(
     available = frozenset(available_tools)
     allowed_tools = set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
     denied_tools = set(ctx.denied_tools)
+    explicit_grants = set(ctx.explicitly_allowed_tools)
 
     allowed_tools, denied_tools = policy_config.apply_base_policy(
         allowed_tools,
         denied_tools,
         global_policy,
         available,
+        explicit_grants=explicit_grants,
     )
     allowed_tools, denied_tools = policy_config.apply_base_policy(
         allowed_tools,
@@ -52,6 +54,7 @@ def apply_tool_policy(
         agent_policy,
         available,
         profile_overrides=True,
+        explicit_grants=explicit_grants,
     )
     hard_denied = set(denied_tools)
 
@@ -61,24 +64,28 @@ def apply_tool_policy(
         channel_denied,
         default_channel_policy,
         available,
+        explicit_grants=explicit_grants,
     )
     allowed_tools, channel_denied = policy_config.apply_sender_layer(
         allowed_tools,
         channel_denied,
         policy_config.sender_policy(default_channel_policy, ctx.sender_id),
         available,
+        explicit_grants=explicit_grants,
     )
     allowed_tools, channel_denied = policy_config.apply_channel_layer(
         allowed_tools,
         channel_denied,
         channel_policy,
         available,
+        explicit_grants=explicit_grants,
     )
     allowed_tools, channel_denied = policy_config.apply_sender_layer(
         allowed_tools,
         channel_denied,
         policy_config.sender_policy(channel_policy, ctx.sender_id),
         available,
+        explicit_grants=explicit_grants,
     )
 
     denied_tools = hard_denied | channel_denied
@@ -88,6 +95,7 @@ def apply_tool_policy(
     return replace(
         ctx,
         allowed_tools=allowed_tools,
+        explicitly_allowed_tools=explicit_grants - denied_tools,
         denied_tools=denied_tools,
         workspace_write_deny_globs=_merged_workspace_write_deny_globs(
             ctx,
@@ -139,12 +147,14 @@ def apply_tool_policy_layer(
         return ctx
     allowed_tools = set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
     denied_tools = set(ctx.denied_tools)
+    explicit_grants = set(ctx.explicitly_allowed_tools)
     allowed_tools, denied_tools = policy_config.apply_base_policy(
         allowed_tools,
         denied_tools,
         parsed,
         frozenset(available_tools),
         profile_overrides=False,
+        explicit_grants=explicit_grants,
     )
     if hard_denied:
         denied_tools |= set(hard_denied)
@@ -153,6 +163,7 @@ def apply_tool_policy_layer(
     return replace(
         ctx,
         allowed_tools=allowed_tools,
+        explicitly_allowed_tools=explicit_grants - denied_tools,
         denied_tools=denied_tools,
         workspace_write_deny_globs=_merged_workspace_write_deny_globs(ctx, parsed),
         file_edit_requires_fresh_read=_merged_file_edit_requires_fresh_read(ctx, parsed),

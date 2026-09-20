@@ -869,6 +869,7 @@ jobs:
           composer-paste.spec.ts
           history-hydration.spec.ts
           idle-chat-recovery.spec.ts
+          modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
           router-physical-model.spec.ts
           user-message-newlines.spec.ts
@@ -1533,13 +1534,16 @@ jobs:
               tests/test_tools/test_shell_runtime_preflight.py
             )
           fi
+          # Windows workers hit access violations during timed stack dumps.
+          # Related frame-race report: python/cpython#140815. Disable only
+          # this diagnostic timer; keep fatal-error handling enabled.
           uv run pytest \
             tests/test_sandbox/test_trusted_sandbox_execution.py \
             tests/test_tools/test_approval_unification.py \
             tests/test_live_multi_provider_matrix.py \
             tests/test_live_provider_profile_smoke.py \
             "${regression_args[@]}" \
-            -vv --tb=short -o faulthandler_timeout=60 --maxfail=3 \
+            -vv --tb=short -o faulthandler_timeout=0 --maxfail=3 \
             2>&1 | tee "${CI_REPORT_DIR}/preflight.log"
 
       - name: Test Windows shard
@@ -1570,6 +1574,7 @@ jobs:
             fi
           fi
 
+          # Pass the same timer override to both parallel and serial phases.
           uv run python .github/scripts/windows_test_shards.py run \
             "${{ matrix.shard }}" \
             --junit "${CI_REPORT_DIR}/junit.xml" \
@@ -1577,7 +1582,7 @@ jobs:
             --metadata "${CI_REPORT_DIR}/windows-shard-metadata.json" \
             "${worker_args[@]}" \
             -- \
-            -vv --tb=short -o faulthandler_timeout=60 \
+            -vv --tb=short -o faulthandler_timeout=0 \
             -m "${markers}" \
             --durations=50 \
             "${maxfail_args[@]}" \
@@ -1706,6 +1711,11 @@ jobs:
             tests/test_gateway/test_task_runtime_wait_slots.py
             tests/test_gateway/test_task_progress_projection.py
             tests/test_gateway/test_usage_ledger_runtime.py
+            tests/test_gateway/test_recovery_gateway.py
+            tests/test_gateway/test_recovery_scheduler.py
+            tests/test_gateway/test_recovery_socket.py
+            tests/test_gateway/test_snapshot_recovery_ownership.py
+            tests/test_session/test_recovery_reads.py
             tests/test_engine/test_plan_run_reconciliation.py
             tests/test_engine/test_goal_context_prompt.py
             tests/test_session/test_goal_storage.py
@@ -1853,6 +1863,86 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Verify MCP transports and Desktop bridge on the native platform
+        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest \
+            tests/test_mcp tests/test_mcp_server \
+            tests/test_desktop/test_gateway_functional_probes.py::test_mcp_probe_uses_real_stdio_server_and_gateway \
+            -vv --tb=short \
+            2>&1 | tee "${CI_REPORT_DIR}/mcp-transports.log"
+
+      - name: Verify the frozen production MCP probe and bridge
+        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --extra recommended --extra mcp --group desktop-build --frozen
+          uv run --no-sync python desktop/electron/scripts/verify-mcp-frozen.py \
+            --output-dir "${CI_REPORT_DIR}/mcp-frozen" \
+            2>&1 | tee "${CI_REPORT_DIR}/mcp-frozen.log"
+
+      - name: Build production Docker image and verify MCP
+        if: ${{ runner.os == 'Linux' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
+          mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
+          docker build --file Dockerfile --tag "${mcp_image}" \
+            --build-arg OPENSQUILLA_FORBID_PERSONAL_BGM=1 . \
+            2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
+          docker image inspect --format '{{json .Size}}' "${mcp_image}" \
+            | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"
+          docker run --rm -i --entrypoint python \
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/tests/test_mcp/fixtures,target=/mcp-fixtures,readonly" \
+            "${mcp_image}" - <<'PY' 2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-smoke.log"
+          import asyncio
+          import json
+          import sys
+          from importlib.metadata import version
+
+          from mcp import Client
+          from mcp_types import LATEST_PROTOCOL_VERSION
+
+          from opensquilla.mcp.stdio import MCPStdioClient
+          from opensquilla.mcp.types import MCPServerConfig
+          from opensquilla.mcp_server import create_mcp_server
+
+          async def check():
+              sdk_version = version("mcp")
+              assert sdk_version == "2.2.0", sdk_version
+              async with Client(create_mcp_server(), mode="auto") as server:
+                  assert server.protocol_version == LATEST_PROTOCOL_VERSION
+                  tools = sorted(tool.name for tool in (await server.list_tools()).tools)
+              assert tools == sorted([
+                  "conversations_list", "session_resolve", "messages_read",
+                  "messages_send", "events_wait", "transcript_export",
+              ]), tools
+              for fixture, arguments, tool in [
+                  ("fastmcp_server.py", [], "ping"),
+                  ("legacy_server.py", ["normal"], "echo"),
+              ]:
+                  client = MCPStdioClient(MCPServerConfig(
+                      name="container-probe", transport="stdio", command=sys.executable,
+                      args=["-u", "/mcp-fixtures/" + fixture, *arguments],
+                      tool_timeout_seconds=10,
+                  ))
+                  try:
+                      await client.connect()
+                      assert [item.name for item in await client.list_tools()] == [tool]
+                      result = await client.call_tool(tool, {"text": "container-mcp"})
+                      assert not result.is_error and result.content == "container-mcp"
+                  finally:
+                      await client.close()
+              print(json.dumps({"sdkVersion": sdk_version, "tools": tools,
+                                "stdioPeers": ["modern", "legacy"]}))
+
+          asyncio.run(asyncio.wait_for(check(), timeout=60))
+          PY
+
       - name: Install Desktop dependencies
         working-directory: desktop/electron
         shell: bash
@@ -1923,6 +2013,20 @@ jobs:
             --project=chromium --workers=1 --retries=0 \
             --grep "@plan-goal-runtime" \
             2>&1 | tee "${CI_REPORT_DIR}/plan-goal-runtime.log"
+
+      - name: Run cross-platform modern session recovery contracts
+        if: ${{ (runner.os == 'Windows' || runner.os == 'macOS') && matrix.shard == 'profiles' }}
+        working-directory: opensquilla-webui
+        shell: bash
+        env:
+          OPENSQUILLA_WEBUI_BASE_URL: http://127.0.0.1:18791
+          OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI: gateway
+        run: |
+          set -euo pipefail
+          npm run test:e2e -- \
+            modern-session-recovery.spec.ts \
+            --project=chromium --workers=1 --retries=0 \
+            2>&1 | tee "${CI_REPORT_DIR}/modern-session-recovery.log"
 
       - name: Install Desktop workbench browser
         if: ${{ matrix.shard == 'all' || matrix.shard == 'ownership-workbench' || matrix.shard == 'workbench' }}
@@ -2357,6 +2461,12 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/native-write-view-contracts.xml
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-transports.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-frozen.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-frozen/build.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-build.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-smoke.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-size-bytes.json
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
             ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron

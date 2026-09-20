@@ -1,149 +1,163 @@
-"""MCP stdio transport client."""
+"""SDK stdio client with a byte limit enforced before JSON parsing."""
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-from typing import Any, cast
-
-import structlog
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
 
 from opensquilla import __version__
-from opensquilla.mcp.client import MCPClient
-from opensquilla.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
-
-log = structlog.get_logger(__name__)
+from opensquilla.mcp.sdk_client import SDKMCPClient
+from opensquilla.mcp.types import MCPServerConfig
 
 
-class MCPStdioClient(MCPClient):
-    """MCP client using the stdio transport.
-
-    The MCP stdio transport (protocolVersion 2024-11-05) frames each JSON-RPC
-    message as one line of UTF-8, LF-terminated, with no embedded newlines and
-    no headers. (The earlier LSP-style ``Content-Length`` framing this client
-    used is a different protocol and no conformant MCP server answers it.)
-    """
+class MCPStdioClient(SDKMCPClient):
+    """Let the SDK own the protocol over bounded, LF-delimited subprocess pipes."""
 
     _CLOSE_TIMEOUT_SECONDS = 2.0
-    # Bound each UTF-8 JSON message, excluding its LF delimiter. Large tool
-    # results and server instructions routinely exceed asyncio's 64 KiB default.
+    # Count UTF-8 bytes before parsing, excluding LF (but including any CR).
     _MAX_MESSAGE_BYTES = 16 * 1024 * 1024
 
     def __init__(self, config: MCPServerConfig) -> None:
         super().__init__(config)
         self._process: asyncio.subprocess.Process | None = None
-        self._request_id = 0
-        self._request_lock = asyncio.Lock()
-        self._readahead: bytes = b""
-
-    @staticmethod
-    def _encode_request(request: dict[str, Any]) -> bytes:
-        """Encode a JSON-RPC message as one LF-terminated line.
-
-        ``json.dumps`` with default separators never emits a literal newline, so
-        the message is guaranteed to occupy exactly one line as the transport
-        requires.
-        """
-        return (json.dumps(request) + "\n").encode()
-
-    def _next_id(self) -> int:
-        self._request_id += 1
-        return self._request_id
-
-    async def connect(self) -> None:
-        """Spawn the subprocess and perform MCP initialization handshake."""
-        assert self.config.command is not None, "stdio transport requires command"
         self._readahead = b""
 
-        env: dict[str, str] | None = None
-        if self.config.env:
-            env = {**os.environ, **self.config.env}
+    def _make_sdk_client(self) -> Any:
+        from mcp import Client
+        from mcp.types import Implementation
 
-        self._process = await asyncio.create_subprocess_exec(
-            self.config.command,
-            *self.config.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            env=env,
+        return Client(
+            self._transport(),
+            mode="auto",
+            cache=None,
+            read_timeout_seconds=self.config.tool_timeout_seconds,
+            client_info=Implementation(name="opensquilla", version=__version__),
         )
 
-        # MCP initialize handshake
-        await self._send_request(
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "opensquilla", "version": __version__},
-            },
-        )
-        # Send initialized notification
-        await self._send_notification("notifications/initialized")
+    @asynccontextmanager
+    async def _transport(self) -> AsyncIterator[tuple[Any, Any]]:
+        import anyio
+        from mcp.shared.message import SessionMessage
+        from mcp.types import jsonrpc_message_adapter
 
-    async def close(self) -> None:
-        """Terminate the subprocess."""
-        process = self._process
-        self._process = None
+        if not self.config.command:
+            raise ValueError("stdio transport requires command")
         self._readahead = b""
-        if process is None:
-            return
-        if process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
+        # Shield spawn until the child reference is retained and cleanup installed.
         try:
-            await asyncio.wait_for(process.wait(), timeout=self._CLOSE_TIMEOUT_SECONDS)
-        except TimeoutError:
-            if process.returncode is None:
+            with anyio.CancelScope(shield=True):
+                self._process = await asyncio.create_subprocess_exec(
+                    self.config.command,
+                    *self.config.args,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    env={**os.environ, **self.config.env},
+                )
+            process = self._process
+            assert process is not None
+            assert process.stdin is not None
+            read_send, read_receive = anyio.create_memory_object_stream[SessionMessage | Exception](
+                0
+            )
+            write_send, write_receive = anyio.create_memory_object_stream[SessionMessage](0)
+
+            async def read_stdout() -> None:
+                async with read_send:
+                    try:
+                        while line := await self._readline_safe():
+                            if not line.strip():
+                                continue
+                            try:
+                                message = jsonrpc_message_adapter.validate_json(line, by_name=False)
+                            except ValueError as exc:
+                                await read_send.send(exc)
+                                continue
+                            await read_send.send(SessionMessage(message))
+                    except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+                        pass
+                    except Exception as exc:
+                        await read_send.send(exc)
+                    finally:
+                        with anyio.CancelScope(shield=True):
+                            await self._terminate_process()
+
+            async def write_stdin() -> None:
+                assert process.stdin is not None
                 try:
-                    process.kill()
-                except ProcessLookupError:
+                    async with write_receive:
+                        async for message in write_receive:
+                            payload = message.message.model_dump_json(
+                                by_alias=True, exclude_unset=True
+                            )
+                            process.stdin.write((payload + "\n").encode("utf-8"))
+                            await process.stdin.drain()
+                except (anyio.ClosedResourceError, anyio.BrokenResourceError, OSError):
+                    # Wake pending SDK requests immediately on a broken pipe.
+                    await read_send.aclose()
+
+            async with read_receive, write_send, anyio.create_task_group() as tasks:
+                tasks.start_soon(read_stdout)
+                tasks.start_soon(write_stdin)
+                try:
+                    yield read_receive, write_send
+                finally:
+                    tasks.cancel_scope.cancel()
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self._terminate_process()
+
+    async def _terminate_process(self) -> None:
+        """Terminate and reap the direct child, including during cancellation."""
+        import anyio
+
+        with anyio.CancelScope(shield=True):
+            process = self._process
+            self._process = None
+            self._readahead = b""
+            if process is None:
+                return
+
+            # A full StreamReader buffer pauses the pipe transport. Waiting for
+            # child exit without draining it can leave wait() blocked and the
+            # stdout file descriptor open after the child has already died.
+            # Discard raw bytes only; an invalid frame is never parsed again.
+            async def drain_stdout() -> None:
+                if process.stdout is not None:
+                    while await process.stdout.read(8192):
+                        pass
+
+            drain = asyncio.create_task(drain_stdout())
+            try:
+                if process.returncode is None:
+                    try:
+                        process.terminate()
+                    except ProcessLookupError:
+                        pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=self._CLOSE_TIMEOUT_SECONDS)
+                except TimeoutError:
+                    if process.returncode is None:
+                        try:
+                            process.kill()
+                        except ProcessLookupError:
+                            pass
+                    await asyncio.wait_for(process.wait(), timeout=self._CLOSE_TIMEOUT_SECONDS)
+            finally:
+                # Normally wait() observes EOF after the drain. Bound this join
+                # as well: a descendant outside our direct-child ownership may
+                # have inherited stdout and kept it open.
+                try:
+                    await asyncio.wait_for(drain, timeout=self._CLOSE_TIMEOUT_SECONDS)
+                except TimeoutError:
                     pass
-            await process.wait()
-
-    async def _send_request(
-        self, method: str, params: dict[str, Any] | None = None
-    ) -> dict[str, Any]:
-        """Send a JSON-RPC request and read the matching response."""
-        if self._process is None or self._process.stdin is None or self._process.stdout is None:
-            raise ConnectionError("MCP stdio client is not connected")
-
-        # One coroutine must own both the write and its matching read. Without
-        # this lock, concurrent callers can each consume and discard the other
-        # request's response while waiting for their own id.
-        async with self._request_lock:
-            req_id = self._next_id()
-            request: dict[str, Any] = {"jsonrpc": "2.0", "id": req_id, "method": method}
-            if params is not None:
-                request["params"] = params
-
-            encoded = self._encode_request(request)
-            self._process.stdin.write(encoded)
-            await self._process.stdin.drain()
-
-            return await self._read_response(req_id)
-
-    async def _send_notification(self, method: str) -> None:
-        """Send a JSON-RPC notification (no response expected)."""
-        assert self._process is not None
-        assert self._process.stdin is not None
-
-        notification = {"jsonrpc": "2.0", "method": method}
-        encoded = self._encode_request(notification)
-        self._process.stdin.write(encoded)
-        await self._process.stdin.drain()
 
     async def _readline_safe(self) -> bytes:
-        """Read a JSON line up to 16 MiB, retaining LF to distinguish it from EOF.
-
-        Read in bounded chunks rather than using StreamReader's 64 KiB line
-        limit. A frame over the byte budget invalidates the connection: after
-        consuming only part of a frame it is unsafe to resume normal parsing.
-        """
-        assert self._process is not None
-        assert self._process.stdout is not None
-
+        """Read one bounded frame, retaining LF to distinguish it from EOF."""
+        if self._process is None or self._process.stdout is None:
+            raise ConnectionError("MCP stdio client is not connected")
         stdout = self._process.stdout
         chunks: list[bytes] = []
         size = 0
@@ -157,81 +171,11 @@ class MCPStdioClient(MCPClient):
             nl_idx = data.find(b"\n")
             size += nl_idx if nl_idx >= 0 else len(data)
             if size > self._MAX_MESSAGE_BYTES:
-                await self.close()
-                raise ValueError(
-                    f"MCP stdio message exceeds {self._MAX_MESSAGE_BYTES} byte limit"
-                )
+                await self._terminate_process()
+                raise ValueError(f"MCP stdio message exceeds {self._MAX_MESSAGE_BYTES} byte limit")
             if nl_idx >= 0:
                 chunks.append(data[: nl_idx + 1])
                 self._readahead = data[nl_idx + 1 :]
                 return b"".join(chunks)
             chunks.append(data)
             data = b""
-
-    async def _read_response(self, expected_id: int) -> dict[str, Any]:
-        """Read newline-delimited JSON-RPC messages until the response arrives.
-
-        Server-initiated notifications and requests (messages with no ``id``, or
-        with a ``method`` key) are skipped so they cannot be mistaken for the
-        response to ``expected_id``.
-        """
-        assert self._process is not None
-        assert self._process.stdout is not None
-
-        while True:
-            line = await self._readline_safe()
-            if not line:
-                raise ConnectionError("MCP stdio server closed the connection")
-            try:
-                text = line.decode("utf-8").strip()
-            except UnicodeDecodeError:
-                log.debug("mcp.stdio.invalid_utf8_line")
-                continue
-            if not text:
-                continue
-            try:
-                message = json.loads(text)
-            except json.JSONDecodeError:
-                log.debug("mcp.stdio.non_json_line", line=text[:200])
-                continue
-            if not isinstance(message, dict):
-                continue
-            # Skip server-initiated notifications/requests (no id, or a method).
-            if "method" in message and "id" not in message:
-                log.debug("mcp.stdio.notification", method=message.get("method"))
-                continue
-            if message.get("id") != expected_id:
-                # A response to a different id (or a server request). Ignore it
-                # rather than return it for the wrong call.
-                continue
-            return cast(dict[str, Any], message)
-
-    async def list_tools(self) -> list[MCPToolDef]:
-        """List tools from the MCP server."""
-        response = await self._send_request("tools/list")
-        tools_data = response.get("result", {}).get("tools", [])
-        return [
-            MCPToolDef(
-                name=t["name"],
-                description=t.get("description", ""),
-                input_schema=t.get("inputSchema", {}),
-            )
-            for t in tools_data
-        ]
-
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
-        """Call a tool on the MCP server."""
-        response = await self._send_request("tools/call", {"name": name, "arguments": arguments})
-
-        if "error" in response:
-            return MCPToolResult(
-                content=response["error"].get("message", "Unknown error"),
-                is_error=True,
-            )
-
-        result = response.get("result", {})
-        content_list = result.get("content", [])
-        text = "\n".join(c.get("text", "") for c in content_list if c.get("type") == "text")
-        # The MCP result-level ``isError`` flag signals a tool-execution failure;
-        # propagate it so the agent sees the error instead of a plain result.
-        return MCPToolResult(content=text, is_error=bool(result.get("isError", False)))

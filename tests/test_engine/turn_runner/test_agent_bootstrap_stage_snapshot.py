@@ -7,7 +7,7 @@ dependencies the agent-bootstrap slice needs (the five
 provider helper, the memory sync managers + private-memory check, and
 the Agent constructor) so the slice runs against deterministic stubs.
 
-It then probes ``_maybe_compact_on_t3_upgrade`` (the line immediately
+It then probes ``_maybe_preflight_compact`` (the line immediately
 after the slice in ``_run_turn``) to capture the post-slice locals and
 raise a sentinel ``BaseException`` that halts the generator without
 touching downstream stages. The raising-stub case (#11) exercises the
@@ -104,7 +104,7 @@ class _SliceCapture(BaseException):
 def _capture_locals_at_post_slice() -> dict[str, Any]:
     """Read ``_run_turn``'s locals at the boundary right after the slice.
 
-    The probe is hooked onto ``_maybe_compact_on_t3_upgrade`` (the very
+    The probe is hooked onto ``_maybe_preflight_compact`` (the very
     next call site after the agent-bootstrap slice). At entry, the
     caller's frame contains every local the agent-bootstrap boundary must
     populate.
@@ -345,16 +345,16 @@ def _patch_memory_helpers(runner):
 
 
 def _patch_post_slice_probe(runner):
-    """Hook _maybe_compact_on_t3_upgrade (first call past the slice)."""
+    """Hook _maybe_preflight_compact (first call past the slice)."""
 
     async def _probe(
-        self, session_key, turn, context_window_tokens,
+        self, session_key, context_window_tokens,
         *, compaction_provider=None, compaction_model=None,
     ):  # noqa: ARG001, ARG002
         snapshot = _capture_locals_at_post_slice()
         raise _SliceCapture(snapshot)
 
-    runner._maybe_compact_on_t3_upgrade = _probe.__get__(runner, TurnRunner)
+    runner._maybe_preflight_compact = _probe.__get__(runner, TurnRunner)
 
 
 def _patch_observability(runner):

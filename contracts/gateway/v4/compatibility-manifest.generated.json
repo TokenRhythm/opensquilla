@@ -141,7 +141,7 @@
       "delivery": "live-only-best-effort",
       "family": "sessions.routing.changed",
       "schema": "sessions/sessions-routing-changed.schema.json",
-      "schemaSha256": "8cfde21817d79eeab7da86484f28388a0fd5b97e5585aaf272db1086c2695884",
+      "schemaSha256": "21c16f9554f16c7f3bda4816932668b57d496a6959b8054a66719e36445c6fde",
       "schemaVersion": 1,
       "wireNames": [
         "sessions.routing.changed"
@@ -356,7 +356,7 @@
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "eb6a8e17271310c883d0fa6905c1d1ef53abda4641f4b26f988f77be0729277e"
+      "schemaSha256": "d6baded0b633c50e3981a45810fa085bd202ecb93ff3e2d7f4d715abd60483ad"
     },
     {
       "lifecycle": "stable",
@@ -737,7 +737,7 @@
       "lifecycle": "stable",
       "name": "models.list",
       "schema": "platform/models-list.schema.json",
-      "schemaSha256": "18ad8ea39c1b305a3f98df829113c6caaca3ceb25ca1098f7af9e13e5c9445e2"
+      "schemaSha256": "b99bc09fcc2d71eca1a7d45f45dd9597223438f769bcca219252f5230b797633"
     },
     {
       "lifecycle": "stable",
@@ -1170,6 +1170,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.messages.resume",
+      "schema": "sessions/sessions-messages-resume.schema.json",
+      "schemaSha256": "2d136da239eea4653bcd3973e946c76d2a1278698977a9f085e89ea48696f4f8"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.messages.snapshot",
       "schema": "sessions/sessions-messages-snapshot.schema.json",
       "schemaSha256": "ff2cc8acbb1f85f2da0795ae7548446479e207dcc9a143086889dfe694bb3586"
@@ -1179,6 +1185,12 @@
       "name": "sessions.messages.snapshot.read",
       "schema": "sessions/sessions-messages-snapshot-read.schema.json",
       "schemaSha256": "9a1c7a46a0b58b2ba6d6a1f1871bc80a9fad2a08429279628abc989faa76d244"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.messages.snapshot.release",
+      "schema": "sessions/sessions-messages-snapshot-release.schema.json",
+      "schemaSha256": "93e033dd567eee2a5082005bade00b073319ef6b6d9b1b81b174498d9ce588bb"
     },
     {
       "lifecycle": "stable",
@@ -1208,7 +1220,7 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.enqueue",
       "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
-      "schemaSha256": "27a4d18880e2403dc7251c9a609c7506cc2cb57f2d0e4ab95512ed9c2402129c"
+      "schemaSha256": "0b0cb5de384ec9284528cf67888d712cfad8df98642ba0064ebbaefc83bf4abb"
     },
     {
       "lifecycle": "stable",
@@ -1274,13 +1286,13 @@
       "lifecycle": "stable",
       "name": "sessions.routing.get",
       "schema": "sessions/sessions-routing-get.schema.json",
-      "schemaSha256": "59920bed080825b7267e29970edf57d261409049c172fa8ff7abd52f0d6b5b1d"
+      "schemaSha256": "b2c33c894df8ac2983bf71b9fa513f6e9f9a2b0ec52b3e4edd1cfe9cea72cb77"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.routing.set",
       "schema": "sessions/sessions-routing-set.schema.json",
-      "schemaSha256": "92a44f42be405fd4f9ac04ad7985ea16d929619b4e3939e48817c2b5b4ae3183"
+      "schemaSha256": "d6aba2ea6a1a5b0a4116eac1a4b794c602c69b3b14e7869b3cebc963f2ad80b8"
     },
     {
       "lifecycle": "stable",
@@ -1292,7 +1304,7 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "b8a93c671d81f76a840ee6fa44031a196c0176984216c60523093023a89784f8"
+      "schemaSha256": "e547a6b6899709a35148fc4ad9f10028cb5dc00f9d98d64c4e6443b9fbc2abb1"
     },
     {
       "lifecycle": "stable",
@@ -1476,6 +1488,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "workspaces.references.read",
+      "schema": "workspaces/workspaces-references-read.schema.json",
+      "schemaSha256": "63c30e5b3c065913af27f1ce7650ef45a45e5d9c3cd7fabc2f21f90a1c73e93e"
+    },
+    {
+      "lifecycle": "stable",
       "name": "workspaces.remove",
       "schema": "workspaces/workspaces-remove.schema.json",
       "schemaSha256": "39ea25c309221eddf713ace29784017c6986f9d8c84bfec76896dfc4beaf9f8f"
@@ -1490,10 +1508,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "98262cd21bdbc6de2e38075601b5b389d1fa05bf4db4df748881369a779f55e1",
-    "methodCount": 219,
-    "schemaCount": 229,
-    "schemaTreeSha256": "86a22f6844fb558d064485b98da29e53ad8d9ce917f36e9702c2ed00264aaa8b",
+    "generatorSha256": "cef95d81659ad32a398a9ffe0b9e555b533d57fed64c65094f6380ccdab0bc79",
+    "methodCount": 222,
+    "schemaCount": 232,
+    "schemaTreeSha256": "92ef51838bbc81f197a805ea4a904d454492d5933b385d69eb40fb00cffcd95b",
     "toolchains": {
       "legacyTypes": {
         "python": {

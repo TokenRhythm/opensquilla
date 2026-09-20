@@ -49,6 +49,11 @@ STARTED_AT = datetime(2026, 9, 2, 1, 2, 3, tzinfo=UTC)
 SUCCEEDED_AT = datetime(2026, 9, 2, 1, 2, 9, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _synthetic_device_identity(monkeypatch):
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: "1" * 64)
+
+
 class CapturingRuntime:
     def __init__(self, statuses: list[RecordStatus] | None = None) -> None:
         self.events = []
@@ -139,12 +144,112 @@ async def test_product_active_counts_each_surface_daily_without_creating_cohort(
         "event_name", "event_version", "event_id", "occurred_at_utc", "source",
         "app_version", "platform", "outcome", "error_code", "duration_ms",
         "consent_scope", "notice_version", "sample_rate", "analytics_user_id", "surface",
+        "device_id",
     }
 
     resumed = _sink(runtime, _config(tmp_path))
     assert not await resumed.record_product_active(surface=ClientSurface.DESKTOP)
     await resumed.close()
     assert len(runtime.events) == 5
+
+
+async def test_all_usage_events_share_device_across_profiles_and_surfaces(tmp_path) -> None:
+    events = []
+    for profile in ("profile-a", "profile-b"):
+        runtime = CapturingRuntime()
+        sink = _sink(runtime, _config(tmp_path / profile))
+        for surface in ClientSurface:
+            assert await sink.record_product_active(surface=surface)
+            assert await sink.record_client_launch(
+                surface=surface, entrypoint=ClientEntrypoint.CHAT,
+                execution_mode=ExecutionMode.GATEWAY,
+            )
+        assert await sink.record_metaskill_usage("synthetic-metaskill-run", STARTED_AT)
+        assert await sink.record_coding_mode_usage("synthetic-coding-run", STARTED_AT)
+        await sink.close()
+        events.extend(runtime.events)
+
+    assert len({event.analytics_user_id for event in events}) == 2
+    assert {event.device_id for event in events} == {"1" * 64}
+    assert {event.event_name for event in events} == {
+        "product_active", "client_launch", "metaskill_usage", "coding_mode_usage",
+    }
+
+
+async def test_legacy_pending_activity_replays_unchanged_and_device_activity_starts_today(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: None)
+    runtime = CapturingRuntime([RecordStatus.EVICTED])
+    sink = _sink(runtime, _config(tmp_path))
+    assert not await sink.record_product_active(surface=ClientSurface.CLI)
+    legacy_event = runtime.events[0]
+    legacy_wire = legacy_event.model_dump_json()
+    assert "device_id" not in legacy_wire
+    await sink.close()
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: "1" * 64)
+    recovered_runtime = CapturingRuntime()
+    recovered = _sink(recovered_runtime, _config(tmp_path))
+    await recovered.replay_pending()
+    assert recovered_runtime.events[0].model_dump_json() == legacy_wire
+    assert await recovered.record_product_active(surface=ClientSurface.CLI)
+    assert recovered_runtime.events[1].device_id == "1" * 64
+    assert recovered_runtime.events[1].event_id != legacy_event.event_id
+    assert not await recovered.record_product_active(surface=ClientSurface.CLI)
+    await recovered.close()
+
+
+async def test_same_profile_on_different_device_gets_new_daily_observation(
+    tmp_path, monkeypatch,
+) -> None:
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path))
+    assert await sink.record_product_active(surface=ClientSurface.CLI)
+    await sink.close()
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: "2" * 64)
+    moved = _sink(runtime, _config(tmp_path))
+    assert await moved.record_product_active(surface=ClientSurface.CLI)
+    await moved.close()
+    assert len({event.analytics_user_id for event in runtime.events}) == 1
+    assert {event.device_id for event in runtime.events} == {"1" * 64, "2" * 64}
+
+
+async def test_legacy_pending_launch_is_replayed_after_device_key_upgrade(tmp_path, monkeypatch):
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: None)
+    runtime = CapturingRuntime([RecordStatus.EVICTED])
+    sink = _sink(runtime, _config(tmp_path))
+    arguments = dict(surface=ClientSurface.CLI, entrypoint=ClientEntrypoint.CHAT,
+                     execution_mode=ExecutionMode.STANDALONE)
+    assert not await sink.record_client_launch(**arguments)
+    legacy_wire = runtime.events[0].model_dump_json()
+    await sink.close()
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: "1" * 64)
+    recovered_runtime = CapturingRuntime()
+    recovered = _sink(recovered_runtime, _config(tmp_path))
+    assert await recovered._has_pending()
+    await recovered.replay_pending()
+    assert recovered_runtime.events[0].model_dump_json() == legacy_wire
+    assert not await recovered._has_pending()
+    assert await recovered.record_client_launch(**arguments)
+    assert recovered_runtime.events[1].device_id == "1" * 64
+    await recovered.close()
+
+
+async def test_disabled_growth_never_resolves_device_identity(tmp_path, monkeypatch) -> None:
+    def forbidden():
+        pytest.fail("disabled statistics must not consult device identity")
+
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", forbidden)
+    runtime = CapturingRuntime()
+    sink = _sink(runtime, _config(tmp_path, enabled=False))
+    assert not await sink.record_product_active(surface=ClientSurface.CLI)
+    assert not await sink.record_metaskill_usage("synthetic-run", STARTED_AT)
+    assert not await sink.record_coding_mode_usage("synthetic-run", STARTED_AT)
+    await sink.record_turn_started(STARTED_AT)
+    await sink.close()
+    assert runtime.events == []
 
 
 async def test_usage_producers_upload_valid_wire_and_keep_durable_deduplication(
@@ -816,6 +921,7 @@ async def test_metaskill_usage_counts_new_runs_once_without_payload_details(tmp_
             "notice_version",
             "sample_rate",
             "analytics_user_id",
+            "device_id",
         }
         for event in runtime.events
     )
@@ -888,6 +994,7 @@ async def test_coding_mode_usage_counts_started_runs_once_without_payload_detail
             "notice_version",
             "sample_rate",
             "analytics_user_id",
+            "device_id",
         }
         for event in runtime.events
     )

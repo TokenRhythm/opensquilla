@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
+import hmac
 import json
 import math
 import os
+import secrets
 import stat
 import tempfile
 import time
@@ -61,7 +62,8 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-TOKENRHYTHM_SNAPSHOT_SCHEMA_VERSION = 1
+TOKENRHYTHM_SNAPSHOT_SCHEMA_VERSION = 2
+_LIFECYCLE_FINGERPRINT_KEY = secrets.token_bytes(32)
 TOKENRHYTHM_SUCCESS_TTL_SECONDS = 3600.0
 TOKENRHYTHM_FAILURE_BACKOFF_SECONDS = 300.0
 TOKENRHYTHM_PUBLIC_TIMEOUT_SECONDS = 5.0
@@ -135,12 +137,13 @@ def _canonical_base_url(value: str) -> str:
 
 
 def _digest(domain: str, *parts: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(f"opensquilla:{domain}:v1".encode())
-    for part in parts:
-        digest.update(b"\0")
-        digest.update(part.encode())
-    return digest.hexdigest()
+    # These lifecycle comparisons never leave memory; unlike the persisted
+    # authority identity they need no restart-stable credential derivative.
+    return hmac.new(
+        _LIFECYCLE_FINGERPRINT_KEY,
+        json.dumps((domain, *parts), separators=(",", ":")).encode(),
+        "sha256",
+    ).hexdigest()
 
 
 def _tokenrhythm_request(
@@ -813,7 +816,7 @@ class TokenRhythmCatalogCoordinator:
         self._aligned_at: dict[str, float] = {}
         self._ephemeral_aligned_at: dict[str, float] = {}
         self._failures: dict[tuple[str, str], float] = {}
-        self._last_declared_errors: dict[str, BaseException] = {}
+        self._last_declared_errors: dict[str, dict[str, BaseException]] = {}
         self._inflight: dict[tuple[str, str], asyncio.Task[_RefreshOutcome]] = {}
         # Source flights may outlive the operation that first awaited them
         # (callers use shield for singleflight). Keep a drain reference even
@@ -1402,9 +1405,11 @@ class TokenRhythmCatalogCoordinator:
             else dict(entitlement.models) if entitlement is not None else {}
         )
         declared_available = transient_declared is not None or entitlement is not None
+        # A draft proxy has its own transport. Its authentication failure
+        # must not hide the same account's working saved connection.
         error = declared_error or self._last_declared_errors.get(
-            request.authority_identity
-        )
+            request.authority_identity, {}
+        ).get(request.transport_fingerprint)
         return _CatalogView(
             published=dict(self._published.models),
             declared=declared,
@@ -1724,7 +1729,11 @@ class TokenRhythmCatalogCoordinator:
             if fetch_declared:
                 if outcome.declared is not None:
                     transient_declared = outcome.declared
-                    self._last_declared_errors.pop(request.authority_identity, None)
+                    errors = self._last_declared_errors.get(request.authority_identity)
+                    if errors is not None:
+                        errors.pop(request.transport_fingerprint, None)
+                        if not errors:
+                            self._last_declared_errors.pop(request.authority_identity, None)
                     self._failures.pop(
                         (request.transport_fingerprint, "declared"), None
                     )
@@ -1754,9 +1763,22 @@ class TokenRhythmCatalogCoordinator:
                             )
                         )
                 elif outcome.declared_error is not None:
-                    self._last_declared_errors[
-                        request.authority_identity
-                    ] = outcome.declared_error
+                    if (
+                        persist_entitlement
+                        and _error_failure_kind(outcome.declared_error)
+                        == ProviderFailureKind.AUTH_INVALID.value
+                    ):
+                        # A known rejected credential is not a transient outage.
+                        # Revoke only this saved authority; draft probes must not
+                        # erase the active account's durable entitlement.
+                        self._entitlements.pop(request.authority_identity, None)
+                        self._ephemeral_entitlements.pop(request.authority_identity, None)
+                        self._aligned_at.pop(request.authority_identity, None)
+                        self._ephemeral_aligned_at.pop(request.authority_identity, None)
+                        should_persist = True
+                    self._last_declared_errors.setdefault(
+                        request.authority_identity, {}
+                    )[request.transport_fingerprint] = outcome.declared_error
                     self._failures[
                         (request.transport_fingerprint, "declared")
                     ] = outcome.completed_at
@@ -2220,7 +2242,10 @@ async def discover_tokenrhythm_models(
         catalog=coordinator._catalog,
         request=request,
     )
-    if not view.declared_available and view.declared_error is not None:
+    if view.declared_error is not None and (
+        not view.declared_available
+        or _error_failure_kind(view.declared_error) == ProviderFailureKind.AUTH_INVALID.value
+    ):
         return ProviderModelsDiscoverResult(
             ok=False,
             provider_id=provider_id,

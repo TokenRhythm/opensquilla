@@ -22,7 +22,7 @@ import { validateParams as validateResetRecommendedParams, validateResult as val
 import { MODELS_ROUTING_GET_METHOD } from '@/contracts/generated/v4/modelsRoutingGet'
 import { validateResult as validateModelsRoutingGetResult } from '@/contracts/generated/v4/modelsRoutingGetValidators.mjs'
 import { MODELS_LIST_METHOD } from '@/contracts/generated/v4/modelsList'
-import { validateResult as validateModelsListResult } from '@/contracts/generated/v4/modelsListValidators.mjs'
+import { validateParams as validateModelsListParams, validateResult as validateModelsListResult } from '@/contracts/generated/v4/modelsListValidators.mjs'
 import { MODELS_ROUTING_SET_METHOD } from '@/contracts/generated/v4/modelsRoutingSet'
 import { validateParams as validateModelsRoutingSetParams, validateResult as validateModelsRoutingSetResult } from '@/contracts/generated/v4/modelsRoutingSetValidators.mjs'
 import { MODELS_ROUTING_CHANGED_EVENT } from '@/contracts/generated/v4/modelsRoutingChangedEvent'
@@ -245,7 +245,9 @@ export function createV4ProviderConfiguration(
       return providerCatalog(result)
     },
     async list(request) {
-      const result = await requestProvider(rpc, MODELS_LIST_METHOD, undefined, options(request?.signal))
+      const params = request?.scope ? { scope: request.scope } : undefined
+      if (!validateModelsListParams(params ?? {})) throw new Error(`${MODELS_LIST_METHOD} params are invalid`)
+      const result = await requestProvider(rpc, MODELS_LIST_METHOD, params, options(request?.signal))
       if (!validateModelsListResult(result)) throw new Error(`${MODELS_LIST_METHOD} returned an invalid response`)
       return modelCatalog(result)
     },

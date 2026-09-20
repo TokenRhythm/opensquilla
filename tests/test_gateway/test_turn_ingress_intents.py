@@ -15,6 +15,7 @@ import pytest
 
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.model_routing import model_routing_snapshot
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.session_model_routing import (
@@ -88,6 +89,7 @@ async def _open_intent_stack(db_path: Path) -> AsyncIterator[_IntentStack]:
         session_manager=manager,
         task_runtime=runtime,
     )
+    manager._model_routing_mode_provider = lambda: model_routing_snapshot(context.config)["mode"]
     stack = _IntentStack(
         db_path=db_path,
         storage=storage,
@@ -356,6 +358,7 @@ async def test_chat_send_atomically_snapshots_initial_routing_mode(tmp_path: Pat
             "source": "session",
             "initialized": False,
             "appliesTo": "next_accepted_turn",
+            "modelSelection": None,
         }
         created = await stack.storage.get_session(SESSION_KEY)
         assert created is not None
@@ -603,6 +606,9 @@ async def test_new_chat_storage_busy_does_not_create_session(tmp_path: Path) -> 
                     "intent": "new_chat",
                     "collaborationMode": "plan",
                     "clientRequestId": "new-chat-busy",
+                    "initialModel": "synthetic-model",
+                    "initialProvider": "openai",
+                    "initialRoutingMode": "direct",
                 },
                 stack.context,
             )
@@ -1123,3 +1129,250 @@ async def test_reset_storage_busy_preserves_old_state_and_running_task(
         finally:
             external_writer.execute("ROLLBACK")
             external_writer.close()
+
+
+@pytest.mark.parametrize("provider", [None, "openai", "anthropic", "deepseek"])
+async def test_chat_send_atomically_pins_first_model_and_replays_without_duplicate(
+    tmp_path: Path, provider: str | None,
+) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        gateway_defaults = stack.context.config.model_dump()
+        params = {
+            "sessionKey": SESSION_KEY, "message": "first pinned turn", "intent": "new_chat",
+            "clientRequestId": "pin-request", "initialModel": "synthetic-model",
+            "initialRoutingMode": "direct",
+        }
+        if provider:
+            params["initialProvider"] = provider
+        response = await get_dispatcher().dispatch("pin", "chat.send", params, stack.context)
+        assert response.ok is True, response.error
+        await stack.wait_until_running()
+        assert response.payload["acceptedModel"] == {
+            "model": "synthetic-model", "provider": provider,
+        }
+        node = await stack.storage.get_session(SESSION_KEY)
+        assert node is not None
+        assert node.model == "synthetic-model"
+        assert node.provider_override == provider
+        assert node.model_routing_mode == "direct"
+        assert node.model_override is None
+        assert node.model_provider is None
+        assert stack.context.config.model_dump() == gateway_defaults
+        counts = _table_counts(stack.db_path)
+        assert counts["sessions"] == counts["transcript_entries"] == counts["agent_tasks"] == 1
+        assert counts["turn_ingress_receipts"] == 1
+        # A receipt describes accepted input even after deployment defaults change.
+        stack.context.config.squilla_router.enabled = True
+        replay = await get_dispatcher().dispatch("replay", "chat.send", params, stack.context)
+        assert replay.ok is True, replay.error
+        assert replay.payload["replayed"] is True
+        assert replay.payload["acceptedModel"] == response.payload["acceptedModel"]
+        assert _table_counts(stack.db_path) == counts
+        assert len(stack.handler_runs) == 1
+        for changed in ({"initialModel": "other-model"}, {"initialProvider": "ollama"}):
+            conflict = await get_dispatcher().dispatch(
+                "conflict", "chat.send", {**params, **changed}, stack.context,
+            )
+            assert conflict.ok is False
+            assert conflict.error.code == "IDEMPOTENCY_CONFLICT"
+        assert _table_counts(stack.db_path) == counts
+
+
+@pytest.mark.parametrize("fields", [
+    {}, {"intent": "continue"}, {"intent": "reset"}, {"intent": "fork"},
+    {"intent": "new_chat", "initialRoutingMode": "router"},
+    {"intent": "new_chat", "initialRoutingMode": "ensemble"},
+    {"intent": "new_chat", "initialProvider": "not-a-provider"},
+    {"intent": "new_chat", "forkBeforeMessageId": "prior-message"},
+])
+async def test_chat_send_rejects_invalid_model_pin_without_orphans(tmp_path: Path, fields) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        before = _table_counts(stack.db_path)
+        response = await get_dispatcher().dispatch("reject-pin", "chat.send", {
+            "sessionKey": SESSION_KEY, "message": "must not create", "initialModel": "model",
+            "clientRequestId": "reject-pin", **fields,
+        }, stack.context)
+        assert response.ok is False
+        assert _table_counts(stack.db_path) == before
+        assert stack.handler_runs == []
+
+
+@pytest.mark.parametrize("mode", ["router", "ensemble"])
+async def test_chat_send_pin_does_not_silently_override_gateway_routing(
+    tmp_path: Path, mode,
+) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.squilla_router.enabled = mode == "router"
+        stack.context.config.llm_ensemble.enabled = mode == "ensemble"
+        response = await get_dispatcher().dispatch("reject-pin", "chat.send", {
+            "sessionKey": SESSION_KEY, "message": "must not create", "intent": "new_chat",
+            "initialModel": "model", "clientRequestId": "reject-pin",
+        }, stack.context)
+        assert response.ok is False
+        assert all(count == 0 for count in _table_counts(stack.db_path).values())
+        assert model_routing_snapshot(stack.context.config)["mode"] == mode
+
+
+async def test_chat_send_model_pin_requires_atomic_runtime_and_fresh_session(
+    tmp_path: Path,
+) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        params = {"sessionKey": SESSION_KEY, "message": "hello", "intent": "new_chat",
+                  "initialModel": "new-model", "clientRequestId": "pin-request"}
+        stack.context.task_runtime = None
+        unavailable = await get_dispatcher().dispatch(
+            "no-runtime", "chat.send", params, stack.context,
+        )
+        assert unavailable.ok is False
+        assert all(count == 0 for count in _table_counts(stack.db_path).values())
+        stack.context.task_runtime = stack.runtime
+        await stack.manager.create(SESSION_KEY, agent_id="main", model="old-model")
+        before = _table_counts(stack.db_path)
+        existing = await get_dispatcher().dispatch("existing", "chat.send", params, stack.context)
+        assert existing.ok is False
+        assert _table_counts(stack.db_path) == before
+        assert (await stack.storage.get_session(SESSION_KEY)).model == "old-model"
+
+
+async def test_chat_send_without_pin_preserves_default_model_and_routing(tmp_path: Path) -> None:
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        stack.context.config.squilla_router.enabled = True
+        response = await get_dispatcher().dispatch("default", "chat.send", {
+            "sessionKey": SESSION_KEY, "message": "hello", "intent": "new_chat",
+            "clientRequestId": "default-request",
+        }, stack.context)
+        assert response.ok is True, response.error
+        await stack.wait_until_running()
+        assert "acceptedModel" not in response.payload
+        node = await stack.storage.get_session(SESSION_KEY)
+        assert node.model is None
+        assert node.provider_override is None
+        assert node.model_routing_mode == "router"
+
+
+@pytest.mark.parametrize("provider", ["openai", "anthropic", "deepseek"])
+async def test_accepted_model_pin_survives_restart_and_resolves_its_exact_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from opensquilla.engine.turn_runner.provider_and_tools_stage import ProviderAndToolsStageInput
+    from opensquilla.gateway.boot import build_turn_runner_from_services
+    from opensquilla.gateway.config import LlmProviderProfile
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        response = await get_dispatcher().dispatch("pin", "chat.send", {
+            "sessionKey": SESSION_KEY, "message": "same name across providers",
+            "intent": "new_chat", "clientRequestId": "pin-request",
+            "initialModel": "same-model-name", "initialProvider": provider,
+            "initialRoutingMode": "direct",
+        }, stack.context)
+        assert response.ok is True, response.error
+        await stack.wait_until_running()
+        # A new storage handle/manager has no admission-time cache or UI state.
+        reopened = await SessionStorage.open(str(stack.db_path))
+        try:
+            manager = SessionManager(reopened, inject_time_prefix=False)
+            config = GatewayConfig()
+            config.llm_profiles[provider] = LlmProviderProfile(
+                api_key="synthetic-test-profile-key", base_url=f"https://{provider}.example/v1",
+            )
+            base = ProviderConfig(
+                provider="ollama", model="gateway-default", base_url="http://127.0.0.1:11434",
+            )
+            selector = ModelSelector(SelectorConfig(primary=base))
+            built = []
+
+            def build(selected):
+                built.append((selected.provider, selected.model, selected.base_url))
+                return SimpleNamespace(name=selected.provider, model=selected.model)
+
+            monkeypatch.setattr("opensquilla.provider.selector._build_provider", build)
+            runner = build_turn_runner_from_services(SimpleNamespace(
+                config=config, provider_selector=selector, session_manager=manager,
+                tool_registry=None, skill_loader=None, usage_tracker=None,
+            ))
+            outcome = await runner._provider_and_tools_stage.run(ProviderAndToolsStageInput(
+                session_key=SESSION_KEY, agent_id="main", tool_context=None,
+                run_kind="default", input_mode="user",
+            ))
+            output = outcome.require_output()
+            assert output.provider.name == provider
+            assert output.provider.model == "same-model-name"
+            assert built == [(provider, "same-model-name", f"https://{provider}.example/v1")]
+            assert output.cloned_selector.has_fallback() is False
+            # The same exact physical deployment feeds native image validation.
+            from opensquilla.engine.runtime import _SelectorFallbackProvider
+            from opensquilla.engine.turn_runner.harness import _TurnRunnerModelCatalogAdapter
+
+            vision_calls = []
+
+            class Catalog:
+                def resolve_deployment_limits(self, _model, **_kwargs):
+                    return SimpleNamespace(
+                        context_window=100_000, max_output_tokens=4096,
+                        max_output_tokens_known=True,
+                    )
+
+                def resolve_deployment_capabilities(self, _model, **_kwargs):
+                    return None
+
+                def resolve_deployment_vision_support(self, model, **kwargs):
+                    vision_calls.append((model, kwargs["provider"], kwargs["base_url"]))
+                    return "supported" if kwargs["provider"] == provider else "unsupported"
+
+            runner._model_catalog = Catalog()
+            wrapper = _SelectorFallbackProvider(output.provider, output.cloned_selector)
+            # AgentBootstrapStage uses this physical-config API before native image dispatch.
+            catalog = _TurnRunnerModelCatalogAdapter(runner).lookup_deployment(
+                wrapper.active_deployment_config(),
+            )
+            assert catalog.vision_support == "supported"
+            assert vision_calls == [
+                ("same-model-name", provider, f"https://{provider}.example/v1"),
+            ]
+            assert selector.current_config.provider == "ollama"
+            assert selector.current_config.model == "gateway-default"
+        finally:
+            await reopened.close()
+
+
+@pytest.mark.parametrize("failure", ["unresolved", "build_failed"])
+async def test_pinned_provider_failure_never_runs_gateway_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from opensquilla.engine.turn_runner.provider_and_tools_stage import ProviderAndToolsStageInput
+    from opensquilla.gateway.boot import build_turn_runner_from_services
+    from opensquilla.gateway.config import LlmProviderProfile
+    from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
+
+    async with _open_intent_stack(tmp_path / "sessions.db") as stack:
+        await stack.manager.create(
+            SESSION_KEY, agent_id="main", model="same-model", provider_override="anthropic",
+        )
+        config = GatewayConfig()
+        monkeypatch.setattr("opensquilla.provider.deployment.environment_value", lambda _name: "")
+        if failure == "build_failed":
+            config.llm_profiles["anthropic"] = LlmProviderProfile(api_key="synthetic-test-key")
+        base = ProviderConfig(provider="ollama", model="default", base_url="http://127.0.0.1:11434")
+        built = []
+
+        def fail_build(selected):
+            built.append(selected.provider)
+            raise RuntimeError("synthetic provider build failure")
+
+        monkeypatch.setattr("opensquilla.provider.selector._build_provider", fail_build)
+        runner = build_turn_runner_from_services(SimpleNamespace(
+            config=config, provider_selector=ModelSelector(SelectorConfig(primary=base)),
+            session_manager=stack.manager, tool_registry=None,
+            skill_loader=None, usage_tracker=None,
+        ))
+        with pytest.raises((ValueError, RuntimeError)):
+            await runner._provider_and_tools_stage.run(ProviderAndToolsStageInput(
+                session_key=SESSION_KEY, agent_id="main", tool_context=None,
+                run_kind="default", input_mode="user",
+            ))
+        assert built == (["anthropic"] if failure == "build_failed" else [])

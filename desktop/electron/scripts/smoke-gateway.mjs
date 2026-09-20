@@ -297,9 +297,12 @@ async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
 }
 
 function verifyGatewayMcp(gatewayBinary, env, port) {
-  assert.deepEqual(functionalProbe(gatewayBinary, env, [
+  const { protocolVersion, ...result } = functionalProbe(gatewayBinary, env, [
     '--_desktop-mcp-probe', `ws://127.0.0.1:${port}/ws`,
-  ]), {
+  ])
+  // The Python probe verifies this against the bundled SDK's latest version.
+  assert.match(protocolVersion, /^\d{4}-\d{2}-\d{2}$/)
+  assert.deepEqual(result, {
     probe: 'opensquilla-desktop-mcp', sessions: 0, resources: ['opensquilla://sessions'],
     tools: ['conversations_list', 'events_wait', 'messages_read', 'messages_send', 'session_resolve', 'transcript_export'],
   })

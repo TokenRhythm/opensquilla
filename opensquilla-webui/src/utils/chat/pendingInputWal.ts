@@ -2,6 +2,7 @@ import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
+import { snapshotAttachment } from './attachments'
 import type { TurnSendParams } from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
@@ -261,7 +262,7 @@ function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
     ...(record.draftIds
       ? { draftIds: [...record.draftIds] }
       : {}),
-    attachments: record.attachments.map(attachment => ({ ...attachment })),
+    attachments: record.attachments.map(snapshotAttachment),
   }
 }
 

@@ -174,6 +174,9 @@ describe('v4 SessionDirectory Adapter', () => {
     const requestTransport = vi.fn().mockResolvedValue({
       session_key: 'agent:main:webchat:default',
       session_id: 'session-default',
+      model: 'vendor/exact-Model-ID',
+      title: 'Deployment review',
+      runStatus: 'running',
       future: { retained: true },
     })
     const directory = createV4SessionDirectory({
@@ -188,6 +191,9 @@ describe('v4 SessionDirectory Adapter', () => {
     })).resolves.toEqual({
       key: 'agent:main:webchat:default',
       id: 'session-default',
+      model: 'vendor/exact-Model-ID',
+      title: 'Deployment review',
+      runStatus: 'running',
     })
 
     expect(ready).toHaveBeenCalledWith({
@@ -212,6 +218,23 @@ describe('v4 SessionDirectory Adapter', () => {
     await expect(directory.resolve({ key: 'missing' })).rejects.toMatchObject({
       name: 'SessionDirectoryError',
       code: 'not-found',
+    })
+  })
+
+  it.each(['vendor/exact-Model-ID', null])('preserves the stored session model %s without inferring a provider', async (model) => {
+    const directory = createV4SessionDirectory({
+      request: vi.fn().mockResolvedValue({
+        session_key: 'agent:main:webchat:stored',
+        session_id: 'session-stored',
+        model,
+        usage: { model: 'last-routed-model' },
+      }) as SessionDirectoryTransport['request'],
+    })
+
+    await expect(directory.resolve({ key: 'session-stored' })).resolves.toEqual({
+      key: 'agent:main:webchat:stored',
+      id: 'session-stored',
+      model,
     })
   })
 

@@ -14,6 +14,8 @@ export type ChatRouteHeaderAction =
   | 'deliverables'
   | 'share'
   | 'copy-session-key'
+  | 'copy-session-link'
+  | 'copy-gateway-link'
 
 export interface ChatRouteHeaderModel {
   visible: Readonly<Ref<boolean>>
@@ -31,6 +33,8 @@ export interface ChatRouteHeaderCommands {
   openDeliverables: () => void
   startShare: () => void
   copySessionKey: () => void
+  copySessionLink?: () => void
+  copyGatewayLink?: () => void
   restoreComposerFocus: () => void
 }
 
@@ -152,7 +156,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
     focusAction: action => focusActionForOwner(action),
     closeMenu,
     invoke(command) {
-      activeOwner.value?.commands[command]()
+      activeOwner.value?.commands[command]?.()
     },
   }
 

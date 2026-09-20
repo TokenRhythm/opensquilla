@@ -165,6 +165,7 @@ class GatewayTurnAdmissionAdapter:
             "surface_id",
             "workspaceId",
             "workspace_id",
+            "workspaceFiles",
             "pageContext",
             "selectedSkills",
             "documentContext",
@@ -173,6 +174,10 @@ class GatewayTurnAdmissionAdapter:
             "prompt_annotation_ids",
             "initialRoutingMode",
             "initial_routing_mode",
+            "initialModel",
+            "initial_model",
+            "initialProvider",
+            "initial_provider",
         ):
             if name in params:
                 extra[name] = params[name]

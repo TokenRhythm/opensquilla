@@ -10,38 +10,9 @@ import pytest
 from opensquilla.mcp.stdio import MCPStdioClient
 from opensquilla.mcp.types import MCPServerConfig
 
+_LEGACY_SERVER_SCRIPT = str(Path(__file__).parent / "fixtures" / "legacy_server.py")
+
 _SDK_SERVER_SCRIPT = str(Path(__file__).parent / "fixtures" / "fastmcp_server.py")
-
-# A stdio MCP server (newline-delimited JSON-RPC) exposing one "search" tool
-# whose call response carries the MCP result-level ``isError`` flag.
-_ERROR_SERVER_SCRIPT = r"""
-import json, sys
-
-def send(payload):
-    sys.stdout.buffer.write((json.dumps(payload) + "\n").encode())
-    sys.stdout.buffer.flush()
-
-while True:
-    line = sys.stdin.buffer.readline()
-    if not line:
-        break
-    msg = json.loads(line.decode())
-    msg_id = msg.get("id")
-    if msg_id is None:
-        continue  # notification
-    method = msg.get("method")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": msg_id,
-              "result": {"protocolVersion": "2024-11-05", "capabilities": {},
-                         "serverInfo": {"name": "fake", "version": "0.0.1"}}})
-    elif method == "tools/call":
-        send({"jsonrpc": "2.0", "id": msg_id,
-              "result": {"isError": True,
-                         "content": [{"type": "text",
-                                      "text": "Error: upstream API rejected the query"}]}})
-    else:
-        send({"jsonrpc": "2.0", "id": msg_id, "result": {}})
-"""
 
 
 class _FakeProcess:
@@ -51,6 +22,7 @@ class _FakeProcess:
         self.killed = False
         self.wait_calls = 0
         self.exits_on_terminate = exits_on_terminate
+        self.stdout = None
 
     def terminate(self) -> None:
         self.terminated = True
@@ -74,109 +46,11 @@ def _client_with_process(process: _FakeProcess) -> MCPStdioClient:
     return client
 
 
-class _RecordingStdin:
-    def __init__(self) -> None:
-        self.writes: list[bytes] = []
-        self.changed = asyncio.Event()
-
-    def write(self, data: bytes) -> None:
-        self.writes.append(data)
-        self.changed.set()
-
-    async def drain(self) -> None:
-        return None
-
-    async def wait_for_count(self, count: int) -> None:
-        while len(self.writes) < count:
-            self.changed.clear()
-            await self.changed.wait()
-
-
-class _QueuedStdout:
-    def __init__(self) -> None:
-        self.lines: asyncio.Queue[bytes] = asyncio.Queue()
-        self._readahead = b""
-
-    async def readline(self) -> bytes:
-        return await self.lines.get()
-
-    async def read(self, n: int) -> bytes:
-        """Read up to n bytes, compatible with _readline_safe chunked reads."""
-        if self._readahead:
-            chunk = self._readahead[:n]
-            self._readahead = self._readahead[n:]
-            return chunk
-        try:
-            data = await asyncio.wait_for(self.lines.get(), timeout=10.0)
-        except TimeoutError:
-            return b""
-        if len(data) > n:
-            self._readahead = data[n:]
-            return data[:n]
-        return data
-
-    def respond(self, request_id: int) -> None:
-        self.lines.put_nowait(
-            (json.dumps({"jsonrpc": "2.0", "id": request_id, "result": {}}) + "\n").encode()
-        )
-
-
-class _ConcurrentProcess:
-    def __init__(self) -> None:
-        self.stdin = _RecordingStdin()
-        self.stdout = _QueuedStdout()
-
-
-@pytest.mark.asyncio
-async def test_send_request_before_connect_reports_connection_error() -> None:
-    client = MCPStdioClient(MCPServerConfig(name="demo", transport="stdio", command="demo"))
-
-    with pytest.raises(ConnectionError, match="not connected"):
-        await client._send_request("tools/list")
-
-
-@pytest.mark.asyncio
-async def test_read_response_skips_invalid_utf8_lines() -> None:
-    process = _ConcurrentProcess()
-    process.stdout.lines.put_nowait(b"\xff\n")
-    process.stdout.respond(1)
-    client = _client_with_process(process)  # type: ignore[arg-type]
-
-    assert await client._read_response(1) == {"jsonrpc": "2.0", "id": 1, "result": {}}
-
-
-@pytest.mark.asyncio
-async def test_concurrent_requests_are_serialized_to_preserve_responses() -> None:
-    process = _ConcurrentProcess()
-    client = _client_with_process(process)  # type: ignore[arg-type]
-
-    first = asyncio.create_task(client._send_request("first"))
-    second: asyncio.Task[dict] | None = None
-    try:
-        await process.stdin.wait_for_count(1)
-        second = asyncio.create_task(client._send_request("second"))
-        await asyncio.sleep(0)
-
-        assert len(process.stdin.writes) == 1
-
-        process.stdout.respond(1)
-        await first
-        await process.stdin.wait_for_count(2)
-        process.stdout.respond(2)
-        await second
-    finally:
-        first.cancel()
-        if second is not None:
-            second.cancel()
-        pending = [first] if second is None else [first, second]
-        await asyncio.gather(*pending, return_exceptions=True)
-
-
 @pytest.mark.asyncio
 async def test_close_waits_for_terminated_stdio_process() -> None:
     process = _FakeProcess(exits_on_terminate=True)
 
-    await _client_with_process(process).close()
+    await _client_with_process(process)._terminate_process()
 
     assert process.terminated is True
     assert process.killed is False
@@ -191,24 +65,17 @@ async def test_close_kills_stdio_process_when_terminate_times_out(
     client = _client_with_process(process)
     monkeypatch.setattr(client, "_CLOSE_TIMEOUT_SECONDS", 0.001)
 
-    await client.close()
+    await client._terminate_process()
 
     assert process.terminated is True
     assert process.killed is True
     assert process.wait_calls == 2
 
 
-def test_encode_request_is_newline_delimited_json() -> None:
-    encoded = MCPStdioClient._encode_request({"jsonrpc": "2.0", "id": 1, "method": "x"})
-
-    assert not encoded.startswith(b"Content-Length: ")
-    assert encoded.endswith(b"\n")
-    assert b"\n" not in encoded[:-1]
-
-
 @pytest.mark.asyncio
 async def test_connect_and_list_tools_against_sdk_stdio_server() -> None:
-    pytest.importorskip("mcp")
+    from mcp.types import LATEST_PROTOCOL_VERSION
+
     client = MCPStdioClient(
         MCPServerConfig(
             name="demo",
@@ -219,7 +86,10 @@ async def test_connect_and_list_tools_against_sdk_stdio_server() -> None:
     )
     try:
         await asyncio.wait_for(client.connect(), timeout=30.0)
+        assert client._sdk_client.protocol_version == LATEST_PROTOCOL_VERSION
         tools = await asyncio.wait_for(client.list_tools(), timeout=30.0)
+        result = await client.call_tool("ping", {"text": "modern round trip"})
+        assert result.content == "modern round trip" and not result.is_error
     finally:
         await client.close()
 
@@ -233,7 +103,7 @@ async def test_call_tool_honors_result_level_is_error_flag() -> None:
             name="demo",
             transport="stdio",
             command=sys.executable,
-            args=["-c", _ERROR_SERVER_SCRIPT],
+            args=[_LEGACY_SERVER_SCRIPT, "error"],
         )
     )
     try:
@@ -296,19 +166,6 @@ async def test_readline_safe_reassembles_lines_across_chunks() -> None:
 
 
 @pytest.mark.asyncio
-async def test_read_response_preserves_blank_line_tolerance() -> None:
-    process = _FakeProcess()
-    response = {"jsonrpc": "2.0", "id": 1, "result": {}}
-    process.stdout = _ChunkedStdout(  # type: ignore[attr-defined]
-        b"\n\r\n" + json.dumps(response).encode() + b"\n"
-    )
-    client = _client_with_process(process)
-
-    assert await client._read_response(1) == response
-    assert await client._readline_safe() == b""
-
-
-@pytest.mark.asyncio
 async def test_readline_budget_counts_each_frame_without_its_newline() -> None:
     process = _FakeProcess()
     # Both lines arrive in one read. The next frame must not consume this
@@ -356,7 +213,7 @@ async def test_readline_rejects_over_budget_and_disconnects(
     assert client._process is None
     assert client._readahead == b""
     with pytest.raises(ConnectionError, match="not connected"):
-        await client._send_request("tools/list")
+        await client.list_tools()
 
 
 @pytest.mark.asyncio
@@ -364,80 +221,169 @@ async def test_close_discards_old_process_readahead() -> None:
     client = _client_with_process(_FakeProcess())
     client._readahead = b'{"jsonrpc":"2.0",'
 
-    await client.close()
+    await client._terminate_process()
 
     assert client._readahead == b""
 
 
-@pytest.mark.asyncio
-async def test_connect_does_not_prefix_new_process_response_with_old_bytes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = _FakeProcess()
-    process.stdin = _RecordingStdin()  # type: ignore[attr-defined]
-    process.stdout = _ChunkedStdout(  # type: ignore[attr-defined]
-        b'{"jsonrpc":"2.0","id":1,"result":{}}\n'
-    )
-
-    async def spawn(*args, **kwargs):
-        return process
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
-    client = MCPStdioClient(MCPServerConfig(name="demo", transport="stdio", command="demo"))
-    client._readahead = b'{"jsonrpc":"2.0",'
-    try:
-        await client.connect()
-        assert len(process.stdin.writes) == 2  # type: ignore[attr-defined]
-    finally:
-        await client.close()
-
-
-_LARGE_SERVER_SCRIPT = r"""
-import json, sys
-
-def send(payload):
-    sys.stdout.buffer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
-    sys.stdout.buffer.flush()
-
-for line in sys.stdin.buffer:
-    msg = json.loads(line)
-    request_id = msg.get("id")
-    if request_id is None:
-        continue
-    method = msg.get("method")
-    if method == "initialize":
-        result = {"protocolVersion": "2024-11-05", "capabilities": {},
-                  "serverInfo": {"name": "synthetic", "version": "1"},
-                  "instructions": "x" * (129 * 1024)}
-    elif method == "tools/list":
-        result = {"tools": [{"name": "large", "description": "x" * (129 * 1024),
-                             "inputSchema": {"type": "object"}}]}
-    else:
-        send({"jsonrpc": "2.0", "method": "notifications/message", "params": {}})
-        result = {"content": [{"type": "text", "text": "\U0001f991" * (256 * 1024)}]}
-    send({"jsonrpc": "2.0", "id": request_id, "result": result})
-"""
-
-
-@pytest.mark.asyncio
-async def test_large_initialize_list_and_tool_responses_from_real_subprocess() -> None:
-    client = MCPStdioClient(
+def _legacy_client(mode: str, *, timeout: float = 5.0) -> MCPStdioClient:
+    return MCPStdioClient(
         MCPServerConfig(
-            name="large",
+            name="synthetic",
             transport="stdio",
             command=sys.executable,
-            args=["-u", "-c", _LARGE_SERVER_SCRIPT],
+            args=["-u", _LEGACY_SERVER_SCRIPT, mode],
+            tool_timeout_seconds=timeout,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_legacy_negotiation_large_messages_and_multibyte_results() -> None:
+    client = _legacy_client("large")
     try:
-        async with asyncio.timeout(30):
-            await client.connect()
-            tools = await client.list_tools()
-            assert [tool.name for tool in tools] == ["large"]
-            assert len(tools[0].description) == 129 * 1024
-            result = await client.call_tool("large", {})
-            assert result.content == "🦑" * (256 * 1024)
-            # Consume a subsequent response to cover framing after read-ahead.
-            assert len(await client.list_tools()) == 1
+        await client.connect()
+        tools = await client.list_tools()
+        assert [tool.name for tool in tools] == ["echo"]
+        assert len(tools[0].description) == 129 * 1024
+        result = await client.call_tool("echo", {})
+        assert not result.is_error
+        assert result.content == "🦑" * (256 * 1024)
+        assert len(await client.list_tools()) == 1
     finally:
         await client.close()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_requests_match_out_of_order_responses_and_notifications() -> None:
+    client = _legacy_client("reorder")
+    try:
+        await client.connect()
+        await client.list_tools()
+        async with asyncio.timeout(10):
+            first, second = await asyncio.gather(
+                client.call_tool("echo", {"text": "first"}),
+                client.call_tool("echo", {"text": "second"}),
+            )
+        assert (first.content, second.content) == ("first", "second")
+        assert not first.is_error and not second.is_error
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_sdk_parser_tolerates_blank_and_invalid_lines() -> None:
+    client = _legacy_client("noisy")
+    try:
+        await client.connect()
+        assert [tool.name for tool in await client.list_tools()] == ["echo"]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_stdio_environment_inheritance_and_explicit_overrides(monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_MCP_TEST_INHERITED", "inherited")
+    monkeypatch.setenv("OPENSQUILLA_MCP_TEST_OVERRIDE", "original")
+    client = _legacy_client("environment")
+    client.config.env = {"OPENSQUILLA_MCP_TEST_OVERRIDE": "override"}
+    try:
+        await client.connect()
+        result = await client.call_tool("echo", {})
+        assert json.loads(result.content) == {
+            "OPENSQUILLA_MCP_TEST_INHERITED": "inherited",
+            "OPENSQUILLA_MCP_TEST_OVERRIDE": "override",
+        }
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_real_subprocess_cross_task_connect_call_close_and_reconnect() -> None:
+    client = _legacy_client("normal")
+    baseline = asyncio.all_tasks()
+    await asyncio.create_task(client.connect())
+    process = client._process
+    result = await asyncio.create_task(client.call_tool("echo", {"text": "hello"}))
+    assert not result.is_error and result.content == "hello"
+    await asyncio.create_task(client.close())
+    await client.close()
+    assert process is not None and process.returncode is not None
+    assert client._process is None
+    client._readahead = b"old incomplete message"
+    await client.connect()
+    assert [tool.name for tool in await client.list_tools()] == ["echo"]
+    await client.close()
+    await asyncio.sleep(0)
+    assert not (asyncio.all_tasks() - baseline)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["cancel", "timeout", "close"])
+async def test_initialization_interruption_reaps_real_subprocess(action: str) -> None:
+    client = _legacy_client("hang", timeout=0.2 if action == "timeout" else 5)
+    task = asyncio.create_task(client.connect())
+    try:
+        async with asyncio.timeout(10):
+            while client._process is None:
+                await asyncio.sleep(0.005)
+            process = client._process
+            if action == "cancel":
+                task.cancel()
+            elif action == "close":
+                await client.close()
+            with pytest.raises((asyncio.CancelledError, Exception)):
+                await task
+            await client.close()
+            assert process.returncode is not None
+            assert client._process is None
+    finally:
+        await client.close()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["exit", "oversize"])
+async def test_disconnect_fails_pending_call_and_reaps_child(mode: str) -> None:
+    client = _legacy_client(mode)
+    try:
+        await client.connect()
+        process = client._process
+        async with asyncio.timeout(10):
+            result = await client.call_tool("echo", {})
+            assert result.is_error
+            await client.close()
+        assert process is not None and process.returncode is not None
+        assert client._process is None
+        assert process.stdout is not None and process.stdout.at_eof()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_close_during_call_wakes_request_without_leaving_tasks() -> None:
+    client = _legacy_client("hang_call")
+    await client.connect()
+    pending = asyncio.create_task(client.call_tool("echo", {}))
+    await asyncio.sleep(0.05)
+    await client.close()
+    result = await asyncio.wait_for(pending, 2)
+    assert result.is_error
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("excess", [0, 1])
+async def test_actual_16_mib_preparse_boundary(excess: int) -> None:
+    process = _FakeProcess()
+    budget = 16 * 1024 * 1024
+    process.stdout = _ChunkedStdout(b"x" * (budget + excess) + b"\n")
+    client = _client_with_process(process)
+    assert client._MAX_MESSAGE_BYTES == budget
+    if excess:
+        with pytest.raises(ValueError, match="byte limit"):
+            await client._readline_safe()
+        assert process.terminated
+    else:
+        assert len(await client._readline_safe()) == budget + 1
+    await client._terminate_process()

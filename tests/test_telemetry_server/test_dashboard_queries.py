@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ from opensquilla.telemetry.consent import TelemetryScope
 from opensquilla.telemetry.contracts import TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
 from opensquilla.telemetry.contracts.common import ConsentScope
 from opensquilla.telemetry.server.dashboard_queries import (
+    _ACTIVATION_STAGES,
     DashboardDataError,
     DashboardQueries,
     UtcCohortWindow,
@@ -148,9 +150,15 @@ def _insert(
     app_session_id: str | None = None,
     acquisition_id: str | None = None,
     analytics_user_id: str | None = None,
+    device_id: str | None = "synthetic-default",
     notice_version: str = "test-v1",
     payload: dict[str, Any] | None = None,
 ) -> None:
+    payload = dict(payload or {})
+    if device_id == "synthetic-default" and analytics_user_id is not None:
+        device_id = hashlib.sha256(analytics_user_id.encode()).hexdigest()
+    if device_id is not None and device_id != "synthetic-default":
+        payload["device_id"] = device_id
     values: dict[str, object] = {
         "event_id": event_id or f"event-{sequence:04d}",
         "payload_sha256": "a" * 64,
@@ -248,6 +256,63 @@ def test_product_activity_deduplicates_surfaces_and_repeated_days(tmp_path: Path
         ],
     }
     _assert_no_sensitive_output(result)
+
+
+def test_all_application_device_counts_deduplicate_profiles_without_legacy_fallback(
+    tmp_path: Path,
+) -> None:
+    queries, reliability, growth = _queries(tmp_path)
+    profiles = [
+        ("profile-a", "a" * 64, "cli"),
+        ("profile-b", "a" * 64, "tui"),
+        ("profile-c", "a" * 64, "desktop"),
+        ("profile-a", "b" * 64, "cli"),
+        ("legacy-profile", None, "cli"),
+        ("invalid-device-profile", "A" * 64, "cli"),
+    ]
+    for profile_index, (profile, device, surface) in enumerate(profiles):
+        for offset, (name, source, outcome) in enumerate([
+            ("product_active", "gateway", None),
+            ("client_launch", "gateway", None),
+            ("metaskill_usage", "runtime", None),
+            ("coding_mode_usage", "runtime", None),
+            ("onboarding_result", "desktop", "completed"),
+            ("first_app_ready", "desktop", None),
+            ("first_turn_started", "gateway", None),
+            ("first_turn_result", "runtime", "success"),
+        ]):
+            _insert(growth, sequence=profile_index * 10 + offset, event_name=name,
+                    occurred_at=f"2026-09-01T01:0{offset}:00.000Z", source=source,
+                    outcome=outcome, analytics_user_id=profile, device_id=device,
+                    notice_version="growth-v2", payload={"surface": surface, "entrypoint": "chat"})
+        _insert(reliability, sequence=profile_index, event_name="app_start_result",
+                occurred_at="2026-09-01T01:00:00.000Z", device_id=device,
+                app_session_id=f"session-{profile_index}", outcome="success")
+
+    result = queries.summary(UtcCohortWindow.from_dates("2026-09-01", "2026-09-01"))
+    metrics = result["growth"]
+    assert (metrics["productActivity"]["dau"], metrics["productActivity"]["mau"]) == (2, 2)
+    assert metrics["clientUsage"]["totals"] == {
+        "tuiUsers": 1, "cliUsers": 2, "terminalUsers": 2,
+        "tuiOnly": 0, "cliOnly": 1, "both": 1,
+    }
+    assert metrics["clientUsage"]["entrypoints"] == [{"entrypoint": "chat", "users": 2}]
+    assert [stage["deduplicatedCount"] for stage in metrics["activation"]["stages"]] == [2] * 4
+    for feature in ("metaskillUsage", "codingModeUsage"):
+        assert metrics[feature]["totalUses"] == 6
+        assert metrics[feature]["uniqueDevices"] == 2
+        assert metrics[feature]["dailyTrend"] == [
+            {"period": "2026-09-01", "uses": 6, "uniqueDevices": 2}
+        ]
+    assert metrics["deviceIdentity"] == {
+        "deduplicationUnit": "device", "uniqueDevices": 2,
+        "eventsWithoutDeviceId": 16, "legacyProfileFallback": False,
+    }
+    assert result["reliability"]["deviceIdentity"]["uniqueDevices"] == 2
+    assert result["reliability"]["appStart"]["estimatedEvents"] == 6
+    assert result["reliability"]["crashFreeSessions"]["sessions"] == 6
+    serialized = json.dumps(result)
+    assert "a" * 64 not in serialized and "b" * 64 not in serialized
 
 
 def test_product_activity_rolling_window_includes_history_before_selected_start(
@@ -385,10 +450,9 @@ def test_legacy_collector_schema_aggregates_both_scopes_without_migration(tmp_pa
             event_name=event_name,
             occurred_at=f"2026-09-01T01:0{sequence}:00.000Z",
             outcome=outcome,
-            analytics_user_id="synthetic-user",
+            analytics_user_id="synthetic-user", device_id=None,
         )
-    # Older stores have no per-day launch index. Repeated launches must still
-    # count the same user once for each terminal in read-only aggregation.
+    # Legacy profiles cannot be converted to device identities by the dashboard.
     for sequence, surface in enumerate(("tui", "cli", "cli"), start=5):
         _insert(
             growth,
@@ -397,7 +461,7 @@ def test_legacy_collector_schema_aggregates_both_scopes_without_migration(tmp_pa
             first_batch_id=_LEGACY_BATCH_ID,
             event_name="client_launch",
             occurred_at="2026-09-01T01:05:00.000Z",
-            analytics_user_id="synthetic-user",
+            analytics_user_id="synthetic-user", device_id=None,
             payload={"surface": surface, "entrypoint": "chat"},
         )
     before = {path: path.read_bytes() for path in (reliability, growth)}
@@ -410,10 +474,10 @@ def test_legacy_collector_schema_aggregates_both_scopes_without_migration(tmp_pa
     assert result["reliability"]["appStart"]["estimatedEvents"] == 3
     assert result["reliability"]["appStart"]["estimatedSuccesses"] == 2
     activation = result["growth"]["activation"]
-    assert [stage["deduplicatedCount"] for stage in activation["stages"]] == [1, 1, 1, 1]
-    assert [transition["dropoffRate"] for transition in activation["transitions"]] == [0, 0, 0]
+    assert [stage["deduplicatedCount"] for stage in activation["stages"]] == [0, 0, 0, 0]
+    assert [transition["dropoffRate"] for transition in activation["transitions"]] == [None] * 3
     totals = result["growth"]["clientUsage"]["totals"]
-    assert (totals["tuiUsers"], totals["cliUsers"]) == (1, 1)
+    assert (totals["tuiUsers"], totals["cliUsers"]) == (0, 0)
     assert result["growth"]["metaskillUsage"]["totalUses"] == 0
     assert result["growth"]["codingModeUsage"]["totalUses"] == 0
     for path in (reliability, growth):
@@ -931,7 +995,7 @@ def test_growth_funnels_keep_identifiers_separate_and_use_fixed_windows(
         "windowHours": 24,
         "dropoffRate": pytest.approx(2 / 3),
     }
-    assert result["activation"]["deduplicationUnit"] == "analytics user"
+    assert result["activation"]["deduplicationUnit"] == "device"
     assert activation_counts == [2, 1, 1, 1]
     assert result["linkedInstallToReady"] == {
         "eligibleInstallations": 2,
@@ -995,6 +1059,49 @@ def test_activation_follows_desktop_order_and_accepts_legacy_readiness(
     assert [transition["windowHours"] for transition in activation["transitions"]] == [168] * 3
     if counts == [1, 1, 1, 1]:
         assert [transition["dropoffRate"] for transition in activation["transitions"]] == [0] * 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_schema", [False, True])
+async def test_activation_joins_search_by_device_on_read_only_databases(
+    tmp_path: Path, legacy_schema: bool,
+) -> None:
+    if legacy_schema:
+        growth = _legacy_database(tmp_path, TelemetryScope.GROWTH)
+    else:
+        growth = tmp_path / "growth.sqlite3"
+        storage = await TelemetryIngestStorage.open(growth, ConsentScope.GROWTH)
+        await storage.close()
+        with sqlite3.connect(growth) as connection:
+            connection.execute(
+                "INSERT INTO ingest_batches VALUES (?, ?, ?, ?, 0, 0)",
+                (_LEGACY_BATCH_ID, "a" * 64, "2026-09-01T00:00:00.000Z",
+                 "2026-09-01T00:00:00.000Z"),
+            )
+    for device_number in range(32):
+        for stage_number, stage in enumerate(_ACTIVATION_STAGES):
+            sequence = device_number * len(_ACTIVATION_STAGES) + stage_number + 1
+            _insert(
+                growth, sequence=sequence, event_id=str(UUID(int=sequence, version=4)),
+                first_batch_id=_LEGACY_BATCH_ID, event_name=stage.event_name,
+                occurred_at=f"2026-09-01T00:0{stage_number}:00.000Z",
+                analytics_user_id=f"profile-{device_number}", outcome=stage.outcome,
+            )
+    queries = DashboardQueries(reliability_db_path=growth, growth_db_path=growth)
+    with queries._open(TelemetryScope.GROWTH) as connection:
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        statements: list[str] = []
+        connection.set_trace_callback(statements.append)
+        activation = queries._funnel(
+            connection, _window(), id_column="device_id", stages=_ACTIVATION_STAGES,
+        )
+        connection.set_trace_callback(None)
+        plans = connection.execute(f"EXPLAIN QUERY PLAN {statements[-1]}").fetchall()
+    assert [stage["deduplicatedCount"] for stage in activation["stages"]] == [32] * 4
+    searches = [str(row["detail"]) for row in plans if "SEARCH candidate " in row["detail"]]
+    assert len(searches) == len(_ACTIVATION_STAGES) - 1
+    # Each stage must constrain identity, not scan all devices with this event name.
+    assert all("device_id=?" in plan and "event_name=?" in plan for plan in searches)
 
 
 def test_activation_cohort_uses_first_completed_onboarding_and_distinct_users(
@@ -1159,9 +1266,10 @@ def test_metaskill_usage_counts_runs_and_zero_fills_daily_trend(tmp_path: Path) 
     result = queries.growth(_window())["metaskillUsage"]
 
     assert result["totalUses"] == 3
-    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 2}
-    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0}
-    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1}
+    assert result["uniqueDevices"] == 2
+    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 2, "uniqueDevices": 1}
+    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0, "uniqueDevices": 0}
+    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1, "uniqueDevices": 1}
     _assert_no_sensitive_output(result)
 
 
@@ -1210,8 +1318,9 @@ def test_coding_mode_usage_counts_started_runs_and_zero_fills_daily_trend(
     result = queries.growth(_window())["codingModeUsage"]
 
     assert result["totalUses"] == 2
-    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 1}
-    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0}
-    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1}
+    assert result["uniqueDevices"] == 2
+    assert result["dailyTrend"][0] == {"period": "2026-09-01", "uses": 1, "uniqueDevices": 1}
+    assert result["dailyTrend"][1] == {"period": "2026-09-02", "uses": 0, "uniqueDevices": 0}
+    assert result["dailyTrend"][2] == {"period": "2026-09-03", "uses": 1, "uniqueDevices": 1}
     assert "仅开启模式不计数" in result["note"]
     _assert_no_sensitive_output(result)

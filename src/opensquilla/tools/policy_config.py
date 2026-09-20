@@ -305,6 +305,7 @@ def apply_base_policy(
     available_tools: frozenset[str],
     *,
     profile_overrides: bool = False,
+    explicit_grants: set[str] | None = None,
 ) -> tuple[set[str] | None, set[str]]:
     if policy is None:
         return allowed_tools, denied_tools
@@ -313,10 +314,10 @@ def apply_base_policy(
     if profile_allowed is not None or (profile_overrides and policy.profile == "full"):
         allowed_tools = profile_allowed
 
-    allowed_tools = add_allowed(
-        allowed_tools,
-        expand_selectors(policy.allow | policy.also_allow, available_tools),
-    )
+    additions = expand_selectors(policy.allow | policy.also_allow, available_tools)
+    if explicit_grants is not None:
+        explicit_grants.update(additions)
+    allowed_tools = add_allowed(allowed_tools, additions)
     denied_tools = denied_tools | expand_selectors(policy.deny, available_tools)
     if allowed_tools is not None:
         allowed_tools -= denied_tools
@@ -522,6 +523,8 @@ def apply_channel_layer(
     channel_denied: set[str],
     policy: ToolPolicy | None,
     available_tools: frozenset[str],
+    *,
+    explicit_grants: set[str] | None = None,
 ) -> tuple[set[str] | None, set[str]]:
     if policy is None:
         return allowed_tools, channel_denied
@@ -533,10 +536,10 @@ def apply_channel_layer(
         - _SENDER_SCOPED_TOOL_GROUPS
         - _SENDER_SCOPED_TOOL_NAMES
     )
-    allowed_tools = add_allowed(
-        allowed_tools,
-        expand_selectors(channel_selectors, available_tools),
-    )
+    additions = expand_selectors(channel_selectors, available_tools)
+    if explicit_grants is not None:
+        explicit_grants.update(additions)
+    allowed_tools = add_allowed(allowed_tools, additions)
     channel_denied |= expand_selectors(policy.deny, available_tools)
     return allowed_tools, channel_denied
 
@@ -546,12 +549,17 @@ def apply_sender_layer(
     channel_denied: set[str],
     policy: ToolPolicy | None,
     available_tools: frozenset[str],
+    *,
+    explicit_grants: set[str] | None = None,
 ) -> tuple[set[str] | None, set[str]]:
     if policy is None:
         return allowed_tools, channel_denied
     also_allowed = expand_selectors(policy.also_allow, available_tools)
     channel_denied -= also_allowed
-    allowed_tools = add_allowed(allowed_tools, expand_selectors(policy.allow, available_tools))
+    additions = expand_selectors(policy.allow, available_tools)
+    if explicit_grants is not None:
+        explicit_grants.update(additions | also_allowed)
+    allowed_tools = add_allowed(allowed_tools, additions)
     allowed_tools = add_allowed(allowed_tools, also_allowed)
     channel_denied |= expand_selectors(policy.deny, available_tools)
     return allowed_tools, channel_denied

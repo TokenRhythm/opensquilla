@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- The WebUI and Desktop composer can recover unsent attachment drafts across
+  reloads, with conversation and account/profile scoping, local storage limits,
+  expiry, and explicit recovery errors for unavailable file bytes.
+- Desktop file selection can reference files in the active project without
+  uploading a snapshot; queued use rechecks the current workspace and permissions.
 - Plan proposals can be hidden and restored without losing history or stopping
   work. Queued and running implementations expose the normal task cancellation
   control. Retried implementation requests preserve their original identity.
@@ -37,6 +42,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   never accepted, and existing CORS response-header behavior is unchanged.
 
 ### Changed
+
+- Documents are consumed through bounded file tools with page, slide, paragraph
+  and sheet-range access. Uploaded originals stay immutable; supported edits use
+  persistent session working copies, and forks copy edited bytes under the current
+  file policy. Scanned PDF pages remain explicitly distinguishable from extracted
+  text.
+- Staged attachment uploads survive Gateway restarts within their original
+  10-minute lifetime. Context admission can compact older history once and retry
+  with a fresh text-and-image budget when the selected model's capacity is known.
 
 - Retired four experiment-only diagnostic outputs: runtime-recovery events,
   final-diff observations, salvage events and focused-verification classification.

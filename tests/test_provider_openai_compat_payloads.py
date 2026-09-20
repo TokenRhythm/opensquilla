@@ -378,6 +378,8 @@ def test_openrouter_stream_write_timeout_allows_env_override(
 def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:
+    fallback_started = False
+
     class TimeoutStream:
         async def __aenter__(self) -> Any:
             raise httpx.ReadTimeout("stream idle")
@@ -398,28 +400,42 @@ def test_openrouter_stream_timeout_emits_heartbeat_before_non_stream_fallback(
         def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
             return TimeoutStream()
 
-    class SlowFallbackProvider(OpenAIProvider):
+    class OrderedFallbackProvider(OpenAIProvider):
         async def _complete_non_stream(self, **kwargs: Any):
-            await asyncio.sleep(0.05)
+            nonlocal fallback_started
+            fallback_started = True
             yield ErrorEvent(message="fallback finished", code="timeout")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
-    provider = SlowFallbackProvider(
+    provider = OrderedFallbackProvider(
         api_key="test",
         model="deepseek/deepseek-v4-flash",
         base_url="https://openrouter.ai/api/v1",
         provider_kind="openrouter",
     )
 
-    async def _first_event() -> Any:
+    async def _check_fallback_order() -> Any:
         events = provider.chat(
             [Message(role="user", content="hi")],
             config=ChatConfig(timeout=1.0),
         )
-        return await asyncio.wait_for(anext(events), timeout=0.02)
+        try:
+            # Request preparation may await a worker before the stream starts.
+            # The heartbeat must reach the caller before fallback work begins.
+            first = await anext(events)
+            assert fallback_started is False
+            remaining = [event async for event in events]
+            assert fallback_started is True
+            assert len(remaining) == 1
+            assert isinstance(remaining[0], ErrorEvent)
+            assert remaining[0].message == "fallback finished"
+            assert remaining[0].code == "timeout"
+            return first
+        finally:
+            await events.aclose()
 
     with structlog.testing.capture_logs() as captured:
-        event = asyncio.run(_first_event())
+        event = asyncio.run(_check_fallback_order())
 
     assert isinstance(event, ProviderHeartbeatEvent)
     assert event.phase == "llm_fallback"
@@ -575,6 +591,8 @@ def test_stream_timeout_fallback_drops_stale_install_id_after_hot_disable(
 def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
     monkeypatch: Any,
 ) -> None:
+    fallback_started = False
+
     class TimeoutStream:
         async def __aenter__(self) -> Any:
             raise httpx.ReadTimeout("stream idle")
@@ -595,28 +613,42 @@ def test_dashscope_stream_timeout_emits_heartbeat_before_non_stream_fallback(
         def stream(self, *args: Any, **kwargs: Any) -> TimeoutStream:
             return TimeoutStream()
 
-    class SlowFallbackProvider(OpenAIProvider):
+    class OrderedFallbackProvider(OpenAIProvider):
         async def _complete_non_stream(self, **kwargs: Any):
-            await asyncio.sleep(0.05)
+            nonlocal fallback_started
+            fallback_started = True
             yield ErrorEvent(message="fallback finished", code="timeout")
 
     monkeypatch.setattr("opensquilla.provider.openai.httpx.AsyncClient", TimeoutClient)
-    provider = SlowFallbackProvider(
+    provider = OrderedFallbackProvider(
         api_key="test",
         model="qwen3.6-flash",
         base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
         provider_kind="dashscope",
     )
 
-    async def _first_event() -> Any:
+    async def _check_fallback_order() -> Any:
         events = provider.chat(
             [Message(role="user", content="hi")],
             config=ChatConfig(timeout=1.0),
         )
-        return await asyncio.wait_for(anext(events), timeout=0.02)
+        try:
+            # Request preparation may await a worker before the stream starts.
+            # The heartbeat must reach the caller before fallback work begins.
+            first = await anext(events)
+            assert fallback_started is False
+            remaining = [event async for event in events]
+            assert fallback_started is True
+            assert len(remaining) == 1
+            assert isinstance(remaining[0], ErrorEvent)
+            assert remaining[0].message == "fallback finished"
+            assert remaining[0].code == "timeout"
+            return first
+        finally:
+            await events.aclose()
 
     with structlog.testing.capture_logs() as captured:
-        event = asyncio.run(_first_event())
+        event = asyncio.run(_check_fallback_order())
 
     assert isinstance(event, ProviderHeartbeatEvent)
     assert event.phase == "llm_fallback"

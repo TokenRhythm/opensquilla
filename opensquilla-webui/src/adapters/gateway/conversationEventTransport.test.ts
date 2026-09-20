@@ -378,18 +378,45 @@ describe('conversation event transport adapter', () => {
     })
   })
 
-  it('quarantines malformed frames but does not break the wildcard stream', () => {
+  it.each(['presence', 'tick', 'transport.flow.dirty', 'models.changed'])(
+    'leaves unrelated %s events outside the Conversation consumer', name => {
+      const { rpc, transport } = harness()
+      const event = vi.fn()
+      const error = vi.fn()
+      transport.subscribe({ onEvent: event, onDecodeError: error })
+
+      rpc.emit('*', name, { value: true }, {})
+
+      expect(event).not.toHaveBeenCalled()
+      expect(error).not.toHaveBeenCalled()
+    },
+  )
+
+  it('quarantines malformed conversation frames but does not break the wildcard stream', () => {
     const { rpc, transport } = harness()
     const event = vi.fn()
     const error = vi.fn()
     transport.subscribe({ onEvent: event, onDecodeError: error })
 
-    rpc.emit('*', 'presence', { value: true }, {})
+    rpc.emit('*', 'session.event.text_delta', { key: 'alpha', text: 'synthetic' }, 'invalid metadata')
 
     expect(event).toHaveBeenCalledWith(expect.objectContaining({
       kind: 'invalid',
     }))
     expect(error).toHaveBeenCalledTimes(1)
+    rpc.emit('*', 'session.event.text_delta', { key: 'alpha', text: 'valid' }, {})
+    expect(event).toHaveBeenLastCalledWith(expect.objectContaining({ kind: 'conversation' }))
+    expect(event).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves additive conversation events as unknown domain events', () => {
+    const { rpc, transport } = harness()
+    const event = vi.fn()
+    transport.subscribe({ onEvent: event })
+    rpc.emit('*', 'session.event.synthetic_future_event', { key: 'alpha' }, {})
+    expect(event).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      kind: 'conversation', event: expect.objectContaining({ kind: 'unknown' }),
+    }))
   })
 
   it('projects approval aliases before they reach business consumers', () => {

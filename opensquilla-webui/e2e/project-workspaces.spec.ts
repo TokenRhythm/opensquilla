@@ -45,9 +45,18 @@ interface ProjectLifecycleState {
 
 async function installProjectLifecycleRpc(
   page: Page,
-  options: { connectDelayMs?: number; owner?: boolean; deferInitialSubscription?: boolean } = {},
+  options: { connectDelayMs?: number; owner?: boolean; deferInitialSubscription?: boolean; durableDraftIdentity?: boolean } = {},
 ): Promise<ProjectLifecycleState> {
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+  if (process.env.OPENSQUILLA_PLAYWRIGHT_MANAGE_WEBUI === 'preview') {
+    // Match the Gateway's built entry asset projection on nested SPA routes.
+    await page.route('**/control/chat/new*', async route => {
+      if (!route.request().isNavigationRequest()) return route.fallback()
+      const response = await route.fetch()
+      const body = (await response.text()).replace(/(src|href)="\.\//g, '$1="/control/')
+      await route.fulfill({ response, body })
+    })
+  }
   const state: ProjectLifecycleState = {
     sessionKey: 'agent:main:webchat:project-demo-task',
     requestMethods: [],
@@ -149,7 +158,11 @@ async function installProjectLifecycleRpc(
         case 'connect':
           setTimeout(() => {
             ws.send(helloOkResponse({
-              auth: { principal: { isOwner: options.owner !== false } },
+              auth: { principal: { isOwner: options.owner !== false,
+                ...(options.durableDraftIdentity ? { authenticated: true, authState: 'authenticated',
+                  role: 'operator', scopes: ['operator.read', 'operator.write'],
+                  capabilities: ['chat.read', 'chat.write'] } : {}),
+              } },
               features: {
                 methods: [
                   'workspaces.list',
@@ -467,12 +480,13 @@ test.describe('Project workspaces', () => {
     })
   }
 
-  test('restores the same draft text and project after a page reload', async ({ page }) => {
-    const state = await installProjectLifecycleRpc(page)
+  test('restores the same draft text, attachment bytes and project after a page reload', async ({ page }) => {
+    const state = await installProjectLifecycleRpc(page, { durableDraftIdentity: true })
     await openControl(page)
     await page.locator('.sidebar-new-session').click()
     const message = page.getByRole('textbox', { name: 'Message to send' })
     await message.fill('Continue this draft after refresh')
+    await attachDraftFiles(page)
     const key = await draftKey(page)
     await chooseDraftDirectory(page)
     await page.getByRole('button', { name: 'Trust and open', exact: true }).click()
@@ -483,10 +497,18 @@ test.describe('Project workspaces', () => {
     await expect(page.locator('.conn-pill.connected')).toBeVisible()
     await expect(page.locator('.chat-project-chip')).toHaveAttribute('data-status', 'ready')
     await expect(message).toHaveValue('Continue this draft after refresh')
+    await expect(page.locator('.attachment-chip')).toHaveCount(2)
+    await expect(page.locator('.attachment-chip--busy')).toHaveCount(0)
     expect(await draftKey(page)).toBe(key)
     await page.getByRole('button', { name: 'Send', exact: true }).click()
     await expect.poll(() => state.sends.length).toBe(1)
-    expect(state.sends[0]).toMatchObject({ sessionKey: key, workspaceId: 'project-demo' })
+    expect(state.sends[0]).toMatchObject({
+      sessionKey: key, workspaceId: 'project-demo',
+      attachments: expect.arrayContaining([
+        expect.objectContaining({ name: 'draft.txt', data: Buffer.from('keep this attachment').toString('base64') }),
+        expect.objectContaining({ name: 'draft.pdf', file_uuid: 'draft-staged-pdf' }),
+      ]),
+    })
   })
 
   for (const mode of ['plan', 'goal'] as const) {

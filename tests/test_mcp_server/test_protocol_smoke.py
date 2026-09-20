@@ -8,12 +8,11 @@ import sys
 import textwrap
 import time
 import urllib.request
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
-from pydantic import AnyUrl
+from mcp import ClientSession, StdioServerParameters, stdio_client
 
 from opensquilla.mcp_server.bridge import OpenSquillaMCPBridge
 
@@ -68,7 +67,7 @@ def _stop_process(process: subprocess.Popen[str]) -> None:
 
 
 def _payload_from_tool_result(result: Any) -> dict[str, Any]:
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
     if isinstance(structured, dict):
         return structured
     content = getattr(result, "content", [])
@@ -84,9 +83,6 @@ def _payload_from_resource_result(result: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 async def test_stdio_mcp_protocol_lists_calls_tools_and_reads_resources(tmp_path: Path) -> None:
-    session_mod = pytest.importorskip("mcp.client.session")
-    stdio_mod = pytest.importorskip("mcp.client.stdio")
-
     server_script = tmp_path / "mcp_stdio_smoke_server.py"
     server_script.write_text(
         textwrap.dedent(
@@ -147,21 +143,21 @@ async def test_stdio_mcp_protocol_lists_calls_tools_and_reads_resources(tmp_path
         encoding="utf-8",
     )
 
-    params = stdio_mod.StdioServerParameters(
+    params = StdioServerParameters(
         command=sys.executable,
         args=[str(server_script)],
         env=_src_env(tmp_path),
         cwd=str(Path.cwd()),
     )
     with (tmp_path / "mcp-stderr.log").open("w", encoding="utf-8") as errlog:
-        async with stdio_mod.stdio_client(params, errlog=errlog) as (
+        async with stdio_client(params, errlog=errlog) as (
             read_stream,
             write_stream,
         ):
-            async with session_mod.ClientSession(
+            async with ClientSession(
                 read_stream,
                 write_stream,
-                read_timeout_seconds=timedelta(seconds=10),
+                read_timeout_seconds=10.0,
             ) as session:
                 init = await session.initialize()
                 assert init.capabilities.tools is not None
@@ -175,35 +171,77 @@ async def test_stdio_mcp_protocol_lists_calls_tools_and_reads_resources(tmp_path
                     "messages_send",
                     "events_wait",
                     "transcript_export",
-                }.issubset({tool.name for tool in tools.tools})
+                } == {tool.name for tool in tools.tools}
 
                 list_result = await session.call_tool("conversations_list", {"limit": 3})
-                assert list_result.isError is False
+                assert list_result.is_error is False
                 assert _payload_from_tool_result(list_result)["sessions"][0]["key"] == "demo"
+
+                resolve_result = await session.call_tool("session_resolve", {"key": "demo"})
+                assert resolve_result.is_error is False
+                assert _payload_from_tool_result(resolve_result) == {
+                    "key": "demo", "session_id": "demo",
+                }
+
+                messages_result = await session.call_tool("messages_read", {"key": "demo"})
+                assert messages_result.is_error is False
+                assert _payload_from_tool_result(messages_result) == {
+                    "messages": [{"role": "user", "text": "hello demo"}], "limit": 1000,
+                }
 
                 send_result = await session.call_tool(
                     "messages_send",
                     {"key": "demo", "message": "from mcp smoke"},
                 )
-                assert send_result.isError is False
+                assert send_result.is_error is False
                 assert _payload_from_tool_result(send_result)["current_stream_seq"] == 1
 
+                wait_result = await session.call_tool("events_wait", {"key": "demo"})
+                assert wait_result.is_error is False
+                assert _payload_from_tool_result(wait_result)["current_stream_seq"] == 2
+
+                export_result = await session.call_tool("transcript_export", {"key": "demo"})
+                assert export_result.is_error is False
+                transcript = _payload_from_tool_result(export_result)["result"]
+                assert json.loads(transcript)["message"]["content"][0]["text"] == "hello"
+
                 resources = await session.list_resources()
-                assert "opensquilla://sessions" in {
+                assert {"opensquilla://sessions"} == {
                     str(resource.uri) for resource in resources.resources
                 }
 
                 templates = await session.list_resource_templates()
-                assert "opensquilla://sessions/{key}/messages" in {
-                    str(template.uriTemplate) for template in templates.resourceTemplates
+                assert {
+                    "opensquilla://sessions/{key}",
+                    "opensquilla://sessions/{key}/messages",
+                    "opensquilla://sessions/{key}/transcript.jsonl",
+                } == {
+                    template.uri_template for template in templates.resource_templates
                 }
 
+                sessions_resource = await session.read_resource("opensquilla://sessions")
+                assert (
+                    _payload_from_resource_result(sessions_resource)["sessions"][0]["key"]
+                    == "demo"
+                )
+
+                session_resource = await session.read_resource("opensquilla://sessions/demo")
+                assert _payload_from_resource_result(session_resource)["session_id"] == "demo"
+
                 read_result = await session.read_resource(
-                    AnyUrl("opensquilla://sessions/demo/messages")
+                    "opensquilla://sessions/demo/messages"
                 )
                 assert (
                     _payload_from_resource_result(read_result)["messages"][0]["text"]
                     == "hello demo"
+                )
+
+                transcript_resource = await session.read_resource(
+                    "opensquilla://sessions/demo/transcript.jsonl"
+                )
+                assert (
+                    _payload_from_resource_result(transcript_resource)["message"]["role"]
+                    == "user"
                 )
 
 

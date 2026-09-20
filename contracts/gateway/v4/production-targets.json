@@ -703,6 +703,7 @@
       "kind": "method",
       "wireName": "models.list",
       "roles": [
+        "params",
         "result"
       ]
     },
@@ -908,7 +909,9 @@
     {
       "kind": "method",
       "wireName": "plans.setPresentation",
-      "roles": ["result"]
+      "roles": [
+        "result"
+      ]
     },
     {
       "kind": "method",
@@ -1424,6 +1427,30 @@
       "kind": "method",
       "wireName": "skills.setEnabled",
       "roles": [
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "workspaces.references.read",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.resume",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.messages.snapshot.release",
+      "roles": [
+        "params",
         "result"
       ]
     }

@@ -882,9 +882,14 @@ describe('SetupModelStrategyPanel', () => {
 
     const lineup = el.querySelector<HTMLElement>('[data-testid="ensemble-custom-lineup"]')!
     const imageHint = el.querySelector<HTMLElement>('[data-testid="ensemble-candidate-image-hint"]')
-    expect(imageHint?.textContent).toContain('Ensemble supports text only')
-    expect(imageHint?.textContent).toContain('For images, use intelligent routing')
-    expect(imageHint?.textContent).toContain('a fixed model that supports images')
+    expect(imageHint?.textContent).toContain(
+      `${i18n.global.t('setup.modelStrategy.cards.ensemble.title')} supports text only`,
+    )
+    expect(imageHint?.textContent).toContain(
+      `For images, use ${i18n.global.t('setup.modelStrategy.cards.router.title')}`,
+    )
+    expect(imageHint?.textContent).toContain(i18n.global.t('setup.modelStrategy.cards.single.title'))
+    expect(imageHint?.textContent).toContain('a model that supports images')
     const steps = lineup.querySelectorAll<HTMLElement>('.setup-model-strategy__step')
     expect(steps).toHaveLength(2)
     expect(steps[0]?.textContent).toContain('Proposer')

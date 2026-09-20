@@ -9,8 +9,7 @@ stream-consumer loop.
 
 Side-effect contract:
 
-- Unless ``skip_compaction`` is requested, ``t3_upgrade.maybe_compact`` and
-  ``preflight.maybe_compact`` MAY mutate
+- Unless ``skip_compaction`` is requested, ``preflight.maybe_compact`` MAY mutate
   the DB transcript via ``SessionManager.compact``. They MAY also mutate
   the runner's per-turn ``has_compacted_this_turn`` flag and the
   per-session compaction-failure circuit state. All exceptions other
@@ -31,9 +30,9 @@ NEVER terminates. Always returns ``StageOutcome.success(...)``. The
 ``StageOutcome`` shape is preserved for forward-compatibility with a
 future ``ErrorEvent`` early-yield branch.
 
-Compaction forward-compat: the four ports
-(``T3UpgradeCompactionPort``, ``PreflightCompactionPort``,
-``HistoryLoaderPort``, ``RequestContextPrependPort``) are shaped so
+Compaction forward-compat: the three ports
+(``PreflightCompactionPort``, ``HistoryLoaderPort``,
+``RequestContextPrependPort``) are shaped so
 compaction can drop in replacement implementations (e.g. an incremental
 cut-point compactor) without revising the stage interface. The IN-TURN
 compaction refresh (``CompactionEvent`` -> ``persist_compaction_result``)
@@ -58,71 +57,20 @@ if TYPE_CHECKING:
     from opensquilla.session.compaction import CompactionRequestContext
     from opensquilla.session.compaction_deployment import CompactionExecutionPlan
 
-# Internal sentinels mirroring the runtime.py module-level constants. The
-# stage body branches on ``t3_status`` to decide whether to fall through
-# to preflight; keeping a local copy avoids a runtime → stage import.
-_T3_NOT_APPLICABLE: str = "not_applicable"
-
 # ---------------------------------------------------------------------------
-# Ports — four narrow Protocols
+# Ports — three narrow Protocols
 # ---------------------------------------------------------------------------
-
-@runtime_checkable
-class T3UpgradeCompactionPort(Protocol):
-    """Wraps ``TurnRunner._maybe_compact_on_t3_upgrade``.
-
-    The helper performs router-state inspection, circuit-breaker
-    checks, checkpoint preservation, and the actual
-    ``SessionManager.compact`` call. The port wraps the public contract:
-
-    - Returns one of ``"not_applicable"`` / ``"handled"`` /
-      ``"compact_failed"``. Only ``not_applicable`` falls through
-      to generic preflight.
-    - All exception handling is internal; ``asyncio.CancelledError`` is
-      re-raised, other exceptions are logged + swallowed.
-
-    The port preserves the BEFORE-turn DB-mutation boundary: every successful
-    compaction writes to DB via the SessionManager before this method
-    returns. A replacement implementation MUST also
-    write to DB before returning.
-    """
-
-    async def maybe_compact(
-        self,
-        *,
-        session_key: str,
-        turn: Any,
-        context_window_tokens: int,
-        compaction_provider: Any | None,
-        compaction_model: str | None,
-        compaction_plan: CompactionExecutionPlan | None = None,
-        compaction_request_context: CompactionRequestContext | None = None,
-        history_capacity_tokens: int | None = None,
-        history_capacity_chars: int | None = None,
-        history_has_persisted_user: bool = False,
-        bound_user_message_id: str | None = None,
-        provider_request_correlation: ProviderRequestCorrelation | None = None,
-        consumer_admission: Any | None = None,
-        consumer_admission_fingerprint: str = "",
-        attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
-        transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
-        expected_session_id: str | None = None,
-        expected_session_epoch: int | None = None,
-    ) -> str: ...
 
 @runtime_checkable
 class PreflightCompactionPort(Protocol):
     """Wraps ``TurnRunner._maybe_preflight_compact``.
 
-    Fires ONLY when the t3-upgrade branch returned a status that allows
-    fall-through (i.e., ``not_applicable``).
-
     Returns ``None``. The CALLER does NOT branch on the return; the side
     effect is implicit (DB rewrite + ``mark_compacted_this_turn`` if a
     compaction actually fired).
 
-    Same exception model as T3 port: ``CancelledError`` re-raised,
-    others logged + swallowed.
+    Exceptions other than ``CancelledError`` are logged and swallowed by the
+    runtime helper; cancellation is re-raised.
     """
 
     async def maybe_compact(
@@ -208,8 +156,8 @@ class CompactionAndHistoryStageInput:
 
     Mirrors the locals visible to the original inline slice at the point
     ``AgentBootstrapStage`` has finished. ``agent``,
-    ``context_window_tokens``, ``provider``, ``resolved_model``, and
-    ``turn`` come from the upstream stages; ``session_key``,
+    ``context_window_tokens``, ``provider``, and ``resolved_model`` come from
+    the upstream stages; ``session_key``,
     ``agent_id``, and ``history_has_persisted_user`` come from the
     ``_run_turn`` call site.
     """
@@ -220,7 +168,6 @@ class CompactionAndHistoryStageInput:
     # From PromptAssemblerStage
     provider: Any
     resolved_model: str
-    turn: Any  # post-pipeline pipeline.TurnContext
     # From _run_turn locals (caller-provided)
     session_key: str
     agent_id: str
@@ -251,7 +198,7 @@ class CompactionAndHistoryStageInput:
     )
     # Explicit authority boundary supplied by the runtime. Restricted turns
     # load canonical history for the primary provider projection, but may not
-    # invoke T3/preflight compaction or replay durable summaries because those
+    # invoke before-turn compaction or replay durable summaries because those
     # paths can make auxiliary provider calls over unprojected history.
     # An upstream terminal preflight may suppress auxiliary compaction while
     # retaining the ordinary history-loading path.
@@ -265,14 +212,6 @@ class CompactionAndHistoryStageInput:
 class CompactionAndHistoryStageOutput:
     """The pieces of state subsequent stages and the harness consume.
 
-    - ``t3_upgrade_status``: one of the ``_T3_*`` sentinels,
-      ``"skipped"`` when an upstream terminal preflight suppresses compaction.
-      Surfaced for observability + the equivalence harness snapshot;
-      NOT consumed by downstream stages. It is used only
-      to decide whether to call preflight (folded into the stage body).
-    - ``preflight_invoked``: ``True`` if ``preflight.maybe_compact``
-      was called (i.e. the t3 path returned a fall-through sentinel),
-      ``False`` if skipped. Surfaced for observability + harness only.
     - ``compaction_summary_context``: the string passed to the
       prepender. ``None`` when no durable summaries exist. The
       equivalence harness asserts this is bit-identical between
@@ -284,8 +223,6 @@ class CompactionAndHistoryStageOutput:
       the only place that mutates ``agent.config``.
     """
 
-    t3_upgrade_status: str
-    preflight_invoked: bool
     compaction_summary_context: str | None
     final_request_context_prompt: str | None
 
@@ -297,22 +234,19 @@ class CompactionAndHistoryStage:
     """Compact (if needed), load history, prepend compaction context.
 
     Stable boundary: runs ONCE per turn, after ``AgentBootstrapStage``
-    and before the attachment-build + stream-consumer steps. The four
+    and before the attachment-build + stream-consumer steps. The three
     ports execute strictly sequentially:
 
-    1. ``t3_upgrade.maybe_compact`` (unless compaction is suppressed).
-    2. ``preflight.maybe_compact`` (called ONLY when compaction is enabled and
-       t3 returned ``_T3_NOT_APPLICABLE``).
-    3. ``history_loader.load`` (always called).
-    4. ``request_context_prepender.prepend`` (always called; pure).
+    1. ``preflight.maybe_compact`` (unless compaction is suppressed).
+    2. ``history_loader.load`` (always called).
+    3. ``request_context_prepender.prepend`` (always called; pure).
 
     The stage fires ``CompactionHook.before_compact`` and
-    ``CompactionHook.after_compact`` around BOTH t3 and preflight calls.
-    Hook invocation discriminates t3 vs preflight via
-    ``CompactionState.extra["phase"]``.
+    ``CompactionHook.after_compact`` around the preflight call with
+    ``CompactionState.extra["phase"] == "preflight"``.
 
     Exception model: re-raises ``asyncio.CancelledError`` from any
-    port. Other exceptions from t3/preflight ports are swallowed
+    port. Other exceptions from the preflight port are swallowed
     internally by the helpers (no surrounding
     try/except). History/prepender exceptions propagate to the outer
     terminal handler in ``_run_turn``.
@@ -323,13 +257,11 @@ class CompactionAndHistoryStage:
     def __init__(
         self,
         *,
-        t3_upgrade: T3UpgradeCompactionPort,
         preflight: PreflightCompactionPort,
         history_loader: HistoryLoaderPort,
         request_context_prepender: RequestContextPrependPort,
         compaction_hooks: tuple[CompactionHook, ...] = (),
     ) -> None:
-        self._t3_upgrade = t3_upgrade
         self._preflight = preflight
         self._history_loader = history_loader
         self._request_context_prepender = request_context_prepender
@@ -351,33 +283,27 @@ class CompactionAndHistoryStage:
         )
         compaction_model = inp.compaction_model or inp.resolved_model
 
-        preflight_invoked = False
-        if inp.skip_compaction:
-            t3_status = "skipped"
-        else:
-            # 1. T3-upgrade compaction. Hook fires around the call so even a
-            #    no-op path's observability is uniform.
-            t3_state = CompactionState(
+        if not inp.skip_compaction:
+            preflight_state = CompactionState(
                 session_key=inp.session_key,
                 agent_id=inp.agent_id,
                 total_tokens=0,
                 threshold_tokens=compaction_context_window_tokens,
-                extra={"phase": "t3_upgrade"},
+                extra={"phase": "preflight"},
             )
-            await self._fire_before_compact(t3_state)
-            t3_kwargs: dict[str, Any] = {}
+            await self._fire_before_compact(preflight_state)
+            preflight_kwargs: dict[str, Any] = {}
             if inp.compaction_request_context is not None:
-                t3_kwargs["compaction_request_context"] = inp.compaction_request_context
+                preflight_kwargs["compaction_request_context"] = inp.compaction_request_context
             if inp.attachment_path_resolver is not None:
-                t3_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
+                preflight_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
             if inp.transcript_snapshot is not None:
-                t3_kwargs["transcript_snapshot"] = inp.transcript_snapshot
+                preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
             if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
-                t3_kwargs["expected_session_id"] = inp.expected_session_id
-                t3_kwargs["expected_session_epoch"] = inp.expected_session_epoch
-            t3_status = await self._t3_upgrade.maybe_compact(
+                preflight_kwargs["expected_session_id"] = inp.expected_session_id
+                preflight_kwargs["expected_session_epoch"] = inp.expected_session_epoch
+            await self._preflight.maybe_compact(
                 session_key=inp.session_key,
-                turn=inp.turn,
                 context_window_tokens=compaction_context_window_tokens,
                 compaction_provider=compaction_provider,
                 compaction_model=compaction_model,
@@ -389,47 +315,9 @@ class CompactionAndHistoryStage:
                 provider_request_correlation=inp.provider_request_correlation,
                 consumer_admission=inp.consumer_admission,
                 consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
-                **t3_kwargs,
+                **preflight_kwargs,
             )
-            await self._fire_after_compact(t3_state, {"status": t3_status})
-
-            # 2. Preflight compaction (fall-through cases only).
-            if t3_status == _T3_NOT_APPLICABLE:
-                preflight_invoked = True
-                preflight_state = CompactionState(
-                    session_key=inp.session_key,
-                    agent_id=inp.agent_id,
-                    total_tokens=0,
-                    threshold_tokens=compaction_context_window_tokens,
-                    extra={"phase": "preflight"},
-                )
-                await self._fire_before_compact(preflight_state)
-                preflight_kwargs: dict[str, Any] = {}
-                if inp.compaction_request_context is not None:
-                    preflight_kwargs["compaction_request_context"] = inp.compaction_request_context
-                if inp.attachment_path_resolver is not None:
-                    preflight_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
-                if inp.transcript_snapshot is not None:
-                    preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
-                if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
-                    preflight_kwargs["expected_session_id"] = inp.expected_session_id
-                    preflight_kwargs["expected_session_epoch"] = inp.expected_session_epoch
-                await self._preflight.maybe_compact(
-                    session_key=inp.session_key,
-                    context_window_tokens=compaction_context_window_tokens,
-                    compaction_provider=compaction_provider,
-                    compaction_model=compaction_model,
-                    compaction_plan=inp.compaction_plan,
-                    history_capacity_tokens=inp.history_capacity_tokens,
-                    history_capacity_chars=inp.history_capacity_chars,
-                    history_has_persisted_user=inp.history_has_persisted_user,
-                    bound_user_message_id=inp.bound_user_message_id,
-                    provider_request_correlation=inp.provider_request_correlation,
-                    consumer_admission=inp.consumer_admission,
-                    consumer_admission_fingerprint=inp.consumer_admission_fingerprint,
-                    **preflight_kwargs,
-                )
-                await self._fire_after_compact(preflight_state, {"status": "ran"})
+            await self._fire_after_compact(preflight_state, {"status": "ran"})
 
         # 3. Load history (transcript + reconstructed messages + durable summary).
         history_kwargs: dict[str, Any] = {}
@@ -454,8 +342,6 @@ class CompactionAndHistoryStage:
 
         return StageOutcome.success(
             CompactionAndHistoryStageOutput(
-                t3_upgrade_status=t3_status,
-                preflight_invoked=preflight_invoked,
                 compaction_summary_context=compaction_summary_context,
                 final_request_context_prompt=final_request_context_prompt,
             )

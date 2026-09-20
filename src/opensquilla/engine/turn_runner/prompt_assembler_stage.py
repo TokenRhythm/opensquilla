@@ -128,6 +128,8 @@ class RunPipelineRequest:
         default=None,
         repr=False,
     )
+    # Reference data appended after routing, excluding the base prompt's dynamic suffix.
+    additional_request_context_tokens: int = 0
 
 # ---------------------------------------------------------------------------
 # Ports — narrow Protocols so the stage is unit-testable without the full
@@ -312,6 +314,7 @@ class PromptAssemblerStageInput:
     )
     expected_session_id: str | None = field(default=None, repr=False)
     expected_session_epoch: int | None = field(default=None, repr=False)
+    provider_metadata: dict[str, Any] = field(default_factory=dict)
 
 @dataclass(frozen=True)
 class PromptAssemblerStageOutput:
@@ -447,8 +450,12 @@ class PromptAssemblerStage:
             workspace_dir=(getattr(inp.effective_tool_context, "workspace_dir", None)),
         )
         from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
+        from opensquilla.token_estimation import estimate_tokens
 
         base_prompt = with_collaboration_instructions(base_prompt, inp.effective_tool_context)
+        additional_request_context_tokens = (
+            estimate_tokens("\n\n".join(plan_reference_parts)) if plan_reference_parts else 0
+        )
 
         # 2. Fetch router context (transcript-driven)
         router_context_kwargs: dict[str, Any] = {
@@ -531,6 +538,7 @@ class PromptAssemblerStage:
             cloned_selector=inp.cloned_selector,
             tool_defs=inp.tool_defs,
             base_prompt=base_prompt,
+            additional_request_context_tokens=additional_request_context_tokens,
             attachments=inp.attachments,
             attachment_materialization=inp.attachment_materialization,
             semantic_message=inp.semantic_input,
@@ -587,6 +595,7 @@ class PromptAssemblerStage:
         # 4. Merge prompt + tool metadata
         turn.metadata.update(prompt_metadata)
         turn.metadata.update(inp.tool_metadata)
+        turn.metadata.update(inp.provider_metadata)
 
         # 5. Memory fingerprint merge (defensive — port returns None to skip)
         fingerprint = self._memory_fingerprint.memory_mode_fingerprint()
@@ -616,6 +625,7 @@ class PromptAssemblerStage:
                 inp.model,
                 turn_metadata=turn.metadata,
                 realign_routed_model=True,
+                explicit_capacity_override=True,
             )
             if prior_route_model != turn.metadata.get("executed_model") or (
                 prior_route_provider

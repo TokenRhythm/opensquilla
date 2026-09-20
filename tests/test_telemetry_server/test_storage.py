@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -449,10 +450,128 @@ async def test_client_launch_semantic_daily_deduplication(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("device_id", [None, "d" * 64])
+async def test_launch_lookup_searches_the_matching_full_unique_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device_id: str | None,
+) -> None:
+    database = tmp_path / "indexed-launch.sqlite3"
+    storage = await TelemetryIngestStorage.open(database, ConsentScope.GROWTH)
+    execute = storage._connection.execute
+    lookups = []
+
+    async def capture_lookup(sql, parameters=None):
+        if "SELECT 1 FROM events" in sql:
+            lookups.append((sql, parameters))
+        return await execute(sql, parameters)
+
+    monkeypatch.setattr(storage._connection, "execute", capture_lookup)
+    try:
+        event = _client_launch(event_id=_EVENT_ID)
+        if device_id is not None:
+            event["device_id"] = device_id
+        receipt = await storage.ingest(_parse_batch(
+            _batch_dict(scope=ConsentScope.GROWTH, events=[event]), scope=ConsentScope.GROWTH,
+        ))
+        assert receipt.accepted == 1
+    finally:
+        await storage.close()
+
+    assert len(lookups) == 1
+    sql, parameters = lookups[0]
+    with sqlite3.connect(database) as connection:
+        plan = connection.execute(f"EXPLAIN QUERY PLAN {sql}", parameters).fetchall()
+    identity_kind = "device" if device_id is not None else "user"
+    expected_index = f"idx_events_client_launch_{identity_kind}_surface_day"
+    details = " ".join(str(row[3]) for row in plan)
+    assert f"SEARCH events USING INDEX {expected_index}" in details
+    # The plan must constrain identity, surface, and day, not scan all launches.
+    assert details.count("=?") == 3
+
+
+@pytest.mark.asyncio
+async def test_device_launch_dedup_survives_upgrade_retries_and_profile_copies(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "device-upgrade.sqlite3"
+    scope = ConsentScope.GROWTH
+    storage = await TelemetryIngestStorage.open(database, scope)
+    legacy = _parse_batch(_batch_dict(scope=scope, events=[_client_launch(event_id=_EVENT_ID)]),
+                          scope=scope)
+    await storage.ingest(legacy)
+    await storage.close()
+    with sqlite3.connect(database) as connection:
+        before = connection.execute("SELECT * FROM events").fetchall()
+        connection.execute("DROP INDEX idx_events_client_launch_user_surface_day")
+        connection.execute("DROP INDEX idx_events_client_launch_device_surface_day")
+        connection.execute(storage_module._PRE_DEVICE_EXPECTED_SCHEMA_SQL[
+            ("index", "idx_events_client_launch_user_surface_day")
+        ])
+        connection.execute("UPDATE meta SET protocol_fingerprint = ?", (
+            "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f",
+        ))
+    storage = await TelemetryIngestStorage.open(database, scope)
+    try:
+        with sqlite3.connect(database) as connection:
+            assert connection.execute("SELECT * FROM events").fetchall() == before
+        retry = await storage.ingest(legacy)
+        assert (retry.accepted, retry.duplicates) == (0, 1)
+        events = []
+        for index, (device, profile, surface, day) in enumerate([
+            ("a", _ANALYTICS_ID, "tui", "01"),
+            ("a", _SESSION_ID, "tui", "01"),  # second profile, same device
+            ("b", _ANALYTICS_ID, "tui", "01"),  # profile copied to another device
+            ("a", _ANALYTICS_ID, "cli", "01"),
+            ("a", _ANALYTICS_ID, "tui", "02"),
+        ], start=100):
+            event = _client_launch(event_id=f"00000000-0000-4000-8000-{index:012d}",
+                                   occurred_at=f"2026-09-{day}T01:02:03.456Z")
+            event.update(device_id=device * 64, analytics_user_id=profile, surface=surface)
+            events.append(event)
+        receipt = await storage.ingest(_parse_batch(_batch_dict(
+            scope=scope, batch_id=_SECOND_BATCH_ID, events=events,
+        ), scope=scope))
+        assert (receipt.accepted, receipt.duplicates) == (4, 1)
+        repeated = {**events[1], "event_id": "00000000-0000-4000-8000-000000000999"}
+        receipt = await storage.ingest(_parse_batch(_batch_dict(
+            scope=scope, batch_id=_ACQUISITION_ID, events=[repeated],
+        ), scope=scope))
+        assert (receipt.accepted, receipt.duplicates) == (0, 1)
+        assert (await storage.stats()).event_count == 5
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_two_collectors_atomically_deduplicate_device_launches(tmp_path: Path) -> None:
+    database = tmp_path / "concurrent-device.sqlite3"
+    first = await TelemetryIngestStorage.open(database, ConsentScope.GROWTH)
+    second = await TelemetryIngestStorage.open(database, ConsentScope.GROWTH)
+    try:
+        batches = []
+        for event_id, batch_id, profile in [
+            (_EVENT_ID, _BATCH_ID, _ANALYTICS_ID),
+            (_SECOND_EVENT_ID, _SECOND_BATCH_ID, _SESSION_ID),
+        ]:
+            event = _client_launch(event_id=event_id)
+            event.update(device_id="c" * 64, analytics_user_id=profile)
+            batches.append(_parse_batch(_batch_dict(
+                scope=ConsentScope.GROWTH, batch_id=batch_id, events=[event],
+            ), scope=ConsentScope.GROWTH))
+        receipts = await asyncio.gather(first.ingest(batches[0]), second.ingest(batches[1]))
+        assert sorted((receipt.accepted, receipt.duplicates) for receipt in receipts) == [
+            (0, 1), (1, 0),
+        ]
+        assert (await first.stats()).event_count == 1
+    finally:
+        await first.close()
+        await second.close()
+
+
+@pytest.mark.asyncio
 async def test_exact_previous_protocol_database_is_migrated_in_place(tmp_path: Path) -> None:
     database = tmp_path / "legacy-growth.sqlite3"
     with sqlite3.connect(database) as connection:
-        for statement in storage_module._SCHEMA_STATEMENTS[:-1]:
+        for statement in storage_module._LEGACY_EXPECTED_SCHEMA_SQL.values():
             connection.execute(statement)
         connection.execute(
             """

@@ -56,3 +56,21 @@ describe('hidden control durable outbox', () => {
     expect(listHiddenControls(original.sessionKey, storage)).toEqual([])
   })
 })
+
+
+it('freezes model/provider/routing in the hidden-control identity and keeps legacy records readable', () => {
+  const storage = memoryStorage()
+  const original = {
+    sessionKey: 'agent:main:chat-1', clientRequestId: 'model-request', providerText: '/meta launch', displayText: 'Launch',
+    initialSettings: { intent: 'new_chat' as const, initialRoutingMode: 'direct' as const,
+      initialModel: 'model-a', initialProvider: 'provider-a' },
+  }
+  expect(persistHiddenControl(original, storage)).toBe(true)
+  expect(persistHiddenControl(original, storage)).toBe(true)
+  expect(persistHiddenControl({ ...original,
+    initialSettings: { ...original.initialSettings, initialModel: 'model-b' },
+  }, storage)).toBe(false)
+  expect(listHiddenControls(original.sessionKey, storage)[0]?.initialSettings).toEqual(original.initialSettings)
+  expect(persistHiddenControl({ ...original, clientRequestId: 'legacy', initialSettings: undefined }, storage)).toBe(true)
+  expect(listHiddenControls(original.sessionKey, storage)[1]).not.toHaveProperty('initialSettings')
+})

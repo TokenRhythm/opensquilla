@@ -71,6 +71,7 @@ class AdmitTurnResult(TypedDict, total=False):
     surfaceId: str | None
     acceptedCollaboration: AcceptedCollaboration
     collaboration: AdmissionCollaborationSnapshot
+    acceptedModel: dict[str, str | None]
     acceptedRouting: AcceptedRouting
     routing: AdmissionRoutingSnapshot
 
@@ -147,6 +148,7 @@ class AdmitTurn:
     client_message_id: str | None = None
     surface_id: str | None = None
     attachments: tuple[dict[str, Any], ...] = ()
+    workspace_files: tuple[dict[str, Any], ...] = ()
     selected_skills: tuple[dict[str, str], ...] = ()
     intent: str = "continue"
     intent_was_provided: bool = False
@@ -158,6 +160,8 @@ class AdmitTurn:
     queue_mode: str | None = None
     initial_collaboration_mode: InitialCollaborationMode | None = None
     initial_routing_mode: InitialRoutingMode | None = None
+    initial_model: str | None = None
+    initial_provider: str | None = None
     pending_input: PendingInputGuard | None = None
 
     # Only internal Plan/background producers supply these controls. Gateway

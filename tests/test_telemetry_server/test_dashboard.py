@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -497,7 +498,8 @@ def test_terminal_user_card_counts_each_surface_independently(
                     f"synthetic-launch-{sequence}",
                     "a" * 64,
                     user_id,
-                    json.dumps({"surface": surface}),
+                    json.dumps({"surface": surface,
+                                "device_id": hashlib.sha256(user_id.encode()).hexdigest()}),
                 ),
             )
 
@@ -512,7 +514,7 @@ def test_terminal_user_card_counts_each_surface_independently(
         re.DOTALL,
     )
     assert card is not None
-    assert "终端使用人数" in card.group(1)
+    assert "终端使用设备数" in card.group(1)
     rows = re.findall(
         r'<span class="bar-name">([^<]+)</span>.*?<span class="bar-value">(\d+)</span>',
         card.group(1),
@@ -546,7 +548,7 @@ def test_activation_funnel_follows_desktop_order_without_false_dropoff(
                     received_at_utc
                 ) VALUES (
                     ?, ?, ?, 1, ?, 'desktop', '1.2.3', 'macos', ?,
-                    1.0, 'growth-v2', 'synthetic-new-user', '{}', ?
+                    1.0, 'growth-v2', 'synthetic-new-user', ?, ?
                 )
                 """,
                 (
@@ -555,6 +557,7 @@ def test_activation_funnel_follows_desktop_order_without_false_dropoff(
                     event_name,
                     occurred_at,
                     outcome,
+                    json.dumps({"device_id": "a" * 64}),
                     occurred_at,
                 ),
             )
@@ -572,7 +575,7 @@ def test_activation_funnel_follows_desktop_order_without_false_dropoff(
         re.DOTALL,
     )
     assert card is not None
-    assert "所选日期首次完成引导的用户" in card.group(1)
+    assert "所选日期首次完成引导的设备" in card.group(1)
     assert "从首次可用到首次成功对话" not in page.text
     rows = re.findall(
         r'<span class="bar-name">([^<]+)</span>.*?<span class="bar-value">(\d+)</span>',
@@ -619,7 +622,9 @@ def test_product_activity_cards_chart_and_api_use_product_wide_distinct_users(
                               1, 'growth-v2', ?, ?, ?)
                     """,
                     (f"synthetic-activity-{sequence}", "a" * 64, occurred_at,
-                     user, json.dumps({"surface": surface}), occurred_at),
+                     user, json.dumps({"surface": surface,
+                                      "device_id": hashlib.sha256(user.encode()).hexdigest()}),
+                     occurred_at),
                 )
 
     with TestClient(app, base_url="https://preview.test") as client:
@@ -638,17 +643,20 @@ def test_product_activity_cards_chart_and_api_use_product_wide_distinct_users(
     assert f'id="product-dau">{dau}</div>' in page.text
     assert f'id="product-mau">{mau}</div>' in page.text
     assert page.text.index('id="product-activity-panel"') < page.text.index('id="terminal-trend"')
-    assert 'aria-label="每日匿名配置日活与滚动三十天月活趋势图"' in page.text
+    assert 'aria-label="每日设备日活与滚动三十天月活趋势图"' in page.text
     assert f'data-date="2026-09-30" data-dau="{dau}" data-mau="{mau}"' in page.text
-    assert "日活与月活（匿名配置）" in page.text
-    assert "按匿名配置标识统计 · 非账号口径" in page.text
-    assert "按匿名配置标识、UTC 日期统计" in page.text
-    assert "同一配置使用桌面端、网页端、TUI 或 CLI 跨入口只计 1 份" in page.text
-    assert "这是匿名配置口径，不是登录账号人数" in page.text
-    assert "同一人在不同设备或不同配置中使用可能重复统计" in page.text
-    assert "历史未上报不回填" in page.text
-    assert "月活配置（近 30 天）" in page.text
-    assert "日活配置 ${point.dau} 份 · 近 30 天活跃配置 ${point.mau} 份" in page.text
+    assert "日活与月活（设备去重）" in page.text
+    assert "按设备标识统计 · 跨配置与入口去重" in page.text
+    assert "按设备标识、UTC 日期统计" in page.text
+    assert "同一设备标识跨配置和入口只计 1 台" in page.text
+    assert "设备标识代表操作系统安装实例／执行主机" in page.text
+    assert "通过 Gateway 使用的 Web/TUI 按 Gateway 主机计数" in page.text
+    assert "系统重装或虚拟机克隆可能改变或复制标识" in page.text
+    assert "同一标识下的多个配置只计 1 台" in page.text
+    assert "旧版无设备标识的事件不计入设备数" in page.text
+    assert "历史不推算、不回填" in page.text
+    assert "月活设备（近 30 天）" in page.text
+    assert "日活设备 ${point.dau} 台 · 近 30 天活跃设备 ${point.mau} 台" in page.text
     assert "日活与月活用户" not in page.text
     assert "不受开始日期筛选影响" in page.text
     assert ("当前统计区间暂无产品活跃上报。" in page.text) is not has_activity

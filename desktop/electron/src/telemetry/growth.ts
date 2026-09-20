@@ -29,6 +29,7 @@ import {
   spoolEarlyTelemetryEvent,
 } from './early-spool.js'
 import type { DesktopScopeConsent } from './onboarding-consent.js'
+import { deviceIdentityFields, getDeviceId } from './device-identity.js'
 
 export const GROWTH_COHORT_STATE_NAME = 'growth_cohort.json'
 export const GROWTH_IDENTITY_STATE_NAME = 'growth_identity.json'
@@ -94,6 +95,7 @@ export interface DesktopGrowthTelemetryOptions {
   env?: Environment
   nowDate?: () => Date
   randomId?: () => string
+  deviceId?: () => string | null
 }
 
 export interface GrowthProfileInspection {
@@ -117,6 +119,7 @@ export class DesktopGrowthTelemetry {
   private readonly env: Environment
   private readonly nowDate: () => Date
   private readonly randomId: () => string
+  private readonly deviceId: () => string | null
   private inspectedProfileKey: string | null = null
   private freshCandidate = false
   private importedOrMigrated = false
@@ -130,6 +133,7 @@ export class DesktopGrowthTelemetry {
     this.env = options.env ?? process.env
     this.nowDate = options.nowDate ?? (() => new Date())
     this.randomId = options.randomId ?? randomUUID
+    this.deviceId = options.deviceId ?? getDeviceId
   }
 
   observeProfileInspection(inspection: GrowthProfileInspection): void {
@@ -311,6 +315,7 @@ export class DesktopGrowthTelemetry {
       notice_version: CURRENT_NOTICE_VERSION_BY_SCOPE.growth,
       sample_rate: 1 as const,
       analytics_user_id: analyticsUserId,
+      ...deviceIdentityFields(this.deviceId),
     }
     try {
       return validateDesktopEarlyTelemetryEvent(
@@ -358,7 +363,7 @@ export function clearDesktopGrowthTelemetryState(telemetryDirectory: string): vo
     if (!existsSync(path)) continue
     const metadata = lstatSync(path)
     if (metadata.isSymbolicLink() || !metadata.isFile()) {
-      throw new Error('Growth telemetry state is not a regular file.')
+      throw new Error('Usage statistics state is not a regular file.')
     }
     unlinkSync(path)
   }

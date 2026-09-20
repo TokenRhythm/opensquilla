@@ -308,31 +308,24 @@ def test_workspace_attachment_budget_from_config_guards() -> None:
     )
 
 
-def test_budget_overwrite_of_mismatched_file_frees_replaced_bytes(tmp_path: Path) -> None:
+def test_budget_does_not_overwrite_conflicting_immutable_material(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     payload = b"h" * 10
     sha = hashlib.sha256(payload).hexdigest()
     target_dir = workspace / ".opensquilla" / "attachments" / "session-a"
     target_dir.mkdir(parents=True)
     stale = target_dir / f"{sha[:12]}-h.bin"
-    stale.write_bytes(b"stale-different-content-12345")  # 29 bytes at the target path
-
+    changed = b"externally-modified-material"
+    stale.write_bytes(changed)
     materializer = _budgeted(tmp_path, budget=16)
-    # 29 stale bytes alone exceed the budget, but the overwrite frees them:
-    # (29 - 29) + 10 <= 16 must be admitted.
     result = materializer.materialize_bytes(
         payload, name="h.bin", mime="application/octet-stream", session_id="session-a"
     )
-    assert result.available is True
-    assert stale.read_bytes() == payload
-
-    # Cached usage after the overwrite must be 10 (not 29 or 39): a 6-byte
-    # payload fits (10 + 6 <= 16), one more byte does not.
-    ok = materializer.materialize_bytes(
-        b"i" * 6, name="i.bin", mime="application/octet-stream", session_id="session-a"
+    assert not result.available
+    assert "content conflict" in (result.error or "")
+    assert stale.read_bytes() == changed
+    following = materializer.materialize_bytes(
+        b"i", name="i.bin", mime="application/octet-stream", session_id="session-a"
     )
-    assert ok.available is True
-    over = materializer.materialize_bytes(
-        b"j", name="j.bin", mime="application/octet-stream", session_id="session-a"
-    )
-    assert over.available is False
+    assert not following.available
+    assert "budget exceeded" in (following.error or "")

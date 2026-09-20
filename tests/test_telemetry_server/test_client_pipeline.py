@@ -261,6 +261,7 @@ async def test_desktop_activation_upload_and_lost_receipt_retry_preserve_funnel(
             consent_scope="growth",
             notice_version=CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
             analytics_user_id="00000000-0000-4000-8000-000000000902",
+            device_id="a" * 64,
         )
         if event_name == "onboarding_result":
             payload["flow_version"] = 1

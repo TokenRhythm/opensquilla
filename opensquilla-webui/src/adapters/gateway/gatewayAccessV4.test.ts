@@ -203,3 +203,15 @@ describe('createV4GatewayAccess', () => {
     }
   })
 })
+
+it.each([undefined, false, 'true', true])('advertises initial model only for boolean true (%s)', flag => {
+  const raw = source()
+  raw.policy = { chat_send_initial_model: flag }
+  expect(createV4GatewayAccess(raw).chatSendInitialModel).toBe(flag === true)
+})
+
+it.each([undefined, false, 'true', true])('advertises session model selection only for boolean true (%s)', flag => {
+  const raw = source()
+  raw.policy = { sessions_routing_model_selection: flag }
+  expect(createV4GatewayAccess(raw).sessionsRoutingModelSelection).toBe(flag === true)
+})

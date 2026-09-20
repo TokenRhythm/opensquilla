@@ -203,9 +203,12 @@ class GatewayPendingInputQueueAdapter:
             value = self._value_string(raw, *aliases)
             if value is not None:
                 params[name] = value
+        for field in ("initialModel", "initial_model", "initialProvider", "initial_provider"):
+            if field in raw:
+                params[field] = raw[field]
         for field in (
-            "pageContext", "selectedSkills", "promptAnnotationIds", "prompt_annotation_ids",
-            "documentContext", "document_context",
+            "pageContext", "workspaceFiles", "selectedSkills", "promptAnnotationIds",
+            "prompt_annotation_ids", "documentContext", "document_context",
         ):
             if field in raw:
                 params[field] = raw[field]
@@ -370,6 +373,10 @@ class GatewayPendingInputQueueAdapter:
                 "PENDING_DISPLAY_TEXT_MISMATCH",
                 "Pending display text must match the provider message "
                 "or an exact literal slash escape",
+            ),
+            "initial-model": (
+                "PENDING_INITIAL_MODEL_UNSUPPORTED",
+                "Send a new chat's initialModel with its first chat.send request.",
             ),
             "initial-routing": (
                 "PENDING_INITIAL_ROUTING_UNSUPPORTED",

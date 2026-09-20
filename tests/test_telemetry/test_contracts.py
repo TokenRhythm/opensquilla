@@ -1085,7 +1085,7 @@ def test_protocol_manifest_and_fingerprint_are_stable_cross_language_golden() ->
 
     assert fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
     assert TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 == (
-        "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
+        "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
     )
     assert manifest_events == set(EVENT_MODELS)
     assert manifest["notice_versions"] == dict(CURRENT_NOTICE_VERSION_BY_SCOPE)
@@ -1097,6 +1097,55 @@ def test_protocol_manifest_and_fingerprint_are_stable_cross_language_golden() ->
         "growth": {"max_bytes": MAX_GROWTH_BATCH_BYTES, "max_events": 50},
         "reliability": {"max_bytes": MAX_RELIABILITY_BATCH_BYTES, "max_events": 100},
     }
+
+
+@pytest.mark.parametrize(("_model", "payload"), [
+    *_valid_reliability_payloads(),
+    *(item for item in _valid_growth_payloads() if "analytics_user_id" in item[1]
+      and item[1]["source"] != "account_service"),
+])
+def test_device_identity_is_optional_without_changing_legacy_canonical_bytes(
+    _model: type[object], payload: dict[str, object],
+) -> None:
+    legacy = TELEMETRY_EVENT_ADAPTER.validate_json(_wire_json(payload), strict=True)
+    legacy_payload = dict(payload)
+    if payload["event_name"] == "performance_summary":
+        legacy_payload["sample_rate"] = 1  # The pre-device contract already used Literal[1].
+    expected = json.dumps(legacy_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    assert canonical_json(legacy) == expected
+    assert "device_id" not in legacy.model_dump(mode="json")
+    device_payload = {**payload, "device_id": "a1" * 32}
+    current = TELEMETRY_EVENT_ADAPTER.validate_json(_wire_json(device_payload), strict=True)
+    assert json.loads(canonical_json(current)) == device_payload
+    adapter = (
+        RELIABILITY_BATCH_ADAPTER if payload["consent_scope"] == "reliability"
+        else GROWTH_BATCH_ADAPTER
+    )
+    batch_payload = {
+        "batch_version": 1, "batch_id": BATCH_ID, "sent_at_utc": SENT_AT,
+        "events": [legacy_payload],
+    }
+    batch = adapter.validate_json(_wire_json(batch_payload), strict=True)
+    assert canonical_json(batch) == json.dumps(
+        batch_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+@pytest.mark.parametrize("invalid", ["A" * 64, "g" * 64, "a" * 63, "a" * 65,
+                                      "a" * 63 + "\n", "serial:synthetic", 1, {}])
+def test_device_identity_rejects_raw_or_malformed_values(invalid: object) -> None:
+    payload = {**_valid_reliability_payloads()[0][1], "device_id": invalid}
+    with pytest.raises(ValidationError):
+        TELEMETRY_EVENT_ADAPTER.validate_json(_wire_json(payload), strict=True)
+
+
+def test_acquisition_journeys_do_not_accept_device_identity() -> None:
+    payload = next(item[1] for item in _valid_growth_payloads()
+                   if item[1]["event_name"] == "landing_view")
+    with pytest.raises(ValidationError):
+        TELEMETRY_EVENT_ADAPTER.validate_json(
+            _wire_json({**payload, "device_id": "a" * 64}), strict=True
+        )
 
 
 def test_canonical_json_is_stable_compact_sorted_and_keeps_null_fields() -> None:

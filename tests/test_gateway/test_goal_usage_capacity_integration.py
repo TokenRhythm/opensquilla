@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig, SubagentSpec, ToolResult
+from opensquilla.engine.turn_runner.harness import _TurnRunnerAgentFactoryAdapter
 from opensquilla.engine.types import DoneEvent as EngineDoneEvent
 from opensquilla.engine.usage_accounting import (
     UsageCallResult,
@@ -31,8 +33,9 @@ from opensquilla.session.compaction_deployment import (
     CompactionExecutionPlan,
     CompactionExecutionTarget,
 )
-from opensquilla.session.models import AgentTaskStatus, SessionNode
+from opensquilla.session.models import AgentTaskRecord, AgentTaskStatus, SessionNode
 from opensquilla.session.storage import SessionStorage
+from opensquilla.tools.types import CallerKind, ToolContext
 from tests.test_session.test_goal_storage import (
     SESSION_ID,
     SESSION_KEY,
@@ -75,6 +78,75 @@ class _RecordingDurableSink(SessionUsageEventSink):
     async def finalize(self, call: UsageCallStart, result: UsageCallResult) -> None:
         await super().finalize(call, result)
         self.receipts.append((call, result))
+
+
+@pytest.mark.parametrize("replay_depth", [0, 1])
+async def test_gateway_child_agent_factory_preserves_goal_usage_ancestry(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, replay_depth: int,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_OPENROUTER_LIVE_PRICING", "0")
+    storage = SessionStorage(str(tmp_path / "child-goal-usage.sqlite"))
+    await storage.connect()
+    sink = _RecordingDurableSink(storage)
+    try:
+        await storage.upsert_session(SessionNode(session_key=SESSION_KEY, session_id=SESSION_ID))
+        accepted = await _set_goal(storage)
+        assert accepted.goal is not None
+        child_key = "agent:main:subagent:synthetic-usage-child"
+        child_session_id = "synthetic-child-session"
+        await storage.upsert_session(SessionNode(
+            session_key=child_key, session_id=child_session_id,
+        ))
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="child-task", session_key=child_key, source_kind="subagent",
+            status=AgentTaskStatus.RUNNING,
+            details={
+                "session_id": child_session_id, "session_epoch": 0,
+                "metadata": {
+                    "parent_task_id": "task-1", "parent_session_key": SESSION_KEY,
+                    "parent_session_id": SESSION_ID, "parent_session_epoch": 0,
+                },
+            },
+        ))
+        provider = _Provider([[
+            ProviderText(text="Synthetic child result"),
+            ProviderDone(input_tokens=12, output_tokens=2),
+        ]])
+        factory = _TurnRunnerAgentFactoryAdapter(SimpleNamespace(
+            _usage_event_sink=sink, _usage_tracker=None, _tool_registry=None,
+        ))
+        agent = factory.build(
+            provider=provider,
+            config=AgentConfig(
+                max_iterations=1, provider_id="synthetic", model_id="child-model",
+                context_window_tokens=8192, context_window_known=True, max_tokens=1024,
+            ),
+            tool_definitions=[], tool_handler=None,
+            session_key=child_key, session_id=child_session_id, session_epoch=0,
+            turn_id="child-task", agent_id="main", run_kind="subagent",
+            turn_call_logger=None, memory_sync_manager=None,
+            tool_context=ToolContext(
+                caller_kind=CallerKind.SUBAGENT, parent_task_id="task-1",
+                usage_root_turn_id="task-1", router_control_replay_depth=replay_depth,
+            ),
+        )
+        events = [event async for event in agent.run_turn("Read the synthetic project file")]
+        assert len(provider.configs) == 1
+        assert any(isinstance(event, EngineDoneEvent) for event in events)
+        rows = await (await storage.conn.execute(
+            "SELECT status, execution_id, root_turn_id, parent_turn_id, goal_id FROM usage_events"
+        )).fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["status"] == "finalized"
+        assert row["execution_id"] == ("child-task:1" if replay_depth else "child-task")
+        assert row["root_turn_id"] == row["parent_turn_id"] == "task-1"
+        assert row["goal_id"] == accepted.goal.goal_id
+        goal = await storage.get_goal(SESSION_KEY)
+        assert goal is not None and goal.total_tokens == 14
+    finally:
+        await sink.close()
+        await storage.close()
 
 
 @pytest.mark.parametrize("context_window", [8192, 65536])

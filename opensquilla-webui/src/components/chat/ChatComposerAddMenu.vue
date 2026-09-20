@@ -8,65 +8,75 @@
     :aria-label="t('chat.add')"
     @keydown.esc.stop="$emit('close')"
   >
-    <div class="composer-add-menu__heading">{{ t('chat.add') }}</div>
-    <button
-      type="button"
-      class="composer-add-menu__item"
-      role="menuitem"
-      :disabled="attachmentsDisabled"
-      @click="attachFiles"
-    >
-      <span class="composer-add-menu__icon" aria-hidden="true">
-        <Icon name="paperclip" :size="17" />
-      </span>
-      <span class="composer-add-menu__copy">
-        <strong>{{ t('chat.attachFiles') }}</strong>
-      </span>
-    </button>
-    <button
-      v-if="planModeAvailable"
-      type="button"
-      class="composer-add-menu__item"
-      role="menuitem"
-      :disabled="planModeBusy || planModeActive"
-      :aria-pressed="planModeActive"
-      @click="activatePlanMode"
-    >
-      <span class="composer-add-menu__icon" aria-hidden="true">
-        <Icon name="listChecks" :size="17" />
-      </span>
-      <span class="composer-add-menu__copy">
-        <strong>{{ t('chat.planMode.label') }}</strong>
-        <span>
-          {{ planModeActive
-            ? t('chat.planMode.readOnly')
-            : t('chat.planMode.turnOn') }}
+    <div class="composer-add-menu__group" role="group" :aria-label="t('chat.composer.contentGroup')">
+      <div class="composer-add-menu__heading" aria-hidden="true">{{ t('chat.composer.contentGroup') }}</div>
+      <button
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        :disabled="attachmentsDisabled"
+        @click="attachFiles"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="paperclip" :size="17" />
         </span>
-      </span>
-    </button>
-    <button
-      v-if="goalModeAvailable"
-      type="button"
-      class="composer-add-menu__item"
-      role="menuitem"
-      :disabled="goalModeBusy || goalModeActive || goalModeExisting"
-      :aria-pressed="goalModeActive"
-      @click="activateGoalMode"
-    >
-      <span class="composer-add-menu__icon" aria-hidden="true">
-        <Icon name="target" :size="17" />
-      </span>
-      <span class="composer-add-menu__copy">
-        <strong>{{ t('chat.goal.modeLabel') }}</strong>
-        <span>
-          {{ goalModeActive
-            ? t('chat.goal.modeReady')
-            : goalModeExisting
-              ? t('chat.goal.activeTitle')
-              : t('chat.goal.modeDescription') }}
+        <span class="composer-add-menu__copy">
+          <strong>{{ t('chat.attachFiles') }}</strong>
         </span>
-      </span>
-    </button>
+      </button>
+    </div>
+    <div
+      v-if="planModeAvailable || goalModeAvailable"
+      class="composer-add-menu__group"
+      role="group"
+      :aria-label="t('chat.composer.workStyleGroup')"
+    >
+      <div class="composer-add-menu__heading" aria-hidden="true">{{ t('chat.composer.workStyleGroup') }}</div>
+      <button
+        v-if="planModeAvailable"
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        :disabled="planModeBusy || planModeActive"
+        :aria-pressed="planModeActive"
+        @click="activatePlanMode"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="listChecks" :size="17" />
+        </span>
+        <span class="composer-add-menu__copy">
+          <strong>{{ t('chat.planMode.label') }}</strong>
+          <span>
+            {{ planModeActive
+              ? t('chat.planMode.readOnly')
+              : t('chat.planMode.turnOn') }}
+          </span>
+        </span>
+      </button>
+      <button
+        v-if="goalModeAvailable"
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        :disabled="goalModeBusy || goalModeActive || goalModeExisting"
+        :aria-pressed="goalModeActive"
+        @click="activateGoalMode"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="target" :size="17" />
+        </span>
+        <span class="composer-add-menu__copy">
+          <strong>{{ t('chat.goal.modeLabel') }}</strong>
+          <span>
+            {{ goalModeActive
+              ? t('chat.goal.modeReady')
+              : goalModeExisting
+                ? t('chat.goal.activeTitle')
+                : t('chat.goal.modeDescription') }}
+          </span>
+        </span>
+      </button>
+    </div>
   </section>
 </template>
 
@@ -188,6 +198,12 @@ onBeforeUnmount(() => {
 
 .composer-add-menu.is-positioned {
   visibility: visible;
+}
+
+.composer-add-menu__group + .composer-add-menu__group {
+  margin-top: var(--sp-2);
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--border);
 }
 
 .composer-add-menu__heading {

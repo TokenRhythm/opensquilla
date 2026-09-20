@@ -130,7 +130,7 @@ export interface ProviderCatalog {
 }
 
 export interface ModelCatalog {
-  list(options?: { signal?: AbortSignal }): Promise<ModelCatalogResult>
+  list(options?: { scope?: 'active' | 'configured'; signal?: AbortSignal }): Promise<ModelCatalogResult>
   readonly capacitySupported?: boolean
   resolveCapacity?(models: readonly ModelCapacityTarget[]): Promise<{ models: ModelCapacity[] }>
 }

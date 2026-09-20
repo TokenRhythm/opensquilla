@@ -40,6 +40,8 @@ interface DesktopCleanupReport {
 declare global {
   interface OpenSquillaDesktopApi {
     getOsLocale: () => Promise<string | undefined>
+    getPendingSessionDeepLink?: () => Promise<string | null>
+    onSessionDeepLink?: (callback: (sessionKey: string) => void) => () => void
     isAutoUpdateEnabled: () => Promise<boolean>
     isDesktopUpdateManaged?: () => Promise<boolean>
     getUpdateState?: () => Promise<DesktopUpdateState>
@@ -94,6 +96,10 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseAttachments?: PlatformFilesApi['chooseAttachments']
+    selectAttachmentFile?: PlatformFilesApi['selectAttachmentFile']
+    importAttachmentSelection?: PlatformFilesApi['importAttachmentSelection']
+    cancelAttachmentSelections?: PlatformFilesApi['cancelAttachmentSelections']
     saveArtifact?: PlatformFilesApi['saveArtifact']
     sourceFileAction?: PlatformFilesApi['sourceFileAction']
     chooseProjectDirectory: (

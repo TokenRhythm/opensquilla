@@ -800,6 +800,20 @@ def capture_model_routing_config(
         normalized_mode,
         activation_config=config,
     )
+    if bool(getattr(overlay.squilla_router, "enabled", False)):
+        # Global Direct skips Router defaults at boot. A session-only Router
+        # must use the same provider-aware initialization as a global enable,
+        # preserving explicit custom ladders and Pydantic field provenance.
+        # Only the already detached routing subtrees are replaced/mutated.
+        copy_config = getattr(config, "model_copy", None)
+        initialize_defaults = getattr(config, "initialize_router_profile_defaults", None)
+        if callable(copy_config) and callable(initialize_defaults):
+            routing_config = copy_config(update={
+                "squilla_router": overlay.squilla_router,
+                "llm_ensemble": overlay.llm_ensemble,
+            })
+            routing_config.initialize_router_profile_defaults()
+            overlay.squilla_router = routing_config.squilla_router
     return _ModelRoutingConfigSnapshot(
         squilla_router=overlay.squilla_router,
         llm_ensemble=overlay.llm_ensemble,

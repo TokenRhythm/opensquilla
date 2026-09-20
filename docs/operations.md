@@ -167,17 +167,16 @@ handling.
 
 ## MCP Server
 
-OpenSquilla can run an MCP server bridge when installed with the `mcp` extra:
+The current source includes an MCP server bridge in its base installation:
 
 ```sh
 opensquilla mcp-server run
 ```
 
-Install with:
-
-```sh
-uv tool install --python 3.12 "opensquilla[recommended,mcp] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
-```
+For SDK 2.x source and release installation options, see the
+[MCP installation requirements](mcp-server.md#requirements). Packaged
+installations use the MCP implementation shipped in the
+[release wheel](https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl).
 
 Use this when another MCP-capable client should access OpenSquilla-managed tools
 or runtime surfaces.

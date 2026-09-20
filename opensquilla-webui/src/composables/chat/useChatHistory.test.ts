@@ -3391,7 +3391,7 @@ describe('useChatHistory optimistic local rows', () => {
     ],
     [
       'ensemble_multimodal_unsupported',
-      "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+      "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
     ],
   ])('restores %s as a localized error card', async (errorClass, expectedText) => {
     const { api, messages } = makeHistory(true, {

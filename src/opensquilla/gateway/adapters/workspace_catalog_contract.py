@@ -25,6 +25,7 @@ WORKSPACE_CATALOG_CONTRACT_METHODS: Final = (
     "sandbox.path.list",
     "sandbox.path.create-directory",
     "sandbox.path.pick",
+    "workspaces.references.read",
 )
 
 

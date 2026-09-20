@@ -242,6 +242,7 @@ from opensquilla.project_workspaces import (
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
 )
+from opensquilla.resource_references import session_reference_v1
 from opensquilla.run_mode import (
     RunMode,
     config_run_mode,
@@ -1633,6 +1634,24 @@ def _validate_rpc_session_deployment(
         )
 
 
+def _validate_initial_session_model(
+    ctx: RpcContext,
+    *,
+    session_key: str,
+    model: str,
+    provider: str | None,
+    routing_mode: str | None,
+) -> None:
+    from opensquilla.gateway.model_routing import model_routing_snapshot
+
+    effective_mode = routing_mode or str(model_routing_snapshot(ctx.config).get("mode") or "direct")
+    if effective_mode != "direct":
+        raise ValueError("initialModel requires direct routing")
+    _validate_rpc_session_deployment(
+        ctx, session_key=session_key, model=model, provider=provider, auth_profile=None,
+    )
+
+
 def _raise_explicit_session_deployment_model_required() -> NoReturn:
     raise RpcHandlerError(
         code="INVALID_PARAMS",
@@ -2591,6 +2610,11 @@ async def _handle_sessions_list(params: dict | None, ctx: RpcContext) -> dict:
         )
         row.update(task_summary)
         row.update(view_fields)
+        row["reference"] = session_reference_v1(
+            s.session_key,
+            title=row.get("title") or row.get("display_name"),
+            run_status=row.get("runStatus"),
+        )
         row.update(_workspace_metadata_for_session(s, ctx.config))
         result.append(row)
 
@@ -2656,6 +2680,7 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
             effective_agent_id=view.get("effectiveAgentId"),
             surface=view.get("surface"),
             updated_at=view.get("updatedAt"),
+            run_status=str(view.get("runStatus") or "idle"),
         )
 
     async def read_titles(sessions: Sequence[Any]) -> dict[str, str]:
@@ -2669,6 +2694,16 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
         derive_transcript_title=derive_transcript_title,
         read_transcript_titles=read_titles,
     )
+    keys = list(dict.fromkeys(
+        [hit.key for hit in result.sessions] + [hit.key for hit in result.messages]
+    ))
+    task_rows_by_session = await _list_task_rows_by_session(ctx, storage, keys)
+    run_statuses = {}
+    for key in keys:
+        canonical_key = canonicalize_session_key(key)
+        task_state = _task_state_summary(task_rows_by_session.get(canonical_key, []))
+        await _overlay_runtime_task_snapshot(ctx, canonical_key, task_state)
+        run_statuses[key] = task_state["run_status"]
     return {
         "sessions": [
             {
@@ -2677,6 +2712,12 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
                 "effectiveAgentId": hit.projection.effective_agent_id,
                 "surface": hit.projection.surface,
                 "updatedAt": hit.projection.updated_at,
+                "runStatus": run_statuses[hit.key],
+                "reference": session_reference_v1(
+                    hit.key,
+                    title=hit.projection.title,
+                    run_status=run_statuses[hit.key],
+                ),
             }
             for hit in result.sessions
         ],
@@ -2687,6 +2728,10 @@ async def _handle_sessions_search(params: dict | None, ctx: RpcContext) -> dict:
                 "role": hit.role,
                 "snippet": hit.snippet,
                 "createdAt": hit.created_at,
+                "runStatus": run_statuses[hit.key],
+                "reference": session_reference_v1(
+                    hit.key, title=hit.title, run_status=run_statuses[hit.key],
+                ),
             }
             for hit in result.messages
         ],
@@ -4199,7 +4244,13 @@ async def _hydrate_sessions_messages_metadata(
 
 
 async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.gateway.recovery_scheduler import CURRENT_RECOVERY_OPERATION
+
     key = _require_key(params)
+    operation = CURRENT_RECOVERY_OPERATION.get()
+    subscription_mgr = getattr(ctx, "subscription_manager", None)
+    token = operation.subscription_token if operation is not None else None
+    registered_new = operation.subscription_created if operation is not None else False
     if ":subagent:" in key:
         storage = get_session_storage(getattr(ctx, "session_manager", None))
         session = await storage.get_session(key) if storage is not None else None
@@ -4211,26 +4262,36 @@ async def _handle_sessions_messages_subscribe(params: dict | None, ctx: RpcConte
                 accepted=False,
             )
     fast_ack = (params or {}).get("fast_ack") is True
-    subscription_mgr = getattr(ctx, "subscription_manager", None)
-    registered_new = False
     if subscription_mgr is not None:
-        registered_new = ctx.conn_id not in subscription_mgr.get_message_subscribers(key)
-        subscription_mgr.subscribe_messages(ctx.conn_id, key)
+        if operation is not None:
+            if not operation.current() or not subscription_mgr.activate_message_subscription(
+                ctx.conn_id, key, token,
+            ):
+                raise RpcHandlerError("SNAPSHOT_STALE", "Subscription intent was retired",
+                                      accepted=False)
+        else:
+            registered_new = ctx.conn_id not in subscription_mgr.get_message_subscribers(key)
+            subscription_mgr.subscribe_messages(ctx.conn_id, key)
+            token = subscription_mgr.get_message_subscription_token(ctx.conn_id, key)
 
     try:
-        return await _build_sessions_messages_subscription_payload(
+        result = await _build_sessions_messages_subscription_payload(
             params,
             ctx,
             key=key,
             subscribed=subscription_mgr is not None,
             fast_ack=fast_ack,
         )
+        if operation is not None and not operation.current():
+            raise RpcHandlerError("SNAPSHOT_STALE", "Subscription intent was retired",
+                                  accepted=False)
+        return result
     except BaseException:
         # Registration precedes replay so no event can fall into a subscribe
         # gap.  If replay or payload assembly then fails, remove only the
         # registration created by this request; repeated subscribe stays idempotent.
         if subscription_mgr is not None and registered_new:
-            subscription_mgr.unsubscribe_messages(ctx.conn_id, key)
+            subscription_mgr.unsubscribe_messages(ctx.conn_id, key, expected_token=token)
         raise
 
 
@@ -4266,6 +4327,7 @@ async def _snapshot_session_identity(ctx: RpcContext, key: str) -> tuple[str | N
 
 async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcContext) -> dict:
     from opensquilla.gateway.adapters.connection_recovery_contract import validate_recovery_params
+    from opensquilla.gateway.recovery_scheduler import CURRENT_RECOVERY_OPERATION
     from opensquilla.gateway.snapshot_transfer import SnapshotTransfer, SnapshotTransferError
     from opensquilla.gateway.websocket import get_registry
 
@@ -4280,17 +4342,42 @@ async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcC
     connection = registry.get(ctx.conn_id)
     if connection is None or connection.principal != ctx.principal:
         raise RpcHandlerError("UNAUTHORIZED", "Connection identity is no longer current")
-    transfer = connection._snapshot_transfer
-    if transfer is None:
-        transfer = SnapshotTransfer(
-            connection.reserve_transport_bytes, connection.release_transport_bytes
-        )
-        connection._snapshot_transfer = transfer
-        connection.add_transport_cleanup(transfer.close)
-    identity = await _snapshot_session_identity(ctx, key)
-    if registry.get(ctx.conn_id) is not connection:
-        raise RpcHandlerError("SNAPSHOT_STALE", "Connection is no longer current", accepted=False)
     try:
+        if connection._recovery_enabled:
+            operation = CURRENT_RECOVERY_OPERATION.get()
+            if operation is not None:
+                transfer = operation.transfer
+            else:
+                subscriptions = connection._subscriptions
+                lease = subscriptions.get_message_subscription_token(ctx.conn_id, key) if (
+                    subscriptions is not None
+                ) else None
+
+                def current() -> bool:
+                    return registry.get(ctx.conn_id) is connection and not connection._closing and (
+                        subscriptions is None or
+                        subscriptions.get_message_subscription_token(ctx.conn_id, key) == lease
+                    )
+
+                snapshots = connection.snapshot_registry()
+                transfer = snapshots.get(key, sync_revision, params["snapshot_id"]) if (
+                    params.get("snapshot_id") is not None
+                ) else snapshots.admit(key, sync_revision, lease, is_current=current)
+            if transfer is None or transfer.closed:
+                raise SnapshotTransferError("SNAPSHOT_EXPIRED")
+        else:
+            transfer = connection._snapshot_transfer
+            if transfer is None:
+                transfer = SnapshotTransfer(
+                    connection.reserve_transport_bytes, connection.release_transport_bytes
+                )
+                connection._snapshot_transfer = transfer
+                connection.add_transport_cleanup(transfer.close)
+        identity = await _snapshot_session_identity(ctx, key)
+        if registry.get(ctx.conn_id) is not connection or (
+            connection._recovery_enabled and transfer.closed
+        ):
+            raise SnapshotTransferError("SNAPSHOT_STALE")
         snapshot_id = params.get("snapshot_id")
         if snapshot_id is not None:
             if transfer.identity != identity:
@@ -4315,16 +4402,19 @@ async def _handle_sessions_messages_snapshot_read(params: dict | None, ctx: RpcC
         # Encoding yields; a reset/delete-recreate or disconnect may have
         # invalidated the captured owner while those bytes were being built.
         current_identity = await _snapshot_session_identity(ctx, key)
-        if registry.get(ctx.conn_id) is not connection or current_identity != identity:
+        if registry.get(ctx.conn_id) is not connection or current_identity != identity or (
+            connection._recovery_enabled and transfer.closed
+        ):
             transfer.close()
             raise SnapshotTransferError("SNAPSHOT_STALE")
         if getattr(connection, "flow_enabled", False):
             # Segment credit is released after bounded staging, not after the
             # complete snapshot installs. The latter would deadlock recovery.
             result["delivery"] = connection.reserve_snapshot_delivery(
-                len(result["data"]) + 4096, key, result["snapshot_id"], sync_revision
+                len(result["data"]) + 4096, key, result["snapshot_id"], sync_revision,
+                segment_index=result["segment_index"],
             )
-        return result
+        return cast(dict[str, Any], result)
     except SnapshotTransferError as exc:
         raise RpcHandlerError(
             exc.code,
@@ -4422,6 +4512,23 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
         raise KeyError("No session storage available")
 
     resolution = await SessionDirectory(storage).resolve(key)
+    session = await storage.get_session(resolution.key)
+    channel_types = _channel_types_from_config(getattr(ctx, "config", None))
+    titles = await _list_transcript_titles(
+        storage, [session], channel_types=channel_types
+    ) if session else {}
+    tasks = await _list_task_rows(ctx, storage, resolution.key)
+    task_state = _task_state_summary(tasks)
+    await _overlay_runtime_task_snapshot(ctx, resolution.key, task_state)
+    view = build_session_view_item(
+        session,
+        entry_count=0,
+        task_rows=tasks,
+        now_ms=int(time.time() * 1000),
+        transcript_title=titles.get(resolution.session_id, ""),
+        channel_types=channel_types,
+    )
+    title = str(view.get("title") or resolution.key)
 
     return {
         "session_key": resolution.key,
@@ -4433,6 +4540,13 @@ async def _handle_sessions_resolve(params: dict | None, ctx: RpcContext) -> dict
         "projectWorkspaceDeferred": bool(resolution.workspace_id),
         "created_at": resolution.created_at,
         "updated_at": resolution.updated_at,
+        "title": title,
+        "runStatus": task_state["run_status"],
+        "reference": session_reference_v1(
+            resolution.key,
+            title=title,
+            run_status=task_state["run_status"],
+        ),
     }
 
 
@@ -4516,6 +4630,10 @@ def _session_routing_snapshot(
         "source": str(source or "session"),
         "initialized": bool(initialized),
         "appliesTo": applies_to,
+        "modelSelection": (
+            value.get("modelSelection") if isinstance(value, dict)
+            else getattr(value, "modelSelection", None)
+        ),
     }
 
 
@@ -4638,6 +4756,26 @@ async def _handle_sessions_routing_set(
         or expected_revision < 0
     ):
         raise ValueError("params.expectedRevision must be a non-negative integer")
+    update_model = "modelSelection" in (params or {})
+    selection = (params or {}).get("modelSelection")
+    model: str | None = None
+    provider: str | None = None
+    if update_model and selection is not None:
+        if not isinstance(selection, dict) or set(selection) != {"model", "provider"}:
+            raise ValueError("params.modelSelection must contain model and provider, or be null")
+        for field in ("model", "provider"):
+            value = selection[field]
+            limit = 512 if field == "model" else 128
+            if not isinstance(value, str) or not value.strip() or len(value.strip()) > limit:
+                raise ValueError(
+                    f"params.modelSelection.{field} must be a non-empty bounded string"
+                )
+        model, provider = selection["model"].strip(), selection["provider"].strip().lower()
+        if mode != "direct":
+            raise ValueError("params.modelSelection requires direct routing")
+        _validate_rpc_session_deployment(
+            ctx, session_key=key, model=model, provider=provider, auth_profile=None,
+        )
     # Reuse the global control's activation planner as validation only. It
     # catches an unbuildable Ensemble lineup without changing shared config.
     from opensquilla.gateway.model_routing import model_routing_patches
@@ -4655,7 +4793,13 @@ async def _handle_sessions_routing_set(
 
     async def _commit() -> dict[str, Any]:
         try:
-            stored = await setter(key, mode, expected_revision=expected_revision)
+            model_kwargs = (
+                {"update_model": True, "model": model, "provider": provider}
+                if update_model else {}
+            )
+            stored = await setter(
+                key, mode, expected_revision=expected_revision, **model_kwargs,
+            )
             snapshot = _session_routing_snapshot(stored)
             changed = (
                 stored.get("changed") is True
@@ -4686,11 +4830,41 @@ async def _handle_sessions_routing_set(
                 accepted=False,
             ) from exc
 
+    async def _commit_idle_model() -> dict[str, Any]:
+        """Reject in-flight work rather than changing its execution deployment."""
+        def busy() -> RpcHandlerError:
+            return RpcHandlerError(
+                "SESSION_MODEL_BUSY",
+                "Wait for the current and queued turns to finish before changing the model.",
+                retryable=True, accepted=False,
+            )
+
+        has_work = getattr(runtime, "has_session_work", None)
+        if callable(has_work) and await has_work(key):
+            raise busy()
+        # This also covers durable tasks being restored after a restart.
+        list_tasks = getattr(storage, "list_agent_tasks", None)
+        if callable(list_tasks):
+            for status in _ACTIVE_TASK_STATUSES:
+                if await list_tasks(session_key=key, status=status, limit=1):
+                    raise busy()
+        lock = get_session_lock(ctx.turn_runner, key)
+        if lock is not None:
+            # asyncio.Lock.acquire does not suspend when unlocked; the check
+            # and acquisition cannot let a legacy/direct turn slip between.
+            if lock.locked():
+                raise busy()
+            async with lock:
+                return await _commit()
+        return await _commit()
+
     try:
         collector = getattr(runtime, "collect_admission", None)
         if callable(collector):
             async with collector(key):
-                snapshot = await _commit()
+                snapshot = await (_commit_idle_model() if update_model else _commit())
+        elif update_model:
+            snapshot = await _commit_idle_model()
         else:
             lock = get_session_lock(ctx.turn_runner, key)
             if lock is None:
@@ -4708,6 +4882,10 @@ async def _handle_sessions_routing_set(
             accepted=False,
         ) from exc
 
+    if update_model:
+        keepalive_service = getattr(ctx, "prompt_cache_keepalive_service", None)
+        if keepalive_service is not None:
+            keepalive_service.refresh_required(key, "session_deployment_changed")
     event = {
         "key": key,
         "sessionKey": key,
@@ -5630,6 +5808,7 @@ class _GatewayAdmissionPrimitives(GatewayAdmissionRuntime):
         self.positive_int = _coerce_positive_int
         self.workspace_error = partial(map_project_workspace_error, owner=self.is_owner)
         self.validate_initial_routing = partial(model_routing_patches, ctx.config)
+        self.validate_initial_model = partial(_validate_initial_session_model, ctx)
         self._emit_disposition = partial(
             _publish_admission_disposition,
             ctx,

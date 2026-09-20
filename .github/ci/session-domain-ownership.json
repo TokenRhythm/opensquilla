@@ -201,6 +201,7 @@
           "_trusted_elevated_hint",
           "_trusted_run_mode_hint",
           "_turn_source_scope",
+          "_validate_initial_session_model",
           "build_gateway_turn_admission_adapter",
           "build_turn_admission_application"
         ]
@@ -259,6 +260,11 @@
       "path": "src/opensquilla/gateway/rpc_chat.py",
       "symbol": "_chat_turn_admission_adapter",
       "owner": "TurnAdmission"
+    },
+    {
+      "path": "src/opensquilla/gateway/rpc_sessions.py",
+      "symbol": "_validate_rpc_session_deployment",
+      "owner": "SessionLifecycle"
     }
   ]
 }

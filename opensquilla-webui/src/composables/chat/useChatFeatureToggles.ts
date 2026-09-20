@@ -1,4 +1,4 @@
-import { computed, ref } from 'vue'
+import { computed, ref, watch, type Ref } from 'vue'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
 import type { ChatRouterTierConfig } from '@/types/chat'
@@ -16,6 +16,7 @@ import {
   normalizeRouterVisualMode,
 } from '@/utils/chat/routerVisualMode'
 import { useRouterVisualEffectsPreference } from '@/composables/useRouterVisualEffectsPreference'
+import { normalizeAgentId } from '@/utils/chat/sessionKeys'
 import type { AppSettings } from '@/modules/appSettings'
 import {
   ProviderConfigurationError,
@@ -26,11 +27,15 @@ export interface UseChatFeatureTogglesOptions {
   appSettings: AppSettings
   modelRouting: ModelRouting
   readOptions?: { readonly signal?: AbortSignal }
+  connectionEpoch?: Readonly<Ref<unknown>>
+  connectionAvailable?: Readonly<Ref<boolean>>
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
 
 interface ChatFeatureConfig {
+  llm?: { model?: string; provider?: string }
+  agents?: readonly { id?: string; model?: string | null; enabled?: boolean }[]
   squilla_router?: {
     enabled?: boolean
     rollout_phase?: string
@@ -139,6 +144,49 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   const routerSlots = ref<string[]>([])
   const routerModels = ref<Record<string, string>>({})
   const routerTierConfigs = ref<Record<string, ChatRouterTierConfig>>({})
+  const defaultModelConfig = ref<{
+    model: string
+    provider: string
+    agentModels: Readonly<Record<string, string>>
+  } | null>(null)
+  let defaultModelConfigGeneration = 0
+
+  function invalidateDefaultModel(): number {
+    defaultModelConfig.value = null
+    return ++defaultModelConfigGeneration
+  }
+
+  function applyDefaultModelConfig(cfg: ChatFeatureConfig | undefined, generation: number) {
+    if (generation !== defaultModelConfigGeneration || options.connectionAvailable?.value === false) return
+    const model = typeof cfg?.llm?.model === 'string' ? cfg.llm.model.trim() : ''
+    const provider = typeof cfg?.llm?.provider === 'string' ? cfg.llm.provider.trim().toLowerCase() : ''
+    if (!model || !provider) return
+    const agentModels: Record<string, string> = Object.create(null)
+    for (const agent of Array.isArray(cfg?.agents) ? cfg.agents : []) {
+      if (agent?.enabled === false || typeof agent?.id !== 'string' || typeof agent?.model !== 'string') continue
+      const agentModel = agent.model.trim()
+      if (agentModel) agentModels[normalizeAgentId(agent.id)] = agentModel
+    }
+    defaultModelConfig.value = { model, provider, agentModels }
+  }
+
+  function defaultModelForAgent(agentId: string): { model: string; provider: string } | null {
+    const config = defaultModelConfig.value
+    if (!config || options.connectionAvailable?.value === false) return null
+    const agentModel = config.agentModels[normalizeAgentId(agentId)]
+    // Agent overrides carry only a model ID, not an authoritative deployment.
+    // Do not infer their provider from a potentially ambiguous model catalog.
+    if (agentModel && agentModel !== config.model) return null
+    return { model: config.model, provider: config.provider }
+  }
+
+  if (options.connectionEpoch || options.connectionAvailable) {
+    watch(
+      [() => options.connectionEpoch?.value, () => options.connectionAvailable?.value],
+      invalidateDefaultModel,
+      { flush: 'sync' },
+    )
+  }
 
   const modelRoutingMode = computed<ModelRoutingMode>(() => {
     if (llmEnsembleEnabled.value) return 'llm_ensemble'
@@ -255,12 +303,14 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   }
 
   async function loadFeatureToggles() {
+    const defaultModelGeneration = invalidateDefaultModel()
     const requestGeneration = ++modelRoutingRequestGeneration
     const eventGeneration = modelRoutingEventGeneration
     let cfg: ChatFeatureConfig | undefined
     try {
       cfg = await options.appSettings.readAll({ signal: options.readOptions?.signal }) as ChatFeatureConfig
       if (requestGeneration !== modelRoutingRequestGeneration) return
+      applyDefaultModelConfig(cfg, defaultModelGeneration)
       await applyFeatureConfig(cfg, { refreshUsage: true })
       if (requestGeneration !== modelRoutingRequestGeneration) return
       // Config remains the compatibility source for older Gateways. A routing
@@ -437,6 +487,7 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     routerSlots,
     routerModels,
     routerTierConfigs,
+    defaultModelForAgent,
     loadFeatureToggles,
     setRouterEnabled,
     setModelRoutingMode,

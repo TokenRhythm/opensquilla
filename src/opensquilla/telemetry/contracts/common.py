@@ -1,4 +1,4 @@
-"""Shared, privacy-bounded telemetry event fields."""
+"""Shared, privacy-bounded metrics event fields."""
 
 from __future__ import annotations
 
@@ -58,6 +58,10 @@ NoticeVersion = Annotated[
 ]
 DurationMs = Annotated[int, Field(strict=True, ge=0, le=MAX_DURATION_MS)]
 Counter = Annotated[int, Field(strict=True, ge=0, le=MAX_COUNTER)]
+DeviceId = Annotated[
+    str,
+    StringConstraints(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"),
+]
 PositiveCounter = Annotated[int, Field(strict=True, ge=1, le=MAX_COUNTER)]
 SampleRate = Annotated[
     float,
@@ -171,7 +175,7 @@ class UtcTimestampModel(StrictTelemetryModel):
 
 
 class EventBase(UtcTimestampModel):
-    """Fields present on every telemetry event."""
+    """Fields present on every metrics event."""
 
     event_name: str
     event_version: Literal[1]
@@ -209,6 +213,7 @@ class ReliabilityEventBase(EventBase):
     consent_scope: Literal[ConsentScope.RELIABILITY]
     app_version: AppVersion
     app_session_id: UUID4
+    device_id: DeviceId | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class GrowthEventEnvelopeBase(EventBase):
@@ -228,6 +233,8 @@ class GrowthEventBase(GrowthEventEnvelopeBase):
 
     app_version: AppVersion
     analytics_user_id: UUID4
+    # Omission preserves hashes for queued events created before device identity.
+    device_id: DeviceId | None = Field(default=None, exclude_if=lambda value: value is None)
     duration_ms: None
     error_code: None
 
@@ -260,6 +267,7 @@ __all__ = [
     "ClientSurface",
     "ConsentScope",
     "Counter",
+    "DeviceId",
     "DurationMs",
     "EVENT_VERSION",
     "EventBase",

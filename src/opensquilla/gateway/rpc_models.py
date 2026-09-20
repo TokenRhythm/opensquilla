@@ -35,7 +35,12 @@ async def _handle_models_list(params: dict | None, ctx: RpcContext) -> dict[str,
     capabilities = query.get("capabilities")
     if capabilities is not None and not isinstance(capabilities, list):
         raise ValueError("params.capabilities must be an array")
-    catalog = ModelCatalog(GatewayModelCatalogPort(ctx.provider_selector, ctx.config))
+    scope = query.get("scope", "active")
+    if scope not in {"active", "configured"}:
+        raise ValueError("params.scope must be active or configured")
+    catalog = ModelCatalog(GatewayModelCatalogPort(
+        ctx.provider_selector, ctx.config, include_configured_defaults=scope == "configured",
+    ))
     return cast(
         dict[str, Any],
         await catalog.query(

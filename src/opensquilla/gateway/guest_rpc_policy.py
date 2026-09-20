@@ -37,6 +37,8 @@ GUEST_RPC_ALLOWLIST = frozenset(
         "sessions.messages.hydrate",
         "sessions.messages.snapshot",
         "sessions.messages.snapshot.read",
+        "sessions.messages.resume",
+        "sessions.messages.snapshot.release",
         "transport.flow.update",
         "sessions.messages.unsubscribe",
         "sessions.pending_inputs.enqueue",
@@ -61,6 +63,8 @@ _SESSION_KEY_FIELDS = {
     "sessions.messages.hydrate": ("key", "sessionKey"),
     "sessions.messages.snapshot": ("key", "sessionKey"),
     "sessions.messages.snapshot.read": ("key",),
+    "sessions.messages.resume": ("key",),
+    "sessions.messages.snapshot.release": ("key",),
     "sessions.messages.unsubscribe": ("key", "sessionKey"),
     "sessions.pending_inputs.enqueue": ("key", "sessionKey"),
     "sessions.pending_inputs.list": ("key", "sessionKey"),
@@ -173,6 +177,8 @@ class GuestRpcPolicy:
             params = dict(params)
             params.pop("initialRoutingMode", None)
             params.pop("initial_routing_mode", None)
+            for field in ("initialModel", "initial_model", "initialProvider", "initial_provider"):
+                params.pop(field, None)
 
         if method == SESSIONS_LIST_METHOD:
             return params

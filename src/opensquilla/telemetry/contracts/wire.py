@@ -1,4 +1,4 @@
-"""Fail-closed parsing for untrusted telemetry wire payloads.
+"""Fail-closed parsing for untrusted metrics wire payloads.
 
 Network and file ingress must call :func:`parse_telemetry_wire` instead of
 passing raw input directly to a Pydantic JSON adapter.  The preflight phase
@@ -53,18 +53,18 @@ class TelemetryWireErrorCode(StrEnum):
 
 
 _ERROR_MESSAGES = {
-    TelemetryWireErrorCode.INVALID_INPUT_TYPE: "telemetry wire input must be bytes or text",
-    TelemetryWireErrorCode.INVALID_TARGET: "telemetry wire target is invalid",
-    TelemetryWireErrorCode.BODY_TOO_LARGE: "telemetry wire payload exceeds its byte limit",
-    TelemetryWireErrorCode.INVALID_UTF8: "telemetry wire payload must be valid UTF-8",
-    TelemetryWireErrorCode.UTF8_BOM: "telemetry wire payload must not contain a UTF-8 BOM",
-    TelemetryWireErrorCode.INVALID_JSON: "telemetry wire payload must be valid JSON",
-    TelemetryWireErrorCode.DUPLICATE_KEY: "telemetry wire payload contains a duplicate key",
+    TelemetryWireErrorCode.INVALID_INPUT_TYPE: "statistics wire input must be bytes or text",
+    TelemetryWireErrorCode.INVALID_TARGET: "statistics wire target is invalid",
+    TelemetryWireErrorCode.BODY_TOO_LARGE: "statistics wire payload exceeds its byte limit",
+    TelemetryWireErrorCode.INVALID_UTF8: "statistics wire payload must be valid UTF-8",
+    TelemetryWireErrorCode.UTF8_BOM: "statistics wire payload must not contain a UTF-8 BOM",
+    TelemetryWireErrorCode.INVALID_JSON: "statistics wire payload must be valid JSON",
+    TelemetryWireErrorCode.DUPLICATE_KEY: "statistics wire payload contains a duplicate key",
     TelemetryWireErrorCode.NON_FINITE_NUMBER: (
-        "telemetry wire payload contains a non-finite number"
+        "statistics wire payload contains a non-finite number"
     ),
-    TelemetryWireErrorCode.NESTING_TOO_DEEP: ("telemetry wire payload exceeds its nesting limit"),
-    TelemetryWireErrorCode.SCHEMA_INVALID: "telemetry wire payload does not match its schema",
+    TelemetryWireErrorCode.NESTING_TOO_DEEP: ("statistics wire payload exceeds its nesting limit"),
+    TelemetryWireErrorCode.SCHEMA_INVALID: "statistics wire payload does not match its schema",
 }
 
 

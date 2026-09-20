@@ -63,6 +63,36 @@ async def test_build_services_wires_media_root_into_session_manager(
         media_root = services.session_manager._media_root
         assert media_root is not None
         assert media_root == media_root_from_config(config)
+        resolver = services.session_manager._attachment_fork_context_resolver
+        assert callable(resolver)
+        from opensquilla.session.models import SessionNode
+        from opensquilla.tools.types import ToolContext, current_tool_context
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        from uuid import uuid4
+
+        node = SessionNode(
+            session_key="agent:main:direct:fork-policy",
+            execution_workspace={
+                "version": 1, "id": str(uuid4()), "kind": "configured", "root": str(workspace),
+            },
+        )
+        active = ToolContext(
+            run_mode="safe", guest_safe=True, workspace_write_deny_globs=["*.secret"],
+        )
+        token = current_tool_context.set(active)
+        try:
+            current = await resolver(node)
+        finally:
+            current_tool_context.reset(token)
+        assert current.run_mode == "safe"
+        assert current.guest_safe
+        assert current.workspace_write_deny_globs == ["*.secret"]
+        assert current.workspace_dir == str(workspace)
+        assert current.artifact_session_id == node.session_id
+        assert current.sandbox_gateway_config is config
+        assert current.sandbox_policy is not None
     finally:
         await services.close()
 

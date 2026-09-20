@@ -70,7 +70,7 @@ function openGate() {
   return gate
 }
 
-function runtime(fakePaths, randomId = ids()) {
+function runtime(fakePaths, randomId = ids(), deviceId = () => 'a'.repeat(64)) {
   const telemetry = new DesktopGrowthTelemetry({
     runtimeGate: openGate(),
     appVersion: () => '0.5.3',
@@ -78,6 +78,7 @@ function runtime(fakePaths, randomId = ids()) {
     env: {},
     nowDate: () => NOW,
     randomId,
+    deviceId,
   })
   telemetry.observeProfileInspection({
     profileKey: fakePaths.profileKey,
@@ -100,10 +101,12 @@ try {
   {
     const fakePaths = paths(join(root, 'unset'))
     await mirror(fakePaths.consentMirrorPath, null)
-    const telemetry = runtime(fakePaths)
+    let deviceReads = 0
+    const telemetry = runtime(fakePaths, ids(), () => { deviceReads += 1; return 'a'.repeat(64) })
     telemetry.synchronize(fakePaths)
     assert.equal(existsSync(join(fakePaths.telemetryDirectory, 'growth_identity.json')), false)
     assert.equal(existsSync(join(fakePaths.telemetryDirectory, 'growth_cohort.json')), false)
+    assert.equal(deviceReads, 0)
 
     await mirror(fakePaths.consentMirrorPath, true)
     telemetry.synchronize(fakePaths)
@@ -159,6 +162,7 @@ try {
     ])
     assert.equal(new Set(events.map((event) => event.analytics_user_id)).size, 1)
     assert.equal(events.every((event) => event.sample_rate === 1), true)
+    assert.equal(events.every((event) => event.device_id === 'a'.repeat(64)), true)
     const onboarding = events.find((event) => event.event_name === 'onboarding_result')
     assert.equal(onboarding.flow_version, 1)
     const marker = JSON.parse(readFileSync(
@@ -167,6 +171,27 @@ try {
     ))
     assert.equal(marker.onboarding_result.status, 'enqueued')
     assert.equal(marker.first_app_ready.status, 'enqueued')
+  }
+
+  // Separate profiles share a device count; separate machines do not share one.
+  {
+    const events = []
+    for (const [index, device] of ['a', 'a', 'b'].entries()) {
+      const fakePaths = paths(join(root, `device-profile-${index}`))
+      await mirror(fakePaths.consentMirrorPath, true)
+      const telemetry = runtime(fakePaths, ids(2000 + index * 10), () => device.repeat(64))
+      telemetry.synchronize(fakePaths)
+      telemetry.recordFirstAppReady()
+      events.push(...readyEvents(fakePaths))
+    }
+    assert.equal(new Set(events.map((event) => event.analytics_user_id)).size, 3)
+    assert.equal(new Set(events.map((event) => event.device_id)).size, 2)
+    const unavailablePaths = paths(join(root, 'device-unavailable'))
+    await mirror(unavailablePaths.consentMirrorPath, true)
+    const unavailable = runtime(unavailablePaths, ids(2100), () => null)
+    unavailable.synchronize(unavailablePaths)
+    unavailable.recordFirstAppReady()
+    assert.equal(Object.hasOwn(readyEvents(unavailablePaths)[0], 'device_id'), false)
   }
 
   // A durable cohort receipt can recover identity creation after an OS crash.
@@ -204,11 +229,13 @@ try {
     first.recordOnboardingCompleted()
     assert.deepEqual(readyEvents(fakePaths), [])
 
-    const pendingId = JSON.parse(readFileSync(
-      join(fakePaths.telemetryDirectory, 'growth_desktop_milestones.json'),
-      'utf8',
-    )).onboarding_result.event.event_id
+    const markerPath = join(fakePaths.telemetryDirectory, 'growth_desktop_milestones.json')
+    const marker = JSON.parse(readFileSync(markerPath, 'utf8'))
+    delete marker.onboarding_result.event.device_id
+    writeFileSync(markerPath, JSON.stringify(marker))
+    const pendingEvent = JSON.stringify(marker.onboarding_result.event)
     rmSync(growthSpool, { recursive: true, force: true })
+    let deviceReads = 0
     const second = new DesktopGrowthTelemetry({
       runtimeGate: openGate(),
       appVersion: () => '0.5.3',
@@ -216,13 +243,15 @@ try {
       env: {},
       nowDate: () => NOW,
       randomId: ids(900),
+      deviceId: () => { deviceReads += 1; return 'b'.repeat(64) },
     })
     second.observeProfileInspection({
       profileKey: fakePaths.profileKey,
       stableCode: 'ready',
     })
     second.synchronize(fakePaths)
-    assert.equal(readyEvents(fakePaths)[0].event_id, pendingId)
+    assert.equal(JSON.stringify(readyEvents(fakePaths)[0]), pendingEvent)
+    assert.equal(deviceReads, 0)
   }
 
   // Corrupt authority fails closed and remains untouched.
@@ -259,7 +288,7 @@ try {
   rmSync(root, { recursive: true, force: true })
 }
 
-console.log('telemetry growth milestone tests passed')
+console.log('Usage milestone tests passed')
 
 const mainSource = readFileSync(new URL('../src/main.ts', import.meta.url), 'utf8')
 const appSuccess = mainSource.slice(

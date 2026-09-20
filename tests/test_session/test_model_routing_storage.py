@@ -35,6 +35,7 @@ async def test_legacy_mode_materializes_once_and_same_mode_retry_is_idempotent()
             "revision": 1,
             "source": "legacy_initialized",
             "initialized": True,
+            "modelSelection": None,
         }
         initialized = await storage.get_session(key)
         assert initialized is not None
@@ -82,6 +83,7 @@ async def test_concrete_mode_resolution_never_opens_a_write_transaction(
             "revision": 0,
             "source": "session",
             "initialized": False,
+            "modelSelection": None,
         }
     finally:
         await storage.close()
@@ -362,5 +364,30 @@ async def test_global_change_only_affects_later_sessions_and_prefix_fork_copies_
         # The global default remains independent of both parent and child.
         later = await manager.create("agent:main:webchat:routing-later")
         assert later.model_routing_mode == "router"
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_rename_cannot_undo_new_model_and_provider_selection():
+    storage = SessionStorage(":memory:")
+    await storage.connect()
+    try:
+        manager = SessionManager(storage, model_routing_mode_provider=lambda: "direct")
+        key = "agent:main:webchat:model-stale-rename"
+        created = await manager.create(key, model="before", provider_override="openai")
+        stale = await storage.get_session(key)
+        await storage.set_model_routing_mode(
+            key, "direct", expected_revision=0, update_model=True,
+            model="after", provider="openrouter",
+        )
+        stale.display_name = "A concurrent rename"
+        await storage.upsert_session(stale, expected_session_id=created.session_id)
+        stored = await storage.get_session(key)
+        assert (stored.model, stored.provider_override, stored.model_routing_revision) == (
+            "after", "openrouter", 1,
+        )
+        assert stored.display_name == "A concurrent rename"
+        assert (stale.model, stale.provider_override) == ("after", "openrouter")
     finally:
         await storage.close()

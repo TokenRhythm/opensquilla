@@ -504,9 +504,41 @@ async def test_plain_text_large_context_floor_boundary_keeps_legacy_parity(
     expected_floor: str | None,
 ) -> None:
     fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+    # Pin a compressed-text token estimate below the material heuristic. The
+    # legacy character boundary must not depend on the local tiktoken cache.
+    monkeypatch.setattr(
+        squilla_router_step, "estimate_tokens", lambda text: (len(text) + 7) // 8,
+    )
     ctx = make_context("a" * character_count)
 
     routed = await apply_squilla_router(ctx)
+
+    assert routed.metadata["routed_tier"] == expected_tier
+    assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
+    assert "large_context_capacity_required" not in routed.metadata
+
+
+@pytest.mark.parametrize(
+    ("character_count", "expected_tier", "expected_floor"),
+    [
+        (49_998, "c0", None),
+        (50_000, "c2", "c2"),
+        (99_996, "c2", "c2"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_plain_text_large_context_floor_uses_conservative_tokenizer_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    character_count: int,
+    expected_tier: str,
+    expected_floor: str | None,
+) -> None:
+    from opensquilla import token_estimation
+
+    monkeypatch.setattr(token_estimation, "_get_encoding", lambda: None)
+    fake_strategy(monkeypatch, "c0", 0.91, {"route_class": "R0"})
+
+    routed = await apply_squilla_router(make_context("a" * character_count))
 
     assert routed.metadata["routed_tier"] == expected_tier
     assert routed.metadata.get("large_context_floor_min_tier") == expected_floor
@@ -647,6 +679,25 @@ async def test_complete_estimate_replaces_legacy_fixed_headroom_at_boundary(
     assert "large_context_request_reminder_tokens" not in routed.metadata
 
 
+@pytest.mark.parametrize("dynamic_suffix", [False, True])
+def test_additional_request_context_capacity_is_counted_once(dynamic_suffix: bool) -> None:
+    ctx = make_context("Inspect the attachment.", attachments=[{"type": "text/plain"}])
+    ctx.system_prompt = ("Stable system", "Daily context") if dynamic_suffix else "Stable system"
+    ctx.metadata["attachment_material_estimated_tokens"] = 1_000
+    before = squilla_router_step._complete_request_estimated_tokens(ctx, ctx.message)
+    ctx.metadata["routing_additional_request_context_tokens"] = 8_000
+
+    after = squilla_router_step._complete_request_estimated_tokens(ctx, ctx.message)
+
+    # A dynamic suffix already reserves the one request-context wrapper.
+    # Proposal text extends that same message; repeated admission is not additive.
+    new_wrapper = (
+        0 if dynamic_suffix else ctx.metadata["large_context_request_context_wrapper_tokens"]
+    )
+    assert after == before + 8_000 + new_wrapper
+    assert squilla_router_step._complete_request_estimated_tokens(ctx, ctx.message) == after
+
+
 @pytest.mark.asyncio
 async def test_same_attachment_fits_short_history_but_long_history_is_filtered(
     monkeypatch: pytest.MonkeyPatch,
@@ -735,6 +786,109 @@ async def test_catalog_unknown_custom_attachment_config_has_actionable_error(
     assert "llm.context_window_tokens" in routed.metadata[
         "large_context_capacity_block_reason"
     ]
+
+
+def _attachment_history_pressure_context(monkeypatch: pytest.MonkeyPatch) -> TurnContext:
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openrouter/image-model": {
+            "context_window": 32_000, "max_output_tokens": 4_000,
+        },
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    ctx = make_context("Inspect the supplied image.", attachments=[{"type": "image/png"}])
+    ctx.config.squilla_router.auto_thinking = False
+    ctx.config.squilla_router.tiers = {
+        "c1": {
+            "provider": "openrouter", "model": "image-model", "thinking_level": "off",
+        },
+    }
+    ctx.model = "image-model"
+    ctx.metadata.update({
+        "routed_tier": "c1", "routing_applied": True,
+        "router_image_tier_support": {"c1": "supported"},
+        "attachment_material_estimated_tokens": 1_000,
+        "routing_history_capacity_estimated_tokens": 50_000,
+        "routing_history_capacity_message_count": 20,
+        "routing_history_capacity_estimate_complete": True,
+    })
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_known_attachment_history_pressure_can_readmit_once(monkeypatch) -> None:
+    ctx = _attachment_history_pressure_context(monkeypatch)
+    routed = await finalize_squilla_router_capacity(ctx, allow_compaction_retry=True)
+    assert routed.metadata["large_context_capacity_retry_pending"] is True
+    assert not routed.metadata.get("large_context_capacity_blocked")
+    assert routed.metadata["large_context_capacity_provisional_model"] == "image-model"
+    assert routed.attachments == ctx.attachments
+    await finalize_squilla_router_capacity(routed)
+    assert routed.metadata["large_context_capacity_retry_pending"] is True
+
+    routed.metadata["routing_history_capacity_estimated_tokens"] = 1_000
+    routed.metadata["routing_history_capacity_message_count"] = 2
+    await finalize_squilla_router_capacity(routed, retry_after_compaction=True)
+    assert routed.metadata["large_context_capacity_status"] == "fits"
+    assert routed.metadata["large_context_capacity_retry_attempted"] is True
+    assert routed.metadata["large_context_capacity_retry_pending"] is False
+    assert routed.model == "image-model"
+    await finalize_squilla_router_capacity(routed, retry_after_compaction=True)
+    assert routed.metadata["large_context_capacity_blocked"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", [
+    "disabled", "unknown", "oversized_current", "no_history", "incomplete_history",
+    "ensemble", "tier_ensemble", "cron", "subagent", "already_attempted",
+])
+async def test_attachment_capacity_retry_requires_removable_known_history(
+    monkeypatch, guard,
+) -> None:
+    ctx = _attachment_history_pressure_context(monkeypatch)
+    if guard == "disabled":
+        ctx.config.compaction.enabled = False
+    elif guard == "unknown":
+        monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", ModelCatalog())
+    elif guard == "oversized_current":
+        ctx.metadata["attachment_material_estimated_tokens"] = 50_000
+    elif guard == "no_history":
+        ctx.metadata["routing_history_capacity_estimated_tokens"] = 0
+        ctx.metadata["attachment_material_estimated_tokens"] = 50_000
+    elif guard == "incomplete_history":
+        ctx.metadata["routing_history_capacity_estimate_complete"] = False
+    elif guard == "ensemble":
+        ctx.config.llm_ensemble.enabled = True
+    elif guard == "tier_ensemble":
+        ctx.config.squilla_router.tiers["c1"]["ensemble_selection_mode"] = "custom_b5"
+    elif guard in {"cron", "subagent"}:
+        ctx.session_key = f"{guard}:synthetic"
+    elif guard == "already_attempted":
+        ctx.metadata["large_context_capacity_retry_attempted"] = True
+    routed = await finalize_squilla_router_capacity(ctx, allow_compaction_retry=True)
+    assert routed.metadata.get("large_context_capacity_retry_pending") is not True
+    assert routed.metadata["large_context_capacity_blocked"] is True
+
+
+@pytest.mark.asyncio
+async def test_attachment_retry_still_too_large_does_not_switch_to_new_tier(monkeypatch) -> None:
+    ctx = _attachment_history_pressure_context(monkeypatch)
+    await finalize_squilla_router_capacity(ctx, allow_compaction_retry=True)
+    ctx.config.squilla_router.tiers["c2"] = {
+        "provider": "openrouter", "model": "larger-model", "thinking_level": "off",
+    }
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openrouter/image-model": {"context_window": 32_000, "max_output_tokens": 4_000},
+        "openrouter/larger-model": {"context_window": 200_000, "max_output_tokens": 4_000},
+    })
+    monkeypatch.setattr("opensquilla.provider.model_catalog._shared_catalog", catalog)
+    await finalize_squilla_router_capacity(ctx, retry_after_compaction=True)
+    assert ctx.metadata["large_context_capacity_retry_attempted"] is True
+    assert ctx.metadata["large_context_capacity_blocked"] is True
+    assert "/compact" in ctx.metadata["large_context_capacity_block_reason"]
+    assert "llm.context_window_tokens" not in ctx.metadata["large_context_capacity_block_reason"]
+    assert ctx.model == "image-model"
 
 
 @pytest.mark.asyncio

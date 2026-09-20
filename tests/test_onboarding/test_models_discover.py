@@ -406,6 +406,7 @@ def test_tokenrhythm_subdomain_discovery_uses_isolated_live_listing(
             "api_key_env": "",
             "base_url": "https://uat.tokenrhythm.studio/v1",
             "proxy": "",
+            "allow_default_api_key_env": False,
         }
     ]
 
@@ -906,3 +907,168 @@ async def test_discover_rpc_explicit_credentials_override_stored(
 
     assert payload["ok"] is True
     assert seen[0].headers["authorization"] == "Bearer sk-candidate"
+
+
+@pytest.mark.asyncio
+async def test_saved_discovery_cache_is_shared_but_drafts_cannot_replace_it(monkeypatch):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    calls = []
+
+    async def discover(**kwargs):
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id="openrouter", source="live",
+            models=[{"id": f"model-{len(calls)}"}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key": "synthetic-key"}
+    saved = await discover_selectable_provider_models(**kwargs, persist_catalog=True)
+    draft = await discover_selectable_provider_models(**kwargs, force_refresh=True)
+    saved_again = await discover_selectable_provider_models(**kwargs, persist_catalog=True)
+    assert saved_again.models == saved.models == [{"id": "model-1"}]
+    assert draft.models == [{"id": "model-2"}]
+    assert len(calls) == 2
+    saved_again.models.clear()
+    assert (await discover_selectable_provider_models(**kwargs, persist_catalog=True)).models
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["api_key", "base_url", "proxy"])
+async def test_saved_discovery_cache_is_scoped_to_connection_identity(monkeypatch, change):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    calls = []
+
+    async def discover(**kwargs):
+        calls.append(kwargs)
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id="openrouter", source="live",
+            models=[{"id": f"model-{len(calls)}"}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key": "synthetic-key",
+              "base_url": "https://openrouter.ai/api/v1", "persist_catalog": True}
+    first = await discover_selectable_provider_models(**kwargs)
+    changed = {"api_key": "synthetic-rotated", "base_url": "https://openrouter.ai/other/v1",
+               "proxy": "http://127.0.0.1:9000"}
+    second = await discover_selectable_provider_models(**{**kwargs, change: changed[change]})
+    assert first.models != second.models
+    assert len(calls) == 2
+    assert "synthetic" not in repr(probe_module._saved_discoveries)
+
+
+@pytest.mark.asyncio
+async def test_saved_discovery_environment_rotation_does_not_reuse_catalog(monkeypatch):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    keys = []
+
+    async def discover(**kwargs):
+        keys.append(kwargs["api_key"])
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id="openrouter", source="live", models=[{"id": str(len(keys))}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key_env": "CATALOG_TEST_KEY",
+              "persist_catalog": True}
+    monkeypatch.setenv("CATALOG_TEST_KEY", "synthetic-first")
+    first = await discover_selectable_provider_models(**kwargs)
+    monkeypatch.setenv("CATALOG_TEST_KEY", "synthetic-second")
+    second = await discover_selectable_provider_models(**kwargs)
+    assert first.models != second.models
+    assert keys == ["synthetic-first", "synthetic-second"]
+
+
+@pytest.mark.asyncio
+async def test_saved_discovery_fingerprints_are_process_keyed(monkeypatch):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    calls = 0
+
+    async def discover(**kwargs):
+        nonlocal calls
+        calls += 1
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id="openrouter", source="live", models=[{"id": "model"}],
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key": "synthetic-key",
+              "proxy": "http://user:synthetic-password@proxy.test", "persist_catalog": True}
+    await discover_selectable_provider_models(**kwargs)
+    original_keys = set(probe_module._saved_discoveries)
+    await discover_selectable_provider_models(**kwargs)
+    assert calls == 1
+    monkeypatch.setattr(probe_module, "_SAVED_DISCOVERY_KEY", b"another-process" * 3)
+    await discover_selectable_provider_models(**kwargs)
+    assert calls == 2
+    assert len(set(probe_module._saved_discoveries) - original_keys) == 1
+    assert "synthetic" not in repr(probe_module._saved_discoveries)
+
+
+@pytest.mark.asyncio
+async def test_saved_discovery_retains_transient_lkg_but_auth_failure_revokes_it(monkeypatch):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    results = iter([
+        ProviderModelsDiscoverResult(ok=True, provider_id="openrouter", source="live",
+                                     models=[{"id": "saved-model"}]),
+        ProviderModelsDiscoverResult(ok=False, provider_id="openrouter",
+                                     failure_kind="transport_transient"),
+        ProviderModelsDiscoverResult(ok=False, provider_id="openrouter",
+                                     failure_kind="auth_invalid"),
+        ProviderModelsDiscoverResult(ok=False, provider_id="openrouter",
+                                     failure_kind="transport_transient"),
+    ])
+
+    async def discover(**kwargs):
+        return next(results)
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key": "synthetic-key",
+              "persist_catalog": True, "force_refresh": True}
+    first = await discover_selectable_provider_models(**kwargs)
+    transient = await discover_selectable_provider_models(**kwargs)
+    assert not transient.ok
+    assert transient.models == first.models
+    denied = await discover_selectable_provider_models(**kwargs)
+    assert not denied.ok and denied.models == []
+    after_denial = await discover_selectable_provider_models(**kwargs)
+    assert not after_denial.ok and after_denial.models == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_result", ["auth_invalid", "empty"])
+async def test_force_discovery_serializes_after_older_menu_request(monkeypatch, new_result):
+    monkeypatch.setattr(probe_module, "_saved_discoveries", {})
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def discover(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            started.set()
+            await release.wait()
+            return ProviderModelsDiscoverResult(
+                ok=True, provider_id="openrouter", source="live", models=[{"id": "old"}],
+            )
+        return ProviderModelsDiscoverResult(
+            ok=new_result == "empty", provider_id="openrouter",
+            failure_kind="" if new_result == "empty" else new_result,
+        )
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", discover)
+    kwargs = {"provider_id": "openrouter", "api_key": "synthetic-key", "persist_catalog": True}
+    old_menu = asyncio.create_task(discover_selectable_provider_models(**kwargs))
+    await started.wait()
+    forced = asyncio.create_task(discover_selectable_provider_models(**kwargs, force_refresh=True))
+    await asyncio.sleep(0)
+    assert len(calls) == 1
+    release.set()
+    old, new = await asyncio.gather(old_menu, forced)
+    assert old.models == [{"id": "old"}]
+    assert new.models == []
+    current = await discover_selectable_provider_models(**kwargs)
+    assert current == new
+    assert len(calls) == 2
+    assert not probe_module._saved_discovery_locks

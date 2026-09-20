@@ -1,4 +1,5 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
+import type { AttachmentDraftConsumption } from '@/utils/chat/attachmentDrafts'
 import { normalizePageContext, pageContextForAnnotations, pageAnnotationSnapshots, type ChatPageContext } from '@/types/pageContext'
 import { computed, ref, watch, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
@@ -50,7 +51,8 @@ import {
   hasSendableModelInputImageAttachment,
   isSendableAttachment,
   serializeDisplayAttachment,
-  serializeSendableAttachment,
+  serializeChatFiles,
+  snapshotAttachment,
   type SendableAttachment,
 } from '@/utils/chat/attachments'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
@@ -66,6 +68,7 @@ import {
 } from '@/utils/chat/messageIdentity'
 import {
   type HiddenControlStorage,
+  type HiddenControlInitialSettings,
   listHiddenControls,
   persistHiddenControlResult,
   removeHiddenControl,
@@ -173,6 +176,7 @@ interface SendAttempt {
   selectedSkills: SelectedSkillRef[]
   composerSkillRefs?: SelectedSkillRef[]
   unconsumedComposer?: ComposerSnapshot
+  consumeAttachmentDraft?: AttachmentDraftConsumption
   pageContext: ChatPageContext | null
   queueMode?: 'steer'
   text: string
@@ -180,6 +184,8 @@ interface SendAttempt {
   intent: string | null
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
+  initialModel: string | null
+  initialProvider: string | null
   forkBeforeMessageId: string | null
   workspaceId: string | null
   restoreComposerOnHandoffFailure?: boolean
@@ -215,6 +221,8 @@ interface ExplicitSendPayload {
   selectedSkills?: SelectedSkillRef[]
   pageContext?: ChatPageContext | null
   initialRoutingMode?: GatewayModelRoutingMode | null
+  initialModel?: string | null
+  initialProvider?: string | null
 }
 
 interface ComposerSnapshot {
@@ -230,6 +238,8 @@ interface ComposerSnapshot {
   workspaceId: string | null
   initialCollaborationMode: CollaborationMode | null
   initialRoutingMode: GatewayModelRoutingMode | null
+  initialModel: string | null
+  initialProvider: string | null
   queueOwnerRequestId: string | null
 }
 
@@ -415,15 +425,15 @@ function terminalReplayErrorCode(response: TurnSendResponse, status: string): st
 
 function sameSendableAttachments(
   attachments: SendableAttachment[],
-  attempt: SendAttempt,
+  attempt: Pick<SendAttempt, 'attachments'>,
 ): boolean {
   if (attachments.length !== attempt.attachments.length) return false
   return attachments.every((attachment, index) => {
     const prior = attempt.attachments[index]
     return (
       prior?.local_id === attachment.local_id &&
-      JSON.stringify(serializeSendableAttachment(prior)) ===
-        JSON.stringify(serializeSendableAttachment(attachment))
+      JSON.stringify(serializeChatFiles([prior])) ===
+        JSON.stringify(serializeChatFiles([attachment]))
     )
   })
 }
@@ -440,6 +450,8 @@ function matchesRecoveredDraft(
     intent: string | null
     initialCollaborationMode: CollaborationMode | null
     initialRoutingMode: GatewayModelRoutingMode | null
+    initialModel: string | null
+    initialProvider: string | null
     forkBeforeMessageId: string | null
     workspaceId: string | null
   },
@@ -453,6 +465,8 @@ function matchesRecoveredDraft(
     attempt.intent === input.intent &&
     attempt.initialCollaborationMode === input.initialCollaborationMode &&
     attempt.initialRoutingMode === input.initialRoutingMode &&
+    attempt.initialModel === input.initialModel &&
+    attempt.initialProvider === input.initialProvider &&
     attempt.forkBeforeMessageId === input.forkBeforeMessageId &&
     attempt.workspaceId === input.workspaceId &&
     sameSendableAttachments(input.attachments, attempt)
@@ -474,6 +488,7 @@ export interface UseChatSendOptions {
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
   selectedSkills?: Ref<SelectedSkillRef[]>
+  captureAttachmentDraftConsumption?: (attachments: readonly Attachment[]) => AttachmentDraftConsumption | undefined
   consumeAcceptedDraft?: (
     sessionKey: string,
     snapshot: { text: string; selectedSkills: SelectedSkillRef[] },
@@ -494,6 +509,9 @@ export interface UseChatSendOptions {
   pendingSessionIntent: Ref<string | null>
   initialCollaborationMode: Readonly<Ref<CollaborationMode>>
   initialRoutingMode: Readonly<Ref<GatewayModelRoutingMode | null>>
+  initialModel?: Readonly<Ref<string | null>>
+  initialProvider?: Readonly<Ref<string | null>>
+  restoreInitialModel?: (selection: { model: string; provider: string } | null) => void
   pendingForkBeforeMessageId: Ref<string | null>
   draftIds?: Readonly<Ref<readonly string[]>>
   promptAnnotationSnapshots?: (ids: readonly string[]) => PromptAnnotationSnapshot[]
@@ -741,12 +759,14 @@ export function useChatSend(options: UseChatSendOptions) {
         options.promptAnnotationSnapshots?.(currentAnnotationDraftIds()) || [],
       ),
       attachmentRefs,
-      payloadAttachments: composerAttachments().map(attachment => ({ ...attachment })),
+      payloadAttachments: composerAttachments().map(snapshotAttachment),
       intent,
       forkBeforeMessageId: options.pendingForkBeforeMessageId.value,
       workspaceId: pendingWorkspaceForIntent(intent),
       initialCollaborationMode: initialModeForIntent(intent),
       initialRoutingMode: initialRoutingModeForIntent(intent),
+      initialModel: initialModelForIntent(intent),
+      initialProvider: initialProviderForIntent(intent),
       queueOwnerRequestId: queueOwnerContext?.sessionKey === options.sessionKey.value
         ? queueOwnerContext.ownerRequestId
         : null,
@@ -773,17 +793,23 @@ export function useChatSend(options: UseChatSendOptions) {
       && options.composerRevision
       && options.composerRevision.value !== snapshot.revision
     ) return false
+    return composerValuesMatchSnapshot(snapshot)
+      && options.pendingAttachments.value.length === snapshot.attachmentRefs.length
+      && options.pendingAttachments.value.every(
+        (attachment, index) => attachment === snapshot.attachmentRefs[index],
+      )
+  }
+
+  function composerValuesMatchSnapshot(snapshot: ComposerSnapshot): boolean {
     return (
       options.inputText.value === snapshot.inputText
       && sameSelectedSkills(options.selectedSkills?.value, snapshot.selectedSkills)
       && JSON.stringify(currentAnnotationDraftIds()) === JSON.stringify(snapshot.draftIds)
       && options.pendingSessionIntent.value === snapshot.intent
+      && initialModelForIntent(snapshot.intent) === snapshot.initialModel
+      && initialProviderForIntent(snapshot.intent) === snapshot.initialProvider
       && options.pendingForkBeforeMessageId.value === snapshot.forkBeforeMessageId
       && pendingWorkspaceForIntent(options.pendingSessionIntent.value) === snapshot.workspaceId
-      && options.pendingAttachments.value.length === snapshot.attachmentRefs.length
-      && options.pendingAttachments.value.every(
-        (attachment, index) => attachment === snapshot.attachmentRefs[index],
-      )
     )
   }
 
@@ -797,6 +823,8 @@ export function useChatSend(options: UseChatSendOptions) {
       pageContext: snapshot.pageContext,
       selectedSkills: copySelectedSkills(snapshot.selectedSkills),
       initialRoutingMode: snapshot.initialRoutingMode,
+      initialModel: snapshot.initialModel,
+      initialProvider: snapshot.initialProvider,
     }
   }
 
@@ -1183,7 +1211,19 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   function initialRoutingModeForIntent(intent: string | null): GatewayModelRoutingMode | null {
-    return intent === 'new_chat' ? options.initialRoutingMode.value : null
+    if (intent !== 'new_chat') return null
+    // A pin selected while routing is Off also freezes that effective strategy.
+    // This does not mutate either the visible selector or the gateway default.
+    return options.initialRoutingMode.value
+      ?? (options.initialModel?.value && options.modelRoutingMode.value === 'off' ? 'direct' : null)
+  }
+
+  function initialModelForIntent(intent: string | null): string | null {
+    return intent === 'new_chat' ? options.initialModel?.value ?? null : null
+  }
+
+  function initialProviderForIntent(intent: string | null): string | null {
+    return intent === 'new_chat' ? options.initialProvider?.value ?? null : null
   }
 
   function consumeAcceptedComposer(attempt: SendAttempt): void {
@@ -1191,6 +1231,8 @@ export function useChatSend(options: UseChatSendOptions) {
       if (attempt.unconsumedComposer && !attempt.hiddenControl) {
         const snapshot = attempt.unconsumedComposer
         attempt.unconsumedComposer = undefined
+        void attempt.consumeAttachmentDraft?.consume().catch(() => {})
+        attempt.consumeAttachmentDraft = undefined
         void Promise.resolve(options.consumeAcceptedDraft?.(attempt.requestSessionKey, {
           text: snapshot.inputText,
           selectedSkills: copySelectedSkills(snapshot.selectedSkills),
@@ -1199,6 +1241,7 @@ export function useChatSend(options: UseChatSendOptions) {
       return
     }
     if (!attempt.hiddenControl && options.selectedSkills && attempt.unconsumedComposer
+      && !attempt.consumeAttachmentDraft
       && options.selectedSkills.value === attempt.composerSkillRefs
       && composerMatchesSnapshot(attempt.unconsumedComposer)) {
       const sentAttachmentIds = new Set(attempt.attachments.map(attachment => attachment.local_id))
@@ -1212,6 +1255,29 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       options.autoResizeTextarea()
       attempt.unconsumedComposer = undefined
+      attempt.consumeAttachmentDraft = undefined
+    } else if (!attempt.hiddenControl && attempt.unconsumedComposer && attempt.consumeAttachmentDraft) {
+      const snapshot = attempt.unconsumedComposer
+      const consumption = attempt.consumeAttachmentDraft
+      const isOriginal = () => options.sessionKey.value === attempt.requestSessionKey
+        && options.selectedSkills?.value === attempt.composerSkillRefs && composerMatchesSnapshot(snapshot)
+      void consumption.consumeCurrent(
+        () => options.sessionKey.value === attempt.requestSessionKey && (
+          isOriginal()
+          || (consumption.isRestoredCurrent() && composerValuesMatchSnapshot(snapshot))
+        ),
+        () => {
+          options.inputText.value = ''
+          if (options.selectedSkills) options.selectedSkills.value = []
+          if (options.pendingForkBeforeMessageId.value === attempt.forkBeforeMessageId) {
+            options.pendingForkBeforeMessageId.value = null
+          }
+          options.autoResizeTextarea()
+          attempt.unconsumedComposer = undefined
+          attempt.consumeAttachmentDraft = undefined
+        },
+        isOriginal,
+      ).catch(() => {})
     }
   }
 
@@ -1223,6 +1289,10 @@ export function useChatSend(options: UseChatSendOptions) {
 
   function consumeAcceptedSessionIntent(attempt: SendAttempt): void {
     consumeAcceptedComposer(attempt)
+    consumeAcceptedSessionState(attempt)
+  }
+
+  function consumeAcceptedSessionState(attempt: Pick<SendAttempt, 'requestSessionKey' | 'intent' | 'workspaceId'>): void {
     if (options.sessionKey.value !== attempt.requestSessionKey) return
     if (attempt.intent === 'new_chat') {
       options.materializeDraftSession?.(attempt.requestSessionKey)
@@ -1283,7 +1353,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientMessageId: attempt.clientMessageId,
       params: structuredClone(attempt.params),
       composerText: attempt.composerText,
-      recoveryAttachments: attempt.attachments.map(attachment => ({ ...attachment })),
+      recoveryAttachments: attempt.attachments.map(snapshotAttachment),
       ...(attempt.restoreComposerOnHandoffFailure === false
         ? { restoreComposerOnFailure: false }
         : {}),
@@ -1640,11 +1710,54 @@ export function useChatSend(options: UseChatSendOptions) {
     }
   }
 
+  function consumeRecoveredComposer(record: ResponseHandoffWalRecord): void {
+    const skills = record.params.selectedSkills
+    if (record.restoreComposerOnFailure === false || !skills?.length) return
+    if (options.sessionKey.value !== record.requestSessionKey) {
+      void Promise.resolve(options.consumeAcceptedDraft?.(record.requestSessionKey, {
+        text: record.composerText,
+        selectedSkills: copySelectedSkills(skills),
+      })).catch(() => {})
+      return
+    }
+    // Explicit skill drafts survive until admission. Recovery has no live
+    // SendAttempt, so consume only the exact accepted composer snapshot.
+    if (!options.selectedSkills || options.inputText.value !== record.composerText
+      || !sameSelectedSkills(options.selectedSkills.value, skills)
+      || options.pendingForkBeforeMessageId.value !== (record.params.forkBeforeMessageId ?? null)
+      || options.pendingAttachments.value.some(attachment => !isSendableAttachment(attachment))
+      || !sameSendableAttachments(options.pendingAttachments.value.filter(isSendableAttachment), {
+        attachments: record.recoveryAttachments.filter(isSendableAttachment),
+      })) return
+    if (options.pendingSessionIntent.value === 'new_chat' && (
+      initialRoutingModeForIntent('new_chat') !== (record.params.initialRoutingMode ?? null)
+      || initialModelForIntent('new_chat') !== (record.params.initialModel ?? null)
+      || initialProviderForIntent('new_chat') !== (record.params.initialProvider ?? null)
+      || pendingWorkspaceForIntent('new_chat') !== (record.params.workspaceId ?? null)
+    )) return
+    options.inputText.value = ''
+    options.selectedSkills.value = []
+    const sentAttachmentIds = new Set(record.recoveryAttachments.map(attachment => attachment.local_id))
+    options.pendingAttachments.value = options.pendingAttachments.value.filter(
+      attachment => !sentAttachmentIds.has(attachment.local_id),
+    )
+    if (options.pendingForkBeforeMessageId.value === (record.params.forkBeforeMessageId ?? null)) {
+      options.pendingForkBeforeMessageId.value = null
+    }
+    options.autoResizeTextarea()
+  }
+
   async function finalizeRecoveredHandoff(
     record: ResponseHandoffWalRecord,
     targetSessionKey: string,
   ): Promise<void> {
+    consumeRecoveredComposer(record)
     if (options.sessionKey.value === record.requestSessionKey) {
+      consumeAcceptedSessionState({
+        requestSessionKey: record.requestSessionKey,
+        intent: record.params.intent ?? null,
+        workspaceId: record.params.workspaceId ?? null,
+      })
       const gate = beginResponseHandoff(
         record.requestSessionKey,
         record.ownerRequestId,
@@ -1712,7 +1825,7 @@ export function useChatSend(options: UseChatSendOptions) {
     ))
     if (missingAttachments.length > 0) {
       options.pendingAttachments.value = [
-        ...missingAttachments.map(attachment => ({ ...attachment })),
+        ...missingAttachments.map(snapshotAttachment),
         ...options.pendingAttachments.value,
       ]
     }
@@ -1724,6 +1837,12 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (!options.pendingSessionIntent.value && typeof record.params.intent === 'string') {
       options.pendingSessionIntent.value = record.params.intent
+    }
+    if (record.params.intent === 'new_chat' && record.params.initialModel && record.params.initialProvider) {
+      options.restoreInitialModel?.({
+        model: record.params.initialModel,
+        provider: record.params.initialProvider,
+      })
     }
     options.autoResizeTextarea()
     return true
@@ -1809,7 +1928,7 @@ export function useChatSend(options: UseChatSendOptions) {
                   ...replayRecord,
                   params: {
                     ...replayRecord.params,
-                    attachments: sendable.map(serializeSendableAttachment),
+                    ...serializeChatFiles(sendable),
                   },
                   recoveryAttachments: refreshed,
                   updatedAt: Date.now(),
@@ -2392,6 +2511,8 @@ export function useChatSend(options: UseChatSendOptions) {
         intent: composerSnapshot.intent,
         initialCollaborationMode: composerSnapshot.initialCollaborationMode,
         initialRoutingMode: composerSnapshot.initialRoutingMode,
+        initialModel: composerSnapshot.initialModel,
+        initialProvider: composerSnapshot.initialProvider,
         forkBeforeMessageId: composerSnapshot.forkBeforeMessageId,
         workspaceId: composerSnapshot.workspaceId,
       })
@@ -2815,6 +2936,20 @@ export function useChatSend(options: UseChatSendOptions) {
     )
       ? sendOpts.payload.initialRoutingMode ?? null
       : initialRoutingModeForIntent(intent)
+    const initialModel = intent === 'new_chat'
+      ? sendOpts.payload && 'initialModel' in sendOpts.payload
+        ? sendOpts.payload.initialModel ?? null : initialModelForIntent(intent)
+      : null
+    const initialProvider = initialModel
+      ? sendOpts.payload && 'initialProvider' in sendOpts.payload
+        ? sendOpts.payload.initialProvider ?? null : initialProviderForIntent(intent)
+      : null
+    // Exact receipt recovery must retain the original payload even if today's
+    // draft route differs. A fresh pin may never silently turn routing Off.
+    if (!sendOpts.idempotentReplay && initialModel && (
+      (initialRoutingMode !== null && initialRoutingMode !== 'direct')
+      || options.modelRoutingMode.value !== 'off'
+    )) return 'not_sent'
     const initialSendableAttachments = sourceAttachments.filter(isSendableAttachment)
     const requestedSelectedSkills = copySelectedSkills(
       sendOpts.payload ? sendOpts.payload.selectedSkills : options.selectedSkills?.value,
@@ -2852,6 +2987,8 @@ export function useChatSend(options: UseChatSendOptions) {
           intent,
           initialCollaborationMode,
           initialRoutingMode,
+          initialModel,
+          initialProvider,
           forkBeforeMessageId,
           workspaceId,
         })
@@ -3011,10 +3148,12 @@ export function useChatSend(options: UseChatSendOptions) {
         params.collaborationMode = initialCollaborationMode
       }
       if (initialRoutingMode) params.initialRoutingMode = initialRoutingMode
+      if (initialModel) params.initialModel = initialModel
+      if (initialProvider) params.initialProvider = initialProvider
       if (forkBeforeMessageId) params.forkBeforeMessageId = forkBeforeMessageId
       if (attachmentsToSend.length > 0 || sendOpts.includeEmptyAttachments) {
         params.displayText = userText
-        params.attachments = attachmentsToSend.map(serializeSendableAttachment)
+        Object.assign(params, serializeChatFiles(attachmentsToSend))
       }
       const localSnapshots = options.promptAnnotationSnapshots?.(attemptAnnotationDraftIds) || []
       const sentSnapshots = pageAnnotationSnapshots(attemptPageContext).map((input, index) => ({
@@ -3036,10 +3175,12 @@ export function useChatSend(options: UseChatSendOptions) {
         selectedSkills: copySelectedSkills(attemptSelectedSkills),
         queueMode: sendOpts?.queueMode,
         text,
-        attachments: attachmentsToSend.map(attachment => ({ ...attachment })),
+        attachments: attachmentsToSend.map(snapshotAttachment),
         intent,
         initialCollaborationMode,
         initialRoutingMode,
+        initialModel,
+        initialProvider,
         forkBeforeMessageId,
         workspaceId,
         ...(sendOpts.acceptedVisibleReplay
@@ -3050,7 +3191,7 @@ export function useChatSend(options: UseChatSendOptions) {
           : {}),
         params,
       }
-      if (attempt.forkBeforeMessageId) {
+      if (attempt.forkBeforeMessageId || attempt.initialModel) {
         durableHandoffRecord = await persistResponseHandoff(
           attempt,
           sendOpts.requirePreparedHandoff,
@@ -3078,7 +3219,7 @@ export function useChatSend(options: UseChatSendOptions) {
         options.scrollToBottom()
       }
     }
-    if (attempt.forkBeforeMessageId && !durableHandoffRecord) {
+    if ((attempt.forkBeforeMessageId || attempt.initialModel) && !durableHandoffRecord) {
       durableHandoffRecord = await persistResponseHandoff(
         attempt,
         sendOpts.requirePreparedHandoff,
@@ -3092,6 +3233,7 @@ export function useChatSend(options: UseChatSendOptions) {
     if (preserveComposer) {
       attempt.composerSkillRefs = undefined
       attempt.unconsumedComposer = undefined
+      attempt.consumeAttachmentDraft = undefined
     }
     if (!preserveComposer) options.closeSlashMenu()
     recordSessionNavigationDiag('send.start', {
@@ -3115,6 +3257,8 @@ export function useChatSend(options: UseChatSendOptions) {
         attempt.unconsumedComposer = composerTextBeforeSend === attempt.composerText
           && sameSelectedSkills(options.selectedSkills?.value, attempt.selectedSkills)
           ? captureComposerSnapshot() : undefined
+        attempt.consumeAttachmentDraft = attempt.unconsumedComposer
+          ? options.captureAttachmentDraftConsumption?.(attempt.attachments) : undefined
       } else {
         options.inputText.value = preserveEditedComposer ? composerTextBeforeSend : ''
         options.autoResizeTextarea()
@@ -3170,7 +3314,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     options.aborted.value = false
     let responseHandoff = (
-      attempt.forkBeforeMessageId
+      (attempt.forkBeforeMessageId || attempt.initialModel)
         ? beginResponseHandoff(
             requestSessionKey,
             attempt.clientRequestId,
@@ -3376,6 +3520,14 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
+      if (attempt.initialModel && !attempt.forkBeforeMessageId && commandError?.accepted === false) {
+        // A known rejection is editable again. Do not leave a submitting WAL
+        // record that could later replay an abandoned model choice on reopen.
+        if (durableHandoffRecord && await deleteResponseHandoff(durableHandoffRecord)) {
+          durableHandoffRecord = null
+          if (responseHandoff) responseHandoff.durableRecord = null
+        }
+      }
       if (!acceptedError) setAttemptPromptAnnotations(attempt, [])
       if (acceptedError && !commitAcceptedVisibleReplay({
         messageId: acceptedError.messageId,
@@ -3525,6 +3677,8 @@ export function useChatSend(options: UseChatSendOptions) {
             intent: restoredSnapshot.intent,
             initialCollaborationMode: restoredSnapshot.initialCollaborationMode,
             initialRoutingMode: restoredSnapshot.initialRoutingMode,
+            initialModel: restoredSnapshot.initialModel,
+            initialProvider: restoredSnapshot.initialProvider,
             forkBeforeMessageId: restoredSnapshot.forkBeforeMessageId,
             workspaceId: restoredSnapshot.workspaceId,
           })
@@ -3657,6 +3811,8 @@ export function useChatSend(options: UseChatSendOptions) {
         intent: null,
         initialCollaborationMode: null,
         initialRoutingMode: null,
+        initialModel: null,
+        initialProvider: null,
         forkBeforeMessageId,
         workspaceId: null,
       },
@@ -3895,6 +4051,29 @@ export function useChatSend(options: UseChatSendOptions) {
     const existing = hiddenDispatchInFlight.get(hiddenDispatchKey)
     if (existing) return existing
 
+    const existingRecord = listHiddenControls(requestSessionKey, options.hiddenControlStorage)
+      .find(item => item.clientRequestId === stableClientRequestId)
+    const hiddenIntent = requestSessionKey === options.sessionKey.value
+      && !options.stream.isStreaming.value && !hasAuthoritativeWork()
+      ? options.pendingSessionIntent.value : null
+    const routingMode = initialRoutingModeForIntent(hiddenIntent)
+    const model = initialModelForIntent(hiddenIntent)
+    const provider = model ? initialProviderForIntent(hiddenIntent) : null
+    if (!existingRecord && model && (options.modelRoutingMode.value !== 'off'
+      || (routingMode && routingMode !== 'direct'))) {
+      return Promise.resolve(hiddenDispatchResult('rejected', 'invalid_request', stableClientRequestId, requestSessionKey))
+    }
+    // Reopening or retrying a stable control uses its persisted creation input,
+    // even when the currently visible draft has changed in the meantime.
+    const initialSettings: HiddenControlInitialSettings | null | undefined = existingRecord
+      ? existingRecord.initialSettings
+      : hiddenIntent === 'new_chat' ? {
+          intent: 'new_chat',
+          ...(routingMode ? { initialRoutingMode: routingMode } : {}),
+          ...(model ? { initialModel: model } : {}),
+          ...(provider ? { initialProvider: provider } : {}),
+        } : null
+
     // Persist before either local queueing or RPC. The payload contains only
     // the already-visible control turn (never provider credentials), while its
     // stable request id lets Gateway ingress collapse response-loss retries.
@@ -3903,6 +4082,7 @@ export function useChatSend(options: UseChatSendOptions) {
       clientRequestId: stableClientRequestId,
       providerText,
       displayText,
+      ...(initialSettings !== undefined ? { initialSettings } : {}),
     }, options.hiddenControlStorage)
     if (persistResult === 'conflict' || persistResult === 'failed' || persistResult === 'invalid') {
       return Promise.resolve(hiddenDispatchResult(
@@ -3938,6 +4118,7 @@ export function useChatSend(options: UseChatSendOptions) {
       displayText,
       stableClientRequestId,
       requestSessionKey,
+      initialSettings,
     )
     hiddenDispatchInFlight.set(hiddenDispatchKey, operation)
     void operation.then(() => {
@@ -3957,6 +4138,7 @@ export function useChatSend(options: UseChatSendOptions) {
     displayText: string,
     stableClientRequestId: string,
     requestSessionKey: string,
+    initialSettings: HiddenControlInitialSettings | null | undefined,
   ): Promise<HiddenControlDispatchResult> {
     const compactInFlight = options.isCompactInFlightForCurrentSession()
     const handoffInFlight = responseHandoffBlocksCurrentSession()
@@ -4016,12 +4198,17 @@ export function useChatSend(options: UseChatSendOptions) {
       message: providerText,
       sessionKey: requestSessionKey,
     }
-    const hiddenSessionIntent = requestSessionKey === options.sessionKey.value
-      ? options.pendingSessionIntent.value
-      : null
-    const hiddenInitialRoutingMode = initialRoutingModeForIntent(hiddenSessionIntent)
+    const hiddenSessionIntent = initialSettings !== undefined
+      ? initialSettings?.intent ?? null
+      : requestSessionKey === options.sessionKey.value ? options.pendingSessionIntent.value : null
+    const hiddenInitialRoutingMode = initialSettings !== undefined
+      ? initialSettings?.initialRoutingMode ?? null : initialRoutingModeForIntent(hiddenSessionIntent)
+    const hiddenInitialModel = initialSettings?.initialModel ?? null
+    const hiddenInitialProvider = initialSettings?.initialProvider ?? null
     if (hiddenSessionIntent) params.intent = hiddenSessionIntent
     if (hiddenInitialRoutingMode) params.initialRoutingMode = hiddenInitialRoutingMode
+    if (hiddenInitialModel) params.initialModel = hiddenInitialModel
+    if (hiddenInitialProvider) params.initialProvider = hiddenInitialProvider
     if (displayText && displayText !== providerText) params.displayText = displayText
     params.source = chatSourceMetadata(options)
 
@@ -4043,6 +4230,8 @@ export function useChatSend(options: UseChatSendOptions) {
       intent: hiddenSessionIntent,
       initialCollaborationMode: null,
       initialRoutingMode: hiddenInitialRoutingMode,
+      initialModel: hiddenInitialModel,
+      initialProvider: hiddenInitialProvider,
       forkBeforeMessageId: null,
       workspaceId: null,
       params,
@@ -4075,13 +4264,7 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
-      if (
-        hiddenSessionIntent
-        && requestSessionKey === options.sessionKey.value
-        && options.pendingSessionIntent.value === hiddenSessionIntent
-      ) {
-        options.pendingSessionIntent.value = null
-      }
+      consumeAcceptedSessionIntent(attempt)
       // A resolved chat.send response proves durable ingress acceptance. Clear
       // the browser outbox before any local session handoff work, which can
       // fail independently without making an exact-id resend necessary.
@@ -4215,13 +4398,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedError = acceptedErrorInfo(err)
       const accepted = commandError?.accepted
       if (accepted === true) {
-        if (
-          hiddenSessionIntent
-          && requestSessionKey === options.sessionKey.value
-          && options.pendingSessionIntent.value === hiddenSessionIntent
-        ) {
-          options.pendingSessionIntent.value = null
-        }
+        consumeAcceptedSessionIntent(attempt)
         removeHiddenControl(
           requestSessionKey,
           stableClientRequestId,

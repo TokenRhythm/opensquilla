@@ -3929,3 +3929,41 @@ describe('useChatRpcEventHandlers durable turn receipts', () => {
     }
   })
 })
+
+describe('recovery buffer consumption ownership', () => {
+  function token(sequence: number) {
+    return {
+      kind: 'conversation' as const,
+      event: {
+        kind: 'known' as const, semanticKind: 'text-delta' as const,
+        sessionKey: 'agent:main:test', taskId: 'task-1', turnId: null,
+        streamGeneration: 'stream-1', streamSeq: sequence, connectionSeq: sequence,
+        generationEpoch: null, meta: {},
+        payload: { key: 'agent:main:test', task_id: 'task-1', stream_generation: 'stream-1', stream_seq: sequence, text: 'x' },
+      },
+    }
+  }
+  it('owns normal buffered tokens without recursively requesting recovery', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.api.beginRecovery()
+      for (let sequence = 1; sequence <= 40; sequence++) {
+        expect(h.api.consumeConversationEvent(token(sequence))).toBe('applied')
+      }
+      expect(onRecoveryRequired).not.toHaveBeenCalled()
+      expect(h.lastStreamSeq.value).toBe(0)
+    } finally { h.stop() }
+  })
+  it('declares actual overflow dirty and cannot complete installation', () => {
+    const onRecoveryRequired = vi.fn()
+    const h = createHarness({ onRecoveryRequired })
+    try {
+      h.api.beginRecovery()
+      for (let sequence = 1; sequence <= 64; sequence++) h.api.consumeConversationEvent(token(sequence))
+      expect(h.api.consumeConversationEvent(token(65))).toBe('dirty')
+      expect(onRecoveryRequired).toHaveBeenCalledOnce()
+      expect(h.api.finishRecovery()).toBe(false)
+    } finally { h.stop() }
+  })
+})

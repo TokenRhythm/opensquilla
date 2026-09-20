@@ -421,6 +421,7 @@ class ModelSelector:
         # installed, failure-specific plugin hooks must not replace it with a
         # deployment that was not present in the routed c-tier ladder.
         self._static_fallback_chain_only = False
+        self._session_deployment_pinned = False
 
     def _apply_capacity_fallback_bound(self) -> None:
         allowed = self._capacity_bounded_fallbacks
@@ -771,7 +772,10 @@ class ModelSelector:
             original,
             model=model or original.model,
         )
-        candidates = [*self._config.fallbacks, *self._chain]
+        candidates = (
+            [] if self._session_deployment_pinned
+            else [*self._config.fallbacks, *self._chain]
+        )
         deduped_fallbacks: list[ProviderConfig] = []
         seen: set[_ProviderConfigIdentity] = {_provider_config_identity(restored)}
         for candidate in candidates:
@@ -909,6 +913,12 @@ class ModelSelector:
             self.override_model_with_fallback_chain(model, fallback_chain)
         self._install_capacity_fallback_bound(allowed_entries)
 
+    def pin_provider_config(self, cfg: ProviderConfig) -> None:
+        """Make an explicit session deployment the baseline for clones/realignment."""
+        self._config = SelectorConfig(primary=_copy_provider_config(cfg))
+        self._session_deployment_pinned = True
+        self.override_provider_config(cfg, preserve_existing_tail=False)
+
     def sync_primary(self, cfg: ProviderConfig) -> None:
         """Replace the primary provider config for future resolves and clones."""
         cfg = _copy_provider_config(cfg)
@@ -942,6 +952,7 @@ class ModelSelector:
         cloned._provider_state_replay_disabled = self._provider_state_replay_disabled
         cloned._capacity_bounded_fallbacks = self._capacity_bounded_fallbacks
         cloned._static_fallback_chain_only = self._static_fallback_chain_only
+        cloned._session_deployment_pinned = self._session_deployment_pinned
         cloned._apply_capacity_fallback_bound()
         return cloned
 

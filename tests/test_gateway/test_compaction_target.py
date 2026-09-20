@@ -1198,3 +1198,45 @@ def test_compaction_config_uses_resolved_execution_plan() -> None:
     assert compaction.provider == "ollama"
     assert compaction.model == "qwen-current"
     assert compaction.api_key == ""
+
+
+def test_session_turn_model_only_pin_preserves_legacy_selector_path() -> None:
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+
+    inherited = ProviderConfig(provider="ollama", model="default", base_url="http://localhost:11434")
+    pin = SimpleNamespace(model="chosen-model", provider_override=None, session_key="session")
+    resolved = resolve_gateway_session_turn_deployment(GatewayConfig(), pin, inherited)
+    assert resolved is None
+    assert inherited.model == "default"
+
+
+def test_session_turn_without_pin_keeps_default_resolution_path() -> None:
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+
+    assert resolve_gateway_session_turn_deployment(
+        GatewayConfig(), SimpleNamespace(), None,
+    ) is None
+
+
+def test_session_turn_named_profile_cannot_fall_back_to_provider_default() -> None:
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+
+    inherited = ProviderConfig(provider="openai", model="default", api_key="synthetic-default-key")
+    pin = SimpleNamespace(model="chosen", provider_override="openai",
+                          auth_profile_override="missing-profile", session_key="session")
+    with pytest.raises(ValueError, match="named_auth_profile_not_found"):
+        resolve_gateway_session_turn_deployment(GatewayConfig(), pin, inherited)
+
+
+def test_session_explicit_pin_retains_active_deployment_request_options():
+    from opensquilla.gateway.compaction_target import resolve_gateway_session_turn_deployment
+
+    inherited = ProviderConfig(
+        provider="ollama", model="default", extra_body={"nested": {"option": True}},
+    )
+    pin = SimpleNamespace(model="chosen", provider_override="ollama", session_key="s")
+    resolved = resolve_gateway_session_turn_deployment(GatewayConfig(), pin, inherited)
+    assert resolved is not None
+    assert resolved.extra_body == inherited.extra_body
+    resolved.extra_body["nested"]["option"] = False
+    assert inherited.extra_body["nested"]["option"] is True

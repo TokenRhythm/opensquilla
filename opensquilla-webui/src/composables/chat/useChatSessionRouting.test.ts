@@ -1,4 +1,4 @@
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSessionRouting } from './useChatSessionRouting'
@@ -29,6 +29,7 @@ function harness(options: {
   draft?: boolean
   getResponse?: unknown
   available?: boolean
+  modelSelectionCapable?: boolean
   globalImageInputAdmission?: ImageInputAdmission
   globalImageInputAdmissionReason?: string
   capabilitiesByMode?: ModelRoutingCapabilitiesByMode | null
@@ -65,6 +66,8 @@ function harness(options: {
   const isStreaming = ref(false)
   const isDraft = ref(options.draft === true)
   const available = ref(options.available !== false)
+  const modelSelectionCapable = ref(options.modelSelectionCapable === true)
+  const connectionEpoch = ref(1)
   const notifyError = vi.fn()
   const api = useChatSessionRouting({
     routing,
@@ -74,6 +77,8 @@ function harness(options: {
     globalImageInputAdmissionReason,
     capabilitiesByMode,
     available,
+    modelSelectionCapable,
+    connectionEpoch,
     isStreaming,
     isDraft: () => isDraft.value,
     notifyError,
@@ -81,6 +86,8 @@ function harness(options: {
   return {
     api,
     available,
+    modelSelectionCapable,
+    connectionEpoch,
     capabilitiesByMode,
     globalImageInputAdmission,
     globalImageInputAdmissionReason,
@@ -178,6 +185,7 @@ describe('useChatSessionRouting', () => {
     isStreaming.value = true
 
     expect(api.busy.value).toBe(true)
+    expect(api.mutationBusy.value).toBe(false)
     await expect(api.setMode('llm_ensemble')).resolves.toBe(false)
     expect(api.mode.value).toBe('squilla_router')
     expect(api.initialRoutingMode.value).toBe('router')
@@ -282,12 +290,14 @@ describe('useChatSessionRouting', () => {
     const selected = api.setMode('off')
     await vi.waitFor(() => expect(pendingGets).toHaveLength(1))
     expect(api.busy.value).toBe(true)
+    expect(api.mutationBusy.value).toBe(true)
     await expect(api.setMode('llm_ensemble')).resolves.toBe(false)
     expect(pendingGets).toHaveLength(1)
     pendingGets.forEach(resolve => resolve({ key: SESSION_ONE, mode: 'ensemble', revision: 0 }))
 
     await expect(selected).resolves.toBe(true)
     expect(api.busy.value).toBe(false)
+    expect(api.mutationBusy.value).toBe(false)
     expect(call).toHaveBeenCalledWith('sessions.routing.set', {
       sessionKey: SESSION_ONE,
       mode: 'direct',
@@ -390,5 +400,287 @@ describe('useChatSessionRouting', () => {
     expect(api.revision.value).toBe(4)
     expect(api.imageInputAdmission.value).toBe('blocked')
     expect(api.imageInputAdmissionReason.value).toBe('router_image_route_unavailable')
+  })
+})
+
+
+const PIN = { model: 'shared-model-name', provider: 'provider-one' }
+const OTHER_PIN = { model: 'shared-model-name', provider: 'provider-two' }
+function modelSnapshot(selection: { model: string; provider: string | null } | null, revision = 1, mode = 'direct') {
+  return { key: SESSION_ONE, mode, revision, modelSelection: selection }
+}
+function pending<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail })
+  return { promise, resolve, reject }
+}
+
+describe('durable session model selection', () => {
+  it('replaces a provisional default with the accepted first-turn pin under the same key and revision', async () => {
+    const h = harness({ draft: true, modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(null, 0))
+    await h.api.setMode('off')
+    h.isStreaming.value = true
+    h.rpc.call.mockResolvedValue(modelSnapshot(PIN, 0))
+
+    // Acceptance keeps the draft key. No navigation, reload or menu refresh
+    // occurs, and the old provisional revision cannot reject the saved pin.
+    h.isDraft.value = false
+    expect(h.api.hasAuthoritativeSnapshot.value).toBe(false)
+    expect(h.api.mode.value).toBe('off')
+    expect(h.api.initialRoutingMode.value).toBeNull()
+    expect(h.api.modelSelectionSupported.value).toBe(false)
+    expect(h.rpc.call).not.toHaveBeenCalled()
+
+    // ChatView loads only after the durable bootstrap's critical frames.
+    await expect(h.api.load()).resolves.toBe(true)
+    expect(h.rpc.call).toHaveBeenCalledExactlyOnceWith('sessions.routing.get', { sessionKey: SESSION_ONE })
+    expect(h.api.modelSelection.value).toEqual(PIN)
+    expect(h.api.modelSelectionSupported.value).toBe(true)
+    expect(h.api.revision.value).toBe(0)
+  })
+
+  it.each(['direct', 'router', 'ensemble'] as const)(
+    'accepts the durable %s bootstrap after retiring a same-key provisional snapshot', async mode => {
+      const h = harness({ draft: true, modelSelectionCapable: true })
+      h.api.applyBootstrap(modelSnapshot(null, 0))
+      const selectedMode = mode === 'direct' ? 'off' : mode === 'router' ? 'squilla_router' : 'llm_ensemble'
+      await h.api.setMode(selectedMode)
+      h.isDraft.value = false
+
+      expect(h.api.mode.value).toBe(selectedMode)
+      expect(h.api.applyBootstrap(modelSnapshot(mode === 'direct' ? PIN : null, 0, mode))).toBe(true)
+      expect(h.api.mode.value).toBe(selectedMode)
+      expect(h.api.modelSelection.value).toEqual(mode === 'direct' ? PIN : null)
+      expect(h.api.hasAuthoritativeSnapshot.value).toBe(true)
+      expect(h.rpc.call).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not carry an accepted draft mode or late pin read across navigation', async () => {
+    const h = harness({ draft: true, modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(null, 0))
+    await h.api.setMode('llm_ensemble')
+    h.isDraft.value = false
+    const read = pending<unknown>()
+    h.rpc.call.mockReturnValueOnce(read.promise)
+    const loading = h.api.load()
+
+    h.sessionKey.value = SESSION_TWO
+    h.api.applyBootstrap({ ...modelSnapshot(OTHER_PIN, 0), key: SESSION_TWO })
+    read.resolve(modelSnapshot(PIN, 0, 'ensemble'))
+
+    await expect(loading).resolves.toBe(false)
+    expect(h.api.mode.value).toBe('off')
+    expect(h.api.modelSelection.value).toEqual(OTHER_PIN)
+    expect(h.notifyError).not.toHaveBeenCalled()
+  })
+
+  it('requires both advertised capability and a model-aware authoritative snapshot', () => {
+    const h = harness({ modelSelectionCapable: true })
+    expect(h.api.modelSelectionSupported.value).toBe(false)
+    h.api.applyBootstrap({ key: SESSION_ONE, mode: 'direct', revision: 0 })
+    expect(h.api.modelSelectionSupported.value).toBe(false)
+    h.api.applyBootstrap(modelSnapshot(null))
+    expect(h.api.modelSelectionSupported.value).toBe(true)
+    h.modelSelectionCapable.value = false
+    expect(h.api.modelSelectionSupported.value).toBe(false)
+  })
+
+  it('updates provider and direct mode atomically without an optimistic model label', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN, 2, 'router'))
+    const request = pending<unknown>()
+    h.rpc.call.mockReturnValue(request.promise)
+    const updating = h.api.setModel(OTHER_PIN)
+    expect(h.api.modelSelection.value).toEqual(PIN)
+    expect(h.api.mode.value).toBe('squilla_router')
+    expect(h.api.mutationBusy.value).toBe(true)
+    await expect(h.api.setModel(PIN)).resolves.toBe(false)
+    await expect(h.api.setMode('llm_ensemble')).resolves.toBe(false)
+    expect(h.rpc.call).toHaveBeenCalledExactlyOnceWith('sessions.routing.set', {
+      sessionKey: SESSION_ONE, mode: 'direct', expectedRevision: 2, modelSelection: OTHER_PIN,
+    }, { signal: expect.any(AbortSignal) })
+    request.resolve(modelSnapshot(OTHER_PIN, 3))
+    await expect(updating).resolves.toBe(true)
+    expect(h.api.modelSelection.value).toEqual(OTHER_PIN)
+    expect(h.api.mode.value).toBe('off')
+    expect(h.api.busy.value).toBe(false)
+  })
+
+  it('resets a pin to defaults with explicit null instead of dropping the field', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    h.rpc.call.mockResolvedValue(modelSnapshot(null, 2))
+    await expect(h.api.setModel(null)).resolves.toBe(true)
+    expect(h.rpc.call).toHaveBeenCalledWith('sessions.routing.set', {
+      sessionKey: SESSION_ONE, mode: 'direct', expectedRevision: 1, modelSelection: null,
+    }, { signal: expect.any(AbortSignal) })
+    expect(h.api.modelSelection.value).toBeNull()
+  })
+
+  it('preserves the direct-model pin when choosing a route strategy', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    h.rpc.call.mockResolvedValue(modelSnapshot(PIN, 2, 'ensemble'))
+    await expect(h.api.setMode('llm_ensemble')).resolves.toBe(true)
+    expect(h.rpc.call).toHaveBeenCalledExactlyOnceWith('sessions.routing.set', {
+      sessionKey: SESSION_ONE, mode: 'ensemble', expectedRevision: 1,
+    })
+    expect(h.api.modelSelection.value).toEqual(PIN)
+  })
+
+  it('treats model and provider together as identity and avoids writes for the same pair', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    await expect(h.api.setModel({ ...PIN })).resolves.toBe(true)
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    h.rpc.call.mockResolvedValue(modelSnapshot(OTHER_PIN, 2))
+    await expect(h.api.setModel(OTHER_PIN)).resolves.toBe(true)
+    expect(h.rpc.call).toHaveBeenCalledOnce()
+  })
+
+  it('retains legacy model-only identity without inventing its provider or marking it default', () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot({ model: PIN.model, provider: null }))
+    expect(h.api.modelSelection.value).toEqual({ model: PIN.model, provider: null })
+    expect(h.api.modelSelectionSupported.value).toBe(true)
+  })
+
+  it.each([
+    { model: '', provider: 'provider' }, { model: ' model', provider: 'provider' },
+    { model: 'model', provider: '' }, { model: 'model', provider: 'bad\nprovider' },
+  ])('does not dispatch an invalid provider/model pair %j', async selection => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(null))
+    await expect(h.api.setModel(selection)).resolves.toBe(false)
+    expect(h.rpc.call).not.toHaveBeenCalled()
+  })
+
+  it.each(['draft', 'unsupported', 'streaming', 'disconnected'] as const)(
+    'does not mutate a concrete model while %s', async state => {
+      const h = harness({ modelSelectionCapable: true })
+      h.api.applyBootstrap(modelSnapshot(PIN))
+      if (state === 'draft') h.isDraft.value = true
+      if (state === 'unsupported') h.modelSelectionCapable.value = false
+      if (state === 'streaming') h.isStreaming.value = true
+      if (state === 'disconnected') h.available.value = false
+      await expect(h.api.setModel(OTHER_PIN)).resolves.toBe(false)
+      await expect(h.api.setModel(null)).resolves.toBe(false)
+      expect(h.rpc.call).not.toHaveBeenCalled()
+    },
+  )
+
+  it('keeps existing next-turn route switching available while a turn is streaming', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    h.isStreaming.value = true
+    h.rpc.call.mockResolvedValue(modelSnapshot(PIN, 2, 'router'))
+    await expect(h.api.setMode('squilla_router')).resolves.toBe(true)
+    expect(h.api.modeAppliesNextTurn.value).toBe(true)
+    expect(h.api.modelSelection.value).toEqual(PIN)
+  })
+
+  it('hydrates model support before an atomic mutation and holds the shared lock', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    const read = pending<unknown>()
+    h.rpc.call.mockReturnValueOnce(read.promise).mockResolvedValueOnce(modelSnapshot(PIN, 2))
+    const selection = h.api.setModel(PIN)
+    expect(h.api.busy.value).toBe(true)
+    await expect(h.api.setMode('llm_ensemble')).resolves.toBe(false)
+    read.resolve(modelSnapshot(null))
+    await expect(selection).resolves.toBe(true)
+    expect(h.api.modelSelection.value).toEqual(PIN)
+  })
+
+  it('does not write when a legacy gateway read lacks model selection support', async () => {
+    const h = harness({ modelSelectionCapable: true, getResponse: { key: SESSION_ONE, mode: 'direct', revision: 0 } })
+    await expect(h.api.setModel(PIN)).resolves.toBe(false)
+    expect(h.rpc.call).toHaveBeenCalledExactlyOnceWith('sessions.routing.get', { sessionKey: SESSION_ONE })
+  })
+
+  it('refreshes authoritative state after a conflict and reports a failed choice', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    h.rpc.call.mockRejectedValueOnce(new Error('Another window changed this task'))
+      .mockResolvedValueOnce(modelSnapshot(null, 3, 'ensemble'))
+    await expect(h.api.setModel(OTHER_PIN)).resolves.toBe(false)
+    expect(h.api.modelSelection.value).toBeNull()
+    expect(h.api.mode.value).toBe('llm_ensemble')
+    expect(h.notifyError).toHaveBeenCalledExactlyOnceWith('Another window changed this task')
+    expect(h.api.busy.value).toBe(false)
+  })
+
+  it('rejects missing acknowledgement and never invents a saved model', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    h.rpc.call.mockResolvedValueOnce({ key: SESSION_ONE, mode: 'direct', revision: 2 })
+      .mockResolvedValueOnce(modelSnapshot(PIN))
+    await expect(h.api.setModel(OTHER_PIN)).resolves.toBe(false)
+    expect(h.api.modelSelection.value).toEqual(PIN)
+    expect(h.notifyError).toHaveBeenCalledOnce()
+  })
+
+  it('ignores equal-revision conflicting model events and accepts newer authoritative updates', () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    h.api.subscribe()
+    h.handlers.get('sessions.routing.changed')?.(modelSnapshot(OTHER_PIN))
+    expect(h.api.modelSelection.value).toEqual(PIN)
+    h.handlers.get('sessions.routing.changed')?.(modelSnapshot(OTHER_PIN, 2))
+    expect(h.api.modelSelection.value).toEqual(OTHER_PIN)
+  })
+
+  it.each(['navigation', 'reconnection', 'disconnect'] as const)(
+    'ignores a late model acknowledgement after %s and aborts its transport wait', async cause => {
+      const h = harness({ modelSelectionCapable: true })
+      h.api.applyBootstrap(modelSnapshot(PIN))
+      const write = pending<unknown>()
+      h.rpc.call.mockReturnValueOnce(write.promise).mockResolvedValue(modelSnapshot(PIN))
+      const selection = h.api.setModel(OTHER_PIN)
+      const signal = h.rpc.call.mock.calls[0]?.[2]?.signal as AbortSignal
+      if (cause === 'navigation') {
+        h.sessionKey.value = SESSION_TWO
+        h.sessionKey.value = SESSION_ONE
+      } else if (cause === 'reconnection') h.connectionEpoch.value += 1
+      else h.available.value = false
+      expect(signal.aborted).toBe(true)
+      write.resolve(modelSnapshot(OTHER_PIN, 2))
+      await expect(selection).resolves.toBe(false)
+      expect(h.api.modelSelection.value).not.toEqual(OTHER_PIN)
+      expect(h.notifyError).not.toHaveBeenCalled()
+    },
+  )
+
+  it('does not let an old model write release a new session mutation lock', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    const first = pending<unknown>()
+    const second = pending<unknown>()
+    h.rpc.call.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise)
+    const firstSelection = h.api.setModel(OTHER_PIN)
+    h.sessionKey.value = SESSION_TWO
+    h.api.applyBootstrap({ ...modelSnapshot(null), key: SESSION_TWO })
+    const secondSelection = h.api.setModel(PIN)
+    first.resolve(modelSnapshot(OTHER_PIN, 2))
+    await expect(firstSelection).resolves.toBe(false)
+    expect(h.api.busy.value).toBe(true)
+    second.resolve({ ...modelSnapshot(PIN, 2), key: SESSION_TWO })
+    await expect(secondSelection).resolves.toBe(true)
+    expect(h.api.busy.value).toBe(false)
+  })
+
+  it('does not show an old failure toast after navigation during error recovery', async () => {
+    const h = harness({ modelSelectionCapable: true })
+    h.api.applyBootstrap(modelSnapshot(PIN))
+    const recovery = pending<unknown>()
+    h.rpc.call.mockRejectedValueOnce(new Error('Old session failed')).mockReturnValueOnce(recovery.promise)
+    const updating = h.api.setModel(OTHER_PIN)
+    await nextTick()
+    h.sessionKey.value = SESSION_TWO
+    recovery.resolve(modelSnapshot(PIN))
+    await expect(updating).resolves.toBe(false)
+    expect(h.notifyError).not.toHaveBeenCalled()
   })
 })

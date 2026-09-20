@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 from types import SimpleNamespace
 from typing import Any, cast
@@ -164,11 +165,148 @@ def model_list_error_to_projection(error: Any) -> dict[str, Any]:
 
 
 class GatewayModelCatalogPort:
-    def __init__(self, provider_selector: Any, config: Any) -> None:
+    def __init__(
+        self, provider_selector: Any, config: Any, *, include_configured_defaults: bool = False,
+    ) -> None:
         self._provider_selector = provider_selector
         self._config = config
+        self._include_configured_defaults = include_configured_defaults
 
     async def load_model_catalog(self) -> ModelCatalogResult:
+        if not self._include_configured_defaults:
+            return await self._load_active_catalog()
+        # Settings and chat share the same selectable-discovery policy. Only
+        # durable deployments are resolved here; draft credentials never enter
+        # the chat catalog, and named auth profiles need a separate identity.
+        from opensquilla.engine.selector_override import peek_profile_credential
+        from opensquilla.onboarding.probe import (
+            TRANSIENT_MODEL_DISCOVERY_FAILURES,
+            ProviderModelsDiscoverResult,
+            discover_selectable_provider_models,
+        )
+        from opensquilla.provider.deployment import resolve_provider_deployment
+        from opensquilla.provider.preset_registry import get_preset
+        from opensquilla.provider.registry import UnknownProviderError, get_provider_spec
+
+        models: list[dict[str, Any]] = []
+        errors: list[dict[str, Any]] = []
+        inherited = getattr(self._provider_selector, "current_config", None)
+        active_provider = str(getattr(inherited, "provider", "")).strip().lower()
+        candidates: dict[str, str] = {}
+        if active_provider:
+            candidates[active_provider] = str(getattr(inherited, "model", "") or "")
+        for key, profile in (getattr(self._config, "llm_profiles", None) or {}).items():
+            provider = str(key).strip().lower()
+            if provider in candidates:
+                continue
+            preset = get_preset(provider)
+            candidates[provider] = str(getattr(profile, "model", "") or "").strip() or (
+                preset.default_model if preset else ""
+            )
+
+        async def discover(provider: str, model: str) -> tuple[str, str, Any, Any] | None:
+            try:
+                get_provider_spec(provider)
+            except UnknownProviderError:
+                return None
+            resolution = resolve_provider_deployment(
+                # Listing only needs a connection, not a configured model.
+                # Keep the placeholder out of the fallback rows below.
+                self._config, provider, model or "catalog-discovery",
+                inherited_provider_config=inherited,
+                credential_pool_acquirer=peek_profile_credential,
+            )
+            if not resolution.ready:
+                return provider, model, resolution, None
+            deployment = resolution.provider_config
+            assert deployment is not None
+            try:
+                discovered = await discover_selectable_provider_models(
+                    provider_id=provider, api_key=deployment.api_key, api_key_env="",
+                    base_url=deployment.base_url, proxy=deployment.proxy,
+                    allow_default_api_key_env=False, persist_catalog=True,
+                    catalog_config=self._config,
+                )
+            except Exception:
+                discovered = ProviderModelsDiscoverResult(
+                    ok=False, provider_id=provider, failure_kind="unknown",
+                    detail="Provider model catalog could not be loaded.",
+                )
+            return provider, model, resolution, discovered
+
+        # Providers refresh independently; one unavailable account does not
+        # prevent other saved providers from contributing their model menus.
+        discovered_results = await asyncio.gather(*(
+            discover(provider, model) for provider, model in candidates.items()
+        ))
+        for discovered_result in discovered_results:
+            if discovered_result is None:
+                continue
+            provider, model, resolution, discovered = discovered_result
+            if not resolution.ready:
+                errors.append({
+                    "provider": provider, "kind": "deployment_unavailable",
+                    "detail": resolution.reason,
+                })
+                continue
+            if discovered.source == "live" or not discovered.ok:
+                # A credential-scoped listing is authoritative. In particular,
+                # auth failures cannot resurrect a preset model.
+                for row in discovered.models:
+                    entry = shared_catalog().resolve_entry(str(row["id"]), provider=provider)
+                    models.append({
+                        "id": row["id"], "name": row["name"], "provider": provider,
+                        "contextWindow": row["contextWindow"],
+                        "maxOutputTokens": row["maxOutputTokens"],
+                        "capabilities": row["capabilities"],
+                        "pricing": row.get("pricing") or {"inputPer1k": 0, "outputPer1k": 0},
+                        "source": row.get("capabilitySource") or entry.source,
+                        "reasoningFormat": entry.reasoning_format,
+                        "metadata": row.get("metadata"),
+                    })
+                if not discovered.ok:
+                    errors.append({
+                        "provider": provider, "kind": discovered.failure_kind,
+                        "detail": discovered.detail,
+                    })
+                if not (
+                    not discovered.ok and not discovered.models
+                    and discovered.failure_kind in TRANSIENT_MODEL_DISCOVERY_FAILURES
+                ):
+                    continue
+            # No trustworthy discovery support: preserve the explicitly saved
+            # model instead of guessing every model in a metadata catalog.
+            spec = get_provider_spec(provider)
+            if discovered.ok and spec.live_catalog_shape == "tokenrhythm":
+                from opensquilla.provider.tokenrhythm_catalog import (
+                    is_official_tokenrhythm_endpoint,
+                )
+
+                if is_official_tokenrhythm_endpoint(resolution.provider_config.base_url):
+                    continue
+            fallback_models = (model, *spec.static_model_ids) if discovered.ok else (model,)
+            for configured_model in dict.fromkeys(fallback_models):
+                if not configured_model:
+                    continue
+                entry = shared_catalog().resolve_entry(configured_model, provider=provider)
+                capabilities = ["chat"]
+                for name in ("tools", "vision", "reasoning"):
+                    if getattr(entry, "supports_" + name):
+                        capabilities.append(name)
+                models.append({
+                    "id": configured_model, "name": entry.display_name or configured_model,
+                    "provider": provider, "contextWindow": entry.context_window,
+                    "maxOutputTokens": entry.max_output_tokens, "capabilities": capabilities,
+                    "pricing": {
+                        "inputPer1k": (entry.input_cost_per_mtok or 0) / 1000,
+                        "outputPer1k": (entry.output_cost_per_mtok or 0) / 1000,
+                    },
+                    "source": entry.source, "reasoningFormat": entry.reasoning_format,
+                    "metadata": {"catalogScope": "configured_default"},
+                })
+        return cast(ModelCatalogResult, {"models": models, "errors": errors})
+
+    async def _load_active_catalog(self) -> ModelCatalogResult:
         from opensquilla.provider.model_capacity import (
             custom_capacity_identity,
             install_custom_capacity,

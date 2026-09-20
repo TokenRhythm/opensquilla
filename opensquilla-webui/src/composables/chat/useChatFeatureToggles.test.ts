@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { effectScope, ref, type Ref } from 'vue'
 import { useChatFeatureToggles } from './useChatFeatureToggles'
 import source from './useChatFeatureToggles.ts?raw'
 import chatViewSource from '@/views/ChatView.vue?raw'
@@ -47,6 +48,8 @@ function createHarness(options: {
   patchResults?: RpcResult[]
   readCallOptions?: RpcCallOptions
   hasRpcMethod?: (method: string) => boolean
+  connectionEpoch?: Readonly<Ref<unknown>>
+  connectionAvailable?: Readonly<Ref<boolean>>
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
@@ -124,6 +127,8 @@ function createHarness(options: {
       subscribeChanged,
     },
     readOptions: options.readCallOptions,
+    connectionEpoch: options.connectionEpoch,
+    connectionAvailable: options.connectionAvailable,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
@@ -147,6 +152,130 @@ function routingCalls(rpc: ReturnType<typeof createHarness>['rpc']) {
 afterEach(() => {
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
+})
+
+describe('useChatFeatureToggles default model display', () => {
+  const primaryConfig = { llm: { model: 'Model/CaseSensitive', provider: 'tokenrhythm' } }
+  const primaryModel = { model: 'Model/CaseSensitive', provider: 'tokenrhythm' }
+
+  it('reads the direct default from the existing config request even when global routing is enabled', async () => {
+    const { api, rpc } = createHarness({
+      configGetResults: [{
+        llm: { model: ' Model/CaseSensitive ', provider: ' TokenRhythm ' },
+        squilla_router: { enabled: true, rollout_phase: 'full' },
+      }],
+      routingGetResults: [{ mode: 'router', model: 'not-a-default', provider: 'other' }],
+    })
+    expect(api.defaultModelForAgent('main')).toBeNull()
+    await api.loadFeatureToggles()
+    expect(api.defaultModelForAgent('main')).toEqual(primaryModel)
+    expect(api.defaultModelForAgent('')).toEqual(primaryModel)
+    expect(api.defaultModelForAgent('DEFAULT')).toEqual(primaryModel)
+    expect(api.modelRoutingMode.value).toBe('squilla_router')
+    expect(rpc.call.mock.calls.map(([method]) => method)).toEqual(['config.get', 'models.routing.get'])
+  })
+
+  it('never invents a provider for a different enabled agent override', async () => {
+    const { api } = createHarness({
+      configGetResults: [{
+        ...primaryConfig,
+        agents: [
+          { id: 'Writer', model: 'writer-specific' },
+          { id: 'same', model: 'Model/CaseSensitive' },
+          { id: 'disabled', model: 'another-model', enabled: false },
+          { id: 'inherited', model: null },
+        ],
+      }],
+    })
+    await api.loadFeatureToggles()
+    expect(api.defaultModelForAgent(' writer ')).toBeNull()
+    expect(api.defaultModelForAgent('same')).toEqual(primaryModel)
+    expect(api.defaultModelForAgent('disabled')).toEqual(primaryModel)
+    expect(api.defaultModelForAgent('inherited')).toEqual(primaryModel)
+    expect(api.defaultModelForAgent('main')).toEqual(primaryModel)
+  })
+
+  it.each([
+    {},
+    { llm: {} },
+    { llm: { model: 'known-model' } },
+    { llm: { model: '', provider: 'tokenrhythm' } },
+    { llm: { model: 'known-model', provider: 123 } },
+  ])('keeps an incomplete default unknown for %j', async (config) => {
+    const { api } = createHarness({ configGetResults: [config] })
+    await api.loadFeatureToggles()
+    expect(api.defaultModelForAgent('main')).toBeNull()
+  })
+
+  it('clears the previous default while a settings refresh is pending and adopts the new value', async () => {
+    const nextConfig = deferred<Record<string, unknown>>()
+    const { api } = createHarness({ configGetResults: [primaryConfig, nextConfig.promise] })
+    await api.loadFeatureToggles()
+    expect(api.defaultModelForAgent('main')).toEqual(primaryModel)
+    const refresh = api.loadFeatureToggles()
+    expect(api.defaultModelForAgent('main')).toBeNull()
+    nextConfig.resolve({ llm: { model: 'deepseek-chat', provider: 'deepseek' } })
+    await refresh
+    expect(api.defaultModelForAgent('main')).toEqual({ model: 'deepseek-chat', provider: 'deepseek' })
+  })
+
+  it('keeps the default unknown after a failed config refresh', async () => {
+    const { api } = createHarness({ configGetResults: [primaryConfig, new Error('config unavailable')] })
+    await api.loadFeatureToggles()
+    await api.loadFeatureToggles()
+    expect(api.defaultModelForAgent('main')).toBeNull()
+  })
+
+  it('rejects late default config from an old connection and clears values immediately on loss', async () => {
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const connectionAvailable = ref(true)
+      const oldConfig = deferred<Record<string, unknown>>()
+      const nextModel = { model: 'new-model', provider: 'openrouter' }
+      const { api } = scope.run(() => createHarness({
+        configGetResults: [primaryConfig, oldConfig.promise, { llm: nextModel }],
+        connectionEpoch,
+        connectionAvailable,
+      }))!
+      await api.loadFeatureToggles()
+      expect(api.defaultModelForAgent('main')).toEqual(primaryModel)
+      connectionAvailable.value = false
+      expect(api.defaultModelForAgent('main')).toBeNull()
+      connectionAvailable.value = true
+      const oldRead = api.loadFeatureToggles()
+      connectionEpoch.value = 2
+      oldConfig.resolve(primaryConfig)
+      await oldRead
+      expect(api.defaultModelForAgent('main')).toBeNull()
+      await api.loadFeatureToggles()
+      expect(api.defaultModelForAgent('main')).toEqual(nextModel)
+      connectionEpoch.value = 3
+      expect(api.defaultModelForAgent('main')).toBeNull()
+    } finally {
+      scope.stop()
+    }
+  })
+
+  it('does not let an older config response replace a newer settings read', async () => {
+    const oldConfig = deferred<Record<string, unknown>>()
+    const nextModel = { model: 'new-model', provider: 'openrouter' }
+    const { api } = createHarness({ configGetResults: [oldConfig.promise, { llm: nextModel }] })
+    const oldRead = api.loadFeatureToggles()
+    await api.loadFeatureToggles()
+    oldConfig.resolve(primaryConfig)
+    await oldRead
+    expect(api.defaultModelForAgent('main')).toEqual(nextModel)
+  })
+
+  it('passes agent-specific defaults to both draft and existing selectors and refreshes all authoritative state', () => {
+    expect(chatViewSource).toContain(':default-model="composerDefaultModel"')
+    expect(chatViewSource).toContain('isProvisionalDraftSession() ? draftAgentId() : agentIdFromSessionKey(sessionKey.value)')
+    expect(chatViewSource).toContain('@refresh-models="refreshComposerModels"')
+    expect(chatViewSource).toMatch(/Promise\.allSettled\(\[\s*newTaskModel\.refresh\(\), loadFeatureToggles\(\), chatSessionModel\.refresh\(\),\s*chatSessionRouting\.load\(\)/)
+    expect(chatViewSource).toContain('connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch)')
+    expect(chatViewSource).toContain('connectionAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated)')
+  })
 })
 
 describe('useChatFeatureToggles coding mode', () => {

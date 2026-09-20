@@ -1,4 +1,4 @@
-"""Best-effort lifecycle for scoped telemetry recorders and uploaders.
+"""Best-effort lifecycle for scoped event recorders and uploaders.
 
 The runtime opens each queue lazily under the unified upload preference.
 Recorders and uploaders repeat the policy and environment-veto checks at their
@@ -29,6 +29,7 @@ from opensquilla.telemetry.coordination import scope_consent_coordinator_for
 from opensquilla.telemetry.desktop_ingress import drain_desktop_early_spool
 from opensquilla.telemetry.desktop_state import desktop_early_spool_root
 from opensquilla.telemetry.desktop_turn_counts import record_desktop_turn
+from opensquilla.telemetry.device_identity import get_device_id
 from opensquilla.telemetry.outbox import OutboxPriority, TelemetryOutbox
 from opensquilla.telemetry.recorder import RecordResult, RecordStatus, TelemetryRecorder
 from opensquilla.telemetry.uploader import TelemetryUploader
@@ -52,7 +53,7 @@ class _ScopeRuntime:
 
 
 class ScopedTelemetryRuntime:
-    """Own both isolated telemetry queues without affecting application work."""
+    """Own both isolated event queues without affecting application work."""
 
     def __init__(
         self,
@@ -100,6 +101,15 @@ class ScopedTelemetryRuntime:
     def opened_scopes(self) -> frozenset[TelemetryScope]:
         return frozenset(self._scopes)
 
+    def device_id_for(self, scope: TelemetryScope) -> str | None:
+        """Read device identity only for a locally produced, allowed event."""
+
+        if self._closed or not resolve_scope_consent(
+            scope, config=self._config, env=self._env
+        ).enqueue_allowed:
+            return None
+        return get_device_id()
+
     async def start(self) -> None:
         """Start the wake-up loop without creating files or making requests."""
 
@@ -131,7 +141,7 @@ class ScopedTelemetryRuntime:
         try:
             scope = TelemetryScope(str(getattr(event, "consent_scope", "")))
         except ValueError as exc:
-            raise ValueError("event has an invalid telemetry scope") from exc
+            raise ValueError("event has an invalid statistics scope") from exc
 
         scoped = await self._scope_runtime(scope)
         if scoped is None:
@@ -206,7 +216,7 @@ class ScopedTelemetryRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.debug("telemetry upload attempt failed", exc_info=True)
+            log.debug("statistics upload attempt failed", exc_info=True)
 
     def prepare_shutdown(self) -> None:
         """Bound active sends before producers drain, while still accepting records."""
@@ -261,7 +271,7 @@ class ScopedTelemetryRuntime:
                         return_exceptions=True,
                     )
         except TimeoutError:
-            log.debug("telemetry final upload deadline reached")
+            log.debug("statistics final upload deadline reached")
         finally:
             if upload_guard is not None:
                 upload_guard.cancel()
@@ -280,7 +290,7 @@ class ScopedTelemetryRuntime:
                 try:
                     await scoped.close()
                 except Exception:
-                    log.debug("telemetry scope close failed", exc_info=True)
+                    log.debug("statistics scope close failed", exc_info=True)
             self._owner_loop = None
 
     async def _finish_upload_loop(self, task: asyncio.Task[None], deadline: float) -> None:
@@ -288,9 +298,9 @@ class ScopedTelemetryRuntime:
             async with asyncio.timeout_at(deadline):
                 await asyncio.shield(task)
         except TimeoutError:
-            log.debug("telemetry in-flight upload deadline reached")
+            log.debug("statistics in-flight upload deadline reached")
         except Exception:
-            log.debug("telemetry upload loop close failed", exc_info=True)
+            log.debug("statistics upload loop close failed", exc_info=True)
         finally:
             if not task.done():
                 task.cancel()
@@ -338,7 +348,7 @@ class ScopedTelemetryRuntime:
                         await _ignore_close(outbox.close())
                     raise
                 except Exception:
-                    log.debug("telemetry scope initialization failed", exc_info=True)
+                    log.debug("statistics scope initialization failed", exc_info=True)
                     if uploader is not None:
                         await _ignore_close(uploader.close())
                     if outbox is not None:
@@ -362,7 +372,7 @@ class ScopedTelemetryRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.debug("telemetry event record failed", exc_info=True)
+            log.debug("statistics event record failed", exc_info=True)
 
     async def _run_upload_cycle(self) -> None:
         await self._drain_desktop_spool()
@@ -415,7 +425,7 @@ class ScopedTelemetryRuntime:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.debug("desktop telemetry scope initialization failed", exc_info=True)
+                log.debug("desktop statistics scope initialization failed", exc_info=True)
         if not recorders:
             return
         try:
@@ -428,11 +438,11 @@ class ScopedTelemetryRuntime:
         except asyncio.CancelledError:
             raise
         except Exception:
-            log.debug("desktop telemetry spool drain failed", exc_info=True)
+            log.debug("desktop statistics spool drain failed", exc_info=True)
 
     def _ensure_open(self) -> None:
         if self._closed:
-            raise RuntimeError("telemetry runtime is closed")
+            raise RuntimeError("statistics runtime is closed")
 
     def _bind_owner_loop(self) -> None:
         running_loop = asyncio.get_running_loop()
@@ -440,7 +450,7 @@ class ScopedTelemetryRuntime:
             self._owner_loop = running_loop
             return
         if self._owner_loop is not running_loop:
-            raise RuntimeError("telemetry runtime belongs to another event loop")
+            raise RuntimeError("statistics runtime belongs to another event loop")
 
 
 async def _ignore_close(operation: Coroutine[Any, Any, object]) -> None:

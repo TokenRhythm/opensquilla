@@ -541,16 +541,50 @@ describe('catalog parity', () => {
     )
 
     expect(deprecated).toEqual([])
-    expect({
-      setup: zhHans.setup.router.summaryEnsemble,
-      composer: zhHans.chat.composer.modelRoutingEnsemble,
-      runtime: zhHans.chat.routerFx.ensembleSelecting,
-    }).toEqual({
-      setup: 'AI 智能融合路由',
-      composer: 'AI 智能融合路由',
-      runtime: 'AI 智能融合路由 · 正在选择候选',
-    })
+    expect(zhHans.chat.routerFx.ensembleSelecting).toBe(
+      `${zhHans.setup.modelStrategy.cards.ensemble.title} · 正在选择候选`,
+    )
   })
+
+  it.each(Object.entries({ en, zhHans, de, es, fr, ja }))(
+    'matches the settings strategy cards across routing surfaces in %s',
+    (locale, messages) => {
+      const { cards } = messages.setup.modelStrategy
+      const { composer, modelRouting, routerFx } = messages.chat
+      const expectedModes = [cards.single.title, cards.router.title, cards.ensemble.title]
+
+      expect([modelRouting.direct, modelRouting.router, modelRouting.ensemble], locale).toEqual(expectedModes)
+      expect([
+        composer.modelRoutingOff,
+        composer.modelRoutingSquillaRouter,
+        composer.modelRoutingEnsemble,
+      ], locale).toEqual(expectedModes)
+      expect([
+        messages.setup.provider.modelUsageFixed,
+        messages.setup.provider.modelUsageRouter,
+        messages.setup.provider.modelUsageEnsemble,
+      ], locale).toEqual(expectedModes)
+      expect([
+        messages.setup.modelStrategy.singleTitle,
+        messages.setup.modelStrategy.routerTitle,
+        messages.setup.modelStrategy.ensembleTitle,
+      ], locale).toEqual(expectedModes)
+
+      for (const label of [
+        messages.setup.router.summaryEnsemble,
+        messages.setup.router.ensembleProfileTitle,
+        messages.chat.aiModelEnsembleRouter,
+        routerFx.ensembleModel,
+      ]) {
+        expect(label, locale).toBe(cards.ensemble.title)
+      }
+      for (const status of [routerFx.ensembleSelecting, routerFx.ensembleHandedOff, routerFx.ensembleRunning]) {
+        expect(status.startsWith(`${cards.ensemble.title} · `), locale).toBe(true)
+        expect(status.length, locale).toBeGreaterThan(`${cards.ensemble.title} · `.length)
+      }
+      expect(routerFx.ensembleRunning, locale).toContain('{count}')
+    },
+  )
 
   it('ships the approved Model Service labels in every locale', () => {
     expect({

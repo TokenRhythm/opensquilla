@@ -1,7 +1,7 @@
 """Tests for the bridge upload endpoint + store.
 
-These tests cover the core upload mechanics: the in-memory store with
-per-uuid asyncio.Lock + TTL sweep + ``.meta`` marker, the multipart
+These tests cover the core upload mechanics: disk-backed temporary leases with
+per-uuid asyncio.Lock, restart recovery and TTL sweep, the multipart
 ``POST /api/v1/files/upload`` route with auth, the validator's ``file_uuid``
 resolution path, and the query-token rejection surface for multipart uploads.
 
@@ -16,6 +16,8 @@ import asyncio
 import gc
 import hashlib
 import json
+import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -40,6 +42,7 @@ from opensquilla.gateway.uploads import (
     UploadStoreFullError,
     UploadUnsupportedMimeError,
 )
+from opensquilla.paths import native_io_path
 from tests.helpers.image_bytes import image_bytes
 
 # ---------------------------------------------------------------------------
@@ -85,6 +88,267 @@ def test_upload_round_trip(store: UploadStore) -> None:
     assert meta["mime"] == "application/pdf"
     assert meta["name"] == "r.pdf"
     assert meta["size"] == len(payload)
+
+
+def test_upload_survives_restart_without_loading_payloads(
+    store: UploadStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"%PDF-1.4\nbody\n"
+    file_uuid = asyncio.run(store.put("r.pdf", "application/pdf", payload))
+    read_regular_file = UploadStore._read_regular_file
+
+    def read_only_metadata(path: Path, limit: int) -> bytes:
+        assert path.suffix == ".meta", "startup must not read upload payloads"
+        return read_regular_file(path, limit)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(UploadStore, "_read_regular_file", staticmethod(read_only_metadata))
+        restarted = UploadStore(marker_dir=store.marker_dir)
+
+    assert store._entries[file_uuid].bytes is None
+    assert restarted._entries[file_uuid].bytes is None
+    assert asyncio.run(restarted.get(file_uuid)) == asyncio.run(store.get(file_uuid))
+    assert (store.marker_dir / f"{file_uuid}.bin").read_bytes() == payload
+
+
+def test_upload_without_directory_remains_in_memory() -> None:
+    store = UploadStore(marker_dir=None, max_total_bytes=5)
+    file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    assert asyncio.run(store.get(file_uuid))[0] == b"hello"
+    with pytest.raises(UploadStoreFullError):
+        asyncio.run(store.put("another.txt", "text/plain", b"!"))
+    assert asyncio.run(store.evict(file_uuid))
+
+
+def test_restart_counts_existing_uploads_toward_capacity(tmp_path: Path) -> None:
+    store = UploadStore(marker_dir=tmp_path / "inbound", max_total_bytes=10)
+    file_uuid = asyncio.run(store.put("a.txt", "text/plain", b"a" * 9))
+    restarted = UploadStore(marker_dir=store.marker_dir, max_total_bytes=10)
+    with pytest.raises(UploadStoreFullError):
+        asyncio.run(restarted.put("b.txt", "text/plain", b"bb"))
+    assert asyncio.run(restarted.get(file_uuid))[0] == b"a" * 9
+    assert asyncio.run(restarted.evict(file_uuid))
+    assert not list(store.marker_dir.iterdir())
+    asyncio.run(restarted.put("b.txt", "text/plain", b"b" * 10))
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_expiry_removes_payload_and_metadata(
+    store: UploadStore, monkeypatch: pytest.MonkeyPatch, restart: bool,
+) -> None:
+    file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    expires_at = store._entries[file_uuid].expires_at
+    monkeypatch.setattr(UploadStore, "_now", lambda _self: expires_at + 1)
+    if restart:
+        store = UploadStore(marker_dir=store.marker_dir)
+    with pytest.raises(AttachmentNotFoundError):
+        asyncio.run(store.get(file_uuid))
+    assert not list(store.marker_dir.iterdir())
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_corrupt_payload_is_rejected_when_consumed(store: UploadStore, restart: bool) -> None:
+    file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    (store.marker_dir / f"{file_uuid}.bin").write_bytes(b"other")
+    if restart:
+        store = UploadStore(marker_dir=store.marker_dir)
+    with pytest.raises(AttachmentLostInRestartError):
+        asyncio.run(store.get(file_uuid))
+
+
+@pytest.mark.parametrize("changed", [
+    {"version": 999},
+    {"version": True},
+    {"sha256": "../outside"},
+    {"mime": "text/plain; charset=utf-8"},
+    {"size": -1},
+    {"size": 100},
+    {"size": True},
+    {"expires_at": float("nan")},
+    {"expires_at": 10 ** 400},
+    {"path": "../outside"},
+])
+def test_invalid_recovery_metadata_does_not_restore_uploads(
+    store: UploadStore, changed: dict[str, Any],
+) -> None:
+    file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    marker = store.marker_dir / f"{file_uuid}.meta"
+    metadata = json.loads(marker.read_text())
+    marker.write_text(json.dumps({**metadata, **changed}))
+    restarted = UploadStore(marker_dir=store.marker_dir)
+    with pytest.raises(AttachmentNotFoundError):
+        asyncio.run(restarted.get(file_uuid))
+    assert not list(store.marker_dir.iterdir())
+
+
+def test_restart_discards_incomplete_writes_without_following_paths(store: UploadStore) -> None:
+    (store.marker_dir / "u-orphan.bin").write_bytes(b"orphan")
+    (store.marker_dir / ".u-interrupted.bin.0123456789abcdef.tmp").write_bytes(b"partial")
+    (store.marker_dir / "u-directory.bin").mkdir()
+    unrelated = store.marker_dir / ".unrelated.tmp"
+    unrelated.write_bytes(b"keep")
+    restarted = UploadStore(marker_dir=store.marker_dir)
+    assert not restarted._entries
+    assert sorted(path.name for path in store.marker_dir.iterdir()) == [
+        ".unrelated.tmp", "u-directory.bin",
+    ]
+
+
+def test_upload_ids_cannot_select_arbitrary_paths(store: UploadStore, tmp_path: Path) -> None:
+    outside = tmp_path / "outside.meta"
+    outside.write_text(json.dumps({"expires_at": time.time() + 600}))
+    for file_uuid in ("../outside", "u-../outside", r"u-..\outside", str(outside)):
+        with pytest.raises(AttachmentNotFoundError):
+            asyncio.run(store.get(file_uuid))
+        assert not asyncio.run(store.evict(file_uuid))
+    assert outside.is_file()
+
+
+@pytest.mark.parametrize("suffix", [".meta", ".bin"])
+def test_restart_rejects_symlink_material(
+    store: UploadStore, tmp_path: Path, suffix: str,
+) -> None:
+    file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    material = store.marker_dir / f"{file_uuid}{suffix}"
+    outside = tmp_path / "outside"
+    outside.write_bytes(material.read_bytes())
+    material.unlink()
+    try:
+        material.symlink_to(outside)
+    except OSError:
+        pytest.skip("host does not permit creating symlinks")
+    restarted = UploadStore(marker_dir=store.marker_dir)
+    with pytest.raises(AttachmentNotFoundError):
+        asyncio.run(restarted.get(file_uuid))
+    assert outside.is_file()
+    assert not list(store.marker_dir.iterdir())
+
+
+def test_upload_store_rejects_symlink_directory(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    linked = tmp_path / "linked"
+    try:
+        linked.symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pytest.skip("host does not permit creating symlinks")
+    with pytest.raises(ValueError, match="symlink or junction"):
+        UploadStore(marker_dir=linked)
+    assert not list(outside.iterdir())
+
+
+def test_replaced_upload_directory_cannot_redirect_get_or_evict(
+    store: UploadStore, tmp_path: Path,
+) -> None:
+    file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    moved = tmp_path / "moved"
+    store.marker_dir.rename(moved)
+    try:
+        store.marker_dir.symlink_to(moved, target_is_directory=True)
+    except OSError:
+        pytest.skip("host does not permit creating symlinks")
+    with pytest.raises(AttachmentLostInRestartError):
+        asyncio.run(store.get(file_uuid))
+    assert asyncio.run(store.evict(file_uuid))
+    assert (moved / f"{file_uuid}.bin").read_bytes() == b"hello"
+    assert (moved / f"{file_uuid}.meta").is_file()
+
+
+def test_upload_restart_and_eviction_support_long_storage_paths(tmp_path: Path) -> None:
+    root = tmp_path.joinpath(*["upload-segment-" + "x" * 40] * 5)
+    assert len(str(root)) > 260
+    try:
+        store = UploadStore(marker_dir=root)
+        file_uuid = asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+        restarted = UploadStore(marker_dir=root)
+        assert asyncio.run(restarted.get(file_uuid))[0] == b"hello"
+        assert asyncio.run(restarted.evict(file_uuid))
+        assert not list(native_io_path(root).iterdir())
+    finally:
+        shutil.rmtree(native_io_path(root), ignore_errors=True)
+
+
+def test_failed_metadata_write_releases_capacity_and_files(
+    store: UploadStore, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    write = store._atomic_write
+
+    def fail_metadata(path: Path, payload: bytes) -> None:
+        if path.suffix == ".meta":
+            raise OSError("synthetic disk failure")
+        write(path, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_atomic_write", fail_metadata)
+        with pytest.raises(OSError, match="synthetic disk failure"):
+            asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+    assert not store._entries
+    assert not list(store.marker_dir.iterdir())
+    asyncio.run(store.put("r.txt", "text/plain", b"hello"))
+
+
+def test_concurrent_uploads_reserve_capacity_before_disk_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = UploadStore(marker_dir=tmp_path / "inbound", max_total_bytes=10)
+    entered, release = threading.Event(), threading.Event()
+    persist = store._persist_entry
+
+    def paused_write(*args: Any) -> None:
+        entered.set()
+        assert release.wait(timeout=5), "test failed to release the disk writer"
+        persist(*args)
+
+    monkeypatch.setattr(store, "_persist_entry", paused_write)
+
+    async def run() -> None:
+        first = asyncio.create_task(store.put("a.txt", "text/plain", b"a" * 6))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            with pytest.raises(UploadStoreFullError):
+                await store.put("b.txt", "text/plain", b"b" * 6)
+        finally:
+            release.set()
+            file_uuid = await first
+        assert (await store.get(file_uuid))[0] == b"a" * 6
+        assert len(list(store.marker_dir.iterdir())) == 2
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancellations", [1, 3])
+def test_cancelled_upload_finishes_worker_before_releasing_files(
+    store: UploadStore, monkeypatch: pytest.MonkeyPatch, cancellations: int,
+) -> None:
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    persist = store._persist_entry
+
+    def paused_write(*args: Any) -> None:
+        entered.set()
+        assert release.wait(timeout=5), "test failed to release the disk writer"
+        persist(*args)
+        completed.set()
+
+    monkeypatch.setattr(store, "_persist_entry", paused_write)
+
+    async def run() -> None:
+        pending = asyncio.create_task(store.put("a.txt", "text/plain", b"hello"))
+        try:
+            assert await asyncio.to_thread(entered.wait, 5)
+            for _ in range(cancellations):
+                pending.cancel()
+                await asyncio.sleep(0)
+        finally:
+            release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert await asyncio.to_thread(completed.wait, 5)
+        assert not store._entries
+        assert not list(store.marker_dir.iterdir())
+        file_uuid = await store.put("b.txt", "text/plain", b"world")
+        assert (await store.get(file_uuid))[0] == b"world"
+
+    asyncio.run(run())
 
 
 def test_upload_too_large_30mb_plus_rejected(store: UploadStore) -> None:
@@ -908,7 +1172,7 @@ def test_file_uuid_opaque_reference_resolves_with_store_mime(tmp_path: Path) -> 
 
 
 # ---------------------------------------------------------------------------
-# Aggregate RAM cap: reject-on-full, never evict.
+# Aggregate temporary storage cap: reject-on-full, never evict.
 # ---------------------------------------------------------------------------
 
 
@@ -989,7 +1253,7 @@ def test_payload_larger_than_total_cap_is_permanent_413(tmp_path: Path) -> None:
 
 
 def test_non_positive_total_cap_falls_back_to_default(tmp_path: Path) -> None:
-    # The RAM cap can be raised but not disabled: a non-positive config value
+    # The storage cap can be raised but not disabled: a non-positive config value
     # falls back to the default at app construction (with a boot warning).
     pytest.importorskip("starlette.testclient")
     from opensquilla.gateway.app import create_gateway_app

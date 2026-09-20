@@ -171,10 +171,44 @@ class GatewayAppSettingsPort:
     replace = staticmethod(_update_config_in_place)
     reconcile_routing = staticmethod(reconcile_model_routing_write)
 
-    @staticmethod
-    def validate_routing(previous: Any, candidate: Any, explicit_paths: set[str]) -> None:
+    def validate_routing(self, previous: Any, candidate: Any, explicit_paths: set[str]) -> None:
         from opensquilla.onboarding.router_policy import validate_router_reactivation
 
+        previous_router = getattr(previous, "squilla_router", None)
+        candidate_router = getattr(candidate, "squilla_router", None)
+        owns_preset = any(
+            path == prefix or path.startswith(prefix + ".")
+            for path in explicit_paths
+            for prefix in (
+                "squilla_router.tier_profile",
+                "squilla_router.preset_binding",
+                "squilla_router.tiers",
+            )
+        )
+        full_roundtrip = (
+            candidate_router is not None
+            and self.source == "config.apply"
+            and all(
+                "squilla_router." + name in explicit_paths
+                for name in type(candidate_router).model_fields
+            )
+        )
+        if (
+            previous_router is not None
+            and candidate_router is not None
+            and (not owns_preset or full_roundtrip)
+            and candidate_router.model_dump() == previous_router.model_dump()
+        ):
+            # Generic settings writes rebuild a full dump. An unchanged
+            # Router subtree must not turn implicit provider defaults into
+            # an explicit custom/default-profile choice merely by round trip.
+            # A targeted preset write (including explicit null) owns presence;
+            # only an entirely equal full config.apply dump is a no-op.
+            object.__setattr__(
+                candidate_router,
+                "__pydantic_fields_set__",
+                set(previous_router.model_fields_set),
+            )
         validate_router_reactivation(previous, candidate, explicit_paths=explicit_paths)
 
     routing_snapshot = staticmethod(model_routing_public_snapshot)

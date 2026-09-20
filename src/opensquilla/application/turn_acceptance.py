@@ -86,9 +86,17 @@ class DurableTurnAdmission:
             if command.receipt_replay_only:
                 return await _replay_retired_request(command, ports)
             try:
+                if command.initial_model is not None or command.initial_provider is not None:
+                    if command.intent != "new_chat" or not command.intent_was_provided:
+                        raise ValueError("initialModel requires explicit new_chat intent")
                 if command.surface == "webchat":
                     if ports.sessions is None:
-                        if command.initial_collaboration_mode or command.initial_routing_mode:
+                        if (
+                            command.initial_collaboration_mode
+                            or command.initial_routing_mode
+                            or command.initial_model is not None
+                            or command.initial_provider is not None
+                        ):
                             raise AdmissionUnavailableError(
                                 "Initial session controls require atomic turn acceptance"
                             )
@@ -227,6 +235,11 @@ async def _accept_turn_in_scope(
 ) -> AdmitTurnResult:
     key = command.session_key
     message_text = command.message
+    workspace_files = list(command.workspace_files)
+    if workspace_files and (not ports.is_owner or not command.source.is_web):
+        raise AdmissionError(
+            "WORKSPACE_FILES_FORBIDDEN", "Workspace files require an owner Web session.",
+        )
     page_context = command.page_context
     if page_context is not None and (not ports.is_owner or not command.source.is_web):
         raise AdmissionError(
@@ -264,6 +277,17 @@ async def _accept_turn_in_scope(
         raise ValueError("initialRoutingMode does not match initial_routing_mode")
     if initial_routing_mode is None:
         initial_routing_mode = param_initial_routing_mode
+    initial_model = command.initial_model
+    initial_provider = command.initial_provider
+    if initial_model is not None:
+        if not isinstance(initial_model, str) or not initial_model.strip():
+            raise ValueError("initialModel must be a non-empty string")
+        if initial_routing_mode not in {None, "direct"}:
+            raise ValueError("initialModel requires direct routing")
+        if fork_before_message_id is not None:
+            raise ValueError("initialModel cannot be combined with a transcript fork")
+    if initial_provider is not None and initial_model is None:
+        raise ValueError("initialProvider requires initialModel")
     raw_workspace_id = command.workspace_id
     workspace_id: str | None = None
     if raw_workspace_id is not None:
@@ -417,6 +441,10 @@ async def _accept_turn_in_scope(
                 replay_response["routing"] = await ports.routing_snapshot(
                     previous_acceptance.receipt.accepted_session_key,
                 )
+            if initial_model is not None:
+                replay_response["acceptedModel"] = {
+                    "model": initial_model, "provider": initial_provider,
+                }
             return replay_response
 
 
@@ -465,6 +493,14 @@ async def _accept_turn_in_scope(
             accepted=False,
         )
 
+    if initial_model is not None:
+        ports.validate_initial_model(
+            session_key=key,
+            model=initial_model,
+            provider=initial_provider,
+            routing_mode=initial_routing_mode,
+        )
+
     selected_workspace = None
     workspace_guard = None
     if workspace_id is not None:
@@ -500,6 +536,10 @@ async def _accept_turn_in_scope(
         )
     if initial_routing_mode is not None:
         create_kwargs["model_routing_mode"] = initial_routing_mode
+    if initial_model is not None:
+        create_kwargs["model"] = initial_model
+        if initial_provider is not None:
+            create_kwargs["provider_override"] = initial_provider
     supports_prepared_acceptance = all(
         callable(value)
         for value in (
@@ -516,7 +556,9 @@ async def _accept_turn_in_scope(
         and callable(getattr(task_runtime_candidate, "abort_reservation", None))
     )
     if (
-        initial_collaboration_mode is not None or initial_routing_mode is not None
+        initial_collaboration_mode is not None
+        or initial_routing_mode is not None
+        or initial_model is not None
     ) and not supports_task_runtime_activation:
         raise AdmissionUnavailableError("Initial session controls require atomic turn acceptance")
 
@@ -559,10 +601,16 @@ async def _accept_turn_in_scope(
     except AdmissionStorageBusyError as exc:
         raise _preaccept_storage_busy_error(exc) from exc
 
-    if (initial_collaboration_mode is not None or initial_routing_mode is not None) and (
+    if (
+        initial_collaboration_mode is not None
+        or initial_routing_mode is not None
+        or initial_model is not None
+    ) and (
         atomic_intent_plan is None or getattr(atomic_intent_plan, "action", None) != "create"
     ):
         raise ValueError("Initial session controls require atomic session creation")
+    if initial_model is not None and getattr(session, "model_routing_mode", None) != "direct":
+        raise ValueError("initialModel requires direct routing")
 
     if fork_before_message_id is not None:
         parent_key = key
@@ -892,6 +940,8 @@ async def _accept_turn_in_scope(
     )
     agent_id = prepared_route.agent_id
     route_envelope = prepared_route.envelope
+    if workspace_files:
+        route_envelope.metadata["workspace_files"] = workspace_files
     turn_id = prepared_route.turn_id
     mode_resolution = prepared_route.mode_resolution
     guest_profile = prepared_route.guest_profile
@@ -1105,7 +1155,9 @@ async def _accept_turn_in_scope(
             "Plan implementation requires atomic TaskRuntime acceptance"
         )
     if (
-        initial_collaboration_mode is not None or initial_routing_mode is not None
+        initial_collaboration_mode is not None
+        or initial_routing_mode is not None
+        or initial_model is not None
     ) and not atomic_runtime_acceptance:
         raise AdmissionUnavailableError(
             "Initial session controls require atomic TaskRuntime acceptance"
@@ -1131,7 +1183,7 @@ async def _accept_turn_in_scope(
     if prepared_acceptance:
         persist_content = message_text
         if (
-            raw_attachments or display_text is not None
+            raw_attachments or workspace_files or display_text is not None
             or page_context is not None or command.selected_skills
         ):
             if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
@@ -1147,6 +1199,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
+                **({"workspace_files": workspace_files} if workspace_files else {}),
                 **({"selected_skills": list(command.selected_skills)}
                    if command.selected_skills else {}),
             )
@@ -1161,6 +1214,7 @@ async def _accept_turn_in_scope(
         )
         if (
             not raw_attachments
+            and not workspace_files
             and display_text is None
             and page_context is None
             and not command.selected_skills
@@ -1721,6 +1775,8 @@ async def _accept_turn_in_scope(
                         "sessions.send.initial_collaboration_emit_failed",
                         session_key=key,
                     )
+        if initial_model is not None:
+            response["acceptedModel"] = {"model": initial_model, "provider": initial_provider}
         if initial_routing_mode is not None:
             response["acceptedRouting"] = {"mode": initial_routing_mode}
             response["routing"] = await ports.routing_snapshot(key)
@@ -1956,7 +2012,7 @@ async def _accept_turn_in_scope(
         if callable(get_transcript):
             fresh_user_session = not bool(await get_transcript(key))
         if (
-            raw_attachments or display_text is not None
+            raw_attachments or workspace_files or display_text is not None
             or page_context is not None or command.selected_skills
         ):
             # Stamp up-front so both the stored envelope and the LLM path agree.
@@ -1974,6 +2030,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
+                **({"workspace_files": workspace_files} if workspace_files else {}),
                 **({"selected_skills": list(command.selected_skills)}
                    if command.selected_skills else {}),
             )

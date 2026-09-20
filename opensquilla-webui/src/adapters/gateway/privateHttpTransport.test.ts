@@ -1,3 +1,6 @@
+import { spawnSync } from 'node:child_process'
+import { readFileSync } from 'node:fs'
+import { ModuleKind, ScriptTarget, transpileModule } from '@typescript/typescript6'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
@@ -161,6 +164,12 @@ describe('private Gateway HTTP transport', () => {
 
   it('parses RFC5987 filenames and neutralizes Windows path hazards', async () => {
     const cases = [
+      ['attachment; filename="normal.zip"', 'normal.zip'],
+      ['attachment; filename=plain.zip', 'plain.zip'],
+      ['attachment; filename="quoted\\"name.zip"', 'quoted_name.zip'],
+      ['attachment; filename="back\\\\slash.zip"', 'back_slash.zip'],
+      ['attachment; filename="unfinished.zip', '_unfinished.zip'],
+      ["attachment; filename=old.zip; filename*=UTF-8''new.zip", 'new.zip'],
       ["attachment; filename *= UTF-8''b%C3%BCndel.zip", 'bündel.zip'],
       ["attachment; filename=\"ok.zip\"; filename*=UTF-8''%E0%A4%ZZ", 'ok.zip'],
       ['attachment; filename="C:\\logs\\report.zip"', 'logs_report.zip'],
@@ -181,6 +190,42 @@ describe('private Gateway HTTP transport', () => {
       expect(binary.metadata.filename).toBe(filename)
       await binary.blob()
     }
+  })
+
+  it('handles unterminated escaped filenames without blocking the transport', () => {
+    // Run the real transport in a child: a blocked regex also blocks Vitest timers.
+    const source = readFileSync(new URL('./privateHttpTransport.ts', import.meta.url), 'utf8')
+    const { outputText } = transpileModule(source, {
+      compilerOptions: { module: ModuleKind.ESNext, target: ScriptTarget.ES2022 },
+    })
+    const moduleUrl = `data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`
+    const script = `
+      import assert from 'node:assert/strict';
+      const { createPrivateHttpTransport } = await import(${JSON.stringify(moduleUrl)});
+      for (const count of [64, 300_000]) {
+        const header = 'attachment; filename="' + String.fromCharCode(92).repeat(count);
+        const transport = createPrivateHttpTransport({
+          baseUrl: 'https://control.example/',
+          fetch: async () => new Response('x', {
+            headers: { 'content-disposition': header },
+          }),
+        });
+        for (const binary of [
+          await transport.requestBinary('/api/artifact'),
+          await transport.fetchExternalArtifact('https://artifact.example/download'),
+        ]) {
+          assert.equal(binary.metadata.filename, '_'.repeat(Math.min(1 + count / 2, 255)));
+          assert.equal(await (await binary.blob()).text(), 'x');
+        }
+      }
+    `
+    const child = spawnSync(process.execPath, ['--input-type=module'], {
+      input: script,
+      encoding: 'utf8',
+      timeout: 10_000,
+    })
+    expect(child.error).toBeUndefined()
+    expect(child.status, child.stdout + child.stderr).toBe(0)
   })
 
   it('maps HTTP status and safe response payload into one stable error', async () => {

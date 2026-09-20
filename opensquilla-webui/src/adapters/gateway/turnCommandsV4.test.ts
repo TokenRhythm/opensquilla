@@ -46,6 +46,20 @@ describe('v4 TurnCommands Adapter', () => {
     expect(request).toHaveBeenCalledWith(CHAT_SEND_METHOD, params)
   })
 
+  it('validates a pinned first turn with selected skills, workspace references and imported files', async () => {
+    const request = vi.fn(async <T>() => ({ sessionKey: 'agent:main:test' } as T)) as TurnCommandsTransport['request']
+    const commands = createV4TurnCommands({ request, supports: () => true })
+    const params = {
+      message: 'edit the notes', sessionKey: 'agent:main:test',
+      intent: 'new_chat', initialModel: 'model-a', initialProvider: 'provider-a', initialRoutingMode: 'direct' as const,
+      selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }],
+      workspaceFiles: [{ workspaceId: 'project-1', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' }],
+      attachments: [{ type: 'application/pdf', mime: 'application/pdf', name: 'original.pdf', file_uuid: 'fixture-file' }],
+    }
+    await commands.send({ kind: 'new-turn', params })
+    expect(request).toHaveBeenCalledWith(CHAT_SEND_METHOD, params)
+  })
+
   it.each(['documentContext', 'document_context', 'promptAnnotationIds', 'prompt_annotation_ids'])(
     'requires a fresh user decision before replaying retired %s input', key => {
       expect(() => toWireSendParams({
@@ -247,5 +261,26 @@ describe('v4 TurnCommands Adapter', () => {
     })).resolves.toMatchObject({ accepted: true })
     expect(request).toHaveBeenNthCalledWith(1, SESSIONS_STEER_V2_METHOD, expect.any(Object))
     expect(request).toHaveBeenNthCalledWith(2, SESSIONS_PENDING_INPUTS_STEER_METHOD, expect.any(Object))
+  })
+})
+
+
+describe('initial model wire identity', () => {
+  it('preserves legacy first-send recovery model and provider fields', () => {
+    expect(toWireSendParams({
+      message: 'hello', sessionKey: 'new-task', intent: 'new_chat',
+      initial_model: 'model-a', initial_provider: 'openai',
+    })).toEqual({
+      message: 'hello', sessionKey: 'new-task', intent: 'new_chat',
+      initial_model: 'model-a', initial_provider: 'openai',
+    })
+  })
+  it('prefers explicit canonical selection over legacy recovery fields', () => {
+    expect(toWireSendParams({
+      message: 'hello', sessionKey: 'new-task', initialModel: 'model-b', initialProvider: 'anthropic',
+      initial_model: 'model-a', initial_provider: 'openai',
+    })).toEqual({
+      message: 'hello', sessionKey: 'new-task', initialModel: 'model-b', initialProvider: 'anthropic',
+    })
   })
 })

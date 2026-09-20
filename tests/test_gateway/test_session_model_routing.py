@@ -25,6 +25,87 @@ from opensquilla.gateway.session_model_routing import (
 from opensquilla.tools.types import ToolContext
 
 
+@pytest.mark.parametrize("provider", ["tokenrhythm", "deepseek"])
+def test_session_router_materializes_implicit_provider_tiers_without_global_changes(
+    provider: str,
+) -> None:
+    from opensquilla.provider.preset_registry import get_preset
+
+    config = GatewayConfig(
+        llm={"provider": provider, "model": "configured-direct-model"},
+        squilla_router={"enabled": False},
+    )
+    original = config.squilla_router.model_dump()
+    original_fields = set(config.squilla_router.model_fields_set)
+
+    accepted = capture_model_routing_config(config, session_mode="router")
+
+    preset = get_preset(provider)
+    assert preset is not None
+    assert accepted.squilla_router.tiers == preset.tier_defaults()
+    assert accepted.squilla_router.enabled is True
+    assert accepted.squilla_router.rollout_phase == "full"
+    assert config.squilla_router.model_dump() == original
+    assert config.squilla_router.model_fields_set == original_fields
+
+
+@pytest.mark.parametrize(
+    ("provider", "router_settings"),
+    [
+        ("tokenrhythm", {"preset_binding": "custom"}),
+        ("tokenrhythm", {"tier_profile": None}),
+        ("deepseek", {"tier_profile": "deepseek"}),
+        (
+            "tokenrhythm",
+            {
+                "cross_provider_tiers": True,
+                "tiers": {
+                    "c0": {"provider": "deepseek", "model": "custom-cheap-model"},
+                    "c1": {"provider": "openrouter", "model": "custom/routed-model"},
+                },
+            },
+        ),
+    ],
+)
+def test_session_router_preserves_explicit_operator_tiers_and_provider_policy(
+    provider: str, router_settings: dict[str, Any],
+) -> None:
+    config = GatewayConfig(
+        llm={"provider": provider, "model": "configured-direct-model"},
+        squilla_router={"enabled": False, **router_settings},
+    )
+    original = config.squilla_router.model_dump()
+
+    accepted = capture_model_routing_config(config, session_mode="router")
+
+    assert accepted.squilla_router.tiers == original["tiers"]
+    assert accepted.squilla_router.tier_profile == original["tier_profile"]
+    assert accepted.squilla_router.cross_provider_tiers == original["cross_provider_tiers"]
+    assert accepted.squilla_router.tier_provider_mismatch == original["tier_provider_mismatch"]
+    assert config.squilla_router.model_dump() == original
+
+
+def test_session_router_follow_primary_reuses_provider_default_policy() -> None:
+    from opensquilla.provider.preset_registry import get_preset
+
+    config = GatewayConfig(
+        llm={"provider": "tokenrhythm", "model": "configured-direct-model"},
+        squilla_router={
+            "enabled": False,
+            "preset_binding": "follow_primary",
+            "tiers": {"c0": {"provider": "openrouter", "model": "old-primary/model"}},
+        },
+    )
+    original = config.squilla_router.model_dump()
+
+    accepted = capture_model_routing_config(config, session_mode="router")
+
+    preset = get_preset("tokenrhythm")
+    assert preset is not None
+    assert accepted.squilla_router.tiers == preset.tier_defaults()
+    assert config.squilla_router.model_dump() == original
+
+
 @pytest.mark.asyncio
 async def test_interactive_session_resolution_overlays_global_without_mutating_it() -> None:
     config = GatewayConfig(

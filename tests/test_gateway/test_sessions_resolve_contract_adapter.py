@@ -253,4 +253,15 @@ def test_legacy_v4_frame_reaches_new_gateway_over_real_websocket() -> None:
         "projectWorkspaceDeferred": False,
         "created_at": 1000,
         "updated_at": 2000,
+        "title": "Web chat",
+        "runStatus": "idle",
+        "reference": {
+            "version": 1,
+            "kind": "session",
+            "id": "agent:main:webchat:default",
+            "label": "Web chat",
+            "scope": {"sessionKey": "agent:main:webchat:default"},
+            "state": {"available": True, "runStatus": "idle"},
+            "capabilities": {"open": True, "copy": True},
+        },
     }

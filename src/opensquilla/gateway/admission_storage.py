@@ -295,6 +295,8 @@ class GatewayAdmissionSessions:
         workspace_id: str | None,
         origin: AdmissionProjectOrigin | None,
         model_routing_mode: str | None,
+        model: str | None,
+        provider_override: str | None,
     ) -> dict[str, Any]:
         result: dict[str, Any] = {}
         if display_name is not None:
@@ -312,6 +314,10 @@ class GatewayAdmissionSessions:
             }
         if model_routing_mode is not None:
             result["model_routing_mode"] = model_routing_mode
+        if model is not None:
+            result["model"] = model
+        if provider_override is not None:
+            result["provider_override"] = provider_override
         return result
 
     async def get_or_create(
@@ -341,13 +347,17 @@ class GatewayAdmissionSessions:
         workspace_id: str | None = None,
         origin: AdmissionProjectOrigin | None = None,
         model_routing_mode: str | None = None,
+        model: str | None = None,
+        provider_override: str | None = None,
     ) -> PreparedAdmissionIntent:
         with translate_admission_failure():
             result = await getattr(self.raw, "prepare_intent")(
                 key,
                 SessionIntent(intent),
                 agent_id=agent_id,
-                **self._creation(display_name, workspace_id, origin, model_routing_mode),
+                **self._creation(
+                    display_name, workspace_id, origin, model_routing_mode, model, provider_override
+                ),
             )
         if isinstance(result, PreparedAdmissionIntent):
             return result
@@ -363,13 +373,17 @@ class GatewayAdmissionSessions:
         workspace_id: str | None = None,
         origin: AdmissionProjectOrigin | None = None,
         model_routing_mode: str | None = None,
+        model: str | None = None,
+        provider_override: str | None = None,
     ) -> tuple[SessionIdentity, bool]:
         with translate_admission_failure():
             result = await getattr(self.raw, "apply_intent")(
                 key,
                 SessionIntent(intent),
                 agent_id=agent_id,
-                **self._creation(display_name, workspace_id, origin, model_routing_mode),
+                **self._creation(
+                    display_name, workspace_id, origin, model_routing_mode, model, provider_override
+                ),
             )
         node, fresh = result
         if isinstance(node, SessionIdentity) and isinstance(fresh, bool):

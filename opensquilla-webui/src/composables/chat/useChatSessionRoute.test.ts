@@ -63,6 +63,17 @@ describe('useChatSessionRoute', () => {
     })
   })
 
+  it('recovers an attachment-only guest draft from the matching tab history scope', () => {
+    const key = `agent:main:webchat:guest:${'a'.repeat(64)}:attachment-draft`
+    const scopedDraft = { sessionKey: key, agentId: 'main', projectId: '', hasAttachments: true }
+    const route = useChatSessionRoute(ref(''), () => 'a'.repeat(64))
+    expect(route.resolveInitialSession({ scopedDraft })).toMatchObject({ sessionKey: key, recoveredDraft: true })
+    expect(localStorage.length).toBe(0)
+    expect(route.resolveInitialSession({ scopedDraft: { ...scopedDraft, hasAttachments: false } }).sessionKey).not.toBe(key)
+    expect(route.resolveInitialSession({ scopedDraft: { ...scopedDraft, projectId: 'other-project' } }).sessionKey).not.toBe(key)
+    expect(route.resolveInitialSession({ scopedDraft: { ...scopedDraft, sessionKey: 'not-a-session' } }).sessionKey).not.toBe('not-a-session')
+  })
+
   it('binds a pre-Hello fresh draft once while preserving text typed before the watcher flush', async () => {
     const ownerId = ref<string | null>(null)
     const sessionKey = ref('')

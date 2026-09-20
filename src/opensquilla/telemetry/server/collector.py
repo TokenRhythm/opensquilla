@@ -1,4 +1,4 @@
-"""Starlette ingress for one strictly isolated telemetry consent scope."""
+"""Starlette ingress for one strictly isolated metrics consent scope."""
 
 from __future__ import annotations
 

@@ -1,9 +1,8 @@
 """Snapshot regression net for ``CompactionAndHistoryStage`` through ``TurnRunner._run_turn``.
 
 The corpus enumerates every input shape the stage has been observed to
-handle and pins the output snapshot. The harness patches the four
-BEFORE-turn helpers the slice owns (``_maybe_compact_on_t3_upgrade``,
-``_maybe_preflight_compact``, ``_load_history``,
+handle and pins the output snapshot. The harness patches the three
+BEFORE-turn helpers the slice owns (``_maybe_preflight_compact``, ``_load_history``,
 ``_prepend_request_context_prompt``) plus reuses the upstream stage's
 patch helpers from the agent-bootstrap snapshot harness so the slice
 runs against deterministic stubs.
@@ -18,8 +17,11 @@ contract and the exception-propagation contract.
 
 from __future__ import annotations
 
+import base64
+import json
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from typing import Any
 
@@ -129,20 +131,6 @@ def _patch_thinking(runner: TurnRunner) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _patch_t3(runner, *, return_value="not_applicable", raises=None, calls=None):
-    async def _t3(
-        self, session_key, turn, context_window_tokens,  # noqa: ARG001, ARG002
-        *, compaction_provider=None, compaction_model=None,
-    ):
-        if calls is not None:
-            calls.append({"session_key": session_key})
-        if raises is not None:
-            raise raises("t3 boom")
-        return return_value
-
-    runner._maybe_compact_on_t3_upgrade = _t3.__get__(runner, TurnRunner)
-
-
 def _patch_preflight(runner, *, raises=None, calls=None):
     async def _preflight(
         self, session_key, context_window_tokens,  # noqa: ARG001, ARG002
@@ -234,8 +222,6 @@ class _RecordingCompactionHook:
 
 _CASE_BASE: dict[str, Any] = dict(
     session_key="agent:main:s1",
-    t3_return="not_applicable",
-    t3_raises=None,
     preflight_raises=None,
     history_return=None,
     history_raises=None,
@@ -253,15 +239,8 @@ def _case(case_id: str, **overrides: Any) -> tuple[str, dict[str, Any]]:
 
 
 _CORPUS: list[tuple[str, dict[str, Any]]] = [
-    _case("neither_compaction_fires"),
-    _case("t3_upgrade_fires", t3_return="handled"),
-    _case("t3_disabled_preflight_fires", t3_return="not_applicable"),
-    _case(
-        "cron_prefix_t3_not_applicable",
-        session_key="cron:tick:s1",
-        t3_return="not_applicable",
-    ),
-    _case("compaction_circuit_open", t3_return="handled"),
+    _case("preflight_runs"),
+    _case("cron_prefix_preflight_runs", session_key="cron:tick:s1"),
     _case(
         "durable_summaries_exist",
         history_return="SUMMARY-X",
@@ -336,13 +315,7 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
     _patch_memory_helpers(runner)
     _patch_observability(runner)
 
-    call_log: dict[str, list] = {"t3": [], "preflight": [], "history": []}
-    _patch_t3(
-        runner,
-        return_value=case["t3_return"],
-        raises=case["t3_raises"],
-        calls=call_log["t3"],
-    )
+    call_log: dict[str, list] = {"preflight": [], "history": []}
     _patch_preflight(
         runner,
         raises=case["preflight_raises"],
@@ -367,11 +340,9 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
             _RequestContextPrependAdapter,
             _TurnRunnerHistoryLoaderAdapter,
             _TurnRunnerPreflightCompactionAdapter,
-            _TurnRunnerT3UpgradeCompactionAdapter,
         )
 
         runner._compaction_and_history_stage = CompactionAndHistoryStage(
-            t3_upgrade=_TurnRunnerT3UpgradeCompactionAdapter(runner),
             preflight=_TurnRunnerPreflightCompactionAdapter(runner),
             history_loader=_TurnRunnerHistoryLoaderAdapter(runner),
             request_context_prepender=_RequestContextPrependAdapter(),
@@ -381,7 +352,7 @@ def _setup_runner(case: dict[str, Any]) -> tuple[TurnRunner, dict[str, list]]:
     return runner, call_log
 
 
-async def _drive(runner: TurnRunner, case: dict[str, Any]):
+async def _drive(runner: TurnRunner, case: dict[str, Any], *, tool_context: Any = None):
     captured = None
     raised = None
     yielded: list[Any] = []
@@ -391,7 +362,7 @@ async def _drive(runner: TurnRunner, case: dict[str, Any]):
         agent_id="agent:main",
         model=None,
         attachments=[],
-        tool_context=None,
+        tool_context=tool_context,
         input_mode="user",
         persist_input=False,
         input_provenance=None,
@@ -436,9 +407,7 @@ async def test_compaction_and_history_stage_snapshot(
         assert len(yielded) == 1
         assert isinstance(yielded[0], ErrorEvent)
         assert yielded[0].code == "agent_error"
-        assert len(call_log["t3"]) == 1
-        if case["t3_return"] == "not_applicable":
-            assert len(call_log["preflight"]) == 1
+        assert len(call_log["preflight"]) == 1
         # And history must have been attempted once before raising.
         assert len(call_log["history"]) == 1
         return
@@ -457,14 +426,8 @@ async def test_compaction_and_history_stage_snapshot(
         f"  expected={expected_snapshot}\n  actual  ={captured}"
     )
 
-    # Routing assertions: t3 always invoked exactly once.
-    assert len(call_log["t3"]) == 1, f"{case_id}: t3 calls"
-    # Preflight invoked only on fall-through sentinels.
-    fall_through = case["t3_return"] == "not_applicable"
-    expected_pre_calls = 1 if fall_through else 0
-    assert len(call_log["preflight"]) == expected_pre_calls, (
-        f"{case_id}: preflight calls"
-    )
+    # Every ordinary turn reaches the single canonical preflight entry.
+    assert len(call_log["preflight"]) == 1, f"{case_id}: preflight calls"
     # History always loaded once.
     assert len(call_log["history"]) == 1
     assert (
@@ -497,16 +460,101 @@ async def test_unknown_vision_capability_does_not_skip_compaction() -> None:
 
     assert raised is None
     assert captured is not None
-    assert len(call_log["t3"]) == 1
     assert len(call_log["preflight"]) == 1
     assert len(call_log["history"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_compaction_keeps_file_paths_with_image_retention_disabled(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.session.compaction import (
+        CompactionConfig,
+        CompactionRequest,
+        compact_context,
+        compaction_replay_summary,
+    )
+    from opensquilla.tools.types import ToolContext
+    from tests.helpers.image_bytes import image_bytes
+
+    case = dict(_CASE_BASE)
+    runner, _ = _setup_runner(case)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = GatewayConfig()
+    config.workspace_dir = str(workspace)
+    config.attachments.media_root = str(tmp_path / "media")
+    config.attachments.persist_transcripts = False
+    runner._config = config
+    document_bytes = b"%PDF-1.4\nORIGINAL_DOCUMENT_BODY\n%%EOF"
+    document = {
+        "mime": "application/pdf", "name": "document.pdf",
+        "data": base64.b64encode(document_bytes).decode(),
+    }
+    image = {
+        "mime": "image/png", "name": "image.png",
+        "data": base64.b64encode(image_bytes()).decode(),
+    }
+    seen: dict[str, Any] = {}
+
+    async def summarize(**kwargs: Any) -> str:
+        seen["summary_input"] = kwargs["chunk_text"]
+        return "Continue reviewing the original document."
+
+    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", summarize)
+
+    async def preflight(
+        self: TurnRunner, *args: Any, attachment_path_resolver=None, **kwargs: Any,
+    ) -> None:
+        assert callable(attachment_path_resolver)
+        seen["image_path"] = attachment_path_resolver(image, "s1")
+        result = await compact_context(CompactionRequest(
+            session_id="s1", context_window_tokens=4_000,
+            entries=[
+                {
+                    "id": 1, "role": "user", "message_id": "file-message", "token_count": 5,
+                    "content": json.dumps({"text": "Review.", "attachments": [document, image]}),
+                },
+                {"id": 2, "role": "assistant", "content": "Received.", "token_count": 5},
+                {"id": 3, "role": "user", "content": "Continue.", "token_count": 5},
+                {"id": 4, "role": "assistant", "content": "Continuing.", "token_count": 5},
+            ],
+            config=CompactionConfig(
+                model="synthetic-model", api_key="synthetic-key", safety_margin=1.0,
+                protected_recent_messages=2, attachment_path_resolver=attachment_path_resolver,
+            ), forced_prefix_cut=2, trigger="message_count",
+        ))
+        seen["result"] = result
+
+    runner._maybe_preflight_compact = MethodType(preflight, runner)
+    captured, yielded, raised = await _drive(
+        runner, case, tool_context=ToolContext(workspace_dir=str(workspace)),
+    )
+
+    assert raised is None
+    assert captured is not None, yielded
+    assert seen["image_path"] is None
+    result = seen["result"]
+    assert result.removed_count == 2
+    assert result.summary_payload is not None
+    paths = [item["path"] for item in result.summary_payload["files_and_artifacts"]]
+    assert len(paths) == 1
+    path = paths[0]
+    assert path.startswith(".opensquilla/attachments/s1/")
+    assert (workspace / path).read_bytes() == document_bytes
+    assert path in seen["summary_input"]
+    assert path in compaction_replay_summary(result)
+    assert "ORIGINAL_DOCUMENT_BODY" not in seen["summary_input"]
+    assert image["data"] not in seen["summary_input"]
+    assert not list(workspace.rglob("*.png"))
 
 
 @pytest.mark.asyncio
 async def test_compaction_hook_fan_out(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When hooks are registered, the stage fires the 4-tuple sequence."""
+    """When hooks are registered, the stage fires one before/after pair."""
     case = dict(_CASE_BASE)
     case["hook"] = _RecordingCompactionHook()
     runner, _ = _setup_runner(case)
@@ -515,12 +563,7 @@ async def test_compaction_hook_fan_out(
     assert captured is not None
 
     hook = case["hook"]
-    assert hook.events == [
-        ("before", "t3_upgrade"),
-        ("after", "t3_upgrade"),
-        ("before", "preflight"),
-        ("after", "preflight"),
-    ]
+    assert hook.events == [("before", "preflight"), ("after", "preflight")]
 
 
 @pytest.mark.asyncio
@@ -533,22 +576,19 @@ async def test_raising_hook_does_not_break_turn(
     runner, call_log = _setup_runner(case)
     captured, _, raised = await _drive(runner, case)
 
-    # Turn still completes; t3 + preflight still fired.
+    # Turn still completes; preflight still fired.
     assert raised is None
     assert captured is not None
-    assert len(call_log["t3"]) == 1
     assert len(call_log["preflight"]) == 1
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("phase", ["t3", "preflight"])
 @pytest.mark.parametrize("supports_resolver", [False, True])
 async def test_attachment_path_adapter_preserves_legacy_runner_signatures(
-    phase: str, supports_resolver: bool,
+    supports_resolver: bool,
 ) -> None:
     from opensquilla.engine.turn_runner.harness import (
         _TurnRunnerPreflightCompactionAdapter,
-        _TurnRunnerT3UpgradeCompactionAdapter,
     )
 
     seen: dict[str, Any] = {}
@@ -556,22 +596,18 @@ async def test_attachment_path_adapter_preserves_legacy_runner_signatures(
     def resolver(attachment: dict[str, Any], session_key: str) -> str | None:
         return "assets/sample.png"
 
-    async def modern(*args: Any, attachment_path_resolver=None, **kwargs: Any) -> str:
+    async def modern(*args: Any, attachment_path_resolver=None, **kwargs: Any) -> None:
         seen["resolver"] = attachment_path_resolver
-        return "not_applicable"
+        return None
 
-    async def legacy(*args: Any, compaction_provider=None, compaction_model=None) -> str:
+    async def legacy(*args: Any, compaction_provider=None, compaction_model=None) -> None:
         seen["legacy_called"] = True
-        return "not_applicable"
+        return None
 
     runner = SimpleNamespace(
-        _maybe_compact_on_t3_upgrade=modern if supports_resolver else legacy,
         _maybe_preflight_compact=modern if supports_resolver else legacy,
     )
-    adapter = (
-        _TurnRunnerT3UpgradeCompactionAdapter(runner)
-        if phase == "t3" else _TurnRunnerPreflightCompactionAdapter(runner)
-    )
+    adapter = _TurnRunnerPreflightCompactionAdapter(runner)
     kwargs: dict[str, Any] = {
         "session_key": "agent:main:synthetic-compaction",
         "context_window_tokens": 64_000,
@@ -579,9 +615,6 @@ async def test_attachment_path_adapter_preserves_legacy_runner_signatures(
         "compaction_model": None,
         "attachment_path_resolver": resolver,
     }
-    if phase == "t3":
-        kwargs["turn"] = SimpleNamespace()
-
     await adapter.maybe_compact(**kwargs)
 
     assert seen == ({"resolver": resolver} if supports_resolver else {"legacy_called": True})

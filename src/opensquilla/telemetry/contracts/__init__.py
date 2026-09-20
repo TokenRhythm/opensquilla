@@ -1,4 +1,4 @@
-"""Public telemetry wire contracts.
+"""Public metrics wire contracts.
 
 The event variants are closed and versioned independently. Ingress code selects the leaf
 model through :data:`EVENT_MODELS` using both name and version before accepting

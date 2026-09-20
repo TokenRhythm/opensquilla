@@ -1,6 +1,17 @@
 import type { InjectionKey } from 'vue'
 import type { GatewayModelRoutingMode } from '@/types/modelRouting'
 
+export interface SessionModelSelection {
+  model: string
+  provider: string
+}
+
+/** Legacy sessions can have an explicit model without a pinned provider. */
+export interface StoredSessionModelSelection {
+  model: string
+  provider: string | null
+}
+
 export interface SessionRoutingSnapshot {
   key: string
   mode: GatewayModelRoutingMode
@@ -8,12 +19,15 @@ export interface SessionRoutingSnapshot {
   source: string
   initialized: boolean
   appliesTo: string
+  modelSelection?: StoredSessionModelSelection | null
 }
 
 export interface SessionRoutingSetInput {
   sessionKey: string
   mode: GatewayModelRoutingMode
   expectedRevision: number
+  /** Omitted preserves the current pin; null returns this session to defaults. */
+  modelSelection?: SessionModelSelection | null
 }
 
 export interface SessionRoutingSubscription {
@@ -27,6 +41,7 @@ export type SessionRoutingErrorCode =
   | 'conflict'
   | 'unavailable'
   | 'invalid'
+  | 'busy'
 
 export class SessionRoutingError extends Error {
   readonly code: SessionRoutingErrorCode

@@ -43,6 +43,9 @@ export type SessionDirectoryQueryOptions = RequestOptions
 export interface ResolvedSession {
   key: string
   id: string
+  model?: string | null
+  title?: string
+  runStatus?: string
 }
 
 export type SessionSearchSessionHit = { key: string; title: string; surface: string | null }

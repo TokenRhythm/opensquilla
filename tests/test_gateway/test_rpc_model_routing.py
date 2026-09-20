@@ -1098,6 +1098,8 @@ async def test_admin_config_hot_apply_does_not_broadcast_unchanged_routing(
         squilla_router={"enabled": False, "rollout_phase": "observe"},
     )
     ctx, events = _routing_event_ctx(config, monkeypatch)
+    before_fields = set(config.squilla_router.model_fields_set)
+    before_router = capture_model_routing_config(config, session_mode="router")
 
     response = await _apply_admin_routing_write(
         case,
@@ -1108,6 +1110,10 @@ async def test_admin_config_hot_apply_does_not_broadcast_unchanged_routing(
 
     assert events == []
     assert "model_routing" not in response
+    assert config.squilla_router.model_fields_set == before_fields
+    assert capture_model_routing_config(config, session_mode="router").squilla_router.tiers == (
+        before_router.squilla_router.tiers
+    )
 
 
 async def test_inactive_router_capability_change_broadcasts_public_snapshot(
@@ -1191,6 +1197,37 @@ async def test_safe_patch_noop_does_not_broadcast_model_routing_change(
 
     assert events == []
     assert "model_routing" not in response
+
+
+@pytest.mark.parametrize("case", ["config.set", "config.patch", "config.apply"])
+async def test_explicit_null_router_profile_keeps_operator_field_ownership(
+    case: str, tmp_path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(
+        config_path=str(tmp_path / f"explicit-null-{case}.toml"),
+        llm={"provider": "tokenrhythm", "model": "glm-5.1"},
+        llm_ensemble={"enabled": False},
+        squilla_router={"enabled": False},
+    )
+    original_tiers = config.squilla_router.tiers
+    assert "tier_profile" not in config.squilla_router.model_fields_set
+    ctx, _ = _routing_event_ctx(config, monkeypatch)
+
+    if case == "config.set":
+        await _handle_config_set({"path": "squilla_router.tier_profile", "value": None}, ctx)
+    elif case == "config.patch":
+        await _handle_config_patch({"patches": {"squilla_router.tier_profile": None}}, ctx)
+    else:
+        await _handle_config_apply({"config": {
+            "llm": {"provider": "tokenrhythm", "model": "glm-5.1"},
+            "llm_ensemble": {"enabled": False},
+            "squilla_router": {"enabled": False, "tier_profile": None},
+        }}, ctx)
+
+    assert "tier_profile" in config.squilla_router.model_fields_set
+    assert capture_model_routing_config(config, session_mode="router").squilla_router.tiers == (
+        original_tiers
+    )
 
 
 async def test_unrelated_router_patch_preserves_existing_rollout_fields(tmp_path) -> None:

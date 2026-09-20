@@ -319,3 +319,29 @@ async def test_pending_input_rejects_new_session_routing_before_staging() -> Non
 
     assert caught.value.code == "PENDING_INITIAL_ROUTING_UNSUPPORTED"
     assert caught.value.retryable is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snake", [False, True])
+async def test_pending_input_rejects_new_task_model_before_staging(snake) -> None:
+    adapter = GatewayPendingInputQueueAdapter(object())
+    with pytest.raises(RpcHandlerError) as caught:
+        await adapter.enqueue({
+            "key": "agent:main:webchat:model-pending", "message": "queued first turn",
+            "pendingInputId": "model-input", "clientRequestId": "model-request",
+            "clientMessageId": "model-message", "intent": "new_chat",
+            "initial_model" if snake else "initialModel": "synthetic-model",
+            "initial_provider" if snake else "initialProvider": "openai",
+        })
+    assert caught.value.code == "PENDING_INITIAL_MODEL_UNSUPPORTED"
+    assert caught.value.retryable is False
+
+
+def test_pending_payload_keeps_pin_identity_for_recovery():
+    turn = decode_admit_turn({
+        "key": "agent:main:webchat:model", "message": "hello", "intent": "new_chat",
+        "initialModel": "synthetic-model", "initialProvider": "openai",
+    })
+    payload = pending_input_payload(turn, False)
+    assert payload["initialModel"] == "synthetic-model"
+    assert payload["initialProvider"] == "openai"

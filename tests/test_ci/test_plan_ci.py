@@ -135,6 +135,28 @@ def _windows_partitions_for(*paths: str) -> list[str]:
     return sorted({ownership[path] for path in paths})
 
 
+@pytest.mark.parametrize("path", [
+    "src/opensquilla/mcp/stdio.py",
+    "src/opensquilla/mcp/sdk_client.py",
+    "src/opensquilla/mcp_server/server.py",
+    "tests/test_mcp/test_sdk_client.py",
+    "tests/test_mcp_server/test_protocol_smoke.py",
+])
+def test_mcp_changes_run_native_transport_and_frozen_probes_on_every_platform(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, path)
+    assert {"desktop-recovery-e2e", "frontend-artifact"} <= set(plan["required_suites"])
+    native_platforms = {
+        os_name for os_name, shard in _matrix(plan)
+        if shard in {"ownership", "ownership-workbench", "all"}
+    }
+    assert native_platforms == {"ubuntu-latest", "macos-latest", "windows-latest"}
+    inputs = suite_config["suites"]["desktop-recovery-e2e"]["execution_inputs"]
+    assert {"src/opensquilla/mcp/**", "src/opensquilla/mcp_server/**",
+            "tests/test_mcp/**", "tests/test_mcp_server/**"} <= set(inputs)
+
+
 def test_docs_only_plan_is_small_and_canonical(
     tmp_path: Path, suite_config: dict[str, Any]
 ) -> None:

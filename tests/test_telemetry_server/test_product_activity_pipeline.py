@@ -34,6 +34,8 @@ _FIRST_DAY = datetime(2026, 9, 1, 12, tzinfo=UTC)
 @pytest.fixture
 def activity_clock(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     clock = SimpleNamespace(now=_FIRST_DAY)
+    monkeypatch.setattr("opensquilla.telemetry.growth_sink.get_device_id", lambda: "1" * 64)
+    monkeypatch.setattr("opensquilla.telemetry.runtime.get_device_id", lambda: "1" * 64)
     open_outbox = TelemetryOutbox.open
 
     async def open_with_clock(_cls, path, scope, **kwargs):
@@ -104,7 +106,7 @@ def _use_transport(monkeypatch: pytest.MonkeyPatch, client: httpx.AsyncClient, c
     )
 
 
-async def test_product_activity_sink_upload_counts_profiles_across_surfaces_and_days(
+async def test_product_activity_sink_upload_deduplicates_profiles_surfaces_and_days(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     activity_clock,
@@ -147,7 +149,7 @@ async def test_product_activity_sink_upload_counts_profiles_across_surfaces_and_
             assert _counts(queries, "2026-09-02") == (1, 1)
             assert await second.record_product_active(surface=ClientSurface.WEB)
             await second_runtime.upload_once(TelemetryScope.GROWTH)
-            assert _counts(queries, "2026-09-02") == (2, 2)
+            assert _counts(queries, "2026-09-02") == (1, 1)
             assert _counts(queries, "2026-09-01") == (1, 1)
             assert (await app.state.telemetry_storage.stats()).event_count == 6
             assert (
@@ -164,13 +166,14 @@ async def test_product_activity_sink_upload_counts_profiles_across_surfaces_and_
             }
             assert len({event["analytics_user_id"] for event in requests[0]["events"]}) == 1
             assert len({event["analytics_user_id"] for event in events}) == 2
+            assert {event["device_id"] for event in events} == {"1" * 64}
             assert all(
                 event["source"] == "gateway" and event["sample_rate"] == 1 for event in events
             )
             growth = queries.growth(UtcCohortWindow.from_dates("2026-09-01", "2026-09-02"))
             assert growth["productActivity"]["dailyTrend"] == [
                 {"period": "2026-09-01", "dau": 1, "mau": 1},
-                {"period": "2026-09-02", "dau": 2, "mau": 2},
+                {"period": "2026-09-02", "dau": 1, "mau": 1},
             ]
             assert growth["clientUsage"]["totals"]["terminalUsers"] == 0
         finally:

@@ -71,6 +71,7 @@ def _legacy_database(settings: CollectorSettings, batch: dict[str, object]) -> N
         assert response.json()["accepted"] == 1
     with sqlite3.connect(settings.database_path) as connection:
         connection.execute("DROP INDEX idx_events_client_launch_user_surface_day")
+        connection.execute("DROP INDEX idx_events_client_launch_device_surface_day")
         connection.execute(
             "UPDATE meta SET protocol_fingerprint = ? WHERE singleton = 1",
             (storage_module._LEGACY_PROTOCOL_FINGERPRINT_SHA256,),
@@ -134,6 +135,9 @@ def test_legacy_collector_upgrade_preserves_history_and_accepts_current_metrics(
         failure_stage="agent_execution",
     )
     current_events = {ConsentScope.GROWTH: growth_events, ConsentScope.RELIABILITY: [turn]}
+    for events in current_events.values():
+        for event in events:
+            event["device_id"] = "a" * 64
 
     for scope, config in settings.items():
         with TestClient(create_collector_app(config)) as client:

@@ -1,4 +1,4 @@
-"""Read-only compatibility adapter for the telemetry v1 installation history."""
+"""Read-only compatibility adapter for the v1 installation statistics history."""
 
 from __future__ import annotations
 

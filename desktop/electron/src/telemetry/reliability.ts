@@ -17,6 +17,7 @@ import {
 import { join, resolve } from 'node:path'
 
 import { resolveMirroredConsent } from './consent-mirror.js'
+import { deviceIdentityFields, getDeviceId } from './device-identity.js'
 import {
   CURRENT_NOTICE_VERSION_BY_SCOPE,
   type AppCrashDetectedEvent,
@@ -166,7 +167,8 @@ interface PersistedAppStartResult {
 }
 
 interface SessionMarker {
-  schema_version: 3
+  schema_version: 4
+  device_id: string | null
   marker_kind: 'desktop_reliability_session'
   app_session_id: string
   app_version: string
@@ -189,7 +191,8 @@ interface SessionMarker {
 }
 
 interface UpdateMarker {
-  schema_version: 1
+  schema_version: 2
+  device_id: string | null
   marker_kind: 'desktop_update_transition'
   status: 'handoff' | 'installed'
   source_app_session_id: string
@@ -319,7 +322,7 @@ export interface DesktopReliabilityTelemetryOptions {
   runtimeGate: DesktopTelemetryRuntimeGate
   /**
    * The plain application version used by updater handoff state and semver
-   * comparisons.  Keep this separate from the telemetry identity below.
+   * comparisons.  Keep this separate from the reported build identity below.
    */
   appVersion: () => string
   /**
@@ -334,6 +337,7 @@ export interface DesktopReliabilityTelemetryOptions {
   nowMs?: () => number
   nowDate?: () => Date
   randomId?: () => string
+  deviceId?: () => string | null
 }
 
 export class DesktopReliabilityTelemetry {
@@ -348,6 +352,7 @@ export class DesktopReliabilityTelemetry {
   private readonly nowMs: () => number
   private readonly nowDate: () => Date
   private readonly randomId: () => string
+  private readonly deviceId: () => string | null
   private readonly performance: PerformanceAccumulator
   private paths: DesktopReliabilityPaths | null = null
   private desiredForeground = false
@@ -370,6 +375,7 @@ export class DesktopReliabilityTelemetry {
     this.nowMs = options.nowMs ?? (() => Date.now())
     this.nowDate = options.nowDate ?? (() => new Date())
     this.randomId = options.randomId ?? (() => randomUUID())
+    this.deviceId = options.deviceId ?? getDeviceId
     this.appSessionId = options.appSessionId ?? this.randomId()
     this.performance = new PerformanceAccumulator({ nowMs: this.nowMs })
   }
@@ -388,7 +394,7 @@ export class DesktopReliabilityTelemetry {
           || this.paths.consentMirrorPath !== nextPaths.consentMirrorPath
         )
       ) {
-        // A profile/state-dir switch closes one telemetry session and starts a
+        // A profile/state-dir switch closes one diagnostics session and starts a
         // fresh one. First make the old aggregate/crash facts independently
         // durable; a full/failed sink may retry when that profile is active
         // again, without ever checkpointing A's in-memory state into B.
@@ -419,7 +425,7 @@ export class DesktopReliabilityTelemetry {
       if (!this.reconcileConsentGrant().enabled) return
       this.ensureSession()
     } catch {
-      // Telemetry must never affect profile startup or consent reconciliation.
+      // Statistics must never affect profile startup or consent reconciliation.
     }
   }
 
@@ -544,6 +550,7 @@ export class DesktopReliabilityTelemetry {
     return this.emitUpdateResult({
       eventId: this.randomId(),
       appSessionId: this.appSessionId,
+      deviceId: this.currentMarker?.device_id ?? null,
       ...input,
     })
   }
@@ -592,7 +599,8 @@ export class DesktopReliabilityTelemetry {
       this.ensureSession()
       if (!this.sessionStarted || !isSafeVersion(newVersion)) return false
       const marker: UpdateMarker = {
-        schema_version: 1,
+        schema_version: 2,
+        device_id: this.currentMarker?.device_id ?? null,
         marker_kind: 'desktop_update_transition',
         status: 'handoff',
         source_app_session_id: this.appSessionId,
@@ -641,7 +649,7 @@ export class DesktopReliabilityTelemetry {
       if (!this.writeSessionMarker(this.currentMarker)) return
       this.flushSessionMarker(SESSION_MARKER_NAME, this.currentMarker, false)
     } catch {
-      // Exit must remain committed even when telemetry storage is unavailable.
+      // Exit must remain committed even when statistics storage is unavailable.
     }
   }
 
@@ -691,7 +699,8 @@ export class DesktopReliabilityTelemetry {
     this.performance.reset(this.desiredForeground)
     const nowMs = Math.floor(this.nowMs())
     const marker: SessionMarker = {
-      schema_version: 3,
+      schema_version: 4,
+      device_id: deviceIdentityFields(this.deviceId).device_id ?? null,
       marker_kind: 'desktop_reliability_session',
       app_session_id: this.appSessionId,
       app_version: this.telemetryAppVersion(),
@@ -758,6 +767,7 @@ export class DesktopReliabilityTelemetry {
       eventId: initial.app_start_event_id,
       appSessionId: initial.app_session_id,
       appVersion: initial.app_version,
+      deviceId: initial.device_id,
       occurredAtUtc: utcTimestampFromMs(fact.completed_at_ms),
       outcome: fact.outcome,
       errorCode: fact.error_code,
@@ -833,6 +843,7 @@ export class DesktopReliabilityTelemetry {
           marker.crash_event_id,
           crash.occurred_at_utc,
           marker.app_version,
+          marker.device_id,
         ),
         outcome: 'detected',
         error_code: crash.error_code,
@@ -852,6 +863,7 @@ export class DesktopReliabilityTelemetry {
         eventId: marker.recovered_performance_event_id,
         appSessionId: marker.app_session_id,
         appVersion: marker.app_version,
+        deviceId: marker.device_id,
         durationMs,
         occurredAtUtc: utcTimestampFromMs(marker.last_observed_at_ms),
         summaryKind: marker.clean_exit ? 'session_end' : 'recovered_abnormal',
@@ -951,6 +963,7 @@ export class DesktopReliabilityTelemetry {
       const fact = marker.install_result
       const result = this.emitUpdateResult({
         eventId: marker.install_event_id,
+        deviceId: marker.device_id,
         appSessionId: fact.app_session_id,
         outcome: fact.outcome,
         durationMs: boundedDuration(fact.completed_at_ms - marker.handoff_at_ms),
@@ -969,6 +982,7 @@ export class DesktopReliabilityTelemetry {
       const fact = marker.restart_result
       const result = this.emitUpdateResult({
         eventId: marker.restart_event_id,
+        deviceId: marker.device_id,
         appSessionId: fact.app_session_id,
         outcome: fact.outcome,
         durationMs: boundedDuration(
@@ -1046,6 +1060,7 @@ export class DesktopReliabilityTelemetry {
 
   private emitPerformanceSummary(input: {
     eventId: string
+    deviceId: string | null
     appSessionId: string
     durationMs: number
     summaryKind: 'session_end' | 'recovered_abnormal'
@@ -1062,6 +1077,7 @@ export class DesktopReliabilityTelemetry {
         input.eventId,
         input.occurredAtUtc,
         input.appVersion,
+        input.deviceId,
       ),
       outcome: 'success',
       error_code: null,
@@ -1077,6 +1093,7 @@ export class DesktopReliabilityTelemetry {
 
   private emitAppStartResult(input: {
     eventId: string
+    deviceId: string | null
     appSessionId: string
     appVersion: string
     occurredAtUtc: string
@@ -1092,6 +1109,7 @@ export class DesktopReliabilityTelemetry {
         input.eventId,
         input.occurredAtUtc,
         input.appVersion,
+        input.deviceId,
       ),
       outcome: input.outcome,
       error_code: input.errorCode,
@@ -1103,6 +1121,7 @@ export class DesktopReliabilityTelemetry {
 
   private emitUpdateResult(input: {
     eventId: string
+    deviceId: string | null
     appSessionId: string
     outcome: 'success' | 'fail' | 'timeout' | 'cancel'
     durationMs: number
@@ -1119,6 +1138,8 @@ export class DesktopReliabilityTelemetry {
         'updater',
         input.eventId,
         input.occurredAtUtc,
+        undefined,
+        input.deviceId,
       ),
       outcome: input.outcome,
       error_code: input.errorCode,
@@ -1156,6 +1177,7 @@ export class DesktopReliabilityTelemetry {
     eventId = this.randomId(),
     occurredAt = this.safeNowDate().toISOString(),
     appVersion = this.telemetryAppVersion(),
+    deviceId: string | null = this.currentMarker?.device_id ?? null,
   ) {
     return {
       event_name: eventName,
@@ -1168,6 +1190,7 @@ export class DesktopReliabilityTelemetry {
       consent_scope: 'reliability' as const,
       notice_version: CURRENT_NOTICE_VERSION_BY_SCOPE.reliability,
       sample_rate: 1 as const,
+      ...(deviceId === null ? {} : { device_id: deviceId }),
     }
   }
 
@@ -1533,11 +1556,16 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
   ] as const
   const legacy = value.schema_version === 1 && hasExactKeys(value, legacyKeys)
   const previous = value.schema_version === 2 && hasExactKeys(value, currentKeys)
-  const current = value.schema_version === 3 && hasExactKeys(value, [
+  const consentKeys = [
     ...currentKeys, 'consent_generation', 'gateway_turn_counts_applied',
-  ])
-  if (!legacy && !previous && !current) return null
-  if (current && (
+  ]
+  const priorConsent = value.schema_version === 3 && hasExactKeys(value, consentKeys)
+  const current = value.schema_version === 4 && hasExactKeys(value, [...consentKeys, 'device_id'])
+  if (!legacy && !previous && !priorConsent && !current) return null
+  if (current && value.device_id !== null && (
+    typeof value.device_id !== 'string' || !SHA256_RE.test(value.device_id)
+  )) return null
+  if ((priorConsent || current) && (
     (value.consent_generation !== null && typeof value.consent_generation !== 'string')
     || typeof value.gateway_turn_counts_applied !== 'boolean'
   )) return null
@@ -1575,7 +1603,8 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
   if (legacy) {
     return {
       ...value,
-      schema_version: 3,
+      schema_version: 4,
+      device_id: null,
       consent_generation: null,
       gateway_turn_counts_applied: false,
       app_start_event_id: value.crash_event_id,
@@ -1591,9 +1620,10 @@ function parseSessionMarker(value: unknown): SessionMarker | null {
   }
   return {
     ...value,
-    schema_version: 3,
-    consent_generation: current ? value.consent_generation : null,
-    gateway_turn_counts_applied: current ? value.gateway_turn_counts_applied : false,
+    schema_version: 4,
+    device_id: current ? value.device_id : null,
+    consent_generation: priorConsent || current ? value.consent_generation : null,
+    gateway_turn_counts_applied: priorConsent || current ? value.gateway_turn_counts_applied : false,
     app_start_result: appStart,
     crash,
     performance,
@@ -1634,7 +1664,8 @@ function parsePersistedUpdateResult(value: unknown): PersistedUpdateResult | nul
 }
 
 function parseUpdateMarker(value: unknown): UpdateMarker | null {
-  if (!isRecord(value) || !hasExactKeys(value, [
+  if (!isRecord(value)) return null
+  const keys = [
     'schema_version',
     'marker_kind',
     'status',
@@ -1650,7 +1681,13 @@ function parseUpdateMarker(value: unknown): UpdateMarker | null {
     'install_result_emitted',
     'restart_result',
     'restart_result_emitted',
-  ])) return null
+  ]
+  const legacy = value.schema_version === 1 && hasExactKeys(value, keys)
+  const current = value.schema_version === 2 && hasExactKeys(value, [...keys, 'device_id'])
+  if (!legacy && !current) return null
+  if (current && value.device_id !== null && (
+    typeof value.device_id !== 'string' || !SHA256_RE.test(value.device_id)
+  )) return null
   const installResult = value.install_result === null
     ? null
     : parsePersistedUpdateResult(value.install_result)
@@ -1658,8 +1695,7 @@ function parseUpdateMarker(value: unknown): UpdateMarker | null {
     ? null
     : parsePersistedUpdateResult(value.restart_result)
   if (
-    value.schema_version !== 1
-    || value.marker_kind !== 'desktop_update_transition'
+    value.marker_kind !== 'desktop_update_transition'
     || (value.status !== 'handoff' && value.status !== 'installed')
     || !isUuid(value.source_app_session_id)
     || (value.restart_app_session_id !== null && !isUuid(value.restart_app_session_id))
@@ -1679,7 +1715,10 @@ function parseUpdateMarker(value: unknown): UpdateMarker | null {
     || (value.install_result_emitted && installResult === null)
     || (value.restart_result_emitted && restartResult === null)
   ) return null
-  return { ...value, install_result: installResult, restart_result: restartResult } as unknown as UpdateMarker
+  return {
+    ...value, schema_version: 2, device_id: current ? value.device_id : null,
+    install_result: installResult, restart_result: restartResult,
+  } as unknown as UpdateMarker
 }
 
 function boundedDuration(value: number): number {
@@ -1765,7 +1804,7 @@ function bestEffortChmod(path: string, mode: number): void {
 function requireRealDirectory(path: string): void {
   const metadata = lstatSync(path)
   if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
-    throw new Error('unsafe reliability telemetry directory')
+    throw new Error('unsafe reliability diagnostics directory')
   }
 }
 

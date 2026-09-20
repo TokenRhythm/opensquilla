@@ -13,6 +13,7 @@ export interface SessionCreateRequest extends SessionLifecycleRequestOptions {
   title?: string
   message?: string
   model?: string
+  provider?: string
 }
 
 /** Identity returned by the Gateway after a session is materialized. */

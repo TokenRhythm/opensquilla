@@ -2,6 +2,7 @@ import { computed, nextTick, onUnmounted, reactive, ref } from 'vue'
 import { useRoute } from 'vue-router'
 import i18n from '@/i18n'
 import { useToasts } from '@/composables/useToasts'
+import { useConfirm } from '@/composables/useConfirm'
 import { useProjectWorkspaces } from '@/composables/useProjectWorkspaces'
 import type { CronJob, CronJobFormModel, CronPanelTemplate } from '@/types/cron'
 import { buildDeliveryFromValues, normalizeDeliveryFields } from '@/utils/cron/delivery'
@@ -16,9 +17,15 @@ interface UseCronFormOptions {
 export function useCronForm(scheduler: CronScheduler, options: UseCronFormOptions) {
   const route = useRoute()
   const { pushToast } = useToasts()
+  const { confirm } = useConfirm()
   const projectWorkspaces = useProjectWorkspaces()
   const t = i18n.global.t
   const panelOpen = ref(false)
+  const saving = ref(false)
+  const fieldErrors = ref<Partial<Record<keyof CronJobFormModel, string>>>({})
+  const saveError = ref('')
+  let initialForm = ''
+  let closeRequest: Promise<boolean> | null = null
   const editingJob = ref<CronJob | null>(null)
   const cronExplainHuman = ref(t('cronSkills.form.cronPreviewPlaceholder'))
   const cronExplainValid = ref(false)
@@ -57,6 +64,7 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
     fdWebhookToken: '',
     enabled: true,
   })
+  const hasUnsavedChanges = computed(() => panelOpen.value && JSON.stringify(form) !== initialForm)
 
   const jobModeHint = computed(() => {
     if (form.payloadKind === 'system_event') return t('cronSkills.form.jobModeHint.systemEvent')
@@ -85,6 +93,9 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
   })
 
   function openPanel(job: CronJob | null, template?: CronPanelTemplate) {
+    if (saving.value) return
+    fieldErrors.value = {}
+    saveError.value = ''
     editingJob.value = job
     panelOpen.value = true
     const tpl = template || {}
@@ -125,13 +136,44 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
     Object.assign(form, normalizeDeliveryFields(job))
     void projectWorkspaces.loadWorkspaces().catch(() => undefined)
     onPayloadKindChange()
+    initialForm = JSON.stringify(form)
     renderCronExplain(form.cron)
     nextTick(() => document.getElementById('cp-name')?.focus())
   }
 
-  function closePanel() {
-    panelOpen.value = false
-    editingJob.value = null
+  function closePanel(): Promise<boolean> {
+    if (saving.value) return Promise.resolve(false)
+    if (closeRequest) return closeRequest
+    closeRequest = (async () => {
+      if (hasUnsavedChanges.value && !await confirm({
+        title: t('cronSkills.form.discardTitle'),
+        body: t('cronSkills.form.discardBody'),
+        primaryLabel: t('common.discard'),
+      })) return false
+      panelOpen.value = false
+      editingJob.value = null
+      return true
+    })().finally(() => { closeRequest = null })
+    return closeRequest
+  }
+
+  function rejectField(field: keyof CronJobFormModel, message: string) {
+    fieldErrors.value = { [field]: message }
+    const ids: Partial<Record<keyof CronJobFormModel, string>> = {
+      name: 'cp-name', workspaceId: 'cp-workspace', cron: 'cp-cron',
+      every: 'cp-every-friendly', at: 'cp-at-friendly', targetSessionKey: 'cp-target-session-key',
+      deliveryWebhookUrl: 'cp-delivery-webhook-url', fdWebhookUrl: 'cp-fd-webhook-url',
+      fdTo: 'cp-fd-to', tz: 'cp-tz',
+    }
+    void nextTick(() => {
+      const target = document.getElementById(ids[field] || '')
+      let details = target?.closest('details')
+      while (details) {
+        details.open = true
+        details = details.parentElement?.closest('details') ?? null
+      }
+      target?.focus()
+    })
   }
 
   function onPayloadKindChange() {
@@ -186,9 +228,12 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
   }
 
   async function saveJob() {
+    if (saving.value) return
+    fieldErrors.value = {}
+    saveError.value = ''
     const name = form.name.trim()
     if (!name) {
-      pushToast(t('cronSkills.form.toastNameRequired'), { tone: 'danger' })
+      rejectField('name', t('cronSkills.form.toastNameRequired'))
       return
     }
     const payloadKind = form.payloadKind
@@ -208,28 +253,28 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
       templateId: form.templateId,
     }
     if (payloadKind === 'agent_turn' && form.workspaceRequired && !form.workspaceId.trim()) {
-      pushToast(t('cronSkills.form.toastWorkspaceRequired'), { tone: 'danger' })
+      rejectField('workspaceId', t('cronSkills.form.toastWorkspaceRequired'))
       return
     }
 
     if (form.type === 'cron') {
       const expr = form.cron.trim()
       if (!expr) {
-        pushToast(t('cronSkills.form.toastCronRequired'), { tone: 'danger' })
+        rejectField('cron', t('cronSkills.form.toastCronRequired'))
         return
       }
       payload.schedule = { kind: 'cron', expr }
     } else if (form.type === 'every') {
       const everySeconds = Number(form.every)
       if (!Number.isInteger(everySeconds) || everySeconds < 1) {
-        pushToast(t('cronSkills.form.toastIntervalInvalid'), { tone: 'danger' })
+        rejectField('every', t('cronSkills.form.toastIntervalInvalid'))
         return
       }
       payload.schedule = { kind: 'every', every_seconds: everySeconds }
     } else if (form.type === 'at') {
       const at = form.at.trim()
       if (!at) {
-        pushToast(t('cronSkills.form.toastIsoTimeRequired'), { tone: 'danger' })
+        rejectField('at', t('cronSkills.form.toastIsoTimeRequired'))
         return
       }
       payload.schedule = { kind: 'at', at }
@@ -237,6 +282,12 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
 
     const tz = form.tz.trim()
     if (tz) {
+      try {
+        new Intl.DateTimeFormat('en', { timeZone: tz }).format()
+      } catch {
+        rejectField('tz', t('cronSkills.form.invalidTimezone'))
+        return
+      }
       payload.tz = tz
       const sched = payload.schedule
       if (sched?.kind === 'cron') payload.schedule = { ...sched, tz }
@@ -258,8 +309,8 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
       fdWebhookUrl: form.fdWebhookUrl,
       fdWebhookToken: form.fdWebhookToken,
     })
-    if (deliveryResult.error) {
-      pushToast(deliveryResult.error, { tone: 'danger' })
+    if (deliveryResult.error !== undefined) {
+      rejectField(deliveryResult.errorField, deliveryResult.error)
       return
     }
     if (deliveryResult.delivery !== null) payload.delivery = deliveryResult.delivery
@@ -268,7 +319,7 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
     if (sessionTarget === 'current') {
       const boundSessionKey = targetSessionKey || activeChatSessionKey() || jobSessionKey(editingJob.value)
       if (!boundSessionKey) {
-        pushToast(t('cronSkills.form.toastCurrentSessionRequired'), { tone: 'danger' })
+        rejectField('targetSessionKey', t('cronSkills.form.toastCurrentSessionRequired'))
         return
       }
       payload.sessionKey = boundSessionKey
@@ -278,20 +329,26 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
     if (payloadKind === 'reminder' && activeChatSessionKey()) payload.originSessionKey = activeChatSessionKey()
     if (sessionTarget === 'session') {
       if (!targetSessionKey) {
-        pushToast(t('cronSkills.form.toastNamedSessionRequired'), { tone: 'danger' })
+        rejectField('targetSessionKey', t('cronSkills.form.toastNamedSessionRequired'))
         return
       }
       payload.targetSessionKey = targetSessionKey
     }
 
     if (editingJob.value) payload.id = editingJob.value.id
+    const existing = Boolean(editingJob.value)
+    saving.value = true
     try {
-      await scheduler.saveJob(payload, { existing: Boolean(editingJob.value) })
-      pushToast(editingJob.value ? t('cronSkills.form.toastUpdated') : t('cronSkills.form.toastCreated'), { tone: 'ok' })
-      closePanel()
+      await scheduler.saveJob(payload, { existing })
+      pushToast(existing ? t('cronSkills.form.toastUpdated') : t('cronSkills.form.toastCreated'), { tone: 'ok' })
+      panelOpen.value = false
+      editingJob.value = null
+      initialForm = JSON.stringify(form)
       options.afterSaved()
     } catch (err) {
-      pushToast(t('cronSkills.form.toastSaveFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
+      saveError.value = t('cronSkills.form.toastSaveFailed', { error: err instanceof Error ? err.message : String(err) })
+    } finally {
+      saving.value = false
     }
   }
 
@@ -301,6 +358,10 @@ export function useCronForm(scheduler: CronScheduler, options: UseCronFormOption
 
   return {
     panelOpen,
+    saving,
+    hasUnsavedChanges,
+    fieldErrors,
+    saveError,
     editingJob,
     form,
     cronExplainHuman,

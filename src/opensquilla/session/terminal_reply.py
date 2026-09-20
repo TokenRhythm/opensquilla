@@ -307,6 +307,23 @@ def build_terminal_reply(
             "Usage accounting is temporarily unavailable. This provider request was not "
             "sent. Earlier work in this turn may already have run or been billed."
         )
+    attachment_capacity_messages = {
+        "attachment_capacity_too_large": (
+            "The attachment request exceeds the available model context. "
+            "Reduce the input, run /compact, or start a new session before retrying."
+        ),
+        "attachment_capacity_unknown": (
+            "The model's context capacity could not be verified. Configure the deployment's "
+            "verified context limit before retrying the attachment request."
+        ),
+        "attachment_capacity_unavailable": (
+            "The attachment request could not pass the model capacity check. "
+            "Check the model configuration or start a new session before retrying."
+        ),
+    }
+    capacity_message = attachment_capacity_messages.get(error_class or reason)
+    if capacity_message:
+        return capacity_message
     if status == AgentTaskStatus.FAILED.value or reason in {"error", "tool_error"}:
         failure_kind = _normalize(_read_value(record_or_payload, "failure_kind"))
         if failure_kind:

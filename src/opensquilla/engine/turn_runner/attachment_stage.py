@@ -1,7 +1,7 @@
 """Pre-router attachment materialization and post-router prompt rebind.
 
 The harness invokes ``AttachmentStage.run`` once after provider/tool setup and
-before prompt routing. Extracted text and typed media are then reused by
+before prompt routing. File descriptors, bounded previews, and typed media are reused by
 compaction and provider delivery. A pure post-router helper replaces only the
 prompt block, without reading or parsing an attachment again.
 The bounded worker may materialize already-ingested uploads into the configured
@@ -11,7 +11,7 @@ Validation failures
 media type, ref-without-media-root, invalid base64, oversize) raise
 ``ValueError`` from the port and propagate as-is to the outer terminal
 handler in ``_run_turn``. Per-attachment soft failures (missing ref
-bytes, PDF parse failure, text-family decode failure) are absorbed
+bytes or unavailable workspace material) are absorbed
 inside the build call into ``[attachment unavailable: …]`` placeholder
 text blocks; the stage records only their count.
 
@@ -238,6 +238,7 @@ class AttachmentStageInput:
     persist_image_material: bool | None = None
     image_workspace_dir: str | Path | None = None
     failure_cleanup: Callable[[], None] | None = None
+    working_files: dict[str, dict[str, Any]] | None = None
 
 
 @dataclass(frozen=True)
@@ -330,13 +331,15 @@ class AttachmentStage:
             tuple[FileParseReliabilityFacts, ...],
         ]:
             file_parse_facts: list[FileParseReliabilityFacts] = []
-            image_kwargs = (
+            image_kwargs: dict[str, Any] = (
                 {
                     "persist_image_material": inp.persist_image_material,
                     "image_workspace_dir": inp.image_workspace_dir,
                 }
                 if inp.persist_image_material is not None else {}
             )
+            if inp.working_files is not None:
+                image_kwargs["working_files"] = inp.working_files
             build_cancellable = getattr(self._builder, "build_cancellable", None)
             if callable(build_cancellable):
                 if getattr(self._builder, "supports_file_parse_facts", False) is True:

@@ -1101,14 +1101,83 @@ pre {
 
 .sidebar-history-row.is-reorderable .sidebar-history-item {
   cursor: grab;
+  user-select: none;
 }
 
 .sidebar-history-row.is-reorderable:active .sidebar-history-item {
   cursor: grabbing;
 }
 
+.sidebar-history.is-reordering,
+.sidebar-history.is-reordering .sidebar-history-item {
+  cursor: grabbing;
+  user-select: none;
+}
+
+.sidebar-history.is-reordering .sidebar-row-menu-wrap {
+  visibility: hidden;
+}
+
+.sidebar-history.is-reordering .sidebar-history-item:not(:disabled):active {
+  transform: none;
+}
+
+.sidebar-history-row.sidebar-row-move {
+  transition: transform var(--sidebar-reorder-duration) var(--sidebar-reorder-ease);
+}
+
+.sidebar-history {
+  --sidebar-reorder-duration: 360ms;
+  --sidebar-reorder-ease: cubic-bezier(.22, 1, .36, 1);
+}
+
+.sidebar-history-row.is-settling {
+  z-index: 1;
+}
+
+.sidebar-history-row.is-settling .sidebar-history-item {
+  animation: sidebar-row-settle var(--sidebar-reorder-duration) var(--ease-standard) both;
+}
+
+@keyframes sidebar-row-settle {
+  0%, 100% {
+    box-shadow: none;
+    transform: scale(1);
+  }
+  20%, 76% {
+    box-shadow: var(--shadow-lg);
+    transform: scale(1.008);
+  }
+}
+
 .sidebar-history-row.is-dragging {
-  opacity: 0.42;
+  border-radius: var(--radius-md);
+  background: var(--sidebar-item-hover);
+  outline: 1px dashed var(--sidebar-border);
+  outline-offset: -1px;
+}
+
+.sidebar-history-row.is-dragging > * {
+  opacity: 0.25;
+}
+
+.sidebar-session-drag-preview {
+  position: fixed;
+  z-index: 260;
+  top: 0;
+  left: 0;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  padding: 8px 14px;
+  border: 1px solid var(--sidebar-border);
+  border-radius: var(--radius-md);
+  background: var(--bg-elevated);
+  color: var(--sidebar-text-strong);
+  box-shadow: var(--shadow-lg);
+  pointer-events: none;
+  user-select: none;
+  will-change: transform;
 }
 
 .sidebar-history-row.is-drop-before::after,
@@ -1121,6 +1190,7 @@ pre {
   height: 2px;
   border-radius: var(--radius-pill);
   background: var(--accent);
+  box-shadow: 0 0 0 2px var(--sidebar-bg);
   pointer-events: none;
 }
 
@@ -1424,6 +1494,15 @@ pre {
   white-space: nowrap;
 }
 
+/* The sidebar becomes a full-width surface on narrow layouts. Keep the
+   keyboard/pointer list unobstructed even if a stale preview is still mounted
+   during a responsive resize. */
+@media (max-width: 768px) {
+  .sidebar-session-preview {
+    display: none;
+  }
+}
+
 .sidebar-history-row.is-selected .sidebar-history-item {
   background: var(--sidebar-selection-bg);
   color: var(--sidebar-text-strong);
@@ -1702,6 +1781,10 @@ pre {
   position: relative;
 }
 
+.main--chat.docked:not(.main--sidebar-drawer) {
+  border-left: 1px solid var(--border);
+}
+
 /* Main is pushed when sidebar is docked */
 .main.docked {
   margin-left: var(--sidebar-width);
@@ -1785,11 +1868,10 @@ pre {
   box-sizing: border-box;
   height: 49px;
   min-height: 49px;
-  margin: var(--sp-1) 0 0 var(--sp-1);
+  margin: 0;
   padding: 0 20px 0 12px;
-  border: 1px solid var(--border);
-  border-right: 0;
-  border-radius: var(--radius-lg) 0 0 0;
+  border: 0;
+  border-radius: 0;
   background: var(--bg-surface);
   gap: var(--sp-2);
   pointer-events: auto;
@@ -1923,7 +2005,7 @@ pre {
   /* No right inset: the chat panel meets the screen edge so the thread's
      scrollbar sits where the cursor lands when flung to the edge, instead of
      hiding behind a dead padding strip. */
-  padding: 0 0 var(--sp-1) var(--sp-1);
+  padding: 0;
   background: var(--sidebar-bg);
   border: 0;
   border-radius: 0;
@@ -1932,11 +2014,9 @@ pre {
 }
 
 .main .content--chat .chat {
-  border-right: 0;
-  border-top: 0;
-  border-top-left-radius: 0;
-  border-top-right-radius: 0;
-  border-bottom-right-radius: 0;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
 }
 
 .approval-inline {
@@ -1975,7 +2055,7 @@ pre {
   }
 
   .content--chat {
-    padding: 0 0 var(--sp-1) var(--sp-1);
+    padding: 0;
   }
 
   .topbar {
@@ -1994,7 +2074,7 @@ pre {
     box-sizing: border-box;
     height: calc(56px + env(safe-area-inset-top, 0px));
     min-height: calc(56px + env(safe-area-inset-top, 0px));
-    margin: var(--sp-1) 0 0 var(--sp-1);
+    margin: 0;
     padding: env(safe-area-inset-top, 0px) 10px 0 8px;
     gap: var(--sp-1);
   }

@@ -56,6 +56,15 @@ export interface ApprovalStatusPayload {
 export type AssistantDelivery = 'visible' | 'suppressed'
 export type AssistantSuppressionReason = 'no_reply' | 'heartbeat_ack'
 
+/** A live project file, revalidated against its bound workspace on every use. */
+export interface WorkspaceFileReference {
+  workspaceId: string
+  relativePath: string
+  name: string
+  mime: string
+  size?: number
+}
+
 export interface ChatSendAttachmentPayload {
   type: string
   mime: string
@@ -84,7 +93,7 @@ export interface SessionSteerV2Params {
 }
 
 export interface Attachment {
-  kind: 'inline' | 'staged' | 'inline_pending' | 'uploading' | 'failed'
+  kind: 'inline' | 'staged' | 'workspace' | 'inline_pending' | 'uploading' | 'failed'
   local_id: number
   name: string
   mime: string
@@ -96,11 +105,13 @@ export interface Attachment {
   ttl_seconds?: number
   error?: string
   file?: File
+  workspaceFile?: WorkspaceFileReference
   /** Server-owned bytes restored from the durable pending-input queue. */
   durable_material?: true
 }
 
 export interface DisplayAttachment {
+  workspaceFile?: WorkspaceFileReference
   kind: 'inline' | 'staged' | 'file'
   displayId: string
   renderKey: string
@@ -843,6 +854,8 @@ export interface ChatRenderedMessage {
   /** Explicit placement for successful sessions_spawn cards. An empty array
    *  suppresses the source card after it is rehomed below the parent reply. */
   createdSessionLinks?: ChatCreatedSessionLink[]
+  /** Versioned references returned by a structured session_search result. */
+  sessionReferences?: import('./references').SessionReferenceV1[]
   toolCalls?: ChatToolCall[]
   planRevisions?: import('./plans').PlanRevisionSnapshot[]
   timelineItems?: ChatStreamTimelineItem[]

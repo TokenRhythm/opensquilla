@@ -1,4 +1,25 @@
 {
+  "workspaceReference": {
+    "open": "Abrir {path} en el banco de trabajo",
+    "actions": "Acciones del archivo",
+    "copyPath": "Copiar ruta relativa",
+    "copyLocation": "Copiar ruta y líneas",
+    "loading": "Comprobando archivo…",
+    "copied": "Copiado",
+    "copyFailed": "No se pudo copiar. Inténtalo de nuevo.",
+    "stale": "El archivo ha cambiado. Vuelve a leerlo para actualizar la referencia.",
+    "workspaceMismatch": "Este archivo pertenece a otro espacio de trabajo.",
+    "forbidden": "No tienes acceso a este archivo.",
+    "missing": "El archivo o su tarea ya no están disponibles.",
+    "invalid": "La referencia al archivo no es válida.",
+    "unsupported": "Este archivo no se puede mostrar como código fuente.",
+    "unavailable": "No se pudo abrir. Comprueba la conexión e inténtalo de nuevo.",
+    "readonly": "Código de solo lectura",
+    "refresh": "Comprobar de nuevo",
+    "lines": "Líneas {start}–{end} de {total}",
+    "previous": "Mostrar líneas anteriores",
+    "next": "Mostrar más líneas"
+  },
   "resourceActions": {
     "more": "Acciones de archivo", "preview": "Vista previa en la aplicación", "openSource": "Abrir con la aplicación predeterminada",
     "reveal": "Mostrar en el gestor de archivos", "revealFinder": "Mostrar en Finder", "revealExplorer": "Mostrar en el Explorador de archivos",
@@ -140,6 +161,8 @@
     }
   },
   "common": {
+    "more": "Más",
+    "saving": "Guardando…",
     "close": "Cerrar",
     "save": "Guardar",
     "discard": "Descartar",
@@ -400,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Buscar ajustes",
+      "results": "Resultados de ajustes",
+      "empty": "No hay ajustes coincidentes",
+      "defaultModel": "Modelo predeterminado",
+      "permissions": "Permisos"
+    },
     "appearance": {
       "title": "Interfaz",
       "desc": "Tema y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
@@ -734,7 +764,7 @@
       "customAnthropic": "Personalizado · compatible con Anthropic",
       "partialSaved": "Guardado: {saved}. Sin guardar: {pending}. Se conservan los valores pendientes.",
       "providerPartialSaved": "Se guardó el proveedor. Los límites del modelo no se guardaron; se conservan los datos introducidos.",
-      "backToRouting": "Volver al enrutamiento inteligente",
+      "backToRouting": "Volver al enrutamiento inteligente de modelos",
       "editSharedEnsemble": "Editar conjunto compartido",
       "sharedEnsemble": "C3 y la fusión de modelos comparten este conjunto.",
       "title": "Ajustes del modelo",
@@ -847,7 +877,7 @@
       "profileStatusUnavailable": "Estado no disponible",
       "emptyTitle": "Añade tu primer proveedor de modelos",
       "configuredEmpty": "Conecta un proveedor para verificar credenciales y elegir modelos disponibles.",
-      "emptyRoutingHint": "Después podrás configurar el enrutamiento inteligente; un solo proveedor también puede enrutar entre varios modelos.",
+      "emptyRoutingHint": "Después podrás configurar el enrutamiento inteligente de modelos; un solo proveedor también puede enrutar entre varios modelos.",
       "addProvider": "Añadir proveedor",
       "catalogTitle": "Añadir proveedor",
       "catalogDesc": "Elige un proveedor. Su configuración se abrirá justo debajo.",
@@ -885,10 +915,10 @@
       "openModelRouting": "Abrir Enrutamiento de modelos →",
       "modelUsageTitle": "Uso de modelos",
       "modelUsageRouter": "Enrutamiento inteligente de modelos",
-      "modelUsageEnsemble": "Colaboración multimodelo",
+      "modelUsageEnsemble": "Ensamble de modelos",
       "modelUsageFixed": "Modelo fijo",
       "modelUsageRouterDesc": "Elige un modelo configurado adecuado para cada solicitud.",
-      "modelUsageEnsembleDesc": "Genera con varios modelos y después combina sus resultados.",
+      "modelUsageEnsembleDesc": "Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final.",
       "modelUsageFixedDesc": "Envía cada solicitud al modelo directo actual.",
       "crossProviderActive": "Incluye enrutamiento entre proveedores",
       "configureModelRouting": "Configurar enrutamiento",
@@ -962,7 +992,7 @@
       "choose": "Elige un proveedor",
       "chooseProviderShort": "elegir proveedor",
       "routerTiers": "Enrutamiento de modelos",
-      "routingDesc": "Configura niveles, ensemble y modelo único en Enrutamiento de modelos.",
+      "routingDesc": "Configura niveles, ensemble y modelo fijo en Enrutamiento de modelos.",
       "routerReady": "SquillaRouter listo",
       "directOnly": "Solo directo",
       "chooseToSeeFields": "Elige un proveedor para ver los campos requeridos.",
@@ -993,7 +1023,7 @@
       "configuredModelFallbackLabel": "Modelo de reserva",
       "configuredModelDescFixed": "Modo de modelo fijo: cada solicitud usa el modelo de abajo.",
       "configuredModelDescRouter": "Modo de enrutamiento inteligente de modelos: cada solicitud se dirige a un modelo adecuado y vuelve al modelo de abajo si el enrutamiento no está disponible.",
-      "configuredModelDescEnsemble": "Modo de colaboración multimodelo: varios modelos generan juntos y se vuelve al modelo de abajo si el conjunto no puede completarse.",
+      "configuredModelDescEnsemble": "Ensamble de modelos: Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final. Si el ensamble no puede completarse, se usa el modelo de abajo como respaldo.",
       "defaultModelDesc": "Para solicitudes directas y respaldo principal. Los modelos de ruta se configuran en Enrutamiento de modelos.",
       "defaultModelSemantics": "A recommended model is prefilled when available. Choose or enter another model, then verify it before relying on it.",
       "profileModelTitle": "Modelo directo y de reserva para {provider}",
@@ -1205,7 +1235,7 @@
         }
       },
       "routerDependency": "Elige un modelo para cada nivel de solicitud. Un solo proveedor puede cubrirlos todos.",
-      "ensembleTitle": "Colaboración entre varios modelos",
+      "ensembleTitle": "Ensamble de modelos",
       "ensembleDependency": "Usa credenciales de {provider}; el modelo predeterminado del proveedor es {model}.",
       "ensembleMinimum": "Agrega al menos otro candidato para aprovechar el enrutamiento agregado.",
       "ensembleFailure": "Si la fusión no puede completarse, usa el modelo fijo y de respaldo: {provider} · {model}.",
@@ -1302,12 +1332,12 @@
     "router": {
       "title": "Niveles de modelo",
       "mode": "Modo",
-      "modeModelRouting": "Enrutamiento IA de un solo modelo",
+      "modeModelRouting": "Enrutamiento inteligente de modelos",
       "modeSingleModel": "Desactivado",
       "modeRecommended": "Seguir niveles del proveedor actual",
       "modeDisabled": "Desactivado",
-      "routingDisabledHint": "Activa el enrutamiento IA de un solo modelo para editar niveles de modelo.",
-      "routingEnsembleReadOnlyHint": "El enrutamiento IA agregado está activo. La configuración estándar de niveles de modelo está temporalmente inactiva.",
+      "routingDisabledHint": "Activa el modo «Enrutamiento inteligente de modelos» para editar los niveles de modelo.",
+      "routingEnsembleReadOnlyHint": "El modo «Ensamble de modelos» está activo. La configuración estándar de niveles de modelo está temporalmente inactiva.",
       "defaultTextModel": "Nivel de modelo predeterminado",
       "panelLabel": "Tabla de niveles de modelo",
       "panelDesc": "Los modelos de la tabla de niveles se envían mediante el proveedor de cada fila, por lo que todos los proveedores usan la misma estructura de tabla de enrutamiento.",
@@ -1357,9 +1387,9 @@
       "save": "Guardar enrutador",
       "chooseProviderFirst": "elige primero un proveedor",
       "summaryDisabled": "desactivado",
-      "summaryEnsemble": "Enrutamiento IA agregado",
-      "ensembleProfileTitle": "Enrutamiento IA agregado",
-      "ensembleProfileDesc": "La tabla de niveles de modelo aporta modelos candidatos para el enrutamiento IA agregado.",
+      "summaryEnsemble": "Ensamble de modelos",
+      "ensembleProfileTitle": "Ensamble de modelos",
+      "ensembleProfileDesc": "La tabla de niveles de modelo aporta modelos candidatos para el modo «Ensamble de modelos».",
       "visualMode": {
         "real_candidates": "Candidatos de enrutamiento reales",
         "legacy_grid": "Panel visual de tres niveles"
@@ -1374,8 +1404,8 @@
       }
     },
     "ensemble": {
-      "statusOn": "El enrutamiento IA agregado está activo: varios modelos responden y un modelo sintetiza la respuesta final.",
-      "statusOff": "El enrutamiento IA agregado está desactivado.",
+      "statusOn": "El modo «Ensamble de modelos» está activo. Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final.",
+      "statusOff": "El modo «Ensamble de modelos» está desactivado.",
       "allFailedFallback": "Recurrir a un solo modelo",
       "allFailedError": "Detener e informar de un error"
     },
@@ -2937,6 +2967,9 @@
       ,"workspaceOptionalHint": "Opcional. Elige «Sin espacio de proyecto» para tareas generales o un proyecto cuando necesite sus archivos."
     },
     "form": {
+      "invalidTimezone": "Introduce una zona horaria válida, como Europe/Madrid.",
+      "discardBody": "Se perderán los cambios sin guardar. Cancela para seguir editando.",
+      "discardTitle": "¿Descartar los cambios?",
       "cronPreviewPlaceholder": "Introduce una expresión cron de 5 campos para previsualizar",
       "cronParseError": "No se pudo analizar la expresión; se esperaban 5 campos (m h dom mon dow).",
       "cronCustomCadence": "coincide con una cadencia personalizada",
@@ -3155,6 +3188,9 @@
       "add": "Añadir"
     },
     "skillDetail": {
+      "useUnavailable": "Esta habilidad no está disponible para una nueva tarea. Revisa su estado e inténtalo de nuevo.",
+      "useInTaskHint": "Prepara un borrador con esta habilidad. No se enviará nada hasta que lo decidas.",
+      "useInTask": "Usar en una nueva tarea",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -3656,6 +3692,18 @@
       "deleted": "Eliminado",
       "missing": "La sesión se eliminó o no existe"
     },
+    "sessionReference": {
+      "open": "Abrir chat",
+      "unavailable": "Sesión no disponible",
+      "status": {
+        "queued": "En cola",
+        "running": "En ejecución",
+        "idle": "Inactiva",
+        "failed": "Fallida",
+        "missing": "No encontrada",
+        "checking": "Comprobando…"
+      }
+    },
     "promptCacheKeepalive": {
       "action": "Mantener caché del prompt",
       "title": "Mantener caché del prompt",
@@ -3709,6 +3757,10 @@
     "aiGeneratedLabel": "Contenido generado por IA, solo como referencia.",
     "removeAttachment": "Quitar adjunto",
     "remove": "Quitar",
+    "projectFileTarget": "Archivo del proyecto: {path}",
+    "importedFileTarget": "Copia importada",
+    "projectFileLiveTarget": "Archivo actual del proyecto: {path}",
+    "importedFileWorkingTarget": "Archivo importado; los cambios usan una copia de trabajo",
     "fileLabel": "Archivo",
     "add": "Añadir",
     "attachFiles": "Adjuntar archivos",
@@ -3763,6 +3815,8 @@
     "copied": "Copiado",
     "copy": "Copiar",
     "copySessionKey": "Copiar ID de sesión",
+    "copySessionAppLink": "Copiar enlace de la aplicación",
+    "copySessionGatewayLink": "Copiar enlace web del Gateway",
     "sessionActions": "Acciones de la sesión",
     "share": "Compartir",
     "shareSendFirst": "Envía un mensaje primero para compartir",
@@ -3903,16 +3957,16 @@
     },
     "addToShare": "Añadir a la imagen para compartir",
     "removeFromShare": "Quitar de la imagen para compartir",
-    "aiModelRouter": "Enrutador de modelos de IA",
-    "aiModelEnsembleRouter": "Enrutador agregado de modelos de IA",
+    "aiModelRouter": "Enrutamiento inteligente de modelos",
+    "aiModelEnsembleRouter": "Ensamble de modelos",
     "routerFx": {
       "selectedModel": "El enrutador seleccionó {model}",
       "executionModel": "Modelo en ejecución: {model}",
       "executionModelCompleted": "Ejecutado por {model}",
-      "ensembleModel": "Fusión multimodelo",
-      "ensembleSelecting": "Enrutador agregado de modelos de IA · seleccionando candidatos",
-      "ensembleHandedOff": "Enrutador agregado de modelos de IA · entregado al agente",
-      "ensembleRunning": "Enrutador agregado de modelos de IA · {count} candidatos sintetizando",
+      "ensembleModel": "Ensamble de modelos",
+      "ensembleSelecting": "Ensamble de modelos · seleccionando candidatos",
+      "ensembleHandedOff": "Ensamble de modelos · entregado al agente",
+      "ensembleRunning": "Ensamble de modelos · {count} candidatos sintetizando",
       "ensembleDone": "{count} candidatos sintetizados",
       "ensembleMode": "conjunto",
       "ensembleViewTrace": "ver traza",
@@ -4288,6 +4342,8 @@
       "disableLabel": "Desactivar Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Forma de trabajo",
+      "contentGroup": "Contenido",
       "executionMode": "Modo de ejecución",
       "ownerOnlyUnavailable": "El modo solo para el propietario no está disponible para esta sesión del navegador.",
       "enabled": "Activado",
@@ -4297,16 +4353,16 @@
       "modelRouting": "Enrutamiento de modelos",
       "sessionModelRouting": "Enrutamiento de modelos de este chat",
       "modelRoutingSessionScope": "Los cambios solo se aplican a este chat. Un turno en curso conserva su modo actual.",
-      "ensembleImageUnsupported": "Ensemble aún no admite entradas de imagen. En «Enrutamiento de modelos», usa «Enrutador monomodelo con IA» configurado para imágenes o «Desactivado» con un modelo compatible con imágenes.",
+      "ensembleImageUnsupported": "El modo «Ensamble de modelos» aún no admite entradas de imagen. En «Enrutamiento de modelos», elige «Enrutamiento inteligente de modelos» con un nivel compatible con imágenes, o «Modelo fijo» con un modelo compatible.",
       "imageInputUnsupported": "El modelo seleccionado no puede procesar imágenes. Elige un modelo compatible o elimina la imagen.",
       "routingUpdateBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar.",
       "routingUpdateImageBlocked": "El enrutamiento de modelos se está actualizando. Espera antes de enviar imágenes.",
-      "modelRoutingOff": "Desactivado",
+      "modelRoutingOff": "Modelo fijo",
       "modelRoutingOffDesc": "Envía cada turno al modelo seleccionado.",
-      "modelRoutingSquillaRouter": "Enrutador monomodelo con IA",
+      "modelRoutingSquillaRouter": "Enrutamiento inteligente de modelos",
       "modelRoutingSquillaRouterDesc": "La IA elige un modelo adecuado por turno para reducir costos.",
-      "modelRoutingEnsemble": "Enrutador de conjunto con IA",
-      "modelRoutingEnsembleDesc": "La IA coordina varios modelos para mejorar la capacidad en tareas complejas. Aún no admite entradas de imagen.",
+      "modelRoutingEnsemble": "Ensamble de modelos",
+      "modelRoutingEnsembleDesc": "Los modelos candidatos responden en paralelo y un modelo agregador combina sus respuestas para producir la respuesta final. Aún no se admiten entradas de imagen.",
       "runMode": "Modo de ejecución",
       "runModeSafe": "Seguro",
       "runModeSafeDesc": "Usa el sandbox y tus reglas de archivos, comandos y red.",
@@ -4586,9 +4642,35 @@
       "usageIncompleteUnknown": "Incompleto · total exacto de uso no disponible",
       "unknownProviderCalls": "{count} llamada al proveedor tiene uso desconocido | {count} llamadas al proveedor tienen uso desconocido"
     },
+    "newTaskModel": {
+      "showAll": "Ver todos los modelos",
+      "title": "Modelo de la nueva tarea",
+      "catalog": "Catálogo de la pasarela",
+      "gatewayDefault": "Modelo predeterminado",
+      "gatewayDefaultHint": "Usar el modelo predeterminado de los ajustes",
+      "defaultBadge": "Predeterminado",
+      "search": "Buscar modelos o proveedores…",
+      "loading": "Cargando modelos…",
+      "empty": "No hay modelos coincidentes",
+      "retry": "Reintentar",
+      "scope": "Solo se aplica a esta nueva tarea. No cambia la configuración global.",
+      "partialFailure": "No se pudieron cargar algunos proveedores: {providers}",
+      "routingConflict": "Un modelo específico requiere el modo «Modelo fijo». Borra la selección o elige «Modelo fijo».",
+      "unavailable": "La selección no está disponible en esta conexión. Vuelve a conectarte o borra el modelo seleccionado."
+    },
     "modelRouting": {
       "updateFailed": "No se pudo cambiar el enrutamiento de modelos — revertido. El cambio no está disponible temporalmente.",
-      "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}"
+      "sessionUpdateFailed": "No se pudo actualizar el enrutamiento de modelos de este chat: {error}",
+      "manage": "Ajustes de modelos y enrutamiento",
+      "back": "Volver a modos de enrutamiento",
+      "title": "Modelos y enrutamiento",
+      "direct": "Modelo fijo",
+      "sessionModelFallback": "Usar el modelo de esta tarea",
+      "sessionModelTitle": "Modelo de esta conversación",
+      "sessionModelHint": "Se aplica al siguiente turno. Conserva el historial y no cambia la configuración global.",
+      "sessionModelBusy": "Podrás cambiar el modelo cuando termine la respuesta actual.",
+      "router": "Enrutamiento inteligente de modelos",
+      "ensemble": "Ensamble de modelos"
     },
     "routeFeedback": {
       "up": "Buena elección de modelo para este turno",
@@ -4632,6 +4714,13 @@
       "retry": "Reintentar"
     },
     "sidebar": {
+      "moveDown": "Bajar",
+      "moveUp": "Subir",
+      "subtasksAttention": "{count} requieren atención",
+      "subtasksRunning": "{count} en ejecución",
+      "subtaskCount": "{count} subtareas",
+      "collapseSubtasks": "Ocultar subtareas de {title}",
+      "expandSubtasks": "Mostrar subtareas de {title}",
       "recentConversations": "Tareas recientes",
       "recents": "Recientes",
       "pinned": "Fijadas",

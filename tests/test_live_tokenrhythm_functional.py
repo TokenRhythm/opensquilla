@@ -30,6 +30,12 @@ def _body(model="unpriced-model"):
     }).encode()
 
 
+@pytest.mark.parametrize("max_calls", [0, -1, 61, True])
+def test_functional_global_limit_cannot_exceed_authorized_cap(tmp_path, max_calls):
+    with pytest.raises(module.BudgetRejectedError, match="invalid_call_limit"):
+        module.FunctionalRequestLog(tmp_path / "requests.sqlite", max_calls=max_calls)
+
+
 def _relay(log, handler):
     return module.BudgetRelay(
         None, {}, request_log=log, api_key="synthetic-relay-only-secret",
@@ -61,6 +67,8 @@ def test_functional_rejects_budget_file_without_changing_any_bytes(tmp_path):
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
 
 
+# Run this HTTP/SQLite integration contract alone to retain its fixed read deadline.
+@pytest.mark.ci_serial
 def test_functional_retry_and_fallback_preserve_actual_http_without_fee_gates(
     tmp_path, monkeypatch,
 ):
@@ -177,13 +185,18 @@ def test_functional_unconsumed_stream_and_shutdown_keep_distinct_outcomes(tmp_pa
 
 def test_functional_restart_retains_inflight_and_concurrent_physical_identity(tmp_path):
     log = _log(tmp_path)
+    def attempt(_index):
+        try:
+            return log.start_request(model="same-model", request_bytes=7)
+        except module.BudgetRejectedError as exc:
+            return str(exc)
     with ThreadPoolExecutor(max_workers=6) as pool:
-        ids = list(pool.map(
-            lambda _: log.start_request(model="same-model", request_bytes=7), range(8)
-        ))
-    assert len(set(ids)) == 8
+        results = list(pool.map(attempt, range(8)))
+    ids = [item for item in results if item != "request_already_in_flight"]
+    assert len(ids) == 1
+    assert results.count("request_already_in_flight") == 7
     reopened = module.FunctionalRequestLog(log.path, enabled=True)
-    assert reopened.snapshot()["pendingRequests"] == 8
+    assert reopened.snapshot()["pendingRequests"] == 1
     with pytest.raises(module.BudgetRejectedError, match="requests_still_in_flight"):
         reopened.select_phase(variant="new", case_id="new-case")
     for request_id in ids:
@@ -191,6 +204,62 @@ def test_functional_restart_retains_inflight_and_concurrent_physical_identity(tm
     reopened.select_phase(variant="new", case_id="new-case")
     assert reopened.snapshot()["pendingRequests"] == 0
     assert {row["case_id"] for row in reopened.snapshot()["requests"]} == {"synthetic-landing-r1"}
+
+
+def test_functional_global_cap_charges_failed_retry_and_restart_before_dispatch(tmp_path):
+    log = module.FunctionalRequestLog(tmp_path / "capped.sqlite", enabled=True, max_calls=3)
+    log.select_phase(variant="baseline", case_id="first")
+    received = []
+    def upstream(request):
+        received.append(request)
+        if len(received) == 1:
+            raise httpx.ConnectError("synthetic connection failure", request=request)
+        return httpx.Response(503, json={"error": {"message": "synthetic rejection"}})
+    relay = _relay(log, upstream)
+    try:
+        with pytest.raises(httpx.ConnectError):
+            with relay.forward(_body()):
+                pytest.fail("unexpected response")
+        with relay.forward(_body()) as response:
+            list(response.chunks)
+    finally:
+        relay.close()
+    reopened = module.FunctionalRequestLog(log.path, enabled=True, max_calls=3)
+    reopened.select_phase(variant="new", case_id="restart")
+    relay = _relay(reopened, upstream)
+    try:
+        with relay.forward(_body()) as response:
+            list(response.chunks)
+        with pytest.raises(module.BudgetRejectedError, match="model_call_limit_exhausted"):
+            with relay.forward(_body()):
+                pytest.fail("exhausted cap dispatched")
+    finally:
+        relay.close()
+    assert len(received) == 3
+    assert reopened.snapshot()["callsRemaining"] == 0
+    with pytest.raises(module.BudgetRejectedError, match="call_limit_changed"):
+        module.FunctionalRequestLog(log.path, enabled=True, max_calls=4)
+
+
+def test_phase_caps_are_shared_by_variants_and_cannot_reset_after_restart(tmp_path):
+    log = module.FunctionalRequestLog(
+        tmp_path / "phase.sqlite", enabled=True, max_calls=3,
+        phase_limits={"probe": 1, "files": 2},
+    )
+    log.select_phase(variant="baseline", case_id="first", phase="probe")
+    request = log.start_request(model="synthetic-model", request_bytes=1)
+    log.finish_request(request, completed=False, reason="upstream_timeout", response_bytes=0)
+    reopened = module.FunctionalRequestLog(log.path, enabled=True, max_calls=3)
+    reopened.select_phase(variant="new", case_id="retry", phase="probe")
+    with pytest.raises(module.BudgetRejectedError, match="phase_model_call_limit_exhausted"):
+        reopened.start_request(model="synthetic-model", request_bytes=1)
+    with pytest.raises(module.BudgetRejectedError, match="phase_allocation_required"):
+        reopened.select_phase(variant="new", case_id="ungated")
+    reopened.select_phase(variant="new", case_id="read-file", phase="files")
+    assert reopened.snapshot()["phaseCallsRemaining"] == {"probe": 0, "files": 2}
+    with pytest.raises(module.BudgetRejectedError, match="phase_call_limits_changed"):
+        module.FunctionalRequestLog(log.path, enabled=True, max_calls=3,
+                                    phase_limits={"probe": 2, "files": 1})
 
 
 def test_functional_loopback_auth_host_and_redirect_boundaries_are_preserved(tmp_path):

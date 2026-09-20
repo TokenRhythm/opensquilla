@@ -363,3 +363,27 @@ describe('BrowserPendingInputWal atomic handoff cancellation', () => {
     wal!.close()
   })
 })
+
+
+it('retains the initial model pin through durable handoff storage without adding it to pending inputs', async () => {
+  const factory = new ControlledIdbFactory()
+  const wal = createPendingInputWal(factory.idbFactory)!
+  const record: ResponseHandoffWalRecord = {
+    schemaVersion: 1, ownerRequestId: 'pin-request', requestSessionKey: 'agent:main:webchat:draft',
+    clientRequestId: 'pin-request', clientMessageId: 'pin-message', composerText: 'Start', recoveryAttachments: [],
+    state: 'submitting', createdAt: 1, updatedAt: 1,
+    params: {
+      sessionKey: 'agent:main:webchat:draft', clientRequestId: 'pin-request', clientMessageId: 'pin-message',
+      message: 'Start', intent: 'new_chat', initialRoutingMode: 'direct',
+      initialModel: 'model-a', initialProvider: 'provider-a',
+    },
+  }
+  await wal.putHandoff!(record)
+  record.params.initialModel = 'locally-edited'
+  expect((await wal.listHandoffs!())[0]?.params.initialModel).toBe('model-a')
+  expect((await wal.listHandoffs!())[0]?.params.initialProvider).toBe('provider-a')
+  expect(factory.snapshot([PENDING_STORE]).get(PENDING_STORE)?.size).toBe(0)
+  await wal.acceptHandoff!('pin-request', 'agent:main:webchat:accepted')
+  expect((await wal.listHandoffs!())[0]?.params.initialModel).toBe('model-a')
+  wal.close()
+})

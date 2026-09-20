@@ -279,7 +279,10 @@ def is_tool_visible(rt: RegisteredTool, ctx: ToolContext | None = None) -> bool:
         log.debug("tool_filtered", tool=rt.spec.name, reason="guest_safe_not_allowed")
         return False
     explicitly_allowed = (
-        ctx is not None and ctx.allowed_tools is not None and rt.spec.name in ctx.allowed_tools
+        ctx is not None and (
+            (ctx.allowed_tools is not None and rt.spec.name in ctx.allowed_tools)
+            or rt.spec.name in ctx.explicitly_allowed_tools
+        )
     )
     surfaced = (
         ctx is not None

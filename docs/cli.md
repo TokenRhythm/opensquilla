@@ -363,6 +363,11 @@ Read:
 
 ## MCP Server Bridge
 
+MCP support is included in the current source's base installation. See the
+[MCP installation requirements](mcp-server.md#requirements) for SDK 2.x source
+and release installation options. Start the gateway before launching the stdio
+bridge from an MCP-capable client:
+
 ```sh
 opensquilla mcp-server run
 opensquilla mcp-server run --gateway ws://localhost:18792/ws

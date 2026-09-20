@@ -379,6 +379,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
+      async function finishInstallation() {
+        await live.confirmInstalled?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
+        options.onSnapshotInstalled?.()
+        // Projection/tail application can itself detect loss. Recheck the
+        // adapter's exact invalidation fence after that final consumer step.
+        live.assertInstalledCurrent?.()
+        if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
+      }
       let snapshotTaskLive = false
       const snapshot = live.snapshot
       if (snapshot?.sessionKey === key) {
@@ -417,8 +426,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         )
         if (reconciliation) await options.onReconciliationInstalled?.()
         if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
-        options.onSnapshotInstalled?.()
-        await live.confirmInstalled?.()
+        await finishInstallation()
         return outcome
       }
       if (options.ownershipHydrationRequired?.() !== false) {
@@ -445,8 +453,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         || options.hasActiveInterrupt.value
         || live.activity === 'foreground'
       )
-      options.onSnapshotInstalled?.()
-      await live.confirmInstalled?.()
+      await finishInstallation()
       return {
         authoritative: true,
         live: taskOrInterruptLive || live.activity === 'background',

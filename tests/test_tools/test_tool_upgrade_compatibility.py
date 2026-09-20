@@ -169,6 +169,10 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
         "selected_skills",
         "verified_skill_ids",
         "skill_load_emitter",
+        "workspace_files",
+        "attachment_working_files",
+        "persist_attachment_working_files",
+        "explicitly_allowed_tools",
     ]
 
     assert ToolContext().skill_install_turn is None
@@ -178,6 +182,7 @@ def test_tool_context_appends_new_runtime_fields_after_legacy_fields() -> None:
     assert ToolContext().suspend_compute_slot is None
     assert ToolContext().update_progress is None
     assert ToolContext().usage_root_turn_id is None
+    assert ToolContext().explicitly_allowed_tools == set()
 
 
 def test_tool_context_preserves_complete_legacy_positional_constructor() -> None:
@@ -244,3 +249,59 @@ def test_tool_context_appends_install_receipts_after_published_routing_fields() 
 
     assert context.router_control_routing_revision == 7
     assert context.skill_install_turn is None
+
+
+def test_tool_context_preserves_install_receipt_positional_constructor() -> None:
+    defaults = ToolContext()
+    published_fields = fields(ToolContext)[:112]
+    assert published_fields[-1].name == "skill_install_turn"
+    published_values = [getattr(defaults, item.name) for item in published_fields]
+    install_receipts = object()
+    published_values[-1] = install_receipts
+
+    context = ToolContext(*published_values)
+
+    assert context.skill_install_turn is install_receipts
+    assert context.workspace_files == []
+    assert context.attachment_working_files == {}
+    assert context.persist_attachment_working_files is None
+    assert context.workspace_files is not defaults.workspace_files
+    assert context.attachment_working_files is not defaults.attachment_working_files
+
+
+def test_attachment_fields_follow_published_shared_runtime_positions() -> None:
+    defaults = ToolContext()
+    published_fields = fields(ToolContext)[:118]
+    assert [item.name for item in published_fields[-6:]] == [
+        "suspend_compute_slot", "update_progress", "usage_root_turn_id",
+        "selected_skills", "verified_skill_ids", "skill_load_emitter",
+    ]
+
+    def suspend():
+        return "suspended"
+
+    async def progress(**kwargs):
+        return kwargs
+
+    async def emit_skill_load(receipt):
+        return None
+
+    selection = ({"name": "synthetic", "instanceId": "personal:synthetic", "digest": "a" * 64},)
+    verified_ids = {"personal:synthetic"}
+    published_values = [getattr(defaults, item.name) for item in published_fields]
+    published_values[-6:] = [
+        suspend, progress, "synthetic-root-turn", selection, verified_ids, emit_skill_load,
+    ]
+    context = ToolContext(*published_values)
+
+    assert context.suspend_compute_slot is suspend
+    assert context.update_progress is progress
+    assert context.usage_root_turn_id == "synthetic-root-turn"
+    assert context.selected_skills is selection
+    assert context.verified_skill_ids is verified_ids
+    assert context.skill_load_emitter is emit_skill_load
+    assert context.workspace_files == []
+    assert context.attachment_working_files == {}
+    assert context.persist_attachment_working_files is None
+    assert context.workspace_files is not defaults.workspace_files
+    assert context.attachment_working_files is not defaults.attachment_working_files

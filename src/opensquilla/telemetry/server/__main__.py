@@ -1,4 +1,4 @@
-"""Module entry point for isolated telemetry v2 services."""
+"""Module entry point for isolated metrics v2 services."""
 
 from opensquilla.telemetry.server.runtime import main
 

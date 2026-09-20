@@ -12,8 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import math
+import secrets
+import threading
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -36,6 +40,12 @@ from .tokenrhythm_correlation import (
 
 log = structlog.get_logger(__name__)
 _TOKENS_PER_MTOK = Decimal("1000000")
+# Persisted identities must survive restarts, but must not make API keys or
+# proxy passwords cheap to guess from a copied private catalog snapshot.
+_IDENTITY_MEMO_KEY = secrets.token_bytes(32)
+_IDENTITY_MEMO: OrderedDict[bytes, str] = OrderedDict()
+_IDENTITY_MEMO_LOCK = threading.Lock()
+_IDENTITY_MEMO_LIMIT = 256
 TOKENRHYTHM_PUBLIC_CATALOG_URL = "https://tokenrhythm.studio/api/models"
 TOKENRHYTHM_API_BASE_URL = "https://tokenrhythm.studio/v1"
 _TOKENRHYTHM_OFFICIAL_API_HOST = "tokenrhythm.studio"
@@ -185,12 +195,23 @@ def canonical_tokenrhythm_base_url(value: str) -> str:
 
 
 def _identity_digest(domain: str, *parts: str) -> str:
-    digest = hashlib.sha256()
-    digest.update(f"opensquilla:{domain}:v1".encode())
-    for part in parts:
-        digest.update(b"\0")
-        digest.update(part.encode())
-    return digest.hexdigest()
+    salt = f"opensquilla:{domain}:v2".encode()
+    payload = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode()
+    # Only process-keyed indices and stretched outputs enter the memo. Raw
+    # secrets and fast unkeyed hashes are never retained as cache keys.
+    index = hmac.digest(_IDENTITY_MEMO_KEY, salt + b"\0" + payload, "sha256")
+    with _IDENTITY_MEMO_LOCK:
+        cached = _IDENTITY_MEMO.get(index)
+        if cached is not None:
+            _IDENTITY_MEMO.move_to_end(index)
+            return cached
+    result = hashlib.pbkdf2_hmac("sha256", payload, salt, 600_000, dklen=32).hex()
+    with _IDENTITY_MEMO_LOCK:
+        _IDENTITY_MEMO[index] = result
+        _IDENTITY_MEMO.move_to_end(index)
+        if len(_IDENTITY_MEMO) > _IDENTITY_MEMO_LIMIT:
+            _IDENTITY_MEMO.popitem(last=False)
+    return result
 
 
 def tokenrhythm_authority_identity(

@@ -1,4 +1,4 @@
-"""Canonical JSON serialization for already-validated telemetry models."""
+"""Canonical JSON serialization for already-validated metrics models."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from opensquilla.telemetry.privacy import assert_no_forbidden_fields
 def canonical_json_bytes(value: StrictTelemetryModel) -> bytes:
     """Serialize a validated model into stable compact UTF-8 JSON.
 
-    Nulls remain explicit so all producers hash and retry the same closed
-    shape.  Callers must validate raw input before invoking this function.
+    Historical null fields remain explicit. Optional device identity is
+    omitted when unavailable, preserving hashes of pre-device queued events.
+    Callers must validate raw input before invoking this function.
     """
 
     validated = type(value).model_validate(value, strict=True)

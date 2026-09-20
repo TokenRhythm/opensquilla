@@ -428,6 +428,70 @@ async def test_compaction_preserves_only_verified_readable_image_paths(
         assert "/untrusted/" not in rendered
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("storage", ["inline", "ref"])
+async def test_compaction_keeps_original_document_path_when_images_are_not_retained(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, storage: str,
+) -> None:
+    from opensquilla.attachment_refs import write_transcript_material
+
+    workspace = tmp_path / "workspace"
+    media_root = tmp_path / "media"
+    payload = b"%PDF-1.4\nORIGINAL_DOCUMENT_BODY\n%%EOF"
+    document = {"mime": "application/pdf", "name": "original.pdf", "path": "/untrusted/doc.pdf"}
+    if storage == "inline":
+        document["data"] = base64.b64encode(payload).decode()
+    else:
+        sha, _, _ = write_transcript_material(
+            media_root=media_root, session_id="file-session", payload=payload,
+        )
+        document.update(sha256_ref=sha, size=len(payload))
+    entries = [
+        {
+            "id": 1, "role": "user", "message_id": "file-message", "token_count": 5,
+            "content": json.dumps({"text": "Review this document later.", "attachments": [
+                document,
+                {"mime": "image/png", "name": "image.png", "missing_reason": "not retained"},
+            ]}),
+        },
+        {"id": 2, "role": "assistant", "content": "Document received.", "token_count": 5},
+        {"id": 3, "role": "user", "content": "Continue.", "token_count": 5},
+        {"id": 4, "role": "assistant", "content": "Continuing.", "token_count": 5},
+    ]
+    original = deepcopy(entries)
+    materializer = AttachmentWorkspaceMaterializer(media_root=media_root, workspace_dir=workspace)
+    seen = []
+
+    async def summarize(**kwargs):
+        seen.append(kwargs["chunk_text"])
+        return "The document remains to be reviewed."
+
+    monkeypatch.setattr("opensquilla.session.compaction.call_compaction_llm", summarize)
+    result = await compact_context(CompactionRequest(
+        session_id="file-session", entries=entries, context_window_tokens=4_000,
+        config=CompactionConfig(
+            model="synthetic-model", api_key="synthetic-key", safety_margin=1.0,
+            protected_recent_messages=2,
+            attachment_path_resolver=materializer.materialize_attachment_path,
+        ), forced_prefix_cut=2, trigger="message_count",
+    ))
+    assert result.removed_count == 2
+    assert result.summary_payload is not None
+    assert entries == original
+    paths = [item["path"] for item in result.summary_payload["files_and_artifacts"]]
+    assert len(paths) == 1
+    path = paths[0]
+    assert path.startswith(".opensquilla/attachments/file-session/")
+    assert (workspace / path).read_bytes() == payload
+    assert path in seen[0]
+    assert path in compaction_replay_summary(result)
+    assert not list(workspace.rglob("*.png"))
+    for text in [*seen, compaction_replay_summary(result)]:
+        assert "ORIGINAL_DOCUMENT_BODY" not in text
+        assert base64.b64encode(payload).decode() not in text
+        assert "/untrusted/" not in text
+
+
 def test_compaction_image_path_resolution_only_reads_user_envelopes() -> None:
     calls = []
 

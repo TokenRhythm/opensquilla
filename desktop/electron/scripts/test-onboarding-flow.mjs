@@ -332,6 +332,12 @@ async function verifyBootPhaseTimer(app) {
     control: 3,
     ready: 4,
   }[stateBeforeReload?.status?.phaseId] ?? 0
+  // The boot window sits behind modal onboarding, where Chromium may throttle
+  // its 100 ms timer. Drive elapsed time explicitly instead of racing a brief
+  // wall-clock reset window, and install before reload so every timer is owned.
+  const bootClockOrigin = Date.now()
+  await page.clock.install({ time: bootClockOrigin })
+  await page.clock.pauseAt(bootClockOrigin + 1_000)
   await page.reload({ waitUntil: 'domcontentloaded' })
   await waitForBootProgress(page, persistedProgress)
   await waitFor(async () => (
@@ -340,85 +346,85 @@ async function verifyBootPhaseTimer(app) {
       : null
   ), 'boot progress snapshot to restore after a splash reload')
 
+  async function bootTimestamp(offsetMs = 0) {
+    return await page.evaluate((offset) => new Date(Date.now() + offset).toISOString(), offsetMs)
+  }
+
+  async function applyBootStatus(status) {
+    await sendBootEvent(app, 'desktop:boot:status', status)
+    await waitFor(async () => (
+      (await phase.innerText()).trim() === status.label
+    ), `boot status ${status.label} to render`)
+  }
+
   const staleStatus = {
     phaseId: 'gateway-start',
     label: 'Synthetic gateway start',
-    at: new Date(Date.now() - 3_000).toISOString(),
+    at: await bootTimestamp(-3_000),
   }
-  await sendBootEvent(app, 'desktop:boot:status', staleStatus)
+  await applyBootStatus(staleStatus)
   assert.equal((await waitForBootProgress(page, 1)).width, '25%')
-  const anchoredElapsed = await waitFor(async () => {
-    const value = await bootElapsedSeconds(page)
-    return value >= 2 ? value : null
-  }, 'boot timer to include elapsed phase age')
+  assert.equal(await bootElapsedSeconds(page), 3, 'boot timer must include elapsed phase age')
 
   const activeStatus = {
     phaseId: 'gateway-health',
     label: 'Synthetic gateway health',
-    at: new Date().toISOString(),
+    at: await bootTimestamp(),
   }
-  await sendBootEvent(app, 'desktop:boot:status', activeStatus)
+  await applyBootStatus(activeStatus)
   assert.equal((await waitForBootProgress(page, 2)).width, '50%')
-  const resetElapsed = await waitFor(async () => {
-    const value = await bootElapsedSeconds(page)
-    return value < anchoredElapsed - 1 ? value : null
-  }, 'boot timer to reset for a new phase identity')
+  const resetElapsed = await bootElapsedSeconds(page)
+  assert.equal(resetElapsed, 0, 'boot timer must reset for a new phase identity')
 
-  await delay(350)
+  await page.clock.fastForward(350)
   const beforeReplay = await bootElapsedSeconds(page)
-  await sendBootEvent(app, 'desktop:boot:status', activeStatus)
-  await delay(350)
+  // Labels are not part of BootStatus identity. A distinct label acknowledges
+  // renderer receipt without letting an unchanged DOM value satisfy the wait.
+  await applyBootStatus({ ...activeStatus, label: 'Synthetic gateway health replay' })
+  assert.equal(await bootElapsedSeconds(page), beforeReplay)
+  await page.clock.fastForward(350)
   const afterReplay = await bootElapsedSeconds(page)
   assert.ok(
     afterReplay > beforeReplay && afterReplay > resetElapsed,
     'replaying one BootStatus identity must not reset its elapsed timer',
   )
 
-  const repeatedPhaseWithNewTimestamp = { ...activeStatus, at: new Date().toISOString() }
-  await sendBootEvent(app, 'desktop:boot:status', repeatedPhaseWithNewTimestamp)
-  const repeatedPhaseReset = await waitFor(async () => {
-    const value = await bootElapsedSeconds(page)
-    return value < afterReplay ? value : null
-  }, 'boot timer to reset for a repeated phase with a new timestamp')
-  assert.ok(Number.isFinite(repeatedPhaseReset) && repeatedPhaseReset >= 0)
+  const repeatedPhaseWithNewTimestamp = {
+    ...activeStatus,
+    label: 'Synthetic gateway health restarted',
+    at: await bootTimestamp(),
+  }
+  await applyBootStatus(repeatedPhaseWithNewTimestamp)
+  assert.equal(
+    await bootElapsedSeconds(page),
+    0,
+    'boot timer must reset for a repeated phase with a new timestamp',
+  )
 
   const invalidTimestampLabel = 'Synthetic invalid timestamp'
-  await sendBootEvent(app, 'desktop:boot:status', {
+  await applyBootStatus({
     phaseId: 'gateway-start',
     label: invalidTimestampLabel,
     at: 'not-a-date',
   })
   await waitForBootProgress(page, 2)
-  const invalidTimestampValue = await waitFor(async () => {
-    if ((await phase.innerText()).trim() !== invalidTimestampLabel) return null
-    const value = await bootElapsedSeconds(page)
-    return Number.isFinite(value) && value >= 0 && value < 2 ? { value } : null
-  }, 'invalid boot timestamp to clamp near zero')
-  assert.ok(invalidTimestampValue.value >= 0 && invalidTimestampValue.value < 2)
+  assert.equal(await bootElapsedSeconds(page), 0, 'invalid boot timestamp must clamp to zero')
 
   const futureTimestampLabel = 'Synthetic future timestamp'
-  await sendBootEvent(app, 'desktop:boot:status', {
+  await applyBootStatus({
     phaseId: 'control',
     label: futureTimestampLabel,
-    at: new Date(Date.now() + 60_000).toISOString(),
+    at: await bootTimestamp(60_000),
   })
   assert.equal((await waitForBootProgress(page, 3)).width, '75%')
-  const futureTimestampValue = await waitFor(async () => {
-    if ((await phase.innerText()).trim() !== futureTimestampLabel) return null
-    const value = await bootElapsedSeconds(page)
-    return Number.isFinite(value) && value >= 0 && value < 2 ? { value } : null
-  }, 'future boot timestamp to clamp near zero')
-  assert.ok(futureTimestampValue.value >= 0 && futureTimestampValue.value < 2)
+  assert.equal(await bootElapsedSeconds(page), 0, 'future boot timestamp must clamp to zero')
 
   const activeStepBeforeUnknown = await page.locator('.step.active').getAttribute('data-step')
-  await sendBootEvent(app, 'desktop:boot:status', {
+  await applyBootStatus({
     phaseId: 'future-phase',
     label: 'Synthetic future phase',
-    at: new Date().toISOString(),
+    at: await bootTimestamp(),
   })
-  await waitFor(async () => (
-    (await phase.innerText()).trim() === 'Synthetic future phase' ? true : null
-  ), 'unknown boot phase label to render')
   await waitForBootProgress(page, 3)
   assert.equal(
     await page.locator('.step.active').getAttribute('data-step'),
@@ -426,28 +432,32 @@ async function verifyBootPhaseTimer(app) {
     'an unknown phase must not move the visible milestone state',
   )
 
-  await sendBootEvent(app, 'desktop:boot:status', {
+  await applyBootStatus({
     phaseId: 'ready',
     label: 'Synthetic ready',
-    at: new Date().toISOString(),
+    at: await bootTimestamp(),
   })
   assert.equal((await waitForBootProgress(page, 4)).width, '100%')
 
   await sendBootEvent(app, 'desktop:boot:error', { message: 'Synthetic boot pause.' })
-  await delay(150)
+  await waitFor(async () => (
+    await page.locator('body').evaluate((body) => body.classList.contains('errored'))
+  ), 'boot error to render')
+  await page.clock.fastForward(150)
   const frozenText = await timer.innerText()
-  await delay(350)
+  await page.clock.fastForward(350)
   assert.equal(await timer.innerText(), frozenText, 'boot errors must freeze the elapsed timer')
   await waitForBootProgress(page, 4)
 
-  await sendBootEvent(app, 'desktop:boot:status', {
+  await applyBootStatus({
     phaseId: 'profile',
     label: 'Synthetic retry',
-    at: new Date().toISOString(),
+    at: await bootTimestamp(),
   })
   await waitForBootProgress(page, 0)
-  await delay(350)
+  await page.clock.fastForward(350)
   assert.notEqual(await timer.innerText(), frozenText, 'a new retry status must resume phase timing')
+  await page.clock.resume()
 }
 
 async function launchIsolatedOnboarding(prefix) {

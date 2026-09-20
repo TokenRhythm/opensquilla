@@ -8,7 +8,7 @@ export const CURRENT_NOTICE_VERSION_BY_SCOPE: Readonly<Record<TelemetryScope, st
   })
 
 export const TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 =
-  '9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f'
+  'c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18'
 
 type ResultOutcome = 'success' | 'fail' | 'timeout' | 'cancel'
 
@@ -26,6 +26,7 @@ interface EventEnvelope {
   consent_scope: TelemetryScope
   notice_version: string
   sample_rate: number
+  device_id?: string
 }
 
 interface ReliabilityEnvelope extends EventEnvelope {
@@ -259,7 +260,7 @@ export const DESKTOP_EARLY_EVENT_SCOPES: Readonly<
 
 function asRecord(value: unknown): Record<string, unknown> {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
-    throw new TypeError('telemetry event must be an object')
+    throw new TypeError('event must be an object')
   }
   return value as Record<string, unknown>
 }
@@ -289,63 +290,69 @@ export function isUtcTelemetryTimestamp(value: unknown): value is string {
 function assertExactKeys(record: Record<string, unknown>, expected: readonly string[]): void {
   const actual = Object.keys(record)
   if (actual.length !== expected.length) {
-    throw new TypeError('telemetry event does not match its closed field set')
+    throw new TypeError('event does not match its closed field set')
   }
   const expectedSet = new Set(expected)
   if (actual.some((key) => !expectedSet.has(key))) {
-    throw new TypeError('telemetry event does not match its closed field set')
+    throw new TypeError('event does not match its closed field set')
   }
 }
 
 function validateCommon(record: Record<string, unknown>): void {
-  assertCondition(record.event_version === 1, 'telemetry event version is unsupported')
+  if (Object.hasOwn(record, 'device_id')) {
+    assertCondition(
+      typeof record.device_id === 'string' && FINGERPRINT_RE.test(record.device_id),
+      'device id must be a lowercase SHA256 digest',
+    )
+  }
+  assertCondition(record.event_version === 1, 'event version is unsupported')
   assertCondition(
     typeof record.event_id === 'string' && UUID4_RE.test(record.event_id),
-    'telemetry event id must be UUIDv4',
+    'event id must be UUIDv4',
   )
-  assertCondition(isUtcTelemetryTimestamp(record.occurred_at_utc), 'telemetry timestamp must be UTC')
-  assertCondition(isSafeTelemetryVersion(record.app_version), 'telemetry app version is invalid')
-  assertCondition(hasStringValue(record.platform, PLATFORMS), 'telemetry platform is invalid')
-  assertCondition(isSafeTelemetryVersion(record.notice_version), 'telemetry notice version is invalid')
+  assertCondition(isUtcTelemetryTimestamp(record.occurred_at_utc), 'event timestamp must be UTC')
+  assertCondition(isSafeTelemetryVersion(record.app_version), 'reported app version is invalid')
+  assertCondition(hasStringValue(record.platform, PLATFORMS), 'reported platform is invalid')
+  assertCondition(isSafeTelemetryVersion(record.notice_version), 'notice version is invalid')
   assertCondition(
     typeof record.sample_rate === 'number' &&
       Number.isFinite(record.sample_rate) &&
       record.sample_rate > 0 &&
       record.sample_rate <= 1,
-    'telemetry sample rate is invalid',
+    'event sample rate is invalid',
   )
 }
 
 function validateReliabilityCommon(record: Record<string, unknown>): void {
-  assertCondition(record.consent_scope === 'reliability', 'telemetry scope is invalid')
+  assertCondition(record.consent_scope === 'reliability', 'event scope is invalid')
   assertCondition(
     typeof record.app_session_id === 'string' && UUID4_RE.test(record.app_session_id),
-    'telemetry app session id must be UUIDv4',
+    'app session id must be UUIDv4',
   )
 }
 
 function validateGrowthCommon(record: Record<string, unknown>): void {
-  assertCondition(record.consent_scope === 'growth', 'telemetry scope is invalid')
+  assertCondition(record.consent_scope === 'growth', 'event scope is invalid')
   assertCondition(
     typeof record.analytics_user_id === 'string' && UUID4_RE.test(record.analytics_user_id),
-    'telemetry analytics id must be UUIDv4',
+    'analytics id must be UUIDv4',
   )
-  assertCondition(record.error_code === null, 'growth telemetry cannot include an error code')
-  assertCondition(record.duration_ms === null, 'growth telemetry cannot include a duration')
-  assertCondition(record.sample_rate === 1, 'growth telemetry cannot be sampled')
+  assertCondition(record.error_code === null, 'growth events cannot include an error code')
+  assertCondition(record.duration_ms === null, 'growth events cannot include a duration')
+  assertCondition(record.sample_rate === 1, 'growth events cannot be sampled')
 }
 
 function validateTerminalPair(
   record: Record<string, unknown>,
   errorCodes: ReadonlySet<string>,
 ): void {
-  assertCondition(hasStringValue(record.outcome, RESULT_OUTCOMES), 'telemetry outcome is invalid')
+  assertCondition(hasStringValue(record.outcome, RESULT_OUTCOMES), 'event outcome is invalid')
   if (record.outcome === 'success') {
-    assertCondition(record.error_code === null, 'successful telemetry cannot include an error code')
+    assertCondition(record.error_code === null, 'successful results cannot include an error code')
   } else {
     assertCondition(
       hasStringValue(record.error_code, errorCodes),
-      'failed telemetry requires a closed error code',
+      'failed results require a closed error code',
     )
   }
 }
@@ -511,15 +518,16 @@ function validateGrowth(record: Record<string, unknown>): void {
 }
 
 /**
- * Validate the closed subset of telemetry events owned by the Electron shell.
+ * Validate the closed subset of events owned by the Electron shell.
  * Gateway/runtime-owned events are intentionally rejected at this boundary.
  */
 export function validateDesktopEarlyTelemetryEvent(value: unknown): DesktopEarlyTelemetryEvent {
   const record = asRecord(value)
   const eventName = typeof record.event_name === 'string' ? record.event_name : ''
   const expectedKeys = EVENT_KEYS[eventName]
-  assertCondition(expectedKeys !== undefined, 'telemetry event is not Electron-owned')
-  assertExactKeys(record, expectedKeys)
+  assertCondition(expectedKeys !== undefined, 'event is not Electron-owned')
+  assertExactKeys(record, Object.hasOwn(record, 'device_id')
+    ? [...expectedKeys, 'device_id'] : expectedKeys)
   validateCommon(record)
 
   switch (eventName) {
@@ -548,7 +556,7 @@ export function validateDesktopEarlyTelemetryEvent(value: unknown): DesktopEarly
       validateGrowth(record)
       break
     default:
-      throw new TypeError('telemetry event is not Electron-owned')
+      throw new TypeError('event is not Electron-owned')
   }
   return record as unknown as DesktopEarlyTelemetryEvent
 }

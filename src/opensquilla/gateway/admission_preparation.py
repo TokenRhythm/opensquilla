@@ -341,6 +341,33 @@ async def prepare_route(
     if elevated_hint is not None:
         route_envelope.metadata["elevated"] = elevated_hint
 
+    if command.workspace_files:
+        from opensquilla.gateway.routing import tool_context_from_envelope
+        from opensquilla.sandbox.policy_store import pin_sandbox_policy
+        from opensquilla.sandbox.types import SandboxBackendError
+        from opensquilla.tools.types import SafeToolError
+        from opensquilla.workspace_files import validate_workspace_files
+
+        tool_context = tool_context_from_envelope(
+            route_envelope, is_owner=principal.is_owner,
+            host_execute_allowed=host_execute_allowed, workspace_dir=run_context.workspace,
+            workspace_strict=bool(getattr(config, "workspace_strict", True)),
+        )
+        pin_sandbox_policy(tool_context, config)
+        try:
+            await validate_workspace_files(
+                command.workspace_files, session=session, storage=storage,
+                tool_context=tool_context,
+            )
+        except (
+            ValueError, OSError, ProjectWorkspaceStateError, SafeToolError, SandboxBackendError,
+        ) as exc:
+            raise RpcHandlerError(
+                "WORKSPACE_FILE_UNAVAILABLE",
+                "A project file is no longer available in this workspace. Select it again.",
+                retryable=False,
+            ) from exc
+
     return PreparedRuntimeRoute(
         agent_id,
         route_envelope,

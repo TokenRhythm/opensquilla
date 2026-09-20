@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <link rel="icon" href="data:,">
-    <title>OpenSquilla · 埋点数据 V2</title>
+    <title>OpenSquilla · 设备统计 V2</title>
     <style nonce="{{ csp_nonce }}">
       :root {
         color-scheme: light;
@@ -177,7 +177,7 @@
     {% set error_code_labels = {'provider_timeout':'模型服务超时','provider_rate_limited':'模型服务限流','provider_auth':'模型服务鉴权失败','provider_unavailable':'模型服务不可用','context_limit':'上下文超限','request_too_large':'请求过大','output_truncated':'输出被截断','budget_exhausted':'预算耗尽','hard_deadline':'达到总时限','cancelled_by_user':'用户取消','cancelled_before_start':'启动前取消','shutdown':'服务关闭','platform_validation':'平台校验失败','safety_blocked':'安全策略拦截','internal_error':'内部错误','unknown':'未知错误'} %}
     <main class="page">
       <header class="topbar">
-        <div class="brand"><span class="brand-mark"></span> OpenSquilla <span class="preview-pill">埋点 V2</span></div>
+        <div class="brand"><span class="brand-mark"></span> OpenSquilla <span class="preview-pill">设备统计 V2</span></div>
         <form method="post" action="{{ base_path }}/logout"><input type="hidden" name="csrf_token" value="{{ logout_csrf }}"><button class="quiet-button" type="submit">退出看板</button></form>
       </header>
       <section class="hero">
@@ -202,13 +202,13 @@
         <article class="summary-card"><div class="summary-label">对话成功率</div><div class="summary-value">—</div></article>
         <article class="summary-card"><div class="summary-label">无崩溃会话率</div><div class="summary-value">—</div></article>
         {% endif %}
-        {% if summary.growth is not none %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">{{ summary.growth.activation.stages[-1].deduplicatedCount }}</div><p class="summary-note">按分析专用标识去重</p></article>{% else %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">—</div><p class="summary-note">增长数据域暂不可用</p></article>{% endif %}
+        {% if summary.growth is not none %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">{{ summary.growth.activation.stages[-1].deduplicatedCount }}</div><p class="summary-note">按设备标识去重</p></article>{% else %}<article class="summary-card"><div class="summary-label">首次成功对话</div><div class="summary-value">—</div><p class="summary-note">增长数据域暂不可用</p></article>{% endif %}
       </section>
 
-      <section class="panel evolution-strip" aria-label="埋点版本演进">
-        <article class="evolution-step"><span class="source-tag">埋点 V1</span><strong>安装历史基线</strong><p>桌面端首次安装去重、版本及系统覆盖</p></article>
-        <article class="evolution-step"><span class="source-tag">埋点 V2</span><strong>标准化安装漏斗</strong><p>安装器事件进入统一信封与独立增长端点</p></article>
-        <article class="evolution-step"><span class="source-tag">埋点 V2</span><strong>激活与稳定性</strong><p>首次可用、首次成功对话和操作结果</p></article>
+      <section class="panel evolution-strip" aria-label="统计版本演进">
+        <article class="evolution-step"><span class="source-tag">安装统计 V1</span><strong>安装历史基线</strong><p>桌面端首次安装去重、版本及系统覆盖</p></article>
+        <article class="evolution-step"><span class="source-tag">产品统计 V2</span><strong>标准化安装漏斗</strong><p>安装开始、完成和首次使用的阶段转化</p></article>
+        <article class="evolution-step"><span class="source-tag">运行统计 V2</span><strong>激活与稳定性</strong><p>首次可用、首次成功对话和操作结果</p></article>
       </section>
 
       {% if summary.legacyInstallation is not none %}
@@ -227,7 +227,7 @@
       {% if summary.reliability is not none %}
       {% set reliability_total = summary.reliability.appStart.estimatedEvents + summary.reliability.gatewayStart.estimatedEvents + summary.reliability.turns.estimatedEvents + summary.reliability.tools.estimatedEvents + summary.reliability.fileParsing.estimatedEvents + summary.reliability.updates.estimatedEvents %}
       <section class="panel trend-panel">
-        <div class="trend-summary"><div><div class="summary-label">稳定性概览</div><div class="trend-number">{{ reliability_total }}</div><div class="summary-note">采样校正后的操作结果</div></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>事件量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedEvents') }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch issue"></i>问题量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedIssues') }}</span></div></div></div>
+        <div class="trend-summary"><div><div class="summary-label">稳定性概览</div><div class="trend-number">{{ reliability_total }}</div><div class="summary-note">采样校正后的操作结果 · {{ summary.reliability.deviceIdentity.uniqueDevices }} 台可观测设备</div></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>事件量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedEvents') }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch issue"></i>问题量</span><span class="legend-value">{{ summary.reliability.dailyTrend | sum(attribute='estimatedIssues') }}</span></div></div></div>
         <div class="trend-side"><div class="panel-head"><div><h2>每日稳定性趋势</h2><p>实线为事件量，虚线为失败、超时、取消、拒绝或崩溃</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="reliability-trend" viewBox="0 0 960 285" role="img" aria-label="每日稳定性事件及问题趋势图"></svg>{% if summary.reliability.dailyTrend | sum(attribute='estimatedEvents') == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无稳定性上报；接入生产客户端后趋势会自动出现。</p>{% endif %}<div id="trend-data" hidden>{% for point in summary.reliability.dailyTrend %}<span data-date="{{ point.date }}" data-events="{{ point.estimatedEvents }}" data-issues="{{ point.estimatedIssues }}"></span>{% endfor %}</div></div>
       </section>
       <section class="panel trend-panel">
@@ -261,44 +261,44 @@
 
       {% if summary.growth is not none %}
       {% set product_activity = summary.growth.productActivity %}
-      <div class="section-title" id="product-activity"><div><p class="eyebrow">整体产品活跃</p><h2>日活与月活（匿名配置）</h2></div><p>按匿名配置标识统计 · 非账号口径</p></div>
+      <div class="section-title" id="product-activity"><div><p class="eyebrow">整体产品活跃</p><h2>日活与月活（设备去重）</h2></div><p>按设备标识统计 · 跨配置与入口去重</p></div>
       <section class="panel trend-panel" id="product-activity-panel">
         <div class="trend-summary">
-          <div><div class="summary-label">日活配置</div><div class="trend-number" id="product-dau">{{ product_activity.dau }}</div><p class="summary-note">{{ product_activity.asOfDate }} · UTC 当日</p></div>
-          <div><div class="summary-label">月活配置（近 30 天）</div><div class="summary-value" id="product-mau">{{ product_activity.mau }}</div><p class="summary-note">{{ product_activity.mauStartDate }} → {{ product_activity.asOfDate }} · 不受开始日期筛选影响</p></div>
-          <div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>日活配置</span><span class="legend-value">{{ product_activity.dau }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>近 30 天活跃配置</span><span class="legend-value">{{ product_activity.mau }}</span></div></div>
+          <div><div class="summary-label">日活设备</div><div class="trend-number" id="product-dau">{{ product_activity.dau }}</div><p class="summary-note">{{ product_activity.asOfDate }} · UTC 当日</p></div>
+          <div><div class="summary-label">月活设备（近 30 天）</div><div class="summary-value" id="product-mau">{{ product_activity.mau }}</div><p class="summary-note">{{ product_activity.mauStartDate }} → {{ product_activity.asOfDate }} · 不受开始日期筛选影响</p></div>
+          <div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>日活设备</span><span class="legend-value">{{ product_activity.dau }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>近 30 天活跃设备</span><span class="legend-value">{{ product_activity.mau }}</span></div></div>
         </div>
         <div class="trend-side">
-          <div class="panel-head"><div><h2>每日匿名配置活跃趋势</h2><p>按匿名配置标识、UTC 日期统计；同一配置使用桌面端、网页端、TUI 或 CLI 跨入口只计 1 份。</p></div><p>{{ start_date }} → {{ end_date }}</p></div>
-          <svg id="product-activity-trend" viewBox="0 0 960 285" role="img" aria-label="每日匿名配置日活与滚动三十天月活趋势图"></svg>
+          <div class="panel-head"><div><h2>每日设备活跃趋势</h2><p>按设备标识、UTC 日期统计；同一设备标识跨配置和入口只计 1 台。</p></div><p>{{ start_date }} → {{ end_date }}</p></div>
+          <svg id="product-activity-trend" viewBox="0 0 960 285" role="img" aria-label="每日设备日活与滚动三十天月活趋势图"></svg>
           {% if product_activity.dailyTrend | sum(attribute='mau') == 0 %}<p class="chart-empty-note" role="status">当前统计区间暂无产品活跃上报。</p>{% endif %}
-          <p class="summary-note">这是匿名配置口径，不是登录账号人数；同一人在不同设备或不同配置中使用可能重复统计。仅统计允许上传的产品活跃记录，历史未上报不回填。月活为截至每个日期、含当日的最近 30 天去重配置数，不累加日活。</p>
+          <p class="summary-note">设备标识代表操作系统安装实例／执行主机；同一标识下的多个配置只计 1 台。通过 Gateway 使用的 Web/TUI 按 Gateway 主机计数。系统重装或虚拟机克隆可能改变或复制标识。旧版无设备标识的事件不计入设备数，历史不推算、不回填。月活为截至每个日期、含当日的最近 30 天去重设备数，不累加日活。</p>
           <div id="product-activity-trend-data" hidden>{% for point in product_activity.dailyTrend %}<span data-date="{{ point.period }}" data-dau="{{ point.dau }}" data-mau="{{ point.mau }}"></span>{% endfor %}</div>
         </div>
       </section>
-      <div class="section-title"><div><p class="eyebrow">终端客户端</p><h2>TUI 与 CLI 可观测用户</h2></div><p>按分析专用用户标识去重，不使用事件次数</p></div>
+      <div class="section-title"><div><p class="eyebrow">终端客户端</p><h2>TUI 与 CLI 可观测设备</h2></div><p>按设备标识去重</p></div>
       {% set client_usage = summary.growth.clientUsage %}
       <section class="panel trend-panel">
-        <div class="trend-summary"><div><span class="badge">终端并集</span><div class="trend-number">{{ client_usage.totals.terminalUsers }}</div><p class="summary-note">TUI {{ client_usage.totals.tuiUsers }} · CLI {{ client_usage.totals.cliUsers }}</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>TUI 用户</span><span class="legend-value">{{ client_usage.totals.tuiUsers }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>CLI 用户</span><span class="legend-value">{{ client_usage.totals.cliUsers }}</span></div></div></div>
-        <div class="trend-side"><div class="panel-head"><div><h2>每日去重用户趋势</h2><p>{{ client_usage.observablePopulationNote }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="terminal-trend" viewBox="0 0 960 285" role="img" aria-label="每日 TUI 与 CLI 去重用户趋势图"></svg>{% if client_usage.totals.terminalUsers == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无已同意且可观测的终端用户。</p>{% endif %}<div id="terminal-trend-data" hidden>{% for point in client_usage.dailyTrend %}<span data-date="{{ point.period }}" data-tui="{{ point.tuiUsers }}" data-cli="{{ point.cliUsers }}"></span>{% endfor %}</div></div>
+        <div class="trend-summary"><div><span class="badge">终端并集</span><div class="trend-number">{{ client_usage.totals.terminalUsers }}</div><p class="summary-note">TUI {{ client_usage.totals.tuiUsers }} · CLI {{ client_usage.totals.cliUsers }}</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>TUI 设备</span><span class="legend-value">{{ client_usage.totals.tuiUsers }}</span></div><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>CLI 设备</span><span class="legend-value">{{ client_usage.totals.cliUsers }}</span></div></div></div>
+        <div class="trend-side"><div class="panel-head"><div><h2>每日去重设备趋势</h2><p>{{ client_usage.observablePopulationNote }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="terminal-trend" viewBox="0 0 960 285" role="img" aria-label="每日 TUI 与 CLI 去重设备趋势图"></svg>{% if client_usage.totals.terminalUsers == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无允许上报且携带设备标识的终端设备。</p>{% endif %}<div id="terminal-trend-data" hidden>{% for point in client_usage.dailyTrend %}<span data-date="{{ point.period }}" data-tui="{{ point.tuiUsers }}" data-cli="{{ point.cliUsers }}"></span>{% endfor %}</div></div>
       </section>
       {% set metaskill_usage = summary.growth.metaskillUsage %}
       <section class="panel trend-panel" id="metaskill-usage">
-        <div class="trend-summary"><div><span class="badge">MetaSkill</span><div class="trend-number">{{ metaskill_usage.totalUses }}</div><p class="summary-note">所选时间段内的使用次数</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>运行次数</span><span class="legend-value">{{ metaskill_usage.totalUses }}</span></div></div></div>
+        <div class="trend-summary"><div><span class="badge">MetaSkill</span><div class="trend-number">{{ metaskill_usage.totalUses }}</div><p class="summary-note">所选时间段内的使用次数 · {{ metaskill_usage.uniqueDevices }} 台去重设备</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch" style="background:var(--blue)"></i>运行次数</span><span class="legend-value">{{ metaskill_usage.totalUses }}</span></div></div></div>
         <div class="trend-side"><div class="panel-head"><div><h2>每日 MetaSkill 使用次数</h2><p>{{ metaskill_usage.note }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="metaskill-trend" viewBox="0 0 960 285" role="img" aria-label="每日 MetaSkill 使用次数趋势图"></svg>{% if metaskill_usage.totalUses == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无 MetaSkill 使用记录。</p>{% endif %}<div id="metaskill-trend-data" hidden>{% for point in metaskill_usage.dailyTrend %}<span data-date="{{ point.period }}" data-uses="{{ point.uses }}"></span>{% endfor %}</div></div>
       </section>
       {% set coding_mode_usage = summary.growth.codingModeUsage %}
       <section class="panel trend-panel" id="coding-mode-usage">
-        <div class="trend-summary"><div><span class="badge">编程模式</span><div class="trend-number">{{ coding_mode_usage.totalUses }}</div><p class="summary-note">所选时间段内实际执行次数</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>运行次数</span><span class="legend-value">{{ coding_mode_usage.totalUses }}</span></div></div></div>
+        <div class="trend-summary"><div><span class="badge">编程模式</span><div class="trend-number">{{ coding_mode_usage.totalUses }}</div><p class="summary-note">所选时间段内实际执行次数 · {{ coding_mode_usage.uniqueDevices }} 台去重设备</p></div><div class="trend-legend"><div class="legend-item"><span class="legend-label"><i class="legend-swatch"></i>运行次数</span><span class="legend-value">{{ coding_mode_usage.totalUses }}</span></div></div></div>
         <div class="trend-side"><div class="panel-head"><div><h2>每日编程模式使用次数</h2><p>{{ coding_mode_usage.note }}</p></div><p>{{ start_date }} → {{ end_date }}</p></div><svg id="coding-mode-trend" viewBox="0 0 960 285" role="img" aria-label="每日编程模式使用次数趋势图"></svg>{% if coding_mode_usage.totalUses == 0 %}<p class="chart-empty-note" role="status">当前时间范围暂无编程模式使用记录。</p>{% endif %}<div id="coding-mode-trend-data" hidden>{% for point in coding_mode_usage.dailyTrend %}<span data-date="{{ point.period }}" data-uses="{{ point.uses }}"></span>{% endfor %}</div></div>
       </section>
       <section class="breakdown-grid">
-        <article class="panel breakdown" id="terminal-user-counts"><div class="panel-head"><div><h2>终端使用人数</h2><p>所选时间范围内，TUI 和 CLI 分别按用户去重</p></div></div>{% set client_max = [client_usage.totals.tuiUsers, client_usage.totals.cliUsers, 1] | max %}<div class="bar-list">{% for label, value in [('TUI',client_usage.totals.tuiUsers),('CLI',client_usage.totals.cliUsers)] %}<div class="bar-row"><span class="bar-name">{{ label }}</span><progress max="{{ client_max }}" value="{{ value }}"></progress><span class="bar-value">{{ value }}</span></div>{% endfor %}</div></article>
-        <article class="panel breakdown"><div class="panel-head"><div><h2>入口分布</h2><p>每个入口按分析用户去重</p></div></div>{% set entry_max = client_usage.totals.terminalUsers if client_usage.totals.terminalUsers else 1 %}<div class="bar-list">{% for item in client_usage.entrypoints %}<div class="bar-row"><span class="bar-name">{{ entrypoint_labels.get(item.entrypoint, '其他入口') }}</span><progress max="{{ entry_max }}" value="{{ item.users }}"></progress><span class="bar-value">{{ item.users }}</span></div>{% else %}<div class="empty">暂无入口数据</div>{% endfor %}</div></article>
+        <article class="panel breakdown" id="terminal-user-counts"><div class="panel-head"><div><h2>终端使用设备数</h2><p>所选时间范围内，TUI 和 CLI 分别按设备去重</p></div></div>{% set client_max = [client_usage.totals.tuiUsers, client_usage.totals.cliUsers, 1] | max %}<div class="bar-list">{% for label, value in [('TUI',client_usage.totals.tuiUsers),('CLI',client_usage.totals.cliUsers)] %}<div class="bar-row"><span class="bar-name">{{ label }}</span><progress max="{{ client_max }}" value="{{ value }}"></progress><span class="bar-value">{{ value }}</span></div>{% endfor %}</div></article>
+        <article class="panel breakdown"><div class="panel-head"><div><h2>入口分布</h2><p>每个入口按设备去重</p></div></div>{% set entry_max = client_usage.totals.terminalUsers if client_usage.totals.terminalUsers else 1 %}<div class="bar-list">{% for item in client_usage.entrypoints %}<div class="bar-row"><span class="bar-name">{{ entrypoint_labels.get(item.entrypoint, '其他入口') }}</span><progress max="{{ entry_max }}" value="{{ item.users }}"></progress><span class="bar-value">{{ item.users }}</span></div>{% else %}<div class="empty">暂无入口数据</div>{% endfor %}</div></article>
       </section>
-      <div class="section-title"><div><p class="eyebrow">用户增长</p><h2>用户增长漏斗</h2></div><p>同一批用户、统一窗口、按专用标识去重</p></div>
+      <div class="section-title"><div><p class="eyebrow">用户增长</p><h2>用户增长漏斗</h2></div><p>统一窗口 · 获客按链路、激活按设备去重</p></div>
       <section class="funnel-grid">
-        {% for funnel_id, title, subtitle, deduplication, journey in [('acquisition-funnel','获客漏斗','从落地页到注册成功','按获客链路去重',summary.growth.acquisition),('activation-funnel','激活漏斗','从完成引导到首次成功对话 · 所选日期首次完成引导的用户','按分析用户去重',summary.growth.activation)] %}
+        {% for funnel_id, title, subtitle, deduplication, journey in [('acquisition-funnel','获客漏斗','从落地页到注册成功','按获客链路去重',summary.growth.acquisition),('activation-funnel','激活漏斗','从完成引导到首次成功对话 · 所选日期首次完成引导的设备','按设备去重',summary.growth.activation)] %}
         {% set funnel_max = journey.stages[0].deduplicatedCount if journey.stages and journey.stages[0].deduplicatedCount else 1 %}
         <article class="panel funnel" id="{{ funnel_id }}"><div class="panel-head"><div><h2>{{ title }}</h2><p>{{ subtitle }} · {{ deduplication }}</p></div></div><div class="bar-list">{% for stage in journey.stages %}<div class="bar-row"><span class="bar-name">{{ funnel_labels.get(stage.stage, '未识别阶段') }}</span><progress max="{{ funnel_max }}" value="{{ stage.deduplicatedCount }}"></progress><span class="bar-value">{{ stage.deduplicatedCount }}</span></div>{% endfor %}</div><div class="transition-list">{% for transition in journey.transitions %}<span class="transition-chip">{{ funnel_labels.get(transition['from'], '未识别阶段') }} → {{ funnel_labels.get(transition.to, '未识别阶段') }} · {{ transition.windowHours }} 小时 · 流失 <strong>{{ percent(transition.dropoffRate) }}</strong></span>{% endfor %}</div></article>
         {% endfor %}
@@ -369,9 +369,9 @@
         const hourlyLabel = point => `${String(point.hourUtc).padStart(2, '0')}:00`;
         drawTrend({svgSelector: '#reliability-hourly-trend', data: hourlyData, series: [{key: 'events', lineClass: 'chart-events', pointClass: 'chart-point'}, {key: 'issues', lineClass: 'chart-issues', pointClass: 'chart-point'}], areaId: 'hourly-area-fill', areaClass: 'hourly-chart-area', colors: ['#43a99d'], title: '稳定性事件', axisLabel: hourlyLabel, tooltipText: point => `${hourlyLabel(point)} UTC · 事件量 ${point.events} · 问题量 ${point.issues}`});
         const productActivityData = Array.from(document.querySelectorAll('#product-activity-trend-data [data-date]')).map(node => ({date: node.dataset.date, dau: Number(node.dataset.dau) || 0, mau: Number(node.dataset.mau) || 0}));
-        drawTrend({svgSelector: '#product-activity-trend', data: productActivityData, series: [{key: 'dau', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'mau', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'product-activity-area-fill', areaClass: 'product-activity-chart-area', colors: ['#43a99d'], title: '匿名活跃配置', width: Math.max(320, Math.min(960, document.querySelector('#product-activity-trend')?.clientWidth || 960)), tooltipText: point => `${point.date} UTC · 日活配置 ${point.dau} 份 · 近 30 天活跃配置 ${point.mau} 份`});
+        drawTrend({svgSelector: '#product-activity-trend', data: productActivityData, series: [{key: 'dau', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'mau', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'product-activity-area-fill', areaClass: 'product-activity-chart-area', colors: ['#43a99d'], title: '匿名活跃设备', width: Math.max(320, Math.min(960, document.querySelector('#product-activity-trend')?.clientWidth || 960)), tooltipText: point => `${point.date} UTC · 日活设备 ${point.dau} 台 · 近 30 天活跃设备 ${point.mau} 台`});
         const terminalData = Array.from(document.querySelectorAll('#terminal-trend-data [data-date]')).map(node => ({date: node.dataset.date, tui: Number(node.dataset.tui) || 0, cli: Number(node.dataset.cli) || 0}));
-        drawTrend({svgSelector: '#terminal-trend', data: terminalData, series: [{key: 'tui', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'cli', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'terminal-area-fill', areaClass: 'terminal-chart-area', colors: ['#43a99d'], title: 'TUI 用户'});
+        drawTrend({svgSelector: '#terminal-trend', data: terminalData, series: [{key: 'tui', lineClass: 'chart-tui', pointClass: 'chart-point'}, {key: 'cli', lineClass: 'chart-cli', pointClass: 'install-point'}], areaId: 'terminal-area-fill', areaClass: 'terminal-chart-area', colors: ['#43a99d'], title: 'TUI 设备'});
         const metaskillData = Array.from(document.querySelectorAll('#metaskill-trend-data [data-date]')).map(node => ({date: node.dataset.date, uses: Number(node.dataset.uses) || 0}));
         drawTrend({svgSelector: '#metaskill-trend', data: metaskillData, series: [{key: 'uses', lineClass: 'chart-metaskill', pointClass: 'install-point'}], areaId: 'metaskill-area-fill', areaClass: 'metaskill-chart-area', colors: ['#356f9f'], title: 'MetaSkill 使用次数', tooltipText: point => `${point.date} · MetaSkill 使用 ${point.uses} 次`});
         const codingModeData = Array.from(document.querySelectorAll('#coding-mode-trend-data [data-date]')).map(node => ({date: node.dataset.date, uses: Number(node.dataset.uses) || 0}));

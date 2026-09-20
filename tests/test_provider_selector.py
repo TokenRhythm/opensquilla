@@ -1009,3 +1009,19 @@ def test_sync_primary_transitions_unconfigured_selector_live() -> None:
 
     assert selector.is_configured is True
     assert selector.resolve() is not None
+
+
+def test_session_pin_survives_clone_and_explicit_model_realignment():
+    selector = ModelSelector(SelectorConfig(
+        primary=ProviderConfig(provider="ollama", model="gateway-default"),
+        fallbacks=[ProviderConfig(provider="ollama", model="gateway-fallback")],
+    ))
+    selector.pin_provider_config(ProviderConfig(
+        provider="openai", model="chosen", api_key="synthetic-pin", base_url="https://pin.example/v1",
+    ))
+    cloned = selector.clone()
+    assert [(c.provider, c.model) for c in cloned.remaining_chain()] == [("openai", "chosen")]
+    cloned.override_original_primary_model("chosen-again")
+    assert [(c.provider, c.model) for c in cloned.remaining_chain()] == [("openai", "chosen-again")]
+    assert cloned.current_config.base_url == "https://pin.example/v1"
+    assert selector.current_config.model == "chosen"

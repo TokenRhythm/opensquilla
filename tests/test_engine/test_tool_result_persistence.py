@@ -532,3 +532,90 @@ async def test_agent_queries_missing_middle_then_finishes_after_real_process_fai
     assert tool_events[-1].is_error is False
     assert not any(event.kind == "error" for event in events)
     assert sum(event.kind == "done" for event in events) == 1
+
+
+def test_history_budget_keeps_complete_distinct_session_reference_identities() -> None:
+    from opensquilla.resource_references import session_reference_v1
+
+    references = [
+        session_reference_v1(
+            f"agent:main:webchat:reference-{index:08d}", title=f"Synthetic task {index}",
+        )
+        for index in range(8)
+    ]
+    payload = {
+        "query": "synthetic source lookup",
+        "result_count": len(references),
+        "results": [
+            {
+                "session_key": reference["id"],
+                "snippet": "large synthetic snippet " * 200,
+                "reference": reference,
+            }
+            for reference in references
+        ],
+    }
+    segment = _persisted_tool_result_segment(ToolResultEvent(
+        tool_use_id="reference-search", tool_name="session_search",
+        result=json.dumps(payload),
+    ))
+    assert len(segment["result"]) <= 2000
+    preview = json.loads(segment["result"])
+    retained = [row["reference"] for row in preview["results"]]
+    assert 1 < len(retained) < len(references)
+    assert retained == references[:len(retained)]
+    assert len({reference["id"] for reference in retained}) == len(retained)
+    assert all(reference["id"] == reference["scope"]["sessionKey"] for reference in retained)
+    assert all(len(row["snippet"]) < len(payload["results"][0]["snippet"])
+               for row in preview["results"])
+
+
+def test_history_budget_preserves_workspace_path_scope_range_and_revision() -> None:
+    from opensquilla.tools.source_edit_contract import workspace_file_reference
+
+    reference = workspace_file_reference(
+        "src/components/reference-preview/" + "example_" * 12 + ".py",
+        revision="file_0123456789abcdef", start_line=42, end_line=48,
+        session_key="agent:main:webchat:source-reference",
+        workspace_id="workspace_0123456789abcdef01234567",
+    )
+    segment = _persisted_tool_result_segment(ToolResultEvent(
+        tool_use_id="read-source-reference", tool_name="read_source",
+        result=json.dumps({
+            "reference": reference,
+            "lines": [{"line": number, "text": "source text " * 300}
+                      for number in range(42, 49)],
+        }),
+    ))
+    assert len(segment["result"]) <= 2000
+    assert json.loads(segment["result"])["reference"] == reference
+
+
+@pytest.mark.parametrize("kind", ["session", "workspace_file", "artifact", "document"])
+def test_history_budget_drops_oversized_reference_atomically(kind: str) -> None:
+    reference = {
+        "version": 1, "kind": kind, "id": "identity-" + "x" * 3000,
+        "label": "Synthetic resource", "scope": {"sessionKey": "synthetic-session"},
+        "capabilities": {"open": True},
+    }
+    segment = _persisted_tool_result_segment(ToolResultEvent(
+        tool_use_id="oversized-reference", tool_name="read_source",
+        result=json.dumps({"reference": reference, "text": "body" * 1000}),
+    ))
+    assert len(segment["result"]) <= 2000
+    preview = json.loads(segment["result"])
+    assert preview["result_truncated"] is True
+    assert "reference" not in preview
+    assert "identity-" not in segment["result"]
+
+
+@pytest.mark.parametrize("kind", [{"nested": "kind"}, ["session"], None])
+def test_history_budget_compacts_ordinary_json_with_non_string_kind(kind: object) -> None:
+    segment = _persisted_tool_result_segment(ToolResultEvent(
+        tool_use_id="ordinary-json", tool_name="synthetic_tool",
+        result=json.dumps({"version": 1, "kind": kind, "body": "x" * 4000}),
+    ))
+    assert len(segment["result"]) <= 2000
+    preview = json.loads(segment["result"])
+    assert preview["kind"] == kind
+    assert preview["body"].endswith("…")

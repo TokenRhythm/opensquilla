@@ -13,6 +13,7 @@ from typing import Any, Literal
 import httpx
 import structlog
 
+from opensquilla.endpoint_identity import base_url_hostname
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.secrets import clean_header_secret
 
@@ -584,7 +585,7 @@ class ModelCatalog:
         # openai reasoning dialect to arbitrary proxy base URLs.
         if (
             provider_name == "openai"
-            and "api.openai.com" in base_url.lower()
+            and base_url_hostname(base_url) == "api.openai.com"
             and model_l.startswith(("gpt-5", "o1", "o3", "o4"))
         ):
             return ModelCapabilities(
@@ -626,7 +627,7 @@ class ModelCatalog:
             return True
         if (
             provider_id == "openai"
-            and "api.openai.com" in base_l
+            and base_url_hostname(base_url) == "api.openai.com"
             and model_l.startswith(("gpt-5", "o1", "o3", "o4"))
         ):
             return True

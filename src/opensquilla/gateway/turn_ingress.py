@@ -19,6 +19,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("message", ("message",)),
     ("display_text", ("displayText", "display_text")),
     ("attachments", ("attachments",)),
+    ("workspace_files", ("workspaceFiles",)),
     ("selected_skills", ("selectedSkills",)),
     ("intent", ("intent",)),
     (
@@ -34,6 +35,8 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
         "initial_routing_mode",
         ("initialRoutingMode", "initial_routing_mode"),
     ),
+    ("initial_model", ("initialModel", "initial_model")),
+    ("initial_provider", ("initialProvider", "initial_provider")),
     ("fork_before_message_id", ("forkBeforeMessageId", "fork_before_message_id")),
     ("queue_mode", ("queueMode", "queue_mode")),
     ("no_memory_capture", ("noMemoryCapture", "no_memory_capture")),

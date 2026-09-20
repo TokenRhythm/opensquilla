@@ -536,7 +536,7 @@ def _validate_filesystem_operation_targets(
     runtime_roots: tuple[Path, ...],
 ) -> None:
     target = targets[0] if targets else None
-    if operation.kind == "read_file" and target is not None:
+    if operation.kind in {"read_file", "probe_file"} and target is not None:
         display = request.display_path or str(target)
         if not target.exists():
             raise FileNotFoundError(f"File not found: {display}")
@@ -580,8 +580,11 @@ def _filesystem_operation_targets(
     logical_targets: tuple[Path, ...]
     if operation.kind in {
         "read_file",
+        "probe_file",
         "list_dir",
         "write_text",
+        "copy_attachment",
+        "fork_attachment",
         "edit_text",
         "create_source",
         "edit_source",

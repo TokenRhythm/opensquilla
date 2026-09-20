@@ -6,10 +6,11 @@ Registered at boot time when a SessionStorage is available.
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from opensquilla.resource_references import session_reference_v1
 from opensquilla.tools.registry import ToolRegistry, tool
 from opensquilla.tools.types import PlanAccess, ToolError
 
@@ -93,6 +94,41 @@ def create_session_search_tool(
         if not results:
             return json.dumps({"query": query, "results": [], "note": "No matches found."})
 
+        # Transcript search rows contain excerpts, not session metadata. Read
+        # the authoritative records and task ledger once for each matching key.
+        keys = list(dict.fromkeys(str(row["session_key"]) for row in results))
+        task_rows: dict[str, list[Any]] = {}
+        list_tasks = getattr(active_storage, "list_agent_tasks_for_sessions", None)
+        if callable(list_tasks):
+            task_rows = await list_tasks(keys)
+        references: dict[str, dict[str, Any]] = {}
+        get_session = getattr(active_storage, "get_session", None)
+        for key in keys:
+            session = await get_session(key) if callable(get_session) else None
+            title = next((
+                value for field in ("display_name", "derived_title", "subject")
+                if (value := getattr(session, field, None))
+            ), key)
+            tasks = sorted(
+                task_rows.get(key, []),
+                key=lambda task: getattr(task, "created_at", 0) or 0,
+                reverse=True,
+            )
+            statuses = [str(getattr(task, "status", "")) for task in tasks]
+            run_status = (
+                "running" if "running" in statuses
+                else "queued" if "queued" in statuses
+                else "failed" if statuses and statuses[0] in {
+                    "failed", "timeout", "abandoned", "cancelled",
+                }
+                else "idle"
+            )
+            available = session is not None
+            references[key] = session_reference_v1(
+                key, title=title, run_status=run_status if available else "missing",
+                available=available, can_open=available,
+            )
+
         return json.dumps(
             {
                 "query": query,
@@ -103,6 +139,9 @@ def create_session_search_tool(
                         "role": r["role"],
                         "snippet": r["snippet"],
                         "created_at": r["created_at"],
+                        "title": references[r["session_key"]]["label"],
+                        "runStatus": references[r["session_key"]]["state"]["runStatus"],
+                        "reference": references[r["session_key"]],
                     }
                     for r in results
                 ],

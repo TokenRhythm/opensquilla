@@ -11,6 +11,9 @@ import {
 } from './useChatSteerDelivery'
 import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { useChatMessageActions } from './useChatMessageActions'
+import { useChatAttachments } from './useChatAttachments'
+import { useChatDraftPersistence } from './useChatDraftPersistence'
+import { attachmentDraftKey, type AttachmentDraftStore } from '@/utils/chat/attachmentDrafts'
 import type {
   Attachment,
   ChatMessage,
@@ -1776,7 +1779,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+      text: "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
     })
   })
 
@@ -3074,6 +3077,141 @@ describe('useChatSend attachment payloads', () => {
         _source: { runMode: 'full' },
       }),
     )
+  })
+
+  it.each(['away', 'restored', 'restoring', 'edited-back', 'reselected', 'save-failed', 'consume-failed', 'new-task', 'pinned-task'])(
+    'consumes only the accepted skill/file draft with a late ACK: %s', async scenario => {
+    vi.stubGlobal('localStorage', memoryStorage())
+    const sessionKey = ref('agent:main:webchat:skill-source')
+    const inputText = ref('edit project notes')
+    const selectedSkills = ref([{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }])
+    const sourceScope = { identity: 'fixture-owner', sessionKey: sessionKey.value }
+    const saved = new Map<string, Attachment[]>()
+    const versions = new Map<string, string | undefined>()
+    let releaseLoad: (() => void) | undefined
+    let delayLoad = false
+    const draftStore: AttachmentDraftStore = {
+      load: async scope => saved.get(attachmentDraftKey(scope)) || [],
+      loadSnapshot: async scope => {
+        const snapshot = { attachments: (saved.get(attachmentDraftKey(scope)) || []).map(item => ({ ...item })),
+          revision: versions.get(attachmentDraftKey(scope)) }
+        if (delayLoad) await new Promise<void>(resolve => { releaseLoad = resolve })
+        return snapshot
+      },
+      save: async (scope, attachments, revision) => {
+        if (scenario === 'save-failed') throw new Error('Storage quota exceeded')
+        saved.set(attachmentDraftKey(scope), [...attachments])
+        versions.set(attachmentDraftKey(scope), revision)
+      },
+      consume: async (scope, revision, indexes) => {
+        if (scenario === 'consume-failed') throw new Error('Storage transaction unavailable')
+        const key = attachmentDraftKey(scope)
+        if (versions.get(key) !== revision) return false
+        saved.set(key, (saved.get(key) || []).filter((_item, index) => !indexes.includes(index)))
+        versions.delete(key)
+        return true
+      },
+    }
+    const scope = effectScope()
+    const attachments = scope.run(() => useChatAttachments(undefined, {
+      draftOwnerState: () => [inputText.value, selectedSkills.value],
+      draftScope: () => ({ ...sourceScope, sessionKey: sessionKey.value }), draftStore,
+    }))!
+    const textDraft = scope.run(() => useChatDraftPersistence({ sessionKey, inputText, selectedSkills }))!
+    await vi.waitFor(() => expect(attachments.attachmentWorkBusy.value).toBe(false))
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    attachments.pendingAttachments.value = [{ kind: 'workspace', local_id: 1,
+      name: workspaceFile.name, mime: workspaceFile.mime, workspaceFile }]
+    let accept!: (response: { sessionKey: string }) => void
+    const call = vi.fn(() => new Promise<{ sessionKey: string }>(resolve => { accept = resolve }))
+    const composerRevision = ref(0)
+    scope.run(() => watch([inputText, selectedSkills, attachments.pendingAttachments], () => { composerRevision.value += 1 }, { deep: true, flush: 'sync' }))
+    const captureConsumption = vi.fn(attachments.captureDraftConsumption)
+    const { api } = makeOptions({ sessionKey, inputText, selectedSkills, composerRevision,
+      pendingSessionIntent: ref(['new-task', 'pinned-task'].includes(scenario) ? 'new_chat' : null),
+      ...(scenario === 'pinned-task' ? { initialModel: ref('model-a'), initialProvider: ref('provider-a') } : {}),
+      pendingAttachments: attachments.pendingAttachments, consumeAcceptedDraft: textDraft.consumeAcceptedDraft,
+      captureAttachmentDraftConsumption: captureConsumption,
+      rpc: { call }, methodAvailability: () => true })
+    try {
+      const sending = api.onSend()
+      await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
+      expect(call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+        selectedSkills: selectedSkills.value, workspaceFiles: [workspaceFile],
+        ...(scenario === 'pinned-task' ? { initialModel: 'model-a', initialProvider: 'provider-a', initialRoutingMode: 'direct' } : {}),
+      }))
+      const navigates = !['save-failed', 'consume-failed', 'new-task', 'pinned-task'].includes(scenario)
+      if (navigates) {
+        attachments.retireAttachments()
+        sessionKey.value = 'agent:main:webchat:skill-destination'
+        await nextTick()
+        await attachments.flushAttachmentDraft()
+        expect(saved.get(attachmentDraftKey(sourceScope))).toHaveLength(1)
+      }
+      if (navigates && scenario !== 'away') {
+        attachments.retireAttachments()
+        delayLoad = scenario === 'restoring'
+        sessionKey.value = sourceScope.sessionKey
+        await nextTick()
+        if (delayLoad) {
+          await vi.waitFor(() => expect(releaseLoad).toBeTypeOf('function'))
+          expect(attachments.attachmentWorkBusy.value).toBe(true)
+        } else {
+          await vi.waitFor(() => expect(attachments.attachmentWorkBusy.value).toBe(false))
+          expect(attachments.pendingAttachments.value).toHaveLength(1)
+          expect(captureConsumption.mock.results[0]?.value?.isRestoredCurrent()).toBe(true)
+        }
+        expect(inputText.value).toBe('edit project notes')
+        expect(selectedSkills.value[0]?.instanceId).toBe('skill:tables')
+        if (scenario === 'edited-back') {
+          inputText.value = 'an edited draft'
+          inputText.value = 'edit project notes'
+        } else if (scenario === 'reselected') {
+          attachments.pendingAttachments.value = [{ ...attachments.pendingAttachments.value[0]!, local_id: 2 }]
+        }
+      }
+      accept({ sessionKey: sourceScope.sessionKey })
+      await sending
+      if (delayLoad) releaseLoad!()
+      await attachments.flushAttachmentDraft()
+      const modified = scenario === 'edited-back' || scenario === 'reselected'
+      await vi.waitFor(() => expect(attachments.pendingAttachments.value).toHaveLength(modified ? 1 : 0))
+      if (scenario !== 'save-failed' && scenario !== 'consume-failed') {
+        expect(saved.get(attachmentDraftKey(sourceScope))).toHaveLength(modified ? 1 : 0)
+      }
+      if (!modified && scenario !== 'away') {
+        expect(inputText.value).toBe('')
+        expect(selectedSkills.value).toEqual([])
+      }
+      expect(sessionKey.value).toBe(scenario === 'away' ? 'agent:main:webchat:skill-destination' : sourceScope.sessionKey)
+    } finally { scope.stop(); vi.unstubAllGlobals() }
+  })
+
+  it.each([false, true])('sends workspace and imported files together with selected skills: %s', async withSkills => {
+    const selectedSkills = ref(withSkills
+      ? [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }] : [])
+    const workspaceFile = { workspaceId: 'project-fixture', relativePath: 'docs/notes.md',
+      name: 'notes.md', mime: 'text/markdown', size: 14 }
+    const pendingAttachments = ref<Attachment[]>([
+      { kind: 'workspace', local_id: 1, name: workspaceFile.name,
+        mime: workspaceFile.mime, workspaceFile },
+      { kind: 'staged', local_id: 2, name: 'imported.pdf', mime: 'application/pdf',
+        file_uuid: 'fixture-upload-id' },
+    ])
+    const { api, options, rpc } = makeOptions({ pendingAttachments, selectedSkills, methodAvailability: () => true })
+    await api.onSend()
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      workspaceFiles: [workspaceFile],
+      ...(withSkills ? { selectedSkills: [{ name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }] } : {}),
+      attachments: [{ type: 'application/pdf', mime: 'application/pdf',
+        name: 'imported.pdf', file_uuid: 'fixture-upload-id' }],
+    }))
+    expect(options.messages.value[0]?.attachments?.[0]).toMatchObject({
+      kind: 'file', name: workspaceFile.name, workspaceFile,
+    })
+    expect(pendingAttachments.value).toEqual([])
+    expect(selectedSkills.value).toEqual([])
   })
 
   it('serializes only sendable attachments and leaves failed attachments in the composer', async () => {
@@ -7302,7 +7440,7 @@ describe('useChatSend image admission', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+      text: "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
     })
   })
 
@@ -7337,7 +7475,7 @@ describe('useChatSend image admission', () => {
     await known.api.onSend()
     expect(known.options.messages.value[known.options.messages.value.length - 1]).toMatchObject({
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Ensemble doesn't support image input yet. Under Model routing, choose AI-powered single-model router with an image-capable tier configured, or turn routing Off and select an image-capable model.",
+      text: "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
     })
 
     const unknownRpc = {
@@ -8318,5 +8456,233 @@ describe('useChatSend slash-prefixed input fall-through', () => {
     await expect(sending).resolves.toBe('not_sent')
     expect(executeSlashCommand).not.toHaveBeenCalled()
     expect(rpc.call).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('new-task model pin delivery', () => {
+  function pinned(overrides: SendHarnessOverrides = {}) {
+    return makeOptions({
+      pendingSessionIntent: ref('new_chat'),
+      initialRoutingMode: ref(null),
+      initialModel: ref('model-a'),
+      initialProvider: ref('provider-a'),
+      ...overrides,
+    })
+  }
+
+  it('sends the selected model and effective direct route atomically, then retires its WAL', async () => {
+    const h = pinned()
+    await h.api.onSend()
+    expect(h.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      intent: 'new_chat', initialRoutingMode: 'direct', initialModel: 'model-a', initialProvider: 'provider-a',
+    }))
+    expect(await h.options.pendingInputWal!.listHandoffs!()).toEqual([])
+    expect(h.options.pendingSessionIntent.value).toBeNull()
+  })
+
+  it('keeps selected skills with a pinned draft until acceptance, then consumes both', async () => {
+    const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+    const selectedSkills = ref([skill])
+    let accept!: (result: unknown) => void
+    const rpc = { call: vi.fn((_method: string, _params: unknown) => new Promise(resolve => { accept = resolve })) }
+    const materializeDraftSession = vi.fn()
+    const h = pinned({ selectedSkills, rpc, materializeDraftSession, methodAvailability: () => true })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    expect(h.options.inputText.value).toBe('hello')
+    expect(selectedSkills.value).toEqual([skill])
+    expect(rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      initialModel: 'model-a', initialProvider: 'provider-a', selectedSkills: [skill],
+    })
+    accept({ sessionKey: h.options.sessionKey.value, task_id: 'accepted' })
+    await sending
+    expect(h.options.inputText.value).toBe('')
+    expect(selectedSkills.value).toEqual([])
+    expect(h.options.pendingSessionIntent.value).toBeNull()
+    expect(materializeDraftSession).toHaveBeenCalledExactlyOnceWith(h.options.sessionKey.value)
+    expect(await h.options.pendingInputWal!.listHandoffs!()).toEqual([])
+  })
+
+  it('retains the pin and skills when a project changes during attachment preparation', async () => {
+    const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+    const selectedSkills = ref([skill])
+    const pendingWorkspaceId = ref<string | null>('project-a')
+    let prepared!: (ready: boolean) => void
+    const prepare = vi.fn(() => new Promise<boolean>(resolve => { prepared = resolve }))
+    const h = pinned({ selectedSkills, pendingWorkspaceId, prepareAttachmentsForSend: prepare, methodAvailability: () => true })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce())
+    pendingWorkspaceId.value = 'project-b'
+    prepared(true)
+    await sending
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    expect(h.options.inputText.value).toBe('hello')
+    expect(selectedSkills.value).toEqual([skill])
+    expect(h.options.initialModel?.value).toBe('model-a')
+    expect(h.options.pendingSessionIntent.value).toBe('new_chat')
+    expect(await h.options.pendingInputWal!.listHandoffs!()).toEqual([])
+  })
+
+  it.each([false, true])('consumes a recovered pinned skill draft with durable files: %s', async withFiles => {
+    const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+    const files: Attachment[] = withFiles ? [
+      { kind: 'workspace', local_id: 1, name: 'notes.md', mime: 'text/markdown',
+        workspaceFile: { workspaceId: 'project-a', relativePath: 'docs/notes.md', name: 'notes.md', mime: 'text/markdown' } },
+      { kind: 'staged', local_id: 2, name: 'original.pdf', mime: 'application/pdf', file_uuid: 'durable-import' },
+    ] : []
+    const wal = memoryHandoffWal()
+    const rpc = { call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)) }
+    const first = pinned({ pendingInputWal: wal, selectedSkills: ref([skill]),
+      pendingAttachments: ref(structuredClone(files)), rpc, methodAvailability: () => true })
+    await first.api.onSend()
+    expect(await wal.listHandoffs!()).toHaveLength(1)
+    const selectedSkills = ref([skill])
+    const restored = pinned({ pendingInputWal: wal, selectedSkills,
+      pendingAttachments: ref(structuredClone(files)), methodAvailability: () => true })
+    await restored.api.recoverResponseHandoffs()
+    expect(restored.rpc.call.mock.calls[0]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
+    if (withFiles) expect(restored.rpc.call.mock.calls[0]?.[1]).toMatchObject({
+      initialModel: 'model-a', initialProvider: 'provider-a',
+      workspaceFiles: [{ workspaceId: 'project-a', relativePath: 'docs/notes.md' }],
+      attachments: [{ file_uuid: 'durable-import' }],
+    })
+    expect(restored.options.inputText.value).toBe('')
+    expect(selectedSkills.value).toEqual([])
+    expect(restored.options.pendingAttachments.value).toEqual([])
+    expect(restored.options.pendingSessionIntent.value).toBeNull()
+    expect(await wal.listHandoffs!()).toEqual([])
+  })
+
+  it.each(['text', 'skills', 'model', 'project', 'attachments', 'fork', 'route'] as const)(
+    'preserves an edited %s draft when a pinned skill request is recovered', async change => {
+      const skill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
+      const wal = memoryHandoffWal()
+      const first = pinned({
+        pendingInputWal: wal, selectedSkills: ref([skill]), methodAvailability: () => true,
+        rpc: { call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)) },
+      })
+      await first.api.onSend()
+      const inputText = ref(change === 'text' ? 'A different request' : 'hello')
+      const selectedSkills = ref(change === 'skills' ? [] : [skill])
+      const restored = pinned({
+        pendingInputWal: wal, inputText, selectedSkills, methodAvailability: () => true,
+        initialModel: ref(change === 'model' ? 'model-b' : 'model-a'),
+        pendingWorkspaceId: ref(change === 'project' ? 'project-b' : null),
+        pendingAttachments: ref(change === 'attachments' ? [{
+          kind: 'staged', local_id: 1, name: 'new.pdf', mime: 'application/pdf', file_uuid: 'new-file',
+        }] : []),
+        pendingForkBeforeMessageId: ref(change === 'fork' ? 'different-message' : null),
+        initialRoutingMode: ref(change === 'route' ? 'ensemble' : null),
+      })
+      await restored.api.recoverResponseHandoffs()
+      expect(inputText.value).toBe(change === 'text' ? 'A different request' : 'hello')
+      expect(selectedSkills.value).toEqual(change === 'skills' ? [] : [skill])
+      expect(await wal.listHandoffs!()).toEqual([])
+    },
+  )
+
+  it('omits creation fields for gateway default and existing-session queued inputs', async () => {
+    const defaults = pinned({ initialModel: ref(null), initialProvider: ref(null) })
+    await defaults.api.onSend()
+    expect(defaults.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('initialModel')
+    expect(defaults.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('initialProvider')
+    const existing = pinned({ pendingSessionIntent: ref(null) })
+    await existing.api.sendQueuedFollowup({ pendingUiId: 'model-followup', text: 'follow up', attachments: [], intent: null })
+    expect(existing.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('initialModel')
+    expect(existing.rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('initialProvider')
+  })
+
+  it('rejects a new model pin with Router or Ensemble without rewriting their state', async () => {
+    for (const mode of ['squilla_router', 'llm_ensemble'] as const) {
+      const h = pinned({ modelRoutingMode: ref(mode) })
+      await h.api.onSend()
+      expect(h.rpc.call).not.toHaveBeenCalled()
+      expect(h.options.inputText.value).toBe('hello')
+      expect(h.options.modelRoutingMode.value).toBe(mode)
+    }
+  })
+
+  it('freezes the selected model before asynchronous preparation while preserving a changed draft', async () => {
+    let prepared!: (ready: boolean) => void
+    const prepare = vi.fn(() => new Promise<boolean>(resolve => { prepared = resolve }))
+    const initialModel = ref<string | null>('model-a')
+    const h = pinned({ initialModel, prepareAttachmentsForSend: prepare })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce())
+    initialModel.value = 'model-b'
+    prepared(true)
+    await sending
+    expect(h.rpc.call.mock.calls[0]?.[1]).toMatchObject({ initialModel: 'model-a', initialProvider: 'provider-a' })
+    expect(h.options.inputText.value).toBe('hello')
+  })
+
+  it('uses a fresh request identity when a definitely rejected draft changes model', async () => {
+    const initialModel = ref<string | null>('model-a')
+    const rpc = { call: vi.fn()
+      .mockRejectedValueOnce(Object.assign(new Error('busy'), { accepted: false, retryable: true }))
+      .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test', task_id: 'accepted' }) }
+    const h = pinned({ initialModel, rpc })
+    await h.api.onSend()
+    initialModel.value = 'model-b'
+    await h.api.onSend()
+    const first = rpc.call.mock.calls[0]?.[1]
+    const second = rpc.call.mock.calls[1]?.[1]
+    expect(second.initialModel).toBe('model-b')
+    expect(second.clientRequestId).not.toBe(first.clientRequestId)
+    expect(await h.options.pendingInputWal!.listHandoffs!()).toEqual([])
+  })
+
+  it('replays unknown acceptance with the original model even after the draft selection changes', async () => {
+    const initialModel = ref<string | null>('model-a')
+    const rpc = { call: vi.fn()
+      .mockRejectedValueOnce(new RpcTransportError('Connection closed', null))
+      .mockResolvedValueOnce({ sessionKey: 'agent:main:webchat:test', task_id: 'accepted' }) }
+    const h = pinned({ initialModel, rpc, idempotentReplayBlockedReason: ref(null) })
+    await h.api.onSend()
+    initialModel.value = 'model-b'
+    await h.api.onSend()
+    expect(rpc.call.mock.calls[1]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
+  })
+
+  it('recovers the pre-ACK WAL with the frozen model after a remount', async () => {
+    let accept!: (result: unknown) => void
+    const wal = memoryHandoffWal()
+    const rpc = { call: vi.fn((_method: string, _params: unknown) => new Promise(resolve => { accept = resolve })) }
+    const first = pinned({ pendingInputWal: wal, rpc })
+    const sending = first.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    const records = await wal.listHandoffs!()
+    expect(records[0]?.params).toMatchObject({ initialModel: 'model-a', initialProvider: 'provider-a' })
+    const restored = pinned({ pendingInputWal: wal, initialModel: ref('model-b') })
+    await restored.api.recoverResponseHandoffs()
+    expect(restored.rpc.call.mock.calls[0]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
+    expect(restored.options.pendingSessionIntent.value).toBeNull()
+    accept({ sessionKey: 'agent:main:webchat:test', task_id: 'accepted' })
+    await sending
+  })
+
+  it('recovers the first hidden control with its original model and routing', async () => {
+    const storage = memoryStorage()
+    const rpc = { call: vi.fn().mockRejectedValueOnce(new RpcTransportError('Connection closed', null)) }
+    const first = pinned({ rpc, hiddenControlStorage: storage })
+    await first.api.dispatchHiddenSend('/meta launch', 'Launch', 'stable-model-hidden')
+    const stored = listHiddenControls('agent:main:webchat:test', storage)
+    expect(stored[0]?.initialSettings).toEqual({
+      intent: 'new_chat', initialRoutingMode: 'direct', initialModel: 'model-a', initialProvider: 'provider-a',
+    })
+    const restored = pinned({ hiddenControlStorage: storage, initialModel: ref('model-b'), initialRoutingMode: ref('ensemble') })
+    await restored.api.restoreHiddenControls()
+    expect(restored.rpc.call.mock.calls[0]?.[1]).toEqual(rpc.call.mock.calls[0]?.[1])
+  })
+
+  it('materializes an accepted hidden first turn before retiring its draft model selection', async () => {
+    const materializeDraftSession = vi.fn()
+    const h = pinned({ materializeDraftSession, hiddenControlStorage: memoryStorage() })
+    const result = await h.api.dispatchHiddenSend('/meta launch', 'Launch', 'first-model-hidden')
+    expect(result.status).toBe('accepted')
+    expect(materializeDraftSession).toHaveBeenCalledExactlyOnceWith(h.options.sessionKey.value)
+    expect(h.options.pendingSessionIntent.value).toBeNull()
+    expect(h.options.inputText.value).toBe('hello')
   })
 })
