@@ -33,6 +33,33 @@
 
     <!-- Thread -->
     <div class="chat-body">
+      <div v-if="!isNewChatLanding && !shareMode" class="chat-view-switcher">
+        <div class="chat-view-switcher__tabs" role="group" :aria-label="t('chat.traceView.conversation')">
+          <button type="button" :aria-pressed="conversationView === 'conversation'" @click="conversationView = 'conversation'">
+            {{ t('chat.traceView.conversation') }}
+          </button>
+          <button type="button" :aria-pressed="conversationView === 'trace'" @click="conversationView = 'trace'">
+            {{ t('chat.traceView.trajectory') }}
+          </button>
+        </div>
+        <button
+          v-if="conversationView === 'trace' && (visiblePendingInterruptKeys.length || pendingClarify)"
+          type="button"
+          class="btn btn--ghost"
+          @click="conversationView = 'conversation'"
+        >{{ t('sessions.status.needsInput') }}</button>
+        <select
+          v-if="conversationView === 'trace' && traceTurns.length"
+          v-model="selectedTraceTurn"
+          class="chat-view-switcher__turn"
+          :aria-label="t('chat.traceView.turnSelector')"
+        >
+          <option value="">{{ t('chat.traceView.followLatest') }}</option>
+          <option v-for="(turn, index) in traceTurns" :key="turn.id" :value="turn.id">
+            {{ t('chat.traceView.turn', { number: index + 1 }) }}{{ turn.preview ? ` · ${turn.preview}` : '' }}
+          </option>
+        </select>
+      </div>
       <!-- Share-mode banner stays pinned above the scrolling thread. -->
       <div
         v-if="shareMode"
@@ -59,7 +86,7 @@
           {{ t('common.cancel') }}
         </button>
       </div>
-      <div class="chat-thread-shell">
+      <div v-show="conversationView === 'conversation' || isNewChatLanding || shareMode" class="chat-thread-shell">
         <div
           v-if="forkTransition"
           class="chat-fork-transition-overlay"
@@ -493,6 +520,20 @@
           @navigate-end="onHistoryNavigateEnd"
         />
       </div>
+      <div
+        v-if="conversationView === 'trace' && !isNewChatLanding && !shareMode"
+        class="chat-trace-view"
+        role="region"
+        :aria-label="t('chat.traceView.trajectory')"
+      >
+        <ChatTracePanel
+          v-if="traceTurnId"
+          :session-key="sessionKey"
+          :turn-id="traceTurnId"
+          :running="traceTurnRunning"
+        />
+        <p v-else class="chat-trace-view__empty">{{ t('chat.traceView.waitingForTurn') }}</p>
+      </div>
     </div>
 
     <!-- Composer dock: positioning context so the slash menu anchors directly
@@ -812,6 +853,7 @@ import {
 import ActivityDisclosure from '@/components/chat/ActivityDisclosure.vue'
 import AssistantActivityTimeline from '@/components/chat/AssistantActivityTimeline.vue'
 import UnifiedAssistantActivityTimeline from '@/components/chat/UnifiedAssistantActivityTimeline.vue'
+import ChatTracePanel from '@/components/trace/ChatTracePanel.vue'
 import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
@@ -845,6 +887,7 @@ import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
+import { useChatTraceSelection } from '@/composables/chat/useChatTraceSelection'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
 import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverableUpdateIndicator'
 import { useChatRouteHeaderBridge } from '@/composables/chat/useChatRouteHeaderBridge'
@@ -2291,6 +2334,14 @@ const activeTurnUsesEnsemble = computed(() => (
 const activeTurnId = computed(() => (
   String(activeSteerCapability.value?.expected_turn_id || '').trim()
 ))
+
+const {
+  view: conversationView,
+  selectedTurn: selectedTraceTurn,
+  turns: traceTurns,
+  turnId: traceTurnId,
+  selectedRunning: traceTurnRunning,
+} = useChatTraceSelection({ sessionKey, messages, runStatus, isStreaming })
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -4069,6 +4120,8 @@ async function focusPendingApprovalCard() {
   const request = appStore.approvalFocusRequest
   if (!request || request.sessionKey !== sessionKey.value) return
   const requestScrollEpoch = scrollEpoch.value
+
+  conversationView.value = 'conversation'
 
   await nextTick()
   if (

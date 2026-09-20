@@ -45,6 +45,7 @@ from opensquilla.observability.trace import (
     load_trace_events,
     write_trace_event,
 )
+from opensquilla.observability.trace_projection import build_trace_projection
 from opensquilla.observability.turn_call_log import TurnCallLogger, is_turn_call_log_enabled
 
 __all__ = [
@@ -63,6 +64,7 @@ __all__ = [
     "TraceEvent",
     "TurnCallLogger",
     "build_prompt_report",
+    "build_trace_projection",
     "compute_hashes",
     "format_transcript",
     "is_turn_call_log_enabled",

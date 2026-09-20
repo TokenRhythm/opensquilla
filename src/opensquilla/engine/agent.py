@@ -20,7 +20,7 @@ import stat
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from itertools import chain
@@ -135,7 +135,7 @@ from opensquilla.execution_status import (
     runtime_execution_status,
 )
 from opensquilla.git_runtime import GitRunState, run_git
-from opensquilla.observability.turn_call_log import TurnCallLogger
+from opensquilla.observability.turn_call_log import TurnCallLogger, TurnCallProgress
 from opensquilla.provider import (
     ChatConfig,
     ContentBlockText,
@@ -321,6 +321,7 @@ from .types import (
     EnsembleProgressEvent,
     ErrorEvent,
     ProviderActivityEvent,
+    RouterControlReplayEvent,
     RunHeartbeatEvent,
     StateChangeEvent,
     TextDeltaEvent,
@@ -3525,6 +3526,48 @@ class Agent:
         if self._turn_call_logger is not None:
             self._turn_call_logger.write(kind, payload)
 
+    def _record_trace_boundary(self, event: AgentEvent) -> None:
+        if self._turn_call_logger is None:
+            return
+        if isinstance(event, ProviderActivityEvent):
+            if event.phase not in {"retry_wait", "retrying", "fallback"}:
+                return
+            payload = asdict(event)
+            payload.pop("kind", None)
+            payload["status"] = "success"
+            payload["provider"] = self._provider_log_identity()
+            payload["model"] = str(
+                self.config.metadata.get("executed_model")
+                or self.config.metadata.get("routed_model") or self.config.model_id or ""
+            )
+            self._write_turn_call_log(
+                "provider_fallback" if event.phase == "fallback" else "provider_retry",
+                **payload,
+            )
+        elif isinstance(event, EnsembleProgressEvent):
+            payload = asdict(event)
+            payload.pop("kind", None)
+            payload["status"] = (
+                "error" if event.error else "running"
+                if event.event_type.endswith("start") else "success"
+            )
+            self._write_turn_call_log("ensemble_progress", **payload)
+        elif isinstance(event, CompactionEvent):
+            self._write_turn_call_log(
+                "compaction",
+                status="success",
+                compaction_id=event.compaction_id,
+                summary=event.summary,
+                summary_format=event.summary_format,
+                kept_count=event.kept_count,
+                removed_count=event.removed_count,
+                coverage_status=event.coverage_status,
+            )
+        elif isinstance(event, RouterControlReplayEvent):
+            payload = asdict(event)
+            payload.pop("kind", None)
+            self._write_turn_call_log("router_control_replay", status="success", **payload)
+
     def _notify_provider_call_observer(
         self,
         *,
@@ -5756,6 +5799,7 @@ class Agent:
                     semantic_message,
                     pending_input_provider=pending_input_provider,
                 ):
+                    self._record_trace_boundary(event)
                     yield event
         except asyncio.CancelledError:
             pending_tool_terminal = (ToolOutcome.CANCEL, ToolErrorCode.CANCELLED)
@@ -6875,7 +6919,6 @@ class Agent:
                         reasoning_block_id = ""
                         return event
 
-                    call_started_at = time.monotonic()
                     ignored_post_delivery_tool_use = False
                     if message_count_request_view is not None:
                         base_request_turn_messages = message_count_request_view.materialize(
@@ -7373,6 +7416,7 @@ class Agent:
                             if provider_tools_for_call else None
                         ),
                     )
+                    call_started_at = time.monotonic()
                     self._write_turn_call_log(
                         "llm_request",
                         call_id=call_id,
@@ -7381,6 +7425,17 @@ class Agent:
                         messages=request_messages,
                         tools=provider_tools_for_call,
                         config=call_chat_cfg,
+                    )
+                    call_progress = (
+                        TurnCallProgress(
+                            self._turn_call_logger,
+                            call_id=call_id,
+                            iteration=iterations,
+                            attempt=_call_attempt,
+                            clock=time.monotonic,
+                        )
+                        if self._turn_call_logger is not None
+                        else None
                     )
                     self._record_provider_tool_schema_event(
                         tools=provider_tools_for_call,
@@ -7613,6 +7668,8 @@ class Agent:
                                 assistant_text_parts.clear()
                                 attempt_reasoning_parts.clear()
                                 final_text_parts.clear()
+                                if call_progress is not None:
+                                    call_progress.reset()
                                 tool_calls.clear()
                                 pending_tools.clear()
                                 pending_tool_events.clear()
@@ -7829,6 +7886,8 @@ class Agent:
                                     if reasoning_end is not None:
                                         yield reasoning_end
                                 assistant_text_parts.append(raw_ev.text)
+                                if call_progress is not None:
+                                    call_progress.append(text=raw_ev.text)
                                 if raw_ev.text:
                                     attempt_user_visible_emitted = True
                                     attempt_irreversible_output_emitted = True
@@ -7870,6 +7929,8 @@ class Agent:
                                 if not raw_ev.text:
                                     continue
                                 attempt_reasoning_parts.append(raw_ev.text)
+                                if call_progress is not None:
+                                    call_progress.append(reasoning=raw_ev.text)
                                 if not router_model_call_id:
                                     router_model_call_id = call_id
                                     router_iteration = iterations
@@ -7957,6 +8018,10 @@ class Agent:
                                     tool_argument_heartbeat_chars.clear()
                                     break
                                 seen_tool_use_ids.add(raw_ev.tool_use_id)
+                                if call_progress is not None:
+                                    call_progress.tool_delta(
+                                        raw_ev.tool_use_id, raw_ev.tool_name, ""
+                                    )
                                 # A tool follows, so any further text this call is
                                 # intermediate narration between tools, not the answer.
                                 text_presentation_decided = True
@@ -8011,6 +8076,10 @@ class Agent:
                                 json_fragment = raw_ev.json_fragment
                                 acc.json_buf.append(json_fragment)
                                 acc.json_chars += len(json_fragment)
+                                if call_progress is not None:
+                                    call_progress.tool_delta(
+                                        raw_ev.tool_use_id, acc.tool_name, json_fragment
+                                    )
                                 if json_fragment:
                                     pending_tool_events.append(
                                         ToolUseDeltaEvent(
@@ -8735,6 +8804,7 @@ class Agent:
                         "attempt": _call_attempt,
                         "duration_ms": call_duration_ms,
                         "text": "".join(assistant_text_parts),
+                        "reasoning_content": iter_reasoning_content,
                         "tool_calls": [
                             {
                                 "tool_use_id": tc.tool_use_id,
@@ -11898,6 +11968,13 @@ class Agent:
                                     effect_outcome=projected_result.effect_outcome,
                                     generation_epoch=generation_epoch,
                                 )
+                            self._write_turn_call_log(
+                                "approval_wait",
+                                status="running",
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                                approval_id=pending_approval.get("approval_id"),
+                            )
                             approval_wait_started = _loop.time()
                             suspend = getattr(self._tool_context, "suspend_compute_slot", None)
                             approval_entry = None
@@ -11941,10 +12018,26 @@ class Agent:
                                         # and automatic rule refusals still resume normally.
                                         finish_without_compute()
                             finally:
+                                approval_wait_duration = max(
+                                    0.0, _loop.time() - approval_wait_started
+                                )
                                 if _total_deadline is not None:
-                                    _total_deadline += max(
-                                        0.0, _loop.time() - approval_wait_started,
-                                    )
+                                    _total_deadline += approval_wait_duration
+                            self._write_turn_call_log(
+                                "approval_resolved",
+                                status=(
+                                    "success" if approval_entry is not None
+                                    and approval_entry.approved else "error"
+                                ),
+                                tool_use_id=tc.tool_use_id,
+                                tool_name=tc.tool_name,
+                                approval_id=pending_approval.get("approval_id"),
+                                resolution=(
+                                    str(approval_entry.resolution or "")
+                                    if approval_entry is not None else "unavailable"
+                                ),
+                                duration_ms=max(0, int(approval_wait_duration * 1000)),
+                            )
                             if approval_entry is None or not approval_entry.resolved:
                                 self._set_tool_reliability_terminal(
                                     tool_use_id=tc.tool_use_id,

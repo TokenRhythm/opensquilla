@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
@@ -13,6 +16,7 @@ from opensquilla.gateway.diagnostics import DiagnosticsState
 from opensquilla.observability.decision_log import write_decision_entry
 from opensquilla.observability.turn_call_log import (
     TurnCallLogger,
+    TurnCallProgress,
     is_turn_call_log_enabled,
     resolve_turn_call_log_dir_with_source,
 )
@@ -92,6 +96,39 @@ def test_turn_call_log_is_disabled_by_default(monkeypatch) -> None:
     assert is_turn_call_log_enabled() is False
 
 
+def test_call_progress_bounds_snapshots_and_tracks_streaming_tool_arguments(tmp_path) -> None:
+    logger = TurnCallLogger(
+        trace_id="trace-progress", turn_id="turn-progress", session_key="session-progress",
+        agent_id="test", provider="fake", model="fake", log_dir=tmp_path,
+    )
+    now = [0.0]
+    progress = TurnCallProgress(
+        logger, call_id="call-a", iteration=1, attempt=1, clock=lambda: now[0]
+    )
+    progress.append(text="x" * 40_000)
+    progress.tool_delta("tool-a", "write", '{"content":"')
+    now[0] = 1.0
+    progress.tool_delta("tool-a", "write", "y" * 40_000)
+    [path] = list(tmp_path.glob("turn-calls-*.jsonl"))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 2
+    snapshot = records[-1]["payload"]
+    assert snapshot["partial"] is True
+    assert len(snapshot["text"]) == 32_000
+    assert snapshot["text_chars"] == 40_000
+    assert snapshot["text_offset"] == 8000
+    assert snapshot["tool_calls"][0]["arguments_text"] == "y" * 32_000
+    assert snapshot["tool_calls"][0]["arguments_truncated"] is True
+    assert snapshot["tool_calls"][0]["name"] == "write"
+    assert "messages" not in snapshot
+    assert "duration_ms" not in snapshot
+    progress.reset()
+    reset = json.loads(path.read_text().splitlines()[-1])["payload"]
+    assert reset["call_id"] == "call-a"
+    assert reset["text"] == ""
+    assert reset["tool_calls"] == []
+
+
 def test_turn_call_log_enabled_values(monkeypatch) -> None:
     for value in ("1", "true", "yes", "on"):
         monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", value)
@@ -160,6 +197,12 @@ def test_turn_call_log_writes_raw_trace_contract(tmp_path) -> None:
     assert {record["session_key"] for record in records} == {"agent:main:test"}
     assert records[0]["payload"]["message"] == "raw user prompt"
     assert records[1]["payload"]["final_text"] == "raw assistant text"
+    assert records[0]["ts"].endswith("Z")
+    assert len(records[0]["ts"].split(".", 1)[1][:-1]) == 3
+    assert isinstance(records[0]["elapsed_ms"], int)
+    assert isinstance(records[1]["elapsed_ms"], int)
+    assert records[1]["elapsed_ms"] >= records[0]["elapsed_ms"]
+    assert {record["clock_origin"] for record in records} == {"logger_start"}
 
 
 @pytest.mark.asyncio
@@ -214,8 +257,8 @@ async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(tmp_path, mon
     kinds = [record["kind"] for record in records if record["kind"] in expected_kinds]
 
     assert kinds == [
-        "prompt_report",
         "turn_start",
+        "prompt_report",
         "llm_request",
         "llm_response",
         "tool_request",
@@ -227,6 +270,103 @@ async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(tmp_path, mon
     assert [record["seq"] for record in records] == list(range(1, len(records) + 1))
     assert {record["privacy"] for record in records} == {"raw"}
     assert len({record["trace_id"] for record in records}) == 1
+
+
+@pytest.mark.asyncio
+async def test_runtime_raw_trace_starts_before_setup_and_includes_setup_time(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
+    clock = [100.0]
+    synthetic_time = SimpleNamespace(**vars(time))
+    synthetic_time.monotonic = lambda: clock[0]
+    monkeypatch.setattr("opensquilla.engine.runtime.time", synthetic_time)
+    monkeypatch.setattr("opensquilla.observability.turn_call_log.time", synthetic_time)
+    runner = TurnRunner(provider_selector=_FakeSelector(_ToolLoopProvider()))
+    input_stage_run = runner._input_stage.run
+    prompt_stage_run = runner._prompt_assembler_stage.run
+
+    async def capture_input(inp):
+        [log_file] = list(tmp_path.glob("turn-calls-*.jsonl"))
+        records = [json.loads(line) for line in log_file.read_text().splitlines()]
+        assert [record["kind"] for record in records] == ["turn_start"]
+        assert records[0]["payload"]["message"] == "original input"
+        assert records[0]["elapsed_ms"] == 0
+        assert records[0]["provider"] == records[0]["model"] == ""
+        clock[0] += 0.125
+        output = await input_stage_run(inp)
+        return replace(output, runtime_message="prepared input")
+
+    async def capture_prompt(inp):
+        output = await prompt_stage_run(inp)
+        clock[0] += 1.875
+        return output
+
+    monkeypatch.setattr(runner._input_stage, "run", capture_input)
+    monkeypatch.setattr(runner._prompt_assembler_stage, "run", capture_prompt)
+
+    events = [
+        event
+        async for event in runner.run(
+            "original input",
+            "agent:main:setup-timing",
+            ToolContext(is_owner=True, caller_kind=CallerKind.AGENT),
+        )
+    ]
+
+    assert any(event.kind == "done" for event in events)
+    [log_file] = list(tmp_path.glob("turn-calls-*.jsonl"))
+    records = [json.loads(line) for line in log_file.read_text().splitlines()]
+    assert [record["kind"] for record in records[:2]] == ["turn_start", "prompt_report"]
+    assert {record["clock_origin"] for record in records} == {"turn_runner_start"}
+    assert records[0]["payload"]["boundary"] == "turn_runner_entry"
+    assert records[1]["elapsed_ms"] == 2000
+    assert records[1]["payload"]["effective_runtime_message"] == "prepared input"
+    assert "tool_names" in records[1]["payload"]
+    assert records[1]["provider"] == "fake"
+    assert records[1]["model"] == "fake-model"
+    assert records[-1]["elapsed_ms"] >= 2000
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "terminal_kind"),
+    [(ValueError, "turn_error"), (asyncio.CancelledError, "turn_cancelled")],
+)
+async def test_runtime_raw_trace_closes_when_input_setup_fails(
+    tmp_path, monkeypatch, failure, terminal_kind
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
+    runner = TurnRunner(provider_selector=_FakeSelector(_ToolLoopProvider()))
+
+    async def failing_input(inp):
+        raise failure("synthetic setup failure")
+
+    monkeypatch.setattr(runner._input_stage, "run", failing_input)
+
+    async def run_turn():
+        return [
+            event
+            async for event in runner.run(
+                "original input",
+                "agent:main:setup-failure",
+                ToolContext(is_owner=True, caller_kind=CallerKind.AGENT),
+            )
+        ]
+
+    if failure is asyncio.CancelledError:
+        with pytest.raises(asyncio.CancelledError):
+            await run_turn()
+    else:
+        events = await run_turn()
+        assert any(event.kind == "error" for event in events)
+
+    [raw_log] = list(tmp_path.glob("turn-calls-*.jsonl"))
+    records = [json.loads(line) for line in raw_log.read_text().splitlines()]
+    assert [record["kind"] for record in records] == ["turn_start", terminal_kind]
 
 
 @pytest.mark.asyncio
@@ -291,6 +431,8 @@ async def test_runtime_correlates_trace_decision_and_raw_logs(
 @pytest.mark.asyncio
 async def test_runtime_writes_trace_when_provider_missing(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
     runner = TurnRunner(provider_selector=_NoProviderSelector())
 
     events = [
@@ -324,3 +466,8 @@ async def test_runtime_writes_trace_when_provider_missing(tmp_path, monkeypatch)
         "error_code": "no_provider",
         "error_chars": len("No provider available"),
     }
+    [raw_log] = list(tmp_path.glob("turn-calls-*.jsonl"))
+    raw_records = [json.loads(line) for line in raw_log.read_text().splitlines()]
+    assert [record["kind"] for record in raw_records] == ["turn_start", "turn_error"]
+    assert {record["trace_id"] for record in raw_records} == {trace_records[0]["trace_id"]}
+    assert raw_records[1]["payload"]["error_code"] == "no_provider"

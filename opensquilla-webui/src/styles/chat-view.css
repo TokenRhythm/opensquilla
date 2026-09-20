@@ -179,6 +179,65 @@
   container: chat-thread-shell / inline-size;
 }
 
+.chat-view-switcher {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  flex: 0 0 auto;
+  padding: 0 var(--sp-4);
+  border-bottom: 1px solid var(--border);
+}
+
+.chat-view-switcher__tabs {
+  display: flex;
+  gap: var(--sp-4);
+}
+
+.chat-view-switcher__tabs button {
+  padding: var(--sp-3) 0;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--fs-sm);
+  cursor: pointer;
+}
+
+.chat-view-switcher__tabs button[aria-pressed='true'] {
+  border-bottom-color: var(--accent);
+  color: var(--accent);
+}
+
+.chat-view-switcher__turn {
+  flex: 1;
+  width: 0;
+  min-width: 10rem;
+  max-width: 26rem;
+  margin-left: auto;
+  padding: var(--sp-1) var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--fs-xs);
+}
+
+.chat-trace-view {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: var(--sp-3);
+  scrollbar-gutter: stable;
+}
+
+.chat-trace-view__empty {
+  padding: var(--sp-4);
+  color: var(--text-muted);
+}
+
 .chat--new-landing .chat-body {
   flex: 0 0 auto;
   overflow: visible;

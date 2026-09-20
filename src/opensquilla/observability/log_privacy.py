@@ -24,7 +24,7 @@ from opensquilla.observability.redact import scrub_text
 _IDENTIFIERS = frozenset("""
     event kind event_type privacy level logger source step step_name phase status
     state code error_code error_type exception_type reason_code failure_kind
-    degraded_reason skip_reason method operation mode
+    degraded_reason skip_reason method operation mode requested_mode effective_mode
     session_key session_id turn_id trace_id task_id run_id parent_run_id agent_id
     conn_id connection_id request_id response_id message_id user_message_id
     tool_call_id compaction_id decision_id operation_id workspace_id surface_id error_id

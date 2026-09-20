@@ -23,6 +23,7 @@ describe('usage query presentation boundary', () => {
     const observability: Observability = {
       usage, gatewayStatus: unused, readiness: unused,
       logStatus: unused, tailLogs: unused, updateNotice: unused, downloadSupportBundle: unused,
+      turnTraces: unused, traceProjection: unused, traceDetails: unused, tracePayload: unused,
     }
     const options = {
       signal: new AbortController().signal,

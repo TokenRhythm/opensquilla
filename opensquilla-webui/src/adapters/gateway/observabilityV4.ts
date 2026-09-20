@@ -20,6 +20,7 @@ import {
 } from '@/contracts/generated/v4/logsTail'
 import { validateResult as validateLogsTailResult } from '@/contracts/generated/v4/logsTailValidators.mjs'
 import { createV4UsageReporting } from './usageReportingV4'
+import { detailsFromApi, projectionFromApi } from '@/utils/traceProjection'
 import type {
   GatewayLogBatch,
   GatewayLogEntry,
@@ -28,6 +29,8 @@ import type {
   Observability,
   ReadinessReport,
   UpdateNotice,
+  TurnTracesSnapshot,
+  TracePayloadSnapshot,
 } from '@/modules/observability'
 
 interface RpcTransport {
@@ -87,6 +90,22 @@ function updateNotice(value: unknown): UpdateNotice | null | undefined {
 export function createV4Observability(rpc: RpcTransport, http: HttpTransport): Observability {
   const usageReporting = createV4UsageReporting(rpc)
   return {
+    async turnTraces(sessionKey, turnId, options) {
+      await rpc.ready({ signal: options?.signal })
+      return rpc.request<TurnTracesSnapshot>('logs.turn_traces', { session_key: sessionKey, turn_id: turnId }, callOptions(options?.signal))
+    },
+    async traceProjection(traceId, options) {
+      await rpc.ready({ signal: options?.signal })
+      return projectionFromApi(await rpc.request('logs.trace_projection', { trace_id: traceId }, callOptions(options?.signal)))
+    },
+    async traceDetails(traceId, options) {
+      await rpc.ready({ signal: options?.signal })
+      return detailsFromApi(await rpc.request('logs.trace_details', { trace_id: traceId, limit: options?.limit ?? 1000 }, callOptions(options?.signal)))
+    },
+    async tracePayload(traceId, seq, options) {
+      await rpc.ready({ signal: options?.signal })
+      return rpc.request<TracePayloadSnapshot>('logs.trace_payload', { trace_id: traceId, seq }, callOptions(options?.signal))
+    },
     async gatewayStatus(options) {
       await rpc.ready({ signal: options?.signal })
       const result = await rpc.request<RuntimeStatusResult>(

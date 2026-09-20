@@ -87,6 +87,36 @@
       </label>
     </section>
 
+    <section class="lg-trace-picker" :aria-labelledby="'trace-picker-title'">
+      <div class="lg-trace-picker__copy">
+        <span class="lg-toolbar__label" id="trace-picker-title">{{ t('usageLogs.logs.traceInspector') }}</span>
+        <span class="lg-trace-picker__hint">{{ t('usageLogs.logs.traceHint') }}</span>
+      </div>
+      <form class="lg-trace-picker__form" @submit.prevent="loadTraceProjection">
+        <input
+          v-model="traceIdInput"
+          class="lg-search-input lg-trace-picker__input"
+          type="text"
+          :placeholder="t('usageLogs.logs.traceIdPlaceholder')"
+          autocomplete="off"
+          spellcheck="false"
+        />
+        <button class="btn btn--secondary btn--sm" type="submit" :disabled="traceLoading || !traceIdInput.trim()">
+          {{ traceLoading ? t('usageLogs.logs.traceLoading') : t('usageLogs.logs.traceInspect') }}
+        </button>
+      </form>
+      <span v-if="traceError" class="lg-trace-picker__error" role="alert">{{ traceError }}</span>
+    </section>
+
+    <TraceTimeline
+      v-if="traceProjection"
+      :projection="traceProjection"
+      :details="traceDetails?.rows"
+      :details-available="traceDetails?.available"
+      :details-reason="traceDetails?.reason"
+      :clock-origin="traceDetails?.clockOrigin"
+    />
+
     <section class="lg-stream">
       <div
         v-if="loadState === 'error' && allLines.length > 0"
@@ -216,7 +246,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
+import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
 import { defaultRangeExtractor, measureElement as measureVirtualElement, observeElementOffset, observeElementRect, useVirtualizer, type Rect, type VirtualItem, type Virtualizer } from '@tanstack/vue-virtual'
 import { useI18n } from 'vue-i18n'
 import { RouterLink } from 'vue-router'
@@ -225,10 +255,12 @@ import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
 import SupportDiagnosticsMenu from '@/components/SupportDiagnosticsMenu.vue'
+import TraceTimeline from '@/components/trace/TraceTimeline.vue'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { nodeStepsFromToolCalls } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceSummary } from '@/types/runTrace'
 import { remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
+import type { TraceDetails, TraceProjection } from '@/types/traceView'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -372,6 +404,12 @@ const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => ({
 virtualizer.value.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => (
   layoutAnchor.value === null && item.end <= (instance.scrollOffset ?? 0)
 )
+const traceIdInput = ref(new URLSearchParams(window.location.search).get('traceId') || '')
+const traceProjection = ref<TraceProjection | null>(null)
+const traceDetails = ref<TraceDetails | null>(null)
+const traceLoading = ref(false)
+const traceError = ref('')
+
 
 function rememberReadingAnchor(instance: Virtualizer<HTMLElement, HTMLElement>) {
   // Row RO may precede container RO and shrink/clamp the old scroll range.
@@ -468,6 +506,10 @@ const lineSummary = computed<RunTraceSummary | undefined>(() => {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
+onMounted(() => {
+  if (traceIdInput.value.trim()) void loadTraceProjection()
+})
+
 // Polling lives on activate/deactivate so a kept-alive but hidden Logs view
 // neither tails nor reacts to document visibility changes. onActivated also
 // fires on first mount, so all data ownership starts here without a duplicate
@@ -548,6 +590,39 @@ watch(autoFollow, (val) => {
 // ---------------------------------------------------------------------------
 // Actions
 // ---------------------------------------------------------------------------
+
+async function loadTraceProjection() {
+  const traceId = traceIdInput.value.trim()
+  if (!traceId) return
+  traceLoading.value = true
+  traceError.value = ''
+  try {
+    const projection = await observability.traceProjection(traceId)
+    if (!projection) {
+      traceProjection.value = null
+      traceError.value = t('usageLogs.logs.traceNotFound')
+      return
+    }
+    traceProjection.value = projection
+    try {
+      traceDetails.value = await observability.traceDetails(traceId, { limit: 500 })
+    } catch (error) {
+      const code = error && typeof error === 'object' && 'code' in error ? error.code : null
+      traceDetails.value = code === 'UNAUTHORIZED' || code === 'FORBIDDEN' || code === 'PERMISSION_DENIED'
+        ? { traceId, available: false, reason: 'access_denied', rows: [], count: 0, total: 0 }
+        : null
+    }
+    const url = new URL(window.location.href)
+    url.searchParams.set('traceId', traceId)
+    window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`)
+  } catch (error) {
+    traceProjection.value = null
+    traceDetails.value = null
+    traceError.value = error instanceof Error ? error.message : t('usageLogs.logs.traceLoadFailed')
+  } finally {
+    traceLoading.value = false
+  }
+}
 
 async function loadData() {
   if (initialLoadInFlight || !isActive) return
@@ -801,6 +876,48 @@ function escRegex(s: string): string {
   font-weight: 700;
   letter-spacing: 0.14em;
   text-transform: uppercase;
+}
+
+.lg-trace-picker {
+  align-items: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+  justify-content: space-between;
+  margin-top: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+}
+
+.lg-trace-picker__copy {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-3);
+}
+
+.lg-trace-picker__hint {
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+}
+
+.lg-trace-picker__form {
+  display: flex;
+  gap: var(--sp-2);
+  min-width: min(100%, 360px);
+}
+
+.lg-trace-picker__input {
+  flex: 1;
+  min-width: 0;
+}
+
+.lg-trace-picker__error {
+  color: var(--danger);
+  flex-basis: 100%;
+  font-size: var(--fs-xs);
 }
 
 .lg-levels {
