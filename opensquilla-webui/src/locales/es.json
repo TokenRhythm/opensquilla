@@ -3867,6 +3867,15 @@
     "newChatBrand": "Nuevo chat de OpenSquilla",
     "mainAgent": "Agente principal",
     "jumpToLatest": "Ir al más reciente",
+    "sessionSearch": {
+      "label": "Buscar en la conversación",
+      "placeholder": "Buscar en la conversación",
+      "count": "{index} de {total}",
+      "noResults": "Sin coincidencias",
+      "previous": "Coincidencia anterior",
+      "next": "Coincidencia siguiente",
+      "close": "Cerrar búsqueda"
+    },
     "latest": "Más reciente",
     "thinking": "Razonando",
     "thoughtProcess": "Proceso de razonamiento",

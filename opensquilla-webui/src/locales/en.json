@@ -3952,6 +3952,15 @@
     "newChatBrand": "OpenSquilla new chat",
     "mainAgent": "Main Agent",
     "jumpToLatest": "Jump to latest",
+    "sessionSearch": {
+      "label": "Search in conversation",
+      "placeholder": "Find in conversation",
+      "count": "{index}/{total}",
+      "noResults": "No matches",
+      "previous": "Previous match",
+      "next": "Next match",
+      "close": "Close search"
+    },
     "latest": "Latest",
     "thinking": "Thinking",
     "thoughtProcess": "Thought process",

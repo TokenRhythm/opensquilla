@@ -467,6 +467,26 @@
   transform: translateY(6px);
 }
 
+/* ── In-session search: brief accent edge on the message the find bar lands
+   on, mirroring the minimap arrival guide without a full-row color wash. ── */
+.chat-thread :deep(.is-search-match) {
+  position: relative;
+}
+.chat-thread :deep(.is-search-match)::after {
+  position: absolute;
+  inset: 0 auto 0 -0.625rem;
+  width: 2px;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--accent) 78%, transparent);
+  content: '';
+  pointer-events: none;
+  animation: search-match-arrival calc(var(--dur-pulse) / 2) var(--ease-out) both;
+}
+@keyframes search-match-arrival {
+  from { opacity: 0; transform: scaleY(0.4); }
+  to { opacity: 1; transform: scaleY(1); }
+}
+
 /* ── Streaming caret: blinking tail bar while output is still generating ─ */
 .stream-caret {
   display: inline-block;

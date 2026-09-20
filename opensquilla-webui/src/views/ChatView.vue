@@ -61,6 +61,18 @@
         </button>
       </div>
       <div class="chat-thread-shell">
+        <!-- In-session search (Ctrl/Cmd+F): matches within the loaded transcript,
+             jumping between matching messages without leaving the conversation. -->
+        <ChatSessionSearch
+          :open="sessionSearchOpen"
+          :query="sessionSearchQuery"
+          :active="sessionSearchActive"
+          :total="sessionSearchMatches.length"
+          @update:query="onSessionSearchQuery"
+          @next="stepSessionSearch(1)"
+          @prev="stepSessionSearch(-1)"
+          @close="closeSessionSearch"
+        />
         <div
           v-if="forkTransition"
           class="chat-fork-transition-overlay"
@@ -843,6 +855,7 @@ import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
+import ChatSessionSearch from '@/components/chat/ChatSessionSearch.vue'
 import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
 import { useChatRecoveryNotice } from '@/composables/chat/useChatRecoveryNotice'
 import ChatStallNotice from '@/components/chat/ChatStallNotice.vue'
@@ -6675,6 +6688,93 @@ function jumpToLatest() {
   scrollToBottom()
 }
 
+/* ── In-session search (Ctrl/Cmd+F) ────────────────────────────────── */
+
+const sessionSearchOpen = ref(false)
+const sessionSearchQuery = ref('')
+const sessionSearchActive = ref(0)
+let sessionSearchHighlightTimer: ReturnType<typeof setTimeout> | null = null
+const SESSION_SEARCH_HIGHLIGHT_MS = 1400
+const SESSION_SEARCH_TOP_PAD_PX = 96
+
+const sessionSearchMessages = computed(() => (
+  forkTransition.value?.previewMessages || visibleRenderedMessages.value
+))
+
+const sessionSearchMatches = computed(() => {
+  const needle = sessionSearchQuery.value.trim().toLowerCase()
+  if (!needle) return []
+  const matches: number[] = []
+  sessionSearchMessages.value.forEach((message, index) => {
+    if (typeof message.text === 'string' && message.text.toLowerCase().includes(needle)) {
+      matches.push(index)
+    }
+  })
+  return matches
+})
+
+function openSessionSearch() {
+  sessionSearchOpen.value = true
+}
+
+function closeSessionSearch() {
+  sessionSearchOpen.value = false
+  clearSessionSearchHighlight()
+}
+
+function onSessionSearchQuery(value: string) {
+  sessionSearchQuery.value = value
+  sessionSearchActive.value = 0
+  if (sessionSearchMatches.value.length > 0) void goToSessionSearchMatch(0)
+}
+
+function stepSessionSearch(direction: 1 | -1) {
+  const total = sessionSearchMatches.value.length
+  if (total === 0) return
+  const next = (sessionSearchActive.value + direction + total) % total
+  sessionSearchActive.value = next
+  void goToSessionSearchMatch(next)
+}
+
+async function goToSessionSearchMatch(matchIndex: number) {
+  const messageIndex = sessionSearchMatches.value[matchIndex]
+  const container = threadRef.value
+  if (messageIndex === undefined || !container) return
+  const anchor = await messageListRef.value?.ensureMessageVisible(messageIndex)
+  if (!anchor || !anchor.isConnected) return
+  const anchorTop = anchor.getBoundingClientRect().top
+    - container.getBoundingClientRect().top
+    + container.scrollTop
+  applyProgrammaticScroll(container, () => {
+    container.scrollTo({
+      top: Math.max(0, anchorTop - SESSION_SEARCH_TOP_PAD_PX),
+      behavior: 'auto',
+    })
+  })
+  // Landing away from the live edge means the reader is inspecting history;
+  // release follow so the next stream event cannot yank the view back down.
+  const gap = container.scrollHeight - container.scrollTop - container.clientHeight
+  if (gap > LIVE_EDGE_EPSILON_PX) autoScroll.value = false
+  anchor.classList.add('is-search-match')
+  clearSessionSearchHighlight()
+  sessionSearchHighlightTimer = setTimeout(() => {
+    anchor.classList.remove('is-search-match')
+    sessionSearchHighlightTimer = null
+  }, SESSION_SEARCH_HIGHLIGHT_MS)
+}
+
+function clearSessionSearchHighlight() {
+  if (sessionSearchHighlightTimer === null) return
+  clearTimeout(sessionSearchHighlightTimer)
+  sessionSearchHighlightTimer = null
+}
+
+watch(sessionKey, () => {
+  if (sessionSearchOpen.value) closeSessionSearch()
+  sessionSearchQuery.value = ''
+  sessionSearchActive.value = 0
+})
+
 /* ── Tool calls ────────────────────────────────────────────────────── */
 
 function showToolResultModal(content: string, title = t('chat.toolResult'), context?: ToolResultContext) {
@@ -6764,7 +6864,25 @@ function onDocumentPaste(e: ClipboardEvent) {
 /* ── Document keydown (ESC) ────────────────────────────────────────── */
 
 function onDocumentKeydown(e: KeyboardEvent) {
-  if (e.key !== 'Escape') return
+  if (e.key !== 'Escape') {
+    // In-session search: the floating browser find is useless inside the
+    // desktop shell, so Ctrl/Cmd+F owns the conversation search instead.
+    // Workbench editors keep their own find; dialog layers stay untouched.
+    const key = e.key.toLowerCase()
+    if (
+      key === 'f'
+      && (e.ctrlKey || e.metaKey)
+      && !e.altKey
+      && !e.shiftKey
+      && !hasOpenDialogLayer()
+      && !(e.target instanceof HTMLElement
+        && (e.target.isContentEditable || e.target.closest('.monaco-editor')))
+    ) {
+      e.preventDefault()
+      openSessionSearch()
+    }
+    return
+  }
   if (e.defaultPrevented) return
   if (hasOpenDialogLayer()) return
 

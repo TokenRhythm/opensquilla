@@ -3951,6 +3951,15 @@
     "newChatBrand": "OpenSquilla 新建聊天",
     "mainAgent": "主智能体",
     "jumpToLatest": "跳到最新",
+    "sessionSearch": {
+      "label": "会话内搜索",
+      "placeholder": "在会话中查找",
+      "count": "第 {index} 条 / 共 {total} 条",
+      "noResults": "无匹配结果",
+      "previous": "上一个匹配",
+      "next": "下一个匹配",
+      "close": "关闭搜索"
+    },
     "latest": "最新",
     "thinking": "思考中",
     "thoughtProcess": "思考过程",
