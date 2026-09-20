@@ -4866,11 +4866,16 @@ class TaskRuntime:
             "plan_event_emitter": self._emit,
             "suspend_compute_slot": lambda: self._suspend_compute_slot(task),
         }
-        # WebChat has a request-id response RPC and reconnect hydration. Other
-        # interactive surfaces retain the terminating compatibility protocol
-        # until they expose the same reply transport; injecting a waiter there
-        # would strand the turn behind its own session execution lock.
-        if task.envelope.source_kind is SourceKind.WEB:
+        # WebChat and the gateway CLI resolve request IDs outside the session
+        # execution lane and hydrate pending questions on reconnect. Keep the
+        # task alive while waiting, so Goal cannot mistake a question for an
+        # idle turn and start a continuation before the user answers.
+        # Other surfaces retain the terminating compatibility protocol until
+        # they expose that reply transport.
+        if task.envelope.source_kind is SourceKind.WEB or (
+            task.envelope.source_kind is SourceKind.CLI
+            and metadata.get("structured_user_input") is True
+        ):
             runtime_services["user_input_provider"] = self._user_input_broker
         attached_run_id = str(metadata.get("plan_run_id") or "").strip()
         if attached_run_id and not str(

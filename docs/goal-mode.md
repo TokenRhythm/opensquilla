@@ -178,9 +178,27 @@ compaction, and system turns do not claim it.
 Automatic continuations are system events. They do not invent a user transcript
 row, create a Goal command receipt, or capture a fake user message into memory.
 They still render assistant output, tools, approvals, and usage on connected
-Web UI and CLI surfaces. If terminal input arrives while an external Goal turn
+Web UI and CLI surfaces. A blocking `request_user_input` on Web UI or the
+interactive Gateway CLI keeps the current task waiting for its answer. Goal
+does not start another turn during that wait. In the CLI, reply in the composer
+with text or an option number; answers return to the same task, including after
+reconnecting to a pending question. Stop cancels the question with its task.
+An explicit CLI exit command or end of input also cancels a waiting question,
+so leaving the terminal does not drain work that needs another answer.
+This waiting state does not itself mark the Goal paused or blocked. CLI clients
+opt into this reply transport through the existing connection handshake;
+clients without it retain the terminating question protocol.
+
+If ordinary terminal input arrives while an external Goal turn
 is active, the CLI first tries the normal steering path and falls back to a new
 user turn only if the terminal race rejects the steer.
+
+Each automatic continuation uses the session's current model-routing mode at
+task acceptance, including when the Goal runs in the background. Direct mode
+keeps the session's selected model; router and ensemble modes keep their
+respective behavior. A routing-mode change applies to the next accepted turn;
+an already accepted turn retains its routing snapshot. In router mode, each
+continuation is a new turn and can show its own routing decision.
 
 Goal mode does not retry a failed or timed-out whole turn. A tool may already
 have performed an irreversible action, so replaying the turn could duplicate

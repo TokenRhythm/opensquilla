@@ -20,6 +20,7 @@ from opensquilla.cli.chat.output import ChatOutputHandle
 from opensquilla.cli.chat.session_context import GatewayRuntimeScope, GatewaySessionContext
 from opensquilla.cli.chat.session_state import ChatSessionState
 from opensquilla.cli.chat.turn import TurnResult
+from opensquilla.cli.chat.user_input import GatewayUserInput
 from opensquilla.cli.tui.opentui.context import (
     send_context_patch,
     send_context_update,
@@ -131,6 +132,14 @@ class GatewayClientLike(Protocol):
     ) -> Any: ...
 
     async def abort_session(self, key: str) -> dict[str, Any]: ...
+
+    async def submit_user_input(
+        self,
+        key: str,
+        *,
+        request_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]: ...
 
     async def steer_session(
         self,
@@ -556,6 +565,7 @@ async def _mirror_external_turns(
     external_turn_idle: asyncio.Event,
     external_turn_state: dict[str, str | None] | None = None,
     external_turn_fence: _ExternalTurnFence | None = None,
+    user_input: GatewayUserInput | None = None,
 ) -> None:
     if external_turn_state is None:
         external_turn_state = {"turn_id": None, "session_key": None}
@@ -572,6 +582,8 @@ async def _mirror_external_turns(
         try:
             async for frame in subscription:
                 event = _flatten_event_frame(frame)
+                if user_input is not None:
+                    await user_input.observe(event, session_key=session_key)
                 event_name = str(event.get("event") or "")
                 if not event_name.startswith("session.event."):
                     continue
@@ -726,7 +738,7 @@ async def run_gateway_chat(
         replace_tui_history,
     )
 
-    client = GatewayClient()
+    client = GatewayClient(structured_user_input=True)
     await client.connect(default_gateway_url(), token=default_gateway_token())
 
     elevated_state: dict[str, str | None] = {"mode": None}
@@ -790,6 +802,28 @@ async def run_gateway_chat(
         final_model = state.model
 
         session_context = GatewaySessionContext.create(state)
+
+        async def _write_question(text: str) -> None:
+            output = await _wait_for_output(deps, session_context.scope)
+            if output is not None:
+                await output.write_through(text + "\n")
+
+        async def _submit_question(
+            key: str, *, request_id: str, fields: dict[str, Any],
+        ) -> dict[str, Any]:
+            return await client.submit_user_input(key, request_id=request_id, fields=fields)
+
+        pending_questions = GatewayUserInput(submit=_submit_question, write=_write_question)
+        pending_questions.reset(session_key, snapshot)
+        session_context.scope["answer_user_input"] = pending_questions.answer
+
+        async def _cancel_question() -> bool:
+            if pending_questions.pending:
+                await client.abort_session(session_context.session_key)
+                return True
+            return False
+
+        session_context.scope["cancel_user_input"] = _cancel_question
         session_context.scope["history_replace"] = history_replace
         session_context.scope["bootstrap"] = snapshot
         workspace = bootstrap_session.get("workspace")
@@ -844,6 +878,7 @@ async def run_gateway_chat(
                     fallback_session_key=observed_key,
                 )
                 if session_context.session_key == observed_key:
+                    pending_questions.reset(observed_key, gap_snapshot)
                     apply_bootstrap_to_state(
                         session_context.state,
                         gap_snapshot,
@@ -870,6 +905,7 @@ async def run_gateway_chat(
                             session_id=session_context.session_key,
                             permission=elevated_state.get("mode"),
                         )
+                        await pending_questions.present()
             session_observer_task = asyncio.create_task(
                 _mirror_external_turns(
                     session_subscription,
@@ -882,6 +918,7 @@ async def run_gateway_chat(
                     external_turn_idle=external_turn_idle,
                     external_turn_state=external_turn_state,
                     external_turn_fence=external_turn_fence,
+                    user_input=pending_questions,
                 )
             )
 
@@ -929,6 +966,9 @@ async def run_gateway_chat(
             if not stripped:
                 return True
 
+            if await pending_questions.answer(user_input):
+                return True
+
             if stripped.startswith("/"):
                 slash_session_key = session_context.session_key
                 try:
@@ -952,6 +992,8 @@ async def run_gateway_chat(
                             limit=1,
                         )
                         session_context.scope["bootstrap"] = switch_snapshot
+                        pending_questions.reset(session_context.session_key, switch_snapshot)
+                        await pending_questions.present()
                         raw_switch_session = switch_snapshot.get("session")
                         switch_session = (
                             raw_switch_session if isinstance(raw_switch_session, dict) else {}
@@ -1089,6 +1131,7 @@ async def run_gateway_chat(
                     )
 
             async def _record_surface_ready() -> None:
+                await pending_questions.present()
                 await _record_user_activity()
                 await client.call("telemetry.client_launch.record", {})
 
