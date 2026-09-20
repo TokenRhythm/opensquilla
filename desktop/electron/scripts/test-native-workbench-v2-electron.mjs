@@ -1565,13 +1565,17 @@ try {
         const selection = event.detail.selection
         const expectedTargetId = kind === 'svg'
           ? 'annotation-normalization-target' : 'annotation-normalization-probe'
-        const matchesHost = await v3Contents.executeJavaScript(
-          `document.querySelector(${JSON.stringify(selection.locatorHint)}) === document.getElementById(${JSON.stringify(expectedTargetId)})`,
-        )
         const retained = manager.surfaces.get('artifact:v3-bridge').annotationCandidate
-        const retainedHost = await v3Contents.debugger.sendCommand('Runtime.callFunctionOn', {
+        const selectedTarget = await v3Contents.debugger.sendCommand('Runtime.callFunctionOn', {
           objectId: retained.objectId,
-          functionDeclaration: `function () { return this === document.getElementById(${JSON.stringify(expectedTargetId)}) }`,
+          functionDeclaration: `function (locatorHint, expectedTargetId) {
+            const expected = document.getElementById(expectedTargetId)
+            return {
+              matchesHost: document.querySelector(locatorHint) === expected,
+              retainedHost: this === expected,
+            }
+          }`,
+          arguments: [{ value: selection.locatorHint }, { value: expectedTargetId }],
           returnByValue: true,
         })
         const shown = await manager.showArtifactAnnotationOverlay({
@@ -1579,7 +1583,9 @@ try {
           annotationId: `annotation_normalized_${kind}`, initialBody: '',
         })
         annotationNormalizedSelections.push({
-          kind, matchesHost, retainedHost: retainedHost.result.value,
+          kind,
+          matchesHost: selectedTarget.result.value.matchesHost,
+          retainedHost: selectedTarget.result.value.retainedHost,
           editorVisible: shown.ok && annotationOverlay.view.getVisible(),
           tagName: selection.tagName,
         })
