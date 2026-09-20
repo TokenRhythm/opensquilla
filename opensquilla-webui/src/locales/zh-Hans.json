@@ -161,6 +161,8 @@
     }
   },
   "common": {
+    "more": "更多",
+    "saving": "保存中…",
     "close": "关闭",
     "save": "保存",
     "discard": "放弃",
@@ -421,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "搜索设置",
+      "results": "设置搜索结果",
+      "empty": "未找到匹配的设置",
+      "defaultModel": "默认模型",
+      "permissions": "权限"
+    },
     "appearance": {
       "title": "界面",
       "desc": "此浏览器的主题和本地界面偏好。预设即时生效；自定义宽度需点击应用。",
@@ -3040,6 +3049,9 @@
       ,"workspaceOptionalHint": "可选。通用任务可选择“无项目空间”；需要读取项目文件时请选择对应项目。"
     },
     "form": {
+      "invalidTimezone": "请输入有效时区，例如 Asia/Shanghai。",
+      "discardBody": "未保存的修改将会丢失。取消关闭可继续编辑。",
+      "discardTitle": "放弃定时任务修改？",
       "cronPreviewPlaceholder": "输入 5 字段的 cron 表达式以预览",
       "cronParseError": "无法解析表达式——应为 5 个字段（m h dom mon dow）。",
       "cronCustomCadence": "匹配自定义节奏",
@@ -3258,6 +3270,9 @@
       "add": "下载"
     },
     "skillDetail": {
+      "useUnavailable": "此技能暂时无法用于新任务，请检查状态后重试。",
+      "useInTaskHint": "将此技能带入新任务草稿，发送后才会开始执行。",
+      "useInTask": "用于新任务",
       "allowUse": "允许使用",
       "allowUseHelp": "此开关适用于所有同名技能，不会安装依赖。",
       "enable": "允许使用",
@@ -4411,6 +4426,8 @@
       "disableLabel": "关闭 Coding mode"
     },
     "composer": {
+      "workStyleGroup": "工作方式",
+      "contentGroup": "内容",
       "executionMode": "执行模式",
       "ownerOnlyUnavailable": "此浏览器会话不支持仅限所有者模式。",
       "enabled": "已启用",
@@ -4781,6 +4798,13 @@
       "retry": "重试"
     },
     "sidebar": {
+      "moveDown": "下移",
+      "moveUp": "上移",
+      "subtasksAttention": "{count} 个需处理",
+      "subtasksRunning": "{count} 个运行中",
+      "subtaskCount": "{count} 个子任务",
+      "collapseSubtasks": "收起“{title}”的子任务",
+      "expandSubtasks": "显示“{title}”的子任务",
       "recentConversations": "最近任务",
       "recents": "最近",
       "pinned": "置顶",

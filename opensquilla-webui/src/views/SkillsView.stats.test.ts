@@ -26,7 +26,9 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const routeState = ref<{ query: { skill?: string } }>({ query: {} })
   const allSkills = ref<Array<{ name: string; active?: boolean }>>([])
   const detail = vi.fn(async (skill: { name: string }) => ({ ...skill, content: 'Synthetic content' }))
-  vi.doMock('vue-router', () => ({ useRoute: () => routeState.value }))
+  const push = vi.fn(async () => undefined)
+  const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [{ name: 'synthetic-target', instanceId: 'skill:synthetic', digest: 'a'.repeat(64), kind: 'skill', disabled: false, ready: true }] }))
+  vi.doMock('vue-router', () => ({ useRoute: () => routeState.value, useRouter: () => ({ push }) }))
 
   const iconStub = defineComponent({
     name: 'IconStub',
@@ -47,7 +49,16 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     default: emptyStub('auto-enabled-skills'),
   }))
   vi.doMock('@/components/skills/SkillDetailDialog.vue', () => ({
-    default: emptyStub('skill-detail-dialog'),
+    default: defineComponent({
+      props: ['skill', 'canUseInTask', 'mutationDisabled', 'loadingContent'],
+      emits: ['useInTask', 'close'],
+      setup(props, { emit }) {
+        return () => h('div', { 'data-testid': 'skill-detail-dialog' }, props.skill ? [
+          props.canUseInTask ? h('button', { 'data-testid': 'use-skill', disabled: props.mutationDisabled || props.loadingContent, onClick: () => emit('useInTask', props.skill) }, 'Use in new task') : null,
+          h('button', { 'data-testid': 'close-skill', onClick: () => emit('close') }, 'Close'),
+        ] : [])
+      },
+    }),
   }))
   vi.doMock('@/components/skills/SkillGroup.vue', () => ({
     default: defineComponent({
@@ -175,6 +186,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     skillCatalogKey: (skill: { name: string }) => skill.name,
     skillLayerHelp: (key: string) => `help:${key}`,
     skillLayerLabel: (key: string) => `label:${key}`,
+    isMetaSkill: (skill: { kind?: string }) => skill.kind === 'meta' || skill.kind === 'meta_sop',
     useSkillsCatalog: () => ({
       allSkills,
       filterText: ref(''),
@@ -216,6 +228,8 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   app.provide(SKILL_CATALOG_KEY, {
     reload: () => rpcCall('skills.reload'),
     detail,
+    supportsCandidates: () => true,
+    listCandidates,
   } as never)
   app.mount(el)
   await nextTick()
@@ -234,6 +248,8 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     routeState,
     allSkills,
     detail,
+    push,
+    listCandidates,
   }
 }
 
@@ -260,6 +276,70 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
+  it('resolves candidates only on launch and hands the selected skill to an unsent draft', async () => {
+    const { app, el, routeState, allSkills, listCandidates, push, nextTick } = await mountSkillsView()
+    allSkills.value = [{ name: 'synthetic-target', active: true }]
+    routeState.value.query.skill = 'synthetic-target'
+    await nextTick()
+    await nextTick()
+    await vi.waitFor(() => expect(el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')?.disabled).toBe(false))
+    expect(listCandidates).not.toHaveBeenCalled()
+    el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')!.click()
+    await nextTick()
+    await nextTick()
+    expect(listCandidates).toHaveBeenCalledOnce()
+    expect(push).toHaveBeenCalledExactlyOnceWith({ path: '/chat/new', query: { agent: 'main' }, state: {
+      prefill: '', autosend: false,
+      selectedSkillPrefill: [{ name: 'synthetic-target', instanceId: 'skill:synthetic', digest: 'a'.repeat(64) }],
+    } })
+    app.unmount()
+  })
+
+  it.each(['close', 'deactivate'] as const)('ignores a pending launch after %s', async action => {
+    const { app, el, routeState, allSkills, listCandidates, push, pushToast, viewActive, nextTick } = await mountSkillsView()
+    const candidates = await listCandidates()
+    listCandidates.mockClear()
+    let resolveCandidates!: (value: typeof candidates) => void
+    listCandidates.mockReturnValueOnce(new Promise(resolve => { resolveCandidates = resolve }))
+    allSkills.value = [{ name: 'synthetic-target', active: true }]
+    routeState.value.query.skill = 'synthetic-target'
+    await vi.waitFor(() => expect(el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')?.disabled).toBe(false))
+    el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')!.click()
+    await nextTick()
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')?.disabled).toBe(true)
+    if (action === 'close') el.querySelector<HTMLButtonElement>('[data-testid="close-skill"]')!.click()
+    else viewActive.value = false
+    await nextTick()
+
+    resolveCandidates(candidates)
+    await nextTick()
+    await nextTick()
+    expect(listCandidates).toHaveBeenCalledOnce()
+    expect(push).not.toHaveBeenCalled()
+    expect(pushToast).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('allows retry after a candidate lookup fails without navigating', async () => {
+    const { app, el, routeState, allSkills, listCandidates, push, pushToast, nextTick } = await mountSkillsView()
+    listCandidates.mockRejectedValueOnce(new Error('Synthetic lookup failed'))
+    allSkills.value = [{ name: 'synthetic-target', active: true }]
+    routeState.value.query.skill = 'synthetic-target'
+    await vi.waitFor(() => expect(el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')?.disabled).toBe(false))
+    el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')!.click()
+    await nextTick()
+    await nextTick()
+    expect(push).not.toHaveBeenCalled()
+    expect(pushToast).toHaveBeenCalledWith('Synthetic lookup failed', { tone: 'danger' })
+    expect(el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')?.disabled).toBe(false)
+
+    el.querySelector<HTMLButtonElement>('[data-testid="use-skill"]')!.click()
+    await nextTick()
+    await nextTick()
+    expect(push).toHaveBeenCalledOnce()
+    app.unmount()
+  })
+
   it('opens the requested skill when a slash-menu management link updates the route', async () => {
     const { app, routeState, allSkills, detail, nextTick } = await mountSkillsView()
     allSkills.value = [{ name: 'synthetic-target', active: true }]

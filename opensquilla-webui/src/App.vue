@@ -1536,14 +1536,15 @@ function onPaletteSelectSession(key: string) {
   switchToSession(key, 'command_palette.select_session')
 }
 
-function switchToSession(key: string, source = 'app.switchToSession') {
+async function switchToSession(key: string, source = 'app.switchToSession') {
   if (!key) return
   sessionTaskAttention.markRead(key)
   recordSessionNavigationDiag(source, {
     from: currentSessionKey.value,
     to: key,
   })
-  router.push({ path: '/chat', query: { session: key } })
+  await router.push({ path: '/chat', query: { session: key } })
+  if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
 // Optimistic rename: show the new title immediately, then persist through the

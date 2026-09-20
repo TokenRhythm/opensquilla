@@ -50,4 +50,30 @@ defineProps<{
   font-style: normal;
   margin-right: 4px;
 }
+
+@media (max-width: 760px) {
+  #usage-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: var(--sp-2);
+  }
+  #usage-metrics .control-stat {
+    min-width: 0;
+    padding: var(--sp-3);
+    gap: 3px;
+  }
+  #usage-metrics .control-stat__value {
+    font-size: clamp(19px, 5vw, 28px);
+    overflow-wrap: anywhere;
+  }
+  #usage-metrics .control-stat__label,
+  #usage-metrics .control-stat__hint {
+    overflow-wrap: anywhere;
+  }
+  .usage-token-breakdown {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 2px 6px;
+  }
+  .usage-token-breakdown__sep { display: none; }
+}
 </style>

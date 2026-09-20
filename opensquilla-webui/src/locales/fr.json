@@ -161,6 +161,8 @@
     }
   },
   "common": {
+    "more": "Plus",
+    "saving": "Enregistrement…",
     "close": "Fermer",
     "save": "Enregistrer",
     "discard": "Abandonner",
@@ -421,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Rechercher un paramètre",
+      "results": "Résultats des paramètres",
+      "empty": "Aucun paramètre correspondant",
+      "defaultModel": "Modèle par défaut",
+      "permissions": "Autorisations"
+    },
     "appearance": {
       "title": "Interface",
       "desc": "Thème et préférences d'interface locales à ce navigateur. Les préréglages s'appliquent immédiatement ; utilisez Appliquer pour une largeur personnalisée.",
@@ -2958,6 +2967,9 @@
       ,"workspaceOptionalHint": "Facultatif. Choisissez « Aucun espace de projet » pour une tâche générale, ou un projet si ses fichiers sont nécessaires."
     },
     "form": {
+      "invalidTimezone": "Saisissez un fuseau horaire valide, par exemple Europe/Paris.",
+      "discardBody": "Les modifications non enregistrées seront perdues. Annulez pour continuer à modifier.",
+      "discardTitle": "Abandonner les modifications ?",
       "cronPreviewPlaceholder": "Saisissez une expression cron à 5 champs pour la prévisualiser",
       "cronParseError": "Impossible d'analyser l'expression — 5 champs attendus (m h jdm mois jds).",
       "cronCustomCadence": "correspond à une cadence personnalisée",
@@ -3176,6 +3188,9 @@
       "add": "Ajouter"
     },
     "skillDetail": {
+      "useUnavailable": "Cette compétence ne peut pas être utilisée dans une nouvelle tâche. Vérifiez son état puis réessayez.",
+      "useInTaskHint": "Préparez un brouillon avec cette compétence. Rien ne sera envoyé sans votre action.",
+      "useInTask": "Utiliser dans une nouvelle tâche",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -4327,6 +4342,8 @@
       "disableLabel": "Désactiver Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Méthode de travail",
+      "contentGroup": "Contenu",
       "executionMode": "Mode d'exécution",
       "ownerOnlyUnavailable": "Le mode propriétaire uniquement est indisponible pour cette session de navigateur.",
       "enabled": "Activé",
@@ -4697,6 +4714,13 @@
       "retry": "Réessayer"
     },
     "sidebar": {
+      "moveDown": "Déplacer vers le bas",
+      "moveUp": "Déplacer vers le haut",
+      "subtasksAttention": "{count} à vérifier",
+      "subtasksRunning": "{count} en cours",
+      "subtaskCount": "{count} sous-tâches",
+      "collapseSubtasks": "Masquer les sous-tâches de {title}",
+      "expandSubtasks": "Afficher les sous-tâches de {title}",
       "recentConversations": "Tâches récentes",
       "recents": "Récentes",
       "pinned": "Épinglées",

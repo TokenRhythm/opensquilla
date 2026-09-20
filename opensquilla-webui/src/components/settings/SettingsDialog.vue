@@ -49,6 +49,7 @@
         <div class="settings-main">
           <header class="settings-modal__head">
             <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
+            <SettingsSearch :is-desktop="isDesktop" :disabled="settingsInteractionLocked" @select="selectSearchResult" />
             <button
               ref="closeBtn"
               type="button"
@@ -233,6 +234,7 @@ import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
+import SettingsSearch from '@/components/settings/SettingsSearch.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
@@ -493,6 +495,40 @@ function selectSection(id: string) {
   if (route.params.section !== id) {
     void router.replace({ path: `/settings/${id}` })
   }
+}
+
+const SEARCH_TARGET_IDS: Record<string, string> = {
+  'setup.connection.wsUrlLabel': 'conn-ws-url',
+  'setup.connection.tokenLabel': 'conn-ws-token',
+  'setup.runtime.title': 'settings-gateway-runtime',
+  'settings.search.permissions': 'settings-security-sandbox',
+  'settings.sandbox.title': 'settings-security-sandbox',
+  'settings.sandbox.mode.title': 'settings-security-sandbox',
+}
+
+async function selectSearchResult(id: string, labelKey: string) {
+  selectSection(id)
+  await nextTick()
+  const panel = panelRef.value
+  if (!panel || section.value !== id || settingsInteractionLocked.value) return
+
+  const targetId = SEARCH_TARGET_IDS[labelKey]
+  const label = labelKey ? t(labelKey) : ''
+  const explicitTarget = targetId ? panel.querySelector<HTMLElement>(`#${targetId}`) : null
+  const matched = label
+    ? Array.from(panel.querySelectorAll<HTMLElement>('label, .control-row__label, .capability-card__title, h3, h4'))
+      .find(element => element.textContent?.trim() === label)
+    : undefined
+  const row = matched?.closest<HTMLElement>('.control-row, .capability-card')
+  // A section-only result must not focus an unrelated action at the top of
+  // that section. Exact setting rows can focus their own native control.
+  const target = explicitTarget
+    ?? row?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)')
+    ?? matched
+    ?? panel
+  target.scrollIntoView?.({ block: 'nearest', behavior: 'auto' })
+  if (!target.matches('input, select, button, [tabindex]')) target.tabIndex = -1
+  target.focus({ preventScroll: true })
 }
 
 // Resolve aliases and nested destinations. Old URLs are canonicalized with a
@@ -878,6 +914,7 @@ onUnmounted(() => {
 .settings-modal__head {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   flex-shrink: 0;
   gap: var(--sp-3);
   padding: var(--sp-4) var(--sp-4) 0;

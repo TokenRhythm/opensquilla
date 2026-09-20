@@ -161,6 +161,8 @@
     }
   },
   "common": {
+    "more": "Mehr",
+    "saving": "Wird gespeichert…",
     "close": "Schließen",
     "save": "Speichern",
     "discard": "Verwerfen",
@@ -421,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Einstellungen durchsuchen",
+      "results": "Gefundene Einstellungen",
+      "empty": "Keine passenden Einstellungen",
+      "defaultModel": "Standardmodell",
+      "permissions": "Berechtigungen"
+    },
     "appearance": {
       "title": "Oberfläche",
       "desc": "Design und lokale Oberflächeneinstellungen für diesen Browser. Voreinstellungen werden sofort übernommen; eine benutzerdefinierte Breite wird mit Anwenden bestätigt.",
@@ -2958,6 +2967,9 @@
       ,"workspaceOptionalHint": "Optional. Wählen Sie für allgemeine Aufgaben „Kein Projekt-Arbeitsbereich“ oder ein Projekt, wenn dessen Dateien benötigt werden."
     },
     "form": {
+      "invalidTimezone": "Gültige Zeitzone eingeben, zum Beispiel Europe/Berlin.",
+      "discardBody": "Nicht gespeicherte Änderungen gehen verloren. Abbrechen setzt die Bearbeitung fort.",
+      "discardTitle": "Zeitplanänderungen verwerfen?",
       "cronPreviewPlaceholder": "Geben Sie einen Cron-Ausdruck mit 5 Feldern ein, um eine Vorschau zu sehen",
       "cronParseError": "Ausdruck konnte nicht ausgewertet werden — erwartet wurden 5 Felder (m h dom mon dow).",
       "cronCustomCadence": "entspricht einem benutzerdefinierten Rhythmus",
@@ -3176,6 +3188,9 @@
       "add": "Hinzufügen"
     },
     "skillDetail": {
+      "useUnavailable": "Diese Fähigkeit ist für eine neue Aufgabe nicht verfügbar. Prüfe ihren Status und versuche es erneut.",
+      "useInTaskHint": "Einen Entwurf mit dieser Fähigkeit vorbereiten. Erst beim Senden wird er ausgeführt.",
+      "useInTask": "In neuer Aufgabe verwenden",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -4327,6 +4342,8 @@
       "disableLabel": "Coding mode deaktivieren"
     },
     "composer": {
+      "workStyleGroup": "Arbeitsweise",
+      "contentGroup": "Inhalt",
       "executionMode": "Ausführungsmodus",
       "ownerOnlyUnavailable": "Der Nur-Eigentümer-Modus ist für diese Browser-Sitzung nicht verfügbar.",
       "enabled": "Aktiviert",
@@ -4697,6 +4714,13 @@
       "retry": "Erneut versuchen"
     },
     "sidebar": {
+      "moveDown": "Nach unten",
+      "moveUp": "Nach oben",
+      "subtasksAttention": "{count} erfordern Aufmerksamkeit",
+      "subtasksRunning": "{count} aktiv",
+      "subtaskCount": "{count} Unteraufgaben",
+      "collapseSubtasks": "Unteraufgaben von {title} ausblenden",
+      "expandSubtasks": "Unteraufgaben von {title} anzeigen",
       "recentConversations": "Letzte Aufgaben",
       "recents": "Zuletzt",
       "pinned": "Angeheftet",
