@@ -7,7 +7,7 @@
     role="region"
     :aria-label="regionTitle"
   >
-    <div class="plan-run__toolbar" :class="{ 'plan-run__toolbar--cancellable': showCancel }">
+    <div class="plan-run__toolbar" :class="{ 'plan-run__toolbar--cancellable': showEndPlan }">
     <template v-if="hasInspectableSteps">
       <div class="plan-run__control">
         <div
@@ -161,19 +161,19 @@
       </span>
     </div>
     <button
-      v-if="showCancel"
+      v-if="showEndPlan"
       type="button"
       class="plan-run__end plan-run__cancel"
       :disabled="cancelBusy || disabled"
-      :title="cancelLabel"
-      :aria-label="cancelLabel"
+      :title="endPlanLabel"
+      :aria-label="endPlanLabel"
       :aria-busy="cancelBusy || undefined"
       @click.stop="onEndPlan"
     >
       <span class="plan-run__cancel-content">
         <Icon name="stop" :size="12" aria-hidden="true" />
       </span>
-      <span class="plan-run__sr-only">{{ cancelLabel }}</span>
+      <span class="plan-run__sr-only">{{ endPlanLabel }}</span>
     </button>
     </div>
   </section>
@@ -226,11 +226,6 @@ let lastPointerType = ''
 let suppressNextFocusOpen = false
 const stepsId = `plan-run-steps-${useId()}`
 const isRunning = computed(() => props.run.status === 'running')
-const showCancel = computed(() => props.run.status === 'queued'
-  || isRunning.value || (canCancel.value && !hasInspectableSteps.value))
-const cancelLabel = computed(() => canCancel.value
-  ? (props.cancelBusy ? t('chat.planRun.endingPlan') : t('chat.planRun.endPlan'))
-  : (props.cancelBusy ? t('chat.planRun.cancelling') : t('chat.planRun.cancel')))
 const hasSteps = computed(() => props.run.steps.length > 0)
 const inspectableStatuses = new Set<PlanRunStatus>([
   'queued',
@@ -245,6 +240,12 @@ const canCancel = computed(() =>
   props.run.status === 'paused'
   || props.run.status === 'blocked',
 )
+// Running tasks are stopped from the composer. This separate action is only
+// needed when a paused/blocked plan has no inspectable steps to open.
+const showEndPlan = computed(() => canCancel.value && !hasInspectableSteps.value)
+const endPlanLabel = computed(() => props.cancelBusy
+  ? t('chat.planRun.endingPlan')
+  : t('chat.planRun.endPlan'))
 const RUN_REASON_MAX_CHARS = 160
 
 function safeRunReason(value: string | undefined): string {

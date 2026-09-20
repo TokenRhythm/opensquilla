@@ -673,17 +673,15 @@ describe('PlanRunRibbon', () => {
     expect(host.querySelector('.plan-run__summary')?.hasAttribute('aria-expanded')).toBe(false)
   })
 
-  it.each<PlanRunStatus>(['queued', 'running'])('exposes cancellation for a %s plan before opening progress', async status => {
+  it.each<PlanRunStatus>(['queued', 'running'])('leaves active %s plan stopping to the composer', async status => {
     const cancel = vi.fn()
     const host = mountRibbon(run({ status }), false, { onCancel: cancel })
     await nextTick()
-    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
-    expect(button?.textContent.trim()).toBe('Cancel')
+    expect(host.querySelector('.plan-run__cancel')).toBeNull()
     expect(host.querySelector('.plan-run__popover')).toBeNull()
-    button?.click()
-    expect(cancel).toHaveBeenCalledOnce()
+    expect(cancel).not.toHaveBeenCalled()
     await tapSummary(host.querySelector<HTMLButtonElement>('.plan-run__summary'))
-    expect(host.querySelectorAll('.plan-run__end')).toHaveLength(1)
+    expect(host.querySelectorAll('.plan-run__end')).toHaveLength(0)
   })
 
   it.each<PlanRunStatus>(['paused', 'blocked'])('keeps End plan reachable for %s runs without optional progress', async status => {
@@ -697,14 +695,11 @@ describe('PlanRunRibbon', () => {
     expect(host.querySelector('.plan-run__popover')).toBeNull()
   })
 
-  it('disables the visible cancellation while pending, including a queued plan without steps', async () => {
+  it('does not add a second stop action while a queued plan is pending', async () => {
     const cancel = vi.fn()
     const host = mountRibbon(run({ status: 'queued', steps: [] }), false, { onCancel: cancel, cancelBusy: true })
     await nextTick()
-    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
-    expect(button?.disabled).toBe(true)
-    expect(button?.textContent.trim()).toBe('Cancelling…')
-    button?.click()
+    expect(host.querySelector('.plan-run__cancel')).toBeNull()
     expect(cancel).not.toHaveBeenCalled()
   })
 
