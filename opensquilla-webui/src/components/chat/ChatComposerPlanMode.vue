@@ -61,7 +61,6 @@ const { t } = useI18n()
   min-width: 0;
   min-height: 28px;
   gap: 6px;
-  margin-left: auto;
   padding: 2px 3px 2px 9px;
   border: 1px solid var(--border);
   border-radius: var(--radius-full);
