@@ -1013,7 +1013,9 @@ async def test_channel_default_turn_claims_goal_without_replacing_web_lease(
             owner_connection_id
         }
         get_registry().register(
-            SimpleNamespace(conn_id=owner_connection_id, principal=principal)
+            SimpleNamespace(
+                conn_id=owner_connection_id, principal=principal, client_caps=frozenset(),
+            )
         )
         owner_lease = service._install_lease(
             SimpleNamespace(
