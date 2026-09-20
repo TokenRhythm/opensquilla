@@ -730,6 +730,121 @@ def test_artifact_store_skips_existing_deliverable_with_bad_material(
     )
 
 
+def test_artifact_store_versions_same_session_regenerations_with_same_name(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_key = "agent:main:webchat:session-1"
+
+    first = store.publish_bytes(
+        b"draft one",
+        session_id="session-1",
+        session_key=session_key,
+        name="report.md",
+        mime="text/markdown",
+        source="create_pdf_report",
+    )
+    second = store.publish_bytes(
+        b"draft two",
+        session_id="session-1",
+        session_key=session_key,
+        name="report.md",
+        mime="text/markdown",
+        source="create_pdf_report",
+    )
+    third = store.publish_bytes(
+        b"draft three",
+        session_id="session-1",
+        session_key=session_key,
+        name="report.md",
+        mime="text/markdown",
+        source="create_pdf_report",
+    )
+
+    assert first.name == "report.md"
+    assert second.name == "report-2.md"
+    assert third.name == "report-3.md"
+
+
+def test_artifact_store_versions_names_without_extension_and_compound_stems(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    session_key = "agent:main:webchat:session-1"
+
+    bare_first = store.publish_bytes(
+        b"one",
+        session_id="session-1",
+        session_key=session_key,
+        name="dataset",
+        mime="application/octet-stream",
+        source="create_csv",
+    )
+    bare_second = store.publish_bytes(
+        b"two",
+        session_id="session-1",
+        session_key=session_key,
+        name="dataset",
+        mime="application/octet-stream",
+        source="create_csv",
+    )
+    dotted_first = store.publish_bytes(
+        b"one",
+        session_id="session-1",
+        session_key=session_key,
+        name="export.v2.csv",
+        mime="text/csv",
+        source="create_csv",
+    )
+    dotted_second = store.publish_bytes(
+        b"two",
+        session_id="session-1",
+        session_key=session_key,
+        name="export.v2.csv",
+        mime="text/csv",
+        source="create_csv",
+    )
+
+    assert (bare_first.name, bare_second.name) == ("dataset", "dataset-2")
+    assert (dotted_first.name, dotted_second.name) == ("export.v2.csv", "export.v2-2.csv")
+
+
+def test_artifact_store_name_versioning_is_session_scoped_and_skips_internal(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+
+    other_session = store.publish_bytes(
+        b"draft one",
+        session_id="session-2",
+        session_key="agent:main:webchat:session-2",
+        name="report.md",
+        mime="text/markdown",
+        source="create_pdf_report",
+    )
+    fresh_session = store.publish_bytes(
+        b"draft two",
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name="report.md",
+        mime="text/markdown",
+        source="create_pdf_report",
+    )
+    internal_second = store.publish_bytes(
+        b"draft three",
+        session_id="session-1",
+        session_key="agent:main:webchat:session-1",
+        name="report.md",
+        mime="text/markdown",
+        source="create_pdf_report",
+        visibility="internal",
+    )
+
+    assert other_session.name == "report.md"
+    assert fresh_session.name == "report.md"
+    assert internal_second.name == "report.md"
+
+
 def test_artifact_store_uses_short_material_paths_for_uuid_sessions(tmp_path: Path) -> None:
     store = ArtifactStore(tmp_path)
     long_root = tmp_path / ("deep-root-" + ("x" * 80))

@@ -1333,6 +1333,12 @@ class ArtifactStore:
             else _validate_artifact_id(artifact_id)
         )
         safe_name = _safe_filename(name)
+        if visibility == "listed":
+            safe_name = self._next_listed_display_name(
+                safe_name,
+                session_id=session_id,
+                session_key=session_key,
+            )
         safe_mime = _safe_mime(mime)
         sha = hashlib.sha256(payload).hexdigest()
         created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -1443,6 +1449,12 @@ class ArtifactStore:
         entry_source = source_by_path[manifest.entrypoint]
         payload = entry_source.data
         safe_name = _safe_filename(name)
+        if visibility == "listed":
+            safe_name = self._next_listed_display_name(
+                safe_name,
+                session_id=session_id,
+                session_key=session_key,
+            )
         safe_mime = _safe_mime(mime)
         if len(payload) == 0:
             raise ArtifactBudgetError("artifact payload is empty")
@@ -1630,6 +1642,73 @@ class ArtifactStore:
                     continue
                 return ref
         return None
+
+    def _listed_display_names(
+        self,
+        *,
+        session_id: str,
+        session_key: str,
+    ) -> set[str]:
+        """Collect display names of listed artifacts already in the session.
+
+        Best-effort by design: corrupt metadata, cross-session refs, and
+        unreadable layouts contribute no name. Internal artifacts stay
+        invisible — collision handling only concerns user-facing deliveries.
+        """
+
+        session_id = _validate_non_empty("session_id", session_id)
+        session_key = _validate_non_empty("session_key", session_key)
+        names: set[str] = set()
+        for meta_path in self._iter_session_meta_paths_for_listing(session_id):
+            try:
+                raw = json.loads(native_io_path(meta_path).read_text(encoding="utf-8"))
+                if not isinstance(raw, dict):
+                    continue
+                ref = ArtifactRef.from_dict(raw)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            if ref.session_id != session_id or ref.session_key != session_key:
+                continue
+            layout = self._preferred_artifact_layout(session_id, ref.id)
+            if layout is None or not layout[2]:
+                continue
+            if native_io_path(layout[0] / ARTIFACT_INTERNAL_MARKER_NAME).exists():
+                continue
+            names.add(ref.name)
+        return names
+
+    def _next_listed_display_name(
+        self,
+        name: str,
+        *,
+        session_id: str,
+        session_key: str,
+    ) -> str:
+        """Suffix a display name so same-session regenerations stay distinct.
+
+        Identical content never reaches here — callers answer those publishes
+        from find_existing_ref first. A same-name conflict therefore means a
+        genuinely new version of the deliverable, and publishing it under the
+        identical display name would leave the UI's file list ambiguous
+        (issue 1495): report.md becomes report-2.md, report-3.md, ...
+        """
+
+        taken = self._listed_display_names(
+            session_id=session_id,
+            session_key=session_key,
+        )
+        if name not in taken:
+            return name
+        stem, dot, suffix = name.rpartition(".")
+        if dot and stem:
+            prefix, extension = f"{stem}-", f".{suffix}"
+        else:
+            prefix, extension = f"{name}-", ""
+        for ordinal in range(2, 1000):
+            candidate = f"{prefix}{ordinal}{extension}"
+            if candidate not in taken:
+                return candidate
+        return f"{name}-{secrets.token_hex(4)}"
 
     def get_ref(self, *, session_id: str, artifact_id: str) -> ArtifactRef:
         """Return session-scoped artifact metadata without reading material bytes."""
