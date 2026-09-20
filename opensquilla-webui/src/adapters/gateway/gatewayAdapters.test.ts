@@ -58,6 +58,7 @@ describe('Gateway Adapter composition', () => {
       'migrationOperations',
       'workspaceCatalog',
       'workspaceReferences',
+      'workspaceFiles',
       'sandboxRuntime',
       'usageReporting',
       'commandCatalog',

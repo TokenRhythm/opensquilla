@@ -9,11 +9,15 @@ UI, CLI, channels, and gateway control console.
 
 ## Requirements
 
-The SDK 2.x implementation described here is included in the base installation
-of the current source. The published
-[v0.5.4 wheel](https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl)
-predates this migration; upgrading only its SDK does not migrate OpenSquilla.
-Use [Install from source](../README.md#install-from-source) for this implementation.
+The SDK 2.x implementation described here is included in this source checkout's
+base installation. Install from source, or use an OpenSquilla release that
+includes the SDK 2.x migration; check its release notes before installing.
+Upgrading only the MCP SDK in an older OpenSquilla installation does not migrate
+the application.
+
+Packaged installations use the MCP implementation shipped in the
+[release wheel](https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl).
+For a source installation, follow [Install from source](../README.md#install-from-source).
 From the prepared checkout, install the core profile on macOS/Linux:
 
 ```sh

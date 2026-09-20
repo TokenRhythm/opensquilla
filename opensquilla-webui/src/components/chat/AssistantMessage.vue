@@ -583,6 +583,7 @@ const props = defineProps<{
   planPresentationAvailable?: boolean
   planPresentationPending?: string | null
   showTurnOutcome?: boolean
+  hasErrorNotice?: boolean
   goalOutcome?: GoalSnapshot | null
   goalElapsed?: string
   goalRemovable?: boolean
@@ -1194,6 +1195,11 @@ const activitySummaryLabel = computed(() => {
       String(t(`chat.promptAnnotations.status.${mutationSummaryKey}`)),
       activityCompactElapsedLabel.value,
     ].filter(Boolean).join(' · '))
+  }
+  if (props.hasErrorNotice && ['failed', 'timeout'].includes(outcomePresentation.value)) {
+    // The same-turn notice owns the reason; retain a neutral activity entry
+    // using ActivityDisclosure's existing duration/step summary.
+    return ''
   }
   if (outcomePresentation.value !== 'completed') {
     const label = String(t({

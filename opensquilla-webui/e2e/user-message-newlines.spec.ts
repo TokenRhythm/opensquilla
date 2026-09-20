@@ -82,7 +82,7 @@ test('user message bubbles preserve authored line breaks', async ({ page }) => {
   await expect(bubble).toHaveCSS('white-space', 'pre-wrap')
 })
 
-test('system and error message text preserve authored line breaks', async ({ page }) => {
+test('system text preserves authored line breaks while unknown errors use safe local copy', async ({ page }) => {
   await seedMultilineUserHistory(page)
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await page.waitForSelector('.conn-pill', { timeout: 10000 })
@@ -92,6 +92,7 @@ test('system and error message text preserve authored line breaks', async ({ pag
   await expect(systemText).toHaveCSS('white-space', 'pre-wrap')
 
   const errorText = page.locator('.msg-error__text').first()
-  await expect(errorText).toContainText('错误详情第一行\n错误详情第二行')
-  await expect(errorText).toHaveCSS('white-space', 'pre-wrap')
+  await expect(errorText).toHaveText('The task did not finish. Please try again later.')
+  await expect(page.locator('.chat-thread')).not.toContainText('错误详情第一行')
+  await expect(page.locator('.chat-thread')).not.toContainText('错误详情第二行')
 })

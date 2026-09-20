@@ -1,4 +1,6 @@
 import { test, expect, type Locator, type Page } from '@playwright/test'
+import { readFile } from 'node:fs/promises'
+import { chatHistoryPayload } from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2edeliverables'
@@ -40,6 +42,8 @@ async function seedHistory(
               has_more: false,
               oldest_cursor: options.indexedArtifacts[0]?.id || null,
               newest_cursor: options.indexedArtifacts.at(-1)?.id || null,
+              total_count: options.indexedArtifacts.length,
+              page_size: Number(frame.params?.limit) || 200,
             },
           }))
           return
@@ -61,29 +65,26 @@ async function seedHistory(
           historyIds.delete(String(frame.id))
           frame.ok = true
           delete frame.error
-          frame.payload = {
-            messages: [
-              {
-                role: 'user',
-                text: 'Save a couple of files for me.',
-                id: 'msg-deliv-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: withArtifacts ? 'Saved the files.' : 'Nothing to save on this turn.',
-                id: 'msg-deliv-assistant',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts: withArtifacts
-                  ? [
-                    { id: 'art-deliv-1', name: 'report.csv', mime: 'text/csv', size: 2048 },
-                    { id: 'art-deliv-2', name: 'notes.txt', mime: 'text/plain', size: 512 },
-                  ]
-                  : [],
-              },
-            ],
-            has_more: false,
-          }
+          frame.payload = chatHistoryPayload([
+            {
+              role: 'user',
+              text: 'Save a couple of files for me.',
+              id: 'msg-deliv-user',
+              timestamp: Math.floor(Date.now() / 1000) - 120,
+            },
+            {
+              role: 'assistant',
+              text: withArtifacts ? 'Saved the files.' : 'Nothing to save on this turn.',
+              id: 'msg-deliv-assistant',
+              timestamp: Math.floor(Date.now() / 1000) - 60,
+              artifacts: withArtifacts
+                ? [
+                  { id: 'art-deliv-1', name: 'report.csv', mime: 'text/csv', size: 2048 },
+                  { id: 'art-deliv-2', name: 'notes.txt', mime: 'text/plain', size: 512 },
+                ]
+                : [],
+            },
+          ])
           ws.send(JSON.stringify(frame))
           return
         }
@@ -232,30 +233,49 @@ test.describe('Per-session deliverables drawer', () => {
 
 test.describe('Indexed deliverables with the default Workbench', () => {
   test('unsupported indexed deliverables remain downloadable outside history', async ({ page }) => {
+    const fileContent = '{"archived":true}\n'
+    let downloadRequests = 0
+    await page.route('**/api/v1/artifacts/art-deliv-indexed', route => {
+      downloadRequests += 1
+      expect(route.request().headers()['x-opensquilla-session-key']).toBe(INDEXED_SESSION_KEY)
+      return route.fulfill({ contentType: 'application/json', body: fileContent })
+    })
     await openSeededSession(page, INDEXED_SESSION_KEY, false, {
       indexedArtifacts: [{
         id: 'art-deliv-indexed',
-        name: 'archived-report.csv',
-        mime: 'text/csv',
-        size: 4096,
+        name: 'archived-report.json',
+        mime: 'application/json',
+        size: Buffer.byteLength(fileContent),
         created_at: '2026-08-01T00:00:00Z',
         download_url: '/api/v1/artifacts/art-deliv-indexed',
       }],
     })
 
-    // The current history page has no artifact card. The durable index still
-    // opens a read-only Workbench item with an explicit download action.
+    // The current history page has no artifact card. Unsupported indexed files
+    // remain available through the drawer even with the Workbench enabled.
     await expect(page.locator('.msg-artifact-chip')).toHaveCount(0)
     const trigger = await deliverablesTrigger(page)
     await expect(trigger).toHaveAccessibleName('Deliverables (1)')
     await trigger.click()
 
-    const workbench = page.getByTestId('workbench-host')
-    await expect(workbench).toBeVisible()
-    await expect(workbench).toContainText('archived-report.csv')
-    await expect(workbench.getByRole('button', { name: 'Download archived-report.csv' }))
-      .toBeVisible()
-    await expect(workbench.getByRole('button', { name: 'Download latest version' }))
-      .toBeVisible()
+    const drawer = page.locator('.deliv-drawer')
+    await expect(drawer).toBeVisible()
+    await expect(drawer.locator('.deliv-tile')).toHaveCount(1)
+    await expect(drawer.locator('.deliv-tile__name')).toHaveText('archived-report.json')
+    await drawer.locator('.deliv-tile').click()
+
+    const preview = page.locator('.deliv-preview')
+    await expect(preview).toBeVisible()
+    await expect(preview.locator('.deliv-preview__file')).toBeVisible()
+    await expect(page.getByTestId('workbench-host')).toHaveCount(0)
+    expect(downloadRequests).toBe(0)
+    const downloadPromise = page.waitForEvent('download')
+    await preview.getByRole('button', { name: 'Download', exact: true }).click()
+    const download = await downloadPromise
+    expect(download.suggestedFilename()).toBe('archived-report.json')
+    const path = await download.path()
+    expect(path).not.toBeNull()
+    expect(await readFile(path!, 'utf8')).toBe(fileContent)
+    expect(downloadRequests).toBe(1)
   })
 })

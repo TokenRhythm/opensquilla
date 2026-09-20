@@ -402,6 +402,7 @@
         "README.release.md",
         "RELEASES.md",
         ".github/scripts/prestage-release-to-oss.sh",
+        ".github/scripts/release_protocol_preflight.py",
         ".github/scripts/release_signing_preflight.py",
         ".github/scripts/verify-release-*",
         ".github/scripts/verify-windows-signatures.ps1",

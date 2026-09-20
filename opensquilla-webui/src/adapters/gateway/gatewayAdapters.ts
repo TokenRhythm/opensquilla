@@ -36,6 +36,8 @@ import type { WorkspaceCatalog } from '@/modules/workspaceCatalog'
 import { createV4WorkspaceCatalog } from './workspaceCatalogV4'
 import type { WorkspaceReferences } from '@/modules/workspaceReferences'
 import { createV4WorkspaceReferences } from './workspaceReferencesV4'
+import type { WorkspaceFiles } from '@/modules/workspaceFiles'
+import { createV4WorkspaceFiles } from './workspaceFilesV4'
 import type { SandboxRuntime } from '@/modules/sandboxRuntime'
 import { createV4SandboxRuntime } from './sandboxRuntimeV4'
 import type { UsageReporting } from '@/modules/usageReporting'
@@ -104,6 +106,7 @@ export interface GatewayAdapters {
   readonly migrationOperations: MigrationOperations
   readonly workspaceCatalog: WorkspaceCatalog
   readonly workspaceReferences: WorkspaceReferences
+  readonly workspaceFiles: WorkspaceFiles
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
@@ -185,6 +188,7 @@ export function createGatewayAdapters(
     migrationOperations: createV4MigrationOperations(transports.rpc),
     workspaceCatalog: createV4WorkspaceCatalog(transports.rpc),
     workspaceReferences: createV4WorkspaceReferences(transports.rpc),
+    workspaceFiles: createV4WorkspaceFiles(http),
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),

@@ -1829,6 +1829,10 @@ def test_native_write_view_ci_executes_only_contracts_in_windows_ownership() -> 
             "tests/test_ci/test_release_signing_preflight.py",
         ),
         (
+            ".github/scripts/release_protocol_preflight.py",
+            "tests/test_ci/test_release_signing_preflight.py",
+        ),
+        (
             ".github/scripts/verify-windows-signatures.ps1",
             "tests/test_ci/test_windows_signatures.py",
         ),
@@ -1859,6 +1863,7 @@ def test_signing_source_changes_select_contracts_and_release_packaging(
     "path",
     [
         ".github/scripts/release_signing_preflight.py",
+        ".github/scripts/release_protocol_preflight.py",
         ".github/scripts/verify-windows-signatures.ps1",
         ".github/signing/windows-signing-policy.json",
         ".github/workflows/desktop-fault-injection.yml",

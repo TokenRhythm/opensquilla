@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Route } from '@playwright/test'
+import { chatHistoryPayload } from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eartifactpreview'
@@ -42,24 +43,21 @@ async function seedHistory(page: Page, artifacts: object[] = DEFAULT_ARTIFACTS) 
           historyIds.delete(String(frame.id))
           frame.ok = true
           delete frame.error
-          frame.payload = {
-            messages: [
-              {
-                role: 'user',
-                text: 'Render an image.',
-                id: 'msg-preview-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'Here it is.',
-                id: 'msg-preview-assistant',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts,
-              },
-            ],
-            has_more: false,
-          }
+          frame.payload = chatHistoryPayload([
+            {
+              role: 'user',
+              text: 'Render an image.',
+              id: 'msg-preview-user',
+              timestamp: Math.floor(Date.now() / 1000) - 120,
+            },
+            {
+              role: 'assistant',
+              text: 'Here it is.',
+              id: 'msg-preview-assistant',
+              timestamp: Math.floor(Date.now() / 1000) - 60,
+              artifacts,
+            },
+          ])
           ws.send(JSON.stringify(frame))
           return
         }

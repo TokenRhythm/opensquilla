@@ -21,6 +21,7 @@ from opensquilla.telemetry.growth.state import (
     read_active_growth_cohort,
     write_active_growth_cohort,
 )
+from opensquilla.telemetry.growth_sink import read_desktop_growth_milestone_state
 
 
 def test_active_cohort_receipt_is_strict_stable_and_cross_process_shaped(tmp_path) -> None:
@@ -140,3 +141,43 @@ def test_cohort_receipt_is_private_on_posix(tmp_path) -> None:
 
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize(
+    "mutation", ["valid", "root", "version", "status", "event", "slot", "oversized"],
+)
+def test_desktop_enqueue_receipt_uses_existing_closed_wire_shape(tmp_path, mutation):
+    event = {
+        "event_name": "first_app_ready", "event_version": 1,
+        "event_id": "00000000-0000-4000-8000-000000000001",
+        "occurred_at_utc": "2026-09-02T01:02:03.004Z", "source": "desktop",
+        "app_version": "1.2.3", "platform": "macos", "outcome": None,
+        "error_code": None, "duration_ms": None, "consent_scope": "growth",
+        "notice_version": "growth-v2", "sample_rate": 1,
+        "analytics_user_id": "00000000-0000-4000-8000-000000000002",
+        "device_id": "a" * 64,
+    }
+    record = {"status": "enqueued", "event": event}
+    payload = {
+        "schema_version": 1, "marker_kind": "growth_desktop_milestones",
+        "onboarding_result": None, "first_app_ready": record,
+    }
+    if mutation == "root":
+        payload["unexpected"] = True
+    elif mutation == "version":
+        payload["schema_version"] = True
+    elif mutation == "status":
+        record["status"] = "uploaded"
+    elif mutation == "event":
+        event["prompt"] = "synthetic"
+    elif mutation == "slot":
+        payload["onboarding_result"], payload["first_app_ready"] = record, None
+    path = tmp_path / DESKTOP_GROWTH_MILESTONE_STATE_NAME
+    path.write_text(json.dumps(payload) + (" " * 16_384 if mutation == "oversized" else ""))
+    if mutation == "valid":
+        restored = read_desktop_growth_milestone_state(path)
+        assert len(restored) == 1
+        assert restored[0].event.model_dump(mode="json") == event
+    else:
+        with pytest.raises(GrowthStateError):
+            read_desktop_growth_milestone_state(path)

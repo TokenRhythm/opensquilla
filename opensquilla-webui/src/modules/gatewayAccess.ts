@@ -22,6 +22,8 @@ export interface GatewayConnectionSettings {
  */
 export interface GatewayAccess {
   readonly availability: GatewayAvailability
+  /** The local supervisor is preparing the runtime; no connection has failed. */
+  readonly isRuntimeStarting: boolean
   readonly connectionError: string | null
   readonly requiresCredential: boolean
   readonly isAvailable: boolean

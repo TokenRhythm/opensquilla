@@ -240,7 +240,7 @@ def test_agent_fallback_still_does_not_retry_auth_failures() -> None:
 
 
 def test_anthropic_model_not_found_classifies_for_fallback() -> None:
-    # An Anthropic 404 previously fell through to UNKNOWN and surfaced raw.
+    # The missing-resource envelope explicitly identifies a model.
     kind = classify_provider_error(
         "anthropic",
         404,
@@ -280,11 +280,90 @@ def test_openai_compatible_region_unavailable_403_falls_back_to_next_model(
     assert decide_recovery_action(kind) is ProviderRecoveryAction.FALLBACK_PROVIDER
 
 
-def test_openrouter_plain_403_still_fails_as_auth_configuration() -> None:
-    kind = classify_provider_error("openrouter", 403, message="HTTP 403: forbidden")
+@pytest.mark.parametrize("provider", [spec.provider_id for spec in list_provider_specs()])
+@pytest.mark.parametrize(
+    ("status_code", "message"),
+    [(403, ""), (403, "HTTP 403: forbidden"), (404, ""), (404, "HTTP 404: not found")],
+)
+def test_bare_access_and_missing_resource_errors_do_not_guess_a_cause(
+    provider: str, status_code: int, message: str
+) -> None:
+    kind = classify_provider_error(provider, status_code, message=message)
+
+    assert kind is ProviderFailureKind.UNKNOWN
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
+    assert FallbackPolicy().should_retry(kind, attempt=0) is False
+
+
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "anthropic"])
+@pytest.mark.parametrize(
+    "message",
+    ["The model does not exist", "The requested image model does not exist."],
+)
+def test_explicit_model_nonexistence_preserves_model_fallback(
+    provider: str, message: str
+) -> None:
+    kind = classify_provider_error(provider, 404, message=message)
+
+    assert kind is ProviderFailureKind.MODEL_NOT_FOUND
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.FALLBACK_PROVIDER
+
+
+@pytest.mark.parametrize(
+    ("provider", "raw_code", "message"),
+    [
+        ("openrouter", "", "invalid api key"),
+        ("anthropic", "authentication_error", "invalid x-api-key"),
+        ("ollama", "", "unauthorized"),
+    ],
+)
+def test_403_with_explicit_auth_evidence_still_fails_as_configuration(
+    provider: str, raw_code: str, message: str
+) -> None:
+    kind = classify_provider_error(provider, 403, raw_code=raw_code, message=message)
 
     assert kind is ProviderFailureKind.AUTH_INVALID
     assert decide_recovery_action(kind) is ProviderRecoveryAction.FAIL_CONFIG
+
+
+@pytest.mark.parametrize(
+    ("status_code", "raw_code", "message"),
+    [
+        (404, "not_found_error", ""),
+        (None, "not_found_error", ""),
+        (404, "", '{"type":"not_found_error","message":"File not found"}'),
+        (404, "", '{"type":"not_found_error","message":"Endpoint not found"}'),
+        (404, "", '{"type":"not_found_error","message":"deployment_model: x"}'),
+        (404, "", '{"type":"not_found_error","message":"Endpoint not found for model: x"}'),
+        (404, "not_found_error", "model:"),
+    ],
+)
+def test_anthropic_generic_missing_resource_does_not_trigger_model_fallback(
+    status_code: int | None, raw_code: str, message: str
+) -> None:
+    kind = classify_provider_error("anthropic", status_code, raw_code, message)
+
+    assert kind is ProviderFailureKind.UNKNOWN
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.SURFACE
+
+
+@pytest.mark.parametrize(
+    ("status_code", "raw_code", "message"),
+    [
+        (404, "", "model: claude-nope"),
+        (404, "", "HTTP 404: model: claude-nope"),
+        (404, "", 'HTTP 404: {"error":{"type":"not_found_error","message":"model: x"}}'),
+        (None, "not_found_error", "model: claude-nope"),
+        (404, "model_not_found", ""),
+    ],
+)
+def test_anthropic_explicit_missing_model_evidence_preserves_fallback(
+    status_code: int | None, raw_code: str, message: str
+) -> None:
+    kind = classify_provider_error("anthropic", status_code, raw_code, message)
+
+    assert kind is ProviderFailureKind.MODEL_NOT_FOUND
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.FALLBACK_PROVIDER
 
 
 @pytest.mark.parametrize(

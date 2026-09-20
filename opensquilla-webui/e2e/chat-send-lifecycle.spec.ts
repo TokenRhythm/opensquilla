@@ -289,11 +289,15 @@ test('pending admission is visible and a rejected send restores an editable retr
   await expect(page.locator('.msg-user')).toContainText('Synthetic request to retry.')
 
   gateway.rejectHeldSend()
-  await expect(page.locator('.chat-thread')).toContainText(REJECTION)
+  await expect(page.locator('.chat-thread .msg-error__text')).toHaveText('The task did not finish. Please try again later.')
+  await expect(page.locator('body')).not.toContainText(REJECTION)
+  await expect(page.locator('body')).not.toContainText('SYNTHETIC_ADMISSION_FAILURE')
   await expect(input).toHaveValue('Synthetic request to retry.')
   await expect(send).toBeEnabled()
   await expect(page.locator('.chat-composer-send-pending')).toHaveCount(0)
   await expect(page.locator('.chat-send-tooltip')).toHaveCount(0)
+  // A proven rejection restores an editable draft, but never resends on its own.
+  expect(gateway.sends).toHaveLength(1)
   await page.locator('.toast__action').filter({ hasText: 'Retry' }).click()
   await expect.poll(() => gateway.sends.length).toBe(2)
   expect(gateway.sends[1]?.message).toBe('Synthetic request to retry.')

@@ -49,8 +49,8 @@ import {
   activityReasoningBlocks,
   activitySnapshotMatchesMessage,
 } from '@/utils/chat/activitySnapshot'
-import { isImageInputUnsupported, localizedChatErrorMessage } from '@/utils/chat/errors'
-import { dedupeTerminalErrorNotices } from '@/utils/chat/terminalErrorNotices'
+import { localizedChatErrorMessage } from '@/utils/chat/errors'
+import { dedupeTerminalErrorNotices, hasTerminalErrorNotice } from '@/utils/chat/terminalErrorNotices'
 import { isUsageAccountingBarrier } from '@/utils/chat/usageAccountingFailure'
 import { interleaveHistoryModelCallSegments } from '@/utils/chat/historyModelCallSegments'
 import { normalizePromptAnnotationSnapshot } from '@/utils/chat/promptAnnotationHistory'
@@ -382,6 +382,19 @@ function turnOutcomeRecord(outcome: SessionReadTurnOutcome): Record<string, unkn
   }
 }
 
+function isLegacyTerminalError(message: SessionReadMessage): boolean {
+  if (message.role !== 'system') return false
+  // Cron/channel and imported system rows are user-authored content even when
+  // they happen to begin with “Error:”. Only unscoped engine receipts are
+  // eligible for the safe terminal projection.
+  if (message.provenance.kind || message.provenance.sourceTool || message.provenance.sourceSessionKey) return false
+  const text = (message.text || '').trim()
+  // These are engine-owned transcript receipts. Their prose supplies no
+  // classification: absent a durable outcome they receive the safe unknown.
+  return text.startsWith('Error:')
+    || /^The provider stopped because the output limit was reached before the task finished\.(?: \(ref: [0-9a-f]{8}\))?$/.test(text)
+}
+
 function attachHistoryTurnOutcomes(
   messages: ChatMessage[],
   data: SessionReadHistoryPage,
@@ -391,7 +404,7 @@ function attachHistoryTurnOutcomes(
       .map(outcome => normalizeTurnOutcome(turnOutcomeRecord(outcome)))
       .filter(outcome => outcome !== undefined)
   const byTurnId = new Map(outcomes.map(outcome => [outcome.turnId, outcome] as const))
-  if (byTurnId.size === 0) return messages
+  if (byTurnId.size === 0) return dedupeTerminalErrorNotices(messages)
   const enriched = messages.map(message => {
     const outcome = message.turnId ? byTurnId.get(message.turnId) : undefined
     if (!outcome) return message
@@ -411,11 +424,7 @@ function attachHistoryTurnOutcomes(
         ? activitySnapshot
         : { ...activitySnapshot, complete: false }
       : undefined
-    const usageBarrier = isUsageAccountingBarrier(outcome.errorClass)
-    const durableLocalizedError = (usageBarrier || isImageInputUnsupported(outcome.errorClass)
-      || Boolean(outcome.failureKind) || outcome.errorId !== undefined)
-      && (message.role === 'error' || (message.role === 'system'
-        && message.text.trimStart().startsWith('Error:')))
+    const durableLocalizedError = message.role === 'error'
     return {
       ...message,
       ...(durableLocalizedError
@@ -427,6 +436,7 @@ function attachHistoryTurnOutcomes(
               outcome.replaySafe === true,
               outcome.failureKind,
               outcome.status,
+              { reason: outcome.reason, cancellationSource: outcome.cancellationSource, outcomeKind: outcome.kind },
             ),
             errorCode: outcome.errorClass,
             terminalNotice: true,
@@ -508,12 +518,7 @@ function attachHistoryTurnOutcomes(
   // or paginated window, so recover the notice when its identified turn is
   // present but has no matching error row in this page.
   for (const outcome of outcomes) {
-    if (
-      !isUsageAccountingBarrier(outcome.errorClass)
-      && !isImageInputUnsupported(outcome.errorClass)
-      && !outcome.failureKind
-      && outcome.errorId === undefined
-    ) continue
+    if (!hasTerminalErrorNotice(outcome)) continue
     if (enriched.some(message =>
       message.turnId === outcome.turnId && message.role === 'error',
     )) continue
@@ -529,6 +534,7 @@ function attachHistoryTurnOutcomes(
         outcome.replaySafe === true,
         outcome.failureKind,
         outcome.status,
+        { reason: outcome.reason, cancellationSource: outcome.cancellationSource, outcomeKind: outcome.kind },
       ),
       ts: outcome.finishedAt ?? null,
       turnId: outcome.turnId,
@@ -816,9 +822,13 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const messageId = msg.messageId || msg.id || ''
     const steerContext = historyHasSteerEvidence(msg.turnContext)
     const turnProvenance = historyTurnPresentationProvenance(msg.turnContext)
+    const terminalError = msg.role === 'error' || isLegacyTerminalError(msg)
     return {
-      role: msg.role || 'assistant',
-      text: msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
+      role: terminalError ? 'error' : msg.role || 'assistant',
+      text: terminalError
+        ? localizedChatErrorMessage(undefined, '')
+        : msg.role === 'user' ? options.stripTimePrefix(msg.text || '') : msg.text || '',
+      ...(terminalError ? { terminalNotice: true } : {}),
       ts: msg.createdAt,
       reasoning: reasoningText ? { text: reasoningText, seconds: 0 } : undefined,
       routerDecision: msg.routerDecision,

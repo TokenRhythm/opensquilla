@@ -2480,6 +2480,7 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
           turnOutcome?.replaySafe === true,
           turnOutcome?.failureKind,
           turnOutcome?.status,
+          { reason: turnOutcome?.reason, cancellationSource: turnOutcome?.cancellationSource, outcomeKind: turnOutcome?.kind },
         ),
         errorCode,
         modelCapacity: rawPayload.modelCapacity,

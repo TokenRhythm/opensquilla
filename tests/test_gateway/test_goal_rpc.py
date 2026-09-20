@@ -1327,7 +1327,9 @@ async def test_edit_reactivates_complete_goal_and_returns_new_continuity(
         tmp_path / "goal-edit-complete.sqlite", handler=handler,
     ) as stack:
         created = await _handle_goals_set(_set_params(), stack.context)
-        task = await stack.runtime.wait(created["taskId"], timeout=2.0)
+        # Match _settle_set_task's budget for real SQLite completion under CI load.
+        task = await stack.runtime.wait(created["taskId"], timeout=10.0)
+        assert task.status == AgentTaskStatus.SUCCEEDED
         assert task.details is not None
         context = GoalTurnContext.from_task_detail(task.details.get("goal_context"))
         assert context is not None

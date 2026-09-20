@@ -14,6 +14,7 @@ const WS_URL_KEY = 'opensquilla.wsUrl'
 
 interface GatewayAccessSource {
   readonly state: 'disconnected' | 'connecting' | 'connected'
+  readonly runtimeStarting?: boolean
   readonly error: string | null
   readonly isLocalOwner: boolean
   readonly canManageProjectWorkspaces: boolean
@@ -140,7 +141,11 @@ function streamIdleTimeoutMs(policy: GatewayAccessSource['policy']): number | nu
 export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAccess {
   return {
     get availability() {
+      if (source.runtimeStarting && source.state !== 'connected') return 'preparing'
       return availability(source.state)
+    },
+    get isRuntimeStarting() {
+      return source.runtimeStarting === true
     },
     get connectionError() {
       return source.error

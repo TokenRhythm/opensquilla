@@ -1779,9 +1779,25 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
+      text: 'This mode does not support images.',
     })
   })
+
+  it.each(['DOCUMENT_CHANGED', 'ARTIFACT_PREVIEW_CHANGED'])(
+    'retains a stable artifact cause for rejected %s so rendering can localize it', async code => {
+      const { api, options, rpc } = makeOptions()
+      rpc.call.mockRejectedValue(Object.assign(new Error('PRIVATE_PROVIDER_DETAIL'), {
+        code, accepted: false, retryable: false,
+      }))
+      await expect(api.dispatchHiddenSend('/meta test', '/meta test', 'artifact-rejected-id'))
+        .resolves.toMatchObject({ status: 'rejected', reason: 'send_rejected' })
+      expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
+        role: 'error', errorCode: 'DOCUMENT_CHANGED',
+        text: 'The page changed. Refresh it before trying again.',
+      })
+      expect(rpc.call).toHaveBeenCalledOnce()
+    },
+  )
 
   it('does not send a different payload under an existing hidden-control id', async () => {
     const { api, rpc } = makeOptions()
@@ -3541,7 +3557,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.messages.value.filter(message => message.role === 'user')).toHaveLength(1)
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'Send failed: Connection closed',
+      text: 'The task did not finish. Please try again later.',
     })
 
     await api.onSend()
@@ -4666,7 +4682,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.activeStreamSessionKey.value).toBe('')
   })
 
-  it('surfaces the backend terminal message when a failed replay is already terminal', async () => {
+  it('uses local fallback copy when a failed replay is already terminal', async () => {
     const rpc = {
       call: vi.fn().mockResolvedValue({
         sessionKey: 'agent:main:webchat:test',
@@ -4684,11 +4700,60 @@ describe('useChatSend attachment payloads', () => {
     expect(stream.endStreaming).toHaveBeenCalledTimes(1)
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'Activation failed; retry this message.',
+      text: 'The task did not finish. Please try again later.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
     expect(options.scheduleHistorySync).toHaveBeenCalledTimes(1)
+  })
+
+  it('binds a terminal response to its task and merges an existing same-turn error', async () => {
+    const taskId = 'task-failed-replay'
+    const messages = ref<ChatMessage[]>([{
+      role: 'error', text: 'private live provider details (ref: abcdef01)', ts: null,
+      turnId: taskId, errorCode: 'no_provider', terminalNotice: true,
+      turnOutcome: { turnId: taskId, status: 'failed', errorClass: 'no_provider' },
+    }, {
+      role: 'error', text: 'previous task error', ts: null,
+      turnId: 'unrelated-task', errorCode: 'future_failure', terminalNotice: true,
+      turnOutcome: { turnId: 'unrelated-task', status: 'failed' },
+    }])
+    const rpc = { call: vi.fn().mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test', task_id: taskId, task_status: 'failed',
+      terminal_reason: 'no_provider', terminal_message: 'private response details (ref: abcdef01)', replayed: true,
+    }) }
+    const { api, stream } = makeOptions({ rpc, messages })
+
+    await api.onSend()
+
+    const targetErrors = messages.value.filter(message => message.role === 'error' && message.turnId === taskId)
+    expect(targetErrors).toHaveLength(1)
+    expect(targetErrors[0]).toMatchObject({
+      turnId: taskId, text: 'No model is available.', terminalNotice: true, errorCode: 'no_provider',
+      turnOutcome: { turnId: taskId, taskId, status: 'failed', statusSource: 'task', reason: 'no_provider' },
+    })
+    expect(messages.value.filter(message => message.role === 'error' && message.turnId === 'unrelated-task')).toHaveLength(1)
+    expect(stream.endStreaming).toHaveBeenCalledTimes(1)
+    expect(rpc.call).toHaveBeenCalledTimes(1)
+  })
+
+  it('keeps an existing cause when a replay response uses generic terminal_reason=error', async () => {
+    const taskId = 'task-generic-terminal-reason'
+    const messages = ref<ChatMessage[]>([{
+      role: 'error', text: 'old raw text', ts: null, turnId: taskId,
+      errorCode: 'no_provider', terminalNotice: true,
+      turnOutcome: { turnId: taskId, status: 'failed', errorClass: 'no_provider' },
+    }])
+    const rpc = { call: vi.fn().mockResolvedValue({
+      sessionKey: 'agent:main:webchat:test', task_id: taskId, task_status: 'failed',
+      terminal_reason: 'error', terminal_message: 'private detail (ref: abcdef01)', replayed: true,
+    }) }
+    const { api } = makeOptions({ rpc, messages })
+
+    await api.onSend()
+
+    const notice = messages.value.find(message => message.role === 'error' && message.turnId === taskId)
+    expect(notice).toMatchObject({ errorCode: 'no_provider', text: 'No model is available.' })
   })
 
   it('ends the fresh stream when first acceptance reports activation failure', async () => {
@@ -4711,7 +4776,7 @@ describe('useChatSend attachment payloads', () => {
     expect(options.activeStreamSessionKey.value).toBe('')
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The accepted task could not be activated.',
+      text: 'The task did not finish. Please try again later.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
@@ -4748,7 +4813,7 @@ describe('useChatSend attachment payloads', () => {
     expect(adoptResponseSession).toHaveBeenCalledWith(childSessionKey, expect.any(String))
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The edited question could not be activated.',
+      text: 'The task did not finish. Please try again later.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
@@ -4778,7 +4843,7 @@ describe('useChatSend attachment payloads', () => {
     expect(adoptResponseSession).toHaveBeenCalledWith(childSessionKey, expect.any(String))
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The confirmation could not be activated.',
+      text: 'The task did not finish. Please try again later.',
       errorCode: 'activation_failed',
       terminalNotice: true,
     })
@@ -5555,7 +5620,7 @@ describe('useChatSend attachment payloads', () => {
 
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'Provider did not respond; retry is safe.',
+      text: 'The task timed out before it finished.',
       errorCode: 'timeout',
     })
   })
@@ -7440,7 +7505,7 @@ describe('useChatSend image admission', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
+      text: 'This mode does not support images.',
     })
   })
 
@@ -7458,11 +7523,11 @@ describe('useChatSend image admission', () => {
     expect(options.messages.value[options.messages.value.length - 1]).toMatchObject({
       role: 'error',
       errorCode: 'image_input_unsupported',
-      text: 'The selected model cannot process image input. Choose an image-capable model or remove the image.',
+      text: 'This model does not support images.',
     })
   })
 
-  it('localizes a terminal response code but leaves an unknown server message unchanged', async () => {
+  it('localizes a terminal response code and hides an unknown server message', async () => {
     const knownRpc = {
       call: vi.fn().mockResolvedValue({
         sessionKey: 'agent:main:webchat:test',
@@ -7475,7 +7540,7 @@ describe('useChatSend image admission', () => {
     await known.api.onSend()
     expect(known.options.messages.value[known.options.messages.value.length - 1]).toMatchObject({
       errorCode: 'ensemble_multimodal_unsupported',
-      text: "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
+      text: 'This mode does not support images.',
     })
 
     const unknownRpc = {
@@ -7490,7 +7555,7 @@ describe('useChatSend image admission', () => {
     await unknown.api.onSend()
     expect(unknown.options.messages.value[unknown.options.messages.value.length - 1]).toMatchObject({
       errorCode: 'provider_custom_failure',
-      text: 'Provider supplied this exact explanation.',
+      text: 'The task did not finish. Please try again later.',
     })
   })
 

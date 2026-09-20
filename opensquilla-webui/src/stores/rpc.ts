@@ -100,6 +100,7 @@ async function deliverySalt(): Promise<string | null> {
 export const useRpcStore = defineStore('rpc', () => {
   const client = ref<RpcClient | null>(null)
   const state = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
+  const runtimeStarting = ref(false)
   const policy = ref<Record<string, unknown> | null>(null)
   const auth = ref<Record<string, unknown> | null>(null)
   const methods = ref<string[]>([])
@@ -175,6 +176,7 @@ export const useRpcStore = defineStore('rpc', () => {
     }).catch(() => {
       if (revision !== descriptorRequestRevision || !connectionDesired) return
       error.value = 'Gateway connection information is temporarily unavailable'
+      runtimeStarting.value = false
       if (request.retry && descriptorTimer === null) {
         const cap = Math.min(15_000, 500 * 2 ** Math.min(descriptorAttempt++, 10))
         descriptorTimer = setTimeout(() => {
@@ -272,6 +274,7 @@ export const useRpcStore = defineStore('rpc', () => {
     }
 
     desktopConnectionRevision = payload.revision
+    runtimeStarting.value = payload.status === 'starting' && (!manual || state.value !== 'connected')
     const nextUrl = typeof payload.wsUrl === 'string' ? payload.wsUrl.trim() : ''
     const nextInstance = typeof payload.instanceId === 'string' ? payload.instanceId : ''
     if (payload.status !== 'ready' || !nextUrl || !nextInstance) {
@@ -396,6 +399,7 @@ export const useRpcStore = defineStore('rpc', () => {
       typeof gatewayPlatform.getConnection === 'function'
       && typeof gatewayPlatform.onConnection === 'function'
     ) {
+      runtimeStarting.value = true
       connectionSubscriptions.push(gatewayPlatform.onConnection(payload => applyDesktopConnection(payload)))
       refreshDesktopConnection()
       return
@@ -461,6 +465,7 @@ export const useRpcStore = defineStore('rpc', () => {
 
   function disconnect() {
     connectionDesired = false
+    runtimeStarting.value = false
     beginDeliveryIntent(null)
     cancelDescriptorRecovery()
     client.value?.disconnect()
@@ -550,6 +555,7 @@ export const useRpcStore = defineStore('rpc', () => {
   return {
     client,
     state,
+    runtimeStarting,
     policy,
     auth,
     methods,

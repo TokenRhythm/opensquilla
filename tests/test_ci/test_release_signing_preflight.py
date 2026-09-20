@@ -10,8 +10,9 @@ import os
 import re
 import shutil
 import subprocess
+from email.message import Message
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -26,6 +27,256 @@ POLICY = {
     "publisherSubjectContains": "Test Publisher",
     "timestampUrl": "http://timestamp.example.invalid",
 }
+
+
+@pytest.fixture
+def protocol_preflight(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    script = ROOT / ".github/scripts/release_protocol_preflight.py"
+    spec = importlib.util.spec_from_file_location("release_protocol_preflight", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def no_network(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Protocol preflight tests must not contact a real collector")
+
+    monkeypatch.setattr(module, "build_opener", no_network)
+    # Keep the retry guard local: subprocess also uses the shared time module.
+    monkeypatch.setattr(module, "time", SimpleNamespace(sleep=no_network))
+    return module
+
+
+def _health(scope: str, fingerprint: str) -> dict[str, object]:
+    return {
+        "ok": True,
+        "scope": scope,
+        "schema_version": 1,
+        "protocol_fingerprint": fingerprint,
+    }
+
+
+def test_protocol_approved_predecessor_diff_is_only_optional_device_field(
+    protocol_preflight: ModuleType,
+) -> None:
+    raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
+    current = protocol_preflight.manifest_fingerprint(raw)
+    manifest = json.loads(raw)
+    assert manifest.pop("device_identity") == {
+        "field": "device_id",
+        "format": "sha256-lowercase-hex",
+        "optional": True,
+        "scope": "application-events",
+        "deduplication_unit": "device",
+    }
+    assert manifest["manifest_version"] == 2
+    manifest["manifest_version"] = 1
+    previous = protocol_preflight.manifest_fingerprint(json.dumps(manifest).encode())
+    assert protocol_preflight.COMPATIBLE_PAIRS == {(current, previous)}
+    for scope in ("growth", "reliability"):
+        protocol_preflight.validate_health(_health(scope, current), scope, current)
+        protocol_preflight.validate_health(_health(scope, current), scope, previous)
+        with pytest.raises(ValueError, match="does not support"):
+            protocol_preflight.validate_health(_health(scope, previous), scope, current)
+
+
+def test_protocol_source_reads_fixed_commit_not_mutated_checkout_or_tag(
+    protocol_preflight: ModuleType, local_source: Path,
+) -> None:
+    raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
+    path = local_source / protocol_preflight.MANIFEST_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    sha = _commit(local_source)
+    _git(local_source, "tag", "v0.5.5")
+    path.write_text("{}")
+    newer = _commit(local_source)
+    _git(local_source, "tag", "-f", "v0.5.5", newer)
+    assert protocol_preflight.source_fingerprint(local_source, sha) == (
+        protocol_preflight.manifest_fingerprint(raw)
+    )
+    with pytest.raises(ValueError, match="Unsupported release protocol"):
+        protocol_preflight.source_fingerprint(local_source, newer)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        protocol_preflight.source_fingerprint(local_source, "v0.5.5")
+
+
+def test_protocol_legacy_tag_without_clients_does_not_need_collector(
+    protocol_preflight: ModuleType, local_source: Path,
+) -> None:
+    sha = _git(local_source, "rev-parse", "HEAD")
+    assert protocol_preflight.source_fingerprint(local_source, sha) is None
+
+
+@pytest.mark.parametrize("client_path", [
+    "src/opensquilla/telemetry", "desktop/electron/src/telemetry",
+])
+def test_protocol_existing_client_cannot_bypass_gate_with_missing_manifest(
+    protocol_preflight: ModuleType, local_source: Path, client_path: str,
+) -> None:
+    path = local_source / client_path / "client.txt"
+    path.parent.mkdir(parents=True)
+    path.write_text("synthetic client")
+    sha = _commit(local_source)
+    with pytest.raises(ValueError, match="manifest is missing"):
+        protocol_preflight.source_fingerprint(local_source, sha)
+
+
+@pytest.mark.parametrize("replacement", [
+    {"ok": False}, {"ok": 1}, {"scope": "reliability"},
+    {"schema_version": True}, {"schema_version": 2},
+    {"protocol_fingerprint": "A" * 64}, {"protocol_fingerprint": "b" * 64},
+    {"extra": "unexpected"},
+])
+def test_protocol_health_rejects_wrong_service_version_or_identity(
+    protocol_preflight: ModuleType, replacement: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        protocol_preflight.validate_health({**_health("growth", "a" * 64), **replacement},
+                                          "growth", "a" * 64)
+
+
+@pytest.mark.parametrize("raw", [
+    b"[]", b"null", b"{broken", b'{"manifest_version":1,"manifest_version":2}',
+    b'{"manifest_version":true,"batch_version":1,"events":[{}]}',
+    b'{"manifest_version":2,"batch_version":1,"events":[NaN]}', b"\xff",
+])
+def test_protocol_manifest_rejects_malformed_input(
+    protocol_preflight: ModuleType, raw: bytes,
+) -> None:
+    with pytest.raises(ValueError):
+        protocol_preflight.manifest_fingerprint(raw)
+
+
+@pytest.mark.parametrize(("status", "content_type", "final_url", "raw", "valid"), [
+    (200, "application/json; charset=utf-8", None, b'{"ok":true}', True),
+    (202, "application/json", None, b'{"ok":true}', False),
+    (200, "text/html", None, b'{"ok":true}', False),
+    (200, "application/json", "https://other.example.invalid/", b'{"ok":true}', False),
+    (200, "application/json", None, b'{"ok":false,"ok":true}', False),
+    (200, "application/json", None, b"x" * 4097, False),
+])
+def test_protocol_https_response_is_bounded_and_not_redirected(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
+    status: int, content_type: str, final_url: str | None, raw: bytes, valid: bool,
+) -> None:
+    url = protocol_preflight.HEALTH_URLS["growth"]
+    response = io.BytesIO(raw)
+    response.status = status  # type: ignore[attr-defined]
+    response.headers = Message()  # type: ignore[attr-defined]
+    response.headers["Content-Type"] = content_type  # type: ignore[attr-defined]
+    response.geturl = lambda: final_url or url  # type: ignore[attr-defined]
+
+    class Opener:
+        def open(self, request: object, timeout: int) -> io.BytesIO:
+            assert request.full_url == url  # type: ignore[attr-defined]
+            assert request.get_method() == "GET"  # type: ignore[attr-defined]
+            assert request.get_header("Cache-control") == "no-cache"  # type: ignore[attr-defined]
+            assert timeout == 10
+            return response
+
+    def opener(handler: object) -> Opener:
+        with pytest.raises(ValueError, match="redirects are forbidden"):
+            handler.redirect_request(None, None, 302, None, None, url)  # type: ignore[attr-defined]
+        return Opener()
+
+    monkeypatch.setattr(protocol_preflight, "build_opener", opener)
+    if valid:
+        assert protocol_preflight.read_health(url) == {"ok": True}
+    else:
+        with pytest.raises(ValueError):
+            protocol_preflight.read_health(url)
+    assert response.closed
+
+
+@pytest.mark.parametrize("error", [
+    URLError("synthetic network failure"), TimeoutError(),
+    HTTPError("https://example.invalid", 503, "unavailable", {}, None),
+    HTTPError("https://example.invalid", 429, "rate limited", {}, None),
+])
+def test_protocol_transient_failure_retries_then_checks_both_scopes(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    calls: list[str] = []
+    delays: list[int] = []
+
+    def read(url: str) -> object:
+        calls.append(url)
+        if len(calls) <= 2:
+            raise error
+        scope = "growth" if "/growth/" in url else "reliability"
+        return _health(scope, "a" * 64)
+
+    monkeypatch.setattr(protocol_preflight, "read_health", read)
+    monkeypatch.setattr(protocol_preflight.time, "sleep", delays.append)
+    protocol_preflight.check_collectors("a" * 64)
+    assert calls == [protocol_preflight.HEALTH_URLS["reliability"]] * 3 + [
+        protocol_preflight.HEALTH_URLS["growth"]
+    ]
+    assert delays == [1, 2]
+
+
+@pytest.mark.parametrize(("status", "attempts"), [(301, 1), (401, 1), (404, 1), (503, 3)])
+def test_protocol_http_failure_never_allows_publication(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, status: int, attempts: int,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(protocol_preflight.time, "sleep", lambda _delay: None)
+
+    def read(url: str) -> object:
+        calls.append(url)
+        raise HTTPError(url, status, "synthetic error", {}, None)
+
+    monkeypatch.setattr(protocol_preflight, "read_health", read)
+    with pytest.raises(ValueError):
+        protocol_preflight.check_collectors("a" * 64)
+    assert len(calls) == attempts
+
+
+def test_protocol_second_scope_mismatch_blocks_after_first_scope_succeeds(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def read(url: str) -> object:
+        if url == protocol_preflight.HEALTH_URLS["reliability"]:
+            return _health("reliability", "a" * 64)
+        return _health("growth", "b" * 64)
+
+    monkeypatch.setattr(protocol_preflight, "read_health", read)
+    with pytest.raises(ValueError, match="growth: collector protocol"):
+        protocol_preflight.check_collectors("a" * 64)
+
+
+def test_protocol_release_workflow_gates_fixed_source_before_build_and_publication() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())["jobs"]
+    condition = "${{ github.event_name == 'push' || github.event.inputs.tag != '' }}"
+    preflight = jobs["release-preflight"]["steps"]
+    gate = next(step for step in preflight if step.get("name") ==
+                "Check production collector compatibility")
+    assert gate["env"]["RELEASE_SOURCE_SHA"] == "${{ steps.source.outputs.source_sha }}"
+    assert gate["run"] == (
+        'python .github/scripts/release_protocol_preflight.py --source-sha "$RELEASE_SOURCE_SHA"'
+    )
+    assert preflight.index(gate) > next(i for i, step in enumerate(preflight)
+                                        if step.get("id") == "source")
+    publication = jobs["publish-release"]["steps"]
+    index = next(i for i, step in enumerate(publication)
+                 if step.get("name") == "Upload to GitHub Release")
+    final_gate = publication[index - 1]
+    assert final_gate["env"]["RELEASE_SOURCE_SHA"] == (
+        "${{ needs.build-release-assets.outputs.source_sha }}"
+    )
+    assert final_gate["run"] == (
+        'python .release-validation/.github/scripts/release_protocol_preflight.py '
+        '--source-sha "$RELEASE_SOURCE_SHA"'
+    )
+    tooling = publication[index - 2]
+    assert tooling["uses"] == "actions/checkout@v4"
+    assert tooling["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert tooling["with"]["path"] == ".release-validation"
+    for step in (gate, final_gate):
+        assert step["if"] == condition
+        assert step["timeout-minutes"] == 3
+        assert not step.get("continue-on-error", False)
+        assert "secrets." not in json.dumps(step)
 
 
 @pytest.fixture
@@ -395,8 +646,13 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
                 continue
             ref = step["with"]["ref"]
             assert step["with"]["persist-credentials"] is False
-            if job_name == "release-preflight":
+            if job_name == "release-preflight" or (
+                job_name == "publish-release"
+                and step.get("name") == "Checkout publication validation tooling"
+            ):
                 assert ref == "${{ github.workflow_sha }}"
+                if job_name == "publish-release":
+                    assert step["with"]["path"] == ".release-validation"
                 continue
             match = expression.fullmatch(ref)
             assert match, f"{job_name} checks out a mutable or unvalidated source"

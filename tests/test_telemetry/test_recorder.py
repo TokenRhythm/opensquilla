@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from opensquilla.telemetry.consent import (
     CURRENT_PRODUCT_ANALYTICS_NOTICE_VERSION,
     CURRENT_RELIABILITY_NOTICE_VERSION,
@@ -24,6 +26,7 @@ from opensquilla.telemetry.coordination import (
 )
 from opensquilla.telemetry.outbox import TelemetryOutbox
 from opensquilla.telemetry.recorder import RecordStatus, TelemetryRecorder
+from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
 
 
 def _event(*, notice: str = CURRENT_RELIABILITY_NOTICE_VERSION):
@@ -318,3 +321,76 @@ def test_recorder_constructor_has_no_private_consent_provider_escape_hatch() -> 
     assert "config" in parameters
     assert "consent_state" not in parameters
     assert "coordinator" not in parameters
+
+
+@pytest.mark.parametrize(
+    "case", ["allowed", "disabled", "notice", "identity", "revision", "missing"],
+)
+async def test_contract_recovery_rechecks_current_identity_notice_and_revision(tmp_path, case):
+    from opensquilla.telemetry.identity import (
+        TelemetryIdentityKind,
+        identity_state_path,
+        load_or_create_identity,
+    )
+
+    config = _live_config(tmp_path, global_disabled=case == "disabled")
+    coordinator = scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+    )
+    occurred = _event().occurred_at_utc
+    identity = load_or_create_identity(
+        identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config),
+        TelemetryIdentityKind.ANALYTICS_USER, now=occurred,
+    )
+    payload = _event().model_dump(mode="json")
+    for name in ("app_session_id", "ttft_ms", "stall_count", "stall_threshold_ms"):
+        payload.pop(name)
+    payload.update(
+        event_name="first_turn_started", consent_scope="growth", notice_version="growth-v2",
+        outcome=None, duration_ms=None, analytics_user_id=identity.value, device_id="a" * 64,
+    )
+    event = TELEMETRY_EVENT_ADAPTER.validate_json(json.dumps(payload), strict=True)
+    outbox = await TelemetryOutbox.open(
+        config.state_dir, TelemetryScope.GROWTH,
+        clock=lambda: int(occurred.timestamp() * 1000) + 1000,
+    )
+    try:
+        await outbox.enqueue(event)
+        batch = await outbox.claim_batch()
+        assert batch is not None
+        await outbox.quarantine(batch.lease_id, status_code=422, reason="contract")
+        if case == "notice":
+            event = event.model_copy(update={"notice_version": "growth-older"})
+        elif case == "identity":
+            identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config).unlink()
+            load_or_create_identity(
+                identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config),
+                TelemetryIdentityKind.ANALYTICS_USER, now=occurred,
+            )
+        elif case == "missing":
+            identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=config).unlink()
+        elif case == "revision":
+            async with coordinator.transition(TelemetryScope.GROWTH):
+                pass
+        recorder = TelemetryRecorder(outbox, config=config)
+        assert await recorder.recover_contract_rejection_once(
+            event, expected_consent_revision=0,
+        ) is (case == "allowed")
+        assert (await outbox.stats()).pending_events == int(case == "allowed")
+    finally:
+        await outbox.close()
+
+
+async def test_disabled_recovery_does_not_create_queues_or_read_identity(tmp_path):
+    config = _live_config(tmp_path, global_disabled=True)
+    scope_consent_coordinator_for(
+        config, state_provider=lambda scope: resolve_scope_consent(scope, config=config, env={}),
+    )
+    runtime = ScopedTelemetryRuntime(config=config, env={})
+    try:
+        event = _event().model_copy(update={"consent_scope": "growth"})
+        assert not await runtime.recover_contract_rejection_once(event, expected_consent_revision=0)
+        assert runtime.opened_scopes == frozenset()
+        assert not (tmp_path / "state").exists()
+    finally:
+        await runtime.close(flush=False)

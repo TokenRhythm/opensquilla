@@ -1568,6 +1568,47 @@ async def test_chat_history_preserves_provider_failure_reference_without_error_r
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_id", [None, "abcdef01"])
+async def test_chat_history_preserves_no_provider_cause_without_diagnostic_record(
+    tmp_path, error_id,
+):
+    storage = await SessionStorage.open(str(tmp_path / "no-provider.db"))
+    manager = SessionManager(storage, inject_time_prefix=False)
+    session_key = "agent:main:webchat:no-provider"
+    await manager.create(session_key)
+    try:
+        with turn_context_scope({"turn_id": "unconfigured-turn"}):
+            await manager.append_message(session_key, "user", "synthetic request")
+        outcome = {
+            "kind": "failed", "reason": "no_provider", "error_class": "no_provider",
+            "retryable": False,
+        }
+        if error_id is not None:
+            outcome["error_id"] = error_id
+        await storage.create_agent_task(AgentTaskRecord(
+            task_id="unconfigured-turn", session_key=session_key, agent_id="main",
+            source_kind="webui", queue_mode="followup", run_kind="session_turn",
+            status=AgentTaskStatus.FAILED, terminal_reason="error", error_class="no_provider",
+            details={"turn_id": "unconfigured-turn", "turn_outcome": outcome},
+        ))
+        result = await _handle_chat_history(
+            {"sessionKey": session_key, "limit": 10},
+            RpcContext(conn_id="test", principal=SimpleNamespace(role="operator"),
+                       session_manager=manager),
+        )
+        projected = result["turn_outcomes"][0]
+        assert projected["code"] == "no_provider"
+        assert projected["outcome"] == outcome
+        expected = "The task failed before it could finish."
+        if error_id is not None:
+            expected += f" (ref: {error_id})"
+        assert projected["terminal_message"] == expected
+        assert [m["text"] for m in result["messages"]] == ["synthetic request"]
+    finally:
+        await storage.close()
+
+
+@pytest.mark.asyncio
 async def test_chat_history_projects_usage_barrier_retry_and_activity_snapshot(tmp_path) -> None:
     storage = SessionStorage(str(tmp_path / "history-usage-barrier.db"))
     await storage.connect()

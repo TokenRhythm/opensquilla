@@ -110,7 +110,18 @@ CREATE TABLE IF NOT EXISTS telemetry_rejections (
     status_code INTEGER NOT NULL,
     reason TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS telemetry_contract_recoveries (
+    event_id TEXT PRIMARY KEY,
+    expires_at_ms INTEGER NOT NULL
+);
 """
+
+_RECOVERABLE_GROWTH_EVENTS = frozenset({
+    "product_active", "client_launch", "metaskill_usage", "coding_mode_usage",
+    "first_turn_started", "first_turn_result",
+    "onboarding_result", "first_app_ready",
+})
 
 
 class OutboxPriority(IntEnum):
@@ -296,34 +307,9 @@ class TelemetryOutbox:
         """Revalidate and durably enqueue one typed event."""
 
         self._ensure_open()
-        if not isinstance(event, StrictTelemetryModel):
-            raise TypeError("outbox accepts only validated telemetry models")
-        event_name = getattr(event, "event_name", None)
-        event_version = getattr(event, "event_version", None)
-        if (
-            not isinstance(event_name, str)
-            or isinstance(event_version, bool)
-            or not isinstance(event_version, int)
-        ):
-            raise TypeError("outbox accepts only registered telemetry event models")
-        expected_model = EVENT_MODELS.get((event_name, event_version))
-        if expected_model is None or not isinstance(event, expected_model):
-            raise TypeError("outbox accepts only registered telemetry event models")
-        validated = expected_model.model_validate(event, strict=True)
-        consent_scope = str(getattr(validated, "consent_scope", ""))
-        if consent_scope != self.scope.value:
-            raise ValueError("event consent scope does not match outbox scope")
-
-        payload = canonical_json_bytes(validated)
-        batch_max_bytes = self.limits.batch_max_bytes
-        assert batch_max_bytes is not None
-        if (
-            len(payload) > MAX_TELEMETRY_EVENT_BYTES
-            or len(payload) + _BATCH_ENVELOPE_RESERVE_BYTES > batch_max_bytes
-        ):
-            raise OutboxPayloadTooLargeError("event exceeds scope batch body limit")
+        validated, payload = self._prepare_event(event)
         payload_digest = hashlib.sha256(payload).digest()
-        event_id = str(getattr(validated, "event_id"))
+        event_id = str(validated.event_id)
         normalized_priority = (
             OutboxPriority(priority) if priority is not None else _priority_for(validated)
         )
@@ -340,26 +326,9 @@ class TelemetryOutbox:
                     return EnqueueResult.DUPLICATE
                 raise OutboxEventConflictError("event_id already has different content")
 
-            await self._execute(
-                """
-                INSERT INTO telemetry_outbox (
-                    event_id, event_name, event_version, payload, payload_sha256,
-                    payload_bytes, priority, created_at_ms, expires_at_ms,
-                    next_attempt_at_ms, attempt_count, lease_id, lease_until_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
-                """,
-                (
-                    event_id,
-                    str(event_name),
-                    int(event_version),
-                    payload,
-                    payload_digest,
-                    len(payload),
-                    int(normalized_priority),
-                    now_ms,
-                    now_ms + self.limits.ttl_ms,
-                    now_ms,
-                ),
+            await self._insert_event_locked(
+                validated, payload, priority=normalized_priority,
+                created_at_ms=now_ms, expires_at_ms=now_ms + self.limits.ttl_ms,
             )
             await self._evict_over_capacity_locked(now_ms)
             retained = await self._fetchone(
@@ -367,6 +336,120 @@ class TelemetryOutbox:
                 (event_id,),
             )
             return EnqueueResult.ENQUEUED if retained is not None else EnqueueResult.EVICTED
+
+    def _prepare_event(self, event: StrictTelemetryModel) -> tuple[EventBase, bytes]:
+        if not isinstance(event, StrictTelemetryModel):
+            raise TypeError("outbox accepts only validated telemetry models")
+        event_name = getattr(event, "event_name", None)
+        event_version = getattr(event, "event_version", None)
+        if (
+            not isinstance(event_name, str)
+            or isinstance(event_version, bool)
+            or not isinstance(event_version, int)
+        ):
+            raise TypeError("outbox accepts only registered telemetry event models")
+        expected_model = EVENT_MODELS.get((event_name, event_version))
+        if expected_model is None or not isinstance(event, expected_model):
+            raise TypeError("outbox accepts only registered telemetry event models")
+        validated = expected_model.model_validate(event, strict=True)
+        assert isinstance(validated, EventBase)
+        consent_scope = str(getattr(validated, "consent_scope", ""))
+        if consent_scope != self.scope.value:
+            raise ValueError("event consent scope does not match outbox scope")
+
+        payload = canonical_json_bytes(validated)
+        batch_max_bytes = self.limits.batch_max_bytes
+        assert batch_max_bytes is not None
+        if (
+            len(payload) > MAX_TELEMETRY_EVENT_BYTES
+            or len(payload) + _BATCH_ENVELOPE_RESERVE_BYTES > batch_max_bytes
+        ):
+            raise OutboxPayloadTooLargeError("event exceeds scope batch body limit")
+        return validated, payload
+
+    async def _insert_event_locked(
+        self, event: EventBase, payload: bytes, *, priority: OutboxPriority,
+        created_at_ms: int, expires_at_ms: int,
+    ) -> None:
+        await self._execute(
+            """
+            INSERT INTO telemetry_outbox (
+                event_id, event_name, event_version, payload, payload_sha256,
+                payload_bytes, priority, created_at_ms, expires_at_ms,
+                next_attempt_at_ms, attempt_count, lease_id, lease_until_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL)
+            """,
+            (
+                str(event.event_id), event.event_name, event.event_version,
+                payload, hashlib.sha256(payload).digest(), len(payload), int(priority),
+                created_at_ms, expires_at_ms, self._clock(),
+            ),
+        )
+
+    async def recover_contract_rejection_once(self, event: StrictTelemetryModel) -> bool:
+        """Requeue one retained device event after a contract rejection, at most once.
+
+        A successful enqueue is not proof of server acceptance. Growth ledgers
+        retain a few exact events after enqueue, so they can repair a rejected
+        upload without constructing a new observation. The attempt marker and
+        payload commit atomically; another rejection or process restart cannot
+        create a replay loop. Recovery never extends the original event age.
+        """
+
+        self._ensure_open()
+        if self.scope is not TelemetryScope.GROWTH:
+            return False
+        validated, payload = self._prepare_event(event)
+        if (
+            validated.event_name not in _RECOVERABLE_GROWTH_EVENTS
+            or getattr(validated, "device_id", None) is None
+        ):
+            return False
+        event_id = str(validated.event_id)
+        occurred_at_ms = int(validated.occurred_at_utc.timestamp() * 1_000)
+        expires_at_ms = occurred_at_ms + min(self.limits.ttl_ms, _DEFAULT_TTL_MS)
+        now_ms = self._clock()
+        if not occurred_at_ms <= now_ms < expires_at_ms:
+            return False
+        async with self._transaction():
+            await self._purge_expired_locked(now_ms)
+            rejected = await self._fetchone(
+                """
+                SELECT 1 FROM telemetry_rejections
+                WHERE event_id = ? AND event_name = ? AND status_code = 422
+                  AND reason = 'contract' AND rejected_at_ms <= ?
+                """,
+                (event_id, validated.event_name, now_ms),
+            )
+            if rejected is None or await self._fetchone(
+                "SELECT 1 FROM telemetry_contract_recoveries WHERE event_id = ?", (event_id,),
+            ) is not None or await self._fetchone(
+                "SELECT 1 FROM telemetry_outbox WHERE event_id = ?", (event_id,),
+            ) is not None:
+                return False
+            totals = await self._fetchone(
+                "SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes), 0) AS bytes "
+                "FROM telemetry_outbox"
+            )
+            attempts = await self._fetchone(
+                "SELECT COUNT(*) AS count FROM telemetry_contract_recoveries"
+            )
+            assert totals is not None and attempts is not None
+            if (
+                int(totals["count"]) >= self.limits.max_events
+                or int(totals["bytes"]) + len(payload) > self.limits.max_payload_bytes
+                or int(attempts["count"]) >= self.limits.rejection_max_events
+            ):
+                return False
+            await self._insert_event_locked(
+                validated, payload, priority=_priority_for(validated),
+                created_at_ms=occurred_at_ms, expires_at_ms=expires_at_ms,
+            )
+            await self._execute(
+                "INSERT INTO telemetry_contract_recoveries(event_id, expires_at_ms) VALUES (?, ?)",
+                (event_id, expires_at_ms),
+            )
+            return True
 
     async def claim_batch(self) -> ClaimedBatch | None:
         """Atomically lease the next bounded upload batch."""
@@ -470,6 +553,15 @@ class TelemetryOutbox:
 
         self._ensure_open()
         async with self._transaction():
+            await self._execute(
+                """
+                DELETE FROM telemetry_rejections
+                WHERE event_id IN (
+                    SELECT event_id FROM telemetry_outbox WHERE lease_id = ?
+                ) AND event_id IN (SELECT event_id FROM telemetry_contract_recoveries)
+                """,
+                (lease_id,),
+            )
             return await self._execute(
                 "DELETE FROM telemetry_outbox WHERE lease_id = ?",
                 (lease_id,),
@@ -608,6 +700,7 @@ class TelemetryOutbox:
         async with self._transaction():
             removed = await self._execute("DELETE FROM telemetry_outbox")
             await self._execute("DELETE FROM telemetry_rejections")
+            await self._execute("DELETE FROM telemetry_contract_recoveries")
             return removed
 
     async def stats(self) -> OutboxStats:
@@ -677,6 +770,9 @@ class TelemetryOutbox:
             (now_ms,),
         )
         await self._purge_rejections_locked(now_ms)
+        await self._execute(
+            "DELETE FROM telemetry_contract_recoveries WHERE expires_at_ms <= ?", (now_ms,),
+        )
         return removed
 
     async def _purge_rejections_locked(self, now_ms: int) -> int:

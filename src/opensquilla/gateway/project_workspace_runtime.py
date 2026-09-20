@@ -104,6 +104,7 @@ async def authoritative_project_run_context(
     session: SessionNode,
     config: Any,
     default_workspace: str | None,
+    include_user_grants: bool = True,
 ) -> tuple[RunContext, ProjectWorkspaceGuard | None]:
     context = await get_run_context(
         session_manager,
@@ -111,6 +112,7 @@ async def authoritative_project_run_context(
         config=config,
         workspace=default_workspace,
         session_node=session,
+        include_user_grants=include_user_grants,
     )
     validated = await resolve_session_project_workspace(storage, session)
     if validated is None:
