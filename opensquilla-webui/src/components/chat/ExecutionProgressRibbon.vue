@@ -7,6 +7,7 @@
     role="region"
     :aria-label="regionTitle"
   >
+    <div class="plan-run__toolbar" :class="{ 'plan-run__toolbar--cancellable': showCancel }">
     <template v-if="hasInspectableSteps">
       <div class="plan-run__control">
         <div
@@ -160,14 +161,21 @@
       </span>
     </div>
     <button
-      v-if="run.status === 'queued' || run.status === 'running' || (canCancel && !hasInspectableSteps)"
+      v-if="showCancel"
       type="button"
       class="plan-run__end plan-run__cancel"
       :disabled="cancelBusy || disabled"
+      :title="cancelLabel"
+      :aria-label="cancelLabel"
+      :aria-busy="cancelBusy || undefined"
       @click.stop="onEndPlan"
-    >{{ canCancel
-      ? (cancelBusy ? t('chat.planRun.endingPlan') : t('chat.planRun.endPlan'))
-      : (cancelBusy ? t('chat.planRun.cancelling') : t('chat.planRun.cancel')) }}</button>
+    >
+      <span class="plan-run__cancel-content">
+        <Icon name="stop" :size="12" aria-hidden="true" />
+      </span>
+      <span class="plan-run__sr-only">{{ cancelLabel }}</span>
+    </button>
+    </div>
   </section>
 </template>
 
@@ -218,6 +226,11 @@ let lastPointerType = ''
 let suppressNextFocusOpen = false
 const stepsId = `plan-run-steps-${useId()}`
 const isRunning = computed(() => props.run.status === 'running')
+const showCancel = computed(() => props.run.status === 'queued'
+  || isRunning.value || (canCancel.value && !hasInspectableSteps.value))
+const cancelLabel = computed(() => canCancel.value
+  ? (props.cancelBusy ? t('chat.planRun.endingPlan') : t('chat.planRun.endPlan'))
+  : (props.cancelBusy ? t('chat.planRun.cancelling') : t('chat.planRun.cancel')))
 const hasSteps = computed(() => props.run.steps.length > 0)
 const inspectableStatuses = new Set<PlanRunStatus>([
   'queued',
@@ -514,7 +527,8 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
   position: relative;
   display: flex;
   align-items: center;
-  gap: var(--sp-1);
+  justify-content: center;
+  gap: var(--sp-2);
   width: min(440px, calc(100vw - 24px));
   box-sizing: border-box;
   max-width: 100%;
@@ -523,17 +537,34 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 }
 
 .plan-run__control {
-  display: grid;
+  display: flex;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
-  width: 100%;
-  max-width: calc(100vw - 24px);
+  max-width: 100%;
   align-items: center;
+}
+
+.plan-run__toolbar {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.plan-run__toolbar--cancellable {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface);
+}
+
+.plan-run__toolbar--cancellable .plan-run__summary,
+.plan-run__toolbar--cancellable .plan-run__static {
+  border-color: transparent;
+  border-radius: var(--radius-pill) 0 0 var(--radius-pill);
+  background: transparent;
 }
 
 .plan-run__disclosure {
   position: relative;
-  grid-column: 2;
   width: max-content;
   min-width: 0;
   max-width: 100%;
@@ -854,8 +885,36 @@ function stepStatusLabel(status: PlanRunStepStatus): string {
 }
 
 .plan-run__cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   flex-shrink: 0;
+  width: 36px;
   min-height: 44px;
+  margin-block: -4px;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  white-space: nowrap;
+}
+
+/* A quiet stop control shares the progress capsule, with a 44px hit target. */
+.plan-run__cancel-content {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 20px;
+  box-sizing: border-box;
+  border-left: 1px solid var(--border);
+}
+
+.plan-run__cancel:hover:not(:disabled),
+.plan-run__cancel:focus-visible {
+  background: transparent;
+}
+
+.plan-run__cancel-content :deep(svg) {
+  fill: currentColor;
 }
 
 .plan-run-popover-enter-active {
