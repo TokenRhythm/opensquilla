@@ -1818,16 +1818,16 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-actions--right {
-  flex: 1 1 16rem;
+  flex: 0 1 auto;
   justify-content: flex-end;
   margin-left: auto;
   max-width: 100%;
 }
 
 .chat-model-routing-anchor {
-  flex: 1 1 0;
+  flex: 0 1 auto;
   min-width: 0;
-  max-width: 20rem;
+  max-width: 14rem;
 }
 
 @container chat-composer (max-width: 38rem) {
@@ -1838,12 +1838,8 @@ button.attachment-chip__primary:focus-visible {
   }
 
   .chat-input-actions--right {
-    flex-basis: auto;
+    align-self: flex-end;
     margin-left: 0;
-  }
-
-  .chat-model-routing-anchor {
-    max-width: none;
   }
 
   .chat-more-actions-anchor {
@@ -1931,11 +1927,11 @@ button.attachment-chip__primary:focus-visible {
   min-width: 0;
   max-width: 100%;
   padding: 0 9px;
-  width: 100%;
+  width: auto;
   position: relative;
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   border-radius: var(--radius-control);
-  background: var(--bg-surface);
+  background: transparent;
   color: var(--text-muted);
   font-family: inherit;
   font-weight: 500;
@@ -1952,7 +1948,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-model-routing-btn__label {
-  flex: 1 1 auto;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -2002,8 +1998,8 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-model-routing-btn:hover,
 .chat-model-routing-btn.is-open {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  border-color: var(--border);
+  background: var(--bg-hover);
   color: var(--text);
 }
 
