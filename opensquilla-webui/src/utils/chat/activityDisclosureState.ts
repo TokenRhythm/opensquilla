@@ -1,5 +1,6 @@
 interface ExpansionState {
   expanded: boolean
+  manual: boolean
   version: number
 }
 
@@ -7,30 +8,44 @@ const expandedByKey = new Map<string, ExpansionState>()
 const durationByKey = new Map<string, number>()
 let expansionVersion = 0
 
-export function readAssistantActivityExpansion(
+function readExpansionState(
   key: string,
-  fallback: boolean,
   continuityKey = '',
-): boolean {
+): ExpansionState | undefined {
   const keyed = key ? expandedByKey.get(key) : undefined
   const continuous = continuityKey ? expandedByKey.get(continuityKey) : undefined
   // Canonical reconciliation can remount a turn with an older message key.
   // Prefer the most recently written state across that key and the stable turn
   // identity so the remount cannot resurrect an earlier auto-collapse.
   if (continuous && (!keyed || continuous.version > keyed.version)) {
-    return continuous.expanded
+    return continuous
   }
-  if (keyed) return keyed.expanded
-  if (continuous) return continuous.expanded
-  return fallback
+  return keyed ?? continuous
+}
+
+export function readAssistantActivityExpansion(
+  key: string,
+  fallback: boolean,
+  continuityKey = '',
+): boolean {
+  return readExpansionState(key, continuityKey)?.expanded ?? fallback
+}
+
+export function readAssistantActivityManualChoice(
+  key: string,
+  continuityKey = '',
+): boolean | undefined {
+  const state = readExpansionState(key, continuityKey)
+  return state?.manual ? state.expanded : undefined
 }
 
 export function writeAssistantActivityExpansion(
   key: string,
   expanded: boolean,
   continuityKey = '',
+  manual = false,
 ): void {
-  const state = { expanded, version: ++expansionVersion }
+  const state = { expanded, manual, version: ++expansionVersion }
   if (key) expandedByKey.set(key, state)
   if (continuityKey) expandedByKey.set(continuityKey, state)
 }

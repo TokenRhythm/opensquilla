@@ -88,6 +88,8 @@ export interface SidebarSectionRow {
   effectiveAgentId: string
   agentName: string
   sessionKind: string
+  /** Canonical lineage; display depth is capped and cannot identify a parent. */
+  parentKey?: string
   depth: number
   runStatus: string
   runLabel: string
@@ -171,6 +173,7 @@ export function arrangeSidebarSections(
     effectiveAgentId: item.effectiveAgentId,
     agentName: '',
     sessionKind: item.sessionKind,
+    parentKey: isSubagentSession(item) ? sessionParentKey(item) : undefined,
     depth,
     runStatus: item.runStatus,
     runLabel: item.runLabel,

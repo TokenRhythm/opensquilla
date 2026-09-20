@@ -162,6 +162,8 @@
     }
   },
   "common": {
+    "more": "More",
+    "saving": "Saving…",
     "close": "Close",
     "save": "Save",
     "discard": "Discard",
@@ -422,6 +424,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Search settings",
+      "results": "Settings results",
+      "empty": "No matching settings",
+      "defaultModel": "Default model",
+      "permissions": "Permissions"
+    },
     "appearance": {
       "title": "Interface",
       "desc": "Theme and browser-local interface preferences. Presets apply instantly; custom widths use Apply.",
@@ -3041,6 +3050,9 @@
       ,"workspaceOptionalHint": "Optional. Choose “No project workspace” for general tasks, or select a project when the task needs its files."
     },
     "form": {
+      "invalidTimezone": "Enter a valid time zone, such as Europe/Paris.",
+      "discardBody": "Your unsaved changes will be lost. Continue editing to keep them.",
+      "discardTitle": "Discard schedule changes?",
       "cronPreviewPlaceholder": "Enter a 5-field cron expression to preview",
       "cronParseError": "Could not parse expression — expected 5 fields (m h dom mon dow).",
       "cronCustomCadence": "matches a custom cadence",
@@ -3259,6 +3271,9 @@
       "add": "Add"
     },
     "skillDetail": {
+      "useUnavailable": "This skill is not available for a new task. Check its status and try again.",
+      "useInTaskHint": "Prepare a draft with this skill. Nothing is sent until you send it.",
+      "useInTask": "Use in new task",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -4412,6 +4427,8 @@
       "disableLabel": "Disable Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Work style",
+      "contentGroup": "Content",
       "executionMode": "Execution mode",
       "ownerOnlyUnavailable": "Owner-only mode is unavailable for this browser session.",
       "enabled": "Enabled",
@@ -4782,6 +4799,13 @@
       "retry": "Retry"
     },
     "sidebar": {
+      "moveDown": "Move down",
+      "moveUp": "Move up",
+      "subtasksAttention": "{count} needs attention | {count} need attention",
+      "subtasksRunning": "{count} running",
+      "subtaskCount": "{count} subtask | {count} subtasks",
+      "collapseSubtasks": "Hide subtasks for {title}",
+      "expandSubtasks": "Show subtasks for {title}",
       "recentConversations": "Recent tasks",
       "recents": "Recents",
       "pinned": "Pinned",

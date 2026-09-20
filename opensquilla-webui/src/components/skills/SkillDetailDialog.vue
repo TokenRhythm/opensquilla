@@ -24,6 +24,13 @@
       <section class="sk-detail__body">
         <p class="sk-detail__desc">{{ localizedSkillDescription(skill, String(locale)) }}</p>
 
+        <div v-if="canUseInTask" class="sk-detail__section sk-detail__launch">
+          <button type="button" class="btn btn--primary" :disabled="mutationDisabled || loadingContent" @click="emit('useInTask', skill)">
+            {{ t('cronSkills.skillDetail.useInTask') }}
+          </button>
+          <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.useInTaskHint') }}</p>
+        </div>
+
         <div v-if="canSetEnabled && !isMetaSkill(skill) && skill.name !== 'code-task'" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.allowUse') }}</div>
           <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.allowUseHelp') }}</p>
@@ -235,6 +242,7 @@ const props = defineProps<{
   mutationDisabled?: boolean
   canSetEnabled?: boolean
   settingEnabled?: boolean
+  canUseInTask?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -242,6 +250,7 @@ const emit = defineEmits<{
   installDeps: [name: string, installId: string]
   uninstall: [name: string, installId: string]
   setEnabled: [name: string, enabled: boolean]
+  useInTask: [skill: Skill]
 }>()
 
 const dialogRef = ref<HTMLDialogElement | null>(null)

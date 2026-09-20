@@ -161,6 +161,8 @@
     }
   },
   "common": {
+    "more": "その他",
+    "saving": "保存中…",
     "close": "閉じる",
     "save": "保存",
     "discard": "破棄",
@@ -421,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "設定を検索",
+      "results": "設定の検索結果",
+      "empty": "一致する設定がありません",
+      "defaultModel": "既定のモデル",
+      "permissions": "権限"
+    },
     "appearance": {
       "title": "インターフェース",
       "desc": "このブラウザーのテーマとローカルの表示設定です。プリセットは即時に反映され、カスタム幅は「適用」で確定します。",
@@ -2958,6 +2967,9 @@
       ,"workspaceOptionalHint": "任意。一般的なタスクは「プロジェクトワークスペースなし」を選び、ファイルが必要な場合はプロジェクトを選択します。"
     },
     "form": {
+      "invalidTimezone": "Asia/Tokyo などの有効なタイムゾーンを入力してください。",
+      "discardBody": "未保存の変更は失われます。キャンセルすると編集を続けられます。",
+      "discardTitle": "スケジュールの変更を破棄しますか？",
       "cronPreviewPlaceholder": "プレビューするには 5 フィールドの cron 式を入力してください",
       "cronParseError": "式を解析できませんでした — 5 フィールド（分 時 日 月 曜日）が必要です。",
       "cronCustomCadence": "カスタムの周期に一致",
@@ -3176,6 +3188,9 @@
       "add": "追加"
     },
     "skillDetail": {
+      "useUnavailable": "このスキルは新しいタスクで使用できません。状態を確認して再試行してください。",
+      "useInTaskHint": "このスキルを使う下書きを作成します。送信するまで実行されません。",
+      "useInTask": "新しいタスクで使用",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -4327,6 +4342,8 @@
       "disableLabel": "Coding mode を無効にする"
     },
     "composer": {
+      "workStyleGroup": "作業方法",
+      "contentGroup": "コンテンツ",
       "executionMode": "実行モード",
       "ownerOnlyUnavailable": "オーナー専用モードはこのブラウザーセッションでは利用できません。",
       "enabled": "有効",
@@ -4697,6 +4714,13 @@
       "retry": "再試行"
     },
     "sidebar": {
+      "moveDown": "下へ移動",
+      "moveUp": "上へ移動",
+      "subtasksAttention": "{count} 件要確認",
+      "subtasksRunning": "{count} 件実行中",
+      "subtaskCount": "サブタスク {count} 件",
+      "collapseSubtasks": "「{title}」のサブタスクを隠す",
+      "expandSubtasks": "「{title}」のサブタスクを表示",
       "recentConversations": "最近のタスク",
       "recents": "最近",
       "pinned": "ピン留め",

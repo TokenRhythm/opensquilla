@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive, ref, type App } from 'vue'
 import { createPinia } from 'pinia'
 import i18n, { loadLocaleMessages } from '@/i18n'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import SettingsDialog from './SettingsDialog.vue'
 
 let catalogApi: Record<string, any>
@@ -120,6 +121,11 @@ async function mountDialog() {
   app = createApp(SettingsDialog)
   app.use(i18n)
   app.use(createPinia())
+  app.provide(GATEWAY_ACCESS_KEY, {
+    availability: 'unavailable',
+    requiresCredential: false,
+    loadConnectionEndpoint: () => 'ws://localhost:18790/ws',
+  } as never)
   app.mount(el)
   await nextTick()
   await nextTick()
@@ -242,6 +248,55 @@ describe('SettingsDialog save-all pending state', () => {
     expect(dirtyBar?.textContent).toContain('放弃路由更改')
     expect(dirtyBar?.textContent).toContain('保存路由更改')
     expect(dirtyBar?.textContent).not.toContain('Model Routing')
+  })
+})
+
+describe('SettingsDialog search navigation', () => {
+  it('focuses the token input despite the optional suffix on its label', async () => {
+    mockCatalog().saveAllPending.value = false
+    const el = await mountDialog()
+    const search = el.querySelector<HTMLInputElement>('.settings-search input')!
+    search.focus()
+    search.value = i18n.global.t('setup.connection.tokenLabel')
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+
+    const token = el.querySelector<HTMLInputElement>('#conn-ws-token')
+    expect(token).not.toBeNull()
+    expect(document.activeElement).toBe(token)
+    expect(token?.value).toBe('')
+    expect(routerMock.replace).toHaveBeenCalledWith({ path: '/settings/gateway' })
+  })
+
+  it('focuses the matching local control without changing its value', async () => {
+    mockCatalog().saveAllPending.value = false
+    const el = await mountDialog()
+    const search = el.querySelector<HTMLInputElement>('.settings-search input')!
+    search.focus()
+    search.value = i18n.global.t('setup.behavior.autoTitlesLabel')
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+
+    expect(document.activeElement?.getAttribute('aria-label')).toBe(i18n.global.t('setup.behavior.autoTitlesLabel'))
+    expect(catalogApi.setAutoSessionTitles).not.toHaveBeenCalled()
+  })
+
+  it('focuses the panel for a section-only match instead of an unrelated action', async () => {
+    mockCatalog().saveAllPending.value = false
+    const el = await mountDialog()
+    const search = el.querySelector<HTMLInputElement>('.settings-search input')!
+    search.focus()
+    search.value = 'general'
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+
+    expect(document.activeElement).toBe(el.querySelector('.settings-panel'))
   })
 })
 

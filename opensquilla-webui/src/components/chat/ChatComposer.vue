@@ -263,20 +263,22 @@
             </button>
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
-                class="btn btn--icon btn--ghost chat-run-mode-btn"
+                class="btn btn--ghost chat-run-mode-btn"
                 :class="[`chat-run-mode-btn--${runMode}`, {
                   'is-active': runModeOpen,
                   'is-locked': runModeLocked,
                 }]"
-                :title="runModeLocked ? undefined : t('chat.composer.runMode')"
-                :aria-label="t('chat.composer.runMode')"
+                :title="runModeLocked ? undefined : runModeLabel"
+                :aria-label="`${t('chat.composer.runMode')}: ${runModeLabel}`"
+                aria-haspopup="dialog"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
                 :aria-disabled="runModeLocked ? 'true' : 'false'"
                 :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
                 :disabled="runModeLocked"
                 @click="toggleRunMode"
               >
-                <Icon name="shield" :size="17" />
+                <Icon name="shield" :size="16" aria-hidden="true" />
+                <span class="chat-run-mode-btn__label">{{ runModeLabel }}</span>
               </button>
               <span
                 v-if="runModeLocked"
@@ -666,6 +668,9 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const runModeLabel = computed(() => t(
+  props.runMode === 'full' ? 'chat.composer.runModeFull' : 'chat.composer.runModeSafe',
+))
 
 const showSkillQueueSend = computed(() => props.canStop
   && props.isStreaming
@@ -1982,21 +1987,19 @@ button.attachment-chip__primary:focus-visible {
   --run-mode-border: transparent;
   --run-mode-marker: var(--text-dim);
   position: relative;
+  gap: 0.375rem;
+  min-height: 32px;
+  padding: 0.375rem 0.5rem;
   border-color: var(--run-mode-border);
   background: var(--run-mode-tint);
   color: var(--run-mode-tone);
 }
 
-.chat-run-mode-btn::after {
-  content: "";
-  position: absolute;
-  right: 7px;
-  bottom: 7px;
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-full);
-  background: var(--run-mode-marker);
-  box-shadow: 0 0 0 2px var(--bg-surface);
+.chat-run-mode-btn__label {
+  color: var(--text);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .chat-run-mode-btn--safe {

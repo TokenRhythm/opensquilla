@@ -84,6 +84,21 @@ describe('ChatComposer popovers', () => {
     expect(Boolean(el.querySelector('.chat-model-routing-btn__default'))).toBe(badge)
     app.unmount()
   })
+  it.each([
+    ['safe', 'Safe'],
+    ['full', 'Full Access'],
+  ])('shows the current %s execution permission before opening its menu', async (runMode, label) => {
+    const { app, el } = await mountComposer({ runMode })
+    const trigger = el.querySelector<HTMLButtonElement>('.chat-run-mode-btn')!
+    expect(trigger.textContent?.trim()).toBe(label)
+    expect(trigger.getAttribute('aria-label')).toBe(`Execution mode: ${label}`)
+    expect(trigger.getAttribute('aria-haspopup')).toBe('dialog')
+    trigger.click()
+    await nextTick()
+    expect(el.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain(label)
+    app.unmount()
+  })
+
   it('shows a persisted session model without a default badge or new-task selector', async () => {
     const { app, el } = await mountComposer({ modelSelectionAvailable: false, sessionModelName: 'bound-model' })
     expect(el.querySelector('.chat-model-routing-btn__label')?.textContent).toBe('bound-model')
@@ -270,7 +285,7 @@ describe('ChatComposer popovers', () => {
 
   it.each([
     ["Models & routing", '.composer-model-routing'],
-    ['Execution mode', '.composer-run-mode'],
+    ['Execution mode: Safe', '.composer-run-mode'],
   ])('closes %s on outside pointerdown', async (label, selector) => {
     const { app, el } = await mountComposer()
 
@@ -304,7 +319,7 @@ describe('ChatComposer popovers', () => {
     await clickButton(el, "Models & routing")
     expectPopover(el, '.chat-more-actions-menu', false)
     expectPopover(el, '.composer-model-routing', true)
-    await clickButton(el, 'Execution mode')
+    await clickButton(el, 'Execution mode: Safe')
     expectPopover(el, '.composer-model-routing', false)
     expectPopover(el, '.composer-run-mode', true)
 
@@ -365,7 +380,7 @@ describe('ChatComposer popovers', () => {
       ['Add', '.composer-add-menu'],
       ['More', '.chat-more-actions-menu'],
       ["Models & routing", '.composer-model-routing'],
-      ['Execution mode', '.composer-run-mode'],
+      ['Execution mode: Safe', '.composer-run-mode'],
     ] as const
     for (const [label, selector] of popovers) {
       props.collapsed = false
@@ -393,7 +408,7 @@ describe('ChatComposer popovers', () => {
       runModeLockMessage: lockMessage,
     })
     const button = el.querySelector<HTMLButtonElement>(
-      'button[aria-label="Execution mode"]',
+      'button[aria-label="Execution mode: Safe"]',
     )
     const tooltip = el.querySelector<HTMLElement>('[role="tooltip"]')
 

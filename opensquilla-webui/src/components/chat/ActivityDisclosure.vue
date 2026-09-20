@@ -93,6 +93,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import {
   readAssistantActivityExpansion,
+  readAssistantActivityManualChoice,
   writeAssistantActivityExpansion,
 } from '@/utils/chat/activityDisclosureState'
 
@@ -132,7 +133,9 @@ const open = ref(readAssistantActivityExpansion(
   initialOpen(),
   props.continuityKey,
 ))
-const manuallyToggled = ref(false)
+const manuallyToggled = ref(
+  readAssistantActivityManualChoice(props.stateKey, props.continuityKey) !== undefined,
+)
 
 function toggleOpen() {
   manuallyToggled.value = true
@@ -140,11 +143,11 @@ function toggleOpen() {
 }
 
 watch(open, expanded => {
-  writeAssistantActivityExpansion(props.stateKey, expanded, props.continuityKey)
+  writeAssistantActivityExpansion(props.stateKey, expanded, props.continuityKey, manuallyToggled.value)
 })
 
 watch(() => [props.stateKey, props.continuityKey] as const, ([key, continuityKey]) => {
-  manuallyToggled.value = false
+  manuallyToggled.value = readAssistantActivityManualChoice(key, continuityKey) !== undefined
   open.value = readAssistantActivityExpansion(key, initialOpen(), continuityKey)
 })
 
@@ -152,14 +155,9 @@ watch(
   () => props.defaultOpen,
   (defaultOpen, previousDefaultOpen) => {
     if (defaultOpen === previousDefaultOpen) return
-    if (!defaultOpen) {
-      // A terminal transition is an explicit visual handoff: always collapse
-      // live work so the canonical answer becomes the stable reading endpoint.
-      manuallyToggled.value = false
-      open.value = false
-      return
-    }
-    if (!manuallyToggled.value) open.value = true
+    // Follow the live/terminal default only until the reader chooses a state.
+    // Completing a turn must not close details that they explicitly opened.
+    if (!manuallyToggled.value) open.value = defaultOpen
   },
 )
 

@@ -60,6 +60,7 @@ import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { usePlatform } from '@/platform'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
+import { buildSidebarTaskHierarchy } from '@/utils/sidebarTaskHierarchy'
 import {
   buildSidebarDisplayProjection,
   isSidebarSessionOrderable,
@@ -277,6 +278,62 @@ const displayProjection = computed(() =>
   buildSidebarDisplayProjection(filteredSections.value, props.sessionOrder),
 )
 
+const taskHierarchy = computed(() => buildSidebarTaskHierarchy(displayProjection.value.allRows))
+
+function taskCollapseKey(key: string): string {
+  return `task:${key}`
+}
+
+function isTaskCollapsed(key: string): boolean {
+  const saved = collapsed.value[taskCollapseKey(key)]
+  return typeof saved === 'boolean'
+    ? saved
+    : taskHierarchy.value.summaries.get(key)?.allFinished === true
+}
+
+function toggleTask(row: SidebarDisplayRow) {
+  closeSessionPreview()
+  const next = { ...collapsed.value, [taskCollapseKey(row.key)]: !isTaskCollapsed(row.key) }
+  collapsed.value = next
+  writeSidebarCollapsedState(next)
+}
+
+function filterCollapsedTaskRows<T extends SidebarDisplayRow>(rows: T[]): T[] {
+  return rows.filter(row => row.pinned || !(taskHierarchy.value.ancestors.get(row.key) ?? [])
+    .some(isTaskCollapsed))
+}
+
+function subtaskSummaryLabel(key: string): string {
+  const summary = taskHierarchy.value.summaries.get(key)
+  if (!summary) return ''
+  const labels = [t('shared.sidebar.subtaskCount', { count: summary.count })]
+  if (summary.running) labels.push(t('shared.sidebar.subtasksRunning', { count: summary.running }))
+  if (summary.attention) labels.push(t('shared.sidebar.subtasksAttention', { count: summary.attention }))
+  return labels.join(' · ')
+}
+
+// Route navigation and newly loaded lineage reveal the selected task. Explicit
+// manual collapse remains possible until the user navigates to another task.
+watch(
+  () => {
+    const row = findSessionRow(props.currentKey)
+    return [props.currentKey, row?.workspaceId, row?.displayFamily,
+      ...(taskHierarchy.value.ancestors.get(props.currentKey) ?? [])].join('\u0000')
+  },
+  () => {
+    const row = findSessionRow(props.currentKey)
+    if (!row) return
+    const next = { ...collapsed.value, [row.displayFamily]: false }
+    for (const ancestor of taskHierarchy.value.ancestors.get(row.key) ?? []) {
+      next[taskCollapseKey(ancestor)] = false
+    }
+    if (row.workspaceId) next[projectCollapseKey(row.workspaceId)] = false
+    collapsed.value = next
+    writeSidebarCollapsedState(next)
+  },
+  { immediate: true },
+)
+
 interface SidebarDisplayBlock {
   key: string
   zone: SidebarDisplayZone
@@ -308,7 +365,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
       zone: 'projects',
       label: t('workspaces.projects'),
       count: projection.projectCount,
-      rows: filterCollapsedProjectRows(projection.projects),
+      rows: filterCollapsedTaskRows(filterCollapsedProjectRows(projection.projects)),
       showHeading: true,
     })
   }
@@ -328,7 +385,7 @@ const displayBlocks = computed<SidebarDisplayBlock[]>(() => {
         zone: 'recents',
         label: t('shared.sidebar.recents'),
         count: projection.recentCount,
-        rows: section.rows,
+        rows: filterCollapsedTaskRows(section.rows),
         showHeading: index === 0,
         family: section.family,
         familyLabel: section.label,
@@ -396,6 +453,24 @@ function canDragRow(row: SidebarDisplayRow): boolean {
     && renamingKey.value !== row.key
 }
 
+function keyboardReorderTarget(row: SidebarDisplayRow, direction: 'up' | 'down'): SidebarDisplayRow | undefined {
+  if (!canDragRow(row)) return undefined
+  const siblings = displayBlocks.value.flatMap(block => block.rows)
+    .filter(item => canDragRow(item) && reorderScope(item) === reorderScope(row))
+  const index = siblings.findIndex(item => item.key === row.key)
+  return index < 0 ? undefined : siblings[index + (direction === 'up' ? -1 : 1)]
+}
+
+function reorderFromMenu(row: SidebarDisplayRow, direction: 'up' | 'down') {
+  const target = keyboardReorderTarget(row, direction)
+  if (!target) return
+  const trigger = menuTriggerEl.value
+  closeMenu()
+  settleRow(row.key)
+  emit('reorder', { draggedKey: row.key, targetKey: target.key, position: direction === 'up' ? 'before' : 'after' })
+  nextTick(() => trigger?.focus())
+}
+
 function clearRowDrag() {
   const drag = pointerDrag.value
   if (drag?.active) suppressSelectKey.value = drag.key
@@ -430,7 +505,7 @@ function onRowPointerDown(row: SidebarDisplayRow, event: PointerEvent) {
   // Touch belongs to the scroll container; a swipe must never reorder a task.
   if (event.button !== 0 || event.pointerType === 'touch' || !canDragRow(row)) return
   const target = event.target
-  if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge')) return
+  if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge, .sidebar-task-disclosure')) return
   const source = event.currentTarget
   if (!(source instanceof HTMLElement)) return
   const rect = source.getBoundingClientRect()
@@ -1159,12 +1234,14 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                   'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
                   'sidebar-history-row--workspace': row.rowKind === 'workspace',
                   'sidebar-history-row--workspace-empty': row.rowKind === 'workspace-empty',
+                  'sidebar-history-row--subtask': (taskHierarchy.ancestors.get(row.key)?.length ?? 0) > 0,
                   'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
                   'is-reorderable': canDragRow(row),
                   'is-dragging': draggedRowKey === row.key,
                   'is-settling': settlingRowKey === row.key,
                   'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
                   'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
+                  'has-subtasks': taskHierarchy.summaries.has(row.key),
                 }"
                 :data-family="row.displayFamily"
                 :data-sidebar-zone="row.displayZone"
@@ -1261,6 +1338,17 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                   {{ row.title }}
                 </div>
 
+                <button
+                  v-if="row.rowKind === 'session' && taskHierarchy.summaries.has(row.key)"
+                  type="button"
+                  class="sidebar-task-disclosure"
+                  :aria-expanded="!isTaskCollapsed(row.key)"
+                  :aria-label="t(isTaskCollapsed(row.key) ? 'shared.sidebar.expandSubtasks' : 'shared.sidebar.collapseSubtasks', { title: row.title })"
+                  @click.stop="toggleTask(row)"
+                >
+                  <Icon name="chevronRight" :size="12" />
+                </button>
+
                 <!-- Inline rename input replaces the row button while editing -->
                 <input
                   v-if="row.rowKind === 'session' && renamingKey === row.key"
@@ -1278,6 +1366,7 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                   v-else-if="row.rowKind === 'session'"
                   class="sidebar-history-item"
                   :class="{ 'is-current': row.key === currentKey }"
+                  :aria-current="row.key === currentKey ? 'page' : undefined"
                   :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
                   :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
                   @click="onSelectRow(row, $event)"
@@ -1291,7 +1380,35 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                   >
                     <Icon v-if="isRowSelected(row.key)" name="check" :size="11" />
                   </span>
-                  <span class="sidebar-history-title">{{ row.title }}</span>
+                  <span class="sidebar-history-main">
+                    <span class="sidebar-history-title">{{ row.title }}</span>
+                    <span
+                      v-if="taskHierarchy.summaries.has(row.key) && !selectionMode"
+                      class="sidebar-subtask-summary"
+                      :class="{ 'has-attention': taskHierarchy.summaries.get(row.key)?.attention }"
+                      :title="subtaskSummaryLabel(row.key)"
+                    >
+                      <span class="sidebar-subtask-count">{{ t('shared.sidebar.subtaskCount', { count: taskHierarchy.summaries.get(row.key)?.count }) }}</span>
+                      <span
+                        v-if="taskHierarchy.summaries.get(row.key)?.attention"
+                        class="sidebar-subtask-status sidebar-subtask-status--attention"
+                        role="img"
+                        :aria-label="t('shared.sidebar.subtasksAttention', { count: taskHierarchy.summaries.get(row.key)?.attention })"
+                      >
+                        <Icon name="info" :size="11" aria-hidden="true" />
+                        <span aria-hidden="true">{{ taskHierarchy.summaries.get(row.key)?.attention }}</span>
+                      </span>
+                      <span
+                        v-if="taskHierarchy.summaries.get(row.key)?.running"
+                        class="sidebar-subtask-status"
+                        role="img"
+                        :aria-label="t('shared.sidebar.subtasksRunning', { count: taskHierarchy.summaries.get(row.key)?.running })"
+                      >
+                        <Icon name="refresh" :size="11" aria-hidden="true" />
+                        <span aria-hidden="true">{{ taskHierarchy.summaries.get(row.key)?.running }}</span>
+                      </span>
+                    </span>
+                  </span>
                   <Icon
                     v-if="row.pinned"
                     class="sidebar-history-pin"
@@ -1411,6 +1528,28 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                       <span>{{ row.pinned ? t('shared.sidebar.unpinTask') : t('shared.sidebar.pinTask') }}</span>
                     </button>
                     <button
+                      v-if="keyboardReorderTarget(row, 'up')"
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      data-session-action="move-up"
+                      @click.stop="reorderFromMenu(row, 'up')"
+                    >
+                      <Icon name="arrowUp" :size="14" />
+                      <span>{{ t('shared.sidebar.moveUp') }}</span>
+                    </button>
+                    <button
+                      v-if="keyboardReorderTarget(row, 'down')"
+                      type="button"
+                      class="sidebar-row-menu__item"
+                      role="menuitem"
+                      data-session-action="move-down"
+                      @click.stop="reorderFromMenu(row, 'down')"
+                    >
+                      <Icon class="sidebar-move-down" name="arrowUp" :size="14" />
+                      <span>{{ t('shared.sidebar.moveDown') }}</span>
+                    </button>
+                    <button
                       type="button"
                       class="sidebar-row-menu__item"
                       role="menuitem"
@@ -1491,3 +1630,94 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
     </Teleport>
   </div>
 </template>
+
+<style scoped>
+.sidebar-move-down {
+  transform: rotate(180deg);
+}
+
+.sidebar-history-main {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.sidebar-subtask-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--sidebar-text-soft);
+  font-size: 0.6875rem;
+  font-weight: 400;
+  line-height: 1.35;
+}
+
+.sidebar-subtask-count {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-subtask-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: 0 0 auto;
+}
+
+.sidebar-subtask-status--attention {
+  color: var(--warn);
+}
+
+.sidebar-task-disclosure {
+  position: absolute;
+  z-index: 1;
+  left: calc(var(--row-depth, 0) * 14px);
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--sidebar-text-soft);
+  cursor: pointer;
+}
+
+.sidebar-task-disclosure:hover {
+  color: var(--sidebar-text-strong);
+  background: var(--sidebar-item-hover);
+}
+
+.sidebar-task-disclosure:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.sidebar-task-disclosure[aria-expanded='true'] :deep(svg) {
+  transform: rotate(90deg);
+}
+
+.has-subtasks:has(.sidebar-task-disclosure) .sidebar-history-item,
+.sidebar-history-row--subtask .sidebar-history-item {
+  padding-left: 28px;
+}
+
+@media (pointer: coarse) {
+  .sidebar-task-disclosure {
+    width: 32px;
+    height: 44px;
+  }
+
+  .has-subtasks:has(.sidebar-task-disclosure) .sidebar-history-item,
+  .sidebar-history-row--subtask .sidebar-history-item {
+    min-height: 48px;
+    padding-left: 34px;
+  }
+}
+</style>

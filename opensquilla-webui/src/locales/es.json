@@ -161,6 +161,8 @@
     }
   },
   "common": {
+    "more": "Más",
+    "saving": "Guardando…",
     "close": "Cerrar",
     "save": "Guardar",
     "discard": "Descartar",
@@ -421,6 +423,13 @@
     }
   },
   "settings": {
+    "search": {
+      "label": "Buscar ajustes",
+      "results": "Resultados de ajustes",
+      "empty": "No hay ajustes coincidentes",
+      "defaultModel": "Modelo predeterminado",
+      "permissions": "Permisos"
+    },
     "appearance": {
       "title": "Interfaz",
       "desc": "Tema y preferencias de interfaz locales de este navegador. Los preajustes se aplican al instante; usa Aplicar para un ancho personalizado.",
@@ -2958,6 +2967,9 @@
       ,"workspaceOptionalHint": "Opcional. Elige «Sin espacio de proyecto» para tareas generales o un proyecto cuando necesite sus archivos."
     },
     "form": {
+      "invalidTimezone": "Introduce una zona horaria válida, como Europe/Madrid.",
+      "discardBody": "Se perderán los cambios sin guardar. Cancela para seguir editando.",
+      "discardTitle": "¿Descartar los cambios?",
       "cronPreviewPlaceholder": "Introduce una expresión cron de 5 campos para previsualizar",
       "cronParseError": "No se pudo analizar la expresión; se esperaban 5 campos (m h dom mon dow).",
       "cronCustomCadence": "coincide con una cadencia personalizada",
@@ -3176,6 +3188,9 @@
       "add": "Añadir"
     },
     "skillDetail": {
+      "useUnavailable": "Esta habilidad no está disponible para una nueva tarea. Revisa su estado e inténtalo de nuevo.",
+      "useInTaskHint": "Prepara un borrador con esta habilidad. No se enviará nada hasta que lo decidas.",
+      "useInTask": "Usar en una nueva tarea",
       "allowUse": "Allow use",
       "allowUseHelp": "Applies to every skill with this name. Dependencies are installed separately.",
       "enable": "Allow use",
@@ -4327,6 +4342,8 @@
       "disableLabel": "Desactivar Coding mode"
     },
     "composer": {
+      "workStyleGroup": "Forma de trabajo",
+      "contentGroup": "Contenido",
       "executionMode": "Modo de ejecución",
       "ownerOnlyUnavailable": "El modo solo para el propietario no está disponible para esta sesión del navegador.",
       "enabled": "Activado",
@@ -4697,6 +4714,13 @@
       "retry": "Reintentar"
     },
     "sidebar": {
+      "moveDown": "Bajar",
+      "moveUp": "Subir",
+      "subtasksAttention": "{count} requieren atención",
+      "subtasksRunning": "{count} en ejecución",
+      "subtaskCount": "{count} subtareas",
+      "collapseSubtasks": "Ocultar subtareas de {title}",
+      "expandSubtasks": "Mostrar subtareas de {title}",
       "recentConversations": "Tareas recientes",
       "recents": "Recientes",
       "pinned": "Fijadas",

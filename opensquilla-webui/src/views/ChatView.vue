@@ -897,6 +897,7 @@ import ChatSlashPalette from '@/components/chat/ChatSlashPalette.vue'
 import SkillWorkflowRequestDialog from '@/components/chat/SkillWorkflowRequestDialog.vue'
 import { SKILL_CATALOG_KEY } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { readSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
 import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
 import {
@@ -6806,17 +6807,23 @@ function onDocumentKeydown(e: KeyboardEvent) {
 function consumeDraftPrefill() {
   const state = window.history.state as Record<string, unknown> | null
   const prefill = typeof state?.prefill === 'string' ? state.prefill : ''
-  if (!prefill) return
+  const skills = readSkillTaskPrefill(state)
+  if (!prefill && !skills.length) return
   inputText.value = prefill
+  if (skills.length) {
+    selectedSkills.value = skills
+    markProvisionalDraftUsed()
+    persistDraftHistoryState()
+  }
   landingPrefilled.value = true
   // A Sessions Hub "Start task" hand-off also asks the draft to send the
   // prefill in one step; the actual flush waits for the subscription in onMounted.
-  if (state?.autosend === true) {
+  if (state?.autosend === true && !skills.length) {
     pendingAutoSend.value = prefill
     pendingAutoSendSessionKey.value = sessionKey.value
   }
   try {
-    window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined }, '')
+    window.history.replaceState({ ...window.history.state, prefill: undefined, autosend: undefined, selectedSkillPrefill: undefined }, '')
   } catch { /* ignore */ }
 }
 
@@ -7151,8 +7158,8 @@ onMounted(async () => {
   bindBottomIntersectionObserver()
   const initialRouteFullPath = route.fullPath
   const initialHistoryState = window.history.state as Record<string, unknown> | null
-  const hasExplicitDraftPrefill = typeof initialHistoryState?.prefill === 'string'
-    && initialHistoryState.prefill.length > 0
+  const hasExplicitDraftPrefill = (typeof initialHistoryState?.prefill === 'string'
+    && initialHistoryState.prefill.length > 0) || readSkillTaskPrefill(initialHistoryState).length > 0
   const scopedDraft = scopedDraftFromHistoryState(initialHistoryState)
   const canRecoverDraft = !hasLegacyNewChatQuery() && !hasExplicitDraftPrefill
   const initialSession = resolveInitialSession({
