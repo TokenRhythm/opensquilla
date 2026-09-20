@@ -339,6 +339,12 @@ const args = [
   // PyInstaller's static import discovery of the anyascii._data subpackage.
   '--collect-all',
   'anyascii',
+  // Generic authoring code imports these at runtime. Retired model tools no
+  // longer provide static imports for PyInstaller to discover.
+  '--collect-all',
+  'openpyxl',
+  '--collect-all',
+  'reportlab',
   '--collect-data',
   'certifi',
   '--hidden-import',

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import stat
 import subprocess
 import sys
 import zipfile
@@ -65,6 +66,28 @@ class AvailableSeatbelt(SeatbeltBackend):
             backend_used="seatbelt",
             policy_used=request.policy.summary(),
         )
+
+
+def _directory_link(link: Path, target: Path) -> None:
+    """Exercise real directory aliases without requiring Windows symlink privilege."""
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if sys.platform != "win32" or getattr(exc, "winerror", None) != 1314:
+            raise
+        result = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr or result.stdout
+        assert link.is_junction()
+        assert link.lstat().st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+    else:
+        assert link.is_symlink()
+    assert link.resolve(strict=True) == target.resolve(strict=True)
+    assert link.samefile(target)
 
 
 @pytest.fixture
@@ -277,10 +300,11 @@ def test_replaced_workspace_revokes_attestation(channel_workspace):
     assert not workspace_authoring_attested(ctx)
 
 
-def test_symlink_workspace_cannot_attest(channel_workspace):
+def test_directory_link_workspace_cannot_attest(channel_workspace):
     workspace, _runtime, _backend = channel_workspace
+    assert workspace_authoring_attested(_context(workspace))
     link = workspace.with_name("alias")
-    link.symlink_to(workspace, target_is_directory=True)
+    _directory_link(link, workspace)
     assert not workspace_authoring_attested(_context(link))
 
 
@@ -475,7 +499,7 @@ async def test_channel_runtime_mounts_preserve_denial_through_linux_planner(
     runtime_root.mkdir(parents=True)
     alias = tmp_path / "runtime-alias"
     if denial in {"alias_parent", "canonical_parent"}:
-        alias.symlink_to(parent, target_is_directory=True)
+        _directory_link(alias, parent)
     exposed_root = alias / runtime_root.name if denial == "canonical_parent" else runtime_root
     denied = (
         alias if denial == "alias_parent" else runtime_root if denial == "root" else parent
