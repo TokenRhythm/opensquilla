@@ -208,6 +208,44 @@ def test_unverified_channel_owner_cannot_manage_other_background_sessions() -> N
         current_tool_context.reset(token)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified_admin", [False, True])
+async def test_channel_process_dispatch_requires_verified_admin(verified_admin: bool) -> None:
+    from opensquilla.tool_boundary import ToolCall
+    from opensquilla.tools.dispatch import build_tool_handler
+    from opensquilla.tools.registry import get_default_registry
+
+    own = _session("own", "agent:main:feishu:direct:owner", done=True)
+    other = _session("other", "agent:main:feishu:direct:other", done=True)
+    shell._bg_sessions.update({own.session_id: own, other.session_id: other})
+    ctx = ToolContext(
+        is_owner=True,
+        channel_admin_verified=verified_admin,
+        caller_kind=CallerKind.CHANNEL,
+        session_key=own.session_key,
+        allowed_tools={"process"},
+    )
+    registry = get_default_registry()
+    visible = {tool.name for tool in registry.to_tool_definitions(ctx)}
+    assert ("process" in visible) is verified_admin
+    handler = build_tool_handler(registry, ctx)
+    for target in (own, other):
+        result = await handler(ToolCall(
+            tool_use_id=f"channel-process-{target.session_id}",
+            tool_name="process",
+            arguments={"action": "poll", "execution_id": target.session_id},
+        ))
+        assert result.is_error is not verified_admin
+        payload = json.loads(result.content)
+        if verified_admin:
+            # The authenticated channel-admin contract intentionally permits
+            # managing other sessions; a generic owner flag does not.
+            assert payload["session"]["execution_id"] == target.session_id
+        else:
+            assert payload["error_class"] == "UnsupportedSurface"
+            assert not target.completion_consumed
+
+
 @pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
 @pytest.mark.asyncio
 async def test_exec_command_returns_when_shell_exits_even_if_descendant_holds_pipe() -> None:

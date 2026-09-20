@@ -5,7 +5,7 @@ Every tool that goes through the dispatch pipeline has exactly one
 :attr:`RiskTier.ADMIN_ONLY` regardless of any :func:`declare_tier`
 override:
 
-* ``shell_exec`` / ``exec_command`` / ``background_process``
+* ``shell_exec`` / ``exec_command`` / ``background_process`` / ``process``
 * ``file_write`` / ``write_file`` / ``edit_file`` / ``apply_patch``
   / ``execute_code`` / ``git_push``
 * ``channel_send_as_admin``
@@ -49,6 +49,7 @@ HARDCODED_ADMIN_ONLY: Final[frozenset[str]] = frozenset(
         "shell_exec",
         "exec_command",
         "background_process",
+        "process",
         "file_write",
         "write_file",
         "edit_file",
