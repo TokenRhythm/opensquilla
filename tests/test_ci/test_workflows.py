@@ -245,7 +245,9 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
     assert "concurrency" not in native  # Caller owns cancellation, never cancel the caller.
     result = native["jobs"]["acceptance-result"]
     assert result["if"] == "always()"
-    assert set(result["needs"]) == {"build", "wheelhouse-security", "upgrade-and-start"}
+    assert set(result["needs"]) == {
+        "build", "wheelhouse-security", "upgrade-and-start", "candidate-probes",
+    }
     for job in native["jobs"].values():
         assert not job.get("continue-on-error")
     guard = result["steps"][-1]
@@ -253,16 +255,19 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
         "BUILD_RESULT": "${{ needs.build.result }}",
         "WHEELHOUSE_RESULT": "${{ needs.wheelhouse-security.result }}",
         "UPGRADE_RESULT": "${{ needs.upgrade-and-start.result }}",
+        "PROBE_RESULT": "${{ needs.candidate-probes.result }}",
     }
 
 
-@pytest.mark.parametrize("failed_job", ["BUILD_RESULT", "WHEELHOUSE_RESULT", "UPGRADE_RESULT"])
+@pytest.mark.parametrize(
+    "failed_job", ["BUILD_RESULT", "WHEELHOUSE_RESULT", "UPGRADE_RESULT", "PROBE_RESULT"],
+)
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "skipped", "", "neutral"])
 def test_windows_acceptance_executes_fail_closed_aggregate(failed_job: str, outcome: str) -> None:
     job = _workflow("windows-nsis-upgrade-regression.yml")["jobs"]["acceptance-result"]
     guard = job["steps"][-1]
     env = {**os.environ, "BUILD_RESULT": "success", "WHEELHOUSE_RESULT": "success",
-           "UPGRADE_RESULT": "success", failed_job: outcome}
+           "UPGRADE_RESULT": "success", "PROBE_RESULT": "success", failed_job: outcome}
     result = subprocess.run(
         [_bash_executable(), "-euo", "pipefail", "-c", guard["run"]],
         env=env, capture_output=True, text=True,
@@ -3035,7 +3040,7 @@ def test_container_repository_is_lowercase_through_verification_and_promotion(
 def test_organization_guards_keep_the_maintainer_restriction() -> None:
     jobs = _workflow("desktop-fault-injection.yml")["jobs"]
     guards = [job["if"] for job in jobs.values() if "github.repository" in job.get("if", "")]
-    assert len(guards) == 4
+    assert len(guards) == 5
     for guard in guards:
         assert "github.repository == 'TokenRhythm/opensquilla'" in guard
         assert "github.actor == 'Open-Squilla'" in guard

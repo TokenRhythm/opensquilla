@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { mkdir, writeFile } from 'node:fs/promises'
 import { basename, resolve } from 'node:path'
 
 import {
@@ -7,8 +8,10 @@ import {
   waitFor,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
+import { createSessionRecoveryEvidence } from './session-recovery-rpc-evidence.mjs'
 import {
   captureElectronProcessIdentity,
+  captureFirstSendDiagnostic,
   cleanupPackagedFirstSend,
   electronProcessSnapshot,
 } from './packaged-first-send-cleanup.mjs'
@@ -32,6 +35,7 @@ const expectedLastMessage =
 const preservedDraft = 'Synthetic draft preserved through packaged session recovery.'
 
 let app
+let page
 let processIdentity = {}
 let runError
 let recoveryResult
@@ -46,6 +50,40 @@ const healthySubscribeKeys = []
 let heldHistoryRequests = 0
 let heldSubscribeRequests = 0
 let serverTickCount = 0
+const rpcEvidence = createSessionRecoveryEvidence(sessionKey)
+let faultReleased = 0
+
+async function captureRecoveryFailure() {
+  const directory = resolve(userDataDir, 'logs', 'packaged-session-recovery')
+  await mkdir(directory, { recursive: true })
+  const ui = page ? await captureFirstSendDiagnostic(() => page.evaluate(() => {
+    const composer = document.querySelector('.chat-textarea')
+    const send = document.querySelector('.chat-send-btn.btn--primary')
+    const notices = [...document.querySelectorAll('[data-testid="chat-session-recovery-status"]')]
+    return {
+      pathname: location.pathname,
+      recoveryStates: notices.map(node => node.getAttribute('data-recovery-state')),
+      liveFailureCount: notices.filter(node => node.getAttribute('data-recovery-state') === 'live-degraded').length,
+      sendDisabled: send instanceof HTMLButtonElement ? send.disabled : null,
+      sendTitle: send?.getAttribute('title'),
+      sendAriaLabel: send?.getAttribute('aria-label'),
+      composerEditable: composer instanceof HTMLTextAreaElement && !composer.disabled && !composer.readOnly,
+      composerFocused: composer === document.activeElement,
+      draftLength: composer instanceof HTMLTextAreaElement ? composer.value.length : null,
+    }
+  })) : { pageUnavailable: true }
+  const screenshot = page ? await captureFirstSendDiagnostic(() => page.screenshot({
+    path: resolve(directory, 'failure.png'), timeout: 2_500,
+  })) : null
+  const evidence = {
+    label, heldHistoryRequests, heldSubscribeRequests, socketCount, nextSocketIndex,
+    physicalCloseCount, serverTickCount, faultReleased,
+    ui, rpc: rpcEvidence.snapshot(),
+    screenshot: screenshot?.diagnosticError ? screenshot : { captured: Boolean(screenshot) },
+  }
+  await writeFile(resolve(directory, 'failure.json'), JSON.stringify(evidence, null, 2))
+  return { directory, ...evidence }
+}
 
 try {
   app = await launchPackagedCandidate({
@@ -82,6 +120,11 @@ try {
     client.onMessage((message) => {
       try {
         const frame = JSON.parse(String(message))
+        const held = injectHang && (
+          (frame.method === 'chat.history' && frame.params?.sessionKey === sessionKey)
+          || (frame.method === 'sessions.messages.subscribe' && frame.params?.key === sessionKey)
+        )
+        rpcEvidence.request(socketIndex, frame, held)
         if (
           frame?.type === 'req'
           && frame.method === 'sessions.messages.subscribe'
@@ -123,6 +166,7 @@ try {
     server.onMessage((message) => {
       try {
         const frame = JSON.parse(String(message))
+        rpcEvidence.response(socketIndex, frame)
         if (typeof frame?.protocol === 'number') {
           socketPolicies.set(socketIndex, frame.policy)
         }
@@ -140,7 +184,7 @@ try {
     })
   })
 
-  const page = await app.firstWindow({ timeout: 60_000 })
+  page = await app.firstWindow({ timeout: 60_000 })
   await waitFor(
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
     'candidate Desktop renderer',
@@ -245,6 +289,7 @@ try {
     closeCount: physicalCloseCount - recoveryCloseCountBaseline,
   })
   injectHang = true
+  rpcEvidence.mark('fault-injected')
   await sessionRow(switchSessionKey).locator('.sidebar-history-item').click()
   await waitFor(
     async () => (
@@ -322,6 +367,7 @@ try {
     'concurrent domain failures must share one non-blocking recovery notice')
 
   injectHang = false
+  faultReleased = rpcEvidence.mark('fault-released')
   // No click, reload, route change or focus movement may be needed to recover.
   await waitFor(
     () => recoveredMessage.isVisible(),
@@ -330,9 +376,15 @@ try {
   )
   assert.equal(await historyFailure.count(), 0)
 
+  let recoveredRpc
   await waitFor(
-    async () => await liveFailure.count() === 0 && !await sendButton.isDisabled(),
-    'packaged live subscription to recover',
+    async () => {
+      if (await liveFailure.count() !== 0 || await sendButton.isDisabled()
+        || !rpcEvidence.metadataRecovered(faultReleased)) return false
+      recoveredRpc = rpcEvidence.assertRecovered(faultReleased)
+      return true
+    },
+    'packaged live subscription and metadata to recover',
     SESSION_RECOVERY_TIMEOUT_MS,
   )
 
@@ -389,12 +441,20 @@ try {
     terminalTransport,
     recoveredTransport,
     recoveredViewportSample,
+    recoveredRpc,
+    rpcEvidence: rpcEvidence.snapshot(),
   }
 } catch (error) {
   runError = error
   console.error(JSON.stringify({
     event: 'packaged_session_recovery_failed_before_cleanup',
     error: error?.stack || error?.message || String(error),
+  }))
+  // Capture before natural process cleanup. Diagnostic failure cannot replace
+  // the original contract failure or extend any recovery deadline above.
+  console.error(JSON.stringify({
+    event: 'packaged_session_recovery_failure_evidence',
+    evidence: await captureFirstSendDiagnostic(captureRecoveryFailure, 8_000),
   }))
 } finally {
   try {

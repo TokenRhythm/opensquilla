@@ -527,6 +527,8 @@ jobs:
   build-desktop-windows:
     name: Build and verify signed Windows Electron installer
     needs: build-control-ui
+    outputs:
+      candidate_artifact_id: ${{ steps.internal-candidate.outputs.artifact-id }}
     # Keep the v0.5.3 upgrade baseline on the OS generation it shipped on.
     # The legacy NSIS installer can crash with 0xC0000005 on Windows Server 2025
     # before the candidate installer or profile-preservation checks run.
@@ -700,13 +702,29 @@ jobs:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
         run: npm run verify:gateway-smoke
 
+      - name: Record signed candidate identity
+        shell: pwsh
+        env:
+          CANDIDATE_SOURCE_SHA: ${{ needs.build-control-ui.outputs.source_sha }}
+        run: |
+          $installers = @(Get-ChildItem dist/desktop-electron -Filter 'OpenSquilla-*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected one signed installer.' }
+          python .github/scripts/windows_candidate_identity.py --write --signed `
+            --installer $installers[0].FullName --root dist/desktop-electron/win-unpacked `
+            --manifest dist/desktop-electron/audit-candidate.json `
+            --source-sha $env:CANDIDATE_SOURCE_SHA --workflow-sha $env:GITHUB_WORKFLOW_SHA `
+            --run-id $env:GITHUB_RUN_ID --run-attempt $env:GITHUB_RUN_ATTEMPT
+          if ($LASTEXITCODE -ne 0) { throw 'Signed candidate identity failed.' }
+
       - name: Retain internal signed candidate for diagnosis
+        id: internal-candidate
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-signed-candidate-diagnostics
           overwrite: true
           path: |
+            dist/desktop-electron/audit-candidate.json
             dist/desktop-electron/*.exe
             dist/desktop-electron/*.blockmap
             dist/desktop-electron/latest.yml
@@ -778,6 +796,7 @@ jobs:
         with:
           name: opensquilla-electron-windows
           path: |
+            dist/desktop-electron/audit-candidate.json
             dist/desktop-electron/*.exe
             dist/desktop-electron/*.blockmap
             dist/desktop-electron/latest.yml
@@ -1618,7 +1637,7 @@ jobs:
 
   audit-internal-windows-artifact:
     name: Audit signed Windows test artifact (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }})
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' && needs.build-desktop-windows.outputs.candidate_artifact_id != '' }}
     needs: [build-control-ui, build-desktop-windows]
     runs-on: windows-2022
     timeout-minutes: 120
@@ -1656,7 +1675,7 @@ jobs:
       - name: Download the signed Windows test artifact
         uses: actions/download-artifact@v4
         with:
-          name: opensquilla-electron-windows
+          name: windows-signed-candidate-diagnostics
           path: release-audit
       - name: Verify downloaded signature, install, launch, and uninstall
         shell: pwsh
@@ -1664,13 +1683,43 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASELINE_VERSION: ${{ matrix.baseline-version }}
           INSTALL_MODE: ${{ matrix.install-mode }}
+          CANDIDATE_SOURCE_SHA: ${{ needs.build-control-ui.outputs.source_sha }}
         run: |
           $ErrorActionPreference = 'Stop'
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
           if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
+          python .github/scripts/windows_candidate_identity.py --installer $candidates[0].FullName --manifest release-audit/audit-candidate.json --source-sha $env:CANDIDATE_SOURCE_SHA
+          if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }
           .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
           .github/scripts/verify-release-windows-upgrade.ps1 `
             -CandidateInstaller $candidates[0].FullName `
             -Label "internal-$env:BASELINE_VERSION-$env:INSTALL_MODE" `
             -InstallMode $env:INSTALL_MODE `
             -BaselineVersion $env:BASELINE_VERSION
+
+  internal-windows-candidate-probes:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' && needs.build-desktop-windows.outputs.candidate_artifact_id != '' }}
+    needs: [build-control-ui, build-desktop-windows]
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/windows-candidate-probes.yml
+    with:
+      artifact_name: windows-signed-candidate-diagnostics
+      source_sha: ${{ needs.build-control-ui.outputs.source_sha }}
+      require_signature: true
+
+  internal-windows-acceptance:
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}
+    needs: [build-desktop-windows, audit-internal-windows-artifact, internal-windows-candidate-probes]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every signed candidate gate
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          assert all(job['result'] == 'success' for job in results.values()), results
+          PY

@@ -107,12 +107,15 @@ jobs:
           $asar = Join-Path $root 'win-unpacked/resources/app.asar'
           $manifest = [ordered]@{
             sourceSha = (git rev-parse HEAD).Trim()
+            workflowSha = $env:GITHUB_WORKFLOW_SHA
             auditRunId = $env:GITHUB_RUN_ID
+            runAttempt = $env:GITHUB_RUN_ATTEMPT
             signing = 'unsigned regression only'
             installerName = $installers[0].Name
             installerSha256 = (Get-FileHash -LiteralPath $installers[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant()
             executableSha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
             asarSha256 = (Get-FileHash -LiteralPath $asar -Algorithm SHA256).Hash.ToLowerInvariant()
+            gatewaySha256 = (Get-FileHash -LiteralPath (Join-Path $root 'win-unpacked/resources/runtime/gateway/opensquilla-gateway/opensquilla-gateway.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
             version = ([Diagnostics.FileVersionInfo]::GetVersionInfo($exe)).ProductVersion
             dependencyInventorySha256 = (Get-FileHash -LiteralPath (Join-Path $root 'win-unpacked/resources/runtime/gateway/dependency-inventory.json') -Algorithm SHA256).Hash.ToLowerInvariant()
           }
@@ -286,9 +289,19 @@ jobs:
             candidate/audit-candidate.json
           if-no-files-found: warn
           retention-days: 14
+  candidate-probes:
+    needs: build
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/windows-candidate-probes.yml
+    with:
+      artifact_name: nsis-regression-installer
+      source_sha: ${{ github.sha }}
+
   acceptance-result:
     name: Windows NSIS acceptance result
-    needs: [build, wheelhouse-security, upgrade-and-start]
+    needs: [build, wheelhouse-security, upgrade-and-start, candidate-probes]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -303,10 +316,11 @@ jobs:
           BUILD_RESULT: ${{ needs.build.result }}
           WHEELHOUSE_RESULT: ${{ needs.wheelhouse-security.result }}
           UPGRADE_RESULT: ${{ needs.upgrade-and-start.result }}
+          PROBE_RESULT: ${{ needs.candidate-probes.result }}
         shell: bash
         run: |
           set -euo pipefail
-          for result in "${BUILD_RESULT}" "${WHEELHOUSE_RESULT}" "${UPGRADE_RESULT}"; do
+          for result in "${BUILD_RESULT}" "${WHEELHOUSE_RESULT}" "${UPGRADE_RESULT}" "${PROBE_RESULT}"; do
             if [[ "${result}" != "success" ]]; then
               echo "ERROR: every Windows acceptance job must succeed; got ${result:-missing}." >&2
               exit 1
