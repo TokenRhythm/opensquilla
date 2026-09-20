@@ -84,7 +84,7 @@
     "smol-toml": "1.8.0"
   },
   "devDependencies": {
-    "@types/node": "^24.13.5",
+    "@types/node": "^26.6.1",
     "@typescript/typescript6": "6.0.2",
     "electron": "^42.11.3",
     "electron-builder": "^26.15.3",
