@@ -184,6 +184,30 @@ function subscriptionError(error: unknown): unknown {
   return mapSessionReadError(error)
 }
 
+function snapshotInstallationHooks(
+  staged: StagedSessionSnapshot | null,
+): Pick<SessionReadPortLive, 'confirmInstalled' | 'assertInstalledCurrent'> {
+  if (!staged) return {}
+  // Keep each consumer bound to its exact snapshot. A later reconciliation
+  // must not redirect an older confirmation to the replacement transfer.
+  return {
+    async confirmInstalled() {
+      try {
+        await staged.confirmInstalled()
+      } catch (error) {
+        throw mapSessionReadError(error)
+      }
+    },
+    assertInstalledCurrent() {
+      try {
+        staged.assertInstalledCurrent()
+      } catch (error) {
+        throw mapSessionReadError(error)
+      }
+    },
+  }
+}
+
 function invalidContract(method: string): SessionReadContractError {
   return new SessionReadContractError(`${method} violated its generated v4 Contract.`)
 }
@@ -641,8 +665,7 @@ export function createV4SessionReadPort(
           activeTaskId: snapshot?.task_id ?? activeTaskId(subscription),
           initialMetadata: projectMetadata(subscription),
           snapshot: snapshot ? projectSnapshot(snapshot) : null,
-          confirmInstalled: stagedSnapshot?.confirmInstalled,
-          assertInstalledCurrent: stagedSnapshot?.assertInstalledCurrent,
+          ...snapshotInstallationHooks(stagedSnapshot),
           cursor: Object.freeze({
             sessionKey: request.sessionKey,
             sessionEpoch: subscription.epoch,
@@ -729,8 +752,7 @@ export function createV4SessionReadPort(
               activeTaskId: snapshot?.task_id ?? textValue(metadata.activeTask?.task_id, metadata.activeTask?.taskId),
               initialMetadata: metadata,
               snapshot: snapshot ? projectSnapshot(snapshot) : null,
-              confirmInstalled: stagedSnapshot?.confirmInstalled,
-          assertInstalledCurrent: stagedSnapshot?.assertInstalledCurrent,
+              ...snapshotInstallationHooks(stagedSnapshot),
               cursor: Object.freeze({
                 sessionKey: request.sessionKey,
                 sessionEpoch: metadata.epoch,
@@ -785,16 +807,19 @@ export function createV4SessionReadPort(
         function retryMetadata(): Promise<SessionReadMetadata> {
           if (closed || request.signal.aborted) return Promise.reject(abortError())
           if (retry) return retry
-          const current = Promise.all([
-            criticalRequestsQueued,
-            subscribePromise,
-          ]).then(([, subscription]) => hydrate(
-            rpc,
-            request.sessionKey,
-            request.signal,
-            expectedGeneration,
-            subscription,
-          ))
+          const current = (async () => {
+            await criticalRequestsQueued
+            // Reconciliation may have recovered an initially lost ACK. Its
+            // metadata retry must not replay the original rejected promise.
+            const subscription = acknowledgedSubscription ?? await subscribePromise
+            return hydrate(
+              rpc,
+              request.sessionKey,
+              request.signal,
+              expectedGeneration,
+              subscription,
+            )
+          })()
           const observed = current.finally(() => {
             if (retry === observed) retry = null
           })

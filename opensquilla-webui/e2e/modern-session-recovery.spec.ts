@@ -26,7 +26,7 @@ type Request = {
 type Observed = Request & { connection: number }
 type HeldPiece = { frame: Observed; send: () => void; index: number; delivery: number }
 
-async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') {
+async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' | 'lost-subscribe') {
   await page.clock.install({ time: new Date('2026-01-01T00:00:00Z') })
   await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
   await page.route('**/api/**', route => route.fulfill({ json: {} }))
@@ -37,13 +37,17 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
   const requests: Observed[] = []
   const held: HeldPiece[] = []
   const staged: Array<{ connection: number; delivery: number }> = []
-  const snapshots = new Map<string, { id: string; bytes: Buffer }>()
+  const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean }>()
+  const rejectedResumes: Observed[] = []
+  const heldSubscriptions: Observed[] = []
+  let faultActive = mode === 'lost-subscribe'
 
   await page.routeWebSocket(/\/ws$/, socket => {
     const connection = sockets.push(socket)
     const epoch = `synthetic-delivery-${connection}`
     let nextDelivery = 1
     let acknowledged = 0
+    const subscriptions = new Set<string>()
     socket.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     socket.onMessage(raw => {
       const frame = JSON.parse(String(raw)) as Request
@@ -58,6 +62,13 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
       const respond = (payload: unknown) => socket.send(JSON.stringify({
         type: 'res', id: frame.id, ok: true, payload,
       }))
+      if (faultActive && key === SESSION && (
+        frame.method === 'sessions.messages.subscribe' || frame.method === 'chat.history'
+      )) {
+        if (frame.method === 'sessions.messages.subscribe') heldSubscriptions.push(observed)
+        return
+      }
+      if (frame.method === 'sessions.messages.subscribe') subscriptions.add(key)
       if (frame.method === 'connect') {
         socket.send(helloOkResponse({
           protocol: 4,
@@ -91,7 +102,10 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
             task_id: large ? 'synthetic-progress-task' : null,
             current_stream_seq: large ? 1 : 0,
           })
-          snapshot = { id: `synthetic-snapshot-${snapshots.size + 1}`, bytes: Buffer.from(JSON.stringify(value)) }
+          snapshot = {
+            id: `synthetic-snapshot-${snapshots.size + 1}`,
+            bytes: Buffer.from(JSON.stringify(value)), subscribed: subscriptions.has(key),
+          }
           snapshots.set(owner, snapshot)
         }
         const index = Number(observed.params.segment_index ?? 0)
@@ -106,7 +120,7 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
           session_id: null, session_epoch: null,
           delivery: { delivery_epoch: epoch, delivery_id: delivery },
         }
-        if (key === SESSION && mode !== 'healthy') {
+        if (key === SESSION && (mode === 'stalled' || mode === 'progressing')) {
           held.push({ frame: observed, send: () => respond(payload), index, delivery })
         } else respond(payload)
         return
@@ -122,6 +136,15 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
       }
       if (frame.method === RESUME) {
         expect(observed.params).not.toHaveProperty('ack_delivery_id')
+        const snapshot = snapshots.get(`${connection}:${key}:${observed.params.sync_revision}`)
+        if (mode === 'lost-subscribe' && !snapshot?.subscribed) {
+          rejectedResumes.push(observed)
+          socket.send(JSON.stringify({ type: 'res', id: frame.id, ok: false, error: {
+            code: 'SNAPSHOT_STALE', message: 'Snapshot installation is no longer available',
+            retryable: false, accepted: false,
+          } }))
+          return
+        }
         respond({ ...observed.params, session_id: null, session_epoch: null,
           replay_to_seq: observed.params.stream_seq })
         return
@@ -145,7 +168,10 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
           role: 'user', text: 'Synthetic cached history remains available.',
           message_id: `history-${key}`, timestamp: '2026-01-01T00:00:00Z',
         }]),
-        'sessions.messages.subscribe': sessionMessagesSubscribePayload(key, { stream_generation: GENERATION }),
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(key, {
+          stream_generation: GENERATION,
+          ...(mode === 'lost-subscribe' ? { hydration_complete: false } : {}),
+        }),
         'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
         'sessions.messages.unsubscribe': null,
         'sessions.subscribe': { subscribed: true },
@@ -158,7 +184,8 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
   const tick = () => sockets.forEach(socket => socket.send(JSON.stringify({
     type: 'event', event: 'tick', payload: { time_ms: Date.now() }, seq: 1,
   })))
-  return { sockets, requests, held, staged, tick }
+  return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions,
+    releaseFault: () => { faultActive = false } }
 }
 
 async function advance(page: Page, milliseconds: number) {
@@ -173,6 +200,55 @@ function calls(requests: Observed[], method: string, connection?: number) {
   return requests.filter(item => item.method === method
     && (connection === undefined || item.connection === connection))
 }
+
+test('automatically replaces a stale snapshot after a lost subscribe and hydrates the recovered ACK', async ({ page }) => {
+  const gateway = await prepare(page, 'lost-subscribe')
+  await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
+  await expect.poll(() => calls(gateway.requests, READ).length).toBe(1)
+  await expect.poll(() => gateway.staged.length).toBe(1)
+  const input = page.locator('.chat-textarea')
+  const send = page.locator('.chat-send-btn[aria-label="Send"]')
+  await input.fill(DRAFT)
+  const editor = await input.elementHandle()
+  const originalUrl = page.url()
+  await advance(page, 7_100)
+  const notice = page.getByTestId('chat-session-recovery-status')
+  await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
+  await expect(send).toBeDisabled()
+
+  gateway.releaseFault()
+  // Exercise production recovery scheduling without clicking, changing focus,
+  // reconnecting the transport, or changing any of its timeout budgets.
+  for (let seconds = 0; seconds < 30; seconds++) {
+    await advance(page, 1_000)
+    if (calls(gateway.requests, RESUME).length >= 2
+      && calls(gateway.requests, 'sessions.messages.hydrate').length > 0
+      && await send.isEnabled()) break
+  }
+  expect(gateway.rejectedResumes).toHaveLength(1)
+  const reads = calls(gateway.requests, READ)
+  const resumes = calls(gateway.requests, RESUME)
+  expect(reads).toHaveLength(2)
+  expect(resumes).toHaveLength(2)
+  expect(resumes.map(call => call.params.sync_revision)).toEqual(reads.map(call => call.params.sync_revision))
+  expect(reads[1]!.params.sync_revision).not.toBe(reads[0]!.params.sync_revision)
+  expect(calls(gateway.requests, RELEASE).map(call => call.params.sync_revision)).toEqual([reads[0]!.params.sync_revision])
+  expect(gateway.heldSubscriptions.length).toBeGreaterThan(0)
+  expect(calls(gateway.requests, 'sessions.messages.subscribe')).toHaveLength(gateway.heldSubscriptions.length + 1)
+  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+  await expect(notice).toHaveCount(0)
+  await expect(send).toBeEnabled()
+  await expect(input).toHaveValue(DRAFT)
+  expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
+  expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
+  expect(page.url()).toBe(originalUrl)
+  expect(gateway.sockets).toHaveLength(1)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expect(page.getByText('Synthetic cached history remains available.', { exact: true })).toHaveCount(1)
+  await advance(page, 15_000)
+  expect(calls(gateway.requests, RESUME)).toHaveLength(2)
+  expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+})
 
 test('stays degraded beyond the foreground deadline and does not resurrect a dismissed notice', async ({ page }) => {
   const gateway = await prepare(page, 'stalled')

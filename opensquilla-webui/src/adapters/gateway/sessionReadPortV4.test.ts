@@ -271,6 +271,185 @@ async function flushAsyncWork() {
   await Promise.resolve()
 }
 
+const SNAPSHOT_READ = 'sessions.messages.snapshot.read'
+const SNAPSHOT_RESUME = 'sessions.messages.resume'
+const SNAPSHOT_RELEASE = 'sessions.messages.snapshot.release'
+
+function installationHarness(modern = true) {
+  const base = makeHarness()
+  const snapshot = snapshotResult()
+  const bytes = Buffer.from(JSON.stringify(snapshot))
+  const resume = vi.fn(async (params: Record<string, unknown>) => ({
+    ...params, session_id: null, session_epoch: 3, replay_to_seq: snapshot.current_stream_seq,
+  }))
+  const consume = vi.fn(async () => {})
+  const resumeFlow = vi.fn(async () => {})
+  base.requestMock.mockImplementation(async (method, params = {}, options) => {
+    base.calls.push({ method, params, options })
+    options?.onSent?.(base.rpc.generation)
+    if (method === SNAPSHOT_READ) return {
+      key: 'alpha', sync_revision: params.sync_revision, snapshot_id: `snapshot-${params.sync_revision}`,
+      segment_index: 0, segment_count: 1, byte_length: bytes.length,
+      encoding: 'base64-json-utf8', data: bytes.toString('base64'),
+      stream_generation: snapshot.stream_generation, current_stream_seq: snapshot.current_stream_seq,
+      task_id: snapshot.task_id, session_id: null, session_epoch: 3,
+    }
+    if (method === SNAPSHOT_RESUME) return resume(params)
+    if (method === SNAPSHOT_RELEASE) return { ...params, retired: true }
+    const result = base.results.get(method)
+    if (result instanceof Error) throw result
+    return result
+  })
+  const rpc = {
+    ...base.rpc,
+    get generation() { return base.rpc.generation },
+    supports: (method: string) => method === SNAPSHOT_READ || modern,
+    waitForConsumption: consume,
+    resumeFlow,
+  }
+  return { ...base, rpc, resume, consume, resumeFlow }
+}
+
+describe('SessionReadPort installation error boundary', () => {
+  for (const source of ['initial', 'reconciliation'] as const) {
+    it.each([
+      ['SNAPSHOT_STALE', 'unavailable', true],
+      ['SNAPSHOT_EXPIRED', 'unavailable', true],
+      ['SNAPSHOT_BUSY', 'busy', false],
+      ['RPC_TIMEOUT', 'timeout', false],
+    ] as const)(`${source} installation recovers after %s on the current lease`, async (code, kind, replace) => {
+      const h = installationHarness()
+      const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+      try {
+        let live = await lease.live
+        if (source === 'reconciliation') {
+          await live.confirmInstalled!()
+          live = await lease.reconcile()
+        }
+        const before = h.calls.filter(call => call.method === SNAPSHOT_READ)
+        const revision = before[before.length - 1]!.params!.sync_revision
+        const error = Object.assign(new Error('Snapshot installation is no longer available'), {
+          code, retryable: false, retry_after_ms: 100,
+        })
+        h.resume.mockRejectedValueOnce(error)
+        await expect(live.confirmInstalled!()).rejects.toMatchObject({
+          name: 'SessionReadFailure', kind, retryable: true, retryAfterMs: 100, cause: error,
+        })
+
+        const [first, concurrent] = await Promise.all([lease.reconcile(), lease.reconcile()])
+        expect(first).toBe(concurrent)
+        await first.confirmInstalled!()
+        const reads = h.calls.filter(call => call.method === SNAPSHOT_READ)
+        expect(reads).toHaveLength(before.length + Number(replace))
+        expect(reads[reads.length - 1]!.params!.sync_revision === revision).toBe(!replace)
+        expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(1)
+        expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+      } finally { await lease.close() }
+    })
+  }
+
+  it.each(['legacy-flow', 'consumption'] as const)('maps %s confirmation failures at the same boundary', async source => {
+    const h = installationHarness(source !== 'legacy-flow')
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      const error = Object.assign(new Error('confirmation busy'), { code: 'STORAGE_BUSY' })
+      const confirmation = source === 'legacy-flow' ? h.resumeFlow : h.consume
+      confirmation.mockRejectedValueOnce(error)
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'busy', retryable: true, cause: error })
+    } finally { await lease.close() }
+  })
+
+  it.each(['abort', 'generation'] as const)('fences confirmation and its synchronous check after %s', async reason => {
+    const h = installationHarness()
+    const controller = new AbortController()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(controller.signal))
+    try {
+      const live = await lease.live
+      if (reason === 'abort') controller.abort()
+      else h.setGeneration(8)
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'aborted' })
+      expect(() => live.assertInstalledCurrent!()).toThrow(SessionReadFailure)
+      expect(h.resume).not.toHaveBeenCalled()
+    } finally { await lease.close() }
+  })
+
+  it.each(['abort', 'generation'] as const)('rejects an in-flight proof after %s without consuming its tail', async reason => {
+    const h = installationHarness()
+    const controller = new AbortController()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest(controller.signal))
+    try {
+      const live = await lease.live
+      const proof = deferred<Awaited<ReturnType<typeof h.resume>>>()
+      h.resume.mockImplementationOnce(() => proof.promise)
+      const rejected = expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'aborted' })
+      await flushAsyncWork()
+      if (reason === 'abort') controller.abort()
+      else h.setGeneration(8)
+      proof.resolve({ ...h.resume.mock.calls[0]![0], session_id: null, session_epoch: 3, replay_to_seq: 8 })
+      await rejected
+      expect(h.consume).not.toHaveBeenCalled()
+    } finally { await lease.close() }
+  })
+
+  it('preserves terminal failure and contract-error semantics', async () => {
+    const h = installationHarness()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      const live = await lease.live
+      h.resume.mockRejectedValueOnce(Object.assign(new Error('not authorized'), {
+        code: 'UNAUTHORIZED', retryable: false,
+      }))
+      await expect(live.confirmInstalled!()).rejects.toMatchObject({ kind: 'unavailable', retryable: false })
+      const contractError = new SessionReadContractError('invalid installation proof')
+      h.resume.mockRejectedValueOnce(contractError)
+      await expect(live.confirmInstalled!()).rejects.toBe(contractError)
+    } finally { await lease.close() }
+  })
+
+  it('keeps old installation closures bound to the retired snapshot', async () => {
+    const h = installationHarness()
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      const old = await lease.live
+      await old.confirmInstalled!()
+      const current = await lease.reconcile()
+      const resumeCount = h.resume.mock.calls.length
+      await expect(old.confirmInstalled!()).rejects.toMatchObject({ kind: 'aborted' })
+      expect(() => old.assertInstalledCurrent!()).toThrow(SessionReadFailure)
+      expect(h.resume).toHaveBeenCalledTimes(resumeCount)
+      await current.confirmInstalled!()
+      expect(h.resume).toHaveBeenCalledTimes(resumeCount + 1)
+      expect(h.calls.filter(call => call.method === SNAPSHOT_RELEASE)).toHaveLength(1)
+    } finally { await lease.close() }
+  })
+
+  it('hydrates from the recovered subscription ACK after the original subscribe failed', async () => {
+    const h = installationHarness()
+    h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, new RpcTimeoutError(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, 7_000))
+    const lease = createV4SessionReadPort(h.rpc).open(openRequest())
+    try {
+      await Promise.all([
+        expect(lease.live).rejects.toMatchObject({ kind: 'timeout' }),
+        expect(lease.metadata).rejects.toMatchObject({ kind: 'timeout' }),
+      ])
+      h.results.set(SESSIONS_MESSAGES_SUBSCRIBE_METHOD, subscribeResult({
+        ...metadataFields(false), current_stream_seq: 25,
+      }))
+      await (await lease.reconcile()).confirmInstalled!()
+      const [first, concurrent] = await Promise.all([lease.retryMetadata(), lease.retryMetadata()])
+      expect(first).toBe(concurrent)
+      expect(first).toMatchObject({
+        hydrationComplete: true,
+        pendingUserInputsCursor: { streamGeneration: 'stream-1', currentStreamSeq: 25 },
+      })
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_HYDRATE_METHOD)).toHaveLength(1)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_SUBSCRIBE_METHOD)).toHaveLength(2)
+      expect(h.calls.filter(call => call.method === SESSIONS_MESSAGES_UNSUBSCRIBE_METHOD)).toHaveLength(0)
+    } finally { await lease.close() }
+  })
+})
+
 describe('v4 SessionReadPort Adapter', () => {
   it('recovers admission on the same lease after ready times out without a socket generation change', async () => {
     const harness = makeHarness()
