@@ -2776,6 +2776,22 @@ class GatewayConfig(BaseSettings):
         # as a tier_profile (downgrade contract). Synthesized presets are
         # applied by onboarding/provider saves only, never at boot.
         if provider == "openrouter":
+            if getattr(router, "preset_binding", None) == "follow_primary" and all(
+                isinstance(tier, dict)
+                and str(tier.get("provider") or provider).strip().lower() == provider
+                for tier in router.tiers.values()
+            ):
+                # Desktop persists recommended ladders inline. Refresh only
+                # explicitly managed tiers so upgrades agree with the preset
+                # catalog shown in Settings; historical/custom ladders stay
+                # operator-owned. A foreign-provider ladder may accompany a
+                # legacy-inferred primary; provider reconciliation owns it.
+                # Preserve the inline shape and provenance.
+                fields_set = set(router.model_fields_set)
+                payload = router.model_dump(mode="python")
+                payload["tiers"] = _default_tiers()
+                self.squilla_router = SquillaRouterConfig(**payload)
+                object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
             return self
         curated_inline_preset = None
         if provider not in ROUTER_TIER_PROFILE_IDS:

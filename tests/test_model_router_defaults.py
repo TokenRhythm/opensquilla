@@ -198,7 +198,7 @@ def test_direct_legacy_openrouter_router_defaults_are_migrated(provider_id: str)
 
 TOKENRHYTHM_EXPECTED_TIER_MODELS = {
     "c0": "qwen3.7-flash",
-    "c1": "deepseek-v4-flash-0731",
+    "c1": "deepseek-flash",
     "c2": "deepseek-v4-pro-0813",
     "c3": "glm-5.3",
 }
@@ -467,7 +467,7 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
         assert "thinking_level" not in tiers[name]
     assert tiers["c0"]["model"] == "qwen3.7-flash"
     assert tiers["c0"]["supports_image"] is False
-    assert tiers["c1"]["model"] == "deepseek-v4-flash-0731"
+    assert tiers["c1"]["model"] == "deepseek-flash"
     assert tiers["c2"]["model"] == "deepseek-v4-pro-0813"
     assert tiers["c2"]["supports_image"] is False
     assert tiers["c3"]["model"] == "glm-5.3"

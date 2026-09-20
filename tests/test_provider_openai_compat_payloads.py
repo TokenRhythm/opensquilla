@@ -18,6 +18,7 @@ from opensquilla.provider.openai import (
     _stream_timeout,
     _tool_schema_accepts_arguments,
 )
+from opensquilla.provider.preset_registry import get_preset
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.tokenrhythm_correlation import (
     is_tokenrhythm_correlation_target,
@@ -317,6 +318,29 @@ def _collect(provider: OpenAIProvider, cfg: ChatConfig) -> DoneEvent:
         return done
 
     return asyncio.run(_run())
+
+
+def test_tokenrhythm_recommended_c1_keeps_neutral_request_dialect(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    preset = get_preset("tokenrhythm")
+    assert preset is not None
+    model = preset.tier_defaults()["c1"]["model"]
+    catalog = ModelCatalog()
+    provider = OpenAIProvider(
+        api_key="test-key", model=model,
+        base_url="https://tokenrhythm.studio/v1", provider_kind="tokenrhythm",
+    )
+    _collect(provider, ChatConfig(
+        max_tokens=catalog.resolve_max_tokens(model, provider="tokenrhythm"),
+        model_capabilities=catalog.get_capabilities(model, provider_name="tokenrhythm"),
+    ))
+    payload = captured["payload"]
+    assert payload["model"] == "deepseek-flash"
+    assert payload["max_tokens"] == 384_000
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
 
 
 @pytest.mark.parametrize("provider_id", ["dashscope", "deepseek"])

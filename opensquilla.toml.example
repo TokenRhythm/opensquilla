@@ -424,8 +424,8 @@ supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash-0731"
-description = "Default DeepSeek V4 Flash 0731 route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-flash"
+description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]

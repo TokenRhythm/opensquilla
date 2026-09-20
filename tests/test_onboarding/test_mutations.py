@@ -507,7 +507,7 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     assert res.config.squilla_router.tier_profile is None
     expected = {
         "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
+        "c1": "deepseek-flash",
         "c2": "deepseek-v4-pro-0813",
         "c3": "glm-5.3",
         "image_model": "kimi-k2.6",

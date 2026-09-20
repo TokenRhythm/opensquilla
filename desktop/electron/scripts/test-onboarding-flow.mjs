@@ -1220,9 +1220,9 @@ try {
   const remainingGrowthSpool = await readDirectoryOrEmpty(join(earlySpoolRoot, 'growth'))
   assert.equal(remainingGrowthSpool.some(isManagedTelemetrySpoolEntry), false)
   assert.equal(credential.routerDefaultTier, 'c1')
-  assert.equal(credential.model, 'deepseek-v4-pro-0813')
+  assert.equal(credential.model, 'deepseek-flash')
   assert.equal(credential.routerTiers.c0.model, 'qwen3.7-flash')
-  assert.equal(credential.routerTiers.c1.model, 'deepseek-v4-flash-0731')
+  assert.equal(credential.routerTiers.c1.model, 'deepseek-flash')
   assert.equal(credential.routerTiers.c2.model, 'deepseek-v4-pro-0813')
   assert.equal(credential.routerTiers.c3.model, 'glm-5.3')
   assert.equal(Object.hasOwn(credential.routerTiers.c0, 'supportsImage'), false)
@@ -1233,9 +1233,9 @@ try {
   assert.equal(credential.routerTiers.image_model.model, 'kimi-k2.6')
   assert.equal(Object.hasOwn(credential.routerTiers.image_model, 'supportsImage'), false)
   assert.match(config, /\[squilla_router\]\nenabled = true/)
-  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-v4-pro-0813"/)
+  assert.match(config, /\[llm\][\s\S]*?model = "deepseek-flash"/)
   assert.match(config, /\[squilla_router\.tiers\.c0\]\nprovider = "tokenrhythm"\nmodel = "qwen3.7-flash"/)
-  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-flash-0731"/)
+  assert.match(config, /\[squilla_router\.tiers\.c1\]\nprovider = "tokenrhythm"\nmodel = "deepseek-flash"/)
   assert.match(config, /\[squilla_router\.tiers\.c2\]\nprovider = "tokenrhythm"\nmodel = "deepseek-v4-pro-0813"/)
   assert.match(config, /\[squilla_router\.tiers\.c3\][\s\S]*?model = "glm-5.3"[\s\S]*?ensemble_enabled = false/)
   assert.doesNotMatch(config, /thinking_level\s*=/)
@@ -1395,7 +1395,7 @@ try {
   const reset = await saveDesktop({ routerResetToRecommended: true,
     routerTiers: { c1: { provider: 'tokenrhythm', model: 'untrusted-renderer-model' } } })
   assert.equal(reset.routerPresetBinding, 'follow_primary')
-  assert.equal(reset.routerTiers.c1.model, 'deepseek-v4-flash-0731')
+  assert.equal(reset.routerTiers.c1.model, 'deepseek-flash')
   assert.match(await readFile(routerConfigPath, 'utf8'), /preset_binding = "follow_primary"/)
 
   // Switching a generated Desktop profile must follow config.toml ownership,

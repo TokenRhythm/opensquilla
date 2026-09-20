@@ -179,7 +179,7 @@ def test_tokenrhythm_default_binds_router_tiers_to_tokenrhythm() -> None:
     tiers = cfg.squilla_router.tiers
     expected_models = {
         "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
+        "c1": "deepseek-flash",
         "c2": "deepseek-v4-pro-0813",
         "c3": "glm-5.3",
         "image_model": "kimi-k2.6",
@@ -201,7 +201,7 @@ def test_tokenrhythm_curated_ladder_is_not_rebound_to_the_direct_model() -> None
     # packaged profiles.
     cfg = GatewayConfig(llm={"provider": "tokenrhythm", "model": "glm-5.2"})
     assert cfg.llm.model == "glm-5.2"
-    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek-v4-flash-0731"
+    assert cfg.squilla_router.tiers["c1"]["model"] == "deepseek-flash"
 
 
 def test_tokenrhythm_custom_tiers_are_preserved() -> None:

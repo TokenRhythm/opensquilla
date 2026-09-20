@@ -180,7 +180,9 @@ def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
             output, "catalog"
         )
         assert catalog.resolve_vision_support(model, provider_name=provider) == (
-            "supported" if tier == "c0" else "unsupported"
+            "supported"
+            if tier == "c0" or (provider == "tokenrhythm" and tier == "c1")
+            else "unsupported"
         )
         capabilities = catalog.get_capabilities(model, provider_name=provider)
         assert capabilities.supports_tools is True

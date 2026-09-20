@@ -15,7 +15,7 @@ import { parse, stringify } from 'smol-toml'
 
 const defaults = {
   c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash' },
-  c1: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731' },
+  c1: { provider: 'tokenrhythm', model: 'deepseek-flash' },
   c2: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
   c3: { provider: 'tokenrhythm', model: 'glm-5.3', ensembleEnabled: false },
 }

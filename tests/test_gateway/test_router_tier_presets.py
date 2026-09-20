@@ -23,6 +23,8 @@ from opensquilla.gateway.config import (
     _default_tiers,
     _router_tier_profile_defaults,
 )
+from opensquilla.onboarding.config_store import load_config, persist_config
+from opensquilla.onboarding.router_specs import router_catalog_payload
 
 GOLDEN_PATH = (
     Path(__file__).resolve().parents[1]
@@ -170,6 +172,102 @@ def test_mixed_tiers_without_profile_round_trip_untouched(tmp_path: Path) -> Non
     assert cfg2.squilla_router.tiers == tiers
 
 
+def _previous_openrouter_tiers() -> dict[str, dict[str, str]]:
+    return {
+        tier: {"provider": "openrouter", "model": model, "thinking_level": "high"}
+        for tier, model in zip(
+            ("c0", "c1", "c2", "c3"),
+            (
+                "deepseek/deepseek-v4-flash", "deepseek/deepseek-v4-pro",
+                "z-ai/glm-5.2", "anthropic/claude-opus-4.8",
+            ),
+            strict=True,
+        )
+    }
+
+
+@pytest.mark.parametrize("binding", ["follow_primary", "custom", None])
+def test_old_openrouter_inline_upgrade_respects_ownership_and_sparse_saves(
+    tmp_path: Path, binding: str | None,
+) -> None:
+    router = {
+        "enabled": True,
+        "default_tier": "c2",
+        "rollout_phase": "observe",
+        "tiers": _previous_openrouter_tiers(),
+        **({"preset_binding": binding} if binding else {}),
+    }
+    path = tmp_path / "config.toml"
+    raw = tomli_w.dumps({
+        "llm": {"provider": "openrouter", "model": "deepseek/deepseek-v4-pro"},
+        "squilla_router": router,
+    })
+    path.write_text(raw, encoding="utf-8")
+    cfg = load_config(path)
+    expected_tiers = _default_tiers() if binding == "follow_primary" else router["tiers"]
+    assert cfg.squilla_router.tiers == expected_tiers
+    assert cfg.squilla_router.tier_profile is None
+    assert cfg.squilla_router.model_fields_set == set(router)
+    assert cfg.squilla_router.default_tier == "c2"
+    assert cfg.squilla_router.rollout_phase == "observe"
+    assert cfg.llm.model == "deepseek/deepseek-v4-pro"
+    assert path.read_text(encoding="utf-8") == raw
+    if binding == "follow_primary":
+        profile = next(
+            item for item in router_catalog_payload()["profiles"]
+            if item["providerId"] == "openrouter"
+        )
+        assert {k: v["model"] for k, v in cfg.squilla_router.tiers.items()} == {
+            k: v["model"] for k, v in profile["tiers"].items()
+        }
+
+    # An unrelated settings write must not turn an in-memory upgrade into
+    # an implicit config migration, or reintroduce stale tiers on reload.
+    cfg.log_level = "DEBUG"
+    persist_config(cfg, path=path, backup=False)
+    saved = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert saved["squilla_router"] == router
+    assert load_config(path).squilla_router.tiers == expected_tiers
+
+
+def test_openrouter_managed_inline_refresh_survives_full_model_revalidation() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"enabled": False, "preset_binding": "follow_primary"},
+    )
+    cfg.squilla_router.tiers = _previous_openrouter_tiers()
+    cfg.squilla_router.enabled = True
+    # Full snapshots explicitly include tier_profile=None. That must not
+    # suppress the managed refresh during hot reload/config validation.
+    restored = GatewayConfig.model_validate(cfg.model_dump(mode="python"))
+    assert restored.squilla_router.tier_profile is None
+    assert restored.squilla_router.tiers == _default_tiers()
+
+
+def test_disabled_openrouter_managed_inline_refreshes_on_reactivation() -> None:
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={
+            "enabled": False, "preset_binding": "follow_primary",
+            "tiers": _previous_openrouter_tiers(),
+        },
+    )
+    assert cfg.squilla_router.tiers == _previous_openrouter_tiers()
+    cfg.squilla_router.enabled = True
+    cfg.initialize_router_profile_defaults()
+    assert cfg.squilla_router.tiers == _default_tiers()
+
+
+def test_openrouter_inline_upgrade_does_not_rebind_foreign_provider_tiers() -> None:
+    tiers = _previous_openrouter_tiers()
+    tiers["c1"] = {"provider": "tokenrhythm", "model": "deepseek-flash"}
+    cfg = GatewayConfig(
+        llm={"provider": "openrouter"},
+        squilla_router={"preset_binding": "follow_primary", "tiers": tiers},
+    )
+    assert cfg.squilla_router.tiers == tiers
+
+
 def test_rc1_desktop_legacy_tier_keys_merge_to_single_canonical(tmp_path: Path) -> None:
     """(c) rc1-desktop shape: t0-t3 keys + default_tier="t1" + tier_profile.
 
@@ -251,7 +349,7 @@ def test_full_default_tree_round_trips_via_to_toml_dict(tmp_path: Path) -> None:
     assert set(tiers) == {"c0", "c1", "c2", "c3", "image_model"}
     expected_models = {
         "c0": "qwen3.7-flash",
-        "c1": "deepseek-v4-flash-0731",
+        "c1": "deepseek-flash",
         "c2": "deepseek-v4-pro-0813",
         "c3": "glm-5.3",
         "image_model": "kimi-k2.6",

@@ -1590,7 +1590,7 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
 
     expected_models = (
         "qwen3.7-flash",
-        "deepseek-v4-flash-0731",
+        "deepseek-flash",
         "deepseek-v4-pro-0813",
         "glm-5.3",
         "kimi-k2.6",

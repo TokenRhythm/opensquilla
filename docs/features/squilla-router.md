@@ -44,7 +44,7 @@ OpenRouter and TokenRhythm use the following recommended single-model tiers:
 | Tier | OpenRouter | TokenRhythm |
 | --- | --- | --- |
 | C0 | `qwen/qwen3.7-flash` | `qwen3.7-flash` |
-| C1 | `deepseek/deepseek-v4-flash-0731` | `deepseek-v4-flash-0731` |
+| C1 | `deepseek/deepseek-v4-flash-0731` | `deepseek-flash` |
 | C2 | `deepseek/deepseek-v4-pro-0813` | `deepseek-v4-pro-0813` |
 | C3 | `z-ai/glm-5.3` | `glm-5.3` |
 

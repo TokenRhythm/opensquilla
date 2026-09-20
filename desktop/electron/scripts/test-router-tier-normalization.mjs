@@ -4,7 +4,7 @@ import { normalizeRouterTiers } from '../dist/router-tier-normalization.js'
 
 const currentFallback = {
   c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash', supportsImage: false },
-  c1: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731' },
+  c1: { provider: 'tokenrhythm', model: 'deepseek-flash' },
   c2: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
   c3: { provider: 'tokenrhythm', model: 'glm-5.3', supportsImage: true, ensembleEnabled: false },
 }
