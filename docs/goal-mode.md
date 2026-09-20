@@ -194,7 +194,7 @@ is active, the CLI first tries the normal steering path and falls back to a new
 user turn only if the terminal race rejects the steer.
 
 Each automatic continuation uses the session's current model-routing mode at
-task acceptance, including when the Goal runs in the background. Direct mode
+task acceptance, even without a new user message. Direct mode
 keeps the session's selected model; router and ensemble modes keep their
 respective behavior. A routing-mode change applies to the next accepted turn;
 an already accepted turn retains its routing snapshot. In router mode, each
