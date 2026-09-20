@@ -1863,6 +1863,86 @@ jobs:
         shell: bash
         run: uv sync --extra dev --extra recommended --extra mcp --frozen
 
+      - name: Verify MCP transports and Desktop bridge on the native platform
+        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest \
+            tests/test_mcp tests/test_mcp_server \
+            tests/test_desktop/test_gateway_functional_probes.py::test_mcp_probe_uses_real_stdio_server_and_gateway \
+            -vv --tb=short \
+            2>&1 | tee "${CI_REPORT_DIR}/mcp-transports.log"
+
+      - name: Verify the frozen production MCP probe and bridge
+        if: ${{ matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --extra dev --extra recommended --extra mcp --group desktop-build --frozen
+          uv run --no-sync python desktop/electron/scripts/verify-mcp-frozen.py \
+            --output-dir "${CI_REPORT_DIR}/mcp-frozen" \
+            2>&1 | tee "${CI_REPORT_DIR}/mcp-frozen.log"
+
+      - name: Build production Docker image and verify MCP
+        if: ${{ runner.os == 'Linux' && (matrix.shard == 'ownership' || matrix.shard == 'ownership-workbench' || matrix.shard == 'all') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
+          mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
+          docker build --file Dockerfile --tag "${mcp_image}" \
+            --build-arg OPENSQUILLA_FORBID_PERSONAL_BGM=1 . \
+            2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
+          docker image inspect --format '{{json .Size}}' "${mcp_image}" \
+            | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"
+          docker run --rm -i --entrypoint python \
+            --mount "type=bind,source=${GITHUB_WORKSPACE}/tests/test_mcp/fixtures,target=/mcp-fixtures,readonly" \
+            "${mcp_image}" - <<'PY' 2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-smoke.log"
+          import asyncio
+          import json
+          import sys
+          from importlib.metadata import version
+
+          from mcp import Client
+          from mcp_types import LATEST_PROTOCOL_VERSION
+
+          from opensquilla.mcp.stdio import MCPStdioClient
+          from opensquilla.mcp.types import MCPServerConfig
+          from opensquilla.mcp_server import create_mcp_server
+
+          async def check():
+              sdk_version = version("mcp")
+              assert sdk_version == "2.2.0", sdk_version
+              async with Client(create_mcp_server(), mode="auto") as server:
+                  assert server.protocol_version == LATEST_PROTOCOL_VERSION
+                  tools = sorted(tool.name for tool in (await server.list_tools()).tools)
+              assert tools == sorted([
+                  "conversations_list", "session_resolve", "messages_read",
+                  "messages_send", "events_wait", "transcript_export",
+              ]), tools
+              for fixture, arguments, tool in [
+                  ("fastmcp_server.py", [], "ping"),
+                  ("legacy_server.py", ["normal"], "echo"),
+              ]:
+                  client = MCPStdioClient(MCPServerConfig(
+                      name="container-probe", transport="stdio", command=sys.executable,
+                      args=["-u", "/mcp-fixtures/" + fixture, *arguments],
+                      tool_timeout_seconds=10,
+                  ))
+                  try:
+                      await client.connect()
+                      assert [item.name for item in await client.list_tools()] == [tool]
+                      result = await client.call_tool(tool, {"text": "container-mcp"})
+                      assert not result.is_error and result.content == "container-mcp"
+                  finally:
+                      await client.close()
+              print(json.dumps({"sdkVersion": sdk_version, "tools": tools,
+                                "stdioPeers": ["modern", "legacy"]}))
+
+          asyncio.run(asyncio.wait_for(check(), timeout=60))
+          PY
+
       - name: Install Desktop dependencies
         working-directory: desktop/electron
         shell: bash
@@ -2381,6 +2461,12 @@ jobs:
             ${{ runner.temp }}/desktop-recovery-e2e/first-failure.txt
             ${{ runner.temp }}/desktop-recovery-e2e/desktop-e2e-cases.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/native-write-view-contracts.xml
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-transports.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-frozen.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-frozen/build.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-build.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-smoke.log
+            ${{ runner.temp }}/desktop-recovery-e2e/mcp-docker-size-bytes.json
             ${{ runner.temp }}/desktop-recovery-e2e/retry-classifications.jsonl
             ${{ runner.temp }}/desktop-recovery-e2e/retry-evidence
             ${{ runner.temp }}/desktop-recovery-e2e/windows-update-electron

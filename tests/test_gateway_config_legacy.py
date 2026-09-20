@@ -103,6 +103,30 @@ def test_prompt_mode_accepts_headless_repo_coding_scaffold() -> None:
     assert cfg.prompt.mode == "headless_repo_coding_scaffold"
 
 
+def test_removed_router_compaction_switches_are_migrated_away() -> None:
+    """Retired C3/T3 switches remain loadable without affecting runtime config."""
+    result = migration_module.migrate_config_payload(
+        {
+            "squilla_router": {
+                "upgrade_to_c3_compaction_enabled": True,
+                "upgrade_to_t3_compaction_enabled": False,
+            }
+        },
+        emit_diagnostics=False,
+    )
+
+    router = result.payload["squilla_router"]
+    assert "upgrade_to_c3_compaction_enabled" not in router
+    assert "upgrade_to_t3_compaction_enabled" not in router
+    assert result.changed is True
+    assert {
+        "squilla_router.upgrade_to_c3_compaction_enabled",
+        "squilla_router.upgrade_to_t3_compaction_enabled",
+    } <= set(result.removed_fields)
+    assert any("target-budget preflight" in warning for warning in result.warnings)
+    GatewayConfig.model_validate(result.payload)
+
+
 # ---------------------------------------------------------------------------
 # AC#1 / AC#4: loading does not raise
 # ---------------------------------------------------------------------------

@@ -2776,6 +2776,8 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
         assert f"'{extra}'" in build_gateway
     for module in ["joblib", "sklearn", "lightgbm", "tokenizers", "tiktoken", "onnxruntime", "mcp"]:
         assert f"'{module}'" in build_gateway
+    for distribution in ["httpx2", "httpcore2"]:
+        assert f"'--copy-metadata',\n  '{distribution}'" in build_gateway
     assert "'--collect-all',\n  'sklearn'" not in build_gateway
     assert "'--collect-all',\n  'lightgbm'" not in build_gateway
     assert "'--collect-binaries',\n  'sklearn'" in build_gateway

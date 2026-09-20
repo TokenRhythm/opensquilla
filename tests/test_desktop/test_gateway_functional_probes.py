@@ -101,7 +101,8 @@ def test_document_probe_rejects_invalid_pdf(tmp_path: Path) -> None:
 # and disk budget. Keep the startup deadline independent of parallel test load.
 @pytest.mark.ci_serial
 def test_mcp_probe_uses_real_stdio_server_and_gateway(tmp_path: Path) -> None:
-    pytest.importorskip("mcp")
+    from mcp_types import LATEST_PROTOCOL_VERSION
+
     environment = isolated_environment(tmp_path)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -128,14 +129,17 @@ def test_mcp_probe_uses_real_stdio_server_and_gateway(tmp_path: Path) -> None:
             else:
                 pytest.fail(_gateway_startup_diagnostics(tmp_path))
 
+            frozen_probe = os.environ.get("OPENSQUILLA_TEST_FROZEN_MCP_PROBE")
+            probe_command = [frozen_probe] if frozen_probe else [sys.executable, str(ENTRY)]
             result = subprocess.run(
-                [sys.executable, str(ENTRY), "--_desktop-mcp-probe",
+                [*probe_command, "--_desktop-mcp-probe",
                  f"ws://127.0.0.1:{port}/ws"],
                 env=environment, text=True, capture_output=True, timeout=60,
             )
             assert result.returncode == 0, result.stderr
             assert json.loads(result.stdout) == {
                 "probe": "opensquilla-desktop-mcp", "sessions": 0,
+                "protocolVersion": LATEST_PROTOCOL_VERSION,
                 "tools": ["conversations_list", "events_wait", "messages_read",
                           "messages_send", "session_resolve", "transcript_export"],
                 "resources": ["opensquilla://sessions"],

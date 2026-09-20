@@ -25,6 +25,7 @@ dependencies = [
     "sqlalchemy>=2.0.52",
     "anyio>=4.15.1",
     "httpx>=0.27",
+    "mcp>=2.2.0,<3",
     # Security floors for HTTP and parsing dependencies used by base features.
     "aiohttp>=3.14.3",
     "idna>=3.19",
@@ -83,8 +84,8 @@ dev = [
     "mypy>=2.3.1",
     "ruff>=0.16.7",
 ]
-# The MCP server uses the v1 FastMCP API; v2 requires a separate migration.
-mcp = ["mcp>=1.28.1,<2"]
+# Retain the documented extra name; MCP clients and server now ship in base.
+mcp = []
 # Optional Outlook .msg attachment extraction. Heavy transitive deps
 # (oletools, msoffcrypto-tool, …), so it is opt-in; .msg uploads degrade
 # gracefully with a clear message when this extra is not installed.

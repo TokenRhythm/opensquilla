@@ -42,6 +42,12 @@ class EndpointHandshakeSSEServer:
         self.sessions: dict[str, queue.Queue[dict[str, Any]]] = {}
         self.wrong_posts: list[str] = []
         self.session_posts: list[str] = []
+        self.endpoint_template = "/messages?session_id={sid}"
+        self.tools = TOOLS
+        self.tool_result: dict[str, Any] = {"content": [{"type": "text", "text": "echoed"}]}
+        self.modern = False
+        self.hang_calls = False
+        self.call_started = threading.Event()
         self._shutdown = threading.Event()
 
         outer = self
@@ -63,7 +69,8 @@ class EndpointHandshakeSSEServer:
                 self.send_header("Content-Type", "text/event-stream")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                self._write(f"event: endpoint\ndata: /messages?session_id={sid}\n\n")
+                endpoint = outer.endpoint_template.format(sid=sid, port=outer.port)
+                self._write(f"event: endpoint\ndata: {endpoint}\n\n")
                 while not outer._shutdown.is_set():
                     try:
                         payload = q.get(timeout=0.1)
@@ -85,7 +92,9 @@ class EndpointHandshakeSSEServer:
                 msg = json.loads(body)
                 outer.session_posts.append(msg.get("method", "?"))
                 if "id" in msg:
-                    outer.sessions[sid].put(outer.respond(msg))
+                    response = outer.respond(msg)
+                    if response is not None:
+                        outer.sessions[sid].put(response)
                 self._plain(202, b"Accepted")
 
             def _write(self, chunk: str) -> bool:
@@ -107,17 +116,25 @@ class EndpointHandshakeSSEServer:
         self._server.daemon_threads = True
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
-    @staticmethod
-    def respond(msg: dict[str, Any]) -> dict[str, Any]:
+    def respond(self, msg: dict[str, Any]) -> dict[str, Any] | None:
         method = msg["method"]
-        if method == "initialize":
+        if method == "server/discover" and self.modern:
             result: dict[str, Any] = {
+                "supportedVersions": ["2026-07-28"], "capabilities": {"tools": {}},
+            }
+        elif method == "initialize":
+            result = {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": "sse-test", "version": "0.0.1"},
             }
         elif method == "tools/list":
-            result = {"tools": TOOLS}
+            result = {"tools": self.tools}
+        elif method == "tools/call":
+            self.call_started.set()
+            if self.hang_calls:
+                return None
+            result = self.tool_result
         else:
             return {
                 "jsonrpc": "2.0",
@@ -162,52 +179,189 @@ async def test_connect_completes_endpoint_handshake_and_lists_tools(
     try:
         await asyncio.wait_for(client.connect(), timeout=10)
         tools = await asyncio.wait_for(client.list_tools(), timeout=10)
+        result = await asyncio.wait_for(client.call_tool("echo", {"text": "hello"}), timeout=10)
     finally:
         await client.close()
 
     assert [t.name for t in tools] == ["echo"]
+    assert result.content == "echoed"
+    assert not result.is_error
     assert sse_server.session_posts == [
+        "server/discover",
         "initialize",
         "notifications/initialized",
         "tools/list",
+        "tools/call",
     ]
     assert sse_server.wrong_posts == []
-
-
-def test_endpoint_event_rejects_cross_origin_url() -> None:
-    client = MCPSSEClient(
-        MCPServerConfig(
-            name="demo",
-            transport="sse",
-            url="https://mcp.example.test/sse",
-        )
-    )
-
-    with pytest.raises(ValueError, match="same origin"):
-        client._handle_event("endpoint", "http://127.0.0.1:8080/private")
-
-    assert client._message_url is None
-    assert not client._endpoint_ready.is_set()
 
 
 @pytest.mark.parametrize(
     "endpoint",
     [
-        "/messages?session_id=1",
-        "https://mcp.example.test/messages?session_id=1",
-        "https://mcp.example.test:443/messages?session_id=1",
+        "http://localhost:{port}/messages?session_id={sid}",
+        "https://127.0.0.1:{port}/messages?session_id={sid}",
+        "http://127.0.0.1:1/messages?session_id={sid}",
     ],
 )
-def test_endpoint_event_accepts_same_origin_url(endpoint: str) -> None:
+async def test_endpoint_event_rejects_cross_origin_url(
+    sse_server: EndpointHandshakeSSEServer, endpoint: str, caplog: pytest.LogCaptureFixture,
+) -> None:
+    sse_server.endpoint_template = endpoint
     client = MCPSSEClient(
         MCPServerConfig(
             name="demo",
             transport="sse",
-            url="https://mcp.example.test/sse",
+            url=f"http://127.0.0.1:{sse_server.port}/sse",
+        )
+    )
+    with caplog.at_level("ERROR", logger="mcp.client.sse"):
+        connecting = asyncio.create_task(client.connect())
+        try:
+            async with asyncio.timeout(5):
+                while not any(
+                    record.name == "mcp.client.sse"
+                    and "Endpoint origin does not match connection origin" in record.getMessage()
+                    for record in caplog.records
+                ):
+                    await asyncio.sleep(0.01)
+        finally:
+            connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
+            await client.close()
+    assert len(sse_server.sessions) == 1
+    assert sse_server.session_posts == []
+    assert sse_server.wrong_posts == []
+
+
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "/messages?session_id={sid}",
+        "http://127.0.0.1:{port}/messages?session_id={sid}",
+    ],
+)
+async def test_endpoint_event_accepts_same_origin_url(
+    sse_server: EndpointHandshakeSSEServer, endpoint: str,
+) -> None:
+    sse_server.endpoint_template = endpoint
+    client = MCPSSEClient(
+        MCPServerConfig(
+            name="demo",
+            transport="sse",
+            url=f"http://127.0.0.1:{sse_server.port}/sse",
         )
     )
 
-    client._handle_event("endpoint", endpoint)
+    try:
+        await asyncio.wait_for(client.connect(), timeout=10)
+        assert [tool.name for tool in await client.list_tools()] == ["echo"]
+    finally:
+        await client.close()
 
-    assert client._message_url is not None
-    assert client._endpoint_ready.is_set()
+
+async def test_sdk_output_schema_violation_is_a_tool_error(
+    sse_server: EndpointHandshakeSSEServer,
+) -> None:
+    sse_server.tools = [{
+        **TOOLS[0],
+        "outputSchema": {
+            "type": "object", "properties": {"value": {"type": "integer"}},
+            "required": ["value"],
+        },
+    }]
+    sse_server.tool_result = {
+        "content": [{"type": "text", "text": "looks successful"}],
+        "structuredContent": {"value": "wrong type"},
+    }
+    client = MCPSSEClient(MCPServerConfig(
+        name="schema", transport="sse", url=f"http://127.0.0.1:{sse_server.port}/sse",
+    ))
+    try:
+        await asyncio.wait_for(client.connect(), timeout=10)
+        await client.list_tools()
+        result = await client.call_tool("echo", {"text": "hello"})
+    finally:
+        await client.close()
+    assert result.is_error
+    assert "Invalid structured content" in result.content
+
+
+async def test_explicit_message_endpoint_is_rejected() -> None:
+    client = MCPSSEClient(MCPServerConfig(
+        name="legacy", transport="sse", url="http://127.0.0.1/sse",
+        message_endpoint="/legacy",
+    ))
+    with pytest.raises(ValueError, match="endpoint event"):
+        await client.connect()
+
+
+async def test_input_required_is_rejected_without_replaying_the_tool(
+    sse_server: EndpointHandshakeSSEServer,
+) -> None:
+    sse_server.modern = True
+    sse_server.tool_result = {"resultType": "input_required", "requestState": "synthetic"}
+    client = MCPSSEClient(MCPServerConfig(
+        name="interactive", transport="sse", url=f"http://127.0.0.1:{sse_server.port}/sse",
+    ))
+    try:
+        await asyncio.wait_for(client.connect(), timeout=10)
+        result = await client.call_tool("echo", {})
+    finally:
+        await client.close()
+    assert result.is_error
+    assert "InputRequiredResult" in result.content
+    assert sse_server.session_posts == ["server/discover", "tools/call"]
+
+
+async def test_closing_connection_settles_an_outstanding_tool_call(
+    sse_server: EndpointHandshakeSSEServer,
+) -> None:
+    sse_server.hang_calls = True
+    client = MCPSSEClient(MCPServerConfig(
+        name="pending", transport="sse", url=f"http://127.0.0.1:{sse_server.port}/sse",
+    ))
+    await asyncio.wait_for(client.connect(), timeout=10)
+    calling = asyncio.create_task(client.call_tool("echo", {}))
+    try:
+        assert await asyncio.to_thread(sse_server.call_started.wait, 2)
+        await asyncio.wait_for(client.close(), timeout=2)
+        result = await asyncio.wait_for(calling, timeout=2)
+    finally:
+        await client.close()
+        calling.cancel()
+        await asyncio.gather(calling, return_exceptions=True)
+    assert result.is_error
+
+
+@pytest.mark.parametrize("trust_env", [False, True])
+async def test_sdk_http_factory_preserves_proxy_policy_and_unbounded_idle(
+    monkeypatch: pytest.MonkeyPatch, trust_env: bool,
+) -> None:
+    import httpx2
+    import mcp.client.sse
+
+    captured: dict[str, Any] = {}
+
+    def capture_transport(url: str, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(mcp.client.sse, "sse_client", capture_transport)
+    monkeypatch.setattr("opensquilla.mcp.sse._trust_env", lambda: trust_env)
+    client = MCPSSEClient(MCPServerConfig(
+        name="network", transport="sse", url="https://mcp.example.test/sse",
+        tool_timeout_seconds=17,
+    ))
+    sdk = client._make_sdk_client()
+    assert sdk.mode == "auto" and sdk.cache is None
+    assert sdk.read_timeout_seconds == 17
+    async with captured["httpx_client_factory"](
+        timeout=httpx2.Timeout(17, read=300), headers={"X-Synthetic": "test"},
+    ) as http_client:
+        assert http_client.timeout.read is None
+        assert http_client.timeout.connect == 17
+        assert http_client.timeout.write == 17
+        assert http_client.timeout.pool == 17
+        assert http_client.trust_env is trust_env
+        assert http_client.headers["X-Synthetic"] == "test"

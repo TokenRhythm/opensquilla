@@ -87,10 +87,11 @@ TOKENRHYTHM_TOOL_REASONING_MODELS = frozenset(
 )
 THINKING_CHOICES = ("default", "off", "minimal", "low", "medium", "high", "xhigh", "adaptive")
 COMPACTION_VARIANTS = (
-    "basic", "tools", "replay_off", "model_switch", "repeated", "truncated", "long_reasoning",
+    "basic", "chunked", "tools", "replay_off", "model_switch", "repeated", "truncated",
+    "long_reasoning",
 )
 COMPACTION_CALL_LIMITS = {
-    "basic": 3, "tools": 4, "replay_off": 4, "model_switch": 3,
+    "basic": 3, "chunked": 4, "tools": 4, "replay_off": 4, "model_switch": 3,
     "repeated": 7, "truncated": 3, "long_reasoning": 3,
 }
 COMPACTION_FIRST_PROMPT = (
@@ -1159,6 +1160,8 @@ def _compaction_coverage(variant: str) -> dict[str, Any]:
         expected.extend(("native_parent_state", "replay_disabled"))
     if variant == "model_switch":
         expected.append("model_switch")
+    if variant == "chunked":
+        expected.extend(("chunked_summary", "single_preflight"))
     if variant == "repeated":
         expected.extend(("repeated_compaction", "cumulative_memory"))
     if variant == "long_reasoning":
@@ -1212,8 +1215,10 @@ async def _run_compaction_case(
         provider, model, api_key, endpoint, config.llm.context_window_tokens,
     )
     fact_checks: list[dict[str, Any]] = []
+    recall_checks: list[dict[str, Any]] = []
     pressure_checks: list[dict[str, Any]] = []
     observer.replay_checks["critical_fact_checks"] = fact_checks
+    observer.replay_checks["memory_recall_checks"] = recall_checks
     observer.replay_checks["pressure_checks"] = pressure_checks
     catalog = _Catalog()
     catalog_loaded = False
@@ -1258,6 +1263,11 @@ async def _run_compaction_case(
     # tokens per repetition). Physical request limits remain unchanged.
     seed_repetitions = 16 if conservative_estimate else 45
     seed_padding = " log 17;" if options.native_pressure else COMPACTION_PADDING
+    if variant == "chunked":
+        # Exceed the normal preflight threshold and one summary chunk, without
+        # letting long prose exhaust the independent character budget first.
+        seed_padding = " log 17;"
+        seed_repetitions = max(1, 14_000 // (5 * estimate_tokens_with_source(seed_padding)[0]))
     if options.native_pressure:
         from opensquilla.context_budget import ContextBudgetGovernor
         from opensquilla.token_estimation import estimate_tokens
@@ -1415,7 +1425,11 @@ async def _run_compaction_case(
                     _require(restored == previous_canonical, "database_reopen_state_mismatch")
                     config.compaction.enabled = True
                     config.llm.context_window_tokens = options.context_window_tokens or 20_000
-                    if options.preflight_ratio is None and not options.native_pressure:
+                    if (
+                        options.preflight_ratio is None
+                        and not options.native_pressure
+                        and variant != "chunked"
+                    ):
                         # Small protocol cases exercise a deliberate early trigger.
                         # Native-pressure cases retain the production threshold.
                         config.preflight_compact_ratio = 0.2 if conservative_estimate else 0.1
@@ -1457,6 +1471,7 @@ async def _run_compaction_case(
                 }
                 call_start = len(observer.calls)
                 user = await manager.append_message(key, "user", prompt)
+                compaction_event_start = len(compaction_events)
                 events = [
                     event
                     async for event in runner.run(
@@ -1466,7 +1481,13 @@ async def _run_compaction_case(
                         tool_context=ToolContext(is_owner=True, workspace_dir=config.workspace_dir),
                     )
                 ]
-                attempted_by_turn.append(runner.has_attempted_compaction_this_turn(key))
+                # run() clears its per-turn flags in finally. Retain the actual
+                # lifecycle evidence instead of sampling those cleared flags.
+                started_phases = [
+                    event.get("phase") for event in compaction_events[compaction_event_start:]
+                    if event.get("status") == "started"
+                ]
+                attempted_by_turn.append(bool(started_phases))
                 observer.engine_error_codes.extend(
                     safe_provider_failure_code(
                         getattr(event, "code", None), getattr(event, "failure_kind", None)
@@ -1498,6 +1519,15 @@ async def _run_compaction_case(
                     _require(generated_label is not None, "parent_generated_label_missing")
                     assert generated_label is not None
                     labels.append(generated_label)
+                    first_turn_entries = await manager.get_transcript(key)
+                    _require(
+                        any(
+                            entry.role == "assistant"
+                            and generated_label in str(entry.content or "")
+                            for entry in first_turn_entries
+                        ),
+                        "parent_generated_label_not_persisted",
+                    )
                     _require(
                         all(
                             generated_label not in json.dumps(call.request)
@@ -1551,9 +1581,12 @@ async def _run_compaction_case(
                         _require(observed["source_preserved"], "truncated_summary_deleted_source")
                         _require(observed["no_summary_committed"], "truncated_summary_committed")
                     break
+                expected_summary_calls = (
+                    {2} if variant == "chunked" else {1, 2} if options.native_pressure else {1}
+                )
                 _require(
                     compact is not None
-                    and len(summary_calls) in ({1, 2} if options.native_pressure else {1})
+                    and len(summary_calls) in expected_summary_calls
                     and len(stage_calls) == len(summary_calls) + 1
                     and not _is_compaction_wire_call(stage_calls[-1]),
                     "compaction_live_not_covered",
@@ -1597,6 +1630,9 @@ async def _run_compaction_case(
                     "compaction_source_entry_missing",
                 )
                 source_entry_marker_counts.append(len(source_entry_markers))
+                # A generated label that remains in the protected active suffix
+                # is intentionally absent from the compaction source. Only
+                # labels belonging to removed history need source coverage.
                 removed_text = "\n".join(
                     str(entry.content or "") for entry in before_entries
                     if entry.message_id in removed_ids
@@ -1682,8 +1718,15 @@ async def _run_compaction_case(
                     "same_payload_scope": False,
                     "note": "parent_and_continuation_have_different_current_turns",
                 })
+                recall_check = {
+                    "labels_in_summary": [label in summary_text for label in labels],
+                    "labels_in_answer": [label in answer for label in labels],
+                    "completion_marker_in_answer": "COMPACTION_RECALL_OK" in answer,
+                }
+                recall_checks.append(recall_check)
                 _require(
-                    all(label in answer for label in labels) and "COMPACTION_RECALL_OK" in answer,
+                    all(recall_check["labels_in_answer"])
+                    and recall_check["completion_marker_in_answer"],
                     "compaction_memory_recall_mismatch",
                 )
                 _require(
@@ -1784,6 +1827,9 @@ async def _run_compaction_case(
                         "model"
                     ) and compact.request.get("model") == resumed.request.get("model")
                     _require(observed["model_switch"], "compaction_used_previous_model")
+                if variant == "chunked":
+                    observed["chunked_summary"] = len(summary_calls) == latest.chunk_count == 2
+                    observed["single_preflight"] = started_phases == ["preflight"]
                 if variant == "long_reasoning":
                     reasoning = _usage_report([compact])["reasoning_tokens_by_call"][0]
                     observed["reasoning_over_1024"] = reasoning is not None and reasoning > 1024

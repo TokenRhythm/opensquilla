@@ -69,6 +69,69 @@ opensquilla configure provider --provider openrouter --api-key-env OPENROUTER_AP
 Avoid committing raw API keys to TOML files, shell history, examples, or issue
 reports.
 
+## External MCP Servers
+
+The current source includes an MCP client for external tools. For SDK 2.x,
+follow the [source installation requirements](mcp-server.md#requirements);
+the published v0.5.4 wheel predates this migration. Enable it and configure
+each server in `config.toml`. Supported transports are `stdio` and the legacy
+HTTP/SSE transport named `sse`.
+MCP is disabled by default. With no enabled, configured servers, the gateway
+does not import the SDK or start MCP connection tasks. No installation extra is
+required; `opensquilla[mcp]` remains a compatible installation spelling.
+
+For a local server, replace the example script path with your server's entry
+point. The configured command must be available to the gateway process:
+
+```toml
+[mcp]
+enabled = true
+connect_timeout_seconds = 5.0
+
+[[mcp.servers]]
+name = "local-tools"
+transport = "stdio"
+command = "python"
+args = ["/path/to/your/mcp_server.py"]
+tool_timeout_seconds = 30.0
+```
+
+The child process inherits the gateway's environment. An optional `env` table
+overrides individual values; its values are literal strings. Supply credentials
+through the gateway's environment rather than committing them to TOML.
+
+For an existing HTTP/SSE server, add another entry:
+
+```toml
+[[mcp.servers]]
+name = "remote-tools"
+transport = "sse"
+url = "http://127.0.0.1:8000/sse"
+tool_timeout_seconds = 30.0
+```
+
+Use the server's SSE URL. Its endpoint event supplies the URL for outgoing MCP
+messages. Restart the gateway after changing these settings. To expose
+OpenSquilla itself to another MCP client, see [MCP Server Bridge](mcp-server.md).
+
+The client uses official MCP SDK 2.x protocol negotiation, including older
+servers. Local stdio messages retain a 16 MiB limit before JSON parsing,
+excluding the final LF byte; exceeding it closes the connection. SSE servers
+must publish their message endpoint: OpenSquilla no longer guesses `/message`
+or accepts a `message_endpoint` override. The SDK requires matching URL scheme
+and authority for endpoint events, including explicit ports (`host` and
+`host:443` differ). Redirects must stay on the same origin or upgrade HTTP to
+HTTPS on the same host with default ports; message POST redirects must also
+preserve the method (307/308).
+
+Tool discovery reads every page at gateway startup within the configured
+connection timeout. Tool errors and invalid output schemas remain failures.
+Text blocks are joined in order; structured-only results become JSON text, and
+unsupported non-text-only results report an error. Tools requiring interactive
+input fail without automatically retrying the operation. Streamable HTTP,
+OAuth, automatic reconnection, live tool-list updates, and consuming external
+resources/prompts are not supported by this client.
+
 ## First-Run Wizard
 
 ```sh
