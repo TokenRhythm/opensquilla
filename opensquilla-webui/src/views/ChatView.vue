@@ -4761,7 +4761,10 @@ const liveRecoveryState = computed(() => {
 const recoveryNoticeState = computed(() => historyState.value.sessionMissing
   ? 'session-missing' as const
   : liveRecoveryState.value ?? visibleHistoryRecoveryState.value)
-const recoveryNoticeVisible = useChatRecoveryNotice(recoveryNoticeState)
+const recoveryNoticeVisible = useChatRecoveryNotice(
+  recoveryNoticeState,
+  computed(() => gatewayAccess.isRuntimeStarting),
+)
 
 const showConfirmedEmptySession = computed(() => shouldShowConfirmedEmptySession({
   isDraftLanding: isNewChatLanding.value,

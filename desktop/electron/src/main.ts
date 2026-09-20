@@ -857,7 +857,8 @@ const gatewayState: GatewayState = {
   url: '',
   port: 0,
   owned: false,
-  status: 'stopped',
+  // The first renderer loads while profile preflight is still preparing the runtime.
+  status: 'starting',
   logPath: '',
   sandboxUpgrade: null,
 }
