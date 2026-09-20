@@ -7,9 +7,11 @@ import json
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
 import structlog
 from starlette.websockets import WebSocketState
 
+import opensquilla.gateway.websocket as websocket_module
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.protocol import make_ok_res
 from opensquilla.gateway.websocket import handle_ws_connection
@@ -218,3 +220,58 @@ async def test_connected_receive_runtime_error_remains_visible() -> None:
     errors = [entry for entry in logs if entry.get("event") == "ws.error"]
     assert len(errors) == 1
     assert errors[0].get("error") == "synthetic connected receive failure"
+
+
+@pytest.mark.parametrize("fallback", ["capacity", "timeout"])
+async def test_handler_close_fallback_preserves_awaited_teardown(
+    monkeypatch: pytest.MonkeyPatch,
+    fallback: str,
+) -> None:
+    """A fallback from the reader itself cannot cancel its own cleanup await."""
+    finished = asyncio.Event()
+
+    class SlowDispatcher(_EchoDispatcher):
+        async def dispatch(self, req_id: str, method: str, params: Any, ctx: Any) -> Any:
+            await asyncio.sleep(0.08)
+            finished.set()
+            return make_ok_res(req_id, {})
+
+    class BlockedCloseSocket(_TimeoutDuringWriterWebSocket):
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            self.close_codes.append(code)
+            await asyncio.Future()
+
+    ws = BlockedCloseSocket()
+    registry = websocket_module.ConnectionRegistry()
+    monkeypatch.setattr(websocket_module, "get_registry", lambda: registry)
+    monkeypatch.setattr(websocket_module, "_DIRECT_CLOSE_TIMEOUT_SECONDS", 0.01)
+    current = asyncio.current_task()
+    assert current is not None
+    monkeypatch.setattr(websocket_module, "_MAX_WRITER_TASKS", 1)
+    monkeypatch.setattr(
+        websocket_module, "_SOCKET_CLOSE_TASKS", {current} if fallback == "capacity" else set(),
+    )
+    cleaned: list[str] = []
+    removed: list[str] = []
+    original_cleanup = websocket_module.WsConnection._cleanup_transport
+
+    def record_cleanup(conn: websocket_module.WsConnection) -> None:
+        original_cleanup(conn)
+        cleaned.append(conn.conn_id)
+        assert conn._transport_bytes == 0
+
+    monkeypatch.setattr(websocket_module.WsConnection, "_cleanup_transport", record_cleanup)
+    task = asyncio.create_task(handle_ws_connection(
+        ws,
+        GatewayConfig(client_ws_keepalive_timeout_s=0.01, ws_writer_queue_enabled=True),
+        dispatcher=SlowDispatcher(),
+        subscription_manager=SimpleNamespace(remove_connection=removed.append),
+    ))
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1.0)
+
+    assert finished.is_set()
+    assert registry.all() == []
+    assert len(cleaned) == 1
+    assert removed == cleaned
+    assert task.cancelled()

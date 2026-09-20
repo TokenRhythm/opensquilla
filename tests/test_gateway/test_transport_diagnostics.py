@@ -25,6 +25,9 @@ def test_diagnostics_only_exposes_numeric_watermarks_and_booleans():
         assert sample["flow_last_admitted_delivery_id"] == delivery_id
         assert sample["flow_ack_delivery_id"] == 0
         assert sample["flow_dirty_sessions"] == 1
+        assert sample["queue_oldest_age_ms"] == 0
+        assert sample["writer_task_limit"] == websocket._MAX_WRITER_TASKS
+        assert sample["close_task_count"] == len(websocket._SOCKET_CLOSE_TASKS)
         assert "PRIVATE" not in json.dumps(sample)
         assert conn._flow.epoch not in json.dumps(sample)
         conn._flow.acknowledge(conn._flow.epoch, delivery_id)

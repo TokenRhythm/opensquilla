@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
 from starlette.websockets import WebSocketState
 
+from opensquilla.gateway import websocket as websocket_module
 from opensquilla.gateway.protocol import ResFrame
 from opensquilla.gateway.transport_flow import (
     FLOW_WINDOW_FRAMES,
@@ -196,6 +198,47 @@ async def test_dequeued_control_reservation_released_when_transport_already_clos
     await conn._writer_task
     await conn._stop_writer()
     conn._cleanup_transport()
+    assert conn._transport_bytes == 0
+    assert get_transport_budget().used == before
+
+
+@pytest.mark.parametrize("acknowledged", [False, True])
+async def test_recovery_credit_deadline_closes_only_unacknowledged_delivery(
+    monkeypatch: pytest.MonkeyPatch, acknowledged: bool,
+) -> None:
+    before = get_transport_budget().used
+    ws = _FastSocket()
+    conn = WsConnection("credit-timeout", ws)  # type: ignore[arg-type]
+    conn._recovery_enabled = True
+    conn._enable_flow()
+    conn._start_writer(maxsize=4, enabled=True)
+    transfer = SimpleNamespace(deadline=time.monotonic() + 120)
+    monkeypatch.setattr(
+        WsConnection, "snapshot_registry",
+        lambda self: SimpleNamespace(get=lambda *args: transfer),
+    )
+    assert websocket_module.RECOVERY_CREDIT_SECONDS == 30.0
+    started = time.monotonic()
+    try:
+        receipt = conn.reserve_snapshot_delivery(1000, "s", "snapshot", "revision")
+        delivery_id = receipt["delivery_id"]
+        delivery = conn._flow.deliveries[delivery_id]
+        assert started + 30 <= delivery.deadline <= time.monotonic() + 30
+        assert conn._transport_bytes == 1000
+        if acknowledged:
+            conn._flow.mark_sent(delivery_id)
+            conn._flow.acknowledge(conn._flow.epoch, delivery_id)
+        # Trigger the captured timer callback directly; this verifies terminal
+        # ownership/cleanup, while the assertion above checks its 30s budget.
+        conn._delivery_timers[delivery_id].cancel()
+        conn._expire_snapshot_credit(delivery_id)
+        for _ in range(6):
+            await asyncio.sleep(0)
+        assert bool(ws.closed) is not acknowledged
+        assert conn._closing is not acknowledged
+    finally:
+        await conn._stop_writer()
+        conn._cleanup_transport()
     assert conn._transport_bytes == 0
     assert get_transport_budget().used == before
 

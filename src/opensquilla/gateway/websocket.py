@@ -60,6 +60,7 @@ from opensquilla.gateway.transport_flow import (
     FLOW_WINDOW_BYTES,
     FLOW_WINDOW_FRAMES,
     PROBE_CAPABILITY,
+    RECOVERY_CREDIT_SECONDS,
     BudgetKind,
     FlowWindow,
     get_transport_budget,
@@ -102,6 +103,7 @@ _MAX_DETACHED_READS_PER_CONNECTION = 4
 _DETACHED_READ_STOP_TIMEOUT_SECONDS = 2.0
 _DIRECT_SEND_TIMEOUT_SECONDS = 2.0
 _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
+_WRITER_SEND_TIMEOUT_SECONDS = 60.0
 _MAX_ORDINARY_REQUESTS = 8
 _ORDINARY_DRAIN_SECONDS = 0.25
 _CONTROL_RPC_METHODS = frozenset({"transport.flow.update"})
@@ -249,6 +251,7 @@ class _OutboundFrame:
     delivery_id: int | None = None
     is_control: bool = False
     budget_kind: BudgetKind = None
+    enqueued_at: float = field(default_factory=time.monotonic, repr=False)
 
 
 @dataclass(eq=False, slots=True)
@@ -296,6 +299,7 @@ class WsConnection:
     _writer_queue_maxsize: int = field(default=512, init=False, repr=False)
     _outbox: asyncio.Queue[Any] | None = field(default=None, init=False, repr=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _handler_task: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     _detached_read_tasks: set[asyncio.Task[None]] = field(
         default_factory=set,
         init=False,
@@ -408,7 +412,11 @@ class WsConnection:
             self.snapshot_registry().get(key, sync_revision, snapshot_id)
             if self._recovery_enabled else None
         )
-        deadline = min(time.monotonic() + 30.0, transfer.deadline) if transfer else None
+        deadline = (
+            min(time.monotonic() + RECOVERY_CREDIT_SECONDS, transfer.deadline)
+            if transfer
+            else None
+        )
         delivery_id = self._flow.admit(
             encoded_response_bytes, recovery=True, key=key, owner=transfer,
             segment_index=segment_index, deadline=deadline,
@@ -707,9 +715,22 @@ class WsConnection:
     def transport_diagnostics(self) -> dict[str, int | bool]:
         """Aggregate counters only: never include keys, payloads or credentials."""
         flow = self._flow
+        oldest_age_ms = 0
+        if self._outbox is not None:
+            now = time.monotonic()
+            queued = [
+                item for item in self._outbox._queue  # type: ignore[attr-defined]
+                if isinstance(item, _OutboundFrame)
+            ]
+            if queued:
+                oldest_age_ms = max(0, int((now - min(item.enqueued_at for item in queued)) * 1000))
         return {
             "queue_depth": self._outbox.qsize() if self._outbox is not None else 0,
             "queue_capacity": self._writer_queue_maxsize if self._queue_enabled else 0,
+            "queue_oldest_age_ms": oldest_age_ms,
+            "writer_task_count": len(_WRITER_TASKS),
+            "writer_task_limit": _MAX_WRITER_TASKS,
+            "close_task_count": len(_SOCKET_CLOSE_TASKS),
             "transport_reserved_bytes": self._transport_bytes,
             "global_transport_reserved_bytes": get_transport_budget().used,
             "ordinary_pending_requests": (
@@ -1323,6 +1344,19 @@ class WsConnection:
     async def close(self, code: int = WS_CLOSE_SERVICE_RESTART, reason: str = "") -> None:
         self._closing = True
         if len(_SOCKET_CLOSE_TASKS) >= _MAX_WRITER_TASKS:
+            # A cancellation-resistant close already occupies every slot.
+            # Do not create an untracked task (or await close inline forever).
+            # End the owning ASGI handler: Uvicorn closes the transport when
+            # that handler returns, including its cancellation path.
+            log.error(
+                "gateway.ws_close_task_capacity_exhausted",
+                conn_id=self.conn_id,
+                close_code=code,
+                close_reason=reason,
+                active_close_tasks=len(_SOCKET_CLOSE_TASKS),
+                task_capacity=_MAX_WRITER_TASKS,
+            )
+            self._abort_connection_handler(reason="close_capacity")
             return
         task = asyncio.create_task(
             self.ws.close(code=code, reason=reason) if reason else self.ws.close(code=code),
@@ -1331,9 +1365,38 @@ class WsConnection:
         _SOCKET_CLOSE_TASKS.add(task)
         task.add_done_callback(_SOCKET_CLOSE_TASKS.discard)
         task.add_done_callback(self._consume_task_result)
-        done, _ = await asyncio.wait({task}, timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS)
+        except BaseException:
+            task.cancel()
+            raise
         if not done:
             task.cancel()
+            log.warning(
+                "gateway.ws_socket_close_timeout",
+                conn_id=self.conn_id,
+                close_code=code,
+                close_reason=reason,
+                timeout_seconds=_DIRECT_CLOSE_TIMEOUT_SECONDS,
+            )
+            self._abort_connection_handler(reason="socket_close_timeout")
+
+    def _abort_connection_handler(self, *, reason: str) -> None:
+        handler = self._handler_task
+        abortable = handler is not None and not handler.done() and not handler.cancelling()
+        log.error(
+            "gateway.ws_connection_handler_fallback",
+            conn_id=self.conn_id,
+            reason=reason,
+            handler_cancelled=abortable,
+        )
+        if abortable:
+            if handler is asyncio.current_task():
+                # Inject cancellation before the handler enters its finally.
+                # Queuing self-cancellation would instead interrupt the first
+                # awaited teardown step and skip registry/budget cleanup.
+                raise asyncio.CancelledError
+            handler.cancel()
 
     def _track_detached_request(
         self,
@@ -1430,6 +1493,13 @@ class WsConnection:
             return
         if len(_WRITER_TASKS) >= _MAX_WRITER_TASKS:
             self._closing = True
+            log.error(
+                "gateway.ws_writer_task_capacity_exhausted",
+                conn_id=self.conn_id,
+                active_writer_tasks=len(_WRITER_TASKS),
+                task_capacity=_MAX_WRITER_TASKS,
+                close_reason="writer_capacity",
+            )
             task = asyncio.create_task(self.close(code=1013, reason="writer_capacity"))
             task.add_done_callback(self._consume_task_result)
             return
@@ -1680,92 +1750,98 @@ class WsConnection:
                     return
                 if not isinstance(item, _OutboundFrame):
                     continue
-                if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
-                    # This frame is no longer in the queue drained during
-                    # teardown. Its non-ledger reservation belongs to us.
-                    self._release_outbound_budget(item)
-                    return
+                text: str | None = None
                 try:
-                    if item.encoded_text is not None:
-                        text = item.encoded_text
-                        if (
-                            self._flow_dirty_notice_pending is item
-                            and self._flow is not None
-                        ):
-                            self._freeze_pending_dirty_notice()
-                            assert item.encoded_text is not None
+                    if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
+                        return
+                    try:
+                        if item.encoded_text is not None:
                             text = item.encoded_text
-                        if item.event_name is not None:
-                            text = text[:-1] + f',"seq":{self.next_seq()}' + "}"
-                    elif item.event_name is not None:
-                        text = make_event(
-                            item.event_name,
-                            encode_payload_for_protocol(
-                                item.payload,
-                                protocol=self.protocol,
-                            ),
-                            seq=self.next_seq(),
-                            meta=item.meta,
-                        ).model_dump_json()
-                    elif item.res_frame is not None:
-                        text = item.res_frame.model_copy(
-                            update={
-                                "payload": encode_payload_for_protocol(
-                                    item.res_frame.payload,
+                            if (
+                                self._flow_dirty_notice_pending is item
+                                and self._flow is not None
+                            ):
+                                self._freeze_pending_dirty_notice()
+                                assert item.encoded_text is not None
+                                text = item.encoded_text
+                            if item.event_name is not None:
+                                text = text[:-1] + f',"seq":{self.next_seq()}' + "}"
+                        elif item.event_name is not None:
+                            text = make_event(
+                                item.event_name,
+                                encode_payload_for_protocol(
+                                    item.payload,
                                     protocol=self.protocol,
-                                )
-                            }
-                        ).model_dump_json()
-                    elif item.raw_text is not None:
-                        text = item.raw_text
-                    else:
-                        continue
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # A frame that cannot be serialized (e.g. a lone surrogate
-                    # in a payload) must not silently kill this task: the
-                    # socket would stay open, requests would keep executing,
-                    # and no response would ever leave. Close instead so the
-                    # reader loop tears the connection down normally.
-                    log.warning(
-                        "gateway.ws_frame_serialize_failed",
-                        conn_id=self.conn_id,
-                        exc_info=True,
-                    )
-                    self._closing = True
+                                ),
+                                seq=self.next_seq(),
+                                meta=item.meta,
+                            ).model_dump_json()
+                        elif item.res_frame is not None:
+                            text = item.res_frame.model_copy(
+                                update={
+                                    "payload": encode_payload_for_protocol(
+                                        item.res_frame.payload,
+                                        protocol=self.protocol,
+                                    )
+                                }
+                            ).model_dump_json()
+                        elif item.raw_text is not None:
+                            text = item.raw_text
+                        else:
+                            continue
+                        if not isinstance(text, str):
+                            raise TypeError("Writer serialization did not produce text")
+                    except Exception:
+                        # Reject a malformed frame without leaving a live
+                        # connection whose only writer has stopped.
+                        if self._flow_dirty_notice_pending is item:
+                            self._flow_dirty_notice_pending = None
+                        log.warning(
+                            "gateway.ws_frame_serialize_failed",
+                            conn_id=self.conn_id,
+                            queue_depth=self._outbox.qsize(),
+                            transport_reserved_bytes=self._transport_bytes,
+                            close_reason="writer_serialize_failed",
+                            exc_info=True,
+                        )
+                        self._closing = True
+                        try:
+                            await self.close(code=1011, reason="writer_serialize_failed")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
                     try:
-                        await self.ws.close(code=1011)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return
-                try:
-                    if self._flow is not None and item.delivery_id is not None:
-                        self._flow.mark_sending(item.delivery_id)
-                    async with asyncio.timeout(60.0):
-                        await self.ws.send_text(text)
-                    if self._flow is not None and item.delivery_id is not None:
-                        self._flow.mark_sent(item.delivery_id)
-                except WebSocketDisconnect:
-                    self._closing = True
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.debug(
-                        "gateway.ws_writer_send_failed",
-                        conn_id=self.conn_id,
-                        exc_info=True,
-                    )
-                    self._closing = True
-                    try:
-                        await self.ws.close(code=1011, reason="writer_send_failed")
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return
+                        if self._flow is not None and item.delivery_id is not None:
+                            self._flow.mark_sending(item.delivery_id)
+                        async with asyncio.timeout(_WRITER_SEND_TIMEOUT_SECONDS):
+                            await self.ws.send_text(text)
+                        if self._flow is not None and item.delivery_id is not None:
+                            self._flow.mark_sent(item.delivery_id)
+                    except WebSocketDisconnect:
+                        self._closing = True
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.debug(
+                            "gateway.ws_writer_send_failed",
+                            conn_id=self.conn_id,
+                            exc_info=True,
+                        )
+                        self._closing = True
+                        try:
+                            await self.close(code=1011, reason="writer_send_failed")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
+                    finally:
+                        if self._flow is not None and item.delivery_id is not None:
+                            self._flow.mark_send_finished(item.delivery_id)
                 finally:
-                    if self._flow is not None and item.delivery_id is not None:
-                        self._flow.mark_send_finished(item.delivery_id)
+                    # Once dequeued, every terminal path owns this reservation:
+                    # rejection, serialization failure, cancellation, and send.
+                    # A cancellation-resistant physical send retains it until
+                    # that await actually unwinds and reaches this finally.
                     self._release_outbound_budget(item)
                     # The next queue wait may last for the connection's entire
                     # lifetime. Do not retain an uncharged completed frame.
@@ -1792,6 +1868,11 @@ class WsConnection:
                 if not self._prepare_flow_frame(frame):
                     return
             except Exception:
+                # Admission may have reserved bytes before a later flow
+                # validation/encoding step failed.  The frame will never
+                # enter the outbox, so release that reservation here before
+                # taking either the dirty-session or force-close path.
+                self._release_outbound_budget(frame)
                 log.warning(
                     "gateway.ws_flow_encode_or_budget_failed", conn_id=self.conn_id, exc_info=True
                 )
@@ -2170,6 +2251,7 @@ async def handle_ws_connection(
 
     conn_id = str(uuid.uuid4())
     conn = WsConnection(conn_id=conn_id, ws=ws)
+    conn._handler_task = asyncio.current_task()
     registry = get_registry()
 
     await ws.accept()
@@ -2437,6 +2519,7 @@ async def handle_ws_connection(
     finally:
         # Stop admission before draining. A running mutation may finish under
         # supervision; queued work must never begin after the client has left.
+        conn._handler_task = None
         conn._closing = True
         get_recovery_scheduler().cancel_connection(conn.conn_id)
         await conn._stop_ordinary_requests()
