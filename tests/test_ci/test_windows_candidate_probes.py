@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -33,6 +34,7 @@ def candidate(tmp_path):
         path.write_bytes(relative.encode())
     manifest = {
         "sourceSha": "a" * 40, "installerName": installer.name,
+        "workflowSha": "b" * 40, "version": "0.5.4",
         "installerSha256": IDENTITY.digest(installer),
         **{field: IDENTITY.digest(path) for field, path in IDENTITY.installed_files(root).items()},
     }
@@ -42,6 +44,122 @@ def candidate(tmp_path):
 def test_candidate_verifies_exact_installed_bytes(candidate):
     installer, root, manifest = candidate
     IDENTITY.verify(manifest, installer, "a" * 40, manifest["installerSha256"], root)
+
+
+def test_candidate_binds_workflow_and_version_without_assuming_workflow_equals_source(candidate):
+    installer, root, manifest = candidate
+    IDENTITY.verify(
+        manifest, installer, "a" * 40, manifest["installerSha256"], root,
+        expected_workflow_sha="b" * 40, expected_version="0.5.4", installed_version="0.5.4.0",
+    )
+
+
+@pytest.mark.parametrize("field", ["workflowSha", "version"])
+def test_candidate_requires_workflow_and_version_even_without_external_expectations(
+    candidate, field,
+):
+    installer, _, manifest = candidate
+    del manifest[field]
+    with pytest.raises(ValueError, match="workflow|version"):
+        IDENTITY.verify(manifest, installer, "a" * 40)
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("workflowSha", None), ("workflowSha", "main"), ("workflowSha", "b" * 39),
+    ("workflowSha", "g" * 40), ("version", None), ("version", 0.5),
+    ("version", ""), ("version", "v0.5.4"), ("version", "0.5"),
+    ("version", "00.5.4"), ("version", "0.5.4-01"), ("version", "0.5.4.1"),
+    ("version", "0.5.4.0-rc.1"), ("version", "0.5.4\n"),
+])
+def test_candidate_rejects_malformed_workflow_or_version(candidate, field, value):
+    installer, _, manifest = candidate
+    with pytest.raises(ValueError, match="workflow|version"):
+        IDENTITY.verify({**manifest, field: value}, installer, "a" * 40)
+
+
+@pytest.mark.parametrize("version", ["0.5.4", "0.5.4.0"])
+@pytest.mark.parametrize("expected", ["0.5.4", "0.5.4.0"])
+def test_candidate_normalizes_only_windows_zero_revision(candidate, version, expected):
+    installer, root, manifest = candidate
+    IDENTITY.verify(
+        {**manifest, "version": version}, installer, "a" * 40, root=root,
+        expected_version=expected, installed_version=expected,
+    )
+
+
+@pytest.mark.parametrize("version", ["0.5.5-rc.1", "0.5.5-alpha.01a+build.04", "0.5.5+build.7"])
+def test_candidate_preserves_complete_semver_identity(candidate, version):
+    installer, _, manifest = candidate
+    IDENTITY.verify(
+        {**manifest, "version": version}, installer, "a" * 40,
+        expected_version=version, installed_version=version,
+    )
+    with pytest.raises(ValueError, match="version mismatch"):
+        IDENTITY.verify({**manifest, "version": version}, installer, "a" * 40,
+                        expected_version="0.5.5")
+
+
+@pytest.mark.parametrize("expectations", [
+    {"expected_workflow_sha": "c" * 40},
+    {"expected_version": "0.5.5"}, {"installed_version": "0.5.5.0"},
+    {"expected_workflow_sha": ""}, {"expected_workflow_sha": "main"},
+    {"expected_version": ""}, {"expected_version": "0.5.4.2"},
+    {"installed_version": ""}, {"installed_version": "0.5.4.2"},
+])
+def test_candidate_rejects_wrong_or_invalid_expected_metadata(candidate, expectations):
+    installer, _, manifest = candidate
+    with pytest.raises(ValueError, match="workflow|version"):
+        IDENTITY.verify(manifest, installer, "a" * 40, **expectations)
+
+
+def test_candidate_cli_enforces_expected_and_installed_metadata(candidate, tmp_path, monkeypatch):
+    installer, root, manifest = candidate
+    manifest_path = tmp_path / "candidate.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    arguments = [
+        "windows_candidate_identity.py", "--installer", str(installer),
+        "--manifest", str(manifest_path), "--source-sha", "a" * 40,
+        "--root", str(root), "--workflow-sha", "b" * 40,
+        "--expected-version", "0.5.4", "--installed-version", "0.5.4.0",
+    ]
+    monkeypatch.setattr(sys, "argv", arguments)
+    IDENTITY.main()
+    for option, value in (
+        ("--workflow-sha", "c" * 40), ("--expected-version", "0.5.5"),
+        ("--installed-version", "0.5.5.0"),
+    ):
+        changed = list(arguments)
+        changed[changed.index(option) + 1] = value
+        monkeypatch.setattr(sys, "argv", changed)
+        with pytest.raises(ValueError, match="mismatch"):
+            IDENTITY.main()
+
+
+def test_candidate_writer_uses_checkout_package_version_and_validates_before_publishing(
+    candidate, tmp_path, monkeypatch,
+):
+    installer, root, _ = candidate
+    repository = tmp_path / "source"
+    package = repository / "desktop/electron/package.json"
+    package.parent.mkdir(parents=True)
+    package.write_text(json.dumps({"version": "0.5.5-rc.1"}), encoding="utf-8")
+    monkeypatch.setattr(IDENTITY, "__file__", str(repository / ".github/scripts/identity.py"))
+    monkeypatch.setattr(IDENTITY.subprocess, "check_output", lambda *args, **kwargs: "a" * 40)
+    manifest_path = tmp_path / "written.json"
+    arguments = [
+        "windows_candidate_identity.py", "--write", "--installer", str(installer),
+        "--root", str(root), "--manifest", str(manifest_path), "--source-sha", "a" * 40,
+        "--workflow-sha", "b" * 40, "--expected-version", "0.5.4",
+    ]
+    monkeypatch.setattr(sys, "argv", arguments)
+    with pytest.raises(ValueError, match="version mismatch"):
+        IDENTITY.main()
+    assert not manifest_path.exists()
+    arguments[-1] = "0.5.5-rc.1"
+    IDENTITY.main()
+    written = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert written["version"] == "0.5.5-rc.1"
+    assert written["workflowSha"] == "b" * 40
 
 
 @pytest.mark.parametrize("field", [

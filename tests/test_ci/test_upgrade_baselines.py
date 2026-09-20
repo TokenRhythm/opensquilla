@@ -516,7 +516,11 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     if not node:
         pytest.skip("Node.js is required for the packaged recovery harness")
     scripts = ROOT / "desktop/electron/scripts"
-    for name in ("test-packaged-session-recovery.mjs", "session-recovery-transport-contract.mjs"):
+    for name in (
+        "test-packaged-session-recovery.mjs",
+        "session-recovery-transport-contract.mjs",
+        "session-recovery-rpc-evidence.mjs",
+    ):
         shutil.copyfile(scripts / name, tmp_path / name)
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
         "export function requiredOption(name) {\n"
@@ -531,6 +535,9 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     )
     (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
         "import assert from 'node:assert/strict';\n"
+        "export async function captureFirstSendDiagnostic(operation) {\n"
+        "try { return await operation() }\n"
+        "catch (error) { return { diagnosticError: error.message } } }\n"
         "export async function captureElectronProcessIdentity() {\n"
         "return { wrapperPid: 111, electronPid: 222 } }\n"
         "export function electronProcessSnapshot(identity) { return { ...identity } }\n"
@@ -584,6 +591,12 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     assert "packaged_session_recovery_failed_before_cleanup" in stderr
     assert "synthetic-cleanup-ran" in stderr
     assert "Error: synthetic recovery fault" in stderr
+    assert "packaged_session_recovery_failure_evidence" in stderr
+    evidence_path = tmp_path / "profile/logs/packaged-session-recovery/failure.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["ui"] == {"pageUnavailable": True}
+    assert evidence["rpc"] == {"overflow": False, "events": []}
+    assert evidence["screenshot"] == {"captured": False}
     assert not stdout
     if cleanup_fails:
         assert stderr.rindex("Error: synthetic recovery fault") > stderr.rindex(

@@ -64,6 +64,8 @@ jobs:
       - name: Verify independent installed candidate probe
         env:
           EXPECTED_SOURCE: ${{ inputs.source_sha }}
+          PRODUCER_RUN: ${{ inputs.source_run_id }}
+          GH_TOKEN: ${{ github.token }}
           EXPECTED_INSTALLER_HASH: ${{ inputs.installer_sha256 }}
           SIGNED_CANDIDATE: ${{ inputs.require_signature }}
           CANDIDATE_PROBE: ${{ matrix.probe }}
@@ -74,12 +76,14 @@ jobs:
             -CandidateInstaller $installers[0].FullName `
             -CandidateManifest candidate/audit-candidate.json `
             -SourceSha $env:EXPECTED_SOURCE -Probe $env:CANDIDATE_PROBE `
+            -SourceRunId $env:PRODUCER_RUN `
             -InstallerSha256 $env:EXPECTED_INSTALLER_HASH `
             -RequireSignature:($env:SIGNED_CANDIDATE -eq 'true')
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: candidate-${{ matrix.probe }}-${{ inputs.require_signature && 'signed' || 'unsigned' }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/candidate-${{ matrix.probe }}/evidence/
             candidate/audit-candidate.json

@@ -1688,7 +1688,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
           if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
-          python .github/scripts/windows_candidate_identity.py --installer $candidates[0].FullName --manifest release-audit/audit-candidate.json --source-sha $env:CANDIDATE_SOURCE_SHA
+          $context = .github/scripts/windows-candidate-context.ps1 -SourceSha $env:CANDIDATE_SOURCE_SHA
+          python .github/scripts/windows_candidate_identity.py --installer $candidates[0].FullName --manifest release-audit/audit-candidate.json --source-sha $env:CANDIDATE_SOURCE_SHA --workflow-sha $context.WorkflowSha --expected-version $context.Version
           if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }
           .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
           .github/scripts/verify-release-windows-upgrade.ps1 `
@@ -1702,6 +1703,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: internal-windows-upgrade-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          overwrite: true
           path: ${{ runner.temp }}/opensquilla-release-preservation-internal-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/**
           if-no-files-found: warn
           retention-days: 14

@@ -641,6 +641,20 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
 
     checkouts = 0
     for job_name, job in jobs.items():
+        if "uses" in job:
+            # A reusable verifier consumes the bound candidate SHA rather than
+            # exposing checkout steps in the caller. Keep its provenance chain
+            # subject to the same declared-needs and preflight validation.
+            assert job_name == "internal-windows-candidate-probes"
+            assert job["uses"] == "./.github/workflows/windows-candidate-probes.yml"
+            assert "steps" not in job
+            match = expression.fullmatch(job["with"]["source_sha"])
+            assert match, f"{job_name} consumes a mutable or unvalidated source"
+            needs = job["needs"]
+            assert match[1] in ([needs] if isinstance(needs, str) else needs)
+            assert_provenance(match[1], {job_name})
+            assert job["with"]["require_signature"] is True
+            continue
         for step in job["steps"]:
             if not step.get("uses", "").startswith("actions/checkout@"):
                 continue
@@ -700,7 +714,12 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     audit = jobs["audit-internal-windows-artifact"]
     assert (
         audit["if"]
-        == "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}"
+        == "${{ always() && github.event_name == 'workflow_dispatch' "
+        "&& github.event.inputs.tag == '' "
+        "&& needs.build-desktop-windows.outputs.candidate_artifact_id != '' }}"
+    )
+    assert jobs["build-desktop-windows"]["outputs"]["candidate_artifact_id"] == (
+        "${{ steps.internal-candidate.outputs.artifact-id }}"
     )
     assert "build-desktop-windows" in audit["needs"]
     assert "publish-release" not in audit["needs"]
@@ -716,7 +735,7 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
         for step in audit["steps"]
         if step.get("uses", "").startswith("actions/download-artifact@")
     )
-    assert download["with"]["name"] == "opensquilla-electron-windows"
+    assert download["with"]["name"] == "windows-signed-candidate-diagnostics"
     verify = next(
         step
         for step in audit["steps"]
@@ -724,6 +743,19 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     )
     assert verify["env"]["BASELINE_VERSION"] == "${{ matrix.baseline-version }}"
     assert verify["env"]["INSTALL_MODE"] == "${{ matrix.install-mode }}"
+    assert verify["env"]["CANDIDATE_SOURCE_SHA"] == (
+        "${{ needs.build-control-ui.outputs.source_sha }}"
+    )
+    assert "windows_candidate_identity.py" in verify["run"]
+    assert (
+        "--manifest release-audit/audit-candidate.json --source-sha $env:CANDIDATE_SOURCE_SHA"
+    ) in verify["run"]
+    assert (
+        "if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }"
+    ) in verify["run"]
+    assert verify["run"].index("windows_candidate_identity.py") < verify["run"].index(
+        "verify-windows-signatures.ps1"
+    )
     assert "verify-windows-signatures.ps1 -InstallerPath" in verify["run"]
     assert "-BaselineVersion $env:BASELINE_VERSION" in verify["run"]
     assert "-InstallMode $env:INSTALL_MODE" in verify["run"]
@@ -783,13 +815,20 @@ def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication(
     steps = jobs["build-desktop-windows"]["steps"]
     by_name = {step.get("name"): step for step in steps}
     diagnostic = by_name["Retain internal signed candidate for diagnosis"]
-    assert diagnostic["if"] == jobs["audit-internal-windows-artifact"]["if"]
+    # Upload after signature verification succeeds; downstream audits must
+    # still run after a later build-job gate fails, but only with this artifact.
+    assert diagnostic["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}"
+    )
+    assert diagnostic["id"] == "internal-candidate"
+    assert diagnostic["with"]["name"] == "windows-signed-candidate-diagnostics"
     assert (
         steps.index(by_name["Verify Windows Authenticode signatures and timestamps"])
         < steps.index(diagnostic)
         < steps.index(by_name["Gate packaged first-send renderer"])
     )
     assert diagnostic["with"]["path"].splitlines() == [
+        "dist/desktop-electron/audit-candidate.json",
         "dist/desktop-electron/*.exe",
         "dist/desktop-electron/*.blockmap",
         "dist/desktop-electron/latest.yml",
@@ -805,10 +844,17 @@ def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication(
     assert steps.index(by_name["Remove DigiCert client authentication material"]) < steps.index(
         failure_log
     )
-    for job in jobs.values():
+    for name, job in jobs.items():
         for step in job.get("steps", []):
             if step.get("uses", "").startswith("actions/download-artifact@"):
-                assert "windows-signed-candidate-diagnostics" not in json.dumps(step)
+                if name == "audit-internal-windows-artifact":
+                    assert step["with"]["name"] == "windows-signed-candidate-diagnostics"
+                else:
+                    assert "windows-signed-candidate-diagnostics" not in json.dumps(step)
+    reusable = jobs["internal-windows-candidate-probes"]
+    assert reusable["with"]["artifact_name"] == diagnostic["with"]["name"]
+    assert reusable["with"]["require_signature"] is True
+    assert reusable["if"] == jobs["audit-internal-windows-artifact"]["if"]
 
 
 def test_reused_windows_audits_require_signatures_without_signing_credentials() -> None:

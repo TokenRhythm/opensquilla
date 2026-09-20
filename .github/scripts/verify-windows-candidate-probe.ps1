@@ -3,6 +3,7 @@ param(
   [Parameter(Mandatory = $true)][string]$CandidateInstaller,
   [Parameter(Mandatory = $true)][string]$CandidateManifest,
   [Parameter(Mandatory = $true)][ValidatePattern('^[0-9a-f]{40}$')][string]$SourceSha,
+  [ValidatePattern('^([0-9]+)?$')][string]$SourceRunId = '',
   [ValidatePattern('^([0-9a-f]{64})?$')][string]$InstallerSha256 = '',
   [Parameter(Mandatory = $true)][ValidateSet('startup-compat', 'ownership', 'migration', 'session')][string]$Probe,
   [switch]$RequireSignature
@@ -16,7 +17,9 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or -not $env:RUNNER_TEMP) {
 }
 $candidate = (Resolve-Path -LiteralPath $CandidateInstaller).Path
 $manifest = (Resolve-Path -LiteralPath $CandidateManifest).Path
-$identityArgs = @('--installer', $candidate, '--manifest', $manifest, '--source-sha', $SourceSha)
+$context = .github/scripts/windows-candidate-context.ps1 -SourceSha $SourceSha -SourceRunId $SourceRunId
+$identityArgs = @('--installer', $candidate, '--manifest', $manifest, '--source-sha', $SourceSha,
+  '--workflow-sha', $context.WorkflowSha, '--expected-version', $context.Version)
 if ($InstallerSha256) { $identityArgs += @('--installer-sha256', $InstallerSha256) }
 python .github/scripts/windows_candidate_identity.py @identityArgs
 if ($LASTEXITCODE -ne 0) { throw 'Candidate provenance verification failed.' }
@@ -35,7 +38,8 @@ try {
   if (-not $install.WaitForExit(180000)) { throw 'Candidate installation deadline exceeded.' }
   if ($install.ExitCode -ne 0) { throw "Candidate installer exit $($install.ExitCode)." }
   $installed = $true
-  python .github/scripts/windows_candidate_identity.py @identityArgs --root $installRoot
+  $installedVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo((Join-Path $installRoot 'OpenSquilla.exe')).ProductVersion
+  python .github/scripts/windows_candidate_identity.py @identityArgs --root $installRoot --installed-version $installedVersion
   if ($LASTEXITCODE -ne 0) { throw 'Installed candidate bytes differ from the manifest.' }
   if ($RequireSignature) {
     .github/scripts/verify-windows-signatures.ps1 -InstalledRoot $installRoot
