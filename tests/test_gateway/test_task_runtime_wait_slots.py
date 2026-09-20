@@ -431,6 +431,8 @@ async def test_approval_terminal_denial_needs_no_slot_but_execution_always_reacq
         approval_module, "_DEFAULT_APPROVAL_QUEUE_PATH", tmp_path / "approval.sqlite",
     )
     reset_approval_queue()
+    # Prepare the real SQLite queue before timing the compute-slot handoff.
+    queue = get_approval_queue()
     published, other_started, finish_other, reacquiring = (asyncio.Event() for _ in range(4))
     events: list[Any] = []
     approval: dict[str, str] = {}
@@ -457,7 +459,7 @@ async def test_approval_terminal_denial_needs_no_slot_but_execution_always_reacq
             tool_calls.append(call.tool_use_id)
             if len(tool_calls) > 1:
                 return ToolResult(call.tool_use_id, call.tool_name, "executed")
-            approval["id"] = get_approval_queue().request("exec", {
+            approval["id"] = queue.request("exec", {
                 "toolName": call.tool_name, "command": call.arguments["command"],
                 "args": dict(call.arguments),
                 "reviewer": "auto_review" if decision == "rule_denied" else "user",
@@ -494,9 +496,9 @@ async def test_approval_terminal_denial_needs_no_slot_but_execution_always_reacq
         other = await runtime.enqueue(_envelope("other"), "other")
         await asyncio.wait_for(other_started.wait(), 2)
         if decision == "expired":
-            get_approval_queue().expire_pending(approval["id"])
+            queue.expire_pending(approval["id"])
         else:
-            get_approval_queue().resolve(approval["id"], decision == "approved")
+            queue.resolve(approval["id"], decision == "approved")
         if decision == "denied":
             await runtime.wait(first.task_id, timeout=2)
             assert not reacquiring.is_set()
