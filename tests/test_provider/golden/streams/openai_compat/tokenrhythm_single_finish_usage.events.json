@@ -22,6 +22,7 @@
     "cache_write_tokens": 0,
     "cached_tokens": 5,
     "cost_source": "provider_billed",
+    "cumulative_usage_id": "",
     "ensemble_trace": null,
     "generation_epoch": null,
     "input_tokens": 13,

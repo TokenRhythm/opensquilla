@@ -1570,7 +1570,9 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
 
     assert "routerSupported: true" in tokenrhythm_catalog
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
-    assert "model: 'deepseek-v4-pro-0813'" in tokenrhythm_catalog
+    assert "model: ROUTER_PROFILES.tokenrhythm.c1.model" in tokenrhythm_catalog
+    openrouter_catalog = _section(main_ts, "id: 'openrouter'", "id: 'openai'")
+    assert "model: ROUTER_PROFILES.openrouter.c1.model" in openrouter_catalog
     assert "desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)" in main_ts
     assert "`preset_binding = ${tomlValue(binding)}`" in router_config
     assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html

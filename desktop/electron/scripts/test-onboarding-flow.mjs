@@ -944,7 +944,7 @@ try {
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
   assert.equal(await page.locator('#modelEditor').isVisible(), false)
   assert.equal(await page.locator('#modelSummaryLabel').innerText(), '推荐模型')
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro-0813')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-flash')
   assert.deepEqual(
     await page.evaluate(() => [
       getComputedStyle(document.getElementById('providerSelectLabel')).fontSize,
@@ -1055,7 +1055,7 @@ try {
 
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm')
   assert.equal(await page.locator('#baseUrl').inputValue(), 'https://tokenrhythm.studio/v1')
-  assert.equal(await page.locator('#model').inputValue(), 'deepseek-v4-pro-0813')
+  assert.equal(await page.locator('#model').inputValue(), 'deepseek-flash')
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
@@ -1113,7 +1113,7 @@ try {
   assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
   assert.equal(await page.locator('#modelSummary').isVisible(), true)
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-v4-pro-0813')
+  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'deepseek-flash')
   await page.locator('#apiKey').fill('synthetic-tokenrhythm-key')
   assert.equal(await page.locator('.inline-search-section').isVisible(), true)
   assert.equal(await page.locator('#inlineSearchHeading').innerText(), 'Choose web search')

@@ -1497,7 +1497,14 @@ async def test_tokenrhythm_default_image_route_uses_configured_catalog_vision(
     assert routed.model == config.squilla_router.tiers["c0"]["model"]
     assert routed.metadata["image_input_mode"] == "native"
     assert routed.metadata["routed_model_vision_support"] == "supported"
-    assert routed.metadata["router_fallback_chain"] == []
+    assert routed.metadata["router_fallback_chain"] == [
+        {
+            "tier": "c1",
+            "model": "deepseek-flash",
+            "vision_support": "supported",
+            "provider": "tokenrhythm",
+        }
+    ]
 
 
 @pytest.mark.asyncio

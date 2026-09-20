@@ -1742,7 +1742,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
     id: 'tokenrhythm',
     label: 'TokenRhythm',
-    model: 'deepseek-v4-pro-0813',
+    model: ROUTER_PROFILES.tokenrhythm.c1.model,
     baseUrl: 'https://tokenrhythm.studio/v1',
     apiKeyEnv: 'TOKENRHYTHM_API_KEY',
     requiresApiKey: true,
@@ -1754,7 +1754,7 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
   {
     id: 'openrouter',
     label: 'OpenRouter',
-    model: 'deepseek/deepseek-v4-pro',
+    model: ROUTER_PROFILES.openrouter.c1.model,
     baseUrl: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     requiresApiKey: true,

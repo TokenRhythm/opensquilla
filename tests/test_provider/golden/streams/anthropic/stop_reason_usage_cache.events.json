@@ -9,6 +9,7 @@
     "cache_write_tokens": 40,
     "cached_tokens": 100,
     "cost_source": "none",
+    "cumulative_usage_id": "",
     "ensemble_trace": null,
     "generation_epoch": null,
     "input_tokens": 146,

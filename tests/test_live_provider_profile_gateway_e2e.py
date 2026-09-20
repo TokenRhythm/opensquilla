@@ -797,7 +797,7 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     assert tiers["c2"]["image_only"] is False
     assert all("supports_image" not in tiers[slot] for slot in ("c0", "c1", "c2", "c3"))
     assert (
-        data["models"]["tokenrhythm"]["deepseek-v4-pro-0813"]["context_window"]
+        data["models"]["tokenrhythm"][tiers["c1"]["model"]]["context_window"]
         == e2e.ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS
     )
     assert data["models"]["tokenrhythm"]["kimi-k2.6"]["supports_vision"] is True
