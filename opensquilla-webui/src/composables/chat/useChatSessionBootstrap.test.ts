@@ -14,6 +14,8 @@ import {
   type SessionPhaseResult,
 } from './sessionBootstrapContract'
 import { useChatSessionBootstrap } from './useChatSessionBootstrap'
+import { createConversationEventTransport } from '@/adapters/gateway/conversationEventTransport'
+import type { TransportEventHandler } from '@/adapters/gateway/transportTypes'
 
 const LIVE_READY: SessionSubscriptionOutcome = {
   authoritative: true,
@@ -95,6 +97,43 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it('does not queue another snapshot when an ordinary heartbeat arrives during a slow live transfer', async () => {
+    vi.useFakeTimers()
+    let complete!: (result: SessionSubscriptionOutcome) => void
+    const pending = new Promise<SessionSubscriptionOutcome>(resolve => { complete = resolve })
+    const reconcileSession = vi.fn(async () => LIVE_READY)
+    const h = createBootstrap({
+      subscribeSession: () => pending, reconcileSession, connectionState: ref('connected'),
+    })
+    let wildcard!: TransportEventHandler
+    const transport = createConversationEventTransport({
+      subscribe(event, listener) {
+        if (event === '*') wildcard = listener
+        return { close() {} }
+      },
+    })
+    transport.subscribe({ onEvent: event => {
+      // The real Conversation consumer requests recovery on invalid frames.
+      if (event.kind === 'invalid') void h.api.retryLive()
+    } })
+    try {
+      const run = h.api.startSessionBootstrap()
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(h.api.livePhase.value).toBe('degraded')
+      wildcard('tick', { time_ms: Date.now() }, {})
+      await vi.advanceTimersByTimeAsync(15_000)
+      complete(LIVE_READY)
+      await run.live
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.api.livePhase.value).toBe('ready')
+      expect(reconcileSession).not.toHaveBeenCalled()
+      expect(h.openSessionRead).toHaveBeenCalledOnce()
+    } finally {
+      transport.unsubscribe()
+      h.api.cancelSessionBootstrap()
+    }
+  })
+
   it('merges gaps during an initial live read into a fresh reconciliation on the same lease', async () => {
     let release!: (value: SessionSubscriptionOutcome) => void
     const initial = new Promise<SessionSubscriptionOutcome>(resolve => { release = resolve })

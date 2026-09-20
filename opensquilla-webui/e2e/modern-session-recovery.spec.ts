@@ -155,7 +155,10 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy') 
       respond(Object.hasOwn(payloads, frame.method) ? payloads[frame.method] : {})
     })
   })
-  return { sockets, requests, held, staged }
+  const tick = () => sockets.forEach(socket => socket.send(JSON.stringify({
+    type: 'event', event: 'tick', payload: { time_ms: Date.now() }, seq: 1,
+  })))
+  return { sockets, requests, held, staged, tick }
 }
 
 async function advance(page: Page, milliseconds: number) {
@@ -222,6 +225,9 @@ test('finishes a progressing 48 second transfer with its original sync revision'
     expect(piece.frame.params.sync_revision).toBe(revision)
     await advance(page, 6_000)
     if (index >= 2) await expect(notice).toHaveAttribute('data-recovery-state', 'live-degraded')
+    // Production sends an ordinary heartbeat every 30 seconds. It must not
+    // become a Conversation invalidation and queue another complete snapshot.
+    if (index === 4) gateway.tick()
     piece.send()
     // Flow credit has a scheduled flush; let the production timer run.
     await advance(page, 100)
