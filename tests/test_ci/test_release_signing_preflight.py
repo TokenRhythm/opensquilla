@@ -12,7 +12,7 @@ import shutil
 import subprocess
 from email.message import Message
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -41,7 +41,8 @@ def protocol_preflight(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         pytest.fail("Protocol preflight tests must not contact a real collector")
 
     monkeypatch.setattr(module, "build_opener", no_network)
-    monkeypatch.setattr(module.time, "sleep", no_network)
+    # Keep the retry guard local: subprocess also uses the shared time module.
+    monkeypatch.setattr(module, "time", SimpleNamespace(sleep=no_network))
     return module
 
 
