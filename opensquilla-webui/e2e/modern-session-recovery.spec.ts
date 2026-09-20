@@ -11,6 +11,7 @@ const SESSION = 'agent:main:webchat:modern-recovery'
 const OTHER = 'agent:main:webchat:modern-recovery-other'
 const GENERATION = 'synthetic-modern-stream'
 const DRAFT = 'Synthetic draft survives recovery without being submitted automatically.'
+const REPLY = 'Synthetic live reply after stale snapshot recovery.'
 const READ = 'sessions.messages.snapshot.read'
 const RESUME = 'sessions.messages.resume'
 const RELEASE = 'sessions.messages.snapshot.release'
@@ -40,7 +41,25 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
   const snapshots = new Map<string, { id: string; bytes: Buffer; subscribed: boolean }>()
   const rejectedResumes: Observed[] = []
   const heldSubscriptions: Observed[] = []
+  const sentHistory: Array<Record<string, unknown>> = []
+  const liveFrames: string[] = []
+  let activeTurn: { socket: WebSocketRoute; key: string; task: string } | null = null
+  let streamSequence = 0
+  let lastTask: Record<string, unknown> | null = null
   let faultActive = mode === 'lost-subscribe'
+  const emitTurn = (event: string, payload: Record<string, unknown>) => {
+    if (!activeTurn) throw new Error('No explicit user turn to emit')
+    const frame = JSON.stringify({ type: 'event', event, payload: {
+      key: activeTurn.key, session_key: activeTurn.key, task_id: activeTurn.task,
+      stream_generation: GENERATION, stream_seq: ++streamSequence, ...payload,
+    } })
+    liveFrames.push(frame)
+    activeTurn.socket.send(frame)
+  }
+  const metadata = () => ({ stream_generation: GENERATION, current_stream_seq: streamSequence,
+    run_status: activeTurn ? 'running' : 'idle',
+    active_task: activeTurn ? { task_id: activeTurn.task, status: 'running' } : null,
+    tasks: activeTurn ? [{ task_id: activeTurn.task, status: 'running' }] : [], last_task: lastTask })
 
   await page.routeWebSocket(/\/ws$/, socket => {
     const connection = sockets.push(socket)
@@ -153,6 +172,15 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         respond({ ...observed.params, retired: true })
         return
       }
+      if (frame.method === 'chat.send') {
+        expect(activeTurn).toBeNull()
+        activeTurn = { socket, key, task: 'synthetic-modern-send' }
+        sentHistory.push({ role: 'user', text: observed.params.message, id: 'modern-recovery-user',
+          client_message_id: observed.params.clientMessageId, turn_id: activeTurn.task })
+        respond({ accepted: true, session: key, task_id: activeTurn.task })
+        emitTurn('task.running', { status: 'running' })
+        return
+      }
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -167,16 +195,15 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
         'chat.history': chatHistoryPayload([{
           role: 'user', text: 'Synthetic cached history remains available.',
           message_id: `history-${key}`, timestamp: '2026-01-01T00:00:00Z',
-        }]),
+        }, ...(key === SESSION ? sentHistory : [])]),
         'sessions.messages.subscribe': sessionMessagesSubscribePayload(key, {
           stream_generation: GENERATION,
           ...(mode === 'lost-subscribe' ? { hydration_complete: false } : {}),
         }),
-        'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(key, metadata()),
         'sessions.messages.unsubscribe': null,
         'sessions.subscribe': { subscribed: true },
         'usage.status': { sessions: [] },
-        'chat.send': { accepted: true, session: key, task_id: 'synthetic-modern-send' },
       }
       respond(Object.hasOwn(payloads, frame.method) ? payloads[frame.method] : {})
     })
@@ -185,6 +212,19 @@ async function prepare(page: Page, mode: 'stalled' | 'progressing' | 'healthy' |
     type: 'event', event: 'tick', payload: { time_ms: Date.now() }, seq: 1,
   })))
   return { sockets, requests, held, staged, tick, rejectedResumes, heldSubscriptions,
+    beginReply: () => emitTurn('session.event.text_delta', { text: REPLY }),
+    finishReply: () => {
+      if (!activeTurn) throw new Error('No explicit user turn to finish')
+      const socket = activeTurn.socket
+      sentHistory.push({ role: 'assistant', text: REPLY, id: 'modern-recovery-answer', turn_id: activeTurn.task })
+      emitTurn('session.event.done', { reason: 'completed', text_snapshot: REPLY })
+      emitTurn('task.succeeded', { status: 'succeeded', terminal_reason: 'succeeded' })
+      lastTask = { task_id: activeTurn.task, status: 'succeeded' }
+      activeTurn = null
+      socket.send(JSON.stringify({ type: 'event', event: 'sessions.changed',
+        payload: { key: SESSION, session_key: SESSION, reason: 'task_terminal', ...metadata() } }))
+    },
+    replayTurn: () => { for (const frame of liveFrames) sockets.at(-1)!.send(frame) },
     releaseFault: () => { faultActive = false } }
 }
 
@@ -248,6 +288,34 @@ test('automatically replaces a stale snapshot after a lost subscribe and hydrate
   await advance(page, 15_000)
   expect(calls(gateway.requests, RESUME)).toHaveLength(2)
   expect(calls(gateway.requests, 'sessions.messages.hydrate')).toHaveLength(1)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(0)
+  await expect(input).toHaveValue(DRAFT)
+  expect(await input.evaluate(node => document.activeElement === node)).toBe(true)
+  expect(page.url()).toBe(originalUrl)
+
+  // A new user action must work on the recovered lease, with real consumer
+  // rendering before the terminal frame and no repeated draft submission.
+  await input.press('Enter')
+  await expect.poll(() => calls(gateway.requests, 'chat.send').length).toBe(1)
+  expect(calls(gateway.requests, 'chat.send')[0]!.params).toMatchObject({ sessionKey: SESSION, message: DRAFT })
+  await expect(input).toHaveValue('')
+  gateway.beginReply()
+  const reply = page.locator('.msg-ai-text').filter({ hasText: REPLY })
+  await expect(reply).toHaveCount(1)
+  await expect(reply).toHaveText(REPLY)
+  gateway.finishReply()
+  await advance(page, 1_000)
+  gateway.replayTurn()
+  await advance(page, 10_000)
+  await expect(reply).toHaveCount(1)
+  await expect(reply).toHaveText(REPLY)
+  await expect(page.getByText(DRAFT, { exact: true })).toHaveCount(1)
+  expect(calls(gateway.requests, 'chat.send')).toHaveLength(1)
+  await expect(send).toBeEnabled()
+  await expect(notice).toHaveCount(0)
+  expect(page.url()).toBe(originalUrl)
+  expect(await input.evaluate((node, original) => node === original, editor)).toBe(true)
+  expect(gateway.sockets).toHaveLength(1)
 })
 
 test('stays degraded beyond the foreground deadline and does not resurrect a dismissed notice', async ({ page }) => {

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { createServer } from 'node:http'
 import { basename, resolve } from 'node:path'
+import { setTimeout as delay } from 'node:timers/promises'
 
 import {
   launchPackagedCandidate,
@@ -25,6 +27,7 @@ const userDataDir = resolve(requiredOption('--user-data-dir'))
 const sessionKey = requiredOption('--session-key')
 const switchSessionKey = requiredOption('--switch-session-key')
 const label = requiredOption('--label')
+const verifyRecoveredSend = process.argv.includes('--verify-recovered-send')
 
 if (!/^[A-Za-z0-9._-]{1,80}$/.test(label)) {
   throw new Error('Label must contain only ASCII letters, digits, dot, underscore, or dash')
@@ -33,6 +36,8 @@ if (!/^[A-Za-z0-9._-]{1,80}$/.test(label)) {
 const expectedLastMessage =
   `Synthetic retained history message ${String(LONG_SESSION_MESSAGE_COUNT).padStart(4, '0')} (${label})`
 const preservedDraft = 'Synthetic draft preserved through packaged session recovery.'
+const recoveredReply = `Synthetic live reply after automatic recovery (${label}).`
+const recoveryModel = 'opensquilla-release-session-recovery-smoke'
 
 let app
 let page
@@ -52,6 +57,99 @@ let heldSubscribeRequests = 0
 let serverTickCount = 0
 const rpcEvidence = createSessionRecoveryEvidence(sessionKey)
 let faultReleased = 0
+let provider
+
+async function startRecoveryProvider() {
+  const sockets = new Set()
+  let chatRequests = 0
+  let finishResponse
+  const errors = []
+  const server = createServer(async (request, response) => {
+    let stage = 'endpoint'
+    try {
+      if (request.method === 'GET' && request.url === '/api/tags') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ models: [{ name: recoveryModel, model: recoveryModel,
+          modified_at: '2026-01-01T00:00:00Z', size: 1, digest: 'synthetic-recovery',
+          details: { context_length: 131_072 } }] }))
+        return
+      }
+      if (request.method === 'GET' && request.url === '/api/version') {
+        response.writeHead(200, { 'content-type': 'application/json' })
+        response.end(JSON.stringify({ version: '0.0.0-recovery-audit' }))
+        return
+      }
+      assert.ok(request.method === 'POST' && request.url === '/api/chat', 'Unexpected recovery provider endpoint')
+      stage = 'request-count'
+      assert.equal(++chatRequests, 1, 'Recovery must not submit or retry an additional provider request')
+      stage = 'request-body'
+      let body = ''
+      for await (const chunk of request) {
+        body += chunk
+        assert.ok(Buffer.byteLength(body) <= 4 * 1024 * 1024, 'Recovery provider request exceeds its limit')
+      }
+      const payload = JSON.parse(body)
+      stage = 'model'
+      assert.equal(payload.model, recoveryModel, 'The recovered send must use the loopback model')
+      stage = 'explicit-draft'
+      const currentUser = payload.messages?.findLast(message => message.role === 'user')?.content
+      assert.ok(typeof currentUser === 'string' && currentUser.includes(preservedDraft),
+        'The loopback provider must receive the explicitly submitted draft')
+      response.writeHead(200, { 'content-type': 'application/x-ndjson', 'cache-control': 'no-store' })
+      response.write(JSON.stringify({ model: recoveryModel,
+        message: { role: 'assistant', content: recoveredReply }, done: false }) + '\n')
+      // The driver must observe a real streamed event and visible answer before
+      // allowing completion. A terminal history reload cannot satisfy this proof.
+      finishResponse = () => response.end(JSON.stringify({ model: recoveryModel,
+        message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop',
+        prompt_eval_count: 8, eval_count: 3 }) + '\n')
+    } catch {
+      // Parser/assertion exceptions can quote request bodies. Retain only a
+      // fixed validation stage, never provider messages or prompt fragments.
+      errors.push(stage)
+      if (!response.headersSent) response.writeHead(422, { 'content-type': 'application/json' })
+      response.end(JSON.stringify({ error: 'Synthetic recovery provider rejected the request' }))
+    }
+  })
+  server.on('connection', socket => {
+    sockets.add(socket)
+    socket.once('close', () => sockets.delete(socket))
+  })
+  await new Promise((resolveListen, rejectListen) => {
+    server.once('error', rejectListen)
+    server.listen(0, '127.0.0.1', resolveListen)
+  })
+  return {
+    baseUrl: `http://127.0.0.1:${server.address().port}`,
+    count: () => chatRequests,
+    finish() { assert.ok(finishResponse, 'The provider stream must start before completion'); finishResponse() },
+    assertHealthy() { assert.deepEqual(errors, [], 'The loopback provider must accept only the explicit turn') },
+    async close() {
+      await new Promise(resolveClose => { server.close(resolveClose); for (const socket of sockets) socket.destroy() })
+    },
+  }
+}
+
+async function configureSyntheticRecoveryProvider(baseUrl) {
+  const configPath = resolve(userDataDir, 'opensquilla', 'config.toml')
+  const raw = await readFile(configPath, 'utf8')
+  assert.equal(raw.split(/\r?\n/, 1)[0], `# Synthetic ${label} release-preservation profile`,
+    'recovered-send verification requires its explicitly seeded synthetic profile')
+  const headings = [...raw.matchAll(/^\[llm\]\r?$/gm)]
+  assert.equal(headings.length, 1, 'the synthetic profile must have one LLM section')
+  const start = headings[0].index
+  const next = raw.indexOf('\n[', start + 1)
+  const end = next < 0 ? raw.length : next
+  const section = raw.slice(start, end)
+  assert.match(section, /^provider = "ollama"\r?$/m)
+  assert.ok(section.includes(`model = "${recoveryModel}"`), 'the profile must use the synthetic model')
+  const updated = section.replace(/^base_url = "http:\/\/127\.0\.0\.1:11434"\r?$/m,
+    `base_url = ${JSON.stringify(baseUrl)}`)
+  assert.notEqual(updated, section, 'the synthetic baseline endpoint must be present')
+  // Existing profile config is authoritative over Desktop's credential cache.
+  // Only this disposable send probe redirects its synthetic provider endpoint.
+  await writeFile(configPath, raw.slice(0, start) + updated + raw.slice(end), 'utf8')
+}
 
 async function captureRecoveryFailure() {
   const directory = resolve(userDataDir, 'logs', 'packaged-session-recovery')
@@ -86,15 +184,25 @@ async function captureRecoveryFailure() {
 }
 
 try {
+  if (verifyRecoveredSend) {
+    provider = await startRecoveryProvider()
+    await configureSyntheticRecoveryProvider(provider.baseUrl)
+  }
   app = await launchPackagedCandidate({
     executablePath,
     userDataDir,
-    model: 'opensquilla-release-session-recovery-smoke',
+    model: recoveryModel,
+    ...(provider ? { baseUrl: provider.baseUrl, disableNetworkObservability: true, scrubProviderSecrets: true } : {}),
     env: {
       // A release preflight must exercise production deadlines, not the app's
       // ordinary testing shortcuts or mocked timer policy.
       GITHUB_ACTIONS: '0',
       OPENSQUILLA_TESTING: '0',
+      // Match the existing first-send gate's declared synthetic model capacity.
+      // The retained 320-message fixture must reach this loopback provider;
+      // an unknown model's conservative 8K fallback would reject it pre-send.
+      ...(provider ? { OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: '131072',
+        OPENSQUILLA_LLM_MAX_TOKENS: '4096' } : {}),
     },
   })
   processIdentity = await captureElectronProcessIdentity(app)
@@ -423,6 +531,47 @@ try {
     'the retained message 0320 must remain inside the recovered conversation viewport',
   )
 
+  let recoveredUserTurn
+  if (verifyRecoveredSend) {
+    assert.equal(rpcEvidence.sendCount(), 0, 'automatic recovery must never send or resend a user message')
+    assert.equal(provider.count(), 0, 'automatic recovery must not invoke the model')
+    assert.equal(await page.getByText(expectedLastMessage, { exact: true }).count(), 1,
+      'automatic recovery must not duplicate retained history')
+    const userAction = rpcEvidence.mark('explicit-user-send')
+    await composer.press('Enter')
+    const reply = page.locator('.msg-ai-text').filter({ hasText: recoveredReply })
+    await waitFor(async () => {
+      if (await reply.count() !== 1 || !await reply.isVisible()) return false
+      rpcEvidence.assertUserTurn(userAction, { complete: false })
+      return true
+    }, 'the recovered session to consume a new live streamed reply', SESSION_RECOVERY_TIMEOUT_MS)
+    assert.equal((await reply.innerText()).trim(), recoveredReply,
+      'the streamed answer must contain the provider text exactly once')
+    assert.equal(await composer.inputValue(), '', 'only the explicit send may consume the draft')
+    provider.finish()
+    await waitFor(async () => {
+      if (await sendButton.isDisabled() || await reply.count() !== 1) return false
+      recoveredUserTurn = rpcEvidence.assertUserTurn(userAction)
+      return true
+    }, 'the explicitly sent recovery turn to finish', SESSION_RECOVERY_TIMEOUT_MS)
+    // Permit the real turn-committed/history reconciliation to settle, then
+    // verify it has not repeated the user send or the visible assistant reply.
+    await delay(2_000)
+    recoveredUserTurn = rpcEvidence.assertUserTurn(userAction)
+    assert.equal(rpcEvidence.sendCount(), 1)
+    assert.equal(provider.count(), 1)
+    provider.assertHealthy()
+    assert.equal(await reply.count(), 1, 'live completion and persisted history must render one answer')
+    assert.equal((await reply.innerText()).trim(), recoveredReply,
+      'history reconciliation must not append the streamed text a second time')
+    assert.equal(await page.getByText(preservedDraft, { exact: true }).count(), 1,
+      'the explicit user message must render exactly once')
+    assert.equal(page.url(), recoveryUrl)
+    assert.equal(await composer.evaluate((node, original) => node === original, retainedComposer), true)
+    assert.equal(await page.locator('[data-testid="chat-session-recovery-status"]').count(), 0)
+    recoveryTransportSample()
+  }
+
   recoveryResult = {
     ok: true,
     executable: basename(executablePath),
@@ -442,6 +591,7 @@ try {
     recoveredTransport,
     recoveredViewportSample,
     recoveredRpc,
+    ...(recoveredUserTurn ? { recoveredUserTurn, providerChatRequests: provider.count() } : {}),
     rpcEvidence: rpcEvidence.snapshot(),
   }
 } catch (error) {
@@ -471,6 +621,7 @@ try {
     // Keep the recovery failure primary when cleanup also fails.
     runError ??= error
   }
+  await provider?.close()
 }
 
 if (runError) throw runError

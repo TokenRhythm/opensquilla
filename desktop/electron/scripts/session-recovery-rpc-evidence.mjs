@@ -6,7 +6,9 @@ const READ = 'sessions.messages.snapshot.read'
 const RESUME = 'sessions.messages.resume'
 const RELEASE = 'sessions.messages.snapshot.release'
 const UNSUBSCRIBE = 'sessions.messages.unsubscribe'
-const METHODS = new Set([SUBSCRIBE, HYDRATE, READ, RESUME, RELEASE, UNSUBSCRIBE, 'chat.history'])
+const SEND = 'chat.send'
+const METHODS = new Set([SUBSCRIBE, HYDRATE, READ, RESUME, RELEASE, UNSUBSCRIBE, 'chat.history', SEND])
+const LIVE_EVENTS = new Set(['session.event.text_delta', 'session.event.done', 'session.event.turn_committed'])
 
 // Keep diagnostic evidence limited to the synthetic target's RPC control flow.
 // Never retain connection credentials, lease tokens, messages or snapshot data.
@@ -40,6 +42,13 @@ export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
     if (!held) pending.set(`${socket}:${frame.id}`, item)
   }
   function response(socket, frame) {
+    if (frame?.type === 'event' && LIVE_EVENTS.has(frame.event)
+      && (frame.payload?.key ?? frame.payload?.session_key) === sessionKey) {
+      append({ direction: 'event', socket, event: frame.event,
+        task: identifier(frame.payload?.task_id),
+        streamSequence: Number.isSafeInteger(frame.payload?.stream_seq) ? frame.payload.stream_seq : undefined })
+      return
+    }
     if (frame?.type !== 'res') return
     const key = `${socket}:${frame.id}`
     const item = pending.get(key)
@@ -51,8 +60,34 @@ export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
       snapshot: identifier(frame.payload?.snapshot_id) ?? item.snapshot,
       ...(typeof frame.payload?.hydration_complete === 'boolean'
         ? { hydrationComplete: frame.payload.hydration_complete } : {}),
+      ...(item.method === SEND ? { accepted: frame.payload?.accepted === true,
+        task: identifier(frame.payload?.task_id) } : {}),
       ...(frame.ok !== true ? { errorCode: identifier(frame.error?.code) } : {}),
     })
+  }
+  const sendCount = () => events.filter(item => item.direction === 'request' && item.method === SEND).length
+  function assertUserTurn(after, { complete = true } = {}) {
+    assert.equal(overflow, false, 'recovery RPC evidence must be complete')
+    const turn = events.filter(item => item.sequence > after)
+    const sends = turn.filter(item => item.direction === 'request' && item.method === SEND)
+    assert.equal(sends.length, 1, 'explicit user action must send exactly one request')
+    const accepted = turn.find(item => item.direction === 'response' && item.method === SEND
+      && item.requestSequence === sends[0].sequence && item.ok && item.accepted && item.task)
+    assert.ok(accepted, 'the recovered Gateway must accept the explicit user send')
+    const live = turn.filter(item => item.direction === 'event' && item.task === accepted.task
+      && item.socket === accepted.socket)
+    assert.ok(live.some(item => item.event === 'session.event.text_delta'),
+      'the accepted turn must deliver a new live text event')
+    if (complete) {
+      assert.ok(live.some(item => item.event === 'session.event.done'),
+        'the accepted turn must deliver its live terminal event')
+      assert.ok(live.some(item => item.event === 'session.event.turn_committed'),
+        'the accepted turn must deliver its durable commit event')
+    }
+    return { chatSendCount: sends.length, task: accepted.task,
+      liveTextEvents: live.filter(item => item.event === 'session.event.text_delta').length,
+      liveTerminalEvents: live.filter(item => item.event === 'session.event.done').length,
+      committedEvents: live.filter(item => item.event === 'session.event.turn_committed').length }
   }
   function metadataRecovered(after) {
     return events.some(ack => ack.sequence > after && ack.direction === 'response'
@@ -83,7 +118,7 @@ export function createSessionRecoveryEvidence(sessionKey, now = Date.now) {
       installedSnapshot: installed.snapshot, metadataRecovered: true }
   }
   return {
-    request, response, metadataRecovered, assertRecovered,
+    request, response, metadataRecovered, assertRecovered, sendCount, assertUserTurn,
     mark: stage => append({ stage }),
     snapshot: () => ({ overflow, events: events.map(item => ({ ...item })) }),
   }

@@ -204,6 +204,12 @@ def test_startup_recovery_and_migration_are_independent_required_candidate_probe
     assert "always()" in signed["internal-windows-candidate-probes"]["if"]
     assert "candidate_artifact_id" in signed["internal-windows-candidate-probes"]["if"]
     assert "internal-windows-candidate-probes" in signed["internal-windows-acceptance"]["needs"]
+    controller = (ROOT / ".github/scripts/verify-windows-candidate-probe.ps1").read_text()
+    recovery_command = next(
+        line for line in controller.splitlines()
+        if "node desktop/electron/scripts/test-packaged-session-recovery.mjs" in line
+    )
+    assert "--verify-recovered-send" in recovery_command
 
 
 def test_candidate_probe_inputs_invalidate_ci_attestations():

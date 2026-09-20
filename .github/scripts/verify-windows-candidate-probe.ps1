@@ -74,7 +74,7 @@ try {
       $userData = Join-Path $evidence 'user-data'
       python .github/scripts/verify-release-profile-preservation.py seed --home (Join-Path $userData 'opensquilla') --label candidate-session --baseline-version 0.5.4
       if ($LASTEXITCODE -ne 0) { throw 'Session fixture seed failed.' }
-      node desktop/electron/scripts/test-packaged-session-recovery.mjs --executable $app --user-data-dir $userData --label candidate-session --session-key agent:main:webchat:release-recovery-long-session --switch-session-key agent:main:webchat:release-recovery-switch-session
+      node desktop/electron/scripts/test-packaged-session-recovery.mjs --executable $app --user-data-dir $userData --label candidate-session --session-key agent:main:webchat:release-recovery-long-session --switch-session-key agent:main:webchat:release-recovery-switch-session --verify-recovered-send
       if ($LASTEXITCODE -ne 0) { throw 'Installed session recovery gate failed.' }
     }
   }

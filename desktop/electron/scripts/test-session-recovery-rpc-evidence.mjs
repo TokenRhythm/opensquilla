@@ -65,7 +65,35 @@ assert.equal(wrongSocket.metadataRecovered(0), false)
 wrongSocket.response(0, { type: 'res', id: 'same-id', ok: true, payload: { hydration_complete: true } })
 assert.equal(wrongSocket.metadataRecovered(0), true)
 
+const userTurn = createSessionRecoveryEvidence(KEY)
+assert.equal(userTurn.sendCount(), 0)
+const userAction = userTurn.mark('explicit-user-send')
+const send = { type: 'req', id: 'send-1', method: 'chat.send',
+  params: { sessionKey: KEY, message: 'SECRET-DRAFT', token: 'SECRET-TOKEN' } }
+userTurn.request(0, send)
+userTurn.response(0, { type: 'res', id: 'send-1', ok: true,
+  payload: { accepted: true, task_id: 'synthetic-turn' } })
+const live = (task, event = 'session.event.text_delta') => ({ type: 'event', event,
+  payload: { key: KEY, task_id: task, stream_seq: 1, text: 'SECRET-REPLY' } })
+userTurn.response(0, live('another-turn'))
+assert.throws(() => userTurn.assertUserTurn(userAction), /new live text event/)
+userTurn.response(1, live('synthetic-turn'))
+assert.throws(() => userTurn.assertUserTurn(userAction), /new live text event/)
+userTurn.response(0, live('synthetic-turn'))
+assert.throws(() => userTurn.assertUserTurn(userAction), /live terminal event/)
+assert.equal(userTurn.assertUserTurn(userAction, { complete: false }).liveTextEvents, 1)
+userTurn.response(0, live('synthetic-turn', 'session.event.done'))
+assert.throws(() => userTurn.assertUserTurn(userAction), /durable commit event/)
+userTurn.response(0, live('synthetic-turn', 'session.event.turn_committed'))
+assert.deepEqual(userTurn.assertUserTurn(userAction), {
+  chatSendCount: 1, task: 'synthetic-turn', liveTextEvents: 1, liveTerminalEvents: 1, committedEvents: 1,
+})
+assert.equal(userTurn.sendCount(), 1)
+assert.doesNotMatch(JSON.stringify(userTurn.snapshot()), /SECRET|message|token|text":/)
+userTurn.request(0, { ...send, id: 'send-2' })
+assert.throws(() => userTurn.assertUserTurn(userAction), /exactly one request/)
+
 for (let index = 0; index < 1_001; index++) recovered.evidence.mark('bounded-diagnostic')
 assert.equal(recovered.evidence.snapshot().events.length, 1_000)
 assert.throws(() => recovered.evidence.assertRecovered(0), /evidence must be complete/)
-console.log('Session recovery RPC evidence contracts passed (10 cases)')
+console.log('Session recovery RPC evidence contracts passed (including recovered live send)')
