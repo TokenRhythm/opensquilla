@@ -35,8 +35,8 @@
     "katex": "^0.18.7",
     "marked": "^18.0.13",
     "pinia": "^4.0.3",
-    "vue": "^3.5.42",
-    "vue-i18n": "^11.4.10",
+    "vue": "^3.5.43",
+    "vue-i18n": "^11.4.12",
     "vue-router": "^5.3.1"
   },
   "devDependencies": {
@@ -49,7 +49,7 @@
     "json-schema-to-typescript-legacy": "npm:json-schema-to-typescript@15.0.4",
     "typescript": "7.0.2",
     "vite": "^8.3.0",
-    "vitest": "^5.0.0",
+    "vitest": "^5.0.1",
     "vue-tsc": "^3.3.11"
   }
 }
