@@ -1,9 +1,11 @@
 import { TurnCommandError } from '@/modules/turnCommands'
 import { useToasts } from '@/composables/useToasts'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
-import { ref } from 'vue'
-import { describe, expect, it, vi } from 'vitest'
+import { computed, ref } from 'vue'
+import { createPinia, setActivePinia } from 'pinia'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnotations'
 import type { Attachment, ChatMessage } from '@/types/chat'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { UseChatSendOptions } from './useChatSend'
@@ -111,6 +113,125 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
   return { api: useChatSend(options), options, rpc }
 }
 
+describe('sending with empty page annotation drafts', () => {
+  beforeEach(() => {
+    const values = new Map<string, string>()
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => values.set(key, value),
+      removeItem: (key: string) => values.delete(key),
+    })
+    setActivePinia(createPinia())
+  })
+
+  afterEach(() => vi.unstubAllGlobals())
+
+  async function createDraftHarness(overrides: Partial<UseChatSendOptions> = {}) {
+    const store = useArtifactPromptAnnotationsStore()
+    const sessionKey = 'agent:main:webchat:test'
+    const draft = {
+      annotationId: 'empty-draft', sessionKey, documentId: 'document-1',
+      documentName: 'page.html', resourceId: 'document:document-1', body: ' \n\t ',
+      selection: {
+        selectionId: 'selection-1', targetRef: 'target-1', tagName: 'h1',
+        elementPath: 'h1', selectionText: 'Welcome', locatorHint: 'h1',
+      },
+    }
+    await store.create(draft)
+    const harness = createHarness({
+      draftIds: computed(() => store.sendableDraftsForSession(sessionKey)
+        .map(item => item.annotationId)),
+      sendBlockedReason: computed(() => store.sendBlockedReason(sessionKey)),
+      preparePromptAnnotationsForSend: ids => store.prepareForSend(ids),
+      promptAnnotationSnapshots: ids => store.snapshotsForIds(ids),
+      acknowledgePromptAnnotations: snapshots => { store.acknowledgeSent(snapshots) },
+      ...overrides,
+    })
+    return { ...harness, store, draft }
+  }
+
+  it('sends populated annotations and preserves the empty draft for later editing', async () => {
+    const harness = await createDraftHarness()
+    await harness.store.create({
+      ...harness.draft, annotationId: 'ready-draft', body: 'Enlarge this heading',
+    })
+    await harness.api.onSend()
+    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'Enlarge this heading',
+      pageContext: expect.objectContaining({
+        annotations: [{ text: 'Enlarge this heading', selectionText: 'Welcome', locatorHint: 'h1' }],
+      }),
+    }))
+    expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
+  })
+
+  it('sends ordinary text while keeping empty annotations out of the payload', async () => {
+    const harness = await createDraftHarness({ inputText: ref('Update the page title') })
+    await harness.api.onSend()
+    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: 'Update the page title',
+    }))
+    const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
+    expect(params).not.toHaveProperty('pageContext')
+    expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
+  })
+
+  it('sends restored instructions without preparing an expired automatic screenshot', async () => {
+    const prepare = vi.fn<NonNullable<UseChatSendOptions['prepareAttachmentsForSend']>>(async () => true)
+    const harness = await createDraftHarness({ prepareAttachmentsForSend: prepare })
+    await harness.store.create({
+      ...harness.draft, annotationId: 'restored-draft', body: 'Enlarge this heading',
+    })
+    localStorage.setItem('opensquilla.page-annotation-drafts.v1', JSON.stringify([
+      harness.store.annotations['empty-draft'],
+      {
+        ...harness.store.annotations['restored-draft'],
+        screenshotAttachment: {
+          kind: 'staged', local_id: -1, name: 'page-selection.png', mime: 'image/png',
+          file_uuid: 'expired-capture', expires_at: '2000-01-01T00:00:00Z',
+        },
+      },
+    ]))
+    harness.store.reset()
+
+    await harness.api.onSend()
+    const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
+    expect(params.message).toBe('Enlarge this heading')
+    expect(params.pageContext).toMatchObject({
+      targetRef: 'target-1',
+      annotations: [{ text: 'Enlarge this heading', selectionText: 'Welcome', locatorHint: 'h1' }],
+    })
+    expect(params.attachments ?? []).toEqual([])
+    expect(prepare.mock.calls.every(([options]) => !options?.attachments?.length)).toBe(true)
+    expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
+  })
+
+  it('sends ordinary attachments while empty annotations are present', async () => {
+    const reference: Attachment = {
+      kind: 'staged', local_id: 1, name: 'reference.png', mime: 'image/png',
+      file_uuid: 'reference-file',
+    }
+    const harness = await createDraftHarness({ pendingAttachments: ref([reference]) })
+    await harness.api.onSend()
+    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      attachments: [
+        { file_uuid: 'reference-file', type: 'image/png', mime: 'image/png', name: 'reference.png' },
+      ],
+    }))
+    const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
+    expect(params).not.toHaveProperty('pageContext')
+    expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
+  })
+
+  it('does not send an empty message when the only input is an empty annotation', async () => {
+    const harness = await createDraftHarness()
+    await harness.api.onSend()
+    expect(harness.rpc.call).not.toHaveBeenCalled()
+    expect(harness.options.messages.value).toEqual([])
+    expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
+  })
+})
+
 describe('ordinary page annotation input', () => {
   it('sends text and locators through pageContext and acknowledges the immutable batch', async () => {
     const harness = createHarness()
@@ -129,24 +250,21 @@ describe('ordinary page annotation input', () => {
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('promptAnnotationIds')
     expect(params).not.toHaveProperty('documentContext')
+    expect(params.attachments ?? []).toEqual([])
+    expect(harness.options.messages.value[0]?.attachments ?? []).toEqual([])
     expect(harness.options.acknowledgePromptAnnotations).toHaveBeenCalledWith(
       [snapshot('annotation-2', 0), snapshot('annotation-1', 1)],
       'agent:main:webchat:test', undefined,
     )
   })
 
-  it('sends a captured page and an explicit reference image as ordinary staged attachments', async () => {
-    const capture: Attachment = {
-      kind: 'staged', local_id: -1, name: 'page-selection.png', mime: 'image/png',
-      file_uuid: 'capture-file',
-    }
+  it('sends an explicitly attached reference image alongside page annotations', async () => {
     const reference: Attachment = {
       kind: 'staged', local_id: 1, name: 'reference.png', mime: 'image/png',
       file_uuid: 'reference-file',
     }
     const prepare = vi.fn(async () => true)
     const harness = createHarness({
-      annotationAttachments: () => [capture],
       pendingAttachments: ref([reference]),
       prepareAttachmentsForSend: prepare,
     })
@@ -154,23 +272,18 @@ describe('ordinary page annotation input', () => {
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params.attachments).toEqual([
       { file_uuid: 'reference-file', type: 'image/png', mime: 'image/png', name: 'reference.png' },
-      { file_uuid: 'capture-file', type: 'image/png', mime: 'image/png', name: 'page-selection.png' },
     ])
     expect(JSON.stringify(params.pageContext)).not.toContain('dataBase64')
-    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ attachments: [reference, capture] }))
-    expect(harness.options.messages.value[0]?.attachments).toHaveLength(2)
+    expect(prepare).toHaveBeenCalledWith(expect.objectContaining({ attachments: [reference] }))
+    expect(harness.options.messages.value[0]?.attachments).toHaveLength(1)
   })
 
-  it('freezes screenshot uploads into the ordinary busy follow-up queue', async () => {
-    const capture: Attachment = {
-      kind: 'staged', local_id: -1, name: 'page-selection.png', mime: 'image/png',
-      file_uuid: 'capture-file',
-    }
-    const harness = createHarness({ annotationAttachments: () => [capture] })
+  it('queues page annotations without adding a screenshot attachment', async () => {
+    const harness = createHarness()
     harness.options.stream.isStreaming.value = true
     await harness.api.onSend()
     expect(harness.options.enqueuePendingInput).toHaveBeenCalledWith(
-      '', undefined, expect.objectContaining({ attachments: [capture], pageContext: expect.any(Object) }),
+      '', undefined, expect.objectContaining({ attachments: [], pageContext: expect.any(Object) }),
     )
     expect(harness.rpc.call).not.toHaveBeenCalled()
   })
