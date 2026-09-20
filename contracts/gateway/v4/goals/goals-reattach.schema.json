@@ -195,9 +195,6 @@
         "updated_at": {"type": "integer", "minimum": 0},
         "finishedAt": {"type": ["integer", "null"], "minimum": 0},
         "finished_at": {"type": ["integer", "null"], "minimum": 0},
-        "tokenBudget": {"type": ["integer", "null"], "minimum": 1},
-        "executionPolicy": {"enum": ["foreground", "background"]},
-        "budgetTokensUsed": {"type": "integer", "minimum": 0},
         "usageCoverage": {"enum": ["complete", "partial_history", "partial_usage"]},
         "usageAccountingStartedAtMs": {"type": ["integer", "null"], "minimum": 0}
       },

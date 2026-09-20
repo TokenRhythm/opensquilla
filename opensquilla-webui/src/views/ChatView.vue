@@ -554,15 +554,6 @@
         />
       </div>
     </Transition>
-    <details v-if="goalDraftArmed && !shareMode && (goalTokenBudgetSupported || goalBackgroundExecutionSupported)" class="goal-draft-settings">
-      <summary>{{ t('chat.goal.settings') }}</summary>
-      <GoalExecutionSettings
-        v-model="goalDraftSettings"
-        :disabled="goalBusy"
-        :token-budget-supported="goalTokenBudgetSupported"
-        :background-execution-supported="goalBackgroundExecutionSupported"
-      />
-    </details>
     <Transition name="goal-run-dock">
       <div v-if="activeGoalRun" ref="goalRunDockRef" class="goal-run-dock">
         <GoalRibbon
@@ -572,9 +563,6 @@
           :plan-mode-active="initialCollaborationMode === 'plan'"
           :connection-takeover-available="goalConnectionTakeoverAvailable"
           :reattaching="goalReattaching"
-          :token-budget-supported="goalTokenBudgetSupported"
-          :background-execution-supported="goalBackgroundExecutionSupported"
-          @edit-open="prepareGoalExecutionSettings"
           @edit="editGoalFromRibbon"
           @pause="pauseGoal"
           @resume="resumeGoal"
@@ -867,10 +855,8 @@ import MetaPreflightCard from '@/components/chat/MetaPreflightCard.vue'
 import MetaRibbon from '@/components/chat/MetaRibbon.vue'
 import MetaSkillSetupCard from '@/components/chat/MetaSkillSetupCard.vue'
 import GoalRibbon from '@/components/chat/GoalRibbon.vue'
-import GoalExecutionSettings from '@/components/chat/GoalExecutionSettings.vue'
 import TaskProgressRibbon from '@/components/chat/TaskProgressRibbon.vue'
 import { useChatTaskProgress } from '@/composables/chat/useChatTaskProgress'
-import type { GoalExecutionOptions } from '@/modules/goalCenter'
 import GoalOutcomeNotice from '@/components/chat/GoalOutcomeNotice.vue'
 import PendingQueue from '@/components/chat/PendingQueue.vue'
 import PlanCard from '@/components/chat/PlanCard.vue'
@@ -3446,10 +3432,6 @@ const chatGoals = useChatGoals({
 applyGoalSnapshot = snapshot => { chatGoals.applyHydration(snapshot) }
 const {
   draftArmed: goalDraftArmed,
-  draftSettings: goalDraftSettings,
-  tokenBudgetSupported: goalTokenBudgetSupported,
-  backgroundExecutionSupported: goalBackgroundExecutionSupported,
-  prepareExecutionSettings: prepareGoalExecutionSettings,
   goal: currentGoalRun,
   activeGoal: activeGoalRun,
   lastGoal: lastGoalRun,
@@ -3473,11 +3455,10 @@ disarmGoalDraftForMetaRestore = disarmGoalMode
 async function editGoalFromRibbon(
   objective: string,
   settle?: (accepted: boolean) => void,
-  executionOptions?: GoalExecutionOptions,
 ) {
   let accepted = false
   try {
-    accepted = await editGoal(objective, executionOptions)
+    accepted = await editGoal(objective)
     if (accepted) {
       pushToast(t('chat.goal.editNextTurn'), { tone: 'info', duration: 6000 })
     }
@@ -7841,19 +7822,6 @@ watch(
 <style scoped src="../styles/chat-view.css"></style>
 
 <style scoped>
-.goal-draft-settings {
-  width: var(--chat-col, min(calc(100% - 48px), 980px));
-  max-width: 100%;
-  box-sizing: border-box;
-  margin: var(--sp-2) auto;
-  padding: var(--sp-2);
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-}
-.goal-draft-settings summary {
-  min-height: 44px;
-  cursor: pointer;
-}
 
 /* No shared sr-only utility exists in this repo (each component scopes its
    own), so the completion announcer's clip-out lives here: zero visual

@@ -190,8 +190,6 @@ async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> di
     config = getattr(service, "config", None)
     return {
         "supported": True,
-        "tokenBudgetSupported": True,
-        "backgroundExecutionSupported": True,
         "executionEnabled": bool(service.execution_enabled),
         "maxTurns": int(getattr(config, "max_turns", 50)),
         "runtimeBudgetSeconds": int(getattr(config, "runtime_budget_seconds", 3600)),
@@ -259,27 +257,21 @@ def _objective_param(params: dict | None) -> str:
         ) from exc
 
 
-def _goal_settings(params: dict | None) -> dict[str, Any]:
-    from opensquilla.session.goals import validate_goal_budget
-
+def _reject_retired_goal_options(params: dict | None) -> None:
     values = _require_params(params)
-    result: dict[str, Any] = {}
-    if "tokenBudget" in values:
-        try:
-            result["tokenBudget"] = validate_goal_budget(values["tokenBudget"])
-        except GoalValidationError as exc:
-            raise RpcHandlerError(exc.code, str(exc), retryable=False, accepted=False) from exc
-    if "executionPolicy" in values:
-        if values["executionPolicy"] not in {"foreground", "background"}:
-            raise ValueError("executionPolicy must be foreground or background")
-        result["executionPolicy"] = values["executionPolicy"]
-    return result
+    if any(field in values for field in ("tokenBudget", "executionPolicy")):
+        raise RpcHandlerError(
+            "UNSUPPORTED_GOAL_OPTIONS",
+            "Goal tokenBudget and executionPolicy options are no longer supported",
+            retryable=False,
+            accepted=False,
+        )
 
 
 async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
     service = _goal_service(ctx)
     objective = _objective_param(params)
-    settings = _goal_settings(params)
+    _reject_retired_goal_options(params)
     client_request_id = _uuid_v4_param(
         params,
         "clientRequestId",
@@ -300,8 +292,6 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
             client_request_id=client_request_id,
             client_message_id=client_message_id,
             source_kind=_source_kind(params),
-            token_budget=settings.get("tokenBudget"),
-            execution_policy=settings.get("executionPolicy", "foreground"),
         ),
         service=service,
     )
@@ -332,6 +322,7 @@ def _mutation_params(params: dict | None) -> tuple[str, str, int, str]:
 
 
 async def _handle_goals_edit(params: dict | None, ctx: RpcContext) -> dict:
+    _reject_retired_goal_options(params)
     service = _goal_service(ctx)
     key, goal_id, revision, request_id = _mutation_params(params)
     objective = _objective_param(params)
@@ -346,7 +337,6 @@ async def _handle_goals_edit(params: dict | None, ctx: RpcContext) -> dict:
             client_request_id=request_id,
             source_scope=_source_scope(service, ctx, source_kind),
             source_kind=source_kind,
-            settings=_goal_settings(params),
         ),
         service=service,
     )

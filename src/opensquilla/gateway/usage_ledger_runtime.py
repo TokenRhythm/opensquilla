@@ -334,7 +334,7 @@ class SessionUsageEventSink:
             await self._notify_goal_usage(record)
         except Exception:
             # A finished provider call with an unwritten receipt must not look
-            # like a live, fully accounted request to Goal budget admission.
+            # like a live, fully accounted request in Goal usage coverage.
             # Reuse the existing ledger state; the bounded finalize retry can
             # still replace unknown with its exact receipt later.
             with contextlib.suppress(Exception):

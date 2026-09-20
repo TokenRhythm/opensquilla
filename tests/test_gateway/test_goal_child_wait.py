@@ -32,7 +32,7 @@ from tests.test_gateway.test_goal_rpc import (
 
 @asynccontextmanager
 async def _child_group_stack(
-    tmp_path, monkeypatch, *, record_usage=False, execution_policy="foreground",
+    tmp_path, monkeypatch, *, record_usage=False,
 ):
     parent_started = asyncio.Event()
     release_parent = asyncio.Event()
@@ -125,7 +125,7 @@ async def _child_group_stack(
 
         try:
             created = await _handle_goals_set(
-                {**_set_params(), "executionPolicy": execution_policy}, stack.context,
+                _set_params(), stack.context,
             )
             await asyncio.wait_for(parent_started.wait(), timeout=3)
             yield SimpleNamespace(
@@ -202,7 +202,7 @@ async def test_child_synthesis_usage_settles_under_its_own_goal_root(tmp_path, m
         await asyncio.wait_for(state.continuation_started.wait(), timeout=3)
         goal = await state.stack.storage.get_goal(SOURCE_KEY)
         assert goal is not None
-        assert goal.total_tokens == goal.budget_tokens_used == 10
+        assert goal.total_tokens == 10
         assert goal.turns_started == 3 and goal.turns_settled == 2
         await state.manager.drain(timeout=3)
         assert not await state.manager.active_group_ids(SOURCE_KEY)
@@ -313,17 +313,16 @@ async def _disconnect_owner_and_open_controller(stack):
     return controller
 
 
-async def test_disconnected_background_clear_cannot_reclaim_goal_from_late_child(
+async def test_disconnected_clear_cannot_reclaim_goal_from_late_child(
     tmp_path, monkeypatch,
 ):
     async with _child_group_stack(
-        tmp_path, monkeypatch, execution_policy="background",
+        tmp_path, monkeypatch,
     ) as state:
         stack = state.stack
         controller = await _disconnect_owner_and_open_controller(stack)
         try:
             before = await stack.service.snapshot(await stack.storage.get_goal(SOURCE_KEY))
-            assert before["executionPolicy"] == "background"
             response = await _handle_goals_clear(
                 _mutation_params(before, request_index=2), controller,
             )
@@ -352,11 +351,11 @@ async def test_disconnected_background_clear_cannot_reclaim_goal_from_late_child
 
 
 @pytest.mark.parametrize(
-    ("parent_goal", "background_disconnected"),
+    ("parent_goal", "owner_disconnected"),
     [("none", False), ("current", False), ("replaced", False), ("current", True)],
 )
 async def test_public_stop_releases_old_group_without_reviving_its_goal(
-    parent_goal, background_disconnected, tmp_path, monkeypatch,
+    parent_goal, owner_disconnected, tmp_path, monkeypatch,
 ):
     from opensquilla.gateway.routing import RouteEnvelope, SourceKind
     from opensquilla.gateway.rpc_sessions import _handle_sessions_abort_contract
@@ -409,9 +408,7 @@ async def test_public_stop_releases_old_group_without_reviving_its_goal(
                 ), "Start ordinary child investigation")
                 await stack.runtime.wait(parent.task_id, timeout=2)
             created = await _handle_goals_set(
-                {**_set_params(), "executionPolicy": (
-                    "background" if background_disconnected else "foreground"
-                )}, stack.context,
+                _set_params(), stack.context,
             )
             await stack.runtime.wait(created["taskId"], timeout=2)
             if parent_goal == "replaced":
@@ -423,7 +420,7 @@ async def test_public_stop_releases_old_group_without_reviving_its_goal(
                 await stack.runtime.wait(created["taskId"], timeout=2)
             await asyncio.gather(*list(stack.service._kick_tasks.values()))
             assert not continuation_started.is_set()
-            if background_disconnected:
+            if owner_disconnected:
                 controller = await _disconnect_owner_and_open_controller(stack)
             parent_task_id = calls[0].task_id
             params = {"key": SOURCE_KEY, "taskId": parent_task_id, "scope": "task"}

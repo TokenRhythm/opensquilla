@@ -545,7 +545,7 @@
       "lifecycle": "stable",
       "name": "goals.capabilities",
       "schema": "goals/goals-capabilities.schema.json",
-      "schemaSha256": "465c8714e0e4086d03606c6efc00d8ea40ac7ebfcde6878d1d01ae4abe7d8248"
+      "schemaSha256": "9bb8d1e2c0e3562294de5930544d304fe8a6c7c9cc8e6c97677262a7b6baec38"
     },
     {
       "lifecycle": "stable",
@@ -557,7 +557,7 @@
       "lifecycle": "stable",
       "name": "goals.edit",
       "schema": "goals/goals-edit.schema.json",
-      "schemaSha256": "b69e352c2bc3589fdbb23e8cd0ee606a00a8bbce228418f4c5704fbce296772e"
+      "schemaSha256": "7062b83d81ef052dc5f875c38561b1669cbde213c43d4df265d5e916bd038071"
     },
     {
       "lifecycle": "stable",
@@ -569,7 +569,7 @@
       "lifecycle": "stable",
       "name": "goals.reattach",
       "schema": "goals/goals-reattach.schema.json",
-      "schemaSha256": "1705fd533c9c24caed6f139803802c6b1a6cb9f54a0188902256bfa7491c416b"
+      "schemaSha256": "19d549171295dc04698683a8781c25ca72fcbeccd50eeedffed31602d7dd0726"
     },
     {
       "lifecycle": "stable",
@@ -581,13 +581,13 @@
       "lifecycle": "stable",
       "name": "goals.set",
       "schema": "goals/goals-set.schema.json",
-      "schemaSha256": "52b223587068d3a205b1c70f58faa121ec3a7c43be303b653d2c58b621e440ca"
+      "schemaSha256": "943c4c0924468446aa69d65737785cbcdacc4236b77d98d49e88e452b1618e5e"
     },
     {
       "lifecycle": "stable",
       "name": "goals.status",
       "schema": "goals/goals-status.schema.json",
-      "schemaSha256": "0975d46c404160e3556f914dba33982ac23d15985627fe8a360f0ab950d9cab5"
+      "schemaSha256": "cc9780f6b16f0059b4857cbd28294a9bbea6b985c8b223c90feb001466be67f3"
     },
     {
       "lifecycle": "stable",
@@ -1511,7 +1511,7 @@
     "generatorSha256": "cef95d81659ad32a398a9ffe0b9e555b533d57fed64c65094f6380ccdab0bc79",
     "methodCount": 222,
     "schemaCount": 232,
-    "schemaTreeSha256": "92ef51838bbc81f197a805ea4a904d454492d5933b385d69eb40fb00cffcd95b",
+    "schemaTreeSha256": "e5da54be8c0a9f77abf54c411f5be8d1a8c47ff994bcb8412540e277184abebc",
     "toolchains": {
       "legacyTypes": {
         "python": {

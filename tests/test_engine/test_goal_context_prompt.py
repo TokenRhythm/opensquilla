@@ -367,6 +367,18 @@ def test_goal_tool_contract_requires_evidence_and_keeps_progress_optional() -> N
     )
 
 
+def test_goal_controls_do_not_advertise_retired_budget_or_execution_policy() -> None:
+    registry = get_default_registry()
+    for name in ("create_goal", "update_goal", "get_goal"):
+        registered = registry.get(name)
+        assert registered is not None
+        retired = {"token_budget", "execution_policy", "background"}
+        assert not retired & registered.spec.parameters.keys()
+        assert "token_budget" not in registered.spec.description
+        assert "foreground" not in registered.spec.description
+        assert "background" not in registered.spec.description
+
+
 def test_goal_control_handler_rejects_subagent_even_with_forged_runtime_services() -> None:
     ctx = _tool_context(
         agent_id="worker",

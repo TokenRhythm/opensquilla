@@ -138,8 +138,8 @@ export async function startRealGoalGateway(options: {
     )
   const child = spawn(python, ['-u', fixturePath], {
     // Keep OpenSquilla's normal dotenv bootstrap away from both the checkout
-    // and the user's profile.  The editable virtualenv still resolves the
-    // package by absolute path, while the fixture gets a private home/cwd.
+    // and the user's profile. Pin imports to this checkout while the fixture
+    // gets a private home/cwd, regardless of editable virtualenv metadata.
     cwd: stateDir,
     env: Object.assign(
       Object.fromEntries(
@@ -170,6 +170,7 @@ export async function startRealGoalGateway(options: {
         TEMP: tempDir,
         TMP: tempDir,
         PYTHONNOUSERSITE: '1',
+        PYTHONPATH: join(repoRoot, 'src'),
         OPENSQUILLA_WEBUI_GOAL_E2E_PORT: String(port),
         OPENSQUILLA_WEBUI_GOAL_E2E_STATE: stateDir,
         OPENSQUILLA_WEBUI_GOAL_E2E_EVENT_LOG: eventLog,

@@ -65,18 +65,15 @@ async def get_goal() -> str:
 @tool(
     name="create_goal",
     description=("Create a persistent Goal only when the user explicitly asks for one. "
-                 "Reuse the current task. Set token_budget only when explicitly requested. "
+                 "Reuse the current task. "
                  "An unfinished Goal must be continued rather than replaced."),
-    params={"objective": {"type": "string", "minLength": 1, "maxLength": 4000},
-            "token_budget": {"type": "integer", "minimum": 1}},
+    params={"objective": {"type": "string", "minLength": 1, "maxLength": 4000}},
     required=["objective"], default_access="deny", terminates_turn=False,
 )
-async def create_goal(objective: str, token_budget: int | None = None) -> str:
+async def create_goal(objective: str) -> str:
     ctx = _control_turn()
     try:
-        result = await ctx.goal_service.create_from_turn(
-            ctx, objective=objective, token_budget=token_budget
-        )
+        result = await ctx.goal_service.create_from_turn(ctx, objective=objective)
     except Exception as exc:
         raise SafeToolError(str(exc)) from exc
     return json.dumps(
@@ -87,8 +84,8 @@ async def create_goal(objective: str, token_budget: int | None = None) -> str:
 @tool(
     name="update_goal",
     description=(
-        "Update the current session's Goal using this main task. Change objective or "
-        "token_budget only when the user requests it. "
+        "Update the current session's Goal using this main task. Change the objective "
+        "only when the user requests it. "
         "Edits preserve an unfinished Goal's state unless "
         "status is provided; combine an edit with paused to pause atomically, or active "
         "to resume. Editing a completed Goal reopens it. "
@@ -106,12 +103,11 @@ async def create_goal(objective: str, token_budget: int | None = None) -> str:
     ),
     params={
         "objective": {"type": "string", "minLength": 1, "maxLength": 4000},
-        "token_budget": {"type": ["integer", "null"], "minimum": 1},
         "status": {
             "type": "string",
             "enum": ["complete", "blocked", "paused", "active"],
             "description": (
-                "Requested Goal state. active and paused may accompany objective/budget "
+                "Requested Goal state. active and paused may accompany objective "
                 "edits. Submit complete or blocked separately from edits; complete requires "
                 "proof of the full objective, and blocked requires the repeated-blocker "
                 "and true-impasse conditions."
@@ -134,7 +130,6 @@ async def update_goal(
     status: str | None = None,
     reason: str | None = None,
     objective: str | None = None,
-    token_budget: Any = ...,
 ) -> str:
     normalized = str(status).strip().lower() if status is not None else None
     if normalized not in {None, "complete", "blocked", "paused", "active"}:
@@ -142,20 +137,17 @@ async def update_goal(
     needs_pause_binding = normalized == "paused" and not is_goal_owned_main_default_turn(
         current_tool_context.get()
     )
-    if (objective is not None or token_budget is not ...
-            or normalized == "active" or needs_pause_binding):
+    if objective is not None or normalized == "active" or needs_pause_binding:
         if normalized not in {None, "active", "paused"} or reason is not None:
             raise RetryableToolInputError(
                 "Edits accept status active or paused without reason; "
                 "submit complete or blocked separately"
             )
         ctx = _control_turn()
-        settings = {} if token_budget is ... else {"tokenBudget": token_budget}
         try:
             snapshot = await ctx.goal_service.update_from_turn(
                 ctx,
                 objective=objective,
-                settings=settings,
                 resume=normalized == "active",
                 pause=normalized == "paused",
             )
@@ -163,7 +155,7 @@ async def update_goal(
             raise SafeToolError(str(exc)) from exc
         return json.dumps({"status": "accepted", "goal": snapshot}, ensure_ascii=False)
     if normalized is None:
-        raise RetryableToolInputError("Provide status, objective, or token_budget")
+        raise RetryableToolInputError("Provide status or objective")
     service, context = _goal_turn()
     normalized_reason = _optional_text(reason, field="reason", max_chars=1000)
     if normalized == "blocked" and normalized_reason is None:

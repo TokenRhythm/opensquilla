@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -310,6 +311,61 @@ async def test_goal_set_atomically_accepts_goal_message_task_and_receipts(
     assert replay.replayed is True
     assert replay.goal_command_response == result.goal_command_response
     assert len(await storage.get_transcript(SESSION_ID)) == 1
+
+
+@pytest.mark.parametrize("action", ["set", "edit"])
+async def test_legacy_goal_receipt_replay_omits_retired_policy_without_rewriting_history(
+    storage: SessionStorage, action: str,
+) -> None:
+    set_command = _command("set")
+    accepted = await _set_goal(storage, command=set_command)
+    assert accepted.goal is not None
+    expected = _expected(accepted.goal)
+    if action == "set":
+        command = set_command
+        response = accepted.goal_command_response
+    else:
+        command = _command("edit")
+        edited = await _apply_user_goal_mutation(
+            storage, action="edit", expected=expected, command=command,
+        )
+        response = edited.response
+    assert response is not None
+    legacy_response = {
+        **response,
+        "goal": {
+            **response["goal"],
+            "tokenBudget": 100,
+            "budgetTokensUsed": 20,
+            "executionPolicy": "background",
+        },
+    }
+    persisted = json.dumps(legacy_response)
+    await storage.conn.execute(
+        "UPDATE goal_command_receipts SET response_json = ? WHERE client_request_id = ?",
+        (persisted, command.client_request_id),
+    )
+    await storage.conn.commit()
+
+    receipt = await storage.get_goal_command_receipt(command)
+    assert receipt is not None and receipt.replayed
+    assert receipt.response == response
+    if action == "set":
+        replay = await _set_goal(storage, command=command)
+        assert replay.replayed and replay.goal_command_response == response
+    else:
+        replay = await _apply_user_goal_mutation(
+            storage, action="edit", expected=expected, command=command,
+        )
+        assert replay.replayed and replay.response == response
+    async with storage.conn.execute(
+        "SELECT response_json FROM goal_command_receipts WHERE client_request_id = ?",
+        (command.client_request_id,),
+    ) as cur:
+        assert (await cur.fetchone())[0] == persisted
+    assert len(await storage.get_transcript(SESSION_ID)) == 1
+    async with storage.conn.execute("SELECT count(*) FROM agent_tasks") as cur:
+        assert (await cur.fetchone())[0] == 1
 
 
 async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
@@ -2113,6 +2169,71 @@ async def test_activation_failure_compensation_has_no_orphan_owner(
     )
 
 
+@pytest.mark.parametrize("started", [False, True])
+@pytest.mark.parametrize("paused", [False, True])
+async def test_deferred_continuation_preserves_goal_and_never_replays_started_work(
+    storage: SessionStorage, started: bool, paused: bool,
+) -> None:
+    accepted = await _set_goal(storage)
+    assert accepted.goal_context is not None
+    with pytest.raises(GoalConflictError, match="Only an automatic"):
+        await storage.defer_goal_continuation(accepted.goal_context)
+    await storage.update_agent_task(
+        "task-1", status=AgentTaskStatus.SUCCEEDED, started_at=200, finished_at=220,
+    )
+    settled = await storage.settle_goal_task(
+        accepted.goal_context, max_turns=50, runtime_budget_seconds=3600, now_ms=230,
+    )
+    assert settled is not None
+    task_id = automatic_goal_task_id(settled.goal_id, settled.objective_revision, 1)
+    continued = await storage.accept_goal_continuation(
+        expected=_expected(settled), expected_continuation_seq=0,
+        task_record=AgentTaskRecord(
+            task_id=task_id, session_key=SESSION_KEY, run_kind="goal",
+            status=AgentTaskStatus.QUEUED, created_at=240, updated_at=240,
+        ),
+        now_ms=240,
+    )
+    assert isinstance(continued, GoalTaskAcceptance)
+    if started:
+        await storage.update_agent_task(
+            task_id, status=AgentTaskStatus.RUNNING, started_at=250,
+        )
+    if paused:
+        await storage.pause_goal(
+            session_key=SESSION_KEY, expected=_expected(continued.goal),
+            command=_command("pause"), reason="user", now_ms=255,
+        )
+    before = await storage.get_goal(SESSION_KEY)
+    task_before = await storage.get_agent_task(task_id)
+    assert before is not None and task_before is not None
+    deferred = await storage.defer_goal_continuation(continued.context, now_ms=260)
+    if started:
+        assert deferred is None
+        assert await storage.get_goal(SESSION_KEY) == before
+        assert await storage.get_agent_task(task_id) == task_before
+        return
+
+    assert deferred is not None
+    assert (deferred.status, deferred.pause_reason, deferred.terminal_reason) == (
+        before.status, before.pause_reason, before.terminal_reason,
+    )
+    assert deferred.active_task_id is None
+    assert deferred.turns_started == deferred.turns_settled == 2
+    assert deferred.continuation_seq == before.continuation_seq == 1
+    assert deferred.window_turns_started == before.window_turns_started
+    assert deferred.window_active_time_ms == before.window_active_time_ms
+    task = await storage.get_agent_task(task_id)
+    assert task is not None and task.status == AgentTaskStatus.ABANDONED
+    assert task.started_at is None and task.terminal_reason == "owner_disconnected"
+    assert await storage.defer_goal_continuation(continued.context, now_ms=270) is None
+    assert await storage.settle_goal_task(
+        continued.context, max_turns=50, runtime_budget_seconds=3600, now_ms=280,
+    ) is None
+    assert await storage.get_goal(SESSION_KEY) == deferred
+    assert await storage.get_agent_task(task_id) == task
+
+
 async def test_failed_goal_task_blocks_without_creating_a_retry(
     storage: SessionStorage,
 ) -> None:
@@ -3078,8 +3199,7 @@ async def test_goal_counts_physical_usage_once_after_owner_settles(
     assert goal is not None
     assert goal.active_task_id is None
     assert (goal.input_tokens, goal.output_tokens, goal.total_tokens) == (10, 5, 15)
-    # Cache reads are discounted. Reasoning/cache-write buckets are already included.
-    assert goal.budget_tokens_used == 11
+    assert (goal.reasoning_tokens, goal.cache_read_tokens, goal.cache_write_tokens) == (3, 4, 2)
     assert goal_snapshot(goal)["usageCoverage"] == "complete"
     assert goal_snapshot(goal)["usageAccountingStartedAtMs"] == goal.created_at_ms
 
@@ -3108,57 +3228,35 @@ async def test_upgraded_goal_records_first_new_reservation_boundary_without_back
     snapshot = goal_snapshot(updated)
     assert snapshot["usageAccountingStartedAtMs"] == 220
     assert snapshot["usageCoverage"] == "partial_history"
-    assert snapshot["budgetTokensUsed"] == 11
+    assert snapshot["usage"]["totalTokens"] == 15
 
 
-async def test_goal_budget_pauses_on_descendant_usage_and_can_be_increased(
-    storage: SessionStorage,
+@pytest.mark.parametrize("background", [0, 1])
+async def test_retired_goal_policy_does_not_pause_descendant_usage(
+    storage: SessionStorage, background: int,
 ) -> None:
-    accepted = await _set_goal(storage)
-    assert accepted.goal is not None and accepted.goal_context is not None
-    edited = await storage.edit_goal(
-        session_key=SESSION_KEY,
-        expected=_expected(accepted.goal),
-        objective=accepted.goal.objective,
-        command=_command("edit"),
-        settings={"tokenBudget": 11},
+    await _set_goal(storage)
+    # Stored policy values from an older release remain inert after upgrade.
+    await storage.conn.execute(
+        "UPDATE session_goals SET token_budget = 1, budget_tokens_used = 1, background = ?",
+        (background,),
     )
-    assert edited.goal is not None
-    assert edited.goal.objective_revision == accepted.goal.objective_revision
+    await storage.conn.commit()
     await storage.start_usage_event(
-        await _goal_descendant_usage_start(storage, "budget", turn_id="grandchild")
+        await _goal_descendant_usage_start(storage, "legacy-policy", turn_id="grandchild")
     )
-    await storage.finalize_usage_event("budget", _goal_usage_completion())
+    await storage.finalize_usage_event("legacy-policy", _goal_usage_completion())
     goal = await storage.get_goal(SESSION_KEY)
     assert goal is not None
-    assert (goal.status, goal.pause_reason, goal.budget_tokens_used) == (
-        "paused",
-        "token_budget",
-        11,
-    )
-    task = await storage.get_agent_task("task-1")
-    assert task is not None and task.status == AgentTaskStatus.QUEUED
-    with pytest.raises(GoalConflictError, match="Increase or remove"):
-        await storage.resume_goal(
-            session_key=SESSION_KEY,
-            expected=_expected(goal),
-            command=_command("resume"),
-        )
-    increased = await storage.edit_goal(
-        session_key=SESSION_KEY,
-        expected=_expected(goal),
-        objective=goal.objective,
-        command=_command("edit"),
-        settings={"tokenBudget": 22},
-    )
-    assert increased.goal is not None and increased.goal.status == "paused"
-    resumed = await storage.resume_goal(
-        session_key=SESSION_KEY,
-        expected=_expected(increased.goal),
-        command=_command("resume"),
-    )
-    assert resumed.goal is not None and resumed.goal.status == "active"
-    assert resumed.goal.budget_tokens_used == 11
+    assert (goal.status, goal.pause_reason) == ("active", None)
+    assert (goal.input_tokens, goal.output_tokens, goal.total_tokens) == (10, 5, 15)
+    assert (goal.reasoning_tokens, goal.cache_read_tokens, goal.cache_write_tokens) == (3, 4, 2)
+    assert not {"tokenBudget", "budgetTokensUsed", "executionPolicy"} & goal_snapshot(goal).keys()
+    assert not {"token_budget", "budget_tokens_used", "background"} & goal.model_dump().keys()
+    async with storage.conn.execute(
+        "SELECT token_budget, budget_tokens_used, background FROM session_goals"
+    ) as cur:
+        assert tuple(await cur.fetchone()) == (1, 1, background)
 
 
 async def test_complete_goal_accepts_late_usage_without_reactivation(
@@ -3173,7 +3271,7 @@ async def test_complete_goal_accepts_late_usage_without_reactivation(
     await storage.finalize_usage_event("complete-late", _goal_usage_completion())
     goal = await storage.get_goal(SESSION_KEY)
     assert goal is not None and goal.status == "complete"
-    assert goal.budget_tokens_used == 11
+    assert goal.total_tokens == 15
 
 
 async def test_goal_usage_cannot_move_to_replacement_or_another_root(
@@ -3198,7 +3296,7 @@ async def test_goal_usage_cannot_move_to_replacement_or_another_root(
     assert finalized.goal_id == "goal-1"
     current = await storage.get_goal(SESSION_KEY)
     assert current is not None and current.goal_id == "goal-2"
-    assert current.total_tokens == current.budget_tokens_used == 0
+    assert current.total_tokens == 0
 
 
 async def test_goal_root_rejects_cross_generation_usage(storage: SessionStorage) -> None:
@@ -3209,96 +3307,118 @@ async def test_goal_root_rejects_cross_generation_usage(storage: SessionStorage)
         await storage.start_usage_event(replace(_goal_usage_start("wrong-epoch"), session_epoch=1))
 
 
-async def test_partial_history_goal_allows_budget_before_first_new_receipt(
+async def test_partial_history_goal_keeps_raw_totals_with_retired_policy(
     storage: SessionStorage,
 ) -> None:
     await _set_goal(storage)
     await storage.conn.execute(
         "UPDATE session_goals SET usage_accounting_version = 0, "
         "usage_coverage = 'partial_history', usage_accounting_started_at_ms = NULL, "
-        "input_tokens = 100, output_tokens = 50, total_tokens = 150"
+        "input_tokens = 100, output_tokens = 50, total_tokens = 150, "
+        "token_budget = 1, budget_tokens_used = 1, background = 1"
     )
     await storage.conn.commit()
     goal = await storage.get_goal(SESSION_KEY)
     assert goal is not None
     edited = await storage.edit_goal(
         session_key=SESSION_KEY, expected=_expected(goal), objective=goal.objective,
-        command=_command("edit"), settings={"tokenBudget": 11, "executionPolicy": "background"},
+        command=_command("edit"),
     )
-    assert edited.goal is not None and edited.goal.background is True
-    assert edited.goal.status == "active"
+    assert edited.goal is not None and edited.goal.status == "active"
     assert edited.goal.usage_accounting_started_at_ms is None
-    assert (edited.goal.total_tokens, edited.goal.budget_tokens_used) == (150, 0)
-    await storage.start_usage_event(_goal_usage_start("first-budgeted-request"))
+    assert edited.goal.total_tokens == 150
+    await storage.start_usage_event(_goal_usage_start("first-recorded-request"))
     started = await storage.get_goal(SESSION_KEY)
     assert started is not None and started.usage_accounting_started_at_ms == 220
-    await storage.finalize_usage_event("first-budgeted-request", _goal_usage_completion())
-    spent = await storage.get_goal(SESSION_KEY)
-    assert spent is not None
-    assert (spent.status, spent.pause_reason, spent.budget_tokens_used) == (
-        "paused", "token_budget", 11,
-    )
-    assert (spent.input_tokens, spent.output_tokens, spent.total_tokens) == (110, 55, 165)
-    assert spent.usage_accounting_version == 0
-    assert goal_snapshot(spent)["usageCoverage"] == "partial_history"
+    await storage.finalize_usage_event("first-recorded-request", _goal_usage_completion())
+    recorded = await storage.get_goal(SESSION_KEY)
+    assert recorded is not None
+    assert (recorded.status, recorded.pause_reason) == ("active", None)
+    assert (recorded.input_tokens, recorded.output_tokens, recorded.total_tokens) == (110, 55, 165)
+    assert recorded.usage_accounting_version == 0
+    assert goal_snapshot(recorded)["usageCoverage"] == "partial_history"
 
 
-@pytest.mark.parametrize("budget", [10, 11])
-async def test_partial_history_budget_preserves_spend_and_requires_explicit_resume(
-    storage: SessionStorage, budget: int,
+@pytest.mark.parametrize("pause_reason", ["token_budget", "usage_unknown"])
+@pytest.mark.parametrize("resume_method", ["resume", "edit"])
+async def test_legacy_policy_pause_survives_restart_until_explicit_resume(
+    tmp_path: Path, pause_reason: str, resume_method: str,
 ) -> None:
-    await _set_goal(storage)
-    await storage.conn.execute(
-        "UPDATE session_goals SET usage_accounting_version = 0, "
-        "usage_coverage = 'partial_history', usage_accounting_started_at_ms = NULL, "
-        "input_tokens = 100, output_tokens = 50, total_tokens = 150"
-    )
-    await storage.conn.commit()
-    await storage.start_usage_event(_goal_usage_start("known-after-upgrade"))
-    await storage.finalize_usage_event("known-after-upgrade", _goal_usage_completion())
-    goal = await storage.get_goal(SESSION_KEY)
-    assert goal is not None and goal.budget_tokens_used == 11
-    edited = await storage.edit_goal(
-        session_key=SESSION_KEY, expected=_expected(goal), objective=goal.objective,
-        command=_command("edit"), settings={"tokenBudget": budget},
-    )
-    assert edited.goal is not None
-    assert (edited.goal.status, edited.goal.pause_reason) == ("paused", "token_budget")
-    with pytest.raises(GoalConflictError, match="Increase or remove"):
-        await storage.resume_goal(
-            session_key=SESSION_KEY, expected=_expected(edited.goal), command=_command("resume"),
+    db_path = tmp_path / "legacy-goal-policy.db"
+    first = SessionStorage(str(db_path))
+    await first.connect()
+    try:
+        await first.upsert_session(SessionNode(session_key=SESSION_KEY, session_id=SESSION_ID))
+        accepted = await _set_goal(first)
+        assert accepted.goal_context is not None
+        await first.start_usage_event(_goal_usage_start("legacy-missing-receipt"))
+        await first.mark_usage_event_unknown("legacy-missing-receipt", completed_at_ms=250)
+        await first.update_agent_task(
+            "task-1", status=AgentTaskStatus.SUCCEEDED, started_at=200, finished_at=260,
         )
-    increased = await storage.edit_goal(
-        session_key=SESSION_KEY, expected=_expected(edited.goal), objective=goal.objective,
-        command=_command("edit"), settings={"tokenBudget": 22},
-    )
-    assert increased.goal is not None and increased.goal.status == "paused"
-    assert increased.goal.budget_tokens_used == 11
-    resumed = await storage.resume_goal(
-        session_key=SESSION_KEY, expected=_expected(increased.goal), command=_command("resume"),
-    )
-    assert resumed.goal is not None and resumed.goal.status == "active"
-    assert resumed.goal.usage_accounting_started_at_ms == 220
-    assert resumed.goal.usage_accounting_version == 0
-    assert resumed.goal.usage_coverage == "partial_history"
-    assert (resumed.goal.total_tokens, resumed.goal.budget_tokens_used) == (165, 11)
+        await first.settle_goal_task(
+            accepted.goal_context, max_turns=50, runtime_budget_seconds=3600, now_ms=260,
+        )
+        await first.conn.execute(
+            "UPDATE session_goals SET status = 'paused', pause_reason = ?, terminal_reason = ?, "
+            "token_budget = 1, budget_tokens_used = 100, background = 1",
+            (pause_reason, pause_reason),
+        )
+        await first.conn.commit()
+    finally:
+        await first.close()
+
+    restarted = SessionStorage(str(db_path))
+    await restarted.connect()
+    try:
+        goal = await restarted.get_goal(SESSION_KEY)
+        assert goal is not None
+        assert (goal.status, goal.pause_reason, goal.usage_coverage) == (
+            "paused", pause_reason, "partial_usage",
+        )
+        edited = await restarted.edit_goal(
+            session_key=SESSION_KEY, expected=_expected(goal), objective="Finish the revised task.",
+            command=_command("edit"),
+        )
+        assert edited.goal is not None
+        assert (edited.goal.status, edited.goal.pause_reason) == ("paused", pause_reason)
+        if resume_method == "resume":
+            resumed = await restarted.resume_goal(
+                session_key=SESSION_KEY, expected=_expected(edited.goal),
+                command=_command("resume"),
+            )
+        else:
+            resumed = await restarted.edit_goal(
+                session_key=SESSION_KEY, expected=_expected(edited.goal),
+                objective=edited.goal.objective, command=_command("edit"), resume_requested=True,
+            )
+        assert resumed.goal is not None
+        assert (resumed.goal.status, resumed.goal.pause_reason, resumed.goal.usage_coverage) == (
+            "active", None, "partial_usage",
+        )
+        # Incomplete billing stays observable but cannot refuse an explicit resume.
+        await restarted.finalize_usage_event("legacy-missing-receipt", _goal_usage_completion())
+        recorded = await restarted.get_goal(SESSION_KEY)
+        assert recorded is not None
+        assert (recorded.status, recorded.usage_coverage, recorded.total_tokens) == (
+            "active", "complete", 15,
+        )
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.parametrize("missing_receipt", ["unknown", "usage_missing", "started"])
-async def test_partial_history_budget_rejects_new_missing_receipts_until_repaired(
+async def test_partial_history_tracks_missing_receipts_without_pausing(
     storage: SessionStorage, missing_receipt: str,
 ) -> None:
     accepted = await _set_goal(storage)
     assert accepted.goal is not None and accepted.goal_context is not None
     await storage.conn.execute(
         "UPDATE session_goals SET usage_accounting_version = 0, "
-        "usage_coverage = 'partial_history', usage_accounting_started_at_ms = NULL"
+        "usage_coverage = 'partial_history', usage_accounting_started_at_ms = NULL, "
+        "token_budget = 1, budget_tokens_used = 1"
     )
     await storage.conn.commit()
-    await storage.edit_goal(
-        session_key=SESSION_KEY, expected=_expected(accepted.goal),
-        objective=accepted.goal.objective, command=_command("edit"), settings={"tokenBudget": 100},
-    )
     await storage.start_usage_event(_goal_usage_start("new-missing-receipt"))
     if missing_receipt == "unknown":
         await storage.mark_usage_event_unknown("new-missing-receipt", completed_at_ms=260)
@@ -3315,17 +3435,8 @@ async def test_partial_history_budget_rejects_new_missing_receipts_until_repaire
     )
     assert partial is not None
     assert (partial.status, partial.pause_reason, partial.usage_coverage) == (
-        "paused", "usage_unknown", "partial_usage",
+        "active", None, "partial_usage",
     )
-    with pytest.raises(GoalConflictError, match="complete receipts"):
-        await storage.edit_goal(
-            session_key=SESSION_KEY, expected=_expected(partial), objective=partial.objective,
-            command=_command("edit"), settings={"tokenBudget": 200},
-        )
-    with pytest.raises(GoalConflictError, match="receipts are incomplete"):
-        await storage.resume_goal(
-            session_key=SESSION_KEY, expected=_expected(partial), command=_command("resume"),
-        )
     if missing_receipt == "usage_missing":
         # A finalized incomplete receipt is not rewritten as a different bill.
         return
@@ -3333,17 +3444,11 @@ async def test_partial_history_budget_rejects_new_missing_receipts_until_repaire
     repaired = await storage.get_goal(SESSION_KEY)
     assert repaired is not None
     assert (repaired.status, repaired.pause_reason, repaired.usage_coverage) == (
-        "paused", "usage_unknown", "partial_history",
+        "active", None, "partial_history",
     )
     assert repaired.usage_accounting_version == 0
     assert repaired.usage_accounting_started_at_ms == 220
-    assert repaired.budget_tokens_used == 11
-    resumed = await storage.resume_goal(
-        session_key=SESSION_KEY, expected=_expected(repaired), command=_command("resume"),
-    )
-    assert resumed.goal is not None and resumed.goal.status == "active"
-    assert resumed.goal.usage_coverage == "partial_history"
-    assert resumed.goal.budget_tokens_used == 11
+    assert repaired.total_tokens == 15
 
 
 async def test_natural_goal_reuses_running_task_without_retroactive_usage(
@@ -3435,27 +3540,13 @@ async def test_approval_yield_pauses_goal_without_automatic_retry(
 
 
 @pytest.mark.parametrize(
-    ("receipt_coverage", "goal_coverage", "status"),
-    [
-        ("usage_missing", "partial_usage", "paused"),
-        ("pricing_missing", "complete", "active"),
-    ],
+    ("receipt_coverage", "goal_coverage"),
+    [("usage_missing", "partial_usage"), ("pricing_missing", "complete")],
 )
-async def test_goal_token_budget_distinguishes_missing_usage_from_missing_price(
-    storage: SessionStorage,
-    receipt_coverage: str,
-    goal_coverage: str,
-    status: str,
+async def test_goal_accounting_distinguishes_missing_usage_from_missing_price(
+    storage: SessionStorage, receipt_coverage: str, goal_coverage: str,
 ) -> None:
-    accepted = await _set_goal(storage)
-    assert accepted.goal is not None
-    await storage.edit_goal(
-        session_key=SESSION_KEY,
-        expected=_expected(accepted.goal),
-        objective=accepted.goal.objective,
-        command=_command("edit"),
-        settings={"tokenBudget": 100},
-    )
+    await _set_goal(storage)
     await storage.start_usage_event(_goal_usage_start("partial-receipt"))
     await storage.finalize_usage_event(
         "partial-receipt",
@@ -3463,64 +3554,38 @@ async def test_goal_token_budget_distinguishes_missing_usage_from_missing_price(
     )
     goal = await storage.get_goal(SESSION_KEY)
     assert goal is not None
-    assert (goal.usage_coverage, goal.status) == (goal_coverage, status)
-    assert goal.budget_tokens_used == 11
-    if receipt_coverage == "usage_missing":
-        assert goal.pause_reason == "usage_unknown"
-        with pytest.raises(GoalConflictError, match="complete receipts"):
-            await storage.edit_goal(
-                session_key=SESSION_KEY,
-                expected=_expected(goal),
-                objective=goal.objective,
-                command=_command("edit"),
-                settings={"tokenBudget": 200},
-            )
+    assert (goal.usage_coverage, goal.status, goal.pause_reason) == (goal_coverage, "active", None)
+    assert goal.total_tokens == 15
 
 
-async def test_unknown_goal_usage_pauses_budget_and_late_receipt_restores_coverage(
-    storage: SessionStorage,
+@pytest.mark.parametrize("pause_reason", [None, "token_budget", "usage_unknown"])
+async def test_late_receipt_restores_goal_coverage_without_changing_execution_state(
+    storage: SessionStorage, pause_reason: str | None,
 ) -> None:
-    accepted = await _set_goal(storage)
-    assert accepted.goal is not None
-    await storage.edit_goal(
-        session_key=SESSION_KEY,
-        expected=_expected(accepted.goal),
-        objective=accepted.goal.objective,
-        command=_command("edit"),
-        settings={"tokenBudget": 100},
-    )
+    await _set_goal(storage)
     await storage.start_usage_event(
         await _goal_descendant_usage_start(storage, "unknown-child", turn_id="child")
     )
     await storage.mark_usage_event_unknown("unknown-child", completed_at_ms=260)
+    if pause_reason is not None:
+        await storage.conn.execute(
+            "UPDATE session_goals SET status = 'paused', pause_reason = ?, "
+            "token_budget = 1, budget_tokens_used = 1, background = 1",
+            (pause_reason,),
+        )
+        await storage.conn.commit()
     partial = await storage.get_goal(SESSION_KEY)
     assert partial is not None
-    assert (partial.status, partial.pause_reason, partial.usage_coverage) == (
-        "paused",
-        "usage_unknown",
-        "partial_usage",
+    status = "active" if pause_reason is None else "paused"
+    assert (partial.status, partial.pause_reason, partial.usage_coverage, partial.total_tokens) == (
+        status, pause_reason, "partial_usage", 0,
     )
-    assert partial.budget_tokens_used == 0
-    with pytest.raises(GoalConflictError, match="receipts are incomplete"):
-        await storage.resume_goal(
-            session_key=SESSION_KEY,
-            expected=_expected(partial),
-            command=_command("resume"),
-        )
     await storage.finalize_usage_event("unknown-child", _goal_usage_completion())
     covered = await storage.get_goal(SESSION_KEY)
     assert covered is not None
-    assert (covered.status, covered.usage_coverage, covered.budget_tokens_used) == (
-        "paused",
-        "complete",
-        11,
+    assert (covered.status, covered.pause_reason, covered.usage_coverage, covered.total_tokens) == (
+        status, pause_reason, "complete", 15,
     )
-    resumed = await storage.resume_goal(
-        session_key=SESSION_KEY,
-        expected=_expected(covered),
-        command=_command("resume"),
-    )
-    assert resumed.goal is not None and resumed.goal.status == "active"
 
 
 @pytest.mark.parametrize("mismatch", ["root", "parent_generation", "child_generation"])
@@ -3578,17 +3643,14 @@ async def test_inline_descendant_of_gateway_child_uses_parent_usage_proof(
     assert goal is not None and goal.total_tokens == 15
 
 
-async def test_complete_goal_edit_preserves_objective_but_pauses_incomplete_budget(
+async def test_complete_goal_edit_preserves_objective_and_incomplete_usage(
     storage: SessionStorage,
 ) -> None:
     accepted = await _set_goal(storage)
     assert accepted.goal is not None and accepted.goal_context is not None
     await storage.update_agent_task("task-1", status=AgentTaskStatus.RUNNING, started_at=200)
-    await storage.edit_goal(
-        session_key=SESSION_KEY, expected=_expected(accepted.goal),
-        objective=accepted.goal.objective, command=_command("edit"),
-        settings={"tokenBudget": 100},
-    )
+    await storage.conn.execute("UPDATE session_goals SET token_budget = 1, budget_tokens_used = 1")
+    await storage.conn.commit()
     await storage.start_usage_event(_goal_usage_start("missing-before-complete"))
     await storage.mark_usage_event_unknown("missing-before-complete", completed_at_ms=250)
     await storage.commit_goal_terminal(accepted.goal_context, status="complete", now_ms=251)
@@ -3606,20 +3668,14 @@ async def test_complete_goal_edit_preserves_objective_but_pauses_incomplete_budg
     assert edited.goal is not None
     assert edited.goal.objective == "Complete the next synthetic objective."
     assert (edited.goal.status, edited.goal.pause_reason, edited.goal.usage_coverage) == (
-        "paused", "usage_unknown", "partial_usage",
+        "active", None, "partial_usage",
     )
-    with pytest.raises(GoalConflictError, match="receipts are incomplete"):
-        await storage.resume_goal(
-            session_key=SESSION_KEY, expected=_expected(edited.goal), command=_command("resume"),
-        )
 
 
-@pytest.mark.parametrize("failure", ["started", "partial_usage", "partial_history", "spent"])
-async def test_goal_continuation_rechecks_budget_before_creating_task(
-    storage: SessionStorage, failure: str,
+@pytest.mark.parametrize("legacy_state", ["started", "partial_usage", "partial_history", "spent"])
+async def test_goal_continuation_ignores_retired_policy_and_preserves_coverage(
+    storage: SessionStorage, legacy_state: str,
 ) -> None:
-    from opensquilla.session.goals import GoalGuardrailPause
-
     accepted = await _set_goal(storage)
     assert accepted.goal is not None and accepted.goal_context is not None
     await storage.update_agent_task(
@@ -3628,23 +3684,20 @@ async def test_goal_continuation_rechecks_budget_before_creating_task(
     await storage.settle_goal_task(
         accepted.goal_context, max_turns=50, runtime_budget_seconds=3600, now_ms=260,
     )
-    # Exercise admission independently of the observer/settlement that normally
-    # commits this pause, including an unresolved terminal provider reservation.
-    await storage.conn.execute("UPDATE session_goals SET token_budget = 10")
+    await storage.conn.execute("UPDATE session_goals SET token_budget = 10, background = 1")
     await storage.conn.commit()
-    if failure == "started":
+    if legacy_state == "started":
         await storage.start_usage_event(_goal_usage_start("unwritten-receipt"))
-    elif failure == "partial_usage":
+    elif legacy_state == "partial_usage":
         await storage.start_usage_event(_goal_usage_start("missing-receipt"))
         await storage.mark_usage_event_unknown("missing-receipt", completed_at_ms=260)
-        await storage.conn.execute("UPDATE session_goals SET status = 'active'")
-    elif failure == "partial_history":
+    elif legacy_state == "partial_history":
         await storage.conn.execute("UPDATE session_goals SET usage_accounting_version = 0")
     else:
         await storage.conn.execute("UPDATE session_goals SET budget_tokens_used = 10")
     await storage.conn.commit()
     goal = await storage.get_goal(SESSION_KEY)
-    assert goal is not None
+    assert goal is not None and goal.status == "active"
     task_id = automatic_goal_task_id(
         goal.goal_id, goal.objective_revision, goal.continuation_seq + 1,
     )
@@ -3654,16 +3707,12 @@ async def test_goal_continuation_rechecks_budget_before_creating_task(
             task_id=task_id, session_key=SESSION_KEY, status=AgentTaskStatus.QUEUED,
         ),
     )
-    if failure == "partial_history":
-        assert isinstance(decision, GoalTaskAcceptance)
-        assert decision.goal.usage_coverage == "partial_history"
-        assert decision.goal.token_budget == 10
-        assert decision.goal.budget_tokens_used == 0
-        assert await storage.get_agent_task(task_id) is not None
-    else:
-        assert isinstance(decision, GoalGuardrailPause)
-        assert decision.reason == ("token_budget" if failure == "spent" else "usage_unknown")
-        assert await storage.get_agent_task(task_id) is None
+    assert isinstance(decision, GoalTaskAcceptance)
+    assert decision.goal.usage_coverage == (
+        "partial_history" if legacy_state == "partial_history"
+        else "partial_usage" if legacy_state in {"started", "partial_usage"} else "complete"
+    )
+    assert await storage.get_agent_task(task_id) is not None
 
 
 async def test_goal_usage_rejects_unknown_execution_with_unproved_root(
@@ -3679,15 +3728,8 @@ async def test_goal_usage_rejects_unknown_execution_with_unproved_root(
 async def test_running_child_receipt_is_pending_until_its_own_executor_finishes(
     storage: SessionStorage,
 ) -> None:
-    from opensquilla.session.goals import GoalGuardrailPause
-
     accepted = await _set_goal(storage)
     assert accepted.goal is not None and accepted.goal_context is not None
-    await storage.edit_goal(
-        session_key=SESSION_KEY, expected=_expected(accepted.goal),
-        objective=accepted.goal.objective, command=_command("edit"),
-        settings={"tokenBudget": 100},
-    )
     await storage.start_usage_event(
         await _goal_descendant_usage_start(storage, "pending-live-child", turn_id="child")
     )
@@ -3703,14 +3745,15 @@ async def test_running_child_receipt_is_pending_until_its_own_executor_finishes(
     task_id = automatic_goal_task_id(
         waiting.goal_id, waiting.objective_revision, waiting.continuation_seq + 1,
     )
-    paused = await storage.accept_goal_continuation(
+    continued = await storage.accept_goal_continuation(
         expected=_expected(waiting), expected_continuation_seq=waiting.continuation_seq,
         task_record=AgentTaskRecord(
             task_id=task_id, session_key=SESSION_KEY, status=AgentTaskStatus.QUEUED,
         ),
     )
-    assert isinstance(paused, GoalGuardrailPause) and paused.reason == "usage_unknown"
+    assert isinstance(continued, GoalTaskAcceptance)
+    assert continued.goal.usage_coverage == "partial_usage"
     await storage.finalize_usage_event("pending-live-child", _goal_usage_completion())
     updated = await storage.get_goal(SESSION_KEY)
     assert updated is not None
-    assert (updated.status, updated.usage_coverage) == ("paused", "complete")
+    assert (updated.status, updated.usage_coverage) == ("active", "complete")

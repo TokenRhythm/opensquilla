@@ -6409,7 +6409,6 @@ class Agent:
         router_model_call_id = ""
         router_iteration = 0
         final_reasoning_parts: list[str] = []
-        goal_budget_notice: tuple[Any, ...] | None = None
         replay_boundary_notified = False
         max_iterations_finalization_attempted = False
         max_iterations_finalization_pending = False
@@ -6922,30 +6921,6 @@ class Agent:
 
         try:
             while True:
-                goal_service = getattr(self._tool_context, "goal_service", None)
-                goal_context = getattr(self._tool_context, "goal_context", None)
-                build_goal_context = getattr(goal_service, "build_prompt_context", None)
-                if isinstance(goal_context, Mapping) and callable(build_goal_context):
-                    current_goal = await build_goal_context(goal_context)
-                    if current_goal is not None and current_goal.get("pauseReason") in {
-                        "token_budget", "usage_unknown",
-                    }:
-                        notice = (
-                            current_goal.get("goalId"), current_goal.get("pauseReason"),
-                            current_goal.get("tokenBudget"),
-                        )
-                        if notice != goal_budget_notice:
-                            goal_budget_notice = notice
-                            turn_messages.append(Message(
-                                role="user",
-                                content=(
-                                    "Goal automatic continuation is paused because its token "
-                                    "budget is exhausted or usage coverage is incomplete. "
-                                    "Wrap up the current work safely, preserve results and "
-                                    "report what remains. Started work and this finalization "
-                                    "still count toward usage. Do not resume automatically."
-                                ),
-                            ))
                 if (
                     self.config.max_iterations > 0
                     and iterations >= self.config.max_iterations

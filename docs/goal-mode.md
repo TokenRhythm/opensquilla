@@ -38,21 +38,21 @@ argument shows the current status when a Goal exists and command help otherwise.
 You can also explicitly ask the agent to create a Goal during an ordinary
 Default-mode conversation. `create_goal` attaches it to the task already running;
 it does not add a synthetic user message or start another task. `get_goal` reads
-the current objective and accounting. `update_goal` can edit the objective or
-requested token budget, resume with `active`, pause, or record complete/blocked.
-Creation, objective/budget changes, pause and resume require the user's request.
+the current objective and accounting. `update_goal` can edit the objective,
+resume with `active`, pause, or record complete/blocked.
+Creation, objective changes, pause and resume require the user's request.
 Natural-language resume and edits keep using the current authenticated task.
 These controls do not grant extra tool or filesystem permissions.
 
-An `update_goal` objective or budget edit preserves an unfinished Goal's current
+An `update_goal` objective edit preserves an unfinished Goal's current
 state when no status is supplied. An edit can include `status: "paused"` to change
-the objective or budget and pause in one operation; an already paused Goal stays paused. It
+the objective and pause in one operation; an already paused Goal stays paused. It
 can instead include `status: "active"` for an explicitly requested resume.
 Neither operation creates a second task or cancels the current one. Submit
 `complete` or `blocked` separately from edits; only `blocked` accepts a `reason`.
 An ordinary follow-up can repeat a pause on an already paused Goal. An admitted
-Goal task can also commit a plain pause after its background owner disconnects;
-editing the objective or budget still requires the live authenticated owner.
+Goal task can also commit a plain pause after its owner disconnects;
+editing the objective still requires the live authenticated owner.
 
 Only one unfinished Goal can exist in a session. Starting another one returns a
 conflict instead of silently replacing it. After a completed Goal, a new Goal can
@@ -68,8 +68,6 @@ AgentTask:
   the latest objective instead. Editing a completed Goal reactivates that same
   Goal: its identity, creation time, and lifetime usage remain, while its
   terminal result, progress view, and current guardrail window are reset.
-  If its token budget is exhausted or its usage receipts are incomplete, the
-  edit is saved and the Goal remains paused until the budget allows Resume.
 - `pause` disables future automatic continuation. It does not cancel an already
   accepted task; that task continues and may still submit an explicit complete
   or blocked decision. Use the normal task Stop control when the current task
@@ -162,8 +160,8 @@ following are still true:
   sequence match;
 - the Goal is active and has no owning task;
 - the session is in Default mode;
-- the execution grant is still authorized; foreground Goals also require the
-  owner connection's live subscription;
+- the execution grant is still authorized, and the owner has a live
+  authenticated connection and session subscription;
 - there is no explicit user ingress or other queued/running session work; and
 - the current guardrail window still permits another turn.
 
@@ -217,12 +215,11 @@ Starting or resuming a Goal gives the calling, subscribed Web UI or CLI
 connection an in-memory execution lease. A read-only spectator does not acquire,
 refresh, or inherit that lease. Authority, credentials, and route envelopes are
 not stored in the Goal row; every automatic turn rebuilds and revalidates them
-through the ordinary permission and route preparation path. The default
-`executionPolicy` is `foreground`. An explicit `background` choice in the Goal
-controls or `goals.set`/`goals.edit` keeps the authenticated, process-local grant
-after transport disconnect. It does not bypass approvals or sandbox checks.
+through the ordinary permission and route preparation path. Automatic
+continuation requires both the owner's live authenticated connection and its
+session subscription. There is no per-Goal background execution policy.
 
-For foreground Goals, if the owner disconnects or unsubscribes, the process-local lease detaches but
+If the owner disconnects or unsubscribes, the process-local lease detaches but
 the durable Goal remains `active`. A running task may finish or report a
 blocker, but no new automatic continuation is admitted while the lease is
 detached. Status reports `owner_disconnected` as a continuation defer reason;
@@ -237,13 +234,12 @@ inherit the lease. If the tab-local token is no longer available, an authorized
 operator may explicitly take over a detached lease from the Goal controls or
 `/goal resume`; takeover is refused while a live owner is still attached.
 
-Background Goals may start their next ordinary turn after the owning tab or
-socket disconnects. A pending approval or question keeps waiting on its existing
+A pending approval or question keeps waiting on its existing
 task and releases its compute slot. If an approval cannot continue without a
 human decision, the Goal pauses with `approval_required`; a new Goal turn does
 not approve or retry that action automatically.
 
-Gateway shutdown or restart pauses both foreground and background active Goals with
+Gateway shutdown or restart pauses active Goals with
 `process_restart`; restart never calls a provider to resume them. Reconnect and
 explicitly resume after the Gateway itself has restarted.
 
@@ -308,37 +304,19 @@ For a new Goal it is the creation time. For an upgraded Goal it remains `null`
 until the first newly attributed request starts, then retains that timestamp;
 earlier usage is still incomplete and is not backfilled.
 
-Token budgets are off by default. Set an optional positive `tokenBudget` in the
-Goal controls or RPC; `null` removes it. Budget tokens are
-`max(0, input_tokens - cache_read_tokens) + output_tokens`. Cache-write and
-reasoning buckets are not added again because the normalized input/output
-already include them. The snapshot exposes raw usage separately from
-`budgetTokensUsed`. Reaching the budget pauses future continuation with
-`token_budget` and tells the current ordinary task to wrap up. Already-started
-requests and safe finalization can exceed the limit; this is not an exact
-provider billing cap. Increase or remove an exhausted budget before resuming.
-
-The Web UI shows budget and background settings when the connected Gateway
-advertises support. Older remote Gateways retain ordinary Goal controls; update
-the Gateway to use these additional settings. A reconnect preserves an uncertain
-request's identity and its requested budget or background policy.
-
 `usageCoverage` is `complete`, `partial_history` for Goals upgraded from older
 settlement accounting, or `partial_usage` when a request has no trustworthy
 receipt. Historical totals are preserved without inventing descendant usage.
-An upgraded Goal can use a budget: it counts only `budgetTokensUsed` from the
-`usageAccountingStartedAtMs` boundary, excluding earlier historical totals.
-If that timestamp is still `null`, accounting begins with the first newly
-attributed request. Setting or increasing a budget never resets recorded spend.
-Historical coverage remains `partial_history`; it is not relabeled complete.
-Missing receipts within this accounting period prevent setting or resuming a
-budget and pause a budgeted Goal with `usage_unknown`. Late receipts repair
-current coverage when all unknown calls are resolved, returning upgraded Goals
-to `partial_history`, but do not resume execution automatically. A finished
-request whose receipt could not be saved also prevents budgeted continuation;
-an in-flight child request may finish normally.
-Provider account credit exhaustion remains the distinct
-`usage_limited` state.
+Late receipts repair coverage when unknown calls are resolved. These accounting
+fields describe observed usage; they do not impose a per-Goal Token limit or
+pause execution when receipts are incomplete. Provider account credit exhaustion
+remains the distinct `usage_limited` state.
+
+Per-Goal Token budgets and foreground/background settings have been removed.
+Historical settings are inert, and Goals previously paused by a budget or an
+unknown usage receipt remain paused until explicitly resumed. Upgrading never
+resumes work automatically. Use the current client for Goal mutations; requests
+that still send the removed options are rejected before any task is accepted.
 
 Three consecutive automatic turns with complete activity evidence but no body,
 tools, reasoning, or useful waits pause with `empty_continuations`. User turns,
@@ -395,8 +373,6 @@ Every durable mutation carries a client-generated canonical UUID v4
 `clientRequestId`. `goals.reattach` changes only process-local execution
 authority, uses exact session-generation and Goal fences, and never writes a
 command receipt or resets guardrail counters.
-`goals.set` and `goals.edit` accept optional `tokenBudget` and `executionPolicy`
-(`foreground` or `background`). Settings-only edits send the current objective.
 `goals.set` also carries a UUID v4 `clientMessageId`; edit, pause, resume, and
 clear carry the last observed `expectedGoalId` and `expectedStateRevision`.
 Repeating the same request identity and normalized payload returns the stored
@@ -420,9 +396,7 @@ PLAN_MODE_ACTIVE
 EXECUTION_LEASE_REQUIRED
 GOAL_NOT_RESUMABLE
 GOAL_EXECUTION_DISABLED
-INVALID_GOAL_BUDGET
-GOAL_BUDGET_EXHAUSTED
-GOAL_USAGE_INCOMPLETE
+UNSUPPORTED_GOAL_OPTIONS
 IDEMPOTENCY_CONFLICT
 ```
 

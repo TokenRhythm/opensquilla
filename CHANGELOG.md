@@ -19,12 +19,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Ordinary tasks, Plan implementation and Goals share adjustable `update_plan`
   progress. Planning can investigate with normal tools and permissions;
   implementation no longer requires ordered checkpoints or a delivery-only phase.
-- Goals support natural control within the current task, optional token budgets
-  and explicitly enabled background continuation. Physical usage is attributed
-  to the root Goal across children and late results. Unknown usage pauses
-  budget-driven continuation; Gateway restart always requires explicit resume.
-  Upgraded Goals can budget newly recorded usage. Clients check Gateway support
-  before offering budget and background settings.
+- Goals support natural control within the current task. Physical usage is
+  attributed to the root Goal across children and late results. Automatic
+  continuation requires the owner's live authenticated connection and session
+  subscription; Gateway restart always requires explicit resume.
 - Human input and approval waits release compute capacity while preserving task
   identity and session exclusion. Cancelled questionnaires are closed in the
   history used by subsequent turns, while their original questions are preserved.
@@ -43,6 +41,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Removed per-Goal Token budgets and foreground/background execution settings.
+  Existing Goal history and usage totals remain readable. Previously paused
+  Goals can be resumed explicitly; old settings no longer limit work or allow
+  disconnected continuation.
 - Documents are consumed through bounded file tools with page, slide, paragraph
   and sheet-range access. Uploaded originals stay immutable; supported edits use
   persistent session working copies, and forks copy edited bytes under the current

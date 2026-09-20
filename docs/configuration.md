@@ -621,24 +621,15 @@ turn, active-time, and token totals. Goal mode does not replay a failed or timed
 out whole turn: tools may already have produced side effects. Provider/core
 request retries remain governed by their existing policies.
 
-Goal token budgets are disabled by default and are configured per Goal with
-optional `tokenBudget`, not through a global TOML ceiling. Budget usage is
-`max(0, input_tokens - cache_read_tokens) + output_tokens`, counted once per
-physical root/descendant request at finalization, including late receipts.
-Upgraded Goals can set a budget for usage recorded after the accounting boundary;
-earlier incomplete history is not included. Missing receipts within the current
-accounting period prevent setting a budget or resuming a budgeted Goal.
+Goal usage is counted once per physical root/descendant request at finalization,
+including late receipts. There is no per-Goal Token budget setting.
 Snapshots expose `usageAccountingStartedAtMs`: the creation time for new Goals,
 or the first newly attributed request time for upgraded Goals (`null` until then).
 This boundary does not make an upgraded Goal's earlier history complete.
-Reaching a budget pauses continuation and steers the current task to wrap up;
-already-started requests and safe finalization can exceed it.
-
-The default per-Goal `executionPolicy` is `foreground`: losing the owning Web UI
-or CLI subscription defers continuation until authorized reattachment. Explicit
-`background` execution keeps its process-local authorization across transport
-disconnects and uses the same ordinary task scheduler, sandbox and approval
-checks. Both policies pause on Gateway restart and require explicit resume.
+Losing the owning Web UI or CLI connection or session subscription defers
+automatic continuation until authorized reattachment. Goal execution uses the
+ordinary task scheduler, sandbox and approval checks. Gateway restart pauses
+active Goals and requires explicit resume.
 Questions and approvals keep their existing task while releasing its compute
 slot; they never authorize another automatic Goal turn. Natural create, edit
 and resume controls reuse the current task. Progress uses ordinary `update_plan`.

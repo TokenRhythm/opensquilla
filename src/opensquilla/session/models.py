@@ -358,12 +358,9 @@ class GoalRecord(SQLModel, table=True):
     cache_write_tokens: int = 0
     total_tokens: int = 0
 
-    token_budget: int | None = None
-    budget_tokens_used: int = 0
     usage_accounting_version: int = 1
     usage_coverage: str = "complete"
     usage_accounting_started_at_ms: int | None = None
-    background: bool = False
 
     pause_reason: str | None = None
     blocked_reason: str | None = None

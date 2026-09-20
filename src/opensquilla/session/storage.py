@@ -61,7 +61,6 @@ from opensquilla.session.goals import (
     StartGoalMutation,
     automatic_goal_task_id,
     effective_goal_turn_context,
-    goal_budget_pause_reason,
     goal_snapshot,
     goal_turn_context,
     normalize_goal_objective,
@@ -823,6 +822,7 @@ CREATE TABLE IF NOT EXISTS session_goals (
     cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
     cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
     total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    -- Retired policy columns remain inert to preserve the V045 database lineage.
     token_budget INTEGER CHECK (token_budget IS NULL OR token_budget > 0),
     budget_tokens_used INTEGER NOT NULL DEFAULT 0,
     usage_accounting_version INTEGER NOT NULL DEFAULT 1,
@@ -3614,8 +3614,9 @@ class SessionStorage:
         return finalized, True
 
     async def _refresh_goal_usage_coverage_on_conn(
-        self, conn: Any, goal_id: str, *, pause_active: bool = True,
+        self, conn: Any, goal_id: str,
     ) -> GoalRecord | None:
+        """Refresh receipt completeness without changing Goal execution state."""
         await conn.execute(
             """UPDATE session_goals SET usage_coverage = CASE
                 WHEN EXISTS (SELECT 1 FROM usage_events
@@ -3632,18 +3633,6 @@ class SessionStorage:
                 WHEN usage_accounting_version = 0 THEN 'partial_history'
                 ELSE 'complete' END WHERE goal_id = ?""",
             (goal_id,),
-        )
-        goal = await self._select_goal_on_conn(conn, goal_id=goal_id)
-        if goal is None or not pause_active or goal.status != GoalStatus.ACTIVE.value:
-            return goal
-        reason = goal_budget_pause_reason(goal)
-        if reason is None:
-            return goal
-        await conn.execute(
-            """UPDATE session_goals SET status = 'paused', pause_reason = ?,
-                terminal_reason = ?, state_revision = state_revision + 1
-                WHERE goal_id = ? AND status = 'active'""",
-            (reason, reason, goal_id),
         )
         return await self._select_goal_on_conn(conn, goal_id=goal_id)
 
@@ -3665,9 +3654,6 @@ class SessionStorage:
                 conn, event_id, completion, items, receipts
             )
             if changed and record.goal_id is not None:
-                budget_tokens = (
-                    max(0, record.input_tokens - record.cache_read_tokens) + record.output_tokens
-                )
                 await conn.execute(
                     """UPDATE session_goals SET
                         input_tokens = input_tokens + ?, output_tokens = output_tokens + ?,
@@ -3675,7 +3661,6 @@ class SessionStorage:
                         cache_read_tokens = cache_read_tokens + ?,
                         cache_write_tokens = cache_write_tokens + ?,
                         total_tokens = total_tokens + ?,
-                        budget_tokens_used = budget_tokens_used + ?,
                         updated_at_ms = MAX(updated_at_ms, ?)
                         WHERE goal_id = ?""",
                     (
@@ -3685,7 +3670,6 @@ class SessionStorage:
                         record.cache_read_tokens,
                         record.cache_write_tokens,
                         record.total_tokens,
-                        budget_tokens,
                         record.completed_at_ms,
                         record.goal_id,
                     ),
@@ -7705,7 +7689,6 @@ class SessionStorage:
         if row is None:
             return None
         values = _deserialize_row(dict(row))
-        values["background"] = bool(values.get("background", False))
         return GoalRecord(**values)
 
     @classmethod
@@ -7772,8 +7755,16 @@ class SessionStorage:
             conn,
             session_key=command.request_session_key,
         )
+        response = dict(receipt.response_json)
+        if isinstance(response.get("goal"), dict):
+            # Old receipts stay immutable, but replay must not advertise policy
+            # controls that the current runtime no longer enforces.
+            response["goal"] = {
+                key: value for key, value in response["goal"].items()
+                if key not in {"tokenBudget", "budgetTokensUsed", "executionPolicy"}
+            }
         return GoalCommandResult(
-            response=dict(receipt.response_json),
+            response=response,
             goal=goal,
             replayed=True,
         )
@@ -8011,10 +8002,7 @@ class SessionStorage:
             current = await self._select_goal_on_conn(conn, session_key=goal.session_key)
             if current is not None:
                 if current.goal_id == goal.goal_id and current.active_task_id == task_id:
-                    if (
-                        current.objective != goal.objective
-                        or current.token_budget != goal.token_budget
-                    ):
+                    if current.objective != goal.objective:
                         raise GoalConflictError(
                             "GOAL_ACTIVE", "The creating task already has a Goal", current=current
                         )
@@ -8072,7 +8060,6 @@ class SessionStorage:
         objective: str,
         command: GoalCommandRequest,
         adoption_task_id: str | None = None,
-        settings: dict[str, Any] | None = None,
         binding_task_id: str | None = None,
         resume_requested: bool = False,
         pause_requested: bool = False,
@@ -8097,32 +8084,11 @@ class SessionStorage:
                 session_key=session_key,
                 expected=expected,
             )
-            from opensquilla.session.goals import validate_goal_budget
-
             goal = (
                 await self._refresh_goal_usage_coverage_on_conn(
-                    conn, goal.goal_id, pause_active=False,
+                    conn, goal.goal_id,
                 )
             ) or goal
-            settings = settings or {}
-            token_budget = validate_goal_budget(settings.get("tokenBudget", goal.token_budget))
-            budget_reason = goal_budget_pause_reason(
-                goal.model_copy(update={"token_budget": token_budget})
-            )
-            if ("tokenBudget" in settings or resume_requested) and budget_reason == "usage_unknown":
-                raise GoalConflictError(
-                    "GOAL_USAGE_INCOMPLETE",
-                    "Token budgets require complete receipts for the current accounting period",
-                    current=goal,
-                )
-            execution_policy = settings.get(
-                "executionPolicy", "background" if goal.background else "foreground"
-            )
-            if execution_policy not in {"foreground", "background"}:
-                raise GoalValidationError(
-                    "executionPolicy must be foreground or background", code="INVALID_GOAL_POLICY"
-                )
-            background = execution_policy == "background"
             binding_task = None
             if binding_task_id is not None:
                 await self._require_default_goal_mode_on_conn(conn, goal=goal)
@@ -8142,12 +8108,6 @@ class SessionStorage:
                     or goal.active_task_id not in {None, binding_task_id}
                 ):
                     raise GoalConflictError("STALE_GOAL", "The current task cannot own this Goal")
-            if resume_requested and budget_reason == "token_budget":
-                raise GoalConflictError(
-                    "GOAL_BUDGET_EXHAUSTED",
-                    "Increase or remove the token budget before resuming",
-                    current=goal,
-                )
             if (goal.status == GoalStatus.COMPLETE.value and goal.active_task_id is not None
                     and goal.active_task_id != binding_task_id):
                 raise GoalConflictError(
@@ -8158,7 +8118,7 @@ class SessionStorage:
             async with conn.execute(
                 """
                 UPDATE session_goals
-                SET objective = ?, token_budget = ?, background = ?,
+                SET objective = ?,
                     objective_revision = objective_revision
                         + CASE WHEN objective != ? THEN 1 ELSE 0 END,
                     progress_json = CASE WHEN objective != ? THEN NULL ELSE progress_json END,
@@ -8191,8 +8151,6 @@ class SessionStorage:
                 """,
                 (
                     objective,
-                    token_budget,
-                    int(background),
                     objective,
                     objective,
                     objective,
@@ -8220,12 +8178,6 @@ class SessionStorage:
                     "terminal_reason = NULL, blocked_reason = NULL, terminal_task_id = NULL, "
                     "finished_at_ms = NULL WHERE goal_id = ?",
                     (goal.goal_id,),
-                )
-            if budget_reason is not None:
-                await conn.execute(
-                    """UPDATE session_goals SET status = 'paused', pause_reason = ?,
-                        terminal_reason = ? WHERE goal_id = ? AND status = 'active'""",
-                    (budget_reason, budget_reason, goal.goal_id),
                 )
             if binding_task is not None:
                 await conn.execute(
@@ -8552,20 +8504,9 @@ class SessionStorage:
                 )
             goal = (
                 await self._refresh_goal_usage_coverage_on_conn(
-                    conn, goal.goal_id, pause_active=False,
+                    conn, goal.goal_id,
                 )
             ) or goal
-            budget_reason = goal_budget_pause_reason(goal)
-            if budget_reason == "usage_unknown":
-                raise GoalConflictError(
-                    "GOAL_USAGE_INCOMPLETE", "Usage receipts are incomplete", current=goal
-                )
-            if budget_reason == "token_budget":
-                raise GoalConflictError(
-                    "GOAL_BUDGET_EXHAUSTED",
-                    "Increase or remove the token budget before resuming",
-                    current=goal,
-                )
             await conn.execute(
                 """
                 UPDATE session_goals
@@ -8777,9 +8718,6 @@ class SessionStorage:
                 session_key=task_record.session_key,
             )
             goal = (await self._refresh_goal_usage_coverage_on_conn(conn, goal.goal_id)) or goal
-            budget_reason = goal_budget_pause_reason(goal)
-            if budget_reason is not None:
-                return GoalGuardrailPause(goal=goal, reason=budget_reason)
             guardrail_reason: str | None = None
             if goal.window_turns_started >= max_turns:
                 guardrail_reason = "turn_limit"
@@ -8951,8 +8889,6 @@ class SessionStorage:
             ):
                 return None
             goal = (await self._refresh_goal_usage_coverage_on_conn(conn, goal.goal_id)) or goal
-            if goal_budget_pause_reason(goal) is not None:
-                return None
             try:
                 await self._require_default_goal_mode_on_conn(conn, goal=goal)
             except GoalConflictError as exc:
@@ -9123,8 +9059,6 @@ class SessionStorage:
                     "The task no longer owns this Goal",
                     current=goal,
                 )
-            if goal.pause_reason == "token_budget" and status != GoalStatus.COMPLETE.value:
-                return goal
             await conn.execute(
                 """
                 UPDATE session_goals
@@ -9279,7 +9213,7 @@ class SessionStorage:
                     "The terminal task does not carry this Goal generation",
                 )
             goal = await self._refresh_goal_usage_coverage_on_conn(
-                conn, context.goal_id, pause_active=False,
+                conn, context.goal_id,
             )
             if (
                 goal is None
@@ -9406,12 +9340,6 @@ class SessionStorage:
                     pause_reason = "process_restart"
                     terminal_reason = "process_restart"
 
-            if status == GoalStatus.ACTIVE.value:
-                budget_reason = goal_budget_pause_reason(goal)
-                if budget_reason is not None:
-                    status = GoalStatus.PAUSED.value
-                    pause_reason = terminal_reason = budget_reason
-
             await conn.execute(
                 """
                 UPDATE session_goals
@@ -9463,6 +9391,7 @@ class SessionStorage:
         *,
         reason: str,
         now_ms: int | None,
+        preserve_unstarted_continuation: bool = False,
     ) -> GoalRecord | None:
         timestamp = _now_ms() if now_ms is None else now_ms
         async with self._write_transaction(f"compensate_goal_{reason}") as conn:
@@ -9480,6 +9409,15 @@ class SessionStorage:
                     "STALE_GOAL",
                     "The compensated task does not carry this Goal generation",
                 )
+            if preserve_unstarted_continuation:
+                if not context.automatic:
+                    raise GoalConflictError(
+                        "STALE_GOAL", "Only an automatic Goal continuation can be deferred"
+                    )
+                if task.status != AgentTaskStatus.QUEUED or task.started_at is not None:
+                    # Repeated/stale compensation must never abandon started
+                    # work or settle the same accepted turn twice.
+                    return None
             usage = await self._turn_usage_totals_on_conn(conn, context=context)
             duration_ms = 0
             if task.started_at is not None:
@@ -9513,7 +9451,7 @@ class SessionStorage:
                 or goal.active_task_id != context.task_id
             ):
                 return None
-            preserve_status = goal.status in {
+            preserve_status = preserve_unstarted_continuation or goal.status in {
                 GoalStatus.COMPLETE.value,
                 GoalStatus.BLOCKED.value,
             }
@@ -9539,7 +9477,7 @@ class SessionStorage:
                     total_tokens = total_tokens + ?,
                     pause_reason = ?,
                     terminal_reason = CASE
-                        WHEN status IN ('complete', 'blocked') THEN terminal_reason
+                        WHEN ? THEN terminal_reason
                         ELSE ?
                     END,
                     blocked_reason = CASE
@@ -9561,6 +9499,7 @@ class SessionStorage:
                     usage["cache_write_tokens"],
                     usage["total_tokens"],
                     goal.pause_reason if preserve_status else reason,
+                    int(preserve_status),
                     reason,
                     int(
                         task.started_at is not None
@@ -9572,6 +9511,25 @@ class SessionStorage:
                 ),
             )
             return await self._select_goal_on_conn(conn, goal_id=context.goal_id)
+
+    async def defer_goal_continuation(
+        self,
+        context: GoalTurnContext,
+        *,
+        now_ms: int | None = None,
+    ) -> GoalRecord | None:
+        """Settle an accepted, unstarted continuation without pausing its Goal.
+
+        Keep the abandoned task and consumed sequence as durable evidence of
+        admission. Reattachment admits a new sequence; it never replays this task
+        or resets the Goal's turn/runtime guardrail window.
+        """
+        return await self._compensate_goal_task(
+            context,
+            reason="owner_disconnected",
+            now_ms=now_ms,
+            preserve_unstarted_continuation=True,
+        )
 
     async def compensate_goal_activation_failure(
         self,

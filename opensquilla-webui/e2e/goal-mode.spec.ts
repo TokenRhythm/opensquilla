@@ -124,7 +124,6 @@ async function installFakeGoalGateway(
   options: {
     sessionRouting?: boolean
     goalRemoval?: boolean
-    legacyGoalSettings?: boolean
     history?: Array<Record<string, unknown>>
   } = {},
 ): Promise<MockGoalGateway> {
@@ -239,7 +238,6 @@ async function installFakeGoalGateway(
           executionEnabled: true,
           maxTurns: 50,
           runtimeBudgetSeconds: 3_600,
-          ...(!options.legacyGoalSettings ? { tokenBudgetSupported: true, backgroundExecutionSupported: true } : {}),
           methods: ['goals.set', ...(options.goalRemoval ? ['goals.clear'] : [])],
         },
         'models.routing.get': { mode: 'direct' },
@@ -359,101 +357,43 @@ async function installFakeGoalGateway(
   }
 }
 
-test('An older Gateway keeps Goal objective edits usable without unsupported settings', { tag: '@plan-goal-runtime' }, async ({ page }) => {
-  const gateway = await installFakeGoalGateway(page, { goalRemoval: true, legacyGoalSettings: true })
-  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-  await expect(page.locator('.chat-textarea')).toBeEditable()
-  expect(gateway.methods).not.toContain('goals.capabilities')
-  // Matches the pre-budget Gateway snapshot: no coverage or execution settings.
-  gateway.emitGoal(goalSnapshot({ status: 'paused', activeTaskId: null, executionState: 'idle' }))
-  const ribbon = page.locator('.goal-ribbon')
-  await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
-  await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-  await expect.poll(() => gateway.methods.filter(method => method === 'goals.capabilities').length).toBe(1)
-  await expect(ribbon.getByLabel('Token budget', { exact: true })).toHaveCount(0)
-  await expect(ribbon.locator('select')).toHaveCount(0)
-  await ribbon.locator('textarea').fill('Verify the legacy Goal objective')
-  await ribbon.locator('button[type="submit"]').click()
-  await expect.poll(() => gateway.editParams.length).toBe(1)
-  expect(gateway.editParams[0]).toMatchObject({ objective: 'Verify the legacy Goal objective' })
-  expect(gateway.editParams[0]).not.toHaveProperty('tokenBudget')
-  expect(gateway.editParams[0]).not.toHaveProperty('executionPolicy')
-  await expect(ribbon.locator('textarea')).toHaveCount(0)
-})
-
 for (const width of [1280, 390]) {
-  test(`Goal budget and background settings survive edit and refresh at ${width}px`, { tag: '@plan-goal-runtime' }, async ({ page }) => {
+  test(`Goal creation and objective editing have no execution controls at ${width}px`, { tag: '@plan-goal-runtime' }, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 })
     const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
     await expect(page.locator('.conn-pill.connected')).toBeVisible()
     const composer = page.locator('.chat-textarea')
     await expect(composer).toBeEditable()
-    await composer.fill('/goal')
-    await expect(page.locator('.chat-slash-item').filter({ hasText: '/goal' })).toBeVisible()
-    await composer.fill(`/goal ${OBJECTIVE}`)
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    await page.getByRole('menuitem', { name: /Goal mode/ }).click()
+    await expect(page.locator('.composer-goal-mode')).toBeVisible()
+    await expect(page.locator('.goal-draft-settings')).toHaveCount(0)
+    await expect(page.getByLabel('Token budget', { exact: true })).toHaveCount(0)
+    await expect(page.getByRole('combobox', { name: 'Continue running', exact: true })).toHaveCount(0)
+    await composer.fill(OBJECTIVE)
     await page.locator('.chat-send-btn[aria-label="Send"]').click()
     await expect.poll(() => gateway.setParams.length).toBe(1)
+    expect(gateway.setParams[0]).not.toHaveProperty('tokenBudget')
+    expect(gateway.setParams[0]).not.toHaveProperty('executionPolicy')
     gateway.acceptGoal()
     const ribbon = page.locator('.goal-ribbon')
     await expect(ribbon).toBeVisible()
-    gateway.emitGoal(goalSnapshot({ stateRevision: 2, usageCoverage: 'complete', tokenBudget: null, budgetTokensUsed: 0, executionPolicy: 'foreground' }))
     await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
     await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-    await ribbon.getByLabel('Token budget', { exact: true }).fill('10000')
-    await ribbon.getByRole('combobox', { name: 'Continue running', exact: true }).selectOption('background')
+    await expect(ribbon.getByLabel('Token budget', { exact: true })).toHaveCount(0)
+    await expect(ribbon.locator('select')).toHaveCount(0)
+    await ribbon.locator('textarea').fill('Verify the updated Goal objective')
     await ribbon.locator('button[type="submit"]').click()
     await expect.poll(() => gateway.editParams.length).toBe(1)
-    expect(gateway.editParams[0]).toMatchObject({ objective: OBJECTIVE, tokenBudget: 10000, executionPolicy: 'background', expectedStateRevision: 2 })
-    await expect(ribbon).toContainText('0 / 10,000 tokens')
-    await expect(ribbon).toContainText('Background')
+    expect(gateway.editParams[0]).toMatchObject({ objective: 'Verify the updated Goal objective' })
+    expect(gateway.editParams[0]).not.toHaveProperty('tokenBudget')
+    expect(gateway.editParams[0]).not.toHaveProperty('executionPolicy')
+    await expect(ribbon.locator('textarea')).toHaveCount(0)
+    await expect(ribbon).toContainText('Verify the updated Goal objective')
     await page.reload()
-    await expect(ribbon).toContainText('0 / 10,000 tokens')
-    await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
-    await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-    const budget = ribbon.getByLabel('Token budget', { exact: true })
-    await expect(budget).toHaveValue('10000')
-    const bounds = await budget.boundingBox()
-    expect((bounds?.x ?? -1) + (bounds?.width ?? 0)).toBeLessThanOrEqual(width)
-    await budget.fill('')
-    await ribbon.locator('button[type="submit"]').click()
-    await expect.poll(() => gateway.editParams.length).toBe(2)
-    expect(gateway.editParams[1]?.tokenBudget).toBeNull()
-  })
-
-  test(`An existing Goal budgets recorded usage without losing its accounting start at ${width}px`, { tag: '@plan-goal-runtime' }, async ({ page }) => {
-    await page.setViewportSize({ width, height: 900 })
-    const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
-    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
-    await expect(page.locator('.chat-textarea')).toBeEditable()
-    gateway.emitGoal(goalSnapshot({
-      status: 'paused', activeTaskId: null, executionState: 'idle', stateRevision: 2,
-      usageCoverage: 'partial_history', usageAccountingStartedAtMs: 1800000000000,
-      tokenBudget: null, budgetTokensUsed: 1200, executionPolicy: 'foreground',
-    }))
-    const ribbon = page.locator('.goal-ribbon')
-    await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
-    await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-    const budget = ribbon.getByLabel('Token budget', { exact: true })
-    await expect(budget).toBeEnabled()
-    await expect(ribbon).toContainText('Earlier usage is incomplete and is not counted toward the token budget.')
-    const accountingNote = ribbon.locator('.goal-settings__note').filter({ hasText: 'The token budget counts usage recorded since' })
-    const originalStart = await accountingNote.textContent()
-    expect(originalStart).toBeTruthy()
-    await budget.fill('9000')
-    await ribbon.locator('button[type="submit"]').click()
-    await expect.poll(() => gateway.editParams.length).toBe(1)
-    expect(gateway.editParams[0]).toMatchObject({
-      expectedGoalId: GOAL_ID, expectedStateRevision: 2, tokenBudget: 9000,
-    })
-    await expect(ribbon).toContainText('1,200 / 9,000 tokens')
-    await page.reload()
-    await expect(ribbon).toContainText('1,200 / 9,000 tokens')
-    await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
-    await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-    await expect(budget).toHaveValue('9000')
-    await expect(accountingNote).toHaveText(originalStart!)
-    expect(gateway.setParams).toHaveLength(0)
+    await expect(ribbon).toContainText('Verify the updated Goal objective')
+    expect(gateway.methods).not.toContain('goals.capabilities')
   })
 }
 
@@ -474,21 +414,15 @@ test('Refresh after an unknown Goal acceptance restores its subscription without
   expect(gateway.methods.filter(method => method === 'sessions.messages.subscribe').length).toBeGreaterThanOrEqual(2)
 })
 
-test('Goal pause reasons and the accounting coverage start remain visible after refresh', { tag: '@plan-goal-runtime' }, async ({ page }) => {
+test('Goal pause reasons remain visible after refresh', { tag: '@plan-goal-runtime' }, async ({ page }) => {
   const gateway = await installFakeGoalGateway(page, { goalRemoval: true })
   await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
   await expect(page.locator('.chat-textarea')).toBeEditable()
   gateway.emitGoal(goalSnapshot({ status: 'paused', activeTaskId: null, executionState: 'idle', pauseReason: 'empty_continuations' }))
   const ribbon = page.locator('.goal-ribbon')
   await expect(ribbon).toContainText('Paused after repeated turns with no output or tool activity')
-  gateway.emitGoal(goalSnapshot({ status: 'paused', activeTaskId: null, executionState: 'idle', stateRevision: 2, pauseReason: 'usage_unknown', usageCoverage: 'partial_usage', usageAccountingStartedAtMs: 1800000000000 }))
-  await expect(ribbon).toContainText('Waiting for usage receipts')
   await page.reload()
-  await expect(ribbon).toContainText('Waiting for usage receipts')
-  await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
-  await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-  await expect(ribbon.getByLabel('Token budget', { exact: true })).toBeDisabled()
-  await expect(ribbon).toContainText('The token budget counts usage recorded since')
+  await expect(ribbon).toContainText('Paused after repeated turns with no output or tool activity')
   expect(gateway.setParams).toHaveLength(0)
 })
 
@@ -1113,15 +1047,14 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     await expect(ribbon.locator('.goal-ribbon__progress')).toHaveCount(0)
     await expect(page.locator('.msg-ai').filter({ hasText: REAL_FIRST_REPLY })).toBeVisible()
 
-    // Optional settings load only when the operator opens the editor.
+    // The editor only changes the objective; no optional settings RPC is needed.
     expect(sentRpcMethods).not.toContain('goals.capabilities')
     await ribbon.getByRole('button', { name: 'Goal actions', exact: true }).click()
     await ribbon.getByRole('menuitem', { name: 'Edit goal' }).click()
-    await expect(ribbon.getByLabel('Token budget', { exact: true })).toBeEnabled()
-    await expect(ribbon.locator('select')).toBeEnabled()
-    const capabilitiesRequest = rpcFrames.find(frame => frame.direction === 'sent' && frame.method === 'goals.capabilities')
-    const capabilitiesResponse = rpcFrames.find(frame => frame.direction === 'received' && frame.id === capabilitiesRequest?.id)
-    expect(capabilitiesResponse?.payload).toMatchObject({ tokenBudgetSupported: true, backgroundExecutionSupported: true })
+    await expect(ribbon.getByLabel('Token budget', { exact: true })).toHaveCount(0)
+    await expect(ribbon.locator('select')).toHaveCount(0)
+    expect(sentRpcMethods).not.toContain('goals.capabilities')
+    await page.screenshot({ path: testInfo.outputPath('goal-objective-editor.png') })
     await ribbon.getByRole('button', { name: 'Cancel', exact: true }).click()
 
     // Reload while Task 2 is blocked inside the real provider. The new page
@@ -1181,6 +1114,7 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     await expect(terminalAssistant).toHaveCount(1, { timeout: 30_000 })
     await expect(terminalAssistant.locator('.msg-goal-outcome')).toContainText('Goal achieved')
     await expect(goalSource).toHaveCount(1)
+    await page.screenshot({ path: testInfo.outputPath('goal-reconnected-complete.png') })
 
     await expect.poll(
       async () => (await gateway.readProviderCalls()).map(call => call.callNumber),

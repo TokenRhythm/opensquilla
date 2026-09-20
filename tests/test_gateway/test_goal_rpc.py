@@ -42,10 +42,12 @@ from opensquilla.gateway.rpc_goals import (
     _handle_goals_capabilities,
     _handle_goals_clear,
     _handle_goals_edit,
+    _handle_goals_edit_contract,
     _handle_goals_pause,
     _handle_goals_reattach,
     _handle_goals_resume,
     _handle_goals_set,
+    _handle_goals_set_contract,
     _handle_goals_status,
 )
 from opensquilla.gateway.rpc_sessions import (
@@ -610,8 +612,6 @@ async def test_capabilities_and_empty_status_are_read_only(tmp_path: Path) -> No
 
         assert capabilities == {
             "supported": True,
-            "tokenBudgetSupported": True,
-            "backgroundExecutionSupported": True,
             "executionEnabled": True,
             "maxTurns": 50,
             "runtimeBudgetSeconds": 3600,
@@ -691,28 +691,35 @@ async def test_capabilities_dispatch_preserves_invalid_params_rejection(
         assert stack.events == []
 
 
-async def test_advertised_goal_settings_are_persisted_by_set_and_edit(tmp_path: Path) -> None:
-    async with _open_goal_rpc_stack(tmp_path / "goal-settings-capabilities.sqlite") as stack:
+@pytest.mark.parametrize("retired", [
+    {"tokenBudget": 19}, {"tokenBudget": None},
+    {"executionPolicy": "background"}, {"executionPolicy": "foreground"},
+])
+async def test_retired_goal_options_reject_set_and_edit_without_mutation(
+    tmp_path: Path, retired: dict[str, Any],
+) -> None:
+    async with _open_goal_rpc_stack(tmp_path / "retired-goal-options.sqlite") as stack:
         capabilities = await _handle_goals_capabilities({"sessionKey": SOURCE_KEY}, stack.context)
-        assert capabilities["tokenBudgetSupported"] is True
-        assert capabilities["backgroundExecutionSupported"] is True
-        created = await _handle_goals_set(
-            {**_set_params(), "tokenBudget": 19, "executionPolicy": "background"}, stack.context,
-        )
-        assert created["goal"]["tokenBudget"] == 19
-        assert created["goal"]["executionPolicy"] == "background"
+        assert "tokenBudgetSupported" not in capabilities
+        assert "backgroundExecutionSupported" not in capabilities
+        with pytest.raises(RpcHandlerError) as error:
+            await _handle_goals_set_contract({**_set_params(), **retired}, stack.context)
+        assert error.value.code == "UNSUPPORTED_GOAL_OPTIONS"
+        assert await stack.storage.get_goal(SOURCE_KEY) is None
+        assert await _table_count(stack.storage, "agent_tasks") == 0
+        created = await _handle_goals_set(_set_params(), stack.context)
         await _settle_set_task(stack, created)
+        before = await stack.storage.get_goal(SOURCE_KEY)
         current = await _handle_goals_status({"sessionKey": SOURCE_KEY}, stack.context)
-        edited = await _handle_goals_edit(
-            {**_mutation_params(current["goal"], request_index=2),
-             "objective": current["goal"]["objective"],
-             "tokenBudget": 23, "executionPolicy": "foreground"}, stack.context,
-        )
-        assert edited["goal"]["tokenBudget"] == 23
-        assert edited["goal"]["executionPolicy"] == "foreground"
-        persisted = await stack.storage.get_goal(SOURCE_KEY)
-        assert persisted is not None
-        assert persisted.token_budget == 23 and persisted.background is False
+        assert not {"tokenBudget", "budgetTokensUsed", "executionPolicy"} & current["goal"].keys()
+        with pytest.raises(RpcHandlerError) as error:
+            await _handle_goals_edit_contract({
+                **_mutation_params(current["goal"], request_index=2),
+                "objective": "Changed synthetic objective.", **retired,
+            }, stack.context)
+        assert error.value.code == "UNSUPPORTED_GOAL_OPTIONS"
+        assert await stack.storage.get_goal(SOURCE_KEY) == before
+        assert await _table_count(stack.storage, "agent_tasks") == 1
 
 
 def test_legacy_goal_capabilities_remain_valid_without_advertising_new_settings() -> None:
@@ -3421,9 +3428,12 @@ async def test_prepare_shutdown_fences_resume_waiting_for_goal_transition_lock(
 
 
 @pytest.mark.ci_serial
-@pytest.mark.parametrize("lost_boundary", ["subscription", "shutdown"])
+@pytest.mark.parametrize("lost_boundary", [
+    "connection", "subscription", "shutdown", "feature_disabled",
+    "revoked_principal", "revoked_subscription",
+])
 @pytest.mark.asyncio
-async def test_continuation_transport_loss_after_accept_runs_but_shutdown_compensates(
+async def test_continuation_authority_loss_after_accept_compensates_before_activation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     lost_boundary: str,
@@ -3437,6 +3447,7 @@ async def test_continuation_transport_loss_after_accept_runs_but_shutdown_compen
         tmp_path / f"goal-continuation-{lost_boundary}.sqlite",
         handler=handler,
     ) as stack:
+        monkeypatch.setattr(stack.service, "schedule_idle_evaluation", lambda _key: None)
         created = await _handle_goals_set(_set_params(), stack.context)
         await _settle_set_task(stack, created)
         assert len(runs) == 1
@@ -3445,13 +3456,23 @@ async def test_continuation_transport_loss_after_accept_runs_but_shutdown_compen
 
         async def accept_then_lose_authority(*args: Any, **kwargs: Any) -> Any:
             accepted = await original_accept(*args, **kwargs)
-            if lost_boundary == "subscription":
+            if lost_boundary == "connection":
+                get_registry().unregister(stack.context.conn_id)
+            elif lost_boundary == "subscription":
                 stack.subscriptions.unsubscribe_messages(
                     stack.context.conn_id,
                     SOURCE_KEY,
                 )
-            else:
+            elif lost_boundary == "shutdown":
                 stack.service._closed = True
+            elif lost_boundary == "feature_disabled":
+                stack.service.config.execution_enabled = False
+            else:
+                connection = get_registry().get(stack.context.conn_id)
+                assert connection is not None
+                connection.principal = None
+                if lost_boundary == "revoked_subscription":
+                    stack.subscriptions.unsubscribe_messages(stack.context.conn_id, SOURCE_KEY)
             return accepted
 
         monkeypatch.setattr(
@@ -3470,30 +3491,73 @@ async def test_continuation_transport_loss_after_accept_runs_but_shutdown_compen
             created["goal"]["objectiveRevision"],
             1,
         )
-        if lost_boundary == "subscription":
-            await stack.runtime.wait(task_id, timeout=2.0)
         task = await stack.storage.get_agent_task(task_id)
         goal = await stack.storage.get_goal(SOURCE_KEY)
         assert task is not None
         assert goal is not None
         assert goal.turns_started == 2
         assert await stack.runtime.has_session_work(SOURCE_KEY) is False
-        if lost_boundary == "subscription":
-            assert task.status == AgentTaskStatus.SUCCEEDED
-            assert goal.status == "active"
-            assert goal.pause_reason is None
-            assert goal.active_task_id == task_id
-            assert goal.turns_settled == 1
-            assert SOURCE_KEY not in stack.service._leases
-            assert len(runs) == 2
-        else:
-            assert task.status == AgentTaskStatus.ABANDONED
-            assert task.terminal_reason == "process_restart"
-            assert goal.status == "paused"
-            assert goal.pause_reason == "process_restart"
-            assert goal.active_task_id is None
-            assert goal.turns_settled == 2
-            assert len(runs) == 1
+        detached = lost_boundary in {"connection", "subscription"}
+        reason = (
+            "owner_disconnected" if detached
+            else "process_restart" if lost_boundary == "shutdown"
+            else "feature_disabled" if lost_boundary == "feature_disabled"
+            else "activation_failed"
+        )
+        assert task.status == AgentTaskStatus.ABANDONED
+        assert task.terminal_reason == reason
+        assert task.started_at is None
+        assert goal.status == ("active" if detached else "paused")
+        assert goal.pause_reason == (None if detached else reason)
+        assert goal.active_task_id is None
+        assert goal.turns_settled == 2
+        assert goal.continuation_seq == 1
+        assert SOURCE_KEY not in stack.service._leases
+        assert len(runs) == 1
+        if not detached:
+            assert SOURCE_KEY not in stack.service._continuity_grants
+            return
+
+        assert stack.service._continuity_grants[SOURCE_KEY].continuity_token == (
+            created["continuityToken"]
+        )
+        status = await stack.service.status(SOURCE_KEY)
+        assert status["goal"]["continuationDeferredReason"] == "owner_disconnected"
+        await stack.service._kick_if_idle(SOURCE_KEY)
+        assert await _table_count(stack.storage, "agent_tasks") == 2
+        assert await stack.storage.get_goal(SOURCE_KEY) == goal
+
+        alternate_id = f"goal-reconnect-{uuid.uuid4()}"
+        alternate = RpcContext(
+            conn_id=alternate_id, principal=_PRINCIPAL, config=stack.context.config,
+            task_runtime=stack.runtime, session_manager=stack.manager,
+            subscription_manager=stack.subscriptions,
+        )
+        get_registry().register(_goal_connection(alternate_id))
+        stack.subscriptions.subscribe_messages(alternate_id, SOURCE_KEY)
+        try:
+            reattached = await _handle_goals_reattach(
+                _reattach_params(created, continuity_token=created["continuityToken"]),
+                alternate,
+            )
+            assert reattached["goal"]["status"] == "active"
+            assert reattached["goal"]["stateRevision"] == goal.state_revision
+            assert reattached["goal"]["windowTurnsStarted"] == goal.window_turns_started
+            assert reattached["goal"]["windowActiveTimeMs"] == goal.window_active_time_ms
+            monkeypatch.setattr(stack.storage, "accept_goal_continuation", original_accept)
+            await stack.service._kick_if_idle(SOURCE_KEY)
+            next_id = automatic_goal_task_id(goal.goal_id, goal.objective_revision, 2)
+            await _settle_set_task(stack, {"taskId": next_id})
+            settled = await stack.storage.get_goal(SOURCE_KEY)
+            assert settled is not None and settled.active_task_id is None
+            assert settled.turns_started == settled.turns_settled == 3
+            assert settled.continuation_seq == 2
+            assert [run.task_id for run in runs] == [created["taskId"], next_id]
+            abandoned = await stack.storage.get_agent_task(task_id)
+            assert abandoned == task
+        finally:
+            stack.subscriptions.remove_connection(alternate_id)
+            get_registry().unregister(alternate_id)
 
 
 @pytest.mark.asyncio
@@ -3985,8 +4049,8 @@ async def test_hot_kill_switch_pauses_leased_goal_and_blocks_new_provider_turn(
             stack.context,
         )
         assert capabilities["executionEnabled"] is False
-        assert capabilities["tokenBudgetSupported"] is True
-        assert capabilities["backgroundExecutionSupported"] is True
+        assert "tokenBudgetSupported" not in capabilities
+        assert "backgroundExecutionSupported" not in capabilities
 
 
 @pytest.mark.asyncio
@@ -5350,30 +5414,21 @@ async def test_goal_reattach_contract_maps_invalid_result_without_running_twice(
 
 
 @pytest.mark.parametrize("open_local_owner", [False, True])
-async def test_background_goal_continues_after_disconnect_but_shutdown_pauses(
-    tmp_path: Path, open_local_owner: bool,
+@pytest.mark.parametrize("loss", ["connection", "subscription"])
+async def test_legacy_background_goal_requires_live_connection_and_subscription(
+    tmp_path: Path, open_local_owner: bool, loss: str,
 ) -> None:
-    started = asyncio.Event()
-    release_first = asyncio.Event()
-    continued = asyncio.Event()
-    release_second = asyncio.Event()
+    started, release_first = asyncio.Event(), asyncio.Event()
     runs: list[TaskRun] = []
 
     async def handler(run: TaskRun) -> None:
         runs.append(run)
-        if len(runs) == 1:
-            started.set()
-            await release_first.wait()
-        elif len(runs) == 2:
-            continued.set()
-            await release_second.wait()
-        else:
-            raise AssertionError("Shutdown must not admit another automatic task")
+        assert len(runs) == 1, "Detached Goal must not start another automatic task"
+        started.set()
+        await release_first.wait()
 
     async with _open_goal_rpc_stack(
-        tmp_path / "background-goal.sqlite",
-        handler=handler,
-        wire_lifecycle=True,
+        tmp_path / "legacy-background.sqlite", handler=handler, wire_lifecycle=True,
     ) as stack:
         if open_local_owner:
             from opensquilla.gateway.auth import resolve_auth
@@ -5382,41 +5437,45 @@ async def test_background_goal_continues_after_disconnect_but_shutdown_pauses(
                 stack.context.config, auth_params={}, role_claim="operator", peer_ip="127.0.0.1",
             )
             assert principal is not None and principal.is_owner
-            assert principal.authenticated is False and principal.auth_state == "authenticated"
             stack.context.principal = principal
             get_registry().get(stack.context.conn_id).principal = principal
-        created = await _handle_goals_set(
-            {**_set_params(), "executionPolicy": "background"},
-            stack.context,
-        )
+        created = await _handle_goals_set(_set_params(), stack.context)
         await asyncio.wait_for(started.wait(), 2)
-        assert created["goal"]["executionPolicy"] == "background"
-        stack.subscriptions.unsubscribe_messages(stack.context.conn_id, SOURCE_KEY)
-        get_registry().unregister(stack.context.conn_id)
-        await stack.service.on_subscription_lost(stack.context.conn_id, SOURCE_KEY)
+        # Historical database values cannot grant disconnected execution.
+        await stack.storage.conn.execute(
+            "UPDATE session_goals SET background=1 WHERE session_key=?", (SOURCE_KEY,),
+        )
+        await stack.storage.conn.commit()
+        if loss == "connection":
+            get_registry().unregister(stack.context.conn_id)
+        else:
+            stack.subscriptions.unsubscribe_messages(stack.context.conn_id, SOURCE_KEY)
         release_first.set()
-        await asyncio.wait_for(continued.wait(), 2)
+        await stack.runtime.wait(created["taskId"], timeout=3)
+        await _wait_for_goal(stack.storage, lambda goal: goal.active_task_id is None)
+        await stack.service._kick_if_idle(SOURCE_KEY)
+        await asyncio.gather(*list(stack.service._kick_tasks.values()))
         status = await stack.service.status(SOURCE_KEY)
         assert status["goal"]["status"] == "active"
-        assert status["goal"]["continuationDeferredReason"] is None
+        assert status["goal"]["continuationDeferredReason"] == "owner_disconnected"
+        assert "executionPolicy" not in status["goal"]
+        assert SOURCE_KEY in stack.service._continuity_grants
+        assert SOURCE_KEY not in stack.service._leases
+        assert len(runs) == await _table_count(stack.storage, "agent_tasks") == 1
         await stack.service.prepare_shutdown()
         paused = await stack.storage.get_goal(SOURCE_KEY)
         assert paused is not None
         assert (paused.status, paused.pause_reason) == ("paused", "process_restart")
-        assert paused.background is True
-        release_second.set()
-        await stack.runtime.wait(runs[1].task_id, timeout=2)
-        assert len(runs) == 2
 
 
 @pytest.mark.parametrize("invalid_principal", [None, replace(_PRINCIPAL, scopes=frozenset())])
-async def test_background_goal_cannot_restore_invalid_authority_after_disconnect(
+async def test_goal_cannot_restore_invalid_authority_after_disconnect(
     tmp_path: Path,
     invalid_principal: Principal | None,
 ) -> None:
     async with _open_goal_rpc_stack(tmp_path / "background-revoked.sqlite") as stack:
         await _handle_goals_set(
-            {**_set_params(), "executionPolicy": "background"}, stack.context,
+            _set_params(), stack.context,
         )
         goal = await stack.storage.get_goal(SOURCE_KEY)
         assert goal is not None
@@ -5433,7 +5492,7 @@ async def test_background_goal_cannot_restore_invalid_authority_after_disconnect
 @pytest.mark.parametrize(
     "revocation", ["named_token", "named_token_active", "missing_principal", "removed_write_scope"]
 )
-async def test_background_goal_rechecks_revoked_authority_before_next_admission(
+async def test_goal_rechecks_revoked_authority_before_next_admission(
     tmp_path: Path, revocation: str,
 ) -> None:
     from opensquilla.gateway.auth import resolve_auth
@@ -5479,7 +5538,7 @@ async def test_background_goal_rechecks_revoked_authority_before_next_admission(
             assert principal is not None and principal.authenticated
             stack.context.principal = connection.principal = principal
         created = await _handle_goals_set(
-            {**_set_params(), "executionPolicy": "background"}, stack.context,
+            _set_params(), stack.context,
         )
         await asyncio.wait_for(entered.wait(), 2)
         if revocation == "missing_principal":
@@ -5522,21 +5581,15 @@ async def test_background_goal_rechecks_revoked_authority_before_next_admission(
         await stack.service._kick_if_idle(SOURCE_KEY)
         if stack.service._kick_tasks:
             await asyncio.gather(*list(stack.service._kick_tasks.values()))
+        assert await _table_count(stack.storage, "agent_tasks") == 1
+        assert len(runs) == 1
         if revocation == "named_token_active":
-            await _wait_for_goal(stack.storage, lambda goal: goal.status == "complete")
-            task = await stack.storage.get_agent_task(runs[1].task_id)
-            assert task is not None and task.status == AgentTaskStatus.RUNNING
-            # Terminal Goal status prevents further admission even while the
-            # owning task is still performing its ordinary final response.
-            await stack.service._kick_if_idle(SOURCE_KEY)
-            assert len(runs) == 2
-            finish_summary.set()
-            settled = await stack.runtime.wait(runs[1].task_id, timeout=3)
-            assert settled.status == AgentTaskStatus.SUCCEEDED
-        expected_runs = 2 if revocation == "named_token_active" else 1
-        assert await _table_count(stack.storage, "agent_tasks") == expected_runs
-        assert len(runs) == expected_runs
-        assert SOURCE_KEY not in stack.service._continuity_grants
+            assert SOURCE_KEY in stack.service._continuity_grants
+            goal = await stack.storage.get_goal(SOURCE_KEY)
+            assert goal is not None and stack.service._lease_for(goal) is None
+        else:
+            assert SOURCE_KEY not in stack.service._continuity_grants
+
 
 
 @pytest.mark.parametrize("outcome", ["failure", "replay"])
@@ -5545,7 +5598,7 @@ async def test_goal_authority_rollback_cannot_restore_disconnected_downgraded_ow
 ) -> None:
     async with _open_goal_rpc_stack(tmp_path / "authority-rollback.sqlite") as stack:
         created = await _handle_goals_set(
-            {**_set_params(), "executionPolicy": "background"}, stack.context,
+            _set_params(), stack.context,
         )
         connection = get_registry().get(stack.context.conn_id)
         assert connection is not None
@@ -5590,7 +5643,6 @@ async def test_natural_create_attaches_to_ordinary_running_rpc_task(
         created = await stack.service.create_from_turn(
             ctx,
             objective="Complete the synthetic requested work.",
-            token_budget=None,
         )
         created_goals.append(created)
         runtime_contexts.append(ctx.goal_context)
@@ -5623,7 +5675,7 @@ async def test_natural_create_attaches_to_ordinary_running_rpc_task(
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert len(created_goals) == 1
         assert created_goals[0]["activeTaskId"] == accepted["task_id"]
-        assert created_goals[0]["executionPolicy"] == "foreground"
+        assert "executionPolicy" not in created_goals[0]
         assert runtime_contexts[0]["taskId"] == accepted["task_id"]
         assert await _table_count(stack.storage, "agent_tasks") == 1
         assert await _table_count(stack.storage, "transcript_entries") == 1
@@ -5634,24 +5686,6 @@ async def test_natural_create_attaches_to_ordinary_running_rpc_task(
         assert goal.turns_started == goal.turns_settled == 1
 
 
-async def test_background_opt_in_requires_subscription_before_durable_edit(tmp_path: Path) -> None:
-    async with _open_goal_rpc_stack(tmp_path / "goal-background-authority.sqlite") as stack:
-        created = await _handle_goals_set(_set_params(), stack.context)
-        await stack.runtime.wait(created["taskId"], timeout=2)
-        stack.subscriptions.unsubscribe_messages(stack.context.conn_id, SOURCE_KEY)
-        with pytest.raises(RpcHandlerError) as exc:
-            await _handle_goals_edit(
-                {
-                    **_mutation_params(created["goal"], request_index=2),
-                    "objective": created["goal"]["objective"],
-                    "executionPolicy": "background",
-                },
-                stack.context,
-            )
-        assert exc.value.code == "EXECUTION_LEASE_REQUIRED"
-        goal = await stack.storage.get_goal(SOURCE_KEY)
-        assert goal is not None and goal.background is False
-        assert goal.state_revision == created["goal"]["stateRevision"]
 
 
 async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_path: Path) -> None:
@@ -5753,7 +5787,6 @@ async def test_natural_resume_and_edit_reuse_current_ordinary_task(tmp_path: Pat
         snapshot = await stack.service.update_from_turn(
             ctx,
             objective="Complete the updated synthetic objective.",
-            settings={"tokenBudget": 1000},
             resume=True,
         )
         snapshots.append(snapshot)
@@ -5783,7 +5816,7 @@ async def test_natural_resume_and_edit_reuse_current_ordinary_task(tmp_path: Pat
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert len(runs) == 2 and len(snapshots) == 1
         assert snapshots[0]["objectiveRevision"] == 2
-        assert snapshots[0]["tokenBudget"] == 1000
+        assert "tokenBudget" not in snapshots[0]
         goal = await _wait_for_goal(
             stack.storage,
             lambda value: value.status == "complete" and value.active_task_id is None,
@@ -5794,7 +5827,7 @@ async def test_natural_resume_and_edit_reuse_current_ordinary_task(tmp_path: Pat
 
 
 @pytest.mark.parametrize("initial_status", ["active", "paused"])
-@pytest.mark.parametrize("change", ["objective", "token_budget", "pause_only"])
+@pytest.mark.parametrize("change", ["objective", "pause_only"])
 async def test_natural_dispatch_edits_and_pauses_atomically_in_current_task(
     tmp_path: Path, initial_status: str, change: str,
 ) -> None:
@@ -5850,7 +5883,8 @@ async def test_natural_dispatch_edits_and_pauses_atomically_in_current_task(
             {"objective": "Invalid combined terminal edit.", "status": "complete"},
             {"objective": "Invalid combined terminal edit.", "status": "blocked",
              "reason": "Repeated synthetic blocker."},
-            {"token_budget": 1000, "status": "active", "reason": "Invalid reason."},
+            {"objective": "Invalid resume reason.", "status": "active",
+             "reason": "Invalid reason."},
             {"objective": "Invalid pause reason.", "status": "paused",
              "reason": "Invalid reason."},
         ):
@@ -5860,9 +5894,7 @@ async def test_natural_dispatch_edits_and_pauses_atomically_in_current_task(
         event_count = len(stack.events)
         arguments: dict[str, Any] = {"status": "paused"}
         if change != "pause_only":
-            arguments[change] = (
-                "Complete the edited synthetic objective." if change == "objective" else 1200
-            )
+            arguments[change] = "Complete the edited synthetic objective."
         edited = (await invoke("update_goal", arguments))["goal"]
         snapshots.append(edited)
         assert edited["goalId"] == before.goal_id
@@ -5874,7 +5906,7 @@ async def test_natural_dispatch_edits_and_pauses_atomically_in_current_task(
         assert persisted is not None and persisted.status == "paused"
         assert persisted.active_task_id == run.task_id
         assert persisted.objective == edited["objective"]
-        assert persisted.token_budget == edited["tokenBudget"]
+        assert "tokenBudget" not in edited
         read = (await invoke("get_goal", {}))["goal"]
         assert read["goalId"] == before.goal_id and read["status"] == "paused"
         for arguments in (
@@ -5906,7 +5938,7 @@ async def test_natural_dispatch_edits_and_pauses_atomically_in_current_task(
         assert await _table_count(stack.storage, "transcript_entries") == expected_count
 
 
-async def test_owned_background_turn_dispatch_can_pause_after_disconnect(tmp_path: Path) -> None:
+async def test_owned_turn_dispatch_can_pause_after_disconnect(tmp_path: Path) -> None:
     from opensquilla.engine.types import ToolCall
     from opensquilla.tools.dispatch import build_tool_handler
     from opensquilla.tools.types import CallerKind, ToolContext
@@ -5939,7 +5971,7 @@ async def test_owned_background_turn_dispatch_can_pause_after_disconnect(tmp_pat
         tmp_path / "background-disconnected-pause.sqlite", handler=handler, wire_lifecycle=True,
     ) as stack:
         sent = await _handle_goals_set(
-            {**_set_params(), "executionPolicy": "background"}, stack.context,
+            _set_params(), stack.context,
         )
         task = await stack.runtime.wait(sent["taskId"], timeout=3)
         assert task.status == AgentTaskStatus.SUCCEEDED
@@ -5951,7 +5983,7 @@ async def test_owned_background_turn_dispatch_can_pause_after_disconnect(tmp_pat
 
 
 @pytest.mark.parametrize("receipt", ["finalized", "unknown"])
-async def test_historical_goal_budget_edit_and_resume_account_only_new_receipts(
+async def test_historical_goal_resume_accounts_receipts_without_budget_pauses(
     tmp_path: Path, receipt: str,
 ) -> None:
     from opensquilla.session.goals import goal_snapshot, new_goal
@@ -5978,6 +6010,7 @@ async def test_historical_goal_budget_edit_and_resume_account_only_new_receipts(
                 completed_at_ms=call.started_at_ms + 1,
                 input_tokens=10, output_tokens=5, total_tokens=15, cache_read_tokens=4,
             ))
+        await stack.service.commit_model_status(run.goal_context, status="complete", reason=None)
 
     async with _open_goal_rpc_stack(
         tmp_path / "historical-budget.sqlite", handler=handler, wire_lifecycle=True,
@@ -5998,10 +6031,9 @@ async def test_historical_goal_budget_edit_and_resume_account_only_new_receipts(
         await stack.storage.conn.commit()
         edited = await _handle_goals_edit({
             **_mutation_params(goal_snapshot(historical), request_index=1),
-            "objective": historical.objective, "tokenBudget": 1,
+            "objective": historical.objective,
         }, stack.context)
         assert edited["goal"]["status"] == "paused"
-        assert edited["goal"]["budgetTokensUsed"] == 0
         assert edited["goal"]["usageAccountingStartedAtMs"] is None
         assert await _table_count(stack.storage, "agent_tasks") == 0
 
@@ -6009,21 +6041,20 @@ async def test_historical_goal_budget_edit_and_resume_account_only_new_receipts(
             _mutation_params(edited["goal"], request_index=2), stack.context,
         )
         settled = await _wait_for_goal(stack.storage, lambda goal: (
-            goal.status == "paused" and goal.active_task_id is None and goal.turns_settled == 1
+            goal.status == "complete" and goal.active_task_id is None and goal.turns_settled == 1
         ))
         assert len(calls) == 1
         assert await _table_count(stack.storage, "agent_tasks") == 1
         assert settled.usage_accounting_version == 0
         assert settled.usage_accounting_started_at_ms == calls[0].started_at_ms
         known = receipt == "finalized"
-        assert settled.pause_reason == ("token_budget" if known else "usage_unknown")
+        assert settled.pause_reason is None
         assert settled.usage_coverage == ("partial_history" if known else "partial_usage")
-        assert settled.budget_tokens_used == (11 if known else 0)
         assert (settled.input_tokens, settled.output_tokens, settled.total_tokens) == (
             (110, 55, 165) if known else (100, 50, 150)
         )
         status = await _handle_goals_status({"sessionKey": SOURCE_KEY}, stack.context)
-        assert status["goal"]["budgetTokensUsed"] == settled.budget_tokens_used
+        assert "budgetTokensUsed" not in status["goal"]
         assert status["goal"]["usageCoverage"] == settled.usage_coverage
 
 
@@ -6129,7 +6160,7 @@ async def test_queued_gateway_child_and_grandchild_usage_stays_with_root_goal(
         }
         goal = await stack.storage.get_goal(SOURCE_KEY)
         assert goal is not None and goal.status == "complete"
-        assert goal.total_tokens == goal.budget_tokens_used == 20
+        assert goal.total_tokens == 20
         for call in calls:
             record = await stack.storage.start_usage_event(call)
             assert record is not None and record.goal_id == goal.goal_id
@@ -6155,7 +6186,7 @@ async def test_late_goal_usage_emits_once_after_commit_and_never_recreates_clear
     async with _open_goal_rpc_stack(
         tmp_path / "goal-usage-events.sqlite", handler=handler,
     ) as stack:
-        created = await _handle_goals_set({**_set_params(), "tokenBudget": 5}, stack.context)
+        created = await _handle_goals_set(_set_params(), stack.context)
         await stack.runtime.wait(created["taskId"], timeout=2)
         session = await stack.storage.get_session(SOURCE_KEY)
         assert session is not None
@@ -6196,8 +6227,8 @@ async def test_late_goal_usage_emits_once_after_commit_and_never_recreates_clear
         await sink.finalize(call, result)
         assert len(stack.events) == 1
         snapshot = stack.events[0][2]["goal"]
-        assert snapshot["budgetTokensUsed"] == 6
-        assert (snapshot["status"], snapshot["pauseReason"]) == ("paused", "token_budget")
+        assert snapshot["usage"]["totalTokens"] == 6
+        assert (snapshot["status"], snapshot["pauseReason"]) == ("active", None)
         second_call = replace(call, event_id="cleared-late", call_index=2)
         await sink.start(second_call)
         await _handle_goals_clear(_mutation_params(snapshot, request_index=2), stack.context)
@@ -6208,14 +6239,18 @@ async def test_late_goal_usage_emits_once_after_commit_and_never_recreates_clear
         await sink.close()
 
 
-async def test_completed_goal_edit_with_missing_usage_stays_paused_through_rpc(tmp_path):
+async def test_completed_goal_edit_with_missing_usage_can_resume_through_rpc(tmp_path):
     from opensquilla.session.usage_ledger import UsageEventStart
 
     runs = []
 
     async def handler(run):
         runs.append(run.task_id)
-        assert len(runs) == 1
+        if len(runs) > 1:
+            await stack.service.commit_model_status(
+                run.goal_context, status="complete", reason=None,
+            )
+            return
         await stack.storage.start_usage_event(UsageEventStart(
             event_id="missing-completed-receipt", execution_id=run.task_id,
             turn_id=run.task_id, root_turn_id=run.task_id, call_index=1,
@@ -6230,7 +6265,7 @@ async def test_completed_goal_edit_with_missing_usage_stays_paused_through_rpc(t
     async with _open_goal_rpc_stack(
         tmp_path / "reopen-unknown-budget.sqlite", handler=handler, wire_lifecycle=True,
     ) as stack:
-        created = await _handle_goals_set({**_set_params(), "tokenBudget": 100}, stack.context)
+        created = await _handle_goals_set(_set_params(), stack.context)
         await stack.runtime.wait(created["taskId"], timeout=2)
         completed = await _wait_for_goal(
             stack.storage,
@@ -6242,8 +6277,12 @@ async def test_completed_goal_edit_with_missing_usage_stays_paused_through_rpc(t
             stack.context,
         )
         assert edited["goal"]["objective"] == "Next synthetic task."
-        assert edited["goal"]["status"] == "paused"
-        assert edited["goal"]["pauseReason"] == "usage_unknown"
+        assert edited["goal"]["status"] == "active"
+        assert edited["goal"]["pauseReason"] is None
         await stack.service._kick_if_idle(SOURCE_KEY)
-        assert await _table_count(stack.storage, "agent_tasks") == 1
-        assert runs == [created["taskId"]]
+        resumed = await _wait_for_goal(stack.storage, lambda goal: (
+            goal.status == "complete" and goal.active_task_id is None and goal.turns_settled == 2
+        ))
+        assert resumed.usage_coverage == "partial_usage"
+        assert await _table_count(stack.storage, "agent_tasks") == 2
+        assert len(runs) == 2
