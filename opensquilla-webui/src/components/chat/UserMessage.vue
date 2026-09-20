@@ -106,7 +106,7 @@
               class="msg-thumb-button"
               :title="attachmentPrimaryActionLabel(attachment)"
               :aria-label="attachmentPrimaryActionLabel(attachment)"
-              @click.stop="emit('previewImage', attachment)"
+              @click.stop="previewImage(attachment, $event)"
             >
               <img
                 class="msg-thumb"
@@ -142,7 +142,7 @@
               :aria-label="attachment.workspaceFile ? undefined : attachmentPrimaryActionLabel(attachment)"
               :aria-busy="attachment.workspaceFile ? undefined : downloadingAttachments.has(attachment.renderKey)"
               :disabled="attachment.workspaceFile ? undefined : downloadingAttachments.has(attachment.renderKey)"
-              @click.stop="activateAttachment(attachment)"
+              @click.stop="activateAttachment(attachment, $event)"
             >
               <span class="msg-file-chip__icon" aria-hidden="true">
                 <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
@@ -475,10 +475,16 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   return attachmentOpenReason(attachment)
 }
 
-function activateAttachment(attachment: DisplayAttachment) {
+function previewImage(attachment: DisplayAttachment, event: MouseEvent) {
+  // Establish the return target even when pointer clicks do not focus buttons.
+  if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true })
+  emit('previewImage', attachment)
+}
+
+function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
   if (attachment.workspaceFile) return
   if (isImageDisplayAttachment(attachment)) {
-    emit('previewImage', attachment)
+    previewImage(attachment, event)
     return
   }
   if (attachmentCanOpen(attachment)) {

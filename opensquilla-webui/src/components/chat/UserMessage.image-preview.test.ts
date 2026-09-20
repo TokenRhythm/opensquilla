@@ -78,6 +78,7 @@ describe('UserMessage uploaded image preview', () => {
     expect(download?.contains(open)).toBe(false)
 
     open?.click()
+    expect(document.activeElement).toBe(open)
     expect(previewImage).toHaveBeenCalledExactlyOnceWith(attachment)
     expect(downloadAttachment).not.toHaveBeenCalled()
 

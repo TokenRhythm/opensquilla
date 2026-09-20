@@ -17,7 +17,7 @@
           type="button"
           class="msg-media-card__img"
           :aria-label="t('chat.openTitle', { title: artifactFileTitle(artifact) })"
-          @click="openPreview(artifact)"
+          @click="openPreview(artifact, $event)"
         >
           <img
             :src="thumbUrlFor(artifact)"
@@ -275,7 +275,10 @@ function retryPreview(artifact: ArtifactPayload) {
 
 // App owns image preview so images opened from a message and from the
 // Workbench collection share one Lightbox.
-function openPreview(artifact: ArtifactPayload) {
+function openPreview(artifact: ArtifactPayload, event: MouseEvent) {
+  // WebKit does not focus buttons on pointer clicks; the lightbox records
+  // the active element so it can return focus here when dismissed.
+  if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true })
   emit('open', artifact)
 }
 

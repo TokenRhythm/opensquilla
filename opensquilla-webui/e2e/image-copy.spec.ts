@@ -228,6 +228,9 @@ test.describe('Image copy through the system clipboard', () => {
     const lightbox = page.locator('.deliv-preview')
     await expect(lightbox).toBeVisible()
     await copyImage(page, lightbox)
+    await page.keyboard.press('Escape')
+    await expect(lightbox).toHaveCount(0)
+    await expect(resource.locator('.msg-media-card__img')).toBeFocused()
   })
 
   test('generated SVG copies a transparent PNG and exact UTF-8 source', async ({ page }, testInfo) => {
@@ -273,6 +276,9 @@ test.describe('Image copy through the system clipboard', () => {
     await copyImage(page, resource)
     await resource.locator('.msg-thumb-button').click()
     await copyImage(page, page.locator('.deliv-preview'))
+    await page.keyboard.press('Escape')
+    await expect(page.locator('.deliv-preview')).toHaveCount(0)
+    await expect(resource.locator('.msg-thumb-button')).toBeFocused()
   })
 
   test('SVG scripts, event attributes, and external resources stay inert', async ({ page }) => {
