@@ -52,6 +52,7 @@ import { useI18n } from 'vue-i18n'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
 import SidebarSessionHoverCard, {
+  canShowSessionPreview,
   sessionPreviewPosition,
 } from './SidebarSessionHoverCard.vue'
 import { useConfirm } from '@/composables/useConfirm'
@@ -358,17 +359,42 @@ const hasFilterMatches = computed(() =>
 /* ── Session drag ordering ────────────────────────────────────────── */
 
 const draggedRowKey = ref('')
-const draggedRowScope = ref('')
 const dropTargetKey = ref('')
 const dropPosition = ref<'before' | 'after'>('before')
 const pointerDrag = ref<{
   key: string
+  title: string
   scope: string
+  pointerId: number
+  source: HTMLElement
   startX: number
   startY: number
+  clientX: number
+  clientY: number
+  width: number
+  height: number
   active: boolean
 } | null>(null)
 const suppressSelectKey = ref('')
+const settlingRowKey = ref('')
+let dragScrollFrame = 0
+let dragScrollTime = 0
+let settlingRowTimer: ReturnType<typeof setTimeout> | undefined
+
+const dragPreviewStyle = computed(() => {
+  const drag = pointerDrag.value
+  if (!drag) return {}
+  const width = Math.min(drag.width, 220, window.innerWidth - 24)
+  const left = Math.max(12, Math.min(drag.clientX + 16, window.innerWidth - width - 12))
+  const top = drag.clientY + drag.height + 16 <= window.innerHeight - 12
+    ? drag.clientY + 16
+    : Math.max(12, drag.clientY - drag.height - 16)
+  return {
+    width: `${width}px`,
+    height: `${drag.height}px`,
+    transform: `translate3d(${left}px, ${top}px, 0)`,
+  }
+})
 
 function reorderScope(row: SidebarDisplayRow): string {
   if (row.pinned) return 'pinned'
@@ -384,10 +410,26 @@ function canDragRow(row: SidebarDisplayRow): boolean {
 }
 
 function clearRowDrag() {
+  const drag = pointerDrag.value
+  if (drag?.active) suppressSelectKey.value = drag.key
+  if (dragScrollFrame) cancelAnimationFrame(dragScrollFrame)
+  dragScrollFrame = 0
+  dragScrollTime = 0
+  if (drag?.source.hasPointerCapture?.(drag.pointerId)) {
+    drag.source.releasePointerCapture(drag.pointerId)
+  }
   draggedRowKey.value = ''
-  draggedRowScope.value = ''
   dropTargetKey.value = ''
   pointerDrag.value = null
+}
+
+function settleRow(key: string) {
+  settlingRowKey.value = key
+  if (settlingRowTimer) clearTimeout(settlingRowTimer)
+  settlingRowTimer = setTimeout(() => {
+    if (settlingRowKey.value === key) settlingRowKey.value = ''
+    settlingRowTimer = undefined
+  }, 360)
 }
 
 function findSessionRow(key: string): SidebarDisplayRow | undefined {
@@ -395,47 +437,94 @@ function findSessionRow(key: string): SidebarDisplayRow | undefined {
 }
 
 function onRowPointerDown(row: SidebarDisplayRow, event: PointerEvent) {
-  if (event.button !== 0 || !canDragRow(row)) return
+  if (pointerDrag.value) return
+  // A new gesture (including a touch tap) cannot be the click left by a drag.
+  suppressSelectKey.value = ''
+  // Touch belongs to the scroll container; a swipe must never reorder a task.
+  if (event.button !== 0 || event.pointerType === 'touch' || !canDragRow(row)) return
   const target = event.target
   if (target instanceof Element && target.closest('.sidebar-row-menu-wrap, input, .sidebar-agent-badge')) return
+  const source = event.currentTarget
+  if (!(source instanceof HTMLElement)) return
+  const rect = source.getBoundingClientRect()
   pointerDrag.value = {
     key: row.key,
+    title: row.title,
     scope: reorderScope(row),
+    pointerId: event.pointerId,
+    source,
     startX: event.clientX,
     startY: event.clientY,
+    clientX: event.clientX,
+    clientY: event.clientY,
+    width: rect.width,
+    height: rect.height,
     active: false,
   }
 }
 
-useDocumentEvent('pointermove', (event) => {
+function updateRowDropTarget() {
   const drag = pointerDrag.value
-  if (!drag) return
-  if (!drag.active) {
-    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return
-    drag.active = true
-    draggedRowKey.value = drag.key
-    draggedRowScope.value = drag.scope
-  }
-  event.preventDefault()
-  const target = document.elementFromPoint(event.clientX, event.clientY)
+  if (!drag?.active) return
+  const target = document.elementFromPoint(drag.clientX, drag.clientY)
     ?.closest<HTMLElement>('.sidebar-history-row[data-session-key]')
   const targetKey = target?.dataset.sessionKey || ''
   const row = findSessionRow(targetKey)
-  if (!target || !row || row.key === drag.key || !canDragRow(row) || reorderScope(row) !== drag.scope) {
+  if (
+    !target || !historyList.value?.contains(target) || !row
+    || row.key === drag.key || !canDragRow(row) || reorderScope(row) !== drag.scope
+  ) {
     dropTargetKey.value = ''
     return
   }
   const rect = target.getBoundingClientRect()
   dropTargetKey.value = row.key
-  dropPosition.value = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+  dropPosition.value = drag.clientY < rect.top + rect.height / 2 ? 'before' : 'after'
+}
+
+function scrollDuringRowDrag(time: number) {
+  const drag = pointerDrag.value
+  const list = historyList.value
+  if (!drag?.active || !list) return
+  const elapsed = dragScrollTime ? Math.min(time - dragScrollTime, 32) : 16
+  dragScrollTime = time
+  const rect = list.getBoundingClientRect()
+  const edge = Math.min(48, rect.height / 4)
+  if (edge > 0 && drag.clientX >= rect.left && drag.clientX <= rect.right) {
+    const up = Math.max(0, Math.min(1, (rect.top + edge - drag.clientY) / edge))
+    const down = Math.max(0, Math.min(1, (drag.clientY - rect.bottom + edge) / edge))
+    const before = list.scrollTop
+    list.scrollTop += (down - up) * elapsed * 0.5
+    if (list.scrollTop !== before) updateRowDropTarget()
+  }
+  dragScrollFrame = requestAnimationFrame(scrollDuringRowDrag)
+}
+
+useDocumentEvent('pointermove', (event) => {
+  const drag = pointerDrag.value
+  if (!drag || event.pointerId !== drag.pointerId) return
+  drag.clientX = event.clientX
+  drag.clientY = event.clientY
+  if (!drag.active) {
+    if (Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY) < 6) return
+    drag.active = true
+    draggedRowKey.value = drag.key
+    closeSessionPreview()
+    closeMenu()
+    // Capturing keeps release/cancellation reliable outside the sidebar.
+    if (Number.isFinite(drag.pointerId)) drag.source.setPointerCapture?.(drag.pointerId)
+    dragScrollFrame = requestAnimationFrame(scrollDuringRowDrag)
+  }
+  event.preventDefault()
+  updateRowDropTarget()
 }, { passive: false })
 
-useDocumentEvent('pointerup', () => {
+useDocumentEvent('pointerup', (event) => {
   const drag = pointerDrag.value
-  if (!drag) return
+  if (!drag || event.pointerId !== drag.pointerId) return
   if (drag.active) {
-    suppressSelectKey.value = drag.key
     if (dropTargetKey.value) {
+      settleRow(drag.key)
       emit('reorder', {
         draggedKey: drag.key,
         targetKey: dropTargetKey.value,
@@ -446,7 +535,20 @@ useDocumentEvent('pointerup', () => {
   clearRowDrag()
 })
 
-useDocumentEvent('pointercancel', clearRowDrag)
+useDocumentEvent('pointercancel', (event) => {
+  if (event.pointerId === pointerDrag.value?.pointerId) clearRowDrag()
+})
+useDocumentEvent('keydown', (event) => {
+  if (event.key !== 'Escape' || !pointerDrag.value) return
+  event.preventDefault()
+  clearRowDrag()
+})
+onMounted(() => window.addEventListener('blur', clearRowDrag))
+onUnmounted(() => {
+  window.removeEventListener('blur', clearRowDrag)
+  if (settlingRowTimer) clearTimeout(settlingRowTimer)
+  clearRowDrag()
+})
 
 /* ── Bulk selection ───────────────────────────────────────────────── */
 
@@ -652,9 +754,16 @@ function openSessionPreview(row: SidebarDisplayRow, event: Event) {
   if (
     row.rowKind !== 'session'
     || selectionMode.value
+    || draggedRowKey.value
     || openMenuKey.value
     || renamingKey.value === row.key
   ) return
+  // On narrow/mobile layouts the sidebar fills the viewport. A fixed preview
+  // would cover neighboring rows and make the list hard to operate.
+  if (!canShowSessionPreview(window.innerWidth)) {
+    closeSessionPreview()
+    return
+  }
   const anchor = event.currentTarget
   if (!(anchor instanceof HTMLElement)) return
   sessionPreview.value = {
@@ -808,11 +917,13 @@ function emitSessionPin(row: SidebarConversationItem) {
   if (row.rowKind === 'session') emit('session-pin', { key: row.key, pinned: !row.pinned })
 }
 
-function onSelectRow(row: SidebarConversationItem) {
+function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
   if (row.rowKind !== 'session') return
   if (suppressSelectKey.value === row.key) {
     suppressSelectKey.value = ''
-    return
+    // Keyboard and assistive activation have no pointer click count. Pointer
+    // capture can send the preceding drag click to the row wrapper instead.
+    if (event.detail !== 0) return
   }
   if (row.provisional) return
   if (renamingKey.value === row.key) return
@@ -838,6 +949,7 @@ function onSelectRow(row: SidebarConversationItem) {
     class="sidebar-section sidebar-history"
     :class="{
       'is-selecting': selectionMode,
+      'is-reordering': Boolean(draggedRowKey),
       'has-projects': displayProjection.projectCount > 0,
     }"
     :aria-label="t('shared.sidebar.recentConversations')"
@@ -1038,7 +1150,7 @@ function onSelectRow(row: SidebarConversationItem) {
             :id="`sidebar-group-${block.key}`"
             class="sidebar-group__body"
           >
-            <div class="sidebar-group__content">
+            <TransitionGroup name="sidebar-row" tag="div" class="sidebar-group__content">
               <div
                 v-for="row in block.rows"
                 :key="row.key"
@@ -1050,6 +1162,7 @@ function onSelectRow(row: SidebarConversationItem) {
                   'is-unavailable': row.rowKind === 'workspace' && row.workspaceAvailable === false,
                   'is-reorderable': canDragRow(row),
                   'is-dragging': draggedRowKey === row.key,
+                  'is-settling': settlingRowKey === row.key,
                   'is-drop-before': dropTargetKey === row.key && dropPosition === 'before',
                   'is-drop-after': dropTargetKey === row.key && dropPosition === 'after',
                 }"
@@ -1167,7 +1280,7 @@ function onSelectRow(row: SidebarConversationItem) {
                   :class="{ 'is-current': row.key === currentKey }"
                   :aria-pressed="selectionMode && !row.provisional ? isRowSelected(row.key) : undefined"
                   :aria-describedby="sessionPreview?.row.key === row.key ? 'sidebar-session-preview' : undefined"
-                  @click="onSelectRow(row)"
+                  @click="onSelectRow(row, $event)"
                   @contextmenu="openSessionContextMenu(row, $event)"
                 >
                   <span
@@ -1339,7 +1452,7 @@ function onSelectRow(row: SidebarConversationItem) {
                   {{ agentInitial(row.agentName) }}
                 </button>
               </div>
-            </div>
+            </TransitionGroup>
           </div>
         </Transition>
         <div
@@ -1367,6 +1480,14 @@ function onSelectRow(row: SidebarConversationItem) {
       </div>
     </div>
     <Teleport to="body">
+      <div
+        v-if="pointerDrag?.active"
+        class="sidebar-session-drag-preview"
+        :style="dragPreviewStyle"
+        aria-hidden="true"
+      >
+        <span class="sidebar-history-title">{{ pointerDrag.title }}</span>
+      </div>
       <SidebarSessionHoverCard
         v-if="sessionPreview"
         :title="sessionPreview.row.title"

@@ -141,10 +141,10 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
 }
 
 .topbar--chat {
-  background: color-mix(in srgb, var(--bg-surface) 88%, transparent);
+  background: var(--bg-surface);
   border: 0;
-  border-radius: var(--radius-panel) 0 0 0;
-  margin-top: var(--sp-2);
+  border-radius: 0;
+  margin: 0;
 }
 
 /* Sidebar: calm pill selection, roomier rows, no instrument-like accent rail. */

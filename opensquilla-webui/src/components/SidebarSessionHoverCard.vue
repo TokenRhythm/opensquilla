@@ -1,6 +1,16 @@
 <script lang="ts">
 export const SESSION_PREVIEW_WIDTH = 272
 export const SESSION_PREVIEW_HEIGHT = 104
+/**
+ * On a narrow viewport the sidebar occupies most or all of the screen. A
+ * fixed preview beside a row would cover the list and turn ordinary pointer
+ * movement into an obstructive overlay, so previews are desktop-only there.
+ */
+export const SESSION_PREVIEW_MIN_VIEWPORT_WIDTH = 768
+
+export function canShowSessionPreview(viewportWidth: number): boolean {
+  return viewportWidth > SESSION_PREVIEW_MIN_VIEWPORT_WIDTH
+}
 
 type PreviewPosition = { left: string; top: string }
 type PreviewSize = { width: number; height: number }
