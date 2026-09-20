@@ -1,5 +1,6 @@
 <template>
   <div>
+    <WorkspaceFilePreview :file="selectedWorkspaceFile" :session-key="sessionKey || ''" :scope="workspaceFileScope" @close="selectedWorkspaceFile = null" />
     <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
     <div v-if="part.html" ref="rootEl" class="msg-ai-text" v-html="part.html" />
     <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
@@ -25,7 +26,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, inject, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import WorkspaceFilePreview from '@/components/chat/WorkspaceFilePreview.vue'
+import { WORKSPACE_FILES_KEY, type WorkspaceFile } from '@/modules/workspaceFiles'
+import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { clearWorkspaceFileLinks, decorateWorkspaceFileLinks, workspaceFileCandidates } from '@/utils/chat/workspaceFiles'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { useI18n } from 'vue-i18n'
@@ -60,6 +65,64 @@ const emit = defineEmits<{
 
 const { t } = useI18n()
 const platform = usePlatform()
+const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
+const gateway = inject(GATEWAY_ACCESS_KEY, null)
+const selectedWorkspaceFile = shallowRef<WorkspaceFile | null>(null)
+const workspaceFileScope = computed(() => JSON.stringify([
+  props.sessionKey, gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
+  gateway?.isLocalOwner, gateway?.isAvailable,
+]))
+let fileRequest: AbortController | null = null
+let fileSignature = ''
+let fileResolutionHtml = ''
+let resolvedFiles: WorkspaceFile[] = []
+
+function applyWorkspaceFiles(root: HTMLElement, scope: string) {
+  decorateWorkspaceFileLinks(root, resolvedFiles, file => {
+    if (scope === workspaceFileScope.value) selectedWorkspaceFile.value = file
+  }, file => t('chat.openTitle', { title: file.name }))
+}
+
+function decorateWorkspaceFiles(root: HTMLElement) {
+  const paths = workspaceFileCandidates(root)
+  const scope = workspaceFileScope.value
+  const signature = JSON.stringify([scope, paths])
+  if (signature === fileSignature && (fileRequest || fileResolutionHtml === props.part.html
+    || paths.every(path => resolvedFiles.some(file => file.requestedPath === path)))) {
+    applyWorkspaceFiles(root, scope)
+    return
+  }
+  fileSignature = signature
+  fileResolutionHtml = props.part.html
+  fileRequest?.abort()
+  fileRequest = null
+  resolvedFiles = []
+  if (!workspaceFiles || !props.sessionKey || !gateway?.isLocalOwner || !gateway.isAvailable || !paths.length) return
+  const request = new AbortController()
+  fileRequest = request
+  const sessionKey = props.sessionKey
+  // A single response must not make claims about arbitrary unrequested paths.
+  void (async () => {
+    try {
+      const batches: WorkspaceFile[] = []
+      for (let offset = 0; offset < paths.length; offset += 32) {
+        const files = await workspaceFiles.resolve(sessionKey, paths.slice(offset, offset + 32), request.signal)
+        if (request.signal.aborted || scope !== workspaceFileScope.value) return
+        batches.push(...files)
+      }
+      if (request.signal.aborted || root !== rootEl.value) return
+      resolvedFiles = batches
+      applyWorkspaceFiles(root, scope)
+    } catch { /* Missing, inaccessible, or unsupported files stay plain text. */ }
+    finally {
+      if (fileRequest === request) {
+        fileRequest = null
+        // A later body may announce a file created after the first mention.
+        if (!request.signal.aborted && fileResolutionHtml !== props.part.html) decorate()
+      }
+    }
+  })()
+}
 const fileMenu = ref<InstanceType<typeof ResourceActionsMenu> | null>(null)
 function showFileMenu(event: MouseEvent | KeyboardEvent, preview: WorkspacePreviewLink) {
   void fileMenu.value?.show(event, workspacePreviewOpenAction(preview, props.sessionKey))
@@ -215,6 +278,7 @@ function decorate() {
     mentionedPreviewIds.value = []
     return
   }
+  clearWorkspaceFileLinks(root)
   mentionedPreviewIds.value = decorateWorkspacePreviewLinks(
     root, props.workspacePreviews, preview => emit('workspacePreview', preview), previewLabel, showFileMenu,
   )
@@ -228,12 +292,23 @@ function decorate() {
   })
   decorateCodeBlocks()
   decorateBrowserLinks()
+  decorateWorkspaceFiles(root)
 }
 
 onMounted(decorate)
 watch(() => props.part.html, decorate, { flush: 'post' })
 watch(() => props.sources, decorate, { flush: 'post' })
 watch(() => props.workspacePreviews, decorate, { flush: 'post' })
+watch(workspaceFileScope, () => {
+  fileRequest?.abort()
+  fileRequest = null
+  fileSignature = ''
+  resolvedFiles = []
+  selectedWorkspaceFile.value = null
+  if (rootEl.value) clearWorkspaceFileLinks(rootEl.value)
+  decorate()
+}, { flush: 'sync' })
+onBeforeUnmount(() => { fileRequest?.abort() })
 </script>
 
 <style scoped>

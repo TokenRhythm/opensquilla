@@ -221,6 +221,72 @@ describe('ChatMessageList restart outcome anchor', () => {
   })
 })
 
+describe('ChatMessageList terminal error notice', () => {
+  function notice(turnId: string): ChatRenderedMessage {
+    return {
+      id: `error-${turnId}`, role: 'error', displayRole: 'error', roleLabel: 'Error',
+      text: 'PRIVATE_PROVIDER_DETAIL', errorCode: 'provider_error',
+      turnId, timeStr: '', showHeader: false,
+    }
+  }
+
+  it.each(['failed', 'timeout'])('shows the reason once without the user %s badge', status => {
+    const source = user('source', 'turn:current', 'current')
+    source.turnOutcome = { turnId: 'current', status }
+    const { host } = mountList([source, notice('current')])
+    expect(host.querySelectorAll('.msg-error')).toHaveLength(1)
+    expect(host.querySelector(`.turn-outcome--${status}`)).toBeNull()
+    expect(host.textContent).not.toContain('PRIVATE_PROVIDER_DETAIL')
+  })
+
+  it.each(['failed', 'timeout'])('keeps the %s outcome when its reason has not arrived', status => {
+    const source = user('source', 'turn:current', 'current')
+    source.turnOutcome = { turnId: 'current', status }
+    const { host } = mountList([source])
+    expect(host.querySelector(`.turn-outcome--${status}`)).not.toBeNull()
+  })
+
+  it('preserves partial output while suppressing the assistant failure badge', () => {
+    const partial = assistant('partial', 'turn:current', 'current')
+    partial.turnId = 'current'
+    partial.turnOutcome = { turnId: 'current', status: 'failed' }
+    const { host } = mountList([user('source', 'turn:current', 'current'), partial, notice('current')])
+    expect(host.querySelector('.msg-ai')?.textContent).toContain('Answer partial')
+    expect(host.querySelector('.turn-outcome--failed')).toBeNull()
+    expect(host.querySelector('.msg-error__note')?.textContent).toBe(i18n.global.t('chat.partialFailureNote'))
+  })
+
+  it('does not suppress another turn or a conflicting durable identity', () => {
+    const source = user('old-source', 'turn:shared', 'old')
+    source.turnOutcome = { turnId: 'old', status: 'failed' }
+    const unrelated = notice('new')
+    unrelated.turnKey = source.turnKey
+    const { host } = mountList([source, unrelated])
+    expect(host.querySelector('.turn-outcome--failed')).not.toBeNull()
+  })
+
+  it('matches the durable outcome identity when the rendered message has no direct turn id', () => {
+    const source = user('source', 'turn:current')
+    source.turnOutcome = { turnId: 'current', status: 'failed' }
+    const { host } = mountList([source, notice('current')])
+    expect(host.querySelector('.turn-outcome--failed')).toBeNull()
+  })
+
+  it('keeps the outcome when its direct and nested turn identities conflict', () => {
+    const source = user('source', 'turn:current', 'current')
+    source.turnOutcome = { turnId: 'different', status: 'failed' }
+    const { host } = mountList([source, notice('current')])
+    expect(host.querySelector('.turn-outcome--failed')).not.toBeNull()
+  })
+
+  it('preserves restart guidance even when the same turn has an error notice', () => {
+    const source = user('source', 'turn:current', 'current')
+    source.turnOutcome = { turnId: 'current', status: 'abandoned', reason: 'process_restart' }
+    const { host } = mountList([source, notice('current')])
+    expect(host.querySelector('.turn-outcome--process-restart')).not.toBeNull()
+  })
+})
+
 describe('ChatMessageList usage barrier retry anchor', () => {
   it('shows Retry when the durable same-turn user is loaded', () => {
     const { host } = mountList([

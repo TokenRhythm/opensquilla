@@ -2049,41 +2049,39 @@ async def _emit_task_runtime_stream_events(
             event_dict["terminal_message"] = terminal_message
             event_dict["terminal_reason"] = terminal_payload["terminal_reason"]
             event_dict["error_message"] = safe_error_message
-            # Preserve the stable provider taxonomy inside the typed outcome,
-            # without exposing a second raw top-level field. Clients can now
-            # offer an explicit retry for transient terminal failures even
-            # when a Retry-After hint exceeded the remaining turn deadline.
-            if failure_kind or error_id or is_usage_accounting_barrier(error_code):
-                from opensquilla.engine.outcome import outcome_from_error
+            # Classification must survive absent/failed diagnostic persistence.
+            # Retryability remains a cause hint; whole-turn replay still requires
+            # the separate usage barrier proof below.
+            from opensquilla.engine.outcome import outcome_from_error
 
-                outcome = outcome_from_error(
-                    code=error_code,
-                    message=safe_error_message,
-                    error_class=error_code,
-                    failure_kind=failure_kind,
-                ).to_dict()
-                if error_id is not None:
-                    outcome["error_id"] = error_id
-                if is_usage_accounting_barrier(error_code):
-                    retry_after_ms = safe_retry_after_ms(raw_retry_after_ms)
-                    if retry_after_ms is not None:
-                        outcome["retry_after_ms"] = retry_after_ms
-                        event_dict["retry_after_ms"] = retry_after_ms
-                    event_dict["error_class"] = error_code
-                    event_dict["retryable"] = True
-                    event_dict.update(replay_proof)
-                    outcome.update(replay_proof)
-                    if primary_user_message_id is not None:
-                        outcome["user_message_id"] = primary_user_message_id
-                    if task_id:
-                        activity_snapshot = terminal_activity_snapshot(
-                            activity_phases,
-                            task_id=task_id,
-                            turn_id=task_id,
-                        )
-                        if activity_snapshot is not None:
-                            event_dict["activity_snapshot"] = activity_snapshot
-                event_dict["turn_outcome"] = outcome
+            outcome = outcome_from_error(
+                code=error_code,
+                message=build_terminal_reply(terminal_payload),
+                error_class=error_code,
+                failure_kind=failure_kind,
+            ).to_dict()
+            if error_id is not None:
+                outcome["error_id"] = error_id
+            if is_usage_accounting_barrier(error_code):
+                retry_after_ms = safe_retry_after_ms(raw_retry_after_ms)
+                if retry_after_ms is not None:
+                    outcome["retry_after_ms"] = retry_after_ms
+                    event_dict["retry_after_ms"] = retry_after_ms
+                event_dict["error_class"] = error_code
+                event_dict["retryable"] = True
+                event_dict.update(replay_proof)
+                outcome.update(replay_proof)
+                if primary_user_message_id is not None:
+                    outcome["user_message_id"] = primary_user_message_id
+                if task_id:
+                    activity_snapshot = terminal_activity_snapshot(
+                        activity_phases,
+                        task_id=task_id,
+                        turn_id=task_id,
+                    )
+                    if activity_snapshot is not None:
+                        event_dict["activity_snapshot"] = activity_snapshot
+            event_dict["turn_outcome"] = outcome
         if stream_event_sink is not None:
             # Internal stream relays normally consume only text/done/artifact
             # events. Still, project provider failures through the same safe

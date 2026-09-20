@@ -740,6 +740,34 @@ describe('AssistantMessage activity disclosure', () => {
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
   })
 
+  it.each(['failed', 'timeout'])('keeps a neutral activity entry when the %s reason has its own notice', async status => {
+    const el = mountMessage(baseMessage({
+      turnOutcome: { turnId: `turn-${status}`, status },
+    }), false, { hasErrorNotice: true })
+    await nextTick()
+
+    const summary = el.querySelector<HTMLButtonElement>('.assistant-activity__summary')
+    expect(summary?.textContent).toContain('Worked for')
+    expect(summary?.textContent).not.toMatch(/Failed|Timed out|Completed/)
+    expect(el.querySelector('.assistant-activity--failed')).not.toBeNull()
+    expect(el.querySelector('.tool-row--error')).not.toBeNull()
+    expect(el.textContent).toContain('Canonical answer')
+    summary?.click()
+    await nextTick()
+    expect(summary?.getAttribute('aria-expanded')).toBe('true')
+  })
+
+  it.each([
+    { status: 'cancelled', kind: 'user_stopped', label: 'Stopped' },
+    { status: 'abandoned', kind: 'interrupted', label: 'Interrupted' },
+  ])('keeps $label activity guidance beside an error notice', async ({ label, ...outcome }) => {
+    const el = mountMessage(baseMessage({
+      turnOutcome: { turnId: `turn-${outcome.status}`, ...outcome },
+    }), false, { hasErrorNotice: true })
+    await nextTick()
+    expect(el.querySelector('.assistant-activity__summary')?.textContent).toContain(label)
+  })
+
   it('keeps failed tool rows without treating a settled legacy answer as failed', async () => {
     const el = mountMessage(baseMessage({ turnOutcome: undefined }))
     await nextTick()

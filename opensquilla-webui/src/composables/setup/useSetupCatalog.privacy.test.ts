@@ -85,6 +85,7 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
   const { GATEWAY_ACCESS_KEY } = await import('@/modules/gatewayAccess')
   app.provide(GATEWAY_ACCESS_KEY, {
     get availability() { return gatewayAvailability.value },
+    isRuntimeStarting: false,
     connectionError: null,
     requiresCredential: false,
     get isAvailable() { return gatewayAvailability.value === 'available' },

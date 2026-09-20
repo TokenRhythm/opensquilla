@@ -6682,22 +6682,27 @@ class TaskRuntime:
                 payload["terminal_message"] = append_error_ref(
                     build_terminal_reply(terminal_payload), safe_error_id(error_id)
                 )
-                if failure_kind or safe_error_id(error_id):
-                    details = terminal_update.get("details")
-                    turn_outcome = (
-                        details.get("turn_outcome") if isinstance(details, dict) else None
-                    )
-                    if not isinstance(turn_outcome, dict):
-                        turn_outcome = outcome_from_error(
-                            code=terminal_reason if terminal_reason != "error" else error_class,
-                            message=error_message,
-                            error_class=error_class,
-                            failure_kind=failure_kind,
-                        ).to_dict()
-                        if safe_error_id(error_id):
-                            turn_outcome["error_id"] = error_id
-                    payload["code"] = error_class
-                    payload["turn_outcome"] = dict(turn_outcome)
+                # Classification is a runtime fact, independent of best-effort
+                # diagnostic persistence. Keep it when no error reference exists.
+                details = terminal_update.get("details")
+                turn_outcome = (
+                    details.get("turn_outcome") if isinstance(details, dict) else None
+                )
+                if not isinstance(turn_outcome, dict):
+                    turn_outcome = outcome_from_error(
+                        code=terminal_reason if terminal_reason != "error" else error_class,
+                        error_class=error_class,
+                        failure_kind=failure_kind,
+                    ).to_dict()
+                    if safe_error_id(error_id):
+                        turn_outcome["error_id"] = error_id
+                payload["code"] = error_class or terminal_reason
+                payload["turn_outcome"] = {
+                    **turn_outcome,
+                    # Do not publish internal exception prose with the newly
+                    # unconditional classification. The durable record retains it.
+                    "error_message": build_terminal_reply(terminal_payload),
+                }
             if status != AgentTaskStatus.SUCCEEDED and is_usage_accounting_barrier(error_class):
                 details = terminal_update.get("details")
                 details = details if isinstance(details, dict) else {}

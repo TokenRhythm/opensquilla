@@ -25,6 +25,7 @@ async function mountPanel(options: {
 } = {}) {
   const gatewayAccess = reactive({
     availability: options.availability ?? 'unavailable',
+    isRuntimeStarting: false,
     connectionError: null as string | null,
     requiresCredential: options.requiresCredential ?? false,
     isAvailable: options.availability === 'available',

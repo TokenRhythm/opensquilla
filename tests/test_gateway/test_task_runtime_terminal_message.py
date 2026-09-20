@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.types import AgentState, ErrorEvent, RouterDecisionEvent, StateChangeEvent
 from opensquilla.gateway.boot import (
     TaskRuntimeStreamError,
@@ -26,6 +27,7 @@ from opensquilla.silent_reply import (
     SILENT_REPLY_NOT_ALLOWED_CODE,
     SILENT_REPLY_NOT_ALLOWED_MESSAGE,
 )
+from opensquilla.tools.types import CallerKind, ToolContext
 
 
 def _make_envelope(
@@ -151,6 +153,76 @@ async def test_agent_empty_response_keeps_cause_through_task_terminal(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("writer_mode", ["absent", "rejected", "raises", "recorded"])
+async def test_no_provider_classification_does_not_depend_on_diagnostics(writer_mode: str) -> None:
+    class Writer:
+        def record_error(self, _record):
+            if writer_mode == "raises":
+                raise RuntimeError("PRIVATE_DIAGNOSTIC_FAILURE")
+            return writer_mode == "recorded"
+
+    runner = TurnRunner(
+        provider_selector=None,
+        turn_error_writer=None if writer_mode == "absent" else Writer(),
+        config=SimpleNamespace(context_window_tokens=100_000),
+    )
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    async def emitter(_session: str, name: str, payload: dict[str, Any]) -> None:
+        emitted.append((name, payload))
+
+    async def handler(run: Any) -> None:
+        await _emit_task_runtime_stream_events(
+            runner.run(
+                "Synthetic request", run.envelope.session_key,
+                ToolContext(is_owner=True, caller_kind=CallerKind.WEB),
+                no_memory_capture=True, input_mode="text",
+            ),
+            run.envelope.session_key, emitter, task_id=run.task_id,
+            idle_timeout=1.0, heartbeat_interval=0.0,
+        )
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "Synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.status == AgentTaskStatus.FAILED
+    assert record.error_class == "no_provider"
+    assert record.details["turn_outcome"]["reason"] == "no_provider"
+    for name in ("session.event.error", "task.failed"):
+        payloads = [payload for event, payload in emitted if event == name]
+        assert len(payloads) == 1
+        payload = payloads[0]
+        assert payload["code"] == "no_provider"
+        assert payload["turn_outcome"]["kind"] == "failed"
+        assert payload["turn_outcome"]["reason"] == "no_provider"
+        assert payload["turn_outcome"]["error_class"] == "no_provider"
+        assert bool(payload["turn_outcome"].get("error_id")) == (writer_mode == "recorded")
+        assert "PRIVATE_DIAGNOSTIC_FAILURE" not in repr(payload)
+
+
+@pytest.mark.asyncio
+async def test_unclassified_task_error_publishes_facts_without_raw_exception_text() -> None:
+    emitted: list[tuple[str, dict[str, Any]]] = []
+
+    async def emitter(_session: str, name: str, payload: dict[str, Any]) -> None:
+        emitted.append((name, payload))
+
+    async def handler(_run: Any) -> None:
+        raise RuntimeError("PRIVATE_EXCEPTION_DETAIL")
+
+    runtime = _make_runtime(handler, event_emitter=emitter)
+    handle = await runtime.enqueue(_make_envelope(), "Synthetic request")
+    record = await runtime.wait(handle.task_id, timeout=2.0)
+
+    assert record.error_message == "PRIVATE_EXCEPTION_DETAIL"
+    payload = next(payload for name, payload in emitted if name == "task.failed")
+    assert payload["code"] == "RuntimeError"
+    assert payload["turn_outcome"]["kind"] == "failed"
+    assert "PRIVATE_EXCEPTION_DETAIL" not in repr(payload)
+
+
+@pytest.mark.asyncio
 async def test_mark_terminal_emits_additive_terminal_message_for_timeout_payload() -> None:
     emitted: list[tuple[str, str, dict[str, Any]]] = []
 
@@ -180,6 +252,8 @@ async def test_mark_terminal_emits_additive_terminal_message_for_timeout_payload
     assert record.details is not None
     assert record.details["turn_outcome"]["kind"] == "interrupted"
     assert record.details["turn_outcome"]["error_class"] == "TimeoutError"
+    assert payload["turn_outcome"]["kind"] == "interrupted"
+    assert payload["turn_outcome"]["reason"] == "timeout"
 
 
 @pytest.mark.asyncio
@@ -799,6 +873,13 @@ async def test_task_runtime_stream_error_emits_sanitized_terminal_message() -> N
                 "terminal_message": "The task timed out before it could finish.",
                 "terminal_reason": "timeout",
                 "error_message": "The task timed out before it could finish.",
+                "turn_outcome": {
+                    "kind": "interrupted",
+                    "reason": "iteration_timeout",
+                    "error_class": "iteration_timeout",
+                    "error_message": "The task timed out before it could finish.",
+                    "retryable": True,
+                },
             },
         )
     ]

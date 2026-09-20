@@ -47,7 +47,7 @@
           :strip-time-prefix="stripTimePrefix"
           :copy-message="copyMessage"
           :download-attachment="downloadAttachment"
-          :show-turn-outcome="isTurnTip(entry.index)"
+          :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :is-streaming="isStreaming"
           :is-goal-source="isGoalSource(messages[entry.index])"
           :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
@@ -92,7 +92,8 @@
           :plan-presentations="planPresentations"
           :plan-presentation-available="planPresentationAvailable && !shareMode"
           :plan-presentation-pending="planPresentationPending"
-          :show-turn-outcome="isTurnTip(entry.index)"
+          :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
+          :has-error-notice="hasTurnErrorNotice(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
           :goal-removable="goalRemovable && !shareMode"
@@ -124,8 +125,9 @@
           :subagent-summary="subagentSummary"
           :subagent-body="subagentBody"
           :retry-available="usageBarrierRetryAvailable(entry.index)"
+          :resume-available="sandboxResumeAvailable(messages[entry.index])"
           :has-partial-answer="Boolean(messages[entry.index].turnId && visibleAnswerTurns.has(messages[entry.index].turnId!))"
-          @resume="$emit('resumeSandbox')"
+          @resume="forwardSandboxResume"
           @retry="forwardSystemRetry"
         />
         <SkillLoadStatus
@@ -177,6 +179,8 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
+import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
+import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -213,6 +217,7 @@ const props = defineProps<{
   workbenchAttachmentResources?: ReadonlyMap<string, WorkbenchResource>
   canReusePromptAnnotations?: boolean
   forkBusy?: boolean
+  sandboxResumeTurnId?: string
   planActionPending?: PlanCardAction | null
   planActionsDisabled?: boolean
   planPresentations?: Record<string, PlanPresentationSnapshot>
@@ -259,7 +264,7 @@ const emit = defineEmits<{
   extendInterrupt: [id: string]
   clarifySubmit: [fields: Record<string, string>, request?: NonNullable<Extract<import('@/types/parts').ChatPart, { type: 'interrupt' }>['clarify']>]
   clarifyDismiss: []
-  resumeSandbox: []
+  resumeSandbox: [message: ChatRenderedMessage, sourceSessionKey: string]
   planImplementCurrent: [target: PlanCardActionTarget]
   planImplementNew: [target: PlanCardActionTarget]
   planReplan: [target: PlanCardActionTarget]
@@ -277,9 +282,49 @@ function forwardSystemRetry(
   emit('regenerateMessage', message, settle)
 }
 
+function sandboxResumeAvailable(message: ChatRenderedMessage): boolean {
+  return Boolean(props.sessionKey && props.sandboxResumeTurnId
+    && !props.shareMode && !props.forkBusy && !props.isStreaming
+    && sandboxResumeMessageTurnId(message) === props.sandboxResumeTurnId)
+}
+
+function forwardSandboxResume(message: ChatRenderedMessage) {
+  if (!sandboxResumeAvailable(message) || !props.sessionKey) return
+  emit('resumeSandbox', message, props.sessionKey)
+}
+
 const visibleAnswerTurns = computed(() => new Set(props.messages
   .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
   .map(message => message.turnId!)))
+
+function outcomeTurnIdentity(message: ChatRenderedMessage): string {
+  const directTurnId = message.turnId?.trim()
+  const outcomeTurnId = message.turnOutcome?.turnId?.trim()
+  if (directTurnId && outcomeTurnId && directTurnId !== outcomeTurnId) return ''
+  const turnId = directTurnId || outcomeTurnId
+  if (turnId) return `id:${turnId}`
+  return message.turnKey ? `key:${message.turnKey}` : ''
+}
+
+const errorNoticeTurns = computed(() => new Set(props.messages
+  .filter(message => message.displayRole === 'error')
+  .map(outcomeTurnIdentity)
+  .filter(Boolean)))
+
+function hasTurnErrorNotice(index: number): boolean {
+  const message = props.messages[index]
+  return Boolean(message && errorNoticeTurns.value.has(outcomeTurnIdentity(message)))
+}
+
+function shouldShowTurnOutcome(index: number): boolean {
+  if (!isTurnTip(index)) return false
+  // The centered reason already explains this failed turn. Keep the outcome
+  // fallback when no notice exists, and keep cancellation/restart guidance.
+  const outcome = props.messages[index]?.turnOutcome
+  if (isProcessRestartOutcome(outcome)) return true
+  const presentation = turnOutcomePresentation(outcome)
+  return !(['failed', 'timeout'].includes(presentation) && hasTurnErrorNotice(index))
+}
 
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]
