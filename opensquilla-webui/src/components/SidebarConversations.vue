@@ -51,6 +51,7 @@ import {
 import { useI18n } from 'vue-i18n'
 import type { SessionTaskAttention } from '@/composables/useSessionTaskAttention'
 import Icon from './Icon.vue'
+import SidebarSessionDragPreview from './SidebarSessionDragPreview.vue'
 import SidebarSessionHoverCard, {
   canShowSessionPreview,
   sessionPreviewPosition,
@@ -128,6 +129,7 @@ function maybeLoadMore() {
 }
 
 function onHistoryScroll() {
+  updateRowDropTarget()
   maybeLoadMore()
 }
 
@@ -381,21 +383,6 @@ let dragScrollFrame = 0
 let dragScrollTime = 0
 let settlingRowTimer: ReturnType<typeof setTimeout> | undefined
 
-const dragPreviewStyle = computed(() => {
-  const drag = pointerDrag.value
-  if (!drag) return {}
-  const width = Math.min(drag.width, 220, window.innerWidth - 24)
-  const left = Math.max(12, Math.min(drag.clientX + 16, window.innerWidth - width - 12))
-  const top = drag.clientY + drag.height + 16 <= window.innerHeight - 12
-    ? drag.clientY + 16
-    : Math.max(12, drag.clientY - drag.height - 16)
-  return {
-    width: `${width}px`,
-    height: `${drag.height}px`,
-    transform: `translate3d(${left}px, ${top}px, 0)`,
-  }
-})
-
 function reorderScope(row: SidebarDisplayRow): string {
   if (row.pinned) return 'pinned'
   if (row.displayZone === 'recents') return 'recents'
@@ -415,12 +402,12 @@ function clearRowDrag() {
   if (dragScrollFrame) cancelAnimationFrame(dragScrollFrame)
   dragScrollFrame = 0
   dragScrollTime = 0
-  if (drag?.source.hasPointerCapture?.(drag.pointerId)) {
-    drag.source.releasePointerCapture(drag.pointerId)
-  }
   draggedRowKey.value = ''
   dropTargetKey.value = ''
   pointerDrag.value = null
+  if (drag?.source.hasPointerCapture?.(drag.pointerId)) {
+    drag.source.releasePointerCapture(drag.pointerId)
+  }
 }
 
 function settleRow(key: string) {
@@ -466,12 +453,15 @@ function onRowPointerDown(row: SidebarDisplayRow, event: PointerEvent) {
 function updateRowDropTarget() {
   const drag = pointerDrag.value
   if (!drag?.active) return
+  const sourceRow = findSessionRow(drag.key)
   const target = document.elementFromPoint(drag.clientX, drag.clientY)
     ?.closest<HTMLElement>('.sidebar-history-row[data-session-key]')
   const targetKey = target?.dataset.sessionKey || ''
   const row = findSessionRow(targetKey)
   if (
-    !target || !historyList.value?.contains(target) || !row
+    !sourceRow || !canDragRow(sourceRow) || reorderScope(sourceRow) !== drag.scope
+    || !historyList.value?.contains(drag.source)
+    || !target || !historyList.value?.contains(target) || !row
     || row.key === drag.key || !canDragRow(row) || reorderScope(row) !== drag.scope
   ) {
     dropTargetKey.value = ''
@@ -503,6 +493,10 @@ function scrollDuringRowDrag(time: number) {
 useDocumentEvent('pointermove', (event) => {
   const drag = pointerDrag.value
   if (!drag || event.pointerId !== drag.pointerId) return
+  if (!historyList.value?.contains(drag.source)) {
+    clearRowDrag()
+    return
+  }
   drag.clientX = event.clientX
   drag.clientY = event.clientY
   if (!drag.active) {
@@ -523,6 +517,9 @@ useDocumentEvent('pointerup', (event) => {
   const drag = pointerDrag.value
   if (!drag || event.pointerId !== drag.pointerId) return
   if (drag.active) {
+    drag.clientX = event.clientX
+    drag.clientY = event.clientY
+    updateRowDropTarget()
     if (dropTargetKey.value) {
       settleRow(drag.key)
       emit('reorder', {
@@ -536,6 +533,9 @@ useDocumentEvent('pointerup', (event) => {
 })
 
 useDocumentEvent('pointercancel', (event) => {
+  if (event.pointerId === pointerDrag.value?.pointerId) clearRowDrag()
+})
+useDocumentEvent('lostpointercapture', (event) => {
   if (event.pointerId === pointerDrag.value?.pointerId) clearRowDrag()
 })
 useDocumentEvent('keydown', (event) => {
@@ -1480,14 +1480,7 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
       </div>
     </div>
     <Teleport to="body">
-      <div
-        v-if="pointerDrag?.active"
-        class="sidebar-session-drag-preview"
-        :style="dragPreviewStyle"
-        aria-hidden="true"
-      >
-        <span class="sidebar-history-title">{{ pointerDrag.title }}</span>
-      </div>
+      <SidebarSessionDragPreview v-if="pointerDrag?.active" :drag="pointerDrag" />
       <SidebarSessionHoverCard
         v-if="sessionPreview"
         :title="sessionPreview.row.title"

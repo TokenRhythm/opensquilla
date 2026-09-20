@@ -157,6 +157,55 @@ describe('SidebarConversations drag interaction', () => {
     )
   })
 
+  it('moves the preview without measuring untouched list rows again', async () => {
+    const { source } = await mountSidebar()
+    pointer(source, 'pointerdown')
+    pointer(document, 'pointermove')
+    await nextTick()
+    vi.mocked(source.getBoundingClientRect).mockClear()
+
+    pointer(document, 'pointermove', { clientX: 90, clientY: 215 })
+    await nextTick()
+    const preview = document.querySelector<HTMLElement>('.sidebar-session-drag-preview')!
+    expect(preview.style.transform).toBe('translate3d(106px, 231px, 0)')
+    expect(source.getBoundingClientRect).not.toHaveBeenCalled()
+  })
+
+  it('updates the insertion marker when the list scrolls under a stationary drag', async () => {
+    const { host, source, target, events } = await mountSidebar()
+    pointer(source, 'pointerdown')
+    pointer(document, 'pointermove')
+    await nextTick()
+    expect(target.classList.contains('is-drop-after')).toBe(true)
+
+    const nextTarget = host.querySelector<HTMLElement>('[data-session-key="second"]')!
+    vi.mocked(document.elementFromPoint).mockReturnValue(nextTarget)
+    const list = host.querySelector<HTMLElement>('.sidebar-history-list')!
+    list.scrollTop = 40
+    list.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    expect(nextTarget.classList.contains('is-drop-after')).toBe(true)
+    expect(target.classList.contains('is-drop-after')).toBe(false)
+
+    pointer(document, 'pointerup')
+    expect(events.reorder).toHaveBeenCalledExactlyOnceWith({
+      draggedKey: 'first', targetKey: 'second', position: 'after',
+    })
+  })
+
+  it('hit-tests the release position instead of trusting the previous move', async () => {
+    const { source, events } = await mountSidebar()
+    pointer(source, 'pointerdown')
+    pointer(document, 'pointermove')
+    vi.mocked(document.elementFromPoint).mockReturnValue(null)
+    pointer(document, 'pointerup', { clientX: 800, clientY: 400 })
+    await nextTick()
+
+    expect(document.elementFromPoint).toHaveBeenLastCalledWith(800, 400)
+    expect(events.reorder).not.toHaveBeenCalled()
+    expect(document.querySelector('.sidebar-session-drag-preview')).toBeNull()
+  })
+
   it('ignores a different pointer without interrupting the active drag', async () => {
     const { source, events } = await mountSidebar()
     pointer(source, 'pointerdown')
@@ -201,6 +250,22 @@ describe('SidebarConversations drag interaction', () => {
     await nextTick()
 
     expect(move.defaultPrevented).toBe(false)
+    expect(events.reorder).not.toHaveBeenCalled()
+    expect(document.querySelector('.sidebar-session-drag-preview')).toBeNull()
+  })
+
+  it('cancels when the captured source disappears during a list update', async () => {
+    const { source, events } = await mountSidebar()
+    pointer(source, 'pointerdown')
+    pointer(document, 'pointermove')
+    await nextTick()
+    expect(document.querySelector('.sidebar-session-drag-preview')).not.toBeNull()
+
+    source.remove()
+    pointer(document, 'lostpointercapture')
+    await nextTick()
+    pointer(document, 'pointerup')
+
     expect(events.reorder).not.toHaveBeenCalled()
     expect(document.querySelector('.sidebar-session-drag-preview')).toBeNull()
   })

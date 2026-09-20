@@ -79,6 +79,35 @@ test('Escape cancels a drag without reordering or selecting a task', async ({ pa
   expect(await page.evaluate(key => localStorage.getItem(key), ORDER_STORAGE_KEY)).toBeNull()
 })
 
+test('wheel scrolling during a drag moves the insertion marker to the visible target', async ({ page }) => {
+  await openSidebar(page)
+  await beginDrag(page)
+  const initialUrl = page.url()
+  const originalTarget = page.locator(ROW_SELECTOR).nth(3)
+  const box = (await originalTarget.boundingBox())!
+  const point = { x: box.x + 65, y: box.y + box.height - 6 }
+  await page.mouse.wheel(0, 132)
+  await expect.poll(() => page.locator('.sidebar-history-list').evaluate(el => el.scrollTop))
+    .toBeGreaterThan(100)
+
+  const target = await page.evaluate(({ x, y }) => {
+    const row = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-session-key]')
+    if (!row) return null
+    const rect = row.getBoundingClientRect()
+    return { key: row.dataset.sessionKey!, after: y >= rect.top + rect.height / 2 }
+  }, point)
+  expect(target).not.toBeNull()
+  expect(target!.key).not.toBe(SIDEBAR_SESSION_KEYS[3])
+  await expect(page.locator('.is-drop-before, .is-drop-after'))
+    .toHaveAttribute('data-session-key', target!.key)
+  await page.mouse.up()
+
+  const expected = SIDEBAR_SESSION_KEYS.slice(1)
+  expected.splice(expected.indexOf(target!.key) + Number(target!.after), 0, SIDEBAR_SESSION_KEYS[0]!)
+  await expect.poll(() => renderedOrder(page)).toEqual(expected)
+  await expect(page).toHaveURL(initialUrl)
+})
+
 test('holding a drag at the history edge scrolls and Escape stops it', async ({ page }) => {
   await openSidebar(page)
   await beginDrag(page)
@@ -150,4 +179,23 @@ test('narrow drawer keeps the session hover card out of the list interaction pat
   await firstRow.hover()
   await expect(page.locator('.sidebar-session-preview')).toHaveCount(0)
   await expect(firstRow).toBeVisible()
+})
+
+test('resizing closes the existing preview and keyboard focus respects the breakpoint', async ({ page }) => {
+  await openSidebar(page)
+  const firstButton = page.locator(`${ROW_SELECTOR} .sidebar-history-item`).first()
+  await firstButton.focus()
+  await expect(page.locator('.sidebar-session-preview')).toBeVisible()
+
+  for (const width of [768, 548, 769]) {
+    await page.setViewportSize({ width, height: 900 })
+    await expect(page.locator('.sidebar-session-preview')).toHaveCount(0)
+    const toggle = page.getByTestId('sidebar-toggle-collapsed')
+    if (await toggle.isVisible()) await toggle.click()
+    // Wait for the drawer/compact layout to settle before the keyboard gesture.
+    await firstButton.click({ trial: true })
+    await page.locator(`${ROW_SELECTOR} .sidebar-history-item`).nth(1).focus()
+    await firstButton.focus()
+    await expect(page.locator('.sidebar-session-preview')).toHaveCount(width > 768 ? 1 : 0)
+  }
 })
