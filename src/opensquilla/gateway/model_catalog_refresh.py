@@ -648,6 +648,18 @@ def _error_failure_kind(error: BaseException | None) -> str:
     return ProviderFailureKind.UNKNOWN.value
 
 
+def _is_declared_access_rejection(error: BaseException | None) -> bool:
+    """A denied entitlement fetch cannot validate a previously cached grant.
+
+    A 403 does not prove invalid credentials, so keep its generic failure
+    classification separate from this authenticated catalog access policy.
+    """
+    return (
+        isinstance(error, httpx.HTTPStatusError)
+        and error.response.status_code in {401, 403}
+    )
+
+
 def _first_capability(
     declared: TokenRhythmDeclaredModel,
     published: TokenRhythmPublishedModel | None,
@@ -1765,10 +1777,9 @@ class TokenRhythmCatalogCoordinator:
                 elif outcome.declared_error is not None:
                     if (
                         persist_entitlement
-                        and _error_failure_kind(outcome.declared_error)
-                        == ProviderFailureKind.AUTH_INVALID.value
+                        and _is_declared_access_rejection(outcome.declared_error)
                     ):
-                        # A known rejected credential is not a transient outage.
+                        # A denied entitlement fetch is not a transient outage.
                         # Revoke only this saved authority; draft probes must not
                         # erase the active account's durable entitlement.
                         self._entitlements.pop(request.authority_identity, None)
@@ -2244,7 +2255,7 @@ async def discover_tokenrhythm_models(
     )
     if view.declared_error is not None and (
         not view.declared_available
-        or _error_failure_kind(view.declared_error) == ProviderFailureKind.AUTH_INVALID.value
+        or _is_declared_access_rejection(view.declared_error)
     ):
         return ProviderModelsDiscoverResult(
             ok=False,

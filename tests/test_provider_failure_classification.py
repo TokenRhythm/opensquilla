@@ -295,6 +295,20 @@ def test_bare_access_and_missing_resource_errors_do_not_guess_a_cause(
     assert FallbackPolicy().should_retry(kind, attempt=0) is False
 
 
+@pytest.mark.parametrize("provider", ["openai", "openrouter", "anthropic"])
+@pytest.mark.parametrize(
+    "message",
+    ["The model does not exist", "The requested image model does not exist."],
+)
+def test_explicit_model_nonexistence_preserves_model_fallback(
+    provider: str, message: str
+) -> None:
+    kind = classify_provider_error(provider, 404, message=message)
+
+    assert kind is ProviderFailureKind.MODEL_NOT_FOUND
+    assert decide_recovery_action(kind) is ProviderRecoveryAction.FALLBACK_PROVIDER
+
+
 @pytest.mark.parametrize(
     ("provider", "raw_code", "message"),
     [

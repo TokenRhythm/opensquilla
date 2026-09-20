@@ -210,7 +210,33 @@ async function expectSafeCard(page: Page, message: string, actionCount = 0) {
   await expect(card).toHaveCSS('border-top-width', '0px')
   await expect(card).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)')
   await expect(card).toHaveCSS('box-shadow', 'none')
+  await expect(card).toHaveCSS('text-align', 'center')
+  await expect(card.locator('time, .msg-error__time')).toHaveCount(0)
+  await expect(page.locator('.turn-outcome--failed, .turn-outcome--timeout')).toHaveCount(0)
+  // On desktop the reason, optional preserved-results note and action form one
+  // centered line. Narrow screens may wrap instead of clipping useful copy.
+  if (page.viewportSize()!.width >= 1000) {
+    await expect.poll(() => card.evaluate(element => {
+      const range = document.createRange()
+      range.selectNodeContents(element)
+      const rects = [...range.getClientRects()].filter(rect => rect.width > 0 && rect.height > 0)
+      const bounds = element.getBoundingClientRect()
+      const lineCenters = rects.map(rect => rect.y + rect.height / 2)
+      const contentCenter = (Math.min(...rects.map(rect => rect.left)) + Math.max(...rects.map(rect => rect.right))) / 2
+      return {
+        rendered: rects.length > 0,
+        singleLine: Math.max(...lineCenters) - Math.min(...lineCenters) <= 3,
+        centered: Math.abs(contentCenter - (bounds.x + bounds.width / 2)) <= 2,
+      }
+    })).toEqual({ rendered: true, singleLine: true, centered: true })
+  }
   expect(await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth)).toBeLessThanOrEqual(1)
+}
+
+async function capturePresentation(page: Page, name: string) {
+  const path = test.info().outputPath(`${name}.png`)
+  await page.screenshot({ path, fullPage: true })
+  await test.info().attach(name, { path, contentType: 'image/png' })
 }
 
 for (const locale of ['en', 'zh-Hans'] as const) {
@@ -232,6 +258,7 @@ for (const locale of ['en', 'zh-Hans'] as const) {
       const message = timeout ? copy[locale].timeout : copy[locale].busy
       await expectSafeCard(page, message)
       await expect(page.locator('.msg-ai')).toContainText(partialAnswer)
+      if (delivery === 'history' && width === 390) await capturePresentation(page, `${locale}-partial-mobile`)
       if (delivery !== 'history') {
         await gateway.reconnect()
         await expectSafeCard(page, message)
@@ -255,6 +282,7 @@ for (const locale of ['en', 'zh-Hans'] as const) {
       gateway.fail()
       await expectSafeCard(page, copy[locale].unknown)
       await expect(page.locator('.msg-error__note')).toHaveCount(0)
+      if (status === '403') await capturePresentation(page, `${locale}-unknown-desktop`)
       await page.reload()
       await expectSafeCard(page, copy[locale].unknown)
       expect(gateway.sends()).toBe(1)
@@ -262,8 +290,12 @@ for (const locale of ['en', 'zh-Hans'] as const) {
     })
   }
 
-  for (const hasDiagnostic of [true, false]) {
-    test(`${locale} no_provider has the same safe settings action with diagnostic=${hasDiagnostic}`, async ({ page }) => {
+  for (const { hasDiagnostic, width } of [
+    { hasDiagnostic: true, width: 1280 }, { hasDiagnostic: false, width: 1280 },
+    { hasDiagnostic: false, width: 390 },
+  ]) {
+    test(`${locale} no_provider has the same safe settings action with diagnostic=${hasDiagnostic} at ${width}px`, async ({ page }) => {
+      await page.setViewportSize({ width, height: 900 })
       const gateway = await prepareGateway(page, {
         locale, partial: false,
         outcome: { kind: 'failed', reason: 'no_provider', error_class: 'no_provider', ...(hasDiagnostic ? { error_id: errorId } : {}) },
@@ -272,6 +304,7 @@ for (const locale of ['en', 'zh-Hans'] as const) {
       gateway.fail()
       await expectSafeCard(page, copy[locale].noProvider, 1)
       await expect(page.locator('.msg-error').getByRole('link', { name: copy[locale].modelSettings })).toHaveAttribute('href', '/control/settings/modelStrategy')
+      if (!hasDiagnostic) await capturePresentation(page, `${locale}-settings-${width}px`)
       await page.reload()
       await expectSafeCard(page, copy[locale].noProvider, 1)
       expect(gateway.sends()).toBe(1)

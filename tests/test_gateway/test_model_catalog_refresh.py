@@ -2031,8 +2031,10 @@ async def test_force_refresh_joins_running_auth_only_source_flight(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 403])
-async def test_saved_auth_rejection_revokes_entitlement_lkg(monkeypatch, tmp_path, status):
+@pytest.mark.parametrize("status,revoked", [(401, True), (403, True), (404, False), (503, False)])
+async def test_saved_catalog_access_rejection_controls_entitlement_lkg(
+    monkeypatch, tmp_path, status, revoked,
+):
     import httpx
 
     calls = []
@@ -2041,29 +2043,31 @@ async def test_saved_auth_rejection_revokes_entitlement_lkg(monkeypatch, tmp_pat
     coordinator = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=FakeClock())
     await coordinator.hydrate(config)
     await coordinator.refresh_active(config, force=True)
-    assert coordinator.cached(config)
+    before = coordinator.cached(config)
+    assert before
 
     async def reject(*_args, **_kwargs):
         request = httpx.Request("GET", "https://tokenrhythm.studio/v1/models")
         response = httpx.Response(status, request=request)
-        raise httpx.HTTPStatusError("Unauthorized", request=request, response=response)
+        raise httpx.HTTPStatusError("Catalog request failed", request=request, response=response)
 
     monkeypatch.setattr(
         "opensquilla.gateway.model_catalog_refresh.fetch_tokenrhythm_declared", reject,
     )
     await coordinator.refresh_active(config, force=True)
-    assert coordinator.cached(config) == []
+    expected = [] if revoked else before
+    assert coordinator.cached(config) == expected
     await coordinator.close()
     restored = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=FakeClock())
     await restored.hydrate(config)
-    assert restored.cached(config) == []
+    assert restored.cached(config) == expected
     await restored.close()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [401, 403])
-async def test_draft_proxy_auth_failure_does_not_hide_saved_catalog(
-    monkeypatch, tmp_path, status,
+@pytest.mark.parametrize("status,failure_kind", [(401, "auth_invalid"), (403, "unknown")])
+async def test_draft_proxy_access_rejection_does_not_hide_saved_catalog(
+    monkeypatch, tmp_path, status, failure_kind,
 ):
     import httpx
 
@@ -2088,14 +2092,15 @@ async def test_draft_proxy_auth_failure_does_not_hide_saved_catalog(
             if options.get("proxy"):
                 request = httpx.Request("GET", "https://tokenrhythm.studio/v1/models")
                 response = httpx.Response(status, request=request)
-                raise httpx.HTTPStatusError("Unauthorized", request=request, response=response)
+                raise httpx.HTTPStatusError("Access rejected", request=request, response=response)
             return _declared()
 
         monkeypatch.setattr(refresh_module, "fetch_tokenrhythm_declared", reject_draft)
         draft = await refresh_module.discover_tokenrhythm_models(
             **kwargs, proxy="http://127.0.0.1:9999", force=True,
         )
-        assert not draft.ok and draft.failure_kind == "auth_invalid"
+        assert not draft.ok
+        assert draft.failure_kind == failure_kind
         after = await refresh_module.discover_tokenrhythm_models(**kwargs, persist_entitlement=True)
         assert after.ok
         assert after.models == before.models

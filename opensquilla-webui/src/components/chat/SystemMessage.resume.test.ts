@@ -69,6 +69,26 @@ afterEach(() => {
 })
 
 describe('SystemMessage runtime errors', () => {
+  it('keeps the partial note and safe action without an additional error timestamp', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      errorCode: 'no_provider',
+      ts: 1_800_000_000_000,
+    }), undefined, undefined, false, false, true)
+    const notice = el.querySelector('.msg-error')!
+    expect(notice.querySelector('time')).toBeNull()
+    expect(notice.querySelector('.msg-error__note')?.textContent).toBe(i18n.global.t('chat.partialFailureNote'))
+    expect(notice.querySelectorAll('a,button')).toHaveLength(1)
+    app.unmount()
+  })
+
+  it('keeps timestamps for ordinary system messages', async () => {
+    const { app, el } = await mountMsg(errorMessage({
+      role: 'system', displayRole: 'system', text: 'Session created', ts: 1_800_000_000_000,
+    }))
+    expect(el.querySelector('.msg-system time')).not.toBeNull()
+    app.unmount()
+  })
+
   it.each([
     ['DOCUMENT_CHANGED', 'The page changed. Refresh it before trying again.', '页面已更新。请刷新后再试。'],
     ['PREVIEW_CAPABILITY_EXPIRED', 'The preview needs to be reopened.', '需要重新打开预览。'],

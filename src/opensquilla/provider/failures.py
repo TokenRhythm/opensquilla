@@ -207,6 +207,7 @@ _MODEL_UNAVAILABLE_SUBSTRINGS = (
     "no endpoints found",
     "model not found",
     "model_not_found",
+    "model does not exist",
     "model is not available",
     "model not available",
     "not available in your region",

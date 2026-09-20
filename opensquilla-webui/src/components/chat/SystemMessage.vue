@@ -1,9 +1,9 @@
 <template>
-  <!-- Terminal errors are plain conversation text, not a separate panel. -->
+  <!-- Keep the reason and its one safe action in the conversation flow. -->
   <div v-if="message.displayRole === 'error'" class="msg-error" :role="errorRole">
-    <p v-if="errorText" class="msg-error__text">{{ errorText }}</p>
-    <p v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</p>
-    <div v-if="settingsTarget || showResume || showRetry || timeIso" class="msg-error__actions">
+    <span v-if="errorText" class="msg-error__text">{{ errorText }}</span>
+    <span v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</span>
+    <span v-if="settingsTarget || showResume || showRetry" class="msg-error__actions">
       <RouterLink v-if="settingsTarget" class="msg-error__action"
         :class="{ 'msg-error__capacity': isCapacityError }"
         :to="settingsTarget">{{ actionLabel }}</RouterLink>
@@ -21,8 +21,7 @@
         :disabled="retryResolving"
         @click="onRetry"
       >{{ t('chat.errorAction.retryUsageReplay') }}</button>
-      <time v-if="timeIso" class="msg-error__time" :datetime="timeIso" :title="timeFull">{{ timeAbs }}</time>
-    </div>
+    </span>
   </div>
 
   <!-- All other system roles: centered pill (unchanged). -->
@@ -210,29 +209,22 @@ const timeFull = computed(() => fullTime(props.message.ts))
 
 .msg-error {
   padding: 0.375rem 1.5rem;
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
   color: var(--text-muted);
   line-height: 1.5;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 .msg-error__text,
 .msg-error__note {
   margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .msg-error__note,
 .msg-error__actions {
-  font-size: 0.8125rem;
-  color: var(--text-dim);
-}
-
-.msg-error__actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.25rem 0.75rem;
+  margin-inline-start: 0.5rem;
 }
 
 .msg-error__action {
@@ -241,7 +233,7 @@ const timeFull = computed(() => fullTime(props.message.ts))
   background: none;
   color: inherit;
   font: inherit;
-  text-align: start;
+  text-align: inherit;
   text-decoration: underline;
   text-underline-offset: 0.15em;
   user-select: text;
@@ -251,29 +243,6 @@ const timeFull = computed(() => fullTime(props.message.ts))
 .msg-error__action:disabled {
   opacity: 0.55;
   cursor: default;
-}
-
-.msg-error__time {
-  font-size: var(--fs-xs);
-  font-variant-numeric: tabular-nums;
-  opacity: 0;
-  transition: opacity var(--dur-fast);
-}
-
-.msg-error:hover .msg-error__time {
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .msg-error__time {
-    opacity: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .msg-error__time {
-    transition: none;
-  }
 }
 
 .chat-subagent-disclosure {

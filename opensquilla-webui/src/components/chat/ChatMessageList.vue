@@ -47,7 +47,7 @@
           :strip-time-prefix="stripTimePrefix"
           :copy-message="copyMessage"
           :download-attachment="downloadAttachment"
-          :show-turn-outcome="isTurnTip(entry.index)"
+          :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
           :is-streaming="isStreaming"
           :is-goal-source="isGoalSource(messages[entry.index])"
           :can-reuse-prompt-annotations="canReusePromptAnnotations === true"
@@ -92,7 +92,8 @@
           :plan-presentations="planPresentations"
           :plan-presentation-available="planPresentationAvailable && !shareMode"
           :plan-presentation-pending="planPresentationPending"
-          :show-turn-outcome="isTurnTip(entry.index)"
+          :show-turn-outcome="shouldShowTurnOutcome(entry.index)"
+          :has-error-notice="hasTurnErrorNotice(entry.index)"
           :goal-outcome="goalOutcomeFor(messages[entry.index], entry.index)"
           :goal-elapsed="goalElapsed"
           :goal-removable="goalRemovable && !shareMode"
@@ -179,6 +180,7 @@ import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
+import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -294,6 +296,35 @@ function forwardSandboxResume(message: ChatRenderedMessage) {
 const visibleAnswerTurns = computed(() => new Set(props.messages
   .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
   .map(message => message.turnId!)))
+
+function outcomeTurnIdentity(message: ChatRenderedMessage): string {
+  const directTurnId = message.turnId?.trim()
+  const outcomeTurnId = message.turnOutcome?.turnId?.trim()
+  if (directTurnId && outcomeTurnId && directTurnId !== outcomeTurnId) return ''
+  const turnId = directTurnId || outcomeTurnId
+  if (turnId) return `id:${turnId}`
+  return message.turnKey ? `key:${message.turnKey}` : ''
+}
+
+const errorNoticeTurns = computed(() => new Set(props.messages
+  .filter(message => message.displayRole === 'error')
+  .map(outcomeTurnIdentity)
+  .filter(Boolean)))
+
+function hasTurnErrorNotice(index: number): boolean {
+  const message = props.messages[index]
+  return Boolean(message && errorNoticeTurns.value.has(outcomeTurnIdentity(message)))
+}
+
+function shouldShowTurnOutcome(index: number): boolean {
+  if (!isTurnTip(index)) return false
+  // The centered reason already explains this failed turn. Keep the outcome
+  // fallback when no notice exists, and keep cancellation/restart guidance.
+  const outcome = props.messages[index]?.turnOutcome
+  if (isProcessRestartOutcome(outcome)) return true
+  const presentation = turnOutcomePresentation(outcome)
+  return !(['failed', 'timeout'].includes(presentation) && hasTurnErrorNotice(index))
+}
 
 function usageBarrierRetryAvailable(index: number): boolean {
   const message = props.messages[index]
