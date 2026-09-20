@@ -1,4 +1,23 @@
 {
+  "processes": {
+    "title": "Background processes",
+    "runningCount": "{count} running",
+    "refresh": "Refresh",
+    "logs": "Logs",
+    "stop": "Stop",
+    "close": "Close",
+    "loading": "Loading…",
+    "loadError": "Could not refresh background processes. Try again.",
+    "stopError": "Could not stop the process. Refresh and try again.",
+    "logError": "Could not load the output. Try again.",
+    "emptyLog": "No output yet.",
+    "truncated": "Showing a limited preview of the output.",
+    "running": "Running",
+    "done": "Exited (0)",
+    "failed": "Exited ({code})",
+    "killed": "Stopped",
+    "timed_out": "Timed out"
+  },
   "imageClipboard": {
     "copyImage": "Copy image",
     "copySource": "Copy SVG source",

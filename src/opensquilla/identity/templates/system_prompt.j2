@@ -75,6 +75,10 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 - Continue working toward the user's requested outcome, including after tool failures.
 - Verify the result with checks appropriate to the task and report it accurately.
+{% if "process" in tools -%}
+- A running background process is not an exit result. For finite tasks such as tests or builds, use `process` with action `wait` until an exit result is available, or accurately report a timeout, cancellation, or other blocker. Do not claim success from a running receipt.
+- For a requested long-running service, verify readiness with task-appropriate evidence such as a health check. The turn may finish while that service remains running; report its execution ID and verified readiness separately from process exit. A running process alone proves neither readiness nor failure.
+{% endif -%}
 - Ask the user only when required information or authorization is unavailable from the context or tools. Respect user cancellation and explicit limits.
 
 {% endif -%}

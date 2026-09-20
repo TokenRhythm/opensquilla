@@ -727,7 +727,7 @@ async def test_unknown_background_tool_status_adds_confirmation_guard() -> None:
     outcome = await stage.run(inp)
 
     assert "Opened it in the default browser." in outcome.output.final_text
-    assert "could not confirm" in outcome.output.final_text
+    assert "A running process was reported" in outcome.output.final_text
     assert "background_process" in outcome.output.final_text
     assert recs["transcript_append"].calls[0]["content"] == outcome.output.final_text
 
@@ -989,7 +989,7 @@ async def test_runtime_confirmation_notice_makes_suppressed_model_payload_visibl
         )
     )
 
-    assert "could not confirm" in outcome.output.final_text
+    assert "A running process was reported" in outcome.output.final_text
     assert outcome.output.done_event is not None
     assert outcome.output.done_event.text == outcome.output.final_text
     assert outcome.output.done_event.delivery == "visible"

@@ -1,4 +1,23 @@
 {
+  "processes": {
+    "title": "Procesos en segundo plano",
+    "runningCount": "{count} en ejecución",
+    "refresh": "Actualizar",
+    "logs": "Registros",
+    "stop": "Detener",
+    "close": "Cerrar",
+    "loading": "Cargando…",
+    "loadError": "No se pudieron actualizar los procesos. Inténtalo de nuevo.",
+    "stopError": "No se pudo detener el proceso. Actualiza e inténtalo de nuevo.",
+    "logError": "No se pudo cargar la salida. Inténtalo de nuevo.",
+    "emptyLog": "Todavía no hay salida.",
+    "truncated": "Vista previa limitada de la salida.",
+    "running": "En ejecución",
+    "done": "Finalizado (0)",
+    "failed": "Finalizado ({code})",
+    "killed": "Detenido",
+    "timed_out": "Tiempo agotado"
+  },
   "imageClipboard": {
     "copyImage": "Copiar imagen",
     "copySource": "Copiar código SVG",

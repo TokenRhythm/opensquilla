@@ -2558,6 +2558,9 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
     if (event.kind === 'unknown') return
     if (event.kind === 'known') {
       switch (event.semanticKind) {
+        case 'process-completed':
+          // A retained process may finish after its turn. The process panel owns it.
+          return
         case 'answer-generation-reset':
           handleRpcAnswerGenerationReset(event.payload)
           break

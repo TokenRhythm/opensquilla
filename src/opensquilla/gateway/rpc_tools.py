@@ -12,6 +12,7 @@ from opensquilla.engine.tool_result_store import ToolOutputNotReadyError
 from opensquilla.gateway.adapters._generated_contract_bindings import (
     generated_contract_bindings,
     register_generated_contract_binding,
+    validate_generated_contract_params,
 )
 from opensquilla.gateway.adapters.session_read_contract import decode_execution_log_read_params
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
@@ -78,6 +79,80 @@ _handle_execution_log_read_contract = register_generated_contract_binding(
     internal_error=RpcHandlerError,
     guest_allowed_checker=is_guest_rpc_method_allowed,
 )
+
+
+async def _session_process_owner(params: dict, ctx: RpcContext) -> dict[str, Any]:
+    session_key = params["sessionKey"].strip()
+    if not session_key:
+        raise ValueError("params.sessionKey is required")
+    storage = get_session_storage(ctx.session_manager)
+    session = (
+        await storage.get_session(canonicalize_session_key(session_key))
+        if storage is not None else None
+    )
+    if session is None:
+        raise RpcHandlerError("NOT_FOUND", "Session not found")
+    return {
+        "session_key": session.session_key,
+        "session_id": session.session_id,
+        "session_epoch": session.epoch,
+    }
+
+
+async def _handle_session_processes_list(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.tools.builtin.shell import list_session_processes
+
+    request = validate_generated_contract_params("sessions.processes.list", params, strict=True)
+    owner = await _session_process_owner(request, ctx)
+    return {**owner, "processes": list_session_processes(**owner)}
+
+
+async def _handle_session_processes_log(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.tools.builtin.shell import read_session_process_log
+
+    request = validate_generated_contract_params("sessions.processes.log", params, strict=True)
+    owner = await _session_process_owner(request, ctx)
+    try:
+        preview = await read_session_process_log(
+            request["executionId"], **owner, limit=request.get("limit", 12000),
+        )
+    except LookupError as exc:
+        raise RpcHandlerError("NOT_FOUND", "Managed process not found") from exc
+    if await _session_process_owner(request, ctx) != owner:
+        raise RpcHandlerError("NOT_FOUND", "Managed process not found")
+    return {**owner, **preview}
+
+
+async def _handle_session_processes_stop(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.tools.builtin.shell import stop_session_process
+
+    request = validate_generated_contract_params("sessions.processes.stop", params, strict=True)
+    owner = await _session_process_owner(request, ctx)
+    try:
+        process = await stop_session_process(request["executionId"], **owner)
+    except LookupError as exc:
+        raise RpcHandlerError("NOT_FOUND", "Managed process not found") from exc
+    if await _session_process_owner(request, ctx) != owner:
+        raise RpcHandlerError("NOT_FOUND", "Managed process not found")
+    return {**owner, "process": process}
+
+
+_SESSION_PROCESS_IMPLEMENTATIONS = {
+    "sessions.processes.list": _handle_session_processes_list,
+    "sessions.processes.log": _handle_session_processes_log,
+    "sessions.processes.stop": _handle_session_processes_stop,
+}
+_SESSION_PROCESS_BINDINGS = generated_contract_bindings(
+    _SESSION_PROCESS_IMPLEMENTATIONS, ValueError,
+)
+_SESSION_PROCESS_HANDLERS = {
+    method: register_generated_contract_binding(
+        _d, _SESSION_PROCESS_BINDINGS, method, implementation,
+        internal_error=RpcHandlerError,
+        guest_allowed_checker=is_guest_rpc_method_allowed,
+    )
+    for method, implementation in _SESSION_PROCESS_IMPLEMENTATIONS.items()
+}
 
 
 async def run_web_search_payload(

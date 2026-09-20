@@ -63,6 +63,7 @@ const SEMANTIC_EVENT_KIND_BY_WIRE_NAME = new Map<string, ConversationSemanticEve
   ['session.event.plan_revision', 'plan-revision'],
   ['session.event.plan_run', 'plan-run'],
   ['session.event.progress', 'execution-progress'],
+  ['session.event.process_completed', 'process-completed'],
   ['session.event.provider_activity', 'provider-activity'],
   ['session.event.router_control_replay', 'router-control-replay'],
   ['session.event.router_decision', 'router-decision'],

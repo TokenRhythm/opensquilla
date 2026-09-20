@@ -1,4 +1,23 @@
 {
+  "processes": {
+    "title": "后台进程",
+    "runningCount": "{count} 个运行中",
+    "refresh": "刷新",
+    "logs": "日志",
+    "stop": "停止",
+    "close": "关闭",
+    "loading": "加载中…",
+    "loadError": "无法刷新后台进程，请重试。",
+    "stopError": "无法停止进程，请刷新后重试。",
+    "logError": "无法加载输出，请重试。",
+    "emptyLog": "暂无输出。",
+    "truncated": "仅显示部分输出预览。",
+    "running": "运行中",
+    "done": "已退出（0）",
+    "failed": "已退出（{code}）",
+    "killed": "已停止",
+    "timed_out": "已超时"
+  },
   "imageClipboard": {
     "copyImage": "复制图片",
     "copySource": "复制 SVG 源码",

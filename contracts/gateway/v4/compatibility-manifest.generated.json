@@ -29,7 +29,7 @@
       "delivery": "live-only-best-effort",
       "family": "conversation.events",
       "schema": "conversation/conversation-events.schema.json",
-      "schemaSha256": "37e966a31c677a86cc04fa7bd0bb8e306a2bb082d6696ed9b471f2e34cb77854",
+      "schemaSha256": "b3a87ab466284956737c835208e9044eb4d6eef949f05229e5d9778a428dbae0",
       "schemaVersion": 1,
       "wireNames": [
         "chat.done",
@@ -54,6 +54,7 @@
         "session.event.plan_revision",
         "session.event.plan_run",
         "session.event.progress",
+        "session.event.process_completed",
         "session.event.plan_presentation",
         "session.event.provider_activity",
         "session.event.router_control_replay",
@@ -1254,6 +1255,24 @@
     },
     {
       "lifecycle": "stable",
+      "name": "sessions.processes.list",
+      "schema": "sessions/sessions-processes-list.schema.json",
+      "schemaSha256": "222a5110ea057b8610a12338e7b0699571a99810e1426ae04cdf38bafc31c980"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.processes.log",
+      "schema": "sessions/sessions-processes-log.schema.json",
+      "schemaSha256": "3681edc22ce69ec4de4ea69832861c288d1257078a59306759a0a0cab4440ffa"
+    },
+    {
+      "lifecycle": "stable",
+      "name": "sessions.processes.stop",
+      "schema": "sessions/sessions-processes-stop.schema.json",
+      "schemaSha256": "95a605f6068d9f929ad987f6c95a11117504405a2b040e6651a0e64ebfef920b"
+    },
+    {
+      "lifecycle": "stable",
       "name": "sessions.promptCacheKeepalive.set",
       "schema": "conversation/prompt-cache-keepalive-set.schema.json",
       "schemaSha256": "a23d6a8e14adc1d3d3ca03cf8317463c0ba98b66bf3a0eb9e00f10c8939a1633"
@@ -1508,10 +1527,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "cef95d81659ad32a398a9ffe0b9e555b533d57fed64c65094f6380ccdab0bc79",
-    "methodCount": 222,
-    "schemaCount": 232,
-    "schemaTreeSha256": "e5da54be8c0a9f77abf54c411f5be8d1a8c47ff994bcb8412540e277184abebc",
+    "generatorSha256": "7fdd4c3268ddbef30899a9b5ed5eb8d6ec401a3100294ffa27caaaec4371da58",
+    "methodCount": 225,
+    "schemaCount": 235,
+    "schemaTreeSha256": "0d85b1692d3c76d162f9d8b9322db294d340890ecd8be2e45ac1ff178f2ffbd9",
     "toolchains": {
       "legacyTypes": {
         "python": {

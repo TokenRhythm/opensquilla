@@ -63,6 +63,7 @@
       "session.event.plan_revision",
       "session.event.plan_run",
       "session.event.progress",
+      "session.event.process_completed",
       "session.event.plan_presentation",
       "session.event.provider_activity",
       "session.event.router_control_replay",

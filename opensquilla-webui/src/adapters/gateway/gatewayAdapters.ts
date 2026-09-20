@@ -52,6 +52,8 @@ import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import { createV4ClarificationSubmission } from './clarificationSubmissionV4'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import { createV4SessionMaintenance } from './sessionMaintenanceV4'
+import type { SessionProcesses } from '@/modules/sessionProcesses'
+import { createV4SessionProcesses } from './sessionProcessesV4'
 import type { Observability } from '@/modules/observability'
 import { createV4Observability } from './observabilityV4'
 import type { SkillCatalog } from '@/modules/skillCatalog'
@@ -114,6 +116,7 @@ export interface GatewayAdapters {
   readonly promptCacheLease: PromptCacheLease
   readonly clarificationSubmission: ClarificationSubmission
   readonly sessionMaintenance: SessionMaintenance
+  readonly sessionProcesses: SessionProcesses
   readonly observability: Observability
   readonly skillCatalog: SkillCatalog
   readonly agentCatalog: AgentCatalog
@@ -196,6 +199,7 @@ export function createGatewayAdapters(
     promptCacheLease: createV4PromptCacheLease(transports.rpc),
     clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
     sessionMaintenance: createV4SessionMaintenance(transports.rpc),
+    sessionProcesses: createV4SessionProcesses(transports.rpc, { getAuth: () => source.auth }),
     observability: createV4Observability(transports.rpc, http),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),

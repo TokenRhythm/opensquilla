@@ -243,6 +243,7 @@ async def test_process_projection_uses_session_owner_not_execution_id(harness: _
     await harness.enqueue("launch")
     await harness.emitters["launch"](_event(notify_on_exit=False))
     assert events[0]["session_id"] == "owner"
+    assert events[0]["epoch"] == events[0]["session_epoch"] == 0
     assert events[0]["execution_id"] == "process-one"
 
 

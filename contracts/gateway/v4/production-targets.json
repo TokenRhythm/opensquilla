@@ -3,6 +3,21 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "sessions.processes.list",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.processes.log",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
+      "wireName": "sessions.processes.stop",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
       "wireName": "telemetry.product_active.record",
       "roles": [
         "result"
