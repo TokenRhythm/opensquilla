@@ -287,6 +287,9 @@ _NONCRITICAL_CI_SCRIPT_TARGETS: Final[dict[str, tuple[str, ...]]] = {
     ".github/scripts/release_signing_preflight.py": (
         "tests/test_ci/test_release_signing_preflight.py",
     ),
+    ".github/scripts/release_protocol_preflight.py": (
+        "tests/test_ci/test_release_signing_preflight.py",
+    ),
     ".github/scripts/verify-windows-signatures.ps1": (
         "tests/test_ci/test_windows_signatures.py",
     ),
@@ -1692,6 +1695,7 @@ def _add_noncritical_ci_path(
         (
             ".github/scripts/prestage-release-to-oss",
             ".github/scripts/release_signing_preflight",
+            ".github/scripts/release_protocol_preflight",
             ".github/scripts/verify-release-",
             ".github/scripts/verify-windows-signatures",
             ".github/scripts/verify_desktop_slim_size",

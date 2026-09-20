@@ -58,6 +58,13 @@ jobs:
           INTERNAL_WINDOWS_ONLY: ${{ inputs.internal_windows_only || false }}
         run: python .github/scripts/release_signing_preflight.py
 
+      - name: Check production collector compatibility
+        if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+        timeout-minutes: 3
+        env:
+          RELEASE_SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: python .github/scripts/release_protocol_preflight.py --source-sha "$RELEASE_SOURCE_SHA"
+
   build-control-ui:
     name: Build verified Web UI artifact
     needs: release-preflight
@@ -906,6 +913,21 @@ jobs:
           name: opensquilla-release-assets-${{ env.RELEASE_PROFILE }}
           path: dist/*
           overwrite: true
+
+      - name: Checkout publication validation tooling
+        if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.workflow_sha }}
+          path: .release-validation
+
+      - name: Recheck production collector compatibility before publication
+        if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+        timeout-minutes: 3
+        env:
+          RELEASE_SOURCE_SHA: ${{ needs.build-release-assets.outputs.source_sha }}
+        run: python .release-validation/.github/scripts/release_protocol_preflight.py --source-sha "$RELEASE_SOURCE_SHA"
 
       - name: Upload to GitHub Release
         if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
