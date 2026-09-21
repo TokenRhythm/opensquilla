@@ -357,6 +357,7 @@ def _provider_display_name(provider_kind: str) -> str:
         "qianfan": "Qianfan",
         "volcengine": "Volcengine",
         "tencent_tokenhub": "Tencent TokenHub",
+        "opper": "Opper",
         "tokenrhythm": "TokenRhythm",
     }.get(provider_kind, "Provider")
 
