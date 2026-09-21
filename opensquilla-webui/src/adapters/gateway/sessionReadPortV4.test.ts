@@ -1260,6 +1260,7 @@ describe('v4 SessionReadPort Adapter', () => {
         timeoutAction: expectedAction,
         abortAction: 'reject',
         expectedGeneration: 7,
+        recoveryClass: 'safe-read',
       })
 
       await lease.close()
@@ -1462,7 +1463,7 @@ describe('sent snapshot deadline regression', () => {
     try {
       await lease.criticalRequestsQueued
       const request = harness.calls.find(call => call.method === SESSIONS_MESSAGES_SNAPSHOT_METHOD)
-      expect(request?.options).toMatchObject({ timeoutMs: 3000, timeoutAction: 'reject', abortAction: 'reject', expectedGeneration: 7 })
+      expect(request?.options).toMatchObject({ timeoutMs: 3000, timeoutAction: 'reject', abortAction: 'reject', expectedGeneration: 7, recoveryClass: 'safe-read' })
       await vi.advanceTimersByTimeAsync(2999)
       expect(harness.isSubscribed()).toBe(true)
       await vi.advanceTimersByTimeAsync(1)

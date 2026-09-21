@@ -3442,15 +3442,15 @@ wheels = [
 
 [[package]]
 name = "reportlab"
-version = "4.5.0"
+version = "5.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "charset-normalizer" },
     { name = "pillow" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/dd/23/b8a8b9a5e596ce3de71237c8d6c6a976c763e930878b16340aff3d67ed53/reportlab-4.5.0.tar.gz", hash = "sha256:e595932789ab7a107ba253e83f7815622708a9fd49920d0d6a909880eb66ac75", size = 3914127, upload-time = "2026-04-29T09:12:26.785Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/4a/51/dbe28534ae12c852f61be91f039f343305fd1f34f1c66b8de75afae7a525/reportlab-5.0.1.tar.gz", hash = "sha256:ebd13154be1c8515e665de70bd2d303ae9ddc3ef47e44afd5116441ca0283a26", size = 3945711, upload-time = "2026-08-20T13:48:16.461Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/13/bc43591a54dd38ac5c19e7e849f0311d879737a0d07e032e5be79849a5fb/reportlab-4.5.0-py3-none-any.whl", hash = "sha256:b8cc8996947d84e805368b47b2376070966f091d029351a0d8a1f238984c2c7f", size = 1957238, upload-time = "2026-04-29T09:12:22.904Z" },
+    { url = "https://files.pythonhosted.org/packages/db/cb/dacbc268cb68d0428ea2cbd85266195a9ab3e677449589ddae59bd7542ac/reportlab-5.0.1-py3-none-any.whl", hash = "sha256:1c36e6bb0e71780c72331eba60da7f602e8d4389a8723825af71342e49d791e8", size = 1957258, upload-time = "2026-08-20T13:48:14.026Z" },
 ]
 
 [[package]]

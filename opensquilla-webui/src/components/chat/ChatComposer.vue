@@ -1833,7 +1833,11 @@ button.attachment-chip__primary:focus-visible {
   max-width: 14rem;
 }
 
-@container chat-composer (max-width: 38rem) {
+/* Keep the two footer action groups on one row while the composer still has
+   enough room for their labels. The previous 38rem threshold stacked the
+   controls in the common new-chat width (~552px), leaving a large unused gap
+   and making the routing/send controls look detached from the first row. */
+@container chat-composer (max-width: 32rem) {
   .chat-input-footer {
     flex-direction: column;
     align-items: stretch;

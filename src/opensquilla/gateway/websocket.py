@@ -251,6 +251,7 @@ class _OutboundFrame:
     delivery_id: int | None = None
     is_control: bool = False
     budget_kind: BudgetKind = None
+    is_probe: bool = False
     enqueued_at: float = field(default_factory=time.monotonic, repr=False)
 
 
@@ -299,6 +300,9 @@ class WsConnection:
     _writer_queue_maxsize: int = field(default=512, init=False, repr=False)
     _outbox: asyncio.Queue[Any] | None = field(default=None, init=False, repr=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _last_inbound_at: float | None = field(default=None, init=False, repr=False)
+    _last_outbound_at: float | None = field(default=None, init=False, repr=False)
+    _probe_wait_started_at: float | None = field(default=None, init=False, repr=False)
     _handler_task: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     _detached_read_tasks: set[asyncio.Task[None]] = field(
         default_factory=set,
@@ -712,22 +716,62 @@ class WsConnection:
         else:
             self._transport_cleanup.append(callback)
 
-    def transport_diagnostics(self) -> dict[str, int | bool]:
+    def _mark_inbound(self) -> None:
+        self._last_inbound_at = time.monotonic()
+
+    def _mark_probe_waiting(self) -> None:
+        if self._probe_wait_started_at is None:
+            self._probe_wait_started_at = time.monotonic()
+
+    def _mark_outbound(self, *, probe: bool = False) -> None:
+        self._last_outbound_at = time.monotonic()
+        if probe:
+            self._probe_wait_started_at = None
+
+    def transport_diagnostics(self) -> dict[str, int | bool | str | None]:
         """Aggregate counters only: never include keys, payloads or credentials."""
         flow = self._flow
+        now = time.monotonic()
         oldest_age_ms = 0
         if self._outbox is not None:
-            now = time.monotonic()
             queued = [
                 item for item in self._outbox._queue  # type: ignore[attr-defined]
                 if isinstance(item, _OutboundFrame)
             ]
             if queued:
                 oldest_age_ms = max(0, int((now - min(item.enqueued_at for item in queued)) * 1000))
+        last_inbound_age_ms = (
+            max(0, int((now - self._last_inbound_at) * 1000))
+            if self._last_inbound_at is not None
+            else None
+        )
+        last_outbound_age_ms = (
+            max(0, int((now - self._last_outbound_at) * 1000))
+            if self._last_outbound_at is not None
+            else None
+        )
+        probe_wait_age_ms = (
+            max(0, int((now - self._probe_wait_started_at) * 1000))
+            if self._probe_wait_started_at is not None
+            else None
+        )
+        queue_depth = self._outbox.qsize() if self._outbox is not None else 0
+        if probe_wait_age_ms is not None:
+            starvation_reason = "probe_wait"
+        elif queue_depth and (self._writer_task is None or self._writer_task.done()):
+            starvation_reason = "writer_task_missing"
+        elif queue_depth:
+            starvation_reason = "queue_backlog"
+        else:
+            starvation_reason = "none"
         return {
-            "queue_depth": self._outbox.qsize() if self._outbox is not None else 0,
+            "queue_depth": queue_depth,
             "queue_capacity": self._writer_queue_maxsize if self._queue_enabled else 0,
             "queue_oldest_age_ms": oldest_age_ms,
+            "last_inbound_age_ms": last_inbound_age_ms,
+            "last_outbound_age_ms": last_outbound_age_ms,
+            "probe_wait_age_ms": probe_wait_age_ms,
+            "writer_starvation_reason": starvation_reason,
             "writer_task_count": len(_WRITER_TASKS),
             "writer_task_limit": _MAX_WRITER_TASKS,
             "close_task_count": len(_SOCKET_CLOSE_TASKS),
@@ -1179,7 +1223,7 @@ class WsConnection:
                     pending_count=len(pending),
                 )
 
-    async def _send_direct_text(self, text: str) -> None:
+    async def _send_direct_text(self, text: str, *, probe: bool = False) -> None:
         """Bound legacy direct sends so a wedged socket cannot stall an RPC."""
 
         if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
@@ -1204,6 +1248,7 @@ class WsConnection:
             except BaseException:
                 self._closing = True
                 raise
+            self._mark_outbound(probe=probe)
             return
 
         send_task.cancel()
@@ -1309,7 +1354,7 @@ class WsConnection:
                 )
                 await self._send_direct_text(encoded.model_dump_json())
 
-    async def send_raw_text(self, text: str) -> None:
+    async def send_raw_text(self, text: str, *, probe: bool = False) -> None:
         """Send a protocol-level raw frame through the connection writer."""
 
         if self._closing:
@@ -1323,12 +1368,13 @@ class WsConnection:
                     event_name=None,
                     res_frame=None,
                     raw_text=text,
+                    is_probe=probe,
                 )
             )
             return
         async with self._send_lock:
             if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
-                await self._send_direct_text(text)
+                await self._send_direct_text(text, probe=probe)
 
     async def close(self, code: int = WS_CLOSE_SERVICE_RESTART, reason: str = "") -> None:
         self._closing = True
@@ -1804,6 +1850,7 @@ class WsConnection:
                             self._flow.mark_sending(item.delivery_id)
                         async with asyncio.timeout(_WRITER_SEND_TIMEOUT_SECONDS):
                             await self.ws.send_text(text)
+                        self._mark_outbound(probe=item.is_probe)
                         if self._flow is not None and item.delivery_id is not None:
                             self._flow.mark_sent(item.delivery_id)
                     except WebSocketDisconnect:
@@ -2257,6 +2304,7 @@ async def handle_ws_connection(
     try:
         preauth_timeout = PREAUTH_TIMEOUT_MS / 1000
         raw = await asyncio.wait_for(ws.receive_text(), timeout=preauth_timeout)
+        conn._mark_inbound()
     except TimeoutError:
         log.warning("ws.preauth_timeout", conn_id=conn_id)
         await conn.close()
@@ -2723,6 +2771,7 @@ async def _message_loop(
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=keepalive_timeout)
             else:
                 raw = await ws.receive_text()
+            conn._mark_inbound()
         except WebSocketDisconnect:
             return
         except RuntimeError:
@@ -2826,7 +2875,8 @@ async def _message_loop(
             pong: dict[str, Any] = {"type": "pong"}
             if nonce is not None and PROBE_CAPABILITY in conn.client_caps:
                 pong["nonce"] = nonce
-            await conn.send_raw_text(json.dumps(pong, separators=(",", ":")))
+            conn._mark_probe_waiting()
+            await conn.send_raw_text(json.dumps(pong, separators=(",", ":")), probe=True)
             continue
 
         if frame_type == "pong":

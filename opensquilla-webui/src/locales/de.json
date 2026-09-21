@@ -433,6 +433,9 @@
     "connectionState": {
       "connected": "Verbunden",
       "connecting": "Wird verbunden",
+      "checking": "Gateway-Verbindung wird geprüft",
+      "suspect": "Verbindung instabil",
+      "reconnecting": "Verbindung zum Gateway wird wiederhergestellt",
       "disconnected": "Getrennt"
     },
     "bgm": {

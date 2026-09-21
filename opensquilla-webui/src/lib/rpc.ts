@@ -167,6 +167,8 @@ export interface RpcConnectionIntent {
 
 export type RpcLifecycle = 'stopped' | 'connecting' | 'connected' | 'recovering' | 'blocked';
 export type RpcConsumptionResult = 'applied' | 'dirty';
+export type RecoveryClass = 'safe-read' | 'read' | 'mutation' | 'ephemeral';
+export type RpcRecoveryClass = RecoveryClass;
 export type RpcConsumptionHandler = (
   payload: unknown, meta: Record<string, unknown>,
 ) => RpcConsumptionResult | Promise<RpcConsumptionResult>;
@@ -176,6 +178,12 @@ export interface RpcCallOptions {
   signal?: AbortSignal;
   timeoutAction?: RpcTerminationAction;
   abortAction?: RpcTerminationAction;
+  /**
+   * Whether a request is safe to issue while wake recovery is in progress.
+   * Missing values fail closed as mutations once the transport is checking
+   * or suspect; adapters may explicitly opt a bounded read in.
+   */
+  recoveryClass?: RpcRecoveryClass;
   /** Send a capability-gated cancellation frame before rejecting on abort. */
   cancelOnAbort?: boolean;
   /** Reject before send unless the current socket still owns this generation. */
@@ -266,18 +274,33 @@ const CONNECT_CHALLENGE_TIMEOUT_MS = 15_000;
 const CONNECT_HELLO_TIMEOUT_MS = 45_000;
 const WAKE_DEBOUNCE_MS = 100;
 const PROBE_TIMEOUT_MS = 10_000;
+const NATIVE_RESUME_PROBE_TIMEOUT_MS = 2_000;
+const SOFT_SUSPECT_MS = 5_000;
+const SAFE_READ_TIMEOUT_MS = 5_000;
+const SAFE_READ_MAX_PENDING = 8;
 const SUSPECT_WINDOW_MS = 30_000;
-const WAKE_GRACE_MS = 5_000;
 const SCHEDULER_LAG_MS = 5_000;
 // The first wake signal owns a bounded incident window. Later browser wake
 // signals may request another probe but cannot move this deadline forward.
 const WAKE_INCIDENT_BUDGET_MS = 20_000;
+
+function isSafeReadRecoveryClass(value: RpcRecoveryClass | undefined): boolean {
+  return value === 'read' || value === 'safe-read';
+}
+
+/** The source of a wake observation. It is telemetry, never a liveness proof. */
+export type ResumeSource = 'desktop-resume' | 'pageshow' | 'online' | 'manual';
+export type RpcResumeSource = ResumeSource;
+export type TransportPhase = 'healthy' | 'checking' | 'suspect' | 'reconnecting';
+export type RpcTransportPhase = TransportPhase;
 
 interface WakeIncident {
   id: number;
   generation: number;
   startedAt: number;
   deadlineAt: number;
+  source: RpcResumeSource;
+  probeTimeoutMs: number;
   status: 'probing' | 'suspect' | 'reconnecting' | 'recovered';
   signals: number;
 }
@@ -292,6 +315,18 @@ interface PendingRequest {
   abortHandler: (() => void) | null;
   sentAt: number | null;
   incidentIdAtSend: number | null;
+  recoveryClass: RpcRecoveryClass;
+}
+
+interface QueuedRecoveryRead {
+  method: string;
+  params: Record<string, unknown>;
+  options: RpcCallOptions;
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  deadlineAt: number;
+  timeoutTimer: ReturnType<typeof setTimeout> | null;
+  abortHandler: (() => void) | null;
 }
 
 const GUEST_SESSION_STORAGE_KEY = 'opensquilla.guestSessionKey';
@@ -345,6 +380,7 @@ export class RpcClient {
   private _stableTimer: ReturnType<typeof setTimeout> | null = null;
   private _lastExpediteAt = -Infinity;
   private _health: 'healthy' | 'suspect' = 'healthy';
+  private _phase: RpcTransportPhase = 'healthy';
   private _suspectAt: number | null = null;
   private _probeNonce: string | null = null;
   private _probeCounter = 0;
@@ -374,9 +410,11 @@ export class RpcClient {
   private _wakeDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeProbeGeneration: number | null = null;
+  private _wakeSoftSuspectTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeIncident: WakeIncident | null = null;
   private _wakeIncidentTimer: ReturnType<typeof setTimeout> | null = null;
   private _wakeIncidentCounter = 0;
+  private _recoveryReads: QueuedRecoveryRead[] = [];
   private _firstSuccessfulRpc = false;
   private _challengeWatchdogTimer: ReturnType<typeof setTimeout> | null = null;
   private _challengeWatchdogGeneration: number | null = null;
@@ -392,7 +430,24 @@ export class RpcClient {
     ) {
       return;
     }
-    this.notifyResume();
+    // A normal page navigation emits pageshow with persisted=false. It is
+    // initial document bootstrap, not a BFCache restore or an OS wake, and it
+    // can arrive after Hello but before the first session hydration RPC.
+    const persisted = (event as Event & { persisted?: unknown }).persisted;
+    if (event.type === 'pageshow' && persisted === false) return;
+    // The first pageshow/online/visibility signal belongs to initial page
+    // boot, not to a sleep/wake incident.  Starting an incident before the
+    // first successful Hello would gate the initial session hydration as an
+    // unconfirmed mutation.  Preserve the normal initial-connect/backoff path
+    // without publishing a false checking state.
+    if (!this._everConnected) {
+      this.ensureConnected();
+      return;
+    }
+    const source: RpcResumeSource = event.type === 'pageshow'
+      ? 'pageshow'
+      : event.type === 'online' ? 'online' : 'manual';
+    this.notifyResume(source);
   };
 
   connect(url: string, token?: string, intent: RpcConnectionIntent = {}): void {
@@ -438,17 +493,20 @@ export class RpcClient {
     this._doConnect();
   }
 
-  notifyResume(): void {
+  notifyResume(source: RpcResumeSource = 'manual'): void {
     if (!this._autoReconnect || this._blockedReason) return;
     const now = Date.now();
     const generation = this._socketGeneration;
     const current = this._wakeIncident;
     if (current === null || current.generation !== generation) {
-      this._beginWakeIncident(generation, now);
+      this._beginWakeIncident(generation, now, source);
       if (!this._autoReconnect || generation !== this._socketGeneration || !this._wakeIncident) return;
       if (this._health !== 'suspect') {
         this._clearWakeProbe();
-        this._graceUntil = now + WAKE_GRACE_MS;
+        // Wake is already an explicit liveness observation. Send one bounded
+        // nonce probe immediately; the five-second soft state is reserved for
+        // a probe that never produces a valid response.
+        this._graceUntil = now;
       }
       // A wake signal is not a liveness proof. Preserve an existing suspect
       // state and any armed retry until this generation completes a round trip.
@@ -473,6 +531,7 @@ export class RpcClient {
       false,
       'client_disconnect'
     );
+    this._clearQueuedRecoveryReads(new RpcTransportError('Disconnected', false));
     this._rejectAllPending(new RpcTransportError('Disconnected', null));
     this._setState('disconnected');
   }
@@ -483,6 +542,23 @@ export class RpcClient {
     options: RpcCallOptions = {}
   ): Promise<unknown> {
     return new Promise((resolve, reject) => {
+      if (options.signal?.aborted) {
+        reject(new RpcAbortError(method));
+        return;
+      }
+      if (this._phase !== 'healthy') {
+        if (!isSafeReadRecoveryClass(options.recoveryClass)) {
+          reject(new RpcTransportError(
+            this._phase === 'checking'
+              ? 'Connection is being checked after wake'
+              : 'Connection health is suspect',
+            false,
+          ));
+          return;
+        }
+        this._queueRecoveryRead(method, params, options, resolve, reject);
+        return;
+      }
       const socket = this._ws;
       const generation = this._socketGeneration;
       if (!socket || socket.readyState !== WebSocket.OPEN || this._state !== 'connected') {
@@ -493,14 +569,6 @@ export class RpcClient {
           this._recycleConnection(generation, error, 'socket_not_open');
         }
         reject(error);
-        return;
-      }
-      if (this._health === 'suspect') {
-        reject(new RpcTransportError('Connection health is suspect', false));
-        return;
-      }
-      if (options.signal?.aborted) {
-        reject(new RpcAbortError(method));
         return;
       }
       if (
@@ -528,6 +596,7 @@ export class RpcClient {
         abortHandler: null,
         sentAt: null,
         incidentIdAtSend: null,
+        recoveryClass: options.recoveryClass || 'mutation',
       };
       this._pending.set(id, pending);
 
@@ -555,17 +624,21 @@ export class RpcClient {
         options.signal.addEventListener('abort', pending.abortHandler, { once: true });
       }
 
+      const recoveryTimeoutMs = this._phase !== 'healthy'
+        && isSafeReadRecoveryClass(options.recoveryClass)
+        ? Math.min(options.timeoutMs ?? SAFE_READ_TIMEOUT_MS, SAFE_READ_TIMEOUT_MS)
+        : options.timeoutMs;
       if (
-        options.timeoutMs !== undefined &&
-        options.timeoutMs > 0 &&
-        Number.isFinite(options.timeoutMs)
+        recoveryTimeoutMs !== undefined &&
+        recoveryTimeoutMs > 0 &&
+        Number.isFinite(recoveryTimeoutMs)
       ) {
         pending.timeoutTimer = setTimeout(() => {
           terminate(
-            new RpcTimeoutError(method, options.timeoutMs!),
+            new RpcTimeoutError(method, recoveryTimeoutMs),
             options.timeoutAction || 'reject'
           );
-        }, options.timeoutMs);
+        }, recoveryTimeoutMs);
       }
 
       let frame: string;
@@ -603,6 +676,90 @@ export class RpcClient {
     });
   }
 
+  private _queueRecoveryRead(
+    method: string,
+    params: Record<string, unknown>,
+    options: RpcCallOptions,
+    resolve: (value: unknown) => void,
+    reject: (error: Error) => void,
+  ): void {
+    if (this._recoveryReads.length >= SAFE_READ_MAX_PENDING) {
+      reject(new RpcTransportError('Too many recovery reads pending', false));
+      return;
+    }
+    const deadlineAt = Date.now() + SAFE_READ_TIMEOUT_MS;
+    const item: QueuedRecoveryRead = {
+      method,
+      params,
+      options: { ...options, recoveryClass: 'safe-read' },
+      resolve,
+      reject,
+      deadlineAt,
+      timeoutTimer: null,
+      abortHandler: null,
+    };
+    const remove = (): void => {
+      const index = this._recoveryReads.indexOf(item);
+      if (index >= 0) this._recoveryReads.splice(index, 1);
+      if (item.timeoutTimer !== null) {
+        clearTimeout(item.timeoutTimer);
+        item.timeoutTimer = null;
+      }
+      if (item.options.signal && item.abortHandler) {
+        item.options.signal.removeEventListener('abort', item.abortHandler);
+        item.abortHandler = null;
+      }
+    };
+    item.timeoutTimer = setTimeout(() => {
+      remove();
+      reject(new RpcTimeoutError(method, SAFE_READ_TIMEOUT_MS));
+    }, SAFE_READ_TIMEOUT_MS);
+    if (options.signal) {
+      item.abortHandler = () => {
+        remove();
+        reject(new RpcAbortError(method));
+      };
+      options.signal.addEventListener('abort', item.abortHandler, { once: true });
+    }
+    this._recoveryReads.push(item);
+  }
+
+  private _clearQueuedRecoveryReads(error: Error): void {
+    const queued = this._recoveryReads.splice(0);
+    for (const item of queued) {
+      if (item.timeoutTimer !== null) clearTimeout(item.timeoutTimer);
+      if (item.options.signal && item.abortHandler) {
+        item.options.signal.removeEventListener('abort', item.abortHandler);
+      }
+      item.reject(error);
+    }
+  }
+
+  private _flushQueuedRecoveryReads(): void {
+    if (this._phase !== 'healthy' || this._state !== 'connected') return;
+    const queued = this._recoveryReads.splice(0);
+    for (const item of queued) {
+      if (item.timeoutTimer !== null) clearTimeout(item.timeoutTimer);
+      if (item.options.signal && item.abortHandler) {
+        item.options.signal.removeEventListener('abort', item.abortHandler);
+      }
+      const remainingMs = Math.max(0, item.deadlineAt - Date.now());
+      if (remainingMs <= 0) {
+        item.reject(new RpcTimeoutError(item.method, SAFE_READ_TIMEOUT_MS));
+        continue;
+      }
+      const requestedTimeout = item.options.timeoutMs;
+      const timeoutMs = requestedTimeout === undefined
+        ? remainingMs
+        : Math.min(Math.max(1, requestedTimeout), remainingMs);
+      this.call(item.method, item.params, {
+        ...item.options,
+        timeoutMs,
+        recoveryClass: 'safe-read',
+      }).then(item.resolve, item.reject);
+    }
+  }
+
   on(event: string, handler: RpcEventHandler): () => void {
     if (!this._listeners.has(event)) this._listeners.set(event, new Set());
     this._listeners.get(event)!.add(handler);
@@ -634,6 +791,7 @@ export class RpcClient {
 
   get recoveryReason(): string | null { return this._blockedReason; }
   get health(): 'healthy' | 'suspect' { return this._health; }
+  get phase(): RpcTransportPhase { return this._phase; }
 
   onGap(handler: (detail: unknown) => Promise<boolean>): () => void {
     this._gapHandlers.add(handler);
@@ -790,9 +948,10 @@ export class RpcClient {
     this._stopTickWatch();
     const generation = ++this._socketGeneration;
     this._firstSuccessfulRpc = false;
-    if (this._wakeIncident && this._wakeIncident.generation !== generation) {
-      this._clearWakeIncident();
-    }
+    // The incident deadline belongs to the wake operation, not to one socket.
+    // Carry it onto a replacement generation when resume found no usable
+    // socket or an in-flight connection was replaced.
+    if (this._wakeIncident) this._wakeIncident.generation = generation;
     this._emitTransport('connect_start', generation, {
       reason: 'connect_requested',
     });
@@ -910,6 +1069,7 @@ export class RpcClient {
           if (!this._isCurrentSocket(socket, generation)) return;
           // Clear a previous suspect state before publishing connected. A
           // synchronous state listener may issue its first request immediately.
+          this._setPhase('healthy');
           this._setHealth('healthy');
           if (!this._isCurrentSocket(socket, generation)) return;
           this._setState('connected');
@@ -957,6 +1117,7 @@ export class RpcClient {
             abortHandler: null,
             sentAt: null,
             incidentIdAtSend: null,
+            recoveryClass: 'safe-read',
           });
           try {
             socket.send(
@@ -1065,7 +1226,7 @@ export class RpcClient {
       this._clearHandshakeWatchdogs(generation);
       ++this._socketGeneration;
       this._clearWakeProbe(generation);
-      this._clearWakeIncident(generation);
+      if (this._wakeIncident) this._wakeIncident.generation = this._socketGeneration;
       this._stopPing();
       this._stopTickWatch();
       this._clearStableTimer();
@@ -1199,10 +1360,13 @@ export class RpcClient {
       lastRxAt: this._lastFrameAt,
       loopLagMs: this._lastLoopLagMs,
       maxLoopLagMs: this._maxLoopLagMs,
+      transportPhase: this._phase,
       wakeIncidentId: this._wakeIncident?.id ?? null,
       wakeIncidentStartedAt: this._wakeIncident?.startedAt ?? null,
       wakeIncidentDeadlineAt: this._wakeIncident?.deadlineAt ?? null,
       wakeIncidentStatus: this._wakeIncident?.status ?? null,
+      wakeIncidentSource: this._wakeIncident?.source ?? null,
+      wakeIncidentProbeTimeoutMs: this._wakeIncident?.probeTimeoutMs ?? null,
       wakeSignalCount: this._wakeIncident?.signals ?? 0,
       ...detail,
     });
@@ -1219,46 +1383,84 @@ export class RpcClient {
     }
   }
 
-  private _beginWakeIncident(generation: number, startedAt: number): void {
+  private _beginWakeIncident(
+    generation: number,
+    startedAt: number,
+    source: RpcResumeSource,
+  ): void {
     this._clearWakeIncident();
     const incident: WakeIncident = {
       id: ++this._wakeIncidentCounter,
       generation,
       startedAt,
       deadlineAt: startedAt + WAKE_INCIDENT_BUDGET_MS,
+      source,
+      probeTimeoutMs: source === 'desktop-resume' ? NATIVE_RESUME_PROBE_TIMEOUT_MS : PROBE_TIMEOUT_MS,
       status: this._health === 'suspect' ? 'suspect' : 'probing',
       signals: 1,
     };
     this._wakeIncident = incident;
+    this._setPhase('checking');
+    const softSuspectAt = startedAt + SOFT_SUSPECT_MS;
+    this._wakeSoftSuspectTimer = setTimeout(() => {
+      if (
+        this._wakeIncident?.id !== incident.id
+        || this._health === 'suspect'
+      ) return;
+      this._wakeSoftSuspectTimer = null;
+      const lagMs = Date.now() - softSuspectAt;
+      const activeGeneration = this._socketGeneration;
+      if (lagMs > SCHEDULER_LAG_MS) {
+        this._emitTransport('soft_suspect_deferred', activeGeneration, {
+          incidentId: incident.id,
+          reason: 'scheduler_lag',
+          lagMs,
+        });
+        this._wakeSoftSuspectTimer = setTimeout(() => {
+          if (this._wakeIncident?.id !== incident.id || this._health === 'suspect') return;
+          incident.status = 'suspect';
+          this._setPhase('suspect');
+          this._setHealth('suspect');
+          this._emitTransport('soft_suspect', this._socketGeneration, {
+            incidentId: incident.id,
+            reason: 'wake_probe_unconfirmed',
+          });
+        }, 1_000);
+        return;
+      }
+      incident.status = 'suspect';
+      this._setPhase('suspect');
+      this._setHealth('suspect');
+      this._emitTransport('soft_suspect', activeGeneration, {
+        incidentId: incident.id,
+        reason: 'wake_probe_unconfirmed',
+      });
+    }, SOFT_SUSPECT_MS);
     this._wakeIncidentTimer = setTimeout(() => {
       if (
         this._wakeIncident?.id !== incident.id
-        || this._wakeIncident.generation !== generation
-        || this._socketGeneration !== generation
       ) return;
+      const activeGeneration = this._socketGeneration;
       this._wakeIncidentTimer = null;
       this._suspectAt ??= Date.now();
       incident.status = 'reconnecting';
+      this._setPhase('reconnecting');
       this._setHealth('suspect');
       // Store owners may proxy this client and its incident through Vue ref().
       // Stable IDs preserve the reentrancy fence across raw/proxied access.
       if (
         this._wakeIncident?.id !== incident.id
-        || this._wakeIncident.generation !== generation
-        || this._socketGeneration !== generation
       ) return;
-      this._emitTransport('wake_incident_timeout', generation, {
+      this._emitTransport('wake_incident_timeout', activeGeneration, {
         incidentId: incident.id,
         reason: 'wake_incident_timeout',
       });
       if (
         this._wakeIncident?.id !== incident.id
-        || this._wakeIncident.generation !== generation
-        || this._socketGeneration !== generation
       ) return;
-      this._clearWakeIncident(generation, incident.id);
+      this._clearWakeIncident(undefined, incident.id);
       this._recycleConnection(
-        generation,
+        activeGeneration,
         new Error('Wake incident budget expired'),
         'wake_incident_timeout',
       );
@@ -1276,6 +1478,7 @@ export class RpcClient {
     // Retire ownership before notifying observers: a reentrant wake starts a
     // new incident and must not be deduplicated into this completed one.
     this._clearWakeIncident(generation, incident.id);
+    this._setPhase('healthy');
     this._emitTransport('wake_incident_recovered', generation, {
       incidentId: incident.id,
       reason,
@@ -1295,6 +1498,8 @@ export class RpcClient {
     if (incidentId !== undefined && incident.id !== incidentId) return;
     if (this._wakeIncidentTimer !== null) clearTimeout(this._wakeIncidentTimer);
     this._wakeIncidentTimer = null;
+    if (this._wakeSoftSuspectTimer !== null) clearTimeout(this._wakeSoftSuspectTimer);
+    this._wakeSoftSuspectTimer = null;
     this._wakeIncident = null;
   }
 
@@ -1302,6 +1507,7 @@ export class RpcClient {
     this._blockedReason = reason;
     this._recoveryStartedAt = null;
     this._clearReconnectTimer();
+    this._clearQueuedRecoveryReads(new RpcTransportError(reason, false));
     this._retireCurrentSocket(new Error(reason), false, reason);
     this._emit('_blocked', { reason });
     this._emitStatus();
@@ -1314,8 +1520,18 @@ export class RpcClient {
 
   private _emitStatus(): void {
     this._emit('_status', {
-      lifecycle: this.lifecycle, reason: this.recoveryReason, health: this._health,
+      lifecycle: this.lifecycle,
+      reason: this.recoveryReason,
+      health: this._health,
+      phase: this._phase,
     });
+  }
+
+  private _setPhase(phase: RpcTransportPhase): void {
+    if (this._phase === phase) return;
+    this._phase = phase;
+    this._emitStatus();
+    this._flushQueuedRecoveryReads();
   }
 
   private _setHealth(health: 'healthy' | 'suspect'): void {
@@ -1334,6 +1550,7 @@ export class RpcClient {
     // A callback may start a new incident on this same socket.
     this._health = 'healthy';
     this._completeWakeIncident(generation, 'round_trip');
+    this._setPhase('healthy');
     if (generation !== this._socketGeneration) return;
     if (healthChanged) this._emitStatus();
   }
@@ -1393,7 +1610,9 @@ export class RpcClient {
     this._clearGapRecovery();
     this._clearStableTimer();
     this._clearWakeProbe(generation);
-    this._clearWakeIncident(generation);
+    if (!this._wakeIncident || reason === 'client_disconnect' || reason === 'connection_replaced') {
+      this._clearWakeIncident(generation);
+    }
     this._clearHandshakeWatchdogs(generation);
     this._emitTransport('retire', generation, { reason });
     // Diagnostic listeners are isolated, but they may still deliberately
@@ -1410,6 +1629,7 @@ export class RpcClient {
 
     this._ws = null;
     ++this._socketGeneration;
+    if (this._wakeIncident) this._wakeIncident.generation = this._socketGeneration;
     this._stopPing();
     this._stopTickWatch();
     // The request that triggered retirement has already been removed. Every
@@ -1431,6 +1651,7 @@ export class RpcClient {
   ): void {
     if (generation !== this._socketGeneration) return;
     this._markRecoveryStarted();
+    this._setPhase('reconnecting');
     this._retireCurrentSocket(error, true, reason);
   }
 
@@ -1479,7 +1700,12 @@ export class RpcClient {
     }
     this._lastProbeAt = Date.now();
     if (this._suspectAt !== null) this._suspectProbes += 1;
-    this._armWakeProbe(socket, generation, nonce);
+    this._armWakeProbe(
+      socket,
+      generation,
+      nonce,
+      this._wakeIncident?.probeTimeoutMs ?? PROBE_TIMEOUT_MS,
+    );
   }
 
   private _stopPing(): void {
@@ -1537,35 +1763,82 @@ export class RpcClient {
 
   private _runWakeProbe(): void {
     if (!this._autoReconnect || this._blockedReason) return;
-    if (!this._ws) this.ensureConnected();
+    const incident = this._wakeIncident;
+    if (incident?.source === 'desktop-resume') {
+      // Native resume has a two-second decision window.  There is no useful
+      // probe to send while a socket is still handshaking, closing, or absent;
+      // move through the same generation-safe replacement path instead of
+      // silently waiting for the twenty-second incident deadline.
+      if (!this._ws) {
+        this._clearReconnectTimer();
+        this._doConnect();
+        return;
+      }
+      if (this._ws.readyState !== WebSocket.OPEN || this._state !== 'connected') {
+        this._recycleConnection(
+          this._socketGeneration,
+          new Error('Native resume socket is not probeable'),
+          'native_resume_socket_unavailable',
+        );
+        return;
+      }
+    } else if (!this._ws) this.ensureConnected();
     else if (this._ws.readyState !== WebSocket.OPEN && this._ws.readyState !== WebSocket.CONNECTING) {
       this._recycleConnection(this._socketGeneration, new Error('Socket closed after wake'), 'wake_socket_stale');
     } else this._sendProbe();
+    if (incident?.source === 'desktop-resume') this._sendProbe();
   }
 
-  private _armWakeProbe(socket: WebSocket, generation: number, nonce: string | null): void {
+  private _armWakeProbe(
+    socket: WebSocket,
+    generation: number,
+    nonce: string | null,
+    timeoutMs: number = PROBE_TIMEOUT_MS,
+  ): void {
     this._clearWakeProbe();
     this._probeNonce = nonce;
     this._wakeProbeGeneration = generation;
-    const dueAt = Date.now() + PROBE_TIMEOUT_MS;
+    const dueAt = Date.now() + timeoutMs;
     this._wakeProbeTimer = setTimeout(() => {
       if (!this._isCurrentSocket(socket, generation)) return;
-      this._clearWakeProbe(generation);
       if (Date.now() - dueAt > SCHEDULER_LAG_MS || Date.now() < this._graceUntil) {
+        this._clearWakeProbe(generation);
         this._emitTransport('probe_deferred', generation, {
           reason: Date.now() - dueAt > SCHEDULER_LAG_MS ? 'scheduler_lag' : 'wake_grace',
         });
         this.notifyResume();
         return;
       }
+      const incident = this._wakeIncident;
+      // A native resume has a deliberately short probe budget. Failure means
+      // the old generation is no longer trustworthy, so recycle immediately.
+      if (incident?.generation === generation && incident.source === 'desktop-resume') {
+        this._clearWakeProbe(generation);
+        this._emitTransport('probe_timeout', generation, { reason: 'native_resume_probe_timeout' });
+        this._recycleConnection(
+          generation,
+          new Error('Native resume probe timed out'),
+          'native_resume_probe_timeout',
+        );
+        return;
+      }
+      // Browser wake incidents retain the current nonce until the 20-second
+      // incident deadline. This keeps a delayed but generation-matching pong
+      // at 13 seconds a valid recovery while the UI is already suspect.
+      if (incident?.generation === generation && incident.source !== 'desktop-resume') {
+        this._wakeProbeTimer = null;
+      } else {
+        this._clearWakeProbe(generation);
+      }
       if (this._suspectAt === null) {
         this._suspectAt = Date.now();
         if (this._wakeIncident?.generation === generation) this._wakeIncident.status = 'suspect';
         this._suspectProbes = 0;
+        this._setPhase('suspect');
         this._setHealth('suspect');
         this._emitTransport('probe_timeout', generation, { reason: 'control_unconfirmed' });
       }
-    }, PROBE_TIMEOUT_MS);
+    }, timeoutMs);
   }
 
   private _clearWakeProbe(generation?: number): void {
@@ -1589,6 +1862,12 @@ export class RpcClient {
     if (data?.type === 'pong' && this._wakeProbeGeneration === this._socketGeneration
       && (this._probeNonce === null ? data.nonce === undefined : data.nonce === this._probeNonce)) {
       this._noteRoundTrip();
+    }
+    // Gateway ticks are an inbound liveness proof for the current generation
+    // even when a nonce pong was delayed by the browser or writer queue.
+    if (data?.type === 'event' && data.event === 'tick'
+      && this._wakeIncident?.generation === this._socketGeneration) {
+      this._noteRoundTrip(this._socketGeneration);
     }
     if (!data || data.type !== 'event' || typeof data.seq !== 'number') return true;
 
@@ -1713,5 +1992,6 @@ export class RpcClient {
     this._state = s;
     this._emit('_state', s);
     this._emitStatus();
+    this._flushQueuedRecoveryReads();
   }
 }

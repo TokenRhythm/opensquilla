@@ -48,10 +48,13 @@ import { useI18n } from 'vue-i18n'
 
 import Icon from '@/components/Icon.vue'
 import type { ChatSessionRecoveryState } from '@/utils/chat/sessionLoadState'
+import type { DesktopResumeSource } from '@/platform/types'
 
 const props = defineProps<{
   state: ChatSessionRecoveryState
   transportState?: 'disconnected' | 'connecting' | 'connected'
+  transportPhase?: 'healthy' | 'checking' | 'suspect' | 'reconnecting'
+  resumeSource?: DesktopResumeSource | null
   action?: 'retry-history' | 'retry-live'
   busy?: boolean
 }>()
@@ -79,8 +82,12 @@ const title = computed(() => {
     case 'history-error':
       return t('chat.loadSessionFailed')
     case 'live-connecting':
+      if (props.transportPhase && props.transportPhase !== 'healthy') {
+        return t(`chrome.connectionState.${props.transportPhase}`)
+      }
       return t(
         props.transportState === 'connected'
+          && !props.resumeSource
           ? 'chat.liveConnectingConnected'
           : 'chat.gatewayReconnecting',
       )

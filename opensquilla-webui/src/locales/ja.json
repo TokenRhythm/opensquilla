@@ -433,6 +433,9 @@
     "connectionState": {
       "connected": "接続済み",
       "connecting": "接続中",
+      "checking": "Gateway 接続を確認中",
+      "suspect": "接続が不安定です",
+      "reconnecting": "Gateway に再接続中",
       "disconnected": "切断済み"
     },
     "bgm": {

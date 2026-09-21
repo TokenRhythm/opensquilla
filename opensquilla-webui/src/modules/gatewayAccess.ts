@@ -1,7 +1,9 @@
 import type { InjectionKey } from 'vue'
+import type { DesktopResumeSource } from '@/platform/types'
 
 export type GatewayAvailability = 'unavailable' | 'preparing' | 'available'
 export type GatewayConnectionHealth = 'healthy' | 'suspect'
+export type GatewayConnectionPhase = 'healthy' | 'checking' | 'suspect' | 'reconnecting'
 
 export interface GatewayRunModePolicy {
   readonly allowedRunModes?: unknown
@@ -25,6 +27,10 @@ export interface GatewayAccess {
   readonly availability: GatewayAvailability
   /** Transport health of the current connection; suspect is never user-visible as connected. */
   readonly connectionHealth: GatewayConnectionHealth
+  readonly connectionPhase?: GatewayConnectionPhase
+  /** Native resume is pending a liveness confirmation for the current socket. */
+  readonly isResuming?: boolean
+  readonly resumeSource?: DesktopResumeSource | null
   /** The local supervisor is preparing the runtime; no connection has failed. */
   readonly isRuntimeStarting: boolean
   readonly connectionError: string | null

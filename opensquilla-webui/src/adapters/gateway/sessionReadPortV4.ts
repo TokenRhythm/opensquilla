@@ -148,6 +148,7 @@ function callOptions(
   timeoutMs: number,
   expectedGeneration: number,
   onSent?: (generation: number) => void,
+  recoveryClass: RpcCallOptions['recoveryClass'] = 'mutation',
 ): RpcCallOptions {
   return {
     signal,
@@ -156,6 +157,7 @@ function callOptions(
     abortAction: 'reject',
     cancelOnAbort: true,
     expectedGeneration,
+    recoveryClass,
     ...(onSent ? { onSent } : {}),
   }
 }
@@ -418,7 +420,7 @@ async function hydrate(
     raw = await rpc.request(
       SESSIONS_MESSAGES_HYDRATE_METHOD,
       params,
-      callOptions(signal, READ_TIMEOUT_MS, expectedGeneration),
+      callOptions(signal, READ_TIMEOUT_MS, expectedGeneration, undefined, 'safe-read'),
     )
   } catch (error) {
     throw mapSessionReadError(error)
@@ -449,7 +451,7 @@ async function optionalSnapshot(
       callOptions(signal, SNAPSHOT_TIMEOUT_MS, expectedGeneration, generation => {
         sentGeneration = generation
         latch.sent(generation)
-      }),
+      }, 'safe-read'),
     )
     return requireResult<SessionsMessagesSnapshotResult>(
       SESSIONS_MESSAGES_SNAPSHOT_METHOD,

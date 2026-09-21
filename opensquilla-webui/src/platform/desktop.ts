@@ -2,6 +2,7 @@ import { desktopCapabilities } from './capabilities'
 import type {
   CliInvocation,
   DesktopGatewayConnection,
+  DesktopResumeEvent,
   DesktopUpdateErrorCode,
   DesktopUpdateInstallMode,
   DesktopUpdateSource,
@@ -55,6 +56,16 @@ function normalizeDesktopGatewayConnection(payload: unknown): DesktopGatewayConn
     error: typeof raw.error === 'string' ? raw.error : null,
     ...(sandboxUpgrade ? { sandboxUpgrade } : {}),
   }
+}
+
+function normalizeDesktopResumeEvent(payload: unknown): DesktopResumeEvent {
+  const source = payload && typeof payload === 'object'
+    ? (payload as Record<string, unknown>).source
+    : undefined
+  // The only native source currently exposed is Electron's powerMonitor. An
+  // older shell emitted the event without a payload; retain that event as the
+  // same bounded source rather than dropping wake recovery altogether.
+  return { source: source === 'power-monitor' ? 'desktop-resume' : 'desktop-resume' }
 }
 
 function requireDesktopApi(): OpenSquillaDesktopApi {
@@ -509,7 +520,11 @@ export function createDesktopPlatform(): Platform {
         return { instanceId: connection.instanceId, profileFingerprint: connection.profileFingerprint }
       },
       ...(typeof desktopApi.onSystemResume === 'function'
-        ? { onResume: (callback: () => void) => desktopApi.onSystemResume!(callback) }
+        ? {
+            onResume: (callback: (event: DesktopResumeEvent) => void) => (
+              desktopApi.onSystemResume!((payload) => callback(normalizeDesktopResumeEvent(payload)))
+            ),
+          }
         : {}),
       getStatus: () => requireDesktopApi().getGatewayStatus(),
       ...(typeof desktopApi.getGatewayConnection === 'function'

@@ -24,6 +24,7 @@ export interface SessionNavigationDiagEntry {
   handoffEpoch?: number
   targetKeyHash?: string
   phase?: string
+  transportPhase?: 'healthy' | 'checking' | 'suspect' | 'reconnecting'
   closeCode?: number
   wasClean?: boolean
   reconnectAttempt?: number
@@ -41,8 +42,11 @@ export interface SessionNavigationDiagEntry {
   wakeIncidentStartedAt?: number
   wakeIncidentDeadlineAt?: number
   wakeIncidentStatus?: 'probing' | 'suspect' | 'reconnecting' | 'recovered'
+  wakeIncidentSource?: 'desktop-resume' | 'pageshow' | 'online' | 'manual'
+  wakeIncidentProbeTimeoutMs?: number
   wakeSignalCount?: number
   roundTripMs?: number
+  resumeSource?: 'desktop-resume'
 }
 
 export type SessionNavigationDiagData = Omit<SessionNavigationDiagEntry, 't' | 'iso' | 'source'>
@@ -99,6 +103,10 @@ const SAFE_DIAGNOSTIC_REASONS = new Set([
   'probe_send_failure',
   'probe_failed',
   'control_unconfirmed',
+  'wake_probe_unconfirmed',
+  'native_resume_probe_timeout',
+  'native_resume_socket_unavailable',
+  'desktop_resume',
   'scheduler_lag',
   'wake_grace',
   'hello',
@@ -119,6 +127,8 @@ const SAFE_TRANSPORT_PHASES = new Set([
   'wake_incident_start', 'wake_incident_recovered', 'retire',
   'probe_socket_unavailable', 'probe_deferred', 'probe_timeout',
   'scheduler_lag', 'reconnect_scheduled',
+  'desktop_resume',
+  'soft_suspect', 'soft_suspect_deferred',
 ])
 const TRANSPORT_TIMING_FIELDS = [
   'at', 'suspectAt', 'lastRxAt', 'wakeIncidentStartedAt',
@@ -147,9 +157,23 @@ function safeTransportMetrics(value: Record<string, unknown>): SessionNavigation
     metrics.visibility = value.visibility
   }
   if (value.health === 'healthy' || value.health === 'suspect') metrics.health = value.health
+  if (value.transportPhase === 'healthy' || value.transportPhase === 'checking'
+    || value.transportPhase === 'suspect' || value.transportPhase === 'reconnecting') {
+    metrics.transportPhase = value.transportPhase
+  }
   if (value.wakeIncidentStatus === 'probing' || value.wakeIncidentStatus === 'suspect'
     || value.wakeIncidentStatus === 'reconnecting' || value.wakeIncidentStatus === 'recovered') {
     metrics.wakeIncidentStatus = value.wakeIncidentStatus
+  }
+  if (value.resumeSource === 'desktop-resume') metrics.resumeSource = value.resumeSource
+  if (value.wakeIncidentSource === 'desktop-resume' || value.wakeIncidentSource === 'pageshow'
+    || value.wakeIncidentSource === 'online' || value.wakeIncidentSource === 'manual') {
+    metrics.wakeIncidentSource = value.wakeIncidentSource
+  }
+  if (typeof value.wakeIncidentProbeTimeoutMs === 'number'
+    && Number.isFinite(value.wakeIncidentProbeTimeoutMs)
+    && value.wakeIncidentProbeTimeoutMs >= 0) {
+    metrics.wakeIncidentProbeTimeoutMs = value.wakeIncidentProbeTimeoutMs
   }
   return metrics
 }
@@ -264,6 +288,20 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
     ...(handoff
       ? { handoffEpoch: handoff.epoch, targetKeyHash: handoff.targetKeyHash }
       : {}),
+  })
+}
+
+/** Record the native wake observation without persisting renderer payloads. */
+export function recordRpcResumeDiag(detail: {
+  generation: number
+  resumeSource: 'desktop-resume'
+}): SessionNavigationDiagEntry | null {
+  if (!Number.isFinite(detail.generation)) return null
+  return recordRpcTransportDiag({
+    phase: 'desktop_resume',
+    generation: detail.generation,
+    reason: 'desktop_resume',
+    resumeSource: detail.resumeSource,
   })
 }
 
