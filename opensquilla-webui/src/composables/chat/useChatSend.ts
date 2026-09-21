@@ -1155,7 +1155,12 @@ export function useChatSend(options: UseChatSendOptions) {
         } catch (error: unknown) {
           const commandError = turnCommandFailure(error)
           const accepted = acceptedErrorInfo(error)
-          if (commandError?.accepted === false || accepted?.terminalWithoutTask) {
+          // A local transport rejection describes only this recovery frame.
+          // It cannot prove that the original request was never accepted.
+          if (
+            (commandError?.accepted === false && commandError.kind !== 'transport')
+            || accepted?.terminalWithoutTask
+          ) {
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
             if (

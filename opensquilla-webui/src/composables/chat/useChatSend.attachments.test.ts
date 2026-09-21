@@ -6437,6 +6437,37 @@ describe('useChatSend attachment payloads', () => {
     })
   })
 
+  it('keeps an unknown receipt and Stop pending when a recovery frame is refused locally', async () => {
+    vi.useFakeTimers()
+    try {
+      let rejectFirstSend!: (reason: unknown) => void
+      let sendCalls = 0
+      const rpc = {
+        call: vi.fn(<T = unknown>(method: string) => {
+          if (method === 'chat.abort') return Promise.resolve({ aborted: false }) as Promise<T>
+          sendCalls += 1
+          if (sendCalls === 1) return new Promise<T>((_resolve, reject) => { rejectFirstSend = reject })
+          return Promise.reject(new RpcTransportError('Connection is being checked', false))
+        }) as UseChatSendOptions['rpc']['call'],
+      }
+      const acceptanceStopPending = ref(false)
+      const harness = makeOptions({ rpc, acceptanceStopPending })
+      harness.stream.startStreaming = vi.fn(() => { harness.stream.isStreaming.value = true })
+      harness.stream.endStreaming = vi.fn(() => { harness.stream.isStreaming.value = false })
+      const sending = harness.api.onSend()
+      await Promise.resolve()
+      harness.api.onStop()
+      rejectFirstSend(new RpcTransportError('Response lost', null))
+      await sending
+      await vi.advanceTimersByTimeAsync(250)
+      expect(acceptanceStopPending.value).toBe(true)
+      expect(harness.api.acceptanceRecoveryPendingForCurrentSession.value).toBe(true)
+    } finally {
+      vi.clearAllTimers()
+      vi.useRealTimers()
+    }
+  })
+
   it('automatically replays an unknown stopped acceptance and exactly aborts its receipt task', async () => {
     vi.useFakeTimers()
     try {
