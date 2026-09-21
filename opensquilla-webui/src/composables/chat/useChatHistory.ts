@@ -18,13 +18,7 @@ import {
   reconcileRunningHistoryMessages,
   rehomePromotedSteerRows,
 } from '@/utils/chat/historyMerge'
-import {
-  captureVisibleMessageAnchor,
-  createScrollHandoffGuard,
-  restoreMessageAnchor,
-  stabilizeMessageAnchor,
-} from '@/utils/chat/scrollAnchor'
-import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
+import { createScrollHandoffGuard } from '@/utils/chat/scrollAnchor'
 import type { InitialHistoryLoadStatus } from '@/utils/chat/sessionLoadState'
 import { planRevisionsFromToolSegments } from '@/utils/chat/plans'
 import {
@@ -733,7 +727,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     controller: AbortController
     promise: Promise<SessionPhaseResult | void>
   } | null = null
-  let stopAnchorStabilization: () => void = () => {}
   const loadedEarlierCursors = new Set<string>()
   const historyState = ref<ChatHistoryState>({
     hasMore: false,
@@ -763,12 +756,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         options.onTerminalTask(outcome)
       }
     }
-  }
-
-  function cancelAnchorStabilization() {
-    const stop = stopAnchorStabilization
-    stopAnchorStabilization = () => {}
-    stop()
   }
 
   function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean) {
@@ -929,7 +916,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
   function resetForSession(key: string): boolean {
     if (historySessionKey.value === key) return false
-    cancelAnchorStabilization()
     const crossedSession = Boolean(historySessionKey.value)
     if (crossedSession) {
       acknowledgedPreserveLocalTailGeneration = preserveLocalTailGeneration
@@ -1012,7 +998,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     const lease = options.sessionReadLeaseReader.current()
     const requestScrollEpoch = options.scrollEpoch?.value ?? 0
     const crossedSession = resetForSession(key)
-    cancelAnchorStabilization()
     const historyStateBeforeLoad = historyState.value
     const failedHistoryRequestBeforeLoad = failedHistoryRequest
     const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
@@ -1314,10 +1299,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
       const followingLiveEdge = !params.prepend && (options.autoScroll?.value ?? true)
       const historyContainer = options.threadRef?.value ?? null
-      const visibleAnchor = !followingLiveEdge
-        ? captureVisibleMessageAnchor(historyContainer)
-        : null
-      const prependFallbackHeight = visibleAnchor ? 0 : historyContainer?.scrollHeight ?? 0
       if (params.prepend) {
         const existing = new Set(previousTranscript.map(messageKey))
         const transcript = interleaveHistoryModelCallSegments(
@@ -1360,32 +1341,9 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       options.lastHeaderRole.value = ''
       options.lastHeaderDay.value = ''
 
-      if (visibleAnchor) {
-        await nextTick()
-        if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        if (
-          (options.canApplyViewportCorrection?.() ?? true)
-          && restoreMessageAnchor(visibleAnchor)
-        ) {
-          stopAnchorStabilization = stabilizeMessageAnchor(visibleAnchor, {
-            isCurrent: () => options.sessionKey.value === key
-              && historySessionKey.value === key
-              && historyRequestSeq === requestSeq
-              && requestScrollEpoch === (options.scrollEpoch?.value ?? 0)
-              && options.threadRef?.value === historyContainer
-              && (options.canApplyViewportCorrection?.() ?? true),
-          })
-        }
-      } else if (params.prepend && historyContainer) {
-        await nextTick()
-        if (!isCurrentRequest()) return { ok: false, cancelled: true }
-        applyProgrammaticScroll(historyContainer, () => {
-          historyContainer.scrollTop += Math.max(
-            0,
-            historyContainer.scrollHeight - prependFallbackHeight,
-          )
-        })
-      } else if (followingLiveEdge) {
+      // The list virtualizer owns prepend/reflow geometry. History only
+      // preserves the user's live-edge intent across its async data commit.
+      if (followingLiveEdge) {
         // Message assignment is one synchronous commit. Install the input
         // guard immediately afterwards and before yielding to layout.
         const liveEdgeGuard = historyContainer
@@ -1410,14 +1368,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
             // live-edge ownership captured before the commit and mark the
             // correction as application-owned.
             if (options.autoScroll) options.autoScroll.value = true
-            if (historyContainer) {
-              applyProgrammaticScroll(historyContainer, () => {
-                historyContainer.scrollTop = historyContainer.scrollHeight
-              })
-              liveEdgeGuard?.acceptCurrentPosition()
-            } else {
-              options.scrollToBottom()
-            }
+            options.scrollToBottom()
           }
         } finally {
           liveEdgeGuard?.dispose()
@@ -1610,7 +1561,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     historySyncPending = false
     historySyncPendingNonReconnecting = false
     loadEarlierPending = false
-    cancelAnchorStabilization()
     historyState.value = {
       ...historyState.value,
       loading: false,
@@ -1632,7 +1582,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     cancelActiveHistory()
     historySyncPending = false
     loadEarlierPending = false
-    cancelAnchorStabilization()
   }
 
   return {
@@ -1644,7 +1593,6 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     retryHistory,
     markSessionMissing,
     scheduleHistorySync,
-    cancelAnchorStabilization,
     cancelActiveHistory,
     cleanup,
   }

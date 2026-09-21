@@ -373,6 +373,26 @@ describe('conversation event transport adapter', () => {
     expect(rpc.registered('_state')).toBe(0)
   })
 
+  it('reuses fixed field aliases across a delta flood without caching wire keys or values', () => {
+    // Warm the fixed schema, then check allocation work rather than timing.
+    projectConversationContent({ text: 'warmup' }, 'text-delta')
+    const replace = vi.spyOn(String.prototype, 'replace')
+    try {
+      for (let index = 0; index < 512; index++) {
+        const projected = projectConversationContent({
+          text: `chunk-${index}`, streamSeq: index, preserveCompletedTools: false,
+          [`unknown_wire_key_${index}`]: 'not part of the contract',
+        }, 'text-delta')
+        expect(projected).toEqual({ text: `chunk-${index}`, stream_seq: index, preserve_completed_tools: false })
+      }
+      expect(replace.mock.calls.filter(([pattern]) => (
+        pattern instanceof RegExp && pattern.source === '_([a-z])'
+      ))).toHaveLength(0)
+    } finally {
+      replace.mockRestore()
+    }
+  })
+
   it('decodes aliases into one canonical content projection', () => {
     const { rpc, transport } = harness()
     const event = vi.fn()

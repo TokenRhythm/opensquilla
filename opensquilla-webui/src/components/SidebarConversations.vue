@@ -59,6 +59,7 @@ import SidebarSessionHoverCard, {
 import { useConfirm } from '@/composables/useConfirm'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'
 import { usePlatform } from '@/platform'
+import { useSidebarVirtualizer } from '@/composables/useSidebarVirtualizer'
 import { shouldShowAgentFilterBadge } from '@/utils/sidebarConversations'
 import { buildSidebarTaskHierarchy } from '@/utils/sidebarTaskHierarchy'
 import {
@@ -125,7 +126,7 @@ function maybeLoadMore() {
     || props.loadingMore
     || props.loadMoreError
   ) return
-  const remaining = element.scrollHeight - element.scrollTop - element.clientHeight
+  const remaining = sidebarVirtualizer.distanceFromEnd()
   if (remaining <= 160) emit('load-more')
 }
 
@@ -465,6 +466,7 @@ function reorderFromMenu(row: SidebarDisplayRow, direction: 'up' | 'down') {
   const target = keyboardReorderTarget(row, direction)
   if (!target) return
   const trigger = menuTriggerEl.value
+  focusedItemKey.value = `row:${row.key}`
   closeMenu()
   settleRow(row.key)
   emit('reorder', { draggedKey: row.key, targetKey: target.key, position: direction === 'up' ? 'before' : 'after' })
@@ -880,6 +882,7 @@ function onMenuKeydown(e: KeyboardEvent) {
   if (e.key === 'Escape') {
     e.preventDefault()
     const trigger = menuTriggerEl.value
+    focusedItemKey.value = `row:${openMenuKey.value}`
     closeMenu()
     nextTick(() => trigger?.focus())
     return
@@ -916,7 +919,16 @@ function startRename(row: SidebarConversationItem) {
   })
 }
 
-function commitRename() {
+function restoreRowFocus(key: string) {
+  focusedItemKey.value = `row:${key}`
+  void nextTick(() => {
+    const row = [...(historyList.value?.querySelectorAll<HTMLElement>('[data-sidebar-item-key]') ?? [])]
+      .find(element => element.dataset.sidebarItemKey === `row:${key}`)
+    row?.querySelector<HTMLButtonElement>('.sidebar-history-item')?.focus({ preventScroll: true })
+  })
+}
+
+function commitRename(restoreFocus = false) {
   if (renameCommitting) return
   const key = renamingKey.value
   if (!key) return
@@ -928,12 +940,15 @@ function commitRename() {
   renamingKey.value = ''
   renameDraft.value = ''
   if (title && title !== original) emit('rename', { key, title })
+  if (restoreFocus) restoreRowFocus(key)
 }
 
-function cancelRename() {
+function cancelRename(restoreFocus = true) {
+  const key = renamingKey.value
   renameCommitting = true
   renamingKey.value = ''
   renameDraft.value = ''
+  if (restoreFocus && key) restoreRowFocus(key)
 }
 
 function onRenameBlur() {
@@ -1008,6 +1023,56 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
   }
   emit('select', row.key)
 }
+
+const focusedItemKey = ref('')
+const sidebarVirtualizer = useSidebarVirtualizer(
+  historyList,
+  computed(() => displayBlocks.value.map(block => ({
+    ...block,
+    collapsed: Boolean(block.showFamilyHeader && block.family && isCollapsed(block.family)),
+  }))),
+  computed(() => [renamingKey.value, openMenuKey.value, pointerDrag.value?.key || '', settlingRowKey.value]),
+  focusedItemKey,
+)
+const { renderedBlocks, virtualized } = sidebarVirtualizer
+function measureSidebarItem(value: Element | ComponentPublicInstance | null) {
+  sidebarVirtualizer.measureElement(value instanceof HTMLElement ? value : null)
+}
+function rememberSidebarFocus(event: FocusEvent) {
+  const target = event.target
+  focusedItemKey.value = target instanceof Element
+    ? target.closest<HTMLElement>('[data-sidebar-item-key]')?.dataset.sidebarItemKey || '' : ''
+}
+function releaseSidebarFocus(event: FocusEvent) {
+  // activeElement can temporarily be body between native focusout/focusin.
+  // Keep the destination leased through that handoff, before Vue can unmount it.
+  if (event.relatedTarget instanceof Node && historyList.value?.contains(event.relatedTarget)) return
+  void nextTick(() => {
+    if (!historyList.value?.contains(document.activeElement)) focusedItemKey.value = ''
+  })
+}
+// Reveal a route selected by search / navigation, but not every reorder or
+// metadata refresh. Revisit an initial provisional row when the first page
+// arrives and windowing starts. A manually collapsed row remains collapsed.
+watch([
+  () => props.currentKey,
+  () => sidebarVirtualizer.hasRow(props.currentKey),
+  virtualized,
+  () => Boolean(findSessionRow(props.currentKey)?.provisional),
+  historyList,
+],
+  ([key, present]) => { if (present) void sidebarVirtualizer.revealRow(key) },
+  { immediate: true, flush: 'post' },
+)
+watch(() => sidebarVirtualizer.hasRow(renamingKey.value), present => {
+  if (!present && renamingKey.value) cancelRename(false)
+}, { flush: 'pre' })
+watch(() => sidebarVirtualizer.hasRow(openMenuKey.value), present => {
+  if (!present && openMenuKey.value) closeMenu()
+}, { flush: 'pre' })
+watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => {
+  if (!present && pointerDrag.value) clearRowDrag()
+}, { flush: 'pre' })
 </script>
 
 <template>
@@ -1151,15 +1216,25 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
       v-else
       ref="historyList"
       class="sidebar-history-list"
+      :data-sidebar-virtualized="virtualized"
+      :data-sidebar-loaded-count="totalRows"
       @scroll.passive="onHistoryScroll"
+      @focusin="rememberSidebarFocus"
+      @focusout="releaseSidebarFocus"
     >
       <div
-        v-for="block in displayBlocks"
+        v-for="{ block, headingIndex, rows, gapAfter } in renderedBlocks"
         :key="block.key"
         class="sidebar-group sidebar-zone"
         :data-family="block.family || block.key"
         :data-sidebar-zone-group="block.zone"
       >
+        <div
+          :ref="measureSidebarItem"
+          :data-index="headingIndex"
+          :data-sidebar-item-key="`heading:${block.key}`"
+          class="sidebar-virtual-heading"
+        >
         <div
           v-if="block.showHeading"
           class="sidebar-zone-heading"
@@ -1218,17 +1293,24 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
           <span class="sidebar-group__label">{{ block.familyLabel }}</span>
           <span class="sidebar-group__count">{{ block.rows.length }}</span>
         </button>
-
-        <Transition name="sidebar-group">
+        <div v-if="block.zone === 'recents' && block.rows.length === 0" class="sidebar-zone-empty">
+          <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
+        </div>
+        </div>
           <div
-            v-show="!block.showFamilyHeader || !block.family || !isCollapsed(block.family)"
             :id="`sidebar-group-${block.key}`"
             class="sidebar-group__body"
           >
-            <TransitionGroup name="sidebar-row" tag="div" class="sidebar-group__content">
+            <div class="sidebar-group__content">
+              <template v-for="{ row, index, gapBefore } in rows" :key="row.key">
+              <div v-if="gapBefore" class="sidebar-virtual-spacer" :style="{ height: `${gapBefore}px` }" aria-hidden="true" />
               <div
-                v-for="row in block.rows"
-                :key="row.key"
+                :ref="measureSidebarItem"
+                :data-index="index"
+                :data-sidebar-item-key="`row:${row.key}`"
+                class="sidebar-virtual-row"
+              >
+              <div
                 class="sidebar-history-row"
                 :class="{
                   'is-selected': row.rowKind === 'session' && isRowSelected(row.key),
@@ -1357,8 +1439,8 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                   class="sidebar-history-rename"
                   type="text"
                   :aria-label="t('shared.sidebar.renameLabel', { title: row.title })"
-                  @keydown.enter.prevent="commitRename"
-                  @keydown.esc.prevent="cancelRename"
+                  @keydown.enter.prevent="commitRename(true)"
+                  @keydown.esc.prevent="cancelRename()"
                   @blur="onRenameBlur"
                 />
 
@@ -1591,15 +1673,11 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
                   {{ agentInitial(row.agentName) }}
                 </button>
               </div>
-            </TransitionGroup>
+              </div>
+              </template>
+              <div v-if="gapAfter" class="sidebar-virtual-spacer" :style="{ height: `${gapAfter}px` }" aria-hidden="true" />
+            </div>
           </div>
-        </Transition>
-        <div
-          v-if="block.zone === 'recents' && block.rows.length === 0"
-          class="sidebar-zone-empty"
-        >
-          <div class="sidebar-zone-empty__body">{{ t('shared.sidebar.noConversations') }}</div>
-        </div>
       </div>
       <div
         v-if="loadingMore || loadMoreError || (!hasMore && totalRows > 0)"
@@ -1632,6 +1710,33 @@ function onSelectRow(row: SidebarConversationItem, event: MouseEvent) {
 </template>
 
 <style scoped>
+.sidebar-history-list {
+  padding-top: 0;
+}
+
+.sidebar-history-list[data-sidebar-virtualized='true'] {
+  overflow-anchor: none;
+}
+
+.sidebar-group + .sidebar-group {
+  margin-top: 0;
+}
+
+/* Include group spacing and row margins in TanStack's measured boxes. */
+.sidebar-virtual-heading {
+  display: flow-root;
+  padding-top: var(--sp-1);
+}
+
+.sidebar-virtual-row {
+  display: flow-root;
+}
+
+.sidebar-virtual-spacer {
+  flex: 0 0 auto;
+  pointer-events: none;
+}
+
 .sidebar-move-down {
   transform: rotate(180deg);
 }

@@ -566,7 +566,12 @@ test('recovers stalled history and live hydration in place despite ongoing ticks
               : seededTranscript.length
             const start = Math.max(0, end - requestedLimit)
             const messages = seededTranscript.slice(start, end)
-            seedOffset = Math.min(seedOffset, start)
+            // The read lease also prefetches 100 rows, but Chat consumes its
+            // own 50-row pages. Do not count that unused prefetch as a page
+            // committed to the timeline under test.
+            if (requestSessionKey(frame) === SESSION_KEY && requestedLimit === 50) {
+              seedOffset = Math.min(seedOffset, start)
+            }
             ws.send(successResponse(String(frame.id), {
               messages,
               has_more: start > 0,

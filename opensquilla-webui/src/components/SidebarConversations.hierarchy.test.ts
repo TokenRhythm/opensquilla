@@ -45,7 +45,6 @@ async function mountSidebar(rows: SidebarSectionRow[], currentKey = '') {
   const toggle = async (key: string) => {
     find(key)?.querySelector<HTMLButtonElement>('.sidebar-task-disclosure')?.click()
     await nextTick()
-    await vi.waitFor(() => expect(host.querySelector('.sidebar-row-leave-active')).toBeNull())
   }
   return { host, state, find, toggle, onReorder, onSelect }
 }
@@ -163,6 +162,29 @@ describe('SidebarConversations task hierarchy', () => {
     await nextTick()
     expect(document.querySelector('.sidebar-session-drag-preview')).toBeNull()
     expect(sidebar.onReorder).not.toHaveBeenCalled()
+  })
+
+  it('keeps the next Tab destination mounted during an in-list focus handoff', async () => {
+    vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockReturnValue(44)
+    vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockReturnValue(260)
+    const sidebar = await mountSidebar(Array.from({ length: 200 }, (_, index) => row(`task-${index}`)))
+    const list = sidebar.host.querySelector<HTMLElement>('.sidebar-history-list')!
+    const first = sidebar.find('task-0')!.querySelector<HTMLButtonElement>('.sidebar-history-item')!
+    // Browsers may expose body as activeElement between focusout and focusin.
+    // relatedTarget already identifies the next native Tab destination.
+    first.dispatchEvent(new FocusEvent('focusin', { bubbles: true }))
+    list.scrollTop = 4_400
+    list.dispatchEvent(new Event('scroll'))
+    await nextTick()
+    const next = sidebar.find('task-1')!.querySelector<HTMLButtonElement>('.sidebar-history-item')!
+    first.dispatchEvent(new FocusEvent('focusout', { bubbles: true, relatedTarget: next }))
+    await nextTick()
+    await nextTick()
+    expect(document.activeElement).toBe(document.body)
+    expect(next.isConnected).toBe(true)
+    next.focus()
+    await nextTick()
+    expect(document.activeElement).toBe(next)
   })
 
   it('moves tasks from the keyboard menu within their ordering scope and restores focus', async () => {

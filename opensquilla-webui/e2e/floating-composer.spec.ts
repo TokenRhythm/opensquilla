@@ -656,7 +656,9 @@ test('preserves a non-virtualized reader anchor across width reflow', async ({ p
   })
   await expect(page.locator('.chat-jump-latest')).toBeVisible()
   await expect(thread).toHaveClass(/chat-thread--reading-history/)
-  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('auto')
+  // TanStack owns measurements even below the DOM-windowing threshold; native
+  // anchoring must not apply a second correction to the same width reflow.
+  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
   const wideAnchor = await visibleRowAnchor(page)
 
   await page.setViewportSize({ width: 900, height: 760 })
@@ -671,7 +673,7 @@ test('preserves a non-virtualized reader anchor across width reflow', async ({ p
   const narrowAnchor = await visibleRowAnchor(page, wideAnchor.key)
   expect(Math.abs(narrowAnchor.offset - wideAnchor.offset)).toBeLessThanOrEqual(2)
   await expect(page.locator('.chat-jump-latest')).toBeVisible()
-  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('auto')
+  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
 
   await page.setViewportSize({ width: 1280, height: 760 })
   await expect.poll(async () => {

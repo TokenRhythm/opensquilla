@@ -3,11 +3,18 @@ import { isAbsolute } from 'node:path'
 
 import {
   expect,
-  test,
   type Page,
   type WebSocketRoute,
 } from '@playwright/test'
+import type { WebSocket } from 'ws'
+import { test } from './support/native-gateway-fixture'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-task-resilience'
@@ -21,6 +28,7 @@ type RpcRequest = {
   method?: string
   params?: Record<string, unknown>
   type?: string
+  nonce?: string
 }
 
 type PendingServerRow = {
@@ -115,7 +123,10 @@ function hello(methods: string[] = [], events: string[] = []) {
       ],
     },
     auth: {
-      principal: { isOwner: true },
+      principal: {
+        role: 'operator', authenticated: true, isOwner: true, authState: 'authenticated',
+        scopes: ['operator.admin'], capabilities: [], tokenPublicId: null, guestOwnerId: null,
+      },
       runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
     },
   })
@@ -133,11 +144,7 @@ function basePayload(method: string): unknown {
     'models.routing.get': { mode: 'direct' },
     'onboarding.status': { audioConfigured: false },
     'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-    'sessions.messages.hydrate': {
-      hydration_complete: true,
-      workspaceId: null,
-      run_status: 'idle',
-    },
+    'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY),
     'sessions.messages.unsubscribe': { subscribed: false },
     'sessions.subscribe': { subscribed: true },
     'usage.status': { sessions: [] },
@@ -161,16 +168,13 @@ function runningSubscription(
   currentStreamSeq: number,
   extra: Record<string, unknown> = {},
 ) {
-  return {
-    subscribed: true,
-    hydration_complete: true,
-    replay_complete: true,
+  return sessionMessagesSubscribePayload(SESSION_KEY, {
     current_stream_seq: currentStreamSeq,
     stream_generation: generation,
     run_status: 'running',
     active_task: { task_id: TASK_ID, status: 'running' },
     ...extra,
-  }
+  })
 }
 
 test.describe('0.5.0 long-task resilience', () => {
@@ -232,38 +236,33 @@ test.describe('0.5.0 long-task resilience', () => {
         }
         if (method === 'sessions.messages.snapshot') {
           if (socketIndex === 0) initialSnapshotComplete = true
-          ws.send(successResponse(frame.id, {
-            key: SESSION_KEY,
+          ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(SESSION_KEY, {
             task_id: TASK_ID,
             events: [],
             current_stream_seq: socketIndex === 0 ? 50 : 0,
             stream_generation: generation,
             run_status: 'running',
             active_task: { task_id: TASK_ID, status: 'running' },
-          }))
+          })))
           return
         }
         if (method === 'sessions.messages.hydrate') {
-          ws.send(successResponse(frame.id, {
+          ws.send(successResponse(frame.id, sessionMessagesHydratePayload(SESSION_KEY, {
             ...runningSubscription(generation, socketIndex === 0 ? 50 : 0),
             hydration_complete: true,
             workspaceId: null,
-          }))
+          })))
           return
         }
         if (method === 'chat.history') {
-          ws.send(successResponse(frame.id, {
-            messages: [{
-              role: 'user',
-              text: 'Keep this long-running task alive across a Gateway restart.',
-              id: 'generation-user-message',
-              message_id: 'generation-user-message',
-              timestamp: Math.floor(Date.now() / 1000) - 60,
-              turn_context: { turn_id: TASK_ID },
-            }],
-            has_more: false,
-            canonical_complete: true,
-          }))
+          ws.send(successResponse(frame.id, chatHistoryPayload([{
+            role: 'user',
+            text: 'Keep this long-running task alive across a Gateway restart.',
+            id: 'generation-user-message',
+            message_id: 'generation-user-message',
+            timestamp: Math.floor(Date.now() / 1000) - 60,
+            turn_context: { turn_id: TASK_ID },
+          }])))
           return
         }
         ws.send(successResponse(frame.id, basePayload(method)))
@@ -299,14 +298,19 @@ test.describe('0.5.0 long-task resilience', () => {
       since_stream_generation: generations[0],
       since_stream_seq: 51,
     })
-    // A healthy WebSocket alone is insufficient. The connection pill stays
-    // degraded until the session subscription itself has recovered.
-    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    // The topbar reports the shared transport; the session owns its separate
+    // recovery notice and send gate until the subscription has recovered.
+    const recoveringSession = page.getByText('Gateway connected. Restoring live updates for this session…', { exact: true })
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(recoveringSession).toBeVisible()
+    await page.locator('.chat-textarea').fill('Draft retained while this session reconnects')
+    await expect(page.getByRole('button', { name: 'Send', exact: true })).toBeDisabled()
 
     const release = releaseReplacementSubscription
     if (!release) throw new Error('replacement subscription was not captured')
     release()
-    await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 2_000 })
+    await expect(recoveringSession).toHaveCount(0, { timeout: 2_000 })
+    await expect(page.locator('.chat-textarea')).toHaveValue('Draft retained while this session reconnects')
 
     const firstTokenAt = performance.now()
     sockets[1]!.send(eventFrame('session.event.text_delta', {
@@ -378,7 +382,7 @@ test.describe('0.5.0 long-task resilience', () => {
           },
         })
       }
-      return { messages, has_more: false, canonical_complete: true }
+      return chatHistoryPayload(messages)
     }
 
     await page.routeWebSocket(/\/ws$/, ws => {
@@ -411,33 +415,30 @@ test.describe('0.5.0 long-task resilience', () => {
         }
         if (method === 'sessions.messages.snapshot') {
           const replayRouter = socketIndex > 0 && !settledHistory
-          ws.send(successResponse(frame.id, {
-            key: ROUTER_SESSION_KEY,
+          ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(ROUTER_SESSION_KEY, {
             task_id: settledHistory ? null : ROUTER_TASK_ID,
             stream_generation: generation,
             current_stream_seq: settledHistory ? 11 : replayRouter ? 10 : 9,
             events: replayRouter
               ? [{ event: 'session.event.router_decision', payload: routerPayload }]
               : [],
-          }))
+          })))
           if (socketIndex === 0) initialSnapshotComplete = true
           return
         }
         if (method === 'sessions.messages.subscribe') {
-          ws.send(successResponse(frame.id, {
-            subscribed: true,
-            replay_complete: true,
+          ws.send(successResponse(frame.id, sessionMessagesSubscribePayload(ROUTER_SESSION_KEY, {
             stream_generation: generation,
             current_stream_seq: settledHistory ? 11 : socketIndex > 0 ? 10 : 9,
             run_status: settledHistory ? 'idle' : 'running',
             active_task: settledHistory
               ? null
               : { task_id: ROUTER_TASK_ID, status: 'running' },
-          }))
+          })))
           return
         }
         if (method === 'sessions.messages.hydrate') {
-          ws.send(successResponse(frame.id, {
+          ws.send(successResponse(frame.id, sessionMessagesHydratePayload(ROUTER_SESSION_KEY, {
             hydration_complete: true,
             stream_generation: generation,
             current_stream_seq: settledHistory ? 11 : socketIndex > 0 ? 10 : 9,
@@ -445,7 +446,7 @@ test.describe('0.5.0 long-task resilience', () => {
             active_task: settledHistory
               ? null
               : { task_id: ROUTER_TASK_ID, status: 'running' },
-          }))
+          })))
           return
         }
         if (method === 'config.get') {
@@ -543,16 +544,16 @@ test.describe('0.5.0 long-task resilience', () => {
         }
         if (method === 'sessions.messages.snapshot') {
           snapshotComplete = true
-          ws.send(successResponse(frame.id, {
+          ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(SESSION_KEY, {
             ...runningSubscription(generation, 0),
             key: SESSION_KEY,
             task_id: TASK_ID,
             events: [],
-          }))
+          })))
           return
         }
         if (method === 'chat.history') {
-          ws.send(successResponse(frame.id, { messages: [], has_more: false }))
+          ws.send(successResponse(frame.id, chatHistoryPayload()))
           return
         }
         ws.send(successResponse(frame.id, basePayload(method)))
@@ -563,8 +564,11 @@ test.describe('0.5.0 long-task resilience', () => {
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
     await expect.poll(() => snapshotComplete).toBe(true)
     const liveLabel = page.locator('.assistant-activity--live .assistant-activity__live-label')
-    const sendActivity = (streamSeq: number, payload: Record<string, unknown>) => {
+    const sendActivity = async (streamSeq: number, payload: Record<string, unknown>) => {
       if (!socket) throw new Error('provider activity websocket is not connected')
+      // The provider timestamp and browser clock must share the fake epoch.
+      // Node's real Date.now() would put every phase weeks into the future.
+      const startedAt = await page.evaluate(() => Date.now())
       socket.send(eventFrame('session.event.provider_activity', {
         key: SESSION_KEY,
         task_id: TASK_ID,
@@ -572,13 +576,13 @@ test.describe('0.5.0 long-task resilience', () => {
         stream_seq: streamSeq,
         schema_version: 1,
         activity_id: `provider-activity-${streamSeq}`,
-        started_at: Date.now(),
+        started_at: startedAt,
         heartbeat: false,
         ...payload,
       }))
     }
 
-    sendActivity(1, { phase: 'requesting', reason: 'initial' })
+    await sendActivity(1, { phase: 'requesting', reason: 'initial' })
     await page.clock.runFor(50)
     await expect(liveLabel).toHaveText('Waiting for model')
 
@@ -597,7 +601,7 @@ test.describe('0.5.0 long-task resilience', () => {
       })
       observer.observe(label, { childList: true, characterData: true, subtree: true })
     })
-    sendActivity(2, { phase: 'reasoning', reason: 'reasoning_only' })
+    await sendActivity(2, { phase: 'reasoning', reason: 'reasoning_only' })
     await page.clock.runFor(50)
     await expect(liveLabel).toHaveText('Thinking deeply', { timeout: 1_000 })
     const reasoningLatency = await page.evaluate(() => {
@@ -610,7 +614,7 @@ test.describe('0.5.0 long-task resilience', () => {
     expect(reasoningLatency).toBeLessThanOrEqual(1_000)
 
     const privateProviderBody = 'upstream-secret-debug-body-must-not-render'
-    sendActivity(3, {
+    await sendActivity(3, {
       phase: 'retry_wait',
       reason: 'rate_limited',
       retry_attempt: 1,
@@ -635,10 +639,16 @@ test.describe('0.5.0 long-task resilience', () => {
     // Heartbeats prove transport liveness but must not disguise a provider
     // stall. Advance the browser clock without another semantic signal.
     await page.clock.runFor(20_100)
-    await expect(liveLabel).toHaveText('Still working — no recent signal')
+    // Keep the current phase visible; stale status has its own detail and
+    // screen-reader announcement rather than overwriting the phase label.
+    const staleNote = page.locator('.assistant-activity--live .assistant-activity__stale-note')
+    await expect(staleNote).toHaveText('Still working — no recent signal')
+    await expect(liveLabel).toHaveClass(/is-stale/)
+    await expect(page.locator('.assistant-activity--live [role="status"]'))
+      .toContainText('Still working — no recent signal')
     await expect(page.getByRole('button', { name: /Stop .*response/ })).toBeEnabled()
 
-    sendActivity(5, {
+    await sendActivity(5, {
       phase: 'retrying',
       reason: 'rate_limited',
       retry_attempt: 2,
@@ -646,8 +656,10 @@ test.describe('0.5.0 long-task resilience', () => {
     })
     await page.clock.runFor(50)
     await expect(liveLabel).toHaveText('Retrying 2/3')
+    await expect(staleNote).toHaveCount(0)
+    await expect(liveLabel).not.toHaveClass(/is-stale/)
 
-    sendActivity(6, {
+    await sendActivity(6, {
       phase: 'fallback',
       reason: 'provider_overloaded',
       retry_attempt: 3,
@@ -670,7 +682,7 @@ test.describe('0.5.0 long-task resilience', () => {
   })
 
   test('keeps 200-message history windowed and the composer responsive under a deterministic delta flood', async ({
-    page,
+    page, nativeGateway,
   }, testInfo) => {
     test.setTimeout(180_000)
     await preparePage(page)
@@ -692,7 +704,8 @@ test.describe('0.5.0 long-task resilience', () => {
     })
 
     const generation = 'generation-performance-fixture'
-    let socket: WebSocketRoute | null = null
+    let socket: WebSocket | null = null
+    let connections = 0
     let streamSeq = 0
     let running = true
     const now = Math.floor(Date.now() / 1000)
@@ -704,14 +717,19 @@ test.describe('0.5.0 long-task resilience', () => {
       timestamp: now - (200 - index) * 5,
     }))
 
-    await page.routeWebSocket(/\/ws$/, ws => {
+    const origin = await nativeGateway(ws => {
       socket = ws
+      connections += 1
       ws.send(eventFrame('connect.challenge', {}))
-      ws.onMessage(message => {
+      ws.on('message', message => {
         let frame: RpcRequest
         try {
           frame = JSON.parse(String(message)) as RpcRequest
         } catch {
+          return
+        }
+        if (frame.type === 'ping') {
+          ws.send(JSON.stringify({ type: 'pong', nonce: frame.nonce }))
           return
         }
         if (frame.type !== 'req') return
@@ -723,42 +741,34 @@ test.describe('0.5.0 long-task resilience', () => {
         if (method === 'sessions.messages.subscribe') {
           ws.send(successResponse(frame.id, running
             ? runningSubscription(generation, streamSeq)
-            : {
-                subscribed: true,
-                hydration_complete: true,
-                replay_complete: true,
+            : sessionMessagesSubscribePayload(SESSION_KEY, {
                 current_stream_seq: streamSeq,
                 stream_generation: generation,
                 run_status: 'idle',
                 active_task: null,
-              }))
+              })))
           return
         }
         if (method === 'sessions.messages.snapshot') {
-          ws.send(successResponse(frame.id, {
-            key: SESSION_KEY,
-            task_id: running ? TASK_ID : undefined,
+          ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(SESSION_KEY, {
+            task_id: running ? TASK_ID : null,
             events: [],
             current_stream_seq: streamSeq,
             stream_generation: generation,
             run_status: running ? 'running' : 'idle',
             active_task: running ? { task_id: TASK_ID, status: 'running' } : null,
-          }))
+          })))
           return
         }
         if (method === 'chat.history') {
-          ws.send(successResponse(frame.id, {
-            messages: history,
-            has_more: false,
-            canonical_complete: true,
-          }))
+          ws.send(successResponse(frame.id, chatHistoryPayload(history)))
           return
         }
         ws.send(successResponse(frame.id, basePayload(method)))
       })
     })
 
-    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+    await page.goto(origin + CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
     const list = page.locator('.chat-message-list')
     const thread = page.locator('.chat-thread')
@@ -999,6 +1009,9 @@ test.describe('0.5.0 long-task resilience', () => {
     }, visualAnchor.token)
 
     await flood
+    // A pressure run must exercise one uninterrupted turn, not silently lose
+    // earlier fragments through a mock Gateway's missing heartbeat response.
+    expect(connections).toBe(1)
     heapPhase = 'live-settle'
     // Let the shared rAF publisher render the final shallow snapshot.
     await page.waitForTimeout(250)
@@ -1174,6 +1187,7 @@ test.describe('0.5.0 long-task resilience', () => {
         recalcStyleCount,
         layoutCount,
         fixture: {
+          transport: 'native-websocket',
           historyMessages: 200,
           textDeltas: 4_000,
           reasoningDeltas: 20_000,
@@ -1285,32 +1299,27 @@ test.describe('0.5.0 long-task resilience', () => {
           if (method === 'sessions.messages.subscribe') {
             ws.send(successResponse(frame.id, running
               ? runningSubscription(generation, streamSeq)
-              : {
-                  subscribed: true,
-                  hydration_complete: true,
-                  replay_complete: true,
+              : sessionMessagesSubscribePayload(SESSION_KEY, {
                   current_stream_seq: streamSeq,
                   stream_generation: generation,
                   run_status: 'idle',
                   active_task: null,
-                }))
+                })))
             return
           }
           if (method === 'sessions.messages.snapshot') {
-            ws.send(successResponse(frame.id, {
-              key: SESSION_KEY,
-              task_id: running ? TASK_ID : undefined,
+            ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(SESSION_KEY, {
+              task_id: running ? TASK_ID : null,
               events: [],
               current_stream_seq: streamSeq,
               stream_generation: generation,
               run_status: running ? 'running' : 'idle',
               active_task: running ? { task_id: TASK_ID, status: 'running' } : null,
-            }))
+            })))
             return
           }
           if (method === 'sessions.messages.hydrate') {
-            ws.send(successResponse(frame.id, {
-              subscribed: true,
+            ws.send(successResponse(frame.id, sessionMessagesHydratePayload(SESSION_KEY, {
               hydration_complete: true,
               replay_complete: true,
               current_stream_seq: streamSeq,
@@ -1318,15 +1327,11 @@ test.describe('0.5.0 long-task resilience', () => {
               workspaceId: null,
               run_status: running ? 'running' : 'idle',
               active_task: running ? { task_id: TASK_ID, status: 'running' } : null,
-            }))
+            })))
             return
           }
           if (method === 'chat.history') {
-            ws.send(successResponse(frame.id, {
-              messages: transcript,
-              has_more: false,
-              canonical_complete: true,
-            }))
+            ws.send(successResponse(frame.id, chatHistoryPayload(transcript)))
             return
           }
           if (method === 'sessions.pending_inputs.list') {
@@ -1466,6 +1471,7 @@ test.describe('0.5.0 long-task resilience', () => {
     }))
     await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
+    await expect(page.locator('.chat')).toBeVisible()
     await dropSyntheticFile(page, {
       name: attachmentName,
       type: 'application/pdf',

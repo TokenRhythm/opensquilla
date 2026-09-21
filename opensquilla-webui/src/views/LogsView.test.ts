@@ -1,8 +1,9 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { KeepAlive, computed, createApp, defineComponent, h, nextTick, ref } from 'vue'
+import { KeepAlive, createApp, defineComponent, h, nextTick, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { OBSERVABILITY_KEY } from '@/modules/observability'
+import * as virtualizerLayout from '@/utils/virtualizerLayout'
 
 const rpcMocks = vi.hoisted(() => ({
   call: vi.fn(),
@@ -55,8 +56,13 @@ vi.mock('@/components/Icon.vue', () => ({
 vi.mock('@/components/ControlSwitch.vue', () => ({
   default: defineComponent({
     name: 'ControlSwitchStub',
-    setup() {
-      return () => h('button', { type: 'button', 'data-testid': 'control-switch' })
+    props: { checked: Boolean },
+    emits: ['update:checked'],
+    setup(props, { emit }) {
+      return () => h('button', {
+        type: 'button', 'data-testid': 'control-switch',
+        onClick: () => emit('update:checked', !props.checked),
+      })
     },
   }),
 }))
@@ -74,17 +80,6 @@ vi.mock('@/components/run/RunTrace.vue', () => ({
   default: defineComponent({ name: 'RunTraceStub', setup: () => () => h('div') }),
 }))
 
-vi.mock('@/composables/useFixedWindow', () => ({
-  useFixedWindow: <T,>(source: { value: T[] }) => ({
-    visible: computed(() => source.value.map((item, index) => ({ item, index }))),
-    topPad: computed(() => 0),
-    bottomPad: computed(() => 0),
-    onScroll: vi.fn(),
-    measure: vi.fn(),
-    scrollToEnd: vi.fn(),
-  }),
-}))
-
 import LogsView from './LogsView.vue'
 
 interface MountedLogs {
@@ -94,6 +89,22 @@ interface MountedLogs {
 }
 
 const mounted: MountedLogs[] = []
+let viewportWidth = 800
+let viewportHeight = 240
+let rowHeight = 24
+let resizeObservers: { callback: ResizeObserverCallback; targets: Set<Element> }[] = []
+
+function resize(target: Element) {
+  const bounds = target.getBoundingClientRect()
+  const size = [{ inlineSize: bounds.width, blockSize: bounds.height }]
+  const entry: ResizeObserverEntry = {
+    target, contentRect: bounds, borderBoxSize: size,
+    contentBoxSize: size, devicePixelContentBoxSize: size,
+  }
+  for (const observer of resizeObservers) {
+    if (observer.targets.has(target)) observer.callback([entry], {} as ResizeObserver)
+  }
+}
 
 function normalStatus() {
   return {
@@ -107,7 +118,10 @@ async function flush() {
   await nextTick()
 }
 
-async function mountLogs(): Promise<MountedLogs> {
+async function mountLogs(padding = 0): Promise<MountedLogs> {
+  const styles = document.createElement('style')
+  styles.textContent = `.lg-display { padding: ${padding}px; }`
+  document.head.appendChild(styles)
   const visible = ref(true)
   const Host = defineComponent({
     name: 'LogsKeepAliveHost',
@@ -155,6 +169,7 @@ async function mountLogs(): Promise<MountedLogs> {
     unmount() {
       app.unmount()
       el.remove()
+      styles.remove()
     },
   }
   mounted.push(result)
@@ -168,6 +183,47 @@ function tailCalls() {
 
 beforeEach(() => {
   vi.useFakeTimers()
+  viewportWidth = 800
+  viewportHeight = 240
+  rowHeight = 24
+  resizeObservers = []
+  vi.stubGlobal('ResizeObserver', class {
+    targets = new Set<Element>()
+    constructor(callback: ResizeObserverCallback) { resizeObservers.push({ callback, targets: this.targets }) }
+    observe(target: Element) { this.targets.add(target) }
+    unobserve(target: Element) { this.targets.delete(target) }
+    disconnect() { this.targets.clear() }
+  })
+  // Keep TanStack's real range, key, measurement and scroll implementation. Only
+  // supply the geometry missing from happy-dom, not a mock virtualizer.
+  vi.spyOn(HTMLElement.prototype, 'offsetWidth', 'get').mockImplementation(() => viewportWidth)
+  vi.spyOn(HTMLElement.prototype, 'offsetHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains('lg-display') ? viewportHeight : Math.round(rowHeight)
+  })
+  vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    return this.classList.contains('lg-display') ? viewportHeight : Math.round(rowHeight)
+  })
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(function (this: HTMLElement) {
+    const height = this.classList.contains('lg-display') ? viewportHeight : rowHeight
+    const display = this.closest<HTMLElement>('.lg-display')
+    const top = this.classList.contains('lg-line') && display
+      ? Number.parseFloat(getComputedStyle(display).paddingTop || '0')
+        + Number.parseFloat(this.style.transform.slice(11) || '0') - display.scrollTop : 0
+    return { x: 0, y: top, top, left: 0, right: viewportWidth, bottom: top + height,
+      width: viewportWidth, height, toJSON: () => ({}) }
+  })
+  vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    if (!this.classList.contains('lg-display')) return 24
+    const window = this.querySelector<HTMLElement>('.lg-window')
+    const styles = getComputedStyle(this)
+    const padding = Number.parseFloat(styles.paddingTop || '0') + Number.parseFloat(styles.paddingBottom || '0')
+    return window ? Number.parseFloat(window.style.height || '0') + padding : viewportHeight
+  })
+  vi.spyOn(HTMLElement.prototype, 'scrollTo').mockImplementation(function (this: HTMLElement, options?: ScrollToOptions | number) {
+    if (!options || typeof options !== 'object') return
+    this.scrollTop = Math.max(0, Math.min(options.top ?? 0, this.scrollHeight - this.clientHeight))
+    this.dispatchEvent(new Event('scroll'))
+  })
   rpcMocks.call.mockReset()
   rpcMocks.ready.mockReset()
   rpcMocks.ready.mockResolvedValue(undefined)
@@ -196,6 +252,7 @@ afterEach(() => {
   vi.clearAllTimers()
   vi.useRealTimers()
   vi.restoreAllMocks()
+  vi.unstubAllGlobals()
 })
 
 describe('LogsView states', () => {
@@ -380,5 +437,246 @@ describe('LogsView KeepAlive lifecycle', () => {
     document.dispatchEvent(new Event('visibilitychange'))
     await flush()
     expect(tailCalls()).toHaveLength(callsWhileHidden + 2)
+  })
+})
+
+describe('LogsView virtualization', () => {
+  function mockLogPages(count = 500) {
+    let read = 0
+    rpcMocks.call.mockImplementation(async (method: string) => {
+      if (method === 'logs.status') return normalStatus()
+      if (method === 'logs.tail') {
+        const start = read++ * count
+        return {
+          lines: Array.from({ length: count }, (_, index) => ({
+            level: index % 2 ? 'WARN' : 'INFO', message: `synthetic log ${start + index}`,
+          })),
+          cursor: start + count,
+        }
+      }
+      throw new Error(`unexpected RPC method: ${method}`)
+    })
+  }
+
+  it('mounts a bounded range and follows appended pages using the real virtualizer', async () => {
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(100)
+    await flush()
+
+    expect(el.querySelectorAll('.lg-line').length).toBeLessThan(40)
+    expect(el.querySelector('.lg-line:last-child')?.textContent).toContain('synthetic log 499')
+
+    await vi.advanceTimersByTimeAsync(3_000)
+    await flush()
+    expect(el.querySelectorAll('.lg-line').length).toBeLessThan(40)
+    expect(el.querySelector('.lg-line:last-child')?.textContent).toContain('synthetic log 999')
+  })
+
+  it('does not jump to appended lines when Auto follow is disabled', async () => {
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(100)
+    el.querySelector<HTMLButtonElement>('[data-testid="control-switch"]')!.click()
+    await flush()
+    const display = el.querySelector<HTMLElement>('.lg-display')!
+    display.scrollTo({ top: 2_400 })
+    await flush()
+    const readingOffset = display.scrollTop
+    const firstLine = el.querySelector('.lg-line')?.textContent
+
+    await vi.advanceTimersByTimeAsync(3_000)
+    await flush()
+    expect(display.scrollTop).toBe(readingOffset)
+    expect(el.querySelector('.lg-line')?.textContent).toBe(firstLine)
+    expect(el.textContent).not.toContain('synthetic log 999')
+  })
+
+  it('retires a pending end seek when Auto follow is disabled before a height-only resize', async () => {
+    mockLogPages()
+    const { el } = await mountLogs()
+    const display = el.querySelector<HTMLElement>('.lg-display')!
+    expect(display.scrollHeight - display.clientHeight - display.scrollTop).toBe(0)
+    // Do not advance RAF yet: the initial scrollToEnd still has an index seek
+    // awaiting reconciliation when the reader disables Auto follow.
+    el.querySelector<HTMLButtonElement>('[data-testid="control-switch"]')!.click()
+    await flush()
+    display.dispatchEvent(new WheelEvent('wheel', { deltaY: -9_360 }))
+    display.scrollTo({ top: 2_400 })
+    await flush()
+    const before = display.scrollTop
+    expect(el.querySelector('[data-index="100"]')?.textContent).toContain('synthetic log 100')
+
+    // Only height changes, so width-anchor restoration cannot mask an obsolete
+    // scrollToIndex(last) choosing a new bottom when the native RAF runs.
+    viewportHeight = 320
+    resize(display)
+    await flush()
+    await vi.advanceTimersByTimeAsync(32)
+    await flush()
+    expect(display.scrollTop).toBe(before)
+    expect(el.querySelector('[data-index="100"]')?.textContent).toContain('synthetic log 100')
+    expect(el.textContent).not.toContain('synthetic log 499')
+  })
+
+  it('virtualizes wrapped narrow-screen rows instead of mounting the entire buffer', async () => {
+    viewportWidth = 390
+    rowHeight = 76.5
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(100)
+    await flush()
+    el.querySelectorAll('.lg-line').forEach(row => resize(row))
+    await flush()
+    expect(el.querySelectorAll('.lg-line').length).toBeLessThan(40)
+    expect(el.querySelector('.lg-line:last-child')?.textContent).toContain('synthetic log 499')
+    const rows = el.querySelectorAll<HTMLElement>('.lg-line')
+    const offset = (row: HTMLElement) => Number.parseFloat(row.style.transform.slice(11))
+    expect(offset(rows[rows.length - 1]) - offset(rows[rows.length - 2])).toBe(76.5)
+  })
+
+  it('invalidates offscreen sizes while preserving the reading anchor across a width change', async () => {
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(100)
+    el.querySelector<HTMLButtonElement>('[data-testid="control-switch"]')!.click()
+    await flush()
+    const display = el.querySelector<HTMLElement>('.lg-display')!
+    display.scrollTo({ top: 2_405.5 })
+    await flush()
+    const position = (row: HTMLElement) => Number.parseFloat(row.style.transform.slice(11)) - display.scrollTop
+    const anchor = Array.from(el.querySelectorAll<HTMLElement>('.lg-line')).find(row => position(row) + rowHeight > 0)!
+    const anchorText = anchor.textContent
+    const before = position(anchor)
+    viewportWidth = 390
+    rowHeight = 76.5
+    resize(display)
+    for (let index = 0; index < 8; index++) await flush()
+    await vi.advanceTimersByTimeAsync(32)
+    await flush()
+    const after = Array.from(el.querySelectorAll<HTMLElement>('.lg-line')).find(row => row.textContent === anchorText)!
+    expect(after).toBeDefined()
+    expect(position(after)).toBeCloseTo(before, 4)
+    expect(el.querySelectorAll('.lg-line').length).toBeLessThan(40)
+  })
+
+  it('retains the reading row when row resize notifications precede the viewport width notification', async () => {
+    viewportWidth = 390
+    rowHeight = 120
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(100)
+    el.querySelector<HTMLButtonElement>('[data-testid="control-switch"]')!.click()
+    await flush()
+    const display = el.querySelector<HTMLElement>('.lg-display')!
+    display.scrollTo({ top: 4_805.5 })
+    await flush()
+    el.querySelectorAll('.lg-line').forEach(row => resize(row))
+    await flush()
+    const start = (row: HTMLElement) => Number.parseFloat(row.style.transform.slice(11))
+    const visible = Array.from(el.querySelectorAll<HTMLElement>('.lg-line'))
+      .find(row => start(row) + rowHeight > display.scrollTop)!
+    display.scrollTo({ top: start(visible) + 5.5 })
+    await flush()
+    const anchorText = visible.textContent
+    const before = start(visible) - display.scrollTop
+
+    viewportWidth = 800
+    rowHeight = 24
+    // Browsers may deliver row RO entries before the container RO. Shrinking
+    // previously measured rows changes the range before width invalidation.
+    el.querySelectorAll('.lg-line').forEach(row => resize(row))
+    await flush()
+    display.scrollTo({ top: display.scrollTop })
+    resize(display)
+    for (let index = 0; index < 8; index++) await flush()
+    await vi.advanceTimersByTimeAsync(32)
+    await flush()
+    const after = Array.from(el.querySelectorAll<HTMLElement>('.lg-line'))
+      .find(row => row.textContent === anchorText)!
+    expect(after).toBeDefined()
+    expect(start(after) - display.scrollTop).toBeCloseTo(before, 4)
+    expect(el.querySelectorAll('.lg-line').length).toBeLessThan(40)
+  })
+
+  it('preserves the actual visible row inside the container padding boundary', async () => {
+    mockLogPages()
+    const { el } = await mountLogs(12)
+    await vi.advanceTimersByTimeAsync(100)
+    el.querySelector<HTMLButtonElement>('[data-testid="control-switch"]')!.click()
+    await flush()
+    const display = el.querySelector<HTMLElement>('.lg-display')!
+    expect(getComputedStyle(display).paddingTop).toBe('12px')
+    expect(display.scrollHeight - display.clientHeight - display.scrollTop).toBe(0)
+    // Model row 100 starts at 2400, but its DOM top is 2412. At 2429.5
+    // it is still visible while ignoring padding would select row 101.
+    display.scrollTo({ top: 2_429.5 })
+    await flush()
+    const visible = Array.from(el.querySelectorAll<HTMLElement>('.lg-line'))
+      .find(row => row.getBoundingClientRect().bottom > 0)!
+    const before = visible.getBoundingClientRect().top
+    expect(visible.textContent).toContain('synthetic log 100')
+    expect(before).toBe(-17.5)
+
+    viewportWidth = 390
+    rowHeight = 76.5
+    resize(display)
+    for (let index = 0; index < 8; index++) await flush()
+    await vi.advanceTimersByTimeAsync(32)
+    await flush()
+    const after = Array.from(el.querySelectorAll<HTMLElement>('.lg-line'))
+      .find(row => row.textContent === visible.textContent)!
+    expect(after).toBeDefined()
+    expect(after.getBoundingClientRect().top).toBeCloseTo(before, 4)
+  })
+
+  it('retains row identity and reading position when the capped buffer evicts older logs', async () => {
+    mockLogPages(500)
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(9_100)
+    await flush()
+    const retainedRow = Array.from(el.querySelectorAll('.lg-line'))
+      .find(row => row.textContent?.includes('synthetic log 1999'))!
+    expect(retainedRow).toBeDefined()
+
+    el.querySelector<HTMLButtonElement>('[data-testid="control-switch"]')!.click()
+    await flush()
+    await vi.advanceTimersByTimeAsync(3_000)
+    await flush()
+    const afterEviction = Array.from(el.querySelectorAll('.lg-line'))
+      .find(row => row.textContent?.includes('synthetic log 1999'))
+    expect(afterEviction).toBe(retainedRow)
+  })
+
+  it('retains the last row identity when a level filter changes its index', async () => {
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(100)
+    await flush()
+    const retainedRow = el.querySelector('.lg-line:last-child')
+    expect(retainedRow?.textContent).toContain('synthetic log 499')
+    el.querySelector<HTMLButtonElement>('.lg-level-btn--info')!.click()
+    await flush()
+    await vi.advanceTimersByTimeAsync(100)
+    expect(el.querySelector('.lg-line:last-child')).toBe(retainedRow)
+  })
+
+  it('clears discarded measurements on every buffer trim across repeated tail pages', async () => {
+    const remeasure = vi.spyOn(virtualizerLayout, 'remeasureVirtualizer')
+    mockLogPages()
+    const { el } = await mountLogs()
+    await vi.advanceTimersByTimeAsync(9_100)
+    await flush()
+    expect(remeasure).not.toHaveBeenCalled()
+    for (let page = 1; page <= 4; page++) {
+      await vi.advanceTimersByTimeAsync(3_000)
+      await flush()
+      expect(remeasure).toHaveBeenCalledTimes(page)
+      expect(el.querySelector('.lg-line:last-child')?.textContent)
+        .toContain(`synthetic log ${1_999 + page * 500}`)
+      expect(el.querySelectorAll('.lg-line').length).toBeLessThan(40)
+      const sizes = remeasure.mock.calls[remeasure.mock.calls.length - 1]![0].takeSnapshot()
+      expect(sizes.every(item => Number(item.key) >= page * 500)).toBe(true)
+    }
   })
 })

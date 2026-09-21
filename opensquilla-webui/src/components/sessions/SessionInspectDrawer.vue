@@ -54,37 +54,50 @@
         role="region"
         tabindex="0"
         :aria-label="t('sessions.inspect.transcriptPreview')"
+        @focusin="onTranscriptFocus"
+        @focusout="onTranscriptBlur"
+        @wheel.passive="cancelTranscriptSeek"
+        @touchstart.passive="cancelTranscriptSeek"
+        @pointerdown="cancelTranscriptSeek"
+        @keydown="cancelTranscriptSeek"
       >
-        <RunTrace v-if="!transcriptError" class="inspect-summary" :summary="summary" />
-        <ErrorState
-          v-if="transcriptError"
-          :message="t('sessions.inspect.transcriptError')"
-          :on-retry="reload"
-        />
-        <div v-else-if="loading" class="inspect-state">
-          <LoadingSpinner />
-          <p class="inspect-state__text">{{ t('sessions.inspect.loadingTranscript') }}</p>
-        </div>
-        <template v-else>
-          <HistoryLoadSentinel
-            :scroll-container="bodyRef"
-            :has-more="hasEarlier"
-            :loading="loadingEarlier"
-            :error="loadEarlierError"
-            :canonical-available="canonicalAvailable"
-            :canonical-complete="canonicalComplete"
-            :cursor="oldestCursor"
-            :session-key="item.key"
-            @load-earlier="onLoadEarlier"
-            @retry="onHistoryRetry"
+        <div ref="transcriptHeaderRef" class="inspect-window__header">
+          <RunTrace v-if="!transcriptError" class="inspect-summary" :summary="summary" />
+          <ErrorState
+            v-if="transcriptError"
+            :message="t('sessions.inspect.transcriptError')"
+            :on-retry="reload"
           />
-          <p v-if="transcriptRows.length === 0" class="inspect-empty">{{ t('sessions.inspect.noMessages') }}</p>
+          <div v-else-if="loading" class="inspect-state">
+            <LoadingSpinner />
+            <p class="inspect-state__text">{{ t('sessions.inspect.loadingTranscript') }}</p>
+          </div>
+          <template v-else>
+            <HistoryLoadSentinel
+              :scroll-container="bodyRef"
+              :has-more="hasEarlier"
+              :loading="loadingEarlier"
+              :error="loadEarlierError"
+              :canonical-available="canonicalAvailable"
+              :canonical-complete="canonicalComplete"
+              :cursor="oldestCursor"
+              :session-key="item.key"
+              @load-earlier="onLoadEarlier"
+              @retry="onHistoryRetry"
+            />
+            <p v-if="transcriptRows.length === 0" class="inspect-empty">{{ t('sessions.inspect.noMessages') }}</p>
+          </template>
+        </div>
+        <div class="inspect-window" :style="{ height: virtualizer.getTotalSize() + 'px' }">
           <article
-            v-for="row in transcriptRows"
+            v-for="{ row, index, start } in visibleTranscriptRows"
             :key="row.id"
+            :ref="el => virtualizer.measureElement(el as HTMLElement | null)"
             class="inspect-msg"
             :class="'inspect-msg--' + row.tone"
             :data-message-id="row.id"
+            :data-index="index"
+            :style="{ transform: `translateY(${start - headerHeight}px)` }"
           >
             <div class="inspect-msg__role">{{ row.roleLabel }}</div>
             <!-- eslint-disable-next-line vue/no-v-html — renderMarkdown output is DOMPurify-sanitized -->
@@ -115,7 +128,7 @@
               <pre class="inspect-msg__result-pre">{{ resultView.content }}</pre>
             </div>
           </article>
-        </template>
+        </div>
       </div>
 
       <footer class="inspect-actions">
@@ -139,6 +152,7 @@
 
 <script setup lang="ts">
 import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
+import { defaultRangeExtractor, measureElement as measureVirtualElement, observeElementRect, useVirtualizer, type Rect, type VirtualItem, type Virtualizer } from '@tanstack/vue-virtual'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
@@ -156,11 +170,7 @@ import { useRunTrace } from '@/composables/run/useRunTrace'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { copyTextWithFallback } from '@/utils/browser'
-import {
-  captureVisibleMessageAnchor,
-  restoreMessageAnchor,
-  stabilizeMessageAnchor,
-} from '@/utils/chat/scrollAnchor'
+import { remeasureVirtualizer } from '@/utils/virtualizerLayout'
 import { nodeStepsFromSessionReadMessage } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceStatus, RunTraceSummary } from '@/types/runTrace'
 import type { SessionItem } from '@/composables/useSessions'
@@ -224,6 +234,8 @@ function transcriptToolStateScope(rowId: string): string {
 
 const drawerRef = ref<HTMLElement | null>(null)
 const bodyRef = ref<HTMLElement | null>(null)
+const transcriptHeaderRef = ref<HTMLElement | null>(null)
+const headerHeight = ref(0)
 const closeBtn = ref<HTMLButtonElement | null>(null)
 const keyCopied = ref(false)
 const aborting = ref(false)
@@ -232,13 +244,6 @@ const resultView = ref<{ rowId: string; title: string; content: string } | null>
 let keyCopiedTimer: ReturnType<typeof setTimeout> | null = null
 let invokerEl: HTMLElement | null = null
 let inspectAnchorGeneration = 0
-let stopInspectAnchorStabilization: () => void = () => {}
-
-function cancelInspectAnchorStabilization() {
-  const stop = stopInspectAnchorStabilization
-  stopInspectAnchorStabilization = () => {}
-  stop()
-}
 
 const badge = computed(() => (props.item ? sessionStatusBadge(props.item, props.needsInput === true) : null))
 const canAbort = computed(() =>
@@ -265,14 +270,14 @@ function roleLabel(role: string): string {
 
 const transcriptRows = computed((): TranscriptRow[] => {
   const rows: TranscriptRow[] = []
-  messages.value.forEach((msg, index) => {
+  messages.value.forEach(msg => {
     const role = String(msg.role || 'assistant')
     const text = role === 'user' ? stripTimePrefix(msg.text || '') : msg.text || ''
     const html = text.trim() ? renderMarkdown(text) : ''
     const steps = nodeStepsFromSessionReadMessage(msg)
     if (!html && steps.length === 0) return
     rows.push({
-      id: String(msg.messageId || msg.id || `${index}:${msg.createdAt ?? ''}`),
+      id: String(msg.messageId || msg.id || `${msg.role}:${msg.createdAt ?? ''}:${msg.text}`),
       tone: roleTone(role),
       roleLabel: roleLabel(role),
       html,
@@ -281,6 +286,97 @@ const transcriptRows = computed((): TranscriptRow[] => {
   })
   return rows
 })
+
+const layoutAnchor = ref<VirtualItem['key'] | null>(null)
+const focusedRow = ref<string | null>(null)
+let layoutWidth = 0
+let layoutGeneration = 0
+const transcriptKeys = computed(() => [
+  ...transcriptRows.value.map(row => `message:${props.item?.key ?? ''}:${row.id}`),
+])
+const transcriptRange = computed(() => {
+  const forced = [transcriptKeys.value.indexOf(String(layoutAnchor.value))]
+  if (focusedRow.value) forced.push(transcriptRows.value.findIndex(row => row.id === focusedRow.value))
+  return (range: Parameters<typeof defaultRangeExtractor>[0]) => (
+    [...new Set([...defaultRangeExtractor(range), ...forced])]
+      .filter(index => index >= 0 && index < range.count).sort((a, b) => a - b)
+  )
+})
+const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => {
+  const keys = transcriptKeys.value
+  return {
+    enabled: props.open,
+    count: keys.length,
+    getScrollElement: () => bodyRef.value,
+    getItemKey: (index: number) => keys[index],
+    estimateSize: () => 120,
+    scrollMargin: headerHeight.value,
+    paddingEnd: 16,
+    gap: 12,
+    overscan: 5,
+    anchorTo: 'end' as const,
+    // The pinned core uses this negative threshold to disable resize-end pins;
+    // this read-only preview never owns automatic follow while the user reads.
+    scrollEndThreshold: -1,
+    rangeExtractor: transcriptRange.value,
+    measureElement: (element: HTMLElement, entry: ResizeObserverEntry | undefined, instance: Virtualizer<HTMLElement, HTMLElement>) => (
+      entry?.borderBoxSize?.[0]?.blockSize ?? measureVirtualElement(element, entry, instance)
+    ),
+    observeElementRect: (instance: Virtualizer<HTMLElement, HTMLElement>, callback: (rect: Rect) => void) => (
+      observeElementRect(instance, rect => {
+        const changed = layoutWidth > 0 && layoutWidth !== rect.width
+        layoutWidth = rect.width
+        callback(rect)
+        if (!changed) return
+        const generation = ++layoutGeneration
+        void remeasureVirtualizer(instance, {
+          shouldFollowEnd: () => false,
+          isCurrent: () => props.open && generation === layoutGeneration,
+          getElement: index => bodyRef.value?.querySelector<HTMLElement>(`[data-index="${index}"]`) ?? null,
+          keepAnchorMounted: key => {
+            layoutAnchor.value = key
+            return () => { if (generation === layoutGeneration) layoutAnchor.value = null }
+          },
+        })
+      })
+    ),
+  }
+}))
+const virtualRows = computed(() => virtualizer.value.getVirtualItems())
+const visibleTranscriptRows = computed(() => loading.value || transcriptError.value ? [] : virtualRows.value
+  .map(item => ({ row: transcriptRows.value[item.index], index: item.index, start: item.start })))
+
+// Chrome stays outside the indexed messages, so a top-of-list prepend anchors
+// the first message rather than the summary/sentinel. TanStack owns row sizes.
+watch(transcriptHeaderRef, (header, _, onCleanup) => {
+  if (!header) return
+  const measure = () => { headerHeight.value = header.getBoundingClientRect().height }
+  measure()
+  const observer = new ResizeObserver(measure)
+  observer.observe(header)
+  onCleanup(() => observer.disconnect())
+})
+
+function onTranscriptFocus(event: FocusEvent) {
+  focusedRow.value = event.target instanceof Element
+    ? event.target.closest<HTMLElement>('[data-message-id]')?.dataset.messageId ?? null : null
+}
+
+function onTranscriptBlur() {
+  void nextTick(() => {
+    if (!bodyRef.value?.contains(document.activeElement)) focusedRow.value = null
+  })
+}
+
+function cancelTranscriptSeek() {
+  inspectAnchorGeneration += 1
+  layoutGeneration += 1
+  layoutAnchor.value = null
+  const body = bodyRef.value
+  // Retire the initial/reload index target before a later viewport resize can
+  // reconcile it over the reader's position. This preview never follows live.
+  if (body) virtualizer.value.scrollToOffset(body.scrollTop, { behavior: 'auto' })
+}
 
 // The drawer has no global result modal; "view full" expands a local read-only
 // panel beneath the originating row instead.
@@ -314,15 +410,14 @@ const summary = computed<RunTraceSummary>(() => ({
 }))
 
 function scrollToBottom() {
-  cancelInspectAnchorStabilization()
-  nextTick(() => {
-    if (bodyRef.value) bodyRef.value.scrollTop = bodyRef.value.scrollHeight
+  const generation = inspectAnchorGeneration
+  void nextTick(() => {
+    if (props.open && generation === inspectAnchorGeneration) virtualizer.value.scrollToEnd()
   })
 }
 
 function reload() {
   if (!props.item) return
-  cancelInspectAnchorStabilization()
   const generation = ++inspectAnchorGeneration
   const key = props.item.key
   void load(key).then(() => {
@@ -332,36 +427,12 @@ function reload() {
   })
 }
 
-async function onLoadEarlier() {
-  cancelInspectAnchorStabilization()
-  const generation = ++inspectAnchorGeneration
-  const key = props.item?.key
-  let anchor: ReturnType<typeof captureVisibleMessageAnchor> = null
-  await loadEarlier(() => { anchor = captureVisibleMessageAnchor(bodyRef.value) })
-  await nextTick()
-  if (generation !== inspectAnchorGeneration || !props.open || props.item?.key !== key) return
-  restoreMessageAnchor(anchor)
-  stopInspectAnchorStabilization = stabilizeMessageAnchor(anchor, {
-    isCurrent: () => props.open
-      && props.item?.key === key
-      && generation === inspectAnchorGeneration,
-  })
+function onLoadEarlier() {
+  void loadEarlier()
 }
 
-async function onHistoryRetry() {
-  cancelInspectAnchorStabilization()
-  const generation = ++inspectAnchorGeneration
-  const key = props.item?.key
-  let anchor: ReturnType<typeof captureVisibleMessageAnchor> = null
-  await retryHistory(() => { anchor = captureVisibleMessageAnchor(bodyRef.value) })
-  await nextTick()
-  if (generation !== inspectAnchorGeneration || !props.open || props.item?.key !== key) return
-  restoreMessageAnchor(anchor)
-  stopInspectAnchorStabilization = stabilizeMessageAnchor(anchor, {
-    isCurrent: () => props.open
-      && props.item?.key === key
-      && generation === inspectAnchorGeneration,
-  })
+function onHistoryRetry() {
+  void retryHistory()
 }
 
 async function copyKey() {
@@ -426,8 +497,12 @@ function onDocumentKeydown(event: KeyboardEvent) {
 watch(
   () => [props.open, props.item?.key] as const,
   ([open, key], previous) => {
-    cancelInspectAnchorStabilization()
     inspectAnchorGeneration += 1
+    layoutGeneration += 1
+    layoutAnchor.value = null
+    focusedRow.value = null
+    layoutWidth = 0
+    virtualizer.value.measure()
     const wasOpen = previous?.[0] === true
     if (open && key) {
       if (!wasOpen) {
@@ -453,8 +528,9 @@ watch(
 )
 
 onUnmounted(() => {
-  cancelInspectAnchorStabilization()
   inspectAnchorGeneration += 1
+  layoutGeneration += 1
+  layoutAnchor.value = null
   document.removeEventListener('keydown', onDocumentKeydown)
   if (keyCopiedTimer) clearTimeout(keyCopiedTimer)
 })
@@ -621,12 +697,37 @@ onUnmounted(() => {
 
 .inspect-body {
   background: var(--bg);
-  display: flex;
   flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-anchor: none;
+  padding: 0 var(--sp-4);
+}
+
+.inspect-window {
+  position: relative;
+}
+
+.inspect-window,
+.inspect-window__header,
+.inspect-msg {
+  /* Offsets and spacer height are geometry, not an animated UI transition. */
+  transition: none !important;
+}
+
+.inspect-msg {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+}
+
+.inspect-window__header {
+  display: flex;
   flex-direction: column;
   gap: var(--sp-3);
-  overflow-y: auto;
-  padding: var(--sp-4);
+  padding-top: var(--sp-4);
+  padding-bottom: var(--sp-3);
 }
 
 .inspect-body:focus-visible {

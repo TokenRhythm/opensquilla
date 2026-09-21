@@ -1,5 +1,11 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-history-12-turns'
@@ -47,7 +53,7 @@ async function seedLongHistory(page: Page) {
 
         const payloads: Record<string, unknown> = {
           'agents.list': { agents: [] },
-          'chat.history': { messages: longHistoryMessages(), has_more: false },
+          'chat.history': chatHistoryPayload(longHistoryMessages()),
           'commands.list_for_surface': { commands: [] },
           'config.get': {
             squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
@@ -55,12 +61,9 @@ async function seedLongHistory(page: Page) {
             skills: {},
           },
           'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-          'sessions.messages.subscribe': {
-            subscribed: true,
-            replay_complete: true,
-            current_stream_seq: 0,
-            run_status: 'idle',
-          },
+          'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY),
+          'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY),
+          'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY),
           'usage.status': { sessions: [] },
         }
 
@@ -224,9 +227,14 @@ test.describe('Long conversation history rail', () => {
     const markers = page.getByTestId('conversation-minimap-marker')
     await expect(markers).toHaveCount(12, { timeout: 10000 })
 
-    // The 260px sidebar plus 5px resizer leaves a 1105px chat shell here:
-    // one pixel inside the rail's visible exit edge and closest to collision.
-    await page.setViewportSize({ width: 1370, height: 900 })
+    // Target one pixel inside the rail's visible exit edge. Derive the
+    // surrounding chrome from the rendered shell instead of hard-coding a
+    // sidebar divider width that can change independently of this boundary.
+    const initialShellWidth = (await page.locator('.chat-thread-shell').boundingBox())!.width
+    await page.setViewportSize({
+      width: Math.round(1440 - initialShellWidth + 1105),
+      height: 900,
+    })
     await expect.poll(async () => Math.round(
       (await page.locator('.chat-thread-shell').boundingBox())?.width || 0,
     )).toBe(1105)

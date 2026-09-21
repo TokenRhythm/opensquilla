@@ -311,7 +311,7 @@ function makeLiveEdgeRecovery(overrides: {
     scrollTop: { configurable: true, value: 11_700, writable: true },
   })
   document.body.append(thread)
-  const { api, messages } = makeHistory(true, {
+  const { api, messages, scrollToBottom } = makeHistory(true, {
     autoScroll,
     scrollEpoch: overrides.scrollEpoch,
     canApplyViewportCorrection: overrides.canApplyViewportCorrection,
@@ -339,6 +339,7 @@ function makeLiveEdgeRecovery(overrides: {
   return {
     api,
     autoScroll,
+    scrollToBottom,
     thread,
     cleanup: () => {
       stopRender()
@@ -399,7 +400,7 @@ function makeReaderAnchorRecovery(overrides: {
   renderAnchor()
   document.body.append(thread)
 
-  const { api, messages } = makeHistory(false, {
+  const { api, messages, scrollToBottom } = makeHistory(false, {
     canApplyViewportCorrection: overrides.canApplyViewportCorrection,
     threadRef: ref<HTMLElement | null>(thread),
     messages: [{
@@ -428,6 +429,7 @@ function makeReaderAnchorRecovery(overrides: {
   return {
     api,
     thread,
+    scrollToBottom,
     emitPendingImageLoad: () => emitPendingImageLoad(),
     setMessageContentTop: (top: number) => { messageContentTop = top },
     cleanup: () => {
@@ -1671,7 +1673,7 @@ describe('useChatHistory canonical pagination', () => {
     ])
   })
 
-  it('prepends one page per cursor and preserves the reader scroll anchor', async () => {
+  it('prepends one page per cursor without taking over the virtualizer viewport', async () => {
     const thread = document.createElement('div')
     let height = 400
     const earlySummary = {
@@ -1691,7 +1693,7 @@ describe('useChatHistory canonical pagination', () => {
       scrollTop: { configurable: true, value: 120, writable: true },
     })
     const threadRef = ref<HTMLElement | null>(thread)
-    const { api, readHistory, historyFixture, messages } = makeHistory(false, {
+    const { api, readHistory, historyFixture, messages, scrollToBottom } = makeHistory(false, {
       threadRef,
       response: {
         messages: [historyMessage('m3'), historyMessage('m4')],
@@ -1749,7 +1751,8 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value
       .filter(message => message.role !== 'maintenance')
       .map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
-    expect(thread.scrollTop).toBe(320)
+    expect(thread.scrollTop).toBe(120)
+    expect(scrollToBottom).not.toHaveBeenCalled()
     expect(readHistory).toHaveBeenCalledTimes(2)
     expect(api.historyState.value.canonicalComplete).toBe(true)
     expect(api.historyState.value.newestCursor).toBe('cursor-4')
@@ -2827,7 +2830,7 @@ describe('useChatHistory canonical pagination', () => {
   })
 })
 
-describe('useChatHistory scroll anchoring', () => {
+describe('useChatHistory scroll intent ownership', () => {
   it('does not force the thread to the latest message when the reader has scrolled up', async () => {
     const { api, scrollToBottom } = makeHistory(false)
 
@@ -2846,20 +2849,25 @@ describe('useChatHistory scroll anchoring', () => {
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the visible durable message anchored across a recovery refresh', async () => {
+  it('leaves recovery-refresh geometry to the virtualizer without scanning message DOM', async () => {
     const harness = makeReaderAnchorRecovery()
+    const query = vi.spyOn(harness.thread, 'querySelectorAll')
+    const measure = vi.spyOn(harness.thread, 'getBoundingClientRect')
 
     try {
       await harness.api.loadHistory()
       await nextTick()
 
-      expect(harness.thread.scrollTop).toBe(1_000)
+      expect(harness.thread.scrollTop).toBe(0)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
+      expect(query).not.toHaveBeenCalled()
+      expect(measure).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
   })
 
-  it('does not restore a reader anchor during application-owned history navigation', async () => {
+  it('does not reclaim scroll ownership during application-owned history navigation', async () => {
     const navigationActive = ref(false)
     const harness = makeReaderAnchorRecovery({
       canApplyViewportCorrection: () => !navigationActive.value,
@@ -2871,12 +2879,13 @@ describe('useChatHistory scroll anchoring', () => {
       await nextTick()
 
       expect(harness.thread.scrollTop).toBe(0)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
   })
 
-  it('stops late anchor stabilization when application-owned navigation starts', async () => {
+  it('does not install late image corrections that compete with application navigation', async () => {
     const navigationActive = ref(false)
     const harness = makeReaderAnchorRecovery({
       canApplyViewportCorrection: () => !navigationActive.value,
@@ -2886,20 +2895,22 @@ describe('useChatHistory scroll anchoring', () => {
     try {
       await harness.api.loadHistory()
       await nextTick()
-      expect(harness.thread.scrollTop).toBe(1_000)
+      expect(harness.thread.scrollTop).toBe(0)
 
       navigationActive.value = true
+      harness.thread.scrollTop = 615
       harness.setMessageContentTop(1_140)
       harness.emitPendingImageLoad()
       await Promise.resolve()
 
-      expect(harness.thread.scrollTop).toBe(1_000)
+      expect(harness.thread.scrollTop).toBe(615)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
   })
 
-  it('keeps live-edge ownership when a recovery refresh resets layout scroll', async () => {
+  it('delegates live-edge restoration when a recovery refresh resets layout scroll', async () => {
     const harness = makeLiveEdgeRecovery({
       onCommit: ({ autoScroll, thread }) => {
         // Model the long-history virtualizer clamping the old viewport before
@@ -2915,7 +2926,10 @@ describe('useChatHistory scroll anchoring', () => {
       await nextTick()
 
       expect(harness.autoScroll.value).toBe(true)
-      expect(harness.thread.scrollTop).toBe(12_000)
+      expect(harness.scrollToBottom).toHaveBeenCalledTimes(1)
+      // The injected viewport owner is a spy here; history must not mutate the
+      // DOM independently of that owner. Real geometry has component/E2E tests.
+      expect(harness.thread.scrollTop).toBe(0)
     } finally {
       harness.cleanup()
     }
@@ -2939,6 +2953,7 @@ describe('useChatHistory scroll anchoring', () => {
       expect(outcome).toMatchObject({ ok: false, cancelled: true })
       expect(harness.autoScroll.value).toBe(false)
       expect(harness.thread.scrollTop).toBe(0)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
@@ -2963,6 +2978,7 @@ describe('useChatHistory scroll anchoring', () => {
       expect(outcome).toMatchObject({ ok: true })
       expect(harness.autoScroll.value).toBe(false)
       expect(harness.thread.scrollTop).toBe(6_000)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
@@ -2986,6 +3002,7 @@ describe('useChatHistory scroll anchoring', () => {
       expect(outcome).toMatchObject({ ok: true })
       expect(harness.autoScroll.value).toBe(false)
       expect(harness.thread.scrollTop).toBe(6_000)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }

@@ -196,17 +196,15 @@ describe('useSessionInspect canonical pagination', () => {
     expect(inspect.oldestCursor.value).toBe('cursor-1')
   })
 
-  it('invokes the prepend hook immediately before applying the returned page', async () => {
+  it('preserves existing message identities when prepending a returned page', async () => {
     const inspect = useSessionInspect(inspection)
-    let visibleBeforeApply: string[] = []
 
     await inspect.load('agent:main:webchat:test')
-    await inspect.loadEarlier(() => {
-      visibleBeforeApply = inspect.messages.value.map(row => row.messageId ?? row.id)
-    })
+    const previousMessage = inspect.messages.value[0]
+    await inspect.loadEarlier()
 
-    expect(visibleBeforeApply).toEqual(['m2'])
     expect(inspect.messages.value.map(row => row.messageId)).toEqual(['m1', 'm2'])
+    expect(inspect.messages.value[1]).toBe(previousMessage)
   })
 
   it('fences a stale earlier page when switching sessions', async () => {
