@@ -1387,6 +1387,32 @@ describe('RpcClient', () => {
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
+  it('does not treat initial browser lifecycle signals as a wake incident', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    window.dispatchEvent(new Event('online'))
+    window.dispatchEvent(new Event('pageshow'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    document.dispatchEvent(new Event('resume'))
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    expect(client.phase).toBe('healthy')
+    expect(socket.sent.filter(frame => frame.includes('"type":"ping"'))).toHaveLength(0)
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_start',
+    }))
+
+    establishConnection(socket)
+    expect(client.state).toBe('connected')
+    client.disconnect()
+  })
+
   it('only resets backoff after a stable Hello, not a flapping Hello', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
@@ -1896,6 +1922,44 @@ describe('RpcClient', () => {
     expect(socket.readyState).toBe(MockWebSocket.CLOSED)
     client.disconnect()
   })
+
+  it.each(['connecting', 'no-socket'] as const)(
+    'uses the native resume replacement path for %s sockets', async path => {
+      const client = new RpcClient()
+      const diagnostics: Array<Record<string, unknown>> = []
+      client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+      client.connect('ws://rpc.test')
+      const firstSocket = MockWebSocket.instances[0]
+      establishConnection(firstSocket, { transport_probe_nonce: true })
+      firstSocket.close()
+
+      if (path === 'connecting') {
+        MockWebSocket.initialReadyState = MockWebSocket.CONNECTING
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(MockWebSocket.instances[1].readyState).toBe(MockWebSocket.CONNECTING)
+      }
+
+      client.notifyResume('desktop-resume')
+      await vi.advanceTimersByTimeAsync(100)
+
+      if (path === 'connecting') {
+        expect(MockWebSocket.instances[1].readyState).toBe(MockWebSocket.CLOSED)
+      }
+      if (path === 'connecting') {
+        expect(diagnostics).toContainEqual(expect.objectContaining({
+          phase: 'retire',
+          reason: 'native_resume_socket_unavailable',
+        }))
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(MockWebSocket.instances).toHaveLength(3)
+      } else {
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(diagnostics.filter(item => item.phase === 'connect_start')).toHaveLength(2)
+      }
+      client.disconnect()
+    },
+  )
 
   it('publishes a soft suspect state after five seconds without closing the socket', async () => {
     const client = new RpcClient()

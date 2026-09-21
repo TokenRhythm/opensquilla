@@ -430,6 +430,15 @@ export class RpcClient {
     ) {
       return;
     }
+    // The first pageshow/online/visibility signal belongs to initial page
+    // boot, not to a sleep/wake incident.  Starting an incident before the
+    // first successful Hello would gate the initial session hydration as an
+    // unconfirmed mutation.  Preserve the normal initial-connect/backoff path
+    // without publishing a false checking state.
+    if (!this._everConnected) {
+      this.ensureConnected();
+      return;
+    }
     const source: RpcResumeSource = event.type === 'pageshow'
       ? 'pageshow'
       : event.type === 'online' ? 'online' : 'manual';
@@ -1749,10 +1758,30 @@ export class RpcClient {
 
   private _runWakeProbe(): void {
     if (!this._autoReconnect || this._blockedReason) return;
-    if (!this._ws) this.ensureConnected();
+    const incident = this._wakeIncident;
+    if (incident?.source === 'desktop-resume') {
+      // Native resume has a two-second decision window.  There is no useful
+      // probe to send while a socket is still handshaking, closing, or absent;
+      // move through the same generation-safe replacement path instead of
+      // silently waiting for the twenty-second incident deadline.
+      if (!this._ws) {
+        this._clearReconnectTimer();
+        this._doConnect();
+        return;
+      }
+      if (this._ws.readyState !== WebSocket.OPEN || this._state !== 'connected') {
+        this._recycleConnection(
+          this._socketGeneration,
+          new Error('Native resume socket is not probeable'),
+          'native_resume_socket_unavailable',
+        );
+        return;
+      }
+    } else if (!this._ws) this.ensureConnected();
     else if (this._ws.readyState !== WebSocket.OPEN && this._ws.readyState !== WebSocket.CONNECTING) {
       this._recycleConnection(this._socketGeneration, new Error('Socket closed after wake'), 'wake_socket_stale');
     } else this._sendProbe();
+    if (incident?.source === 'desktop-resume') this._sendProbe();
   }
 
   private _armWakeProbe(
