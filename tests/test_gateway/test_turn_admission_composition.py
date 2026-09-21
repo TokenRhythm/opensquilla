@@ -147,14 +147,20 @@ methods = (
 )
 assert rpc_chat._turn_admission_adapter_factory is rpc_sessions.build_gateway_turn_admission_adapter
 registry = get_dispatcher()
-# Includes product activity and execution logs; excludes retired memory flush/repair methods.
-assert len(registry.list_methods()) == 301
+# Includes durable receipts, product activity and execution logs; excludes retired memory methods.
+assert len(registry.list_methods()) == 302
 assert registry.get_entry("workspaces.references.read") is not None
 assert {"skills.candidates", "skills.setEnabled"}.issubset(registry.list_methods())
 assert registry.get_entry("plans.setPresentation") is not None
 assert registry.get_entry("models.capacity.resolve") is not None
 assert registry.get_entry("telemetry.product_active.record") is not None
 assert registry.get_entry("sessions.executionLog.read") is not None
+receipt_entry = registry.get_entry("turns.receipt.get")
+assert receipt_entry is not None
+assert receipt_entry.required_scope == "operator.read"
+assert receipt_entry.generated_contract_name == "turns.receipt.get"
+assert receipt_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
+assert receipt_entry.handler.__name__ == "handle_contract_method"
 for method in methods:
     entry = registry.get_entry(method)
     assert entry is not None
