@@ -45,6 +45,7 @@ def build_isolated_core_wheel(repo_root: Path, temp_root: Path) -> Path:
     for filename in (
         ".gitignore",
         "LICENSE",
+        "THIRD_PARTY_NOTICES.md",
         "README.md",
         "hatch_build.py",
         "pyproject.toml",
