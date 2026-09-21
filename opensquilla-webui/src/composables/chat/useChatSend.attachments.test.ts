@@ -324,6 +324,164 @@ function usageReplayMessages(): ChatMessage[] {
 }
 
 describe('useChatSend durable application lifetime integration', () => {
+  it.each([null, 'synthetic-fork-anchor'])('gives an explicitly resent stopped draft fresh IDs, including handoff %s', async fork => {
+    const send = vi.fn<TurnCommands['send']>()
+      .mockRejectedValueOnce(new TurnCommandError('aborted', 'Stopped before sending', 'DELIVERY_STOPPED', false, false))
+      .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' })
+    const commands: TurnCommands = { send, steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const failPendingQueueHandoff = vi.fn()
+    const harness = makeOptions({ turnCommands: commands, inputText: ref('Synthetic stopped draft'),
+      pendingForkBeforeMessageId: ref(fork), failPendingQueueHandoff })
+    try {
+      await harness.api.onSend()
+      expect(harness.options.inputText.value).toBe('Synthetic stopped draft')
+      expect(harness.options.pendingForkBeforeMessageId.value).toBe(fork)
+      if (fork) expect(failPendingQueueHandoff).toHaveBeenCalledWith(send.mock.calls[0]![0].params.clientRequestId)
+      await harness.api.onSend()
+      expect(send).toHaveBeenCalledTimes(2)
+      const first = send.mock.calls[0]![0]
+      const second = send.mock.calls[1]![0]
+      if (first.kind !== 'new-turn' || second.kind !== 'new-turn') throw new Error('Expected ordinary turn requests')
+      expect(second.params.clientRequestId).not.toBe(first.params.clientRequestId)
+      expect(second.params.clientMessageId).not.toBe(first.params.clientMessageId)
+      expect(second.params.message).toBe('Synthetic stopped draft')
+      expect(second.params.forkBeforeMessageId ?? null).toBe(fork)
+    } finally { harness.api.dispose() }
+  })
+
+  it('uses authoritative stopped-unsent observation before the rejection catch to release the first attempt', async () => {
+    const wal = memoryDeliveryWal()
+    let rejectSend!: (error: unknown) => void
+    const send = vi.fn<TurnCommands['send']>()
+      .mockImplementationOnce(() => new Promise((_, reject) => { rejectSend = reject }))
+      .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' })
+    const commands: TurnCommands = { send, steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const owner = createDurableDelivery({ wal, commands,
+      access: { identity: () => 'synthetic-identity', available: () => true, generation: () => 1 } })
+    const harness = makeOptions({ turnCommands: owner.commands, durableDelivery: owner, pendingInputWal: wal,
+      deliveryIdentity: ref('synthetic-identity'), canStop: () => true })
+    try {
+      const first = harness.api.onSend()
+      await vi.waitFor(() => expect(send).toHaveBeenCalledTimes(1))
+      const firstId = send.mock.calls[0]![0].params.clientRequestId!
+      harness.api.onStop()
+      await vi.waitFor(async () => expect((await wal.getDelivery!(firstId))?.stop?.requested).toBe(true))
+      rejectSend(new TurnCommandError('rejected', 'Known rejection', 'NOT_ADMITTED', false, true))
+      await first
+      expect((await wal.getDelivery!(firstId))).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(harness.options.inputText.value).toBe('hello')
+      await harness.api.onSend()
+      expect(send).toHaveBeenCalledTimes(2)
+      expect(send.mock.calls[1]![0].params.clientRequestId).not.toBe(firstId)
+      expect(commands.cancel).not.toHaveBeenCalled()
+    } finally { harness.api.dispose(); owner.dispose() }
+  })
+
+  it('does not treat a later stopped error as proof that an earlier unknown send was never admitted', async () => {
+    const send = vi.fn<TurnCommands['send']>().mockRejectedValue(new TurnCommandError('transport', 'Lost ACK', undefined, null))
+    const lookupReceipt = vi.fn<NonNullable<TurnCommands['lookupReceipt']>>()
+      .mockRejectedValueOnce(new TurnCommandError('aborted', 'Unrelated local rejection', 'DELIVERY_STOPPED', false, false))
+      .mockResolvedValue({ status: 'not-found' })
+    const commands: TurnCommands = { send, lookupReceipt, supportsReceiptLookup: () => true,
+      steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const harness = makeOptions({ turnCommands: commands })
+    try {
+      await harness.api.onSend()
+      await harness.api.onSend()
+      await harness.api.onSend()
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(lookupReceipt).toHaveBeenCalledTimes(2)
+      expect(lookupReceipt.mock.calls.every(([request]) => request.kind === 'send'
+        && request.request.params.clientRequestId === send.mock.calls[0]![0].params.clientRequestId)).toBe(true)
+      expect(harness.options.inputText.value).toBe('')
+    } finally { harness.api.dispose() }
+  })
+
+  it.each([false, true])('retains a stopped durable queue draft through original-row cancellation (failure=%s)', async cancelFails => {
+    const records = new Map<string, import('@/utils/chat/pendingInputWal').PendingInputWalRecord>()
+    const wal: PendingInputWal = { ...memoryHandoffWal(),
+      put: async record => { records.set(record.pendingInputId, record) },
+      list: async key => [...records.values()].filter(record => record.sessionKey === key),
+      delete: async id => { records.delete(id) } }
+    const inputText = ref('')
+    const pendingAttachments = ref<Attachment[]>([])
+    const pendingSessionIntent = ref<string | null>(null)
+    const sessionKey = ref('agent:main:webchat:test')
+    const queueRpc = vi.fn(async (method: string) => {
+      if (method.endsWith('.enqueue')) return { requestFingerprint: 'sha256:synthetic-stopped', revision: 1 }
+      if (method.endsWith('.cancel')) {
+        if (cancelFails) throw new Error('Synthetic cancellation unavailable')
+        return { cancelled: true }
+      }
+      return { items: [] }
+    })
+    const pendingInputQueue = createLegacyPendingInputQueue({
+      request: async <T>(method: string) => await queueRpc(method) as T,
+      supports: () => true,
+    })
+    const pending = useChatPendingQueue({ sessionKey, inputText, pendingAttachments, pendingSessionIntent,
+      isStreaming: ref(false), isBlocked: () => true, autoResizeTextarea: vi.fn(), sendCurrentInput: vi.fn(),
+      resetInputHistory: vi.fn(), hasComposer: () => true, pendingInputWal: wal, pendingInputQueue })
+    const send = vi.fn<TurnCommands['send']>()
+      .mockRejectedValueOnce(new TurnCommandError('aborted', 'Stopped before sending', 'DELIVERY_STOPPED', false, false))
+      .mockResolvedValue({ sessionKey: sessionKey.value })
+    const commands: TurnCommands = { send, steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const cancel = vi.fn(pending.cancelDurableItem)
+    const harness = makeOptions({ turnCommands: commands, sessionKey, inputText, pendingAttachments,
+      pendingSessionIntent, cancelDurablePendingItem: cancel })
+    try {
+      await pending.enqueuePendingPayload({ text: 'Synthetic queued stopped draft', attachments: [], intent: null })
+      await vi.waitFor(() => expect(pending.pendingQueue.value[0]?.pendingPersistenceState).toBe('staged'))
+      const item = pending.pendingQueue.value[0]!
+      const originalId = item.pendingClientRequestId
+      const outcome = await harness.api.sendQueuedFollowup(item)
+      pending.settlePendingDelivery(item, outcome)
+      expect(cancel).toHaveBeenCalledExactlyOnceWith(item, { retainAfterCancel: true })
+      expect(queueRpc.mock.calls.filter(([method]) => method.endsWith('.cancel'))).toHaveLength(1)
+      expect(pending.pendingQueue.value).toHaveLength(1)
+      expect(records.get(item.pendingInputId!)).toMatchObject({ text: item.text, retainAfterCancel: true,
+        state: cancelFails ? 'cancelling' : 'local_only' })
+      expect(outcome).toBe(cancelFails ? 'retryable_failure' : 'not_sent')
+      if (!cancelFails) {
+        expect(await harness.api.sendQueuedFollowup(item)).toBe('not_sent')
+        expect(send).toHaveBeenCalledTimes(1)
+        expect(pending.editPendingItem(item.pendingUiId)).toBe(true)
+        await vi.waitFor(() => expect(inputText.value).toBe('Synthetic queued stopped draft'))
+        await harness.api.onSend()
+        expect(send).toHaveBeenCalledTimes(2)
+        expect(send.mock.calls[1]![0].params.clientRequestId).not.toBe(originalId)
+      }
+    } finally { harness.api.dispose(); pending.cleanup() }
+  })
+
+  it('removes an explicitly stopped hidden control from restart replay without inventing a new ID', async () => {
+    const send = vi.fn<TurnCommands['send']>()
+      .mockRejectedValue(new TurnCommandError('aborted', 'Stopped before sending', 'DELIVERY_STOPPED', false, false))
+    const commands: TurnCommands = { send, steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const harness = makeOptions({ turnCommands: commands })
+    try {
+      expect(await harness.api.dispatchHiddenSend('/meta synthetic', 'Synthetic', 'synthetic-hidden-stopped')).toMatchObject({ status: 'rejected' })
+      expect(listHiddenControls(harness.options.sessionKey.value, harness.options.hiddenControlStorage)).toEqual([])
+      await harness.api.restoreHiddenControls()
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(send.mock.calls[0]![0].params.clientRequestId).toBe('synthetic-hidden-stopped')
+    } finally { harness.api.dispose() }
+  })
+
+  it('does not reopen a stopped logical usage-barrier replay with a new admission identity', async () => {
+    const send = vi.fn<TurnCommands['send']>()
+      .mockRejectedValue(new TurnCommandError('aborted', 'Stopped before sending', 'DELIVERY_STOPPED', false, false))
+    const commands: TurnCommands = { send, steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const harness = makeOptions({ turnCommands: commands, messages: ref(usageReplayMessages()) })
+    try {
+      const payload = { text: '/reset', forkBeforeMessageId: 'usage-primary' }
+      expect(await harness.api.sendUsageBarrierReplay(payload)).toBe(false)
+      expect(await harness.api.sendUsageBarrierReplay(payload)).toBe(false)
+      expect(send).toHaveBeenCalledTimes(1)
+      expect(harness.options.messages.value).toEqual(usageReplayMessages())
+    } finally { harness.api.dispose() }
+  })
+
   it('offers an exact ordinary Stop after a lost ACK has ended the originating send transaction', async () => {
     const wal = memoryDeliveryWal()
     let available = true

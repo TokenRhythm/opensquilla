@@ -195,6 +195,8 @@ interface SendAttempt {
   replayCoordinationKey?: string
   params: TurnSendParams
   requiresIdempotentReplay?: boolean
+  /** Authoritative proof this original ID was stopped without admission. */
+  stoppedBeforeAdmission?: boolean
   // A Stop issued before durable acceptance is known belongs to this exact
   // idempotent request, not to whichever session happens to be visible later.
   stopRequested?: boolean
@@ -255,6 +257,7 @@ interface DispatchSendOptions {
   retryAttempt?: SendAttempt | null
   idempotentReplay?: boolean
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
+  retainStoppedDraft?: (attempt: SendAttempt) => Promise<boolean> | boolean
   durablePendingItem?: ChatPendingItem
   /** Delay branch truncation and optimistic rendering until ingress accepts. */
   acceptedVisibleReplay?: { forkBeforeMessageId: string }
@@ -720,6 +723,20 @@ export function useChatSend(options: UseChatSendOptions) {
   const stopDeliveryObserver = options.durableDelivery?.observe(record => {
     if (disposed) return
     if (record.deliveryIdentity !== options.deliveryIdentity?.value) return
+    if (record.phase === 'not-sent' && record.stop?.requested && record.stop.completed) {
+      // This is proof about the original request, unlike a rejection of a
+      // later receipt read. Mark an in-flight attempt before its catch runs.
+      for (const attempt of new Set([
+        recoveryAttempts.get(record.ownerRequestId), activeAcceptanceTransaction?.attempt,
+        recoveredAttempt, usageBarrierReplayAttempt,
+      ])) {
+        if (!attempt || attempt.clientRequestId !== record.ownerRequestId
+          || attempt.deliveryIdentity !== record.deliveryIdentity
+          || attempt.requestSessionKey !== record.requestSessionKey) continue
+        releaseStoppedAttempt(attempt)
+      }
+      return
+    }
     if (record.phase === 'accepted' && record.response && record.requestSessionKey === options.sessionKey.value) {
       options.scheduleHistorySync()
       if (record.kind === 'send' && record.response.sessionKey
@@ -1093,6 +1110,15 @@ export function useChatSend(options: UseChatSendOptions) {
       acceptanceStopPending.value = false
     }
     attempt.stopOwner = undefined
+  }
+
+  function releaseStoppedAttempt(attempt: SendAttempt) {
+    attempt.stoppedBeforeAdmission = true
+    attempt.requiresIdempotentReplay = false
+    attempt.acceptanceResolved = true
+    clearAttemptStop(attempt)
+    recoveryAttempts.delete(attempt.clientRequestId)
+    if (recoveredAttempt === attempt) recoveredAttempt = null
   }
 
   const acceptanceRecoveryDelaysMs = [250, 1_000, 4_000, 15_000] as const
@@ -2749,9 +2775,10 @@ export function useChatSend(options: UseChatSendOptions) {
       && !options.offlineQueueIdentity?.value
     )
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
+    let retainedStoppedDraft = false
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
-      (retryAttempt || steerRetryAttempt)
+      !retainedStoppedDraft && (retryAttempt || steerRetryAttempt)
       && (outcome === 'deferred' || outcome === 'not_sent')
         ? 'retryable_failure'
         : outcome
@@ -2759,6 +2786,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const blockedOutcome = () => preserveRetryState(
       delivery === 'followup' ? 'deferred' : 'not_sent',
     )
+    if (item.pendingRetainAfterCancel) return 'not_sent'
     if (!ownerSessionKey || options.sessionKey.value !== ownerSessionKey) {
       return preserveRetryState('not_sent')
     }
@@ -2887,6 +2915,16 @@ export function useChatSend(options: UseChatSendOptions) {
       retryAttempt,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
+      },
+      retainStoppedDraft: async () => {
+        recoveredQueuedAttempts.delete(item)
+        // Stop cancelled this dispatch, not the queued payload. Tombstone its
+        // original server row and retain an editable local draft; editing it
+        // transfers ownership to the composer and its next fresh request ID.
+        retainedStoppedDraft = item.pendingInputId
+          ? await options.cancelDurablePendingItem?.(item, { retainAfterCancel: true }) === true
+          : (item.pendingRetainAfterCancel = true)
+        return retainedStoppedDraft
       },
       ...(item.pendingInputId
         && item.pendingClientRequestId
@@ -3145,7 +3183,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     let durableHandoffRecord: ResponseHandoffWalRecord | null = null
     const rejectBeforeDispatch = async (): Promise<ChatSendOutcome> => {
-      if (attempt && sendOpts.acceptedVisibleReplay) {
+      if (attempt && !attempt.stoppedBeforeAdmission && sendOpts.acceptedVisibleReplay) {
         sendOpts.rememberRetryableAttempt?.(attempt)
       }
       await discardUnsentResponseHandoff(durableHandoffRecord)
@@ -3560,7 +3598,21 @@ export function useChatSend(options: UseChatSendOptions) {
     } catch (err: unknown) {
       const commandError = turnCommandFailure(err)
       const acceptedError = acceptedErrorInfo(err)
-      if (attempt.initialModel && !attempt.forkBeforeMessageId && commandError?.accepted === false) {
+      const stoppedBeforeAdmission = attempt.stoppedBeforeAdmission === true || (
+        commandError?.failureCode === 'DELIVERY_STOPPED' && commandError.accepted === false
+        && !attempt.requiresIdempotentReplay
+      )
+      if (stoppedBeforeAdmission) releaseStoppedAttempt(attempt)
+      const retainStoppedDraft = async (): Promise<ChatSendOutcome> => {
+        try {
+          const retained = await sendOpts.retainStoppedDraft?.(attempt)
+          return retained === false ? 'retryable_failure' : 'not_sent'
+        } catch {
+          // The queued payload still owns its cancellation/retry state.
+          return 'retryable_failure'
+        }
+      }
+      if (!stoppedBeforeAdmission && attempt.initialModel && !attempt.forkBeforeMessageId && commandError?.accepted === false) {
         // A known rejection is editable again. Do not leave a submitting WAL
         // record that could later replay an abandoned model choice on reopen.
         if (durableHandoffRecord && await deleteResponseHandoff(durableHandoffRecord)) {
@@ -3584,6 +3636,13 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
+        if (stoppedBeforeAdmission) {
+          if (!preserveComposer && restoreComposer) {
+            restoreSendAttempt(attempt, { requiresIdempotentReplay: false })
+            if (recoveredAttempt === attempt) recoveredAttempt = null
+          }
+          return
+        }
         const acceptanceUnknown = attempt.requiresIdempotentReplay === true || hasUnknownAcceptance(err)
         attempt.requiresIdempotentReplay = acceptanceUnknown
         if (preserveComposer) {
@@ -3678,11 +3737,11 @@ export function useChatSend(options: UseChatSendOptions) {
           current: options.sessionKey.value,
           reason: errorMessage(err),
         })
-        return acceptedError ? 'accepted' : 'retryable_failure'
+        return stoppedBeforeAdmission ? retainStoppedDraft() : acceptedError ? 'accepted' : 'retryable_failure'
       }
       if (!wasStreaming && !freshSendStillOwnsStream(freshSendToken, requestSessionKey)) {
         rememberRetryableAttempt(false)
-        return acceptedError ? 'accepted' : 'retryable_failure'
+        return stoppedBeforeAdmission ? retainStoppedDraft() : acceptedError ? 'accepted' : 'retryable_failure'
       }
       if (!wasStreaming) {
         if (activeFreshSendToken === freshSendToken) {
@@ -3693,13 +3752,16 @@ export function useChatSend(options: UseChatSendOptions) {
         options.stream.endStreaming()
       }
       if (responseHandoff && commandError?.accepted === false) {
-        if (sendOpts.requirePreparedHandoff && commandError.retryable !== false) {
+        if (stoppedBeforeAdmission) {
+          await markResponseHandoffFailed(responseHandoff, err)
+        } else if (sendOpts.requirePreparedHandoff && commandError.retryable !== false) {
           await resetResponseHandoffForRetry(responseHandoff, attempt)
         } else if (commandError.retryable === false) {
           await markResponseHandoffFailed(responseHandoff, err)
         }
       }
       rememberRetryableAttempt(true)
+      if (stoppedBeforeAdmission) return retainStoppedDraft()
       if (!preserveComposer && !acceptedError && !sendOpts.suppressRejectedFailureMessage) {
         const restoredSnapshot = captureComposerSnapshot()
         const separateSkillDraft = explicitComposerChanged(attempt)
@@ -3798,6 +3860,8 @@ export function useChatSend(options: UseChatSendOptions) {
       `usage-barrier-coordinate\0${canonicalSessionKey(requestSessionKey)}\0${forkBeforeMessageId}`,
     )
     if (!replayCoordinationKey) return false
+    if (usageBarrierReplayAttempt?.stoppedBeforeAdmission
+      && usageBarrierReplayAttempt.replayCoordinationKey === replayCoordinationKey) return false
     const stableClientRequestId = await stableClientUuid(
       `usage-barrier-request\0${replayCoordinationKey}`,
     )
@@ -3875,6 +3939,9 @@ export function useChatSend(options: UseChatSendOptions) {
         rememberRetryableAttempt: attempt => {
           usageBarrierReplayAttempt = attempt
         },
+        // A barrier replay has a stable protocol identity. Stopping that
+        // logical replay never authorizes manufacturing another admission.
+        retainStoppedDraft: attempt => { usageBarrierReplayAttempt = attempt; return true },
         acceptedVisibleReplay: { forkBeforeMessageId },
         suppressRejectedFailureMessage: true,
         includeEmptyAttachments: true,
