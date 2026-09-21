@@ -347,6 +347,11 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       if (!record || record.deliveryIdentity !== identity) {
         throw new TurnCommandError('conflict', 'Delivery belongs to another identity or an older client', 'DELIVERY_QUARANTINED', null, false)
       }
+      if (record.phase === 'not-sent' && record.stop?.completed) {
+        publish(record, null)
+        throw new TurnCommandError('aborted', 'This delivery was stopped; a new send requires a new request identity',
+          'DELIVERY_STOPPED', false, false)
+      }
       if (stopIntents.has(id)) await requestStop(id)
       publish(record)
       if (!created.applied && record.phase === 'accepted' && record.response) return record.response
@@ -367,6 +372,9 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
             if (current.lease?.owner !== owner || current.lease.epoch !== epoch
               || (current.phase !== 'prepared' && current.phase !== 'not-sent')) {
               throw new TurnCommandError('session-changed', 'Delivery lease changed', 'DELIVERY_LEASE_LOST', null)
+            }
+            if (current.stop?.requested || stopIntents.get(id)?.identity === identity) {
+              throw new TurnCommandError('aborted', 'Delivery stopped before dispatch', 'DELIVERY_STOPPED', false, false)
             }
             return { ...current, phase: 'submitting', response: undefined }
           })
@@ -422,6 +430,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       matched = !disposed && !invalidated && options.access.identity() === intent.identity
         && current.deliveryIdentity === intent.identity
       if (!matched) return null
+      if (current.phase === 'prepared') current = { ...current, phase: 'not-sent' }
       if (intent.initialRejectionEpoch !== undefined && current.phase !== 'not-sent') {
         if (current.lease?.owner === owner && current.lease.epoch === intent.initialRejectionEpoch
           && (current.phase === 'submitting' || current.phase === 'unknown') && !current.response) {
@@ -479,10 +488,9 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     if (intent.completed || intent.paused || flights.has(id) || activeLeases.has(id)) return
     const record = intent.record
     if (!record || intent.identity !== options.access.identity() || allowed(record)) return
-    // This original call was definitively rejected. A failed Stop write does
-    // not create an unknown task to look up; persistStopIntent settles it when
-    // storage is writable again.
-    if (record.phase === 'not-sent' || intent.initialRejectionEpoch !== undefined) return
+    // An unarmed or definitively rejected call has no unknown task to look up.
+    // persistStopIntent settles it once storage is writable again.
+    if (record.phase === 'prepared' || record.phase === 'not-sent' || intent.initialRejectionEpoch !== undefined) return
     const trigger = `${intent.identity}:${options.access.generation()}`
     if (!manualRetries.has(id) && roundTriggers.get(id) === trigger) return
     const operation = (async () => {
@@ -644,17 +652,17 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   async function round(record: DeliveryWalRecord): Promise<void> {
     const intent = stopIntents.get(record.ownerRequestId)
     if (intent?.storageFailed) { await recoverVolatileStop(record.ownerRequestId, intent); return }
-    if (record.phase === 'prepared') { publish(record, 'not-sent'); return }
-    if (record.phase === 'not-sent') {
-      // Settle older persisted Stops from authoritative initial rejections.
+    if (record.phase === 'prepared' && !record.stop) { publish(record, 'not-sent'); return }
+    if (record.phase === 'not-sent' || record.phase === 'prepared') {
+      // Settle persisted Stops before arming or after an initial rejection.
       // This local CAS needs no connection and never treats a failed receipt
       // read as proof that an unknown original request was not admitted.
       if (record.deliveryIdentity !== options.access.identity()) { publish(record, 'identity'); return }
       try {
         const settled = await update(record.ownerRequestId, current =>
-          current.deliveryIdentity === options.access.identity() && current.phase === 'not-sent'
+          current.deliveryIdentity === options.access.identity() && (current.phase === 'not-sent' || current.phase === 'prepared')
             && current.stop && !current.stop.completed
-            ? { ...current, stop: { ...current.stop, completed: true } } : null)
+            ? { ...current, phase: 'not-sent', stop: { ...current.stop, completed: true } } : null)
         if (settled) publish(settled, null)
       } catch { publish(record, 'storage') }
       return

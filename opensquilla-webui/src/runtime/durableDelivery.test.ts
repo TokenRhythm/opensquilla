@@ -469,6 +469,188 @@ describe('application-owned durable delivery', () => {
     test.owner.dispose()
   })
 
+  it('settles Stop for a prepared write-after-throw record without receipt lookup', async () => {
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    storage.wal.prepareDelivery = async record => { await prepare(record); throw new Error('synthetic write-after-throw') }
+    const test = harness({}, storage)
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toThrow('write-after-throw')
+      await test.owner.requestStop('synthetic-request')
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('settles a Stop latched before initial prepare finishes and never arms that dispatch', async () => {
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    let release!: () => void
+    storage.wal.prepareDelivery = async record => {
+      await new Promise<void>(resolve => { release = resolve })
+      return prepare(record)
+    }
+    const test = harness({}, storage)
+    try {
+      const sending = test.owner.commands.send(request())
+      const failed = expect(sending).rejects.toMatchObject({ accepted: false })
+      await flush()
+      await test.owner.requestStop('synthetic-request')
+      release()
+      await failed
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('fences a queued original dispatch after another tab stops it', async () => {
+    const storage = memoryWal()
+    const releases: Array<() => void> = []
+    const first = harness({ send: vi.fn(() => new Promise<TurnSendResponse>(resolve => {
+      releases.push(() => resolve({ taskId: `occupied-${releases.length}`, sessionKey: 'synthetic-session' }))
+    })) }, storage)
+    const second = harness({}, storage)
+    try {
+      const occupied = [first.owner.commands.send(request('slot-1')), first.owner.commands.send(request('slot-2'))]
+      await flush()
+      const queued = first.owner.commands.send(request())
+      const settled = expect(queued).rejects.toMatchObject({ accepted: false })
+      await flush()
+      expect(storage.records.get('synthetic-request')?.phase).toBe('prepared')
+      await second.owner.requestStop('synthetic-request')
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      for (const release of releases) release()
+      await Promise.all(occupied)
+      await settled
+      await flush()
+      expect(first.commands.send).toHaveBeenCalledTimes(2)
+      expect(second.commands.send).not.toHaveBeenCalled()
+      expect(first.commands.cancel).not.toHaveBeenCalled()
+      expect(second.commands.cancel).not.toHaveBeenCalled()
+    } finally { first.owner.dispose(); second.owner.dispose() }
+  })
+
+  it('lets another tab Stop win the CAS immediately before admission is armed', async () => {
+    const storage = memoryWal()
+    const first = harness({}, storage)
+    const second = harness({}, storage)
+    const compare = storage.wal.compareAndSwapDelivery!
+    let stopped = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (!stopped && id === 'synthetic-request' && record?.phase === 'submitting') {
+        stopped = true
+        await second.owner.requestStop(id)
+      }
+      return compare(id, revision, record)
+    }
+    try {
+      await expect(first.owner.commands.send(request())).rejects.toMatchObject({ accepted: false, failureCode: 'DELIVERY_STOPPED' })
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(first.commands.send).not.toHaveBeenCalled()
+      expect(second.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(second.commands.cancel).not.toHaveBeenCalled()
+    } finally { first.owner.dispose(); second.owner.dispose() }
+  })
+
+  it('blocks queued admission with an in-memory Stop when all Stop writes fail', async () => {
+    const storage = memoryWal()
+    const releases: Array<() => void> = []
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>(resolve => {
+      releases.push(() => resolve({ taskId: 'occupied-task', sessionKey: 'synthetic-session' }))
+    })) }, storage)
+    const compare = storage.wal.compareAndSwapDelivery!
+    try {
+      const occupied = [test.owner.commands.send(request('slot-1')), test.owner.commands.send(request('slot-2'))]
+      await flush()
+      const queued = test.owner.commands.send(request())
+      const rejected = expect(queued).rejects.toMatchObject({ accepted: false })
+      await flush()
+      storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+        if (id === 'synthetic-request' && record?.stop) throw new Error('Synthetic Stop quota failure')
+        return compare(id, revision, record)
+      }
+      await test.owner.requestStop('synthetic-request')
+      for (const release of releases) release()
+      await Promise.all(occupied)
+      await rejected
+      await test.owner.wake()
+      expect(test.owner.snapshots().find(item => item.id === 'synthetic-request')).toMatchObject({ waitReason: 'storage' })
+      expect(test.commands.send).toHaveBeenCalledTimes(2)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      storage.wal.compareAndSwapDelivery = compare
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+    } finally { test.owner.dispose() }
+  })
+
+  it('retains the storage warning after a prepared Stop commits and then throws', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'send', request: request() }, phase: 'prepared', revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async (...args) => { await compare(...args); throw new Error('Synthetic post-commit failure') }
+    const test = harness({}, storage)
+    try {
+      await test.owner.requestStop('synthetic-request')
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(test.owner.snapshots()[0]?.waitReason).toBe('storage')
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      storage.wal.compareAndSwapDelivery = compare
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false })
+      expect(test.owner.snapshots()[0]?.waitReason).not.toBe('storage')
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('requires a fresh request ID after a completed prepared Stop and never cancels the fresh task', async () => {
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    storage.wal.prepareDelivery = async record => { await prepare(record); throw new Error('synthetic write-after-throw') }
+    const test = harness({}, storage)
+    try {
+      await expect(test.owner.commands.send(request())).rejects.toThrow('write-after-throw')
+      await test.owner.requestStop('synthetic-request')
+      storage.wal.prepareDelivery = prepare
+      await expect(test.owner.commands.send(request())).rejects.toMatchObject({ accepted: false, failureCode: 'DELIVERY_STOPPED' })
+      await expect(test.owner.commands.send(request('fresh-request'))).resolves.toMatchObject({ taskId: 'synthetic-task' })
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(storage.records.get('fresh-request')).toMatchObject({ phase: 'accepted' })
+      expect(storage.records.get('fresh-request')?.stop).toBeUndefined()
+      expect(test.commands.send).toHaveBeenCalledTimes(1)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('settles a reopened persisted prepared Stop offline without replaying admission', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'send', request: request() }, phase: 'prepared', stop: { requested: true },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const test = harness({}, storage)
+    test.available(false)
+    try {
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { completed: true } })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
   it('persists unknown Stop across owner disposal and resumes only for the same identity', async () => {
     vi.useFakeTimers()
     const storage = memoryWal()
