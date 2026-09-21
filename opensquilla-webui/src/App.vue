@@ -310,6 +310,7 @@
         </div>
       </div>
     </header>
+    <DeliveryRecoveryNotice @open-session="switchToSession" />
     <div class="app-workspace">
       <main
         class="content"
@@ -475,6 +476,7 @@ import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
+import DeliveryRecoveryNotice from './components/DeliveryRecoveryNotice.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'

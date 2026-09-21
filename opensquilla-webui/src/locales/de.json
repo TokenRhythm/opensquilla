@@ -4932,5 +4932,32 @@
       "copyFailed": "Befehl konnte nicht kopiert werden",
       "copyLabel": "Gateway-Neustart-Befehl kopieren"
     }
+  },
+  "deliveryRecovery": {
+    "label": "Ausstehende Zustellprüfungen",
+    "count": "{count} Zustellergebnisse müssen bestätigt werden",
+    "show": "Details anzeigen",
+    "collapse": "Details ausblenden",
+    "open": "Unterhaltung öffnen",
+    "check": "Erneut prüfen",
+    "checking": "Wird geprüft…",
+    "more": "Mehr anzeigen",
+    "stopPending": "Nach Bestätigung der ursprünglichen Aufgabe wird das Stoppen fortgesetzt.",
+    "reason": {
+      "not-sent": "Diese Nachricht wurde noch nicht gesendet. Öffne die Unterhaltung, prüfe den Entwurf und sende ihn.",
+      "pending": "Die ursprüngliche Zustellung wird geprüft.",
+      "stop": "Die Aufgabe wird gestoppt.",
+      "offline": "Verbindung wiederherstellen, um die ursprüngliche Zustellung zu prüfen.",
+      "identity": "Zum ursprünglichen Gateway und Konto wechseln, um diese Zustellung zu prüfen.",
+      "receipt-unsupported": "Dieses Gateway unterstützt keine Empfangsprüfung. Öffne die Unterhaltung und prüfe das Ergebnis.",
+      "receipt-missing": "Kein Empfangsnachweis gefunden. Die ursprüngliche Zustellung bleibt unbestätigt.",
+      "storage": "Die Stoppanforderung konnte nicht gespeichert werden. Prüfe die Aufgabe vor dem Schließen; nach dem Neustart kann der Stopp nicht garantiert werden.",
+      "lease": "Ein anderes Fenster prüft diese Zustellung.",
+      "budget": "Automatische Prüfungen pausieren. Du kannst erneut prüfen.",
+      "permission": "Keine Berechtigung für diese Prüfung. Zugriff wiederherstellen und erneut prüfen.",
+      "conflict": "Gespeicherte Anfrage und Empfangsnachweis stimmen nicht überein. Prüfe das Ergebnis in der Unterhaltung.",
+      "reload": "Die Wiederherstellung wurde pausiert, da der Speicher in einem anderen Fenster aktualisiert wurde. Sichere ungesendete Entwürfe und lade dieses Fenster neu.",
+      "legacy": "Für eine ältere Zustellung fehlt eine bestätigte Verbindungsidentität. Prüfe die ursprüngliche Unterhaltung."
+    }
   }
 }

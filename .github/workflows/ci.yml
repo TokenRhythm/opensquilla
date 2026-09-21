@@ -1021,6 +1021,7 @@ jobs:
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node scripts/test-working-preview-refresh.mjs
           node scripts/test-resource-file-actions.mjs
           node --test scripts/fixtures/workspace-inline-preview/provider.test.mjs
           npm run test:live-html-harness

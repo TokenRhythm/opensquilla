@@ -5017,5 +5017,32 @@
       "copyFailed": "Could not copy the command",
       "copyLabel": "Copy the gateway restart command"
     }
+  },
+  "deliveryRecovery": {
+    "label": "Pending delivery checks",
+    "count": "{count} delivery results need confirmation",
+    "show": "View details",
+    "collapse": "Hide details",
+    "open": "Open conversation",
+    "check": "Check again",
+    "checking": "Checking…",
+    "more": "Show more",
+    "stopPending": "Stop will continue after the original task is confirmed.",
+    "reason": {
+      "not-sent": "This message has not been sent. Open the conversation to review the draft and send it.",
+      "pending": "The original delivery is being checked.",
+      "stop": "Waiting for the task to stop.",
+      "offline": "Reconnect to check the original delivery.",
+      "identity": "Switch to the original Gateway and account to check this delivery.",
+      "receipt-unsupported": "This Gateway cannot check delivery receipts. Open the conversation to inspect the result.",
+      "receipt-missing": "No receipt was found. The original delivery remains unconfirmed.",
+      "storage": "The Stop request could not be saved. Check the task before closing; Stop cannot be guaranteed after reopening.",
+      "lease": "Another open window is checking this delivery.",
+      "budget": "Automatic checks have paused. You can check again.",
+      "permission": "Permission to check this delivery was denied. Restore access before checking again.",
+      "conflict": "The saved request and receipt disagree. Open the conversation to inspect the result.",
+      "reload": "Delivery recovery paused because storage was upgraded in another window. Save your unsent draft, then reload this window.",
+      "legacy": "An older delivery has no verified connection identity. Open the original conversation to inspect it."
+    }
   }
 }

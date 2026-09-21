@@ -4932,5 +4932,32 @@
       "copyFailed": "Impossible de copier la commande",
       "copyLabel": "Copier la commande de redémarrage de la passerelle"
     }
+  },
+  "deliveryRecovery": {
+    "label": "Vérifications de livraison en attente",
+    "count": "{count} résultats de livraison restent à confirmer",
+    "show": "Voir les détails",
+    "collapse": "Masquer les détails",
+    "open": "Ouvrir la conversation",
+    "check": "Vérifier à nouveau",
+    "checking": "Vérification…",
+    "more": "Afficher plus",
+    "stopPending": "L’arrêt se poursuivra après confirmation de la tâche initiale.",
+    "reason": {
+      "not-sent": "Ce message n’a pas été envoyé. Ouvrez la conversation pour vérifier le brouillon et l’envoyer.",
+      "pending": "Vérification de la livraison initiale.",
+      "stop": "En attente de l’arrêt de la tâche.",
+      "offline": "Reconnectez-vous pour vérifier la livraison initiale.",
+      "identity": "Revenez au Gateway et au compte d’origine pour vérifier cette livraison.",
+      "receipt-unsupported": "Ce Gateway ne permet pas de vérifier les reçus. Ouvrez la conversation pour examiner le résultat.",
+      "receipt-missing": "Aucun reçu trouvé. La livraison initiale reste non confirmée.",
+      "storage": "La demande d’arrêt n’a pas pu être enregistrée. Vérifiez la tâche avant de fermer ; l’arrêt après réouverture ne peut être garanti.",
+      "lease": "Une autre fenêtre vérifie cette livraison.",
+      "budget": "Les vérifications automatiques sont en pause. Vous pouvez vérifier à nouveau.",
+      "permission": "Accès refusé pour cette vérification. Rétablissez l’accès avant de réessayer.",
+      "conflict": "La demande enregistrée et le reçu ne concordent pas. Examinez le résultat dans la conversation.",
+      "reload": "La récupération est en pause car le stockage a été mis à jour dans une autre fenêtre. Enregistrez les brouillons non envoyés, puis rechargez cette fenêtre.",
+      "legacy": "Une ancienne livraison n’a pas d’identité de connexion vérifiée. Examinez la conversation d’origine."
+    }
   }
 }

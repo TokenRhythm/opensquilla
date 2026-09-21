@@ -41,9 +41,13 @@ import {
 import {
   TURNS_RECEIPT_GET_METHOD,
   type TurnReceiptSteer,
+  type TurnsReceiptGetParams,
   type TurnsReceiptGetResult,
 } from '@/contracts/generated/v4/turnsReceiptGet'
-import { validateTurnsReceiptGetResult } from '@/contracts/generated/v4/turnsReceiptGetValidators.mjs'
+import {
+  validateTurnsReceiptGetParams,
+  validateTurnsReceiptGetResult,
+} from '@/contracts/generated/v4/turnsReceiptGetValidators.mjs'
 import {
   type TurnSendRequest,
   type TurnCancelRequest,
@@ -569,9 +573,10 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
       const operation = query.kind === 'steer'
         ? query.request.pendingInputId ? SESSIONS_PENDING_INPUTS_STEER_METHOD : SESSIONS_STEER_V2_METHOD
         : query.request.kind === 'pending-input' ? SESSIONS_PENDING_INPUTS_DISPATCH_METHOD : CHAT_SEND_METHOD
+      const params = response<TurnsReceiptGetParams>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetParams, { operation, originalRequest })
       let raw: unknown
       try {
-        raw = await transport.request(TURNS_RECEIPT_GET_METHOD, { operation, originalRequest }, {
+        raw = await transport.request(TURNS_RECEIPT_GET_METHOD, params as unknown as Record<string, unknown>, {
           ...requestOptions(options), recoveryClass: 'safe-read',
         })
       } catch (error) {
