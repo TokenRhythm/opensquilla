@@ -50,6 +50,7 @@ import {
   type CoordinatedOnboardingFlow,
 } from './onboarding-flow-coordinator.js'
 import { OnboardingSaveTelemetry } from './onboarding-save-telemetry.js'
+import { renderUnconfiguredDesktopConfig } from './desktop-unconfigured-profile.js'
 import {
   applyDesktopTelemetryConsentPayload,
   desktopPrivacyTomlLines,
@@ -199,7 +200,9 @@ import {
   type DesktopRouterWriteIntent,
   type RouterPresetBinding,
 } from './desktop-router-config.js'
-import { defaultRouterTiers, ROUTER_PROFILES } from './desktop-router-profiles.js'
+import {
+  defaultRouterTiers, DesktopRoutingConfigurationError, ROUTER_PROFILES, supportsRouter,
+} from './desktop-router-profiles.js'
 import type { DesktopPrimaryProviderChange } from './desktop-primary-provider-change.js'
 import {
   DESKTOP_RENDERER_ENTRY,
@@ -363,7 +366,7 @@ interface OnboardingFlow extends CoordinatedOnboardingFlow<
   OnboardingSaveResult
 > {
   window: BrowserWindow | null
-  resolve: ((credential: DesktopConnection) => void) | null
+  resolve: ((credential: DesktopConnection | null) => void) | null
   reject: ((error: Error) => void) | null
 }
 
@@ -809,6 +812,7 @@ let bootStatus: BootStatus = {
 }
 let bootError: BootError | null = null
 let forceOnboardingOnNextStartup = false
+let onboardingPromptProfileKey: string | null = null
 let recoveryInspection: RecoveryProtocolResult | null = null
 let primaryRecoveryInspection: RecoveryProtocolResult | null = null
 let recoveryOperationBusy = false
@@ -1744,9 +1748,8 @@ const LEGACY_TEXT_TIER_ALIASES: Record<string, TextRouterTier> = {
 function canonicalTierKey(name: string): string {
   return LEGACY_TEXT_TIER_ALIASES[name] ?? name
 }
-const ROUTER_PROFILE_IDS = new Set(['tokenrhythm', 'openrouter', 'dashscope', 'deepseek', 'gemini', 'volcengine', 'openai', 'zhipu', 'moonshot'])
 const TOKENRHYTHM_REGISTER_URL = 'https://tokenrhythm.studio/register'
-const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
+const PROVIDER_CATALOG: ProviderCatalogEntry[] = ([
   {
     id: 'tokenrhythm',
     label: 'TokenRhythm',
@@ -1754,7 +1757,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://tokenrhythm.studio/v1',
     apiKeyEnv: 'TOKENRHYTHM_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     ensembleSelectionMode: 'static_tokenrhythm_b5',
     deployment: 'cloud',
     note: 'DeepSeek, GLM, MiniMax and Kimi model families on one key.',
@@ -1766,7 +1768,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://openrouter.ai/api/v1',
     apiKeyEnv: 'OPENROUTER_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     ensembleSelectionMode: 'static_openrouter_b5',
     deployment: 'cloud',
     note: 'One account for mixed-model routing.',
@@ -1778,7 +1779,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.openai.com/v1',
     apiKeyEnv: 'OPENAI_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'OpenAI-only tier profile.',
   },
@@ -1789,7 +1789,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.openai.com/v1',
     apiKeyEnv: 'OPENAI_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'OpenAI Responses-API shape (chat + responses).',
   },
@@ -1800,7 +1799,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.anthropic.com',
     apiKeyEnv: 'ANTHROPIC_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Direct Claude access without SquillaRouter tiers.',
   },
@@ -1811,7 +1809,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
     apiKeyEnv: 'DASHSCOPE_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Qwen tier profile for Mainland-friendly access.',
   },
@@ -1822,7 +1819,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://coding.dashscope.aliyuncs.com/v1',
     apiKeyEnv: 'BAILIAN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Mainland China Coding Plan. Requires a dedicated sk-sp- API key.',
   },
@@ -1833,7 +1829,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://coding-intl.dashscope.aliyuncs.com/v1',
     apiKeyEnv: 'BAILIAN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'International Coding Plan. Requires a dedicated sk-sp- API key.',
   },
@@ -1844,7 +1839,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.deepseek.com',
     apiKeyEnv: 'DEEPSEEK_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'DeepSeek-only fast and pro routing.',
   },
@@ -1855,7 +1849,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai',
     apiKeyEnv: 'GEMINI_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Gemini OpenAI-compatible tier profile.',
   },
@@ -1866,7 +1859,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.moonshot.ai/v1',
     apiKeyEnv: 'MOONSHOT_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Kimi text and image-capable routes.',
   },
@@ -1877,7 +1869,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'http://localhost:11434',
     apiKeyEnv: '',
     requiresApiKey: false,
-    routerSupported: false,
     deployment: 'local',
     note: 'Local direct model path.',
   },
@@ -1888,9 +1879,8 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://qianfan.baidubce.com/v2',
     apiKeyEnv: 'QIANFAN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
-    note: 'Direct provider model id required.',
+    note: 'Qianfan text and image-capable routes.',
   },
   {
     id: 'kimi_coding_openai',
@@ -1899,7 +1889,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.kimi.com/coding/v1',
     apiKeyEnv: 'KIMI_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Kimi coding-plan endpoint.',
   },
@@ -1910,7 +1899,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.kimi.com/coding',
     apiKeyEnv: 'KIMI_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Kimi coding-plan Anthropic-shaped endpoint.',
   },
@@ -1921,7 +1909,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/anthropic',
     apiKeyEnv: 'MINIMAX_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax Anthropic-compatible endpoint.',
   },
@@ -1932,7 +1919,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/anthropic',
     apiKeyEnv: 'MINIMAX_CN_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax mainland Anthropic-compatible endpoint.',
   },
@@ -1943,7 +1929,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimax.io/anthropic',
     apiKeyEnv: 'MINIMAX_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax global Anthropic-compatible endpoint.',
   },
@@ -1954,7 +1939,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimax.io/v1',
     apiKeyEnv: 'MINIMAX_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax OpenAI-compatible endpoint.',
   },
@@ -1965,7 +1949,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/v1',
     apiKeyEnv: 'MINIMAX_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax coding-plan OpenAI-compatible endpoint.',
   },
@@ -1976,7 +1959,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://api.minimaxi.com/anthropic',
     apiKeyEnv: 'MINIMAX_CODING_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiniMax coding-plan Anthropic-shaped endpoint.',
   },
@@ -1987,7 +1969,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://token-plan-cn.xiaomimimo.com/v1',
     apiKeyEnv: 'MIMO_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiMo coding-plan endpoint.',
   },
@@ -1998,7 +1979,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://token-plan-cn.xiaomimimo.com/anthropic',
     apiKeyEnv: 'MIMO_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'MiMo coding-plan Anthropic-shaped endpoint.',
   },
@@ -2009,7 +1989,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
     apiKeyEnv: 'VOLCENGINE_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'Doubao tier profile.',
   },
@@ -2020,7 +1999,6 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://ark.cn-beijing.volces.com/api/coding/v3',
     apiKeyEnv: 'VOLCENGINE_API_KEY',
     requiresApiKey: true,
-    routerSupported: false,
     deployment: 'cloud',
     note: 'Volcengine coding-plan endpoint.',
   },
@@ -2031,11 +2009,13 @@ const PROVIDER_CATALOG: ProviderCatalogEntry[] = [
     baseUrl: 'https://open.bigmodel.cn/api/paas/v4',
     apiKeyEnv: 'ZAI_API_KEY',
     requiresApiKey: true,
-    routerSupported: true,
     deployment: 'cloud',
     note: 'GLM tier profile.',
   },
-]
+] satisfies Omit<ProviderCatalogEntry, 'routerSupported'>[]).map(provider => ({
+  ...provider,
+  routerSupported: supportsRouter(provider.id),
+}))
 
 const PROVIDER_BY_ID = new Map(PROVIDER_CATALOG.map((provider) => [provider.id, provider]))
 
@@ -2101,7 +2081,7 @@ function providerDefaults(provider: string): { model: string; baseUrl: string; a
     baseUrl: defaults.baseUrl,
     apiKeyEnv: defaults.apiKeyEnv,
     requiresApiKey: defaults.requiresApiKey,
-    routerSupported: defaults.routerSupported,
+    routerSupported: supportsRouter(provider),
   }
 }
 
@@ -2119,11 +2099,12 @@ function normalizeTextTier(raw: unknown): TextRouterTier {
 }
 
 function normalizeRouterMode(raw: unknown, provider: string): RouterMode {
-  const value = String(raw || '').trim().toLowerCase()
+  const value = String(raw ?? '').trim().toLowerCase()
   if (value === 'disabled') return 'disabled'
+  if (!value) return supportsRouter(provider) ? 'recommended' : 'disabled'
   if (value === 'openrouter-mix' && provider === 'openrouter') return 'openrouter-mix'
-  if (ROUTER_PROFILE_IDS.has(provider)) return 'recommended'
-  return 'disabled'
+  if (value === 'recommended' && supportsRouter(provider)) return 'recommended'
+  throw new DesktopRoutingConfigurationError()
 }
 
 function modelRoutingModeAllowed(mode: ModelRoutingMode, provider: string): boolean {
@@ -2131,17 +2112,21 @@ function modelRoutingModeAllowed(mode: ModelRoutingMode, provider: string): bool
   if (mode === 'llm_ensemble') {
     return Boolean(PROVIDER_BY_ID.get(provider)?.ensembleSelectionMode)
   }
-  return ROUTER_PROFILE_IDS.has(provider)
+  return supportsRouter(provider)
 }
 
 function modelRoutingModeForRouterMode(routerMode: RouterMode, provider: string): ModelRoutingMode {
   if (routerMode === 'disabled') return 'direct'
   if (routerMode === 'openrouter-mix' && provider === 'openrouter') return 'llm_ensemble'
-  return modelRoutingModeAllowed('squilla_router', provider) ? 'squilla_router' : 'direct'
+  if (modelRoutingModeAllowed('squilla_router', provider)) return 'squilla_router'
+  throw new DesktopRoutingConfigurationError()
 }
 
 function normalizeModelRoutingMode(raw: unknown, provider: string, fallbackRouterMode?: RouterMode): ModelRoutingMode {
-  const value = String(raw || '').trim().toLowerCase()
+  const value = String(raw ?? '').trim().toLowerCase()
+  if (value && !['squilla_router', 'direct', 'llm_ensemble'].includes(value)) {
+    throw new DesktopRoutingConfigurationError()
+  }
   const requested = ['squilla_router', 'direct', 'llm_ensemble'].includes(value)
     ? value as ModelRoutingMode
     : fallbackRouterMode
@@ -2149,8 +2134,13 @@ function normalizeModelRoutingMode(raw: unknown, provider: string, fallbackRoute
       : modelRoutingModeAllowed('squilla_router', provider)
         ? 'squilla_router'
         : 'direct'
-  if (modelRoutingModeAllowed(requested, provider)) return requested
-  return modelRoutingModeAllowed('squilla_router', provider) ? 'squilla_router' : 'direct'
+  if (!modelRoutingModeAllowed(requested, provider)) throw new DesktopRoutingConfigurationError()
+  if (value && fallbackRouterMode
+    && fallbackRouterMode !== routerModeForModelRoutingMode(requested, provider)
+    && !(fallbackRouterMode === 'openrouter-mix' && requested === 'llm_ensemble')) {
+    throw new DesktopRoutingConfigurationError()
+  }
+  return requested
 }
 
 function routerModeForModelRoutingMode(mode: ModelRoutingMode, provider: string): RouterMode {
@@ -2502,7 +2492,8 @@ function isConnectionReady(record: DesktopConnection): boolean {
 function normalizeDesktopCredential(parsed: Partial<DesktopConnection>): DesktopConnection {
   const provider = normalizeProvider(parsed.provider)
   const defaults = providerDefaults(provider)
-  const legacyRouterMode = normalizeRouterMode(parsed.routerMode, provider)
+  const legacyRouterMode = parsed.routerMode === undefined
+    ? undefined : normalizeRouterMode(parsed.routerMode, provider)
   const modelRoutingMode = normalizeModelRoutingMode(parsed.modelRoutingMode, provider, legacyRouterMode)
   const routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
   const routerDefaultTier = normalizeTextTier(parsed.routerDefaultTier)
@@ -2763,6 +2754,7 @@ async function loadDesktopCredential(): Promise<DesktopConnection | null> {
     return normalizeDesktopCredential(JSON.parse(raw) as Partial<DesktopConnection>)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    if (error instanceof DesktopRoutingConfigurationError) throw error
     throw new Error('Saved Desktop credential is invalid or unreadable.', { cause: error })
   }
 }
@@ -2783,9 +2775,14 @@ async function saveDesktopCredential(
   }
   const provider = normalizeProvider(payload.provider ?? existing?.provider)
   const defaults = providerDefaults(provider)
-  const legacyRouterMode = normalizeRouterMode(payload.routerMode ?? existing?.routerMode, provider)
   const hasModelRoutingMode = Object.prototype.hasOwnProperty.call(payload, 'modelRoutingMode')
   const hasRouterMode = Object.prototype.hasOwnProperty.call(payload, 'routerMode')
+  // An explicit new selection replaces the previous provider's mode. Validate
+  // both aliases only when the caller actually supplies both of them.
+  const rawRouterMode = hasRouterMode ? payload.routerMode
+    : hasModelRoutingMode ? undefined : existing?.routerMode
+  const legacyRouterMode = rawRouterMode === undefined
+    ? undefined : normalizeRouterMode(rawRouterMode, provider)
   const rawModelRoutingMode = hasModelRoutingMode
     ? payload.modelRoutingMode
     : hasRouterMode
@@ -2800,8 +2797,11 @@ async function saveDesktopCredential(
     routerDefaultTier: normalizeTextTier(payload.routerDefaultTier ?? existing?.routerDefaultTier),
     // A disabled Router retains its ladder for re-enabling. Defaults used for
     // genuine fresh creation/reset are generated only in this trusted process.
-    defaultTiers: defaultRouterTiers(provider, normalizeRouterMode('recommended', provider)),
-    freshConfig: completingOnboarding && existing === null && existingConfigRaw === null,
+    defaultTiers: defaultRouterTiers(provider, normalizeRouterMode(undefined, provider)),
+    freshConfig: completingOnboarding && existing === null && (
+      existingConfigRaw === null
+      || existingConfigRaw === renderUnconfiguredDesktopConfig(desktopLocale, process.platform)
+    ),
     providerChangedWithoutConfig: existingConfigRaw === null && existing !== null && existing.provider !== provider,
   })
   let primaryChange: DesktopPrimaryProviderChange | null = null
@@ -2810,14 +2810,14 @@ async function saveDesktopCredential(
     primaryChange = prepareDesktopPrimaryProviderChange({
       existingRaw: existingConfigRaw,
       provider,
-      defaultTiers: defaultRouterTiers(provider, normalizeRouterMode('recommended', provider)),
+      defaultTiers: defaultRouterTiers(provider, normalizeRouterMode(undefined, provider)),
       requestedRouter: routerUpdate,
       ...(hasModelRoutingMode || hasRouterMode ? { requestedMode: modelRoutingMode } : {}),
     })
     if (primaryChange) {
       routerUpdate = { ...primaryChange.router, writeIntent: 'preserve' }
-      routerMode = primaryChange.router.routerMode as RouterMode
       modelRoutingMode = primaryChange.modelRoutingMode
+      routerMode = routerModeForModelRoutingMode(modelRoutingMode, provider)
     }
   }
   const providerChanged = primaryChange !== null || (existing !== null && existing.provider !== provider)
@@ -3799,7 +3799,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continue',
     'onboarding.step2.badge': 'Required',
     'onboarding.step2.heading': 'Model service setup',
-    'onboarding.step2.subtitle': 'Enter an API key to get started.',
+    'onboarding.step2.subtitle': "Connect a model service, or finish later in Settings.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
     'onboarding.step2.tokenrhythmRegistration': 'Register to claim ¥68 in free tokens.',
@@ -3830,7 +3830,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchHintDefault': 'DuckDuckGo is enough to start.',
     'onboarding.telemetry.notice': 'Operation results, errors, activation milestones, and actual feature usage help improve OpenSquilla. Uploads follow the network reporting setting in Security & Privacy. Prompts, replies, files, task parameters, and raw account IDs are excluded.',
     'onboarding.step5.back': 'Back',
-    'onboarding.step5.finish': 'Start OpenSquilla',
+    'onboarding.step5.finish': "Save and enter",
   },
   'zh-Hans': {
     'menu.edit': '编辑',
@@ -3937,7 +3937,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': '继续',
     'onboarding.step2.badge': '必填',
     'onboarding.step2.heading': '模型服务配置',
-    'onboarding.step2.subtitle': '输入 API 密钥即可开始使用',
+    'onboarding.step2.subtitle': "连接模型服务，或稍后在设置中完成。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
     'onboarding.step2.tokenrhythmRegistration': '注册即领价值 68 元 Token',
@@ -3968,7 +3968,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchHintDefault': 'DuckDuckGo 足以开始使用。',
     'onboarding.telemetry.notice': '操作结果、错误、激活流程和功能实际使用次数用于改进 OpenSquilla，统一遵循“安全与隐私”中的网络上报设置；不包含提示词、回复、文件、任务参数或原始账号 ID。',
     'onboarding.step5.back': '返回',
-    'onboarding.step5.finish': '启动 OpenSquilla',
+    'onboarding.step5.finish': "保存并进入",
   },
   ja: {
     'menu.edit': '編集',
@@ -4070,7 +4070,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': '続行',
     'onboarding.step2.badge': '必須',
     'onboarding.step2.heading': 'モデルサービス設定',
-    'onboarding.step2.subtitle': 'API キーを入力して利用を開始します。',
+    'onboarding.step2.subtitle': "モデルサービスに接続するか、後で設定できます。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
     'onboarding.step2.tokenrhythmRegistration': '登録で68元相当のTokenを無料進呈',
@@ -4103,7 +4103,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': '検索 API キー',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo で始めるには十分です。',
     'onboarding.step5.back': '戻る',
-    'onboarding.step5.finish': 'OpenSquilla を起動',
+    'onboarding.step5.finish': "保存して続ける",
   },
   fr: {
     'menu.edit': 'Édition',
@@ -4205,7 +4205,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continuer',
     'onboarding.step2.badge': 'Requis',
     'onboarding.step2.heading': 'Configuration du service de modèles',
-    'onboarding.step2.subtitle': 'Saisissez une clé API pour commencer.',
+    'onboarding.step2.subtitle': "Connectez un service de modèles ou configurez-le plus tard.",
     'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
     'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous pour recevoir 68 ¥ de tokens gratuits.',
@@ -4238,7 +4238,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': 'Clé API de recherche',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo suffit pour démarrer.',
     'onboarding.step5.back': 'Retour',
-    'onboarding.step5.finish': 'Démarrer OpenSquilla',
+    'onboarding.step5.finish': "Enregistrer et continuer",
   },
   de: {
     'menu.edit': 'Bearbeiten',
@@ -4340,7 +4340,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Weiter',
     'onboarding.step2.badge': 'Erforderlich',
     'onboarding.step2.heading': 'Modellservice konfigurieren',
-    'onboarding.step2.subtitle': 'Geben Sie einen API-Schlüssel ein, um zu beginnen.',
+    'onboarding.step2.subtitle': "Verbinde einen Modelldienst oder richte ihn später ein.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
     'onboarding.step2.tokenrhythmRegistration': 'Registrieren und 68 ¥ Gratis-Token erhalten.',
@@ -4373,7 +4373,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': 'Such-API-Schlüssel',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo reicht für den Start.',
     'onboarding.step5.back': 'Zurück',
-    'onboarding.step5.finish': 'OpenSquilla starten',
+    'onboarding.step5.finish': "Speichern und öffnen",
   },
   es: {
     'menu.edit': 'Edición',
@@ -4475,7 +4475,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step1.continue': 'Continuar',
     'onboarding.step2.badge': 'Obligatorio',
     'onboarding.step2.heading': 'Configuración del servicio de modelos',
-    'onboarding.step2.subtitle': 'Introduce una clave API para empezar.',
+    'onboarding.step2.subtitle': "Conecta un servicio de modelos o configúralo más tarde.",
     'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
     'onboarding.step2.tokenrhythmRegistration': 'Regístrate y recibe 68 ¥ en tokens gratis.',
@@ -4508,7 +4508,7 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step5.searchKey': 'Clave API de búsqueda',
     'onboarding.step5.searchHintDefault': 'DuckDuckGo es suficiente para empezar.',
     'onboarding.step5.back': 'Atrás',
-    'onboarding.step5.finish': 'Iniciar OpenSquilla',
+    'onboarding.step5.finish': "Guardar y entrar",
   },
 }
 
@@ -4563,7 +4563,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'Default router tier requires a model.',
     searchApiKeyRequired: '{label} search API key is required.',
     savingSetup: 'Saving setup…',
-    setupTakingLonger: 'First-time setup usually takes 10–20 seconds. Please keep this window open.',
+    skipSetup: "Set up later",
+    testConnection: "Test connection (optional)",
+    notTested: "Not tested",
+    keyRejected: "The key was rejected. Check it and paste it again.",
+    connectionUnavailable: "Unable to connect right now. You can still save and enter.",
+    connectionFailed: "The model could not be used. Check the model and service settings. You can still save and enter.",
+    localSaveFailed: "Could not save locally. Please retry, or continue in the client and configure it later.",
+    setupTakingLonger: "Saving local settings is taking longer. You can continue in the client.",
     stepLabel: 'Step {n}',
   },
   'zh-Hans': {
@@ -4611,7 +4618,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: '默认路由层级需要一个模型。',
     searchApiKeyRequired: '需要 {label} 搜索 API 密钥。',
     savingSetup: '正在保存设置…',
-    setupTakingLonger: '首次设置通常需要 10–20 秒，请保持此窗口打开。',
+    skipSetup: "稍后配置",
+    testConnection: "测试连接（可选）",
+    notTested: "尚未测试",
+    keyRejected: "密钥被拒绝，请检查后重新粘贴。",
+    connectionUnavailable: "暂时无法连接。你仍可保存配置并进入。",
+    connectionFailed: "模型暂不可用，请检查模型和服务设置。你仍可保存并进入。",
+    localSaveFailed: "本地保存失败，请重试；也可先进入客户端，稍后配置。",
+    setupTakingLonger: "本地保存耗时较长。你可以先进入客户端。",
     stepLabel: '步骤 {n}',
   },
   ja: {
@@ -4659,7 +4673,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'デフォルトのルーターティアにはモデルが必要です。',
     searchApiKeyRequired: '{label} の検索 API キーが必要です。',
     savingSetup: '設定を保存しています…',
-    setupTakingLonger: '初回セットアップには通常10～20秒かかります。このウィンドウを開いたままお待ちください。',
+    skipSetup: "後で設定",
+    testConnection: "接続テスト（任意）",
+    notTested: "未テスト",
+    keyRejected: "キーが拒否されました。確認して再入力してください。",
+    connectionUnavailable: "現在接続できません。保存して続行できます。",
+    connectionFailed: "モデルを利用できません。設定を確認してください。保存して続行できます。",
+    localSaveFailed: "保存できませんでした。再試行するか、後で設定してください。",
+    setupTakingLonger: "保存に時間がかかっています。クライアントで続行できます。",
     stepLabel: 'ステップ {n}',
   },
   fr: {
@@ -4707,7 +4728,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'Le niveau de routeur par défaut nécessite un modèle.',
     searchApiKeyRequired: 'La clé API de recherche {label} est requise.',
     savingSetup: 'Enregistrement…',
-    setupTakingLonger: 'La configuration initiale prend généralement 10 à 20 secondes. Gardez cette fenêtre ouverte.',
+    skipSetup: "Configurer plus tard",
+    testConnection: "Tester la connexion (facultatif)",
+    notTested: "Non testé",
+    keyRejected: "Clé refusée. Vérifiez-la et collez-la à nouveau.",
+    connectionUnavailable: "Connexion indisponible. Vous pouvez enregistrer et continuer.",
+    connectionFailed: "Modèle indisponible. Vérifiez les paramètres. Vous pouvez enregistrer et continuer.",
+    localSaveFailed: "Échec de l’enregistrement local. Réessayez ou configurez plus tard.",
+    setupTakingLonger: "L’enregistrement prend du temps. Vous pouvez continuer dans le client.",
     stepLabel: 'Étape {n}',
   },
   de: {
@@ -4755,7 +4783,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'Die Standard-Routerstufe erfordert ein Modell.',
     searchApiKeyRequired: 'Der Such-API-Schlüssel für {label} ist erforderlich.',
     savingSetup: 'Einrichtung wird gespeichert…',
-    setupTakingLonger: 'Die Ersteinrichtung dauert normalerweise 10–20 Sekunden. Lassen Sie dieses Fenster geöffnet.',
+    skipSetup: "Später einrichten",
+    testConnection: "Verbindung testen (optional)",
+    notTested: "Nicht getestet",
+    keyRejected: "Der Schlüssel wurde abgelehnt. Prüfe ihn und füge ihn erneut ein.",
+    connectionUnavailable: "Verbindung derzeit nicht möglich. Speichern und Fortfahren ist möglich.",
+    connectionFailed: "Modell nicht verfügbar. Prüfe die Einstellungen. Du kannst trotzdem speichern.",
+    localSaveFailed: "Lokales Speichern fehlgeschlagen. Wiederhole es oder richte den Dienst später ein.",
+    setupTakingLonger: "Das Speichern dauert länger. Du kannst im Client fortfahren.",
     stepLabel: 'Schritt {n}',
   },
   es: {
@@ -4803,7 +4838,14 @@ const ONBOARDING_SCRIPT_MESSAGES: Record<DesktopLocale, Record<string, string>> 
     defaultTierRequiresModel: 'El nivel de enrutador predeterminado requiere un modelo.',
     searchApiKeyRequired: 'Se requiere la clave API de búsqueda de {label}.',
     savingSetup: 'Guardando la configuración…',
-    setupTakingLonger: 'La configuración inicial suele tardar entre 10 y 20 segundos. Mantén esta ventana abierta.',
+    skipSetup: "Configurar después",
+    testConnection: "Probar conexión (opcional)",
+    notTested: "Sin probar",
+    keyRejected: "Clave rechazada. Revísala y vuelve a pegarla.",
+    connectionUnavailable: "No se puede conectar ahora. Puedes guardar y continuar.",
+    connectionFailed: "Modelo no disponible. Revisa la configuración. Puedes guardar y continuar.",
+    localSaveFailed: "No se pudo guardar localmente. Reintenta o configura más tarde.",
+    setupTakingLonger: "El guardado está tardando. Puedes continuar en el cliente.",
     stepLabel: 'Paso {n}',
   },
 }
@@ -6403,6 +6445,9 @@ function onboardingHtml(
     .error:empty {
       display: none;
     }
+    .probe-row { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+    .probe-row .secondary { padding-left: 0; }
+    .probe-status { color: var(--muted); font-size: 12px; flex: 1; min-width: 160px; }
     @media (max-width: 680px) {
       main {
         padding: 14px;
@@ -6511,6 +6556,10 @@ function onboardingHtml(
             <span class="field-error" id="modelError" role="alert" aria-live="polite"></span>
           </div>
         </div>
+        <div class="probe-row">
+          <button class="secondary" type="button" id="probe"></button>
+          <span class="probe-status" id="probeStatus" role="status" aria-live="polite"></span>
+        </div>
         <section class="inline-search-section" aria-labelledby="inlineSearchHeading">
           <button class="inline-search-toggle" id="inlineSearchToggle" type="button" aria-expanded="false" aria-controls="inlineSearchPanel">
             <span class="inline-search-title" id="inlineSearchHeading" data-i18n="onboarding.step5.heading">${ot('onboarding.step5.heading')}</span>
@@ -6532,7 +6581,7 @@ function onboardingHtml(
         <p class="telemetry-notice" data-i18n="onboarding.telemetry.notice">${ot('onboarding.telemetry.notice')}</p>
         </div>
         <footer class="actions">
-          <button class="secondary" type="button" id="cancel" data-i18n="onboarding.step1.quit">${ot('onboarding.step1.quit')}</button>
+          <button class="secondary" type="button" id="skip"></button>
           <span class="submit-status" id="submitStatus" role="status" aria-live="polite" aria-atomic="true"></span>
           <button class="primary" type="button" id="finish" data-i18n="onboarding.step5.finish">${ot('onboarding.step5.finish')}</button>
         </footer>
@@ -6556,13 +6605,19 @@ function onboardingHtml(
       if (vars) for (const name of Object.keys(vars)) out = out.split('{' + name + '}').join(String(vars[name]));
       return out;
     }
-    const providers = ${inlineScriptJson(PROVIDER_CATALOG)};
+    const providers = ${inlineScriptJson(PROVIDER_CATALOG.map(entry => ({
+      ...entry,
+      onboardingModel: ['tokenrhythm', 'openrouter'].includes(entry.id) ? entry.model : '',
+    })))};
     const searchProviders = ${inlineScriptJson(SEARCH_PROVIDER_CATALOG)};
     const initialProviderPrefill = ${inlineScriptJson(pendingProviderSetup)};
     let searchPaidOpen = false;
     let searchSectionOpen = false;
     let modelEditorOpen = false;
     let submitting = false;
+    let probeRevision = 0;
+    let probing = false;
+    let leaving = false;
     const SUBMIT_SLOW_FEEDBACK_MS = 8_000;
     let submitSlowTimer = null;
     const setupForm = document.getElementById('setup-form');
@@ -6587,6 +6642,9 @@ function onboardingHtml(
     const searchApiKey = document.getElementById('searchApiKey');
     const searchApiKeyError = document.getElementById('searchApiKeyError');
     const finish = document.getElementById('finish');
+    const skip = document.getElementById('skip');
+    const probe = document.getElementById('probe');
+    const probeStatus = document.getElementById('probeStatus');
     const submitStatus = document.getElementById('submitStatus');
     const searchProvider = document.getElementById('searchProvider');
 	    const searchProviderGrid = document.getElementById('searchProviderGrid');
@@ -6623,7 +6681,7 @@ function onboardingHtml(
       return providers.find((item) => item.id === provider.value) || providers[0];
     }
     function defaultModelRoutingModeFor(selected) {
-      return selected.routerSupported ? 'squilla_router' : 'direct';
+      return selected.onboardingModel && selected.routerSupported ? 'squilla_router' : 'direct';
     }
     function syncRouterModeFromModelRouting() {
       routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';
@@ -6649,11 +6707,10 @@ function onboardingHtml(
 	      apiKey.placeholder = selected.requiresApiKey ? 'sk-...' : t.noKeyRequired;
 	      if (resetRouter) {
 	        baseUrl.value = selected.baseUrl || '';
-	        model.value = selected.model || '';
+	        model.value = selected.onboardingModel || '';
           modelEditorOpen = !model.value.trim();
 	      } else {
 	        if (!baseUrl.value && selected.baseUrl) baseUrl.value = selected.baseUrl;
-	        if (!model.value && selected.model) model.value = selected.model;
 	      }
 	      if (resetRouter) {
 	        modelRoutingMode.value = defaultModelRoutingModeFor(selected);
@@ -6670,6 +6727,7 @@ function onboardingHtml(
       if (next === provider.value) return;
       provider.value = next;
       apiKey.value = '';
+      invalidateProbe();
       clearValidationErrors();
       syncProviderDefaults(true);
       renderProviderGrid();
@@ -6767,6 +6825,7 @@ function onboardingHtml(
       syncProviderDefaults(false);
       renderModelField();
       render();
+      invalidateProbe();
     }
     function currentSearchProvider() {
       return searchProviders.find((item) => item.providerId === searchProvider.value) || searchProviders[0];
@@ -6837,6 +6896,9 @@ function onboardingHtml(
     function render() {
       syncProviderDefaults(false);
       syncSearchProviderControls();
+      skip.textContent = t.skipSetup;
+      probe.textContent = probing ? t.verifyingConfiguration : t.testConnection;
+      if (!probeStatus.textContent) probeStatus.textContent = t.notTested;
     }
     function clearSubmitSlowTimer() {
       if (submitSlowTimer !== null) clearTimeout(submitSlowTimer);
@@ -6864,7 +6926,7 @@ function onboardingHtml(
         submitStatus.textContent = '';
       }
     }
-    window.addEventListener('pagehide', clearSubmitSlowTimer);
+    window.addEventListener('pagehide', () => { leaving = true; probeRevision++; clearSubmitSlowTimer(); });
 	    onboardingLocale.addEventListener('change', () => {
 	      applyLocale(onboardingLocale.value);
 	    });
@@ -6922,6 +6984,7 @@ function onboardingHtml(
     [[apiKey, apiKeyError], [model, modelError], [searchApiKey, searchApiKeyError]].forEach(([input, output]) => {
       input.addEventListener('input', () => {
         clearFieldError(input, output);
+        if (input !== searchApiKey) invalidateProbe();
         if (input === model) renderModelField();
       });
     });
@@ -6936,8 +6999,67 @@ function onboardingHtml(
       renderModelField();
       modelEditToggle.focus({ preventScroll: true });
     });
-    document.getElementById('cancel').addEventListener('click', () => {
-      window.opensquillaDesktop.cancelOnboarding();
+    function invalidateProbe() {
+      probeRevision++;
+      probing = false;
+      probe.disabled = false;
+      probe.textContent = t.testConnection;
+      probeStatus.textContent = t.notTested;
+    }
+    baseUrl.addEventListener('input', invalidateProbe);
+    probe.addEventListener('click', async () => {
+      if (probing || submitting || leaving) return;
+      clearValidationErrors();
+      const selected = currentProvider();
+      if (selected.requiresApiKey && !apiKey.value.trim()) {
+        presentValidationIssue({input:apiKey,output:apiKeyError,message:fmt('apiKeyRequired',{label:selected.label})});
+        return;
+      }
+      if (!model.value.trim()) {
+        presentValidationIssue({input:model,output:modelError,message:t.directModelRequiredDirect});
+        return;
+      }
+      const snapshot = onboardingPayloadSnapshot();
+      const revision = ++probeRevision;
+      probing = true;
+      probe.disabled = true;
+      probe.textContent = t.verifyingConfiguration;
+      probeStatus.textContent = t.verifyingConfiguration;
+      try {
+        const result = await window.opensquillaDesktop.probeOnboarding(snapshot);
+        if (leaving || submitting || revision !== probeRevision) return;
+        if (result && result.ok) {
+          probeStatus.textContent = fmt('configurationVerifiedWithLatency', {ms:result.latencyMs});
+        } else if (result && result.failureKind === 'auth_invalid') {
+          apiKeyError.textContent = t.keyRejected;
+          apiKey.setAttribute('aria-invalid', 'true');
+          probeStatus.textContent = t.keyRejected;
+        } else {
+          probeStatus.textContent = result && ['transport_transient','probe_timeout','network_error','timeout','unavailable'].includes(result.failureKind)
+            ? t.connectionUnavailable : t.connectionFailed;
+        }
+      } catch {
+        if (!leaving && !submitting && revision === probeRevision) probeStatus.textContent = t.connectionUnavailable;
+      } finally {
+        if (revision === probeRevision) {
+          probing = false;
+          probe.disabled = false;
+          probe.textContent = t.testConnection;
+        }
+      }
+    });
+    skip.addEventListener('click', async () => {
+      if (leaving) return;
+      leaving = true;
+      probeRevision++;
+      try {
+        const result = await window.opensquillaDesktop.skipOnboarding();
+        if (!result || !result.ok) throw new Error('skip failed');
+      } catch {
+        leaving = false;
+        invalidateProbe();
+        errorBox.textContent = t.localSaveFailed;
+      }
     });
     finish.addEventListener('click', async () => {
       if (submitting) return;
@@ -6948,6 +7070,7 @@ function onboardingHtml(
         return;
       }
       const payload = onboardingPayloadSnapshot();
+      invalidateProbe();
       setSubmitting(true);
       let succeeded = false;
       try {
@@ -6962,7 +7085,7 @@ function onboardingHtml(
         succeeded = true;
         clearSubmitSlowTimer();
       } catch (error) {
-        errorBox.textContent = error && error.message ? error.message : String(error);
+        errorBox.textContent = t.localSaveFailed;
       } finally {
         if (!succeeded) {
           setSubmitting(false);
@@ -7011,10 +7134,7 @@ function abandonOnboardingFlow(
   reject?.(error)
 }
 
-async function runOnboarding(): Promise<DesktopConnection> {
-  // A detached save retains coordinator ownership until it settles, preventing
-  // Retry from opening a replacement flow that the old completion could affect.
-  await onboardingFlows.waitForAbandonedSave()
+async function prepareDesktopStartupConnection(): Promise<DesktopConnection | null> {
   const pendingProviderSetup = await loadPendingMigrationProviderSetup()
   const existing = await loadDesktopCredential()
   // A saved credential encrypted with the OS keychain that this session cannot
@@ -7054,6 +7174,53 @@ async function runOnboarding(): Promise<DesktopConnection> {
     return existing
   }
 
+  // An explicit empty primary prevents provider defaults or inherited API keys
+  // from silently configuring a fresh profile. The config also records that the
+  // first-run invitation has been offered; later launches use Settings instead.
+  if (!(await pathExists(desktopConfigPath()))) {
+    const finishWriter = beginDesktopWriterOperation('initialize unconfigured desktop profile')
+    const profile = activeDesktopProfile()
+    try {
+      const inspection = await preflightDesktopConfigWrite(profile)
+      const initialized = await runRecoveryCli(profile, [
+        'initialize-unconfigured', '--home', profile.home,
+        '--transaction-id', inspection.transaction_id ?? '',
+        '--expected-revision', String(inspection.revision),
+        '--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS), '--json',
+      ], JSON.stringify({config: renderUnconfiguredDesktopConfig(desktopLocale, process.platform)}), true)
+      if (initialized.outcome === 'recovery_required' || !(await pathExists(desktopConfigPath()))) {
+        throw new Error(`Desktop profile could not be initialized (${initialized.stable_code}).`)
+      }
+      if (initialized.stable_code === 'unconfigured_profile_initialized') {
+        onboardingPromptProfileKey = desktopProfileKey(profile)
+      }
+    } finally {
+      finishWriter()
+    }
+  }
+  if (pendingProviderSetup || forceOnboardingOnNextStartup) {
+    onboardingPromptProfileKey = desktopProfileKey()
+  }
+  return null
+}
+
+function dismissOnboardingFlow(flow: OnboardingFlow): void {
+  const resolve = flow.resolve
+  flow.resolve = null
+  flow.reject = null
+  // Keep an admitted save owned by the coordinator until its atomic write has
+  // settled. Closing the invitation never cancels or duplicates that write.
+  onboardingFlows.abandon(flow)
+  const window = flow.window
+  if (window && !window.isDestroyed()) window.close()
+  resolve?.(null)
+  focusMainWindow()
+}
+
+async function runOnboarding(): Promise<DesktopConnection | null> {
+  await onboardingFlows.waitForAbandonedSave()
+  const pendingProviderSetup = await loadPendingMigrationProviderSetup()
+
   return new Promise((resolveCredential, rejectCredential) => {
     if (onboardingFlows.active) {
       focusOnboardingWindow()
@@ -7070,7 +7237,7 @@ async function runOnboarding(): Promise<DesktopConnection> {
       icon: appIconPath(),
       resizable: true,
       parent: parentWindow ?? undefined,
-      modal: Boolean(parentWindow),
+      modal: false,
       show: false,
       // Match the onboarding page's base so the first frame is not white.
       backgroundColor: '#f5f2eb',
@@ -7131,7 +7298,7 @@ async function runOnboarding(): Promise<DesktopConnection> {
       // Re-enable View → Reload now that the wizard is gone.
       createApplicationMenu()
       if (flow.state !== 'completed' && flow.state !== 'abandoned') {
-        abandonOnboardingFlow(flow, new Error('OpenSquilla setup was closed.'), false)
+        dismissOnboardingFlow(flow)
       }
     })
 
@@ -8960,17 +9127,17 @@ async function startGateway(): Promise<GatewayState> {
   if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway recovery.')
 
   sendBootStatus('profile')
-  const connection = await runOnboarding()
+  const connection = await prepareDesktopStartupConnection()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
   forceOnboardingOnNextStartup = false
-  const apiKey = decryptApiKey(connection)
+  const apiKey = connection ? decryptApiKey(connection) : ''
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
   // by onboarding without a key, so only treat a missing key as fatal when the
   // provider actually needs one — otherwise every keyless credential wedges boot.
-  if (providerDefaults(connection.provider).requiresApiKey && !apiKey) {
+  if (connection && providerDefaults(connection.provider).requiresApiKey && !apiKey) {
     throw new Error('Saved desktop API key could not be read.')
   }
-  const searchApiKey = decryptSearchApiKey(connection)
+  const searchApiKey = connection ? decryptSearchApiKey(connection) : ''
   // Config is seeded (when missing) inside runOnboarding / the onboarding save,
   // and is otherwise the RPC-owned source of truth — so it is intentionally NOT
   // regenerated here on every boot.
@@ -9049,8 +9216,8 @@ async function startGateway(): Promise<GatewayState> {
   const childEnv = desktopChildEnvironment(activeProfile, {
     PATH: childPath,
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
-    ...(connection.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
-    ...(connection.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
+    ...(connection?.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
+    ...(connection?.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
@@ -9059,7 +9226,7 @@ async function startGateway(): Promise<GatewayState> {
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
-    ...(connection.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
+    ...(connection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
@@ -9894,6 +10061,14 @@ async function openOrResumeDesktopApp(): Promise<void> {
             if (operationIsCurrent()) {
               sendBootStatus('ready')
               finishAppStartSuccess()
+              if (onboardingPromptProfileKey === desktopProfileKey() && !onboardingFlows.active) {
+                onboardingPromptProfileKey = null
+                // The client and Gateway are already ready. This optional,
+                // non-modal invitation must never participate in boot failure.
+                void runOnboarding().catch(() => {
+                  desktopLog('onboarding_invitation_unavailable')
+                })
+              }
             }
           }
         }
@@ -9911,8 +10086,13 @@ async function openOrResumeDesktopApp(): Promise<void> {
             gatewayStatus: gatewayState.status,
             error: error instanceof Error ? error.message : String(error),
           })
-          if (currentMainWindow()) sendBootError(error)
-          finishAppStartFailure(error)
+          if (error instanceof DesktopRoutingConfigurationError) {
+            await restoreMainWindowToBootPage()
+          }
+          if (operationIsCurrent()) {
+            if (currentMainWindow()) sendBootError(error)
+            finishAppStartFailure(error)
+          }
         }
       }
       if (desktopOpenAuthorityIsCurrent(revision, requestedProfileKey)) return
@@ -12733,6 +12913,7 @@ async function applyApprovedDesktopCleanup(
     return { ok: false, detail: 'OpenSquilla is finishing another profile operation. Try again.' }
   }
   desktopCleanupBusy = true
+  if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   let shouldQuit = false
   try {
     await waitForDesktopWriterOperations(1)
@@ -13939,6 +14120,9 @@ ipcMain.handle('desktop:migration:run', async (
       detail: 'Another profile operation, update, or quit is already in progress.',
     }
   }
+  // A non-modal invitation may still contain a draft for the old profile.
+  // Once import owns admission, discard that UI before adopting new credentials.
+  if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   let report: Record<string, unknown> | null = null
   let migrationVerified = false
   let migrationApplied = false
@@ -14258,7 +14442,12 @@ async function performOnboardingSave(
     app.isPackaged,
     (event, detail) => desktopLog(event, detail),
   )
+  const savedProfileKey = desktopProfileKey()
+  const restartGatewayAfterSave = Boolean(gatewayProcess && gatewayState.owned)
   try {
+    // Settings transactions require exclusive ownership of the profile. The
+    // client stays open while its local Gateway drains and restarts afterwards.
+    if (restartGatewayAfterSave) await stopOwnedGatewayAndWait()
     // Keep the existing writer-admission boundary: lifecycle drains do not need
     // to wait for an inspect that has not begun a settings write.
     let recoveryRequired: boolean
@@ -14285,21 +14474,8 @@ async function performOnboardingSave(
       ))
     }
 
-    // Validate credential-backed providers before entering writer admission:
-    // a rejected draft must never reach credential/config persistence. Keep
-    // keyless providers such as Ollama on their existing local-first path.
-    const provider = PROVIDER_BY_ID.get(normalizeProvider(payload.provider))
-    if (provider?.requiresApiKey) {
-      try {
-        const probe = await probeOnboardingProvider(payload)
-        if (!probe.ok) {
-          throw new Error(probe.message || 'Configuration verification failed.')
-        }
-      } catch (error) {
-        if (flow.state === 'saving') flow.state = 'editing'
-        throw error
-      }
-    }
+    // Connection tests are an optional diagnostic. Saving validates local
+    // fields and persists them even while the provider or network is offline.
 
     let finishWriter: (() => void) | null = null
     try {
@@ -14382,8 +14558,19 @@ async function performOnboardingSave(
       }
       return telemetry.recordReturned({ ok: true })
     })
+  } catch (error) {
+    // Even failures before writer admission (for example a Gateway that cannot
+    // stop yet) must leave a visible invitation retryable.
+    if (flow.state === 'saving') flow.state = 'editing'
+    throw error
   } finally {
     telemetry.finish()
+    if (restartGatewayAfterSave && desktopProfileKey() === savedProfileKey
+      && !isQuitting && !desktopWriters.closed && appExitPhase === 'running') {
+      clearReusableGatewayState()
+      bootError = null
+      void openOrResumeDesktopApp()
+    }
   }
 }
 
@@ -14410,6 +14597,7 @@ async function withRecoveryOperation<T>(
     }
   }
   recoveryOperationBusy = true
+  if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)
   recoveryOperationError = null
   publishRecoveryState()
   let outcome: { ok: true; value: T } | { ok: false; error: string }
@@ -14840,6 +15028,14 @@ ipcMain.handle('desktop:onboarding:save', async (event, payload: OnboardingPaylo
     return onboardingSaveFailure('onboarding_inactive', 'OpenSquilla setup is no longer active.')
   }
   return await request.promise
+})
+ipcMain.handle('desktop:onboarding:skip', (event) => {
+  const flow = onboardingFlows.active
+  if (!flow || !trustedOnboardingIpc(event, flow)) {
+    return onboardingSaveFailure('onboarding_inactive', 'No trusted onboarding is in progress.')
+  }
+  dismissOnboardingFlow(flow)
+  return { ok: true }
 })
 ipcMain.handle('desktop:onboarding:cancel', (event) => {
   const flow = onboardingFlows.active

@@ -230,6 +230,31 @@ const inlineSaved = 'llm = { provider = "openrouter" }\r\nsquilla_router = { ena
 const inlineChanged = switchPrimary(savedPrimary, { existingRaw: inlineSaved })
 assert.equal(parse(inlineChanged.routerLines.join('\n')).squilla_router.enabled, false)
 assert.equal(inlineChanged.router.routerTiers.c1.provider, 'tokenrhythm')
+
+const directWithoutTiers = {
+  llm: { provider: 'ollama', model: 'synthetic-local-model' },
+  squilla_router: { enabled: false, preset_binding: 'follow_primary' },
+  llm_ensemble: { enabled: false },
+}
+const enabledFromDirect = switchPrimary(directWithoutTiers, { requestedMode: 'squilla_router' })
+assert.equal(parse(enabledFromDirect.routerLines.join('\n')).squilla_router.enabled, true)
+assert.equal(enabledFromDirect.router.routerTiers.c1.provider, 'tokenrhythm')
+const directCustomWithoutTiers = {
+  ...directWithoutTiers,
+  squilla_router: { enabled: false, preset_binding: 'custom' },
+}
+const replacedDirect = switchPrimary(directCustomWithoutTiers, {
+  requestedMode: 'squilla_router',
+  requestedRouter: { ...fresh, writeIntent: 'replace' },
+})
+assert.equal(replacedDirect.router.routerPresetBinding, 'follow_primary')
+assert.equal(replacedDirect.router.routerTiers.c1.provider, 'tokenrhythm')
+const retainedDirect = switchPrimary(directCustomWithoutTiers, { requestedMode: 'direct' })
+assert.equal(retainedDirect.router.routerMode, 'disabled')
+assert.deepEqual(retainedDirect.router.routerTiers, {})
+assert.deepEqual(parse(retainedDirect.routerLines.join('\n')).squilla_router,
+  directCustomWithoutTiers.squilla_router)
+
 assert.equal(switchPrimary(savedPrimary, { provider: 'openrouter' }), null)
 const custom = structuredClone(savedPrimary)
 custom.squilla_router.preset_binding = 'custom'

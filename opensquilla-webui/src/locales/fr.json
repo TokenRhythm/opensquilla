@@ -3630,6 +3630,10 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "Configurez un service de modèle avant de discuter.",
+      "configure": "Configurer le modèle"
+    },
     "skillPalette": {
       "title": "Commands and skills",
       "command": "Commands",

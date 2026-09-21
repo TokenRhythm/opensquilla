@@ -640,6 +640,7 @@
       :events="conversationSessionRuntime.events"
     />
 
+    <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
@@ -849,6 +850,7 @@ import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDi
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
 import ChatProcesses from '@/components/chat/ChatProcesses.vue'
+import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'

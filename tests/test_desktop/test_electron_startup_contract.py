@@ -997,7 +997,7 @@ def test_mutating_recovery_commands_wait_briefly_for_a_busy_profile_writer() -> 
     main_ts = _read("desktop/electron/src/main.ts")
 
     assert "const RECOVERY_LOCK_TIMEOUT_SECONDS = 5" in main_ts
-    assert main_ts.count("'--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS)") == 5
+    assert main_ts.count("'--lock-timeout', String(RECOVERY_LOCK_TIMEOUT_SECONDS)") == 6
 
 
 def test_desktop_runtime_is_primary_only_with_safe_legacy_enumeration() -> None:
@@ -1465,7 +1465,7 @@ def test_desktop_local_packaging_builds_slim_package_without_runtime_fetch() -> 
     assert scripts["pack:prepared"].endswith(" && npm run verify:package")
 
 
-def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
+def test_desktop_onboarding_is_owned_nonmodal_child_of_main_window() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     verifier = _read("desktop/electron/scripts/verify-package.mjs")
     onboarding = _section(
@@ -1477,12 +1477,14 @@ def test_desktop_onboarding_is_owned_modal_child_of_main_window() -> None:
     assert "const parentWindow = currentMainWindow()" in onboarding
     assert "const window = new BrowserWindow" in onboarding
     assert "parent: parentWindow ?? undefined" in onboarding
-    assert "modal: Boolean(parentWindow)" in onboarding
+    assert "modal: false" in onboarding
+    assert "modal: Boolean(parentWindow)" not in onboarding
     assert "onboardingWindow = window" in onboarding
     assert "focusOnboardingWindow()" in onboarding
     assert r"const\s+window\s*=\s*new\s+" in verifier
     assert r"onboardingWindow\s*=\s*window\b" in verifier
     assert "onboardingWindowAssignmentIndex < modalOptionIndex" in verifier
+    assert r"modal\s*:\s*false" in verifier
 
 
 def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_cta() -> None:
@@ -1562,20 +1564,29 @@ def test_desktop_onboarding_exposes_immediate_and_slow_submit_feedback() -> None
 
 def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
-    router_profiles = _read("desktop/electron/src/desktop-router-profiles.ts")
+    router_profiles = json.loads(
+        _read("desktop/electron/src/generated/desktop-router-catalog.ts").split(" = ", 1)[1]
+    )
     router_config = _read("desktop/electron/src/desktop-router-config.ts")
     tokenrhythm_catalog = _section(main_ts, "id: 'tokenrhythm'", "id: 'openrouter'")
-    tokenrhythm_profile = _section(router_profiles, "  tokenrhythm: {", "  openrouter: {")
+    tokenrhythm_profile = router_profiles["tokenrhythm"]
     onboarding_html = _section(main_ts, "function onboardingHtml", "async function runOnboarding")
 
-    assert "routerSupported: true" in tokenrhythm_catalog
+    assert "routerSupported: supportsRouter(provider.id)" in main_ts
     assert "ensembleSelectionMode: 'static_tokenrhythm_b5'" in tokenrhythm_catalog
     assert "model: ROUTER_PROFILES.tokenrhythm.c1.model" in tokenrhythm_catalog
     openrouter_catalog = _section(main_ts, "id: 'openrouter'", "id: 'openai'")
     assert "model: ROUTER_PROFILES.openrouter.c1.model" in openrouter_catalog
     assert "desktopRouterConfigTomlLines(credential, existingRaw, routerWriteIntent)" in main_ts
     assert "`preset_binding = ${tomlValue(binding)}`" in router_config
-    assert "return selected.routerSupported ? 'squilla_router' : 'direct';" in onboarding_html
+    assert (
+        "return selected.onboardingModel && selected.routerSupported ? 'squilla_router' : 'direct';"
+        in onboarding_html
+    )
+    assert (
+        "onboardingModel: ['tokenrhythm', 'openrouter'].includes(entry.id) ? entry.model : ''"
+        in onboarding_html
+    )
     assert (
         "routerMode.value = modelRoutingMode.value === 'direct' ? 'disabled' : 'recommended';"
         in onboarding_html
@@ -1597,10 +1608,9 @@ def test_desktop_tokenrhythm_single_page_onboarding_defaults_to_router() -> None
         "glm-5.3",
         "kimi-k2.6",
     )
-    for model in expected_models:
-        assert model in tokenrhythm_profile
-    assert "ensembleEnabled: false" in tokenrhythm_profile
-    assert "thinkingLevel" not in tokenrhythm_profile
+    assert {tier["model"] for tier in tokenrhythm_profile.values()} == set(expected_models)
+    assert tokenrhythm_profile["c3"]["ensembleEnabled"] is False
+    assert all("thinkingLevel" not in tier for tier in tokenrhythm_profile.values())
     assert "ensemble_enabled = ${tomlValue(ensembleEnabled)}" in router_config
 
 
@@ -2617,7 +2627,7 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
     )
     assert "else if (desktopUpdateManaged())" in startup
     assert "desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)" in startup
-    assert "connection.disableNetworkObservability" in start
+    assert "connection?.disableNetworkObservability" in start
     assert "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1'" in start
 
 
@@ -2656,7 +2666,7 @@ def test_package_verifier_hard_fails_stale_runtime_and_boot_contract() -> None:
         "gatewayStartPromise",
         "openOrResumeDesktopApp",
         "load the local Desktop renderer before gateway startup",
-        "first-run onboarding an owned modal child window",
+        "first-run onboarding an owned non-modal child window",
         "does not prefer the onboarding window when focusing",
         "app.asar package.json version is not npm semver",
         "prereleases must use 0.5.0-rc2 style, not 0.5.0rc2",
@@ -3895,7 +3905,8 @@ def test_desktop_boot_does_not_run_legacy_typescript_import_recovery() -> None:
     assert "recoverInterruptedDesktopImport()" not in start
     assert "recoverPendingMigrationReconciliation()" not in start
     assert "relocateLegacyDesktopStateLayout" not in main_ts
-    assert "await runOnboarding()" in start
+    assert "await prepareDesktopStartupConnection()" in start
+    assert "await runOnboarding()" not in start
 
 
 def test_desktop_migration_run_requires_valid_report_and_reopens_before_restart() -> None:
@@ -3988,6 +3999,11 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
         "ipcMain.handle('desktop:boot:state'",
     )
     onboarding = _section(main_ts, "async function runOnboarding", "async function pathExists")
+    prepare = _section(
+        main_ts,
+        "async function prepareDesktopStartupConnection",
+        "function dismissOnboardingFlow",
+    )
     save = _section(
         main_ts,
         "ipcMain.handle('desktop:onboarding:save'",
@@ -4010,7 +4026,10 @@ def test_settings_import_reconciles_or_prompts_for_imported_provider() -> None:
     assert "onboardingHtml(" in onboarding
     assert "pendingProviderSetup," in onboarding
     assert "onboardingMigrationCandidates" not in onboarding
-    assert "desktopSecretStoragePolicyBackend() === 'safeStorage'" in onboarding
+    assert "desktopSecretStoragePolicyBackend() === 'safeStorage'" in prepare
+    assert prepare.index("desktopSecretStoragePolicyBackend() === 'safeStorage'") < prepare.index(
+        "if (!pendingProviderSetup && existing && isConnectionReady(existing))"
+    )
 
     reconcile = _section(
         main_ts,
@@ -4139,11 +4158,16 @@ def test_onboarding_inline_json_escapes_script_terminators_and_line_separators()
         "ONBOARDING_SCRIPT_MESSAGES",
         "SEARCH_PROVIDER_NOTE_MESSAGES",
         "desktopLocale",
-        "PROVIDER_CATALOG",
         "SEARCH_PROVIDER_CATALOG",
         "pendingProviderSetup",
     ):
         assert f"${{inlineScriptJson({value})}}" in html
+    assert re.search(
+        r"const providers = \$\{inlineScriptJson\(PROVIDER_CATALOG\.map\(entry => \(\{"
+        r"\s*\.\.\.entry,\s*onboardingModel: \['tokenrhythm', 'openrouter'\]"
+        r"\.includes\(entry\.id\) \? entry\.model : '',\s*\}\)\)\)\};",
+        html,
+    ), "the derived onboarding provider catalog must also use the script-safe serializer"
     assert "${inlineScriptJson(PROVIDER_NOTE_MESSAGES)}" not in html
     assert "${inlineScriptJson(TEXT_ROUTER_TIERS)}" not in html
     assert "${inlineScriptJson(ROUTER_PROFILES)}" not in html
