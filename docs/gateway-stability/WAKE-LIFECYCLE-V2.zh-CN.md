@@ -25,8 +25,8 @@ Gateway writer 保留已有 2 秒 direct-send、30 秒 recovery-credit、60 秒 
 
 ## 验证结果
 
-- WebUI 全量 Vitest：513 个测试文件、7756 个测试通过。
-- Wake/RPC 状态机：`rpc.test.ts` 139 个测试通过；新增覆盖初始 `pageshow`、native resume 的 CONNECTING/无 socket 路径。
+- WebUI 全量 Vitest：513 个测试文件、7757 个测试通过。
+- Wake/RPC 状态机和诊断清洗：181 个定向测试通过；新增覆盖初始 `pageshow`、native resume 的 CONNECTING/无 socket 路径和 close reason 保留。
 - Gateway writer/close/flow/diagnostics 定向 pytest：87 个通过。
 - Electron TypeScript：`npx tsc --noEmit -p desktop/electron/tsconfig.json` 通过。
 - Electron source build：`npm run build` 通过。
