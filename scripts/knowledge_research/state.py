@@ -214,8 +214,9 @@ class KnowledgeResearchStore:
             "verificationStatus": "server_authoritative",
             "mode": mode,
             "workflow": (
-                "Discover, search within candidate files, draft small batches, compare the "
-                "draft with sources via researchNavigate view=review, then finalize."
+                "Discover, search within candidate files, draft small batches, evaluate the "
+                "draft via researchNavigate view=review, apply the returned optimization "
+                "actions, repeat evaluation until it passes, then finalize."
                 if mode == "deep"
                 else "Use relevant evidence and disclose limitations."
             ),

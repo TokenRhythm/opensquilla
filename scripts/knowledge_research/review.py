@@ -369,4 +369,20 @@ def review_requirements(state: Mapping[str, Any]) -> dict[str, Any] | None:
             }
         )
     pending.extend(report_breadth_checks(state))
-    return {"status": "needs_review", "checks": pending, "review": preparation} if pending else None
+    if not pending:
+        return None
+    return {
+        "status": "needs_review",
+        "phase": "evaluation",
+        "evaluation": {
+            "status": "failed",
+            "blockingIssueCount": len(pending),
+        },
+        "optimizationRequired": True,
+        "nextStep": (
+            "Apply the listed optimization actions, run researchNavigate with view=review "
+            "again, then retry researchFinalize."
+        ),
+        "checks": pending,
+        "review": preparation,
+    }

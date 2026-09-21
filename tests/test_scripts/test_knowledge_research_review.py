@@ -46,6 +46,10 @@ def test_deep_requires_scoped_call_and_current_complete_comparison(tmp_path: Pat
     invoke(bridge, "researchAddClaims", {**common, "batchKey": "one", "claims": [claim]})
     store.atomic_update(rid, lambda state: state.update(mode="deep"))
     pending = store.finalize(research_id=rid)
+    assert pending["phase"] == "evaluation"
+    assert pending["evaluation"]["status"] == "failed"
+    assert pending["optimizationRequired"] is True
+    assert "researchNavigate" in pending["nextStep"]
     assert {check["code"] for check in pending["checks"]} == {
         "SCOPED_SEARCH_REQUIRED",
         "SOURCE_COMPARISON_REQUIRED",

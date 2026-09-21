@@ -41,8 +41,11 @@ rules. These notes explain tool outputs, not additional research quotas.
   `completeEvidenceProjectionCount` and `filesWithCompleteEvidenceProjectionCount`
   count prepared evidence ranges, not whole-file reading or comprehension.
   `modelDelivery="unknown"` must not be reinterpreted as successful reading.
-- Finalize's `needs_review` checks are actionable gate failures with no manifest;
-  `finalized` permits manifest publication but does not certify source semantics.
+- Finalize's `needs_review` response is the lightweight evaluation stage: it lists
+  actionable gate failures, sets `optimizationRequired=true`, and gives the next
+  step to optimize, run `researchNavigate(view="review")` again, and retry
+  finalize. No manifest is produced until the response is clear. `finalized`
+  permits manifest publication but does not certify source semantics.
   Optional expected-item lists cover submitted items only.
 - Tool receipts cannot observe model failures before execution or complete provider
   token/cost accounting. Do not fill missing usage with zero or call it a billed total.

@@ -155,6 +155,12 @@ Correct the paragraph or caption using its current hash, then review changed
 groups again. Reading pages is not a semantic certificate. Preserve supported
 detail when correcting errors; do not shrink the report merely to pass checks.
 
+Treat this as a simple evaluation loop: if `mcp_researchFinalize` returns
+`status="needs_review"`, read its `checks` as the optimization list, make the
+smallest evidence-backed fixes, run a fresh review, and retry finalization. Do
+not publish between iterations. Continue until the actionable checks are empty;
+no separate scorecard is required for this first workflow version.
+
 Call `mcp_researchFinalize` only after this work. Resolve `needs_review` through
 correction or justified qualification, never by dropping integrity expectations
 or changing mode. Core conclusions without evidence and broken artifacts block
