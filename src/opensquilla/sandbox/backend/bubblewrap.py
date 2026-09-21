@@ -299,6 +299,14 @@ class BubblewrapBackend(Backend):
             return False
         return probe_bwrap().available
 
+    async def probe_runtime(self, *, cwd: Path | None = None) -> None:
+        """Run bubblewrap's bounded namespace/proc readiness checks."""
+
+        _ = cwd
+        probe = probe_bwrap()
+        if not probe.available:
+            raise SandboxBackendError(f"helper_probe_failed: {probe.message}")
+
     def operation_domains_supported(self) -> frozenset[SandboxOperationDomain]:
         return frozenset({"filesystem"})
 

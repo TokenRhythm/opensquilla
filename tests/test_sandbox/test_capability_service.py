@@ -38,3 +38,18 @@ def test_failed_setup_is_not_available() -> None:
     assert report.available is False
     assert report.code == "setup_failed"
     assert report.capabilities == frozenset()
+
+
+def test_failed_setup_preserves_stable_probe_error_code() -> None:
+    report = capability_report_from_setup(
+        SetupResult(
+            state=SandboxSetupState.FAILED,
+            platform="win32",
+            message="failed",
+            detail="helper_probe_timeout: helper did not exit before deadline",
+        ),
+        backend="windows_default",
+    )
+
+    assert report.available is False
+    assert report.code == "helper_probe_timeout"

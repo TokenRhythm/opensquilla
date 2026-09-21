@@ -7164,6 +7164,14 @@ async function pathIsFile(path: string): Promise<boolean> {
   }
 }
 
+async function pathIsDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 async function assertRepoRoot(): Promise<void> {
   const pyprojectPath = join(repoRoot, 'pyproject.toml')
   const webuiPath = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist', 'index.html')
@@ -7175,6 +7183,19 @@ async function assertRepoRoot(): Promise<void> {
       `Built Control UI not found at ${webuiPath}. Run "cd opensquilla-webui && npm run build" first.`
     )
   }
+}
+
+async function validateGatewayRuntime(runtime: RuntimeLaunch): Promise<RuntimeLaunch> {
+  if (typeof runtime.command !== 'string' || runtime.command.trim() === '') {
+    throw new Error('runtime_root_missing: Gateway command is empty')
+  }
+  if (!(await pathIsDirectory(runtime.cwd))) {
+    throw new Error(`runtime_root_missing: Gateway cwd does not exist: ${runtime.cwd}`)
+  }
+  if (runtime.mode === 'bundled' && !(await pathIsFile(runtime.command))) {
+    throw new Error(`runtime_root_missing: Gateway binary does not exist: ${runtime.command}`)
+  }
+  return runtime
 }
 
 function packagedRuntimeRoot(): string {
@@ -7228,22 +7249,30 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
   const onedirBinary = join(runtimeRoot, 'opensquilla-gateway', binaryName)
   const flatBinary = join(runtimeRoot, binaryName)
   const bundledBinary = (await pathIsFile(onedirBinary)) ? onedirBinary : flatBinary
-  if (await pathIsFile(bundledBinary)) {
-    return {
+  // Development must always use the selected checkout. A staged runtime under
+  // packageRoot can be removed by worktree cleanup while the Gateway is still
+  // alive; only packaged applications own that runtime for the child lifetime.
+  if (app.isPackaged && await pathIsFile(bundledBinary)) {
+    return await validateGatewayRuntime({
       command: bundledBinary,
       args: ['gateway', 'run'],
       cwd: dirname(bundledBinary),
       mode: 'bundled',
-    }
+    })
   }
 
-  await assertRepoRoot()
-  return {
+  try {
+    await assertRepoRoot()
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`runtime_root_missing: ${detail}`)
+  }
+  return await validateGatewayRuntime({
     command: 'uv',
     args: ['run', 'opensquilla', 'gateway', 'run'],
     cwd: repoRoot,
     mode: 'dev',
-  }
+  })
 }
 
 const ONBOARDING_PROBE_STDOUT_LIMIT = 256 * 1024
@@ -8984,6 +9013,15 @@ async function startGateway(): Promise<GatewayState> {
     advanceGatewayStartTelemetry('spawn', 'runtime_unavailable')
     throw error
   }
+  if (!(await pathIsDirectory(runtime.cwd))) {
+    advanceGatewayStartTelemetry('spawn', 'runtime_unavailable')
+    throw new Error(`runtime_root_missing: Gateway cwd does not exist: ${runtime.cwd}`)
+  }
+  desktopLog('gateway_runtime_resolved', {
+    mode: runtime.mode,
+    command: runtime.command,
+    cwd: runtime.cwd,
+  })
 
   // Start the main-process-only bridge before the final port-selection await.
   // Its random endpoint and 256-bit token are injected only into this owned
@@ -9094,6 +9132,9 @@ async function startGateway(): Promise<GatewayState> {
     profileKind: activeProfile.kind,
     pid: child.pid,
     port,
+    runtimeMode: runtime.mode,
+    runtimeCommand: runtime.command,
+    runtimeCwd: runtime.cwd,
   })
   if (runtime.mode === 'dev') gatewayProcessTreeChildren.add(child)
 

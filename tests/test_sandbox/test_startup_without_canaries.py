@@ -183,6 +183,64 @@ async def test_startup_failure_does_not_install_repair_or_retry(monkeypatch):
     assert calls == ["initialize"]
 
 
+async def test_startup_runs_backend_probe_once_and_keeps_status_passive(monkeypatch):
+    """Startup validates the selected backend; capability status remains a read."""
+
+    setup_runtime.mark_sandbox_startup_pending()
+    calls: list[dict[str, object]] = []
+
+    class Backend:
+        name = "windows_default"
+
+        async def probe_runtime(self, **kwargs):
+            calls.append(kwargs)
+
+    backend = Backend()
+
+    async def initialize():
+        return backend
+
+    monkeypatch.setattr(integration, "initialize_runtime_backend", initialize)
+    monkeypatch.setattr(integration, "get_runtime", lambda: SimpleNamespace(backend=backend))
+    result = await setup_runtime.initialize_sandbox_runtime(SimpleNamespace())
+
+    assert result.state is SandboxSetupState.READY
+    assert len(calls) == 1
+
+    # The cached startup result prevents a second helper launch. The capability
+    # report itself remains a passive status path and does not probe again.
+    report = await setup_runtime.current_sandbox_capability_report(SimpleNamespace())
+    assert report.available is True
+    assert len(calls) == 1
+
+
+async def test_startup_probe_failure_marks_safe_unavailable_without_full_fallback(monkeypatch):
+    setup_runtime.mark_sandbox_startup_pending()
+
+    class Backend:
+        name = "windows_default"
+
+        async def probe_runtime(self, **_kwargs):
+            from opensquilla.sandbox.types import SandboxBackendError
+
+            raise SandboxBackendError("helper_probe_timeout: startup helper did not exit")
+
+    backend = Backend()
+
+    async def initialize():
+        return backend
+
+    monkeypatch.setattr(integration, "initialize_runtime_backend", initialize)
+    monkeypatch.setattr(integration, "get_runtime", lambda: SimpleNamespace(backend=backend))
+
+    result = await setup_runtime.initialize_sandbox_runtime(SimpleNamespace())
+
+    assert result.state is SandboxSetupState.FAILED
+    assert "helper_probe_timeout" in (result.detail or "")
+    report = await setup_runtime.current_sandbox_capability_report(SimpleNamespace())
+    assert report.available is False
+
+
 async def test_full_access_remains_authorized_when_sandbox_startup_fails(monkeypatch):
     from opensquilla.sandbox.mode_resolver import ModeResolutionError, resolve_mode
     from opensquilla.sandbox.run_mode import RunMode

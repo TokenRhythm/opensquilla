@@ -1924,6 +1924,33 @@ def test_start_gateway_preserves_host_path_without_static_runtime_injection() ->
     assert "PATH: childPath" in start
 
 
+def test_gateway_runtime_selection_validates_cwd_and_keeps_dev_on_checkout() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    resolver = _section(
+        main_ts,
+        "async function resolveGatewayRuntime(): Promise<RuntimeLaunch>",
+        "const ONBOARDING_PROBE_STDOUT_LIMIT",
+    )
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    # A staged runtime is owned by packaged Electron only. Development must
+    # run from the selected checkout so worktree cleanup cannot orphan a child
+    # whose helper still points at that staged directory.
+    assert "if (app.isPackaged && await pathIsFile(bundledBinary))" in resolver
+    assert "await assertRepoRoot()" in resolver
+    assert "command: 'uv'" in resolver
+    assert "mode: 'dev'" in resolver
+    assert "async function validateGatewayRuntime(runtime: RuntimeLaunch)" in main_ts
+    assert "runtime_root_missing: Gateway cwd does not exist" in main_ts
+    assert "cwd: runtime.cwd" in start
+    assert "runtimeMode: runtime.mode" in start
+    assert "runtimeCwd: runtime.cwd" in start
+
+
 def test_desktop_python_children_force_utf8_stdio() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
     start = _section(

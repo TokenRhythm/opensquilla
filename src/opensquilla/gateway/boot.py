@@ -1206,7 +1206,7 @@ def _desktop_ownership_profile_home(config: GatewayConfig) -> Path:
 
 
 async def _ensure_sandbox_setup_on_boot(config: GatewayConfig) -> Any | None:
-    """Initialize the existing sandbox after gateway readiness, without self-tests."""
+    """Initialize Safe and run its bounded backend helper readiness probe."""
     from opensquilla.sandbox.setup_runtime import initialize_sandbox_runtime
 
     result = await initialize_sandbox_runtime(config)
