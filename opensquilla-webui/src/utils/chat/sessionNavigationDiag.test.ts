@@ -138,6 +138,7 @@ describe('sessionNavigationDiag', () => {
   it.each([
     'wake_incident_timeout', 'socket_not_open', 'probe_socket_unavailable', 'probe_failed',
     'probe_send_failure', 'control_unconfirmed', 'scheduler_lag', 'wake_grace',
+    'native_resume_socket_unavailable',
     'round_trip', 'hello', 'direct_send_timeout', 'recovery_credit_timeout',
     'writer_send_failed', 'writer_serialize_failed', 'writer_capacity', 'transport_resource_limit',
   ])('preserves the fixed transport reason %s', reason => {

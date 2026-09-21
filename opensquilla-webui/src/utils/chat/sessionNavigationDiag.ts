@@ -105,6 +105,7 @@ const SAFE_DIAGNOSTIC_REASONS = new Set([
   'control_unconfirmed',
   'wake_probe_unconfirmed',
   'native_resume_probe_timeout',
+  'native_resume_socket_unavailable',
   'desktop_resume',
   'scheduler_lag',
   'wake_grace',
