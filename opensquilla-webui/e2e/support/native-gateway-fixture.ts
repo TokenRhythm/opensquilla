@@ -26,7 +26,11 @@ export const test = base.extend<{ nativeGateway: StartNativeGateway }>({
             return
           }
           const request = upstream.protocol === 'https:' ? httpsRequest : httpRequest
-          const proxy = request(asset, { method: incoming.method }, response => {
+          // The request target may select a path, never the upstream authority.
+          const proxy = request(upstream, {
+            path: asset.pathname + asset.search,
+            method: incoming.method,
+          }, response => {
             outgoing.writeHead(response.statusCode || 502, response.headers)
             response.pipe(outgoing)
           })

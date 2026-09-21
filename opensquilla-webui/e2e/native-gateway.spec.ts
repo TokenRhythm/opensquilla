@@ -1,3 +1,4 @@
+import { request as httpRequest } from 'node:http'
 import { expect } from '@playwright/test'
 import { test } from './support/native-gateway-fixture'
 
@@ -23,4 +24,23 @@ test('serves UI assets and native WebSocket frames without forwarding gateway re
   expect((await request.get(origin + '/api/approvals')).status()).toBe(403)
   expect((await request.post(origin + '/control/')).status()).toBe(403)
   expect((await request.get(origin + '/control/../api/approvals')).status()).toBe(403)
+})
+
+test('rejects raw request targets that escape the configured asset upstream', async ({ nativeGateway }) => {
+  const origin = await nativeGateway(() => {})
+  for (const path of [
+    '//127.0.0.1:9/control/',
+    'http://127.0.0.1:9/control/',
+    '/control/%2e%2e/api/approvals',
+  ]) {
+    const status = await new Promise<number | undefined>((resolve, reject) => {
+      const request = httpRequest(origin, { path }, response => {
+        response.resume()
+        resolve(response.statusCode)
+      })
+      request.on('error', reject)
+      request.end()
+    })
+    expect(status).toBe(403)
+  }
 })
