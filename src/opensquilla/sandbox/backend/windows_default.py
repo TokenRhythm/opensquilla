@@ -146,7 +146,7 @@ class WindowsDefaultBackend(Backend):
         request = SandboxRequest(
             argv=(str(_python_executable()), "-c", "pass"),
             cwd=helper_root,
-            action_kind="capability.probe",
+            action_kind="helper.startup_probe",
             policy=SandboxPolicy(
                 level=SecurityLevel.STANDARD,
                 network=NetworkMode.NONE,
@@ -386,6 +386,8 @@ def _payload_for_request(
         # the user's real Safe profile, which can trigger expensive inherited
         # ACL churn on a large home directory.
         policy["capabilityProbe"] = True
+    if _is_helper_startup_probe_request(request):
+        policy["helperProbe"] = True
     network_boundary = _windows_network_boundary_payload(request)
     if network_boundary is not None:
         policy["windowsNetworkBoundary"] = network_boundary
@@ -413,6 +415,10 @@ def _is_capability_probe_request(request: SandboxRequest) -> bool:
     return request.action_kind == "capability.probe" or request.action_kind.startswith(
         "capability.probe.fs.worker."
     )
+
+
+def _is_helper_startup_probe_request(request: SandboxRequest) -> bool:
+    return request.action_kind == "helper.startup_probe"
 
 
 def _extract_authenticated_helper_timeout(
@@ -1330,7 +1336,7 @@ def _request_needs_host_tool_paths(request: SandboxRequest) -> bool:
     return (
         request.env.get("OPENSQUILLA_GUEST_SAFE") != "1"
         and not _is_filesystem_worker_request(request)
-        and request.action_kind != "capability.probe"
+        and request.action_kind not in {"capability.probe", "helper.startup_probe"}
     )
 
 

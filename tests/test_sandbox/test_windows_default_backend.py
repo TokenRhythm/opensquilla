@@ -105,7 +105,7 @@ async def test_windows_startup_probe_uses_validated_helper_root_and_no_cache_sid
 
     request = captured["request"]
     assert request.cwd == helper_root
-    assert request.action_kind == "capability.probe"
+    assert request.action_kind == "helper.startup_probe"
     assert request.policy.network is NetworkMode.NONE
     assert request.policy.workspace_rw is False
     assert request.policy.tmp_writable is False
