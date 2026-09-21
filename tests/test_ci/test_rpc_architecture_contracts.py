@@ -37,6 +37,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/session_read_contract.py",
         # Additive connection-local snapshot and consumption control Contracts.
         "src/opensquilla/gateway/adapters/connection_recovery_contract.py",
+        # Read-only acceptance recovery validates frozen material without copying bodies.
+        "src/opensquilla/gateway/adapters/turn_receipt_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -127,8 +129,8 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Add metadata-only Skill candidates and the allow-use setting.
 # Add the owner-authorized workspace source reference reader.
 # Add session-owned managed process list, output preview and stop.
-RUNTIME_RPC_METHOD_BASELINE = 301
-RUNTIME_RPC_METHOD_DIGEST = "7979e15e8945643942f2ae907c5d8526e9412202607771d87f5ad7d4286a3ca5"
+RUNTIME_RPC_METHOD_BASELINE = 302
+RUNTIME_RPC_METHOD_DIGEST = "1f72bc664390009413bcdad04bee72f9964a70605eef4d9d2d71018ba6a654a8"
 STATIC_RPC_DECORATOR_BASELINE = 72
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1430,6 +1432,7 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         ("sessions.processes.list", "operator.read"),
         ("sessions.processes.log", "operator.read"),
         ("sessions.processes.stop", "operator.write"),
+        ("turns.receipt.get", "operator.read"),
     ):
         process_entry = registry.get_entry(method)
         assert process_entry is not None

@@ -149,6 +149,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "sandbox.run_mode.preference.get",
         "sessions.list",
         "sessions.messages.hydrate",
+        "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     }
@@ -2446,10 +2447,16 @@ async def handle_ws_connection(
         conn._enable_flow()
 
     # Step 6: Send HelloOk
+    from opensquilla.gateway.turn_receipts import (
+        TURN_RECEIPT_CAPABILITY,
+        TURN_RECEIPT_METHOD,
+        can_read_turn_receipts,
+    )
+
     hello = HelloOk(
         protocol=negotiated,
         server=ServerInfo(version=__version__, conn_id=conn_id),
-        features=_build_features(dispatcher),
+        features=_build_features(dispatcher, principal=conn.principal),
         snapshot=SnapshotInfo(
             uptime_ms=int(time.time() * 1000),
             config_path=config.config_path,
@@ -2457,6 +2464,12 @@ async def handle_ws_connection(
             auth_mode=config.auth.mode,
         ),
         policy=PolicyInfo(
+            turn_receipt_lookup=(
+                TURN_RECEIPT_CAPABILITY
+                if can_read_turn_receipts(conn.principal)
+                and TURN_RECEIPT_METHOD in dispatcher.list_methods()
+                else None
+            ),
             transport_probe_nonce=PROBE_CAPABILITY in conn.client_caps,
             transport_flow=(
                 {
@@ -3133,11 +3146,14 @@ async def _dispatch_and_send(
     await conn.send_res(response)
 
 
-def _build_features(dispatcher: RpcDispatcher) -> Any:
+def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = None) -> Any:
     from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
+    from opensquilla.gateway.turn_receipts import TURN_RECEIPT_METHOD, can_read_turn_receipts
 
     methods = dispatcher.list_methods()
+    if principal is not None and not can_read_turn_receipts(principal):
+        methods = [method for method in methods if method != TURN_RECEIPT_METHOD]
     events = [
         "connect.challenge",
         "agent",

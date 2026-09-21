@@ -3,6 +3,11 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "turns.receipt.get",
+      "roles": ["params", "result"]
+    },
+    {
+      "kind": "method",
       "wireName": "sessions.processes.list",
       "roles": ["params", "result"]
     },

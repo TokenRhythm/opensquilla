@@ -11361,6 +11361,26 @@ class SessionStorage:
             ),
         )
 
+    @_serialized_read
+    async def get_turn_receipt_context(
+        self, session_id: str, message_id: str,
+    ) -> dict[str, Any] | None:
+        """Read receipt disposition without decoding message bodies or replaying admission."""
+        async with self.conn.execute(
+            "SELECT turn_context FROM compacted_transcript_entries "
+            "WHERE session_id = ? AND message_id = ? "
+            "UNION ALL SELECT turn_context FROM transcript_entries "
+            "WHERE session_id = ? AND message_id = ? LIMIT 1",
+            (session_id, message_id, session_id, message_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            return None
+        raw = row["turn_context"]
+        if isinstance(raw, str):
+            raw = json.loads(raw)
+        return raw if isinstance(raw, dict) else {}
+
     async def replay_turn_ingress_receipt(
         self,
         *,

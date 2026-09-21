@@ -78,6 +78,7 @@ import opensquilla.gateway.rpc_system  # noqa: E402, F401
 import opensquilla.gateway.rpc_telemetry  # noqa: E402, F401
 import opensquilla.gateway.rpc_tools  # noqa: E402, F401
 import opensquilla.gateway.rpc_transport  # noqa: E402, F401
+import opensquilla.gateway.rpc_turn_receipts  # noqa: E402, F401
 import opensquilla.gateway.rpc_usage  # noqa: E402, F401
 import opensquilla.gateway.rpc_wizard  # noqa: E402, F401
 import opensquilla.gateway.rpc_workbench_resources  # noqa: E402, F401

@@ -394,6 +394,7 @@ class PolicyInfo(BaseModel):
     client_ws_keepalive_timeout_ms: int = 0
     transport_probe_nonce: bool = False
     transport_flow: dict[str, Any] | None = None
+    turn_receipt_lookup: Literal["turns.receipt.read.v1"] | None = None
 
 
 class HelloOk(BaseModel):

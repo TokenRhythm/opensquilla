@@ -1441,6 +1441,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "turns.receipt.get",
+      "schema": "conversation/turns-receipt-get.schema.json",
+      "schemaSha256": "77cc0ff556b4dac77c096a1f6d2bc37128dd2f867085cb7a19b99f900b9e6029"
+    },
+    {
+      "lifecycle": "stable",
       "name": "usage.cost",
       "schema": "conversation/usage-cost.schema.json",
       "schemaSha256": "c4cb8527211ff633205ffa7c53a2c712756516e1bfa9881c43a4860cc02c7b2d"
@@ -1527,10 +1533,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "7fdd4c3268ddbef30899a9b5ed5eb8d6ec401a3100294ffa27caaaec4371da58",
-    "methodCount": 225,
-    "schemaCount": 235,
-    "schemaTreeSha256": "0d85b1692d3c76d162f9d8b9322db294d340890ecd8be2e45ac1ff178f2ffbd9",
+    "generatorSha256": "b34f4830fc0f8e5af6b9301da83eb99a93d1168a4b75578c13545c6a4b03a41c",
+    "methodCount": 226,
+    "schemaCount": 236,
+    "schemaTreeSha256": "c6f88179a90dbb0ca80807545a64e8aa9632831c391a0e60add79b4facba2034",
     "toolchains": {
       "legacyTypes": {
         "python": {
