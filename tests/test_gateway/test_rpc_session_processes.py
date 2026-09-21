@@ -115,9 +115,16 @@ async def test_completion_log_and_read_rpc_do_not_consume_notifications(process_
     _, session, ctx, _ = process_env
     execution_id = await start(process_env, "print('界' * 15000, flush=True)")
     process = shell._bg_sessions[execution_id]
-    await asyncio.wait_for(asyncio.shield(process.collector_task), 15)
-    page = await call(ctx, session.session_key, "log", executionId=execution_id, limit=40)
-    assert page.error is None
+    async with asyncio.timeout(15):
+        await asyncio.shield(process.collector_task)
+        # Output collection can finish before the POSIX anchor confirms that
+        # the process group is empty. Wait for the public lifecycle boundary.
+        while True:
+            page = await call(ctx, session.session_key, "log", executionId=execution_id, limit=40)
+            assert page.error is None
+            if page.payload["status"] != "running":
+                break
+            await asyncio.sleep(0.03)
     assert page.payload["status"] == "done"
     assert len(page.payload["output"]) == 40
     assert page.payload["truncated"] is True

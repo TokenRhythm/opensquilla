@@ -953,7 +953,11 @@ def _capture_posix_group_descendants(
         info for info in snapshot.values() if info.pgid == pgid and info.pid != anchor_pid
     )
     if not roots:
-        return _PosixDescendantCapture((), False)
+        # Natural completion can leave only the still-owned anchor before a
+        # stop arrives. Confirm the empty group independently; an unavailable
+        # snapshot or a surviving member must still fail closed. The anchor
+        # retains its consecutive-empty checks before releasing ownership.
+        return _PosixDescendantCapture((), _posix_group_members(pgid) == (anchor_pid,))
     children: dict[int, list[_PosixProcessInfo]] = {}
     for info in snapshot.values():
         children.setdefault(info.ppid, []).append(info)
@@ -1903,19 +1907,6 @@ class ProcessTreeOwner:
         """Idempotently terminate this owner, bounded by the supplied timeouts."""
 
         async with self._terminate_lock:
-            if (
-                self.posix_anchor is not None
-                and getattr(self.process, "returncode", None) is not None
-                and self.is_active()
-            ):
-                # The leader can be reaped before the anchor confirms its
-                # empty group. Let that natural completion settle before a
-                # signal requests a descendant capture with no surviving root.
-                # Charge this wait to the existing grace budget; a still-live
-                # tree must continue through the normal termination path.
-                deadline = asyncio.get_running_loop().time() + max(0.0, graceful_timeout)
-                await self.posix_anchor.settle(graceful_timeout)
-                graceful_timeout = max(0.0, deadline - asyncio.get_running_loop().time())
             if not self.is_active():
                 await self._mark_closed()
                 if self.posix_anchor is not None:
