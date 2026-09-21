@@ -12,6 +12,9 @@ import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import { SESSION_ROUTING_KEY } from './modules/sessionRouting'
 import { TURN_COMMANDS_KEY } from './modules/turnCommands'
+import { DURABLE_DELIVERY_KEY } from './modules/delivery'
+import { createDurableDelivery } from './runtime/durableDelivery'
+import { createPendingInputWal } from './utils/chat/pendingInputWal'
 import { PENDING_INPUT_QUEUE_KEY } from './modules/pendingInputQueue'
 import { APPROVAL_CENTER_KEY } from './modules/approvalCenter'
 import { GOAL_CENTER_KEY } from './modules/goalCenter'
@@ -69,6 +72,23 @@ rpcStore.init()
 const gatewayAdapters = createGatewayAdapters(rpcStore, {
   http: createPrivateHttpTransport(),
 })
+const durableDelivery = createDurableDelivery({
+  commands: gatewayAdapters.turnCommands,
+  wal: createPendingInputWal(),
+  access: {
+    identity: () => gatewayAdapters.gatewayAccess.deliveryIdentity,
+    available: () => gatewayAdapters.gatewayAccess.isAvailable
+      && gatewayAdapters.gatewayAccess.connectionPhase === 'healthy',
+    generation: () => gatewayAdapters.gatewayAccess.subscriptionEpoch,
+  },
+})
+const stopDeliveryWatch = watch(() => [
+  gatewayAdapters.gatewayAccess.deliveryIdentity,
+  gatewayAdapters.gatewayAccess.isAvailable,
+  gatewayAdapters.gatewayAccess.connectionPhase,
+  gatewayAdapters.gatewayAccess.subscriptionEpoch,
+], () => { void durableDelivery.wake() }, { immediate: true })
+app.onUnmount(() => { stopDeliveryWatch(); durableDelivery.dispose() })
 appStore.bindAppSettings(gatewayAdapters.appSettings)
 watch(() => rpcStore.state, (state) => {
   if (state === 'connected' && appStore.pendingChannelNoticeLocale) {
@@ -95,7 +115,8 @@ app.provide(
   gatewayAdapters.sessionLifecycle,
 )
 app.provide(SESSION_ROUTING_KEY, gatewayAdapters.sessionRouting)
-app.provide(TURN_COMMANDS_KEY, gatewayAdapters.turnCommands)
+app.provide(TURN_COMMANDS_KEY, durableDelivery.commands)
+app.provide(DURABLE_DELIVERY_KEY, durableDelivery)
 app.provide(PENDING_INPUT_QUEUE_KEY, gatewayAdapters.pendingInputQueue)
 app.provide(APPROVAL_CENTER_KEY, gatewayAdapters.approvalCenter)
 app.provide(GOAL_CENTER_KEY, gatewayAdapters.goalCenter)

@@ -1,16 +1,17 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 
 import {
   createPendingInputWal,
   type PendingInputWalRecord,
   type ResponseHandoffWalRecord,
+  type DeliveryWalRecord,
 } from './pendingInputWal'
 
 const PENDING_STORE = 'pending_chat_inputs'
 const HANDOFF_STORE = 'response_handoffs'
 
 type StoreName = typeof PENDING_STORE | typeof HANDOFF_STORE
-type StoredValue = PendingInputWalRecord | ResponseHandoffWalRecord
+type StoredValue = PendingInputWalRecord | ResponseHandoffWalRecord | DeliveryWalRecord
 
 function clone<T>(value: T): T {
   return structuredClone(value)
@@ -34,6 +35,7 @@ class ControlledOpenRequest extends ControlledRequest<IDBDatabase> {
 }
 
 class ControlledIdbFactory {
+  readonly versions: number[] = []
   private readonly stores = new Map<StoreName, Map<IDBValidKey, StoredValue>>()
   private holdNextAtomic = false
   private heldTransaction: ControlledTransaction | null = null
@@ -42,7 +44,7 @@ class ControlledIdbFactory {
   private resolveHeldWrites: ((stores: readonly StoreName[]) => void) | null = null
 
   readonly idbFactory = {
-    open: () => this.open(),
+    open: (_name: string, version: number) => { this.versions.push(version); return this.open() },
   } as unknown as IDBFactory
 
   open(): IDBOpenDBRequest {
@@ -385,5 +387,81 @@ it('retains the initial model pin through durable handoff storage without adding
   expect(factory.snapshot([PENDING_STORE]).get(PENDING_STORE)?.size).toBe(0)
   await wal.acceptHandoff!('pin-request', 'agent:main:webchat:accepted')
   expect((await wal.listHandoffs!())[0]?.params.initialModel).toBe('model-a')
+  wal.close()
+})
+
+function deliveryRecord(id = 'synthetic-delivery'): DeliveryWalRecord {
+  return {
+    schemaVersion: 2, ownerRequestId: id, deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+    request: { kind: 'send', request: { kind: 'new-turn', params: {
+      sessionKey: 'synthetic-session', clientRequestId: id, clientMessageId: 'synthetic-message', message: 'synthetic text',
+    } } }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1,
+  }
+}
+
+it('uses v3 and preserves delivery authority while handoff fields change', async () => {
+  const factory = new ControlledIdbFactory()
+  const wal = createPendingInputWal(factory.idbFactory)!
+  const record = deliveryRecord()
+  await wal.prepareDelivery!(record)
+  expect(factory.versions).toEqual([3])
+  const handoff: ResponseHandoffWalRecord = {
+    schemaVersion: 1, ownerRequestId: record.ownerRequestId, requestSessionKey: record.requestSessionKey,
+    clientRequestId: record.ownerRequestId, clientMessageId: 'synthetic-message', composerText: 'synthetic text',
+    recoveryAttachments: [], params: { sessionKey: record.requestSessionKey, clientRequestId: record.ownerRequestId,
+      clientMessageId: 'synthetic-message', message: 'synthetic text' },
+    state: 'submitting', createdAt: 1, updatedAt: 1,
+  }
+  await wal.putHandoff!(handoff)
+  await wal.acceptHandoff!(record.ownerRequestId, 'synthetic-target')
+  expect(await wal.getDelivery!(record.ownerRequestId)).toMatchObject({
+    schemaVersion: 2, deliveryIdentity: 'synthetic-identity', phase: 'unknown',
+    handoff: { state: 'accepted', acceptedSessionKey: 'synthetic-target' },
+  })
+  await wal.deleteHandoff!(record.ownerRequestId)
+  expect(await wal.getDelivery!(record.ownerRequestId)).toMatchObject({ schemaVersion: 2, phase: 'unknown' })
+  expect(await wal.listHandoffs!()).toEqual([])
+  expect(factory.snapshot([HANDOFF_STORE]).get(HANDOFF_STORE)?.size).toBe(1)
+  wal.close()
+})
+
+it('rejects stale delivery CAS and does not adopt legacy records without a live handoff owner', async () => {
+  const factory = new ControlledIdbFactory()
+  const wal = createPendingInputWal(factory.idbFactory)!
+  const record = deliveryRecord()
+  await wal.prepareDelivery!(record)
+  const stopped = { ...record, revision: 2, stop: { requested: true as const } }
+  expect((await wal.compareAndSwapDelivery!(record.ownerRequestId, 1, stopped)).applied).toBe(true)
+  expect((await wal.compareAndSwapDelivery!(record.ownerRequestId, 1, { ...record, revision: 2, phase: 'accepted' })).applied).toBe(false)
+  expect((await wal.getDelivery!(record.ownerRequestId))?.stop?.requested).toBe(true)
+  const legacy: ResponseHandoffWalRecord = {
+    schemaVersion: 1, ownerRequestId: 'legacy-request', requestSessionKey: 'synthetic-session', clientRequestId: 'legacy-request',
+    clientMessageId: 'synthetic-message', composerText: 'synthetic text', recoveryAttachments: [],
+    params: { sessionKey: 'synthetic-session', clientRequestId: 'legacy-request', clientMessageId: 'synthetic-message', message: 'synthetic text' },
+    state: 'submitting', createdAt: 1, updatedAt: 1,
+  }
+  await wal.putHandoff!(legacy)
+  expect(await wal.prepareDelivery!(deliveryRecord('legacy-request'))).toEqual({ applied: false, record: null })
+  expect(factory.record(HANDOFF_STORE, 'legacy-request')).toEqual(legacy)
+  wal.close()
+})
+
+it('closes a late successful blocked open and never deletes the database on a downgrade error', async () => {
+  const blocked = new ControlledOpenRequest()
+  const downgraded = new ControlledOpenRequest()
+  const close = vi.fn()
+  const indexedDb = { open: vi.fn().mockReturnValueOnce(blocked).mockReturnValueOnce(downgraded), deleteDatabase: vi.fn() }
+  const wal = createPendingInputWal(indexedDb as unknown as IDBFactory)!
+  const waiting = wal.listDeliveries!()
+  blocked.onblocked?.(new Event('blocked'))
+  await expect(waiting).rejects.toThrow('blocked')
+  blocked.result = { close } as unknown as IDBDatabase
+  blocked.onsuccess?.(new Event('success'))
+  expect(close).toHaveBeenCalledTimes(1)
+  const retry = wal.listDeliveries!()
+  downgraded.error = new DOMException('Synthetic newer schema exists', 'VersionError')
+  downgraded.onerror?.(new Event('error'))
+  await expect(retry).rejects.toMatchObject({ name: 'VersionError' })
+  expect(indexedDb.deleteDatabase).not.toHaveBeenCalled()
   wal.close()
 })

@@ -908,6 +908,7 @@ import {
 } from '@/modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
+import { DURABLE_DELIVERY_KEY } from '@/modules/delivery'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
 import { GOAL_CONTINUITY_KEY, type GoalContinuity } from '@/modules/goalContinuity'
@@ -1241,6 +1242,7 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
 if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
 const turnCommands: TurnCommands = injectedTurnCommands
+const durableDelivery = inject(DURABLE_DELIVERY_KEY)
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter: ApprovalCenter = injectedApprovalCenter
@@ -3647,6 +3649,7 @@ const {
 resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 
 const chatSend = useChatSend({
+  durableDelivery,
   selectedSkills,
   consumeAcceptedDraft: draftPersistence.consumeAcceptedDraft,
   captureAttachmentDraftConsumption: chatAttachments.captureDraftConsumption,
@@ -3662,6 +3665,9 @@ const chatSend = useChatSend({
     },
     cancel: (request, options) => turnCommands.cancel(request, options),
     steer: (request, options) => turnCommands.steer(request, options),
+    lookupReceipt: (request, options) => turnCommands.lookupReceipt?.(request, options)
+      || Promise.resolve({ status: 'unsupported' as const }),
+    supportsReceiptLookup: () => turnCommands.supportsReceiptLookup?.() ?? false,
     supports: capability => turnCommands.supports(capability),
   },
   activeSteerCapability,
@@ -7448,6 +7454,7 @@ watch(
 )
 
 onUnmounted(() => {
+  chatSend.dispose()
   cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)
   window.removeEventListener('pointercancel', onThreadPointerEnd)

@@ -3,10 +3,14 @@ import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
 import { snapshotAttachment } from './attachments'
-import type { TurnSendParams } from '@/modules/turnCommands'
+import type {
+  TurnCancelRequest, TurnReceiptRequest, TurnSendParams, TurnSendResponse, TurnSteerResponse,
+} from '@/modules/turnCommands'
 
 const DATABASE_NAME = 'opensquilla-chat-pending-inputs'
-const DATABASE_VERSION = 2
+// Older clients opening v2 must fail with VersionError, never replay v3 data
+// without the identity fence or delete the database to repair that error.
+const DATABASE_VERSION = 3
 const STORE_NAME = 'pending_chat_inputs'
 const HANDOFF_STORE_NAME = 'response_handoffs'
 
@@ -76,6 +80,29 @@ export interface ResponseHandoffWalRecord {
   updatedAt: number
 }
 
+/** One authority for a delivery and its optional session handoff projection. */
+export interface DeliveryWalRecord {
+  schemaVersion: 2
+  ownerRequestId: string
+  deliveryIdentity: string
+  requestSessionKey: string
+  request?: TurnReceiptRequest
+  phase: 'prepared' | 'submitting' | 'unknown' | 'accepted' | 'not-sent'
+  response?: TurnSendResponse | TurnSteerResponse
+  stop?: { requested: true; request?: TurnCancelRequest; completed?: boolean }
+  paused?: 'authority' | 'conflict'
+  handoff?: ResponseHandoffWalRecord
+  revision: number
+  lease?: { owner: string; epoch: number; expiresAt: number }
+  createdAt: number
+  updatedAt: number
+}
+
+export interface DeliveryWalMutation {
+  applied: boolean
+  record: DeliveryWalRecord | null
+}
+
 export interface PendingInputOrderCommit {
   records: PendingInputWalRecord[]
 }
@@ -120,7 +147,61 @@ export interface PendingInputWal {
     handoffSignal?: AbortSignal,
   ) => Promise<AcceptedHandoffCommit | null>
   deleteHandoff?: (ownerRequestId: string) => Promise<void>
+  listDeliveries?: () => Promise<DeliveryWalRecord[]>
+  listRecoveryDeliveries?: (after?: string, limit?: number) => Promise<{ records: DeliveryWalRecord[]; next?: string }>
+  findDeliveryByTask?: (identity: string, sessionKey: string, taskId: string) => Promise<DeliveryWalRecord | null>
+  onInvalidated?: (listener: () => void) => () => void
+  countQuarantinedDeliveries?: () => Promise<number>
+  getDelivery?: (ownerRequestId: string) => Promise<DeliveryWalRecord | null>
+  /** Create only, or attach to the exact handoff prepared by this live caller. */
+  prepareDelivery?: (
+    record: DeliveryWalRecord,
+    handoffOwner?: { owner: string; revision: number },
+  ) => Promise<DeliveryWalMutation>
+  /** An IndexedDB read/write transaction is the cross-tab CAS authority. */
+  compareAndSwapDelivery?: (
+    ownerRequestId: string,
+    expectedRevision: number,
+    record: DeliveryWalRecord | null,
+  ) => Promise<DeliveryWalMutation>
   close: () => void
+}
+
+function isDeliveryWalRecord(value: unknown): value is DeliveryWalRecord {
+  if (!value || typeof value !== 'object') return false
+  const record = value as DeliveryWalRecord
+  return record.schemaVersion === 2
+    && typeof record.ownerRequestId === 'string' && record.ownerRequestId.length > 0
+    && typeof record.deliveryIdentity === 'string' && record.deliveryIdentity.length > 0
+    && typeof record.requestSessionKey === 'string' && record.requestSessionKey.length > 0
+    && ['prepared', 'submitting', 'unknown', 'accepted', 'not-sent'].includes(record.phase)
+    && Number.isSafeInteger(record.revision) && record.revision >= 1
+    && Number.isFinite(record.createdAt) && Number.isFinite(record.updatedAt)
+    && (record.request?.kind === 'send' || record.request?.kind === 'steer' || !!record.stop?.request?.taskId)
+}
+
+function handoffFromStored(value: unknown): ResponseHandoffWalRecord | null {
+  const candidate = isDeliveryWalRecord(value) ? value.handoff : value
+  return isResponseHandoffWalRecord(candidate) ? candidate : null
+}
+
+function withHandoff(value: unknown, handoff: ResponseHandoffWalRecord | null): unknown {
+  return isDeliveryWalRecord(value)
+    ? indexedDelivery({ ...value, handoff: handoff || undefined, revision: value.revision + 1, updatedAt: Date.now() })
+    : handoff
+}
+
+function indexedDelivery(record: DeliveryWalRecord) {
+  const response = record.response
+  const promotedTask = response && 'disposition' in response && response.disposition === 'promoted' ? response.promotedTurnId : undefined
+  const task = promotedTask || record.stop?.request?.taskId || response?.taskId
+    || (response && 'promotedTurnId' in response ? response.promotedTurnId : undefined)
+    || (response && 'turnId' in response ? response.turnId : undefined)
+  const pending = ['prepared', 'unknown', 'submitting'].includes(record.phase) || !!(record.stop && !record.stop.completed)
+  return { ...record, recoveryState: pending ? 'pending' : 'settled',
+    ...(task ? { taskScope: [record.deliveryIdentity, record.stop?.request?.sessionKey
+      || response?.sessionKey || response?.key || record.requestSessionKey, task] } : {}),
+  }
 }
 
 const WAL_STATES = new Set<PendingInputWalState>([
@@ -291,12 +372,18 @@ function transactionDone(transaction: IDBTransaction): Promise<void> {
 
 class BrowserPendingInputWal implements PendingInputWal {
   private databasePromise: Promise<IDBDatabase> | null = null
+  private openEpoch = 0
+  private invalidated = false
+  private invalidationListeners = new Set<() => void>()
 
   constructor(private readonly indexedDb: IDBFactory) {}
 
   private database(): Promise<IDBDatabase> {
+    if (this.invalidated) return Promise.reject(new Error('Pending-input WAL version changed; reload this client'))
     if (this.databasePromise) return this.databasePromise
+    const epoch = ++this.openEpoch
     this.databasePromise = new Promise<IDBDatabase>((resolve, reject) => {
+      let abandoned = false
       const request = this.indexedDb.open(DATABASE_NAME, DATABASE_VERSION)
       request.onupgradeneeded = () => {
         const database = request.result
@@ -308,22 +395,37 @@ class BrowserPendingInputWal implements PendingInputWal {
             unique: false,
           })
         }
-        if (!database.objectStoreNames.contains(HANDOFF_STORE_NAME)) {
-          database.createObjectStore(HANDOFF_STORE_NAME, {
+        const handoffs = !database.objectStoreNames.contains(HANDOFF_STORE_NAME)
+          ? database.createObjectStore(HANDOFF_STORE_NAME, {
             keyPath: 'ownerRequestId',
           })
-        }
+          : request.transaction!.objectStore(HANDOFF_STORE_NAME)
+        if (!handoffs.indexNames?.contains('recovery_state')) handoffs.createIndex('recovery_state', 'recoveryState', { unique: false })
+        if (!handoffs.indexNames?.contains('task_scope')) handoffs.createIndex('task_scope', 'taskScope', { unique: false })
+        if (!handoffs.indexNames?.contains('handoff_session')) handoffs.createIndex('handoff_session', 'handoff.requestSessionKey', { unique: false })
       }
       request.onsuccess = () => {
-        request.result.onversionchange = () => request.result.close()
+        if (abandoned || epoch !== this.openEpoch) {
+          request.result.close()
+          reject(new Error('Pending-input WAL open was superseded'))
+          return
+        }
+        request.result.onversionchange = () => {
+          this.invalidated = true
+          request.result.close()
+          if (epoch === this.openEpoch) this.databasePromise = null
+          for (const listener of this.invalidationListeners) listener()
+        }
         resolve(request.result)
       }
       request.onerror = () => {
-        this.databasePromise = null
+        abandoned = true
+        if (epoch === this.openEpoch) this.databasePromise = null
         reject(request.error || new Error('Unable to open pending-input WAL'))
       }
       request.onblocked = () => {
-        this.databasePromise = null
+        abandoned = true
+        if (epoch === this.openEpoch) this.databasePromise = null
         reject(new Error('Pending-input WAL upgrade is blocked by another tab'))
       }
     })
@@ -413,7 +515,12 @@ class BrowserPendingInputWal implements PendingInputWal {
   async putHandoff(record: ResponseHandoffWalRecord): Promise<void> {
     const database = await this.database()
     const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
-    transaction.objectStore(HANDOFF_STORE_NAME).put(cloneHandoffRecord(record))
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const current = await requestResult(store.get(record.ownerRequestId))
+    if (current !== undefined && !handoffFromStored(current) && !isDeliveryWalRecord(current)) {
+      throw new Error('Unrecognized delivery record is quarantined')
+    }
+    store.put(withHandoff(current, cloneHandoffRecord(record)))
     await transactionDone(transaction)
   }
 
@@ -423,10 +530,11 @@ class BrowserPendingInputWal implements PendingInputWal {
     const database = await this.database()
     const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
     const store = transaction.objectStore(HANDOFF_STORE_NAME)
-    const current = await requestResult(store.get(record.ownerRequestId))
-    if (isResponseHandoffWalRecord(current)) {
+    const stored = await requestResult(store.get(record.ownerRequestId))
+    const current = handoffFromStored(stored)
+    if (stored !== undefined) {
       await transactionDone(transaction)
-      return { applied: false, record: cloneHandoffRecord(current) }
+      return { applied: false, record: current ? cloneHandoffRecord(current) : null }
     }
     const prepared = cloneHandoffRecord(record)
     store.put(prepared)
@@ -443,20 +551,22 @@ class BrowserPendingInputWal implements PendingInputWal {
     const database = await this.database()
     const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
     const store = transaction.objectStore(HANDOFF_STORE_NAME)
-    const current = await requestResult(store.get(ownerRequestId))
+    const stored = await requestResult(store.get(ownerRequestId))
+    const current = handoffFromStored(stored)
     if (
-      !isResponseHandoffWalRecord(current)
+      !current
       || current.walOwnerId !== expectedWalOwnerId
       || current.walRevision !== expectedWalRevision
     ) {
       await transactionDone(transaction)
       return {
         applied: false,
-        record: isResponseHandoffWalRecord(current) ? cloneHandoffRecord(current) : null,
+        record: current ? cloneHandoffRecord(current) : null,
       }
     }
     if (!record) {
-      store.delete(ownerRequestId)
+      if (isDeliveryWalRecord(stored)) store.put(withHandoff(stored, null))
+      else store.delete(ownerRequestId)
       await transactionDone(transaction)
       return { applied: true, record: null }
     }
@@ -469,7 +579,7 @@ class BrowserPendingInputWal implements PendingInputWal {
       throw new Error('Invalid response handoff compare-and-swap transition')
     }
     const next = cloneHandoffRecord(record)
-    store.put(next)
+    store.put(withHandoff(stored, next))
     await transactionDone(transaction)
     return { applied: true, record: next }
   }
@@ -477,10 +587,14 @@ class BrowserPendingInputWal implements PendingInputWal {
   async listHandoffs(requestSessionKey?: string): Promise<ResponseHandoffWalRecord[]> {
     const database = await this.database()
     const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
-    const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME).getAll())
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const raw = await requestResult(requestSessionKey
+      ? store.index('handoff_session').getAll(requestSessionKey)
+      : store.getAll())
     await transactionDone(transaction)
     return (raw as unknown[])
-      .filter(isResponseHandoffWalRecord)
+      .map(handoffFromStored)
+      .filter((record): record is ResponseHandoffWalRecord => record !== null)
       .filter(record => !requestSessionKey || record.requestSessionKey === requestSessionKey)
       .map(cloneHandoffRecord)
       .sort((left, right) => left.createdAt - right.createdAt)
@@ -514,8 +628,9 @@ class BrowserPendingInputWal implements PendingInputWal {
     const handoffStore = transaction.objectStore(HANDOFF_STORE_NAME)
     const pendingStore = transaction.objectStore(STORE_NAME)
     try {
-      const rawHandoff = await requestResult(handoffStore.get(ownerRequestId))
-      if (!isResponseHandoffWalRecord(rawHandoff)) {
+      const stored = await requestResult(handoffStore.get(ownerRequestId))
+      const rawHandoff = handoffFromStored(stored)
+      if (!rawHandoff) {
         transaction.abort()
         throw new Error('Response handoff no longer exists')
       }
@@ -534,7 +649,7 @@ class BrowserPendingInputWal implements PendingInputWal {
         acceptedSessionKey,
         updatedAt: Date.now(),
       })
-      handoffStore.put(handoff)
+      handoffStore.put(withHandoff(stored, handoff))
       const records = (rawPending as unknown[])
         .filter(isPendingInputWalRecord)
         .filter(record => record.ownerRequestId === ownerRequestId)
@@ -563,8 +678,125 @@ class BrowserPendingInputWal implements PendingInputWal {
   async deleteHandoff(ownerRequestId: string): Promise<void> {
     const database = await this.database()
     const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
-    transaction.objectStore(HANDOFF_STORE_NAME).delete(ownerRequestId)
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const stored = await requestResult(store.get(ownerRequestId))
+    if (isDeliveryWalRecord(stored)) store.put(withHandoff(stored, null))
+    else if (isResponseHandoffWalRecord(stored)) store.delete(ownerRequestId)
     await transactionDone(transaction)
+  }
+
+  async listDeliveries(): Promise<DeliveryWalRecord[]> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME).getAll())
+    await transactionDone(transaction)
+    return (raw as unknown[]).filter(isDeliveryWalRecord).map(record => structuredClone(record))
+  }
+
+  async listRecoveryDeliveries(after?: string, limit = 16): Promise<{ records: DeliveryWalRecord[]; next?: string }> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const records: DeliveryWalRecord[] = []
+    let next: string | undefined
+    const request = transaction.objectStore(HANDOFF_STORE_NAME).index('recovery_state').openCursor(IDBKeyRange.only('pending'))
+    await new Promise<void>((resolve, reject) => {
+      request.onerror = () => reject(request.error || new Error('Delivery recovery cursor failed'))
+      request.onsuccess = () => {
+        const cursor = request.result
+        if (!cursor) { resolve(); return }
+        const id = String(cursor.primaryKey)
+        if (after && id <= after) { cursor.continue(); return }
+        if (records.length >= Math.max(1, Math.min(limit, 64))) {
+          next = records[records.length - 1]?.ownerRequestId
+          resolve()
+          return
+        }
+        if (isDeliveryWalRecord(cursor.value)) records.push(structuredClone(cursor.value))
+        cursor.continue()
+      }
+    })
+    await transactionDone(transaction)
+    return { records, ...(next ? { next } : {}) }
+  }
+
+  async findDeliveryByTask(identity: string, sessionKey: string, taskId: string): Promise<DeliveryWalRecord | null> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME).index('task_scope').get([identity, sessionKey, taskId]))
+    await transactionDone(transaction)
+    return isDeliveryWalRecord(raw) ? structuredClone(raw) : null
+  }
+
+  async countQuarantinedDeliveries(): Promise<number> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    // Count native index entries; legacy attachment payloads are never loaded.
+    const [total, indexed] = await Promise.all([requestResult(store.count()), requestResult(store.index('recovery_state').count())])
+    await transactionDone(transaction)
+    return total - indexed
+  }
+
+  onInvalidated(listener: () => void): () => void {
+    this.invalidationListeners.add(listener)
+    return () => { this.invalidationListeners.delete(listener) }
+  }
+
+  async getDelivery(ownerRequestId: string): Promise<DeliveryWalRecord | null> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME).get(ownerRequestId))
+    await transactionDone(transaction)
+    return isDeliveryWalRecord(raw) ? structuredClone(raw) : null
+  }
+
+  async prepareDelivery(
+    record: DeliveryWalRecord,
+    handoffOwner?: { owner: string; revision: number },
+  ): Promise<DeliveryWalMutation> {
+    if (!isDeliveryWalRecord(record)) throw new Error('Invalid delivery record')
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const raw = await requestResult(store.get(record.ownerRequestId))
+    const handoff = handoffFromStored(raw)
+    const canAdopt = !isDeliveryWalRecord(raw) && handoff && handoffOwner
+      && handoff.walOwnerId === handoffOwner.owner
+      && handoff.walRevision === handoffOwner.revision
+      && handoff.requestSessionKey === record.requestSessionKey
+      && handoff.state === 'submitting'
+    if (raw !== undefined && !canAdopt) {
+      await transactionDone(transaction)
+      return { applied: false, record: isDeliveryWalRecord(raw) ? structuredClone(raw) : null }
+    }
+    const next = structuredClone({ ...record, ...(canAdopt ? { handoff } : {}) })
+    store.put(indexedDelivery(next))
+    await transactionDone(transaction)
+    return { applied: true, record: next }
+  }
+
+  async compareAndSwapDelivery(
+    ownerRequestId: string,
+    expectedRevision: number,
+    record: DeliveryWalRecord | null,
+  ): Promise<DeliveryWalMutation> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readwrite')
+    const store = transaction.objectStore(HANDOFF_STORE_NAME)
+    const raw = await requestResult(store.get(ownerRequestId))
+    if (!isDeliveryWalRecord(raw) || raw.revision !== expectedRevision) {
+      await transactionDone(transaction)
+      return { applied: false, record: isDeliveryWalRecord(raw) ? structuredClone(raw) : null }
+    }
+    if (record) {
+      if (!isDeliveryWalRecord(record) || record.ownerRequestId !== ownerRequestId
+        || record.revision !== expectedRevision + 1 || record.deliveryIdentity !== raw.deliveryIdentity) {
+        throw new Error('Invalid delivery compare-and-swap transition')
+      }
+      store.put(indexedDelivery(structuredClone(record)))
+    } else store.delete(ownerRequestId)
+    await transactionDone(transaction)
+    return { applied: true, record: record ? structuredClone(record) : null }
   }
 
   async delete(pendingInputId: string): Promise<void> {
@@ -575,6 +807,7 @@ class BrowserPendingInputWal implements PendingInputWal {
   }
 
   close(): void {
+    this.openEpoch += 1
     if (!this.databasePromise) return
     void this.databasePromise.then(database => database.close(), () => {})
     this.databasePromise = null

@@ -227,9 +227,31 @@ function makeOptions(overrides: SendHarnessOverrides = {}) {
     ...sendOverrides,
   }
   if (!sendOverrides.turnCommands) {
+    // Existing scenarios supply admission-shaped synthetic receipts. Keep
+    // their payload fixtures while exercising the new read-only RPC method;
+    // adapter tests independently verify the real receipt wire envelope.
+    const receiptRpc = {
+      async call(method: string, params?: Record<string, unknown>, requestOptions?: unknown) {
+        if (method !== 'turns.receipt.get') return requestOptions
+          ? options.rpc.call(method, params, requestOptions) : options.rpc.call(method, params)
+        const original = params?.originalRequest as Record<string, unknown>
+        const raw = await options.rpc.call(method, original)
+        return {
+          status: 'found', accepted: true, requestFingerprint: `sha256:${'a'.repeat(64)}`,
+          receipt: {
+            requestSessionKey: original.sessionKey || original.key,
+            sessionKey: raw.sessionKey || raw.key || original.sessionKey || original.key,
+            sessionId: 'synthetic-session-id', sessionEpoch: 1,
+            clientRequestId: original.clientRequestId || original.client_request_id,
+            messageId: raw.user_message_id || raw.message_id || 'synthetic-message-id',
+            taskId: raw.task_id || raw.taskId || null, taskStatus: raw.task_status || null,
+          },
+        }
+      },
+    }
     options.turnCommands = createV4TurnCommandsFromRpcClient(
-      options.rpc as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
-      methodAvailability,
+      receiptRpc as Parameters<typeof createV4TurnCommandsFromRpcClient>[0],
+      method => method === 'turns.receipt.get' || Boolean(methodAvailability?.(method)),
     )
   }
   return { api: useChatSend(options), options, rpc, stream, pendingQueue, metaDiscardDraft }
@@ -1399,7 +1421,7 @@ describe('useChatSend attachment payloads', () => {
     await api.recoverResponseHandoffs()
 
     expect(rpc.call).toHaveBeenCalledOnce()
-    expect(rpc.call).toHaveBeenCalledWith('chat.send', params)
+    expect(rpc.call).toHaveBeenCalledWith('turns.receipt.get', params)
     expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(
       parent,
       child,
@@ -1512,7 +1534,7 @@ describe('useChatSend attachment payloads', () => {
     expect(await pendingInputWal.listHandoffs!()).toEqual([])
   })
 
-  it('refreshes expired handoff attachments only after a definite rejection', async () => {
+  it('preserves frozen handoff attachments when receipt lookup fails', async () => {
     const parent = 'agent:main:webchat:expired-fork-parent'
     const child = 'agent:main:webchat:expired-fork-child'
     const file = new File(['durable'], 'durable.txt', { type: 'text/plain' })
@@ -1589,21 +1611,12 @@ describe('useChatSend attachment payloads', () => {
 
     await api.recoverResponseHandoffs()
 
-    expect(prepareAttachmentsForSend).toHaveBeenCalledOnce()
-    expect(rpc.call).toHaveBeenCalledTimes(2)
-    const replay = rpc.call.mock.calls[1]?.[1] as { attachments?: Array<{ file_uuid?: string }> }
-    expect(replay.attachments?.[0]?.file_uuid).toBe('refreshed-upload')
-    expect(replay).toMatchObject({
-      clientRequestId: 'expired-fork-request',
-      clientMessageId: 'expired-fork-message',
-      sessionKey: parent,
-    })
-    expect(recoverPendingQueueHandoff).toHaveBeenCalledWith(
-      parent,
-      child,
-      'expired-fork-request',
-    )
-    expect(retained).toBeNull()
+    expect(prepareAttachmentsForSend).not.toHaveBeenCalled()
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call.mock.calls[0]?.[0]).toBe('turns.receipt.get')
+    expect(recoverPendingQueueHandoff).not.toHaveBeenCalled()
+    expect(retained?.params.attachments?.[0]?.file_uuid).toBe('expired-upload')
+
   })
 
   it('keeps a follow-up in the composer when fork handoff WAL is unavailable', async () => {
@@ -6692,7 +6705,7 @@ describe('useChatSend attachment payloads', () => {
     },
   )
 
-  it('keeps automatically replaying the stopped request beyond a 30 second disconnect', async () => {
+  it('parks an unknown stopped request after four receipt reads without resending', async () => {
     vi.useFakeTimers()
     try {
       let rejectFirstSend!: (reason: unknown) => void
@@ -6744,19 +6757,14 @@ describe('useChatSend attachment payloads', () => {
       rejectFirstSend(Object.assign(new Error('response lost'), { retryable: true }))
       await firstSend
 
-      // 250 + 1,000 + 4,000 + 15,000 + 15,000 ms. Recovery must not
-      // silently stop after exhausting the first pass through the backoff.
-      await vi.advanceTimersByTimeAsync(35_250)
-
-      expect(sendCalls).toBe(6)
+      await vi.advanceTimersByTimeAsync(120_000)
+      expect(sendCalls).toBe(5)
       expect(new Set(requestIds)).toEqual(new Set([requestIds[0]]))
-      expect(abortCalls).toContainEqual({
-        sessionKey: 'agent:main:webchat:test',
-        taskId: 'task-recovered-after-long-disconnect',
-        source: 'webui_stop',
-        scope: 'task',
-      })
-      expect(acceptanceStopPending.value).toBe(false)
+      expect(rpc.call.mock.calls.filter((call: unknown[]) => call[0] === 'chat.send')).toHaveLength(1)
+      expect(rpc.call.mock.calls.filter((call: unknown[]) => call[0] === 'turns.receipt.get')).toHaveLength(4)
+      expect(abortCalls.every(call => !call.taskId)).toBe(true)
+      expect(acceptanceStopPending.value).toBe(true)
+      harness.api.dispose()
     } finally {
       vi.useRealTimers()
     }

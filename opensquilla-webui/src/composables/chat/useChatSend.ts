@@ -33,6 +33,7 @@ import type {
 } from '@/modules/turnCommands'
 import { TurnCommandError } from '@/modules/turnCommands'
 import type { MetaRunCenter } from '@/modules/metaRunCenter'
+import type { DurableDelivery } from '@/modules/delivery'
 import type { ChatRpcStreamApi } from '@/composables/chat/useChatRpcEventHandlers'
 import type { ChatTaskOwnershipApi } from '@/composables/chat/useChatTaskOwnership'
 import type {
@@ -486,6 +487,7 @@ export interface UseChatSendOptions {
   metaRunCenter?: Pick<MetaRunCenter, 'discardDraft'>
   /** Semantic command port; v4 method aliases live in the Gateway Adapter. */
   turnCommands: TurnCommands
+  durableDelivery?: DurableDelivery
   activeSteerCapability?: Readonly<Ref<ChatSteerCapability | null>>
   inputText: Ref<string>
   selectedSkills?: Ref<SelectedSkillRef[]>
@@ -631,6 +633,9 @@ export interface UseChatSendOptions {
 }
 
 export function useChatSend(options: UseChatSendOptions) {
+  let disposed = false
+  const recoveryAttempts = new Map<string, SendAttempt>()
+  const recoveryTimers = new Map<ReturnType<typeof setTimeout>, () => void>()
   const { pushToast } = useToasts()
   const acceptanceStopPending = options.acceptanceStopPending || ref(false)
   let activeFreshSendToken: FreshSendToken | null = null
@@ -664,6 +669,8 @@ export function useChatSend(options: UseChatSendOptions) {
     acceptanceRecoveryVersion.value
     const key = options.sessionKey.value
     if (!key) return false
+    if (options.durableDelivery?.snapshots().some(item => item.sessionKey === key
+      && (item.phase === 'unknown' || item.phase === 'submitting' || item.stopPending))) return true
     for (const attempt of stoppedAcceptanceAttempts.values()) {
       if (attempt.requestSessionKey === key && attempt.stopRequested) return true
     }
@@ -677,6 +684,38 @@ export function useChatSend(options: UseChatSendOptions) {
       options.acceptanceRecoveryPending.value = pending
     }
   }, { immediate: true })
+  const stopDeliverySubscription = options.durableDelivery?.subscribe(noteAcceptanceRecoveryChanged)
+  const stopDeliveryObserver = options.durableDelivery?.observe(record => {
+    if (disposed) return
+    if (record.deliveryIdentity !== options.deliveryIdentity?.value) return
+    if (record.phase === 'accepted' && record.response && record.requestSessionKey === options.sessionKey.value) {
+      options.scheduleHistorySync()
+      if (record.kind === 'send' && record.response.sessionKey
+        && record.response.sessionKey !== record.requestSessionKey) {
+        void options.durableDelivery?.get(record.ownerRequestId).then(delivery => {
+          if (!disposed && delivery?.handoff) return finalizeRecoveredHandoff(delivery.handoff, record.response!.sessionKey!)
+        })
+      }
+      if (record.kind === 'steer') {
+        const response = record.response as import('@/modules/turnCommands').TurnSteerResponse
+        if (response.accepted === true) options.steerDelivery.accept({
+          clientRequestId: record.ownerRequestId, clientMessageId: response.clientMessageId,
+          expectedTurnId: response.expectedTurnId, userMessageId: response.userMessageId,
+          disposition: response.disposition, revision: response.revision, turnId: response.turnId,
+          promotedTurnId: response.promotedTurnId, promotedFromTurnId: response.promotedFromTurnId,
+          appliedIteration: response.appliedIteration, modelCallId: response.modelCallId,
+        })
+      }
+    }
+    const attempt = recoveryAttempts.get(record.ownerRequestId)
+    if (!attempt) return
+    if (record.stop?.completed && attempt.stopRequested) clearAttemptStop(attempt)
+    if (record.phase === 'accepted' && record.response) {
+      void settleRecoveredAcceptance(attempt, record.response).then(settled => {
+        if (settled) recoveryAttempts.delete(record.ownerRequestId)
+      })
+    }
+  })
 
   function metaDiscardStorage(): MetaDiscardStorage | null | undefined {
     return options.metaDiscardStorage
@@ -1125,22 +1164,34 @@ export function useChatSend(options: UseChatSendOptions) {
       attempt.acceptanceResolved = false
       return false
     }
+    if (options.durableDelivery) return false
     return abortRecoveredAcceptedTask(attempt)
   }
 
   function scheduleAcceptanceRecovery(attempt: SendAttempt) {
     if ((attempt.acceptanceResolved && !attempt.stopRequested) || !attempt.acceptanceRequest) return
+    recoveryAttempts.set(attempt.clientRequestId, attempt)
+    if (options.durableDelivery) {
+      void options.durableDelivery.wake()
+      return
+    }
     const key = acceptanceAttemptKey(attempt)
     if (acceptanceRecoveryWorkers.has(key)) return
 
     const operation = (async () => {
       let recoveryAttempt = 0
-      while (!attempt.acceptanceResolved || attempt.stopRequested) {
+      const deadline = Date.now() + 30_000
+      while (!disposed && recoveryAttempt < 4 && Date.now() < deadline
+        && (!attempt.acceptanceResolved || attempt.stopRequested)) {
         const delayMs = acceptanceRecoveryDelaysMs[
           Math.min(recoveryAttempt, acceptanceRecoveryDelaysMs.length - 1)
         ]!
         recoveryAttempt += 1
-        await new Promise<void>(resolve => globalThis.setTimeout(resolve, delayMs))
+        await new Promise<void>(resolve => {
+          const timer = globalThis.setTimeout(() => { recoveryTimers.delete(timer); resolve() }, delayMs)
+          recoveryTimers.set(timer, resolve)
+        })
+        if (disposed) return
         if (attempt.acceptanceResolved) {
           if (await abortRecoveredAcceptedTask(attempt)) return
           continue
@@ -1148,19 +1199,16 @@ export function useChatSend(options: UseChatSendOptions) {
         if (attempt.acceptanceInFlight) continue
         attempt.acceptanceInFlight = true
         try {
-          const response = await options.turnCommands.send(
-            attempt.acceptanceRequest!.request,
-          )
-          if (await settleRecoveredAcceptance(attempt, response)) return
+          if (!options.turnCommands.lookupReceipt || options.turnCommands.supportsReceiptLookup?.() === false) return
+          const receipt = await options.turnCommands.lookupReceipt({ kind: 'send', request: attempt.acceptanceRequest!.request })
+          if (receipt.status === 'unsupported') return
+          if (receipt.status === 'found' && await settleRecoveredAcceptance(attempt, receipt.response)) return
         } catch (error: unknown) {
           const commandError = turnCommandFailure(error)
           const accepted = acceptedErrorInfo(error)
           // A local transport rejection describes only this recovery frame.
           // It cannot prove that the original request was never accepted.
-          if (
-            (commandError?.accepted === false && commandError.kind !== 'transport')
-            || accepted?.terminalWithoutTask
-          ) {
+          if (accepted?.terminalWithoutTask) {
             attempt.acceptanceResolved = true
             if (attempt.stopRequested) clearAttemptStop(attempt)
             if (
@@ -1338,6 +1386,11 @@ export function useChatSend(options: UseChatSendOptions) {
     attempt: SendAttempt,
     requirePrepared = false,
   ): Promise<ResponseHandoffWalRecord | null> {
+    if (options.durableDelivery) {
+      const existing = await options.durableDelivery.get(attempt.clientRequestId).catch(() => null)
+      if (existing?.handoff) return existing.handoff
+    }
+    requirePrepared ||= Boolean(options.durableDelivery)
     const wal = options.pendingInputWal
     if (!wal) return null
     if (requirePrepared && (!wal.prepareHandoff || !wal.compareAndSwapHandoff)) return null
@@ -1857,108 +1910,45 @@ export function useChatSend(options: UseChatSendOptions) {
       if (!wal?.listHandoffs || activeResponseHandoff) return
       let records: ResponseHandoffWalRecord[]
       try {
-        records = await wal.listHandoffs()
+        records = await wal.listHandoffs(options.durableDelivery ? options.sessionKey.value : undefined)
       } catch {
         return
       }
       for (const record of records) {
-        if (record.state === 'preparing') {
-          if (record.walOwnerId && record.walRevision) {
-            await wal.compareAndSwapHandoff?.(
-              record.ownerRequestId,
-              record.walOwnerId,
-              record.walRevision,
-              null,
-            ).catch(() => {})
-          }
+        if (disposed) return
+        // Legacy records have no proven delivery identity. Only the app owner
+        // can authorize recovery; an unknown receipt never re-enters send.
+        if (options.durableDelivery) {
+          const delivery = await options.durableDelivery.get(record.ownerRequestId)
+          if (!delivery || delivery.deliveryIdentity !== options.deliveryIdentity?.value) continue
+          if (delivery.phase === 'accepted' && delivery.response) {
+            await finalizeRecoveredHandoff(record,
+              delivery.response.sessionKey || delivery.response.key || record.requestSessionKey)
+          } else void options.durableDelivery.wake()
           continue
         }
-        if (record.state === 'failed') {
-          if (restoreResponseHandoffDraft(record)) {
-            await deleteResponseHandoff(record)
-          }
+        if (record.state === 'preparing') {
+          if (record.walOwnerId && record.walRevision) await wal.compareAndSwapHandoff?.(
+            record.ownerRequestId, record.walOwnerId, record.walRevision, null,
+          ).catch(() => {})
           continue
         }
         if (record.state === 'accepted' && record.acceptedSessionKey) {
           await finalizeRecoveredHandoff(record, record.acceptedSessionKey)
           continue
         }
-        let replayRecord = record
-        let refreshedExpiredAttachments = false
-        while (true) {
-          try {
-            const response = await options.turnCommands.send({
-              kind: 'new-turn',
-              params: replayRecord.params,
-            })
-            const targetSessionKey = response.sessionKey || replayRecord.requestSessionKey
-            await finalizeRecoveredHandoff(replayRecord, targetSessionKey)
-            break
-          } catch (error) {
-            const accepted = acceptedErrorInfo(error)
-            if (accepted?.sessionKey) {
-              await finalizeRecoveredHandoff(replayRecord, accepted.sessionKey)
-              break
-            }
-            const commandError = turnCommandFailure(error)
-            const code = errorCode(error)
-            const definitelyRejected = commandError?.accepted === false
-            const canRefreshExpiredAttachments = (
-              definitelyRejected
-              && !refreshedExpiredAttachments
-              && options.prepareAttachmentsForSend
-              && (code === 'ATTACHMENT_EXPIRED' || code === 'ATTACHMENT_LOST_IN_RESTART')
-              && replayRecord.recoveryAttachments.some(attachment => (
-                attachment.kind === 'staged' && Boolean(attachment.file)
-              ))
-            )
-            if (canRefreshExpiredAttachments) {
-              refreshedExpiredAttachments = true
-              const refreshed = replayRecord.recoveryAttachments.map(attachment => ({
-                ...attachment,
-                ...(attachment.kind === 'staged' && attachment.file
-                  ? { expires_at: 0 }
-                  : {}),
-              }))
-              const ready = await options.prepareAttachmentsForSend!({
-                attachments: refreshed,
-                isCurrent: () => true,
-              })
-              const sendable = refreshed.filter(isSendableAttachment)
-              if (ready && sendable.length === refreshed.length) {
-                replayRecord = {
-                  ...replayRecord,
-                  params: {
-                    ...replayRecord.params,
-                    ...serializeChatFiles(sendable),
-                  },
-                  recoveryAttachments: refreshed,
-                  updatedAt: Date.now(),
-                }
-                await wal.putHandoff?.(replayRecord)
-                // The Gateway explicitly rejected the old attachment tokens,
-                // so changing only those tokens cannot conflict with a receipt.
-                continue
-              }
-            }
-            if (definitelyRejected && commandError?.retryable === false) {
-              await wal.putHandoff?.({
-                ...replayRecord,
-                state: 'failed',
-                errorCode: code,
-                updatedAt: Date.now(),
-              }).catch(() => {})
-              await options.failPendingQueueHandoff?.(replayRecord.ownerRequestId)
-              pushToast(
-                sendFailureMessage(error),
-                { tone: 'danger' },
-              )
-            }
-            // Unknown/retryable acceptance deliberately remains submitting
-            // and is replayed byte-for-byte after the next reconnect.
-            break
-          }
+        if (record.state === 'failed') {
+          if (restoreResponseHandoffDraft(record)) await deleteResponseHandoff(record)
+          continue
         }
+        if (!options.turnCommands.lookupReceipt || options.turnCommands.supportsReceiptLookup?.() === false) continue
+        try {
+          const receipt = await options.turnCommands.lookupReceipt({
+            kind: 'send', request: { kind: 'new-turn', params: record.params },
+          })
+          if (receipt.status === 'found') await finalizeRecoveredHandoff(record,
+            receipt.response.sessionKey || record.requestSessionKey)
+        } catch { /* Receipt failures cannot settle or rewrite the original handoff. */ }
       }
     })().finally(() => {
       handoffRecoveryPromise = null
@@ -2253,6 +2243,7 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     try {
       const response = await options.turnCommands.steer(toCanonicalTurnSteerRequest(params))
+      if (disposed) return response.accepted ? 'accepted' : 'retryable_failure'
       const sessionChanged = options.sessionKey.value !== requestSessionKey
       if (sessionChanged && response.accepted === true) {
         options.steerDelivery.acknowledgeAcceptedOffscreen(pendingItem)
@@ -3298,7 +3289,7 @@ export function useChatSend(options: UseChatSendOptions) {
       }
       return rejectBeforeDispatch()
     }
-    if (sendOpts.requirePreparedHandoff) {
+    if (sendOpts.requirePreparedHandoff || durableHandoffRecord?.state === 'preparing') {
       const armed = await armPreparedResponseHandoff(durableHandoffRecord, attempt)
       if (!armed) {
         if (freshSendToken && activeFreshSendToken === freshSendToken) {
@@ -3310,6 +3301,7 @@ export function useChatSend(options: UseChatSendOptions) {
         return rejectBeforeDispatch()
       }
       durableHandoffRecord = armed
+      options.durableDelivery?.registerPreparedHandoff(armed)
       if (!preDispatchAllowed('before_rpc')) {
         durableHandoffRecord = await disarmResponseHandoff(armed, attempt) || armed
         if (freshSendToken && activeFreshSendToken === freshSendToken) {
@@ -3363,7 +3355,14 @@ export function useChatSend(options: UseChatSendOptions) {
       )
       attempt.acceptanceRequest = { request: acceptanceRequest }
       attempt.acceptanceInFlight = true
-      const res = await options.turnCommands.send(acceptanceRequest)
+      let res: TurnSendResponse
+      if (attempt.requiresIdempotentReplay) {
+        const receipt = await options.turnCommands.lookupReceipt?.({ kind: 'send', request: acceptanceRequest })
+        if (receipt?.status !== 'found') throw new TurnCommandError('unavailable',
+          'Delivery receipt is still unknown', 'DELIVERY_RECEIPT_UNKNOWN', null, true)
+        res = receipt.response
+      } else res = await options.turnCommands.send(acceptanceRequest)
+      if (disposed) return 'accepted'
       consumeAcceptedComposer(attempt)
       acknowledgeAttemptPromptAnnotations(attempt, res)
 
@@ -3553,7 +3552,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const acceptedSessionKey = acceptedError?.sessionKey || requestSessionKey
       const rememberRetryableAttempt = (restoreComposer: boolean) => {
         if (!shouldRestoreSendAttempt(err)) return
-        const acceptanceUnknown = hasUnknownAcceptance(err)
+        const acceptanceUnknown = attempt.requiresIdempotentReplay === true || hasUnknownAcceptance(err)
         attempt.requiresIdempotentReplay = acceptanceUnknown
         if (preserveComposer) {
           if (sendOpts.rememberRetryableAttempt) {
@@ -3575,13 +3574,13 @@ export function useChatSend(options: UseChatSendOptions) {
       const stoppedByUser = acceptanceTransaction.stoppedByUser
         || responseHandoff?.stoppedByUser === true
       if (stoppedByUser) {
-        if (acceptedError?.terminalWithoutTask || commandError?.accepted === false) {
+        if (acceptedError?.terminalWithoutTask || (commandError?.accepted === false && !attempt.requiresIdempotentReplay)) {
           clearAcceptanceStop(acceptanceTransaction)
         } else if (hasUnknownAcceptance(err)) {
           void options.reconcileTaskOwnership?.()
         }
       }
-      if (hasUnknownAcceptance(err)) {
+      if (hasUnknownAcceptance(err) || attempt.requiresIdempotentReplay) {
         attempt.requiresIdempotentReplay = true
         if (attempt.stopRequested || attempt.autoRecoverAcceptance) {
           scheduleAcceptanceRecovery(attempt)
@@ -3943,6 +3942,7 @@ export function useChatSend(options: UseChatSendOptions) {
       acceptance.stoppedByUser = true
       if (acceptance.attempt) {
         acceptance.attempt.stopRequested = true
+        void options.durableDelivery?.requestStop(acceptance.attempt.clientRequestId).catch(() => {})
         acceptance.attempt.stopOwner = acceptance.id
         stoppedAcceptanceAttempts.set(
           acceptanceAttemptKey(acceptance.attempt),
@@ -3993,6 +3993,12 @@ export function useChatSend(options: UseChatSendOptions) {
     // intentionally retains legacy session-tree cancellation semantics.
     if (stoppedTurnId || taskAcceptancePending) abortParams.scope = 'task'
     if (stoppedTurnId) abortParams.taskId = stoppedTurnId
+    // Request-owned unknown Stop waits for its exact receipt task. The app
+    // owner persists that intent; a task-less cancel must not widen it.
+    if (acceptanceOwnsStop && options.durableDelivery) {
+      if (handoff) void options.durableDelivery.requestStop(handoff.ownerRequestId).catch(() => {})
+      return
+    }
     options.turnCommands.cancel(abortParams)
       .then((response) => {
         if (response?.aborted === true) {
@@ -4270,6 +4276,7 @@ export function useChatSend(options: UseChatSendOptions) {
         kind: 'new-turn',
         params,
       })
+      if (disposed) return hiddenDispatchResult('accepted', 'accepted', stableClientRequestId, requestSessionKey)
       attempt.acceptanceResolved = true
       attempt.acceptedTaskId = acceptedTaskId(res)
       attempt.acceptedSessionKey = res?.sessionKey || requestSessionKey
@@ -4674,6 +4681,15 @@ export function useChatSend(options: UseChatSendOptions) {
   }
 
   return {
+    dispose() {
+      disposed = true
+      stopDeliveryObserver?.()
+      stopDeliverySubscription?.()
+      for (const [timer, resolve] of recoveryTimers) { clearTimeout(timer); resolve() }
+      recoveryTimers.clear()
+      recoveryAttempts.clear()
+      stoppedAcceptanceAttempts.clear()
+    },
     onSend,
     sendPending,
     onStop,
