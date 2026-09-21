@@ -55,6 +55,7 @@ type CommittedTurn = {
   createdAt: number
   transcriptId: number
   finished: boolean
+  terminalStatus?: 'succeeded' | 'cancelled'
 }
 
 type MockGatewayState = {
@@ -86,6 +87,16 @@ type MockGateway = {
   pendingRows: () => PendingRow[]
   reorderCount: number
   releaseFirstAck: () => void
+  aborts: Array<Record<string, unknown>>
+  socketCount: number
+  waitingHandshakeCount: number
+  receiptInFlight: number
+  peakReceiptInFlight: number
+  dropFirstAck: () => void
+  holdConnections: () => void
+  releaseConnections: () => void
+  holdReceiptReplies: () => void
+  releaseReceiptReplies: () => void
 }
 
 function successResponse(id: string | number | undefined, payload: unknown) {
@@ -214,7 +225,7 @@ function committedHistory(state: MockGatewayState, params: Record<string, unknow
       transcript_id: turn.transcriptId, turn_id: turn.taskId,
       turn_context: { turn_id: turn.taskId },
     }
-    return turn.finished ? [user, {
+    return turn.finished && turn.terminalStatus !== 'cancelled' ? [user, {
       ...user, role: 'assistant', text: 'ok', id: `synthetic-assistant-${turn.taskId}`,
       message_id: `synthetic-assistant-${turn.taskId}`, client_message_id: '',
       timestamp: turn.createdAt + 1_000, transcript_id: turn.transcriptId + 1,
@@ -228,8 +239,8 @@ function committedHistory(state: MockGatewayState, params: Record<string, unknow
     oldest_cursor: page.length ? cursor(page[0]!) : null,
     newest_cursor: page.length ? cursor(page[page.length - 1]!) : null,
     turn_outcomes: turns.filter(turn => turn.finished).map(turn => ({
-      task_id: turn.taskId, turn_id: turn.taskId, status: 'succeeded',
-      outcome: { kind: 'completed' }, started_at: turn.createdAt,
+      task_id: turn.taskId, turn_id: turn.taskId, status: turn.terminalStatus || 'succeeded',
+      outcome: { kind: turn.terminalStatus === 'cancelled' ? 'cancelled' : 'completed' }, started_at: turn.createdAt,
       finished_at: turn.createdAt + 1_000,
       activity_snapshot: {
         version: 2, task_id: turn.taskId, turn_id: turn.taskId, complete: true,
@@ -246,9 +257,9 @@ function committedHistory(state: MockGatewayState, params: Record<string, unknow
 function committedMetadata(state: MockGatewayState, sessionKey: string) {
   const tasks = state.turns.filter(turn => turn.sessionKey === sessionKey).map(turn => ({
     task_id: turn.taskId, turn_id: turn.taskId, session_id: `synthetic-session-${sessionKey}`,
-    status: turn.finished ? 'succeeded' : 'running', queue_mode: 'followup',
+    status: turn.finished ? turn.terminalStatus || 'succeeded' : 'running', queue_mode: 'followup',
     created_at: turn.createdAt, started_at: turn.createdAt,
-    ...(turn.finished ? { finished_at: turn.createdAt + 1_000, terminal_reason: 'completed' } : {}),
+    ...(turn.finished ? { finished_at: turn.createdAt + 1_000, terminal_reason: turn.terminalStatus === 'cancelled' ? 'user_abort' : 'completed' } : {}),
   }))
   const active = tasks.find(task => task.status === 'running') || null
   return {
@@ -267,6 +278,17 @@ async function installMockGateway(
   const firstTaskId = 'p1-5-first-task'
   let connectionCount = 0
   let subscribedConnection = 0
+  let holdingConnections = false
+  let holdingReceiptReplies = false
+  let peakReceiptInFlight = 0
+  const waitingHandshakes = new Set<WebSocketRoute>()
+  const receiptReplies = new Map<() => void, WebSocketRoute>()
+  const aborts: Array<Record<string, unknown>> = []
+  const forgetSocket = (socket: WebSocketRoute) => {
+    sockets.delete(socket)
+    waitingHandshakes.delete(socket)
+    for (const [reply, owner] of receiptReplies) if (owner === socket) receiptReplies.delete(reply)
+  }
 
   const emit = (event: string, payload: Record<string, unknown>) => {
     if (event !== 'session.event.done') state.liveEvents.push({ event, payload })
@@ -290,8 +312,9 @@ async function installMockGateway(
   await page.routeWebSocket(/\/ws$/, ws => {
     let connection = 0
     sockets.add(ws)
-    ws.onClose(() => sockets.delete(ws))
-    ws.send(eventFrame('connect.challenge', {}))
+    ws.onClose(() => forgetSocket(ws))
+    if (holdingConnections) waitingHandshakes.add(ws)
+    else ws.send(eventFrame('connect.challenge', {}))
     ws.onMessage(message => {
       let frame: RpcRequest
       try {
@@ -314,32 +337,52 @@ async function installMockGateway(
       if (method === 'turns.receipt.get') {
         const params = frame.params || {}
         state.receiptQueries.push(params)
-        const original = (params.originalRequest || {}) as Record<string, unknown>
-        const requestId = String(original.clientRequestId || '')
-        const targetSessionKey = state.handoffTargets[requestId]
-        if (params.operation !== 'chat.send' || !targetSessionKey) {
-          ws.send(successResponse(frame.id, { status: 'not_found', accepted: null }))
+        const reply = () => {
+          if (!receiptReplies.delete(reply)) return
+          const original = (params.originalRequest || {}) as Record<string, unknown>
+          const requestId = String(original.clientRequestId || '')
+          const targetSessionKey = state.handoffTargets[requestId]
+          if (params.operation !== 'chat.send' || !targetSessionKey) {
+            ws.send(successResponse(frame.id, { status: 'not_found', accepted: null }))
+            return
+          }
+          // Admission committed before ACK loss. Read the original receipt;
+          // never invoke chat.send or manufacture another task while checking.
+          state.firstSessionKey = targetSessionKey
+          const turn = state.turns.find(turn => turn.taskId === firstTaskId)
+          ws.send(successResponse(frame.id, {
+            status: 'found',
+            accepted: true,
+            requestFingerprint: `sha256:${'a'.repeat(64)}`,
+            receipt: {
+              requestSessionKey: original.sessionKey,
+              sessionKey: targetSessionKey,
+              sessionId: `synthetic-session-${targetSessionKey}`,
+              sessionEpoch: 1,
+              clientRequestId: requestId,
+              messageId: original.clientMessageId,
+              taskId: firstTaskId,
+              taskStatus: turn?.finished ? turn.terminalStatus || 'succeeded' : 'running',
+            },
+          }))
+        }
+        receiptReplies.set(reply, ws)
+        peakReceiptInFlight = Math.max(peakReceiptInFlight, receiptReplies.size)
+        if (!holdingReceiptReplies) reply()
+        return
+      }
+      if (method === 'chat.abort') {
+        const params = { ...(frame.params || {}) }
+        aborts.push(params)
+        const turn = state.turns.find(turn => turn.taskId === params.taskId && turn.sessionKey === params.sessionKey)
+        if (!turn) {
+          ws.send(successResponse(frame.id, { aborted: false, reason: 'task_not_active' }))
           return
         }
-        // This task was already admitted before the response was lost. A read
-        // recovers its identity without entering the chat.send mock at all.
-        state.firstSessionKey = targetSessionKey
-        ws.send(successResponse(frame.id, {
-          status: 'found',
-          accepted: true,
-          requestFingerprint: `sha256:${'a'.repeat(64)}`,
-          receipt: {
-            requestSessionKey: original.sessionKey,
-            sessionKey: targetSessionKey,
-            sessionId: `synthetic-session-${targetSessionKey}`,
-            sessionEpoch: 1,
-            clientRequestId: requestId,
-            messageId: original.clientMessageId,
-            taskId: firstTaskId,
-            taskStatus: state.turns.find(turn => turn.taskId === firstTaskId)?.finished
-              ? 'succeeded' : 'running',
-          },
-        }))
+        turn.finished = true
+        turn.terminalStatus = 'cancelled'
+        state.liveEvents = state.liveEvents.filter(event => event.payload.task_id !== turn.taskId)
+        ws.send(successResponse(frame.id, { aborted: true, key: turn.sessionKey }))
         return
       }
       if (method === 'sessions.messages.snapshot') {
@@ -504,6 +547,33 @@ async function installMockGateway(
     receiptQueries: state.receiptQueries,
     get connectionCount() { return connectionCount },
     get subscribedConnection() { return subscribedConnection },
+    aborts,
+    get socketCount() { return sockets.size },
+    get waitingHandshakeCount() { return waitingHandshakes.size },
+    get receiptInFlight() { return receiptReplies.size },
+    get peakReceiptInFlight() { return peakReceiptInFlight },
+    dropFirstAck() {
+      if (!firstAck) throw new Error('No committed first send is awaiting its lost ACK')
+      firstAck = null
+      holdingConnections = true
+      for (const socket of [...sockets]) {
+        socket.close({ code: 1012, reason: 'Synthetic accepted send lost ACK' })
+        // onClose handles the page closing its side; this branch owns the
+        // synthetic server close and retires its held replies immediately.
+        forgetSocket(socket)
+      }
+    },
+    holdConnections() { holdingConnections = true },
+    releaseConnections() {
+      holdingConnections = false
+      for (const socket of waitingHandshakes) socket.send(eventFrame('connect.challenge', {}))
+      waitingHandshakes.clear()
+    },
+    holdReceiptReplies() { holdingReceiptReplies = true },
+    releaseReceiptReplies() {
+      holdingReceiptReplies = false
+      for (const reply of [...receiptReplies.keys()]) reply()
+    },
     dispatchMessages: state.dispatchMessages,
     get dispatchCount() { return state.dispatchCount },
     get enqueueCount() { return state.enqueueCount },
@@ -795,6 +865,205 @@ test.describe('P1-5 first-send renderer release gate', () => {
 
 test.describe('durable handoff and pending order release gate', () => {
   test.describe.configure({ mode: 'serial' })
+
+  test('ordinary unknown Stop survives chat unmount and full App reload without duplicate admission', async ({ page }, testInfo) => {
+    test.setTimeout(45_000)
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await preparePage(page)
+    const errors = collectRendererErrors(page)
+    const state = createMockGatewayState()
+    state.supportsPendingQueue = false
+    const gateway = await installMockGateway(page, 'delayed', state)
+    const sessionKey = 'agent:main:webchat:synthetic-ordinary-stop-reload'
+    const text = 'Synthetic ordinary request whose accepted ACK is lost.'
+    let requestId = ''
+
+    // Read only the actual application-created record. This test neither seeds
+    // a delivery owner nor rewrites its phase, identity, Stop, lease, or clock.
+    const readDelivery = () => page.evaluate(async id => {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = indexedDB.open('opensquilla-chat-pending-inputs', 3)
+        request.onsuccess = () => resolve(request.result)
+        request.onerror = () => reject(request.error)
+      })
+      try {
+        return await new Promise<{
+          count: number
+          record: {
+            schemaVersion: number; revision: number; ownerRequestId: string; deliveryIdentity: string;
+            requestSessionKey: string; phase: string; response?: { taskId?: string };
+            request: { kind: string; request: { kind: string; params: Record<string, unknown> } };
+            stop?: { requested: boolean; completed?: boolean; request?: Record<string, unknown> };
+            lease?: { owner: string; epoch: number; expiresAt: number };
+          }
+        }>((resolve, reject) => {
+          const transaction = database.transaction('response_handoffs', 'readonly')
+          const store = transaction.objectStore('response_handoffs')
+          const get = store.get(id)
+          const count = store.count()
+          transaction.oncomplete = () => resolve({ count: count.result, record: get.result })
+          transaction.onabort = () => reject(transaction.error)
+        })
+      } finally { database.close() }
+    }, requestId)
+
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(sessionKey)}`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    const composer = page.locator('.chat-textarea')
+    await expect(composer).toBeEditable()
+    await composer.fill(text)
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => gateway.chatSends.length).toBe(1)
+    const original = structuredClone(gateway.chatSends[0]!)
+    requestId = String(original.clientRequestId)
+    expect(original.clientRequestId).toEqual(expect.any(String))
+    expect(requestId).not.toBe('')
+    expect(original.clientMessageId).toEqual(expect.any(String))
+    expect(original.clientMessageId).not.toBe('')
+    expect(original).toMatchObject({ sessionKey, message: text })
+    expect(state.turns).toHaveLength(1)
+    expect(state.turns[0]).toMatchObject({ sessionKey, taskId: 'p1-5-first-task', finished: false })
+
+    // Acceptance exists server-side, but the socket loses its ACK before any
+    // task event. Hold the next Hello so Stop must own this unknown request,
+    // not a task opportunistically learned from a later history hydration.
+    gateway.dropFirstAck()
+    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    await expect.poll(async () => (await readDelivery()).record.phase).toBe('unknown')
+    expect((await readDelivery()).record.response).toBeUndefined()
+    const stopButton = page.getByRole('button', { name: 'Stop current response', exact: true })
+    await expect(stopButton).toBeVisible()
+    await stopButton.click()
+    await expect.poll(async () => (await readDelivery()).record.stop).toMatchObject({ requested: true })
+    const originalRecord = (await readDelivery()).record
+    expect(originalRecord.stop?.completed).not.toBe(true)
+    expect(originalRecord.deliveryIdentity).toBeTruthy()
+    expect(originalRecord.request).toMatchObject({ kind: 'send', request: { kind: 'new-turn' } })
+    const frozenDomainParams = structuredClone(originalRecord.request.request.params)
+    // WAL preserves domain fields (such as source), while the adapter owns
+    // wire aliases (_source). Check each complete snapshot in its own domain.
+    expect(frozenDomainParams).toMatchObject({ sessionKey, message: text,
+      clientRequestId: requestId, clientMessageId: original.clientMessageId })
+    expect(gateway.aborts).toEqual([])
+    expect(gateway.receiptQueries).toEqual([])
+    const initialOwner = originalRecord.lease?.owner
+    expect(initialOwner).toBeTruthy()
+
+    gateway.releaseConnections()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect.poll(() => gateway.receiptQueries.length).toBeGreaterThan(0)
+    const connectedBeforeNavigation = gateway.connectionCount
+    await page.locator('a[href$="/usage"]').first().click()
+    await expect(page).toHaveURL(/\/usage(?:\?|$)/)
+    await expect(page.locator('.chat')).toHaveCount(0)
+    const notice = page.getByTestId('delivery-recovery-notice')
+    await expect(notice).toBeVisible()
+    // ACK loss surfaces the existing transient failure toast. A user can
+    // dismiss it before using the bottom recovery notice; keep real clicks.
+    const lostAckToast = page.getByTestId('toast').filter({ hasText: 'The task did not finish. Please try again later.' })
+    await expect(lostAckToast).toBeVisible()
+    await lostAckToast.getByRole('button', { name: 'Dismiss notification', exact: true }).click()
+    await expect(lostAckToast).toHaveCount(0)
+    await notice.getByRole('button', { name: 'View details', exact: true }).click({ timeout: 5_000 })
+    await expect(notice).toContainText('Stop will continue after the original task is confirmed.')
+    const noticeScreenshot = testInfo.outputPath('usage-expanded-delivery-notice.png')
+    await page.screenshot({ path: noticeScreenshot })
+    await testInfo.attach('Usage delivery actions after chat unmount', {
+      path: noticeScreenshot, contentType: 'image/png',
+    })
+    // Use the same App and unresolved delivery at a narrow viewport. Close the
+    // real sidebar before it becomes a modal drawer; do not remove overlays.
+    await page.getByTestId('sidebar-toggle-expanded').click()
+    await page.setViewportSize({ width: 390, height: 844 })
+    await notice.getByRole('button', { name: 'Hide details', exact: true }).click({ timeout: 5_000 })
+    await notice.getByRole('button', { name: 'View details', exact: true }).click({ timeout: 5_000 })
+    await expect(notice).toContainText('Stop will continue after the original task is confirmed.')
+    await notice.getByRole('button', { name: 'Open conversation', exact: true }).click({ trial: true, timeout: 5_000 })
+    const mobileNoticeScreenshot = testInfo.outputPath('usage-mobile-expanded-delivery-notice.png')
+    await page.screenshot({ path: mobileNoticeScreenshot })
+    await testInfo.attach('Narrow Usage recovery controls remain reachable', {
+      path: mobileNoticeScreenshot, contentType: 'image/png',
+    })
+    await page.setViewportSize({ width: 1440, height: 900 })
+    await page.getByTestId('sidebar-toggle-collapsed').click()
+    // The actual App owner finishes its finite not-found round after ChatView
+    // has unmounted. Its lease stays with the same owner, and is released.
+    await expect.poll(() => gateway.receiptQueries.length, { timeout: 10_000 }).toBe(4)
+    await expect.poll(async () => (await readDelivery()).record.lease?.expiresAt).toBe(0)
+    await expect(notice).toContainText('Automatic checks have paused.')
+    expect((await readDelivery()).record.lease?.owner).toBe(initialOwner)
+    await notice.getByRole('button', { name: 'Open conversation', exact: true }).click()
+    await expect(page).toHaveURL(url => url.pathname.endsWith('/chat') && url.searchParams.get('session') === sessionKey)
+    await expectSingletonChat(page)
+    expect(gateway.connectionCount).toBe(connectedBeforeNavigation)
+    expect((await readDelivery()).record.lease?.owner).toBe(initialOwner)
+    expect((await readDelivery()).record.stop?.requested).toBe(true)
+    expect(gateway.chatSends).toHaveLength(1)
+    expect(gateway.aborts).toEqual([])
+    await page.locator('a[href$="/usage"]').first().click()
+    await expect(page.locator('.chat')).toHaveCount(0)
+
+    // Recreate the whole production main/App in the same origin, retaining
+    // native IndexedDB. A cached identity alone must not authorize recovery.
+    gateway.holdConnections()
+    gateway.holdReceiptReplies()
+    await page.reload()
+    await expect.poll(() => gateway.waitingHandshakeCount).toBe(1)
+    await expect(page.getByTestId('delivery-recovery-notice')).toBeVisible()
+    const unconfirmed = await readDelivery()
+    expect(unconfirmed.count).toBe(1)
+    expect(unconfirmed.record).toMatchObject({ ownerRequestId: requestId, phase: 'unknown',
+      deliveryIdentity: originalRecord.deliveryIdentity, stop: { requested: true } })
+    expect(unconfirmed.record.stop?.completed).not.toBe(true)
+    expect(gateway.receiptQueries).toHaveLength(4)
+    expect(gateway.aborts).toEqual([])
+
+    // Same authenticated Gateway + account; the already committed receipt now
+    // becomes available. Keep the read pending to observe real single-flight
+    // and lease ownership while the global notice also requests a recheck.
+    state.handoffTargets[requestId] = sessionKey
+    gateway.releaseConnections()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect.poll(() => gateway.receiptInFlight).toBe(1)
+    const replacementRecord = (await readDelivery()).record
+    expect(replacementRecord.lease?.owner).toBeTruthy()
+    expect(replacementRecord.lease?.owner).not.toBe(initialOwner)
+    expect(replacementRecord.lease!.epoch).toBeGreaterThan(originalRecord.lease!.epoch)
+    expect(replacementRecord.lease!.expiresAt).toBeGreaterThan(Date.now())
+    const replacementNotice = page.getByTestId('delivery-recovery-notice')
+    await replacementNotice.getByRole('button', { name: 'View details', exact: true }).click({ timeout: 5_000 })
+    await replacementNotice.getByRole('button', { name: 'Check again', exact: true }).click()
+    await expect.poll(async () => (await readDelivery()).record.revision).toBeGreaterThan(replacementRecord.revision)
+    await expect(replacementNotice.getByRole('button', { name: 'Check again', exact: true })).toBeEnabled()
+    expect(gateway.socketCount).toBe(1)
+    expect(gateway.receiptInFlight).toBe(1)
+    expect(gateway.receiptQueries).toHaveLength(5)
+    expect(gateway.peakReceiptInFlight).toBe(1)
+    expect(gateway.aborts).toEqual([])
+    gateway.releaseReceiptReplies()
+    await expect.poll(() => gateway.aborts.length).toBe(1)
+    expect(gateway.aborts[0]).toMatchObject({ sessionKey, taskId: 'p1-5-first-task', scope: 'task' })
+    await expect.poll(async () => (await readDelivery()).record.stop?.completed).toBe(true)
+    await expect(replacementNotice).toHaveCount(0)
+    const completed = await readDelivery()
+    expect(completed.count).toBe(1)
+    expect(completed.record).toMatchObject({ ownerRequestId: requestId, phase: 'accepted',
+      deliveryIdentity: originalRecord.deliveryIdentity, response: { taskId: 'p1-5-first-task' },
+      lease: { owner: replacementRecord.lease!.owner }, stop: { requested: true, completed: true } })
+    expect(completed.record.request.request.params).toEqual(frozenDomainParams)
+    for (const query of gateway.receiptQueries) expect(query).toEqual({ operation: 'chat.send', originalRequest: original })
+    expect(gateway.chatSends).toEqual([original])
+    expect(gateway.aborts).toHaveLength(1)
+    expect(gateway.receiptQueries).toHaveLength(5)
+    expect(gateway.receiptInFlight).toBe(0)
+    expect(gateway.peakReceiptInFlight).toBe(1)
+    expect(state.turns).toHaveLength(1)
+    expect(state.turns[0]?.terminalStatus).toBe('cancelled')
+    expect(errors.pageErrors).toEqual([])
+    expect(errors.consoleErrors.filter(message => FATAL_RENDERER_PATTERN.test(message))).toEqual([])
+    // These are operational owner proxies (lease writer, in-flight read, and
+    // exact mutation counts), not a claim to count dormant JS owner objects.
+  })
 
   test('refresh reads a fork receipt without resending and moves owner follow-ups exactly once', async ({ page }) => {
     test.setTimeout(45_000)
