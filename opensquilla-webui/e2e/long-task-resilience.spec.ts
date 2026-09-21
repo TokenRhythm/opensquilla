@@ -8,6 +8,12 @@ import {
   type WebSocketRoute,
 } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2e-long-task-resilience'
@@ -180,6 +186,206 @@ test.describe('0.5.0 long-task resilience', () => {
   // measured browser heap into a host-load assertion. CI already uses one
   // worker, and local runs must exercise the same deterministic isolation.
   test.describe.configure({ mode: 'serial' })
+
+  test('recovers a terminal event lost while disconnected and sends the next turn once', async ({ page }) => {
+    const key = 'agent:main:webchat:synthetic-lost-terminal'
+    const sessionId = 'synthetic-lost-terminal-session'
+    const taskId = 'synthetic-lost-terminal-task'
+    const generation = 'synthetic-lost-terminal-generation'
+    const epoch = 7
+    const startedAt = 1_800_000_000_000
+    const partial = 'Synthetic partial answer.'
+    const answer = `${partial} Synthetic durable completion.`
+    const draft = 'Synthetic next request after terminal recovery.'
+    const sockets: WebSocketRoute[] = []
+    const reads: Array<{ method: string; connection: number; params: Record<string, unknown> }> = []
+    const sends: Array<Record<string, unknown>> = []
+    const pushedEvents: string[] = []
+    const errors: string[] = []
+    let complete = false
+    let sequence = 0
+    let nextTask: Record<string, unknown> | null = null
+
+    page.on('pageerror', error => errors.push(error.message))
+    page.on('console', message => {
+      if (message.type() === 'error') errors.push(message.text())
+    })
+    await preparePage(page)
+    await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+    await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
+    await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
+      status: 204, contentType: 'image/png', body: '',
+    }))
+
+    const task = () => ({
+      task_id: taskId, turn_id: taskId, session_id: sessionId,
+      status: complete ? 'succeeded' : 'running', queue_mode: 'followup',
+      created_at: startedAt, started_at: startedAt,
+      ...(complete ? { finished_at: startedAt + 3_000, terminal_reason: 'completed' } : {}),
+    })
+    const metadata = () => ({
+      epoch, tasks: [task(), ...(nextTask ? [nextTask] : [])],
+      active_task: nextTask || (complete ? null : task()), last_task: nextTask || task(),
+      queued_task_ids: [], run_status: nextTask || !complete ? 'running' : 'idle',
+    })
+    const history = () => chatHistoryPayload([
+      {
+        role: 'user', text: 'Synthetic request completed during a transport outage.',
+        id: 'synthetic-lost-terminal-user', message_id: 'synthetic-lost-terminal-user',
+        timestamp: startedAt - 1_000, turn_id: taskId, turn_context: { turn_id: taskId },
+      },
+      ...(complete ? [{
+        role: 'assistant', text: answer, id: 'synthetic-lost-terminal-assistant',
+        message_id: 'synthetic-lost-terminal-assistant', timestamp: startedAt + 3_000,
+        turn_id: taskId, turn_context: { turn_id: taskId },
+      }] : []),
+      ...(nextTask ? [{
+        role: 'user', text: sends[0]?.message, id: 'synthetic-next-user',
+        message_id: 'synthetic-next-user', client_message_id: sends[0]?.clientMessageId,
+        timestamp: startedAt + 4_000, turn_id: 'synthetic-next-task',
+      }] : []),
+    ], {
+      turn_outcomes: complete ? [{
+        task_id: taskId, turn_id: taskId, status: 'succeeded', outcome: { kind: 'completed' },
+        started_at: startedAt, finished_at: startedAt + 3_000,
+        activity_snapshot: {
+          version: 2, task_id: taskId, turn_id: taskId, complete: true,
+          reasoning_utf16_length: 0,
+          entries: [{
+            type: 'phase', id: 'synthetic-lost-terminal-provider', order: 1,
+            kind: 'provider', phase: 'requesting', at: startedAt, ended_at: startedAt + 3_000,
+          }],
+        },
+      }] : [],
+    })
+    const push = (socket: WebSocketRoute, event: string, payload: Record<string, unknown>) => {
+      pushedEvents.push(event)
+      socket.send(eventFrame(event, payload))
+    }
+
+    await page.routeWebSocket(/\/ws$/, socket => {
+      const connection = sockets.push(socket)
+      // Hold the replacement handshake until the old browser socket has closed
+      // and the synthetic server has persisted completion without any push.
+      if (connection === 1) push(socket, 'connect.challenge', {})
+      socket.onMessage(raw => {
+        const frame = JSON.parse(String(raw)) as RpcRequest
+        if (frame.type === 'ping') {
+          socket.send(JSON.stringify({ type: 'pong' }))
+          return
+        }
+        if (frame.type !== 'req') return
+        const method = String(frame.method || '')
+        const params = frame.params || {}
+        const respond = (payload: unknown) => socket.send(successResponse(frame.id, payload))
+        if (method === 'connect') {
+          socket.send(helloOkResponse({
+            protocol: 4,
+            server: { conn_id: `synthetic-lost-terminal-${connection}` },
+            features: {
+              methods: ['sessions.messages.subscribe', 'sessions.messages.snapshot',
+                'sessions.messages.hydrate', 'sessions.messages.unsubscribe'],
+              events: ['session.event.text_delta', 'session.event.done', 'task.succeeded'],
+            },
+            policy: { concurrent_history_reads: true },
+            auth: {
+              principal: { role: 'operator', authenticated: true, isOwner: true,
+                authState: 'authenticated', scopes: ['operator.read', 'operator.write'],
+                capabilities: ['chat.read', 'chat.write'] },
+              runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
+            },
+          }))
+          return
+        }
+        if (method === 'chat.send') {
+          sends.push({ ...params })
+          nextTask = { task_id: 'synthetic-next-task', turn_id: 'synthetic-next-task',
+            session_id: sessionId, status: 'running', started_at: startedAt + 4_000 }
+          respond({ sessionKey: key, task_id: 'synthetic-next-task', task_status: 'running' })
+          return
+        }
+        if (method === 'chat.history' || method.startsWith('sessions.messages.')) {
+          reads.push({ method, connection, params: { ...params } })
+        }
+        if (method === 'chat.history') { respond(history()); return }
+        if (method === 'sessions.messages.snapshot') {
+          // A terminal snapshot cache may be reclaimed after its complete
+          // transcript/activity snapshot is durable. Metadata/history own it.
+          respond(sessionMessagesSnapshotPayload(key, {
+            task_id: nextTask?.task_id || (complete ? null : taskId),
+            stream_generation: generation, current_stream_seq: sequence, events: [],
+          }))
+          return
+        }
+        if (method === 'sessions.messages.subscribe') {
+          const gap = complete && Number(params.since_stream_seq ?? 0) < sequence
+          respond(sessionMessagesSubscribePayload(key, {
+            stream_generation: generation, current_stream_seq: sequence,
+            replay_complete: !gap, replay_gap_reason: gap ? 'buffer_window_missed' : null,
+            projectWorkspaceDeferred: true, run_mode_lock: { locked: true, source: 'deferred' },
+            hydration_complete: false,
+            deferred_fields: ['workspaceId', 'projectWorkspace', 'tasks', 'active_task',
+              'last_task', 'run_status', 'active_task_group_ids', 'run_mode_lock',
+              'pendingUserInputs', 'collaboration', 'routing', 'currentPlan', 'activePlanRun',
+              'planPresentations', 'goal', 'goalSnapshotStreamSeq', 'epoch'],
+          }))
+          return
+        }
+        if (method === 'sessions.messages.hydrate') {
+          respond(sessionMessagesHydratePayload(key, metadata()))
+          return
+        }
+        if (method === 'sandbox.run_mode.preference.get') {
+          respond({ runMode: 'full', source: 'config' })
+          return
+        }
+        respond(basePayload(method))
+      })
+    })
+
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(key)}`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+    sequence = 1
+    push(sockets[0]!, 'session.event.text_delta', {
+      key, session_key: key, task_id: taskId, turn_id: taskId, epoch,
+      stream_generation: generation, stream_seq: sequence, text: partial,
+    })
+    await expect(page.getByText(partial, { exact: true })).toBeVisible()
+    const composer = page.locator('.chat-textarea')
+    await composer.fill(draft)
+
+    await sockets[0]!.close({ code: 1012, reason: 'Synthetic outage before terminal delivery' })
+    await expect(page.locator('.conn-pill.connected')).toHaveCount(0)
+    complete = true
+    sequence = 3
+    // The committed terminal text and outcome exist only in subsequent reads:
+    // neither the lost done frame nor task.succeeded is pushed or replayed.
+    await expect.poll(() => sockets.length).toBe(2)
+    push(sockets[1]!, 'connect.challenge', {})
+    await expect.poll(() => reads.some(read => read.connection === 2
+      && read.method === 'sessions.messages.snapshot')).toBe(true)
+    await expect.poll(() => reads.some(read => read.connection === 2
+      && read.method === 'sessions.messages.hydrate')).toBe(true)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.getByText(answer, { exact: true })).toHaveCount(1)
+    await expect(page.getByRole('button', { name: 'Stop current response' })).toHaveCount(0)
+    await expect(page.locator('.assistant-activity--live')).toHaveCount(0)
+    await expect(page.getByText('Working', { exact: true })).toHaveCount(0)
+    await expect(composer).toHaveValue(draft)
+    expect(sends).toEqual([])
+    expect(pushedEvents).not.toContain('session.event.done')
+    expect(pushedEvents).not.toContain('task.succeeded')
+
+    const send = page.locator('.chat-send-btn[aria-label="Send"]')
+    await expect(send).toBeEnabled()
+    await send.click()
+    await expect.poll(() => sends.length).toBe(1)
+    expect(sends[0]).toMatchObject({ sessionKey: key, message: draft })
+    await expect(page.locator('.chat-pending-card')).toHaveCount(0)
+    await expect(page.getByRole('button', { name: 'Stop current response' })).toBeVisible()
+    expect(errors).toEqual([])
+  })
 
   test('resets the stream cursor across a Gateway generation and automatically re-subscribes', async ({
     page,
