@@ -287,6 +287,14 @@ def _contains_forbidden_release_segment(path: str) -> bool:
 
 def _is_allowed_runtime_markdown(path: str) -> bool:
     name = _release_name(path)
+    parts = name.split("/")
+    if (
+        len(parts) == 3
+        and parts[0].startswith("opensquilla-")
+        and parts[0].endswith(".dist-info")
+        and parts[1:] == ["licenses", "THIRD_PARTY_NOTICES.md"]
+    ):
+        return True
     if name == ROUTER_PROVENANCE_WHEEL_PATH:
         return True
     if name == TOKENJUICE_PROVENANCE_WHEEL_PATH:
