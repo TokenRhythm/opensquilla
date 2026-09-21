@@ -64,6 +64,8 @@ type MockGatewayState = {
 type MockGateway = {
   chatSends: Array<Record<string, unknown>>
   receiptQueries: Array<Record<string, unknown>>
+  connectionCount: number
+  subscribedConnection: number
   dispatchMessages: string[]
   dispatchCount: number
   enqueueCount: number
@@ -181,6 +183,8 @@ async function installMockGateway(
   let firstAck: (() => void) | null = null
   let firstTaskId = 'p1-5-first-task'
   let streamSeq = 0
+  let connectionCount = 0
+  let subscribedConnection = 0
 
   const emit = (event: string, payload: Record<string, unknown>) => {
     for (const socket of sockets) socket.send(eventFrame(event, payload))
@@ -198,6 +202,7 @@ async function installMockGateway(
   })
 
   await page.routeWebSocket(/\/ws$/, ws => {
+    let connection = 0
     sockets.add(ws)
     ws.onClose(() => sockets.delete(ws))
     ws.send(eventFrame('connect.challenge', {}))
@@ -212,6 +217,7 @@ async function installMockGateway(
       const method = String(frame.method || '')
 
       if (method === 'connect') {
+        connection = ++connectionCount
         ws.send(hello(state.supportsPendingQueue))
         return
       }
@@ -260,6 +266,9 @@ async function installMockGateway(
         return
       }
       if (method === 'sessions.messages.subscribe' || method === 'sessions.messages.hydrate') {
+        if (method === 'sessions.messages.subscribe' && frame.params?.key === state.firstSessionKey) {
+          subscribedConnection = connection
+        }
         const running = Boolean(state.firstSessionKey && !state.firstFinished)
         const payload = method === 'sessions.messages.subscribe'
           ? sessionMessagesSubscribePayload : sessionMessagesHydratePayload
@@ -402,6 +411,8 @@ async function installMockGateway(
   return {
     chatSends: state.chatSends,
     receiptQueries: state.receiptQueries,
+    get connectionCount() { return connectionCount },
+    get subscribedConnection() { return subscribedConnection },
     dispatchMessages: state.dispatchMessages,
     get dispatchCount() { return state.dispatchCount },
     get enqueueCount() { return state.enqueueCount },
@@ -636,6 +647,11 @@ async function runFirstSendIteration(page: Page, scenario: Scenario, iteration: 
   await expectSingletonChat(page)
 
   if (scenario === 'reconnect') {
+    // A connected pill can still belong to the socket scheduled for closure.
+    // Observe a new Hello and this session's subscription on that connection
+    // before completing this scenario's task on the replacement socket.
+    await expect.poll(() => gateway.connectionCount).toBe(2)
+    await expect.poll(() => gateway.subscribedConnection).toBe(2)
     await expect(page.locator('.conn-pill.connected')).toBeVisible({ timeout: 10_000 })
   }
   gateway.finishFirst()
@@ -652,6 +668,8 @@ async function runFirstSendIteration(page: Page, scenario: Scenario, iteration: 
     await expect.poll(() => gateway.chatSends.length).toBe(2)
     expect(gateway.chatSends.filter(send => String(send.message || '') === `${SECOND_TEXT} ${iteration}`))
       .toHaveLength(1)
+    await expect(page.locator('.chat-pending-card').filter({ hasText: SECOND_TEXT })).toHaveCount(0)
+    expect(gateway.pendingRows()).toEqual([])
   }
 
   await expectSingletonChat(page)
