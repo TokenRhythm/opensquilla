@@ -58,6 +58,24 @@ describe('application delivery recovery notice', () => {
     expect(view.unsubscribe).toHaveBeenCalledTimes(1)
   })
 
+  it('keeps the recheck button usable and shows an unexpected storage failure without a global error', async () => {
+    const view = mount([{ id: 'original-request', sessionKey: 'source', phase: 'unknown', stopPending: false, waitReason: 'budget' }])
+    view.retry.mockRejectedValueOnce(new Error('Synthetic storage failure'))
+    view.root.querySelector('button')!.click()
+    await nextTick()
+    const check = [...view.root.querySelectorAll('button')].find(button => button.textContent === 'Check again')!
+    check.click()
+    await nextTick()
+    await nextTick()
+    expect(check.disabled).toBe(false)
+    expect(view.root.textContent).toContain('Recovery state could not be accessed')
+    check.click()
+    await nextTick()
+    await nextTick()
+    expect(view.retry).toHaveBeenCalledTimes(2)
+    expect(check.disabled).toBe(false)
+  })
+
   it('keeps rendering bounded for hundreds of unresolved deliveries and clears completed rows', async () => {
     const view = mount(Array.from({ length: 500 }, (_, index) => ({ id: `${index}`, sessionKey: `session-${index}`, phase: 'unknown', stopPending: false, waitReason: 'receipt-missing' })))
     expect(view.root.querySelectorAll('li')).toHaveLength(0)

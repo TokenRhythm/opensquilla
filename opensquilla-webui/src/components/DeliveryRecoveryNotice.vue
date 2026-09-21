@@ -12,6 +12,7 @@ onUnmounted(() => unsubscribe?.())
 const expanded = ref(false)
 const limit = ref(10)
 const checking = ref(false)
+const failedCheck = ref<string | null>(null)
 const entries = computed(() => snapshots.value.filter(item => (
   item.phase === 'unknown' || item.stopPending || item.waitReason
 )))
@@ -19,13 +20,14 @@ const visible = computed(() => expanded.value ? entries.value.slice(0, limit.val
 
 function detail(item: DeliverySnapshot): string {
   // Product copy stays here; the application owner keeps framework-free status.
-  return t(`deliveryRecovery.reason.${item.waitReason || (item.stopPending ? 'stop' : 'pending')}`)
+  return t(`deliveryRecovery.reason.${failedCheck.value === item.id ? 'storage-check' : item.waitReason || (item.stopPending ? 'stop' : 'pending')}`)
 }
 
 async function recheck(id: string): Promise<void> {
   if (!delivery || checking.value) return
   checking.value = true
-  try { await delivery.retry(id) } finally { checking.value = false }
+  failedCheck.value = null
+  try { await delivery.retry(id) } catch { failedCheck.value = id } finally { checking.value = false }
 }
 </script>
 

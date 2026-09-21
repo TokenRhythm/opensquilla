@@ -3,7 +3,7 @@ import type { TurnCommands, TurnReceiptRequest } from './turnCommands'
 import type { DeliveryWalRecord, ResponseHandoffWalRecord } from '@/utils/chat/pendingInputWal'
 
 export type DeliveryWaitReason = 'offline' | 'identity' | 'receipt-unsupported' | 'receipt-missing' | 'storage' | 'lease' | 'budget'
-  | 'permission' | 'conflict' | 'reload' | 'legacy' | 'not-sent'
+  | 'permission' | 'conflict' | 'reload' | 'legacy' | 'not-sent' | 'storage-check'
 export interface DeliverySnapshot {
   id: string
   sessionKey: string

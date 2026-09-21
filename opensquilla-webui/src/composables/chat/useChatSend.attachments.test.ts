@@ -40,7 +40,7 @@ import {
 } from '@/utils/chat/metaDiscardOutbox'
 import { RpcTransportError } from '@/lib/rpc'
 import { createDurableDelivery } from '@/runtime/durableDelivery'
-import { TurnCommandError, type TurnCommands, type TurnSteerResponse } from '@/modules/turnCommands'
+import { TurnCommandError, type TurnCommands, type TurnSendResponse, type TurnSteerResponse } from '@/modules/turnCommands'
 import {
   readSessionNavigationDiag,
   setSessionNavigationDiagStorageForTest,
@@ -324,6 +324,42 @@ function usageReplayMessages(): ChatMessage[] {
 }
 
 describe('useChatSend durable application lifetime integration', () => {
+  it('keeps an ordinary Stop after its WAL write fails and the originating view is disposed', async () => {
+    const wal = memoryDeliveryWal()
+    let available = true
+    let rejectSend!: (error: unknown) => void
+    const raw: TurnCommands = {
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })),
+      steer: vi.fn(async () => ({ accepted: true })), cancel: vi.fn(async () => ({ aborted: true })),
+      lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { taskId: 'exact-ordinary-task', sessionKey: 'agent:main:webchat:test' } })),
+      supportsReceiptLookup: () => true, supports: () => true,
+    }
+    const owner = createDurableDelivery({ wal, commands: raw,
+      access: { identity: () => 'synthetic-identity', available: () => available, generation: () => 1 } })
+    const harness = makeOptions({ turnCommands: owner.commands, durableDelivery: owner, pendingInputWal: wal,
+      deliveryIdentity: ref('synthetic-identity'), inputText: ref('Synthetic Stop fixture') })
+    try {
+      const sending = harness.api.onSend()
+      await vi.waitFor(() => expect(raw.send).toHaveBeenCalledTimes(1))
+      wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+      available = false
+      harness.stream.isStreaming.value = true
+      harness.api.onStop()
+      await vi.waitFor(() => expect(owner.snapshots()).toContainEqual(expect.objectContaining({ stopPending: true, waitReason: 'storage' })))
+      rejectSend(new TurnCommandError('transport', 'Synthetic lost ACK', undefined, null))
+      await sending
+      harness.api.dispose()
+      vi.mocked(harness.options.scheduleHistorySync).mockClear()
+      available = true
+      await owner.wake()
+      await vi.waitFor(() => expect(raw.cancel).toHaveBeenCalledTimes(1))
+      expect(raw.send).toHaveBeenCalledTimes(1)
+      expect(raw.cancel).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ taskId: 'exact-ordinary-task', scope: 'task' }), expect.anything())
+      expect(harness.options.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(owner.snapshots()).toContainEqual(expect.objectContaining({ stopPending: false, waitReason: 'storage' }))
+    } finally { harness.api.dispose(); owner.dispose() }
+  })
+
   it('retains the composer when the first ordinary send cannot commit its WAL', async () => {
     const wal = memoryDeliveryWal()
     wal.prepareDelivery = async () => { throw new Error('synthetic quota denial') }

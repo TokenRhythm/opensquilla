@@ -5036,6 +5036,7 @@
       "identity": "Switch to the original Gateway and account to check this delivery.",
       "receipt-unsupported": "This Gateway cannot check delivery receipts. Open the conversation to inspect the result.",
       "receipt-missing": "No receipt was found. The original delivery remains unconfirmed.",
+      "storage-check": "Recovery state could not be accessed. You can check again when local storage is available.",
       "storage": "The Stop request could not be saved. Check the task before closing; Stop cannot be guaranteed after reopening.",
       "lease": "Another open window is checking this delivery.",
       "budget": "Automatic checks have paused. You can check again.",

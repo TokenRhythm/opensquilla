@@ -4951,6 +4951,7 @@
       "identity": "Zum ursprünglichen Gateway und Konto wechseln, um diese Zustellung zu prüfen.",
       "receipt-unsupported": "Dieses Gateway unterstützt keine Empfangsprüfung. Öffne die Unterhaltung und prüfe das Ergebnis.",
       "receipt-missing": "Kein Empfangsnachweis gefunden. Die ursprüngliche Zustellung bleibt unbestätigt.",
+      "storage-check": "Der Wiederherstellungsstatus ist nicht zugänglich. Prüfe erneut, sobald der lokale Speicher verfügbar ist.",
       "storage": "Die Stoppanforderung konnte nicht gespeichert werden. Prüfe die Aufgabe vor dem Schließen; nach dem Neustart kann der Stopp nicht garantiert werden.",
       "lease": "Ein anderes Fenster prüft diese Zustellung.",
       "budget": "Automatische Prüfungen pausieren. Du kannst erneut prüfen.",

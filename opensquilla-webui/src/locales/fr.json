@@ -4951,6 +4951,7 @@
       "identity": "Revenez au Gateway et au compte d’origine pour vérifier cette livraison.",
       "receipt-unsupported": "Ce Gateway ne permet pas de vérifier les reçus. Ouvrez la conversation pour examiner le résultat.",
       "receipt-missing": "Aucun reçu trouvé. La livraison initiale reste non confirmée.",
+      "storage-check": "L’état de récupération est inaccessible. Réessayez lorsque le stockage local sera disponible.",
       "storage": "La demande d’arrêt n’a pas pu être enregistrée. Vérifiez la tâche avant de fermer ; l’arrêt après réouverture ne peut être garanti.",
       "lease": "Une autre fenêtre vérifie cette livraison.",
       "budget": "Les vérifications automatiques sont en pause. Vous pouvez vérifier à nouveau.",

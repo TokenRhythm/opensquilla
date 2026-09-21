@@ -4951,6 +4951,7 @@
       "identity": "Vuelve al Gateway y a la cuenta originales para comprobar esta entrega.",
       "receipt-unsupported": "Este Gateway no permite consultar recibos. Abre la conversación para comprobar el resultado.",
       "receipt-missing": "No se encontró ningún recibo. La entrega original sigue sin confirmar.",
+      "storage-check": "No se pudo acceder al estado de recuperación. Vuelve a comprobar cuando el almacenamiento local esté disponible.",
       "storage": "No se pudo guardar la solicitud de detención. Comprueba la tarea antes de cerrar; no se garantiza la detención al volver a abrir.",
       "lease": "Otra ventana está comprobando esta entrega.",
       "budget": "Las comprobaciones automáticas están en pausa. Puedes comprobar de nuevo.",

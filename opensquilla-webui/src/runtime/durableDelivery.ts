@@ -20,6 +20,17 @@ interface DeliveryOptions {
   ownerId?: string
 }
 
+interface PendingStopIntent {
+  identity: string
+  record?: DeliveryWalRecord
+  request?: TurnCancelRequest
+  completed?: boolean
+  terminalReceipt?: boolean
+  needsReceipt?: boolean
+  storageFailed?: boolean
+  paused?: 'authority' | 'conflict'
+}
+
 const LEASE_MS = 60_000
 const RENEW_MS = 10_000
 const ROUND_MS = 30_000
@@ -58,6 +69,11 @@ function taskIdentity(record: DeliveryWalRecord): string | undefined {
     || (response && 'turnId' in response ? response.turnId : undefined)
 }
 
+function terminalReceipt(record: DeliveryWalRecord, response: TurnSendResponse | TurnSteerResponse): boolean {
+  return ('taskStatus' in response && ['succeeded', 'completed', 'finished', 'cancelled', 'canceled', 'failed', 'timeout', 'abandoned', 'interrupted', 'aborted', 'stopped'].includes(response.taskStatus || ''))
+    || (record.request?.kind === 'steer' && 'disposition' in response && ['cancelled', 'rejected'].includes(response.disposition || ''))
+}
+
 /** Delivery owns only admission and exact Stop; socket, reads and event recovery keep their existing owners. */
 export function createDurableDelivery(options: DeliveryOptions): DurableDelivery {
   const now = options.now || Date.now
@@ -69,7 +85,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   const summaries = new Map<string, DeliverySnapshot>()
   const flights = new Map<string, Promise<TurnSendResponse | TurnSteerResponse>>()
   const handoffOwners = new Map<string, { owner: string; revision: number }>()
-  const stopIntents = new Set<string>()
+  const stopIntents = new Map<string, PendingStopIntent>()
+  const volatileStopFlights = new Map<string, Promise<void>>()
   const controllers = new Set<AbortController>()
   const renewals = new Set<ReturnType<typeof setInterval>>()
   const controllerIdentities = new Map<AbortController, string>()
@@ -104,11 +121,12 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
 
   function publish(record: DeliveryWalRecord, waitReason?: DeliveryWaitReason | null) {
     const previous = summaries.get(record.ownerRequestId)
-    const reason = waitReason === undefined && previous?.phase === record.phase
+    const intent = stopIntents.get(record.ownerRequestId)
+    const reason = intent?.storageFailed ? 'storage' : waitReason === undefined && previous?.phase === record.phase
       ? previous.waitReason : waitReason
     const summary: DeliverySnapshot = {
       id: record.ownerRequestId, sessionKey: record.requestSessionKey, phase: record.phase,
-      stopPending: !!(record.stop && !record.stop.completed), ...(reason ? { waitReason: reason } : {}),
+      stopPending: !!(record.stop && !record.stop.completed) || !!(intent && !intent.completed), ...(reason ? { waitReason: reason } : {}),
     }
     if (JSON.stringify(summaries.get(record.ownerRequestId)) !== JSON.stringify(summary)) {
       summaries.set(record.ownerRequestId, summary)
@@ -126,9 +144,10 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     }
     // Completed receipts stay on disk for deduplication, while the app retains
     // only a small notification window. Unresolved delivery is never evicted.
-    const completed = [...summaries.values()].filter(item => item.phase === 'accepted' && !item.stopPending)
+    const completed = [...summaries.values()].filter(item => item.phase === 'accepted' && !item.stopPending && item.waitReason !== 'storage')
     for (const item of completed.slice(0, Math.max(0, completed.length - 128))) {
       summaries.delete(item.id); observed.delete(item.id)
+      if (!stopIntents.has(item.id)) { roundTriggers.delete(item.id); manualRetries.delete(item.id) }
     }
   }
 
@@ -138,7 +157,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     return undefined
   }
 
-  async function update(id: string, mutate: (current: DeliveryWalRecord) => DeliveryWalRecord | null): Promise<DeliveryWalRecord | null> {
+  async function update(id: string, mutate: (current: DeliveryWalRecord) => DeliveryWalRecord | null,
+    onConflict?: () => void): Promise<DeliveryWalRecord | null> {
     storageReady()
     for (let attempt = 0; attempt < 8; attempt += 1) {
       const current = await wal!.getDelivery!(id)
@@ -149,6 +169,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
         ...next, revision: current.revision + 1, updatedAt: now(),
       })
       if (result.applied) { if (result.record) publish(result.record); return result.record }
+      onConflict?.()
     }
     throw new Error('Delivery record changed concurrently')
   }
@@ -232,15 +253,25 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
 
   async function receive(id: string, response: TurnSendResponse | TurnSteerResponse, epoch: number) {
     let accepted = false
+    let candidate: DeliveryWalRecord | undefined
     const result = await update(id, current => {
       accepted = current.lease?.owner === owner && current.lease.epoch === epoch && current.lease.expiresAt > now()
       if (!accepted) return null
+      candidate = { ...current, response: structuredClone(response), phase: 'accepted' }
       const steer = current.request?.kind === 'steer'
-      const terminal = ('taskStatus' in response && ['succeeded', 'completed', 'finished', 'cancelled', 'canceled', 'failed', 'timeout', 'abandoned', 'interrupted', 'aborted', 'stopped'].includes(response.taskStatus || ''))
-        || (steer && 'disposition' in response && ['cancelled', 'rejected'].includes(response.disposition || ''))
+      const terminal = terminalReceipt(current, response)
       return { ...current, phase: steer && 'accepted' in response && response.accepted === false ? 'not-sent'
         : steer && (!('accepted' in response) || response.accepted !== true) ? 'unknown' : 'accepted',
       response: structuredClone(response), ...(terminal && current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
+    }, () => { candidate = undefined }).catch(async error => {
+      // A failed write may leave a useful exact task in this process. A lost
+      // CAS or lease never authorizes a stale callback to supply that task.
+      const intent = stopIntents.get(id)
+      const latest = candidate && await wal?.getDelivery?.(id).catch(() => null)
+      if (intent && candidate && latest?.revision === candidate.revision
+        && latest.lease?.owner === owner && latest.lease.epoch === epoch && latest.lease.expiresAt > now()
+        && intent.identity === latest.deliveryIdentity) intent.record = candidate
+      throw error
     })
     if (!accepted) throw new TurnCommandError('session-changed', 'Delivery lease changed', 'DELIVERY_LEASE_LOST', null, true)
     return result
@@ -270,7 +301,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       const created = await wal!.prepareDelivery!({
         schemaVersion: 2, ownerRequestId: id, deliveryIdentity: identity, requestSessionKey: session,
         request: structuredClone(request), phase: 'prepared', revision: 1, createdAt: now(), updatedAt: now(),
-        ...(stopIntents.has(id) ? { stop: { requested: true as const } } : {}),
+        ...(stopIntents.get(id)?.identity === identity ? { stop: { requested: true as const } } : {}),
         ...(request.kind === 'send' && request.request.kind === 'new-turn' ? {
           handoff: {
             schemaVersion: 1 as const, ownerRequestId: id, requestSessionKey: session,
@@ -337,12 +368,108 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     return operation
   }
 
+  function reportStopStorage(id: string, intent: PendingStopIntent) {
+    intent.storageFailed = true
+    const previous = summaries.get(id)
+    summaries.set(id, { id, sessionKey: intent.record?.requestSessionKey || previous?.sessionKey || '',
+      phase: intent.record?.phase || previous?.phase || 'unknown', stopPending: !intent.completed, waitReason: 'storage' })
+    for (const listener of changes) listener()
+  }
+
+  async function persistStopIntent(id: string, intent: PendingStopIntent): Promise<void> {
+    let matched = false
+    const record = await update(id, current => {
+      matched = current.deliveryIdentity === intent.identity
+      if (!matched) return null
+      // Retain an authoritative receipt obtained while writes were failing.
+      if (current.response || !intent.record?.response) intent.record = current
+      const currentTask = taskIdentity(current)
+      const completed = intent.completed === true && (intent.terminalReceipt || !currentTask || currentTask === intent.request?.taskId)
+      return { ...current, ...(intent.paused ? { paused: intent.paused } : {}), stop: { ...current.stop, requested: true, completed,
+        ...(intent.request && (!currentTask || currentTask === intent.request.taskId) ? { request: intent.request } : {}) } }
+    })
+    if (!matched || !record) return
+    if (stopIntents.get(id) === intent) stopIntents.delete(id)
+    if (!record.stop?.completed) manualRetries.add(id)
+    publish(record, null)
+  }
+
   async function requestStop(id: string): Promise<void> {
-    stopIntents.add(id)
+    const identity = options.access.identity()
+    if (!identity) return
+    const intent = stopIntents.get(id) || { identity }
+    stopIntents.set(id, intent)
     manualRetries.add(id)
-    const record = await update(id, current => current.deliveryIdentity === options.access.identity()
-      ? { ...current, stop: { ...current.stop, requested: true, completed: false } } : null)
-    if (record) { stopIntents.delete(id); void wake() }
+    try { await persistStopIntent(id, intent) } catch { reportStopStorage(id, intent) }
+    void wake()
+  }
+
+  /** A failed WAL write cannot suppress the user's in-process exact Stop.
+   * This uses the existing app scheduler and slots, with at most one read and
+   * one cancellation per trigger. Unlike automatic recovery, an explicit Stop
+   * may repeat safe reads and exact cancellation across tabs while storage
+   * cannot grant a lease. It never claims cross-restart durability. */
+  async function recoverVolatileStop(id: string, intent: PendingStopIntent): Promise<void> {
+    if (disposed || invalidated) return
+    const active = volatileStopFlights.get(id)
+    if (active) return active
+    if (intent.completed || intent.paused || flights.has(id) || activeLeases.has(id)) return
+    const record = intent.record
+    if (!record || intent.identity !== options.access.identity() || allowed(record)) return
+    const trigger = `${intent.identity}:${options.access.generation()}`
+    if (!manualRetries.has(id) && roundTriggers.get(id) === trigger) return
+    const operation = (async () => {
+      roundTriggers.set(id, trigger)
+      manualRetries.delete(id)
+      const controller = new AbortController()
+      controllers.add(controller)
+      controllerIdentities.set(controller, intent.identity)
+      const deadline = setTimeout(() => controller.abort(), ROUND_MS)
+      try {
+        let current = intent.record!
+        if (intent.needsReceipt || !taskIdentity(current)) {
+          if (!current.request || !options.commands.lookupReceipt || options.commands.supportsReceiptLookup?.() === false) return
+          const receipt = await slot(false, () => fenced(current, controller.signal, opts => options.commands.lookupReceipt!(current.request!, opts)))
+          if (receipt.status !== 'found') return
+          current = { ...current, response: receipt.response, phase: 'accepted' }
+          intent.record = current
+          intent.needsReceipt = false
+        }
+        if (current.response && terminalReceipt(current, current.response)) {
+          intent.completed = true
+          intent.terminalReceipt = true
+          try { await persistStopIntent(id, intent) } catch { /* Keep the storage warning until committed. */ }
+          return
+        }
+        const taskId = taskIdentity(current)
+        if (!taskId) return
+        const request: TurnCancelRequest = { sessionKey: current.response?.sessionKey || current.response?.key || current.requestSessionKey,
+          taskId, source: 'webui_stop', scope: 'task' }
+        const response = await slot(true, () => fenced(current, controller.signal, opts => options.commands.cancel(request, opts)))
+        const inactive = ['task_not_active', 'task_mismatch'].includes(response.reason || '')
+        const pendingSteer = current.request?.kind === 'steer' && (!current.response || !('disposition' in current.response)
+          || !['applied', 'promoted', 'cancelled', 'rejected'].includes(current.response.disposition || ''))
+        if (response.aborted || (inactive && !pendingSteer)) { intent.completed = true; intent.request = request }
+        else if (inactive && pendingSteer) {
+          intent.needsReceipt = true
+          intent.record = { ...current, response: undefined, phase: 'unknown' }
+        }
+        try { await persistStopIntent(id, intent) } catch { /* The visible storage warning remains until a CAS commits. */ }
+      } catch (error) {
+        if (error instanceof TurnCommandError && (error.kind === 'conflict'
+          || /FORBIDDEN|UNAUTHORIZED|PERMISSION|SCOPE|IDENTITY|FINGERPRINT/i.test(error.failureCode || ''))) {
+          intent.paused = error.kind === 'conflict' ? 'conflict' : 'authority'
+        }
+        // Unknown delivery remains pending; another valid trigger may recheck it.
+      }
+      finally {
+        clearTimeout(deadline)
+        controllers.delete(controller); controllerIdentities.delete(controller)
+        if (stopIntents.get(id) === intent) reportStopStorage(id, intent)
+      }
+    })().finally(() => { volatileStopFlights.delete(id) })
+    volatileStopFlights.set(id, operation)
+    return operation
   }
 
   async function requestSteerStop(sessionKey: string, expectedTurnId: string): Promise<void> {
@@ -367,9 +494,17 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     if (disposed || invalidated || !token || receiptEventTokens.get(id) === token) return
     if (!summaries.has(id) && !flights.has(id)) return
     const record = await wal?.getDelivery?.(id)
-    if (!record || !unfinished(record) || record.deliveryIdentity !== options.access.identity() || record.paused) return
+    const intent = stopIntents.get(id)
+    if (!record || (!unfinished(record) && !intent) || record.deliveryIdentity !== options.access.identity() || record.paused) return
     receiptEventTokens.set(id, token)
     if (receiptEventTokens.size > 256) receiptEventTokens.delete(receiptEventTokens.keys().next().value!)
+    if (intent?.storageFailed) {
+      intent.record = { ...record, response: undefined, phase: 'unknown' }
+      intent.needsReceipt = true
+      manualRetries.add(id)
+      await recoverVolatileStop(id, intent)
+      return
+    }
     const fresh = record.stop && record.phase === 'accepted'
       ? await update(id, current => ({ ...current, phase: 'unknown' })) : record
     manualRetries.add(id)
@@ -440,6 +575,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   }
 
   async function round(record: DeliveryWalRecord): Promise<void> {
+    const intent = stopIntents.get(record.ownerRequestId)
+    if (intent?.storageFailed) { await recoverVolatileStop(record.ownerRequestId, intent); return }
     if (record.phase === 'prepared') { publish(record, 'not-sent'); return }
     const waitReason = allowed(record)
     if (waitReason) { publish(record, waitReason); return }
@@ -502,6 +639,11 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     const operation = (async () => {
       try {
         storageReady()
+        for (const [id, intent] of stopIntents) {
+          if (intent.identity !== options.access.identity()) continue
+          try { await persistStopIntent(id, intent) } catch { reportStopStorage(id, intent) }
+          if (stopIntents.get(id) === intent) await recoverVolatileStop(id, intent)
+        }
         if (!quarantineChecked && wal!.countQuarantinedDeliveries) {
           quarantineChecked = true
           if (await wal!.countQuarantinedDeliveries() > 0) {
@@ -556,8 +698,21 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     async retry(id) {
       if (id) {
         manualRetries.add(id)
-        const record = await update(id, current => current.deliveryIdentity === options.access.identity() ? { ...current, paused: undefined } : null)
-        if (record) await round(record)
+        const intent = stopIntents.get(id)
+        if (intent) intent.paused = undefined
+        try {
+          if (intent) await persistStopIntent(id, intent)
+          const record = await update(id, current => current.deliveryIdentity === options.access.identity() ? { ...current, paused: undefined } : null)
+          if (record) await round(record)
+        } catch {
+          if (intent) { reportStopStorage(id, intent); await recoverVolatileStop(id, intent) }
+          else {
+            const previous = summaries.get(id)
+            summaries.set(id, { id, sessionKey: previous?.sessionKey || '', phase: previous?.phase || 'unknown',
+              stopPending: previous?.stopPending || false, waitReason: previous?.stopPending ? 'storage' : 'storage-check' })
+            for (const listener of changes) listener()
+          }
+        }
         return
       }
       await wake()

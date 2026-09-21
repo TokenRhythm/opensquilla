@@ -225,6 +225,195 @@ describe('application-owned durable delivery', () => {
     test.owner.dispose()
   })
 
+  it('keeps an unknown Stop visible and cancels its exact receipt task while WAL writes fail', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request() }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async () => { throw new DOMException('Synthetic quota failure', 'QuotaExceededError') }
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { taskId: 'exact-recovered-task', sessionKey: 'forked-session' } })) }, storage)
+    await expect(test.owner.requestStop('synthetic-request')).resolves.toBeUndefined()
+    await test.owner.wake()
+    expect(test.owner.snapshots()).toContainEqual(expect.objectContaining({ id: 'synthetic-request', waitReason: 'storage' }))
+    expect(test.commands.send).not.toHaveBeenCalled()
+    expect(test.commands.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'exact-recovered-task', sessionKey: 'forked-session', scope: 'task' }), expect.anything())
+    expect(storage.records.get('synthetic-request')?.stop).toBeUndefined()
+    await test.owner.wake()
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(1)
+    expect(test.commands.cancel).toHaveBeenCalledTimes(1)
+    storage.wal.compareAndSwapDelivery = compare
+    await test.owner.wake()
+    expect(storage.records.get('synthetic-request')?.stop).toMatchObject({ requested: true, completed: true })
+    expect(test.owner.snapshots().find(item => item.id === 'synthetic-request')?.waitReason).not.toBe('storage')
+    test.owner.dispose()
+  })
+
+  it('CAS-persists an unknown Stop after storage recovers before reopening its original identity', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request() }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic storage failure') }
+    const first = harness({}, storage)
+    first.available(false)
+    await expect(first.owner.requestStop('synthetic-request')).resolves.toBeUndefined()
+    expect(first.owner.snapshots()).toContainEqual(expect.objectContaining({ stopPending: true, waitReason: 'storage' }))
+    storage.wal.compareAndSwapDelivery = compare
+    await first.owner.wake()
+    expect(storage.records.get('synthetic-request')?.stop).toMatchObject({ requested: true, completed: false })
+    first.owner.dispose()
+    const second = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { taskId: 'reopened-task' } })) }, storage)
+    await second.owner.wake()
+    expect(second.commands.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'reopened-task', scope: 'task' }), expect.anything())
+    expect(storage.records.get('synthetic-request')?.stop?.completed).toBe(true)
+    second.owner.dispose()
+  })
+
+  it('fences a volatile Stop to its original identity and keeps unsupported receipt recovery read-only', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request() }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1 })
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic storage failure') }
+    const test = harness({ supportsReceiptLookup: () => false }, storage)
+    test.available(false)
+    await test.owner.requestStop('synthetic-request')
+    test.available(true)
+    test.identity('another-synthetic-identity')
+    await test.owner.wake()
+    expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    test.identity('synthetic-identity')
+    await test.owner.retry('synthetic-request')
+    expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    expect(test.commands.send).not.toHaveBeenCalled()
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    expect(test.owner.snapshots()).toContainEqual(expect.objectContaining({ stopPending: true, waitReason: 'storage' }))
+    test.owner.dispose()
+  })
+
+  it('contains a manual receipt recheck storage failure and keeps a visible recovery state', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request() }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1 })
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic storage failure') }
+    const test = harness({}, storage)
+    await expect(test.owner.retry('synthetic-request')).resolves.toBeUndefined()
+    expect(test.owner.snapshots()).toContainEqual(expect.objectContaining({ id: 'synthetic-request', waitReason: 'storage-check' }))
+    expect(test.commands.send).not.toHaveBeenCalled()
+    test.owner.dispose()
+  })
+
+  it('uses the independent Stop slot for an exact volatile task while both admissions are occupied', async () => {
+    const resolves: Array<(response: TurnSendResponse) => void> = []
+    const storage = memoryWal()
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (id === 'volatile-task') throw new Error('Synthetic quota failure')
+      return compare(id, revision, record)
+    }
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>(resolve => resolves.push(resolve))) }, storage)
+    const admissions = [test.owner.commands.send(request('ordinary-a')), test.owner.commands.send(request('ordinary-b'))]
+    await flush()
+    expect(test.commands.send).toHaveBeenCalledTimes(2)
+    storage.records.set('volatile-task', { schemaVersion: 2, ownerRequestId: 'volatile-task', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', phase: 'accepted', response: { taskId: 'exact-task' }, revision: 1, createdAt: 1, updatedAt: 1 })
+    await test.owner.requestStop('volatile-task')
+    await flush()
+    expect(test.commands.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'exact-task' }), expect.anything())
+    expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    for (const resolve of resolves) resolve({ taskId: 'ordinary-task' })
+    await Promise.all(admissions)
+    test.owner.dispose()
+  })
+
+  it('allows an explicit volatile Stop to read and cancel exactly while a foreign lease survives a quota failure', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request() }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1,
+      lease: { owner: 'foreign-owner', epoch: 7, expiresAt: Date.now() + 60_000 } })
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { taskId: 'exact-task' } })) }, storage)
+    await test.owner.requestStop('synthetic-request')
+    await test.owner.wake()
+    expect(test.commands.send).not.toHaveBeenCalled()
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(1)
+    expect(test.commands.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'exact-task', scope: 'task' }), expect.anything())
+    expect(storage.records.get('synthetic-request')?.lease).toMatchObject({ owner: 'foreign-owner', epoch: 7 })
+    expect(storage.records.get('synthetic-request')?.stop).toBeUndefined()
+    test.owner.dispose()
+  })
+
+  it('never caches a receipt that lost its CAS before a volatile Stop sees a newer promoted task', async () => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'steer', request: { key: 'synthetic-session', clientRequestId: 'synthetic-request',
+        clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'Synthetic steer' } }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1 })
+    let resolveLookup!: (response: TurnReceiptResult) => void
+    const test = harness({ lookupReceipt: vi.fn(() => new Promise<TurnReceiptResult>(resolve => { resolveLookup = resolve })) }, storage)
+    const recovering = test.owner.wake()
+    await flush()
+    let receiptRace = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (!receiptRace && record?.response?.taskId === 'old-task') {
+        receiptRace = true
+        const newer = { ...storage.records.get(id)!, revision: revision + 1, phase: 'accepted' as const,
+          response: { accepted: true, disposition: 'promoted' as const, taskId: 'old-task', promotedTurnId: 'promoted-task' },
+          lease: { owner: 'foreign-owner', epoch: 9, expiresAt: Date.now() + 60_000 } }
+        storage.records.set(id, newer)
+        return { applied: false, record: structuredClone(newer) }
+      }
+      throw new Error('Synthetic quota failure')
+    }
+    await test.owner.requestStop('synthetic-request')
+    resolveLookup({ status: 'found', response: { accepted: true, disposition: 'steering', taskId: 'old-task' } })
+    await vi.advanceTimersByTimeAsync(1_000)
+    await recovering
+    await test.owner.wake()
+    expect(test.commands.cancel).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ taskId: 'promoted-task' }), expect.anything())
+    expect(storage.records.get('synthetic-request')?.lease?.epoch).toBe(9)
+    test.owner.dispose()
+  })
+
+  it.each(['cancelled', 'rejected'] as const)('does not cancel the historical task from a terminal %s Steer receipt when Stop storage fails', async disposition => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'steer', request: { key: 'synthetic-session', clientRequestId: 'synthetic-request',
+        clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'Synthetic steer' } }, phase: 'unknown', revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { accepted: true, disposition, taskId: 'old-task' } })) }, storage)
+    await test.owner.requestStop('synthetic-request')
+    await test.owner.wake()
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    expect(test.owner.snapshots()).toContainEqual(expect.objectContaining({ stopPending: false, waitReason: 'storage' }))
+    storage.wal.compareAndSwapDelivery = compare
+    await test.owner.wake()
+    expect(storage.records.get('synthetic-request')?.stop?.completed).toBe(true)
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    test.owner.dispose()
+  })
+
+  it('refreshes an inactive volatile Steer target instead of reusing the old persisted steering receipt', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'steer', request: { key: 'synthetic-session', clientRequestId: 'synthetic-request',
+        clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'Synthetic steer' } }, phase: 'accepted', revision: 1, createdAt: 1, updatedAt: 1,
+      response: { accepted: true, disposition: 'steering', taskId: 'old-task' } })
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { accepted: true, disposition: 'promoted' as const, taskId: 'old-task', promotedTurnId: 'promoted-task' } })),
+      cancel: vi.fn().mockResolvedValueOnce({ aborted: false, reason: 'task_not_active' }).mockResolvedValue({ aborted: true }) }, storage)
+    await test.owner.requestStop('synthetic-request')
+    await test.owner.wake()
+    expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    expect(test.commands.cancel).toHaveBeenCalledTimes(1)
+    await test.owner.retry('synthetic-request')
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(test.commands.cancel).mock.calls.map(call => call[0].taskId)).toEqual(['old-task', 'promoted-task'])
+    expect(test.owner.snapshots()).toContainEqual(expect.objectContaining({ stopPending: false, waitReason: 'storage' }))
+    test.owner.dispose()
+  })
+
   it('rereads a queued admission after another tab has made its acceptance unknown', async () => {
     const resolves: Array<(response: TurnSendResponse) => void> = []
     const test = harness({
