@@ -99,6 +99,13 @@ source. Correct or qualify claims with their current hash and review changed
 groups again. A finished draft is not finished research, and a successful tool
 call is not semantic verification.
 
+Use a lightweight evaluation loop for the first workflow version. If
+`mcp_researchFinalize` returns `status="needs_review"`, treat its `checks` as
+the optimization list, make the smallest evidence-backed fixes, run a fresh
+`mcp_researchNavigate(view="review")`, and retry finalization. Do not publish
+between iterations. Continue until the actionable checks are empty; no separate
+scorecard is required yet.
+
 Follow the report companion for artifact and publication rules. Final chat
 should contain the answer, material limits, and usable links only; do not expose
 internal IDs, private paths, raw provenance, or tool narration.
