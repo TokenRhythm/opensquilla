@@ -190,6 +190,7 @@ export function createV4SessionSnapshotTransfer(
       const raw = await requestOwned(SESSIONS_MESSAGES_SNAPSHOT_READ_METHOD, params, {
         signal: controller.signal, expectedGeneration: generation, timeoutMs: remaining(15_000),
         cancelOnAbort: true, timeoutAction: 'reject', abortAction: 'reject',
+        recoveryClass: 'safe-read',
         ...(onSent ? { onSent } : {}),
       })
       if (!validateSessionsMessagesSnapshotReadResult(raw)) {

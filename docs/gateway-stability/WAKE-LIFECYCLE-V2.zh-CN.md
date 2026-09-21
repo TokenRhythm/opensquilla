@@ -15,7 +15,7 @@
 
 Electron resume 走 2 秒 nonce probe。成功沿用旧 generation；失败立即退役旧 generation 并建立新连接，同时保留同一个 incident 的截止时间。未确认的 Goal、steer、chat send 等 mutation 不会自动重放；已发送但未确认的请求继续以 `accepted=null` 的传输错误交给调用方处理。
 
-明确标记为 safe-read 的读取请求在恢复期间最多排队 8 条，单条最多等待 5 秒；默认请求属于 mutation，checking/suspect/reconnecting 阶段不会写入旧 socket。双 WebSocket warm reconnect 未启用。
+明确标记为 safe-read 的读取请求在恢复期间最多排队 8 条，单条最多等待 5 秒；当前 session history、hydrate、snapshot 读取已显式标注，订阅、snapshot release、Goal 和发送操作仍按 mutation 处理。默认请求属于 mutation，checking/suspect/reconnecting 阶段不会写入旧 socket。双 WebSocket warm reconnect 未启用。
 
 Gateway writer 保留已有 2 秒 direct-send、30 秒 recovery-credit、60 秒 queued-writer 和 512 槽边界。本次只增加 `queue_oldest_age_ms`、`last_inbound_age_ms`、`last_outbound_age_ms`、`probe_wait_age_ms` 和有限枚举 `writer_starvation_reason` 诊断，不改变 writer 调度或协议。
 
