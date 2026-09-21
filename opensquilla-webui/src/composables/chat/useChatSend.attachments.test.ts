@@ -432,6 +432,54 @@ describe('useChatSend durable application lifetime integration', () => {
     } finally { harness.api.dispose(); owner.dispose() }
   })
 
+  it.each([false, true])('only prioritizes an existing task after hydration resolves: %s', async hydrationResolved => {
+    const wal = memoryDeliveryWal()
+    let available = true
+    let rejectSend!: (error: unknown) => void
+    const raw: TurnCommands = {
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })),
+      steer: vi.fn(async () => ({ accepted: true })), cancel: vi.fn(async () => ({ aborted: true })),
+      supports: () => true,
+    }
+    const owner = createDurableDelivery({ wal, commands: raw,
+      access: { identity: () => 'synthetic-identity', available: () => available, generation: () => 1 } })
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('known-earlier-task')
+    if (!hydrationResolved) taskOwnership.beginHydration()
+    const acceptanceStopAvailable = ref(false)
+    const harness = makeOptions({ turnCommands: owner.commands, durableDelivery: owner, taskOwnership,
+      deliveryIdentity: ref('synthetic-identity'), acceptanceStopAvailable,
+      activeStreamTaskId: ref('known-earlier-task'),
+      canStop: () => acceptanceStopAvailable.value || taskOwnership.hydrationResolved.value,
+      canStopKnownTask: () => taskOwnership.hydrationResolved.value })
+    try {
+      const sending = owner.commands.send({ kind: 'new-turn', params: {
+        sessionKey: 'agent:main:webchat:test', clientRequestId: 'synthetic-unknown-B',
+        clientMessageId: 'synthetic-message-B', message: 'Synthetic unknown B',
+      } }).catch(() => {})
+      await vi.waitFor(() => expect(raw.send).toHaveBeenCalledTimes(1))
+      available = false
+      rejectSend(new TurnCommandError('transport', 'Synthetic lost ACK', undefined, null))
+      await sending
+      await nextTick()
+      expect(acceptanceStopAvailable.value).toBe(true)
+      const requestStop = vi.spyOn(owner, 'requestStop')
+      available = hydrationResolved
+      harness.api.onStop()
+      if (hydrationResolved) {
+        await vi.waitFor(() => expect(raw.cancel).toHaveBeenCalledTimes(1))
+        expect(raw.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'known-earlier-task', scope: 'task' }), expect.anything())
+        expect(requestStop).not.toHaveBeenCalled()
+        expect((await wal.getDelivery!('synthetic-unknown-B'))?.stop?.requested).not.toBe(true)
+      } else {
+        expect(requestStop).toHaveBeenCalledExactlyOnceWith('synthetic-unknown-B')
+        await vi.waitFor(async () => expect((await wal.getDelivery!('synthetic-unknown-B'))?.stop?.requested).toBe(true))
+        expect(raw.cancel).not.toHaveBeenCalled()
+        expect(taskOwnership.stopRequestedTaskId.value).toBe('')
+      }
+    } finally { harness.api.dispose(); owner.dispose() }
+  })
+
   it('keeps an ordinary Stop after its WAL write fails and the originating view is disposed', async () => {
     const wal = memoryDeliveryWal()
     let available = true

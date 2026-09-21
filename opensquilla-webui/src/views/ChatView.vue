@@ -3754,6 +3754,7 @@ const chatSend = useChatSend({
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,
+  canStopKnownTask: () => !isSessionHydrating.value && taskOwnership.hydrationResolved.value,
   normalizeElevatedMode,
   adoptResponseSession: async (key, ownerRequestId) => {
     const sourceKey = sessionKey.value

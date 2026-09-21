@@ -546,6 +546,8 @@ export interface UseChatSendOptions {
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
+  /** A retained task id cannot outrank a request while its session is hydrating. */
+  canStopKnownTask?: () => boolean
   normalizeElevatedMode: (mode: string) => string
   adoptResponseSession: (
     key: string,
@@ -3943,14 +3945,15 @@ export function useChatSend(options: UseChatSendOptions) {
     // Keep that transaction latched until its ACK/reconcile so a double click
     // cannot widen the second request into legacy whole-session cancellation.
     if (acceptanceStopPending.value) return
-    const handoffCanStop = responseHandoffBlocksCurrentSession()
+    const knownTaskReady = options.canStopKnownTask?.() ?? true
+    const handoffCanStop = knownTaskReady && responseHandoffBlocksCurrentSession()
     if (!(handoffCanStop || (options.canStop?.() ?? options.stream.isStreaming.value))) return
     const handoff = handoffCanStop ? activeResponseHandoff : null
-    const acceptance = activeAcceptanceTransaction?.requestSessionKey === options.sessionKey.value
+    const acceptance = knownTaskReady && activeAcceptanceTransaction?.requestSessionKey === options.sessionKey.value
       ? activeAcceptanceTransaction
       : null
-    const ownershipStopTarget = options.taskOwnership?.beginStop() || ''
-    const rawStoppedTurnId = ownershipStopTarget || currentExpectedTurnId()
+    const ownershipStopTarget = knownTaskReady ? options.taskOwnership?.beginStop() || '' : ''
+    const rawStoppedTurnId = knownTaskReady ? ownershipStopTarget || currentExpectedTurnId() : ''
     const stoppedTurnId = rawStoppedTurnId
       && ![
         PENDING_STREAM_TASK_ID,
@@ -3974,6 +3977,9 @@ export function useChatSend(options: UseChatSendOptions) {
       })
       return
     }
+    // The hydration bypass only authorizes the exact durable request above.
+    // It never authorizes a retained task, handoff, or session-tree target.
+    if (!knownTaskReady) return
     if (!stoppedTurnId && !handoff && !acceptance && options.durableDelivery
       && acceptanceRecoveryPendingForCurrentSession.value) {
       // The template's watched boolean can lag a synchronous second click.
