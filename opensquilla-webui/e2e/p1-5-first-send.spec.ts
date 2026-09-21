@@ -6,12 +6,28 @@ import {
   type WebSocketRoute,
 } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const RELEASE_ITERATIONS = Number(process.env.OPENSQUILLA_P1_5_ITERATIONS || '1')
 const FIRST_TEXT = 'P1-5 deterministic first send'
 const SECOND_TEXT = 'P1-5 deterministic follow-up'
 const FATAL_RENDERER_PATTERN = /(?:emitsOptions|exposed|nextSibling|getNextHostNode|Teleport\.process)/
+const DELIVERY_PRINCIPAL = {
+  role: 'operator',
+  authenticated: true,
+  isOwner: true,
+  authState: 'authenticated',
+  scopes: ['operator.admin', 'operator.read', 'operator.write'],
+  capabilities: [],
+  tokenPublicId: 'synthetic_p1_5_owner',
+  guestOwnerId: null,
+}
 
 type Scenario = 'immediate' | 'delayed' | 'event-before-ack' | 'reconnect' | 'queued-wal'
 type RpcRequest = {
@@ -33,6 +49,7 @@ type PendingRow = {
 
 type MockGatewayState = {
   chatSends: Array<Record<string, unknown>>
+  receiptQueries: Array<Record<string, unknown>>
   dispatchMessages: string[]
   dispatchCount: number
   enqueueCount: number
@@ -46,6 +63,7 @@ type MockGatewayState = {
 
 type MockGateway = {
   chatSends: Array<Record<string, unknown>>
+  receiptQueries: Array<Record<string, unknown>>
   dispatchMessages: string[]
   dispatchCount: number
   enqueueCount: number
@@ -75,6 +93,7 @@ function basePayload(method: string): unknown {
     },
     'models.routing.get': { mode: 'direct' },
     'onboarding.status': { audioConfigured: false },
+    'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
     'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
     'sessions.messages.unsubscribe': { subscribed: false },
     'sessions.subscribe': { subscribed: true },
@@ -100,6 +119,7 @@ function hello(supportsPendingQueue = true) {
         'sessions.messages.subscribe',
         'sessions.messages.snapshot',
         'sessions.messages.hydrate',
+        'turns.receipt.get',
         ...pendingMethods,
       ],
       events: [
@@ -109,7 +129,7 @@ function hello(supportsPendingQueue = true) {
       ],
     },
     auth: {
-      principal: { isOwner: true },
+      principal: DELIVERY_PRINCIPAL,
       runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
     },
   })
@@ -124,6 +144,8 @@ async function preparePage(page: Page) {
     contentType: 'application/json',
     body: JSON.stringify({ pending: [], mode: 'prompt', allowPatterns: [], denyPatterns: [] }),
   }))
+  await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   // `vite preview` owns only the built frontend. The packaged Gateway normally
   // serves this backend-owned brand asset from static/img; keep the standalone
   // production-bundle fixture console-clean without starting a second server.
@@ -137,6 +159,7 @@ async function preparePage(page: Page) {
 function createMockGatewayState(): MockGatewayState {
   return {
     chatSends: [],
+    receiptQueries: [],
     dispatchMessages: [],
     dispatchCount: 0,
     enqueueCount: 0,
@@ -193,37 +216,60 @@ async function installMockGateway(
         return
       }
       if (method === 'chat.history') {
+        ws.send(successResponse(frame.id, chatHistoryPayload()))
+        return
+      }
+      if (method === 'turns.receipt.get') {
+        const params = frame.params || {}
+        state.receiptQueries.push(params)
+        const original = (params.originalRequest || {}) as Record<string, unknown>
+        const requestId = String(original.clientRequestId || '')
+        const targetSessionKey = state.handoffTargets[requestId]
+        if (params.operation !== 'chat.send' || !targetSessionKey) {
+          ws.send(successResponse(frame.id, { status: 'not_found', accepted: null }))
+          return
+        }
+        // This task was already admitted before the response was lost. A read
+        // recovers its identity without entering the chat.send mock at all.
+        state.firstSessionKey = targetSessionKey
         ws.send(successResponse(frame.id, {
-          messages: [],
-          has_more: false,
-          canonical_complete: true,
+          status: 'found',
+          accepted: true,
+          requestFingerprint: `sha256:${'a'.repeat(64)}`,
+          receipt: {
+            requestSessionKey: original.sessionKey,
+            sessionKey: targetSessionKey,
+            sessionId: 'synthetic-p1-5-child-session',
+            sessionEpoch: 1,
+            clientRequestId: requestId,
+            messageId: original.clientMessageId,
+            taskId: firstTaskId,
+            taskStatus: state.firstFinished ? 'completed' : 'running',
+          },
         }))
         return
       }
       if (method === 'sessions.messages.snapshot') {
         const running = Boolean(state.firstSessionKey && !state.firstFinished)
-        ws.send(successResponse(frame.id, {
-          key: String(frame.params?.key || ''),
-          events: [],
+        ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(String(frame.params?.key || ''), {
           current_stream_seq: streamSeq,
           stream_generation: 'p1-5-generation',
           run_status: running ? 'running' : 'idle',
-          active_task: running ? { task_id: firstTaskId, state: 'running' } : null,
-        }))
+          active_task: running ? { task_id: firstTaskId, status: 'running' } : null,
+        })))
         return
       }
       if (method === 'sessions.messages.subscribe' || method === 'sessions.messages.hydrate') {
         const running = Boolean(state.firstSessionKey && !state.firstFinished)
-        ws.send(successResponse(frame.id, {
-          subscribed: true,
-          hydration_complete: true,
-          replay_complete: true,
+        const payload = method === 'sessions.messages.subscribe'
+          ? sessionMessagesSubscribePayload : sessionMessagesHydratePayload
+        ws.send(successResponse(frame.id, payload(String(frame.params?.key || ''), {
           current_stream_seq: streamSeq,
           stream_generation: 'p1-5-generation',
-          workspaceId: null,
           run_status: running ? 'running' : 'idle',
-          active_task: running ? { task_id: firstTaskId, state: 'running' } : null,
-        }))
+          active_task: running ? { task_id: firstTaskId, status: 'running' } : null,
+          tasks: running ? [{ task_id: firstTaskId, status: 'running' }] : [],
+        })))
         return
       }
       if (method === 'sessions.pending_inputs.list') {
@@ -355,6 +401,7 @@ async function installMockGateway(
 
   return {
     chatSends: state.chatSends,
+    receiptQueries: state.receiptQueries,
     dispatchMessages: state.dispatchMessages,
     get dispatchCount() { return state.dispatchCount },
     get enqueueCount() { return state.enqueueCount },
@@ -430,8 +477,23 @@ async function seedDurableHandoff(
     followups: string[]
   },
 ) {
-  await page.evaluate(async seed => {
-    const open = indexedDB.open('opensquilla-chat-pending-inputs', 2)
+  await expect.poll(() => page.evaluate(() => localStorage.getItem('opensquilla.deliverySalt.v1')))
+    .toMatch(/^[0-9a-f]{32}$/)
+  await page.evaluate(async ({ seed, principal }) => {
+    // Freeze this synthetic connection's credential-free delivery-v1 identity.
+    // This works with the production bundle without development-only hooks.
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const target = JSON.stringify(['browser', `${protocol}//${location.host}/ws`, ''])
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify([
+      localStorage.getItem('opensquilla.deliverySalt.v1'), target,
+    ])))
+    const targetId = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('')
+    const deliveryIdentity = JSON.stringify([
+      'delivery-v1', targetId, principal.role, principal.authState,
+      principal.authenticated, principal.isOwner, [...principal.scopes].sort(),
+      [...principal.capabilities].sort(), principal.tokenPublicId, principal.guestOwnerId,
+    ])
+    const open = indexedDB.open('opensquilla-chat-pending-inputs', 3)
     const database = await new Promise<IDBDatabase>((resolve, reject) => {
       open.onupgradeneeded = () => {
         const db = open.result
@@ -440,7 +502,11 @@ async function seedDurableHandoff(
           store.createIndex('session_created', ['sessionKey', 'createdAt'], { unique: false })
         }
         if (!db.objectStoreNames.contains('response_handoffs')) {
-          db.createObjectStore('response_handoffs', { keyPath: 'ownerRequestId' })
+          const handoffs = db.createObjectStore('response_handoffs', { keyPath: 'ownerRequestId' })
+          handoffs.createIndex('recovery_state', 'recoveryState')
+          handoffs.createIndex('task_scope', 'taskScope')
+          handoffs.createIndex('handoff_session', 'handoff.requestSessionKey')
+          handoffs.createIndex('steer_scope', 'steerScope')
         }
       }
       open.onsuccess = () => resolve(open.result)
@@ -452,24 +518,37 @@ async function seedDurableHandoff(
         'readwrite',
       )
       const now = Date.now()
-      transaction.objectStore('response_handoffs').put({
-        schemaVersion: 1,
-        ownerRequestId: seed.ownerRequestId,
-        requestSessionKey: seed.parentSessionKey,
+      const params = {
         clientRequestId: seed.ownerRequestId,
         clientMessageId: seed.clientMessageId,
-        params: {
+        message: 'P1-5 durable fork prompt',
+        queueMode: 'followup',
+        sessionKey: seed.parentSessionKey,
+        forkBeforeMessageId: 'synthetic-parent-message',
+        source: { channel: 'webui' },
+      }
+      transaction.objectStore('response_handoffs').put({
+        schemaVersion: 2,
+        ownerRequestId: seed.ownerRequestId,
+        deliveryIdentity,
+        requestSessionKey: seed.parentSessionKey,
+        request: { kind: 'send', request: { kind: 'new-turn', params } },
+        phase: 'unknown',
+        recoveryState: 'pending',
+        revision: 1,
+        handoff: {
+          schemaVersion: 1,
+          ownerRequestId: seed.ownerRequestId,
+          requestSessionKey: seed.parentSessionKey,
           clientRequestId: seed.ownerRequestId,
           clientMessageId: seed.clientMessageId,
-          message: 'P1-5 durable fork prompt',
-          queueMode: 'followup',
-          sessionKey: seed.parentSessionKey,
-          forkBeforeMessageId: 'synthetic-parent-message',
-          _source: { channel: 'webui' },
+          params,
+          composerText: 'P1-5 durable fork prompt',
+          recoveryAttachments: [],
+          state: 'submitting',
+          createdAt: now,
+          updatedAt: now,
         },
-        composerText: 'P1-5 durable fork prompt',
-        recoveryAttachments: [],
-        state: 'submitting',
         createdAt: now,
         updatedAt: now,
       })
@@ -485,6 +564,7 @@ async function seedDurableHandoff(
           attachments: [],
           intent: null,
           ownerRequestId: seed.ownerRequestId,
+          deliveryIdentity,
           state: 'saving',
           mayHaveServerCopy: false,
           position,
@@ -501,7 +581,7 @@ async function seedDurableHandoff(
     } finally {
       database.close()
     }
-  }, input)
+  }, { seed: input, principal: DELIVERY_PRINCIPAL })
 }
 
 async function pendingCardOrder(page: Page): Promise<string[]> {
@@ -608,7 +688,7 @@ test.describe('P1-5 first-send renderer release gate', () => {
 test.describe('durable handoff and pending order release gate', () => {
   test.describe.configure({ mode: 'serial' })
 
-  test('refresh replays a fork receipt and moves owner follow-ups exactly once', async ({ page }) => {
+  test('refresh reads a fork receipt without resending and moves owner follow-ups exactly once', async ({ page }) => {
     test.setTimeout(45_000)
     const errors = collectRendererErrors(page)
     await preparePage(page)
@@ -630,12 +710,19 @@ test.describe('durable handoff and pending order release gate', () => {
 
     await page.reload()
     await expect(page).toHaveURL(url => url.searchParams.get('session') === childSessionKey)
-    await expect.poll(() => gateway.chatSends.length).toBe(1)
-    expect(gateway.chatSends[0]).toMatchObject({
-      clientRequestId: ownerRequestId,
-      clientMessageId: 'message-durable-handoff',
-      sessionKey: parentSessionKey,
-      forkBeforeMessageId: 'synthetic-parent-message',
+    await expect.poll(() => gateway.receiptQueries.length).toBe(1)
+    expect(gateway.chatSends).toHaveLength(0)
+    expect(gateway.receiptQueries[0]).toEqual({
+      operation: 'chat.send',
+      originalRequest: {
+        clientRequestId: ownerRequestId,
+        clientMessageId: 'message-durable-handoff',
+        sessionKey: parentSessionKey,
+        forkBeforeMessageId: 'synthetic-parent-message',
+        message: 'P1-5 durable fork prompt',
+        queueMode: 'followup',
+        _source: { channel: 'webui' },
+      },
     })
     await expect.poll(() => gateway.enqueueCount).toBe(2)
     // The fork task remains the delivery barrier. Complete it only after the
@@ -646,7 +733,7 @@ test.describe('durable handoff and pending order release gate', () => {
       'handoff follow-up B',
     ])
     await expect.poll(() => gateway.pendingRows()).toEqual([])
-    await expect.poll(() => page.evaluate(async () => {
+    await expect.poll(() => page.evaluate(async requestId => {
       const request = indexedDB.open('opensquilla-chat-pending-inputs')
       const database = await new Promise<IDBDatabase>((resolve, reject) => {
         request.onsuccess = () => resolve(request.result)
@@ -654,16 +741,28 @@ test.describe('durable handoff and pending order release gate', () => {
       })
       try {
         const transaction = database.transaction('response_handoffs', 'readonly')
-        const rows = await new Promise<unknown[]>((resolve, reject) => {
-          const all = transaction.objectStore('response_handoffs').getAll()
-          all.onsuccess = () => resolve(all.result)
-          all.onerror = () => reject(all.error)
+        const row = await new Promise<Record<string, unknown>>((resolve, reject) => {
+          const get = transaction.objectStore('response_handoffs').get(requestId)
+          get.onsuccess = () => resolve(get.result)
+          get.onerror = () => reject(get.error)
         })
-        return rows.length
+        return row
       } finally {
         database.close()
       }
-    })).toBe(0)
+    }, ownerRequestId)).toMatchObject({
+      schemaVersion: 2,
+      ownerRequestId,
+      phase: 'accepted',
+      request: {
+        kind: 'send',
+        request: { kind: 'new-turn', params: { clientRequestId: ownerRequestId } },
+      },
+      response: { sessionKey: childSessionKey, taskId: 'p1-5-first-task', replayed: true },
+      handoff: undefined,
+    })
+    expect(gateway.receiptQueries).toHaveLength(1)
+    expect(gateway.chatSends).toHaveLength(0)
 
     const allErrors = [...errors.pageErrors, ...errors.consoleErrors]
     expect(allErrors, allErrors.join('\n')).toEqual([])
