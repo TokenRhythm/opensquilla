@@ -13,7 +13,7 @@ if __package__:
     from .references import _clean_title, source_format
     from .table_views import _source_text, table_quality_view
     from .writing_preparation import (
-        bibliography_breadth_check,
+        report_breadth_checks,
         scoped_search_check,
         scoped_search_count,
     )
@@ -31,7 +31,7 @@ else:  # pragma: no cover - standalone bridge
         table_quality_view,
     )
     from writing_preparation import (  # type: ignore[import-not-found,no-redef]
-        bibliography_breadth_check,
+        report_breadth_checks,
         scoped_search_check,
         scoped_search_count,
     )
@@ -368,7 +368,5 @@ def review_requirements(state: Mapping[str, Any]) -> dict[str, Any] | None:
                 ),
             }
         )
-    breadth = bibliography_breadth_check(state)
-    if breadth is not None:
-        pending.append(breadth)
+    pending.extend(report_breadth_checks(state))
     return {"status": "needs_review", "checks": pending, "review": preparation} if pending else None

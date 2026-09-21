@@ -6,7 +6,10 @@ from typing import Any
 import pytest
 
 from scripts.knowledge_research.navigation import Navigation
-from scripts.knowledge_research.writing_preparation import bibliography_breadth_check
+from scripts.knowledge_research.writing_preparation import (
+    bibliography_breadth_check,
+    report_breadth_checks,
+)
 from tests.test_scripts.test_knowledge_research_navigation import (
     REVISION,
     invoke,
@@ -222,6 +225,14 @@ def test_broad_deep_report_requires_independent_bibliography_breadth(tmp_path: P
     assert check["required"]["bibliographyEntries"] == 30
     assert check["observed"]["bibliographyEntries"] == 1
     assert check["suggestedSelection"]["selection"]["kind"] == "files"
+
+    table_check = next(
+        item
+        for item in report_breadth_checks(store.snapshot(rid))
+        if item["code"] == "REPORT_TABLE_BREADTH_REQUIRED"
+    )
+    assert table_check["required"]["reportTableExhibits"] == 3
+    assert table_check["required"]["reportTableSourceFiles"] == 3
 
 
 def test_mixed_first_batch_requires_each_cited_excerpt_but_no_uncited_files(tmp_path: Path) -> None:

@@ -3,7 +3,7 @@ name: knowledge-local-research
 description: Research local Knowledge and deliver evidence-grounded analytical HTML/PDF reports with original table exhibits and provenance. Use for local investigation, financial research, and multi-document synthesis; not internet research.
 ---
 
-# Local Knowledge Research 2.4
+# Local Knowledge Research 2.5
 
 ## Research mandate
 
@@ -59,11 +59,16 @@ while an unread important candidate or targeted query could materially change th
 conclusion, mechanism, disagreement, or scenario. For a broad corpus with at least
 30 discovered source files, build a bibliography from at least 30 independent
 sources before finalizing; use those sources in substantive claims, comparisons,
-mechanisms, risks, or scenarios. The sidecar blocks finalization below this adaptive
-breadth target and also requires a core set of explicitly read files. Do not pad the
-list with metadata-only or unread sources. Smaller corpora keep the existing
-source-grounded evidence and review requirements without a forced bibliography
-floor. If focused rechecks no longer resolve a
+mechanisms, risks, or scenarios. Explicitly read a core set of up to 24 files
+(at least 12 when the bibliography reaches 30), following continuations rather
+than treating a search hit as a read. Build 3–5 source-grounded data exhibits
+from distinct source files when the corpus is broad: choose the exhibits that
+make the question concrete, such as index/market comparisons, company or segment
+metrics, earnings/valuation, mechanism indicators, scenarios, or risk matrices.
+The sidecar blocks finalization below these adaptive bibliography, reading, and
+exhibit targets. Do not pad the list with metadata-only or unread sources, and do
+not invent table cells. Smaller corpora keep the existing source-grounded evidence
+and review requirements without a forced bibliography or exhibit floor. If focused rechecks no longer resolve a
 material gap, preserve that limit and narrow the judgment; do not search indefinitely
 or manufacture precision.
 
@@ -123,6 +128,12 @@ numbers belong in that sourced caption unless text evidence separately supports 
 prose claim. Explain what the table cannot establish; do not use it as decoration.
 Keep every nonredundant exhibit that materially improves understanding.
 
+For a broad report, the table set should support the argument rather than repeat
+the prose: state the entity, metric, unit, period, actual/estimate status and
+source in the caption or cells, then explain the comparison and its limit. A
+report with many citations but only a single generic table is not a sufficiently
+data-supported deep report; add the missing exhibit or narrow the judgment.
+
 Every published table needs usable complete text and an original PDF crop. Crop
 availability does not prove visual inspection: claim to have checked an image
 only if it was delivered to your vision input. Unseen but available original crops
@@ -147,7 +158,8 @@ detail when correcting errors; do not shrink the report merely to pass checks.
 Call `mcp_researchFinalize` only after this work. Resolve `needs_review` through
 correction or justified qualification, never by dropping integrity expectations
 or changing mode. Core conclusions without evidence and broken artifacts block
-publication; secondary gaps and nonessential missing tables do not. Explain only
+publication; the adaptive table and reading requirements also block publication
+when the corpus is broad. Explain only
 limitations affecting interpretation, not routine tool warnings.
 
 Publish exactly the finalized manifest's three artifacts, with `bundle="none"`:

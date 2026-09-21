@@ -17,7 +17,8 @@ else:  # pragma: no cover - standalone bridge
 
 
 MAX_BIBLIOGRAPHY_SOURCES = 30
-MAX_EXPLICIT_READ_SOURCES = 12
+MAX_EXPLICIT_READ_SOURCES = 24
+MAX_REPORT_TABLES = 5
 
 
 def scoped_search_count(state: Mapping[str, Any]) -> int:
@@ -81,7 +82,39 @@ def explicit_read_breadth_target(state: Mapping[str, Any]) -> int:
     # gate. The additional core-reading breadth rule is for genuinely broad work.
     if target < 10:
         return 0
-    return min(MAX_EXPLICIT_READ_SOURCES, max(3, (target + 1) // 2))
+    # A broad report should be built from a real core reading set.  Keep the
+    # floor at twelve for a 30-source bibliography and scale toward 80% for
+    # smaller corpora, while preserving a bounded upper limit.
+    return min(MAX_EXPLICIT_READ_SOURCES, max(12, (target * 4 + 4) // 5))
+
+
+def report_table_breadth_target(state: Mapping[str, Any]) -> int:
+    """Return the adaptive number of source-grounded data exhibits expected."""
+
+    if state.get("mode") != "deep":
+        return 0
+    candidate_count = len(_discovered_file_ids(state))
+    if candidate_count < 10:
+        return 0
+    # Three exhibits make a broad report comparable and concrete; very large
+    # corpora earn up to five so the report can cover index data, mechanisms,
+    # scenarios, risks and company/segment evidence without padding.
+    return min(MAX_REPORT_TABLES, max(3, (candidate_count + 9) // 10))
+
+
+def _report_table_stats(state: Mapping[str, Any]) -> tuple[int, int]:
+    items = state.get("report", {}).get("items", [])
+    tables = state.get("ledger", {}).get("tables", {})
+    source_ids: set[str] = set()
+    count = 0
+    for item in items:
+        if not isinstance(item, Mapping) or item.get("kind") != "table":
+            continue
+        count += 1
+        table = tables.get(item.get("tableId"), {})
+        if isinstance(table, Mapping) and table.get("fileId"):
+            source_ids.add(str(table["fileId"]))
+    return count, len(source_ids)
 
 
 def bibliography_breadth_summary(state: Mapping[str, Any]) -> dict[str, Any]:
@@ -90,20 +123,29 @@ def bibliography_breadth_summary(state: Mapping[str, Any]) -> dict[str, Any]:
     target = bibliography_breadth_target(state)
     read_files = _complete_read_file_ids(state)
     read_target = explicit_read_breadth_target(state)
+    table_count, table_source_count = _report_table_stats(state)
+    table_target = report_table_breadth_target(state)
     return {
-        "schemaVersion": "research-breadth-audit/1",
+        "schemaVersion": "research-breadth-audit/2",
         "status": (
             "ready"
-            if bibliography["sourceCount"] >= target and len(read_files) >= read_target
+            if bibliography["sourceCount"] >= target
+            and len(read_files) >= read_target
+            and table_count >= table_target
+            and table_source_count >= table_target
             else "insufficient"
         ),
         "candidateSourceFiles": candidate_count,
         "bibliographyEntries": bibliography["sourceCount"],
         "citedSourceFiles": bibliography["sourceFileCount"],
         "explicitlyReadSourceFiles": len(read_files),
+        "reportTableExhibits": table_count,
+        "reportTableSourceFiles": table_source_count,
         "minimums": {
             "bibliographyEntries": target,
             "explicitlyReadSourceFiles": read_target,
+            "reportTableExhibits": table_target,
+            "reportTableSourceFiles": table_target,
         },
     }
 
@@ -111,8 +153,21 @@ def bibliography_breadth_summary(state: Mapping[str, Any]) -> dict[str, Any]:
 def bibliography_breadth_check(state: Mapping[str, Any]) -> dict[str, Any] | None:
     """Block finalization when a broad corpus was reduced to a tiny citation set."""
 
+    return next(
+        (
+            check
+            for check in report_breadth_checks(state)
+            if check["code"] == "BIBLIOGRAPHY_BREADTH_REQUIRED"
+        ),
+        None,
+    )
+
+
+def report_breadth_checks(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return finalization checks for bibliography, reading and exhibit breadth."""
+
     if state.get("mode") != "deep" or not state.get("report", {}).get("items"):
-        return None
+        return []
     summary = bibliography_breadth_summary(state)
     missing_refs = max(
         0,
@@ -122,65 +177,122 @@ def bibliography_breadth_check(state: Mapping[str, Any]) -> dict[str, Any] | Non
         0,
         summary["minimums"]["explicitlyReadSourceFiles"] - summary["explicitlyReadSourceFiles"],
     )
-    if not missing_refs and not missing_reads:
-        return None
+    missing_tables = max(
+        0,
+        summary["minimums"]["reportTableExhibits"] - summary["reportTableExhibits"],
+    )
+    missing_table_sources = max(
+        0,
+        summary["minimums"]["reportTableSourceFiles"] - summary["reportTableSourceFiles"],
+    )
 
-    navigation = state.get("extensions", {}).get("navigation", {})
-    cited: set[str] = set()
-    for item in state["report"]["items"]:
-        if item.get("kind") == "claim":
-            cited.update(
-                str(state["ledger"]["evidence"][evidence_id]["fileId"])
-                for evidence_id in item.get("evidenceIds", [])
+    checks: list[dict[str, Any]] = []
+    if missing_refs or missing_reads:
+        navigation = state.get("extensions", {}).get("navigation", {})
+        cited: set[str] = set()
+        for item in state["report"]["items"]:
+            if item.get("kind") == "claim":
+                cited.update(
+                    str(state["ledger"]["evidence"][evidence_id]["fileId"])
+                    for evidence_id in item.get("evidenceIds", [])
+                )
+            elif item.get("kind") == "table":
+                table = state["ledger"]["tables"].get(item.get("tableId"), {})
+                if table.get("fileId"):
+                    cited.add(str(table["fileId"]))
+        candidate_refs = [
+            str(row["ref"])
+            for file_id, row in navigation.get("files", {}).items()
+            if file_id not in cited and isinstance(row.get("ref"), str)
+        ]
+        completed_files = _complete_read_file_ids(state)
+        unread_cited_refs = [
+            str(row["ref"])
+            for file_id, row in navigation.get("files", {}).items()
+            if file_id in cited
+            and file_id not in completed_files
+            and isinstance(row.get("ref"), str)
+        ]
+        reasons: list[str] = []
+        if missing_refs:
+            reasons.append(
+                f"cite at least {missing_refs} more independent source file(s) in supported claims"
             )
-        elif item.get("kind") == "table":
-            table = state["ledger"]["tables"].get(item.get("tableId"), {})
-            if table.get("fileId"):
-                cited.add(str(table["fileId"]))
-    candidate_refs = [
-        str(row["ref"])
-        for file_id, row in navigation.get("files", {}).items()
-        if file_id not in cited and isinstance(row.get("ref"), str)
-    ]
-    completed_files = _complete_read_file_ids(state)
-    unread_cited_refs = [
-        str(row["ref"])
-        for file_id, row in navigation.get("files", {}).items()
-        if file_id in cited and file_id not in completed_files and isinstance(row.get("ref"), str)
-    ]
-    checks: list[str] = []
-    if missing_refs:
-        checks.append(
-            f"cite at least {missing_refs} more independent source file(s) in supported claims"
-        )
-    if missing_reads:
-        checks.append(f"complete explicit reading for {missing_reads} more core source file(s)")
-    check: dict[str, Any] = {
-        "code": "BIBLIOGRAPHY_BREADTH_REQUIRED",
-        "tool": "searchByIds",
-        "arguments": {
-            "researchId": state["researchId"],
-            "query": (
-                "Extract the main finding, assumptions, key numbers, qualifications, "
-                "and contrary evidence relevant to the report question."
+        if missing_reads:
+            reasons.append(
+                f"complete explicit reading for {missing_reads} more core source file(s)"
+            )
+        check: dict[str, Any] = {
+            "code": "BIBLIOGRAPHY_BREADTH_REQUIRED",
+            "tool": "searchByIds",
+            "arguments": {
+                "researchId": state["researchId"],
+                "query": (
+                    "Extract the main finding, assumptions, key numbers, qualifications, "
+                    "and contrary evidence relevant to the report question."
+                ),
+            },
+            "required": {
+                "bibliographyEntries": summary["minimums"]["bibliographyEntries"],
+                "explicitlyReadSourceFiles": summary["minimums"]["explicitlyReadSourceFiles"],
+            },
+            "observed": {
+                "bibliographyEntries": summary["bibliographyEntries"],
+                "explicitlyReadSourceFiles": summary["explicitlyReadSourceFiles"],
+            },
+            "message": (
+                "The discovered corpus is broad but the draft cites too few independent sources. "
+                + "; ".join(reasons)
+                + ". Use returned evidenceRefs in substantive claims; do not add a bare or "
+                "unread bibliography list."
             ),
-        },
-        "required": summary["minimums"],
-        "observed": {
-            "bibliographyEntries": summary["bibliographyEntries"],
-            "explicitlyReadSourceFiles": summary["explicitlyReadSourceFiles"],
-        },
-        "message": (
-            "The discovered corpus is broad but the draft cites too few independent sources. "
-            + "; ".join(checks)
-            + ". Use returned evidenceRefs in substantive claims; do not add a bare or "
-            "unread bibliography list."
-        ),
-    }
-    selection_refs = candidate_refs if missing_refs else unread_cited_refs
-    if selection_refs:
-        check["suggestedSelection"] = {"selection": {"kind": "files", "refs": selection_refs[:20]}}
-    return check
+        }
+        selection_refs = candidate_refs if missing_refs else unread_cited_refs
+        if selection_refs:
+            check["suggestedSelection"] = {
+                "selection": {"kind": "files", "refs": selection_refs[:20]}
+            }
+        checks.append(check)
+
+    if missing_tables or missing_table_sources:
+        navigation = state.get("extensions", {}).get("navigation", {})
+        refs = [
+            str(row["ref"])
+            for row in navigation.get("files", {}).values()
+            if isinstance(row.get("ref"), str)
+        ]
+        checks.append(
+            {
+                "code": "REPORT_TABLE_BREADTH_REQUIRED",
+                "tool": "searchByIds",
+                "arguments": {
+                    "researchId": state["researchId"],
+                    "query": (
+                        "Find quantitative comparisons, index or company data, earnings, "
+                        "valuation, scenarios, mechanisms and risks that can become "
+                        "source-grounded report tables."
+                    ),
+                },
+                "required": {
+                    "reportTableExhibits": summary["minimums"]["reportTableExhibits"],
+                    "reportTableSourceFiles": summary["minimums"]["reportTableSourceFiles"],
+                },
+                "observed": {
+                    "reportTableExhibits": summary["reportTableExhibits"],
+                    "reportTableSourceFiles": summary["reportTableSourceFiles"],
+                },
+                "message": (
+                    "The report needs more original-source data exhibits before it can be "
+                    f"finalized: add {max(missing_tables, missing_table_sources)} more table(s) "
+                    "from distinct source files where possible. Inspect complete inventories, "
+                    "fetch the relevant tables and original crops, and add them with "
+                    "mcp_researchAddTable. Every table must include units, period, estimate "
+                    "status and a precise source; never fabricate or pad a table."
+                ),
+                "suggestedSelection": {"selection": {"kind": "files", "refs": refs[:20]}},
+            }
+        )
+    return checks
 
 
 def _breadth_checks(state: Mapping[str, Any]) -> list[dict[str, Any]]:
