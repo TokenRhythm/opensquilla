@@ -6263,13 +6263,15 @@ function onThreadScroll() {
   // write sites, so every other position change belongs to the reader.
   const programmatic = scrollMutation?.matched ?? false
   const intent = programmatic ? null : currentThreadScrollIntent()
+  const resizingLiveEdge = autoScroll.value && intent === null
+    && sourceLessScrollPointerId === null && messageListRef.value?.hasPendingLayout()
   if (!programmatic && historyNavigationScrollLock.locked) {
     const moved = previousScrollTop !== null
       && Math.abs(currentScrollTop - previousScrollTop) > SCROLL_DIRECTION_EPSILON_PX
     if (intent !== null || (sourceLessScrollPointerId !== null && moved)) {
       interruptHistoryNavigationForReader()
     }
-  } else if (!programmatic && !historyNavigationScrollLock.locked) {
+  } else if (!programmatic && !resizingLiveEdge && !historyNavigationScrollLock.locked) {
     const movedUp = previousScrollTop !== null
       && currentScrollTop < previousScrollTop - SCROLL_DIRECTION_EPSILON_PX
     const movedDown = previousScrollTop !== null

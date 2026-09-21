@@ -8,6 +8,7 @@ export interface ChatMessageListVirtualizer {
   scrollToMessage: (index: number, options?: ScrollToOptions) => void
   scrollToEnd: (options?: Pick<ScrollToOptions, 'behavior'>) => void
   getDistanceFromEnd: () => number
+  hasPendingLayout: () => boolean
   cancelScroll: () => void
   /** Temporarily give a live-to-canonical text handoff ownership of position. */
   beginScrollHandoff: () => () => void

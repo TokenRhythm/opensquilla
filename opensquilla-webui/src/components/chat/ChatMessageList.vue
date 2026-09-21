@@ -675,6 +675,14 @@ function queueLiveEdgePin() {
   void nextTick(() => {
     liveEdgePinScheduled = false
     if (generation !== layoutGeneration || !props.followLiveEdge) return
+    const container = props.scrollContainer
+    if (container && container.scrollHeight <= container.clientHeight) {
+      // A fitting transcript never emits the native scroll event that would
+      // acknowledge a clamped size correction. Publish its committed offset
+      // through core's observer so an old seek can finish without RAF polling.
+      if (virtualizer.value.scrollOffset !== container.scrollTop) synchronizeScrollOffset?.()
+      return
+    }
     scrollToEnd()
   })
 }
@@ -809,6 +817,17 @@ function onFocusOut() {
   })
 }
 
+function hasPendingLayout(): boolean {
+  const container = props.scrollContainer
+  const rect = virtualizer.value.scrollRect
+  if (!container || !rect) return layoutPending.value
+  // Native scroll clamping is delivered before ResizeObserver. Until core
+  // sees this viewport, its previous end seek must not become reader intent.
+  return layoutPending.value
+    || Math.abs(rect.width - container.offsetWidth) > 0.5
+    || Math.abs(rect.height - container.offsetHeight) > 0.5
+}
+
 function syncPreference(event: StorageEvent) {
   if (event.key === null || event.key === VIRTUALIZATION_STORAGE_KEY) {
     virtualizationAllowed.value = readVirtualizationPreference()
@@ -826,6 +845,7 @@ defineExpose<ChatMessageListVirtualizer>({
   scrollToMessage,
   scrollToEnd,
   getDistanceFromEnd: () => readDistanceFromEnd(props.scrollContainer, virtualizer.value),
+  hasPendingLayout,
   cancelScroll,
   beginScrollHandoff,
   geometryVersion: () => measurementVersion.value,

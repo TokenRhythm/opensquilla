@@ -59,6 +59,14 @@ describe('ChatView scroll ownership wiring', () => {
     expect(source).toContain('autoScroll.value = false')
   })
 
+  it('keeps layout clamping separate from explicit reader navigation', () => {
+    const source = threadScrollHandlerSource()
+    expect(source).toContain('const resizingLiveEdge = autoScroll.value && intent === null')
+    expect(source).toContain('sourceLessScrollPointerId === null')
+    expect(source).toContain('messageListRef.value?.hasPendingLayout()')
+    expect(source).toContain('!programmatic && !resizingLiveEdge && !historyNavigationScrollLock.locked')
+  })
+
   it('shares the virtualizer bottom-distance read without changing follow ownership', () => {
     expect(chatViewSource).toContain('messageListRef.value.getDistanceFromEnd()')
     expect(chatViewSource).toContain(': readDistanceFromEnd(container)')

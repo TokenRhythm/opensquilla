@@ -618,15 +618,19 @@ test('pins the live edge across viewport changes without moving a historical rea
   await thread.evaluate(el => { el.scrollTop = el.scrollHeight })
   await expect(list).toHaveAttribute('data-virtualized', 'false')
   await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
-  await page.setViewportSize({ width: 900, height: 760 })
-  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
-  await expect(page.locator('.chat-jump-latest')).toHaveCount(0)
-  await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
+  // Coalesced native clamp events can arrive before the next ResizeObserver
+  // delivery. Repeated width/height changes must not look like reader input.
+  for (let cycle = 0; cycle < 5; cycle++) {
+    await page.setViewportSize({ width: 900, height: 760 })
+    await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+    await expect(page.locator('.chat-jump-latest')).toHaveCount(0)
+    await expect.poll(() => thread.evaluate(el => getComputedStyle(el).overflowAnchor)).toBe('none')
 
-  await page.setViewportSize({ width: 1280, height: 760 })
-  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
-  await page.setViewportSize({ width: 1280, height: 520 })
-  await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+    await page.setViewportSize({ width: 1280, height: 760 })
+    await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+    await page.setViewportSize({ width: 1280, height: 520 })
+    await expect.poll(() => scrollGap(page)).toBeLessThan(2)
+  }
 
   await thread.evaluate(el => {
     const thread = el as HTMLElement

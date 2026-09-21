@@ -149,6 +149,7 @@ function makeThread(
     }),
     scrollToEnd: vi.fn(),
     getDistanceFromEnd: () => Math.max(0, container.scrollHeight - container.scrollTop - container.clientHeight),
+    hasPendingLayout: () => false,
     cancelScroll: vi.fn(),
     beginScrollHandoff: () => () => {},
     geometryVersion: () => geometryVersion.value,

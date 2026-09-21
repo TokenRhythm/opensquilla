@@ -58,6 +58,7 @@ async function mountList(options: {
   trailing?: boolean
   bottomPadding?: number
   withoutScrollContainer?: boolean
+  fitsViewport?: boolean
 } = {}) {
   const container = document.createElement('div')
   container.dataset.testScroll = 'true'
@@ -68,10 +69,13 @@ async function mountList(options: {
     offsetHeight: { configurable: true, value: 600 },
     offsetWidth: { configurable: true, value: 800 },
     clientHeight: { configurable: true, value: 600 },
-    scrollHeight: { configurable: true, value: 18_800 },
+    scrollHeight: { configurable: true, value: options.fitsViewport ? 600 : 18_800 },
     scrollTop: { configurable: true, value: 0, writable: true },
   })
   container.getBoundingClientRect = () => ({ top: 0 } as DOMRect)
+  if (options.fitsViewport) {
+    vi.spyOn(container, 'scrollTo').mockImplementation(() => { container.scrollTop = 0 })
+  }
 
   const componentProps = reactive({
     messages: options.messages ?? Array.from({ length: 200 }, (_, index) => message(index)),
@@ -137,6 +141,42 @@ afterEach(() => {
 })
 
 describe('ChatMessageList long-history virtualization', () => {
+  it('settles clamped short-transcript measurements without idle frame polling', async () => {
+    vi.useFakeTimers({ toFake: ['requestAnimationFrame', 'cancelAnimationFrame'] })
+    try {
+      const frames = vi.spyOn(window, 'requestAnimationFrame')
+      const mounted = mountList({
+        messages: [message(0)], followLiveEdge: true, fitsViewport: true,
+      })
+      await vi.advanceTimersByTimeAsync(32)
+      const { host, api } = await mounted
+      const row = host.querySelector('[data-chat-message-index="0"]') as HTMLElement
+      row.getBoundingClientRect = () => ({ height: 130, width: 800, top: 0 } as DOMRect)
+      resize(row)
+      await nextTick()
+      await nextTick()
+      const before = frames.mock.calls.length
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(api.getDistanceFromEnd()).toBe(0)
+      expect(frames.mock.calls.length - before).toBeLessThanOrEqual(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports a viewport resize before the native observer consumes it', async () => {
+    const { api, container } = await mountList({ followLiveEdge: true })
+    expect(api.hasPendingLayout()).toBe(false)
+    Object.defineProperty(container, 'offsetHeight', { configurable: true, value: 400 })
+    Object.defineProperty(container, 'clientHeight', { configurable: true, value: 400 })
+    expect(api.hasPendingLayout()).toBe(true)
+    resize(container)
+    await nextTick()
+    await nextTick()
+    expect(api.hasPendingLayout()).toBe(false)
+    expect(api.getDistanceFromEnd()).toBe(0)
+  })
+
   it.each([2, 200])('exposes live bottom distance for %i rows before a native scroll notification', async count => {
     const { api, container, props } = await mountList({
       messages: Array.from({ length: count }, (_, index) => message(index)),
