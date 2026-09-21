@@ -57,6 +57,32 @@ async function flush() { for (let index = 0; index < 60; index += 1) await Promi
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  it('bounds completed not-sent notifications without evicting an unresolved delivery', async () => {
+    const storage = memoryWal()
+    const seed = (id: string, phase: DeliveryWalRecord['phase']): DeliveryWalRecord => ({
+      schemaVersion: 2, ownerRequestId: id, deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request(id) },
+      phase, ...(phase === 'not-sent' ? { stop: { requested: true, completed: true } } : {}),
+      revision: 1, createdAt: 1, updatedAt: 1,
+    })
+    storage.records.set('unresolved', seed('unresolved', 'unknown'))
+    const test = harness({}, storage)
+    test.available(false)
+    try {
+      await test.owner.wake()
+      for (let index = 0; index < 130; index += 1) {
+        const id = `stopped-${index}`
+        storage.records.set(id, seed(id, 'not-sent'))
+        await expect(test.owner.commands.send(request(id))).rejects.toMatchObject({ failureCode: 'DELIVERY_STOPPED' })
+      }
+      expect(test.owner.snapshots()).toHaveLength(129)
+      expect(test.owner.snapshots().find(item => item.id === 'unresolved')).toMatchObject({ phase: 'unknown' })
+      expect(storage.records).toHaveLength(131)
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
   it('offers exact Stop while sending or unknown, including offline, and revokes it after identity changes', async () => {
     let rejectSend!: (reason: unknown) => void
     const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })) })

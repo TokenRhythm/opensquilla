@@ -154,7 +154,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     }
     // Completed receipts stay on disk for deduplication, while the app retains
     // only a small notification window. Unresolved delivery is never evicted.
-    const completed = [...summaries.values()].filter(item => item.phase === 'accepted' && !item.stopPending && item.waitReason !== 'storage')
+    const completed = [...summaries.values()].filter(item => (item.phase === 'accepted' || item.phase === 'not-sent')
+      && !item.stopPending && item.waitReason !== 'storage')
     for (const item of completed.slice(0, Math.max(0, completed.length - 128))) {
       summaries.delete(item.id); observed.delete(item.id); summaryIdentities.delete(item.id)
       if (!stopIntents.has(item.id)) { roundTriggers.delete(item.id); manualRetries.delete(item.id) }
