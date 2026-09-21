@@ -85,7 +85,7 @@ def explicit_read_breadth_target(state: Mapping[str, Any]) -> int:
     # A broad report should be built from a real core reading set.  Keep the
     # floor at twelve for a 30-source bibliography and scale toward 80% for
     # smaller corpora, while preserving a bounded upper limit.
-    return min(MAX_EXPLICIT_READ_SOURCES, max(12, (target * 4 + 4) // 5))
+    return min(target, MAX_EXPLICIT_READ_SOURCES, max(12, (target * 4 + 4) // 5))
 
 
 def report_table_breadth_target(state: Mapping[str, Any]) -> int:
