@@ -19,6 +19,8 @@ export interface DurableDelivery {
   readonly commands: TurnCommands
   registerPreparedHandoff(record: ResponseHandoffWalRecord): void
   requestStop(requestId: string): Promise<void>
+  requestSteerStop(sessionKey: string, expectedTurnId: string): Promise<void>
+  noteReceiptChanged(requestId: string, eventToken: string): Promise<void>
   observe(listener: (record: DeliveryUpdate) => void): () => void
   snapshots(): readonly DeliverySnapshot[]
   subscribe(listener: () => void): () => void

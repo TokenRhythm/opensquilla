@@ -150,6 +150,7 @@ export interface PendingInputWal {
   listDeliveries?: () => Promise<DeliveryWalRecord[]>
   listRecoveryDeliveries?: (after?: string, limit?: number) => Promise<{ records: DeliveryWalRecord[]; next?: string }>
   findDeliveryByTask?: (identity: string, sessionKey: string, taskId: string) => Promise<DeliveryWalRecord | null>
+  findSteerDeliveries?: (identity: string, sessionKey: string, expectedTurnId: string) => Promise<DeliveryWalRecord[]>
   onInvalidated?: (listener: () => void) => () => void
   countQuarantinedDeliveries?: () => Promise<number>
   getDelivery?: (ownerRequestId: string) => Promise<DeliveryWalRecord | null>
@@ -199,6 +200,7 @@ function indexedDelivery(record: DeliveryWalRecord) {
     || (response && 'turnId' in response ? response.turnId : undefined)
   const pending = ['prepared', 'unknown', 'submitting'].includes(record.phase) || !!(record.stop && !record.stop.completed)
   return { ...record, recoveryState: pending ? 'pending' : 'settled',
+    ...(record.request?.kind === 'steer' ? { steerScope: [record.deliveryIdentity, record.request.request.key, record.request.request.expectedTurnId] } : {}),
     ...(task ? { taskScope: [record.deliveryIdentity, record.stop?.request?.sessionKey
       || response?.sessionKey || response?.key || record.requestSessionKey, task] } : {}),
   }
@@ -403,6 +405,7 @@ class BrowserPendingInputWal implements PendingInputWal {
         if (!handoffs.indexNames?.contains('recovery_state')) handoffs.createIndex('recovery_state', 'recoveryState', { unique: false })
         if (!handoffs.indexNames?.contains('task_scope')) handoffs.createIndex('task_scope', 'taskScope', { unique: false })
         if (!handoffs.indexNames?.contains('handoff_session')) handoffs.createIndex('handoff_session', 'handoff.requestSessionKey', { unique: false })
+        if (!handoffs.indexNames?.contains('steer_scope')) handoffs.createIndex('steer_scope', 'steerScope', { unique: false })
       }
       request.onsuccess = () => {
         if (abandoned || epoch !== this.openEpoch) {
@@ -735,6 +738,14 @@ class BrowserPendingInputWal implements PendingInputWal {
     const [total, indexed] = await Promise.all([requestResult(store.count()), requestResult(store.index('recovery_state').count())])
     await transactionDone(transaction)
     return total - indexed
+  }
+
+  async findSteerDeliveries(identity: string, sessionKey: string, expectedTurnId: string): Promise<DeliveryWalRecord[]> {
+    const database = await this.database()
+    const transaction = database.transaction(HANDOFF_STORE_NAME, 'readonly')
+    const raw = await requestResult(transaction.objectStore(HANDOFF_STORE_NAME).index('steer_scope').getAll([identity, sessionKey, expectedTurnId]))
+    await transactionDone(transaction)
+    return (raw as unknown[]).filter(isDeliveryWalRecord).map(record => structuredClone(record))
   }
 
   onInvalidated(listener: () => void): () => void {

@@ -317,6 +317,56 @@ describe('application-owned durable delivery', () => {
     test.owner.dispose()
   })
 
+  it('rechecks a Steer receipt after the old task ends and stops its newly promoted task within four calls', async () => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    storage.records.set('synthetic-steer', { schemaVersion: 2, ownerRequestId: 'synthetic-steer', deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'steer', request: { key: 'synthetic-session', clientRequestId: 'synthetic-steer', clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'synthetic steer' } },
+      phase: 'unknown', stop: { requested: true }, revision: 1, createdAt: 1, updatedAt: 1 })
+    const test = harness({
+      lookupReceipt: vi.fn().mockResolvedValueOnce({ status: 'found', response: { accepted: true, disposition: 'steering', taskId: 'old-task' } })
+        .mockResolvedValue({ status: 'found', response: { accepted: true, disposition: 'promoted', taskId: 'old-task', promotedTurnId: 'promoted-task' } }),
+      cancel: vi.fn().mockResolvedValueOnce({ aborted: false, reason: 'task_not_active' }).mockResolvedValue({ aborted: true }),
+    }, storage)
+    const recovering = test.owner.wake()
+    await vi.advanceTimersByTimeAsync(6_000)
+    await recovering
+    expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(2)
+    expect(test.commands.cancel).toHaveBeenCalledTimes(2)
+    expect(vi.mocked(test.commands.cancel).mock.calls.map(call => call[0].taskId)).toEqual(['old-task', 'promoted-task'])
+    expect(storage.records.get('synthetic-steer')?.stop?.completed).toBe(true)
+    test.owner.dispose()
+  })
+
+  it('keeps a pending Steer Stop until a new authoritative disposition wakes a deduplicated receipt round', async () => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    storage.records.set('synthetic-steer', { schemaVersion: 2, ownerRequestId: 'synthetic-steer', deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'steer', request: { key: 'synthetic-session', clientRequestId: 'synthetic-steer', clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'synthetic steer' } },
+      phase: 'unknown', stop: { requested: true }, revision: 1, createdAt: 1, updatedAt: 1 })
+    const lookupReceipt = vi.fn().mockResolvedValue({ status: 'found', response: { accepted: true, disposition: 'steering', taskId: 'old-task' } })
+    const cancel = vi.fn().mockResolvedValue({ aborted: false, reason: 'task_not_active' })
+    const test = harness({ lookupReceipt, cancel }, storage)
+    const recovering = test.owner.wake()
+    await vi.advanceTimersByTimeAsync(6_000)
+    await recovering
+    expect(lookupReceipt).toHaveBeenCalledTimes(2)
+    expect(cancel).toHaveBeenCalledTimes(2)
+    expect(storage.records.get('synthetic-steer')?.stop?.completed).not.toBe(true)
+    await test.owner.wake()
+    expect(lookupReceipt).toHaveBeenCalledTimes(2)
+    lookupReceipt.mockResolvedValue({ status: 'found', response: { accepted: true, disposition: 'promoted', taskId: 'old-task', promotedTurnId: 'promoted-task' } })
+    cancel.mockResolvedValue({ aborted: true })
+    const hint = test.owner.noteReceiptChanged('synthetic-steer', '2:promoted-task:promoted')
+    await vi.advanceTimersByTimeAsync(6_000)
+    await hint
+    await test.owner.noteReceiptChanged('synthetic-steer', '2:promoted-task:promoted')
+    expect(lookupReceipt).toHaveBeenCalledTimes(3)
+    expect(cancel).toHaveBeenLastCalledWith(expect.objectContaining({ taskId: 'promoted-task' }), expect.anything())
+    expect(storage.records.get('synthetic-steer')?.stop?.completed).toBe(true)
+    test.owner.dispose()
+  })
+
   it('does not clone attachment payloads or notify observers on lease renewal', async () => {
     vi.useFakeTimers()
     const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>(() => {})) })

@@ -3965,6 +3965,7 @@ export function useChatSend(options: UseChatSendOptions) {
       acceptanceStopPending.value = true
     }
     options.steerDelivery.markStopRequested(stoppedTurnId)
+    void options.durableDelivery?.requestSteerStop(options.sessionKey.value, stoppedTurnId).catch(() => {})
     const latestUserMessage = [...options.messages.value]
       .reverse()
       .find(message => message.role === 'user')

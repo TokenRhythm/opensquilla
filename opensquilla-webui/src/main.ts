@@ -88,7 +88,20 @@ const stopDeliveryWatch = watch(() => [
   gatewayAdapters.gatewayAccess.connectionPhase,
   gatewayAdapters.gatewayAccess.subscriptionEpoch,
 ], () => { void durableDelivery.wake() }, { immediate: true })
-app.onUnmount(() => { stopDeliveryWatch(); durableDelivery.dispose() })
+const stopDeliveryEvents = gatewayAdapters.conversationEvents.subscribe({
+  onEvent(message) {
+    if (message.kind !== 'conversation' || message.event.semanticKind !== 'input-disposition') return
+    const event = message.event
+    const requestId = event.payload.client_request_id
+    if (!requestId) return
+    // This observer opens no session read or remote subscription. Only an
+    // authenticated semantic disposition can wake its exact pending receipt.
+    const token = JSON.stringify([event.payload.revision, event.payload.promoted_turn_id,
+      event.payload.target_turn_id, event.payload.disposition])
+    void durableDelivery.noteReceiptChanged(requestId, token).catch(() => {})
+  },
+})
+app.onUnmount(() => { stopDeliveryWatch(); stopDeliveryEvents(); durableDelivery.dispose() })
 appStore.bindAppSettings(gatewayAdapters.appSettings)
 watch(() => rpcStore.state, (state) => {
   if (state === 'connected' && appStore.pendingChannelNoticeLocale) {

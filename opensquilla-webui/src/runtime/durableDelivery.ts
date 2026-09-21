@@ -75,6 +75,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   const controllerIdentities = new Map<AbortController, string>()
   const roundTriggers = new Map<string, string>()
   const manualRetries = new Set<string>()
+  const receiptEventTokens = new Map<string, string>()
+  const activeLeases = new Map<string, number>()
   let disposed = false
   let invalidated = false
   let quarantineChecked = false
@@ -202,6 +204,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       return undefined
     }
     const epoch = claimed.lease!.epoch
+    activeLeases.set(record.ownerRequestId, epoch)
     const controller = new AbortController()
     controllers.add(controller)
     controllerIdentities.set(controller, record.deliveryIdentity)
@@ -222,6 +225,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       controllerIdentities.delete(controller)
       await update(record.ownerRequestId, current => current.lease?.owner === owner && current.lease.epoch === epoch
         ? { ...current, lease: { ...current.lease, expiresAt: 0 } } : null).catch(() => {})
+      if (activeLeases.get(record.ownerRequestId) === epoch) activeLeases.delete(record.ownerRequestId)
+      if (manualRetries.has(record.ownerRequestId)) void wake()
     }
   }
 
@@ -231,7 +236,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       accepted = current.lease?.owner === owner && current.lease.epoch === epoch && current.lease.expiresAt > now()
       if (!accepted) return null
       const steer = current.request?.kind === 'steer'
-      const terminal = 'taskStatus' in response && ['completed', 'finished', 'cancelled', 'canceled', 'failed', 'interrupted', 'aborted', 'stopped'].includes(response.taskStatus || '')
+      const terminal = ('taskStatus' in response && ['succeeded', 'completed', 'finished', 'cancelled', 'canceled', 'failed', 'timeout', 'abandoned', 'interrupted', 'aborted', 'stopped'].includes(response.taskStatus || ''))
+        || (steer && 'disposition' in response && ['cancelled', 'rejected'].includes(response.disposition || ''))
       return { ...current, phase: steer && 'accepted' in response && response.accepted === false ? 'not-sent'
         : steer && (!('accepted' in response) || response.accepted !== true) ? 'unknown' : 'accepted',
       response: structuredClone(response), ...(terminal && current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
@@ -333,20 +339,64 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
 
   async function requestStop(id: string): Promise<void> {
     stopIntents.add(id)
+    manualRetries.add(id)
     const record = await update(id, current => current.deliveryIdentity === options.access.identity()
       ? { ...current, stop: { ...current.stop, requested: true, completed: false } } : null)
     if (record) { stopIntents.delete(id); void wake() }
   }
 
-  async function stopRecord(record: DeliveryWalRecord, signal: AbortSignal | undefined, epoch: number): Promise<TurnCancelResponse | undefined> {
-    const taskId = record.stop?.request?.taskId || taskIdentity(record)
+  async function requestSteerStop(sessionKey: string, expectedTurnId: string): Promise<void> {
+    if (!expectedTurnId) return
+    storageReady()
+    const identity = options.access.identity()
+    if (!identity) return
+    const records = wal!.findSteerDeliveries
+      ? await wal!.findSteerDeliveries(identity, sessionKey, expectedTurnId)
+      : (await wal!.listDeliveries!()).filter(record => record.deliveryIdentity === identity
+        && record.request?.kind === 'steer' && record.request.request.key === sessionKey
+        && record.request.request.expectedTurnId === expectedTurnId)
+    for (const record of records) {
+      if (record.phase === 'not-sent' || record.stop?.completed) continue
+      const response = record.response
+      if (response && 'disposition' in response && ['rejected', 'cancelled'].includes(response.disposition || '')) continue
+      await requestStop(record.ownerRequestId)
+    }
+  }
+
+  async function noteReceiptChanged(id: string, token: string): Promise<void> {
+    if (disposed || invalidated || !token || receiptEventTokens.get(id) === token) return
+    if (!summaries.has(id) && !flights.has(id)) return
+    const record = await wal?.getDelivery?.(id)
+    if (!record || !unfinished(record) || record.deliveryIdentity !== options.access.identity() || record.paused) return
+    receiptEventTokens.set(id, token)
+    if (receiptEventTokens.size > 256) receiptEventTokens.delete(receiptEventTokens.keys().next().value!)
+    const fresh = record.stop && record.phase === 'accepted'
+      ? await update(id, current => ({ ...current, phase: 'unknown' })) : record
+    manualRetries.add(id)
+    if (activeLeases.has(id)) return
+    if (fresh) await round(fresh)
+  }
+
+  async function stopRecord(record: DeliveryWalRecord, signal: AbortSignal | undefined, epoch: number, recovering = false): Promise<TurnCancelResponse | undefined> {
+    const promoted = record.request?.kind === 'steer' && record.response && 'disposition' in record.response
+      && record.response.disposition === 'promoted'
+    const taskId = promoted ? taskIdentity(record) : record.stop?.request?.taskId || taskIdentity(record)
     if (!record.stop || record.stop.completed || !taskId) return undefined
-    const request: TurnCancelRequest = record.stop.request || {
+    const request: TurnCancelRequest = (!promoted && record.stop.request) || {
       sessionKey: record.response?.sessionKey || record.response?.key || record.requestSessionKey,
       taskId, source: 'webui_stop', scope: 'task',
     }
     const response = await slot(true, () => fenced(record, signal, opts => options.commands.cancel(request, opts)))
-    if (response.aborted || ['task_not_active', 'task_mismatch'].includes(response.reason || '')) {
+    const inactive = ['task_not_active', 'task_mismatch'].includes(response.reason || '')
+    const pendingSteer = record.request?.kind === 'steer' && (!record.response
+      || !('disposition' in record.response) || !['applied', 'promoted', 'cancelled', 'rejected'].includes(record.response.disposition || ''))
+    if (!response.aborted && inactive && pendingSteer) {
+      // The old turn ending does not prove that a queued Steer was cancelled:
+      // its receipt can move to a promoted task after this exact Stop answer.
+      await update(record.ownerRequestId, current => current.lease?.owner === owner && current.lease.epoch === epoch
+        ? { ...current, phase: 'unknown' } : null)
+      if (!recovering) roundTriggers.delete(record.ownerRequestId)
+    } else if (response.aborted || inactive) {
       await update(record.ownerRequestId, current => current.lease?.owner === owner && current.lease.epoch === epoch
         ? { ...current, stop: { requested: true, request, completed: true } } : null)
     }
@@ -411,7 +461,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           if (waiting) { publish(current, waiting); return }
           try {
             if (current.phase === 'prepared') { publish(current, 'not-sent'); return }
-            if (current.phase === 'accepted' && current.stop) await stopRecord(current, controller.signal, epoch)
+            if (current.phase === 'accepted' && current.stop) await stopRecord(current, controller.signal, epoch, true)
             else if (current.request) {
               const result = await lookupRecord(current, controller.signal, epoch)
               if (result.status === 'unsupported') return
@@ -497,6 +547,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
         { owner: record.walOwnerId, revision: record.walRevision })
     },
     requestStop,
+    requestSteerStop,
+    noteReceiptChanged,
     observe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
     snapshots: () => [...summaries.values()],
     subscribe(listener) { changes.add(listener); return () => { changes.delete(listener) } },
@@ -520,7 +572,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       renewals.clear()
       stopInvalidation?.()
       for (const resolve of [...ordinaryWaiters.splice(0), ...stopWaiters.splice(0)]) resolve()
-      listeners.clear(); changes.clear(); summaries.clear(); observed.clear(); handoffOwners.clear(); stopIntents.clear()
+      listeners.clear(); changes.clear(); summaries.clear(); observed.clear(); handoffOwners.clear(); stopIntents.clear(); receiptEventTokens.clear()
       wal?.close()
     },
   }

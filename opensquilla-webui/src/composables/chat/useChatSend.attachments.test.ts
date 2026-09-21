@@ -39,6 +39,8 @@ import {
   persistPendingMetaDiscard,
 } from '@/utils/chat/metaDiscardOutbox'
 import { RpcTransportError } from '@/lib/rpc'
+import { createDurableDelivery } from '@/runtime/durableDelivery'
+import { TurnCommandError, type TurnCommands, type TurnSteerResponse } from '@/modules/turnCommands'
 import {
   readSessionNavigationDiag,
   setSessionNavigationDiagStorageForTest,
@@ -46,6 +48,7 @@ import {
 import type {
   PendingInputWal,
   ResponseHandoffWalRecord,
+  DeliveryWalRecord,
 } from '@/utils/chat/pendingInputWal'
 
 const pushToast = vi.hoisted(() => vi.fn())
@@ -112,6 +115,28 @@ function memoryHandoffWal(): PendingInputWal {
     },
     deleteHandoff: async ownerRequestId => { handoffs.delete(ownerRequestId) },
     close: () => {},
+  }
+}
+
+function memoryDeliveryWal(): PendingInputWal {
+  const records = new Map<string, DeliveryWalRecord>()
+  return {
+    ...memoryHandoffWal(),
+    getDelivery: async id => records.has(id) ? structuredClone(records.get(id)!) : null,
+    listDeliveries: async () => [...records.values()].map(record => structuredClone(record)),
+    prepareDelivery: async record => {
+      const existing = records.get(record.ownerRequestId)
+      if (existing) return { applied: false, record: structuredClone(existing) }
+      records.set(record.ownerRequestId, structuredClone(record))
+      return { applied: true, record: structuredClone(record) }
+    },
+    compareAndSwapDelivery: async (id, revision, record) => {
+      const existing = records.get(id)
+      if (!existing || existing.revision !== revision) return { applied: false, record: existing ? structuredClone(existing) : null }
+      if (record) records.set(id, structuredClone(record))
+      else records.delete(id)
+      return { applied: true, record: record ? structuredClone(record) : null }
+    },
   }
 }
 
@@ -297,6 +322,85 @@ function usageReplayMessages(): ChatMessage[] {
     },
   ]
 }
+
+describe('useChatSend durable application lifetime integration', () => {
+  it('retains the composer when the first ordinary send cannot commit its WAL', async () => {
+    const wal = memoryDeliveryWal()
+    wal.prepareDelivery = async () => { throw new Error('synthetic quota denial') }
+    const raw: TurnCommands = {
+      send: vi.fn(async () => ({ taskId: 'synthetic-task' })), steer: vi.fn(async () => ({ accepted: true })),
+      cancel: vi.fn(async () => ({ aborted: true })), supports: () => true,
+    }
+    const owner = createDurableDelivery({ wal, commands: raw,
+      access: { identity: () => 'synthetic-identity', available: () => true, generation: () => 1 } })
+    const harness = makeOptions({ turnCommands: owner.commands, durableDelivery: owner, pendingInputWal: wal,
+      deliveryIdentity: ref('synthetic-identity'), inputText: ref('synthetic draft') })
+    await harness.api.onSend()
+    expect(raw.send).not.toHaveBeenCalled()
+    expect(harness.options.inputText.value).toBe('synthetic draft')
+    harness.api.dispose()
+    owner.dispose()
+  })
+
+  it('persists a real Steer Stop across disposal and binds its promoted receipt only to the new view', async () => {
+    vi.useFakeTimers()
+    const wal = memoryDeliveryWal()
+    let available = true
+    let rejectSteer!: (error: unknown) => void
+    const raw: TurnCommands = {
+      send: vi.fn(async () => ({ taskId: 'unrelated-task' })),
+      steer: vi.fn(() => new Promise<TurnSteerResponse>((_, reject) => { rejectSteer = reject })),
+      cancel: vi.fn(async () => ({ aborted: true })),
+      lookupReceipt: vi.fn(async () => ({ status: 'not-found' as const })),
+      supportsReceiptLookup: () => true, supports: () => true,
+    }
+    const access = { identity: () => 'synthetic-identity', available: () => available, generation: () => 1 }
+    const firstOwner = createDurableDelivery({ wal, commands: raw, access })
+    const first = makeOptions({ ...sameTurnSteerOptions('old-task'), turnCommands: firstOwner.commands,
+      durableDelivery: firstOwner, pendingInputWal: wal, deliveryIdentity: ref('synthetic-identity'), busySendMode: ref('steer') })
+    let secondOwner: ReturnType<typeof createDurableDelivery> | undefined
+    let second: ReturnType<typeof makeOptions> | undefined
+    try {
+      first.stream.isStreaming.value = true
+      const sending = first.api.onSend()
+      await vi.waitFor(() => expect(raw.steer).toHaveBeenCalledTimes(1))
+      const requestId = (await wal.listDeliveries!()).find(record => record.request?.kind === 'steer')!.ownerRequestId
+      first.api.onStop()
+      await vi.waitFor(async () => expect((await wal.getDelivery!(requestId))?.stop?.requested).toBe(true))
+      available = false
+      rejectSteer(new TurnCommandError('transport', 'synthetic lost Steer ACK', undefined, null))
+      await sending
+      first.api.dispose()
+      firstOwner.dispose()
+      await Promise.resolve()
+      vi.mocked(first.options.scheduleHistorySync).mockClear()
+
+      const recovered: TurnCommands = {
+        ...raw, send: vi.fn(async () => ({ taskId: 'must-not-send' })), cancel: vi.fn(async () => ({ aborted: true })),
+        lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { accepted: true,
+          disposition: 'promoted' as const, taskId: 'old-task', turnId: 'old-task', promotedTurnId: 'promoted-task',
+          clientRequestId: requestId, sessionKey: 'agent:main:webchat:test' } })),
+      }
+      available = true
+      secondOwner = createDurableDelivery({ wal, commands: recovered, access })
+      second = makeOptions({ turnCommands: secondOwner.commands, durableDelivery: secondOwner, pendingInputWal: wal,
+        deliveryIdentity: ref('synthetic-identity') })
+      const projected = vi.spyOn(second.options.steerDelivery, 'accept')
+      const recovery = secondOwner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await recovery
+      expect(recovered.send).not.toHaveBeenCalled()
+      expect(recovered.cancel).toHaveBeenCalledTimes(1)
+      expect(recovered.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'promoted-task', scope: 'task' }), expect.anything())
+      expect(projected).toHaveBeenCalledWith(expect.objectContaining({ clientRequestId: requestId, promotedTurnId: 'promoted-task' }))
+      expect(first.options.scheduleHistorySync).not.toHaveBeenCalled()
+      expect((await wal.getDelivery!(requestId))?.stop?.completed).toBe(true)
+    } finally {
+      first.api.dispose(); firstOwner.dispose(); second?.api.dispose(); secondOwner?.dispose()
+      vi.clearAllTimers(); vi.useRealTimers()
+    }
+  })
+})
 
 describe('useChatSend dedicated usage-barrier replay', () => {
   it('atomically admits only one of two cross-tab clicks for the same barrier', async () => {
