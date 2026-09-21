@@ -142,6 +142,8 @@
           v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState && !chatSessionBootstrap.noticeDismissed.value"
           :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
+          :transport-phase="gatewayAccess.connectionPhase"
+          :resume-source="gatewayAccess.resumeSource"
           :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
           :busy="chatSessionBootstrap.retryBusy.value"
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
@@ -1228,7 +1230,9 @@ const gatewayAccess = injectedGatewayAccess
 const deliveryIdentity = computed(() => gatewayAccess.deliveryIdentity)
 const gatewayConnectionState = computed(() => {
   if (gatewayAccess.availability === 'available') {
-    return gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+    const phase = gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
+    return phase === 'healthy' ? 'connected' : 'connecting'
   }
   return gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected'
 })

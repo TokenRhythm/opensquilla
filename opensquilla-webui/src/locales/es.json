@@ -433,6 +433,9 @@
     "connectionState": {
       "connected": "Conectado",
       "connecting": "Conectando",
+      "checking": "Comprobando la conexión con Gateway",
+      "suspect": "Conexión inestable",
+      "reconnecting": "Reconectando con Gateway",
       "disconnected": "Desconectado"
     },
     "bgm": {

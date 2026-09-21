@@ -4,6 +4,7 @@ import {
   beginSessionHandoffDiag,
   finishSessionHandoffDiag,
   readSessionNavigationDiag,
+  recordRpcResumeDiag,
   recordRpcTransportDiag,
   recordSessionNavigationDiag,
   SESSION_NAVIGATION_DIAG_LIMIT,
@@ -77,6 +78,7 @@ describe('sessionNavigationDiag', () => {
     setSessionNavigationDiagStorageForTest(memory)
     const timeline = {
       at: 1_020_000, topology: 'proxy/vpn', visibility: 'hidden', health: 'suspect',
+      transportPhase: 'checking', wakeIncidentSource: 'desktop-resume', wakeIncidentProbeTimeoutMs: 2_000,
       suspectAt: 1_015_000, lastRxAt: 999_000, wakeIncidentId: 3,
       wakeIncidentStartedAt: 1_000_000, wakeIncidentDeadlineAt: 1_020_000,
       wakeIncidentStatus: 'reconnecting', wakeSignalCount: 7,
@@ -268,5 +270,25 @@ describe('sessionNavigationDiag', () => {
       reason: 'generation_consistency_recovery',
       reconnectAttempt: 2,
     })
+  })
+
+  it('records the bounded Desktop resume source without accepting arbitrary payloads', () => {
+    setSessionNavigationDiagStorageForTest(new MemoryStorage())
+
+    recordRpcResumeDiag({ generation: 9, resumeSource: 'desktop-resume' })
+
+    expect(readSessionNavigationDiag()[0]).toMatchObject({
+      source: 'rpc.transport',
+      phase: 'desktop_resume',
+      generation: 9,
+      reason: 'desktop_resume',
+      resumeSource: 'desktop-resume',
+    })
+    const result = recordRpcResumeDiag({
+      generation: Number.NaN,
+      resumeSource: 'desktop-resume',
+    })
+    expect(result).toBeNull()
+    expect(JSON.stringify(readSessionNavigationDiag())).not.toContain('PRIVATE')
   })
 })

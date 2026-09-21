@@ -15201,7 +15201,7 @@ if (!gotSingleInstanceLock) {
     const notifySystemResume = () => {
       for (const window of BrowserWindow.getAllWindows()) {
         if (!window.isDestroyed() && !window.webContents.isDestroyed()) {
-          window.webContents.send('desktop:system:resume')
+          window.webContents.send('desktop:system:resume', { source: 'desktop-resume' })
         }
       }
     }

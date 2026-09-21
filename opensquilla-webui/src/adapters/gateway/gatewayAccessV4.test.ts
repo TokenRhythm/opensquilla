@@ -17,6 +17,8 @@ function source() {
   return {
     state: 'disconnected' as 'disconnected' | 'connecting' | 'connected',
     health: 'healthy' as 'healthy' | 'suspect',
+    isResuming: false,
+    resumeSource: null as 'desktop-resume' | null,
     error: null as string | null,
     isLocalOwner: false,
     canManageProjectWorkspaces: false,
@@ -98,6 +100,18 @@ describe('createV4GatewayAccess', () => {
 
     expect(access.availability).toBe('available')
     expect(access.isAvailable).toBe(true)
+    expect(access.connectionHealth).toBe('suspect')
+  })
+
+  it('projects a native resume as suspect until the transport confirms liveness', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.isResuming = true
+    raw.resumeSource = 'desktop-resume'
+    const access = createV4GatewayAccess(raw)
+
+    expect(access.isResuming).toBe(true)
+    expect(access.resumeSource).toBe('desktop-resume')
     expect(access.connectionHealth).toBe('suspect')
   })
 

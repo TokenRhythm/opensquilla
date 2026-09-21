@@ -16,6 +16,18 @@ export interface GatewayStatus {
 export type DesktopGatewayConnectionStatus = 'starting' | 'ready' | 'stopped' | 'error'
 
 /**
+ * A native resume notification is an observation only. Keep its source
+ * explicit so the renderer can distinguish the OS power event from its own
+ * browser lifecycle signals without inferring suspend state.
+ */
+/** `power-monitor` remains accepted for older preload shells and is normalized. */
+export type DesktopResumeSource = 'desktop-resume' | 'power-monitor'
+
+export interface DesktopResumeEvent {
+  source: DesktopResumeSource
+}
+
+/**
  * Connection facts published only to the trusted Desktop main frame. The
  * instance-scoped auth token is derived from the owned Gateway launch and
  * expires with that process; it is never the operator's configured token.
@@ -515,7 +527,7 @@ export interface PlatformGatewayApi {
   /** Non-secret binding for local attachment intake and profile-scoped drafts. */
   getAttachmentBinding?: () => Promise<{ instanceId: string; profileFingerprint: string } | null>
   /** Observation only: never restart the Gateway or reload the renderer. */
-  onResume?: (callback: () => void) => () => void
+  onResume?: (callback: (event: DesktopResumeEvent) => void) => () => void
   getStatus(): Promise<GatewayStatus>
   getConnection?: () => Promise<DesktopGatewayConnection>
   onConnection?: (

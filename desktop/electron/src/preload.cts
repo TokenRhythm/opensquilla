@@ -122,8 +122,8 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.on('gateway:connection-changed', listener)
     return () => ipcRenderer.removeListener('gateway:connection-changed', listener)
   },
-  onSystemResume: (callback: () => void) => {
-    const listener = () => callback()
+  onSystemResume: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:system:resume', listener)
     return () => ipcRenderer.removeListener('desktop:system:resume', listener)
   },
