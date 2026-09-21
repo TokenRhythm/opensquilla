@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
+from opensquilla.application.turn_admission import TurnAdmission
+from opensquilla.compat.aiosqlite import _AsyncConnection
+from opensquilla.gateway.adapters.turn_admission import GatewayTurnAdmissionAdapter
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
 from opensquilla.gateway.rpc_turn_receipts import _handle_turns_receipt_get
@@ -27,6 +32,10 @@ from opensquilla.session.storage import SessionStorage
 KEY = "agent:main:webchat:receipt-fixture"
 REQUEST_ID = "receipt-request-fixture"
 HASH = "sha256:" + "a" * 64
+OPERATIONS = (
+    "chat.send", "sessions.send", "sessions.steer.v2",
+    "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
+)
 
 
 @pytest.fixture
@@ -100,13 +109,9 @@ def _context(storage: SessionStorage) -> RpcContext:
     )
 
 
-@pytest.mark.parametrize("operation", [
-    "chat.send", "sessions.send", "sessions.steer.v2",
-    "sessions.pending_inputs.dispatch", "sessions.pending_inputs.steer",
-])
-async def test_existing_receipt_is_read_without_writes(storage: SessionStorage, operation: str):
-    params = _params(operation)
-    await _seed(storage, params)
+async def _read_only_receipt(
+    storage: SessionStorage, params: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, Any]:
     # A SQLite authorizer rejects every mutation, including unnoticed transactions
     # that delete Meta drafts or consume pending input on existing replay paths.
     denied = {
@@ -121,12 +126,40 @@ async def test_existing_receipt_is_read_without_writes(storage: SessionStorage, 
             return sqlite3.SQLITE_DENY
         return sqlite3.SQLITE_OK
 
-    await storage.conn._execute(storage.conn._conn.set_authorizer, authorize)
-    try:
-        result = await _handle_turns_receipt_get(params, _context(storage))
-    finally:
-        await storage.conn._execute(storage.conn._conn.set_authorizer, None)
+    async def set_authorizer(callback):
+        setter = storage.conn._conn.set_authorizer
+        if isinstance(storage.conn, _AsyncConnection):
+            # The sqlite3 fallback permits worker-thread access as well.
+            await asyncio.to_thread(setter, callback)
+        else:
+            await storage.conn._execute(setter, callback)
+
+    forbidden = AsyncMock(side_effect=AssertionError("Receipt lookup entered admission"))
+    changes = storage.conn.total_changes
+    with monkeypatch.context() as patch:
+        for owner in (TurnAdmission, GatewayTurnAdmissionAdapter):
+            patch.setattr(owner, "admit", forbidden)
+            patch.setattr(owner, "steer", forbidden)
+        patch.setattr(storage, "accept_turn", forbidden)
+        patch.setattr(storage, "replay_turn_ingress_receipt", forbidden)
+        await set_authorizer(authorize)
+        try:
+            result = await _handle_turns_receipt_get(params, _context(storage))
+        finally:
+            await set_authorizer(None)
+    forbidden.assert_not_called()
     assert mutations == []
+    assert storage.conn.total_changes == changes
+    return result
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_existing_receipt_is_read_without_writes(
+    storage: SessionStorage, operation: str, monkeypatch: pytest.MonkeyPatch,
+):
+    params = _params(operation)
+    await _seed(storage, params)
+    result = await _read_only_receipt(storage, params, monkeypatch)
     assert result["status"] == "found"
     assert result["accepted"] is True
     assert result["receipt"]["sessionEpoch"] == 4
@@ -158,6 +191,125 @@ async def test_deleted_receipt_is_unknown_even_after_same_key_recreated(storage:
         "status": "not_found", "accepted": None,
     }
     assert await storage.get_transcript("replacement-fixture") == []
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_real_reset_never_rebinds_old_receipt_to_replacement_turn(
+    storage: SessionStorage, operation: str, monkeypatch: pytest.MonkeyPatch,
+):
+    params = _params(operation)
+    await _seed(storage, params)
+    original = await _read_only_receipt(storage, params, monkeypatch)
+    session = await storage.get_session(KEY)
+    assert session is not None
+    replacement = session.model_copy(update={"session_id": "session-after-reset", "epoch": 5})
+    archives = []
+
+    async def archive(snapshot):
+        archives.append(snapshot)
+
+    await storage.reset_session(
+        replacement, expected_session_id="session-fixture", expected_epoch=4,
+        archive_writer=archive,
+    )
+    assert len(archives) == 1
+    assert archives[0].node.session_id == "session-fixture"
+    assert [entry.message_id for entry in archives[0].entries] == ["message-fixture"]
+    assert await storage.get_transcript("session-fixture") == []
+
+    next_params = _params()
+    next_params["originalRequest"]["clientRequestId"] = "request-after-reset"
+    query = decode_turn_receipt_query(next_params, principal_role="operator")
+    await storage.accept_turn(
+        TranscriptEntry(
+            session_id=replacement.session_id, session_key=KEY,
+            message_id="message-after-reset", role="user", content="Synthetic replacement turn",
+        ),
+        expected_epoch=5, updated_at=200,
+        task_record=AgentTaskRecord(
+            session_key=KEY, task_id="task-after-reset",
+            details={"session_id": replacement.session_id, "session_epoch": 5},
+        ),
+        source_scope=query.source_scope, request_session_key=KEY,
+        client_request_id=query.client_request_id, request_fingerprint=query.request_fingerprint,
+    )
+    next_receipt = await _read_only_receipt(storage, next_params, monkeypatch)
+    assert next_receipt["receipt"]["sessionId"] == replacement.session_id
+    assert next_receipt["receipt"]["sessionEpoch"] == 5
+    assert next_receipt["receipt"]["taskId"] == "task-after-reset"
+
+    result = await _read_only_receipt(storage, params, monkeypatch)
+    if operation in {"chat.send", "sessions.send"}:
+        # Reset retains ingress receipts, which still own the old generation.
+        assert result == original
+        assert result["receipt"]["sessionId"] == "session-fixture"
+        assert result["receipt"]["sessionEpoch"] == 4
+        assert result["receipt"]["taskId"] == "task-fixture"
+    else:
+        # Reset removes the context required to prove pending/Steer identity.
+        assert result == {"status": "not_found", "accepted": None}
+    assert (await storage.get_session(KEY)).session_id == replacement.session_id
+    assert {task.task_id for task in await storage.list_agent_tasks(KEY)} == {
+        "task-fixture", "task-after-reset",
+    }
+    assert [entry.message_id for entry in await storage.get_transcript(replacement.session_id)] == [
+        "message-after-reset",
+    ]
+
+
+def _sqlite_backup(source: Path, destination: Path) -> None:
+    # SQLite's backup API reads one consistent snapshot including committed WAL
+    # pages; copying only the main database file would not prove restoration.
+    with (
+        closing(sqlite3.connect(source)) as reader,
+        closing(sqlite3.connect(destination)) as writer,
+    ):
+        reader.backup(writer)
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+async def test_sqlite_backup_restores_receipt_after_delete_without_readmission(
+    tmp_path: Path, operation: str, monkeypatch: pytest.MonkeyPatch,
+):
+    path, backup = tmp_path / "live.sqlite", tmp_path / "consistent-backup.sqlite"
+    params = _params(operation)
+    storage = await SessionStorage.open(str(path))
+    try:
+        await _seed(storage, params)
+        original = await _read_only_receipt(storage, params, monkeypatch)
+        await asyncio.to_thread(_sqlite_backup, path, backup)
+        await storage.delete_session(KEY)
+        assert await _read_only_receipt(storage, params, monkeypatch) == {
+            "status": "not_found", "accepted": None,
+        }
+        assert await storage.get_session(KEY) is None
+        assert await storage.list_agent_tasks(KEY) == []
+    finally:
+        await storage.close()
+
+    await asyncio.to_thread(_sqlite_backup, backup, path)
+    restored = await SessionStorage.open(str(path))
+    try:
+        # Startup marks unstarted tasks abandoned. The later lookup must only
+        # report that durable state; restoring a backup does not resume a task.
+        expected = {**original, "receipt": {**original["receipt"], "taskStatus": "abandoned"}}
+        assert await _read_only_receipt(restored, params, monkeypatch) == expected
+        tasks = await restored.list_agent_tasks(KEY)
+        assert [task.task_id for task in tasks] == ["task-fixture"]
+        assert tasks[0].terminal_reason == "process_restart"
+        assert tasks[0].details["session_id"] == "session-fixture"
+        assert tasks[0].details["session_epoch"] == 4
+        assert [entry.message_id for entry in await restored.get_transcript("session-fixture")] == [
+            "message-fixture",
+        ]
+        if operation.startswith("sessions.pending_inputs."):
+            assert await restored.get_pending_chat_input("pending-fixture") is None
+            pending_receipt = await restored.get_pending_chat_input_dispatch_receipt(
+                "pending-fixture",
+            )
+            assert pending_receipt is not None
+    finally:
+        await restored.close()
 
 
 async def test_concurrent_delete_cannot_readmit_original(storage: SessionStorage, monkeypatch):
