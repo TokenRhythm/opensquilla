@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { reactive } from 'vue'
 import { createDurableDelivery } from './durableDelivery'
 import { TurnCommandError } from '@/modules/turnCommands'
-import type { TurnCommands, TurnSendRequest, TurnReceiptResult, TurnSendResponse } from '@/modules/turnCommands'
+import type { TurnCommands, TurnSendRequest, TurnReceiptResult, TurnSendResponse, TurnSteerResponse } from '@/modules/turnCommands'
 import type { DeliveryWalRecord, PendingInputWal } from '@/utils/chat/pendingInputWal'
 
 function memoryWal() {
@@ -213,6 +213,246 @@ describe('application-owned durable delivery', () => {
     expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent',
       request: { request: { params: { message: 'synthetic message' } } } })
     test.owner.dispose()
+  })
+
+  it('settles Stop latched during an authoritative initial rejection without receipt reads', async () => {
+    vi.useFakeTimers()
+    let rejectSend!: (reason: unknown) => void
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })) })
+    try {
+      const sending = test.owner.commands.send(request())
+      const rejected = expect(sending).rejects.toMatchObject({ accepted: false })
+      await flush()
+      await test.owner.requestStop('synthetic-request')
+      rejectSend(new TurnCommandError('unavailable', 'Synthetic ingress queue full', 'UNAVAILABLE', false, true))
+      await rejected
+      await vi.advanceTimersByTimeAsync(6_000)
+      await test.owner.wake()
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { requested: true, completed: true } })
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.send).toHaveBeenCalledTimes(1)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('settles Stop after an initial rejected Steer without a terminal disposition', async () => {
+    vi.useFakeTimers()
+    let resolveSteer!: (response: TurnSteerResponse) => void
+    const test = harness({ steer: vi.fn(() => new Promise<TurnSteerResponse>(resolve => { resolveSteer = resolve })) })
+    try {
+      const steering = test.owner.commands.steer({ key: 'synthetic-session', clientRequestId: 'synthetic-steer',
+        clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'Synthetic steer' })
+      await flush()
+      await test.owner.requestStop('synthetic-steer')
+      resolveSteer({ status: 'not_accepted', accepted: false, fallbackSafe: true, failureCode: 'ACTIVE_TURN_NOT_STEERABLE' })
+      await steering
+      await vi.advanceTimersByTimeAsync(6_000)
+      await test.owner.wake()
+      expect(test.records.get('synthetic-steer')).toMatchObject({ phase: 'not-sent', stop: { requested: true, completed: true } })
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.steer).toHaveBeenCalledTimes(1)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it.each([true, false])('settles a persisted not-sent Stop after reopening with connection available=%s', async available => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'send', request: request() }, phase: 'not-sent', stop: { requested: true },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const test = harness({}, storage)
+    test.available(available)
+    try {
+      const recovery = test.owner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await recovery
+      expect(storage.records.get('synthetic-request')?.stop?.completed).toBe(true)
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not settle an unknown delivery after losing a not-sent Stop CAS to another tab', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'send', request: request() }, phase: 'not-sent', stop: { requested: true },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    let raced = false
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (!raced && record?.stop?.completed) {
+        raced = true
+        const newer: DeliveryWalRecord = { ...storage.records.get(id)!, revision: revision + 1,
+          phase: 'unknown', lease: { owner: 'other-tab', epoch: 2, expiresAt: Date.now() + 60_000 } }
+        storage.records.set(id, newer)
+        return { applied: false, record: structuredClone(newer) }
+      }
+      return compare(id, revision, record)
+    }
+    const test = harness({}, storage)
+    test.available(false)
+    try {
+      await test.owner.wake()
+      expect(raced).toBe(true)
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'unknown',
+        stop: { requested: true }, lease: { owner: 'other-tab', epoch: 2 } })
+      expect(storage.records.get('synthetic-request')?.stop?.completed).not.toBe(true)
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(true)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('persists a failed Stop intent as completed after the initial call is authoritatively rejected', async () => {
+    vi.useFakeTimers()
+    let rejectSend!: (reason: unknown) => void
+    const storage = memoryWal()
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (record?.phase === 'submitting' && record.stop) throw new Error('Synthetic Stop quota failure')
+      return compare(id, revision, record)
+    }
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })) }, storage)
+    try {
+      const sending = test.owner.commands.send(request())
+      const rejected = expect(sending).rejects.toMatchObject({ accepted: false })
+      await flush()
+      await test.owner.requestStop('synthetic-request')
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: true, waitReason: 'storage' })
+      rejectSend(new TurnCommandError('unavailable', 'Synthetic ingress queue full', 'UNAVAILABLE', false, true))
+      await rejected
+      await vi.advanceTimersByTimeAsync(6_000)
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { requested: true, completed: true } })
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('does not reopen a completed not-sent Stop when a failed Stop intent can be persisted again', async () => {
+    vi.useFakeTimers()
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session',
+      request: { kind: 'send', request: request() }, phase: 'not-sent', stop: { requested: true, completed: true },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic Stop quota failure') }
+    const test = harness({}, storage)
+    try {
+      await test.owner.requestStop('synthetic-request')
+      await test.owner.wake()
+      storage.wal.compareAndSwapDelivery = compare
+      const recovery = test.owner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await recovery
+      expect(storage.records.get('synthetic-request')?.stop?.completed).toBe(true)
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      expect(test.commands.send).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it.each(['send', 'steer'] as const)('retains an initial %s rejection proof when both Stop and rejection-state writes fail', async kind => {
+    vi.useFakeTimers()
+    let rejectSend!: (reason: unknown) => void
+    let resolveSteer!: (response: TurnSteerResponse) => void
+    const test = harness({
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })),
+      steer: vi.fn(() => new Promise<TurnSteerResponse>(resolve => { resolveSteer = resolve })),
+    })
+    const compare = test.wal.compareAndSwapDelivery!
+    try {
+      const operation = kind === 'send' ? test.owner.commands.send(request())
+        : test.owner.commands.steer({ key: 'synthetic-session', clientRequestId: 'synthetic-request',
+          clientMessageId: 'synthetic-message', expectedTurnId: 'old-task', message: 'Synthetic steer' })
+      const failed = expect(operation).rejects.toThrow()
+      await flush()
+      test.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+      await test.owner.requestStop('synthetic-request')
+      if (kind === 'send') rejectSend(new TurnCommandError('unavailable', 'Synthetic initial refusal', 'UNAVAILABLE', false))
+      else resolveSteer({ status: 'not_accepted', accepted: false, fallbackSafe: true })
+      await failed
+      await vi.advanceTimersByTimeAsync(6_000)
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]?.waitReason).toBe('storage')
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      test.wal.compareAndSwapDelivery = compare
+      const recovery = test.owner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await recovery
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent', stop: { requested: true, completed: true } })
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(false)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+      expect(kind === 'send' ? test.commands.send : test.commands.steer).toHaveBeenCalledTimes(1)
+    } finally { test.owner.dispose() }
+  })
+
+  it('discards a cached initial rejection when another lease epoch owns an unknown delivery', async () => {
+    vi.useFakeTimers()
+    let rejectSend!: (reason: unknown) => void
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })) })
+    const compare = test.wal.compareAndSwapDelivery!
+    try {
+      const sending = test.owner.commands.send(request())
+      const failed = expect(sending).rejects.toMatchObject({ accepted: false })
+      await flush()
+      test.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+      await test.owner.requestStop('synthetic-request')
+      rejectSend(new TurnCommandError('unavailable', 'Synthetic initial refusal', 'UNAVAILABLE', false))
+      await failed
+      await flush()
+      const previous = test.records.get('synthetic-request')!
+      test.records.set('synthetic-request', { ...previous, phase: 'unknown', revision: previous.revision + 1,
+        lease: { owner: 'other-tab', epoch: 9, expiresAt: Date.now() + 60_000 } })
+      test.wal.compareAndSwapDelivery = compare
+      await test.owner.wake()
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'unknown',
+        stop: { requested: true, completed: false }, lease: { owner: 'other-tab', epoch: 9 } })
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(true)
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(test.commands.cancel).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('supersedes a cached initial rejection with an accepted receipt in the same lease epoch', async () => {
+    vi.useFakeTimers()
+    let rejectSend!: (reason: unknown) => void
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })) })
+    const compare = test.wal.compareAndSwapDelivery!
+    try {
+      const sending = test.owner.commands.send(request())
+      const failed = expect(sending).rejects.toMatchObject({ accepted: false })
+      await flush()
+      test.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+      await test.owner.requestStop('synthetic-request')
+      rejectSend(new TurnCommandError('unavailable', 'Synthetic initial refusal', 'UNAVAILABLE', false))
+      await failed
+      await flush()
+      const previous = test.records.get('synthetic-request')!
+      test.records.set('synthetic-request', { ...previous, phase: 'accepted', revision: previous.revision + 1,
+        response: { taskId: 'new-task', sessionKey: 'synthetic-session' },
+        lease: { ...previous.lease!, expiresAt: 0 } })
+      test.wal.compareAndSwapDelivery = compare
+      await test.owner.wake()
+      await vi.advanceTimersByTimeAsync(6_000)
+      await test.owner.wake()
+      expect(test.records.get('synthetic-request')).toMatchObject({ phase: 'accepted', stop: { completed: true } })
+      expect(test.commands.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'new-task' }), expect.anything())
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
   })
 
   it('does not submit a prepared write-after-throw record on wake or explicit receipt recheck', async () => {

@@ -26,6 +26,7 @@ interface PendingStopIntent {
   request?: TurnCancelRequest
   completed?: boolean
   terminalReceipt?: boolean
+  initialRejectionEpoch?: number
   needsReceipt?: boolean
   storageFailed?: boolean
   paused?: 'authority' | 'conflict'
@@ -268,7 +269,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       if (!accepted) return null
       candidate = { ...current, response: structuredClone(response), phase: 'accepted' }
       const steer = current.request?.kind === 'steer'
-      const terminal = terminalReceipt(current, response)
+      const terminal = (steer && 'accepted' in response && response.accepted === false)
+        || terminalReceipt(current, response)
       return { ...current, phase: steer && 'accepted' in response && response.accepted === false ? 'not-sent'
         : steer && (!('accepted' in response) || response.accepted !== true) ? 'unknown' : 'accepted',
       response: structuredClone(response), ...(terminal && current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
@@ -284,6 +286,23 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     })
     if (!accepted) throw new TurnCommandError('session-changed', 'Delivery lease changed', 'DELIVERY_LEASE_LOST', null, true)
     return result
+  }
+
+  async function retainInitialRejection(id: string, candidate: DeliveryWalRecord | undefined, epoch: number) {
+    if (!candidate || disposed || invalidated) return
+    const latest = await wal?.getDelivery?.(id).catch(() => null)
+    const intent = stopIntents.get(id)
+    if (!latest || latest.revision !== candidate.revision || latest.deliveryIdentity !== options.access.identity()
+      || latest.lease?.owner !== owner || latest.lease.epoch !== epoch || latest.lease.expiresAt <= now()
+      || (intent && intent.identity !== latest.deliveryIdentity) || (!intent && !latest.stop?.requested)) return
+    // Keep only a refusal from this original invocation, fenced like a late
+    // receipt. A lookup failure never supplies this proof. It remains visibly
+    // uncommitted until storage can save not-sent and the completed Stop.
+    const pending: PendingStopIntent = intent || { identity: latest.deliveryIdentity }
+    pending.record = latest
+    pending.initialRejectionEpoch = epoch
+    stopIntents.set(id, pending)
+    reportStopStorage(id, pending)
   }
 
   async function lookupRecord(record: DeliveryWalRecord, signal: AbortSignal | undefined, epoch: number): Promise<TurnReceiptResult> {
@@ -341,6 +360,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           throw new TurnCommandError('unavailable', 'Delivery receipt is still unknown', 'DELIVERY_RECEIPT_UNKNOWN', null, true)
         }
         const epoch = claimed.lease!.epoch
+        let initialResponseReceived = false
+        let initiallyRejected = false
         try {
           const armed = await update(id, current => {
             if (current.lease?.owner !== owner || current.lease.epoch !== epoch
@@ -358,12 +379,22 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           try { response = await fenced(armed, controller.signal, opts => frozen.kind === 'send'
             ? options.commands.send(frozen.request, opts) : options.commands.steer(frozen.request, opts))
           } finally { commandOptions?.signal?.removeEventListener('abort', abort) }
+          initialResponseReceived = true
+          initiallyRejected = frozen.kind === 'steer' && 'accepted' in response && response.accepted === false
           await receive(id, response, epoch)
           return response
         } catch (error) {
-          await update(id, current => current.lease?.owner === owner && current.lease.epoch === epoch ? ({ ...current,
-            phase: error instanceof TurnCommandError && error.accepted === false ? 'not-sent' : 'unknown',
-          }) : null).catch(() => {})
+          const notSent = initiallyRejected || (!initialResponseReceived && error instanceof TurnCommandError && error.accepted === false)
+          let rejectedCandidate: DeliveryWalRecord | undefined
+          await update(id, current => {
+            if (current.lease?.owner !== owner || current.lease.epoch !== epoch) return null
+            const next: DeliveryWalRecord = { ...current, phase: notSent ? 'not-sent' : 'unknown',
+              ...(notSent && current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
+            if (notSent) rejectedCandidate = next
+            return next
+          }, () => { rejectedCandidate = undefined }).catch(async () => {
+            if (notSent) await retainInitialRejection(id, rejectedCandidate, epoch)
+          })
           throw error
         }
       }))
@@ -391,10 +422,21 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       matched = !disposed && !invalidated && options.access.identity() === intent.identity
         && current.deliveryIdentity === intent.identity
       if (!matched) return null
+      if (intent.initialRejectionEpoch !== undefined && current.phase !== 'not-sent') {
+        if (current.lease?.owner === owner && current.lease.epoch === intent.initialRejectionEpoch
+          && (current.phase === 'submitting' || current.phase === 'unknown') && !current.response) {
+          current = { ...current, phase: 'not-sent' }
+        } else {
+          // A successor lease or receipt supersedes this process's refusal.
+          intent.initialRejectionEpoch = undefined
+        }
+        intent.record = current
+      }
       // Retain an authoritative receipt obtained while writes were failing.
       if (current.response || !intent.record?.response) intent.record = current
       const currentTask = taskIdentity(current)
-      const completed = intent.completed === true && (intent.terminalReceipt || !currentTask || currentTask === intent.request?.taskId)
+      const completed = current.phase === 'not-sent'
+        || (intent.completed === true && (intent.terminalReceipt || !currentTask || currentTask === intent.request?.taskId))
       return { ...current, ...(intent.paused ? { paused: intent.paused } : {}), stop: { ...current.stop, requested: true, completed,
         ...(intent.request && (!currentTask || currentTask === intent.request.taskId) ? { request: intent.request } : {}) } }
     })
@@ -437,6 +479,10 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     if (intent.completed || intent.paused || flights.has(id) || activeLeases.has(id)) return
     const record = intent.record
     if (!record || intent.identity !== options.access.identity() || allowed(record)) return
+    // This original call was definitively rejected. A failed Stop write does
+    // not create an unknown task to look up; persistStopIntent settles it when
+    // storage is writable again.
+    if (record.phase === 'not-sent' || intent.initialRejectionEpoch !== undefined) return
     const trigger = `${intent.identity}:${options.access.generation()}`
     if (!manualRetries.has(id) && roundTriggers.get(id) === trigger) return
     const operation = (async () => {
@@ -599,6 +645,20 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     const intent = stopIntents.get(record.ownerRequestId)
     if (intent?.storageFailed) { await recoverVolatileStop(record.ownerRequestId, intent); return }
     if (record.phase === 'prepared') { publish(record, 'not-sent'); return }
+    if (record.phase === 'not-sent') {
+      // Settle older persisted Stops from authoritative initial rejections.
+      // This local CAS needs no connection and never treats a failed receipt
+      // read as proof that an unknown original request was not admitted.
+      if (record.deliveryIdentity !== options.access.identity()) { publish(record, 'identity'); return }
+      try {
+        const settled = await update(record.ownerRequestId, current =>
+          current.deliveryIdentity === options.access.identity() && current.phase === 'not-sent'
+            && current.stop && !current.stop.completed
+            ? { ...current, stop: { ...current.stop, completed: true } } : null)
+        if (settled) publish(settled, null)
+      } catch { publish(record, 'storage') }
+      return
+    }
     const waitReason = allowed(record)
     if (waitReason) { publish(record, waitReason); return }
     if (flights.has(record.ownerRequestId)) return
