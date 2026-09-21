@@ -310,6 +310,28 @@ def startup_gateway():
     assert not gateway.root.exists()
 
 
+def test_gateway_restart_keeps_the_first_launch_port(
+    startup_gateway, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = startup_gateway
+    launch_ports: list[int] = []
+
+    def launch(command, **_kwargs):
+        launch_ports.append(int(command[command.index("--port") + 1]))
+        return SimpleNamespace(poll=lambda: 17)
+
+    monkeypatch.setattr(driver.subprocess, "Popen", launch)
+    with pytest.raises(driver.DriverConfigurationError):
+        gateway.start()
+    gateway.stop()
+    with pytest.raises(driver.DriverConfigurationError):
+        gateway.restart(force=True)
+
+    assert len(launch_ports) == 2
+    assert launch_ports[0] > 0
+    assert launch_ports[1] == launch_ports[0]
+
+
 @pytest.mark.parametrize("exit_code", [17, None])
 @pytest.mark.parametrize("prefix", [
     "", "2026-09-18T13:00:00+00:00 [INFO] opensquilla.gateway.boot: ",
@@ -1112,12 +1134,24 @@ def test_fault_429_case_proves_retry_after_was_not_violated(
 ) -> None:
     monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-not-a-real-key")
     request_records: list[FaultRequestRecord] = []
+    gateways: list[driver.GatewayProcess] = []
+
+    class ObservedGateway(driver.GatewayProcess):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            gateways.append(self)
 
     class ObservedFaultProxy(DeterministicFaultProxy):
+        def __init__(self, *args, **kwargs) -> None:
+            # Reproduce kernel reuse of any port selected before the proxy
+            # binds. Its /health is also 200, but its /ws must never be used.
+            super().__init__(*args, port=gateways[-1].port, **kwargs)
+
         def close(self) -> None:
             request_records.extend(self.records)
             super().close()
 
+    monkeypatch.setattr(driver, "GatewayProcess", ObservedGateway)
     monkeypatch.setattr(driver, "DeterministicFaultProxy", ObservedFaultProxy)
     case = driver.LiveCase(
         case_id="deepseek-fault-429-retry-after-synthetic-1",

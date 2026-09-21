@@ -508,9 +508,18 @@ async def test_writer_send_timeout_releases_budget_with_unresponsive_close(
     monkeypatch.setattr(websocket_module, "_WRITER_SEND_TIMEOUT_SECONDS", 0.01)
     monkeypatch.setattr(websocket_module, "_DIRECT_CLOSE_TIMEOUT_SECONDS", 0.01)
     try:
-        await conn.send_raw_text('{"type":"pong"}')
-        assert conn._transport_bytes > 0
-        await asyncio.wait_for(conn._writer_task, timeout=0.5)  # type: ignore[arg-type]
+        # Capture timeout evidence without charging synchronous traceback
+        # rendering to the asynchronous resource-release watchdog.
+        with structlog.testing.capture_logs() as logs:
+            await conn.send_raw_text('{"type":"pong"}')
+            assert conn._transport_bytes > 0
+            await asyncio.wait_for(conn._writer_task, timeout=0.5)  # type: ignore[arg-type]
+        assert any(entry["event"] == "gateway.ws_writer_send_failed" for entry in logs)
+        assert any(
+            entry["event"] == "gateway.ws_socket_close_timeout"
+            and entry["close_reason"] == "writer_send_failed"
+            for entry in logs
+        )
         assert fake.close_reason == "writer_send_failed"
         assert conn._transport_bytes == 0
         assert websocket_module.get_transport_budget().used == before

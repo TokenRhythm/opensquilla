@@ -558,7 +558,7 @@ class GatewayProcess:
             self.turn_log_dir,
         ):
             directory.mkdir(mode=0o700)
-        self.port = _free_port()
+        self.port = 0
         self.proc: subprocess.Popen[bytes] | None = None
         self._stdout: Any = None
         self._stderr: Any = None
@@ -611,6 +611,11 @@ class GatewayProcess:
     def start(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             raise RuntimeError("Gateway is already running")
+        if not self.port:
+            # Fault proxies bind between construction and the first start.
+            # Select afterward so they cannot take our released ephemeral
+            # port; retain it on restart for existing browser/RPC clients.
+            self.port = _free_port()
         self._stdout = (self.root / "gateway.stdout.log").open("ab")
         self._stderr = (self.root / "gateway.stderr.log").open("ab")
         # Restarts append to the raw logs so cleanup can scan every attempt.
