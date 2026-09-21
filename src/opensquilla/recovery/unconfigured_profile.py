@@ -73,7 +73,7 @@ def _initial_consent_mirror(path: Path) -> bool:
     if snapshot.identity is None:
         return False
     try:
-        mirror = json.loads(snapshot.data)
+        mirror: object = json.loads(snapshot.data)
     except (UnicodeError, json.JSONDecodeError):
         return False
     unset = {
