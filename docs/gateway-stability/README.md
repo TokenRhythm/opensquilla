@@ -1,6 +1,12 @@
 # Gateway connection recovery and evidence
 
-Integration baseline: `c31abea3184938ff6877f4e5b92092138755922b` (`origin/main` verified on 2026-09-21). Historical experiments used `6750223bf72b418a257a2276c18e6edec07ef14f` plus an earlier working-tree candidate. Further frontend and backend review fixes followed those experiments. **The historical figures below do not validate the final implementation or its updated dependencies.** Final acceptance requires a new run against the final source and lockfile hashes.
+Integration baseline: `c31abea3184938ff6877f4e5b92092138755922b` (`origin/main` verified on 2026-09-21). Historical experiments used `6750223bf72b418a257a2276c18e6edec07ef14f` plus an earlier working-tree candidate. Further frontend and backend review fixes followed those experiments. **The historical figures below do not validate the final implementation or its updated dependencies.**
+
+## Current validation
+
+The final candidate and c31 baseline completed 300 Vue-proxied browser relay trials, plus 210 production-writer application-fixture trials, with 30 trials per cell. Single-wake blackhole recovery improved from baseline p50 47.4431 s to 20.4167 s (p95 20.5288 s, max 20.5612 s). Repeated-wake baseline cases remained unrecovered at the 90-second observation limit; the candidate recovered in every trial. Both versions retained all scripted 13-second pauses. Final writer budgets and writer/close task counts were zero. Source/lock hashes, evidence identifiers, full tables and suite results are in [VALIDATION.zh-CN.md](VALIDATION.zh-CN.md).
+
+The source Windows Electron check exposed and helped fix a Vue proxy identity bug missed by raw-client tests. Its final rerun passed: suspect UI at 15.938 s, successful replacement observed at 20.413 s, seven resume signals in one incident, one replacement, draft and renderer preserved. Physical sleep/remote-network and packaged Windows 30-cycle business gates remain open. The 20-second budget is provisional; controlled results do not establish production latency or a physical Windows wake fix.
 
 ## Mechanism
 
@@ -35,8 +41,11 @@ For a smaller formal browser selection, set `OSQ_WAKE_VARIANTS=candidate20` and 
 ```powershell
 $env:OSQ_WAKE_BASELINE_SHA = 'c31abea3184938ff6877f4e5b92092138755922b'
 $env:OSQ_WAKE_VARIANTS = 'baselinec31abea3,candidate20'
+$env:OSQ_WAKE_CLIENT_MODE = 'vue'
 node scripts/gateway_wake_real_clock.mjs
 ```
+
+`OSQ_WAKE_CLIENT_MODE=vue` wraps both variants in the installed Vue `ref()` and calls `notifyResume()` through that proxy, matching the store-owned Desktop resume path. The default raw-client mode dispatches `pageshow`. The report records the mode and Vue bundle hash; do not pool these modes. The harness captures its own hash before the run and reports whether it remained unchanged.
 
 `scripts/summarize_gateway_wake_partial.mjs EVIDENCE_DIR [EMPTY_OUTPUT_DIR]` recovers the historical full five-variant matrix from per-trial files. It marks incomplete cells separately, writes outside the input directory, and cannot infer the process exit code or interruption cause. Retain the original terminal/process record for those facts.
 
@@ -70,4 +79,4 @@ The local 13-second test alone supports 15 seconds as the shortest passing candi
 
 The browser harness uses real Chromium/native WebSocket, clocks and loopback TCP relay, with a synthetic handshake/pong/echo upstream. It models an old-connection blackhole with healthy replacements, not a physical remote network or the full Python Gateway. The writer harness exercises production `WsConnection`/flow code with a cooperatively cancellable application socket fixture, not kernel backpressure. Parallel samples share a host and are not a population latency estimate.
 
-Source Electron runs emit resume events; they are neither physical sleep nor packaged EXE tests. No result here establishes real Wi-Fi/VPN/NIC behavior, packaged 30-cycle reliability, Goal lease/session hydration, snapshot/replay/steer, or exactly-once mutation behavior. Historical v0.5.4 and 8c7 results are not pooled into this matrix. Final-source reruns and the missing native/business gates must remain distinct in the PR validation record.
+Source Electron runs emit resume events; they are neither physical sleep nor packaged EXE tests. Browser recovery/Goal/steer/hydration E2E coverage is recorded separately from native acceptance. No result here establishes real Wi-Fi/VPN/NIC behavior, packaged 30-cycle reliability, or exactly-once mutation behavior under physical wake faults. Historical v0.5.4 and 8c7 results are not pooled into this matrix. Final-source controlled runs and the missing native/business gates remain distinct in the PR validation record.

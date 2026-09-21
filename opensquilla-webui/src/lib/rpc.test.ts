@@ -1798,6 +1798,34 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
+  it('preserves Vue ref-owned recovery during the deadline status callback after scheduler lag', async () => {
+    const client = ref(new RpcClient()).value as RpcClient
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = markRaw(MockWebSocket.instances[0])
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.on('_status', detail => {
+      if ((detail as { health: string }).health !== 'suspect') return
+      const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+      expect(ping.type).toBe('ping')
+      socket.receive({ type: 'pong', nonce: ping.nonce })
+    })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    vi.setSystemTime(Date.now() + 6_000)
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(client.health).toBe('healthy')
+    expect(diagnostics.some(item => item.phase === 'wake_incident_recovered')).toBe(false)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(diagnostics).toContainEqual(expect.objectContaining({ phase: 'wake_incident_recovered' }))
+    expect(diagnostics.some(item => item.phase === 'wake_incident_timeout')).toBe(false)
+    expect(client.health).toBe('healthy')
+    expect(client.state).toBe('connected')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    client.disconnect()
+  })
+
   it('publishes healthy before a synchronous connected listener sends its first replacement RPC', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
