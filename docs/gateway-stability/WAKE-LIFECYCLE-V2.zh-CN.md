@@ -1,7 +1,7 @@
 # Gateway Wake 生命周期与用户体验改进
 
 本文记录当前实现相对于 `origin/main` 的可复核变更和测试边界。基线为
-`3a49edcf1285f5ce0e80b28c87cc3b99e4076c81`；PR #1780 的历史合入 SHA 为
+`10e9a4adba2e8d71491599016d6274c7298b6f7e`；PR #1780 的历史合入 SHA 为
 `fcf0ecf8185dc32aae2d22168015caf8991032ac`，历史数据不计入本次通过数。
 
 ## 行为
