@@ -15,11 +15,13 @@ describe('application delivery recovery notice', () => {
     let notify = () => {}
     const unsubscribe = vi.fn()
     const retry = vi.fn().mockResolvedValue(undefined)
+    const requestStop = vi.fn().mockResolvedValue(undefined)
     const open = vi.fn()
     const owner = {
       snapshots: () => records,
       subscribe: (listener: () => void) => { notify = listener; return unsubscribe },
       retry,
+      requestStop,
     } as unknown as DurableDelivery
     const root = document.createElement('div')
     document.body.append(root)
@@ -27,8 +29,58 @@ describe('application delivery recovery notice', () => {
     app.use(createI18n({ legacy: false, locale: 'en', messages: { en } }))
     app.provide(DURABLE_DELIVERY_KEY, owner)
     app.mount(root)
-    return { root, retry, open, unsubscribe, async update(next: DeliverySnapshot[]) { records = next; notify(); await nextTick() } }
+    return { root, retry, requestStop, open, unsubscribe,
+      replaceBeforeRedraw(next: DeliverySnapshot[]) { records = next; notify() },
+      async update(next: DeliverySnapshot[]) { records = next; notify(); await nextTick() } }
   }
+
+  it('lets an off-page user stop submitting and unknown requests individually, with duplicate clicks latched', async () => {
+    const view = mount([{ id: 'first', sessionKey: 'source', phase: 'submitting', stopPending: false, stopAvailable: true, preview: 'First synthetic request' },
+      { id: 'second', sessionKey: 'source', phase: 'unknown', stopPending: false, stopAvailable: true },
+      { id: 'foreign', sessionKey: 'other', phase: 'unknown', stopPending: false, waitReason: 'identity' }])
+    let finish!: () => void
+    view.requestStop.mockImplementation(() => new Promise<void>(resolve => { finish = resolve }))
+    view.root.querySelector('button')!.click()
+    await nextTick()
+    const stops = [...view.root.querySelectorAll('button')].filter(button => button.textContent === 'Stop original request')
+    expect(stops).toHaveLength(2)
+    expect(view.root.textContent).toContain('First synthetic request')
+    stops[1]!.click()
+    stops[1]!.click()
+    await nextTick()
+    expect(view.requestStop).toHaveBeenCalledExactlyOnceWith('second')
+    expect(view.retry).not.toHaveBeenCalled()
+    finish()
+    await nextTick()
+    await view.update([{ id: 'second', sessionKey: 'source', phase: 'unknown', stopPending: true, stopAvailable: false }])
+    expect(view.root.textContent).toContain('Stop will continue')
+    expect(view.root.textContent).not.toContain('Stop original request')
+  })
+
+  it('reports a failed Stop write without losing the action or throwing an unhandled error', async () => {
+    const view = mount([{ id: 'first', sessionKey: 'source', phase: 'unknown', stopPending: false, stopAvailable: true }])
+    view.requestStop.mockRejectedValueOnce(new Error('Synthetic storage failure'))
+    view.root.querySelector('button')!.click()
+    await nextTick()
+    const stop = [...view.root.querySelectorAll('button')].find(button => button.textContent === 'Stop original request')!
+    stop.click()
+    await nextTick()
+    await nextTick()
+    expect(view.root.textContent).toContain('could not be saved')
+    expect(stop.disabled).toBe(false)
+  })
+
+  it('does not discard a click when a late ACK resolves the request before Vue redraws', async () => {
+    const view = mount([{ id: 'original', sessionKey: 'source', phase: 'unknown', stopPending: false, stopAvailable: true }])
+    view.root.querySelector('button')!.click()
+    await nextTick()
+    const stop = [...view.root.querySelectorAll('button')].find(button => button.textContent === 'Stop original request')!
+    view.replaceBeforeRedraw([{ id: 'original', sessionKey: 'source', phase: 'accepted', stopPending: false, stopAvailable: false }])
+    stop.click()
+    await nextTick()
+    expect(view.requestStop).toHaveBeenCalledExactlyOnceWith('original')
+    expect(view.retry).not.toHaveBeenCalled()
+  })
 
   it('keeps a parked unknown delivery visible and lets a user recheck its exact identity', async () => {
     const { root, retry, open } = mount([{ id: 'original-request', sessionKey: 'source', phase: 'unknown', stopPending: true, waitReason: 'budget' }])

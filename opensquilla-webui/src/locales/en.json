@@ -5027,6 +5027,7 @@
     "check": "Check again",
     "checking": "Checking…",
     "more": "Show more",
+    "stop": "Stop original request",
     "stopPending": "Stop will continue after the original task is confirmed.",
     "reason": {
       "not-sent": "This message has not been sent. Open the conversation to review the draft and send it.",

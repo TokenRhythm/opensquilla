@@ -4942,6 +4942,7 @@
     "check": "Erneut prüfen",
     "checking": "Wird geprüft…",
     "more": "Mehr anzeigen",
+    "stop": "Ursprüngliche Anfrage stoppen",
     "stopPending": "Nach Bestätigung der ursprünglichen Aufgabe wird das Stoppen fortgesetzt.",
     "reason": {
       "not-sent": "Diese Nachricht wurde noch nicht gesendet. Öffne die Unterhaltung, prüfe den Entwurf und sende ihn.",

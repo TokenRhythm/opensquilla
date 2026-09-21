@@ -83,6 +83,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   const observed = new Map<string, string>()
   const changes = new Set<() => void>()
   const summaries = new Map<string, DeliverySnapshot>()
+  const summaryIdentities = new Map<string, string>()
   const flights = new Map<string, Promise<TurnSendResponse | TurnSteerResponse>>()
   const handoffOwners = new Map<string, { owner: string; revision: number }>()
   const stopIntents = new Map<string, PendingStopIntent>()
@@ -103,6 +104,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   let stopActive = 0
   let leaseWakeTimer: ReturnType<typeof setTimeout> | undefined
   let leaseWakeAt = Infinity
+  let lastPublishedIdentity = options.access.identity()
   const ordinaryWaiters: Array<() => void> = []
   const stopWaiters: Array<() => void> = []
   const stopInvalidation = wal?.onInvalidated?.(() => {
@@ -124,9 +126,16 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     const intent = stopIntents.get(record.ownerRequestId)
     const reason = intent?.storageFailed ? 'storage' : waitReason === undefined && previous?.phase === record.phase
       ? previous.waitReason : waitReason
+    summaryIdentities.set(record.ownerRequestId, record.deliveryIdentity)
+    const params = record.request?.kind === 'send' ? record.request.request.params : record.request?.request
+    const text = params && ('displayText' in params && typeof params.displayText === 'string'
+      ? params.displayText : 'message' in params ? params.message : undefined)
     const summary: DeliverySnapshot = {
       id: record.ownerRequestId, sessionKey: record.requestSessionKey, phase: record.phase,
       stopPending: !!(record.stop && !record.stop.completed) || !!(intent && !intent.completed), ...(reason ? { waitReason: reason } : {}),
+      stopAvailable: !!record.request && !record.paused && !record.stop?.requested && !intent
+        && (record.phase === 'submitting' || record.phase === 'unknown'),
+      ...(typeof text === 'string' && text ? { preview: text.slice(0, 160) } : {}),
     }
     if (JSON.stringify(summaries.get(record.ownerRequestId)) !== JSON.stringify(summary)) {
       summaries.set(record.ownerRequestId, summary)
@@ -146,7 +155,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     // only a small notification window. Unresolved delivery is never evicted.
     const completed = [...summaries.values()].filter(item => item.phase === 'accepted' && !item.stopPending && item.waitReason !== 'storage')
     for (const item of completed.slice(0, Math.max(0, completed.length - 128))) {
-      summaries.delete(item.id); observed.delete(item.id)
+      summaries.delete(item.id); observed.delete(item.id); summaryIdentities.delete(item.id)
       if (!stopIntents.has(item.id)) { roundTriggers.delete(item.id); manualRetries.delete(item.id) }
     }
   }
@@ -379,7 +388,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   async function persistStopIntent(id: string, intent: PendingStopIntent): Promise<void> {
     let matched = false
     const record = await update(id, current => {
-      matched = current.deliveryIdentity === intent.identity
+      matched = !disposed && !invalidated && options.access.identity() === intent.identity
+        && current.deliveryIdentity === intent.identity
       if (!matched) return null
       // Retain an authoritative receipt obtained while writes were failing.
       if (current.response || !intent.record?.response) intent.record = current
@@ -388,7 +398,13 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       return { ...current, ...(intent.paused ? { paused: intent.paused } : {}), stop: { ...current.stop, requested: true, completed,
         ...(intent.request && (!currentTask || currentTask === intent.request.taskId) ? { request: intent.request } : {}) } }
     })
-    if (!matched || !record) return
+    if (!matched || !record) {
+      if (record && record.deliveryIdentity !== intent.identity && stopIntents.get(id) === intent) {
+        stopIntents.delete(id)
+        manualRetries.delete(id)
+      }
+      return
+    }
     if (stopIntents.get(id) === intent) stopIntents.delete(id)
     if (!record.stop?.completed) manualRetries.add(id)
     publish(record, null)
@@ -396,9 +412,14 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
 
   async function requestStop(id: string): Promise<void> {
     const identity = options.access.identity()
-    if (!identity) return
-    const intent = stopIntents.get(id) || { identity }
+    if (!identity || disposed || invalidated) return
+    const existing = stopIntents.get(id)
+    if ((existing && existing.identity !== identity)
+      || (summaryIdentities.has(id) && summaryIdentities.get(id) !== identity)) return
+    const intent = existing || { identity }
     stopIntents.set(id, intent)
+    // Subscribers must latch the click before the first asynchronous WAL read.
+    for (const listener of changes) listener()
     manualRetries.add(id)
     try { await persistStopIntent(id, intent) } catch { reportStopStorage(id, intent) }
     void wake()
@@ -635,6 +656,12 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     for (const [controller, identity] of controllerIdentities) {
       if (identity !== options.access.identity()) controller.abort()
     }
+    // Identity may change while an earlier recovery page is still awaiting a
+    // read. Revoke stale UI actions and previews before that asynchronous work.
+    if (lastPublishedIdentity !== options.access.identity()) {
+      lastPublishedIdentity = options.access.identity()
+      for (const listener of changes) listener()
+    }
     if (recovery) { recoveryAgain = true; return recovery }
     const operation = (async () => {
       try {
@@ -692,7 +719,16 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     requestSteerStop,
     noteReceiptChanged,
     observe(listener) { listeners.add(listener); return () => { listeners.delete(listener) } },
-    snapshots: () => [...summaries.values()],
+    snapshots: () => [...summaries.values()].map(summary => {
+      const intent = stopIntents.get(summary.id)
+      const sameIdentity = !!options.access.identity() && summaryIdentities.get(summary.id) === options.access.identity()
+      return { ...summary, stopPending: summary.stopPending || !!(intent && !intent.completed),
+        stopAvailable: !!summary.stopAvailable && !intent && !disposed && !invalidated && sameIdentity,
+        ...(summaryIdentities.has(summary.id) && !sameIdentity ? { waitReason: 'identity' as const } : {}),
+        // A switch must not expose another account's request text while wake
+        // is still asynchronously paging its saved delivery summaries.
+        preview: sameIdentity && !invalidated ? summary.preview : undefined }
+    }),
     subscribe(listener) { changes.add(listener); return () => { changes.delete(listener) } },
     get: id => wal?.getDelivery?.(id) || Promise.resolve(null),
     async retry(id) {
@@ -727,7 +763,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       renewals.clear()
       stopInvalidation?.()
       for (const resolve of [...ordinaryWaiters.splice(0), ...stopWaiters.splice(0)]) resolve()
-      listeners.clear(); changes.clear(); summaries.clear(); observed.clear(); handoffOwners.clear(); stopIntents.clear(); receiptEventTokens.clear()
+      listeners.clear(); changes.clear(); summaries.clear(); summaryIdentities.clear(); observed.clear(); handoffOwners.clear(); stopIntents.clear(); receiptEventTokens.clear()
       wal?.close()
     },
   }

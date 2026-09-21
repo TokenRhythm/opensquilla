@@ -4942,6 +4942,7 @@
     "check": "Comprobar de nuevo",
     "checking": "Comprobando…",
     "more": "Mostrar más",
+    "stop": "Detener solicitud original",
     "stopPending": "La detención continuará tras confirmar la tarea original.",
     "reason": {
       "not-sent": "Este mensaje no se ha enviado. Abre la conversación para revisar el borrador y enviarlo.",

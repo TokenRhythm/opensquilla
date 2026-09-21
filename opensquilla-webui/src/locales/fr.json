@@ -4942,6 +4942,7 @@
     "check": "Vérifier à nouveau",
     "checking": "Vérification…",
     "more": "Afficher plus",
+    "stop": "Arrêter la demande initiale",
     "stopPending": "L’arrêt se poursuivra après confirmation de la tâche initiale.",
     "reason": {
       "not-sent": "Ce message n’a pas été envoyé. Ouvrez la conversation pour vérifier le brouillon et l’envoyer.",

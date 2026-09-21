@@ -9,6 +9,10 @@ export interface DeliverySnapshot {
   sessionKey: string
   phase: DeliveryWalRecord['phase']
   stopPending: boolean
+  /** The owner permits recording an exact Stop, even while offline. */
+  stopAvailable?: boolean
+  /** Bounded user-facing request text, never attachment material. */
+  preview?: string
   waitReason?: DeliveryWaitReason
 }
 export type DeliveryUpdate = Pick<DeliveryWalRecord,

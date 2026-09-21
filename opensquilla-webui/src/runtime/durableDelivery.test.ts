@@ -57,6 +57,108 @@ async function flush() { for (let index = 0; index < 60; index += 1) await Promi
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  it('offers exact Stop while sending or unknown, including offline, and revokes it after identity changes', async () => {
+    let rejectSend!: (reason: unknown) => void
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })) })
+    const sending = test.owner.commands.send(request())
+    const failed = expect(sending).rejects.toThrow('synthetic lost ACK')
+    await flush()
+    expect(test.owner.snapshots()[0]).toMatchObject({ phase: 'submitting', stopAvailable: true })
+    test.available(false)
+    rejectSend(new TurnCommandError('transport', 'synthetic lost ACK', undefined, null))
+    await failed
+    await test.owner.wake()
+    expect(test.owner.snapshots()[0]).toMatchObject({ phase: 'unknown', stopAvailable: true })
+    expect(test.owner.snapshots()[0]?.preview).toBe('synthetic message')
+    const identityUpdate = vi.fn()
+    test.owner.subscribe(() => identityUpdate(test.owner.snapshots()[0]))
+    test.identity('another-identity')
+    const changed = test.owner.wake()
+    // Subscribers clear their rendered preview before asynchronous WAL paging.
+    expect(identityUpdate).toHaveBeenCalledWith(expect.objectContaining({ stopAvailable: false, waitReason: 'identity', preview: undefined }))
+    await changed
+    expect(test.owner.snapshots()[0]).toMatchObject({ stopAvailable: false, waitReason: 'identity' })
+    expect(test.owner.snapshots()[0]?.preview).toBeUndefined()
+    await test.owner.requestStop('synthetic-request')
+    expect(test.records.get('synthetic-request')?.stop).toBeUndefined()
+    test.identity('synthetic-identity')
+    await test.owner.wake()
+    expect(test.owner.snapshots()[0]?.stopAvailable).toBe(true)
+    await test.owner.requestStop('synthetic-request')
+    expect(test.records.get('synthetic-request')?.stop?.requested).toBe(true)
+    expect(test.owner.snapshots()[0]?.stopAvailable).toBe(false)
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    test.owner.dispose()
+  })
+
+  it('does not offer Stop for an unsent or authority-paused delivery', async () => {
+    const test = harness()
+    test.available(false)
+    await expect(test.owner.commands.send(request('not-sent'))).rejects.toMatchObject({ accepted: false })
+    test.records.set('paused', { schemaVersion: 2, ownerRequestId: 'paused', requestSessionKey: 'synthetic-session',
+      deliveryIdentity: 'synthetic-identity', phase: 'unknown', request: { kind: 'send', request: request('paused') },
+      paused: 'authority', revision: 1, createdAt: 1, updatedAt: 1 })
+    await test.owner.wake()
+    expect(test.owner.snapshots().every(item => !item.stopAvailable)).toBe(true)
+    test.owner.dispose()
+  })
+
+  it('revokes Stop actions and previews synchronously when storage is invalidated', async () => {
+    const storage = memoryWal()
+    let invalidate!: () => void
+    storage.wal.onInvalidated = listener => { invalidate = listener; return () => {} }
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', requestSessionKey: 'synthetic-session',
+      deliveryIdentity: 'synthetic-identity', phase: 'unknown', request: { kind: 'send', request: request() },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const test = harness({}, storage)
+    test.available(false)
+    await test.owner.wake()
+    expect(test.owner.snapshots()[0]).toMatchObject({ stopAvailable: true, preview: 'synthetic message' })
+    const changed = vi.fn()
+    test.owner.subscribe(() => changed(test.owner.snapshots()[0]))
+    invalidate()
+    expect(changed).toHaveBeenCalledWith(expect.objectContaining({ stopAvailable: false, preview: undefined }))
+    test.identity('another-identity')
+    await test.owner.requestStop('synthetic-request')
+    expect(storage.records.get('synthetic-request')?.stop).toBeUndefined()
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    test.owner.dispose()
+  })
+
+  it('fences Stop after an asynchronous WAL read changes identity without losing the original intent', async () => {
+    const test = harness({ send: vi.fn(async () => { throw new TurnCommandError('transport', 'lost ACK', undefined, null) }) })
+    test.available(false)
+    // Seed a real-shaped unknown record to isolate the Stop read/CAS boundary.
+    test.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', requestSessionKey: 'synthetic-session',
+      deliveryIdentity: 'synthetic-identity', phase: 'unknown', request: { kind: 'send', request: request() },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    await test.owner.wake()
+    const originalGet = test.wal.getDelivery!
+    let release!: () => void
+    test.wal.getDelivery = async id => {
+      const record = await originalGet(id)
+      await new Promise<void>(resolve => { release = resolve })
+      return record
+    }
+    const stop = test.owner.requestStop('synthetic-request')
+    await flush()
+    expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: true, stopAvailable: false })
+    test.identity('another-identity')
+    test.wal.getDelivery = originalGet
+    release()
+    await stop
+    await test.owner.wake()
+    expect(test.records.get('synthetic-request')?.stop).toBeUndefined()
+    await test.owner.requestStop('synthetic-request')
+    expect(test.records.get('synthetic-request')?.stop).toBeUndefined()
+    test.identity('synthetic-identity')
+    await test.owner.wake()
+    expect(test.records.get('synthetic-request')?.stop?.requested).toBe(true)
+    expect(test.commands.cancel).not.toHaveBeenCalled()
+    test.owner.dispose()
+  })
+
   it('snapshots nested Vue proxies before storing an immutable request', async () => {
     const test = harness()
     const sending = reactive(request())

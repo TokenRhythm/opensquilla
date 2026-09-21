@@ -13,14 +13,25 @@ const expanded = ref(false)
 const limit = ref(10)
 const checking = ref(false)
 const failedCheck = ref<string | null>(null)
+const stopping = ref(false)
+const failedStop = ref<string | null>(null)
 const entries = computed(() => snapshots.value.filter(item => (
-  item.phase === 'unknown' || item.stopPending || item.waitReason
+  item.phase === 'unknown' || item.stopAvailable || item.stopPending || item.waitReason
 )))
 const visible = computed(() => expanded.value ? entries.value.slice(0, limit.value) : [])
 
 function detail(item: DeliverySnapshot): string {
   // Product copy stays here; the application owner keeps framework-free status.
-  return t(`deliveryRecovery.reason.${failedCheck.value === item.id ? 'storage-check' : item.waitReason || (item.stopPending ? 'stop' : 'pending')}`)
+  return t(`deliveryRecovery.reason.${failedStop.value === item.id ? 'storage' : failedCheck.value === item.id ? 'storage-check' : item.waitReason || (item.stopPending ? 'stop' : 'pending')}`)
+}
+
+async function stop(id: string): Promise<void> {
+  // A late ACK may resolve this row between pointer-down and Vue's redraw.
+  // The owner rechecks identity and stops the same request's exact task.
+  if (!delivery || stopping.value) return
+  stopping.value = true
+  failedStop.value = null
+  try { await delivery.requestStop(id) } catch { failedStop.value = id } finally { stopping.value = false }
 }
 
 async function recheck(id: string): Promise<void> {
@@ -41,9 +52,11 @@ async function recheck(id: string): Promise<void> {
     </div>
     <ul v-if="expanded" class="delivery-notice__items">
       <li v-for="item in visible" :key="item.id">
+        <p v-if="item.preview" class="delivery-notice__preview">{{ item.preview }}</p>
         <span>{{ detail(item) }}</span>
         <span v-if="item.stopPending && item.waitReason !== 'storage'" class="delivery-notice__stop">{{ t('deliveryRecovery.stopPending') }}</span>
         <div class="delivery-notice__actions">
+          <button v-if="item.stopAvailable" type="button" :disabled="stopping" @click="stop(item.id)">{{ t('deliveryRecovery.stop') }}</button>
           <button v-if="item.sessionKey && item.waitReason !== 'identity'" type="button" @click="emit('openSession', item.sessionKey)">{{ t('deliveryRecovery.open') }}</button>
           <button v-if="item.waitReason !== 'reload' && item.waitReason !== 'not-sent'" type="button" :disabled="checking" @click="recheck(item.id)">
             {{ t(checking ? 'deliveryRecovery.checking' : 'deliveryRecovery.check') }}
@@ -72,6 +85,7 @@ async function recheck(id: string): Promise<void> {
 .delivery-notice__items { max-height: 25vh; overflow: auto; margin: var(--sp-2) 0 0; padding-left: var(--sp-4); }
 .delivery-notice__items li { padding: var(--sp-2) 0; }
 .delivery-notice__stop { display: block; color: var(--text-muted); }
+.delivery-notice__preview { overflow-wrap: anywhere; white-space: pre-wrap; }
 .delivery-notice button { background: transparent; border: 0; color: var(--text); cursor: pointer; font: inherit; text-decoration: underline; padding: var(--sp-1); }
 .delivery-notice button:disabled { color: var(--text-muted); cursor: wait; }
 </style>
