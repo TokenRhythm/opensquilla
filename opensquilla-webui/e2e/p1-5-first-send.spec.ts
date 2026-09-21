@@ -47,18 +47,30 @@ type PendingRow = {
   revision: number
 }
 
+type CommittedTurn = {
+  taskId: string
+  sessionKey: string
+  messageId: string
+  message: string
+  createdAt: number
+  transcriptId: number
+  finished: boolean
+}
+
 type MockGatewayState = {
   chatSends: Array<Record<string, unknown>>
   receiptQueries: Array<Record<string, unknown>>
   dispatchMessages: string[]
   dispatchCount: number
   enqueueCount: number
-  firstFinished: boolean
   firstSessionKey: string
   handoffTargets: Record<string, string>
   pendingRows: PendingRow[]
   reorderCount: number
   supportsPendingQueue: boolean
+  turns: CommittedTurn[]
+  streamSeq: number
+  liveEvents: Array<{ event: string; payload: Record<string, unknown> }>
 }
 
 type MockGateway = {
@@ -115,6 +127,7 @@ function hello(supportsPendingQueue = true) {
       ]
     : []
   return helloOkResponse({
+    protocol: 4,
     policy: { concurrent_history_reads: true },
     features: {
       methods: [
@@ -165,12 +178,82 @@ function createMockGatewayState(): MockGatewayState {
     dispatchMessages: [],
     dispatchCount: 0,
     enqueueCount: 0,
-    firstFinished: false,
     firstSessionKey: '',
     handoffTargets: {},
     pendingRows: [],
     reorderCount: 0,
     supportsPendingQueue: true,
+    turns: [],
+    streamSeq: 0,
+    liveEvents: [],
+  }
+}
+
+function commitTurn(
+  state: MockGatewayState,
+  sessionKey: string,
+  taskId: string,
+  params: Record<string, unknown>,
+) {
+  state.turns.push({
+    taskId, sessionKey,
+    messageId: String(params.clientMessageId || `synthetic-user-${taskId}`),
+    message: String(params.message || ''),
+    createdAt: 1_800_000_000_000 + state.turns.length * 10_000,
+    transcriptId: state.turns.length * 2 + 1,
+    finished: false,
+  })
+}
+
+function committedHistory(state: MockGatewayState, params: Record<string, unknown>) {
+  const turns = state.turns.filter(turn => turn.sessionKey === params.sessionKey)
+  const messages = turns.flatMap(turn => {
+    const user = {
+      role: 'user', text: turn.message, id: turn.messageId, message_id: turn.messageId,
+      client_message_id: turn.messageId, timestamp: turn.createdAt,
+      transcript_id: turn.transcriptId, turn_id: turn.taskId,
+      turn_context: { turn_id: turn.taskId },
+    }
+    return turn.finished ? [user, {
+      ...user, role: 'assistant', text: 'ok', id: `synthetic-assistant-${turn.taskId}`,
+      message_id: `synthetic-assistant-${turn.taskId}`, client_message_id: '',
+      timestamp: turn.createdAt + 1_000, transcript_id: turn.transcriptId + 1,
+    }] : [user]
+  })
+  const cursor = (message: typeof messages[number]) => `${message.timestamp}|${message.transcript_id}`
+  const afterIndex = params.after ? messages.findIndex(message => cursor(message) === params.after) : -1
+  const beforeIndex = params.before ? messages.findIndex(message => cursor(message) === params.before) : -1
+  const page = beforeIndex >= 0 ? messages.slice(0, beforeIndex) : messages.slice(afterIndex + 1)
+  return chatHistoryPayload(page, {
+    oldest_cursor: page.length ? cursor(page[0]!) : null,
+    newest_cursor: page.length ? cursor(page[page.length - 1]!) : null,
+    turn_outcomes: turns.filter(turn => turn.finished).map(turn => ({
+      task_id: turn.taskId, turn_id: turn.taskId, status: 'succeeded',
+      outcome: { kind: 'completed' }, started_at: turn.createdAt,
+      finished_at: turn.createdAt + 1_000,
+      activity_snapshot: {
+        version: 2, task_id: turn.taskId, turn_id: turn.taskId, complete: true,
+        reasoning_utf16_length: 0, entries: [{
+          type: 'phase', id: `synthetic-provider-${turn.taskId}`, order: 1,
+          kind: 'provider', phase: 'requesting', at: turn.createdAt,
+          ended_at: turn.createdAt + 1_000,
+        }],
+      },
+    })),
+  })
+}
+
+function committedMetadata(state: MockGatewayState, sessionKey: string) {
+  const tasks = state.turns.filter(turn => turn.sessionKey === sessionKey).map(turn => ({
+    task_id: turn.taskId, turn_id: turn.taskId, session_id: `synthetic-session-${sessionKey}`,
+    status: turn.finished ? 'succeeded' : 'running', queue_mode: 'followup',
+    created_at: turn.createdAt, started_at: turn.createdAt,
+    ...(turn.finished ? { finished_at: turn.createdAt + 1_000, terminal_reason: 'completed' } : {}),
+  }))
+  const active = tasks.find(task => task.status === 'running') || null
+  return {
+    epoch: 1, tasks, active_task: active, last_task: tasks.at(-1) || null,
+    queued_task_ids: [], run_status: active ? 'running' : 'idle',
   }
 }
 
@@ -181,25 +264,28 @@ async function installMockGateway(
 ): Promise<MockGateway> {
   const sockets = new Set<WebSocketRoute>()
   let firstAck: (() => void) | null = null
-  let firstTaskId = 'p1-5-first-task'
-  let streamSeq = 0
+  const firstTaskId = 'p1-5-first-task'
   let connectionCount = 0
   let subscribedConnection = 0
 
   const emit = (event: string, payload: Record<string, unknown>) => {
+    if (event !== 'session.event.done') state.liveEvents.push({ event, payload })
     for (const socket of sockets) socket.send(eventFrame(event, payload))
   }
 
-  const sendDone = (taskId: string) => emit('session.event.done', {
-    key: state.firstSessionKey,
-    sessionKey: state.firstSessionKey,
-    task_id: taskId,
-    stream_generation: 'p1-5-generation',
-    stream_seq: ++streamSeq,
-    status: 'succeeded',
-    reason: 'completed',
-    text_snapshot: 'ok',
-  })
+  const sendDone = (taskId: string) => {
+    const turn = state.turns.find(turn => turn.taskId === taskId)
+    if (!turn || turn.finished) return
+    // A terminal push follows durable transcript/outcome persistence. Subsequent
+    // reads must observe the same completed task, including instant completions.
+    turn.finished = true
+    state.liveEvents = state.liveEvents.filter(event => event.payload.task_id !== taskId)
+    emit('session.event.done', {
+      key: turn.sessionKey, sessionKey: turn.sessionKey, task_id: taskId, epoch: 1,
+      stream_generation: 'p1-5-generation', stream_seq: ++state.streamSeq,
+      status: 'succeeded', reason: 'completed', text_snapshot: 'ok',
+    })
+  }
 
   await page.routeWebSocket(/\/ws$/, ws => {
     let connection = 0
@@ -222,7 +308,7 @@ async function installMockGateway(
         return
       }
       if (method === 'chat.history') {
-        ws.send(successResponse(frame.id, chatHistoryPayload()))
+        ws.send(successResponse(frame.id, committedHistory(state, frame.params || {})))
         return
       }
       if (method === 'turns.receipt.get') {
@@ -245,23 +331,25 @@ async function installMockGateway(
           receipt: {
             requestSessionKey: original.sessionKey,
             sessionKey: targetSessionKey,
-            sessionId: 'synthetic-p1-5-child-session',
+            sessionId: `synthetic-session-${targetSessionKey}`,
             sessionEpoch: 1,
             clientRequestId: requestId,
             messageId: original.clientMessageId,
             taskId: firstTaskId,
-            taskStatus: state.firstFinished ? 'completed' : 'running',
+            taskStatus: state.turns.find(turn => turn.taskId === firstTaskId)?.finished
+              ? 'succeeded' : 'running',
           },
         }))
         return
       }
       if (method === 'sessions.messages.snapshot') {
-        const running = Boolean(state.firstSessionKey && !state.firstFinished)
-        ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(String(frame.params?.key || ''), {
-          current_stream_seq: streamSeq,
+        const key = String(frame.params?.key || '')
+        const metadata = committedMetadata(state, key)
+        ws.send(successResponse(frame.id, sessionMessagesSnapshotPayload(key, {
+          current_stream_seq: state.streamSeq,
           stream_generation: 'p1-5-generation',
-          run_status: running ? 'running' : 'idle',
-          active_task: running ? { task_id: firstTaskId, status: 'running' } : null,
+          task_id: metadata.active_task?.task_id || null,
+          events: state.liveEvents.filter(event => event.payload.key === key),
         })))
         return
       }
@@ -269,15 +357,17 @@ async function installMockGateway(
         if (method === 'sessions.messages.subscribe' && frame.params?.key === state.firstSessionKey) {
           subscribedConnection = connection
         }
-        const running = Boolean(state.firstSessionKey && !state.firstFinished)
+        const key = String(frame.params?.key || '')
         const payload = method === 'sessions.messages.subscribe'
           ? sessionMessagesSubscribePayload : sessionMessagesHydratePayload
-        ws.send(successResponse(frame.id, payload(String(frame.params?.key || ''), {
-          current_stream_seq: streamSeq,
+        const gap = Number(frame.params?.since_stream_seq ?? state.streamSeq) < state.streamSeq
+        ws.send(successResponse(frame.id, payload(key, {
+          current_stream_seq: state.streamSeq,
           stream_generation: 'p1-5-generation',
-          run_status: running ? 'running' : 'idle',
-          active_task: running ? { task_id: firstTaskId, status: 'running' } : null,
-          tasks: running ? [{ task_id: firstTaskId, status: 'running' }] : [],
+          ...committedMetadata(state, key),
+          ...(method === 'sessions.messages.subscribe' ? {
+            replay_complete: !gap, replay_gap_reason: gap ? 'buffer_window_missed' : null,
+          } : {}),
         })))
         return
       }
@@ -334,6 +424,7 @@ async function installMockGateway(
         const [committed] = rowIndex >= 0 ? state.pendingRows.splice(rowIndex, 1) : []
         if (committed) state.dispatchMessages.push(committed.message)
         const queuedTaskId = `p1-5-queued-task-${state.dispatchCount}`
+        if (committed) commitTurn(state, state.firstSessionKey, queuedTaskId, committed)
         ws.send(successResponse(frame.id, {
           accepted: true,
           replayed: !committed,
@@ -359,6 +450,9 @@ async function installMockGateway(
           || sessionKey
         if (ordinal === 1) state.firstSessionKey = responseSessionKey
         const taskId = ordinal === 1 ? firstTaskId : `p1-5-follow-up-${ordinal}`
+        // Real admission commits the user transcript, task, and receipt before
+        // returning ACK. Keep reads consistent even if routing races that ACK.
+        commitTurn(state, responseSessionKey, taskId, params)
         const acknowledge = () => {
           ws.send(successResponse(frame.id, {
             sessionKey: responseSessionKey,
@@ -374,7 +468,7 @@ async function installMockGateway(
               key: sessionKey,
               task_id: taskId,
               stream_generation: 'p1-5-generation',
-              stream_seq: ++streamSeq,
+              stream_seq: ++state.streamSeq,
               schema_version: 1,
               activity_id: 'p1-5-activity',
               phase: 'reasoning',
@@ -389,7 +483,7 @@ async function installMockGateway(
               key: sessionKey,
               task_id: taskId,
               stream_generation: 'p1-5-generation',
-              stream_seq: ++streamSeq,
+              stream_seq: ++state.streamSeq,
               text: 'event before durable acknowledgement',
             })
           }
@@ -397,10 +491,7 @@ async function installMockGateway(
         }
 
         acknowledge()
-        queueMicrotask(() => {
-          if (taskId === firstTaskId) state.firstFinished = true
-          sendDone(taskId)
-        })
+        queueMicrotask(() => sendDone(taskId))
         return
       }
 
@@ -417,7 +508,6 @@ async function installMockGateway(
     get dispatchCount() { return state.dispatchCount },
     get enqueueCount() { return state.enqueueCount },
     finishFirst() {
-      state.firstFinished = true
       sendDone(firstTaskId)
     },
     pendingRow: () => state.pendingRows[0] || null,
@@ -715,6 +805,10 @@ test.describe('durable handoff and pending order release gate', () => {
     const childSessionKey = 'agent:main:webchat:handoff-child'
     const ownerRequestId = 'request-durable-handoff'
     state.handoffTargets[ownerRequestId] = childSessionKey
+    state.firstSessionKey = childSessionKey
+    commitTurn(state, childSessionKey, 'p1-5-first-task', {
+      clientMessageId: 'message-durable-handoff', message: 'P1-5 durable fork prompt',
+    })
     const gateway = await installMockGateway(page, 'immediate', state)
 
     await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(parentSessionKey)}`)
