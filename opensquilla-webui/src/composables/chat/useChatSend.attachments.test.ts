@@ -324,6 +324,114 @@ function usageReplayMessages(): ChatMessage[] {
 }
 
 describe('useChatSend durable application lifetime integration', () => {
+  it('offers an exact ordinary Stop after a lost ACK has ended the originating send transaction', async () => {
+    const wal = memoryDeliveryWal()
+    let available = true
+    const deliveryIdentity = ref('synthetic-identity')
+    let rejectSend!: (error: unknown) => void
+    const raw: TurnCommands = {
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSend = reject })),
+      steer: vi.fn(async () => ({ accepted: true })), cancel: vi.fn(async () => ({ aborted: true })),
+      lookupReceipt: vi.fn(async () => ({ status: 'not-found' as const })),
+      supportsReceiptLookup: () => true, supports: () => true,
+    }
+    const owner = createDurableDelivery({ wal, commands: raw,
+      access: { identity: () => deliveryIdentity.value, available: () => available, generation: () => 1 } })
+    const acceptanceStopAvailable = ref(false)
+    const durableStopPending = ref(false)
+    const harness = makeOptions({ turnCommands: owner.commands, durableDelivery: owner, pendingInputWal: wal,
+      deliveryIdentity, inputText: ref('Synthetic unknown request'),
+      acceptanceStopAvailable, durableStopPending, canStop: () => acceptanceStopAvailable.value })
+    try {
+      const sending = harness.api.onSend()
+      await vi.waitFor(() => expect(raw.send).toHaveBeenCalledTimes(1))
+      await nextTick()
+      expect(acceptanceStopAvailable.value).toBe(true)
+      expect(durableStopPending.value).toBe(false)
+      available = false
+      rejectSend(new TurnCommandError('transport', 'Synthetic lost ACK', undefined, null))
+      await sending
+      await nextTick()
+      const record = (await wal.listDeliveries!())[0]!
+      expect(record.phase).toBe('unknown')
+      expect(harness.options.activeStreamTaskId.value).toBe('')
+      expect(acceptanceStopAvailable.value).toBe(true)
+      deliveryIdentity.value = 'synthetic-other-identity'
+      await nextTick()
+      expect(acceptanceStopAvailable.value).toBe(false)
+      harness.api.onStop()
+      expect((await wal.getDelivery!(record.ownerRequestId))?.stop).toBeUndefined()
+      deliveryIdentity.value = 'synthetic-identity'
+      await nextTick()
+      expect(acceptanceStopAvailable.value).toBe(true)
+      harness.options.inputText.value = 'A later editable draft'
+      const requestStop = vi.spyOn(owner, 'requestStop')
+      harness.api.onStop()
+      harness.api.onStop()
+      await vi.waitFor(async () => expect((await wal.getDelivery!(record.ownerRequestId))?.stop?.requested).toBe(true))
+      await nextTick()
+      expect(requestStop).toHaveBeenCalledExactlyOnceWith(record.ownerRequestId)
+      expect(acceptanceStopAvailable.value).toBe(false)
+      expect(durableStopPending.value).toBe(true)
+      expect(harness.options.inputText.value).toBe('A later editable draft')
+      expect(raw.cancel).not.toHaveBeenCalled()
+      expect(raw.send).toHaveBeenCalledTimes(1)
+      harness.api.dispose()
+      const replacement = makeOptions({ turnCommands: owner.commands, durableDelivery: owner,
+        deliveryIdentity: ref('synthetic-identity'), acceptanceStopAvailable, durableStopPending })
+      expect(acceptanceStopAvailable.value).toBe(false)
+      expect(durableStopPending.value).toBe(true)
+      replacement.api.dispose()
+    } finally { harness.api.dispose(); owner.dispose() }
+  })
+
+  it('requires an individual delivery selection for multiple unknown requests and prioritizes a known task', async () => {
+    const wal = memoryDeliveryWal()
+    let available = true
+    const rejectSends: Array<(error: unknown) => void> = []
+    const raw: TurnCommands = {
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, reject) => { rejectSends.push(reject) })),
+      steer: vi.fn(async () => ({ accepted: true })), cancel: vi.fn(async () => ({ aborted: true })),
+      lookupReceipt: vi.fn(async () => ({ status: 'not-found' as const })),
+      supportsReceiptLookup: () => true, supports: () => true,
+    }
+    const owner = createDurableDelivery({ wal, commands: raw,
+      access: { identity: () => 'synthetic-identity', available: () => available, generation: () => 1 } })
+    const acceptanceStopAvailable = ref(false)
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.reset(true)
+    const harness = makeOptions({ turnCommands: owner.commands, durableDelivery: owner,
+      deliveryIdentity: ref('synthetic-identity'), acceptanceStopAvailable, taskOwnership,
+      canStop: () => acceptanceStopAvailable.value || Boolean(taskOwnership.stopTargetTaskId.value) })
+    try {
+      const sends = ['synthetic-unknown-A', 'synthetic-unknown-B'].map(id => owner.commands.send({
+        kind: 'new-turn', params: { sessionKey: 'agent:main:webchat:test', clientRequestId: id,
+          clientMessageId: `message-${id}`, message: id },
+      }).catch(() => {}))
+      await vi.waitFor(() => expect(raw.send).toHaveBeenCalledTimes(2))
+      available = false
+      for (const reject of rejectSends) reject(new TurnCommandError('transport', 'Synthetic lost ACK', undefined, null))
+      await Promise.all(sends)
+      await nextTick()
+      expect(owner.snapshots().filter(item => item.stopAvailable)).toHaveLength(2)
+      expect(acceptanceStopAvailable.value).toBe(false)
+      const requestStop = vi.spyOn(owner, 'requestStop')
+      harness.api.onStop()
+      expect(requestStop).not.toHaveBeenCalled()
+      expect(raw.cancel).not.toHaveBeenCalled()
+
+      taskOwnership.noteRunning('known-original-task')
+      available = true
+      harness.api.onStop()
+      await vi.waitFor(() => expect(raw.cancel).toHaveBeenCalledTimes(1))
+      expect(raw.cancel).toHaveBeenCalledWith(expect.objectContaining({ taskId: 'known-original-task', scope: 'task' }), expect.anything())
+      expect(requestStop).not.toHaveBeenCalled()
+      expect((await wal.listDeliveries!()).filter(record => record.request)).toSatisfy(
+        (records: DeliveryWalRecord[]) => records.every(record => !record.stop?.requested),
+      )
+    } finally { harness.api.dispose(); owner.dispose() }
+  })
+
   it('keeps an ordinary Stop after its WAL write fails and the originating view is disposed', async () => {
     const wal = memoryDeliveryWal()
     let available = true

@@ -1753,6 +1753,8 @@ const activeStreamTaskId = ref<string>('')
 const activeStreamSessionKey = ref<string>('')
 const acceptanceStopPending = ref(false)
 const acceptanceRecoveryPending = ref(false)
+const acceptanceStopAvailable = ref(false)
+const durableStopPending = ref(false)
 const taskOwnership = useChatTaskOwnership()
 const taskProgress = useChatTaskProgress({
   sessionKey, currentEpoch, activeTaskId: taskOwnership.stopTargetTaskId,
@@ -1761,7 +1763,7 @@ const ordinaryTaskProgress = taskProgress.progress
 const isStopPending = computed(() => (
   Boolean(taskOwnership.stopRequestedTaskId.value)
   || acceptanceStopPending.value
-  || acceptanceRecoveryPending.value
+  || (durableStopPending.value && !acceptanceStopAvailable.value && !taskOwnership.stopTargetTaskId.value)
 ))
 let bindActiveStreamTask = (taskId: string) => { activeStreamTaskId.value = taskId }
 let restoreLiveTurnSnapshot = (_snapshot: SessionReadSnapshot) => {}
@@ -3167,27 +3169,28 @@ const sessionHasActiveWork = computed(() => (
   || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
 ))
 const canStop = computed(() => (
-  !isSessionHydrating.value
-  && taskOwnership.hydrationResolved.value
-  && !taskOwnership.stopRequestedTaskId.value
+  !taskOwnership.stopRequestedTaskId.value
   && !acceptanceStopPending.value
-  && !acceptanceRecoveryPending.value
-  && (
-    Boolean(taskOwnership.stopTargetTaskId.value)
-    || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
-    || Boolean(
-      activeStreamTaskId.value
-      && ![
-        FINISHED_STREAM_TASK_ID,
-        STOPPED_STREAM_TASK_ID,
-      ].includes(activeStreamTaskId.value),
+  && (acceptanceStopAvailable.value || (
+    !isSessionHydrating.value
+    && taskOwnership.hydrationResolved.value
+    && (
+      Boolean(taskOwnership.stopTargetTaskId.value)
+      || activeStreamTaskId.value === PENDING_STREAM_TASK_ID
+      || Boolean(
+        activeStreamTaskId.value
+        && ![
+          FINISHED_STREAM_TASK_ID,
+          STOPPED_STREAM_TASK_ID,
+        ].includes(activeStreamTaskId.value),
+      )
+      || isCompactInFlightForCurrentSession()
+      || activeTaskGroups.value.size > 0
+      || activePlanRun.value?.status === 'queued'
+      || activePlanRun.value?.status === 'running'
+      || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
     )
-    || isCompactInFlightForCurrentSession()
-    || activeTaskGroups.value.size > 0
-    || activePlanRun.value?.status === 'queued'
-    || activePlanRun.value?.status === 'running'
-    || pendingQueueOwnerContext.value?.sessionKey === sessionKey.value
-  )
+  ))
 ))
 const runModeLocked = computed(
   () => isSessionHydrating.value
@@ -3746,6 +3749,8 @@ const chatSend = useChatSend({
   taskOwnership,
   acceptanceStopPending,
   acceptanceRecoveryPending,
+  acceptanceStopAvailable,
+  durableStopPending,
   autoScroll,
   stream: chatStream,
   canStop: () => canStop.value,

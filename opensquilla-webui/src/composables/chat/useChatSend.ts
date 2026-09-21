@@ -541,6 +541,8 @@ export interface UseChatSendOptions {
   taskOwnership?: ChatTaskOwnershipApi
   acceptanceStopPending?: Ref<boolean>
   acceptanceRecoveryPending?: Ref<boolean>
+  acceptanceStopAvailable?: Ref<boolean>
+  durableStopPending?: Ref<boolean>
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
@@ -652,6 +654,7 @@ export function useChatSend(options: UseChatSendOptions) {
   const hiddenDispatchInFlight = new Map<string, Promise<HiddenControlDispatchResult>>()
   const renderedHiddenControls = new Set<string>()
   const acceptanceRecoveryVersion = ref(0)
+  const pendingDeliveryStops = new Set<string>()
   const composerSubmissions = new Map<symbol, { sessionKey: string; snapshot: ComposerSnapshot }>()
   const composerSubmissionVersion = ref(0)
   const sendPending = computed(() => {
@@ -662,6 +665,33 @@ export function useChatSend(options: UseChatSendOptions) {
   function noteAcceptanceRecoveryChanged() {
     acceptanceRecoveryVersion.value += 1
   }
+
+  const stoppableDeliveryForCurrentSession = computed(() => {
+    acceptanceRecoveryVersion.value
+    options.deliveryIdentity?.value
+    const key = options.sessionKey.value
+    if (!key) return null
+    // The app owner decides identity/phase eligibility. The composer can only
+    // target an unambiguous request; multiple unknowns have individual actions
+    // in the application notice.
+    const candidates = options.durableDelivery?.snapshots().filter(item => (
+      item.sessionKey === key && item.stopAvailable && !pendingDeliveryStops.has(item.id)
+    )) || []
+    return candidates.length === 1 ? candidates[0]! : null
+  })
+  const acceptanceStopAvailableForCurrentSession = computed(() => Boolean(stoppableDeliveryForCurrentSession.value))
+  const durableStopPendingForCurrentSession = computed(() => {
+    acceptanceRecoveryVersion.value
+    options.deliveryIdentity?.value
+    return Boolean(options.durableDelivery?.snapshots().some(item => item.sessionKey === options.sessionKey.value
+      && (item.stopPending || pendingDeliveryStops.has(item.id))))
+  })
+  watch(acceptanceStopAvailableForCurrentSession, available => {
+    if (options.acceptanceStopAvailable) options.acceptanceStopAvailable.value = available
+  }, { immediate: true })
+  watch(durableStopPendingForCurrentSession, pending => {
+    if (options.durableStopPending) options.durableStopPending.value = pending
+  }, { immediate: true })
 
   const acceptanceRecoveryPendingForCurrentSession: ComputedRef<boolean> = computed(() => {
     // Depend on an explicit version because the attempt registry is purposely
@@ -3929,6 +3959,28 @@ export function useChatSend(options: UseChatSendOptions) {
       ].includes(rawStoppedTurnId)
       ? rawStoppedTurnId
       : ''
+    const delivery = stoppableDeliveryForCurrentSession.value
+    if (!stoppedTurnId && !handoff && !acceptance && delivery && options.durableDelivery) {
+      // ACK loss ends the view's send transaction, but not the app-owned
+      // request. Persist Stop against its original id, including after a view
+      // remount, without inventing a task id or a whole-session cancellation.
+      pendingDeliveryStops.add(delivery.id)
+      noteAcceptanceRecoveryChanged()
+      void options.durableDelivery.requestStop(delivery.id).catch(() => {
+        if (!disposed) pushToast(i18n.global.t('deliveryRecovery.reason.storage'), { tone: 'warn' })
+      }).finally(() => {
+        pendingDeliveryStops.delete(delivery.id)
+        if (!disposed) noteAcceptanceRecoveryChanged()
+      })
+      return
+    }
+    if (!stoppedTurnId && !handoff && !acceptance && options.durableDelivery
+      && acceptanceRecoveryPendingForCurrentSession.value) {
+      // The template's watched boolean can lag a synchronous second click.
+      // An already-stopping or ambiguous unknown request never falls through
+      // to the legacy whole-session action while that view catches up.
+      return
+    }
     const taskAcceptancePending = Boolean(handoff || acceptance)
     const acceptanceOwnsStop = taskAcceptancePending && !stoppedTurnId
     if (!acceptanceOwnsStop && acceptance?.attempt) {
@@ -4708,5 +4760,7 @@ export function useChatSend(options: UseChatSendOptions) {
     sendHiddenMetaPreflightConfirmation,
     sendUsageBarrierReplay,
     acceptanceRecoveryPendingForCurrentSession,
+    acceptanceStopAvailableForCurrentSession,
+    durableStopPendingForCurrentSession,
   }
 }
