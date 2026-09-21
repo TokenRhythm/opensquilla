@@ -59,10 +59,14 @@ the time boundary. Continue targeted discovery until another relevant source
 could no longer materially change the conclusion; if a gap remains unresolved,
 narrow the judgment and state the limit. For a broad corpus with at least 30
 discovered source files, use at least 30 independent sources in substantive
-claims before finalization. The sidecar enforces this adaptive breadth target
-and a core explicitly-read set; do not pad the bibliography with metadata-only
-or unread sources. Smaller investigations keep the ordinary source-grounded
-review requirements without a forced bibliography floor.
+claims before finalization. Explicitly read a core set of up to 24 files (at
+least 12 for a 30-source bibliography), following continuations. Build 3–5
+source-grounded data exhibits from distinct source files when the corpus is
+broad, covering the comparisons, metrics, mechanisms, scenarios, or risks that
+make the answer concrete. The sidecar enforces these adaptive bibliography,
+reading, and exhibit targets; do not pad the bibliography or invent table
+cells. Smaller investigations keep the ordinary source-grounded review
+requirements without a forced bibliography or exhibit floor.
 
 ## Drafting discipline
 
@@ -80,6 +84,12 @@ reading are complete. Use stable `claimKey`/`batchKey` values and exact
 If a write returns `RESEARCH_PREPARATION_REQUIRED`, perform the missing scoped
 reads, evidence continuations, or PDF inventory, then replay the unchanged
 batch. Keep successful receipts and never hand-edit generated artifacts.
+
+For a broad report, each exhibit must state the entity, metric, unit, period,
+actual/estimate status and source, and explain what the comparison can and
+cannot establish. A report with many citations but one generic table is not a
+complete deep report; add the missing source-grounded exhibits or narrow the
+judgment.
 
 ## Review boundary
 
