@@ -1012,6 +1012,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
