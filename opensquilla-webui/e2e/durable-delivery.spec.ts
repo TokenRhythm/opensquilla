@@ -23,7 +23,37 @@ test.beforeAll(async () => {
         import { createPendingInputWal } from ${source('src/utils/chat/pendingInputWal.ts')};
         import { createDurableDelivery } from ${source('src/runtime/durableDelivery.ts')};
         import { TurnCommandError } from ${source('src/modules/turnCommands.ts')};
-        window.deliveryFixture = { createPendingInputWal, createDurableDelivery, TurnCommandError };
+        import { useChatPendingQueue } from ${source('src/composables/chat/useChatPendingQueue.ts')};
+        import { PARKED_PENDING_QUEUE_LIMITS } from ${source('src/utils/chat/parkedPendingQueueCache.ts')};
+        import { effectScope, nextTick, ref } from 'vue';
+        function createOfflinePendingQueue(initialSessionKey) {
+          const scope = effectScope();
+          const sessionKey = ref(initialSessionKey);
+          const wal = createPendingInputWal();
+          const errors = [];
+          const queue = scope.run(() => useChatPendingQueue({
+            sessionKey, inputText: ref(''), pendingAttachments: ref([]),
+            pendingSessionIntent: ref(null), isStreaming: ref(false),
+            connectionState: ref('disconnected'), deliveryIdentity: ref('synthetic-identity'),
+            isBlocked: () => true, hasComposer: () => true,
+            autoResizeTextarea() {}, resetInputHistory() {},
+            sendCurrentInput() { throw new Error('Offline pressure fixture must not dispatch'); },
+            onPendingPersistenceError: reason => errors.push(reason),
+            pendingInputWal: wal, pendingInputQueue: null,
+          }));
+          return { queue, wal, errors, sessionKey,
+            async switchTo(key) {
+              await queue.switchPendingQueue(key);
+              sessionKey.value = key;
+              await nextTick();
+              await queue.hydratePendingQueue(key);
+              await nextTick();
+            },
+            cleanup() { queue.cleanup(); scope.stop(); },
+          };
+        }
+        window.deliveryFixture = { createPendingInputWal, createDurableDelivery, TurnCommandError,
+          createOfflinePendingQueue, PARKED_PENDING_QUEUE_LIMITS, nextTick };
         window.deliveryFixture.wal = createPendingInputWal();
       ` : undefined,
     }],
@@ -469,4 +499,144 @@ test('native IDB quota fault injection preserves a first-send draft and keeps un
       fixture.owner.dispose()
     })
   }
+})
+
+test('500 real pending queues obey retention budgets and recover evicted attachment bytes after reopening', async ({ context }) => {
+  // This exercises retained domain accounting and native persisted bytes, not
+  // process RSS, forced garbage collection, or a full application mount loop.
+  test.setTimeout(60_000)
+  const page = await fixturePage(context)
+  const pressure = await page.evaluate(async databaseName => {
+    const fixture = (window as any).deliveryFixture
+    const MiB = 1024 * 1024
+    const session = (index: number) => `agent:main:webchat:synthetic-pressure-${index}`
+    const harness = fixture.createOfflinePendingQueue(session(0))
+    const originalRevoke = URL.revokeObjectURL
+    const revoked = new Set<string>()
+    URL.revokeObjectURL = function (url: string) { revoked.add(url); originalRevoke.call(URL, url) }
+    const selected: Array<{
+      sessionKey: string; pendingInputId: string; clientRequestId: string; clientMessageId: string;
+      ownerRequestId?: string; draftIds: string[]; textLength: number; textHash: string;
+      attachment?: { name: string; size: number; sha256: string; originalUrl: string };
+    }> = []
+    const samples: Record<string, unknown> = {}
+    async function hash(bytes: ArrayBuffer | Uint8Array<ArrayBuffer>): Promise<string> {
+      return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+        .map(value => value.toString(16).padStart(2, '0')).join('')
+    }
+    try {
+      await harness.queue.hydratePendingQueue(session(0))
+      for (let index = 0; index < 500; index += 1) {
+        const text = index === 2 ? 'x'.repeat(9 * MiB) : `Synthetic retained draft ${index}`
+        const size = index < 2 ? 17 * MiB : index === 3 ? 2 * MiB : 0
+        const bytes = size ? new Uint8Array(size).fill(index + 1) : undefined
+        const name = `synthetic-attachment-${index}.bin`
+        const file = bytes ? new File([bytes], name, { type: 'application/octet-stream', lastModified: 1 }) : undefined
+        const url = file ? URL.createObjectURL(file) : ''
+        const attachments = file ? [{ kind: 'staged', local_id: index + 1, name, mime: file.type,
+          size: file.size, file, dataUrl: url }] : []
+        const owner = index === 3 ? { ownerRequestId: 'synthetic-protected-handoff' } : undefined
+        const saved = await harness.queue.enqueuePendingPayload({ text, attachments,
+          deliveryIdentity: 'synthetic-identity', draftIds: [`synthetic-annotation-${index}`] }, owner)
+        if (!saved || harness.errors.length) throw new Error(`Synthetic queue failed to persist at ${index}`)
+        const item = harness.queue.pendingQueue.value.find((value: { ownerSessionKey: string }) => value.ownerSessionKey === session(index))
+        if (!item) throw new Error(`Synthetic queue lost its active draft at ${index}`)
+        if (index < 4) selected.push({
+          sessionKey: session(index), pendingInputId: item.pendingInputId,
+          clientRequestId: item.pendingClientRequestId, clientMessageId: item.pendingClientMessageId,
+          ...(item.ownerRequestId ? { ownerRequestId: item.ownerRequestId } : {}),
+          draftIds: [...item.draftIds], textLength: text.length, textHash: await hash(new TextEncoder().encode(text)),
+          ...(bytes ? { attachment: { name, size, sha256: await hash(bytes), originalUrl: url } } : {}),
+        })
+        await harness.switchTo(session(index + 1))
+        const usage = harness.queue.getParkedQueueUsage()
+        if (usage.sessions > 16 || usage.payloadBytes > 16 * MiB || usage.blobBytes > 32 * MiB) {
+          throw new Error(`Synthetic parked queue exceeded its retention budget at ${index}`)
+        }
+        if (index === 0) samples.firstBlob = usage
+        if (index === 1) samples.blobPressure = { ...usage, earlyBlobRevoked: revoked.has(selected[0]!.attachment!.originalUrl) }
+        if (index === 2) samples.payloadPressure = usage
+      }
+      const usage = harness.queue.getParkedQueueUsage()
+      const persistedCount = await new Promise<number>((resolve, reject) => {
+        const opening = indexedDB.open(databaseName, 3)
+        opening.onerror = () => reject(opening.error)
+        opening.onsuccess = () => {
+          const database = opening.result
+          const transaction = database.transaction('pending_chat_inputs')
+          const count = transaction.objectStore('pending_chat_inputs').count()
+          transaction.oncomplete = () => { database.close(); resolve(count.result) }
+          transaction.onabort = () => { database.close(); reject(transaction.error) }
+        }
+      })
+      // Only identity/digest metadata crosses the page boundary. No test-side
+      // array retains the evicted File objects or the oversized draft text.
+      harness.cleanup()
+      return { selected, samples, usage, persistedCount, limits: fixture.PARKED_PENDING_QUEUE_LIMITS,
+        afterCleanup: harness.queue.getParkedQueueUsage(), activeItems: harness.queue.pendingQueue.value.length,
+        errors: harness.errors, revoked: [...revoked] }
+    } finally {
+      harness.cleanup()
+      URL.revokeObjectURL = originalRevoke
+    }
+  }, DATABASE)
+  const MiB = 1024 * 1024
+  expect(pressure.limits).toEqual({ sessions: 16, payloadBytes: 16 * MiB, blobBytes: 32 * MiB })
+  expect(pressure.samples.firstBlob).toMatchObject({ sessions: 1, blobBytes: 17 * MiB, protectedSessions: 0 })
+  expect(pressure.samples.blobPressure).toMatchObject({ sessions: 1, blobBytes: 17 * MiB, earlyBlobRevoked: true })
+  expect(pressure.samples.payloadPressure).toMatchObject({ sessions: 0, payloadBytes: 0, blobBytes: 0 })
+  expect(pressure.usage).toMatchObject({ sessions: 16, protectedSessions: 1, protectedBlobBytes: 2 * MiB,
+    reclaimableSessions: 15, reclaimableBlobBytes: 0, blobBytes: 2 * MiB })
+  expect(pressure.usage.protectedPayloadBytes).toBeGreaterThan(0)
+  expect(pressure.usage.payloadBytes).toBe(pressure.usage.protectedPayloadBytes + pressure.usage.reclaimablePayloadBytes)
+  expect(pressure.persistedCount).toBe(500)
+  expect(pressure.errors).toEqual([])
+  expect(pressure.activeItems).toBe(0)
+  expect(pressure.afterCleanup).toMatchObject({ sessions: 0, payloadBytes: 0, blobBytes: 0 })
+  await page.close()
+
+  const reopened = await fixturePage(context)
+  try {
+    const restored = await reopened.evaluate(async selected => {
+      const fixture = (window as any).deliveryFixture
+      const harness = fixture.createOfflinePendingQueue(selected[0]!.sessionKey)
+      async function hash(bytes: ArrayBuffer | Uint8Array<ArrayBuffer>): Promise<string> {
+        return [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))]
+          .map(value => value.toString(16).padStart(2, '0')).join('')
+      }
+      const recovered = []
+      try {
+        for (const expected of selected) {
+          await harness.switchTo(expected.sessionKey)
+          const item = harness.queue.pendingQueue.value.find((value: { pendingInputId: string }) => value.pendingInputId === expected.pendingInputId)
+          if (!item) throw new Error('Native WAL did not restore the original synthetic input identity')
+          const attachment = item.attachments[0]
+          let attachmentResult
+          if (expected.attachment) {
+            if (!(attachment?.file instanceof Blob)) throw new Error('Native WAL did not retain the synthetic attachment bytes')
+            if (!attachment.dataUrl?.startsWith('blob:')) throw new Error('Restored attachment has no display URL')
+            const displayBytes = await (await fetch(attachment.dataUrl)).arrayBuffer()
+            attachmentResult = { name: attachment.name, size: attachment.file.size,
+              sha256: await hash(await attachment.file.arrayBuffer()), displayHash: await hash(displayBytes),
+              newDisplayUrl: attachment.dataUrl !== expected.attachment.originalUrl }
+          }
+          recovered.push({ pendingInputId: item.pendingInputId, clientRequestId: item.pendingClientRequestId,
+            clientMessageId: item.pendingClientMessageId, ownerRequestId: item.ownerRequestId,
+            deliveryIdentity: item.pendingDeliveryIdentity, draftIds: [...item.draftIds],
+            textLength: item.text.length, textHash: await hash(new TextEncoder().encode(item.text)), attachment: attachmentResult })
+        }
+        return { recovered, errors: harness.errors }
+      } finally { harness.cleanup() }
+    }, pressure.selected)
+    expect(restored.errors).toEqual([])
+    expect(restored.recovered).toHaveLength(4)
+    for (const [index, expected] of pressure.selected.entries()) {
+      expect(restored.recovered[index]).toMatchObject({ pendingInputId: expected.pendingInputId,
+        clientRequestId: expected.clientRequestId, clientMessageId: expected.clientMessageId,
+        deliveryIdentity: 'synthetic-identity', draftIds: expected.draftIds, textLength: expected.textLength, textHash: expected.textHash })
+      expect(restored.recovered[index]?.ownerRequestId).toBe(expected.ownerRequestId)
+      if (expected.attachment) expect(restored.recovered[index]?.attachment).toEqual({ name: expected.attachment.name,
+        size: expected.attachment.size, sha256: expected.attachment.sha256, displayHash: expected.attachment.sha256, newDisplayUrl: true })
+    }
+  } finally { await reopened.close() }
 })
