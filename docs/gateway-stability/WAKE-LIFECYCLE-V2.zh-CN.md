@@ -6,7 +6,7 @@
 
 ## 行为
 
-一次 wake incident 由第一次 wake 信号创建，并固定 20 秒截止时间。`pageshow`、`online`、Electron `desktop-resume` 和手动信号只增加信号计数，不能延长截止时间。
+一次 wake incident 由第一次有效 wake 信号创建，并固定 20 秒截止时间。普通导航产生的 `pageshow.persisted=false` 以及首个 Hello 前的 browser lifecycle 信号属于初始启动，不创建 incident；BFCache `pageshow.persisted=true`、`online`、Electron `desktop-resume` 和手动信号只增加信号计数，不能延长截止时间。
 
 - `checking`：incident 创建后立即发布。UI 不再把仍在确认的连接显示为正常 connected。
 - `suspect`：5 秒内没有当前 generation 的 nonce pong 或 Gateway `tick` 时发布。旧 socket 保留，mutation 直接失败；草稿和 session 页面保持不变。
@@ -25,11 +25,12 @@ Gateway writer 保留已有 2 秒 direct-send、30 秒 recovery-credit、60 秒 
 
 ## 验证结果
 
-- WebUI 全量 Vitest：513 个测试文件、7751 个测试通过。
-- Wake/RPC、GatewayAccess、诊断和设置 UI 定向测试：5 个文件、220 个测试通过。
+- WebUI 全量 Vitest：513 个测试文件、7756 个测试通过。
+- Wake/RPC 状态机：`rpc.test.ts` 139 个测试通过；新增覆盖初始 `pageshow`、native resume 的 CONNECTING/无 socket 路径。
 - Gateway writer/close/flow/diagnostics 定向 pytest：87 个通过。
 - Electron TypeScript：`npx tsc --noEmit -p desktop/electron/tsconfig.json` 通过。
 - Electron source build：`npm run build` 通过。
+- 静态 Gateway artifact、`OPENSQUILLA_TESTING` 环境下的 `history-hydration @session-hang-recovery` 通过；同一 loopback 场景本地连续 30/30 通过。
 - Desktop background-flow harness 已更新以接受新 phase、source 和 generation 在同一 incident 内轮换；本环境执行时需要下载 Electron 二进制，下载未完成，因此没有把它冒充成 packaged/native 通过。
 
 完整 `tests/test_gateway` 收集到一个环境阻塞：`test_rpc_selflearning_status.py` 需要未安装的 `numpy`；这不是本次改动产生的失败。远程 relay、真实 Windows 睡眠/唤醒和 packaged EXE 的 30 次循环仍需在具备 Electron 缓存、远程拓扑和物理睡眠能力的 runner 上执行，不能由 loopback 或 fake clock 代替。
