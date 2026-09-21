@@ -7,12 +7,34 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
 import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
+import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { parse, stringify } from 'smol-toml'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const packageRoot = resolve(scriptDir, '..')
 const repoRoot = resolve(packageRoot, '../..')
 const screenshotPath = String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_SCREENSHOT || '').trim()
+const CASE_NAMES = ['submit', 'optional-probe', 'skip', 'close', 'slow-probe', 'provider-client']
+const selectedCases = new Set(String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_CASES || '')
+  .split(',').map(value => value.trim()).filter(Boolean))
+const onboardingDiagnosticContexts = new WeakMap()
+const reportedOnboardingFailures = new WeakSet()
+// Match the existing orphan-recovery native harness's cold-start budget:
+// Gateway readiness owns 120s, with 45s for the surrounding Desktop startup.
+// Each launch consumes one absolute deadline; it is not renewed by assertions.
+const INITIAL_DESKTOP_STARTUP_BUDGET_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + 45_000
+for (const name of selectedCases) {
+  assert.ok(CASE_NAMES.includes(name), `Unknown onboarding case: ${name}; choose ${CASE_NAMES.join(', ')}`)
+}
+function caseSelected(name) {
+  return selectedCases.size === 0 || selectedCases.has(name)
+}
+async function runCase(name, verify) {
+  if (!caseSelected(name)) return
+  console.log(`RUN onboarding ${name}`)
+  await verify()
+  console.log(`PASS onboarding ${name}`)
+}
 const ONBOARDING_TELEMETRY_EVENTS = new Set([
   'onboarding_save_started',
   'onboarding_save_stage_started',
@@ -75,6 +97,10 @@ async function startOnboardingProbeServer(initialMode = 'success') {
         authorization: request.headers.authorization || '',
         body: Buffer.concat(body).toString('utf8'),
       })
+      if (mode === 'disconnect') {
+        request.socket.destroy()
+        return
+      }
       if (mode === 'reject') {
         response.writeHead(401, { 'content-type': 'application/json' })
         response.end(JSON.stringify({
@@ -206,15 +232,106 @@ function assertOnboardingTelemetrySchema(records, expectedSecret) {
   )
 }
 
+function diagnosticUrl(raw) {
+  if (String(raw).startsWith('data:')) return 'data:[onboarding document omitted]'
+  try {
+    const url = new URL(raw)
+    return `${url.protocol}//${url.host}${url.pathname}`
+  } catch {
+    return '<unavailable>'
+  }
+}
+
+function redactDiagnosticText(value) {
+  return String(value)
+    .replace(/synthetic-[A-Za-z0-9_-]*key\b/g, '[fixture-key]')
+    .replace(/\bBearer\s+[A-Za-z0-9._~-]+/gi, 'Bearer [redacted]')
+    .replace(/("(?:api[_-]?key|encryptedApiKey|authToken|authorization|token|secret|password)"\s*:\s*)"(?:\\.|[^"\\])*"/gi, '$1"[redacted]"')
+}
+
+async function diagnosticRead(read, fallback) {
+  let timer
+  try {
+    return await Promise.race([
+      Promise.resolve().then(read),
+      new Promise(resolveRead => { timer = setTimeout(() => resolveRead(fallback), 1_500) }),
+    ])
+  } catch {
+    return fallback
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function reportOnboardingFailure(app, phase, error) {
+  if (error && typeof error === 'object') {
+    if (reportedOnboardingFailures.has(error)) return
+    reportedOnboardingFailures.add(error)
+  }
+  const context = onboardingDiagnosticContexts.get(app)
+  const readLog = name => context
+    ? diagnosticRead(() => readFile(join(context.userDataDir, 'logs', name), 'utf8'), '<log unavailable>')
+    : Promise.resolve('<profile unavailable>')
+  const windows = await diagnosticRead(() => Promise.all(app.windows().map(async page => ({
+    closed: page.isClosed(),
+    url: diagnosticUrl(page.url()),
+    title: await diagnosticRead(() => page.title(), '<title unavailable>'),
+    connection: await diagnosticRead(() => page.evaluate(async () => {
+      const connection = await window.opensquillaDesktop?.getGatewayConnection?.()
+      // Never serialize the descriptor's authToken or any form/request values.
+      return connection ? {
+        status: connection.status,
+        revision: connection.revision,
+        error: connection.error,
+      } : null
+    }), { diagnosticError: 'connection snapshot unavailable' }),
+  }))), [{ diagnosticError: 'window snapshot unavailable' }])
+  const [desktopLog, gatewayLog] = await Promise.all([readLog('desktop.log'), readLog('gateway.log')])
+  const report = JSON.stringify({
+    event: 'onboarding_e2e_failure',
+    fixture: context?.prefix ?? 'unknown',
+    phase,
+    startup: context ? {
+      elapsedMs: Date.now() - context.startupStartedAt,
+      budgetMs: INITIAL_DESKTOP_STARTUP_BUDGET_MS,
+      readyConfirmed: context.startupReady,
+    } : null,
+    error: String(error?.stack || error),
+    windows,
+    desktopLogTail: desktopLog.slice(-24_000),
+    gatewayLogTail: gatewayLog.slice(-24_000),
+  }, (_key, value) => typeof value === 'string' ? redactDiagnosticText(value) : value, 2)
+  console.error(report)
+  const reportDir = String(process.env.CI_REPORT_DIR || '').trim()
+  if (reportDir) {
+    const fileName = `${context?.prefix ?? 'onboarding-'}${phase}-${Date.now()}`
+      .replace(/[^A-Za-z0-9_.-]/g, '_') + '.json'
+    await diagnosticRead(async () => {
+      await mkdir(reportDir, { recursive: true })
+      await writeFile(join(reportDir, fileName), report + '\n', 'utf8')
+    }, null)
+  }
+}
+
 async function setupWindow(app) {
-  return await waitFor(async () => {
-    for (const page of app.windows()) {
-      if (page.isClosed()) continue
-      await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
-      if (await page.locator('#setup-form').count().catch(() => 0)) return page
-    }
-    return null
-  }, 'desktop onboarding window')
+  let phase = 'gateway-startup'
+  try {
+    // The optional invitation is published only after the client and Gateway
+    // are ready. Profile preparation must not consume its separate UI deadline.
+    await readyDesktopWindow(app)
+    phase = 'setup-window'
+    return await waitFor(async () => {
+      for (const page of app.windows()) {
+        if (page.isClosed()) continue
+        await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
+        if (await page.locator('#setup-form').count().catch(() => 0)) return page
+      }
+      return null
+    }, 'desktop onboarding window')
+  } catch (error) {
+    await reportOnboardingFailure(app, phase, error)
+    throw error
+  }
 }
 
 async function bootWindow(app) {
@@ -287,7 +404,7 @@ function boxesOverlap(left, right) {
 
 async function assertSubmitActionsDoNotOverlap(page) {
   const boxes = {
-    cancel: await page.locator('#cancel').boundingBox(),
+    skip: await page.locator('#skip').boundingBox(),
     submitStatus: await page.locator('#submitStatus').boundingBox(),
     finish: await page.locator('#finish').boundingBox(),
   }
@@ -295,8 +412,8 @@ async function assertSubmitActionsDoNotOverlap(page) {
     assert.ok(box, `${name} must have a visible bounding box`)
   }
   for (const [leftName, rightName] of [
-    ['cancel', 'submitStatus'],
-    ['cancel', 'finish'],
+    ['skip', 'submitStatus'],
+    ['skip', 'finish'],
     ['submitStatus', 'finish'],
   ]) {
     assert.equal(
@@ -332,7 +449,7 @@ async function verifyBootPhaseTimer(app) {
     control: 3,
     ready: 4,
   }[stateBeforeReload?.status?.phaseId] ?? 0
-  // The boot window sits behind modal onboarding, where Chromium may throttle
+  // The boot window sits behind the setup invitation, where Chromium may throttle
   // its 100 ms timer. Drive elapsed time explicitly instead of racing a brief
   // wall-clock reset window, and install before reload so every timer is owned.
   const bootClockOrigin = Date.now()
@@ -356,6 +473,18 @@ async function verifyBootPhaseTimer(app) {
       (await phase.innerText()).trim() === status.label
     ), `boot status ${status.label} to render`)
   }
+  // The non-blocking onboarding invitation now opens after real boot has
+  // reached ready. A boot error arms the documented retry reset; a profile
+  // status alone must not make completed progress go backwards.
+  await sendBootEvent(app, 'desktop:boot:error', { message: 'Synthetic retry boundary.' })
+  await waitFor(async () => page.locator('body').evaluate(body => body.classList.contains('errored')),
+    'boot error to arm the retry progress reset')
+  await applyBootStatus({
+    phaseId: 'profile',
+    label: 'Synthetic new boot sequence',
+    at: await bootTimestamp(),
+  })
+  await waitForBootProgress(page, 0)
 
   const staleStatus = {
     phaseId: 'gateway-start',
@@ -460,12 +589,16 @@ async function verifyBootPhaseTimer(app) {
   await page.clock.resume()
 }
 
-async function launchIsolatedOnboarding(prefix) {
-  const userDataRoot = await mkdtemp(join(tmpdir(), prefix))
+async function launchIsolatedOnboarding(prefix, existingUserDataRoot) {
+  const userDataRoot = existingUserDataRoot || await mkdtemp(join(tmpdir(), prefix))
   const userDataDir = join(userDataRoot, 'chromium-user-data')
   const isolatedHome = join(userDataRoot, 'home')
   await mkdir(isolatedHome, { recursive: true })
+  const startupStartedAt = Date.now()
   const app = await electron.launch({
+    ...(process.env.OPENSQUILLA_DESKTOP_TEST_ELECTRON_EXECUTABLE
+      ? { executablePath: process.env.OPENSQUILLA_DESKTOP_TEST_ELECTRON_EXECUTABLE }
+      : {}),
     args: [
       '--use-mock-keychain',
       `--user-data-dir=${userDataDir}`,
@@ -484,7 +617,44 @@ async function launchIsolatedOnboarding(prefix) {
       LC_ALL: 'en_US.UTF-8',
     },
   })
+  onboardingDiagnosticContexts.set(app, {
+    prefix, userDataDir, startupStartedAt,
+    startupDeadline: startupStartedAt + INITIAL_DESKTOP_STARTUP_BUDGET_MS,
+    startupReady: false,
+  })
   return { app, userDataDir, userDataRoot }
+}
+
+async function readyDesktopWindow(app) {
+  const context = onboardingDiagnosticContexts.get(app)
+  const initialStartup = context && !context.startupReady
+  const timeoutMs = initialStartup ? context.startupDeadline - Date.now() : 60_000
+  if (timeoutMs <= 0) {
+    throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+  }
+  const result = await waitFor(async () => {
+    const child = app.process()
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return { error: `Electron exited before Gateway readiness (code=${child.exitCode}, signal=${child.signalCode}).` }
+    }
+    for (const page of app.windows()) {
+      if (page.isClosed() || !page.url().startsWith('opensquilla-app://desktop/')) continue
+      const connection = await page.evaluate(
+        () => window.opensquillaDesktop?.getGatewayConnection?.(),
+      )
+      // Return terminal failures from the poll, then throw below: waitFor's
+      // transient-observation catch must not swallow a real startup failure.
+      if (connection?.status === 'error') return { error: connection.error || 'Desktop Gateway startup failed.' }
+      if (connection?.status === 'ready') return { page }
+    }
+    return null
+  }, 'ready Desktop Gateway without model configuration', timeoutMs)
+  if (result.error) throw new Error(result.error)
+  if (initialStartup && Date.now() >= context.startupDeadline) {
+    throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+  }
+  if (context) context.startupReady = true
+  return result.page
 }
 
 async function installPendingSaveStub(app) {
@@ -504,6 +674,30 @@ async function installPendingSaveStub(app) {
       })
     })
   })
+}
+
+async function installPendingProbeStub(app) {
+  await app.evaluate(({ ipcMain }) => {
+    const requests = []
+    globalThis.__opensquillaOnboardingProbeTest = requests
+    ipcMain.removeHandler('desktop:onboarding:probe')
+    ipcMain.handle('desktop:onboarding:probe', (_event, payload) => (
+      new Promise(resolveProbe => requests.push({ payload, resolveProbe }))
+    ))
+  })
+}
+
+async function pendingProbeCount(app) {
+  return await app.evaluate(() => globalThis.__opensquillaOnboardingProbeTest.length)
+}
+
+async function settlePendingProbe(app, index, result) {
+  await app.evaluate((_electron, payload) => {
+    const request = globalThis.__opensquillaOnboardingProbeTest[payload.index]
+    if (!request?.resolveProbe) throw new Error('No synthetic onboarding probe is pending.')
+    request.resolveProbe(payload.result)
+    request.resolveProbe = null
+  }, { index, result })
 }
 
 async function assertUnifiedTelemetryNotice(page) {
@@ -559,7 +753,7 @@ async function assertSubmitPending(
   const finish = page.locator('#finish')
   const cardBody = page.locator('.card-body')
   const locale = page.locator('#onboardingLocale')
-  const cancel = page.locator('#cancel')
+  const skip = page.locator('#skip')
   const submitStatus = page.locator('#submitStatus')
   const providerSelectToggle = page.locator('#providerSelectToggle')
   const providerSelectPanel = page.locator('#providerSelectPanel')
@@ -575,7 +769,7 @@ async function assertSubmitPending(
   assert.equal(await form.getAttribute('aria-busy'), 'true')
   assert.equal(await cardBody.evaluate((card) => card.inert), true)
   assert.equal(await locale.isDisabled(), true)
-  assert.equal(await cancel.isDisabled(), false)
+  assert.equal(await skip.isDisabled(), false)
   assert.equal(await providerSelectToggle.getAttribute('aria-expanded'), 'false')
   assert.equal(await providerSelectPanel.isHidden(), true)
   assert.equal(await submitStatus.isVisible(), true)
@@ -590,7 +784,7 @@ async function assertSubmitRestored(
   page,
   expectedError,
   expectedApiKey,
-  expectedFinishLabel = 'Start OpenSquilla',
+  expectedFinishLabel = 'Save and enter',
 ) {
   const form = page.locator('#setup-form')
   const finish = page.locator('#finish')
@@ -662,7 +856,7 @@ async function verifySubmitFeedbackAndSingleFlight() {
     }, 'slow onboarding feedback')
     assert.equal(
       slowSubmitStatus,
-      'Die Ersteinrichtung dauert normalerweise 10–20 Sekunden. Lassen Sie dieses Fenster geöffnet.',
+      'Das Speichern dauert länger. Du kannst im Client fortfahren.',
     )
     assert.equal(await page.locator('#submitStatus').isVisible(), true)
     assert.equal(await page.locator('#finish').isDisabled(), true)
@@ -689,9 +883,9 @@ async function verifySubmitFeedbackAndSingleFlight() {
     })
     await assertSubmitRestored(
       page,
-      'Synthetic onboarding save was refused.',
+      'Lokales Speichern fehlgeschlagen. Wiederhole es oder richte den Dienst später ein.',
       'synthetic-submit-key',
-      'OpenSquilla starten',
+      'Speichern und öffnen',
     )
     await page.clock.fastForward(8_000)
     assert.equal(
@@ -707,7 +901,11 @@ async function verifySubmitFeedbackAndSingleFlight() {
       reject: true,
       error: 'Synthetic onboarding save rejected.',
     })
-    await assertSubmitRestored(page, 'Synthetic onboarding save rejected.', 'synthetic-submit-key')
+    await assertSubmitRestored(page,
+      'Could not save locally. Please retry, or continue in the client and configure it later.',
+      'synthetic-submit-key')
+    assert.doesNotMatch(await page.locator('#error').innerText(), /Synthetic|Error invoking remote method/,
+      'raw IPC exceptions must not be shown as user-facing save errors')
 
     await clickFinish(page)
     await assertSubmitPending(page, app, 3)
@@ -738,26 +936,17 @@ async function verifySubmitFeedbackAndSingleFlight() {
       'a successful save must clear its slow-feedback timer while the window closes',
     )
   } catch (error) {
-    const windows = await Promise.all(app.windows().map(async (page) => ({
-      closed: page.isClosed(),
-      title: await page.title().catch(() => ''),
-      url: page.url(),
-    })))
-    const desktopLog = await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8')
-      .catch(() => '<desktop log unavailable>')
-    throw new Error(
-      `${error?.message || error}\nWindows: ${JSON.stringify(windows)}\nDesktop log:\n${desktopLog}`,
-      { cause: error },
-    )
+    await reportOnboardingFailure(app, 'submit-feedback', error)
+    throw error
   } finally {
     await app.close().catch(() => {})
     await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
   }
 }
 
-await verifySubmitFeedbackAndSingleFlight()
+await runCase('submit', verifySubmitFeedbackAndSingleFlight)
 
-async function verifyProbeBeforePersistenceAndRetry() {
+async function verifyOptionalProbeDoesNotBlockPersistence() {
   const probeServer = await startOnboardingProbeServer('reject')
   const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
     'opensquilla-electron-onboarding-probe-test-',
@@ -767,61 +956,74 @@ async function verifyProbeBeforePersistenceAndRetry() {
   const syntheticKey = 'synthetic-probe-retry-key'
   try {
     const page = await setupWindow(app)
+    await readyDesktopWindow(app)
+    const initialConfig = await readFile(configPath, 'utf8')
+    assert.equal(await fileExists(credentialPath), false)
     await page.locator('#providerSelectToggle').click()
     await page.locator('[data-provider-option="openai"]').click()
     await page.locator('#apiKey').fill(syntheticKey)
+    assert.equal(await page.locator('#model').inputValue(), '', 'OpenAI does not receive a preset model')
+    assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
+    await page.locator('#model').fill('synthetic-user-selected-model')
     await setOnboardingBaseUrl(page, probeServer.baseUrl)
     await assertUnifiedTelemetryNotice(page)
     const submittedModel = await page.locator('#model').inputValue()
 
-    await page.locator('#finish').click()
+    await page.locator('#probe').click()
     const errorText = await waitFor(async () => {
-      const text = (await page.locator('#error').innerText()).trim()
-      const formReady = await page.locator('#setup-form').getAttribute('aria-busy') === 'false'
-      return text && formReady && !await page.locator('#finish').isDisabled() ? text : null
-    }, 'rejected provider probe to restore onboarding editing')
-    assert.match(errorText, /401|authentication|credential|API key/i)
-    const retryLayout = await page.evaluate(() => ({
-      error: document.querySelector('#error').getBoundingClientRect().toJSON(),
-      finish: document.querySelector('#finish').getBoundingClientRect().toJSON(),
-    }))
-    assert.ok(retryLayout.error.bottom <= retryLayout.finish.top,
-      `probe error must not cover the retry action: ${JSON.stringify(retryLayout)}`)
-    if (screenshotPath) await page.screenshot({ path: screenshotPath.replace(/\.png$/i, '') + '-retry.png' })
+      const text = [
+        await page.locator('#apiKeyError').innerText(),
+        await page.locator('#probeStatus').innerText(),
+      ].join(' ').trim()
+      return /rejected|authentication|credential|API key/i.test(text)
+        && !await page.locator('#probe').isDisabled() ? text : null
+    }, 'optional provider probe to report rejected credentials')
+    assert.equal(await page.locator('#apiKeyError').innerText(), 'The key was rejected. Check it and paste it again.')
+    assert.doesNotMatch(errorText, /Synthetic|401|Error invoking remote method/)
+    assert.equal(await page.locator('#finish').isDisabled(), false)
+    assert.equal(await page.locator('#skip').isDisabled(), false)
+    assert.notEqual(await page.locator('#setup-form').getAttribute('aria-busy'), 'true',
+      'an optional probe must not make the form busy')
     assert.equal(errorText.includes(syntheticKey), false, 'probe errors must redact the submitted key')
     assert.equal(await page.locator('#apiKey').inputValue(), syntheticKey)
-    assert.equal(await fileExists(credentialPath), false, 'a rejected probe must not persist credentials')
-    assert.equal(await fileExists(configPath), false, 'a rejected probe must not persist config')
-    const failedTrace = await waitFor(async () => {
-      const records = await readOnboardingTelemetry(userDataDir)
-      return records.find((record) => (
-        record.event === 'onboarding_save_finished' && record.outcome === 'threw'
-      )) || null
-    }, 'rejected provider probe timing trace')
-    assert.equal(failedTrace.writerAdmitted, false)
-    assert.equal(failedTrace.settingsPersistedConfirmed, false)
+    assert.equal(await fileExists(credentialPath), false, 'an optional probe must not persist credentials')
+    assert.equal(await readFile(configPath, 'utf8'), initialConfig, 'a probe must not mutate the empty startup config')
+    assert.deepEqual(await readOnboardingTelemetry(userDataDir), [], 'testing is not a save attempt')
     assert.equal(probeServer.requests.length, 1)
     assert.equal(probeServer.requests[0].method, 'POST')
     assert.equal(probeServer.requests[0].url, '/v1/chat/completions')
     assert.equal(probeServer.requests[0].authorization, `Bearer ${syntheticKey}`)
     assert.equal(JSON.parse(probeServer.requests[0].body).model, submittedModel)
 
-    probeServer.setMode('success')
+    probeServer.setMode('disconnect')
+    await page.locator('#probe').click()
+    await waitFor(async () => {
+      const text = await page.locator('#probeStatus').innerText()
+      return /connect|network|unavailable|reach|连接|网络/i.test(text)
+        && !await page.locator('#probe').isDisabled()
+    }, 'optional probe to report network failure')
+    assert.equal(await page.locator('#probeStatus').innerText(), 'Unable to connect right now. You can still save and enter.')
+    assert.equal(await page.locator('#apiKey').getAttribute('aria-invalid'), null,
+      'a network error must not mark the API key as invalid')
+    assert.equal(await page.locator('#finish').isDisabled(), false)
+    assert.equal(await page.locator('#skip').isDisabled(), false)
+    if (screenshotPath) await page.screenshot({ path: screenshotPath.replace(/\.png$/i, '') + '-retry.png' })
+    const requestsBeforeSave = probeServer.requests.length
     await page.locator('#finish').click()
     const saved = await waitFor(async () => {
       if (!await fileExists(credentialPath) || !await fileExists(configPath)) return null
       return JSON.parse(await readFile(credentialPath, 'utf8'))
-    }, 'successful retry to persist onboarding settings')
+    }, 'save after failed optional probes to persist onboarding settings')
     assert.equal(saved.provider, 'openai')
     assert.equal(saved.model, submittedModel)
     assert.equal(saved.baseUrl, probeServer.baseUrl)
-    assert.equal(probeServer.requests.length, 2, 'retry must perform a fresh provider probe')
-    assert.equal(probeServer.requests[1].authorization, `Bearer ${syntheticKey}`)
-    assert.equal(JSON.parse(probeServer.requests[1].body).model, submittedModel)
+    await waitFor(() => page.isClosed(), 'saved onboarding panel to close')
+    await readyDesktopWindow(app)
+    assert.equal(probeServer.requests.length, requestsBeforeSave,
+      'save must not repeat or require a provider probe, even while the network is unavailable')
   } catch (error) {
-    const desktopLog = await readFile(join(userDataDir, 'logs', 'desktop.log'), 'utf8')
-      .catch(() => '<desktop log unavailable>')
-    throw new Error(`${error?.message || error}\nDesktop log:\n${desktopLog}`, { cause: error })
+    await reportOnboardingFailure(app, 'optional-probe', error)
+    throw error
   } finally {
     await app.close().catch(() => {})
     await probeServer.close().catch(() => {})
@@ -829,8 +1031,151 @@ async function verifyProbeBeforePersistenceAndRetry() {
   }
 }
 
-await verifyProbeBeforePersistenceAndRetry()
+await runCase('optional-probe', verifyOptionalProbeDoesNotBlockPersistence)
 
+async function verifyEmptySetupCanBeDismissedAndStaysDismissed(action = 'skip') {
+  const prefix = `opensquilla-electron-onboarding-${action}-test-`
+  const initial = await launchIsolatedOnboarding(prefix)
+  let app = initial.app
+  let phase = 'setup-window'
+  try {
+    const page = await setupWindow(app)
+    phase = 'initial-gateway-ready'
+    const desktop = await readyDesktopWindow(app)
+    phase = `dismiss-${action}`
+    const initialWindows = await app.evaluate(({ BrowserWindow }) => (
+      BrowserWindow.getAllWindows().map(window => ({
+        title: window.webContents.getTitle(),
+        url: window.webContents.getURL(),
+        modal: window.isModal(),
+        enabled: window.isEnabled(),
+      }))
+    ))
+    assert.equal(initialWindows.some(window => window.modal), false,
+      'first-run configuration must not disable the client behind a modal window')
+    assert.equal(initialWindows.find(window => window.url.startsWith('opensquilla-app://desktop/'))?.enabled, true)
+    assert.equal(await page.locator('#apiKey').inputValue(), '')
+    if (action === 'close') {
+      const title = await page.title()
+      await app.evaluate(({ BrowserWindow }, setupTitle) => {
+        const window = BrowserWindow.getAllWindows().find(candidate => (
+          candidate.webContents.getTitle() === setupTitle
+        ))
+        if (!window) throw new Error('Onboarding window is unavailable.')
+        window.close()
+      }, title)
+    } else {
+      await page.locator('#skip').click()
+    }
+    await waitFor(() => page.isClosed(), 'empty configuration panel to close')
+    assert.equal(desktop.isClosed(), false, 'skipping must not quit the client')
+    assert.equal(await fileExists(join(initial.userDataDir, 'desktop-credential.json')), false,
+      'skipping must not invent provider credentials')
+    const config = parse(await readFile(join(initial.userDataDir, 'opensquilla', 'config.toml'), 'utf8'))
+    assert.equal(config.llm?.provider || '', '')
+    assert.equal(config.llm?.model || '', '')
+    phase = 'initial-shutdown'
+    await app.close()
+
+    phase = 'relaunch'
+    app = (await launchIsolatedOnboarding(prefix, initial.userDataRoot)).app
+    phase = 'restarted-gateway-ready'
+    await readyDesktopWindow(app)
+    phase = 'no-repeated-onboarding'
+    for (const candidate of app.windows()) {
+      if (candidate.isClosed()) continue
+      assert.equal(await candidate.locator('#setup-form').count(), 0,
+        'restarting after skip must not ask for model setup again')
+    }
+  } catch (error) {
+    await reportOnboardingFailure(app, phase, error)
+    throw error
+  } finally {
+    await app.close().catch(() => {})
+    await rm(initial.userDataRoot, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+await runCase('skip', () => verifyEmptySetupCanBeDismissedAndStaysDismissed())
+await runCase('close', () => verifyEmptySetupCanBeDismissedAndStaysDismissed('close'))
+
+async function verifySlowProbeDoesNotOwnSetupActions() {
+  const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
+    'opensquilla-electron-onboarding-slow-probe-test-',
+  )
+  let phase = 'setup-window'
+  try {
+    const page = await setupWindow(app)
+    phase = 'initial-gateway-ready'
+    const desktop = await readyDesktopWindow(app)
+    phase = 'probe-edit-races'
+    await installPendingProbeStub(app)
+    await page.locator('#apiKey').fill('synthetic-original-key')
+
+    await page.locator('#probe').click()
+    await waitFor(async () => await pendingProbeCount(app) === 1, 'first pending probe')
+    assert.equal(await page.locator('#finish').isDisabled(), false)
+    assert.equal(await page.locator('#skip').isDisabled(), false)
+
+    await page.locator('#apiKey').fill('synthetic-edited-key')
+    assert.equal(await page.locator('#probeStatus').innerText(), 'Not tested')
+    await page.locator('#probe').click()
+    await waitFor(async () => await pendingProbeCount(app) === 2, 'new probe after editing')
+    await settlePendingProbe(app, 1, { ok: true, latencyMs: 17 })
+    await waitFor(async () => (await page.locator('#probeStatus').innerText()) === 'Verified · 17 ms',
+      'current probe success')
+    await settlePendingProbe(app, 0, { ok: false, failureKind: 'auth_invalid', message: 'STALE REJECTION' })
+    // A round trip through the renderer drains the queued IPC completion.
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)))
+    assert.equal(await page.locator('#probeStatus').innerText(), 'Verified · 17 ms',
+      'a late result for the previous key must not overwrite the current result')
+    assert.equal(await page.locator('#apiKey').getAttribute('aria-invalid'), null)
+
+    phase = 'probe-pending-during-save'
+    await page.locator('#probe').click()
+    await waitFor(async () => await pendingProbeCount(app) === 3, 'probe pending before save')
+    await installPendingSaveStub(app)
+    await clickFinish(page)
+    await assertSubmitPending(page, app, 1)
+    await settlePendingProbe(app, 2, { ok: false, failureKind: 'auth_invalid', message: 'STALE SAVE REJECTION' })
+    await page.evaluate(() => new Promise(resolve => setTimeout(resolve, 0)))
+    assert.equal(await page.locator('#apiKeyError').innerText(), '',
+      'a probe completing during save must not introduce a credential error')
+    assert.equal((await pendingSaveState(app)).hasPending, true,
+      'the independent save must remain owned by its own completion')
+    await settlePendingSave(app, { reject: true, error: 'Synthetic local write failed.' })
+    await assertSubmitRestored(page,
+      'Could not save locally. Please retry, or continue in the client and configure it later.',
+      'synthetic-edited-key')
+    assert.equal(await page.locator('#probe').isDisabled(), false,
+      'a failed save must leave optional testing usable after an older probe finishes')
+    assert.equal(await page.locator('#probeStatus').innerText(), 'Not tested')
+
+    phase = 'probe-pending-during-skip'
+    await page.locator('#probe').click()
+    await waitFor(async () => await pendingProbeCount(app) === 4, 'probe pending before skip')
+    await page.locator('#skip').click()
+    await waitFor(() => page.isClosed(), 'skip to close setup without waiting for the probe')
+    await settlePendingProbe(app, 3, { ok: true, latencyMs: 9000 })
+    assert.equal(desktop.isClosed(), false)
+    assert.equal((await desktop.evaluate(() => window.opensquillaDesktop.getGatewayConnection())).status, 'ready')
+    assert.equal(await fileExists(join(userDataDir, 'desktop-credential.json')), false,
+      'a late probe must not persist credentials or complete a dismissed configuration')
+  } catch (error) {
+    await reportOnboardingFailure(app, phase, error)
+    throw error
+  } finally {
+    await app.close().catch(() => {})
+    await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+await runCase('slow-probe', verifySlowProbeDoesNotOwnSetupActions)
+
+// The remaining integration scenario is the legacy top-level client workflow.
+// Selected regression runs may finish here; the default still runs every case.
+if (!caseSelected('provider-client')) process.exit(0)
+console.log('RUN onboarding provider-client')
 const successfulProbeServer = await startOnboardingProbeServer()
 
 const { app, userDataDir, userDataRoot } = await launchIsolatedOnboarding(
@@ -862,11 +1207,12 @@ try {
     'the local Desktop renderer must exist before onboarding and Gateway readiness',
   )
   assert.equal(await desktopPage.locator('#app').count(), 1)
+  await readyDesktopWindow(app)
   const startingConnection = await desktopPage.evaluate(
     () => window.opensquillaDesktop?.getGatewayConnection?.(),
   )
-  assert.equal(startingConnection?.status, 'starting')
-  assert.equal(startingConnection?.wsUrl, null)
+  assert.equal(startingConnection?.status, 'ready', 'the client must start before the user completes model setup')
+  assert.match(startingConnection?.wsUrl || '', /^ws:\/\/127\.0\.0\.1:\d+\/ws$/)
   const pageErrors = []
   page.on('pageerror', (error) => pageErrors.push(error.message || String(error)))
   const providerScreen = page.locator('[data-screen="1"]')
@@ -890,7 +1236,7 @@ try {
   assert.equal(await page.locator('.step-switcher, [data-route-step]').count(), 0, 'onboarding should not render a numbered step switcher')
   assert.equal(await providerScreen.locator('.context-label').count(), 0)
   assert.equal(await providerScreen.locator('h2').innerText(), '模型服务配置')
-  assert.equal(await providerScreen.locator('.card-head > p').innerText(), '输入 API 密钥即可开始使用')
+  assert.equal(await providerScreen.locator('.card-head > p').innerText(), '连接模型服务，或稍后在设置中完成。')
   assert.equal(await page.locator('#apiKeyRequiredMarker').innerText(), '*')
   assert.equal(await page.locator('#apiKeyRequiredMarker').isVisible(), true)
   assert.equal(
@@ -904,7 +1250,9 @@ try {
     'rgb(52, 58, 64)',
     'the single primary action should use the softer graphite treatment',
   )
-  assert.equal(await page.locator('#finish').innerText(), '启动 OpenSquilla')
+  assert.equal(await page.locator('#finish').innerText(), '保存并进入')
+  assert.equal(await page.locator('#skip').innerText(), '稍后配置')
+  assert.equal(await page.locator('#cancel').count(), 0, 'configuration must not make quitting the only alternative to saving')
   assert.equal(await page.locator('.next-button, .back-button').count(), 0, 'single-page onboarding must not render next or back actions')
   assert.equal(await providerScreen.locator('.provider-feature, .provider-disclosure').count(), 0, 'provider setup should use one unified select')
   assert.equal(await providerScreen.locator('.provider-promo').count(), 0, 'the promotion should not occupy a separate row')
@@ -975,8 +1323,10 @@ try {
   assert.equal(
     await page.locator('#verifyProvider, #providerVerifyStatus, #providerVerifyError, .provider-verify-inline').count(),
     0,
-    'provider verification controls should not be exposed in onboarding',
+    'retired provider verification controls must remain removed',
   )
+  assert.equal(await page.locator('#probe').isVisible(), true)
+  assert.equal(await page.locator('#probe').innerText(), '测试连接（可选）')
   const apiKeyLabelBox = await page.locator('.api-key-label').boundingBox()
   const providerLabelBox = await page.locator('#providerSelectLabel').boundingBox()
   const claimButtonBox = await page.locator('#tokenrhythmRegister').boundingBox()
@@ -1083,13 +1433,20 @@ try {
   assert.equal(await providerScreen.locator('h2').innerText(), 'Model service setup')
   assert.equal(await page.locator('#provider').inputValue(), 'tokenrhythm', 'locale changes should preserve the selected provider')
 
+  await chooseProvider('openrouter')
+  assert.notEqual(await page.locator('#model').inputValue(), '', 'OpenRouter keeps its model preset')
+  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'squilla_router')
+  assert.equal(await page.locator('#modelSummary').isVisible(), true)
+
   await chooseProvider('minimax_cn', 'MiniMax Mainland')
   assert.equal(await page.locator('#provider').inputValue(), 'minimax_cn')
   assert.equal(await tokenRhythmCta.isVisible(), true, 'the promotion should remain available when another provider is selected')
   assert.equal(await page.locator('#providerSelectedBadges .provider-badge').count(), 0)
-  assert.equal(await page.locator('#model').inputValue(), 'MiniMax-M2.7')
-  assert.equal(await page.locator('#modelSummaryValue').innerText(), 'MiniMax-M2.7')
-  assert.equal(await page.locator('#modelSummary').isVisible(), true)
+  assert.equal(await page.locator('#model').inputValue(), '')
+  assert.equal(await page.locator('#modelSummary').isVisible(), false)
+  assert.equal(await page.locator('#modelEditor').isVisible(), true)
+  assert.equal(await page.locator('#modelRoutingMode').inputValue(), 'direct')
+  assert.equal(await page.locator('#routerMode').inputValue(), 'disabled')
   assert.equal(await page.locator('#apiKeyRequiredMarker').isVisible(), true)
 
   await chooseProvider('ollama', 'Ollama')
@@ -1241,13 +1598,8 @@ try {
   assert.doesNotMatch(config, /thinking_level\s*=/)
   assert.doesNotMatch(config, /supports_image\s*=/)
   assert.match(config, /\[llm_ensemble\]\nenabled = false/)
-  assert.equal(successfulProbeServer.requests.length, 1)
-  assert.equal(successfulProbeServer.requests[0].url, '/v1/chat/completions')
-  assert.equal(
-    successfulProbeServer.requests[0].authorization,
-    'Bearer synthetic-tokenrhythm-key',
-  )
-  assert.equal(JSON.parse(successfulProbeServer.requests[0].body).model, credential.model)
+  assert.equal(successfulProbeServer.requests.length, 0,
+    'saving complete, untested configuration must not make a provider request')
 
   const readyConnection = await waitFor(async () => {
     const connection = await desktopPage.evaluate(
@@ -1446,3 +1798,4 @@ try {
   await successfulProbeServer.close().catch(() => {})
   await rm(userDataRoot, { recursive: true, force: true }).catch(() => {})
 }
+console.log('PASS onboarding provider-client')

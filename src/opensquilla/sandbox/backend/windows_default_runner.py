@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import re
 import subprocess
@@ -20,6 +21,8 @@ from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
+
+log = logging.getLogger(__name__)
 
 HELPER_MODULE = "opensquilla.sandbox.backend.windows_default_runner"
 _LOCK_ACQUIRE_TIMEOUT_S = 30.0
@@ -278,6 +281,8 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
 def _validate_policy_is_enforceable(policy: dict[str, Any]) -> None:
     if "capabilityProbe" in policy and not isinstance(policy["capabilityProbe"], bool):
         raise SystemExit("windows_default capabilityProbe marker must be boolean")
+    if "helperProbe" in policy and not isinstance(policy["helperProbe"], bool):
+        raise SystemExit("windows_default helperProbe marker must be boolean")
     network = policy.get("network")
     if network not in {"none", "host", "proxy_allowlist"}:
         raise SystemExit(f"windows_default runner received unknown network mode: {network!r}")
@@ -1535,12 +1540,61 @@ def _payload_to_json(payload: HelperPayload) -> str:
 
 
 def _helper_import_root() -> Path:
-    path = Path(__file__).resolve()
-    package_root = path.parents[2]
-    import_root = package_root.parent
-    if (import_root / "opensquilla").exists():
-        return import_root
-    return Path.cwd()
+    """Return an existing runtime root suitable for the offline helper.
+
+    The Gateway can outlive the checkout or unpacked runtime that launched it.
+    Passing that vanished directory as ``lpCurrentDirectory`` makes
+    ``CreateProcessWithLogonW`` fail with Win32 error 267.  Never fall back to
+    the inherited process cwd; it is not an owned runtime location.
+    """
+
+    candidates: list[Path] = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if isinstance(meipass, str) and meipass.strip():
+        candidates.append(Path(meipass))
+
+    try:
+        path = Path(__file__).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        path = Path(__file__)
+    if len(path.parents) >= 3:
+        # Source checkouts expose ``opensquilla`` below ``src``; one-dir
+        # frozen builds expose it below ``_internal``.  Keep both the package
+        # import root and its parent as candidates, but validate each one.
+        candidates.extend((path.parents[2], path.parents[2].parent))
+
+    try:
+        executable_parent = Path(sys.executable).resolve(strict=True).parent
+    except (OSError, RuntimeError, ValueError):
+        executable_parent = Path(sys.executable).parent
+    candidates.extend((executable_parent, executable_parent / "_internal"))
+
+    seen: set[str] = set()
+    rejected: list[str] = []
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=True)
+        except (OSError, RuntimeError, ValueError) as exc:
+            rejected.append(f"{candidate}: {exc}")
+            continue
+        key = str(resolved).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if not resolved.is_dir():
+            rejected.append(f"{resolved}: not a directory")
+            continue
+        if not (resolved / "opensquilla").is_dir():
+            rejected.append(f"{resolved}: opensquilla package is missing")
+            continue
+        log.debug(
+            "sandbox.windows_default_helper_root: root=%s provenance=validated_package_root",
+            resolved,
+        )
+        return resolved
+
+    detail = "; ".join(rejected[-4:]) or "no runtime candidates were discovered"
+    raise RuntimeError(f"helper_root_unavailable: {detail}")
 
 
 def _helper_child_env() -> dict[str, str]:

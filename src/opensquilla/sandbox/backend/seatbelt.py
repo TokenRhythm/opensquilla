@@ -53,10 +53,12 @@ from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
 from opensquilla.sandbox.types import (
     NetworkMode,
     NetworkProxySpec,
+    ResourceLimits,
     SandboxBackendError,
     SandboxPolicy,
     SandboxRequest,
     SandboxResult,
+    SecurityLevel,
 )
 
 log = logging.getLogger(__name__)
@@ -1072,6 +1074,45 @@ class SeatbeltBackend(Backend):
         if sys.platform != "darwin":
             return False
         return _sandbox_exec_binary(self._binary) is not None
+
+    async def probe_runtime(self, *, cwd: Path | None = None) -> None:
+        """Execute a no-op through ``sandbox-exec`` to verify the profile path."""
+
+        if not self.available():
+            raise SandboxBackendError("helper_probe_failed: sandbox-exec is unavailable")
+        probe_cwd = cwd if cwd is not None and cwd.is_dir() else Path(__file__).resolve().parent
+        request = SandboxRequest(
+            argv=(str(_python_executable()), "-c", "pass"),
+            cwd=probe_cwd,
+            action_kind="capability.probe",
+            policy=SandboxPolicy(
+                level=SecurityLevel.STANDARD,
+                network=NetworkMode.NONE,
+                mounts=(),
+                workspace_rw=False,
+                tmp_writable=False,
+                limits=ResourceLimits(wall_timeout_s=5.0),
+                env_allowlist=("PATH", "PYTHONPATH", "LANG", "LC_ALL"),
+                require_approval=False,
+                description="Seatbelt startup probe",
+                file_system=FileSystemPermissionProfile.read_only(
+                    readable_roots=(Path(_python_executable()).parent,),
+                    host_root_readonly=True,
+                ),
+            ),
+            env=dict(os.environ),
+            reason="Seatbelt startup probe",
+            run_mode="safe",
+        )
+        try:
+            result = await self._run_request(request, private_transport=None)
+        except SandboxBackendError as exc:
+            raise SandboxBackendError(f"helper_launch_failed: {exc}") from exc
+        if result.timed_out:
+            raise SandboxBackendError("helper_probe_timeout: Seatbelt helper timed out")
+        if result.returncode != 0:
+            detail = result.stderr.strip() or f"exit={result.returncode}"
+            raise SandboxBackendError(f"helper_launch_failed: {detail}")
 
     def operation_domains_supported(self) -> frozenset[SandboxOperationDomain]:
         return frozenset({"filesystem"})

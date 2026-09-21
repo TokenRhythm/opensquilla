@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 from typing import Any
 
+from opensquilla.paths import default_opensquilla_home
 from opensquilla.sandbox.capability_service import CapabilityReport, capability_report_from_setup
 from opensquilla.sandbox.setup_state import (
     SandboxSetupState,
@@ -108,9 +110,7 @@ async def initialize_sandbox_runtime(config: Any) -> SetupResult:
             return _LAST_RESULT
         _SETTING_UP = True
         try:
-            from opensquilla.sandbox.integration import initialize_runtime_backend
-
-            await initialize_runtime_backend()
+            await _initialize_backend_and_probe(config)
             _require_current_generation(generation)
             result = SetupResult(
                 state=SandboxSetupState.READY,
@@ -159,9 +159,7 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
             setup_result = await ensure_sandbox_setup(config)
             _require_current_generation(generation)
             if setup_result.state is SandboxSetupState.READY:
-                from opensquilla.sandbox.integration import initialize_runtime_backend
-
-                await initialize_runtime_backend()
+                await _initialize_backend_and_probe(config)
                 _require_current_generation(generation)
             _LAST_RESULT = setup_result
             return setup_result
@@ -184,6 +182,42 @@ async def ensure_sandbox_setup_auto(config: Any) -> SetupResult:
 def _require_current_generation(generation: int) -> None:
     if generation != _GENERATION:
         raise asyncio.CancelledError("Sandbox initialization belongs to a retired runtime.")
+
+
+def _startup_probe_cwd(config: Any) -> Path:
+    """Choose an existing, non-temporary directory for backend probes."""
+
+    for name in ("state_dir", "config_path"):
+        raw = getattr(config, name, None)
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw).expanduser()
+            if name == "config_path":
+                candidate = candidate.parent
+            candidate = candidate.resolve(strict=True)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            continue
+        if candidate.is_dir():
+            return candidate
+    home = default_opensquilla_home()
+    try:
+        resolved_home = home.expanduser().resolve(strict=True)
+    except OSError:
+        resolved_home = Path(__file__).resolve().parent
+    return resolved_home if resolved_home.is_dir() else Path(__file__).resolve().parent
+
+
+async def _initialize_backend_and_probe(config: Any) -> Any:
+    """Select the backend and run its real, bounded startup readiness probe."""
+
+    from opensquilla.sandbox.integration import initialize_runtime_backend
+
+    backend = await initialize_runtime_backend()
+    probe = getattr(backend, "probe_runtime", None)
+    if callable(probe):
+        await probe(cwd=_startup_probe_cwd(config))
+    return backend
 
 
 def reset_sandbox_setup_runtime_state() -> None:

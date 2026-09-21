@@ -3715,6 +3715,10 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "聊天前请配置模型服务。",
+      "configure": "配置模型"
+    },
     "skillPalette": {
       "title": "命令与技能",
       "command": "命令",

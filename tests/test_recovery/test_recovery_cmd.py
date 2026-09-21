@@ -50,6 +50,7 @@ def test_recovery_command_surface_is_registered_with_complete_offline_actions() 
         "reconcile",
         "choose-workspace",
         "apply-settings",
+        "initialize-unconfigured",
         "recover-settings",
         "recover-config",
         "restore-profile",

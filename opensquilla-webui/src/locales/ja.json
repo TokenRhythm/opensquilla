@@ -3633,6 +3633,10 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "チャットを始める前にモデルサービスを設定してください。",
+      "configure": "モデルを設定"
+    },
     "skillPalette": {
       "title": "Commands and skills",
       "command": "Commands",

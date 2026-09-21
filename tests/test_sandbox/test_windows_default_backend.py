@@ -81,6 +81,83 @@ def _request(tmp_path: Path) -> SandboxRequest:
 
 
 @pytest.mark.asyncio
+async def test_windows_startup_probe_uses_validated_helper_root_and_no_cache_side_effects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend import windows_default_runner as runner
+
+    helper_root = tmp_path / "runtime" / "_internal"
+    (helper_root / "opensquilla").mkdir(parents=True)
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(runner, "_helper_import_root", lambda: helper_root)
+    monkeypatch.setattr(mod, "_python_executable", lambda: Path("python.exe"))
+
+    async def fake_run(_self, request, **kwargs):
+        captured["request"] = request
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stderr="", timed_out=False)
+
+    monkeypatch.setattr(mod.WindowsDefaultBackend, "_run", fake_run)
+    await mod.WindowsDefaultBackend().probe_runtime(cwd=tmp_path / "deleted-worktree")
+
+    request = captured["request"]
+    assert request.cwd == helper_root
+    assert request.action_kind == "helper.startup_probe"
+    assert request.policy.network is NetworkMode.NONE
+    assert request.policy.workspace_rw is False
+    assert request.policy.tmp_writable is False
+    assert captured["kwargs"] == {
+        "prepare_cache": False,
+        "rehome_user_state": False,
+        "private_mounts_are_required": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_windows_startup_probe_preserves_helper_root_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend import windows_default_runner as runner
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(
+        runner,
+        "_helper_import_root",
+        lambda: (_ for _ in ()).throw(RuntimeError("helper_root_unavailable: deleted")),
+    )
+
+    with pytest.raises(mod.SandboxBackendError, match=r"^helper_root_unavailable:"):
+        await mod.WindowsDefaultBackend().probe_runtime()
+
+
+@pytest.mark.asyncio
+async def test_windows_startup_probe_normalizes_nested_helper_root_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend import windows_default_runner as runner
+
+    helper_root = tmp_path / "runtime"
+    (helper_root / "opensquilla").mkdir(parents=True)
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(runner, "_helper_import_root", lambda: helper_root)
+
+    async def fake_run(_self, _request, **_kwargs):
+        raise mod.SandboxBackendError(
+            "helper_launch_failed: RuntimeError: helper_root_unavailable: deleted"
+        )
+
+    monkeypatch.setattr(mod.WindowsDefaultBackend, "_run", fake_run)
+
+    with pytest.raises(mod.SandboxBackendError, match=r"^helper_root_unavailable:"):
+        await mod.WindowsDefaultBackend().probe_runtime()
+
+
+@pytest.mark.asyncio
 async def test_windows_guest_process_is_rejected_before_support_or_acl_work(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1286,7 +1363,7 @@ async def test_backend_fails_closed_when_setup_is_not_ready(
 
     monkeypatch.setattr(mod, "_support_ready", lambda: False)
 
-    with pytest.raises(SandboxBackendError, match="windows_default backend unavailable"):
+    with pytest.raises(SandboxBackendError, match="sandbox_setup_required"):
         await WindowsDefaultBackend().run(_request(tmp_path))
 
 
@@ -1583,6 +1660,71 @@ async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
     monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     with pytest.raises(SandboxBackendError, match="execution lease is busy"):
+        await WindowsDefaultBackend().run(_request(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_invalid_helper_cwd_is_classified_as_launch_failure_without_host_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 1
+
+        async def communicate(self):
+            marker = (
+                "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+                '{"nonce":"nonce-267","message":"OSError: [Errno 267] '
+                'CreateProcessWithLogonW failed: 目录名称无效。"}\n'
+            )
+            return b"", marker.encode()
+
+    launches = 0
+
+    async def fake_exec(*_argv, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-267", raising=False)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxBackendError, match=r"^helper_launch_failed:.*Errno 267"):
+        await WindowsDefaultBackend().run(_request(tmp_path))
+    assert launches == 1
+
+
+@pytest.mark.asyncio
+async def test_helper_root_error_keeps_its_stable_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 1
+
+        async def communicate(self):
+            marker = (
+                "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+                '{"nonce":"nonce-root","message":"RuntimeError: '
+                'helper_root_unavailable: deleted runtime"}\n'
+            )
+            return b"", marker.encode()
+
+    async def fake_exec(*_argv, **_kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-root", raising=False)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxBackendError, match=r"^helper_root_unavailable:"):
         await WindowsDefaultBackend().run(_request(tmp_path))
 
 

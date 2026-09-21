@@ -8,6 +8,7 @@ import {
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from '../dist/gateway-lifecycle.js'
+import { DesktopRoutingConfigurationError } from '../dist/desktop-router-profiles.js'
 
 // Run the actual main-process startup wiring with profile inspection held open.
 // Readiness helpers alone do not cover the descriptor seen by the first renderer.
@@ -33,15 +34,22 @@ function deferred() {
 function mainStartupHarness() {
   const inspection = deferred()
   const inspectionStarted = deferred()
-  const calls = { rendered: [], published: [], readiness: [], starts: 0, successes: 0, failures: [] }
+  const calls = { rendered: [], published: [], readiness: [], starts: 0, successes: 0, failures: [], invitations: 0 }
   const snapshot = () => runInContext('desktopGatewayConnectionSnapshot()', context)
   const context = createContext({
     Error,
+    DesktopRoutingConfigurationError,
     isQuitting: false,
     appExitPhase: 'running',
     gatewayProcess: null,
     gatewayProfileKey: 'synthetic-profile',
     forceOnboardingOnNextStartup: false,
+    onboardingPromptProfileKey: null,
+    onboardingFlows: { active: null },
+    runOnboarding: () => {
+      calls.invitations += 1
+      return new Promise(() => {})
+    },
     activeDesktopProfile: () => ({ home: 'synthetic-profile' }),
     desktopProfileFingerprint: () => 'synthetic-fingerprint',
     desktopProfileKey: () => 'synthetic-profile',
@@ -118,6 +126,24 @@ async function runWarmExternalGatewayReuseCase() {
   for (const descriptor of [...harness.calls.rendered, ...harness.calls.published]) {
     assert.equal(descriptor.status, 'ready', 'warm launch must not publish a spurious startup transition')
   }
+}
+
+async function runOptionalOnboardingDoesNotDelayReadyCase() {
+  const harness = mainStartupHarness()
+  runInContext(`
+    Object.assign(gatewayState, { status: 'ready', url: 'http://127.0.0.1:8765', port: 8765 });
+    onboardingPromptProfileKey = 'synthetic-profile';
+  `, harness.context)
+  const opening = runInContext('openOrResumeDesktopApp()', harness.context)
+  await harness.inspectionStarted
+  harness.inspection.resolve(true)
+  await opening
+
+  assert.equal(harness.calls.invitations, 1, 'ready startup offers the optional first-run invitation')
+  assert.equal(harness.calls.successes, 1, 'startup completes while the invitation remains unanswered')
+  assert.equal(harness.snapshot().status, 'ready')
+  assert.deepEqual(harness.calls.failures, [])
+  assert.equal(runInContext('onboardingPromptProfileKey', harness.context), null)
 }
 
 function mainExitHarness() {
@@ -525,6 +551,7 @@ async function runSlowColdStartReadinessCase() {
 
 await runColdStartDescriptorCase()
 await runWarmExternalGatewayReuseCase()
+await runOptionalOnboardingDoesNotDelayReadyCase()
 runExitDescriptorCase()
 await runQuitDrainDescriptorCase(true)
 await runQuitDrainDescriptorCase(false)

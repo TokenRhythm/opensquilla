@@ -83,6 +83,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
   probeOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:probe', payload),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
+  skipOnboarding: () => ipcRenderer.invoke('desktop:onboarding:skip'),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
   openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain'),

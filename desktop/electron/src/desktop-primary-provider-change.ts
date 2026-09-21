@@ -78,16 +78,17 @@ export function prepareDesktopPrimaryProviderChange(options: {
   if (!['c0', 'c1', 'c2', 'c3'].includes(defaultTier)) {
     throw new Error('Review the saved Router default tier in Model Routing before changing providers.')
   }
-  const savedTiers = saved.tiers ?? defaultRouterTiers(
-    String(saved.tier_profile || previousProvider), 'recommended',
-  )
+  // Replacing the ladder does not depend on the previous provider having a
+  // preset. Disabled direct configurations may legitimately have no tiers.
+  const selectedTiers = replaceTiers
+    ? explicitReplacement ? requested.routerTiers : options.defaultTiers
+    : saved.tiers ?? (enabled
+      ? defaultRouterTiers(String(saved.tier_profile || previousProvider), 'recommended')
+      : {})
   const router: DesktopRouterConfig = {
     routerMode: enabled ? binding === 'follow_primary' ? 'recommended' : 'custom' : 'disabled',
     routerDefaultTier: defaultTier as DesktopRouterConfig['routerDefaultTier'],
-    routerTiers: normalizeRouterTiers(
-      replaceTiers ? explicitReplacement ? requested.routerTiers : options.defaultTiers : savedTiers,
-      {},
-    ),
+    routerTiers: normalizeRouterTiers(selectedTiers, {}),
     ...(binding ? { routerPresetBinding: binding } : {}),
   }
   if (enabled && saved.cross_provider_tiers !== true

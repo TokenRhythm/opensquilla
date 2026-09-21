@@ -3633,6 +3633,10 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "Richten Sie vor dem Chatten einen Modelldienst ein.",
+      "configure": "Modell konfigurieren"
+    },
     "skillPalette": {
       "title": "Commands and skills",
       "command": "Commands",
