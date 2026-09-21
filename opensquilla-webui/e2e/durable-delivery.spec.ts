@@ -310,3 +310,163 @@ test('a later database upgrade invalidates the existing WAL and application owne
   expect(outcome.snapshots).toContainEqual(expect.objectContaining({ waitReason: 'reload' }))
   expect(outcome.calls).toEqual({ sends: 0, lookups: 0, cancels: [] })
 })
+
+test('an aborted native v2 to v3 upgrade preserves both stores and can retry without resetting the database', async ({ context }) => {
+  const page = await fixturePage(context)
+  const result = await page.evaluate(async databaseName => {
+    const fixture = (window as any).deliveryFixture
+    const pending = { schemaVersion: 1, pendingInputId: 'synthetic-v2-draft', sessionKey: 'synthetic-session',
+      clientRequestId: 'synthetic-v2-request', clientMessageId: 'synthetic-v2-message', text: 'Synthetic retained draft',
+      attachments: [], intent: null, state: 'local_only', createdAt: 1, updatedAt: 1 }
+    const handoff = { schemaVersion: 1, ownerRequestId: 'synthetic-v2-handoff', requestSessionKey: 'synthetic-session',
+      clientRequestId: 'synthetic-v2-handoff', clientMessageId: 'synthetic-message', params: { message: 'Synthetic handoff' },
+      composerText: 'Synthetic handoff', recoveryAttachments: [], state: 'submitting', createdAt: 1, updatedAt: 1 }
+    await new Promise<void>((resolve, reject) => {
+      const request = indexedDB.open(databaseName, 2)
+      request.onupgradeneeded = () => {
+        const drafts = request.result.createObjectStore('pending_chat_inputs', { keyPath: 'pendingInputId' })
+        drafts.createIndex('session_created', ['sessionKey', 'createdAt'])
+        drafts.put(pending)
+        request.result.createObjectStore('response_handoffs', { keyPath: 'ownerRequestId' }).put(handoff)
+      }
+      request.onerror = () => reject(request.error)
+      request.onsuccess = () => { request.result.close(); resolve() }
+    })
+    const originalOpen = IDBFactory.prototype.open
+    const originalDelete = IDBFactory.prototype.deleteDatabase
+    let deleteCalls = 0
+    let interrupted = false
+    let attemptedIndexes: string[] = []
+    IDBFactory.prototype.deleteDatabase = function () {
+      deleteCalls += 1
+      throw new Error('An interrupted upgrade must never reset the database')
+    }
+    IDBFactory.prototype.open = function (name: string, version?: number) {
+      const request = version === undefined ? originalOpen.call(this, name) : originalOpen.call(this, name, version)
+      if (name === databaseName && version === 3) {
+        // Let the WAL register its migration callback first, then append an
+        // observer before the browser dispatches the native upgrade event.
+        queueMicrotask(() => {
+          request.addEventListener('upgradeneeded', () => {
+            // Abort after production created its indexes. This is a native
+            // transaction interruption, not an operating-system crash.
+            attemptedIndexes = [...request.transaction!.objectStore('response_handoffs').indexNames]
+            interrupted = true
+            request.transaction!.abort()
+          }, { once: true })
+        })
+      }
+      return request
+    }
+    async function snapshot(version: number) {
+      const database = await new Promise<IDBDatabase>((resolve, reject) => {
+        const request = originalOpen.call(indexedDB, databaseName, version)
+        request.onerror = () => reject(request.error)
+        request.onsuccess = () => resolve(request.result)
+      })
+      try {
+        const transaction = database.transaction(['pending_chat_inputs', 'response_handoffs'])
+        const drafts = transaction.objectStore('pending_chat_inputs').getAll()
+        const handoffStore = transaction.objectStore('response_handoffs')
+        const handoffs = handoffStore.getAll()
+        const indexes = [...handoffStore.indexNames]
+        await new Promise<void>((resolve, reject) => {
+          transaction.oncomplete = () => resolve()
+          transaction.onabort = () => reject(transaction.error)
+        })
+        return { version: database.version, drafts: drafts.result, handoffs: handoffs.result, indexes }
+      } finally { database.close() }
+    }
+    try {
+      let failure = ''
+      try { await fixture.wal.countQuarantinedDeliveries() } catch (error) { failure = (error as DOMException).name }
+      const afterAbort = await snapshot(2)
+      IDBFactory.prototype.open = originalOpen
+      const quarantined = await fixture.wal.countQuarantinedDeliveries()
+      const afterRetry = await snapshot(3)
+      return { interrupted, attemptedIndexes, failure, afterAbort, afterRetry, quarantined, deleteCalls, pending, handoff }
+    } finally {
+      IDBFactory.prototype.open = originalOpen
+      IDBFactory.prototype.deleteDatabase = originalDelete
+      fixture.wal.close()
+    }
+  }, DATABASE)
+  expect(result.interrupted).toBe(true)
+  expect(result.attemptedIndexes).toContain('recovery_state')
+  expect(result.failure).toBe('AbortError')
+  expect(result.afterAbort).toMatchObject({ version: 2, drafts: [result.pending], handoffs: [result.handoff], indexes: [] })
+  expect(result.afterRetry).toMatchObject({ version: 3, drafts: [result.pending], handoffs: [result.handoff] })
+  expect(result.afterRetry.indexes).toContain('recovery_state')
+  expect(result.quarantined).toBe(1)
+  expect(result.deleteCalls).toBe(0)
+})
+
+test('native IDB quota fault injection preserves a first-send draft and keeps unknown Stop exact and visible', async ({ context }) => {
+  const page = await fixturePage(context)
+  await installOwner(page)
+  try {
+    const first = await page.evaluate(async record => {
+      const fixture = (window as any).deliveryFixture
+      const draft = { schemaVersion: 1, pendingInputId: 'synthetic-quota-draft', sessionKey: 'synthetic-session',
+        clientRequestId: 'synthetic-first-send', clientMessageId: 'synthetic-first-message', text: 'Synthetic retained input',
+        attachments: [], intent: null, state: 'local_only', draftIds: ['synthetic-annotation'], createdAt: 1, updatedAt: 1 }
+      await fixture.wal.put(draft)
+      await fixture.wal.prepareDelivery(record)
+      fixture.beforeQuota = await fixture.wal.getDelivery(record.ownerRequestId)
+      fixture.savedDraft = (await fixture.wal.list(draft.sessionKey))[0]
+      const originalPut = IDBObjectStore.prototype.put
+      fixture.quotaFaults = 0
+      // Inject the native API's failure at the real WAL write boundary. Do not
+      // fill disk or claim that this exhausts the browser's physical quota.
+      IDBObjectStore.prototype.put = function (value: unknown, key?: IDBValidKey) {
+        if (this.name === 'response_handoffs') {
+          fixture.quotaFaults += 1
+          throw new DOMException('Synthetic quota fault injection', 'QuotaExceededError')
+        }
+        return key === undefined ? originalPut.call(this, value) : originalPut.call(this, value, key)
+      }
+      fixture.restoreQuotaPatch = () => { IDBObjectStore.prototype.put = originalPut }
+      const request = { kind: 'new-turn', params: { sessionKey: draft.sessionKey, clientRequestId: draft.clientRequestId,
+        clientMessageId: draft.clientMessageId, message: draft.text } }
+      const frozen = structuredClone(request)
+      let failure: { accepted: unknown; failureCode: unknown; message: string } | undefined
+      try { await fixture.owner.commands.send(request) } catch (error) {
+        const rejected = error as { accepted?: unknown; failureCode?: unknown; message: string }
+        failure = { accepted: rejected.accepted, failureCode: rejected.failureCode, message: rejected.message }
+      }
+      await fixture.owner.requestStop(record.ownerRequestId)
+      await fixture.owner.wake()
+      return { request, frozen, failure, firstRecord: await fixture.wal.getDelivery(draft.clientRequestId) }
+    }, deliveryRecord())
+    expect(first.failure).toMatchObject({ accepted: false, failureCode: 'DELIVERY_STORAGE_UNAVAILABLE' })
+    expect(first.failure?.message).toContain('Synthetic quota fault injection')
+    expect(first.request).toEqual(first.frozen)
+    expect(first.firstRecord).toBeNull()
+    await expect.poll(() => page.evaluate(() => (window as any).deliveryFixture.calls.cancels.length)).toBe(1)
+    const failedStorage = await page.evaluate(async () => {
+      const fixture = (window as any).deliveryFixture
+      return { calls: fixture.calls, snapshots: fixture.owner.snapshots(), faults: fixture.quotaFaults,
+        before: fixture.beforeQuota, after: await fixture.wal.getDelivery('synthetic-delivery'),
+        draft: (await fixture.wal.list('synthetic-session'))[0], savedDraft: fixture.savedDraft }
+    })
+    expect(failedStorage.faults).toBeGreaterThan(0)
+    expect(failedStorage.after).toEqual(failedStorage.before)
+    expect(failedStorage.draft).toEqual(failedStorage.savedDraft)
+    expect(failedStorage.snapshots).toContainEqual(expect.objectContaining({ id: 'synthetic-delivery', waitReason: 'storage', stopPending: false }))
+    expect(failedStorage.calls).toEqual({ sends: 0, lookups: 1, cancels: [{
+      sessionKey: 'synthetic-handoff-target', taskId: 'synthetic-recovered-task', source: 'webui_stop', scope: 'task',
+    }] })
+    await page.evaluate(async () => {
+      const fixture = (window as any).deliveryFixture
+      fixture.restoreQuotaPatch()
+      await fixture.owner.wake()
+    })
+    await expect.poll(() => page.evaluate(async () => (await (window as any).deliveryFixture.wal.getDelivery('synthetic-delivery')).stop?.completed)).toBe(true)
+  } finally {
+    await page.evaluate(() => {
+      const fixture = (window as any).deliveryFixture
+      fixture.restoreQuotaPatch?.()
+      fixture.owner.dispose()
+    })
+  }
+})
