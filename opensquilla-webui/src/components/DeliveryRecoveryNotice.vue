@@ -73,7 +73,7 @@ async function recheck(id: string): Promise<void> {
 <style scoped>
 .delivery-notice {
   flex-shrink: 0;
-  border-bottom: 1px solid var(--border);
+  border-top: 1px solid var(--border);
   background: color-mix(in srgb, var(--info) 8%, var(--bg-surface));
   color: var(--text);
   font-size: var(--fs-sm);

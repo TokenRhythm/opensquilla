@@ -310,7 +310,6 @@
         </div>
       </div>
     </header>
-    <DeliveryRecoveryNotice @open-session="switchToSession" />
     <div class="app-workspace">
       <main
         class="content"
@@ -356,6 +355,9 @@
       />
       <ArtifactImageLightbox />
     </div>
+    <!-- Keep recovery actions in normal flow, clear of the floating console
+         topbar. The main shell already reserves the mobile tab-bar inset. -->
+    <DeliveryRecoveryNotice @open-session="switchToSession" />
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
