@@ -1026,8 +1026,10 @@ jobs:
           npm run test:live-html-harness
           node scripts/test-onboarding-flow-coordinator.mjs
           node scripts/test-onboarding-save-telemetry.mjs
+          node scripts/test-desktop-unconfigured-profile.mjs
           node scripts/test-router-tier-normalization.mjs
           node scripts/test-desktop-router-config.mjs
+          node scripts/test-onboarding-routing.mjs
           node scripts/test-ci-case-telemetry.mjs
           node scripts/test-telemetry-consent.mjs
           node scripts/test-telemetry-early-spool.mjs
@@ -2089,7 +2091,7 @@ jobs:
       - name: Verify compiled Desktop Router against Gateway provider mutations
         env:
           OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE: '1'
-        run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py
+        run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py tests/test_desktop/test_router_catalog_generation.py
 
       - name: Run compiled Desktop recovery flows
         working-directory: desktop/electron
@@ -2361,12 +2363,14 @@ jobs:
               if [[ "${RUNNER_OS}" == "macOS" ]]; then
                 entries+=(
                   'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                  'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
                 )
               fi
               ;;
             profiles)
               entries=(
                 'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
                 'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
                 'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
                 'profile-import-flow:scripts/test-profile-import-flow.mjs'

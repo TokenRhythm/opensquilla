@@ -433,6 +433,9 @@
     "connectionState": {
       "connected": "已连接",
       "connecting": "连接中",
+      "checking": "正在检查 Gateway 连接",
+      "suspect": "连接不稳定",
+      "reconnecting": "正在重新连接 Gateway",
       "disconnected": "已断开"
     },
     "bgm": {
@@ -3712,6 +3715,10 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "聊天前请配置模型服务。",
+      "configure": "配置模型"
+    },
     "skillPalette": {
       "title": "命令与技能",
       "command": "命令",

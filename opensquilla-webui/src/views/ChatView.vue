@@ -142,6 +142,8 @@
           v-if="!forkTransition && recoveryNoticeVisible && recoveryNoticeState && !chatSessionBootstrap.noticeDismissed.value"
           :state="recoveryNoticeState"
           :transport-state="gatewayConnectionState"
+          :transport-phase="gatewayAccess.connectionPhase"
+          :resume-source="gatewayAccess.resumeSource"
           :action="recoveryNoticeState.startsWith('live-') ? 'retry-live' : 'retry-history'"
           :busy="chatSessionBootstrap.retryBusy.value"
           @dismiss="chatSessionBootstrap.dismissRecoveryNotice()"
@@ -633,13 +635,7 @@
       />
     </div>
 
-    <ChatProcesses
-      :session-key="isDraftSurface() ? '' : sessionKey"
-      :gateway="gatewayAccess"
-      :process-access="sessionProcesses"
-      :events="conversationSessionRuntime.events"
-    />
-
+    <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
@@ -848,7 +844,7 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
-import ChatProcesses from '@/components/chat/ChatProcesses.vue'
+import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
 import ChatSessionRecoveryStatus from '@/components/chat/ChatSessionRecoveryStatus.vue'
@@ -911,7 +907,6 @@ import {
   type ClarificationSubmission,
 } from '@/modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY, type SessionMaintenance } from '@/modules/sessionMaintenance'
-import { SESSION_PROCESSES_KEY } from '@/modules/sessionProcesses'
 import { TURN_COMMANDS_KEY, type TurnCommands } from '@/modules/turnCommands'
 import { APPROVAL_CENTER_KEY, type ApprovalCenter } from '@/modules/approvalCenter'
 import { GOAL_CENTER_KEY, type GoalCenter } from '@/modules/goalCenter'
@@ -1228,7 +1223,9 @@ const gatewayAccess = injectedGatewayAccess
 const deliveryIdentity = computed(() => gatewayAccess.deliveryIdentity)
 const gatewayConnectionState = computed(() => {
   if (gatewayAccess.availability === 'available') {
-    return gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+    const phase = gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
+    return phase === 'healthy' ? 'connected' : 'connecting'
   }
   return gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected'
 })
@@ -1279,8 +1276,6 @@ const clarificationSubmission: ClarificationSubmission = injectedClarificationSu
 const injectedSessionMaintenance = inject(SESSION_MAINTENANCE_KEY)
 if (!injectedSessionMaintenance) throw new Error('SessionMaintenance was not provided')
 const sessionMaintenance: SessionMaintenance = injectedSessionMaintenance
-const sessionProcesses = inject(SESSION_PROCESSES_KEY)
-if (!sessionProcesses) throw new Error('SessionProcesses was not provided')
 const conversationEvents = inject(CONVERSATION_EVENTS_KEY)
 if (!conversationEvents) throw new Error('ConversationEvents was not provided')
 const sessionReadLifecycleFactory = inject(SESSION_READ_LIFECYCLE_FACTORY_KEY)

@@ -452,6 +452,7 @@ import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
+import { useReadinessConnectionSync } from './composables/setup/useReadinessConnectionSync'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
@@ -544,6 +545,7 @@ const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
+useReadinessConnectionSync(gatewayAccess)
 const productActivity = inject(PRODUCT_ACTIVITY_KEY)
 if (productActivity) useProductActivity(gatewayAccess, productActivity)
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
@@ -631,11 +633,17 @@ const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 // Localized connection-state label for the topbar pill and its tooltip. The
 // Semantic availability is projected into the existing presentation keys;
 // CSS uppercases the result (a no-op for CJK scripts).
-const connectionState = computed(() => {
+const gatewayConnectionPhase = computed(() => {
   if (gatewayAccess.availability === 'available') {
-    return gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+    return gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
   }
-  return gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected'
+  return gatewayAccess.availability === 'preparing' ? 'checking' : 'disconnected'
+})
+const connectionState = computed(() => {
+  if (gatewayConnectionPhase.value === 'healthy') return 'connected'
+  if (gatewayConnectionPhase.value === 'disconnected') return 'disconnected'
+  return 'connecting'
 })
 const effectiveConnectionState = computed(() => effectiveChatConnectionState(
   connectionState.value,
@@ -644,7 +652,9 @@ const effectiveConnectionState = computed(() => effectiveChatConnectionState(
 ))
 const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewayAccess.requiresCredential
   ? t('setup.connection.tokenRequired')
-  : t(`chrome.connectionState.${effectiveConnectionState.value}`))
+  : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
+  ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
+  : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {

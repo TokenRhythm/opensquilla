@@ -4,6 +4,7 @@ import {
   beginSessionHandoffDiag,
   finishSessionHandoffDiag,
   readSessionNavigationDiag,
+  recordRpcResumeDiag,
   recordRpcTransportDiag,
   recordSessionNavigationDiag,
   SESSION_NAVIGATION_DIAG_LIMIT,
@@ -77,6 +78,7 @@ describe('sessionNavigationDiag', () => {
     setSessionNavigationDiagStorageForTest(memory)
     const timeline = {
       at: 1_020_000, topology: 'proxy/vpn', visibility: 'hidden', health: 'suspect',
+      transportPhase: 'checking', wakeIncidentSource: 'desktop-resume', wakeIncidentProbeTimeoutMs: 2_000,
       suspectAt: 1_015_000, lastRxAt: 999_000, wakeIncidentId: 3,
       wakeIncidentStartedAt: 1_000_000, wakeIncidentDeadlineAt: 1_020_000,
       wakeIncidentStatus: 'reconnecting', wakeSignalCount: 7,
@@ -136,6 +138,7 @@ describe('sessionNavigationDiag', () => {
   it.each([
     'wake_incident_timeout', 'socket_not_open', 'probe_socket_unavailable', 'probe_failed',
     'probe_send_failure', 'control_unconfirmed', 'scheduler_lag', 'wake_grace',
+    'native_resume_socket_unavailable',
     'round_trip', 'hello', 'direct_send_timeout', 'recovery_credit_timeout',
     'writer_send_failed', 'writer_serialize_failed', 'writer_capacity', 'transport_resource_limit',
   ])('preserves the fixed transport reason %s', reason => {
@@ -268,5 +271,25 @@ describe('sessionNavigationDiag', () => {
       reason: 'generation_consistency_recovery',
       reconnectAttempt: 2,
     })
+  })
+
+  it('records the bounded Desktop resume source without accepting arbitrary payloads', () => {
+    setSessionNavigationDiagStorageForTest(new MemoryStorage())
+
+    recordRpcResumeDiag({ generation: 9, resumeSource: 'desktop-resume' })
+
+    expect(readSessionNavigationDiag()[0]).toMatchObject({
+      source: 'rpc.transport',
+      phase: 'desktop_resume',
+      generation: 9,
+      reason: 'desktop_resume',
+      resumeSource: 'desktop-resume',
+    })
+    const result = recordRpcResumeDiag({
+      generation: Number.NaN,
+      resumeSource: 'desktop-resume',
+    })
+    expect(result).toBeNull()
+    expect(JSON.stringify(readSessionNavigationDiag())).not.toContain('PRIVATE')
   })
 })

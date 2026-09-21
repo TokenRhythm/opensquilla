@@ -433,6 +433,9 @@
     "connectionState": {
       "connected": "Connecté",
       "connecting": "Connexion…",
+      "checking": "Vérification de la connexion au Gateway",
+      "suspect": "Connexion instable",
+      "reconnecting": "Reconnexion au Gateway",
       "disconnected": "Déconnecté"
     },
     "bgm": {
@@ -3630,6 +3633,10 @@
     }
   },
   "chat": {
+    "modelSetup": {
+      "notice": "Configurez un service de modèle avant de discuter.",
+      "configure": "Configurer le modèle"
+    },
     "skillPalette": {
       "title": "Commands and skills",
       "command": "Commands",

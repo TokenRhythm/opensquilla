@@ -231,19 +231,23 @@ async function readRpcTransportObservation(page) {
       'watchdog_timeout', 'handshake_invalid', 'wake_incident_timeout',
       'wake_incident_start', 'wake_incident_recovered', 'retire',
       'probe_socket_unavailable', 'probe_deferred', 'probe_timeout',
-      'scheduler_lag', 'reconnect_scheduled',
+      'scheduler_lag', 'reconnect_scheduled', 'soft_suspect', 'soft_suspect_deferred',
+      'desktop_resume',
     ])
     const numericFields = [
       'at', 'generation', 'suspectAt', 'lastRxAt', 'wakeIncidentId',
       'wakeIncidentStartedAt', 'wakeIncidentDeadlineAt', 'wakeSignalCount',
       'roundTripMs', 'reconnectAttempt', 'recoveryMs', 'loopLagMs', 'maxLoopLagMs',
-      'closeCode', 'delayMs',
+      'closeCode', 'delayMs', 'wakeIncidentProbeTimeoutMs',
     ]
     const enums = {
       health: ['healthy', 'suspect'],
       topology: ['loopback', 'remote', 'proxy/vpn', 'unknown'],
       visibility: ['visible', 'hidden', 'unknown'],
       wakeIncidentStatus: ['probing', 'suspect', 'reconnecting', 'recovered'],
+      transportPhase: ['healthy', 'checking', 'suspect', 'reconnecting'],
+      wakeIncidentSource: ['desktop-resume', 'pageshow', 'online', 'manual'],
+      resumeSource: ['desktop-resume'],
     }
     let entries
     try { entries = JSON.parse(localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]') }
@@ -475,20 +479,25 @@ try {
       const timeline = await readDiagnostics()
       const incidentStart = timeline.find(entry => entry.phase === 'wake_incident_start')
       assert.ok(incidentStart, 'wake must start an incident')
-      const incidentEntries = timeline.filter(entry => (
-        entry.wakeIncidentId === incidentStart.wakeIncidentId
-        && entry.generation === incidentStart.generation
-      ))
+      // A native probe failure deliberately rotates the socket generation while
+      // preserving the same bounded wake incident. Correlate by incident id.
+      const incidentEntries = timeline.filter(entry => entry.wakeIncidentId === incidentStart.wakeIncidentId)
       assert.equal(incidentEntries.filter(entry => entry.phase === 'wake_incident_start').length, 1,
         'duplicate native resume signals must share the first incident')
-      const incidentEnd = incidentEntries.find(entry => entry.phase === 'wake_incident_timeout')
-      assert.ok(incidentEnd, 'first wake incident must reach its timeout')
+      const incidentEnd = incidentEntries.find(entry => (
+        entry.phase === 'wake_incident_timeout' || entry.phase === 'wake_incident_recovered'
+      ))
+      assert.ok(incidentEnd, 'first wake incident must reach a terminal outcome')
       assert.equal(incidentStart.topology, 'loopback')
       assert.equal(incidentEnd.wakeIncidentId, incidentStart.wakeIncidentId)
       assert.equal(incidentEnd.wakeIncidentDeadlineAt, incidentStart.wakeIncidentDeadlineAt)
       assert.ok(incidentEnd.wakeSignalCount > 1, 'duplicate resume signals must be counted')
-      assert.equal(incidentEnd.reason, 'wake_incident_timeout')
-      assert.equal(incidentEnd.health, 'suspect')
+      if (incidentEnd.phase === 'wake_incident_timeout') {
+        assert.equal(incidentEnd.reason, 'wake_incident_timeout')
+        assert.equal(incidentEnd.health, 'suspect')
+      } else {
+        assert.equal(incidentEnd.phase, 'wake_incident_recovered')
+      }
       assert.ok(Date.now() - wakeStarted < 25_000, 'wake recovery should fit the candidate budget plus handshake')
       assert.equal(page.url(), resumeUrl, 'wake recovery must not reload renderer')
       assert.equal(await composer.inputValue(), draft)

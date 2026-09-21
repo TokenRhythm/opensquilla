@@ -72,7 +72,7 @@ function button(el: HTMLElement, label: string): HTMLButtonElement {
 describe('SetupConnectionPanel', () => {
   it('shows reconnecting instead of connected while transport health is suspect', async () => {
     const { el, gatewayAccess } = await mountPanel({ availability: 'available', health: 'suspect' })
-    expect(el.querySelector('.conn-status__pill')?.textContent).toContain(i18n.global.t('setup.connection.connecting'))
+    expect(el.querySelector('.conn-status__pill')?.textContent).toContain(i18n.global.t('chrome.connectionState.suspect'))
     gatewayAccess.connectionHealth = 'healthy'
     await nextTick()
     expect(el.querySelector('.conn-status__pill')?.textContent).toContain(i18n.global.t('setup.connection.connected'))

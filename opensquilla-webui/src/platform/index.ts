@@ -24,6 +24,8 @@ export type {
   CliInvocation,
   DesktopMainWindowCloseBehavior,
   DesktopGatewayConnection,
+  DesktopResumeEvent,
+  DesktopResumeSource,
   DesktopPreferences,
   DesktopSettings,
   DesktopSettingsPayload,
