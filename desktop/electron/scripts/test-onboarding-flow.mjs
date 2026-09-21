@@ -7,6 +7,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { _electron as electron } from 'playwright'
 import { desktopRouterConfigTomlLines } from '../dist/desktop-router-config.js'
+import { DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS } from '../dist/gateway-lifecycle.js'
 import { parse, stringify } from 'smol-toml'
 
 const scriptDir = dirname(fileURLToPath(import.meta.url))
@@ -18,6 +19,10 @@ const selectedCases = new Set(String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_
   .split(',').map(value => value.trim()).filter(Boolean))
 const onboardingDiagnosticContexts = new WeakMap()
 const reportedOnboardingFailures = new WeakSet()
+// Match the existing orphan-recovery native harness's cold-start budget:
+// Gateway readiness owns 120s, with 45s for the surrounding Desktop startup.
+// Each launch consumes one absolute deadline; it is not renewed by assertions.
+const INITIAL_DESKTOP_STARTUP_BUDGET_MS = DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS + 45_000
 for (const name of selectedCases) {
   assert.ok(CASE_NAMES.includes(name), `Unknown onboarding case: ${name}; choose ${CASE_NAMES.join(', ')}`)
 }
@@ -286,6 +291,11 @@ async function reportOnboardingFailure(app, phase, error) {
     event: 'onboarding_e2e_failure',
     fixture: context?.prefix ?? 'unknown',
     phase,
+    startup: context ? {
+      elapsedMs: Date.now() - context.startupStartedAt,
+      budgetMs: INITIAL_DESKTOP_STARTUP_BUDGET_MS,
+      readyConfirmed: context.startupReady,
+    } : null,
     error: String(error?.stack || error),
     windows,
     desktopLogTail: desktopLog.slice(-24_000),
@@ -304,7 +314,12 @@ async function reportOnboardingFailure(app, phase, error) {
 }
 
 async function setupWindow(app) {
+  let phase = 'gateway-startup'
   try {
+    // The optional invitation is published only after the client and Gateway
+    // are ready. Profile preparation must not consume its separate UI deadline.
+    await readyDesktopWindow(app)
+    phase = 'setup-window'
     return await waitFor(async () => {
       for (const page of app.windows()) {
         if (page.isClosed()) continue
@@ -314,7 +329,7 @@ async function setupWindow(app) {
       return null
     }, 'desktop onboarding window')
   } catch (error) {
-    await reportOnboardingFailure(app, 'setup-window', error)
+    await reportOnboardingFailure(app, phase, error)
     throw error
   }
 }
@@ -579,6 +594,7 @@ async function launchIsolatedOnboarding(prefix, existingUserDataRoot) {
   const userDataDir = join(userDataRoot, 'chromium-user-data')
   const isolatedHome = join(userDataRoot, 'home')
   await mkdir(isolatedHome, { recursive: true })
+  const startupStartedAt = Date.now()
   const app = await electron.launch({
     ...(process.env.OPENSQUILLA_DESKTOP_TEST_ELECTRON_EXECUTABLE
       ? { executablePath: process.env.OPENSQUILLA_DESKTOP_TEST_ELECTRON_EXECUTABLE }
@@ -601,21 +617,44 @@ async function launchIsolatedOnboarding(prefix, existingUserDataRoot) {
       LC_ALL: 'en_US.UTF-8',
     },
   })
-  onboardingDiagnosticContexts.set(app, { prefix, userDataDir })
+  onboardingDiagnosticContexts.set(app, {
+    prefix, userDataDir, startupStartedAt,
+    startupDeadline: startupStartedAt + INITIAL_DESKTOP_STARTUP_BUDGET_MS,
+    startupReady: false,
+  })
   return { app, userDataDir, userDataRoot }
 }
 
 async function readyDesktopWindow(app) {
-  return await waitFor(async () => {
+  const context = onboardingDiagnosticContexts.get(app)
+  const initialStartup = context && !context.startupReady
+  const timeoutMs = initialStartup ? context.startupDeadline - Date.now() : 60_000
+  if (timeoutMs <= 0) {
+    throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+  }
+  const result = await waitFor(async () => {
+    const child = app.process()
+    if (child.exitCode !== null || child.signalCode !== null) {
+      return { error: `Electron exited before Gateway readiness (code=${child.exitCode}, signal=${child.signalCode}).` }
+    }
     for (const page of app.windows()) {
       if (page.isClosed() || !page.url().startsWith('opensquilla-app://desktop/')) continue
       const connection = await page.evaluate(
         () => window.opensquillaDesktop?.getGatewayConnection?.(),
       )
-      if (connection?.status === 'ready') return page
+      // Return terminal failures from the poll, then throw below: waitFor's
+      // transient-observation catch must not swallow a real startup failure.
+      if (connection?.status === 'error') return { error: connection.error || 'Desktop Gateway startup failed.' }
+      if (connection?.status === 'ready') return { page }
     }
     return null
-  }, 'ready Desktop Gateway without model configuration')
+  }, 'ready Desktop Gateway without model configuration', timeoutMs)
+  if (result.error) throw new Error(result.error)
+  if (initialStartup && Date.now() >= context.startupDeadline) {
+    throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+  }
+  if (context) context.startupReady = true
+  return result.page
 }
 
 async function installPendingSaveStub(app) {
