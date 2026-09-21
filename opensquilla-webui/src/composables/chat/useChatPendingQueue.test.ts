@@ -214,6 +214,66 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
   return { records, handoffs, wal }
 }
 
+it('bounds 500 parked sessions and restores an evicted draft with its original WAL identities', async () => {
+  const { wal, records } = memoryWal()
+  const h = makeQueue(undefined, () => true, undefined, undefined, { pendingInputWal: wal })
+  const firstSession = h.sessionKey.value
+  let firstId = ''
+  try {
+    for (let i = 0; i < 500; i++) {
+      expect(await h.queue.enqueuePendingPayload({ text: `Synthetic draft ${i}`, draftIds: [`draft-${i}`] })).toBe(true)
+      if (i === 0) firstId = h.queue.pendingQueue.value[0]!.pendingInputId!
+      const next = `agent:main:webchat:cache-${i + 1}`
+      await h.queue.switchPendingQueue(next)
+      h.sessionKey.value = next
+      await nextTick()
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    }
+    expect(h.queue.getParkedQueueUsage()).toMatchObject({ sessions: 16, protectedSessions: 0 })
+    expect(records.size).toBe(500)
+    const original = structuredClone(records.get(firstId))
+    await h.queue.switchPendingQueue(firstSession)
+    h.sessionKey.value = firstSession
+    await nextTick()
+    await h.queue.hydratePendingQueue(firstSession)
+    expect(h.queue.pendingQueue.value).toHaveLength(1)
+    expect(h.queue.pendingQueue.value[0]).toMatchObject({
+      pendingInputId: firstId, text: 'Synthetic draft 0', draftIds: ['draft-0'],
+      pendingClientRequestId: original!.clientRequestId,
+      pendingClientMessageId: original!.clientMessageId,
+    })
+    expect(wal.delete).not.toHaveBeenCalled()
+  } finally { h.queue.cleanup() }
+})
+
+it('retains an inactive in-flight delivery under cache pressure without changing its object identity', async () => {
+  const h = makeQueue(undefined, () => true)
+  const firstSession = h.sessionKey.value
+  try {
+    expect(await h.queue.enqueuePendingPayload({ text: 'Synthetic in-flight input' })).toBe(true)
+    const id = h.queue.pendingQueue.value[0]!.pendingUiId!
+    const active = h.queue.beginPendingDelivery(id)!
+    expect(active).toBeTruthy()
+    for (let i = 0; i < 25; i++) {
+      const next = `agent:main:webchat:pinned-${i}`
+      await h.queue.switchPendingQueue(next)
+      h.sessionKey.value = next
+      await nextTick()
+      expect(await h.queue.enqueuePendingPayload({ text: `Other synthetic draft ${i}` })).toBe(true)
+      for (let turn = 0; turn < 5; turn++) await Promise.resolve()
+    }
+    expect(h.queue.getParkedQueueUsage().protectedSessions).toBe(1)
+    await h.queue.switchPendingQueue(firstSession)
+    h.sessionKey.value = firstSession
+    await nextTick()
+    await h.queue.hydratePendingQueue(firstSession)
+    expect(h.queue.pendingQueue.value[0]).toBe(active)
+    expect(h.queue.pendingQueue.value[0]?.text).toBe('Synthetic in-flight input')
+    h.queue.settlePendingDelivery(active, 'deferred')
+    expect(h.queue.pendingQueue.value[0]?.deliveryState).toBeUndefined()
+  } finally { h.queue.cleanup() }
+})
+
 class TestBroadcastChannel {
   static readonly channels = new Map<string, Set<TestBroadcastChannel>>()
 
