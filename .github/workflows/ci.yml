@@ -886,6 +886,25 @@ jobs:
           --project=chromium
           --workers=2
 
+      # Keep absolute performance gates isolated from other renderer processes.
+      - name: Run production-dist long-list virtualization contracts
+        working-directory: opensquilla-webui
+        run: >-
+          npm run test:e2e --
+          chat-virtualization.spec.ts
+          conversation-minimap.spec.ts
+          floating-composer.spec.ts
+          virtualized-logs.spec.ts
+          long-task-resilience.spec.ts
+          native-gateway.spec.ts
+          sidebar-drag.spec.ts
+          sidebar-hover-geometry.spec.ts
+          sidebar-virtualization.spec.ts
+          --project=chromium
+          --workers=1
+          --retries=0
+          --output=test-results/virtualization
+
       - name: Upload chat recovery traces
         id: chat-traces
         continue-on-error: true
