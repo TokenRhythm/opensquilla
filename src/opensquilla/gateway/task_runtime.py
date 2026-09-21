@@ -7612,23 +7612,34 @@ class TaskRuntime:
     async def _persist_terminal_update(
         self, task_id: str, session_key: str, update: dict[str, Any],
     ) -> None:
+        details = update.get("details") or {}
         if not callable(getattr(type(self._storage), "settle_agent_task", None)):
             await self._storage.update_agent_task(task_id, **update)
-            return
-        details = update.get("details") or {}
-        remove_keys = ["cancellation_requested"]
-        if "applied_steer_evidence" not in details:
-            remove_keys.append("applied_steer_evidence")
-        await self._storage.settle_agent_task(
-            task_id,
-            session_key=session_key,
-            details_patch={
-                key: value for key, value in details.items() if key in _TERMINAL_DETAIL_KEYS
-            },
-            remove_detail_keys=remove_keys,
-            plan_result=(details.get("metadata") or {}).get("plan_result"),
-            **{key: value for key, value in update.items() if key != "details"},
+        else:
+            remove_keys = ["cancellation_requested"]
+            if "applied_steer_evidence" not in details:
+                remove_keys.append("applied_steer_evidence")
+            await self._storage.settle_agent_task(
+                task_id,
+                session_key=session_key,
+                details_patch={
+                    key: value for key, value in details.items() if key in _TERMINAL_DETAIL_KEYS
+                },
+                remove_detail_keys=remove_keys,
+                plan_result=(details.get("metadata") or {}).get("plan_result"),
+                **{key: value for key, value in update.items() if key != "details"},
+            )
+        # Successful terminal persistence may still lack complete presentation
+        # evidence. Never reclaim its only remaining trace on that basis.
+        snapshot = terminal_activity_snapshot(
+            details.get("activity_snapshot"), task_id=task_id, turn_id=task_id,
         )
+        if snapshot is not None and snapshot.get("complete") is True:
+            from opensquilla.gateway.session_streams import get_session_streams
+
+            get_session_streams().mark_terminal_persisted(
+                session_key, task_id, reconstructible=True,
+            )
 
     def _remember_compensated_terminal(self, task_id: str) -> None:
         record = self._terminal_fallback_records.pop(task_id, None)
