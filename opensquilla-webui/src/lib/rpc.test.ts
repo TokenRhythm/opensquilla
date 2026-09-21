@@ -1413,6 +1413,27 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
+  it('ignores a non-persisted pageshow after Hello', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    const pageshow = new Event('pageshow')
+    Object.defineProperty(pageshow, 'persisted', { value: false })
+
+    window.dispatchEvent(pageshow)
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    expect(client.phase).toBe('healthy')
+    expect(socket.sent.filter(frame => frame.includes('"type":"ping"'))).toHaveLength(0)
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_start',
+    }))
+    client.disconnect()
+  })
+
   it('only resets backoff after a stable Hello, not a flapping Hello', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')

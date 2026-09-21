@@ -430,6 +430,11 @@ export class RpcClient {
     ) {
       return;
     }
+    // A normal page navigation emits pageshow with persisted=false. It is
+    // initial document bootstrap, not a BFCache restore or an OS wake, and it
+    // can arrive after Hello but before the first session hydration RPC.
+    const persisted = (event as Event & { persisted?: unknown }).persisted;
+    if (event.type === 'pageshow' && persisted === false) return;
     // The first pageshow/online/visibility signal belongs to initial page
     // boot, not to a sleep/wake incident.  Starting an incident before the
     // first successful Hello would gate the initial session hydration as an
