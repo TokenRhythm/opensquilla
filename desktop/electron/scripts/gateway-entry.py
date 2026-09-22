@@ -172,7 +172,7 @@ def _run_desktop_pty_probe() -> int:
                     if not chunk:
                         break
                     chunks.append(chunk)
-                return b"".join(chunks).decode("utf-8", errors="replace"), exited.result()
+                return b"".join(chunks).decode("utf-8", errors="replace"), await exited
         except PtyBackendError as exc:
             handle = exc.handle or handle
             raise
@@ -190,8 +190,9 @@ def _run_desktop_pty_probe() -> int:
                 # reader thread, including a failed spawn that returned a handle.
                 with suppress(Exception):
                     await terminate_pty(handle)
-                with suppress(Exception):
-                    await asyncio.wait_for(wait_pty(handle), timeout=5.0)
+                if exited is None or exited.cancelled() or not exited.done():
+                    with suppress(Exception):
+                        await asyncio.wait_for(wait_pty(handle), timeout=5.0)
 
     try:
         output, returncode = asyncio.run(collect())
