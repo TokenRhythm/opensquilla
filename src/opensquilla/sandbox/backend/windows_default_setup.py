@@ -934,7 +934,7 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
     env = {**os.environ, "OPENSQUILLA_SANDBOX_PASSWORD": password}
     completed = subprocess.run(
         [
-            "powershell",
+            _trusted_windows_powershell_path(),
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
@@ -957,6 +957,20 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
         "username": OFFLINE_USERNAME,
         "protectedPassword": protect_password(password),
     }
+
+
+def _trusted_windows_powershell_path() -> str:
+    """Use inbox Windows PowerShell for LocalAccounts and ADSI setup.
+
+    PowerShell 7 can resolve these commands through compatibility modules but
+    hosted runners may not be able to load those modules. The inbox binary is
+    present on supported Windows hosts and owns the LocalAccounts module.
+    """
+
+    system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
+    if system_root and "\x00" not in system_root:
+        return str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+    return r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
 def lock_persistent_sandbox_dirs(
