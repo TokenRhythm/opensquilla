@@ -8826,7 +8826,11 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
-  child.once('exit', () => {
+  // The close handler classifies the child's final status. Keep the explicit
+  // stop marker until close because Node emits exit before close; clearing it
+  // on exit would make an intentional clean stop look like an unexpected
+  // ready-child disconnect and schedule a replacement.
+  child.once('close', () => {
     gatewayStoppingProcesses.delete(child)
     if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
   })
@@ -9315,11 +9319,10 @@ async function startGateway(): Promise<GatewayState> {
     const childWasReady = childReadyAuthority !== null
     const unexpectedReadyExit = isCurrentGateway
       && childWasReady
-      && abnormalExit
       && !isQuitting
       && !gatewayStoppingProcesses.has(child)
     gatewayReadyProcesses.delete(child)
-    if (unexpectedReadyExit) {
+    if (unexpectedReadyExit && abnormalExit) {
       desktopReliabilityTelemetry.recordCrash({
         component: 'gateway',
         errorCode: 'gateway_unexpected_exit',
@@ -9345,7 +9348,12 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
-    if (abnormalExit) {
+    // A ready Gateway can receive SIGTERM and exit cleanly (code=0). That is
+    // still an unexpected disconnect while the Desktop app is alive. Treat it
+    // like an abnormal ready exit so the bounded recovery series can restore
+    // the child. The stopping set and lifecycle authority checks above/below
+    // keep explicit quit, update, and profile recovery drains excluded.
+    if (abnormalExit || unexpectedReadyExit) {
       if (scheduleGatewayUnexpectedExitRestart(
         classifiedMessage,
         childWasReady,

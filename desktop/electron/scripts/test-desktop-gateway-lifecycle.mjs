@@ -21,6 +21,34 @@ function mainSection(start, end) {
   return main.slice(from, to)
 }
 
+function runCleanExitRecoveryContractCase() {
+  const closeHandler = mainSection("child.once('close', (code, signal) => {", "  // A failed spawn")
+  const stoppingMarker = mainSection(
+    'function trackStoppingGatewayProcess',
+    'function liveLifecycleOwnedGatewayProcesses',
+  )
+  assert.match(
+    closeHandler,
+    /const unexpectedReadyExit = [\s\S]*&& childWasReady[\s\S]*&& !isQuitting[\s\S]*&& !gatewayStoppingProcesses\.has\(child\)/,
+    'a ready Gateway clean exit must be classified as unexpected while Desktop is alive',
+  )
+  assert.match(
+    closeHandler,
+    /if \(abnormalExit \|\| unexpectedReadyExit\) \{/,
+    'clean ready exits must enter the bounded Gateway recovery series',
+  )
+  assert.match(
+    stoppingMarker,
+    /child\.once\('close',/,
+    'intentional-stop markers must survive exit until the close classifier runs',
+  )
+  assert.doesNotMatch(
+    stoppingMarker,
+    /child\.once\('exit',/,
+    'intentional-stop markers must not be cleared on exit before close',
+  )
+}
+
 function deferred() {
   let resolve
   let reject
@@ -550,6 +578,7 @@ async function runSlowColdStartReadinessCase() {
 }
 
 await runColdStartDescriptorCase()
+runCleanExitRecoveryContractCase()
 await runWarmExternalGatewayReuseCase()
 await runOptionalOnboardingDoesNotDelayReadyCase()
 runExitDescriptorCase()

@@ -1850,6 +1850,11 @@ def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restar
         "async function stopAndJoinAllLifecycleOwnedGateways",
         "function restoreDownloadedUpdateRetryState",
     )
+    stopping_marker = _section(
+        main_ts,
+        "function trackStoppingGatewayProcess",
+        "function liveLifecycleOwnedGatewayProcesses",
+    )
     migration = _section(
         main_ts,
         "ipcMain.handle('desktop:migration:run'",
@@ -1877,15 +1882,19 @@ def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restar
     )
     assert "gateway_child_process_error" in post_spawn_error
     assert "return" in post_spawn_error
-    abnormal_exit = _section(
-        start,
-        "if (abnormalExit)",
-        "publishTerminalGatewayExitError(classifiedMessage)",
-    )
-    assert "scheduleGatewayUnexpectedExitRestart" in abnormal_exit
-    assert "childWasReady" in abnormal_exit
-    assert "childReadyAuthority" in abnormal_exit
-    assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in abnormal_exit
+    assert "const unexpectedReadyExit = isCurrentGateway" in start
+    assert "&& childWasReady" in start
+    assert "&& !isQuitting" in start
+    assert "&& !gatewayStoppingProcesses.has(child)" in start
+    assert "if (abnormalExit || unexpectedReadyExit)" in start
+    assert "scheduleGatewayUnexpectedExitRestart" in start
+    assert "childReadyAuthority" in start
+    assert "if (unexpectedReadyExit && abnormalExit)" in start
+    # Clean exits that are not unexpected ready-child exits (for example an
+    # intentional stop before readiness) still cancel any pending recovery.
+    assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in start
+    assert "child.once('close'," in stopping_marker
+    assert "child.once('exit'," not in stopping_marker
     assert (
         "scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))"
         in start
