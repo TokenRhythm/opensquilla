@@ -90,6 +90,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume'),
   retryStartup: () => ipcRenderer.invoke('desktop:boot:retry'),
   quitApp: () => ipcRenderer.invoke('desktop:boot:quit'),
+  quitDialogRespond: (response: unknown) => ipcRenderer.send('desktop:quit-dialog-response', response),
   getRecoveryState: () => ipcRenderer.invoke('desktop:recovery:state'),
   retryProfileConsolidation: () => ipcRenderer.invoke('desktop:recovery:retry-consolidation'),
   chooseRecoveryWorkspace: (payload: unknown) => ipcRenderer.invoke('desktop:recovery:choose-workspace', payload),

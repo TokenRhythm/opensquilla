@@ -173,6 +173,26 @@ function verifyGatewayCaStore(gatewayBinary, env) {
   }
 }
 
+function verifyGatewayToolSearch(gatewayBinary, env) {
+  const result = spawnSync(gatewayBinary, ['--_desktop-tool-search-probe'], {
+    cwd: dirname(gatewayBinary),
+    env,
+    encoding: 'utf8',
+    timeout: 30_000,
+    windowsHide: true,
+  })
+  if (result.error) throw result.error
+  if (result.status !== 0 || result.stdout.trim() !== 'opensquilla-desktop-tool-search-ok') {
+    throw new Error(
+      `Packaged gateway Unicode tool search probe failed with exit ${result.status ?? 'null'}.`
+        + formatTail(
+          result.stdout ? result.stdout.trim().split(/\r?\n/) : [],
+          result.stderr ? result.stderr.trim().split(/\r?\n/) : [],
+        ),
+    )
+  }
+}
+
 function verifyGatewayFilesystemWorker(gatewayBinary, env, targetPath) {
   const payload = JSON.stringify({
     kind: 'read_file',

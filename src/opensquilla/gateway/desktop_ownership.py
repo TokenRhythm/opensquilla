@@ -46,6 +46,7 @@ DESKTOP_GATEWAY_INSTANCE_NONCE_ENV: Final = (
 )
 DESKTOP_GATEWAY_INSTANCE_ID_ENV: Final = "OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID"
 DESKTOP_GATEWAY_AUTH_CONTEXT: Final = b"opensquilla-desktop-gateway-auth-v1"
+DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL: Final = "opensquilla-desktop-lifecycle-v1"
 
 _ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 _PROOF_VALUE_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -79,6 +80,25 @@ def canonical_shutdown_payload(
 
     return _canonical_payload(
         {**public_record, "action": "shutdown", "challenge": challenge}
+    )
+
+
+def canonical_lifecycle_payload(
+    public_record: dict[str, Any],
+    challenge: str,
+    action: str,
+    fields: dict[str, Any],
+) -> bytes:
+    """Bind lifecycle requests and replies to the same exact owned process."""
+
+    return _canonical_payload(
+        {
+            **public_record,
+            **fields,
+            "lifecycle_protocol": DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+            "action": action,
+            "challenge": challenge,
+        }
     )
 
 
@@ -498,6 +518,33 @@ class DesktopGatewayOwnership:
             hashlib.sha256,
         ).hexdigest()
         return hmac.compare_digest(proof, expected)
+
+    def lifecycle_proof(
+        self, challenge: str, action: str, fields: dict[str, Any]
+    ) -> str:
+        return hmac.new(
+            self.instance_nonce.encode("ascii"),
+            canonical_lifecycle_payload(self.public_record, challenge, action, fields),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def verify_lifecycle_proof(
+        self, challenge: str, proof: str, action: str, fields: dict[str, Any]
+    ) -> bool:
+        if not valid_desktop_challenge(challenge) or not valid_desktop_proof(proof):
+            return False
+        return hmac.compare_digest(proof, self.lifecycle_proof(challenge, action, fields))
+
+    def lifecycle_response(
+        self, challenge: str, action: str, fields: dict[str, Any]
+    ) -> dict[str, Any]:
+        return {
+            **fields,
+            "lifecycle_protocol": DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+            "action": action,
+            "challenge": challenge,
+            "proof": self.lifecycle_proof(challenge, action, fields),
+        }
 
 
 _ACTIVE_DESKTOP_GATEWAY_OWNERSHIP: DesktopGatewayOwnership | None = None

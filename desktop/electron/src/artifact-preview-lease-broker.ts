@@ -359,6 +359,15 @@ function failure(
   return { ok: false, status, code, message }
 }
 
+function untilAborted<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason)
+    if (signal.aborted) abort()
+    else signal.addEventListener('abort', abort, { once: true })
+    pending.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort))
+  })
+}
+
 export class ArtifactPreviewLeaseBroker {
   private readonly fetchImpl: typeof fetch
   private readonly now: () => number
@@ -368,6 +377,9 @@ export class ArtifactPreviewLeaseBroker {
     Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>>
   >()
   private generation = 0
+  private shuttingDown = false
+  private shutdownResult: Promise<void> | null = null
+  private readonly shutdownController = new AbortController()
 
   constructor(private readonly options: ArtifactPreviewLeaseBrokerOptions) {
     this.fetchImpl = options.fetchImpl ?? fetch
@@ -378,6 +390,44 @@ export class ArtifactPreviewLeaseBroker {
   clear(): void {
     this.generation += 1
     this.issued.clear()
+  }
+
+  /** Permanently stop preview admission and join cleanup within the caller's budget. */
+  shutdown({ signal }: { signal?: AbortSignal } = {}): Promise<void> {
+    if (this.shutdownResult) return this.shutdownResult
+    this.shuttingDown = true
+    const issued = [...this.issued.values()]
+    const pending = [...this.inFlightCreates]
+    this.clear()
+    const budget = AbortSignal.any([
+      AbortSignal.timeout(this.timeoutMs),
+      ...(signal ? [signal] : []),
+    ])
+    const abort = () => this.shutdownController.abort(budget.reason)
+    if (budget.aborted) abort()
+    else budget.addEventListener('abort', abort, { once: true })
+    const revocations = issued.map(lease => {
+      if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== lease.gatewayOrigin) {
+        return Promise.resolve()
+      }
+      return this.request(
+        new URL(
+          `/api/v1/artifact-preview-leases/${encodeURIComponent(lease.leaseId)}`,
+          lease.gatewayOrigin,
+        ),
+        'DELETE',
+        lease.scopeId,
+        lease.authToken,
+      )
+    })
+    this.shutdownResult = untilAborted(
+      Promise.allSettled([...revocations, ...pending]),
+      budget,
+    ).then(() => undefined, () => undefined).finally(() => {
+      budget.removeEventListener('abort', abort)
+      this.shutdownController.abort()
+    })
+    return this.shutdownResult
   }
 
   /**
@@ -424,6 +474,7 @@ export class ArtifactPreviewLeaseBroker {
   private async createNow(
     value: unknown,
   ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
+    if (this.shuttingDown) return this.shutdownFailure()
     const generation = this.generation
     let request: ArtifactPreviewLeaseCreateRequest
     try {
@@ -454,6 +505,9 @@ export class ArtifactPreviewLeaseBroker {
       request.authToken,
       JSON.stringify({ version: 1, mode: request.mode, client: 'desktop',
         ...(request.pagePath ? { pagePath: request.pagePath } : {}) }),
+      payload => this.revokeLateCreation(
+        payload, request.mode, gatewayOrigin, request.scopeId, request.authToken,
+      ),
     )
     if (!response.ok) return response
     if (response.status !== 201) {
@@ -513,6 +567,7 @@ export class ArtifactPreviewLeaseBroker {
   async renew(
     value: unknown,
   ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeaseRenewalPayload>> {
+    if (this.shuttingDown) return this.shutdownFailure()
     let request: ArtifactPreviewLeaseControlRequest
     try {
       request = parseArtifactPreviewLeaseControlRequest(value)
@@ -536,6 +591,7 @@ export class ArtifactPreviewLeaseBroker {
       request.scopeId,
       request.authToken,
     )
+    if (this.shuttingDown) return this.shutdownFailure()
     if (!response.ok) {
       if (response.status === 404 || response.status === 410) {
         this.issued.delete(request.leaseId)
@@ -594,6 +650,32 @@ export class ArtifactPreviewLeaseBroker {
     return { ok: true, status: response.status, payload: undefined }
   }
 
+  private async revokeLateCreation(
+    payload: unknown,
+    mode: ArtifactPreviewLeaseMode,
+    gatewayOrigin: string,
+    scopeId: string,
+    authToken?: string,
+  ): Promise<void> {
+    if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== gatewayOrigin) return
+    const parsed = parseLeasePayload(payload, mode)
+    await this.request(
+      new URL(
+        `/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`,
+        gatewayOrigin,
+      ),
+      'DELETE',
+      scopeId,
+      authToken,
+      undefined,
+      true,
+    )
+  }
+
+  private shutdownFailure(): ArtifactPreviewLeaseBrokerFailure {
+    return failure(503, 'PREVIEW_BROKER_SHUTTING_DOWN', 'The Desktop preview service is shutting down.')
+  }
+
   authorizesSurface(grant: ArtifactPreviewSurfaceGrant): boolean {
     return this.resolveSurfaceArtifactId(grant) !== null
   }
@@ -649,30 +731,57 @@ export class ArtifactPreviewLeaseBroker {
     scopeId: string,
     authToken?: string,
     body?: string,
+    onLatePayload?: (payload: unknown) => Promise<void>,
   ): Promise<ArtifactPreviewLeaseBrokerResult<unknown>> {
-    const response = await this.request(url, method, scopeId, authToken, body)
-    if (!response.ok) return response
-    try {
-      const contentType = response.response.headers.get('content-type') || ''
-      if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+    const signal = this.requestSignal()
+    const pending = (async (): Promise<ArtifactPreviewLeaseBrokerResult<unknown>> => {
+      const response = await this.requestWithSignal(url, method, scopeId, signal, authToken, body)
+      if (!response.ok) return response
+      try {
+        const contentType = response.response.headers.get('content-type') || ''
+        if (!/^application\/json(?:\s*;|$)/i.test(contentType)) {
+          return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
+        }
+        const contentLength = Number(response.response.headers.get('content-length') || '0')
+        if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
+          return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
+        }
+        const text = await response.response.text()
+        if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
+          return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
+        }
+        return {
+          ok: true,
+          status: response.status,
+          payload: JSON.parse(text) as unknown,
+        }
+      } catch {
         return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
       }
-      const contentLength = Number(response.response.headers.get('content-length') || '0')
-      if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
-        return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
-      }
-      const text = await response.response.text()
-      if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
-        return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
-      }
-      return {
-        ok: true,
-        status: response.status,
-        payload: JSON.parse(text) as unknown,
-      }
-    } catch {
-      return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
+    })()
+    if (onLatePayload) {
+      void pending.then(response => {
+        if (signal.aborted && response.ok && response.status === 201) {
+          // A transport may ignore abort. Retire any lease it issues after the
+          // caller stopped waiting without reopening local preview authority.
+          return onLatePayload(response.payload).catch(() => {})
+        }
+      })
     }
+    try {
+      return await untilAborted(pending, signal)
+    } catch {
+      return this.requestFailure()
+    }
+  }
+
+  private requestSignal(ignoreShutdown = false): AbortSignal {
+    const timeout = AbortSignal.timeout(this.timeoutMs)
+    return ignoreShutdown ? timeout : AbortSignal.any([timeout, this.shutdownController.signal])
+  }
+
+  private requestFailure(): ArtifactPreviewLeaseBrokerFailure {
+    return failure(503, 'PREVIEW_BROKER_UNAVAILABLE', 'The Desktop preview service is unavailable.')
   }
 
   private async request(
@@ -681,12 +790,36 @@ export class ArtifactPreviewLeaseBroker {
     scopeId: string,
     authToken?: string,
     body?: string,
+    ignoreShutdown = false,
+  ): Promise<
+    | ArtifactPreviewLeaseBrokerFailure
+    | { ok: true; status: number; response: Response }
+  > {
+    const signal = this.requestSignal(ignoreShutdown)
+    try {
+      return await untilAborted(
+        this.requestWithSignal(url, method, scopeId, signal, authToken, body),
+        signal,
+      )
+    } catch {
+      return this.requestFailure()
+    }
+  }
+
+  private async requestWithSignal(
+    url: URL,
+    method: 'POST' | 'DELETE',
+    scopeId: string,
+    signal: AbortSignal,
+    authToken?: string,
+    body?: string,
   ): Promise<
     | ArtifactPreviewLeaseBrokerFailure
     | { ok: true; status: number; response: Response }
   > {
     let response: Response
     try {
+      if (signal.aborted) return this.requestFailure()
       response = await this.fetchImpl(url, {
         method,
         headers: {
@@ -699,14 +832,10 @@ export class ArtifactPreviewLeaseBroker {
         cache: 'no-store',
         credentials: 'omit',
         redirect: 'error',
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal,
       })
     } catch {
-      return failure(
-        503,
-        'PREVIEW_BROKER_UNAVAILABLE',
-        'The Desktop preview service is unavailable.',
-      )
+      return this.requestFailure()
     }
     if (!response.ok) {
       let payload: Record<string, unknown> | null = null

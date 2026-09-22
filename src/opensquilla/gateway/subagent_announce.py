@@ -339,7 +339,10 @@ async def announce_subagent_completion(
             transport_payload,
         )
 
-    if channel_manager is not None and parent is not None:
+    if (
+        channel_manager is not None and parent is not None
+        and not getattr(task_runtime, "desktop_quitting", False)
+    ):
         if event.parent_session_id is not None or event.parent_session_epoch is not None:
             parent = await _read_current_session_owner(
                 event.parent_session_key,
@@ -347,7 +350,10 @@ async def announce_subagent_completion(
                 expected_session_id=event.parent_session_id,
                 expected_session_epoch=event.parent_session_epoch,
             )
-        await _announce_to_parent_channel(payload, parent=parent, channel_manager=channel_manager)
+        if not getattr(task_runtime, "desktop_quitting", False):
+            await _announce_to_parent_channel(
+                payload, parent=parent, channel_manager=channel_manager,
+            )
 
     if task_runtime is not None and parent_wake_payloads:
         await _send_parent_wake(

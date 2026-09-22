@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import { appendDesktopLogRecord } from '../dist/desktop-log-file.js'
+import { createMainWindowConsoleListener } from './renderer-log-test-helpers.mjs'
 import {
   buildRendererConsoleLogEntry,
   buildRendererGoneLogEntry,
@@ -13,6 +14,38 @@ import {
   shouldForwardConsoleLevel,
 } from '../dist/desktop-renderer-log.js'
 
+const consoleRecords = []
+const mainFrame = {}
+let windowDestroyed = false
+let contentsDestroyed = false
+const contents = {
+  isDestroyed: () => contentsDestroyed,
+  get mainFrame() {
+    assert.equal(contentsDestroyed, false, 'Destroyed WebContents must not be read.')
+    return mainFrame
+  },
+}
+const consoleWindow = {
+  isDestroyed: () => windowDestroyed,
+  get webContents() {
+    assert.equal(windowDestroyed, false, 'Destroyed BrowserWindow must not be read.')
+    return contents
+  },
+}
+const consoleListener = createMainWindowConsoleListener(consoleWindow, consoleRecords)
+const consoleMessage = {
+  frame: mainFrame, level: 'error', message: 'synthetic renderer error',
+  sourceId: 'https://example.test/main.js', lineNumber: 1,
+}
+consoleListener(consoleMessage)
+assert.equal(consoleRecords.length, 1)
+consoleListener({ ...consoleMessage, frame: {} })
+assert.equal(consoleRecords.length, 1, 'Child frames must not write lifecycle logs.')
+contentsDestroyed = true
+assert.doesNotThrow(() => consoleListener(consoleMessage))
+windowDestroyed = true
+assert.doesNotThrow(() => consoleListener(consoleMessage))
+assert.equal(consoleRecords.length, 1, 'Late events must not write after teardown.')
 // A late console event must not touch an already destroyed native window.
 // The signed Windows package failed here after app.exit: Electron's default
 // uncaught-exception handler opened a synchronous error dialog and blocked exit.

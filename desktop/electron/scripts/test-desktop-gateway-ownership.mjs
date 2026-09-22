@@ -12,10 +12,12 @@ import { join } from 'node:path'
 
 import {
   DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL,
+  DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
   canonicalDesktopGatewayIdentityPayload,
   canonicalDesktopGatewayShutdownPayload,
   desktopGatewayAuthToken,
   desktopGatewayIdentityProof,
+  desktopGatewayLifecycleProof,
   desktopGatewayOwnershipMatchesLaunch,
   desktopGatewayOwnershipRecordPath,
   desktopGatewayShutdownProof,
@@ -26,6 +28,8 @@ import {
   loadDesktopGatewayOwnershipRecord,
   posixPsLstartIdentity,
   requestVerifiedDesktopGatewayShutdown,
+  requestVerifiedDesktopGatewayQuit,
+  readVerifiedDesktopGatewayActivity,
   sameDesktopGatewayOwnershipInstance,
   verifyDesktopGatewayOwnership,
   verifyDesktopGatewayLaunchOwnership,
@@ -89,6 +93,112 @@ assert.equal(
   '68b2c749e4d727fbbc92cffa8b4e6bbe1e7c7c0ad4175a1671f903d0be2eb5d9',
   'identity and shutdown proofs use separate cross-language domains',
 )
+assert.equal(
+  desktopGatewayLifecycleProof(record, challenge, 'shutdown', {
+    mode: 'quit', remaining_ms: 5000,
+  }),
+  'd8efe03e8bd6959e27c5a91814a904ef6c8042509b904f9a358f01d91a94eeca',
+  'lifecycle mode, budget, version, and instance share the Python signed vector',
+)
+const activity = { running: 1, queued: 2, waiting: 3, reservations: 1, auxiliary: 4 }
+assert.equal(
+  desktopGatewayLifecycleProof(record, challenge, 'status_ack', { activity }),
+  '8189bd193141c8602b4aee1b9eb6a668b7f8288f97996d509c7b63b726e0c1d5',
+  'nested activity counts use the same canonical ordering as Python',
+)
+
+function lifecycleReply(action, fields, overrides = {}) {
+  return {
+    ...fields,
+    lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+    action: `${action}_ack`,
+    challenge,
+    proof: desktopGatewayLifecycleProof(record, challenge, `${action}_ack`, fields),
+    ...overrides,
+  }
+}
+
+assert.deepEqual(await readVerifiedDesktopGatewayActivity(record, {
+  challenge,
+  fetchImpl: async (url, init) => {
+    assert.equal(String(url), 'http://127.0.0.1:18791/api/desktop/lifecycle')
+    const body = JSON.parse(String(init.body))
+    assert.equal(body.action, 'status')
+    assert.equal(body.mode, undefined)
+    assert.equal(body.remaining_ms, undefined)
+    assert.equal(body.proof, desktopGatewayLifecycleProof(record, challenge, 'status'))
+    return Response.json(lifecycleReply('status', { activity }))
+  },
+}), { kind: 'ok', activeCount: 11, activity })
+
+assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+  challenge, remainingMs: 5000,
+  fetchImpl: async (url, init) => {
+    assert.equal(String(url), 'http://127.0.0.1:18791/api/desktop/lifecycle')
+    assert.deepEqual(JSON.parse(String(init.body)), {
+      mode: 'quit', remaining_ms: 5000,
+      lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+      action: 'shutdown', challenge,
+      proof: 'd8efe03e8bd6959e27c5a91814a904ef6c8042509b904f9a358f01d91a94eeca',
+    })
+    return Response.json(lifecycleReply('shutdown', {
+      accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250,
+    }), { status: 202 })
+  },
+}), { kind: 'quit_accepted', remainingMs: 1250, totalRemainingMs: 6250 })
+
+for (const [status, kind] of [[404, 'unsupported'], [405, 'unsupported'], [403, 'rejected'],
+  [400, 'rejected'], [503, 'rejected']]) {
+  let requests = 0
+  assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+    challenge, remainingMs: 5000,
+    fetchImpl: async (url) => {
+      requests += 1
+      assert.match(String(url), /\/api\/desktop\/lifecycle$/)
+      return Response.json({}, { status })
+    },
+  }), { kind })
+  assert.equal(requests, 1, 'unsupported and rejected requests never trigger implicit legacy drain')
+}
+for (const reply of [
+  {},
+  lifecycleReply('shutdown', { accepted_mode: 'drain', remaining_ms: 1250, total_remaining_ms: 6250 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 5001, total_remaining_ms: 10000 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: -1, total_remaining_ms: 6250 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 10001 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 1249 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250 }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250 }, { proof: '0'.repeat(64) }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250 }, { challenge: nonce }),
+  lifecycleReply('shutdown', { accepted_mode: 'quit', remaining_ms: 1250, total_remaining_ms: 6250 }, { total_remaining_ms: 5000 }),
+  lifecycleReply('status', { activity }),
+]) {
+  assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+    challenge, remainingMs: 5000,
+    fetchImpl: async () => Response.json(reply, { status: 202 }),
+  }), { kind: 'rejected' })
+}
+assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+  challenge, remainingMs: 5000,
+  fetchImpl: async () => Response.json(lifecycleReply('shutdown', {
+    accepted_mode: 'quit', remaining_ms: 0, total_remaining_ms: 200,
+  }), { status: 202 }),
+}), { kind: 'quit_accepted', remainingMs: 0, totalRemainingMs: 200 })
+for (const badActivity of [
+  { ...activity, queued: -1 },
+  { ...activity, waiting: '3' },
+  { ...activity, reservations: 0.5 },
+  { running: 1 },
+]) {
+  assert.deepEqual(await readVerifiedDesktopGatewayActivity(record, {
+    challenge,
+    fetchImpl: async () => Response.json(lifecycleReply('status', { activity: badActivity })),
+  }), { kind: 'rejected' })
+}
+assert.deepEqual(await requestVerifiedDesktopGatewayQuit(record, {
+  challenge, remainingMs: 5000,
+  fetchImpl: async () => { throw new Error('connection closed') },
+}), { kind: 'unreachable' })
 assert.equal(
   desktopGatewayOwnershipMatchesLaunch({ ...record, pid: 9999 }, {
     instanceNonce: nonce,

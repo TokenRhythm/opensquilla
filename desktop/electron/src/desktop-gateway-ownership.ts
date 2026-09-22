@@ -5,6 +5,7 @@ import { join, normalize, resolve } from 'node:path'
 
 export const DESKTOP_GATEWAY_OWNERSHIP_SCHEMA_VERSION = 1
 export const DESKTOP_GATEWAY_OWNERSHIP_PROTOCOL = 'opensquilla-desktop-gateway-ownership-v1'
+export const DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL = 'opensquilla-desktop-lifecycle-v1'
 const DESKTOP_GATEWAY_AUTH_CONTEXT = 'opensquilla-desktop-gateway-auth-v1'
 
 const OWNER_TOKEN_RE = /^[A-Za-z0-9_-]{32,128}$/
@@ -227,12 +228,14 @@ function canonicalSortedAsciiJson(payload: object): string {
   // Python uses json.dumps(..., sort_keys=True, separators=(',', ':'),
   // ensure_ascii=True). Every value in this protocol is ASCII, so sorted key
   // insertion plus JSON.stringify is byte-identical.
-  const sorted = Object.fromEntries(
-    Object.entries(payload).sort(([left], [right]) => (
-      left < right ? -1 : left > right ? 1 : 0
-    )),
-  )
-  return JSON.stringify(sorted)
+  const sortedValue = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(sortedValue)
+    if (!isRecord(value)) return value
+    return Object.fromEntries(Object.entries(value)
+      .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+      .map(([key, item]) => [key, sortedValue(item)]))
+  }
+  return JSON.stringify(sortedValue(payload))
 }
 
 export function canonicalDesktopGatewayIdentityPayload(
@@ -376,6 +379,161 @@ export async function requestVerifiedDesktopGatewayShutdown(
     return response.status === 202
   } catch {
     return false
+  }
+}
+
+export type DesktopGatewayLifecycleFailure = {
+  kind: 'unsupported' | 'rejected' | 'unreachable'
+}
+
+export interface DesktopGatewayActivity {
+  running: number
+  queued: number
+  waiting: number
+  reservations: number
+  auxiliary: number
+}
+
+export type DesktopGatewayActivityResult = DesktopGatewayLifecycleFailure | {
+  kind: 'ok'
+  activeCount: number
+  activity: DesktopGatewayActivity
+}
+
+export type DesktopGatewayQuitResult = DesktopGatewayLifecycleFailure | {
+  kind: 'quit_accepted'
+  remainingMs: number
+  totalRemainingMs: number
+}
+
+export interface DesktopGatewayQuitOptions extends DesktopGatewayIdentityVerificationOptions {
+  remainingMs: number
+}
+
+export function desktopGatewayLifecycleProof(
+  record: DesktopGatewayOwnershipRecord,
+  challenge: string,
+  action: string,
+  fields: Record<string, unknown> = {},
+): string {
+  const { instance_nonce, ...publicRecord } = record
+  return createHmac('sha256', instance_nonce)
+    .update(canonicalSortedAsciiJson({
+      ...publicRecord,
+      ...fields,
+      lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+      action,
+      challenge,
+    }), 'utf8')
+    .digest('hex')
+}
+
+async function requestDesktopGatewayLifecycle(
+  record: DesktopGatewayOwnershipRecord,
+  action: 'status' | 'shutdown',
+  fields: Record<string, unknown>,
+  options: DesktopGatewayIdentityVerificationOptions,
+): Promise<DesktopGatewayLifecycleFailure | { kind: 'reply'; fields: Record<string, unknown> }> {
+  const challenge = options.challenge ?? randomBytes(32).toString('base64url')
+  if (!OWNER_TOKEN_RE.test(challenge)) return { kind: 'rejected' }
+  try {
+    const response = await (options.fetchImpl ?? fetch)(
+      `http://127.0.0.1:${record.port}/api/desktop/lifecycle`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          ...fields,
+          lifecycle_protocol: DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+          action,
+          challenge,
+          proof: desktopGatewayLifecycleProof(record, challenge, action, fields),
+        }),
+        signal: AbortSignal.timeout(Math.max(1, options.timeoutMs ?? 1000)),
+      },
+    )
+    // The separate endpoint cannot accidentally ask an older Gateway to drain.
+    // Only absence selects legacy compatibility; authentication/ACK failures do not.
+    if (response.status === 404 || response.status === 405) return { kind: 'unsupported' }
+    if (response.status !== (action === 'status' ? 200 : 202)) return { kind: 'rejected' }
+    const payload: unknown = await response.json().catch(() => null)
+    if (!isRecord(payload)) return { kind: 'rejected' }
+    const {
+      proof,
+      challenge: replyChallenge,
+      action: replyAction,
+      lifecycle_protocol: protocol,
+      ...replyFields
+    } = payload
+    if (
+      typeof proof !== 'string'
+      || replyChallenge !== challenge
+      || replyAction !== `${action}_ack`
+      || protocol !== DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL
+      || !safeHexEqual(proof, desktopGatewayLifecycleProof(
+        record, challenge, `${action}_ack`, replyFields,
+      ))
+    ) return { kind: 'rejected' }
+    return { kind: 'reply', fields: replyFields }
+  } catch {
+    return { kind: 'unreachable' }
+  }
+}
+
+/** Read only; counts no task text and never closes task admission. */
+export async function readVerifiedDesktopGatewayActivity(
+  record: DesktopGatewayOwnershipRecord,
+  options: DesktopGatewayIdentityVerificationOptions = {},
+): Promise<DesktopGatewayActivityResult> {
+  const result = await requestDesktopGatewayLifecycle(record, 'status', {}, {
+    ...options,
+    timeoutMs: Math.min(1000, options.timeoutMs ?? 1000),
+  })
+  if (result.kind !== 'reply') return result
+  const activity = result.fields.activity
+  const keys = ['running', 'queued', 'waiting', 'reservations', 'auxiliary'] as const
+  if (
+    !isRecord(activity)
+    || Object.keys(result.fields).length !== 1
+    || Object.keys(activity).length !== keys.length
+    || keys.some(key => !Number.isSafeInteger(activity[key]) || Number(activity[key]) < 0)
+  ) return { kind: 'rejected' }
+  const counts = Object.fromEntries(
+    keys.map(key => [key, Number(activity[key])]),
+  ) as unknown as DesktopGatewayActivity
+  return {
+    kind: 'ok',
+    activeCount: keys.reduce((count, key) => count + counts[key], 0),
+    activity: counts,
+  }
+}
+
+/** An accepted reply proves that this exact instance installed the quit policy. */
+export async function requestVerifiedDesktopGatewayQuit(
+  record: DesktopGatewayOwnershipRecord,
+  options: DesktopGatewayQuitOptions,
+): Promise<DesktopGatewayQuitResult> {
+  if (!Number.isInteger(options.remainingMs) || options.remainingMs < 0
+    || options.remainingMs > 10_000) return { kind: 'rejected' }
+  const result = await requestDesktopGatewayLifecycle(record, 'shutdown', {
+    mode: 'quit',
+    remaining_ms: options.remainingMs,
+  }, { ...options, timeoutMs: Math.min(options.timeoutMs ?? 1000, options.remainingMs) })
+  if (result.kind !== 'reply') return result
+  if (
+    result.fields.accepted_mode !== 'quit'
+    || Object.keys(result.fields).length !== 3
+    || !Number.isInteger(result.fields.remaining_ms)
+    || Number(result.fields.remaining_ms) < 0
+    || Number(result.fields.remaining_ms) > options.remainingMs
+    || !Number.isInteger(result.fields.total_remaining_ms)
+    || Number(result.fields.total_remaining_ms) < Number(result.fields.remaining_ms)
+    || Number(result.fields.total_remaining_ms) > options.remainingMs + 5000
+  ) return { kind: 'rejected' }
+  return {
+    kind: 'quit_accepted',
+    remainingMs: Number(result.fields.remaining_ms),
+    totalRemainingMs: Number(result.fields.total_remaining_ms),
   }
 }
 

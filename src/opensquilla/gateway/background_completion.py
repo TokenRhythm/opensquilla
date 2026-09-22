@@ -153,6 +153,7 @@ class BackgroundCompletionManager:
         self._cancelling_groups: set[str] = set()
         self._watch_state_changed = asyncio.Event()
         self._closing = False
+        self._cancel_on_close = False
         self._idle_listener: Callable[[str], None] | None = None
         self._cancel_listener: Callable[[str, str], Awaitable[None]] | None = None
 
@@ -492,15 +493,63 @@ class BackgroundCompletionManager:
                 )
                 return
 
-    async def close(self, *, timeout: float | None = 30.0) -> None:
-        async with self._state_lock:
-            self._closing = True
-        await self.drain(timeout=timeout)
+    def shutdown_activity_count(self) -> int:
+        return sum(not task.done() for task in self._watch_tasks) + sum(
+            count for groups in self._group_admissions.values() for count in groups.values()
+        )
+
+    def begin_shutdown(self, *, cancel: bool = False) -> None:
+        """Fence completion admission before the quit acknowledgement is returned."""
+        self._closing = True
+        if cancel:
+            self._cancel_on_close = True
+            self._cancelled_groups.update(self._group_parents)
+            self._cancelled_groups.update(self._waiting_groups | self._wake_groups)
+            for task in tuple(self._watch_tasks):
+                if not task.done():
+                    task.cancel()
+        self._notify_watch_state_changed()
+
+    async def close(
+        self, *, timeout: float | None = 30.0, cancel: bool = False,
+        deadline: float | None = None,
+    ) -> bool:
+        now = asyncio.get_running_loop().time()
+        if deadline is None and timeout is not None:
+            deadline = now + timeout + (0.0 if cancel else 5.0)
+        self.begin_shutdown(cancel=cancel)
+        if not self._cancel_on_close:
+            drain_timeout = timeout
+            if deadline is not None:
+                remaining = max(0.0, deadline - now)
+                drain_timeout = remaining if timeout is None else min(timeout, remaining)
+            await self.drain(timeout=drain_timeout)
+        if not self._cancel_on_close:
+            cancel_deadline = asyncio.get_running_loop().time() + 5.0
+            deadline = cancel_deadline if deadline is None else min(deadline, cancel_deadline)
         tasks = await self._snapshot_watch_tasks()
         for task in tasks:
             task.cancel()
         if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+            remaining = None if deadline is None else max(
+                0.0, deadline - asyncio.get_running_loop().time()
+            )
+            _, pending = await asyncio.wait(tasks, timeout=remaining)
+            if pending:
+                log.warning("background_completion.close_timeout", remaining=len(pending))
+                return False
+        while self._group_admissions:
+            # Route lookups admitted before the fence still hold session storage.
+            changed = self._watch_state_changed
+            remaining = None if deadline is None else max(
+                0.0, deadline - asyncio.get_running_loop().time()
+            )
+            if remaining is not None and remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(changed.wait(), timeout=remaining)
+            except TimeoutError:
+                return False
         async with self._state_lock:
             released_parents = {
                 self._group_parents[group_id]
@@ -515,7 +564,6 @@ class BackgroundCompletionManager:
             self._delivery_targets.clear()
             self._parent_envelopes.clear()
             self._parent_run_mode_overrides.clear()
-            self._cancelled_groups.clear()
             self._group_parents.clear()
             self._watch_tasks.clear()
             self._watch_task_owners.clear()
@@ -527,6 +575,7 @@ class BackgroundCompletionManager:
             self._closing = True
         for parent_session_key in released_parents:
             self._notify_parent_idle(parent_session_key)
+        return True
 
     async def _snapshot_watch_tasks(self) -> list[asyncio.Task[None]]:
         async with self._state_lock:
@@ -753,7 +802,7 @@ class BackgroundCompletionManager:
         try:
             await self._wait_for_parent_task_to_release(task_runtime, parent_task_id)
             async with self._state_lock:
-                if group_id in self._cancelled_groups:
+                if self._cancel_on_close or group_id in self._cancelled_groups:
                     return
             send_with_envelope = getattr(task_runtime, "send_with_envelope", None)
             if parent_envelope is not None and callable(send_with_envelope):
@@ -891,7 +940,10 @@ class BackgroundCompletionManager:
 
         synthesis_status = _status_value(getattr(record, "status", None))
         async with self._state_lock:
-            if self.group_id(parent_session_key, parent_task_id) in self._cancelled_groups:
+            if (
+                self._cancel_on_close
+                or self.group_id(parent_session_key, parent_task_id) in self._cancelled_groups
+            ):
                 return
         if synthesis_status != AgentTaskStatus.SUCCEEDED.value:
             await self._emit_terminal_failure(
@@ -1008,6 +1060,8 @@ class BackgroundCompletionManager:
             return _DeliveryResult("not_applicable")
 
         async with self._state_lock:
+            if self._cancel_on_close:
+                return _DeliveryResult("not_applicable")
             if group_id in self._delivery_attempted:
                 return _DeliveryResult("sent")
             self._delivery_attempted.add(group_id)

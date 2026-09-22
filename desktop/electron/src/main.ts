@@ -24,6 +24,11 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import { DesktopQuitBudget, DesktopQuitConfirmation, quitGatewayWithinBudget } from './desktop-quit.js'
+import {
+  buildDesktopQuitDialogHtml,
+  parseDesktopQuitDialogResponse,
+} from './desktop-quit-dialog.js'
 import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
@@ -31,6 +36,8 @@ import {
   desktopGatewayOwnershipMatchesLaunch,
   desktopProfileFingerprint,
   loadDesktopGatewayOwnershipRecord,
+  readVerifiedDesktopGatewayActivity,
+  requestVerifiedDesktopGatewayQuit,
   requestVerifiedDesktopGatewayShutdown,
   verifyDesktopGatewayLaunchOwnership,
   waitForDesktopGatewayOwnershipRelease,
@@ -580,6 +587,12 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+let quitConfirmed = false
+let quitConfirmationPromise: Promise<void> | null = null
+let quitConfirmationWantsExit = false
+const desktopQuitConfirmation = new DesktopQuitConfirmation()
+let quitFromSignal = false
+let appExitStatusKey = 'tray.running'
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
@@ -868,7 +881,8 @@ const gatewayState: GatewayState = {
 }
 
 function desktopGatewayConnectionSuspendedForExit(): boolean {
-  return appExitPhase === 'draining' || appExitPhase === 'committed'
+  return appExitPhase === 'draining' || appExitPhase === 'terminating'
+    || appExitPhase === 'failed' || appExitPhase === 'committed'
 }
 
 function desktopGatewayConnectionSnapshot(): DesktopGatewayConnection {
@@ -3704,6 +3718,23 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.open': 'Open OpenSquilla',
     'tray.running': 'OpenSquilla is running in the background',
     'tray.quit': 'Quit OpenSquilla',
+    'quit.title': 'Quit OpenSquilla?',
+    'quit.active': 'There are unfinished tasks.',
+    'quit.unknown': 'OpenSquilla could not check whether tasks are still running.',
+    'quit.detail': 'Quitting will stop tasks and try to save the replies and execution records received so far.',
+    'quit.keepRunning': 'Keep Running',
+    'quit.confirm': 'Stop Tasks and Quit',
+    'quit.exiting': 'Quitting OpenSquilla…',
+    'quit.saving': 'Saving configuration before quitting…',
+    'quit.migrating': 'Finishing data migration before quitting…',
+    'quit.cleaning': 'Finishing data cleanup before quitting…',
+    'quit.updating': 'Waiting for the update to finish…',
+    'quit.legacy': 'Waiting for an older Gateway to finish its tasks…',
+    'quit.terminating': 'Terminating unresponsive processes…',
+    'quit.failed': 'Quit failed: the local Gateway has not stopped safely',
+    'quit.failedDetail': 'OpenSquilla has stopped accepting desktop operations. Try Quit again to retry stopping its local processes.',
+    'quit.manualRecovery': 'Quit failed: process cleanup needs manual recovery',
+    'quit.manualRecoveryDetail': 'The Gateway has exited, but OpenSquilla could not confirm that all task processes stopped. Retrying cannot safely identify those processes. Save your work in other apps, then sign out of Windows or restart Windows before reopening OpenSquilla.',
     'tray.backgroundTitle': 'OpenSquilla is still running',
     'tray.backgroundDetail': 'Tasks, schedules, and connected channels continue in the background. Open or quit OpenSquilla from the system tray.',
     'closePrompt.title': 'Close OpenSquilla?',
@@ -3841,6 +3872,23 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'tray.open': '打开 OpenSquilla',
     'tray.running': 'OpenSquilla 正在后台运行',
     'tray.quit': '退出 OpenSquilla',
+    'quit.title': '退出 OpenSquilla？',
+    'quit.active': '当前还有未完成的任务。',
+    'quit.unknown': '暂时无法确认是否还有任务正在运行。',
+    'quit.detail': '退出将停止任务，并尝试保存已收到的回复和执行记录。',
+    'quit.keepRunning': '继续运行',
+    'quit.confirm': '停止任务并退出',
+    'quit.exiting': '正在退出 OpenSquilla…',
+    'quit.saving': '正在保存配置，完成后退出…',
+    'quit.migrating': '正在迁移数据，完成后退出…',
+    'quit.cleaning': '正在清理数据，完成后退出…',
+    'quit.updating': '正在等待更新完成…',
+    'quit.legacy': '正在等待旧版 Gateway 完成任务…',
+    'quit.terminating': '正在终止未响应的进程…',
+    'quit.failed': '退出失败：本地 Gateway 尚未安全停止',
+    'quit.failedDetail': 'OpenSquilla 已停止接收桌面操作。请再次点击退出，重试停止它的本地进程。',
+    'quit.manualRecovery': '退出失败：需要手动完成进程清理',
+    'quit.manualRecoveryDetail': 'Gateway 已退出，但无法确认所有任务进程均已停止。再次退出也无法安全识别这些进程。请先保存其他应用中的工作，然后注销 Windows 或重启 Windows，再打开 OpenSquilla。',
     'tray.backgroundTitle': 'OpenSquilla 仍在运行',
     'tray.backgroundDetail': '任务、定时任务和已连接渠道会继续在后台运行。可从系统托盘打开或退出 OpenSquilla。',
     'closePrompt.title': '关闭 OpenSquilla？',
@@ -4980,13 +5028,24 @@ function focusMainWindow(): boolean {
 }
 
 function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
-  if (appExitPhase === next) return
   const connectionWasSuspended = desktopGatewayConnectionSuspendedForExit()
   desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
   appExitPhase = next
   if (connectionWasSuspended !== desktopGatewayConnectionSuspendedForExit()) {
     publishGatewayConnection()
   }
+  appExitStatusKey = next === 'running' ? 'tray.running'
+    : next === 'failed' ? 'quit.failed'
+      : next === 'terminating' ? 'quit.terminating'
+        : updateApplying ? 'quit.updating'
+          : next === 'deferred' ? (desktopCleanupBusy ? 'quit.cleaning'
+            : recoveryOperationBusy ? 'quit.migrating' : 'quit.saving')
+          : 'quit.exiting'
+  rebuildWindowsTrayMenu()
+}
+
+function setQuitStatus(key: string): void {
+  appExitStatusKey = key
   rebuildWindowsTrayMenu()
 }
 
@@ -4998,6 +5057,7 @@ function destroyWindowsTray(): void {
 
 function rebuildWindowsTrayMenu(): void {
   if (!windowsTray) return
+  windowsTray.setToolTip(desktopT(appExitStatusKey))
   windowsTray.setContextMenu(Menu.buildFromTemplate([
     {
       label: desktopT('tray.open'),
@@ -5005,12 +5065,13 @@ function rebuildWindowsTrayMenu(): void {
       click: () => revealDesktopApp(),
     },
     {
-      label: desktopT('tray.running'),
+      label: desktopT(appExitStatusKey),
       enabled: false,
     },
     { type: 'separator' },
     {
       label: desktopT('tray.quit'),
+      enabled: appExitPhase === 'running' || appExitPhase === 'failed',
       click: () => app.quit(),
     },
   ]))
@@ -5187,6 +5248,8 @@ function registerDesktopDeepLinkProtocolClient(): void {
 
 async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
   if (mainWindowClosePrompt) return await mainWindowClosePrompt
+  const canFinishClose = (): boolean => !window.isDestroyed() && appExitPhase === 'running'
+    && !quitConfirmationWantsExit && !quitConfirmed && !systemSessionEnding && !updateApplying
   mainWindowClosePrompt = (async () => {
     const result = await dialog.showMessageBox(window, {
       type: 'question',
@@ -5204,7 +5267,7 @@ async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
       checkboxChecked: false,
       noLink: true,
     })
-    if (window.isDestroyed() || appExitPhase !== 'running') return
+    if (!canFinishClose()) return
     if (result.response === 0) {
       if (result.checkboxChecked) {
         await saveDesktopPreferences({
@@ -5215,7 +5278,7 @@ async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
           })
         })
       }
-      hideMainWindow(window)
+      if (canFinishClose()) hideMainWindow(window)
       return
     }
     if (result.response === 1) {
@@ -5228,7 +5291,7 @@ async function promptForMainWindowClose(window: BrowserWindow): Promise<void> {
           })
         })
       }
-      app.quit()
+      if (canFinishClose()) app.quit()
     }
   })().finally(() => {
     mainWindowClosePrompt = null
@@ -5247,19 +5310,27 @@ function handleMainWindowClose(window: BrowserWindow, event: Electron.Event): vo
   })
   if (action === 'allow') return
   event.preventDefault()
+  // A second native close must not hide the parent while we check activity or
+  // wait for the interruption dialog, even though the exit is not committed.
+  if (quitConfirmationPromise) return
   if (action === 'focus-onboarding') {
     focusOnboardingWindow()
-    return
-  }
-  if (action === 'hide') {
-    hideMainWindow(window)
     return
   }
   if (action === 'quit') {
     app.quit()
     return
   }
-  void promptForMainWindowClose(window)
+  const closeIdleWindow = (): void | Promise<void> => {
+    if (window.isDestroyed() || systemSessionEnding || updateApplying || quitConfirmed) return
+    if (action === 'hide') hideMainWindow(window)
+    else return promptForMainWindowClose(window)
+  }
+  // Keep the parent visible until its owned Gateway reports idle. Active (or
+  // unknown) work uses the same confirmation as a tray/menu Quit, irrespective
+  // of the idle-window background preference.
+  if (appExitPhase === 'running' && holdQuitForTaskConfirmation(event, closeIdleWindow)) return
+  closeIdleWindow()
 }
 
 function installEditingContextMenu(window: BrowserWindow): void {
@@ -15086,11 +15157,241 @@ ipcMain.handle('desktop:onboarding:cancel', (event) => {
 let quitGatewayDrainPromise: Promise<boolean> | null = null
 let quitDeferredForDesktopWriters = false
 let quitWriterAdmission: symbol | null = null
+const quitUnconfirmedProcessTrees = new Set<ChildProcessWithoutNullStreams>()
 
-async function drainOwnedGatewayForQuit(
+function ownedGatewayRecord(child: ChildProcessWithoutNullStreams): DesktopGatewayOwnershipRecord | null {
+  const context = gatewayProcessOwnershipContexts.get(child)
+  if (!context) return null
+  const loaded = loadDesktopGatewayOwnershipRecord(context.ownershipDir)
+  return loaded.status === 'valid' && desktopGatewayOwnershipMatchesLaunch(loaded.record, {
+    instanceNonce: context.nonce,
+    profileFingerprint: context.profileFingerprint,
+    port: context.port,
+  }) ? loaded.record : null
+}
+
+async function showDesktopQuitConfirmation(options: {
+  parent?: BrowserWindow
+  title: string
+  message: string
+  detail: string
+  keepRunning: string
+  confirm: string
+}): Promise<boolean> {
+  const parent = options.parent && !options.parent.isDestroyed() ? options.parent : undefined
+  const confirmationWindow = new BrowserWindow({
+    width: 500,
+    height: 300,
+    useContentSize: true,
+    resizable: false,
+    minimizable: false,
+    maximizable: false,
+    show: false,
+    frame: false,
+    transparent: true,
+    hasShadow: true,
+    skipTaskbar: true,
+    alwaysOnTop: true,
+    parent,
+    modal: Boolean(parent),
+    backgroundColor: '#00000000',
+    webPreferences: {
+      preload: join(__dirname, 'preload.cjs'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  })
+  let resolve!: (accepted: boolean) => void
+  const resultPromise = new Promise<boolean>(accept => { resolve = accept })
+  let settled = false
+  const settle = (accepted: boolean): void => {
+    if (settled) return
+    settled = true
+    if (!confirmationWindow.isDestroyed()) confirmationWindow.close()
+    resolve(accepted)
+  }
+  const responseListener = (event: Electron.IpcMainEvent, value: unknown): void => {
+    if (event.sender.id !== confirmationWindow.webContents.id) return
+    const response = parseDesktopQuitDialogResponse(value)
+    if (response) settle(response === 'confirm')
+  }
+  ipcMain.on('desktop:quit-dialog-response', responseListener)
+  confirmationWindow.on('closed', () => {
+    ipcMain.removeListener('desktop:quit-dialog-response', responseListener)
+    settle(false)
+  })
+  confirmationWindow.webContents.on('will-navigate', event => event.preventDefault())
+  confirmationWindow.once('ready-to-show', () => {
+    if (!confirmationWindow.isDestroyed()) {
+      confirmationWindow.center()
+      confirmationWindow.show()
+      confirmationWindow.focus()
+    }
+  })
+  try {
+    const html = buildDesktopQuitDialogHtml({
+      title: options.title,
+      message: options.message,
+      detail: options.detail,
+      keepRunning: options.keepRunning,
+      confirm: options.confirm,
+    })
+    await confirmationWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(html)}`)
+  } catch (error) {
+    desktopLog('quit_confirmation_window_failed', { error: String(error) })
+    settle(false)
+  }
+  return await resultPromise
+}
+
+function holdQuitForTaskConfirmation(
+  event: Electron.Event,
+  onIdleClose?: () => void | Promise<void>,
+): boolean {
+  if (quitConfirmed || quitFromSignal) return false
+  if (quitConfirmationPromise) {
+    event.preventDefault()
+    // A tray/menu Quit during an idle-window check must still exit, rather
+    // than inherit that window's background-close preference.
+    if (!onIdleClose) quitConfirmationWantsExit = true
+    return true
+  }
+  const children = liveLifecycleOwnedGatewayProcesses()
+  if (children.length === 0) return false
+  event.preventDefault()
+  quitConfirmationWantsExit = !onIdleClose
+  let idle = false
+  let retryQuit = false
+  quitConfirmationPromise = (async () => {
+    const accepted = await desktopQuitConfirmation.request({
+      check: async () => {
+        const activity = await Promise.all(children.map(async child => {
+          if (hasGatewayProcessExited(child)) return { kind: 'ok' as const, activeCount: 0 }
+          const record = ownedGatewayRecord(child)
+          return record
+            ? await readVerifiedDesktopGatewayActivity(record, { timeoutMs: 1_000 })
+            : { kind: 'unreachable' as const }
+        }))
+        if (activity.some(result => result.kind === 'ok' && result.activeCount > 0)) return 'active'
+        idle = activity.every(result => result.kind === 'ok')
+        return idle ? 'idle' : 'unknown'
+      },
+      confirm: async state => {
+        if (systemSessionEnding || updateApplying) return false
+        const window = currentMainWindow() ?? currentOnboardingWindow()
+        if (window) {
+          if (window.isMinimized()) window.restore()
+          window.show()
+        }
+        return await showDesktopQuitConfirmation({
+          parent: window ?? undefined,
+          title: desktopT('quit.title'),
+          message: desktopT(state === 'active' ? 'quit.active' : 'quit.unknown'),
+          detail: desktopT('quit.detail'),
+          keepRunning: desktopT('quit.keepRunning'),
+          confirm: desktopT('quit.confirm'),
+        })
+      },
+    })
+    if (!accepted) {
+      desktopLog('quit_cancelled_by_user')
+      return
+    }
+    if (systemSessionEnding || updateApplying) return
+    if (idle && onIdleClose && !quitConfirmationWantsExit) {
+      await onIdleClose()
+      // A Quit queued while the idle preference dialog/save was pending must
+      // recheck activity: new work may have started since the initial check.
+      retryQuit = quitConfirmationWantsExit
+      return
+    }
+    quitConfirmed = true
+    desktopLog('quit_confirmed')
+    app.quit()
+  })().catch(error => {
+    desktopLog('quit_confirmation_failed', { error: String(error) })
+  }).finally(() => {
+    quitConfirmationPromise = null
+    quitConfirmationWantsExit = false
+    if (retryQuit) app.quit()
+  })
+  return true
+}
+
+async function terminateOwnedGatewayForQuit(
+  child: ChildProcessWithoutNullStreams,
+  budget: DesktopQuitBudget,
+): Promise<boolean> {
+  if (hasGatewayProcessExited(child)) return true
+  if (budget.remainingTotalMs <= 0) return false
+  gatewayHardTerminatedProcesses.add(child)
+  let treeStopped = true
+  if (process.platform === 'win32' && child.pid) {
+    quitUnconfirmedProcessTrees.add(child)
+    let termination = gatewayProcessTreeTerminations.get(child)
+    if (!termination) {
+      termination = terminateWindowsProcessTree({
+        pid: child.pid,
+        timeoutMs: budget.remainingTotalMs,
+        // Keep the root available for a retry if the tree helper fails. Killing
+        // only that root would discard our ability to identify its descendants.
+        fallback: () => {},
+        onFailure: failure => desktopLog('gateway_process_tree_termination_failed', { ...failure }),
+      })
+      gatewayProcessTreeTerminations.set(child, termination)
+      void termination.finally(() => {
+        if (gatewayProcessTreeTerminations.get(child) === termination) {
+          gatewayProcessTreeTerminations.delete(child)
+        }
+      })
+    }
+    treeStopped = await termination
+    if (treeStopped) quitUnconfirmedProcessTrees.delete(child)
+    else quitUnconfirmedProcessTrees.add(child)
+  } else {
+    terminateGatewayProcess(child, 'SIGKILL')
+  }
+  const exited = await waitForGatewayProcessExit(child, budget.remainingTotalMs)
+  desktopLog('quit_gateway_termination', { pid: child.pid, exited, treeStopped })
+  return exited && treeStopped
+}
+
+async function quitOwnedGateway(
+  child: ChildProcessWithoutNullStreams,
+  budget: DesktopQuitBudget,
+): Promise<boolean> {
+  const result = await quitGatewayWithinBudget({
+    budget,
+    hasExited: () => hasGatewayProcessExited(child),
+    requestQuit: async remainingMs => {
+      const record = ownedGatewayRecord(child)
+      const result = record
+        ? await requestVerifiedDesktopGatewayQuit(record, { remainingMs })
+        : { kind: 'unreachable' as const }
+      desktopLog('quit_gateway_shutdown_requested', { pid: child.pid, ...result })
+      return result
+    },
+    legacyDrain: () => drainOwnedGatewayForLegacyQuit(child, '', true, true),
+    waitForExit: timeoutMs => waitForGatewayProcessExit(child, timeoutMs),
+    terminate: () => terminateOwnedGatewayForQuit(child, budget),
+    onLegacyDrain: () => setQuitStatus('quit.legacy'),
+    onTerminating: () => setAppExitPhase('terminating', 'quit cleanup deadline reached'),
+  })
+  desktopLog('quit_gateway_exit', {
+    pid: child.pid,
+    exited: result,
+    elapsedMs: Math.round(budget.elapsedMs),
+    hardTerminated: gatewayHardTerminatedProcesses.has(child),
+  })
+  return result
+}
+
+async function drainOwnedGatewayForLegacyQuit(
   child: ChildProcessWithoutNullStreams,
   url: string,
   requestShutdown: boolean,
+  requireAccepted = false,
 ): Promise<boolean> {
   if (hasGatewayProcessExited(child)) {
     desktopLog('quit_gateway_exit', {
@@ -15100,6 +15401,7 @@ async function drainOwnedGatewayForQuit(
     return true
   }
   const accepted = requestShutdown ? await requestOwnedGatewayShutdown(child, url) : null
+  if (requireAccepted && accepted !== true) return false
   desktopLog('quit_gateway_shutdown_requested', { accepted, alreadyStopping: !requestShutdown })
   let hardTerminated = gatewayHardTerminatedProcesses.has(child)
   let exited = false
@@ -15147,8 +15449,30 @@ async function drainOwnedGatewayForQuit(
   return exited || hasGatewayProcessExited(child)
 }
 
+function showDesktopQuitFailure(): void {
+  // A live owned root can be retried. Once it exits, its PID cannot safely
+  // identify the unconfirmed descendants or be reused for another tree kill.
+  const needsManualRecovery = [...quitUnconfirmedProcessTrees].some(hasGatewayProcessExited)
+  const titleKey = needsManualRecovery ? 'quit.manualRecovery' : 'quit.failed'
+  isQuitting = true
+  setAppExitPhase('failed', needsManualRecovery
+    ? 'Gateway exited without confirmed process-tree cleanup'
+    : 'Gateway quit did not complete safely')
+  if (needsManualRecovery) setQuitStatus(titleKey)
+  gatewayState.status = 'error'
+  gatewayState.error = desktopT(titleKey)
+  publishGatewayConnection()
+  desktopLog('quit_gateway_still_running', {
+    pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
+    needsManualRecovery,
+  })
+  dialog.showErrorBox(
+    desktopT(titleKey),
+    desktopT(needsManualRecovery ? 'quit.manualRecoveryDetail' : 'quit.failedDetail'),
+  )
+}
+
 app.on('before-quit', (event) => {
-  desktopUpdateCheckScheduler.stop()
   // Windows session shutdown cannot wait on our normal asynchronous quit
   // drain. Let the OS-owned close proceed and synchronously signal the current
   // child so the window can never be converted back into background mode.
@@ -15187,9 +15511,10 @@ app.on('before-quit', (event) => {
   }
   if (quitGatewayDrainPromise) {
     event.preventDefault()
-    setAppExitPhase('draining', 'Gateway quit drain already in progress')
     return
   }
+  if (holdQuitForTaskConfirmation(event)) return
+  desktopUpdateCheckScheduler.stop()
   if (desktopWriters.activeCount > 0 || quitDeferredForDesktopWriters) {
     event.preventDefault()
     setAppExitPhase('deferred', 'waiting for desktop writers')
@@ -15213,6 +15538,7 @@ app.on('before-quit', (event) => {
     gatewayDrainInFlight: quitGatewayDrainPromise !== null,
   })
   isQuitting = true
+  cancelGatewayUnexpectedExitRestart('Desktop quit confirmed')
   // Defer the normal quit on every platform until every lifecycle-owned child
   // has exited. This includes a child already draining for restart, recovery,
   // cleanup, or update after stopGateway cleared the current process slot.
@@ -15221,27 +15547,35 @@ app.on('before-quit', (event) => {
     ? gatewayProcess
     : null
   const children = liveLifecycleOwnedGatewayProcesses()
-  if (children.length > 0) {
+  if (children.length > 0 || !quitFromSignal || quitUnconfirmedProcessTrees.size > 0) {
     event.preventDefault()
     setAppExitPhase('draining', 'stopping lifecycle-owned Gateway')
-    // Fence new preview work and join creates already in flight before making
-    // the Gateway unavailable. Native surface teardown stays best-effort: its
-    // candidate cleanup can depend on the Gateway and must not block shutdown.
-    const previewCleanup = artifactPreviewLeaseBroker.revokeAll()
-    void nativeWorkbenchSurfaces.destroyAll()
-    const drain = previewCleanup
-      .then(() => Promise.all(children.map((child) => drainOwnedGatewayForQuit(
+    const budget = new DesktopQuitBudget()
+    const previewCleanup = artifactPreviewLeaseBroker.shutdown({ signal: budget.signal })
+    const surfaceCleanup = nativeWorkbenchSurfaces.destroyAll()
+    // Cancellation starts alongside local cleanup. No preview or network wait
+    // receives a fresh timeout before the Gateway learns about the user's quit.
+    const childCleanup = Promise.all(children.map(child => quitFromSignal
+      ? drainOwnedGatewayForLegacyQuit(
         child,
         currentChild === child ? gatewayState.url || '' : '',
         currentChild === child,
-      ))))
-      .then((results) => results.every(Boolean))
+      )
+      : quitOwnedGateway(child, budget)))
+    const drain = Promise.all([
+      childCleanup,
+      budget.cleanup(Promise.allSettled([previewCleanup, surfaceCleanup])),
+    ])
+      .then(([results]) => results.every(Boolean)
+        && liveLifecycleOwnedGatewayProcesses().length === 0
+        && quitUnconfirmedProcessTrees.size === 0)
       .catch((error) => {
         desktopLog('quit_gateway_drain_failed', {
           error: error instanceof Error ? error.message : String(error),
         })
         return false
       })
+      .finally(() => budget.dispose())
     quitGatewayDrainPromise = drain
     void drain.then((exited) => {
       if (exited) {
@@ -15252,23 +15586,10 @@ app.on('before-quit', (event) => {
         app.exit(0)
         return
       }
-      // Fail closed: keep Electron alive while a child we own is still live.
-      // A later Quit retries the same exact handles; it never guesses via a PID
-      // file, occupied port, or health response.
+      // Fail closed while owned processes remain live or their tree cleanup
+      // cannot be confirmed. Never guess ownership from a PID, port, or health.
       quitGatewayDrainPromise = null
-      isQuitting = false
-      setAppExitPhase('running', 'Gateway quit drain failed safely')
-      if (quitWriterAdmission) {
-        desktopWriters.reopen(quitWriterAdmission)
-        quitWriterAdmission = null
-      }
-      desktopLog('quit_gateway_still_running', {
-        pids: liveLifecycleOwnedGatewayProcesses().map((child) => child.pid),
-      })
-      dialog.showErrorBox(
-        'OpenSquilla could not quit safely',
-        'The local Gateway is still shutting down. OpenSquilla stayed open to avoid leaving a background process; try Quit again.',
-      )
+      showDesktopQuitFailure()
     })
     return
   }
@@ -15283,6 +15604,7 @@ app.on('before-quit', (event) => {
 
 function shutdownFromSignal(): void {
   isQuitting = true
+  quitFromSignal = true
   // before-quit owns the child handle until its single-flight drain finishes.
   // Clearing it here would recreate the orphaned-gateway race on SIGINT/SIGTERM.
   app.quit()

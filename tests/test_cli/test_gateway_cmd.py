@@ -1914,6 +1914,48 @@ def test_gateway_shutdown_watchdog_can_be_disarmed_or_force_exit(monkeypatch) ->
     assert exits == [1]
 
 
+def test_desktop_incomplete_shutdown_keeps_root_for_parent_force_stop(tmp_path, monkeypatch):
+    from opensquilla.gateway.shutdown import ShutdownRequest
+
+    config = tmp_path / "gw.toml"
+    config.write_text('host = "127.0.0.1"\nport = 18791\n', encoding="utf-8")
+    reached_parent_window = []
+
+    class _IncompleteDesktopServer(_ShutdownProbeServer):
+        async def close(self, reason):
+            await super().close(reason)
+            current = asyncio.current_task()
+
+            def parent_stops_process():
+                reached_parent_window.append(True)
+                current.cancel()
+
+            asyncio.get_running_loop().call_later(0.03, parent_stops_process)
+            return SimpleNamespace(clean=False)
+
+    server = _IncompleteDesktopServer(fire="desktop_quit", via="http")
+    server.app.state.shutdown_request = ShutdownRequest("quit", gateway_cmd.time.monotonic() + 1)
+    exits = []
+    timeouts = []
+    original_watchdog = gateway_cmd._GatewayShutdownWatchdog
+
+    def watchdog(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return original_watchdog(**kwargs)
+
+    _install_fake_start(server, {}, monkeypatch)
+    monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
+    monkeypatch.setattr(gateway_cmd, "_force_process_exit", exits.append)
+    monkeypatch.setattr(gateway_cmd, "_GatewayShutdownWatchdog", watchdog)
+    with pytest.raises(asyncio.CancelledError):
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
+    assert reached_parent_window == [True]
+    assert exits == []
+    assert 5 < timeouts[0] <= 6
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle stop: graceful HTTP shutdown (Windows) + POSIX SIGTERM fallback
 # ---------------------------------------------------------------------------
