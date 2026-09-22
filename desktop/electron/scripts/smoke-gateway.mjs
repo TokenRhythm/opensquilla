@@ -326,12 +326,14 @@ async function verifyGatewaySafeExecution(gatewayBinary, env, tempHome) {
     console.log('Windows Safe smoke provisioning is explicitly enabled for this disposable runner.')
     probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX = '1'
     // The elevated helper deliberately accepts only profile-scoped marker
-    // paths. Keep the rest of the smoke isolated in tempHome, but provision
-    // the disposable runner's profile-scoped sandbox once for this probe.
+    // paths. Exercise the Safe child in that same profile-scoped workspace so
+    // its offline identity receives the ACL traversal grant that production
+    // workspaces use. This branch is limited to the disposable CI provision
+    // gate above.
     const profileHome = process.env.USERPROFILE || process.env.HOME
     if (!profileHome) throw new Error('Windows Safe smoke requires a user profile home.')
     probeEnv.OPENSQUILLA_STATE_DIR = join(profileHome, '.opensquilla')
-    probeEnv.OPENSQUILLA_SMOKE_WORKSPACE_ROOT = tempHome
+    probeEnv.OPENSQUILLA_SMOKE_WORKSPACE_ROOT = join(profileHome, '.opensquilla')
   }
   const backend = { darwin: 'seatbelt', win32: 'windows_default', linux: 'bubblewrap' }[process.platform]
   assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
