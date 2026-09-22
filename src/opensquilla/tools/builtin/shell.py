@@ -8776,7 +8776,7 @@ async def process(
         return json.dumps(payload, ensure_ascii=False)
 
     if action == "log":
-        previously_consumed = session.completion_consumed
+        consumed_before_log = session.completion_consumed
         if _session_result_ready(session):
             session.completion_consumed = True
         delivered = False
@@ -8819,7 +8819,7 @@ async def process(
             return log_result
         finally:
             if not delivered:
-                session.completion_consumed = previously_consumed
+                session.completion_consumed = consumed_before_log
                 if session.done and not session.completion_consumed:
                     # A cancelled disk read returned no result to the model.
                     await _emit_bg_session_completion(session)
