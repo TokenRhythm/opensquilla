@@ -34,8 +34,8 @@ import tomllib
 import pytest
 
 import opensquilla.gateway.rpc_onboarding  # noqa: F401  ensures registration
-from opensquilla.gateway.auth import Principal
 from opensquilla.config_version import LATEST_CONFIG_VERSION
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 
 
