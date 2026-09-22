@@ -11,6 +11,7 @@ import contextlib
 import json
 import os
 import socket
+import stat
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -63,12 +64,32 @@ async def verify_safe_execution() -> dict[str, object]:
             detail = setup.detail
             if sys.platform == "win32":
                 support = probe_windows_default_support()
+                marker = default_setup_marker_path()
+                roots = (
+                    marker.parent,
+                    marker.parent.parent / "sandbox-secrets",
+                    marker.parent.parent / "sandbox-bin",
+                )
+
+                def describe_storage_root(root: Path) -> str:
+                    if not root.exists():
+                        return f"{root}:missing"
+                    return (
+                        f"{root}:dir={root.is_dir()}:write={os.access(root, os.W_OK)}:"
+                        f"mode={stat.S_IMODE(root.stat().st_mode)}"
+                    )
+
+                storage_roots = ",".join(
+                    describe_storage_root(root)
+                    for root in roots
+                )
                 detail = (
-                    f"{detail}; marker={default_setup_marker_path()}; "
+                    f"{detail}; marker={marker}; "
                     f"setup_ready={support.setup_ready}; "
                     f"identity_ready={support.identity_ready}; "
                     f"storage_ready={support.storage_ready}; "
-                    f"network_boundary={support.proxy_allowlist_enforced}"
+                    f"network_boundary={support.proxy_allowlist_enforced}; "
+                    f"storage_roots={storage_roots}"
                 )
             raise RuntimeError(f"Safe initialization failed: {detail}")
         backend = get_runtime().backend
