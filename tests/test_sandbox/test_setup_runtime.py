@@ -150,6 +150,7 @@ async def test_ready_setup_is_idempotent_after_a_client_loses_the_response(monke
 async def test_windows_ready_setup_revalidates_after_passive_startup(monkeypatch) -> None:
     from opensquilla.sandbox import integration, setup_runtime
 
+    monkeypatch.setattr(setup_runtime.sys, "platform", "win32")
     config = SimpleNamespace()
     setup_calls = 0
     promotions = []
