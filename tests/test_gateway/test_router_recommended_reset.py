@@ -6,6 +6,7 @@ import tomllib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import tomli_w
 
 from opensquilla.application.provider_configuration import ModelRouting
 from opensquilla.contracts.generated.v4.gateway_contract_registry import GATEWAY_METHOD_CONTRACTS
@@ -15,6 +16,7 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_models import _handle_models_routing_reset_recommended
 from opensquilla.gateway.scopes import ADMIN_SCOPE, WRITE_SCOPE
+from opensquilla.onboarding.config_store import load_config
 from opensquilla.onboarding.mutations import upsert_router
 from opensquilla.onboarding.router_policy import (
     PrimaryProviderChangedError,
@@ -22,6 +24,7 @@ from opensquilla.onboarding.router_policy import (
     validate_router_candidate,
     validate_router_reactivation,
 )
+from opensquilla.provider.preset_registry import get_preset
 
 
 def legacy_config(**kwargs) -> GatewayConfig:
@@ -32,6 +35,7 @@ def legacy_config(**kwargs) -> GatewayConfig:
             "preset_binding": "custom",
             "default_tier": "c2",
             "rollout_phase": "prompt_only",
+            "tiers": get_preset("tokenrhythm").tier_defaults(),
         },
         llm_ensemble={
             "enabled": True,
@@ -84,6 +88,117 @@ def test_reset_expected_primary_fails_without_mutating_source():
             config, "openrouter", activate_router=True
         )
     assert config.model_dump() == source
+
+
+@pytest.mark.parametrize("provider,primary", [
+    ("tokenrhythm", "openrouter"), ("openrouter", "tokenrhythm"),
+])
+async def test_reset_cross_provider_ladder_preserves_provider_after_reload(
+    provider, primary, tmp_path,
+):
+    path = tmp_path / "config.toml"
+    path.write_text(tomli_w.dumps({
+        "llm": {"provider": primary, "model": "primary-model"},
+        "squilla_router": {
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "default_tier": "c2",
+            "tiers": {
+                f"c{index}": {"provider": provider, "model": f"custom-model-{index}"}
+                for index in range(4)
+            },
+        },
+    }), encoding="utf-8")
+    config = load_config(path)
+    before_llm = config.llm.model_dump()
+    await _handle_models_routing_reset_recommended(
+        {"providerId": provider, "activateRouter": False},
+        RpcContext(conn_id="test", config=config),
+    )
+    restored = GatewayConfig(**tomllib.loads(path.read_text(encoding="utf-8")))
+    assert restored.llm.model_dump() == before_llm
+    assert restored.squilla_router.tiers == get_preset(provider).tier_defaults()
+    assert restored.squilla_router.tier_profile is None
+    assert restored.squilla_router.enabled is True
+    assert restored.squilla_router.cross_provider_tiers is True
+    assert restored.squilla_router.default_tier == "c2"
+
+
+async def test_reset_cannot_replace_tokenrhythm_ladder_with_primary_openrouter(tmp_path):
+    path = tmp_path / "config.toml"
+    config = GatewayConfig(
+        config_path=str(path),
+        llm={"provider": "openrouter"},
+        squilla_router={
+            "preset_binding": "custom",
+            "cross_provider_tiers": True,
+            "tiers": get_preset("tokenrhythm").tier_defaults(),
+        },
+    )
+    before = config.model_dump()
+    result = await get_dispatcher().dispatch(
+        "stale-target", "models.routing.resetRecommended",
+        {"providerId": "openrouter", "activateRouter": False},
+        RpcContext(conn_id="test", config=config),
+    )
+    assert result.error.code == "CONFLICT"
+    assert result.error.details == {"reason": "router_provider_changed"}
+    assert not path.exists()
+    assert config.model_dump() == before
+
+
+async def test_reset_rejects_new_foreign_routes_without_cross_provider_permission(tmp_path):
+    path = tmp_path / "config.toml"
+    config = GatewayConfig(
+        config_path=str(path),
+        llm={"provider": "openrouter"},
+        squilla_router={
+            "enabled": True,
+            "preset_binding": "custom",
+            "cross_provider_tiers": False,
+            "tiers": {"c3": {
+                "provider": "tokenrhythm", "model": "custom-c3", "ensemble_enabled": True,
+            }},
+        },
+        llm_ensemble={"enabled": False, "selection_mode": "static_openrouter_b5"},
+    )
+    validate_router_candidate(config)
+    before = config.model_dump()
+    result = await get_dispatcher().dispatch(
+        "foreign-draft", "models.routing.resetRecommended",
+        {"providerId": "tokenrhythm", "activateRouter": False},
+        RpcContext(conn_id="test", config=config),
+    )
+    assert result.error.code == "ROUTER_PROVIDER_CONFLICT"
+    assert not path.exists()
+    assert config.model_dump() == before
+
+
+@pytest.mark.parametrize("primary", ["openrouter", "groq"])
+def test_synthesized_reset_uses_only_its_primary_provider_model(primary):
+    config = GatewayConfig(
+        llm={"provider": primary, "model": "configured-primary-model"},
+        squilla_router={
+            "preset_binding": "custom", "cross_provider_tiers": True,
+            "tiers": {f"c{index}": {
+                "provider": "groq", "model": "configured-groq-model",
+            } for index in range(4)},
+        },
+        llm_profiles={"groq": {"model": "configured-groq-model"}},
+    )
+    before = config.model_dump()
+    policy = GatewayModelRoutingPolicyPort()
+    if primary == "groq":
+        candidate = policy.prepare_recommended(config, "groq").config
+        assert all(
+            tier["provider"] == "groq" and tier["model"] == "configured-primary-model"
+            for tier in candidate.squilla_router.tiers.values()
+        )
+    else:
+        with pytest.raises(PrimaryProviderChangedError):
+            policy.prepare_recommended(config, "groq")
+    assert config.model_dump() == before
 
 
 def test_ensemble_to_router_checks_newly_executable_drafts():

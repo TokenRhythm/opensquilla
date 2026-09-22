@@ -1216,7 +1216,7 @@
       "summaryRouter": "Modellrouting",
       "summaryOn": "Ein",
       "summaryOff": "Aus",
-      "bindingFollowPrimary": "Empfohlen · folgt Hauptanbieter",
+      "bindingFollowPrimary": "Empfohlen · folgt Anbietervorgabe",
       "bindingCustom": "Eigene Stufen",
       "bindingLegacy": "Bestehende Stufen · Bindung unbestimmt",
       "resetRecommended": "Empfohlene Stufen von {provider} verwenden",

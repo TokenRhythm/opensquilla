@@ -1298,7 +1298,7 @@
       "summaryRouter": "智能模型路由",
       "summaryOn": "已开启",
       "summaryOff": "已关闭",
-      "bindingFollowPrimary": "推荐分层 · 随主用更新",
+      "bindingFollowPrimary": "推荐分层 · 随服务商预设更新",
       "bindingCustom": "自定义分层",
       "bindingLegacy": "原有分层 · 未指定跟随",
       "resetRecommended": "使用 {provider} 推荐分层",

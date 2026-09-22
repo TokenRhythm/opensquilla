@@ -2642,7 +2642,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
-  it('re-enables an inline provider preset without leaking materialized OpenRouter tiers', async () => {
+  it('re-enables an inline provider preset when the saved router has no tiers', async () => {
     mockProviderState(
       {
         ...configuredProviderStatus('tokenrhythm'),
@@ -2654,9 +2654,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
         llm: { provider: 'tokenrhythm', model: 'deepseek-v4-flash' },
         squilla_router: {
           enabled: false,
-          tiers: {
-            c0: { provider: 'openrouter', model: 'materialized-default' },
-          },
+          tiers: {},
         },
         llm_ensemble: { enabled: false },
       },
@@ -2705,9 +2703,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
         llm: { provider: 'anthropic', model: 'claude-sonnet-4' },
         squilla_router: {
           enabled: false,
-          tiers: {
-            c0: { provider: 'openrouter', model: 'materialized-default' },
-          },
+          tiers: {},
         },
         llm_ensemble: { enabled: false },
       },
@@ -7237,6 +7233,56 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
 
 
 describe('recommended Router reset and activation safety', () => {
+  it('resets TokenRhythm tiers within TokenRhythm when the primary is OpenRouter', async () => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    saved.squilla_router.preset_binding = 'follow_primary'
+    saved.squilla_router.tiers.c0 = { provider: 'tokenrhythm', model: 'custom-fast-model' }
+    saved.squilla_router.tiers.c1 = { provider: 'tokenrhythm', model: 'custom-balanced-model' }
+    await api.loadData()
+
+    expect(api.modelStrategyPanel.value.routingSummary).toMatchObject({
+      providerId: 'openrouter',
+      recommendedProviderId: 'tokenrhythm',
+    })
+    expect(api.modelStrategyPanel.value.router.tierRows[0]).toMatchObject({
+      provider: 'tokenrhythm', model: 'custom-fast-model',
+    })
+    expect(await api.resetRecommendedRouter()).toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', {
+      providerId: 'tokenrhythm', activateRouter: false,
+    })
+    expect(confirmAction).toHaveBeenCalledWith(expect.objectContaining({
+      title: expect.stringContaining('tokenrhythm'),
+    }))
+    expect(saved.llm.provider).toBe('openrouter')
+    app.unmount()
+  })
+
+  it.each(['openai', 'mixed'])('does not offer or submit a reset for %s tiers', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    saved.squilla_router.tiers.c0.provider = provider === 'mixed' ? 'tokenrhythm' : provider
+    saved.squilla_router.tiers.c1.provider = provider === 'mixed' ? 'openrouter' : provider
+    await api.loadData()
+
+    expect(api.modelStrategyPanel.value.routingSummary?.recommendedProviderId).toBe('')
+    expect(await api.resetRecommendedRouter()).toBe(false)
+    expect(confirmAction).not.toHaveBeenCalled()
+    expect(rpcCall).not.toHaveBeenCalledWith('models.routing.resetRecommended', expect.anything())
+    app.unmount()
+  })
+
+  it.each(['openrouter', 'tokenrhythm', 'openai'])('uses only a supported %s primary when there are no saved text tiers', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    saved.llm.provider = provider
+    saved.squilla_router.tiers = {} as typeof saved.squilla_router.tiers
+    Object.assign(saved.squilla_router.tiers, {
+      image_model: { provider: 'another-image-provider', model: 'vision-model' },
+    })
+    await api.loadData()
+    expect(api.modelStrategyPanel.value.routingSummary?.recommendedProviderId).toBe(provider === 'openai' ? '' : provider)
+    app.unmount()
+  })
+
   it('requires explicit reset support and leaves ordinary single-mode operations available', async () => {
     hasRpcMethod.mockImplementation(method => method !== 'models.routing.resetRecommended')
     const { api, app } = await primaryTransitionScenario()

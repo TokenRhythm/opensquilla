@@ -488,7 +488,7 @@ class RpcRegistry:
                 )
             if isinstance(exc, PrimaryProviderChangedError):
                 return make_error_res(
-                    req_id, "CONFLICT", str(exc), details={"reason": "primary_changed"}
+                    req_id, "CONFLICT", str(exc), details={"reason": exc.reason}
                 )
             if _is_artifact_product_method(method):
                 return _safe_artifact_dispatch_failure(

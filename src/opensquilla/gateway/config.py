@@ -55,7 +55,12 @@ from opensquilla.provider.credentials import (
     credential_provider_hint,
     endpoint_provider_hint,
 )
-from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
+from opensquilla.provider.preset_registry import (
+    PREVIOUS_RECOMMENDED_TEXT_MODELS,
+    get_preset,
+    legacy_profile_ids,
+    router_ladder_provider,
+)
 from opensquilla.router_tiers import (
     CUSTOM_B5_MAX_PROPOSERS,
     CUSTOM_B5_MAX_TOTAL_CALLS,
@@ -1372,11 +1377,11 @@ class SquillaRouterConfig(BaseSettings):
     # OpenSquilla owns the ladder and may replace it with the active
     # provider's preset when the primary provider changes.  ``custom`` means
     # the operator owns the ladder and provider switches must preserve it.
-    # ``None`` is deliberately retained for pre-field configs: treating an
-    # unclassified historical ladder as custom is the only non-destructive
-    # upgrade behavior.  A later explicit Router save records one of the two
-    # concrete values.  Additive and downgrade-safe because this settings
-    # section ignores unknown fields in older gateways.
+    # ``None`` is retained for pre-field configs. Historical/custom ladders
+    # remain operator-owned except for recognized, unchanged shipped model
+    # sequences that receive preset upgrades. A later explicit Router save
+    # records one of the two concrete values. Additive and downgrade-safe:
+    # this settings section ignores unknown fields in older gateways.
     preset_binding: Literal["follow_primary", "custom"] | None = None
     visual_mode: str = "real_candidates"
     # Preview: execute router tiers whose provider differs from llm.provider,
@@ -2761,59 +2766,112 @@ class GatewayConfig(BaseSettings):
     def initialize_router_profile_defaults(self) -> GatewayConfig:
         """Resolve implicit Router defaults after loading or enabling routing."""
         router = self.squilla_router
-        if not router or not getattr(router, "enabled", False):
+        if not router:
             return self
+        fields_set = set(router.model_fields_set)
+        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        follows_primary_preset = router.preset_binding == "follow_primary"
+        has_explicit_ladder = "tiers" in fields_set or bool(router.tier_profile)
+        ladder_provider = router_ladder_provider(router.tiers, provider)
+        if (
+            has_explicit_ladder
+            and ladder_provider is not None
+            and ladder_provider in PREVIOUS_RECOMMENDED_TEXT_MODELS
+        ):
+            if (
+                ladder_provider != provider
+                and not router.cross_provider_tiers
+                and not all(name in router.tiers for name in TEXT_TIERS)
+            ):
+                # A partial foreign ladder may contain only a dormant C3
+                # fusion draft. Filling missing rows would introduce direct
+                # foreign routes without cross-provider execution enabled.
+                return self
+            previous_models = tuple(
+                TierConfig.from_value(router.tiers.get(name)).model for name in TEXT_TIERS
+            )
+            is_previous_default = (
+                previous_models in PREVIOUS_RECOMMENDED_TEXT_MODELS[ladder_provider]
+            )
+            if follows_primary_preset or is_previous_default:
+                preset = get_preset(ladder_provider)
+                if preset is not None:
+                    defaults = preset.tier_defaults()
+                    tiers = dict(router.tiers)
+                    for name in TEXT_TIERS:
+                        previous = tiers.get(name)
+                        tier = dict(defaults[name])
+                        if not follows_primary_preset and isinstance(previous, dict):
+                            # Keep explicit reasoning and extra per-tier options.
+                            # Models, capabilities and the old C3 fusion default
+                            # belong to the shipped ladder being upgraded.
+                            tier.update(previous)
+                            for key in (
+                                "model", "description", "supports_image",
+                                "ensemble_enabled", "ensemble_selection_mode",
+                                "ensembleEnabled", "ensembleSelectionMode",
+                            ):
+                                tier.pop(key, None)
+                                if key in defaults[name]:
+                                    tier[key] = defaults[name][key]
+                        tiers[name] = tier
+                    if "image_model" not in tiers and "image_model" in defaults:
+                        tiers["image_model"] = defaults["image_model"]
+                    payload = router.model_dump(mode="python")
+                    payload["tiers"] = tiers
+                    self.squilla_router = SquillaRouterConfig(**payload)
+                    object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
+                return self
         # An explicit custom binding is an operator ownership boundary.  Do
         # not turn a sparse custom ladder into a provider preset at load time.
         if getattr(router, "preset_binding", None) == "custom":
             return self
         if getattr(router, "tier_profile", None):
             return self
-        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        if not router.enabled and not follows_primary_preset:
+            return self
+        # Loading is not a primary-provider switch. Saved managed ladders may
+        # intentionally execute against another provider, including a mixture.
+        if has_explicit_ladder and follows_primary_preset and ladder_provider != provider:
+            return self
         # Boot auto-default: persistable packaged profiles write the compact
         # tier_profile form; curated-inline presets (e.g. tokenrhythm) apply
         # their ladder as inline tiers because their ids must never persist
-        # as a tier_profile (downgrade contract). Synthesized presets are
-        # applied by onboarding/provider saves only, never at boot.
+        # as a tier_profile (downgrade contract). Sparse explicitly managed
+        # ladders may also initialize synthesized presets; historical configs
+        # without this ownership flag retain their prior boot behavior.
         if provider == "openrouter":
-            if getattr(router, "preset_binding", None) == "follow_primary" and all(
-                isinstance(tier, dict)
-                and str(tier.get("provider") or provider).strip().lower() == provider
-                for tier in router.tiers.values()
-            ):
-                # Desktop persists recommended ladders inline. Refresh only
-                # explicitly managed tiers so upgrades agree with the preset
-                # catalog shown in Settings; historical/custom ladders stay
-                # operator-owned. A foreign-provider ladder may accompany a
-                # legacy-inferred primary; provider reconciliation owns it.
-                # Preserve the inline shape and provenance.
-                fields_set = set(router.model_fields_set)
-                payload = router.model_dump(mode="python")
-                payload["tiers"] = _default_tiers()
-                self.squilla_router = SquillaRouterConfig(**payload)
-                object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
             return self
-        curated_inline_preset = None
+        initializing_managed_defaults = follows_primary_preset and not has_explicit_ladder
+        inline_preset = None
         if provider not in ROUTER_TIER_PROFILE_IDS:
             preset = get_preset(provider)
-            if preset is None or preset.synthesized or preset.persistable:
+            if (
+                preset is None
+                or preset.persistable
+                or (preset.synthesized and not initializing_managed_defaults)
+            ):
                 return self
-            curated_inline_preset = preset
-        fields_set = set(getattr(router, "model_fields_set", set()))
+            inline_preset = preset
         has_custom_tiers = (
             "tiers" in fields_set and getattr(router, "tiers", {}) != _default_tiers()
         )
-        follows_primary_preset = getattr(router, "preset_binding", None) == "follow_primary"
-        if "tier_profile" in fields_set or (has_custom_tiers and not follows_primary_preset):
+        if "tier_profile" in fields_set and not initializing_managed_defaults:
+            return self
+        if has_custom_tiers and not follows_primary_preset:
             return self
         payload = router.model_dump(mode="python")
-        if curated_inline_preset is None:
+        if inline_preset is None:
             payload["tier_profile"] = provider
             payload.pop("tiers", None)
             self.squilla_router = SquillaRouterConfig(**payload)
             return self
         payload["tier_profile"] = None
-        payload["tiers"] = curated_inline_preset.tier_defaults()
+        payload["tiers"] = inline_preset.tier_defaults()
+        if inline_preset.synthesized:
+            for tier in payload["tiers"].values():
+                if not str(tier.get("model") or "").strip():
+                    tier["model"] = str(self.llm.model or "").strip()
         self.squilla_router = SquillaRouterConfig(**payload)
         # The rebuild marks every field explicitly set; restore the original
         # provenance so the seeded ladder stays in-memory only (the load-time

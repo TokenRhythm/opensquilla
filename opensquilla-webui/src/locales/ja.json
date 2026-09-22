@@ -1216,7 +1216,7 @@
       "summaryRouter": "モデルルーティング",
       "summaryOn": "オン",
       "summaryOff": "オフ",
-      "bindingFollowPrimary": "推奨 · 主用に追従",
+      "bindingFollowPrimary": "推奨 · プロバイダーのプリセットに追従",
       "bindingCustom": "カスタム階層",
       "bindingLegacy": "既存の階層 · 追従は未指定",
       "resetRecommended": "{provider} の推奨階層を使用",

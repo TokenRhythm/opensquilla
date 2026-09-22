@@ -290,19 +290,22 @@ def test_profile_remove_rejects_disabled_static_ensemble_reference() -> None:
         remove_llm_profile(cfg, provider_id="openrouter")
 
 
-def test_profile_remove_allows_untouched_packaged_defaults() -> None:
+@pytest.mark.parametrize("binding", [None, "follow_primary"])
+def test_profile_remove_allows_untouched_packaged_defaults(binding: str | None) -> None:
     """A profile blocked only by packaged preset defaults is removable (#1297).
 
-    With a non-openrouter primary, an untouched router still materializes the
-    packaged openrouter tier preset, and the legacy static selection_mode
-    default — neither is persisted, so neither can dangle after removal.
+    A disabled unmanaged router still materializes OpenRouter defaults, while
+    a managed router resolves the primary provider's preset. Neither the
+    implicit tiers nor the legacy static selection mode pins a saved profile.
     """
     cfg = GatewayConfig(
         llm={"provider": "tokenrhythm", "api_key": "k"},
         llm_profiles={"openrouter": {"api_key_env": "OPENROUTER_PROFILE_KEY"}},
-        squilla_router={"preset_binding": "follow_primary", "enabled": False},
+        squilla_router={"preset_binding": binding, "enabled": False},
     )
-    assert cfg.squilla_router.tiers["c0"].get("provider") == "openrouter"
+    assert cfg.squilla_router.tiers["c0"].get("provider") == (
+        "tokenrhythm" if binding == "follow_primary" else "openrouter"
+    )
     assert cfg.llm_ensemble.selection_mode == "static_openrouter_b5"
 
     result = remove_llm_profile(cfg, provider_id="openrouter")

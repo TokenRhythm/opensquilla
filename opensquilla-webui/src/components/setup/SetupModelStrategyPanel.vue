@@ -99,6 +99,8 @@ interface ModelStrategyPanelContract {
   routingSummary?: {
     providerId: string
     providerLabel: string
+    recommendedProviderId: string
+    recommendedProviderLabel: string
     enabled: boolean
     binding: 'follow_primary' | 'custom' | 'legacy'
     crossProviderEnabled: boolean
@@ -145,7 +147,7 @@ const bindingLabel = computed(() => t(
 
 function requestRecommendedReset() {
   const summary = props.panel.routingSummary
-  if (!summary || summary.resetDisabledReason || summary.resetPending || props.routingModeBusy) return
+  if (!summary?.recommendedProviderId || summary.resetDisabledReason || summary.resetPending || props.routingModeBusy) return
   emit('resetRecommendedRouter')
 }
 
@@ -836,7 +838,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             {{ t('setup.modelStrategy.retainedDrafts') }}
           </p>
         </div>
-        <div class="setup-model-strategy__reset">
+        <div v-if="panel.routingSummary.recommendedProviderId" class="setup-model-strategy__reset">
           <button
             type="button"
             class="btn btn--ghost"
@@ -847,7 +849,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             @click="requestRecommendedReset"
           >
             <Icon name="refresh" :size="15" aria-hidden="true" />
-            {{ t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.providerLabel }) }}
+            {{ t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.recommendedProviderLabel }) }}
           </button>
           <p :id="resetHelpId">{{ panel.routingSummary.resetDisabledReason || t(panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff') }}</p>
         </div>

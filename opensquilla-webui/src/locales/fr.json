@@ -1216,7 +1216,7 @@
       "summaryRouter": "Routage des modèles",
       "summaryOn": "Activé",
       "summaryOff": "Désactivé",
-      "bindingFollowPrimary": "Recommandé · suit le principal",
+      "bindingFollowPrimary": "Recommandé · suit le préréglage du fournisseur",
       "bindingCustom": "Niveaux personnalisés",
       "bindingLegacy": "Niveaux existants · suivi non défini",
       "resetRecommended": "Utiliser les niveaux recommandés de {provider}",

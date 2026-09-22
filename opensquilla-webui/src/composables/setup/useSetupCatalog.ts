@@ -1220,9 +1220,8 @@ const currentRouterProfile = computed(() => {
   if (persistedProfile) return persistedProfile
   // Curated inline and synthesized presets are intentionally absent from the
   // legacy tier_profile catalog, but their provider entries still carry the
-  // managed ladder. Follow-primary must use that ladder too; otherwise a
-  // disabled sparse config would expose the settings model's materialized
-  // OpenRouter defaults when re-enabled.
+  // managed ladder used to fill missing rows in an empty or sparse config.
+  // Effective saved tiers always take precedence when the form is initialized.
   const provider = runtimeProviders.value.find(
     candidate => normalizeProviderId(candidate.providerId) === providerId,
   )
@@ -1848,9 +1847,23 @@ const routerBinding = computed<'follow_primary' | 'custom' | 'legacy'>(() => {
 })
 const ensembleEnabled = computed(() => config.value.llm_ensemble?.enabled === true)
 const resetRecommendedSupported = computed(() => providerConfiguration.resetRecommendedSupported === true)
+const recommendedRouterProvider = computed(() => {
+  const providers = new Set(Object.entries(config.value.squilla_router?.tiers || {})
+    .filter(([name]) => (TEXT_TIERS as readonly string[]).includes(normalizeRouterTier(name) || name))
+    .map(([, tier]) => normalizeProviderId(tier.provider || currentProvider.value))
+    .filter(Boolean))
+  // Reset within the saved ladder's provider, even when the direct/fallback
+  // provider differs. A mixed ladder has no unambiguous recommendation target.
+  const providerId = providers.size === 0
+    ? normalizeProviderId(currentProvider.value)
+    : providers.size === 1 ? [...providers][0] || '' : ''
+  return providerId === 'openrouter' || providerId === 'tokenrhythm' ? providerId : ''
+})
 const routingSummary = computed(() => ({
   providerId: hasSavedProvider.value ? currentProvider.value : '',
   providerLabel: hasSavedProvider.value ? providerCatalogLabel(currentProvider.value) : '',
+  recommendedProviderId: recommendedRouterProvider.value,
+  recommendedProviderLabel: recommendedRouterProvider.value ? providerCatalogLabel(recommendedRouterProvider.value) : '',
   enabled: modelRouterEnabled.value,
   binding: routerBinding.value,
   crossProviderEnabled: config.value.squilla_router?.cross_provider_tiers === true,
@@ -3335,8 +3348,8 @@ async function setModelStrategy(strategy: ModelStrategy) {
 }
 
 async function resetRecommendedRouter(): Promise<boolean> {
-  if (routingSummary.value.resetDisabledReason) return false
-  const providerId = currentProvider.value
+  if (routingSummary.value.resetDisabledReason || !recommendedRouterProvider.value) return false
+  const providerId = recommendedRouterProvider.value
   routerResetPending.value = true
   let acknowledged = false
   try {

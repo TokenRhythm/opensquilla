@@ -52,8 +52,17 @@ The TokenRhythm ladder leaves tier `thinking_level` unset. Direct
 requests without an explicit thinking setting preserve the provider default;
 Router auto-thinking can still choose a per-turn level (normally `low` on C1).
 Fresh and managed (`preset_binding = "follow_primary"`) configurations receive
-this ladder; custom inline tiers remain authoritative and are not migrated.
+this ladder. Upgrades also refresh recognized previous OpenRouter and
+TokenRhythm default ladders saved inline, including historical saves without a
+managed binding. Edited model ladders and mixed-provider ladders remain
+authoritative. Upgrading keeps the ladder's provider and the Router's enabled
+state; it does not switch TokenRhythm routes to OpenRouter or vice versa.
 OpenRouter retains `high` as its packaged tier thinking level.
+
+Settings offers a recommended-tier reset for single-provider OpenRouter and
+TokenRhythm ladders. The button names and restores the ladder's own provider,
+even when the primary provider differs. Other providers and mixed-provider
+ladders do not show this shortcut. Restoring tiers keeps the current usage mode.
 
 C3 can optionally use the shared multi-model fusion plan configured under
 `llm_ensemble`. Enabling fusion on C3 makes it use that plan instead of its
