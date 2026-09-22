@@ -931,10 +931,17 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
         "$user = Get-LocalUser -Name $name; "
         "$user.SID.Value"
     )
-    env = {**os.environ, "OPENSQUILLA_SANDBOX_PASSWORD": password}
+    powershell = _trusted_windows_powershell_path()
+    env = {
+        **os.environ,
+        "OPENSQUILLA_SANDBOX_PASSWORD": password,
+        # Keep PowerShell 7 compatibility modules out of inbox Windows
+        # PowerShell resolution; they can shadow Microsoft.PowerShell.Security.
+        "PSModulePath": str(Path(powershell).parent / "Modules"),
+    }
     completed = subprocess.run(
         [
-            _trusted_windows_powershell_path(),
+            powershell,
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
