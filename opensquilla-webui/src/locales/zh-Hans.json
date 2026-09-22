@@ -4963,7 +4963,7 @@
       "activityBytesWritten": "已写入 {size}",
       "activityContentSize": "{lines} 行 · {characters} 个字符",
       "activityExitCode": "退出码 {code}",
-      "activityNotCompleted": "未通过",
+      "activityNotCompleted": "未正常完成",
       "activityPublished": "已发布",
       "documentErrorCategory": "类别：{category}（{code}）",
       "documentPreviewUnavailableCategory": "编辑预览不可用",

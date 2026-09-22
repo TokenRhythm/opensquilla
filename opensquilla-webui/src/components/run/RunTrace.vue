@@ -161,7 +161,14 @@
                 class="tool-row__status tool-row__status--execution-io"
                 :class="`tool-row__status--execution-${executionIoForGroup(item.group).kind}`"
               >{{ executionIoLabel(executionIoForGroup(item.group)) }}</span>
-              <span v-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
+              <span
+                v-if="presentation === 'activity' && showGroupStatus(item.group)"
+                class="tool-row__status-dot"
+                role="img"
+                :aria-label="activityStatusHint(resolvedGroupStatusText(item.group))"
+                :title="activityStatusHint(resolvedGroupStatusText(item.group))"
+              />
+              <span v-else-if="showGroupStatus(item.group)" class="tool-row__status">{{ resolvedGroupStatusText(item.group) }}</span>
               <Icon v-if="presentation !== 'activity' && groupHasDetails(item.group)" class="step-chevron" name="chevronRight" :size="14" />
             </span>
           </button>
@@ -213,11 +220,15 @@
                     class="tool-row__status tool-row__status--execution-io"
                     :class="`tool-row__status--execution-${executionIoForCall(call).kind}`"
                   >{{ executionIoLabel(executionIoForCall(call)) }}</span>
-                  <!-- Failure text is plain row content on purpose: it joins the
-                       button's accessible name, which screen readers announce when
-                       the row is reached. A live region mounted already-populated
-                       would never announce. -->
-                  <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
+                  <!-- The dot's accessible name keeps the status available when
+                       the disclosure row receives keyboard focus. -->
+                  <span
+                    v-if="activityTerminalStatusText(call)"
+                    class="tool-row__status-dot"
+                    role="img"
+                    :aria-label="activityStatusHint(activityTerminalStatusText(call))"
+                    :title="activityStatusHint(activityTerminalStatusText(call))"
+                  />
                   <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                   <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                   <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -307,7 +318,13 @@
                   class="tool-row__status tool-row__status--execution-io"
                   :class="`tool-row__status--execution-${executionIoForCall(call).kind}`"
                 >{{ executionIoLabel(executionIoForCall(call)) }}</span>
-                <span v-if="activityTerminalStatusText(call)" class="tool-row__status">{{ activityTerminalStatusText(call) }}</span>
+                <span
+                  v-if="activityTerminalStatusText(call)"
+                  class="tool-row__status-dot"
+                  role="img"
+                  :aria-label="activityStatusHint(activityTerminalStatusText(call))"
+                  :title="activityStatusHint(activityTerminalStatusText(call))"
+                />
                 <span v-if="resultCountText(call)" class="tool-row__status">{{ resultCountText(call) }}</span>
                 <span v-if="elapsedFor(call)" class="tool-row__elapsed">{{ elapsedFor(call) }}</span>
                 <Icon v-if="presentation !== 'activity' && iconFor(call).glyph === 'check'" class="tool-row__state-icon tool-row__state-icon--ok" name="check" :size="13" />
@@ -1357,6 +1374,10 @@ function activityTerminalStatusText(call: ChatToolCallRenderItem): string {
   return injected
 }
 
+function activityStatusHint(status: string): string {
+  return `${status} · ${t('shared.runTrace.activityViewDetails')}`
+}
+
 function executionIoTextKey(summary: ExecutionIoSummary): string {
   if (summary.kind === 'pty') return 'shared.runTrace.executionIoPty'
   if (summary.kind === 'fallback') return 'shared.runTrace.executionIoFallback'
@@ -1782,6 +1803,14 @@ function fmtTok(n?: number | null): string {
   font-size: 0.8125rem;
   color: var(--text-dim);
   white-space: nowrap;
+}
+
+.tool-row__status-dot {
+  width: 0.375rem;
+  height: 0.375rem;
+  flex: 0 0 auto;
+  border-radius: var(--radius-full);
+  background: var(--warn);
 }
 
 .tool-row__status--execution-io {
