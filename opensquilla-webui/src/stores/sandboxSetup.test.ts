@@ -127,7 +127,7 @@ describe('sandbox setup store', () => {
     expect(pushToast).toHaveBeenCalledWith('Safe mode is ready.', { tone: 'ok' })
   })
 
-  it('reports one failure when capability verification fails', async () => {
+  it('silently retains the mode when capability verification fails', async () => {
     ensureReady.mockResolvedValue(readyResult(false))
     const store = createStore()
 
@@ -135,11 +135,19 @@ describe('sandbox setup store', () => {
 
     expect(store.outcome).toBe('verification_failed')
     expect(selectMode).not.toHaveBeenCalled()
-    expect(pushToast).toHaveBeenCalledTimes(1)
-    expect(pushToast).toHaveBeenCalledWith(
-      'Safe mode setup could not finish. Try again from Safe mode.',
-      { tone: 'danger' },
-    )
+    expect(pushToast).not.toHaveBeenCalled()
+  })
+
+  it('silently handles a rejected setup without changing modes', async () => {
+    ensureReady.mockRejectedValue(new Error('synthetic private helper diagnostic'))
+    const store = createStore()
+
+    await expect(store.startSafeSetup()).resolves.toBe(false)
+
+    expect(store.outcome).toBe('failed')
+    expect(store.ensuring).toBe(false)
+    expect(selectMode).not.toHaveBeenCalled()
+    expect(pushToast).not.toHaveBeenCalled()
   })
 
   it('keeps an ambiguous server-side setup in progress without a failure toast', async () => {

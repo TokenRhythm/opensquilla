@@ -5025,9 +5025,9 @@ function cancelComposerSandboxSetup(): void {
 async function confirmComposerSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
   const ready = await sandboxSetupStore.startSafeSetup()
+  if (sandboxSetupOutcome.value !== 'in_progress') composerSandboxSetupOpen.value = false
   await sandboxSetupRecovery.refresh()
   if (ready) {
-    composerSandboxSetupOpen.value = false
     await refreshRunModePreference()
   }
 }

@@ -6,18 +6,16 @@ cancellation. Backends must surface setup failures by raising
 :class:`~opensquilla.sandbox.types.SandboxBackendError`; they must never fall
 back to unsandboxed host execution on failure.
 
-``available`` remains a cheap selection check. ``probe_runtime`` is the
-bounded startup check used after selection when callers need evidence that the
-actual helper launch path works. Capability status reads do not call it.
+Startup selects installed backends without executing test commands. Actual
+operations enforce their policy and report failures without a host fallback.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import TYPE_CHECKING
 
-from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
+from opensquilla.sandbox.types import SandboxRequest, SandboxResult
 
 if TYPE_CHECKING:
     from opensquilla.sandbox.operation_runtime import (
@@ -50,20 +48,6 @@ class Backend(ABC):
         failures raise :class:`SandboxBackendError`; non-zero exit codes do
         not.
         """
-
-    async def probe_runtime(self, *, cwd: Path | None = None) -> None:
-        """Validate the selected backend without running user work.
-
-        Backends with a meaningful no-op launch path override this method. The
-        default keeps test and third-party backends source-compatible while
-        still failing closed when their cheap availability check is negative.
-        """
-
-        _ = cwd
-        if not self.available():
-            raise SandboxBackendError(
-                f"helper_probe_failed: {self.name} backend is unavailable"
-            )
 
     def operation_domains_supported(self) -> frozenset[SandboxOperationDomain]:
         """Return operation domains this backend can run through the sandbox."""

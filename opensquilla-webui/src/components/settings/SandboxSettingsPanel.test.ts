@@ -691,8 +691,9 @@ describe('SandboxSettingsPanel', () => {
 
     expect(el.querySelector('[data-testid="sandbox-full-mode"]')?.classList.contains('is-selected'))
       .toBe(true)
-    expect(el.querySelector('[data-testid="sandbox-setup-result"]')?.textContent)
-      .not.toContain('windows_setup_helper_cancelled')
+    expect(el.querySelector('[data-testid="sandbox-setup-result"]')).toBeNull()
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+    expect(document.body.textContent).not.toContain('windows_setup_helper_cancelled')
     expect(operations.selectMode).not.toHaveBeenCalled()
   })
 

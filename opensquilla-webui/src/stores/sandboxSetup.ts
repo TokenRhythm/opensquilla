@@ -38,10 +38,8 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
       status.value = result.status
       outcome.value = result.outcome
       if (!result.ready) {
-        if (result.outcome === 'in_progress') return false
-        pushToast(String(i18n.global.t('settings.sandbox.setup.failedToast')), {
-          tone: 'danger',
-        })
+        // The selector reflects availability without interrupting the user or
+        // silently changing their mode to Full Access.
         return false
       }
       if (intendedMode.value === 'safe') {
@@ -53,9 +51,6 @@ export const useSandboxSetupStore = defineStore('sandboxSetup', () => {
       return true
     } catch {
       outcome.value = 'failed'
-      pushToast(String(i18n.global.t('settings.sandbox.setup.failedToast')), {
-        tone: 'danger',
-      })
       return false
     }
   }

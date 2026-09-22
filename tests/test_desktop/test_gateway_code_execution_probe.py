@@ -73,3 +73,39 @@ def test_probe_rejects_unsuccessful_tool_results(
 
     with pytest.raises(RuntimeError, match="execute_code expected exit"):
         probe["_execution_result"](json.dumps(payload), expected_exit)
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="native Seatbelt required")
+def test_safe_release_gate_executes_and_denies_real_operations(tmp_path: Path) -> None:
+    environment = {key: value for key, value in os.environ.items() if key in {"PATH"}}
+    profile = tmp_path / "isolated profile"
+    profile.mkdir()
+    environment.update({
+        "HOME": str(profile), "OPENSQUILLA_STATE_DIR": str(profile),
+        "PYTHONPATH": str(_ROOT / "src"), "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONNOUSERSITE": "1", "PYTHONUTF8": "1",
+    })
+    result = subprocess.run(
+        [sys.executable, str(_SCRIPTS / "gateway-entry.py"),
+         "--internal-child", "python-code",
+         (_SCRIPTS / "probe-safe-execution.py").read_text(encoding="utf-8")],
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout) == {
+        "probe": "opensquilla-desktop-safe-execution", "frozen": False,
+        "backend": "seatbelt", "read": True, "write": True,
+        "readonlyChild": True, "writeDenied": True, "networkDenied": True,
+    }
+
+
+def test_packaged_smoke_requires_safe_success_and_explicit_windows_provisioning() -> None:
+    smoke = (_SCRIPTS / "smoke-gateway.mjs").read_text(encoding="utf-8")
+    workflow = (_ROOT / ".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+    assert "await verifyGatewaySafeExecution(gatewayBinary, env, tempHome)" in smoke
+    assert "--internal-child', 'python-code', code" in smoke
+    assert "cwd: tempHome" in smoke
+    assert "frozen: true, backend" in smoke
+    assert "writeDenied: true, networkDenied: true" in smoke
+    assert "process.argv.includes('--provision-windows-sandbox')" in smoke
+    assert "npm run verify:gateway-smoke -- --provision-windows-sandbox" in workflow

@@ -105,11 +105,11 @@ describe('SandboxSetupDialog', () => {
       .toBe(true)
   })
 
-  it('keeps a retryable failure visible', () => {
-    const body = mountDialog(false, 'verification_failed')
+  it.each(['failed', 'verification_failed', 'cancelled'])('quietly closes after %s', outcome => {
+    const body = mountDialog(false, outcome)
 
-    expect(body.textContent).toContain('Live safety verification did not pass.')
-    expect(body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
-    expect(body.querySelector('[data-testid="sandbox-setup-continue"]')?.textContent).toContain('Retry')
+    expect(body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+    expect(body.textContent).not.toContain('Safe mode could not be configured.')
+    expect(body.textContent).not.toContain('Live safety verification did not pass.')
   })
 })

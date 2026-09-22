@@ -281,8 +281,6 @@ def _parse_payload(args: Sequence[str]) -> HelperPayload:
 def _validate_policy_is_enforceable(policy: dict[str, Any]) -> None:
     if "capabilityProbe" in policy and not isinstance(policy["capabilityProbe"], bool):
         raise SystemExit("windows_default capabilityProbe marker must be boolean")
-    if "helperProbe" in policy and not isinstance(policy["helperProbe"], bool):
-        raise SystemExit("windows_default helperProbe marker must be boolean")
     network = policy.get("network")
     if network not in {"none", "host", "proxy_allowlist"}:
         raise SystemExit(f"windows_default runner received unknown network mode: {network!r}")

@@ -265,9 +265,10 @@ function documentFixture() {
   return Buffer.from(body, 'ascii')
 }
 
-function functionalProbe(gatewayBinary, env, args) {
+function functionalProbe(gatewayBinary, env, args, options = {}) {
   const result = spawnSync(gatewayBinary, args, {
     cwd: dirname(gatewayBinary), env, encoding: 'utf8', windowsHide: true, timeout: 60_000,
+    ...options,
   })
   if (result.error) throw result.error
   if (result.status !== 0) {
@@ -308,6 +309,25 @@ async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
     documents: { csvRows: 2, xlsxValue: 42, pdfText: '中文文件验收 样本 42' },
     published: 4,
   })
+}
+
+async function verifyGatewaySafeExecution(gatewayBinary, env, tempHome) {
+  const code = await readFile(join(scriptDir, 'probe-safe-execution.py'), 'utf8')
+  const probeEnv = { ...env, PYTHONDONTWRITEBYTECODE: '1' }
+  // Provision only on an explicitly opted-in disposable Windows CI runner.
+  // This gate is never invoked by application startup or capability polling.
+  delete probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX
+  if (process.platform === 'win32' && process.argv.includes('--provision-windows-sandbox')) {
+    probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX = '1'
+  }
+  const backend = { darwin: 'seatbelt', win32: 'windows_default', linux: 'bubblewrap' }[process.platform]
+  assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
+    '--internal-child', 'python-code', code,
+  ], { cwd: tempHome, timeout: 180_000 }), {
+    probe: 'opensquilla-desktop-safe-execution', frozen: true, backend,
+    read: true, write: true, readonlyChild: true, writeDenied: true, networkDenied: true,
+  })
+  console.log(`Packaged Safe execution passed with ${backend}; write and network denials verified.`)
 }
 
 function verifyGatewayMcp(gatewayBinary, env, port) {
@@ -556,6 +576,7 @@ async function main() {
     verifyGatewayFilesystemWorker(gatewayBinary, env, join(workspaceDir, 'SOUL.md'))
     verifyGatewayDocument(gatewayBinary, env, documentPath)
     await verifyGatewayCodeExecution(gatewayBinary, env, tempHome)
+    await verifyGatewaySafeExecution(gatewayBinary, env, tempHome)
 
     const port = await findFreePort()
     child = spawn(gatewayBinary, ['gateway', 'run', '--port', String(port), '--bind', '127.0.0.1', '--config', config], {

@@ -717,7 +717,7 @@ jobs:
         working-directory: desktop/electron
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
-        run: npm run verify:gateway-smoke
+        run: npm run verify:gateway-smoke -- --provision-windows-sandbox
 
       - name: Record signed candidate identity
         shell: pwsh
