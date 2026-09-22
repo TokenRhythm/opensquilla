@@ -2439,6 +2439,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "auth-connection-recovery.spec.ts",
         "chat-send-lifecycle.spec.ts",
         "chat-send-lifecycle.real.spec.ts",
+        "cross-window-sync.real.spec.ts",
         "composer-paste.spec.ts",
         "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
