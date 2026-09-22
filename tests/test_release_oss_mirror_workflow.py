@@ -214,6 +214,10 @@ def test_aliyun_oss_release_mirror_workflow_contract() -> None:
     assert "MANUAL_RELEASE_TAG: ${{ inputs.tag }}" in workflow
     assert 'tag="${MANUAL_RELEASE_TAG}"' in workflow
     assert 'tag="${{ inputs.tag }}"' not in workflow
+    assert "CANONICAL_GITHUB_REPOSITORY: TokenRhythm/opensquilla" in workflow
+    assert "Verify canonical GitHub repository" in workflow
+    assert '"${GITHUB_REPOSITORY}" != "${CANONICAL_GITHUB_REPOSITORY}"' in workflow
+    assert '--repo "${CANONICAL_GITHUB_REPOSITORY}"' in workflow
     assert "gh release download" in workflow
     assert "gh release view" in workflow
     assert "gh release list" in workflow

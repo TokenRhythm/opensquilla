@@ -110,6 +110,16 @@ Current clients accept both official repository spellings; new GitHub release
 metadata comes from `TokenRhythm/opensquilla`. Keep the legacy v1 field even
 when new API and download links use TokenRhythm.
 
+The canonical repository for new release preparation, tags, GitHub Releases,
+and GHCR publication is `TokenRhythm/opensquilla`. A checkout may still have
+`origin` pointed at the pre-transfer `opensquilla/opensquilla` repository, so
+release preparation must verify the canonical remote explicitly and use that
+remote for the final tag push. The Aliyun OSS mirror is a separate namespace:
+the organization transfer does not change its reviewed bucket, `releases`
+prefix, versioned paths, `latest/` aliases, or `channels/` manifests. OSS
+promotion remains downstream of the canonical GitHub Release and must preserve
+the legacy v1 `releaseUrl` in generated manifests.
+
 Before publishing a final release after the transfer, both official 0.5.3 and
 0.5.4 baselines must pass the Draft upgrade audits on macOS and Windows.
 Pre-stage immutable assets for those audits, publish only after they pass, and
@@ -126,9 +136,10 @@ README install commands must use tag-pinned URLs such as:
 ## Release SOP
 
 1. Verify `git status` is clean before starting release prep.
-2. Confirm the latest `origin/main` SHA is the intended release baseline and
-   that its required CI run completed successfully.
-3. Prepare a release PR from `origin/main`: update version metadata,
+2. Verify that the canonical remote resolves to `TokenRhythm/opensquilla`, fetch
+   its `main` branch and tags, and confirm the latest `tokenrhythm/main` SHA is
+   the intended release baseline with its required CI run completed successfully.
+3. Prepare a release PR from `tokenrhythm/main`: update version metadata,
    `CHANGELOG.md`, `RELEASES.md`, `CONTRIBUTORS.md`, release notes, README
    download sections, install scripts, workflow asset contracts, and release
    tests.
@@ -142,12 +153,13 @@ README install commands must use tag-pinned URLs such as:
    release version.
 6. Run the focused release contract tests locally, then open and merge the
    release PR only after review and CI pass.
-7. Fetch `origin main --tags`, verify the merged `origin/main` SHA and CI one
-   more time, then create the annotated tag on that exact SHA:
+7. Fetch `tokenrhythm main --tags`, verify the merged `tokenrhythm/main` SHA and
+   CI one more time, then create the annotated tag on that exact SHA and push it
+   to the canonical repository:
 
    ```sh
    git tag -a v0.5.4 <verified-sha> -m "OpenSquilla 0.5.4"
-   git push origin v0.5.4
+   git push tokenrhythm v0.5.4
    ```
 
 8. Wait for both `.github/workflows/wheelhouse-release.yml` and
@@ -162,8 +174,10 @@ README install commands must use tag-pinned URLs such as:
    the newly created `ghcr.io/tokenrhythm/opensquilla` package public, then
    confirm both `v0.5.4` and `latest` resolve to an amd64/arm64 manifest and
    pass a gateway health smoke test.
-10. Publish the GitHub Release only after maintainer confirmation, then run the
-   post-publish tag URL checks:
+10. Publish the GitHub Release only after maintainer confirmation, then verify
+   the OSS mirror workflow has consumed the canonical `TokenRhythm/opensquilla`
+   release. Check the versioned OSS objects and the promoted aliases/manifests
+   before running the post-publish GitHub tag URL checks:
 
    ```sh
    curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg
