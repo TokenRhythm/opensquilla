@@ -86,6 +86,7 @@ jobs:
       - name: Audit frozen dependencies and verify packaged first interaction
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
+          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
         run: |
           $inventory = 'dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json'
           python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"

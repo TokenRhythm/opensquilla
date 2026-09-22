@@ -318,7 +318,12 @@ async function verifyGatewaySafeExecution(gatewayBinary, env, tempHome) {
   // Provision only on an explicitly opted-in disposable Windows CI runner.
   // This gate is never invoked by application startup or capability polling.
   delete probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX
-  if (process.platform === 'win32' && process.argv.includes('--provision-windows-sandbox')) {
+  const provisionRequested = process.platform === 'win32' && (
+    process.argv.includes('--provision-windows-sandbox')
+    || process.env.OPENSQUILLA_SMOKE_PROVISION_SANDBOX === '1'
+  )
+  if (provisionRequested) {
+    console.log('Windows Safe smoke provisioning is explicitly enabled for this disposable runner.')
     probeEnv.OPENSQUILLA_SMOKE_PROVISION_SANDBOX = '1'
     // The elevated helper deliberately accepts only profile-scoped marker
     // paths. Keep the rest of the smoke isolated in tempHome, but provision
