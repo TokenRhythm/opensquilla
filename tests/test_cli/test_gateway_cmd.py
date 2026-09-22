@@ -1858,11 +1858,21 @@ def test_gateway_run_drains_via_http_shutdown_trigger(tmp_path, monkeypatch) -> 
     _install_fake_start(server, holder, monkeypatch)
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
 
-    gateway_cmd.run_gateway(
-        port=None, bind=None, listen="", debug=False, config_path=str(config)
-    )
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
 
     assert holder["server"].closed == ["api_shutdown"]
+    assert {
+        "event": "gateway.shutdown_requested",
+        "reason": "api_shutdown",
+    } in [
+        {key: event[key] for key in ("event", "reason") if key in event}
+        for event in logs
+    ]
 
 
 def test_gateway_run_force_exits_after_incomplete_shutdown(tmp_path, monkeypatch) -> None:

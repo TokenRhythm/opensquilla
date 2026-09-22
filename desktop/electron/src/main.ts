@@ -9318,6 +9318,16 @@ async function startGateway(): Promise<GatewayState> {
       && abnormalExit
       && !isQuitting
       && !gatewayStoppingProcesses.has(child)
+    desktopLog('gateway_exited', {
+      pid: child.pid,
+      code,
+      signal,
+      abnormalExit,
+      current: isCurrentGateway,
+      ready: childWasReady,
+      quitting: isQuitting,
+      gatewayStopping: gatewayStoppingProcesses.has(child),
+    })
     gatewayReadyProcesses.delete(child)
     if (unexpectedReadyExit) {
       desktopReliabilityTelemetry.recordCrash({
