@@ -51,7 +51,12 @@
     "refresh": "ファイルを再確認",
     "lines": "{total} 行中 {start}–{end} 行",
     "previous": "前の行を表示",
-    "next": "さらに表示"
+    "next": "さらに表示",
+    "search": "ソースを検索",
+    "searchPlaceholder": "テキストを検索…",
+    "noMatches": "一致する行がありません",
+    "jumpToLine": "行へ移動",
+    "copyContents": "ファイル内容をコピー"
   },
   "resourceActions": {
     "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",

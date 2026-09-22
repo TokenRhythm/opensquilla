@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
+import io
 import json
 import os
 import stat
@@ -39,6 +41,7 @@ MAX_WORKSPACE_FILE_BYTES = 32 * 1024 * 1024
 MAX_RESOLVE_PATHS = 64
 _MAX_REQUEST_BYTES = 64 * 1024
 _HEADERS = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+_NATIVE_METADATA_SIGNING_CONTEXT = b"opensquilla-native-workspace-file-v1\n"
 _IMAGE_MIMES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp", "image/bmp"})
 _TEXT_SUFFIXES = frozenset(
     {
@@ -75,6 +78,33 @@ _TEXT_SUFFIXES = frozenset(
 
 class WorkspaceFileUnavailableError(ValueError):
     """No readable file exists under the supplied session authority."""
+
+
+def _workspace_metadata_signature(
+    instance_id: str,
+    instance_nonce: str,
+    session_key: str,
+    path: str,
+    workspace_binding: str,
+) -> str:
+    """Sign the exact metadata request accepted from the trusted Desktop main process."""
+
+    payload = json.dumps(
+        {
+            "v": 1,
+            "instanceId": instance_id,
+            "sessionKey": session_key,
+            "path": path,
+            "workspaceBinding": workspace_binding,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hmac.new(
+        instance_nonce.encode("ascii"),
+        _NATIVE_METADATA_SIGNING_CONTEXT + payload,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -194,6 +224,49 @@ class WorkspaceFiles:
             raise WorkspaceFileUnavailableError()
         return target.name, artifact_mime_for_name(target.name), data
 
+    async def read_page(
+        self, session_key: str, path: str, binding: str, start_line: int, end_line: int
+    ) -> dict[str, Any]:
+        workspace = await self.workspace(session_key)
+        if not binding or binding != workspace.binding:
+            raise WorkspaceFileUnavailableError()
+        target, content, total_lines = await asyncio.to_thread(
+            _read_file_page, workspace, path, start_line, end_line
+        )
+        if await self.workspace(session_key) != workspace:
+            raise WorkspaceFileUnavailableError()
+        return {
+            "relativePath": target.relative_to(workspace.root).as_posix(),
+            "content": content,
+            "totalLines": total_lines,
+            "startLine": start_line,
+            "endLine": min(end_line, total_lines),
+        }
+
+    async def metadata(self, session_key: str, path: str, binding: str) -> dict[str, Any]:
+        """Return controlled native-open metadata for one workspace file.
+
+        The absolute paths in this response are intended for the trusted
+        Electron main process only.  Renderer-facing catalogue and content
+        responses continue to expose relative paths exclusively.
+        """
+        workspace = await self.workspace(session_key)
+        if not binding or binding != workspace.binding:
+            raise WorkspaceFileUnavailableError()
+        target, metadata = await asyncio.to_thread(_readable_file, workspace, path)
+        if await self.workspace(session_key) != workspace:
+            raise WorkspaceFileUnavailableError()
+        relative = target.relative_to(workspace.root).as_posix()
+        return {
+            "workspaceBinding": workspace.binding,
+            "relativePath": relative,
+            "sourcePath": str(target),
+            "workspace": str(workspace.root),
+            "name": target.name,
+            "mime": artifact_mime_for_name(target.name),
+            "size": metadata.st_size,
+        }
+
 
 def _file(workspace: _Workspace, raw: str) -> tuple[Path, os.stat_result]:
     if not raw or len(raw) > 4096 or any(ord(char) < 32 for char in raw):
@@ -221,6 +294,42 @@ def _file(workspace: _Workspace, raw: str) -> tuple[Path, os.stat_result]:
     if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > MAX_WORKSPACE_FILE_BYTES:
         raise WorkspaceFileUnavailableError()
     return target, metadata
+
+
+def _read_file_page(
+    workspace: _Workspace, raw: str, start_line: int, end_line: int
+) -> tuple[Path, str, int]:
+    if start_line < 1 or end_line < start_line or end_line - start_line >= 200:
+        raise WorkspaceFileUnavailableError()
+    target, before = _file(workspace, raw)
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    with os.fdopen(os.open(native_io_path(target), flags), "rb") as stream:
+        opened = os.fstat(stream.fileno())
+        if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
+            raise WorkspaceFileUnavailableError()
+        text_stream = io.TextIOWrapper(stream, encoding="utf-8", newline="")
+        selected: list[str] = []
+        total = 0
+        try:
+            for line in text_stream:
+                total += 1
+                if "\x00" in line:
+                    raise WorkspaceFileUnavailableError()
+                if start_line <= total <= end_line:
+                    selected.append(line)
+            after_read = os.fstat(text_stream.buffer.fileno())
+        except (UnicodeError, ValueError) as exc:
+            raise WorkspaceFileUnavailableError() from exc
+        finally:
+            text_stream.detach()
+    _, after = _file(workspace, raw)
+    if (
+        not os.path.samestat(before, after)
+        or after.st_mtime_ns != before.st_mtime_ns
+        or after_read.st_mtime_ns != before.st_mtime_ns
+    ):
+        raise WorkspaceFileUnavailableError()
+    return target, "".join(selected), max(1, total)
 
 
 def _read_file(workspace: _Workspace, raw: str) -> tuple[Path, bytes]:
@@ -330,9 +439,73 @@ def register_workspace_file_routes(
             },
         )
 
+    async def page(request: Request) -> Response:
+        denied = guard(request)
+        if denied is not None:
+            return denied
+        try:
+            start_line = int(request.query_params.get("startLine", ""))
+            end_line = int(request.query_params.get("endLine", ""))
+        except ValueError:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=_HEADERS)
+        if start_line < 1 or end_line < start_line or end_line - start_line >= 200:
+            return JSONResponse({"code": "INVALID_REQUEST"}, status_code=400, headers=_HEADERS)
+        try:
+            result = await service.read_page(
+                request.headers.get("x-opensquilla-session-key", ""),
+                request.query_params.get("path", ""),
+                request.query_params.get("workspaceBinding", ""),
+                start_line,
+                end_line,
+            )
+        except (OSError, ValueError, RpcHandlerError, ProjectWorkspaceStateError):
+            return unavailable()
+        return JSONResponse(result, headers=_HEADERS)
+
+    async def metadata(request: Request) -> Response:
+        denied = guard(request)
+        if denied is not None:
+            return denied
+        owner = getattr(request.app.state, "desktop_gateway_ownership", None)
+        session_key = request.headers.get("x-opensquilla-session-key", "")
+        path = request.query_params.get("path", "")
+        binding = request.query_params.get("workspaceBinding", "")
+        try:
+            signature = _workspace_metadata_signature(
+                str(getattr(owner, "instance_id", "")),
+                str(getattr(owner, "instance_nonce", "")),
+                session_key,
+                path,
+                binding,
+            )
+        except (UnicodeError, TypeError, ValueError):
+            signature = ""
+        if (
+            owner is None
+            or not getattr(owner, "instance_id", "")
+            or not getattr(owner, "instance_nonce", "")
+            or not hmac.compare_digest(
+                signature, request.headers.get("x-opensquilla-native-signature", "")
+            )
+        ):
+            return JSONResponse(
+                {"code": "NATIVE_WORKSPACE_FILE_FORBIDDEN"}, status_code=403, headers=_HEADERS
+            )
+        try:
+            result = await service.metadata(
+                session_key,
+                path,
+                binding,
+            )
+        except (OSError, ValueError, RpcHandlerError, ProjectWorkspaceStateError):
+            return unavailable()
+        return JSONResponse(result, headers=_HEADERS)
+
     app.router.routes.extend(
         [
             Route("/api/v1/workspace-files/resolve", resolve, methods=["POST"]),
             Route("/api/v1/workspace-files/content", content, methods=["GET"]),
+            Route("/api/v1/workspace-files/page", page, methods=["GET"]),
+            Route("/api/v1/workspace-files/metadata", metadata, methods=["GET"]),
         ]
     )

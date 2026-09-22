@@ -3,7 +3,7 @@ import { createV4WorkspaceFiles } from './workspaceFilesV4'
 
 function fixture() {
   const file = { requestedPath: 'outputs/中文 图.svg', path: 'outputs/中文 图.svg', name: '中文 图.svg',
-    mime: 'image/svg+xml', size: 42, kind: 'text', contentUrl: 'https://untrusted.test/leak' }
+    mime: 'image/svg+xml', size: 42, kind: 'text', workspaceBinding: 'binding-A', contentUrl: 'https://untrusted.test/leak' }
   const http = { requestJson: vi.fn().mockResolvedValue({ workspaceBinding: 'binding-A', files: [file] }),
     requestBlob: vi.fn().mockResolvedValue(new Blob(['<svg/>'], { type: 'image/svg+xml' })) }
   return { file, http, access: createV4WorkspaceFiles(http) }
@@ -32,6 +32,19 @@ describe('workspace files HTTP adapter', () => {
     const { access, http, file } = fixture()
     http.requestJson.mockResolvedValue({ workspaceBinding: 'binding-A', files: [{ ...file, ...invalid }] })
     await expect(access.resolve('session-A', [file.requestedPath])).rejects.toThrow()
+  })
+
+  it('reads bounded source pages and validates the page envelope', async () => {
+    const { access, http, file } = fixture()
+    http.requestJson.mockResolvedValue({
+      relativePath: file.path, content: 'line 201\n', totalLines: 450, startLine: 201, endLine: 201,
+    })
+    await expect(access.readPage?.('session-A', { ...file, kind: 'text' }, 201, 400))
+      .resolves.toMatchObject({ relativePath: file.path, startLine: 201, endLine: 201 })
+    const [endpoint, options] = http.requestJson.mock.calls[0]
+    expect(endpoint).toContain('/api/v1/workspace-files/page?')
+    expect(new URL(endpoint, 'https://gateway.test').searchParams.get('startLine')).toBe('201')
+    expect(options).toMatchObject({ method: 'GET', sessionKey: 'session-A' })
   })
 
   it('never classifies SVG or HTML as an executable image preview', async () => {

@@ -51,7 +51,12 @@
     "refresh": "重新检查文件",
     "lines": "第 {start}–{end} 行，共 {total} 行",
     "previous": "显示前面的行",
-    "next": "显示更多行"
+    "next": "显示更多行",
+    "search": "搜索源码",
+    "searchPlaceholder": "查找文本…",
+    "noMatches": "没有匹配的行",
+    "jumpToLine": "跳转到行",
+    "copyContents": "复制文件内容"
   },
   "resourceActions": {
     "more": "文件操作", "preview": "在应用中预览", "openSource": "用默认应用打开",

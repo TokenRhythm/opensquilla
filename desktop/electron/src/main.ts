@@ -9,7 +9,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
-import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -12490,6 +12490,20 @@ ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileAc
       if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken) return null
       return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
         url: snapshot.httpUrl, authToken: snapshot.authToken }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  })
+})
+ipcMain.handle('desktop:workspace-file:action', async (event, payload: WorkspaceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted workspace file request.')
+  return performWorkspaceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcess ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce : null
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
   })

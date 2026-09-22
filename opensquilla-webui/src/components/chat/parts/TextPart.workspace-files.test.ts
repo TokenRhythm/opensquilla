@@ -44,6 +44,41 @@ describe('TextPart workspace files', () => {
     expect(access.resolve).toHaveBeenCalledOnce()
   })
 
+  it('keeps the inline link appearance and shares the ellipsis/context menu actions', async () => {
+    const access = { resolve: vi.fn().mockResolvedValue([file]), read: vi.fn().mockResolvedValue(new Blob(['safe'])) }
+    const { root } = await mount(access)
+    await vi.waitFor(() => expect(root.querySelector('button.workspace-file-link')).not.toBeNull())
+    expect(root.querySelector<HTMLButtonElement>('button.workspace-file-link')?.textContent).toBe('图.svg')
+    const trigger = root.querySelector<HTMLButtonElement>('.workspace-file-action-trigger')
+    expect(trigger).not.toBeNull()
+    trigger!.click()
+    await nextTick()
+    const menu = document.querySelector('[role="menu"]')
+    expect(menu?.textContent).toContain('Copy relative path')
+    expect(menu?.textContent).toContain('Download')
+    ;(document.activeElement as HTMLElement)?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    await nextTick()
+    expect(document.querySelector('[role="menu"]')).toBeNull()
+
+    root.querySelector<HTMLButtonElement>('button.workspace-file-link')!.dispatchEvent(
+      new MouseEvent('contextmenu', { bubbles: true, clientX: 24, clientY: 24 }),
+    )
+    await nextTick()
+    expect(document.querySelector('[role="menu"]')).not.toBeNull()
+  })
+
+  it('closes a file actions menu when the workspace scope changes', async () => {
+    const access = { resolve: vi.fn().mockResolvedValue([file]), read: vi.fn().mockResolvedValue(new Blob(['safe'])) }
+    const { root, state } = await mount(access)
+    await vi.waitFor(() => expect(root.querySelector('.workspace-file-action-trigger')).not.toBeNull())
+    root.querySelector<HTMLButtonElement>('.workspace-file-action-trigger')!.click()
+    await nextTick()
+    expect(document.querySelector('[role="menu"]')).not.toBeNull()
+    state.sessionKey = 'B'
+    await nextTick()
+    expect(document.querySelector('[role="menu"]')).toBeNull()
+  })
+
   it('does not make missing paths clickable when resolution fails', async () => {
     const { root } = await mount({ resolve: vi.fn().mockRejectedValue(new Error('404')), read: vi.fn() })
     await nextTick()

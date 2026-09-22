@@ -1,6 +1,25 @@
 <template>
   <div>
-    <WorkspaceFilePreview :file="selectedWorkspaceFile" :session-key="sessionKey || ''" :scope="workspaceFileScope" @close="selectedWorkspaceFile = null" />
+    <WorkspaceFilePreview
+      :file="selectedWorkspaceFile"
+      :session-key="sessionKey || ''"
+      :scope="workspaceFileScope"
+      :workbench-available="workspaceWorkbenchAvailable"
+      :native-actions-available="nativeWorkspaceActionsAvailable"
+      :native-reveal-label="isMacPlatform() ? t('resourceActions.revealFinder') : t('resourceActions.reveal')"
+      @close="selectedWorkspaceFile = null"
+      @action="handleWorkspaceFileAction"
+    />
+    <WorkspaceFileActionsMenu
+      ref="workspaceFileMenu"
+      :session-key="sessionKey || ''"
+      :workbench-available="workspaceWorkbenchAvailable"
+      :native-open-available="nativeWorkspaceActionsAvailable"
+      :native-reveal-available="nativeWorkspaceActionsAvailable"
+      :native-reveal-label="isMacPlatform() ? t('resourceActions.revealFinder') : t('resourceActions.reveal')"
+      :copy-contents-available="true"
+      @action="handleWorkspaceFileAction"
+    />
     <ResourceActionsMenu ref="fileMenu" :session-key="sessionKey" @open="emit('openResource', $event)" />
     <div v-if="part.html" ref="rootEl" class="msg-ai-text" v-html="part.html" />
     <p v-if="unmentionedPreviews.length" class="workspace-preview-fallback">
@@ -28,6 +47,7 @@
 <script setup lang="ts">
 import { computed, inject, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import WorkspaceFilePreview from '@/components/chat/WorkspaceFilePreview.vue'
+import WorkspaceFileActionsMenu from '@/components/chat/WorkspaceFileActionsMenu.vue'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { clearWorkspaceFileLinks, decorateWorkspaceFileLinks, workspaceFileCandidates } from '@/utils/chat/workspaceFiles'
@@ -43,9 +63,12 @@ import {
   workspacePreviewOpenAction,
   type WorkspacePreviewLink,
 } from '@/utils/chat/workspacePreviews'
-import { copyTextWithFallback } from '@/utils/browser'
+import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
 import { usePlatform } from '@/platform'
 import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
+import { useWorkbenchStore } from '@/workbench/store'
+import { createResolvedWorkspaceFileItem } from '@/workbench/workspaceFileItems'
+import { useToasts } from '@/composables/useToasts'
 
 const props = withDefaults(
   defineProps<{
@@ -53,8 +76,9 @@ const props = withDefaults(
     sources?: SourcePart[]
     workspacePreviews?: WorkspacePreviewLink[]
     sessionKey?: string
+    preferWorkspaceWorkbench?: boolean
   }>(),
-  { sources: () => [], workspacePreviews: () => [] },
+  { sources: () => [], workspacePreviews: () => [], preferWorkspaceWorkbench: false },
 )
 
 const emit = defineEmits<{
@@ -64,10 +88,23 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { pushToast } = useToasts()
 const platform = usePlatform()
+// TextPart is also rendered in lightweight chat tests and in older clients
+// without a Workbench provider. Resolve the store only for the Workbench path
+// so the fallback preview remains usable in those hosts.
+const workbench = props.preferWorkspaceWorkbench ? useWorkbenchStore() : null
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
 const selectedWorkspaceFile = shallowRef<WorkspaceFile | null>(null)
+const workspaceWorkbenchAvailable = computed(() => Boolean(
+  props.preferWorkspaceWorkbench && workbench,
+))
+const workspaceFileMenu = ref<InstanceType<typeof WorkspaceFileActionsMenu> | null>(null)
+const nativeWorkspaceActionsAvailable = computed(() => platform.id === 'desktop'
+  && Boolean(platform.files.workspaceFileAction)
+  && Boolean(platform.gateway.getConnection)
+  && Boolean(gateway?.isLocalOwner && gateway.isAvailable))
 const workspaceFileScope = computed(() => JSON.stringify([
   props.sessionKey, gateway?.deliveryIdentity, gateway?.subscriptionEpoch,
   gateway?.isLocalOwner, gateway?.isAvailable,
@@ -79,8 +116,59 @@ let resolvedFiles: WorkspaceFile[] = []
 
 function applyWorkspaceFiles(root: HTMLElement, scope: string) {
   decorateWorkspaceFileLinks(root, resolvedFiles, file => {
-    if (scope === workspaceFileScope.value) selectedWorkspaceFile.value = file
-  }, file => t('chat.openTitle', { title: file.name }))
+    if (scope === workspaceFileScope.value) openWorkspaceFile(file)
+  }, file => t('chat.openTitle', { title: file.path }), (event, file) => {
+    void workspaceFileMenu.value?.show(event, file)
+  })
+}
+
+function openWorkspaceFile(file: WorkspaceFile) {
+  if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench?.openItem(
+    createResolvedWorkspaceFileItem(props.sessionKey, file),
+  )) return
+  selectedWorkspaceFile.value = file
+}
+
+async function handleWorkspaceFileAction(action: string, file: WorkspaceFile) {
+  if (action === 'open') { openWorkspaceFile(file); return }
+  if (action === 'copy-path') {
+    try {
+      await copyTextWithFallback(file.path)
+      pushToast(t('workspaceReference.copied'), { tone: 'ok' })
+    } catch {
+      pushToast(t('workspaceReference.copyFailed'), { tone: 'danger' })
+    }
+    return
+  }
+  if (action === 'native-open' || action === 'reveal') {
+    try {
+      const connection = await platform.gateway.getConnection?.()
+      if (!connection || connection.status !== 'ready' || !connection.instanceId) throw new Error('unavailable')
+      const result = await platform.files.workspaceFileAction?.({
+        gatewayInstanceId: connection.instanceId,
+        sessionKey: props.sessionKey || '',
+        path: file.path,
+        workspaceBinding: file.workspaceBinding,
+        action: action === 'native-open' ? 'open' : 'reveal',
+      })
+      if (result && !result.ok) throw new Error(result.message || 'failed')
+    } catch (error) {
+      pushToast(error instanceof Error ? error.message : t('resourceActions.failed'), { tone: 'danger' })
+    }
+    return
+  }
+  if (!workspaceFiles || !props.sessionKey) return
+  try {
+    const blob = await workspaceFiles.read(props.sessionKey, file)
+    if (action === 'copy-contents') {
+      await copyTextWithFallback(await blob.text())
+      pushToast(t('workspaceReference.copied'), { tone: 'ok' })
+    } else {
+      downloadBlob(blob, file.name)
+    }
+  } catch {
+    pushToast(t('resourceActions.failed'), { tone: 'danger' })
+  }
 }
 
 function decorateWorkspaceFiles(root: HTMLElement) {
@@ -304,6 +392,7 @@ watch(workspaceFileScope, () => {
   fileRequest = null
   fileSignature = ''
   resolvedFiles = []
+  workspaceFileMenu.value?.close()
   selectedWorkspaceFile.value = null
   if (rootEl.value) clearWorkspaceFileLinks(rootEl.value)
   decorate()
@@ -343,9 +432,50 @@ onBeforeUnmount(() => { fileRequest?.abort() })
   overflow-wrap: anywhere;
 }
 
+.workspace-file-entry,
+.msg-ai-text :deep(.workspace-file-entry) {
+  display: inline;
+}
+
+.workspace-file-action-trigger,
+.msg-ai-text :deep(.workspace-file-action-trigger) {
+  padding: 0 0.2rem;
+  background: var(--bg-hover);
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.35rem;
+  height: 1.35rem;
+  margin-inline-start: 0.45rem;
+  line-height: 1;
+  vertical-align: middle;
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px var(--bg-surface);
+}
+.workspace-file-action-trigger:focus-visible,
+.msg-ai-text :deep(.workspace-file-action-trigger:focus-visible) {
+  color: var(--accent);
+  background: var(--bg-surface);
+  border-color: var(--border-focus);
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+.workspace-file-action-trigger:hover,
+.msg-ai-text :deep(.workspace-file-action-trigger:hover) {
+  color: var(--accent);
+  background: var(--bg-surface);
+  border-color: var(--accent);
+}
+.workspace-file-action-trigger :deep(svg),
+.msg-ai-text :deep(.workspace-file-action-trigger svg) { width: 15px; height: 15px; }
+
 .workspace-file-link:focus-visible,
 .msg-ai-text :deep(.workspace-file-link:focus-visible) {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--border-focus);
   outline-offset: 3px;
   border-radius: var(--radius-sm);
 }

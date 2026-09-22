@@ -51,7 +51,12 @@
     "refresh": "Check file again",
     "lines": "Lines {start}–{end} of {total}",
     "previous": "Show previous lines",
-    "next": "Show more lines"
+    "next": "Show more lines",
+    "search": "Search source",
+    "searchPlaceholder": "Find text…",
+    "noMatches": "No matching lines",
+    "jumpToLine": "Jump to line",
+    "copyContents": "Copy file contents"
   },
   "resourceActions": {
     "more": "File actions", "preview": "Preview in app", "openSource": "Open with default app",

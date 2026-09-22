@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest'
 import { WorkspaceReferenceError, type WorkspaceReferences } from '@/modules/workspaceReferences'
 import { normalizeWorkspaceFileReferenceV1 } from '@/types/references'
-import { createWorkspaceFileItem } from '@/workbench/workspaceFileItems'
+import { createResolvedWorkspaceFileItem, createWorkspaceFileItem } from '@/workbench/workspaceFileItems'
+import type { WorkspaceFile } from '@/modules/workspaceFiles'
 import type { WorkbenchItem } from '@/workbench/types'
 import { createWorkspaceFileDefinition } from './workspaceFileProvider'
 
@@ -22,6 +23,50 @@ async function setup(read: WorkspaceReferences['read']) {
   return { item, runtime, state: () => state }
 }
 describe('workspace file runtime', () => {
+  it('loads a resolved workspace text file with line metadata', async () => {
+    const file: WorkspaceFile = {
+      requestedPath: '_img/build.py', path: '_img/build.py', name: 'build.py', mime: 'text/x-python',
+      size: 14, kind: 'text', workspaceBinding: 'binding-A',
+    }
+    const state: Record<string, unknown> = {}
+    const runtime = await createWorkspaceFileDefinition(null, {
+      read: vi.fn().mockResolvedValue(new Blob(['one\ntwo\n'])),
+      resolve: vi.fn(),
+    }, key => key).createRuntime!(createResolvedWorkspaceFileItem('task', file), {
+      getRenderState: () => state,
+      updateRenderState: patch => Object.assign(state, patch),
+      isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+    })
+    const item = createResolvedWorkspaceFileItem('task', file)
+    await runtime.activate!(item)
+    await vi.waitFor(() => expect(state.snapshot).toMatchObject({ relativePath: '_img/build.py', totalLines: 2, startLine: 1, endLine: 2 }))
+    expect((state.snapshot as { content: string }).content).toBe('one\ntwo\n')
+  })
+
+  it('loads and switches bounded pages for a large resolved text file', async () => {
+    const file: WorkspaceFile = {
+      requestedPath: 'large.py', path: 'large.py', name: 'large.py', mime: 'text/x-python',
+      size: 8 * 1024 * 1024, kind: 'text', workspaceBinding: 'binding-A',
+    }
+    const state: Record<string, unknown> = {}
+    const readPage = vi.fn(async (_session: string, _file: WorkspaceFile, startLine: number) => ({
+      relativePath: 'large.py', content: `line ${startLine}\n`, totalLines: 5000,
+      startLine, endLine: startLine,
+    }))
+    const runtime = await createWorkspaceFileDefinition(null, {
+      read: vi.fn(), resolve: vi.fn(), readPage,
+    }, key => key).createRuntime!(createResolvedWorkspaceFileItem('task', file), {
+      getRenderState: () => state, updateRenderState: patch => Object.assign(state, patch),
+      isItemOpen: () => true, setExpanded: vi.fn(), reportError: vi.fn(),
+    })
+    const item = createResolvedWorkspaceFileItem('task', file)
+    await runtime.activate!(item)
+    await vi.waitFor(() => expect(state.snapshot).toMatchObject({ startLine: 1, paged: true }))
+    runtime.handleComponentEvent!({ type: 'workspace-file-page', payload: { startLine: 201 } }, item)
+    await vi.waitFor(() => expect(state.snapshot).toMatchObject({ startLine: 201, paged: true }))
+    expect(readPage).toHaveBeenCalledWith('task', file, 201, 400, expect.any(AbortSignal))
+  })
+
   it('clears source on suspend and revalidates when resumed', async () => {
     const read = vi.fn().mockResolvedValue({ content: 'old text' })
     const { item, runtime, state } = await setup(read)

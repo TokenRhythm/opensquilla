@@ -1,9 +1,10 @@
-import type { WorkspaceFile, WorkspaceFiles } from '@/modules/workspaceFiles'
+import type { WorkspaceFile, WorkspaceFilePage, WorkspaceFiles } from '@/modules/workspaceFiles'
 
 interface WorkspaceFileHttp {
-  requestJson<T>(endpoint: string, options: {
-    method: 'POST'; sessionKey: string; json: { paths: string[] }; signal?: AbortSignal
-  }): Promise<T>
+  requestJson<T>(endpoint: string, options?:
+    | { method?: 'GET'; sessionKey?: string; signal?: AbortSignal }
+    | { method: 'POST'; sessionKey: string; json: { paths: string[] }; signal?: AbortSignal }
+  ): Promise<T>
   requestBlob(endpoint: string, options: { sessionKey: string; signal?: AbortSignal }): Promise<Blob>
 }
 
@@ -46,6 +47,31 @@ export function createV4WorkspaceFiles(http: WorkspaceFileHttp): WorkspaceFiles 
       // Construct the endpoint from validated identity; never navigate to model or server supplied URLs.
       const query = new URLSearchParams({ path: file.path, workspaceBinding: file.workspaceBinding })
       return http.requestBlob(`/api/v1/workspace-files/content?${query}`, { sessionKey, signal })
+    },
+    async readPage(sessionKey, file, startLine, endLine, signal): Promise<WorkspaceFilePage> {
+      if (!sessionKey || !relativePath(file.path) || !file.workspaceBinding
+        || !Number.isSafeInteger(startLine) || !Number.isSafeInteger(endLine)
+        || startLine < 1 || endLine < startLine || endLine - startLine >= 200) {
+        throw new Error('Invalid workspace file page')
+      }
+      const query = new URLSearchParams({
+        path: file.path, workspaceBinding: file.workspaceBinding,
+        startLine: String(startLine), endLine: String(endLine),
+      })
+      const raw = await http.requestJson<unknown>(`/api/v1/workspace-files/page?${query}`, {
+        method: 'GET', sessionKey, signal,
+      })
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('Invalid workspace file page')
+      const value = raw as Record<string, unknown>
+      if (value.relativePath !== file.path || typeof value.content !== 'string'
+        || !Number.isSafeInteger(value.totalLines) || Number(value.totalLines) < 1
+        || value.startLine !== startLine || !Number.isSafeInteger(value.endLine)
+        || Number(value.endLine) < startLine || Number(value.endLine) > Number(value.totalLines)) {
+        throw new Error('Invalid workspace file page')
+      }
+      if (value.content.includes('\u0000')) throw new Error('Invalid workspace file page')
+      return { relativePath: file.path, content: value.content, totalLines: Number(value.totalLines),
+        startLine, endLine: Number(value.endLine) }
     },
   }
 }

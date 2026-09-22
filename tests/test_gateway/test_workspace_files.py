@@ -34,6 +34,10 @@ async def files(tmp_path):
         session = await manager.create("agent:main:webchat:workspace-files")
         root = Path(session.execution_workspace["root"])
         app = Starlette()
+        app.state.desktop_gateway_ownership = SimpleNamespace(
+            instance_id="fixture-instance",
+            instance_nonce="fixture-instance-nonce",
+        )
         register_artifact_routes(app, config=config, session_manager=manager)
         app.add_middleware(AuthMiddleware, config=config)
         headers = {
@@ -61,6 +65,18 @@ async def resolve(files, paths, **kwargs):
     return await files.client.post(
         "/api/v1/workspace-files/resolve", json={"paths": paths}, **kwargs
     )
+
+
+def metadata_headers(files, *, path: str, binding: str, session_key: str | None = None):
+    key = session_key or files.session.session_key
+    owner = files.app.state.desktop_gateway_ownership
+    return {
+        **files.headers,
+        "x-opensquilla-session-key": key,
+        "x-opensquilla-native-signature": workspace_files._workspace_metadata_signature(
+            owner.instance_id, owner.instance_nonce, key, path, binding
+        ),
+    }
 
 
 async def test_resolve_and_read_unpublished_files_preserves_current_bytes(files):
@@ -94,6 +110,103 @@ async def test_resolve_and_read_unpublished_files_preserves_current_bytes(files)
     (files.root / "empty.txt").write_text("edited after resolve")
     entry = next(item for item in entries if item["requestedPath"] == "empty.txt")
     assert (await files.client.get(entry["contentUrl"])).text == "edited after resolve"
+
+
+async def test_read_page_streams_text_ranges_without_returning_absolute_paths(files):
+    target = files.root / "large.py"
+    target.write_text("".join(f"line {index}\n" for index in range(1, 451)))
+    resolved = (await resolve(files, ["large.py"])).json()
+    entry = resolved["files"][0]
+    response = await files.client.get(
+        "/api/v1/workspace-files/page",
+        params={
+            "path": entry["path"],
+            "workspaceBinding": resolved["workspaceBinding"],
+            "startLine": 201,
+            "endLine": 400,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "relativePath": "large.py",
+        "content": "".join(f"line {index}\n" for index in range(201, 401)),
+        "totalLines": 450,
+        "startLine": 201,
+        "endLine": 400,
+    }
+    assert "sourcePath" not in response.json()
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/page",
+            params={
+                "path": "large.py",
+                "workspaceBinding": resolved["workspaceBinding"],
+                "startLine": 1,
+                "endLine": 201,
+            },
+        )
+    ).status_code == 400
+
+
+async def test_metadata_returns_verified_native_identity_only_for_current_binding(files):
+    target = files.root / "build.py"
+    target.write_text("print('fixture')\n")
+    resolved = (await resolve(files, ["build.py"])).json()
+    entry = resolved["files"][0]
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": entry["path"], "workspaceBinding": resolved["workspaceBinding"]},
+    )
+    assert response.status_code == 403
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": entry["path"], "workspaceBinding": resolved["workspaceBinding"]},
+        headers=metadata_headers(
+            files, path=entry["path"], binding=resolved["workspaceBinding"]
+        ),
+    )
+    assert response.status_code == 200, response.text
+    metadata = response.json()
+    assert metadata["relativePath"] == "build.py"
+    assert metadata["workspaceBinding"] == resolved["workspaceBinding"]
+    assert metadata["sourcePath"] == str(target)
+    assert metadata["workspace"] == str(files.root)
+    assert metadata["size"] == target.stat().st_size
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/metadata",
+            params={"path": "build.py", "workspaceBinding": "stale"},
+            headers=metadata_headers(files, path="build.py", binding="stale"),
+        )
+    ).status_code == 404
+    await files.storage.upsert_session(
+        files.session.model_copy(update={"epoch": files.session.epoch + 1})
+    )
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/metadata",
+            params={"path": "build.py", "workspaceBinding": resolved["workspaceBinding"]},
+            headers=metadata_headers(
+                files, path="build.py", binding=resolved["workspaceBinding"]
+            ),
+        )
+    ).status_code == 404
+
+
+async def test_metadata_requires_an_active_desktop_owner(files):
+    target = files.root / "build.py"
+    target.write_text("print('fixture')\n")
+    resolved = (await resolve(files, ["build.py"])).json()
+    headers = metadata_headers(
+        files, path="build.py", binding=resolved["workspaceBinding"]
+    )
+    files.app.state.desktop_gateway_ownership = None
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": "build.py", "workspaceBinding": resolved["workspaceBinding"]},
+        headers=headers,
+    )
+    assert response.status_code == 403
 
 
 @pytest.mark.parametrize(

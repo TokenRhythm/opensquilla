@@ -51,7 +51,12 @@
     "refresh": "Vérifier à nouveau",
     "lines": "Lignes {start}–{end} sur {total}",
     "previous": "Afficher les lignes précédentes",
-    "next": "Afficher plus de lignes"
+    "next": "Afficher plus de lignes",
+    "search": "Rechercher dans le code",
+    "searchPlaceholder": "Rechercher du texte…",
+    "noMatches": "Aucune ligne correspondante",
+    "jumpToLine": "Aller à la ligne",
+    "copyContents": "Copier le contenu du fichier"
   },
   "resourceActions": {
     "more": "Actions du fichier", "preview": "Aperçu dans l’application", "openSource": "Ouvrir avec l’application par défaut",

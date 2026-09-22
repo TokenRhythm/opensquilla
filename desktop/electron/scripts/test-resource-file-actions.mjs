@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict'
+import { createHmac } from 'node:crypto'
 import { test } from 'node:test'
 import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as fs from 'node:fs/promises'
-import { saveArtifactFile, performSourceFileAction } from '../dist/resource-file-actions.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction } from '../dist/resource-file-actions.js'
 
 async function fixture(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-file-actions-')))
@@ -121,6 +122,63 @@ test('connection switch during metadata read prevents delayed native action', as
   assert.deepEqual(f.opened, [])
 })
 
+const workspaceRequest = { gatewayInstanceId: 'owned-one', sessionKey: 'agent:main:webchat:fixture',
+  path: 'build.py', workspaceBinding: 'binding-one', action: 'open' }
+async function workspaceFixture(t) {
+  const { root } = await fixture(t)
+  const page = join(root, workspaceRequest.path)
+  await writeFile(page, 'print("fixture")\n')
+  let connection = { instanceId: 'owned-one', profile: 'profile-one', url: 'http://127.0.0.1:18792', authToken: 'fixture', nonce: 'fixture-nonce' }
+  const metadata = { workspaceBinding: workspaceRequest.workspaceBinding, relativePath: workspaceRequest.path,
+    sourcePath: page, workspace: root, name: 'build.py', mime: 'text/x-python', size: 17 }
+  const opened = [], revealed = []
+  const deps = {
+    connection: () => connection,
+    fetch: async (url, options) => {
+      assert.equal(url.pathname, '/api/v1/workspace-files/metadata')
+      assert.equal(url.searchParams.get('path'), workspaceRequest.path)
+      assert.equal(url.searchParams.get('workspaceBinding'), workspaceRequest.workspaceBinding)
+      assert.equal(options.headers['x-opensquilla-session-key'], workspaceRequest.sessionKey)
+      assert.equal(options.headers.Authorization, 'Bearer fixture')
+      const signed = JSON.stringify({ v: 1, instanceId: workspaceRequest.gatewayInstanceId,
+        sessionKey: workspaceRequest.sessionKey, path: workspaceRequest.path,
+        workspaceBinding: workspaceRequest.workspaceBinding })
+      assert.equal(options.headers['x-opensquilla-native-signature'], createHmac('sha256', connection.nonce)
+        .update('opensquilla-native-workspace-file-v1\n' + signed).digest('hex'))
+      assert.equal(options.redirect, 'error')
+      return Response.json(metadata)
+    },
+    openPath: async path => { opened.push(path); return '' }, reveal: path => revealed.push(path),
+  }
+  return { root, page, metadata, deps, opened, revealed, switchConnection: next => { connection = next } }
+}
+test('workspace native actions open and reveal the verified relative file', async t => {
+  const f = await workspaceFixture(t)
+  await performWorkspaceFileAction(workspaceRequest, f.deps)
+  await performWorkspaceFileAction({ ...workspaceRequest, action: 'reveal' }, f.deps)
+  assert.deepEqual(f.opened, [f.page])
+  assert.deepEqual(f.revealed, [f.page])
+})
+for (const patch of [{ path: '../build.py' }, { path: '/tmp/build.py' }, { path: 'file:///tmp/build.py' },
+  { path: 'dir/../../build.py' }, { action: 'exec' }, { gatewayInstanceId: 'stale' }]) {
+  test(`rejects unsafe workspace request ${JSON.stringify(patch)}`, async t => {
+    const f = await workspaceFixture(t)
+    await assert.rejects(performWorkspaceFileAction({ ...workspaceRequest, ...patch }, f.deps))
+    assert.deepEqual(f.opened, [])
+  })
+}
+test('workspace native actions reject symlink and connection changes', async t => {
+  const f = await workspaceFixture(t)
+  const link = join(f.root, 'link.py')
+  await symlink(f.page, link)
+  f.metadata.sourcePath = link
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, f.deps), /identity changed/)
+  f.metadata.sourcePath = f.page
+  f.deps.fetch = async () => { f.switchConnection(null); return Response.json(f.metadata) }
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, f.deps), /Gateway changed/)
+  assert.deepEqual(f.opened, [])
+})
+
 test('IPC retains separate trusted-window and owned-local authority boundaries', async () => {
   const main = await readFile(new URL('../src/main.ts', import.meta.url), 'utf8')
   const save = main.slice(main.indexOf("ipcMain.handle('desktop:artifact:save'"), main.indexOf("ipcMain.handle('desktop:source-file:action'"))
@@ -132,4 +190,9 @@ test('IPC retains separate trusted-window and owned-local authority boundaries',
   assert.match(source, /gatewayState\.status !== 'ready'/)
   assert.match(source, /snapshot\.profileFingerprint/)
   assert.match(source, /snapshot\.instanceId/)
+  const workspace = main.slice(main.indexOf("ipcMain.handle('desktop:workspace-file:action'"), main.indexOf("ipcMain.handle('desktop:workspace:choose-directory'"))
+  assert.match(workspace, /trustedControlUiIpc\(event\)/)
+  assert.match(workspace, /gatewayState\.status !== 'ready'/)
+  assert.match(workspace, /gatewayProcessOwnershipContexts\.get\(gatewayProcess\)\?\.nonce/)
+  assert.match(workspace, /nonce\)/)
 })

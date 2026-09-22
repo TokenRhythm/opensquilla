@@ -51,7 +51,12 @@
     "refresh": "Datei erneut prüfen",
     "lines": "Zeilen {start}–{end} von {total}",
     "previous": "Vorherige Zeilen anzeigen",
-    "next": "Weitere Zeilen anzeigen"
+    "next": "Weitere Zeilen anzeigen",
+    "search": "Quelltext durchsuchen",
+    "searchPlaceholder": "Text suchen…",
+    "noMatches": "Keine passenden Zeilen",
+    "jumpToLine": "Zu Zeile springen",
+    "copyContents": "Dateiinhalt kopieren"
   },
   "resourceActions": {
     "more": "Dateiaktionen", "preview": "Vorschau in der App", "openSource": "Mit Standard-App öffnen",

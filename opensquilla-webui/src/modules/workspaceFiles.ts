@@ -10,9 +10,18 @@ export interface WorkspaceFile {
   workspaceBinding: string
 }
 
+export interface WorkspaceFilePage {
+  relativePath: string
+  content: string
+  totalLines: number
+  startLine: number
+  endLine: number
+}
+
 export interface WorkspaceFiles {
   resolve(sessionKey: string, paths: string[], signal?: AbortSignal): Promise<WorkspaceFile[]>
   read(sessionKey: string, file: WorkspaceFile, signal?: AbortSignal): Promise<Blob>
+  readPage?(sessionKey: string, file: WorkspaceFile, startLine: number, endLine: number, signal?: AbortSignal): Promise<WorkspaceFilePage>
 }
 
 export const WORKSPACE_FILES_KEY: InjectionKey<WorkspaceFiles> = Symbol('WorkspaceFiles')
