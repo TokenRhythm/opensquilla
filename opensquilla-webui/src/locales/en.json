@@ -294,6 +294,7 @@
       "restoreDefaultMode": "Restore the default preview mode",
       "defaultModeSaved": "Default preview mode saved.",
       "offlineWebLimits": "Some external content and advanced web features may be unavailable in restricted preview.",
+      "pdfViewerUnavailable": "The current browser cannot render PDFs inside the app. Open the file externally or download it instead.",
       "compatibilityFallback": "This Desktop version supports only the legacy single-file preview.",
       "upgradeDesktopShort": "Update Desktop",
       "permissionTitle": "Allow page permission?",

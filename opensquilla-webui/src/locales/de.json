@@ -293,6 +293,7 @@
       "restoreDefaultMode": "Standard-Vorschaumodus wiederherstellen",
       "defaultModeSaved": "Standard-Vorschaumodus gespeichert.",
       "offlineWebLimits": "Einige externe Inhalte und erweiterte Webfunktionen sind in der eingeschränkten Vorschau möglicherweise nicht verfügbar.",
+      "pdfViewerUnavailable": "Die aktuelle Umgebung kann PDFs nicht in der App anzeigen. Öffnen Sie die Datei extern oder laden Sie sie herunter.",
       "compatibilityFallback": "Diese Desktop-Version unterstützt nur die ältere Einzeldateivorschau.",
       "upgradeDesktopShort": "Desktop aktualisieren",
       "permissionTitle": "Seitenberechtigung zulassen?",

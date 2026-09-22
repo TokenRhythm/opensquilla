@@ -293,6 +293,7 @@
       "restoreDefaultMode": "既定のプレビューモードに戻す",
       "defaultModeSaved": "既定のプレビューモードを保存しました。",
       "offlineWebLimits": "制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能を利用できない場合があります。",
+      "pdfViewerUnavailable": "現在の環境ではアプリ内で PDF を表示できません。外部で開くか、ダウンロードしてください。",
       "compatibilityFallback": "この Desktop バージョンでは従来の単一ファイルプレビューのみ利用できます。",
       "upgradeDesktopShort": "Desktop を更新",
       "permissionTitle": "ページの権限を許可しますか？",

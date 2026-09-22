@@ -293,6 +293,7 @@
       "restoreDefaultMode": "Restaurar el modo de vista previa predeterminado",
       "defaultModeSaved": "Modo de vista previa predeterminado guardado.",
       "offlineWebLimits": "Es posible que algunos contenidos externos y funciones web avanzadas no estén disponibles en la vista previa restringida.",
+      "pdfViewerUnavailable": "El entorno actual no puede mostrar PDF dentro de la aplicación. Ábrelo externamente o descárgalo.",
       "compatibilityFallback": "Esta versión de Desktop solo admite la vista previa antigua de un solo archivo.",
       "upgradeDesktopShort": "Actualizar Desktop",
       "permissionTitle": "¿Permitir el acceso de la página?",

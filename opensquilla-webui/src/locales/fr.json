@@ -293,6 +293,7 @@
       "restoreDefaultMode": "Rétablir le mode d’aperçu par défaut",
       "defaultModeSaved": "Mode d’aperçu par défaut enregistré.",
       "offlineWebLimits": "Certains contenus externes et certaines fonctions web avancées peuvent être indisponibles dans l’aperçu restreint.",
+      "pdfViewerUnavailable": "L’environnement actuel ne peut pas afficher les PDF dans l’application. Ouvrez le fichier à l’extérieur ou téléchargez-le.",
       "compatibilityFallback": "Cette version Desktop ne prend en charge que l’ancien aperçu à fichier unique.",
       "upgradeDesktopShort": "Mettre Desktop à jour",
       "permissionTitle": "Autoriser la permission de la page ?",

@@ -9539,6 +9539,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Electron disables Chromium's built-in PDF plugin by default. The
+      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
+      // keep the renderer sandboxed while enabling that viewer.
+      plugins: true,
     },
   })
   mainWindow = window
