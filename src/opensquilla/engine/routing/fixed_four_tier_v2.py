@@ -1,7 +1,7 @@
 """Fixed four-tier single-model routing state machine.
 
-The state machine accepts either the legacy deterministic random mock or one
-hash-pinned model set produced by routing-training-platform.  Both classifier
+The state machine accepts the legacy deterministic random mock, a hash-pinned
+model set produced by routing-training-platform, or the remote Jev adapter. Both classifier
 heads receive the same complete route-before input; policy rules decide which
 head is authoritative for a turn.
 """
@@ -183,6 +183,37 @@ def _validate_registered_classifier_contract(
         raise ValueError("registered model decision registry status is incompatible")
     if identity.get("input_schema_version") != feature_schema_version:
         raise ValueError("registered model decision runtime input schema is inconsistent")
+
+
+def _validate_jev_classifier_contract(
+    *,
+    identity: Mapping[str, Any] | None,
+    feature_schema_version: str,
+    feature_vector_dim: int | None,
+    feature_vector_status: str,
+) -> None:
+    """Remote evidence must not masquerade as local materialized/native evidence."""
+    if (
+        feature_schema_version != "jev_router_input.v1"
+        or feature_vector_dim is not None
+        or feature_vector_status != "remote_evaluated"
+    ):
+        raise ValueError("Jev decision remote feature contract is incompatible")
+    if not isinstance(identity, Mapping) or (
+        identity.get("schema_version") != "jev_classifier_identity.v1"
+        or identity.get("model_id") != "typesafe-ai/jev"
+        or identity.get("endpoint") != "https://ai-gateway.vercel.sh/v1/evaluate"
+        or identity.get("execution_mode") != "remote_gateway"
+        or identity.get("input_schema_version") != feature_schema_version
+        or identity.get("prompt_version") != "jev-four-tier-questions.v1"
+        or not _is_tagged_sha256(identity.get("prompt_hash"))
+        or identity.get("confidence_semantics")
+        != "selected_class_probability; vendor confidence retained in raw receipt"
+        or identity.get("tier_selection_mode") not in {None, "probability_argmax.v1"}
+        or "model_revision" not in identity
+        or identity.get("model_revision") is not None
+    ):
+        raise ValueError("Jev decision remote identity is unavailable or incompatible")
 
 
 _NEW_TASK_CONTROL_EVENTS = frozenset(
@@ -370,8 +401,13 @@ class ClassificationAudit:
     final: str
     reason: str
     version: str | None
+    # Serialized through the owning decision's Jev classifier identity; old
+    # traces and every other classifier retain strict probability validation.
+    probability_argmax: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.probability_argmax, bool):
+            raise ValueError("four_tier_mapping classifier audit has invalid selection mode")
         if not isinstance(self.source, str) or self.source not in {
             "rule",
             "classifier",
@@ -419,13 +455,14 @@ class ClassificationAudit:
                 ):
                     raise ValueError("four_tier_mapping classifier audit has invalid probabilities")
                 normalized[label] = float(raw_probability)
-            if not normalized or not math.isclose(
-                sum(normalized.values()),
-                1.0,
-                rel_tol=1e-6,
-                abs_tol=1e-6,
+            if not normalized or (
+                not self.probability_argmax and not math.isclose(
+                    sum(normalized.values()), 1.0, rel_tol=1e-6, abs_tol=1e-6
+                )
             ):
                 raise ValueError("four_tier_mapping classifier audit has invalid probabilities")
+            if self.probability_argmax and set(normalized) != set(TIERS):
+                raise ValueError("Jev argmax audit requires all four tier probabilities")
             object.__setattr__(self, "probabilities", normalized)
         if self.run_status == "not_run" and any(
             value is not None for value in (self.prediction, self.probabilities, self.confidence)
@@ -453,6 +490,8 @@ class ClassificationAudit:
             winners = [
                 label for label, probability in self.probabilities.items() if probability == maximum
             ]
+            if self.probability_argmax:
+                winners = [max(TIERS, key=lambda label: self.probabilities[label])]
             if winners != [self.prediction] or not math.isclose(
                 float(self.confidence),
                 maximum,
@@ -956,7 +995,7 @@ class FixedFourTierDecision:
             raise ValueError("four_tier_mapping decision feature input audit is malformed")
         if self.schema_version not in {SCHEMA_VERSION, *LEGACY_SCHEMA_VERSIONS}:
             raise ValueError("four_tier_mapping decision schema_version is incompatible")
-        if self.classifier_backend not in {"random_mock", "registered_model", "injected"}:
+        if self.classifier_backend not in {"random_mock", "registered_model", "injected", "jev"}:
             raise ValueError("four_tier_mapping decision classifier backend is incompatible")
         if self.classifier_identity is not None:
             if not isinstance(self.classifier_identity, Mapping) or not self.classifier_identity:
@@ -975,8 +1014,14 @@ class FixedFourTierDecision:
             or self.feature_vector_dim <= 0
         ):
             raise ValueError("four_tier_mapping decision feature dimension is invalid")
-        if self.feature_vector_status not in {"mock_not_materialized", "materialized"}:
+        if self.feature_vector_status not in {
+            "mock_not_materialized",
+            "materialized",
+            "remote_evaluated",
+        }:
             raise ValueError("four_tier_mapping decision feature status is invalid")
+        if self.feature_vector_status == "remote_evaluated" and self.classifier_backend != "jev":
+            raise ValueError("remote classifier features require the Jev backend")
         if self.feature_vector_status == "materialized" and self.classifier_identity is None:
             raise ValueError("materialized classifier features require a runtime identity")
         if self.classifier_backend == "registered_model":
@@ -988,6 +1033,40 @@ class FixedFourTierDecision:
             )
             if self.feature_input_audit.input_contract != "canonical_router_input":
                 raise ValueError("registered model decision requires a canonical RouterInput audit")
+        if self.classifier_backend == "jev":
+            _validate_jev_classifier_contract(
+                identity=self.classifier_identity,
+                feature_schema_version=self.feature_schema_version,
+                feature_vector_dim=self.feature_vector_dim,
+                feature_vector_status=self.feature_vector_status,
+            )
+            if self.feature_input_audit.input_contract != "canonical_router_input":
+                raise ValueError("Jev decision requires a canonical RouterInput audit")
+        jev_argmax = (
+            self.classifier_backend == "jev"
+            and isinstance(self.classifier_identity, Mapping)
+            and self.classifier_identity.get("tier_selection_mode") == "probability_argmax.v1"
+        )
+        if self.intent.probability_argmax or self.tier.probability_argmax != (
+            jev_argmax and self.tier.run_status == "ran"
+        ):
+            raise ValueError("Jev argmax audit conflicts with classifier identity")
+        if jev_argmax and self.tier.run_status == "ran":
+            selected = (
+                self.tier.source == "classifier"
+                and self.tier.reason == "classifier_argmax_selected"
+            )
+            redo_blocked = (
+                self.intent.final == "redo"
+                and self.tier.source == "fallback"
+                and self.tier.reason == "redo_downgrade_blocked"
+                and self.previous_tier in TIERS
+                and self.final_tier == self.previous_tier
+                and self.tier.prediction in TIERS
+                and TIERS.index(self.tier.prediction) < TIERS.index(self.previous_tier)
+            )
+            if not (selected or redo_blocked):
+                raise ValueError("Jev argmax audit cannot use confidence or validation fallback")
         for field_name, value in (
             ("route_id", self.route_id),
             ("task_id", self.task_id),
@@ -1036,8 +1115,11 @@ class FixedFourTierDecision:
             or not 0 <= self.effective_mock_seed <= (1 << 64) - 1
         ):
             raise ValueError("four_tier_mapping decision has invalid effective mock seed")
-        if self.classifier_backend == "registered_model" and self.effective_mock_seed is not None:
-            raise ValueError("registered model decision cannot carry a mock seed")
+        if (
+            self.classifier_backend in {"registered_model", "jev"}
+            and self.effective_mock_seed is not None
+        ):
+            raise ValueError("model decision cannot carry a mock seed")
 
         intent = cast(Intent, self.intent.final)
         if intent == "new_task":
@@ -1141,7 +1223,11 @@ class FixedFourTierDecision:
             or feature_dim_value <= 0
         ):
             raise ValueError("four_tier_mapping decision feature dimension is incompatible")
-        if feature_status_value not in {"mock_not_materialized", "materialized"}:
+        if feature_status_value not in {
+            "mock_not_materialized",
+            "materialized",
+            "remote_evaluated",
+        }:
             raise ValueError("four_tier_mapping decision feature status is incompatible")
         if schema_version_value in LEGACY_SCHEMA_VERSIONS and (
             feature_schema_value != FEATURE_SCHEMA_VERSION
@@ -1154,7 +1240,7 @@ class FixedFourTierDecision:
         if schema_version_value in LEGACY_SCHEMA_VERSIONS:
             classifier_backend_value = "random_mock"
             classifier_identity_value = None
-        if classifier_backend_value not in {"random_mock", "registered_model", "injected"}:
+        if classifier_backend_value not in {"random_mock", "registered_model", "injected", "jev"}:
             raise ValueError("four_tier_mapping decision classifier backend is incompatible")
         if classifier_identity_value is not None and (
             not isinstance(classifier_identity_value, Mapping) or not classifier_identity_value
@@ -1237,6 +1323,13 @@ class FixedFourTierDecision:
                 final=final_value,
                 reason=reason_value,
                 version=version_value,
+                probability_argmax=(
+                    name == "tier" and run_status == "ran"
+                    and classifier_backend_value == "jev"
+                    and isinstance(value.get("classifier_identity"), Mapping)
+                    and value["classifier_identity"].get("tier_selection_mode")
+                    == "probability_argmax.v1"
+                ),
             )
             if result.source == "classifier":
                 if result.prediction not in allowed_labels or result.final != result.prediction:
@@ -1251,6 +1344,8 @@ class FixedFourTierDecision:
                     for label, probability in classifier_probabilities.items()
                     if probability == maximum
                 ]
+                if result.probability_argmax:
+                    winners = [max(TIERS, key=lambda label: classifier_probabilities[label])]
                 if winners != [result.prediction] or not math.isclose(
                     classifier_confidence,
                     maximum,
@@ -1562,7 +1657,7 @@ def _feature_input_audit(
             reason="feature_masks_unavailable",
         )
 
-    if classifier_backend == "registered_model":
+    if classifier_backend in {"registered_model", "jev"}:
         router_input = snapshot.get("router_input")
         if not isinstance(router_input, Mapping):
             raise FixedFourTierRoutingError(
@@ -1693,6 +1788,27 @@ def _classifier_audit(
             final=fallback,
             reason=f"classifier_error:{type(exc).__name__}",
             version=version,
+        )
+
+    if (
+        tuple(probability_labels) == TIERS
+        and getattr(classifier, "backend", None) == "jev"
+        and getattr(classifier, "tier_selection_mode", None) == "probability_argmax.v1"
+    ):
+        # The Jev adapter has already validated the four finite probabilities.
+        # Do not apply local-model confidence, margin, sum or tie fallbacks.
+        probabilities = cast(Mapping[str, float], result.probabilities)
+        prediction = max(TIERS, key=lambda label: probabilities[label])
+        return ClassificationAudit(
+            source="classifier",
+            run_status="ran",
+            prediction=prediction,
+            probabilities=dict(probabilities),
+            confidence=probabilities[prediction],
+            final=prediction,
+            reason="classifier_argmax_selected",
+            version=result.version or version,
+            probability_argmax=True,
         )
 
     try:
