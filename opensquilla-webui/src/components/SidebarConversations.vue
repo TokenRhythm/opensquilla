@@ -1206,14 +1206,14 @@ watch(() => sidebarVirtualizer.hasRow(pointerDrag.value?.key || ''), present => 
 
     <!-- Filtered to nothing within the Chats agent filter -->
     <div
-      v-else-if="agentFilter && !hasFilterMatches && !hasMore"
+      v-if="agentFilter && !hasFilterMatches && !hasMore && !error"
       class="sidebar-history-empty"
     >
       {{ t('shared.sidebar.noMatches') }}
     </div>
 
     <div
-      v-else
+      v-else-if="!error || totalRows > 0 || displayProjection.projectCount > 0"
       ref="historyList"
       class="sidebar-history-list"
       :data-sidebar-virtualized="virtualized"

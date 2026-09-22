@@ -461,6 +461,7 @@ import {
   arrangeSidebarSections,
   useSessions,
   type SessionItem,
+  type SessionListLoadResult,
   type SidebarSection,
   type SidebarSectionRow,
 } from './composables/useSessions'
@@ -1705,8 +1706,9 @@ function scheduleSessionRefresh() {
   automaticAppRpc.schedule()
 }
 
-async function performSidebarLoad(): Promise<void> {
-  const requests: Promise<unknown>[] = [loadSessions()]
+async function performSidebarLoad(): Promise<SessionListLoadResult> {
+  const sessionRead = loadSessions()
+  const requests: Promise<unknown>[] = [sessionRead]
   if (
     gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
@@ -1716,6 +1718,7 @@ async function performSidebarLoad(): Promise<void> {
     )
   }
   await Promise.allSettled(requests)
+  return sessionRead
 }
 
 const automaticAppRpc = createAppAutomaticRpc({
@@ -1730,6 +1733,11 @@ const automaticAppRpc = createAppAutomaticRpc({
 
 function loadSidebarData(): Promise<void> {
   return automaticAppRpc.load()
+}
+
+function handleAppForeground() {
+  markCurrentSessionReadIfVisible()
+  if (document.visibilityState === 'visible') automaticAppRpc.foreground()
 }
 
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
@@ -1963,8 +1971,8 @@ onMounted(() => {
   })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.addEventListener('focus', markCurrentSessionReadIfVisible)
-  document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.addEventListener('focus', handleAppForeground)
+  document.addEventListener('visibilitychange', handleAppForeground)
   void automaticAppRpc.mount()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
@@ -1977,8 +1985,8 @@ onUnmounted(() => {
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.removeEventListener('focus', markCurrentSessionReadIfVisible)
-  document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.removeEventListener('focus', handleAppForeground)
+  document.removeEventListener('visibilitychange', handleAppForeground)
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()

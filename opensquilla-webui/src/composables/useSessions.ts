@@ -378,6 +378,8 @@ export function groupSessions(items: SessionItem[]): SessionGroup[] {
     .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0))
 }
 
+export type SessionListLoadResult = 'applied' | 'failed' | 'superseded'
+
 export function useSessions(directory: SessionDirectory) {
   const sessionsList = ref<SessionItem[]>([])
   const sessionListError = ref(false)
@@ -446,7 +448,7 @@ export function useSessions(directory: SessionDirectory) {
     return added
   }
 
-  async function loadSessions() {
+  async function loadSessions(): Promise<SessionListLoadResult> {
     const generation = ++requestGeneration
     const request = beginRequest()
     const pagesToReload = Math.max(1, loadedPageCount)
@@ -467,7 +469,7 @@ export function useSessions(directory: SessionDirectory) {
           cursor: requestedCursor,
           signal: request.signal,
         })
-        if (generation !== requestGeneration) return
+        if (generation !== requestGeneration) return 'superseded'
         const added = appendUniqueSessions(refreshed, data.items)
         refreshedPageCount += 1
         refreshedPageState = pageState(data, refreshedCursors, requestedCursor)
@@ -479,25 +481,27 @@ export function useSessions(directory: SessionDirectory) {
         requestedCursor = refreshedPageState.nextCursor
       }
 
-      if (generation !== requestGeneration) return
+      if (generation !== requestGeneration) return 'superseded'
       sessionsList.value = refreshed
       loadedPageCount = refreshedPageCount
       pageCursors = refreshedCursors
       hasMore.value = refreshedPageState.hasMore
       nextCursor.value = refreshedPageState.nextCursor
+      return 'applied'
     } catch (err: unknown) {
-      if (generation !== requestGeneration) return
+      if (generation !== requestGeneration) return 'superseded'
       console.error('[useSessions] session directory error:', err instanceof Error ? err.message : err)
       // A reconnect/event refresh must not collapse an already useful ledger.
       // Keep the last complete traversal and its retry cursor until a whole
       // replacement snapshot succeeds.
+      sessionListError.value = true
       if (sessionsList.value.length === 0) {
-        sessionListError.value = true
         hasMore.value = false
         nextCursor.value = null
         loadedPageCount = 0
         pageCursors = new Set<string>()
       }
+      return 'failed'
     } finally {
       if (generation === requestGeneration) isLoading.value = false
     }

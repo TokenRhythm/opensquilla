@@ -706,6 +706,17 @@ type FailedHistoryRequest =
     }
 
 const MAX_FORWARD_BRIDGE_PAGES = 2
+const BACKGROUND_HISTORY_RETRY_DELAYS_MS = [250, 1_000, 3_000] as const
+
+type HistoryLoadResult = SessionPhaseResult & { historyContinuation?: boolean }
+
+interface BackgroundHistoryRecovery {
+  key: string
+  lease: SessionReadLease | null
+  expectedUserMessageIds: Set<string>
+  retryCount: number
+  exhausted: boolean
+}
 
 export function useChatHistory(options: UseChatHistoryOptions) {
   let historySyncTimer: ReturnType<typeof setTimeout> | null = null
@@ -721,8 +732,10 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   let hasLoadedEarlier = false
   let loadEarlierPending = false
   let failedHistoryRequest: FailedHistoryRequest | null = null
+  let backgroundRecovery: BackgroundHistoryRecovery | null = null
   let activeHistory: {
     key: string
+    lease: SessionReadLease | null
     bootstrapGeneration: number
     controller: AbortController
     promise: Promise<SessionPhaseResult | void>
@@ -758,7 +771,15 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     }
   }
 
-  function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean) {
+  function isCurrentRecovery(recovery: BackgroundHistoryRecovery): boolean {
+    return backgroundRecovery === recovery
+      && recovery.key === options.sessionKey.value
+      && recovery.lease === options.sessionReadLeaseReader.current()
+  }
+
+  function armHistorySync(nonReconnecting: boolean, advanceGeneration: boolean, delayMs = 50) {
+    const key = options.sessionKey.value
+    const lease = options.sessionReadLeaseReader.current()
     if (nonReconnecting && advanceGeneration) preserveLocalTailGeneration += 1
     historySyncTimerNonReconnecting ||= nonReconnecting
     if (historySyncTimer) clearTimeout(historySyncTimer)
@@ -766,17 +787,86 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       historySyncTimer = null
       const timerNonReconnecting = historySyncTimerNonReconnecting
       historySyncTimerNonReconnecting = false
-      if (historyState.value.loading || failedHistoryRequest?.kind === 'latest') {
+      if (key !== options.sessionKey.value || lease !== options.sessionReadLeaseReader.current()) return
+      const activeReadIsStale = activeHistory && (
+        activeHistory.key !== key || activeHistory.lease !== lease
+      )
+      if ((historyState.value.loading && !activeReadIsStale) || failedHistoryRequest?.kind === 'latest') {
         historySyncPending = true
         historySyncPendingNonReconnecting ||= timerNonReconnecting
         return
       }
       void loadHistory({ nonReconnecting: timerNonReconnecting })
-    }, 50)
+    }, delayMs)
   }
 
-  function scheduleHistorySync(preserveLocalTail = false) {
+  function scheduleHistorySync(preserveLocalTail = false, expectedUserMessageId?: string) {
+    if (preserveLocalTail) {
+      const expectedId = expectedUserMessageId?.trim()
+      if (!backgroundRecovery || !isCurrentRecovery(backgroundRecovery)) {
+        backgroundRecovery = {
+          key: options.sessionKey.value,
+          lease: options.sessionReadLeaseReader.current(),
+          expectedUserMessageIds: new Set(),
+          retryCount: 0,
+          exhausted: false,
+        }
+      } else if (expectedId && backgroundRecovery.expectedUserMessageIds.has(expectedId)) {
+        // queued/running/input notifications for one input share one budget.
+        return
+      } else if (backgroundRecovery.exhausted) {
+        // An explicit terminal/commit invalidation can arrive after an outage
+        // exhausted input hydration. Give that new durable evidence its own
+        // bounded budget; identified duplicate input events return above.
+        backgroundRecovery.retryCount = 0
+        backgroundRecovery.exhausted = false
+      }
+      if (expectedId) backgroundRecovery.expectedUserMessageIds.add(expectedId)
+    }
     armHistorySync(preserveLocalTail, true)
+  }
+
+  function finishBackgroundRecovery(
+    recovery: BackgroundHistoryRecovery,
+    result: HistoryLoadResult | void,
+    requestPreserveLocalTailGeneration: number,
+  ) {
+    if (!isCurrentRecovery(recovery)) return
+    if (result?.cancelled) {
+      backgroundRecovery = null
+      if (historySyncTimer) clearTimeout(historySyncTimer)
+      historySyncTimer = null
+      historySyncTimerNonReconnecting = false
+      historySyncPending = false
+      historySyncPendingNonReconnecting = false
+      return
+    }
+    // Forward bridging already schedules its next bounded page. Progress is
+    // not a failed attempt merely because the latest input is further ahead.
+    if (result?.ok && result.historyContinuation) return
+    // A successful read admitted before a later terminal/input invalidation
+    // cannot settle it. The pending post-invalidation read owns that proof.
+    if (result?.ok && requestPreserveLocalTailGeneration < preserveLocalTailGeneration) return
+    const missingInput = [...recovery.expectedUserMessageIds].some(id => (
+      !options.messages.value.some(message => message.role === 'user' && message.messageId === id)
+    ))
+    if (result?.ok && !missingInput) {
+      backgroundRecovery = null
+      return
+    }
+    // Cursor invalidation has its own explicit canonical-window replacement.
+    if (failedHistoryRequest?.kind === 'latest') return
+    historySyncPending = false
+    historySyncPendingNonReconnecting = false
+    const delay = BACKGROUND_HISTORY_RETRY_DELAYS_MS[recovery.retryCount]
+    if (delay !== undefined) {
+      recovery.retryCount += 1
+      armHistorySync(true, true, delay)
+      return
+    }
+    recovery.exhausted = true
+    failedHistoryRequest = { kind: 'page', key: recovery.key, before: null, prepend: false }
+    historyState.value = { ...historyState.value, recoveryError: true }
   }
 
   function flushPendingHistorySync() {
@@ -916,6 +1006,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
 
   function resetForSession(key: string): boolean {
     if (historySessionKey.value === key) return false
+    if (backgroundRecovery?.key !== key) backgroundRecovery = null
     const crossedSession = Boolean(historySessionKey.value)
     if (crossedSession) {
       acknowledgedPreserveLocalTailGeneration = preserveLocalTailGeneration
@@ -992,7 +1083,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   async function runHistoryLoad(
     params: HistoryLoadParams = {},
     bootstrap: SessionBootstrapPhaseContext,
-  ): Promise<SessionPhaseResult | void> {
+  ): Promise<HistoryLoadResult | void> {
     if (!options.sessionKey.value) return
     const key = options.sessionKey.value
     const lease = options.sessionReadLeaseReader.current()
@@ -1384,7 +1475,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       }
       if (!bridgeContinuationNeeded) acknowledgePreservedLocalTail()
       flushPendingHistorySync()
-      return { ok: true }
+      return bridgeContinuationNeeded ? { ok: true, historyContinuation: true } : { ok: true }
     } catch (error: unknown) {
       // History endpoint may not exist yet.
       if (isCurrentRequest()) {
@@ -1451,6 +1542,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
     if (activeHistory) {
       if (
         activeHistory.key === key
+        && activeHistory.lease === options.sessionReadLeaseReader.current()
         && (
           !bootstrap
           || activeHistory.bootstrapGeneration === bootstrap.generation
@@ -1466,7 +1558,11 @@ export function useChatHistory(options: UseChatHistoryOptions) {
         // The caller observes the real terminal result of the in-flight read.
         return activeHistory.promise
       }
+      const currentRecovery = backgroundRecovery && isCurrentRecovery(backgroundRecovery)
+        ? backgroundRecovery
+        : null
       cancelActiveHistory()
+      backgroundRecovery = currentRecovery
     }
 
     const controller = new AbortController()
@@ -1487,16 +1583,37 @@ export function useChatHistory(options: UseChatHistoryOptions) {
           skipSnapshot: false,
         }
 
+    const lease = options.sessionReadLeaseReader.current()
+    const requestPreserveLocalTailGeneration = preserveLocalTailGeneration
     const request = runHistoryLoad(params, boundedContext)
-    const tracked = request.finally(() => {
+    const finishRequest = () => {
       parentSignal?.removeEventListener('abort', relayAbort)
-      if (activeHistory?.promise === tracked) {
-        activeHistory = null
+      if (activeHistory?.promise !== tracked) return false
+      activeHistory = null
+      return true
+    }
+    const tracked = request.then(result => {
+      if (finishRequest()) {
+        // An input notification can create recovery after this read started.
+        // Join it at completion, but never retire a successor lease's recovery
+        // because the previous request returned a cancelled result.
+        if (
+          (!params.prepend || result?.ok === false)
+          && backgroundRecovery?.key === key
+          && backgroundRecovery.lease === lease
+        ) {
+          finishBackgroundRecovery(backgroundRecovery, result, requestPreserveLocalTailGeneration)
+        }
         flushPendingHistorySync()
       }
+      return result
+    }, error => {
+      if (finishRequest()) flushPendingHistorySync()
+      throw error
     })
     activeHistory = {
       key,
+      lease,
       bootstrapGeneration: bootstrap?.generation ?? -1,
       controller,
       promise: tracked,
@@ -1516,6 +1633,17 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function retryHistory(bootstrap?: SessionBootstrapPhaseContext) {
+    if (
+      backgroundRecovery?.exhausted
+      && isCurrentRecovery(backgroundRecovery)
+      && failedHistoryRequest?.kind !== 'latest'
+    ) {
+      backgroundRecovery.retryCount = 0
+      backgroundRecovery.exhausted = false
+      failedHistoryRequest = null
+      preserveLocalTailGeneration += 1
+      return loadHistory({ nonReconnecting: true, retry: true }, bootstrap)
+    }
     const failed = failedHistoryRequest
     if (failed?.key === options.sessionKey.value) {
       if (failed.kind === 'latest') {
@@ -1550,6 +1678,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
   }
 
   function cancelActiveHistory() {
+    backgroundRecovery = null
     activeHistory?.controller.abort()
     activeHistory = null
     ++historyRequestSeq

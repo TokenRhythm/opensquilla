@@ -10,9 +10,9 @@ function deferred<T = void>() {
   return { promise, resolve, reject }
 }
 
-const page = (title: string) => ({
+const page = (title: string, runStatus = 'idle') => ({
   count: 1, ts: 1,
-  sessions: [{ key: 'agent:main:webchat:one', title, updatedAt: 1 }],
+  sessions: [{ key: 'agent:main:webchat:one', title, updatedAt: 1, runStatus }],
 })
 
 function setup(initiallyAvailable = false) {
@@ -227,5 +227,93 @@ describe('App automatic RPC lifecycle with the real directory adapter', () => {
     expect(app.sessions.sessionListError.value).toBe(true)
     expect(error).toHaveBeenCalledExactlyOnceWith('[useSessions] session directory error:', 'ready timed out after 10000ms')
     app.lifecycle.dispose()
+  })
+
+  it('retries a failed terminal refresh and replaces the stale running row without another event', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const app = setup(true)
+    app.request.mockResolvedValueOnce(page('Active task', 'running'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    app.request.mockRejectedValueOnce(new Error('Temporary read failure'))
+      .mockResolvedValueOnce(page('Stopped task', 'killed'))
+    app.lifecycle.schedule()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('running')
+    expect(app.sessions.sessionListError.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(499)
+    expect(app.request).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(app.request).toHaveBeenCalledTimes(3)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('cancelled')
+    expect(app.sessions.sessionListError.value).toBe(false)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(app.request).toHaveBeenCalledTimes(3)
+    app.lifecycle.dispose()
+  })
+
+  it('bounds retries, retains the useful directory, and permits a new foreground attempt', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const app = setup(true)
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    app.request.mockRejectedValue(new Error('Still offline'))
+    app.lifecycle.schedule()
+    await vi.advanceTimersByTimeAsync(30_000)
+    // Initial successful read, one invalidation read, and three retries.
+    expect(app.request).toHaveBeenCalledTimes(5)
+    expect(app.sessions.sessionsList.value[0]?.title).toBe('Current')
+    expect(app.sessions.sessionListError.value).toBe(true)
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(app.request).toHaveBeenCalledTimes(5)
+    app.request.mockResolvedValue(page('Recovered'))
+    app.lifecycle.foreground()
+    app.lifecycle.foreground()
+    await vi.advanceTimersByTimeAsync(150)
+    expect(app.request).toHaveBeenCalledTimes(6)
+    expect(app.sessions.sessionsList.value[0]?.title).toBe('Recovered')
+    expect(app.sessions.sessionListError.value).toBe(false)
+    app.lifecycle.dispose()
+  })
+
+  it('recovers a missed invalidation on foreground while respecting chat admission', async () => {
+    const app = setup(true)
+    app.request.mockResolvedValueOnce(page('Active task', 'running'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    app.state.admitted = false
+    await app.lifecycle.admissionChanged()
+    app.request.mockResolvedValue(page('Stopped task', 'killed'))
+    app.lifecycle.foreground()
+    app.lifecycle.foreground()
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(app.request).toHaveBeenCalledOnce()
+    app.state.admitted = true
+    await app.lifecycle.admissionChanged()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.request).toHaveBeenCalledTimes(2)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('cancelled')
+    app.lifecycle.dispose()
+  })
+
+  it('retires retry timers across disconnect and disposal', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const app = setup(true)
+    app.request.mockRejectedValue(new Error('Read failed'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.request).toHaveBeenCalledOnce()
+    app.state.available = false
+    await app.lifecycle.availabilityChanged()
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(app.request).toHaveBeenCalledOnce()
+    app.state.available = true
+    await app.lifecycle.availabilityChanged()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.request).toHaveBeenCalledTimes(2)
+    app.lifecycle.dispose()
+    app.lifecycle.foreground()
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(app.request).toHaveBeenCalledTimes(2)
   })
 })

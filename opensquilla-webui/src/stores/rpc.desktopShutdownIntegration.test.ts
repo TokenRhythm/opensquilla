@@ -63,9 +63,9 @@ const ready: DesktopGatewayConnection = {
 const stopped: DesktopGatewayConnection = {
   ...ready, revision: 2, status: 'stopped', wsUrl: null, authToken: null,
 }
-const page = (title: string) => ({
+const page = (title: string, runStatus = 'idle') => ({
   count: 1, ts: 1, hasMore: true, nextCursor: 'next-page',
-  sessions: [{ key: 'agent:main:webchat:one', title, updatedAt: 1 }],
+  sessions: [{ key: 'agent:main:webchat:one', title, updatedAt: 1, runStatus }],
 })
 
 function hello(socket: Socket) {
@@ -178,6 +178,47 @@ afterEach(async () => {
 })
 
 describe('Desktop shutdown with the real RPC and App directory lifecycle', () => {
+  it('recovers from a missing directory event and failed read without clearing a successor task', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const app = await setup()
+    const initial = app.automatic.load()
+    await vi.advanceTimersByTimeAsync(0)
+    app.socket.respond('sessions.list', page('Active task', 'running'))
+    await initial
+
+    // The chat lane reports the predecessor's cancellation; sessions.changed
+    // is deliberately absent. Duplicate terminal notices coalesce to one read.
+    for (const event of ['task.cancelled', 'session.event.done']) {
+      app.socket.receive({ type: 'event', event, payload: {
+        schema_version: 1, key: 'agent:main:webchat:one', task_id: 'predecessor',
+      } })
+    }
+    await vi.advanceTimersByTimeAsync(150)
+    expect(app.socket.requests('sessions.list')).toHaveLength(3)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('running')
+    app.socket.respond('sessions.list', page('Successor task', 'running'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.sessions.sessionsList.value[0]).toMatchObject({ title: 'Successor task', runStatus: 'running' })
+
+    app.socket.receive({ type: 'event', event: 'task.cancelled', payload: {
+      schema_version: 1, key: 'agent:main:webchat:one', task_id: 'successor',
+    } })
+    await vi.advanceTimersByTimeAsync(150)
+    const listRequests = app.socket.requests('sessions.list')
+    const failedRequest = listRequests[listRequests.length - 1]!
+    app.socket.receive({ type: 'res', id: failedRequest.id, ok: false, error: {
+      code: 'INTERNAL_ERROR', message: 'Temporary directory failure',
+    } })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('running')
+    await vi.advanceTimersByTimeAsync(500)
+    expect(app.socket.requests('sessions.list')).toHaveLength(5)
+    app.socket.respond('sessions.list', page('Stopped task', 'killed'))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('cancelled')
+    expect(app.sessions.sessionListError.value).toBe(false)
+  })
+
   it.each(['list', 'next-page'] as const)('fault control exposes a pending %s rejection without App cancellation', async kind => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {})
     const app = await setup(false)

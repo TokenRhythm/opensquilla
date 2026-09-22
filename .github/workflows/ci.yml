@@ -866,6 +866,7 @@ jobs:
           auth-connection-recovery.spec.ts
           chat-send-lifecycle.spec.ts
           chat-send-lifecycle.real.spec.ts
+          cross-window-sync.real.spec.ts
           composer-paste.spec.ts
           history-hydration.spec.ts
           idle-chat-recovery.spec.ts
