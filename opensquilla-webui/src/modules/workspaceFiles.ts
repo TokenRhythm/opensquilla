@@ -8,6 +8,9 @@ export interface WorkspaceFile {
   size: number
   kind: 'text' | 'image' | 'download'
   workspaceBinding: string
+  /** Explicit Gateway capabilities; absent on older Gateways. */
+  textPaging?: boolean
+  nativeActions?: boolean
 }
 
 export interface WorkspaceFilePage {
@@ -18,10 +21,17 @@ export interface WorkspaceFilePage {
   endLine: number
 }
 
+export interface WorkspaceFileSearch {
+  relativePath: string
+  totalLines: number
+  matchLine: number | null
+}
+
 export interface WorkspaceFiles {
   resolve(sessionKey: string, paths: string[], signal?: AbortSignal): Promise<WorkspaceFile[]>
   read(sessionKey: string, file: WorkspaceFile, signal?: AbortSignal): Promise<Blob>
   readPage?(sessionKey: string, file: WorkspaceFile, startLine: number, endLine: number, signal?: AbortSignal): Promise<WorkspaceFilePage>
+  search?(sessionKey: string, file: WorkspaceFile, query: string, signal?: AbortSignal): Promise<WorkspaceFileSearch>
 }
 
 export const WORKSPACE_FILES_KEY: InjectionKey<WorkspaceFiles> = Symbol('WorkspaceFiles')

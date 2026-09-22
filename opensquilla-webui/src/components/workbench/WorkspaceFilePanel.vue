@@ -6,7 +6,7 @@
       <div class="workspace-file__toolbar">
         <label>
           <span class="sr-only">{{ t('workspaceReference.search') }}</span>
-          <input v-model="query" type="search" :placeholder="t('workspaceReference.searchPlaceholder')" @keydown.enter="findMatch">
+          <input v-model="query" type="search" maxlength="512" @input="resetSearch" :placeholder="t('workspaceReference.searchPlaceholder')" @keydown.enter="findMatch">
         </label>
         <button type="button" class="workspace-file__tool" :disabled="!query.trim()" @click="findMatch">
           {{ t('workspaceReference.search') }}
@@ -15,19 +15,22 @@
           <span class="sr-only">{{ t('workspaceReference.jumpToLine') }}</span>
           <input v-model="jump" type="number" min="1" :max="snapshot.totalLines" :placeholder="t('workspaceReference.jumpToLine')" @keydown.enter="jumpToLine">
         </label>
-        <button type="button" class="workspace-file__tool" @click="copyContents">
-          {{ copied ? t('workspaceReference.copied') : t('workspaceReference.copyContents') }}
+        <button type="button" class="workspace-file__tool" :disabled="copying" @click="copyContents">
+          {{ copying ? t('workspaceReference.loading') : copied ? t('workspaceReference.copied') : t('workspaceReference.copyContents') }}
         </button>
       </div>
-      <p v-if="query.trim() && !matches.length" class="workspace-file__status" role="status">{{ t('workspaceReference.noMatches') }}</p>
+      <p v-if="searching" class="workspace-file__status" role="status">{{ t('workspaceReference.loading') }}</p>
+      <p v-else-if="noMatches" class="workspace-file__status" role="status">{{ t('workspaceReference.noMatches') }}</p>
+      <p v-if="searchErrorKey" class="workspace-file__status" role="alert">{{ t(searchErrorKey) }}</p>
+      <p v-if="copyErrorKey" class="workspace-file__status" role="alert">{{ t(copyErrorKey) }}</p>
       <div class="workspace-file__range" role="status">
-        {{ t('workspaceReference.lines', { start: snapshot.startLine, end: snapshot.endLine, total: snapshot.totalLines }) }}
+        {{ t('workspaceReference.lines', { start: rangeStart, end: rangeEnd, total: snapshot.totalLines }) }}
       </div>
       <button v-if="canPrevious" class="workspace-file__more" type="button" @click="previousPage">{{ t('workspaceReference.previous') }}</button>
       <pre ref="source" class="workspace-file__source" tabindex="0" :aria-label="snapshot.relativePath"><code><span
         v-for="line in visibleLines" :key="line.number" class="workspace-file__line"
         :class="{ 'is-selected': Boolean(snapshot.reference) && line.number >= snapshot.startLine && line.number <= snapshot.endLine, 'is-match': line.match }"
-        :data-line="line.number" :aria-current="line.number === snapshot.startLine ? 'location' : undefined"
+        :data-line="line.number" :aria-current="line.number === focusLine ? 'location' : undefined"
       ><span class="workspace-file__number" aria-hidden="true">{{ line.number }}</span><span>{{ line.text || ' ' }}</span></span></code></pre>
       <button v-if="canNext" class="workspace-file__more" type="button" @click="nextPage">{{ t('workspaceReference.next') }}</button>
     </template>
@@ -38,7 +41,6 @@
 import { computed, nextTick, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { WorkspaceSourceSnapshot } from '@/modules/workspaceReferences'
-import { copyTextWithFallback } from '@/utils/browser'
 
 interface WorkspaceFileViewSnapshot {
   relativePath: string
@@ -51,17 +53,30 @@ interface WorkspaceFileViewSnapshot {
   focusLine?: number
 }
 
-const props = defineProps<{ snapshot?: WorkspaceFileViewSnapshot | null; loading?: boolean; errorKey?: string; copyContents?: () => Promise<string> }>()
+const props = defineProps<{
+  snapshot?: WorkspaceFileViewSnapshot | null
+  loading?: boolean
+  errorKey?: string
+  viewId?: number
+  copying?: boolean
+  copied?: boolean
+  copyErrorKey?: string
+  searchStatus?: 'idle' | 'searching' | 'found' | 'not-found'
+  searchQuery?: string
+  searchErrorKey?: string
+}>()
 const emit = defineEmits<{ 'workbench-event': [event: { type: string; payload?: unknown }] }>()
 const { t } = useI18n()
 const source = ref<HTMLElement | null>(null)
 const query = ref('')
 const jump = ref('')
-const copied = ref(false)
+const searchedQuery = ref('')
+const focusLine = ref(1)
 const lines = computed(() => {
-  // Match the source receipt's Python splitlines() boundaries exactly.
-  const values = props.snapshot?.content.split(/\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/) ?? []
-  if (values[values.length - 1] === '') values.pop()
+  if (!props.snapshot) return []
+  // Match Python splitlines(), with a visible first line for an empty file.
+  const values = props.snapshot.content.split(/\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/)
+  if (values.length > 1 && values[values.length - 1] === '') values.pop()
   return values
 })
 const windowStart = ref(0)
@@ -74,26 +89,38 @@ const canNext = computed(() => paged.value
   ? (props.snapshot?.endLine ?? 0) < (props.snapshot?.totalLines ?? 0)
   : windowEnd.value < lines.value.length)
 const matches = computed(() => {
-  const needle = query.value.trim().toLocaleLowerCase()
+  const needle = query.value.trim().toLowerCase()
   if (!needle) return []
-  return lines.value.flatMap((text, index) => text.toLocaleLowerCase().includes(needle) ? [index + 1] : [])
+  return lines.value.flatMap((text, index) => text.toLowerCase().includes(needle) ? [index + 1] : [])
 })
+const searching = computed(() => props.searchStatus === 'searching' && props.searchQuery === query.value.trim())
+const noMatches = computed(() => !!query.value.trim() && (paged.value
+  ? props.searchStatus === 'not-found' && props.searchQuery === query.value.trim()
+  : searchedQuery.value === query.value.trim() && !matches.value.length))
 const visibleLines = computed(() => lines.value.slice(windowStart.value, windowEnd.value)
   .map((text, index) => ({
     text,
     number: (paged.value ? (props.snapshot?.startLine ?? 1) - 1 : 0) + windowStart.value + index + 1,
     match: matches.value.includes(windowStart.value + index + 1),
   })))
-watch(() => props.snapshot, async snapshot => {
-  windowStart.value = snapshot?.paged
-    ? Math.max(0, (snapshot?.focusLine ?? snapshot.startLine) - snapshot.startLine - 41)
-    : Math.max(0, (snapshot?.startLine ?? 1) - 41)
+const rangeStart = computed(() => props.snapshot?.reference ? props.snapshot.startLine : visibleLines.value[0]?.number ?? 1)
+const rangeEnd = computed(() => props.snapshot?.reference ? props.snapshot.endLine : visibleLines.value[visibleLines.value.length - 1]?.number ?? 1)
+watch(() => props.viewId, () => {
   query.value = ''
   jump.value = ''
-  copied.value = false
+  searchedQuery.value = ''
+})
+watch(() => props.snapshot, async snapshot => {
+  if (!snapshot) return
+  focusLine.value = snapshot.focusLine ?? snapshot.startLine
+  windowStart.value = snapshot.paged ? 0 : Math.max(0, focusLine.value - 41)
   await nextTick()
-  source.value?.querySelector('[aria-current="location"]')?.scrollIntoView?.({ block: 'center' })
+  if (props.snapshot === snapshot) scrollToLine(focusLine.value)
 }, { immediate: true })
+
+function scrollToLine(line: number) {
+  source.value?.querySelector(`[data-line="${line}"]`)?.scrollIntoView?.({ block: 'center' })
+}
 
 function previousPage() {
   if (paged.value) {
@@ -102,36 +129,46 @@ function previousPage() {
     } })
   } else {
     windowStart.value = Math.max(0, windowStart.value - 200)
+    focusLine.value = windowStart.value + 1
+    void nextTick(() => scrollToLine(focusLine.value))
   }
 }
 
 function nextPage() {
   if (paged.value) {
     emit('workbench-event', { type: 'workspace-file-page', payload: {
-      startLine: (props.snapshot?.startLine ?? 1) + 200,
+      startLine: (props.snapshot?.endLine ?? 0) + 1,
     } })
   } else {
     windowStart.value = windowEnd.value
+    focusLine.value = windowStart.value + 1
+    void nextTick(() => scrollToLine(focusLine.value))
   }
 }
 
+function resetSearch() {
+  searchedQuery.value = ''
+  emit('workbench-event', { type: 'workspace-file-search-cancel' })
+}
+
 function findMatch() {
-  const line = matches.value[0]
-  if (line) {
-    windowStart.value = Math.max(0, line - 41)
-    void nextTick(() => source.value?.querySelector(`[data-line="${(paged.value ? (props.snapshot?.startLine ?? 1) - 1 : 0) + line}"]`)?.scrollIntoView?.({ block: 'center' }))
+  if (!query.value.trim()) return
+  if (paged.value) {
+    emit('workbench-event', { type: 'workspace-file-search', payload: { query: query.value } })
     return
   }
-  if (paged.value && query.value.trim()) {
-    emit('workbench-event', { type: 'workspace-file-search', payload: { query: query.value } })
+  searchedQuery.value = query.value.trim()
+  const line = matches.value[0]
+  if (line) {
+    focusLine.value = line
+    windowStart.value = Math.max(0, line - 41)
+    void nextTick(() => scrollToLine(line))
   }
 }
 
 function jumpToLine() {
   const requested = Math.max(1, Number.parseInt(jump.value, 10) || 1)
-  const line = paged.value
-    ? Math.min(props.snapshot?.totalLines ?? requested, requested)
-    : Math.min(lines.value.length, requested)
+  const line = Math.min(props.snapshot?.totalLines ?? 1, requested)
   if (paged.value && (line < (props.snapshot?.startLine ?? 1) || line > (props.snapshot?.endLine ?? 0))) {
     emit('workbench-event', { type: 'workspace-file-page', payload: {
       startLine: Math.floor((line - 1) / 200) * 200 + 1,
@@ -139,21 +176,13 @@ function jumpToLine() {
     } })
     return
   }
-  windowStart.value = paged.value
-    ? Math.max(0, line - (props.snapshot?.startLine ?? 1) - 41)
-    : Math.max(0, line - 41)
-  void nextTick(() => source.value?.querySelector(`[data-line="${line}"]`)?.scrollIntoView?.({ block: 'center' }))
+  focusLine.value = line
+  if (!paged.value) windowStart.value = Math.max(0, line - 41)
+  void nextTick(() => scrollToLine(line))
 }
 
-async function copyContents() {
-  if (!props.snapshot) return
-  try {
-    await copyTextWithFallback(props.copyContents ? await props.copyContents() : props.snapshot.content)
-    copied.value = true
-    window.setTimeout(() => { copied.value = false }, 1600)
-  } catch {
-    copied.value = false
-  }
+function copyContents() {
+  emit('workbench-event', { type: 'workspace-file-copy' })
 }
 </script>
 
@@ -164,7 +193,7 @@ async function copyContents() {
 .workspace-file__toolbar label { min-width: 0; }
 .workspace-file__toolbar input { min-width: 10rem; max-width: 18rem; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.35rem 0.5rem; background: var(--bg-hover); color: var(--text); font: inherit; font-size: var(--fs-sm); }
 .workspace-file__toolbar input:focus-visible, .workspace-file__tool:focus-visible { outline: 2px solid var(--border-focus); outline-offset: 2px; }
-.workspace-file__jump input { width: 7rem; min-width: 0; }
+.workspace-file__jump input { width: 8.5rem; min-width: 0; }
 .workspace-file__tool { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.35rem 0.55rem; background: transparent; color: var(--text); font: inherit; font-size: var(--fs-sm); cursor: pointer; }
 .workspace-file__tool:hover:not(:disabled) { background: var(--bg-hover); }
 .workspace-file__tool:disabled { cursor: default; opacity: var(--state-disabled-opacity); }

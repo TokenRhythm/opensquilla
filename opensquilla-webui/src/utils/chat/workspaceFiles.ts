@@ -44,7 +44,7 @@ export function decorateWorkspaceFileLinks(
   onOpen: (file: WorkspaceFile) => void,
   labelFor: (file: WorkspaceFile) => string,
   onMenu?: (event: MouseEvent | KeyboardEvent, file: WorkspaceFile) => void,
-  displayLabelFor?: (file: WorkspaceFile) => string,
+  menuLabelFor?: (file: WorkspaceFile) => string,
 ): void {
   clearWorkspaceFileLinks(root)
   const items: Decoration[] = []
@@ -62,17 +62,7 @@ export function decorateWorkspaceFileLinks(
     button.setAttribute('aria-label', button.title)
     if (element.tagName === 'CODE') {
       button.appendChild(element.cloneNode(true))
-      const displayLabel = displayLabelFor?.(file)
-      if (displayLabel && displayLabel !== element.textContent?.trim()) {
-        const detail = document.createElement('span')
-        detail.className = 'workspace-file-label'
-        const pathMarker = ` · ${file.path}`
-        detail.textContent = displayLabel.includes(pathMarker)
-          ? ` · ${displayLabel.slice(displayLabel.indexOf(pathMarker) + pathMarker.length).replace(/^ · /, '')}`
-          : ` · ${displayLabel}`
-        button.appendChild(detail)
-      }
-    } else button.textContent = displayLabelFor?.(file) || element.textContent
+    } else button.textContent = element.textContent
     button.addEventListener('click', event => {
       event.preventDefault()
       event.stopPropagation()
@@ -84,9 +74,14 @@ export function decorateWorkspaceFileLinks(
       actionButton.type = 'button'
       actionButton.className = 'workspace-file-action-trigger'
       actionButton.innerHTML = getIconSvg('moreHorizontal', 14)
-      actionButton.title = labelFor(file)
-      actionButton.setAttribute('aria-label', labelFor(file))
+      actionButton.title = menuLabelFor?.(file) || labelFor(file)
+      actionButton.setAttribute('aria-label', actionButton.title)
+      actionButton.setAttribute('aria-haspopup', 'menu')
       actionButton.addEventListener('click', event => onMenu(event, file))
+      actionButton.addEventListener('contextmenu', event => onMenu(event, file))
+      actionButton.addEventListener('keydown', event => {
+        if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) onMenu(event, file)
+      })
       container.appendChild(actionButton)
       button.addEventListener('contextmenu', event => onMenu(event, file))
       button.addEventListener('keydown', event => {

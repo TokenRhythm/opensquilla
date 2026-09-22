@@ -2,7 +2,7 @@
 import { computed, inject, onBeforeUnmount, ref, shallowRef, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile } from '@/modules/workspaceFiles'
-import { downloadBlob } from '@/utils/browser'
+import { usePlatform } from '@/platform'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import Icon from '@/components/Icon.vue'
 import WorkspaceFileActionsMenu, { type WorkspaceFileAction } from './WorkspaceFileActionsMenu.vue'
@@ -17,6 +17,7 @@ const props = withDefaults(defineProps<{
 }>(), { workbenchAvailable: false, nativeActionsAvailable: false, nativeRevealLabel: '' })
 const emit = defineEmits<{ close: []; action: [action: WorkspaceFileAction, file: WorkspaceFile] }>()
 const { t } = useI18n()
+const platform = usePlatform()
 const access = inject(WORKSPACE_FILES_KEY, null)
 const panel = ref<HTMLElement | null>(null)
 const loading = ref(false)
@@ -33,6 +34,7 @@ function releaseImage() {
   imageUrl.value = ''
 }
 watch([() => props.file, () => props.sessionKey, () => props.scope], async ([file, sessionKey], _old, onCleanup) => {
+  actionsMenu.value?.close()
   const request = new AbortController()
   onCleanup(() => { request.abort(); releaseImage() })
   releaseImage()
@@ -49,8 +51,10 @@ watch([() => props.file, () => props.sessionKey, () => props.scope], async ([fil
     if (file.kind === 'image' && /^image\/(png|jpeg|gif|webp)$/.test(result.type)) {
       imageUrl.value = URL.createObjectURL(result)
     } else if (file.kind === 'text' && result.size <= 2 * 1024 * 1024) {
-      const text = await result.text()
-      if (!request.signal.aborted) content.value = text
+      const text = new TextDecoder('utf-8', { fatal: true }).decode(await result.arrayBuffer())
+      if (request.signal.aborted) return
+      if (text.includes('\0')) unsupported.value = true
+      else content.value = text
     } else {
       // Unsupported or changed content remains downloadable, never executable.
       unsupported.value = true
@@ -63,9 +67,9 @@ watch([() => props.file, () => props.sessionKey, () => props.scope], async ([fil
 }, { immediate: true, flush: 'sync' })
 onBeforeUnmount(releaseImage)
 function download() {
-  if (blob.value && props.file) downloadBlob(blob.value, props.file.name)
+  if (blob.value && props.file) emit('action', 'download', props.file)
 }
-function showActions(event: MouseEvent) {
+function showActions(event: MouseEvent | KeyboardEvent) {
   if (props.file) void actionsMenu.value?.show(event, props.file)
 }
 function handleAction(action: WorkspaceFileAction, file: WorkspaceFile) {
@@ -89,14 +93,14 @@ function formatType(file: WorkspaceFile): string {
 <template>
   <Teleport to="body">
     <div v-if="file" class="workspace-file-preview" @click.self="emit('close')">
-      <section ref="panel" class="workspace-file-preview__panel" role="dialog" aria-modal="true" :aria-label="file.name" @contextmenu.prevent="showActions">
+      <section ref="panel" class="workspace-file-preview__panel" role="dialog" aria-modal="true" :aria-label="file.name" @contextmenu="showActions" @keydown="showActions">
         <header>
           <div class="workspace-file-preview__heading">
             <strong>{{ file.name }}</strong>
-            <small>{{ file.path }} · {{ formatType(file) }} · {{ formatSize(file.size) }} · {{ t('workspaceReference.readonly') }}</small>
+            <small :title="file.path">{{ file.path }} · {{ formatType(file) }} · {{ formatSize(file.size) }} · {{ t('workspaceReference.readonly') }}</small>
           </div>
           <div class="workspace-file-preview__actions">
-            <button type="button" class="btn btn--icon btn--ghost" :aria-label="t('workspaceReference.actions')" @click="showActions"><span aria-hidden="true">⋯</span></button>
+            <button type="button" class="btn btn--icon btn--ghost" :aria-label="t('workspaceReference.actions')" aria-haspopup="menu" @click="showActions"><Icon name="moreHorizontal" :size="16" /></button>
             <button type="button" class="btn btn--icon btn--ghost" :aria-label="t('chat.closePreview')" @click="emit('close')"><Icon name="x" :size="16" /></button>
           </div>
         </header>
@@ -106,7 +110,7 @@ function formatType(file: WorkspaceFile): string {
         <img v-else-if="imageUrl" :src="imageUrl" :alt="file.name" />
         <pre v-else tabindex="0"><code>{{ content }}</code></pre>
         <footer v-if="blob">
-          <button type="button" class="btn btn--primary" @click="download"><Icon name="download" :size="14" />{{ t('chat.download') }}</button>
+          <button type="button" class="btn btn--primary" @click="download"><Icon name="download" :size="14" />{{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}</button>
         </footer>
       </section>
       <WorkspaceFileActionsMenu

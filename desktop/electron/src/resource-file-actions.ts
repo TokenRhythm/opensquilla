@@ -1,4 +1,5 @@
 import { createHmac, randomUUID } from 'node:crypto'
+import type { BigIntStats } from 'node:fs'
 import { open, rename, unlink, lstat, realpath } from 'node:fs/promises'
 import { basename, dirname, isAbsolute, join, relative, sep, extname } from 'node:path'
 
@@ -155,6 +156,21 @@ function workspaceRelativePath(value: unknown): value is string {
     && !isAbsolute(value) && value.split('/').every(part => part && part !== '.' && part !== '..')
 }
 
+export function workspaceFileIdentityMatches(
+  value: unknown,
+  info: Pick<BigIntStats, 'dev' | 'ino' | 'size' | 'mtimeNs' | 'ctimeNs'>,
+  platform = process.platform,
+): boolean {
+  if (!value || typeof value !== 'object') return false
+  const identity = value as Record<string, unknown>
+  const properties = ['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'] as const
+  if (properties.some(key => typeof identity[key] !== 'string' || !/^\d+$/.test(identity[key] as string))) return false
+  // CPython still reports creation time as Windows lstat ctime; libuv reports
+  // change time. dev is normalized to libuv's low DWORD by the Gateway.
+  return properties.every(key => (platform === 'win32' && key === 'ctimeNs')
+    || info[key].toString() === identity[key])
+}
+
 /** Open or reveal a file that still belongs to the currently owned workspace. */
 export async function performWorkspaceFileAction(
   payload: WorkspaceFileActionRequest,
@@ -212,7 +228,22 @@ export async function performWorkspaceFileAction(
     redirect: 'error', signal: AbortSignal.timeout(15_000),
   })
   if (!response.ok) throw new Error(`Workspace file unavailable (${response.status})`)
-  const metadata = await response.json() as Record<string, unknown>
+  const reader = response.body?.getReader()
+  if (!reader) throw new Error('Missing workspace file metadata')
+  let text = ''
+  const decoder = new TextDecoder('utf-8', { fatal: true })
+  try {
+    let size = 0
+    for (;;) {
+      const next = await reader.read()
+      if (next.done) break
+      size += next.value.byteLength
+      if (size > 64 * 1024) throw new Error('Workspace metadata is too large')
+      text += decoder.decode(next.value, { stream: true })
+    }
+    text += decoder.decode()
+  } finally { await reader.cancel().catch(() => {}) }
+  const metadata = JSON.parse(text) as Record<string, unknown>
   assertCurrent()
   if (metadata?.workspaceBinding !== payload.workspaceBinding
     || metadata?.relativePath !== payload.path
@@ -227,6 +258,15 @@ export async function performWorkspaceFileAction(
     || isAbsolute(location) || location === '..' || location.startsWith(`..${sep}`)
     || location.split(sep).join('/') !== payload.path
     || !(await lstat(source)).isFile()) throw new Error('Workspace file identity changed')
+  let ancestor = workspace
+  for (const segment of ['', ...payload.path.split('/')]) {
+    if (segment) ancestor = join(ancestor, segment)
+    if ((await lstat(ancestor)).isSymbolicLink()) throw new Error('Workspace file identity changed')
+  }
+  const info = await lstat(source, { bigint: true })
+  if (!info.isFile() || !workspaceFileIdentityMatches(metadata.identity, info)) {
+    throw new Error('Workspace file identity changed')
+  }
   assertCurrent()
   if (payload.action === 'reveal') deps.reveal(source)
   else {

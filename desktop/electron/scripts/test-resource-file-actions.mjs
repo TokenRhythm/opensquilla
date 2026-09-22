@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, readFile, readdir, realpath, rm, symlink, writeFile } f
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import * as fs from 'node:fs/promises'
-import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction } from '../dist/resource-file-actions.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, workspaceFileIdentityMatches } from '../dist/resource-file-actions.js'
 
 async function fixture(t) {
   const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-file-actions-')))
@@ -128,9 +128,11 @@ async function workspaceFixture(t) {
   const { root } = await fixture(t)
   const page = join(root, workspaceRequest.path)
   await writeFile(page, 'print("fixture")\n')
+  const info = await fs.lstat(page, { bigint: true })
   let connection = { instanceId: 'owned-one', profile: 'profile-one', url: 'http://127.0.0.1:18792', authToken: 'fixture', nonce: 'fixture-nonce' }
   const metadata = { workspaceBinding: workspaceRequest.workspaceBinding, relativePath: workspaceRequest.path,
-    sourcePath: page, workspace: root, name: 'build.py', mime: 'text/x-python', size: 17 }
+    sourcePath: page, workspace: root, name: 'build.py', mime: 'text/x-python', size: 17,
+    identity: Object.fromEntries(['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs'].map(key => [key, info[key].toString()])) }
   const opened = [], revealed = []
   const deps = {
     connection: () => connection,
@@ -159,6 +161,24 @@ test('workspace native actions open and reveal the verified relative file', asyn
   assert.deepEqual(f.opened, [f.page])
   assert.deepEqual(f.revealed, [f.page])
 })
+test('Windows identity compares normalized dev and inode without confusing birthtime with ctime', () => {
+  // Gateway metadata uses the low DWORD of CPython's 64-bit volume serial.
+  // Its Windows lstat ctime is creation time; libuv ctime is change time.
+  const info = { dev: 0xABCDEF01n, ino: 0x123456789ABCDEF0n, size: 17n,
+    mtimeNs: 1700000001000000000n, ctimeNs: 1700000002000000000n }
+  const metadata = { dev: '2882400001', ino: '1311768467463790320', size: '17',
+    mtimeNs: '1700000001000000000', ctimeNs: '1700000000000000000' }
+  assert.equal(workspaceFileIdentityMatches(metadata, info, 'win32'), true)
+  assert.equal(workspaceFileIdentityMatches(metadata, info, 'darwin'), false)
+  assert.equal(workspaceFileIdentityMatches(metadata, info, 'linux'), false)
+  for (const key of ['dev', 'ino', 'size', 'mtimeNs']) {
+    assert.equal(workspaceFileIdentityMatches({ ...metadata, [key]: '0' }, info, 'win32'), false)
+  }
+  for (const key of Object.keys(metadata)) {
+    assert.equal(workspaceFileIdentityMatches({ ...metadata, [key]: undefined }, info, 'win32'), false)
+    assert.equal(workspaceFileIdentityMatches({ ...metadata, [key]: 'invalid' }, info, 'win32'), false)
+  }
+})
 for (const patch of [{ path: '../build.py' }, { path: '/tmp/build.py' }, { path: 'file:///tmp/build.py' },
   { path: 'dir/../../build.py' }, { action: 'exec' }, { gatewayInstanceId: 'stale' }]) {
   test(`rejects unsafe workspace request ${JSON.stringify(patch)}`, async t => {
@@ -176,6 +196,29 @@ test('workspace native actions reject symlink and connection changes', async t =
   f.metadata.sourcePath = f.page
   f.deps.fetch = async () => { f.switchConnection(null); return Response.json(f.metadata) }
   await assert.rejects(performWorkspaceFileAction(workspaceRequest, f.deps), /Gateway changed/)
+  assert.deepEqual(f.opened, [])
+})
+
+test('workspace native actions reject changed file identity and missing ownership nonce', async t => {
+  const f = await workspaceFixture(t)
+  await writeFile(f.page, 'changed after metadata')
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, f.deps), /identity changed/)
+  f.switchConnection({ instanceId: 'owned-one', profile: 'profile-one', url: 'http://127.0.0.1:18792', authToken: 'fixture' })
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, f.deps), /unavailable/)
+  assert.deepEqual(f.opened, [])
+})
+
+test('workspace native actions reject remote gateways, oversized metadata and native failures', async t => {
+  const f = await workspaceFixture(t)
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, {
+    ...f.deps, connection: () => ({ ...f.deps.connection(), url: 'https://remote.invalid' }),
+  }), /Invalid owned Gateway/)
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, {
+    ...f.deps, fetch: async () => new Response(' '.repeat(65537)),
+  }), /too large/)
+  await assert.rejects(performWorkspaceFileAction(workspaceRequest, {
+    ...f.deps, openPath: async () => 'application could not open file',
+  }), /application could not open file/)
   assert.deepEqual(f.opened, [])
 })
 

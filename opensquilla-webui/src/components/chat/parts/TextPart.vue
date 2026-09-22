@@ -119,55 +119,69 @@ function applyWorkspaceFiles(root: HTMLElement, scope: string) {
     if (scope === workspaceFileScope.value) openWorkspaceFile(file)
   }, file => t('chat.openTitle', { title: file.path }), (event, file) => {
     void workspaceFileMenu.value?.show(event, file)
-  })
+  }, file => `${t('resourceActions.more')} · ${file.path}`)
 }
 
 function openWorkspaceFile(file: WorkspaceFile) {
   if (file.kind === 'text' && workspaceWorkbenchAvailable.value && props.sessionKey && workbench?.openItem(
     createResolvedWorkspaceFileItem(props.sessionKey, file),
-  )) return
+  )) { selectedWorkspaceFile.value = null; return }
   selectedWorkspaceFile.value = file
 }
 
+let fileActionRequest: AbortController | null = null
 async function handleWorkspaceFileAction(action: string, file: WorkspaceFile) {
-  if (action === 'open') { openWorkspaceFile(file); return }
-  if (action === 'copy-path') {
-    try {
+  const sessionKey = props.sessionKey
+  const scope = workspaceFileScope.value
+  if (!sessionKey || !gateway?.isLocalOwner || !gateway.isAvailable) return
+  fileActionRequest?.abort()
+  const request = new AbortController()
+  fileActionRequest = request
+  const current = () => !request.signal.aborted && scope === workspaceFileScope.value
+  try {
+    if (action === 'open') { openWorkspaceFile(file); return }
+    if (action === 'copy-path') {
       await copyTextWithFallback(file.path)
-      pushToast(t('workspaceReference.copied'), { tone: 'ok' })
-    } catch {
-      pushToast(t('workspaceReference.copyFailed'), { tone: 'danger' })
+      if (current()) pushToast(t('workspaceReference.copied'), { tone: 'ok' })
+      return
     }
-    return
-  }
-  if (action === 'native-open' || action === 'reveal') {
-    try {
+    if (action === 'native-open' || action === 'reveal') {
+      const nativeAction = platform.files.workspaceFileAction
+      if (!file.nativeActions || !nativeWorkspaceActionsAvailable.value || !nativeAction) throw new Error('unavailable')
       const connection = await platform.gateway.getConnection?.()
+      if (!current()) return
       if (!connection || connection.status !== 'ready' || !connection.instanceId) throw new Error('unavailable')
-      const result = await platform.files.workspaceFileAction?.({
+      const result = await nativeAction({
         gatewayInstanceId: connection.instanceId,
-        sessionKey: props.sessionKey || '',
+        sessionKey,
         path: file.path,
         workspaceBinding: file.workspaceBinding,
         action: action === 'native-open' ? 'open' : 'reveal',
       })
-      if (result && !result.ok) throw new Error(result.message || 'failed')
-    } catch (error) {
-      pushToast(error instanceof Error ? error.message : t('resourceActions.failed'), { tone: 'danger' })
+      if (!result?.ok) throw new Error('failed')
+      return
     }
-    return
-  }
-  if (!workspaceFiles || !props.sessionKey) return
-  try {
-    const blob = await workspaceFiles.read(props.sessionKey, file)
+    if (!workspaceFiles) throw new Error('unavailable')
+    const blob = await workspaceFiles.read(sessionKey, file, request.signal)
+    if (!current()) return
     if (action === 'copy-contents') {
-      await copyTextWithFallback(await blob.text())
-      pushToast(t('workspaceReference.copied'), { tone: 'ok' })
-    } else {
-      downloadBlob(blob, file.name)
+      if (file.kind !== 'text') throw new Error('unsupported')
+      const content = new TextDecoder('utf-8', { fatal: true }).decode(await blob.arrayBuffer())
+      if (!current()) return
+      if (content.includes('\0')) throw new Error('unsupported')
+      await copyTextWithFallback(content)
+      if (current()) pushToast(t('workspaceReference.copied'), { tone: 'ok' })
+    } else if (action === 'download') {
+      if (platform.files.saveArtifact) {
+        const data = await blob.arrayBuffer()
+        if (!current()) return
+        await platform.files.saveArtifact({ data, name: file.name, mime: blob.type })
+      } else { downloadBlob(blob, file.name) }
     }
   } catch {
-    pushToast(t('resourceActions.failed'), { tone: 'danger' })
+    if (current()) pushToast(t('resourceActions.failed'), { tone: 'danger' })
+  } finally {
+    if (fileActionRequest === request) fileActionRequest = null
   }
 }
 
@@ -388,6 +402,8 @@ watch(() => props.part.html, decorate, { flush: 'post' })
 watch(() => props.sources, decorate, { flush: 'post' })
 watch(() => props.workspacePreviews, decorate, { flush: 'post' })
 watch(workspaceFileScope, () => {
+  fileActionRequest?.abort()
+  fileActionRequest = null
   fileRequest?.abort()
   fileRequest = null
   fileSignature = ''
@@ -397,7 +413,7 @@ watch(workspaceFileScope, () => {
   if (rootEl.value) clearWorkspaceFileLinks(rootEl.value)
   decorate()
 }, { flush: 'sync' })
-onBeforeUnmount(() => { fileRequest?.abort() })
+onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
 </script>
 
 <style scoped>

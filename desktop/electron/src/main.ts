@@ -12506,6 +12506,10 @@ ipcMain.handle('desktop:workspace-file:action', async (event, payload: Workspace
         url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  }).catch(() => {
+    // Native filesystem errors can embed host paths. Only the main process
+    // receives controlled metadata; renderer errors remain path-free.
+    throw new Error('Workspace file action failed')
   })
 })
 // File paths enter this broker only from the native picker or isolated preload's

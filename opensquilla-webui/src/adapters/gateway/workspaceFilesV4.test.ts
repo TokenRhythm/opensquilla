@@ -37,7 +37,7 @@ describe('workspace files HTTP adapter', () => {
   it('reads bounded source pages and validates the page envelope', async () => {
     const { access, http, file } = fixture()
     http.requestJson.mockResolvedValue({
-      relativePath: file.path, content: 'line 201\n', totalLines: 450, startLine: 201, endLine: 201,
+      relativePath: file.path, content: 'line 201\n', totalLines: 201, startLine: 201, endLine: 201,
     })
     await expect(access.readPage?.('session-A', { ...file, kind: 'text' }, 201, 400))
       .resolves.toMatchObject({ relativePath: file.path, startLine: 201, endLine: 201 })
@@ -45,6 +45,37 @@ describe('workspace files HTTP adapter', () => {
     expect(endpoint).toContain('/api/v1/workspace-files/page?')
     expect(new URL(endpoint, 'https://gateway.test').searchParams.get('startLine')).toBe('201')
     expect(options).toMatchObject({ method: 'GET', sessionKey: 'session-A' })
+  })
+
+  it('only enables capabilities explicitly advertised by the current Gateway', async () => {
+    const { access, http, file } = fixture()
+    expect((await access.resolve('session-A', [file.path]))[0]).toMatchObject({ textPaging: false, nativeActions: false })
+    http.requestJson.mockResolvedValue({ workspaceBinding: 'binding-A', files: [{ ...file, textPaging: true, nativeActions: true }] })
+    expect((await access.resolve('session-A', [file.path]))[0]).toMatchObject({ textPaging: true, nativeActions: true })
+  })
+
+  it('searches through a session-bound endpoint and rejects an out-of-range result', async () => {
+    const { access, http, file } = fixture()
+    const resolved = { ...file, kind: 'text' as const }
+    const signal = new AbortController().signal
+    http.requestJson.mockResolvedValue({ relativePath: file.path, totalLines: 500, matchLine: 450 })
+    await expect(access.search!('session-A', resolved, 'target', signal)).resolves.toMatchObject({ matchLine: 450 })
+    const [endpoint, options] = http.requestJson.mock.calls[0]
+    expect(new URL(endpoint, 'https://gateway.test').searchParams.get('query')).toBe('target')
+    expect(options).toEqual({ method: 'GET', sessionKey: 'session-A', signal })
+    http.requestJson.mockResolvedValue({ relativePath: file.path, totalLines: 500, matchLine: 501 })
+    await expect(access.search!('session-A', resolved, 'target')).rejects.toThrow()
+  })
+
+  it('rejects oversized page ranges, mismatched paths and invalid page bounds', async () => {
+    const { access, http, file } = fixture()
+    const resolved = { ...file, kind: 'text' as const }
+    await expect(access.readPage!('session-A', resolved, 1, 201)).rejects.toThrow()
+    expect(http.requestJson).not.toHaveBeenCalled()
+    for (const patch of [{ relativePath: 'other.py' }, { endLine: 300 }, { content: '\0binary' }]) {
+      http.requestJson.mockResolvedValue({ relativePath: file.path, content: 'safe', totalLines: 500, startLine: 1, endLine: 200, ...patch })
+      await expect(access.readPage!('session-A', resolved, 1, 200)).rejects.toThrow()
+    }
   })
 
   it('never classifies SVG or HTML as an executable image preview', async () => {
