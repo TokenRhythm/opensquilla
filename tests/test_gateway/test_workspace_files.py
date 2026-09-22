@@ -132,9 +132,10 @@ async def test_ordinary_gateway_does_not_advertise_native_actions(files):
     assert entry["textPaging"] is True
 
 
-async def test_read_page_streams_text_ranges_without_returning_absolute_paths(files):
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+async def test_read_page_streams_text_ranges_without_returning_absolute_paths(files, newline):
     target = files.root / "large.py"
-    target.write_text("".join(f"line {index}\n" for index in range(1, 451)))
+    target.write_bytes("".join(f"line {index}{newline}" for index in range(1, 451)).encode())
     resolved = (await resolve(files, ["large.py"])).json()
     entry = resolved["files"][0]
     response = await files.client.get(
@@ -149,7 +150,7 @@ async def test_read_page_streams_text_ranges_without_returning_absolute_paths(fi
     assert response.status_code == 200, response.text
     assert response.json() == {
         "relativePath": "large.py",
-        "content": "".join(f"line {index}\n" for index in range(201, 401)),
+        "content": "".join(f"line {index}{newline}" for index in range(201, 401)),
         "totalLines": 450,
         "startLine": 201,
         "endLine": 400,
@@ -168,12 +169,13 @@ async def test_read_page_streams_text_ranges_without_returning_absolute_paths(fi
     ).status_code == 400
 
 
-async def test_read_page_handles_source_larger_than_two_mib(files):
-    line = "text source " + "x" * 64 + "\n"
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+async def test_read_page_handles_source_larger_than_two_mib(files, newline):
+    line = "text source " + "x" * 64 + newline
     count = 40_000
     content = line * count
     assert len(content) > 2 * 1024 * 1024
-    (files.root / "source.py").write_text(content)
+    (files.root / "source.py").write_bytes(content.encode())
     response = await read_page(files, start=20_001, end=20_200)
     assert response.status_code == 200, response.text
     assert response.json()["content"] == line * 200
@@ -214,6 +216,7 @@ async def test_page_rejects_invalid_text_even_outside_requested_page(files, cont
         (b"x" * (workspace_files.MAX_TEXT_LINE_BYTES - 1) + b"\n") * 5,
         ("文" * (workspace_files.MAX_TEXT_LINE_BYTES // 3 + 1)).encode(),
     ],
+    ids=["oversized-line", "oversized-page", "oversized-utf8-line"],
 )
 async def test_page_has_byte_limits_for_lines_and_response(files, content):
     (files.root / "source.py").write_bytes(content)
@@ -278,9 +281,11 @@ async def test_page_discards_file_changed_during_read_even_with_restored_mtime(f
     assert (await read_page(files, binding=binding)).status_code == 404
 
 
-async def test_page_does_not_follow_file_growth_past_initial_size(files, monkeypatch):
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+async def test_page_does_not_follow_file_growth_past_initial_size(files, monkeypatch, newline):
     target = files.root / "source.py"
-    target.write_text("original\n")
+    content = b"original" + newline
+    target.write_bytes(content)
     binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
     original_open = workspace_files.os.fdopen
     reads = []
@@ -308,7 +313,7 @@ async def test_page_does_not_follow_file_growth_past_initial_size(files, monkeyp
         workspace_files.os, "fdopen", lambda *args: GrowingStream(original_open(*args))
     )
     assert (await read_page(files, binding=binding)).status_code == 404
-    assert reads == [len("original\n") + 1]
+    assert reads == [len(content) + 1]
 
 
 async def test_search_scans_once_and_obeys_text_and_binding_guards(files, monkeypatch):
