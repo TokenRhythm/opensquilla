@@ -9,6 +9,7 @@ from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
+import yaml
 
 _ROOT = Path(__file__).resolve().parents[2]
 _SCRIPTS = _ROOT / "desktop" / "electron" / "scripts"
@@ -109,3 +110,11 @@ def test_packaged_smoke_requires_safe_success_and_explicit_windows_provisioning(
     assert "writeDenied: true, networkDenied: true" in smoke
     assert "process.argv.includes('--provision-windows-sandbox')" in smoke
     assert "npm run verify:gateway-smoke -- --provision-windows-sandbox" in workflow
+    jobs = yaml.safe_load(workflow)["jobs"]
+    for platform in ("macos", "windows"):
+        step = next(
+            step for step in jobs[f"build-desktop-{platform}"]["steps"]
+            if step["name"] == "Smoke packaged gateway"
+        )
+        provisioning = step["env"].get("OPENSQUILLA_SMOKE_PROVISION_SANDBOX")
+        assert provisioning == ("1" if platform == "windows" else None)
