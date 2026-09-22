@@ -1531,7 +1531,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "font-src 'self' opensquilla-app://desktop data:",
       "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
-      "frame-src blob: http: https:",
+      "frame-src blob: data: http: https:",
       "worker-src 'self' opensquilla-app://desktop blob:",
     ].join('; '),
   )
