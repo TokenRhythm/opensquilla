@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 
 async def verify_safe_execution() -> dict[str, object]:
+    from opensquilla.sandbox.backend.windows_default_setup import default_setup_marker_path
+    from opensquilla.sandbox.backend.windows_default_support import probe_windows_default_support
     from opensquilla.sandbox.config import SandboxSettings
     from opensquilla.sandbox.integration import configure_runtime, get_runtime, reset_runtime
     from opensquilla.sandbox.operation_runtime import SandboxOperation
@@ -58,7 +60,17 @@ async def verify_safe_execution() -> dict[str, object]:
         setup = await initialize_sandbox_runtime(config)
         report = await current_sandbox_capability_report(config)
         if setup.state is not SandboxSetupState.READY or not report.available:
-            raise RuntimeError(f"Safe initialization failed: {setup.detail}")
+            detail = setup.detail
+            if sys.platform == "win32":
+                support = probe_windows_default_support()
+                detail = (
+                    f"{detail}; marker={default_setup_marker_path()}; "
+                    f"setup_ready={support.setup_ready}; "
+                    f"identity_ready={support.identity_ready}; "
+                    f"storage_ready={support.storage_ready}; "
+                    f"network_boundary={support.proxy_allowlist_enforced}"
+                )
+            raise RuntimeError(f"Safe initialization failed: {detail}")
         backend = get_runtime().backend
         if backend.name not in {"seatbelt", "windows_default", "bubblewrap"}:
             raise RuntimeError(f"Expected real isolation, received {backend.name}")
