@@ -43,10 +43,10 @@ async def verify_safe_execution() -> dict[str, object]:
     target.write_text("synthetic Safe fixture\n", encoding="utf-8")
     config = SimpleNamespace(state_dir=str(root / "state"))
     if sys.platform == "win32" and os.environ.get("OPENSQUILLA_SMOKE_PROVISION_SANDBOX") == "1":
-        import ctypes
-
-        if not ctypes.windll.shell32.IsUserAnAdmin():
-            raise RuntimeError("CI sandbox provisioning requires an elevated disposable runner")
+        # Let the product setup path request UAC through its existing elevated
+        # helper.  Hosted Windows runners commonly use an unelevated token
+        # even for an Administrator account; rejecting that token here would
+        # prevent the explicit disposable-runner provision gate from running.
         setup = await ensure_sandbox_setup(config)
         if setup.state is not SandboxSetupState.READY:
             raise RuntimeError(f"CI sandbox provisioning failed: {setup.detail}")
