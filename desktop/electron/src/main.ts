@@ -580,6 +580,7 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+let gatewayShutdownRequestInterceptorInstalled = false
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
@@ -1485,6 +1486,13 @@ async function proxyDesktopRendererRequest(
   const body = method === 'GET' || method === 'HEAD'
     ? undefined
     : new Uint8Array(await request.arrayBuffer())
+  if (isCurrentGatewayShutdownRequest(`${gatewayState.url}${pathAndQuery}`, method)) {
+    const child = gatewayProcess
+    if (child && gatewayState.owned) {
+      trackStoppingGatewayProcess(child)
+      cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+    }
+  }
   const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
     method,
     headers,
@@ -8836,6 +8844,35 @@ function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): voi
   })
 }
 
+function isCurrentGatewayShutdownRequest(url: string, method: string): boolean {
+  if (method !== 'POST' || !gatewayState.url) return false
+  try {
+    const request = new URL(url)
+    const gateway = new URL(gatewayState.url)
+    return request.origin === gateway.origin && request.pathname === '/api/system/shutdown'
+  } catch {
+    return false
+  }
+}
+
+function installGatewayShutdownRequestInterceptor(window: BrowserWindow): void {
+  if (gatewayShutdownRequestInterceptorInstalled) return
+  gatewayShutdownRequestInterceptorInstalled = true
+  window.webContents.session.webRequest.onBeforeRequest(
+    { urls: ['<all_urls>'] },
+    (details, callback) => {
+      if (isCurrentGatewayShutdownRequest(details.url, details.method)) {
+        const child = gatewayProcess
+        if (child && gatewayState.owned) {
+          trackStoppingGatewayProcess(child)
+          cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+        }
+      }
+      callback({})
+    },
+  )
+}
+
 function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] {
   const children = new Set(gatewayStoppingProcesses)
   if (gatewayProcess && gatewayState.owned) children.add(gatewayProcess)
@@ -9495,6 +9532,7 @@ async function createMainWindow(): Promise<BrowserWindow> {
     },
   })
   mainWindow = window
+  installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
     window.webContents,

@@ -1895,6 +1895,9 @@ def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restar
     assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in start
     assert "child.once('close'," in stopping_marker
     assert "child.once('exit'," not in stopping_marker
+    assert "function isCurrentGatewayShutdownRequest" in main_ts
+    assert "session.webRequest.onBeforeRequest" in main_ts
+    assert "Gateway shutdown endpoint requested" in main_ts
     assert (
         "scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))"
         in start
