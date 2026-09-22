@@ -42,7 +42,10 @@ async def verify_safe_execution() -> dict[str, object]:
     root = Path(os.environ["OPENSQUILLA_STATE_DIR"]).resolve()
     workspace_root = Path(os.environ.get("OPENSQUILLA_SMOKE_WORKSPACE_ROOT", str(root))).resolve()
     workspace = workspace_root / "safe-execution"
-    workspace.mkdir()
+    # The explicit Windows CI provision path may select a fresh profile root;
+    # create its disposable workspace parent before setup validates the marker
+    # target. Production startup never invokes this probe or provisions state.
+    workspace.mkdir(parents=True, exist_ok=True)
     target = workspace / "read-only.txt"
     target.write_text("synthetic Safe fixture\n", encoding="utf-8")
     config = SimpleNamespace(state_dir=str(root / "state"))
