@@ -276,21 +276,26 @@ def establish_windows_network_setup(path: Path) -> WindowsNetworkSetup:
     )
 
 
-def run_elevated_setup_helper(path: Path) -> None:
+def run_elevated_setup_helper(path: Path, *, already_elevated: bool = False) -> None:
     try:
         setup_helper_report_path(path).unlink()
     except FileNotFoundError:
         pass
     payload = _encode_setup_helper_payload(path, user_sid=_current_windows_user_sid())
     helper_args = ["--elevated-helper", payload]
-    if not getattr(sys, "frozen", False):
-        helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
-    parameters = subprocess.list2cmdline(helper_args)
-    exit_code = _shell_execute_runas_and_wait(
-        executable=sys.executable,
-        parameters=parameters,
-        directory=str(_setup_helper_import_root()),
-    )
+    if already_elevated:
+        # Use the same validated, locked setup and ACL repair for an admin
+        # caller, without requesting another UAC elevation.
+        exit_code = elevated_setup_helper_main(helper_args)
+    else:
+        if not getattr(sys, "frozen", False):
+            helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
+        parameters = subprocess.list2cmdline(helper_args)
+        exit_code = _shell_execute_runas_and_wait(
+            executable=sys.executable,
+            parameters=parameters,
+            directory=str(_setup_helper_import_root()),
+        )
     if exit_code != 0:
         detail = _setup_helper_report_detail(path)
         message = f"windows_setup_helper_failed: exit={exit_code}"
