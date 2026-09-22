@@ -10,6 +10,7 @@ from threading import Event
 import pytest
 
 from opensquilla.engine.context import load_context_files
+from opensquilla.gateway.config_migration import LATEST_CONFIG_VERSION
 from opensquilla.migration.openclaw import (
     MigrationOptions,
     OpenClawMigrator,
@@ -218,7 +219,7 @@ def test_apply_defers_legacy_target_config_upgrade_to_final_persist(
     ).migrate()
 
     persisted = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    assert persisted["config_version"] == 1
+    assert persisted["config_version"] == LATEST_CONFIG_VERSION
     assert persisted["llm_ensemble"]["proposer_timeout_seconds"] == 3600.0
     assert persisted["llm_ensemble"]["aggregator_timeout_seconds"] == 3600.0
     backups = list(tmp_path.glob("config.toml.backup.*"))

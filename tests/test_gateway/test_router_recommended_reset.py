@@ -13,6 +13,7 @@ from opensquilla.contracts.generated.v4.gateway_contract_registry import GATEWAY
 from opensquilla.gateway.adapters.provider_configuration import GatewayModelRoutingPolicyPort
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
+from opensquilla.gateway.config_migration import LATEST_CONFIG_VERSION
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_models import _handle_models_routing_reset_recommended
 from opensquilla.gateway.scopes import ADMIN_SCOPE, WRITE_SCOPE
@@ -93,11 +94,12 @@ def test_reset_expected_primary_fails_without_mutating_source():
 @pytest.mark.parametrize("provider,primary", [
     ("tokenrhythm", "openrouter"), ("openrouter", "tokenrhythm"),
 ])
-async def test_reset_cross_provider_ladder_preserves_provider_after_reload(
+async def test_reset_cross_provider_ladder_uses_saved_primary_after_reload(
     provider, primary, tmp_path,
 ):
     path = tmp_path / "config.toml"
     path.write_text(tomli_w.dumps({
+        "config_version": LATEST_CONFIG_VERSION,
         "llm": {"provider": primary, "model": "primary-model"},
         "squilla_router": {
             "enabled": True,
@@ -111,21 +113,24 @@ async def test_reset_cross_provider_ladder_preserves_provider_after_reload(
         },
     }), encoding="utf-8")
     config = load_config(path)
+    assert config.squilla_router.tiers["c0"]["provider"] == provider
     before_llm = config.llm.model_dump()
     await _handle_models_routing_reset_recommended(
-        {"providerId": provider, "activateRouter": False},
+        {"providerId": primary, "activateRouter": False},
         RpcContext(conn_id="test", config=config),
     )
     restored = GatewayConfig(**tomllib.loads(path.read_text(encoding="utf-8")))
     assert restored.llm.model_dump() == before_llm
-    assert restored.squilla_router.tiers == get_preset(provider).tier_defaults()
-    assert restored.squilla_router.tier_profile is None
+    assert restored.squilla_router.tiers == get_preset(primary).tier_defaults()
+    assert restored.squilla_router.tier_profile == (
+        primary if get_preset(primary).persistable else None
+    )
     assert restored.squilla_router.enabled is True
     assert restored.squilla_router.cross_provider_tiers is True
     assert restored.squilla_router.default_tier == "c2"
 
 
-async def test_reset_cannot_replace_tokenrhythm_ladder_with_primary_openrouter(tmp_path):
+async def test_reset_rejects_ladder_provider_when_it_is_not_the_saved_primary(tmp_path):
     path = tmp_path / "config.toml"
     config = GatewayConfig(
         config_path=str(path),
@@ -139,11 +144,11 @@ async def test_reset_cannot_replace_tokenrhythm_ladder_with_primary_openrouter(t
     before = config.model_dump()
     result = await get_dispatcher().dispatch(
         "stale-target", "models.routing.resetRecommended",
-        {"providerId": "openrouter", "activateRouter": False},
+        {"providerId": "tokenrhythm", "activateRouter": False},
         RpcContext(conn_id="test", config=config),
     )
     assert result.error.code == "CONFLICT"
-    assert result.error.details == {"reason": "router_provider_changed"}
+    assert result.error.details == {"reason": "primary_changed"}
     assert not path.exists()
     assert config.model_dump() == before
 
@@ -170,7 +175,8 @@ async def test_reset_rejects_new_foreign_routes_without_cross_provider_permissio
         {"providerId": "tokenrhythm", "activateRouter": False},
         RpcContext(conn_id="test", config=config),
     )
-    assert result.error.code == "ROUTER_PROVIDER_CONFLICT"
+    assert result.error.code == "CONFLICT"
+    assert result.error.details == {"reason": "primary_changed"}
     assert not path.exists()
     assert config.model_dump() == before
 
@@ -275,6 +281,7 @@ async def test_reset_persists_and_reloads_without_losing_settings(provider, acti
     )
     durable = tomllib.loads(path.read_text(encoding="utf-8"))
     restored = GatewayConfig(**durable)
+    assert restored.llm.provider == provider
     assert restored.squilla_router.preset_binding == "follow_primary"
     assert restored.squilla_router.default_tier == "c2"
     assert restored.squilla_router.enabled is activate

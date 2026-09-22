@@ -420,25 +420,20 @@ class GatewayModelRoutingPolicyPort:
             validate_router_candidate,
             validate_router_reactivation,
         )
-        from opensquilla.provider.preset_registry import router_ladder_provider
-
         primary = str(config.llm.provider).strip().lower()
-        ladder_provider = router_ladder_provider(config.squilla_router.tiers, primary)
-        # The OpenRouter/TokenRhythm shortcuts restore their own curated ladder.
-        # Activation and other providers retain the primary-directed contract;
-        # synthesized presets may depend on the primary's configured model.
-        expected = (
-            ladder_provider
-            if not activate_router and ladder_provider in {"openrouter", "tokenrhythm"}
-            else primary
-        )
-        if provider_id.strip().lower() != expected:
+        # Both the summary and recommendation action follow the saved primary.
+        # A foreign/custom ladder must be replaceable with its recommendation;
+        # the expected primary also rejects a stale client after a switch.
+        if provider_id.strip().lower() != primary:
             raise PrimaryProviderChangedError(
-                "The saved routing provider changed; reload before resetting Router",
-                reason="primary_changed" if activate_router else "router_provider_changed",
+                "The primary provider changed; reload before resetting Router",
             )
         candidate = config.model_copy(deep=True)
-        reconcile_recommended_router(candidate, expected)
+        reconcile_recommended_router(candidate, primary)
+        # A first sparse save must retain the chosen primary even when it
+        # equals the default; otherwise a provider-less reload may infer the
+        # legacy provider from the direct model and retarget this ladder.
+        candidate.mark_force_persist("llm.provider")
         patched = [
             "squilla_router.tiers",
             "squilla_router.tier_profile",

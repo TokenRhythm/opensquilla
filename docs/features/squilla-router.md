@@ -52,17 +52,20 @@ The TokenRhythm ladder leaves tier `thinking_level` unset. Direct
 requests without an explicit thinking setting preserve the provider default;
 Router auto-thinking can still choose a per-turn level (normally `low` on C1).
 Fresh and managed (`preset_binding = "follow_primary"`) configurations receive
-this ladder. Upgrades also refresh recognized previous OpenRouter and
-TokenRhythm default ladders saved inline, including historical saves without a
-managed binding. Edited model ladders and mixed-provider ladders remain
-authoritative. Upgrading keeps the ladder's provider and the Router's enabled
-state; it does not switch TokenRhythm routes to OpenRouter or vice versa.
+this ladder. The one-time configuration version 2 migration replaces old text
+tiers with the saved primary provider's recommended ladder when that primary is
+OpenRouter or TokenRhythm. This includes custom and mixed text tiers from 0.5.4.
+The migration preserves the routing mode, primary credentials, and other router
+controls, and backs up the previous configuration before writing. Custom edits
+made after this migration remain intact on subsequent loads.
 OpenRouter retains `high` as its packaged tier thinking level.
 
-Settings offers a recommended-tier reset for single-provider OpenRouter and
-TokenRhythm ladders. The button names and restores the ladder's own provider,
-even when the primary provider differs. Other providers and mixed-provider
-ladders do not show this shortcut. Restoring tiers keeps the current usage mode.
+Setting OpenRouter or TokenRhythm as primary also applies that provider's
+recommended text tiers while preserving the current usage mode. The saved
+primary summary and recommended-tier button use the same primary provider.
+The reset button replaces the current ladder with that provider's recommendation,
+including saved or unsaved custom tiers. Other primary providers do not show this
+shortcut. Restoring tiers keeps the current usage mode.
 
 C3 can optionally use the shared multi-model fusion plan configured under
 `llm_ensemble`. Enabling fusion on C3 makes it use that plan instead of its

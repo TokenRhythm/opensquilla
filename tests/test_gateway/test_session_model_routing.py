@@ -86,7 +86,7 @@ def test_session_router_preserves_explicit_operator_tiers_and_provider_policy(
 
 
 @pytest.mark.parametrize("has_explicit_ladder", [False, True])
-def test_session_router_managed_ladder_preserves_its_provider(has_explicit_ladder: bool) -> None:
+def test_session_router_managed_ladder_follows_primary(has_explicit_ladder: bool) -> None:
     from opensquilla.provider.preset_registry import get_preset
 
     config = GatewayConfig(
@@ -104,7 +104,7 @@ def test_session_router_managed_ladder_preserves_its_provider(has_explicit_ladde
 
     accepted = capture_model_routing_config(config, session_mode="router")
 
-    preset = get_preset("openrouter" if has_explicit_ladder else "tokenrhythm")
+    preset = get_preset("tokenrhythm")
     assert preset is not None
     assert accepted.squilla_router.tiers == preset.tier_defaults()
     assert config.squilla_router.model_dump() == original

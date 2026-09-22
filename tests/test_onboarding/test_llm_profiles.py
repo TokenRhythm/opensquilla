@@ -13,9 +13,11 @@ from opensquilla.onboarding.mutations import (
     remove_llm_profile,
     upsert_and_activate_llm_profile,
     upsert_llm_profile,
+    upsert_llm_provider,
 )
 from opensquilla.onboarding.status import get_onboarding_status
 from opensquilla.provider.deployment import resolve_provider_deployment
+from opensquilla.provider.preset_registry import get_preset
 
 
 def test_profile_upsert_redacts_secret_and_keeps_credential_sources() -> None:
@@ -736,6 +738,108 @@ def test_profile_activation_managed_router_follows_primary_and_preserves_control
     }
     assert activated.llm.model == "deepseek-chat"
     assert activated.llm_ensemble.model_dump(mode="python") == ensemble_before
+
+
+def _curated_primary_switch_config(
+    source: str,
+    target: str,
+    *,
+    binding: str | None = "custom",
+    enabled: bool = True,
+    cross_provider: bool = False,
+) -> GatewayConfig:
+    return GatewayConfig(
+        llm={"provider": source, "model": "synthetic-old-model", "api_key": "old-secret"},
+        llm_profiles={
+            target: {"model": "synthetic-new-model", "api_key": "new-secret"},
+        },
+        squilla_router={
+            "enabled": enabled,
+            "preset_binding": binding,
+            "cross_provider_tiers": cross_provider,
+            "rollout_phase": "observe",
+            "default_tier": "c2",
+            "confidence_threshold": 0.71,
+            "tiers": {
+                name: {"provider": source, "model": f"synthetic-{name}"}
+                for name in ("c0", "c1", "c2", "c3")
+            },
+        },
+        llm_ensemble={"enabled": False, "candidate_max_chars": 12345},
+    )
+
+
+@pytest.mark.parametrize(
+    ("source", "target"), [("openrouter", "tokenrhythm"), ("tokenrhythm", "openrouter")]
+)
+@pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("cross_provider", [False, True])
+def test_curated_primary_activation_replaces_ladder_and_preserves_strategy(
+    source, target, binding, enabled, cross_provider,
+) -> None:
+    cfg = _curated_primary_switch_config(
+        source, target, binding=binding, enabled=enabled, cross_provider=cross_provider,
+    )
+    router_before = cfg.squilla_router.model_dump(mode="python")
+    ensemble_before = cfg.llm_ensemble.model_dump(mode="python")
+
+    activated = activate_llm_profile(cfg, provider_id=target).config
+
+    preset = get_preset(target)
+    assert preset is not None
+    defaults = preset.tier_defaults()
+    router = activated.squilla_router
+    assert router.preset_binding == "follow_primary"
+    assert router.tier_profile == (target if enabled and preset.persistable else None)
+    for name in ("c0", "c1", "c2", "c3"):
+        assert router.tiers[name] == defaults[name]
+    assert router.enabled is enabled
+    assert router.cross_provider_tiers is cross_provider
+    assert router.rollout_phase == "observe"
+    assert router.default_tier == "c2"
+    assert router.confidence_threshold == 0.71
+    assert activated.llm_ensemble.model_dump(mode="python") == ensemble_before
+    assert activated.llm.model == "synthetic-new-model"
+    assert activated.llm.api_key == "new-secret"
+    assert activated.llm_profiles[source].api_key == "old-secret"
+    assert cfg.llm.provider == source
+    assert cfg.squilla_router.model_dump(mode="python") == router_before
+
+
+@pytest.mark.parametrize(
+    ("source", "target"), [("openrouter", "tokenrhythm"), ("tokenrhythm", "openrouter")]
+)
+@pytest.mark.parametrize("action", ["use_recommended", "disable", "enable_cross_provider"])
+def test_curated_primary_activation_honors_explicit_router_action(source, target, action) -> None:
+    cfg = _curated_primary_switch_config(source, target)
+    tiers_before = cfg.squilla_router.tiers
+
+    activated = activate_llm_profile(cfg, provider_id=target, router_action=action).config
+
+    router = activated.squilla_router
+    assert router.enabled is (action != "disable")
+    assert router.cross_provider_tiers is (action == "enable_cross_provider")
+    assert router.default_tier == "c2"
+    assert router.rollout_phase == "observe"
+    if action == "use_recommended":
+        assert router.preset_binding == "follow_primary"
+        assert router.tiers["c0"]["provider"] == target
+    else:
+        assert router.preset_binding == "custom"
+        assert router.tiers == tiers_before
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "tokenrhythm"])
+def test_curated_primary_model_edit_preserves_custom_ladder(provider) -> None:
+    target = "tokenrhythm" if provider == "openrouter" else "openrouter"
+    cfg = _curated_primary_switch_config(provider, target)
+    router_before = cfg.squilla_router.model_dump(mode="python")
+
+    result = upsert_llm_provider(cfg, provider_id=provider, model="synthetic-edited-model")
+
+    assert result.config.llm.model == "synthetic-edited-model"
+    assert result.config.squilla_router.model_dump(mode="python") == router_before
 
 
 @pytest.mark.parametrize("binding", [None, "custom"])

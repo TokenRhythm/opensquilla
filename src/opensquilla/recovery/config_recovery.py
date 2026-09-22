@@ -16,6 +16,7 @@ import os
 import tomllib
 from pathlib import Path
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.recovery.atomic import _native_io_path, native_move_no_replace
 from opensquilla.recovery.config_patch import ConfigSnapshot
 from opensquilla.recovery.errors import (
@@ -31,7 +32,7 @@ from opensquilla.recovery.locking import (
 from opensquilla.recovery.models import RecoveryReport
 
 _RECOVERABLE_CONFIG_CODES = frozenset({"config_invalid", "config_unreadable"})
-_DEFAULT_CONFIG = b"config_version = 1\n"
+_DEFAULT_CONFIG = f"config_version = {LATEST_CONFIG_VERSION}\n".encode()
 _BACKUP_PREFIX = "config.toml.backup."
 
 

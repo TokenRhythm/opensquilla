@@ -1848,15 +1848,9 @@ const routerBinding = computed<'follow_primary' | 'custom' | 'legacy'>(() => {
 const ensembleEnabled = computed(() => config.value.llm_ensemble?.enabled === true)
 const resetRecommendedSupported = computed(() => providerConfiguration.resetRecommendedSupported === true)
 const recommendedRouterProvider = computed(() => {
-  const providers = new Set(Object.entries(config.value.squilla_router?.tiers || {})
-    .filter(([name]) => (TEXT_TIERS as readonly string[]).includes(normalizeRouterTier(name) || name))
-    .map(([, tier]) => normalizeProviderId(tier.provider || currentProvider.value))
-    .filter(Boolean))
-  // Reset within the saved ladder's provider, even when the direct/fallback
-  // provider differs. A mixed ladder has no unambiguous recommendation target.
-  const providerId = providers.size === 0
-    ? normalizeProviderId(currentProvider.value)
-    : providers.size === 1 ? [...providers][0] || '' : ''
+  // The recommendation and summary share the saved primary. Existing custom
+  // tiers and unsaved provider/tier drafts must not change the reset target.
+  const providerId = normalizeProviderId(currentProvider.value)
   return providerId === 'openrouter' || providerId === 'tokenrhythm' ? providerId : ''
 })
 const routingSummary = computed(() => ({
@@ -2792,8 +2786,14 @@ function acceptPrimaryRouterAction(action?: string) {
   }
 }
 
-function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string) {
-  const synchronized = action === 'use_recommended' || previousBinding === 'follow_primary'
+function primarySwitchReplacesRouter(providerId: string, previousProvider: string): boolean {
+  const provider = normalizeProviderId(providerId)
+  return provider !== normalizeProviderId(previousProvider)
+    && (provider === 'openrouter' || provider === 'tokenrhythm')
+}
+
+function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string, replacedRouter = false) {
+  const synchronized = action === 'use_recommended' || previousBinding === 'follow_primary' || replacedRouter
   const message = t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
     : synchronized ? 'setup.provider.routerOutcomeSynchronized'
       : 'setup.provider.routerOutcomePreserved')
@@ -2828,6 +2828,7 @@ async function activateProvider(value: string) {
   primaryMutationPending.value = true
   let acknowledged = false
   const previousBinding = routerBinding.value
+  const replacesRouter = primarySwitchReplacesRouter(providerId, currentProvider.value)
   try {
     providerActivation.value = {
       providerId,
@@ -2844,8 +2845,13 @@ async function activateProvider(value: string) {
       if (!transition) return
       acknowledged = true
       acceptPrimaryRouterAction(transition.routerAction)
-      await loadData({ preserveDirtySectionDrafts: true, forceResetRouter: transition.routerAction === 'use_recommended', throwOnError: true })
-      pushPrimaryRouterOutcome(transition.routerAction, previousBinding)
+      await loadData({
+        preserveDirtySectionDrafts: true,
+        forceResetRouter: transition.routerAction === 'use_recommended'
+          || (replacesRouter && transition.routerAction !== 'disable'),
+        throwOnError: true,
+      })
+      pushPrimaryRouterOutcome(transition.routerAction, previousBinding, replacesRouter)
     } catch (err) {
       if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'danger' })
       else await reportPrimaryMutationFailure(err)
@@ -3921,6 +3927,8 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   let primaryAcknowledged = false
   let refreshStarted = false
   let resolvedRouterAction: 'use_recommended' | 'disable' | undefined
+  let replacedRouter = false
+  const previousProvider = currentProvider.value
   const previousBinding = routerBinding.value
   const providerOwnedFixedModelDraft = providerOwnsFixedModelDraft.value
   const providerModelDraftWasSubmitted = options.includeProviderModelDraft === true
@@ -3929,7 +3937,13 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     forceResetModelStrategy = false,
   ) => {
     refreshStarted = true
-    await loadData({ preserveDirtySectionDrafts, forceResetModelStrategy, forceResetRouter: resolvedRouterAction === 'use_recommended', throwOnError: true })
+    await loadData({
+      preserveDirtySectionDrafts,
+      forceResetModelStrategy,
+      forceResetRouter: resolvedRouterAction === 'use_recommended'
+        || (replacedRouter && resolvedRouterAction !== 'disable'),
+      throwOnError: true,
+    })
     if (providerOwnedFixedModelDraft && !replacesPrimaryOnLegacyGateway) {
       providerOwnsFixedModelDraft.value = false
       providerFixedModelDraftSnapshot.value = null
@@ -3993,6 +4007,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         }, command => setupWorkflow.profile.upsertAndActivateProfile(command), providerCatalogLabel)
         if (!transition) return false
         resolvedRouterAction = transition.routerAction
+        replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
         acceptPrimaryRouterAction(resolvedRouterAction)
       } else {
         await setupWorkflow.profile.upsertProfile(payload)
@@ -4011,7 +4026,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         applyConfiguredProviderSelection(selectedProviderId)
       }
       if (activateProfile) {
-        pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding)
+        pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter)
       } else {
         pushToast(t('setup.toast.providerProfileSaved', {
           provider: providerCatalogLabel(selectedProviderId),
@@ -4028,6 +4043,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     if (!transition) return false
     primaryAcknowledged = true
     resolvedRouterAction = transition.routerAction
+    replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
     acceptPrimaryRouterAction(resolvedRouterAction)
     const restart = await patchConfig(providerPatches)
     // The per-model context-window override rides the deep-merge patch form. Key
@@ -4047,7 +4063,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       pushToast(t('setup.toast.envNotVisibleGateway', { envKey: providerEnvKey.value }), { tone: 'danger' })
       return true
     }
-    pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding)
+    pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter)
     if (!resolvedRouterAction) {
       pushToast(restart ? t('setup.toast.providerSavedRestart') : t('setup.toast.providerSaved'))
     }

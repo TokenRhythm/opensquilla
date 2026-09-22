@@ -1944,17 +1944,17 @@ const summary = {
 }
 
 describe('saved routing summary and recommended recovery', () => {
-  it('labels the reset for the saved ladder while keeping the primary provider visible', async () => {
+  it.each(['OpenRouter', 'TokenRhythm'])('labels the reset and summary for the saved %s primary', async providerLabel => {
+    const providerId = providerLabel.toLowerCase()
     const { app, el } = await mountPanel({
-      routingSummary: { ...summary, providerId: 'openrouter', providerLabel: 'OpenRouter' },
+      routingSummary: { ...summary, providerId, providerLabel, recommendedProviderId: providerId, recommendedProviderLabel: providerLabel },
     })
-    expect(el.querySelector('[data-testid="routing-saved-summary"]')?.textContent).toContain('OpenRouter')
-    expect(el.querySelector('[data-testid="router-reset-recommended"]')?.textContent).toContain('TokenRhythm')
-    expect(el.querySelector('[data-testid="router-reset-recommended"]')?.textContent).not.toContain('OpenRouter')
+    expect(el.querySelector('[data-testid="routing-saved-summary"]')?.textContent).toContain(providerLabel)
+    expect(el.querySelector('[data-testid="router-reset-recommended"]')?.textContent).toContain(providerLabel)
     app.unmount()
   })
 
-  it('hides reset when the saved ladder has no supported recommendation target', async () => {
+  it('hides reset when the saved primary has no supported recommendation target', async () => {
     const { app, el } = await mountPanel({
       routingSummary: { ...summary, recommendedProviderId: '', recommendedProviderLabel: '' },
     })
@@ -1983,7 +1983,7 @@ describe('saved routing summary and recommended recovery', () => {
   })
 
   it.each([
-    ['follow_primary', 'Recommended · follows provider preset'],
+    ['follow_primary', 'Recommended · follows primary provider'],
     ['legacy', 'Existing tiers · follow behavior unspecified'],
   ])('shows %s ownership independently of the enabled state', async (binding, label) => {
     const { app, el } = await mountPanel({ routingSummary: { ...summary, binding, enabled: true, hasUnsavedChanges: true, crossProviderEnabled: true } })

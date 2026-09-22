@@ -20,7 +20,7 @@ import pytest
 
 import opensquilla.gateway.config as config_module
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.config_migration import migrate_config_payload
+from opensquilla.gateway.config_migration import LATEST_CONFIG_VERSION, migrate_config_payload
 from opensquilla.migration.opensquilla_home import (
     OpenSquillaHomeMigrator,
     OpenSquillaMigrationOptions,
@@ -221,6 +221,7 @@ def test_mismatched_tier_profile_is_cleared_not_fatal() -> None:
 def test_matching_tier_profile_is_untouched() -> None:
     result = migrate_config_payload(
         {
+            "config_version": LATEST_CONFIG_VERSION,
             "llm": {"provider": "openrouter", "model": "dummy/model"},
             "squilla_router": {"tier_profile": "openrouter"},
         }

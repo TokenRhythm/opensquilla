@@ -1375,11 +1375,12 @@ class SquillaRouterConfig(BaseSettings):
     tier_profile: str | None = None
     # Explicit ownership for the router ladder.  ``follow_primary`` means
     # OpenSquilla owns the ladder and may replace it with the active
-    # provider's preset when the primary provider changes.  ``custom`` means
-    # the operator owns the ladder and provider switches must preserve it.
-    # ``None`` is retained for pre-field configs. Historical/custom ladders
-    # remain operator-owned except for recognized, unchanged shipped model
-    # sequences that receive preset upgrades. A later explicit Router save
+    # provider's preset when the primary provider changes. ``custom`` keeps
+    # operator edits on load; explicitly selecting a curated primary provider
+    # can replace the ladder with that provider's recommendations.
+    # ``None`` is retained for pre-field configs. The versioned disk migration
+    # refreshes old OpenRouter/TokenRhythm ladders once; custom ladders saved
+    # afterward remain operator-owned. A later explicit Router save
     # records one of the two concrete values. Additive and downgrade-safe:
     # this settings section ignores unknown fields in older gateways.
     preset_binding: Literal["follow_primary", "custom"] | None = None
@@ -2790,11 +2791,14 @@ class GatewayConfig(BaseSettings):
             previous_models = tuple(
                 TierConfig.from_value(router.tiers.get(name)).model for name in TEXT_TIERS
             )
-            is_previous_default = (
+            is_previous_default = self.config_version < 2 and (
                 previous_models in PREVIOUS_RECOMMENDED_TEXT_MODELS[ladder_provider]
             )
             if follows_primary_preset or is_previous_default:
-                preset = get_preset(ladder_provider)
+                recommended_provider = (
+                    provider if provider in PREVIOUS_RECOMMENDED_TEXT_MODELS else ladder_provider
+                )
+                preset = get_preset(recommended_provider)
                 if preset is not None:
                     defaults = preset.tier_defaults()
                     tiers = dict(router.tiers)
@@ -2807,7 +2811,7 @@ class GatewayConfig(BaseSettings):
                             # belong to the shipped ladder being upgraded.
                             tier.update(previous)
                             for key in (
-                                "model", "description", "supports_image",
+                                "provider", "model", "description", "supports_image",
                                 "ensemble_enabled", "ensemble_selection_mode",
                                 "ensembleEnabled", "ensembleSelectionMode",
                             ):
@@ -2819,6 +2823,8 @@ class GatewayConfig(BaseSettings):
                         tiers["image_model"] = defaults["image_model"]
                     payload = router.model_dump(mode="python")
                     payload["tiers"] = tiers
+                    if recommended_provider != ladder_provider:
+                        payload["tier_profile"] = None
                     self.squilla_router = SquillaRouterConfig(**payload)
                     object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
                 return self
@@ -2830,8 +2836,8 @@ class GatewayConfig(BaseSettings):
             return self
         if not router.enabled and not follows_primary_preset:
             return self
-        # Loading is not a primary-provider switch. Saved managed ladders may
-        # intentionally execute against another provider, including a mixture.
+        # Mixed or other-provider ladders have no single curated primary
+        # preset to apply here; retain their existing routing configuration.
         if has_explicit_ladder and follows_primary_preset and ladder_provider != provider:
             return self
         # Boot auto-default: persistable packaged profiles write the compact
