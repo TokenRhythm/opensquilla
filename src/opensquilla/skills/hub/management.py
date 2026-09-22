@@ -691,7 +691,13 @@ def _normalize_legacy_manifest(
             sort_keys=False,
             width=1_000,
         ).rstrip()
-        manifest.write_text(f"---\n{rendered}\n---\n{body.strip()}\n", encoding="utf-8")
+        # Keep the normalized bytes identical across platforms; Windows text
+        # translation must not change the installed manifest or its digest.
+        manifest.write_text(
+            f"---\n{rendered}\n---\n{body.strip()}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     return final_dir, changed
 
 
