@@ -172,6 +172,7 @@ class BoundedOutputCapture:
     async def drain(
         self, reader: OutputReader | None, stream: str = "stdout", *,
         process_exited: asyncio.Event | None = None, idle_timeout: float = 1.0,
+        timeout_after_process_exit_is_eof: bool = False,
     ) -> None:
         if reader is None:
             return
@@ -211,7 +212,8 @@ class BoundedOutputCapture:
                     writing.result()
                     raise
         except TimeoutError:
-            self.incomplete_reason = "output pipe remained open after process exit"
+            if not timeout_after_process_exit_is_eof:
+                self.incomplete_reason = "output pipe remained open after process exit"
         except OSError as exc:
             self.incomplete_reason = f"output read failed ({type(exc).__name__})"
         except asyncio.CancelledError:

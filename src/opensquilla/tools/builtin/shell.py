@@ -6460,6 +6460,14 @@ async def _read_bg_output(session: _BgSession, process_exited: asyncio.Event) ->
         await session.output_capture.drain(
             _PtyReader(handle), process_exited=process_exited,
             idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+            # ConPTY's socket can remain open after the owned process tree has
+            # exited.  The reader has already had the post-exit grace period to
+            # consume buffered bytes; treat the quiet socket as EOF so it does
+            # not turn a successful PTY command into an incomplete capture.
+            timeout_after_process_exit_is_eof=(
+                handle.platform == "windows"
+                and getattr(handle.raw, "_server", None) is not None
+            ),
         )
         return
     await session.output_capture.drain(
