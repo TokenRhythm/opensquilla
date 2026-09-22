@@ -46,8 +46,8 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from opensquilla.gateway_client import GatewayRPCClient  # noqa: E402
 from opensquilla.config_version import LATEST_CONFIG_VERSION  # noqa: E402
+from opensquilla.gateway_client import GatewayRPCClient  # noqa: E402
 from opensquilla.provider.registry import get_provider_spec  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
     classify_failure,

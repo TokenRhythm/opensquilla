@@ -39,8 +39,8 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor  # noqa: E402
 from opensquilla.config_version import LATEST_CONFIG_VERSION  # noqa: E402
+from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor  # noqa: E402
 from opensquilla.engine.capacity_admission import (  # noqa: E402
     MAX_THINKING_BUDGET_TOKENS,
     model_has_request_capacity,
