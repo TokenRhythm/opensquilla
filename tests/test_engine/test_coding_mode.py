@@ -251,16 +251,22 @@ class TestDirectiveInjection:
         assert "platform" in low and "styling" in low
 
     @pytest.mark.asyncio
-    async def test_directive_warns_against_killing_running_code_task(self):
-        """Isolation rule: the source repo stays empty until verified, so don't
-        judge progress by it and don't kill/retry a running code-task."""
+    async def test_directive_preserves_isolation_and_agent_choice(self):
+        """An empty source repo is expected during an isolated run, while the
+        agent still chooses when to wait or hand off and respects cancellation."""
         ctx = await enforce_coding_mode(self._ctx(True))
         _, suffix = ctx.system_prompt
         low = suffix.lower()
         assert "isolated run directory" in low
         assert "stays empty until" in low  # source empty until verified
         assert "do not judge progress by the source" in low
-        assert "do not kill" in low
+        assert "empty source repo alone is not a reason to cancel or restart" in low
+        assert "respect user cancellation" in low
+        assert "when your next step needs the result" in low
+        assert "finish the turn with an accurate pending status" in low
+        assert "will not resume this task automatically" in low
+        assert "do not kill" not in low
+        assert "just wait" not in low
         assert "status.json" in low
 
     @pytest.mark.asyncio

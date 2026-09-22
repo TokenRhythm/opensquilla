@@ -976,6 +976,8 @@ def _cleanup_guest_profile(task: _RuntimeTask) -> None:
 @dataclass(frozen=True)
 class _SteeredInput:
     text: str
+    # Internal notices may be consumed by this turn without creating another.
+    allow_followup: bool = True
     semantic_message: str | None = None
     persisted_user_message_id: str | None = None
     client_request_id: str | None = None
@@ -3792,7 +3794,7 @@ class TaskRuntime:
     async def _deliver_process_completion(
         self, task: _RuntimeTask, payload: dict[str, Any],
     ) -> None:
-        """Accept one notice through the same generation fence as ordinary ingress."""
+        """Deliver once to the originating active turn, without starting another."""
         from opensquilla.tools.builtin.shell import is_background_process_completion_consumed
 
         envelope = task.envelope
@@ -3812,7 +3814,13 @@ class TaskRuntime:
                 self._process_completion_seen.pop(next(iter(self._process_completion_seen)))
 
         async with self.collect_admission(envelope.session_key):
-            if self._closing or task.cancel_requested or key in self._process_completion_seen:
+            if (
+                self._closing
+                or task.cancel_requested
+                or task.terminal_closing
+                or task.status is not AgentTaskStatus.RUNNING
+                or key in self._process_completion_seen
+            ):
                 return
             if consumed():
                 return
@@ -3828,47 +3836,22 @@ class TaskRuntime:
             if tail:
                 notice += f"\noutput_tail:\n{tail}"
             async with self._state_lock:
-                if self._closing or task.cancel_requested or consumed():
-                    return
                 running = self._running_by_session.get(envelope.session_key)
-                if running is not None and (
-                    running.envelope.session_id != envelope.session_id
-                    or running.envelope.session_epoch != envelope.session_epoch
-                ):
-                    return
                 if (
-                    running is not None
-                    and running.status is AgentTaskStatus.RUNNING
-                    and not running.terminal_closing
-                    and not running.cancel_requested
+                    self._closing
+                    or running is not task
+                    or task.status is not AgentTaskStatus.RUNNING
+                    or task.terminal_closing
+                    or task.cancel_requested
+                    or consumed()
                 ):
-                    # No await between the terminal guard and append: terminal
-                    # settlement claims this same lock before draining steers.
-                    running.pending_input_provider.append(_SteeredInput(text=notice))
-                    accepted()
                     return
-            # Terminalization drops the envelope cache. The originating route
-            # remains valid while its durable session generation is unchanged,
-            # including after an intervening user turn in the same session.
-            followup = replace(
-                _reusable_route_envelope(envelope),
-                input_provenance={
-                    "kind": "process_completed",
-                    "execution_id": execution_id,
-                },
-            )
-            await self.cancel_auxiliary(envelope.session_key)
-            if consumed():
-                return
-            await self._reserve_persist_and_activate(
-                followup,
-                notice,
-                mode="followup",
-                run_kind="runtime_send",
-                accepted_run_mode_override=task.accepted_run_mode_override,
-                update_envelope_cache=False,
-            )
-            accepted()
+                # No await between the terminal guard and append: terminal
+                # settlement claims this same lock before draining steers.
+                task.pending_input_provider.append(
+                    _SteeredInput(text=notice, allow_followup=False),
+                )
+                accepted()
 
     async def wait(self, task_id: str, timeout: float | None = None) -> AgentTaskRecord:
         runtime_task = self._tasks.get(task_id)
@@ -4974,7 +4957,7 @@ class TaskRuntime:
                     return
                 except Exception:
                     log.warning(
-                        "task_runtime.process_completion_wake_failed",
+                        "task_runtime.process_completion_delivery_failed",
                         session_key=task.envelope.session_key,
                         execution_id=execution_id,
                         attempt=attempt + 1,
@@ -5751,6 +5734,9 @@ class TaskRuntime:
     ) -> _SteerPromotionResult | None:
         """Turn a too-late steer into one durable follow-up task."""
 
+        # Unread process notices expire with their originating turn. Output
+        # remains queryable through process; user steering still promotes.
+        items = [item for item in items if item.allow_followup]
         if not items:
             return None
         last = items[-1]

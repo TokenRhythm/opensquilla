@@ -338,11 +338,16 @@ def test_managed_process_guidance_distinguishes_exit_from_readiness(mode: str) -
     profile = AgentProfile(agent_id="main", prompt_mode=mode)
     prompt = assemble_system_prompt(profile, tools=["exec_command", "process"])
 
-    assert "use `process` with action `wait` until an exit result is available" in prompt
+    assert "confirms launch, not completion" in prompt
+    assert "inspect output or wait when needed" in prompt
+    assert "call other tools, or finish the turn" in prompt
+    assert "does not automatically start another agent turn" in prompt
+    assert "retrieved with `process` in a later turn" in prompt
+    assert "Check the completed result before claiming" in prompt
     assert "verify readiness" in prompt
     assert "The turn may finish while that service remains running" in prompt
     assert "A running process alone proves neither readiness nor failure" in prompt
-    assert "use `process` with action `wait`" not in assemble_system_prompt(
+    assert "confirms launch, not completion" not in assemble_system_prompt(
         profile, tools=["exec_command"],
     )
 

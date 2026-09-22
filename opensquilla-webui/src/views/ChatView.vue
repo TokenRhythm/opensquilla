@@ -1176,6 +1176,7 @@ import {
   resolveChatWheelOwnership,
 } from '@/utils/chat/chatScrollOwnership'
 import { clearAssistantActivityExpansionState } from '@/utils/chat/activityDisclosureState'
+import { stripBackgroundProcessNoticeTimeline } from '@/utils/chat/backgroundProcessNotice'
 import {
   resolveChatHistoryRecoveryState,
   shouldShowConfirmedEmptySession,
@@ -4263,7 +4264,11 @@ const { attachTurnReasoning } = rpcEventHandlers
 
 // The append-only turn log is the single live content projection. The activity
 // head (phase/elapsed) remains presentation state outside the transcript fold.
-const liveTimelineItems = computed(() => foldedTurn.value.timelineItems)
+const liveTimelineItems = computed(() => stripBackgroundProcessNoticeTimeline(
+  foldedTurn.value.timelineItems,
+  foldedTurn.value.toolCalls,
+  renderMarkdown,
+))
 const liveTimelineSplit = computed(() => splitLiveAssistantTimeline(liveTimelineItems.value, {
   keepToolTurnTextInActivity: true,
 }))
