@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, h, nextTick, reactive, type App } from 'vue'
+import { setActivePinia } from 'pinia'
 import i18n from '@/i18n'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile, type WorkspaceFiles } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
@@ -16,13 +17,13 @@ const apps: App[] = []
 const file: WorkspaceFile = { requestedPath: '图.svg', path: '图.svg', name: '图.svg', mime: 'image/svg+xml', size: 64,
   kind: 'text', workspaceBinding: 'binding-A' }
 function pending<T>() { let finish!: (value: T) => void; return { promise: new Promise<T>(resolve => { finish = resolve }), finish: (value: T) => finish(value) } }
-async function mount(access: WorkspaceFiles) {
+async function mount(access: WorkspaceFiles, preferWorkspaceWorkbench = false) {
   const state = reactive({ sessionKey: 'A', text: '| Result |\n| --- |\n| `图.svg` |' })
   const gateway = reactive({ isLocalOwner: true, isAvailable: true, deliveryIdentity: 'owner-A', subscriptionEpoch: 1 })
   const renderer = useChatTextRendering()
   const root = document.createElement('div')
   document.body.appendChild(root)
-  const app = createApp({ render: () => h(TextPart, { sessionKey: state.sessionKey,
+  const app = createApp({ render: () => h(TextPart, { sessionKey: state.sessionKey, preferWorkspaceWorkbench,
     part: { type: 'text', key: 'answer', rawText: state.text, html: renderer.renderMarkdown(state.text) } }) })
   app.use(i18n)
   app.provide(WORKSPACE_FILES_KEY, access)
@@ -42,6 +43,14 @@ beforeEach(() => {
 afterEach(() => { apps.splice(0).forEach(app => app.unmount()); document.body.innerHTML = ''; vi.restoreAllMocks() })
 
 describe('TextPart workspace files', () => {
+  it('uses the preview fallback when Workbench is preferred but its store is unavailable', async () => {
+    setActivePinia(undefined)
+    const { root } = await mount({ resolve: vi.fn().mockResolvedValue([file]),
+      read: vi.fn().mockResolvedValue(new Blob(['safe source'])) }, true)
+    await vi.waitFor(() => expect(root.querySelector('.workspace-file-link')).not.toBeNull())
+    root.querySelector<HTMLButtonElement>('.workspace-file-link')!.click()
+    await vi.waitFor(() => expect(document.querySelector('[role="dialog"] pre')?.textContent).toBe('safe source'))
+  })
   it.each(['open', 'reveal'])('passes only bound relative workspace identity to desktop %s', async action => {
     mocks.platform.id = 'desktop'
     const nativeAction = vi.fn().mockResolvedValue({ ok: true })

@@ -46,6 +46,7 @@
 
 <script setup lang="ts">
 import { computed, inject, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
+import { getActivePinia } from 'pinia'
 import WorkspaceFilePreview from '@/components/chat/WorkspaceFilePreview.vue'
 import WorkspaceFileActionsMenu from '@/components/chat/WorkspaceFileActionsMenu.vue'
 import { WORKSPACE_FILES_KEY, type WorkspaceFile } from '@/modules/workspaceFiles'
@@ -93,7 +94,8 @@ const platform = usePlatform()
 // TextPart is also rendered in lightweight chat tests and in older clients
 // without a Workbench provider. Resolve the store only for the Workbench path
 // so the fallback preview remains usable in those hosts.
-const workbench = props.preferWorkspaceWorkbench ? useWorkbenchStore() : null
+const pinia = props.preferWorkspaceWorkbench ? getActivePinia() : undefined
+const workbench = pinia ? useWorkbenchStore(pinia) : null
 const workspaceFiles = inject(WORKSPACE_FILES_KEY, null)
 const gateway = inject(GATEWAY_ACCESS_KEY, null)
 const selectedWorkspaceFile = shallowRef<WorkspaceFile | null>(null)
