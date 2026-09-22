@@ -172,6 +172,7 @@
       :mutation-blocked="mutationBusy && !queueRunning"
       @close="addSkillOpen = false"
       @search="searchRegistry"
+      @source-change="resetRegistrySearch"
       @install-github="installGithub"
       @install="installSkill"
       @view-details="openRegistryResultDetails"
@@ -345,6 +346,7 @@ const {
   installingDepsId,
   uninstallingName,
   searchRegistry,
+  resetRegistrySearch,
   installGithub,
   installSkill,
   retryQueueItem,

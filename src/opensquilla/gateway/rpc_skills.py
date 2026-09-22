@@ -1374,6 +1374,12 @@ async def _search_skill_catalog(
                 "identifier": r.identifier,
                 "installReference": r.canonical_identifier or r.identifier,
                 "installed": is_skill_meta_installed(r, installed),
+                "license": r.license,
+                "homepage": r.homepage,
+                "upstream_url": r.upstream_url,
+                "origin_source": r.origin_source,
+                "signature_status": r.signature_status,
+                "content_hash": r.content_hash,
             }
             for r in results
         ],

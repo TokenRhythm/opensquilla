@@ -907,6 +907,102 @@ describe('useSkillRegistry install state', () => {
     expect(registry.registryLoading.value).toBe(false)
   })
 
+  it('clears the previous source results and diagnostics while preserving the search query', async () => {
+    const call = vi.fn(async () => ({
+      results: [{ name: 'ClawHub result', source: 'clawhub' }],
+      diagnostics: [{ code: 'SOURCE_RATE_LIMITED', message: 'ClawHub rate limit' }],
+      message: 'ClawHub search failed',
+    }))
+    const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+    registry.registryQuery.value = 'paper'
+    await registry.searchRegistry('clawhub')
+
+    registry.resetRegistrySearch()
+
+    expect(registry.registryQuery.value).toBe('paper')
+    expect(registry.registryResults.value).toEqual([])
+    expect(registry.registryDiagnostics.value).toEqual([])
+    expect(registry.registrySearchError.value).toBe('')
+    expect(registry.registryLoading.value).toBe(false)
+  })
+
+  it.each(['success', 'error'] as const)(
+    'discards a pending source search %s after reset without starting another search',
+    async (outcome) => {
+      let resolveSearch!: (value: unknown) => void
+      let rejectSearch!: (reason: Error) => void
+      const pending = new Promise((resolve, reject) => {
+        resolveSearch = resolve
+        rejectSearch = reject
+      })
+      const registry = useSkillRegistry({ call: vi.fn(() => pending) }, vi.fn(async () => true))
+      registry.registryQuery.value = 'paper'
+      const searching = registry.searchRegistry('clawhub')
+      expect(registry.registryLoading.value).toBe(true)
+
+      registry.resetRegistrySearch()
+      expect(registry.registryLoading.value).toBe(false)
+      if (outcome === 'success') {
+        resolveSearch({
+          results: [{ name: 'Stale ClawHub result', source: 'clawhub' }],
+          diagnostics: [{ code: 'SOURCE_RATE_LIMITED', message: 'ClawHub rate limit' }],
+          message: 'Stale ClawHub message',
+        })
+      } else {
+        rejectSearch(new Error('ClawHub timed out'))
+      }
+      await searching
+
+      expect(registry.registryResults.value).toEqual([])
+      expect(registry.registryDiagnostics.value).toEqual([])
+      expect(registry.registrySearchError.value).toBe('')
+      expect(registry.registryLoading.value).toBe(false)
+      expect(pushToast).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each(['success', 'error'] as const)(
+    'keeps the new source search loading when the discarded search returns %s',
+    async (outcome) => {
+      let resolveFirst!: (value: unknown) => void
+      let rejectFirst!: (reason: Error) => void
+      let resolveSecond!: (value: unknown) => void
+      const first = new Promise((resolve, reject) => {
+        resolveFirst = resolve
+        rejectFirst = reject
+      })
+      const second = new Promise((resolve) => { resolveSecond = resolve })
+      const call = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second)
+      const registry = useSkillRegistry({ call }, vi.fn(async () => true))
+      registry.registryQuery.value = 'paper'
+      const firstSearch = registry.searchRegistry('clawhub')
+
+      registry.resetRegistrySearch()
+      expect(registry.registryLoading.value).toBe(false)
+      const secondSearch = registry.searchRegistry('skillhub')
+      expect(call).toHaveBeenLastCalledWith('skills.search', {
+        query: 'paper', limit: 20, source: 'skillhub',
+      })
+      if (outcome === 'success') {
+        resolveFirst({ results: [{ name: 'Stale ClawHub result', source: 'clawhub' }] })
+      } else {
+        rejectFirst(new Error('ClawHub timed out'))
+      }
+      await firstSearch
+
+      expect(registry.registryLoading.value).toBe(true)
+      expect(registry.registryResults.value).toEqual([])
+      expect(registry.registryDiagnostics.value).toEqual([])
+      expect(registry.registrySearchError.value).toBe('')
+      expect(pushToast).not.toHaveBeenCalled()
+      resolveSecond({ results: [{ name: 'SkillHub result', source: 'skillhub' }] })
+      await secondSearch
+
+      expect(registry.registryResults.value).toEqual([{ name: 'SkillHub result', source: 'skillhub' }])
+      expect(registry.registryLoading.value).toBe(false)
+    },
+  )
+
   it('warns when installation succeeds but the catalog list cannot refresh', async () => {
     const call = vi.fn(async () => ({
       success: true,

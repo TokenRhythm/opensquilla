@@ -184,6 +184,14 @@ class SkillMeta:
     tags: list[str] = field(default_factory=list)
     platforms: list[str] = field(default_factory=list)
     canonical_identifier: str = ""
+    # Provenance fields are intentionally additive.  Older sources may leave
+    # them empty while modern registries can expose the upstream origin and
+    # their own integrity status without overloading ``homepage`` or
+    # ``trust_level``.
+    upstream_url: str = ""
+    origin_source: str = ""
+    signature_status: str = ""
+    content_hash: str = ""
 
     @property
     def canonical_identity(self) -> str:
@@ -333,3 +341,14 @@ class SkillSource(ABC):
     @abstractmethod
     def trust_level(self) -> str:
         """Trust level: 'builtin', 'trusted', or 'community'."""
+
+    @property
+    def requires_immutable_resolution(self) -> bool:
+        """Whether management must install only an immutable resolution.
+
+        Legacy adapters and test doubles can keep the historical fetch-only
+        contract. Registry adapters that hand off a versioned archive should
+        opt in so the policy does not need a growing source-name allowlist.
+        """
+
+        return False

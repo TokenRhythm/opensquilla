@@ -82,7 +82,7 @@ export function skillInstallCandidates(result: InstallResult | undefined): Skill
   return candidates
 }
 
-export type SkillInstallSource = 'clawhub' | 'github'
+export type SkillInstallSource = 'clawhub' | 'skillhub' | 'github'
 
 export const GITHUB_BATCH_MAX_REFERENCES = 10
 
@@ -227,7 +227,8 @@ export interface SkillRegistry {
   mutationBusy: ComputedRef<boolean>
   installingDepsId: Ref<string | null>
   uninstallingName: Ref<string | null>
-  searchRegistry: () => Promise<void>
+  searchRegistry: (source?: SkillInstallSource) => Promise<void>
+  resetRegistrySearch: () => void
   installGithub: () => Promise<void>
   installSkill: (identifier: string, source: string, displayName?: string) => Promise<void>
   retryQueueItem: (id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string) => Promise<void>
@@ -261,6 +262,7 @@ export function useSkillRegistry(
   const installingId = ref<string | null>(null)
   const installActivities = ref<SkillInstallActivities>({
     clawhub: { items: [], refreshWarning: '', phase: 'terminal' },
+    skillhub: { items: [], refreshWarning: '', phase: 'terminal' },
     github: { items: [], refreshWarning: '', phase: 'terminal' },
   })
   const runningSource = ref<SkillInstallSource | null>(null)
@@ -329,7 +331,16 @@ export function useSkillRegistry(
     if (supported) void restoreInstallReceipts()
   }, { immediate: true })
 
-  async function searchRegistry() {
+  function resetRegistrySearch() {
+    // A source switch discards pending responses without clearing the user's query.
+    searchRequestId += 1
+    registryResults.value = []
+    registryDiagnostics.value = []
+    registrySearchError.value = ''
+    registryLoading.value = false
+  }
+
+  async function searchRegistry(source: SkillInstallSource = 'clawhub') {
     const query = registryQuery.value.trim()
     const requestId = ++searchRequestId
     if (!query) {
@@ -343,7 +354,7 @@ export function useSkillRegistry(
     try {
       const data = await catalog.search(query, {
         limit: 20,
-        source: 'clawhub',
+        source,
       })
       if (requestId !== searchRequestId) return
       registryResults.value = [...data.results]
@@ -385,7 +396,9 @@ export function useSkillRegistry(
   }
 
   function activitySource(source: string): SkillInstallSource {
-    return source === 'github' ? 'github' : 'clawhub'
+    if (source === 'github') return 'github'
+    if (source === 'skillhub') return 'skillhub'
+    return 'clawhub'
   }
 
   function removeSuccessfulGithubLines(items: SkillInstallQueueItem[]) {
@@ -574,7 +587,7 @@ export function useSkillRegistry(
   }
 
   async function retryQueueItem(id: string, acknowledgeRisk = false, candidateIdentifier = '') {
-    const source = (['clawhub', 'github'] as const).find(candidate =>
+    const source = (['clawhub', 'skillhub', 'github'] as const).find(candidate =>
       installActivities.value[candidate].items.some(item => item.id === id))
     if (!source) return
     const item = installActivities.value[source].items.find(candidate => candidate.id === id)
@@ -744,6 +757,7 @@ export function useSkillRegistry(
     installingDepsId,
     uninstallingName,
     searchRegistry,
+    resetRegistrySearch,
     installGithub,
     installSkill,
     retryQueueItem,

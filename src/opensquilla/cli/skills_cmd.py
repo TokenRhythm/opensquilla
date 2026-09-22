@@ -889,8 +889,9 @@ def skills_install(
         "--source",
         "-s",
         help=(
-            "Source (clawhub, github). GitHub accepts owner/repo, "
-            "owner/repo@ref:path, or GitHub URLs."
+            "Source (clawhub, skillhub, github). SkillHub accepts a registry slug "
+            "or slug@version; GitHub accepts owner/repo, owner/repo@ref:path, "
+            "or GitHub URLs."
         ),
     ),
     force: bool = typer.Option(

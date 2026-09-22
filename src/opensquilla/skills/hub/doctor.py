@@ -1123,7 +1123,7 @@ def _compatibility_observation(
         requires = spec.metadata.requires if spec.metadata and spec.metadata.requires else None
         if requires and requires.config:
             compatibility = SkillCompatibilityState.DEGRADED
-        is_community = entry is not None and entry.source in {"clawhub", "github"}
+        is_community = entry is not None and entry.source in {"clawhub", "skillhub", "github"}
         unsupported_execution = bool(
             spec.entrypoint or spec.composition_raw or spec.kind not in {"", "skill"}
         )
