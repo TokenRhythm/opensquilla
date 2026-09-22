@@ -51,6 +51,7 @@ from opensquilla.gateway.session_lifecycle import (
     TaskLifecycleEvent,
     TaskLifecycleListener,
 )
+from opensquilla.gateway.shutdown import ShutdownRequest
 from opensquilla.gateway.terminal_activity import (
     is_usage_accounting_barrier,
     safe_primary_user_message_id,
@@ -1458,6 +1459,7 @@ class TaskRuntime:
         self._driver_state_changed = asyncio.Event()
         self._closing = False
         self._shutdown_task: asyncio.Task[TaskRuntimeShutdownResult] | None = None
+        self._shutdown_request: ShutdownRequest | None = None
         self._terminal_fallback_records: dict[str, AgentTaskRecord] = {}
         self._terminal_pending_updates: dict[str, dict[str, Any]] = {}
         self._terminal_retry_task: asyncio.Task[None] | None = None
@@ -3646,6 +3648,25 @@ class TaskRuntime:
             {task.task_id: task for task in candidates}.values(),
             key=lambda task: task.task_id,
         )
+        immediate_quit = source == "gateway_shutdown" and reason == "desktop_quit"
+        if immediate_quit:
+            # Desktop quit stops execution before waiting on a claim or storage.
+            # The existing terminal path still settles accepted input and partial
+            # output with the system-cancellation source set below.
+            for task in ordered_candidates:
+                if self._tasks.get(task.task_id) is not task or task.status in TERMINAL_STATUSES:
+                    continue
+                already_cancelled = (
+                    task.cancel_requested and task.cancel_source == source
+                    and task.cancel_reason == reason
+                )
+                if not task.cancel_requested:
+                    task.cancel_requested_at_monotonic = time.monotonic()
+                task.cancel_requested = True
+                task.cancel_source = source
+                task.cancel_reason = reason
+                if not already_cancelled and task.asyncio_task is not None:
+                    task.asyncio_task.cancel()
         async with contextlib.AsyncExitStack() as steer_fences:
             for task in ordered_candidates:
                 await steer_fences.enter_async_context(task.steer_claim)
@@ -3667,10 +3688,9 @@ class TaskRuntime:
                     task.cancel_requested = True
                     task.cancel_source = _clean_cancel_detail(source, "unknown")
                     task.cancel_reason = _clean_cancel_detail(reason, "cancelled")
-            # Persist the user/system cancellation distinction before signalling
-            # the coroutine. If the process dies during disposition cleanup,
-            # startup recovery can still decide whether pending steer text must
-            # be restored to the composer or promoted as system-abandoned work.
+            # Persist the user/system distinction for startup recovery. Desktop
+            # quit has already stopped execution; other callers keep the durable
+            # intent-before-cancel ordering used by interactive stop and drain.
             for task in tasks:
                 try:
                     existing = await self._storage.get_agent_task(task.task_id)
@@ -3696,7 +3716,10 @@ class TaskRuntime:
                         exc_info=True,
                     )
             for task in tasks:
-                if task.asyncio_task is not None and not task.asyncio_task.done():
+                if (
+                    not immediate_quit and task.asyncio_task is not None
+                    and not task.asyncio_task.done()
+                ):
                     task.asyncio_task.cancel()
         # A coroutine cancelled before its first event-loop step never enters
         # ``_execute`` and therefore cannot run its CancelledError cleanup.
@@ -3877,6 +3900,66 @@ class TaskRuntime:
         await asyncio.wait_for(runtime_task.done.wait(), timeout=timeout)
         return await self.status(task_id)
 
+    @property
+    def desktop_quitting(self) -> bool:
+        return self._shutdown_request is not None and self._shutdown_request.mode == "quit"
+
+    def close_admission(self, request: ShutdownRequest) -> None:
+        """Fence new work synchronously when the authenticated request is accepted."""
+        self._closing = True
+        self._shutdown_request = request
+        if request.mode == "quit":
+            for task in tuple(self._tasks.values()):
+                if task.status in TERMINAL_STATUSES:
+                    continue
+                already_cancelled = (
+                    task.cancel_requested and task.cancel_source == "gateway_shutdown"
+                    and task.cancel_reason == "desktop_quit"
+                )
+                if not task.cancel_requested:
+                    task.cancel_requested_at_monotonic = time.monotonic()
+                task.cancel_requested = True
+                task.cancel_source = "gateway_shutdown"
+                task.cancel_reason = "desktop_quit"
+                if not already_cancelled and task.asyncio_task is not None:
+                    task.asyncio_task.cancel()
+        self._signal_driver_state_changed()
+
+    def shutdown_activity(self) -> dict[str, int]:
+        """Return a conservative in-memory snapshot for desktop quit confirmation."""
+        from opensquilla.tools.builtin.shell import active_background_process_task_owners
+
+        tasks = tuple(self._tasks.values())
+        visible_drivers = {task.asyncio_task for task in tasks}
+        settling_drivers = sum(
+            not driver.done() and driver not in visible_drivers
+            for drivers in self._driver_tasks_by_session.values() for driver in drivers
+        )
+        return {
+            "running": (
+                sum(task.status == AgentTaskStatus.RUNNING for task in tasks) + settling_drivers
+            ),
+            "queued": sum(task.status == AgentTaskStatus.QUEUED for task in tasks),
+            "waiting": sum(
+                task.status == AgentTaskStatus.RUNNING and not task.execution_started
+                for task in tasks
+            ),
+            "reservations": sum(len(items) for items in self._reservations_by_session.values()),
+            "auxiliary": (
+                sum(not task.done() for task in self._auxiliary_tasks_by_session.values())
+                + len(active_background_process_task_owners())
+            ),
+        }
+
+    def shutdown_task_owners(self) -> set[tuple[str, str]]:
+        tasks = list(self._tasks.values())
+        tasks.extend(
+            reservation.runtime_task
+            for reservations in self._reservations_by_session.values()
+            for reservation in reservations
+        )
+        return {(task.envelope.session_key, task.task_id) for task in tasks}
+
     async def shutdown(
         self,
         *,
@@ -3884,6 +3967,7 @@ class TaskRuntime:
         timeout: float = 5.0,
         graceful: bool = False,
         graceful_timeout: float | None = None,
+        request: ShutdownRequest | None = None,
     ) -> TaskRuntimeShutdownResult:
         """Shut down all in-flight tasks.
 
@@ -3906,9 +3990,12 @@ class TaskRuntime:
             Deadline (seconds) for the graceful drain phase.  ``None`` means
             wait indefinitely (use with care in production; set a finite value).
 
-        The first call closes admission and owns the shutdown budgets. Concurrent
-        and later callers await that same process-lifetime shutdown result.
+        Legacy callers share the first shutdown operation. A desktop request
+        can escalate its drain to cancellation and shorten the shared deadline;
+        it cannot reopen admission or extend the original process budget.
         """
+        if request is not None:
+            self.close_admission(request)
         async with self._state_lock:
             shutdown_task = self._shutdown_task
             if shutdown_task is None:
@@ -3923,7 +4010,29 @@ class TaskRuntime:
                 )
                 self._shutdown_task = shutdown_task
                 self._signal_driver_state_changed()
-        return await asyncio.shield(shutdown_task)
+        if request is None:
+            return await asyncio.shield(shutdown_task)
+        started = time.monotonic()
+        while not shutdown_task.done():
+            changed = asyncio.create_task(request.changed.wait())
+            done, _ = await asyncio.wait(
+                {shutdown_task, changed}, timeout=request.remaining(),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not changed.done():
+                changed.cancel()
+            await asyncio.gather(changed, return_exceptions=True)
+            if not done or request.remaining() <= 0:
+                # The driver/finalizer keeps its stateful dependencies until
+                # process exit even if a required durable write resists cancel.
+                if shutdown_task.done():
+                    return shutdown_task.result()
+                result = await self._shutdown_result(started, 0)
+                return replace(
+                    result, clean=False,
+                    remaining_auxiliary_count=result.remaining_auxiliary_count + 1,
+                )
+        return shutdown_task.result()
 
     async def _shutdown_impl(
         self,
@@ -3945,13 +4054,15 @@ class TaskRuntime:
         for auxiliary_task in auxiliary_tasks:
             auxiliary_task.cancel()
 
-        if graceful:
+        if graceful and not self.desktop_quitting:
             graceful_deadline = (
                 None
                 if graceful_timeout is None
                 else time.monotonic() + max(0.0, graceful_timeout)
             )
-            if await self._wait_for_shutdown_quiescence(deadline=graceful_deadline):
+            if await self._wait_for_shutdown_quiescence(
+                deadline=graceful_deadline, draining=True
+            ):
                 return await self._shutdown_result(started, abandoned_task_count)
             drivers, reservations, auxiliaries = await self._shutdown_counts()
             log.warning(
@@ -3963,17 +4074,23 @@ class TaskRuntime:
             )
 
         cancel_deadline = time.monotonic() + max(0.0, timeout)
+        if self._shutdown_request is not None and self.desktop_quitting:
+            cancel_deadline = self._shutdown_request.deadline
+        cancel_reason = (
+            "desktop_quit" if self.desktop_quitting
+            else "graceful_timeout" if graceful else "shutdown"
+        )
         cancelled_drivers: set[asyncio.Task[None]] = set()
         if cancel:
             await self._request_shutdown_cancellation(
                 source="gateway_shutdown",
-                reason="graceful_timeout" if graceful else "shutdown",
+                reason=cancel_reason,
                 cancelled_drivers=cancelled_drivers,
             )
         if await self._wait_for_shutdown_quiescence(
             deadline=cancel_deadline,
             cancel_source=("gateway_shutdown" if cancel else None),
-            cancel_reason=("graceful_timeout" if graceful else "shutdown"),
+            cancel_reason=cancel_reason,
             cancelled_drivers=cancelled_drivers,
         ):
             return await self._shutdown_result(started, abandoned_task_count)
@@ -4011,6 +4128,8 @@ class TaskRuntime:
                     force
                     or not task.cancel_requested
                     or task.cancel_source != source
+                    or task.cancel_reason != reason
+                    or (reason == "desktop_quit" and task.asyncio_task not in cancelled_drivers)
                 )
             ]
             drivers = {
@@ -4029,11 +4148,19 @@ class TaskRuntime:
                     cancelled_drivers.add(task.asyncio_task)
 
         if runtime_tasks:
-            await self._cancel_runtime_tasks(
-                runtime_tasks,
-                source=source,
-                reason=reason,
-            )
+            if reason == "desktop_quit":
+                # One blocked durable write must not delay cancellation of
+                # unrelated tasks. Each task still persists intent first.
+                await asyncio.gather(*(
+                    self._cancel_runtime_tasks([task], source=source, reason=reason)
+                    for task in runtime_tasks
+                ))
+            else:
+                await self._cancel_runtime_tasks(
+                    runtime_tasks,
+                    source=source,
+                    reason=reason,
+                )
         for driver in drivers:
             if driver not in runtime_drivers and (
                 force or driver not in cancelled_drivers
@@ -4049,12 +4176,20 @@ class TaskRuntime:
         cancel_source: str | None = None,
         cancel_reason: str | None = None,
         cancelled_drivers: set[asyncio.Task[None]] | None = None,
+        draining: bool = False,
     ) -> bool:
         """Wait for the driver registry and admission gap to reach a fixed point."""
 
         if cancelled_drivers is None:
             cancelled_drivers = set()
         while True:
+            request = self._shutdown_request
+            if draining and self.desktop_quitting:
+                return False
+            if request is not None:
+                deadline = request.deadline if deadline is None else min(deadline, request.deadline)
+            if self.desktop_quitting and cancel_source is not None:
+                cancel_reason = "desktop_quit"
             if cancel_source is not None:
                 await self._request_shutdown_cancellation(
                     source=cancel_source,
@@ -4585,6 +4720,16 @@ class TaskRuntime:
                         candidate.collected_primary_inputs.append(collected_identity)
             return handle, persisted
 
+    def _fence_desktop_quit_execution(self, task: _RuntimeTask) -> None:
+        if not self.desktop_quitting:
+            return
+        if not task.cancel_requested:
+            task.cancel_requested_at_monotonic = time.monotonic()
+        task.cancel_requested = True
+        task.cancel_source = "gateway_shutdown"
+        task.cancel_reason = "desktop_quit"
+        raise asyncio.CancelledError
+
     async def _execute(self, task: _RuntimeTask) -> None:
         # Set before the first await so cancellation can distinguish a
         # never-started coroutine from one that owns runtime cleanup, even
@@ -4594,7 +4739,9 @@ class TaskRuntime:
         write_lock = self._session_locks.setdefault(session_key, asyncio.Lock())
         execution_lock = self._session_execution_locks.setdefault(session_key, asyncio.Lock())
         try:
+            self._fence_desktop_quit_execution(task)
             async with execution_lock:
+                self._fence_desktop_quit_execution(task)
                 if task.cancel_requested:
                     reason = "overflow_drop" if task.overflow_dropped else "user_cancel"
                     terminal_reason = (
@@ -4620,6 +4767,7 @@ class TaskRuntime:
                     acquired = True
                     async with write_lock:
                         pass
+                    self._fence_desktop_quit_execution(task)
                     heartbeat_task = self._start_running_heartbeat(task)
                     metadata = task.envelope.metadata
                     turn_context = {
@@ -4721,6 +4869,7 @@ class TaskRuntime:
                     from opensquilla.session.turn_context import turn_context_scope
 
                     with turn_context_scope(turn_context):
+                        self._fence_desktop_quit_execution(task)
                         await self._run_turn_handler_with_write_lock_bypass(
                             run,
                             write_lock=write_lock,

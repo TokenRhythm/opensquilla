@@ -18,6 +18,7 @@ from opensquilla.gateway.auth import resolve_auth
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.desktop_ownership import (
     DESKTOP_GATEWAY_INSTANCE_NONCE_ENV,
+    DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
     DESKTOP_GATEWAY_OWNERSHIP_DIR_ENV,
     DESKTOP_GATEWAY_OWNERSHIP_FILENAME,
     DESKTOP_GATEWAY_OWNERSHIP_LOCK_FILENAME,
@@ -514,6 +515,174 @@ def test_desktop_shutdown_requested_before_cli_handler_is_replayed() -> None:
 
     relay("signal_after_install")
     assert reasons == ["desktop_api_shutdown", "signal_after_install"]
+
+
+def _lifecycle_request(owner, action: str, **fields):
+    return {
+        **fields,
+        "lifecycle_protocol": DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL,
+        "action": action,
+        "challenge": _CHALLENGE,
+        "proof": owner.lifecycle_proof(_CHALLENGE, action, fields),
+    }
+
+
+def test_desktop_lifecycle_proofs_match_cross_language_vectors(tmp_path):
+    owner = DesktopGatewayOwnership(
+        state_dir=tmp_path,
+        profile_fingerprint="0123456789abcdef" * 4,
+        pid=4242,
+        start_identity="opaque-start-identity",
+        port=18791,
+        version="1.2.3",
+        instance_nonce="abcdefghijklmnopqrstuvwxyzABCDEFG",
+    )
+    challenge = "0123456789abcdef0123456789abcdef"
+    assert owner.lifecycle_proof(
+        challenge, "shutdown", {"mode": "quit", "remaining_ms": 5000}
+    ) == "d8efe03e8bd6959e27c5a91814a904ef6c8042509b904f9a358f01d91a94eeca"
+    assert owner.lifecycle_proof(
+        challenge,
+        "status_ack",
+        {"activity": {"running": 1, "queued": 2, "waiting": 3, "reservations": 1, "auxiliary": 4}},
+    ) == "8189bd193141c8602b4aee1b9eb6a668b7f8288f97996d509c7b63b726e0c1d5"
+
+
+def test_desktop_lifecycle_activity_is_authenticated_and_read_only(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    owner = _owner(tmp_path, monkeypatch)
+    counts = {"running": 1, "queued": 2, "waiting": 3, "reservations": 1, "auxiliary": 4}
+    calls = []
+    runtime = SimpleNamespace(shutdown_activity=lambda: counts)
+    app = create_gateway_app(
+        GatewayConfig(host="127.0.0.1", auth={"mode": "token", "token": "test-token"}),
+        task_runtime=runtime,
+    )
+    app.state.desktop_gateway_ownership = owner
+    app.state.request_desktop_shutdown = lambda *args: calls.append(args)
+    request = _lifecycle_request(owner, "status")
+    with TestClient(app, client=_OWNER_PEER) as client:
+        response = client.post("/api/desktop/lifecycle", json=request)
+        assert response.status_code == 200
+        assert response.json() == owner.lifecycle_response(
+            _CHALLENGE, "status_ack", {"activity": counts}
+        )
+        assert calls == []
+        response = client.post(
+            "/api/desktop/lifecycle", json={**request, "proof": "0" * 64}
+        )
+        assert response.status_code == 403
+        response = client.post(
+            "/api/desktop/lifecycle",
+            json=request,
+            headers={"Origin": "https://attacker.example"},
+        )
+        assert response.status_code == 403
+    with TestClient(app, client=_REMOTE_PEER) as client:
+        assert client.post("/api/desktop/lifecycle", json=request).status_code == 403
+
+
+def test_desktop_lifecycle_shutdown_signs_mode_budget_and_effective_ack(tmp_path, monkeypatch):
+    owner = _owner(tmp_path, monkeypatch)
+    app = create_gateway_app(GatewayConfig(host="127.0.0.1"))
+    app.state.desktop_gateway_ownership = owner
+    calls = []
+
+    def accept(mode, remaining_ms):
+        calls.append((mode, remaining_ms))
+        return {
+            "accepted_mode": mode,
+            "remaining_ms": min(remaining_ms, 1250),
+            "total_remaining_ms": min(remaining_ms + 5000, 6250),
+        }
+
+    app.state.request_desktop_shutdown = accept
+    request = _lifecycle_request(owner, "shutdown", mode="quit", remaining_ms=5000)
+    with TestClient(app, client=_OWNER_PEER) as client:
+        for tampered in (
+            {**request, "mode": "drain"},
+            {**request, "remaining_ms": 9000},
+            {**request, "proof": owner.identity_response(_CHALLENGE)["proof"]},
+            {**request, "proof": owner.lifecycle_proof(_CHALLENGE, "status", {})},
+        ):
+            assert client.post("/api/desktop/lifecycle", json=tampered).status_code == 403
+        assert calls == []
+        response = client.post("/api/desktop/lifecycle", json=request)
+        assert response.status_code == 202
+        assert response.json() == owner.lifecycle_response(
+            _CHALLENGE,
+            "shutdown_ack",
+            {"accepted_mode": "quit", "remaining_ms": 1250, "total_remaining_ms": 6250},
+        )
+        assert calls == [("quit", 5000)]
+
+
+def test_desktop_lifecycle_activity_uses_complete_gateway_snapshot(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    owner = _owner(tmp_path, monkeypatch)
+    idle = {"running": 0, "queued": 0, "waiting": 0, "reservations": 0, "auxiliary": 0}
+    aggregated = {**idle, "auxiliary": 2}
+    app = create_gateway_app(
+        GatewayConfig(host="127.0.0.1"),
+        task_runtime=SimpleNamespace(shutdown_activity=lambda: idle),
+    )
+    app.state.desktop_gateway_ownership = owner
+    app.state.desktop_shutdown_activity = lambda: aggregated
+    with TestClient(app, client=_OWNER_PEER) as client:
+        response = client.post(
+            "/api/desktop/lifecycle", json=_lifecycle_request(owner, "status")
+        )
+    assert response.status_code == 200
+    assert response.json() == owner.lifecycle_response(
+        _CHALLENGE, "status_ack", {"activity": aggregated}
+    )
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"mode": "force", "remaining_ms": 5000},
+        {"mode": "quit", "remaining_ms": -1},
+        {"mode": "quit", "remaining_ms": 10_001},
+        {"mode": "quit", "remaining_ms": True},
+        {"mode": "quit", "remaining_ms": 5.5},
+        {"mode": "quit", "remaining_ms": "5000"},
+    ],
+)
+def test_desktop_lifecycle_rejects_invalid_policy_without_side_effects(
+    tmp_path, monkeypatch, fields
+):
+    owner = _owner(tmp_path, monkeypatch)
+    app = create_gateway_app(GatewayConfig(host="127.0.0.1"))
+    app.state.desktop_gateway_ownership = owner
+    calls = []
+    app.state.request_desktop_shutdown = lambda *args: calls.append(args)
+    with TestClient(app, client=_OWNER_PEER) as client:
+        response = client.post(
+            "/api/desktop/lifecycle", json=_lifecycle_request(owner, "shutdown", **fields)
+        )
+    assert response.status_code == 400
+    assert calls == []
+
+
+def test_desktop_lifecycle_unavailable_does_not_accept_quit(tmp_path, monkeypatch):
+    owner = _owner(tmp_path, monkeypatch)
+    app = create_gateway_app(GatewayConfig(host="127.0.0.1"))
+    app.state.desktop_gateway_ownership = owner
+    with TestClient(app, client=_OWNER_PEER) as client:
+        assert client.post(
+            "/api/desktop/lifecycle", json=_lifecycle_request(owner, "status")
+        ).status_code == 503
+        assert client.post(
+            "/api/desktop/lifecycle",
+            json=_lifecycle_request(owner, "shutdown", mode="quit", remaining_ms=5000),
+        ).status_code == 503
+        assert client.post(
+            "/api/desktop/lifecycle",
+            json={**_lifecycle_request(owner, "status"), "lifecycle_protocol": "future"},
+        ).status_code == 400
 
 
 def test_active_desktop_record_cleanup_is_ownership_safe(

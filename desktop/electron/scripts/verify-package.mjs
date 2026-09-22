@@ -281,6 +281,7 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   const binary = requireGatewayBinary(root, label, platform)
   if (executeCommands) {
     if (!binary) return
+    verifyGatewayCommand(binary, label, ['--_desktop-tool-search-probe'])
     verifyGatewayCommand(binary, label, ['--help'])
     verifyGatewayCommand(binary, label, ['code-task', '--help'])
     verifyGatewayCommand(binary, label, ['code-task', 'stage-task-file'], { input: 'desktop package smoke\n' })

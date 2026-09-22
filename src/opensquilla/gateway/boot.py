@@ -65,6 +65,7 @@ from opensquilla.gateway.session_lifecycle import (
 )
 from opensquilla.gateway.session_services import get_session_storage
 from opensquilla.gateway.session_streams import get_session_streams, reset_session_streams
+from opensquilla.gateway.shutdown import ShutdownRequest
 from opensquilla.gateway.task_runtime import TaskRuntimeShutdownResult
 from opensquilla.gateway.terminal_activity import (
     append_activity_phase,
@@ -2318,13 +2319,30 @@ class _GatewayShutdownRelay:
 
     _handler: Callable[[str], None] | None = field(default=None, repr=False)
     _pending_reason: str | None = field(default=None, repr=False)
+    request: ShutdownRequest | None = field(default=None, repr=False)
+    on_request: Callable[[ShutdownRequest], None] | None = field(default=None, repr=False)
 
     def __call__(self, reason: str) -> None:
+        if self.request is None:
+            self.request = ShutdownRequest("drain", time.monotonic() + gateway_shutdown_deadline())
+        if self.on_request is not None:
+            self.on_request(self.request)
         handler = self._handler
         if handler is not None:
             handler(reason)
         elif self._pending_reason is None:
             self._pending_reason = reason
+
+    def desktop(self, mode: str, remaining_ms: int) -> dict[str, str | int]:
+        if self.request is None:
+            self.request = ShutdownRequest(mode, time.monotonic() + remaining_ms / 1000)
+        else:
+            self.request.update(mode, remaining_ms)
+        # A quit arriving during early boot supersedes the buffered drain reason.
+        if self.request.mode == "quit":
+            self._pending_reason = "desktop_quit"
+        self("desktop_quit" if self.request.mode == "quit" else "desktop_drain")
+        return self.request.acknowledgement()
 
     def install(self, handler: Callable[[str], None]) -> None:
         self._handler = handler
@@ -2416,6 +2434,7 @@ class GatewayServer:
     _services: ServiceContainer | None = field(default=None, repr=False)
     _background_completion_manager: Any = field(default=None, repr=False)
     _pid_lock: Any = field(default=None, repr=False)
+    _quit_process_cleanup_task: asyncio.Task[bool] | None = field(default=None, repr=False)
 
     def _release_pid_lock(self) -> None:
         pid_lock = self._pid_lock
@@ -2426,9 +2445,97 @@ class GatewayServer:
         finally:
             self._pid_lock = None
 
-    async def close(
+    async def close(self, reason: str = "shutdown") -> TaskRuntimeShutdownResult | None:
+        state = getattr(getattr(self, "app", None), "state", None)
+        request = getattr(state, "shutdown_request", None)
+        relay = getattr(state, "request_shutdown", None)
+        if not isinstance(request, ShutdownRequest) and isinstance(relay, _GatewayShutdownRelay):
+            # Signals enter through the CLI handler rather than the HTTP relay.
+            # Bind them to the same state so a later desktop quit can escalate.
+            relay(reason)
+            request = relay.request
+        if not isinstance(request, ShutdownRequest):
+            return await self._close_impl(reason)
+
+        started = time.monotonic()
+        closing = asyncio.create_task(self._close_impl(reason, request=request))
+        process_cleanup: asyncio.Task[bool] | None = None
+        while True:
+            changed = asyncio.create_task(request.changed.wait())
+            if request.mode == "quit" and process_cleanup is None:
+                process_cleanup = asyncio.create_task(self._stop_owned_processes())
+                self._quit_process_cleanup_task = process_cleanup
+            participants: set[asyncio.Task[Any]] = {closing}
+            if process_cleanup is not None:
+                participants.add(process_cleanup)
+            pending = {task for task in participants if not task.done()}
+            if not pending:
+                changed.cancel()
+                await asyncio.gather(changed, return_exceptions=True)
+                for task in participants:
+                    task.result()
+                result = closing.result()
+                if process_cleanup is not None and process_cleanup.result() is False:
+                    return TaskRuntimeShutdownResult(
+                        clean=False, elapsed_ms=int((time.monotonic() - started) * 1000),
+                        abandoned_task_count=0, remaining_driver_count=0,
+                        remaining_reservation_count=0, remaining_auxiliary_count=1,
+                    )
+                if result is None or result.clean:
+                    self._release_pid_lock()
+                return result
+            done, _ = await asyncio.wait(
+                pending | {changed}, timeout=request.remaining(),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if not changed.done():
+                changed.cancel()
+            await asyncio.gather(changed, return_exceptions=True)
+            if not done or request.remaining() <= 0:
+                # Do not cancel/join finalizers here: they deliberately shield
+                # durable writes. The process watchdog is the final boundary.
+                for task in pending:
+                    task.add_done_callback(_consume_websocket_close_task)
+                runtime = getattr(self._services, "task_runtime", None)
+                activity = runtime.shutdown_activity() if runtime is not None else {}
+                log.error("gateway.desktop_shutdown_deadline", mode=request.mode, **activity)
+                return TaskRuntimeShutdownResult(
+                    clean=False, elapsed_ms=int((time.monotonic() - started) * 1000),
+                    abandoned_task_count=0,
+                    remaining_driver_count=int(activity.get("running", 0)),
+                    remaining_reservation_count=int(activity.get("reservations", 0)),
+                    remaining_auxiliary_count=len(pending),
+                )
+
+    async def _stop_owned_processes(self) -> bool:
+        from opensquilla.process_tree import cancel_persisted_processes_for_task
+        from opensquilla.tools.builtin.shell import (
+            active_background_process_task_owners,
+            cancel_background_processes_for_task,
+        )
+
+        owners = set(active_background_process_task_owners())
+        runtime = getattr(self._services, "task_runtime", None)
+        if runtime is not None:
+            owners.update(runtime.shutdown_task_owners())
+        results = await asyncio.gather(*(
+            operation
+            for session_key, task_id in owners
+            for operation in (
+                cancel_background_processes_for_task(session_key, task_id),
+                cancel_persisted_processes_for_task(self.config.state_dir, session_key, task_id),
+            )
+        ), return_exceptions=True)
+        if any(isinstance(result, BaseException) for result in results):
+            log.warning("gateway.owned_process_cleanup_failed")
+            return False
+        return not owners.intersection(active_background_process_task_owners())
+
+    async def _close_impl(
         self,
         reason: str = "shutdown",
+        *,
+        request: ShutdownRequest | None = None,
     ) -> TaskRuntimeShutdownResult | None:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
         runtime_shutdown_result: TaskRuntimeShutdownResult | None = None
@@ -2446,15 +2553,23 @@ class GatewayServer:
                 if self._services is not None
                 else None
             )
+            goal_pause = None
             if goal_service is not None:
-                try:
-                    await goal_service.prepare_shutdown()
-                except Exception:
-                    log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
+                async def pause_goals() -> None:
+                    try:
+                        await goal_service.prepare_shutdown()
+                    except Exception:
+                        log.debug("gateway.goal_service_shutdown_failed", exc_info=True)
+                goal_pause = asyncio.create_task(pause_goals())
             if self._services is not None and self._services.task_runtime is not None:
                 try:
+                    runtime_kwargs: dict[str, Any] = {
+                        "graceful": True, "graceful_timeout": drain_budget,
+                    }
+                    if request is not None:
+                        runtime_kwargs["request"] = request
                     runtime_shutdown_result = await self._services.task_runtime.shutdown(
-                        graceful=True, graceful_timeout=drain_budget
+                        **runtime_kwargs
                     )
                     runtime_shutdown_clean = (
                         runtime_shutdown_result is None or runtime_shutdown_result.clean
@@ -2471,6 +2586,22 @@ class GatewayServer:
                     )
                     log.exception("gateway.task_runtime_shutdown_failed")
 
+            if goal_pause is not None:
+                await goal_pause
+            if self._quit_process_cleanup_task is not None:
+                process_clean = await self._quit_process_cleanup_task
+                if runtime_shutdown_clean:
+                    # A tool may have registered a background process after the
+                    # initial quit snapshot. No driver can spawn after this fence.
+                    process_clean = await self._stop_owned_processes()
+                if process_clean is False:
+                    runtime_shutdown_clean = False
+                    runtime_shutdown_result = TaskRuntimeShutdownResult(
+                        clean=False, elapsed_ms=0, abandoned_task_count=0,
+                        remaining_driver_count=0, remaining_reservation_count=0,
+                        remaining_auxiliary_count=1,
+                    )
+
             if runtime_shutdown_result is not None and not runtime_shutdown_result.clean:
                 log.error(
                     "gateway.task_runtime_shutdown_incomplete",
@@ -2483,8 +2614,30 @@ class GatewayServer:
 
             if self._background_completion_manager is not None and runtime_shutdown_clean:
                 try:
-                    await self._background_completion_manager.close(timeout=drain_budget)
+                    completion_kwargs: dict[str, Any] = {"timeout": drain_budget}
+                    if request is not None:
+                        completion_kwargs.update(
+                            timeout=(request.remaining() if request.mode == "quit"
+                                     else min(drain_budget, request.remaining())),
+                            cancel=request.mode == "quit", deadline=request.deadline,
+                        )
+                    completion_clean = await self._background_completion_manager.close(
+                        **completion_kwargs
+                    )
+                    if completion_clean is False:
+                        runtime_shutdown_clean = False
+                        runtime_shutdown_result = TaskRuntimeShutdownResult(
+                            clean=False, elapsed_ms=0, abandoned_task_count=0,
+                            remaining_driver_count=0, remaining_reservation_count=0,
+                            remaining_auxiliary_count=1,
+                        )
                 except Exception:
+                    runtime_shutdown_clean = False
+                    runtime_shutdown_result = TaskRuntimeShutdownResult(
+                        clean=False, elapsed_ms=0, abandoned_task_count=0,
+                        remaining_driver_count=0, remaining_reservation_count=0,
+                        remaining_auxiliary_count=1,
+                    )
                     log.debug("gateway.background_completion_close_failed", exc_info=True)
                 try:
                     from opensquilla.gateway.subagent_announce import (
@@ -2507,6 +2660,8 @@ class GatewayServer:
                 log.info("gateway.channels_stopped")
 
             registry = get_registry()
+            if request is not None and request.mode == "quit":
+                reason = "desktop_quit"
             await registry.broadcast("shutdown", {"reason": reason})
 
             # Close all active WS connections
@@ -2577,7 +2732,7 @@ class GatewayServer:
                 elif self._services is not None:
                     log.warning("gateway.services_close_skipped_for_live_runtime")
             finally:
-                if runtime_shutdown_clean:
+                if runtime_shutdown_clean and request is None:
                     self._release_pid_lock()
         return runtime_shutdown_result
 
@@ -5119,7 +5274,25 @@ async def start_gateway_server(
         # identity endpoint. cli.gateway_cmd installs the final event handler
         # after this function returns; an early authenticated request is queued
         # by the relay instead of transiently returning 503 and wedging recovery.
-        shutdown_relay = _GatewayShutdownRelay()
+        def accept_shutdown(request: ShutdownRequest) -> None:
+            app.state.shutdown_request = request
+            if svc.task_runtime is not None:
+                svc.task_runtime.close_admission(request)
+            if request.mode == "quit" and background_completion_manager is not None:
+                background_completion_manager.begin_shutdown(cancel=True)
+
+        def desktop_shutdown_activity() -> dict[str, int]:
+            counts = (
+                svc.task_runtime.shutdown_activity() if svc.task_runtime is not None
+                else {"running": 0, "queued": 0, "waiting": 0, "reservations": 0, "auxiliary": 0}
+            )
+            counts["auxiliary"] += background_completion_manager.shutdown_activity_count()
+            return counts
+
+        shutdown_relay = _GatewayShutdownRelay(on_request=accept_shutdown)
+        app.state.desktop_shutdown_activity = desktop_shutdown_activity
+        app.state.shutdown_request = None
+        app.state.request_desktop_shutdown = shutdown_relay.desktop
         app.state.request_shutdown = shutdown_relay
         app.state.install_shutdown_handler = shutdown_relay.install
     startup_phase_started_at = _log_gateway_startup_phase(

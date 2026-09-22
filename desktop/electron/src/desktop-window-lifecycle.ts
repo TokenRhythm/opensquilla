@@ -2,6 +2,8 @@ export const DESKTOP_EXIT_PHASES = [
   'running',
   'deferred',
   'draining',
+  'terminating',
+  'failed',
   'committed',
 ] as const
 

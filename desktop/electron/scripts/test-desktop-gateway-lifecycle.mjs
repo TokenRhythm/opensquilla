@@ -8,6 +8,7 @@ import {
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from '../dist/gateway-lifecycle.js'
+import { DesktopQuitBudget } from '../dist/desktop-quit.js'
 import { DesktopRoutingConfigurationError } from '../dist/desktop-router-profiles.js'
 
 // Run the actual main-process startup wiring with profile inspection held open.
@@ -153,8 +154,13 @@ function mainExitHarness() {
   const drainResult = deferred()
   const calls = { published: [], order: [], refreshes: 0, exits: [], errors: [], resumedQuits: 0 }
   let beforeQuit
+  let childExited = false
   const context = createContext({
     appExitPhase: 'running', isQuitting: false, process: { platform: 'win32' },
+    appExitStatusKey: 'tray.running', desktopCleanupBusy: false, recoveryOperationBusy: false,
+    quitFromSignal: false, quitUnconfirmedProcessTrees: new Set(), DesktopQuitBudget,
+    holdQuitForTaskConfirmation: () => false,
+    cancelGatewayUnexpectedExitRestart() {}, desktopT: key => key,
     gatewayProcess: child,
     gatewayProcessOwnershipContexts: new Map([[child, { nonce: 'synthetic-owner' }]]),
     desktopGatewayAuthToken: nonce => `auth-${nonce}`,
@@ -184,20 +190,19 @@ function mainExitHarness() {
     desktopReliabilityTelemetry: { finishSession() {} },
     artifactPreviewLeaseBroker: {
       clear() {},
-      revokeAll: () => { calls.order.push('preview-cleanup'); return previewCleanup.promise },
+      shutdown: () => { calls.order.push('preview-cleanup'); return previewCleanup.promise },
     },
     nativeWorkbenchSurfaces: { destroyAll: async () => {} },
     desktopBrowser: { close: async () => {} },
     destroyWindowsTray() {}, stopGateway() {},
-    hasGatewayProcessExited: () => false,
-    liveLifecycleOwnedGatewayProcesses: () => [child],
-    drainOwnedGatewayForQuit: (process, url, requestShutdown) => {
+    hasGatewayProcessExited: () => childExited,
+    liveLifecycleOwnedGatewayProcesses: () => childExited ? [] : [child],
+    quitOwnedGateway: async (process) => {
       assert.equal(process, child)
-      assert.equal(url, 'http://127.0.0.1:8765', 'shutdown retains the internal Gateway URL')
-      assert.equal(requestShutdown, true)
       calls.order.push('gateway-shutdown')
       drainRequested.resolve()
-      return drainResult.promise
+      childExited = await drainResult.promise
+      return childExited
     },
     dialog: { showErrorBox: (...args) => calls.errors.push(args) },
     desktopUpdateInstallMode: () => 'manual',
@@ -210,6 +215,7 @@ function mainExitHarness() {
     mainSection('function publishGatewayConnection(', 'const artifactPreviewLeaseBroker ='),
     mainSection('function setAppExitPhase(', 'function destroyWindowsTray('),
     mainSection('function restoreDownloadedUpdateRetryState(', 'async function stopOwnedGatewaysForUpdate('),
+    mainSection('function showDesktopQuitFailure(', "app.on('before-quit',"),
     mainSection("app.on('before-quit',", 'function shutdownFromSignal('),
     "Object.assign(gatewayState, { status: 'ready', url: 'http://127.0.0.1:8765', port: 8765, owned: true })",
   ].join('\n'), context)
@@ -242,6 +248,10 @@ function runExitDescriptorCase() {
   assert.equal(harness.calls.published.at(-1).revision, ready.revision + 1)
   assert.equal(runInContext('gatewayState.status', harness.context), 'ready', 'internal drain authority stays intact')
   assert.equal(harness.calls.refreshes, 0, 'drain publication must not start an optional HTTP diagnostic')
+  harness.phase('terminating')
+  assertRendererStopped(harness.snapshot())
+  harness.phase('failed')
+  assertRendererStopped(harness.snapshot())
   harness.phase('committed')
   assertRendererStopped(harness.snapshot())
   assert.equal(harness.calls.published.length, 1, 'already stopped phase changes do not republish admission')
@@ -265,7 +275,8 @@ async function runQuitDrainDescriptorCase(exited) {
   const harness = mainExitHarness()
   harness.quit()
   assertRendererStopped(harness.calls.published.at(-1))
-  assert.deepEqual(harness.calls.order, ['descriptor:stopped', 'preview-cleanup'])
+  assert.deepEqual(harness.calls.order, ['descriptor:stopped', 'preview-cleanup', 'gateway-shutdown'],
+    'task cancellation must begin without waiting for preview cleanup')
   harness.previewCleanup.resolve()
   await harness.drainRequested
   assert.deepEqual(harness.calls.order, ['descriptor:stopped', 'preview-cleanup', 'gateway-shutdown'])
@@ -276,7 +287,7 @@ async function runQuitDrainDescriptorCase(exited) {
     assertRendererStopped(harness.snapshot())
     assert.deepEqual(harness.calls.exits, [0])
   } else {
-    assert.equal(harness.calls.published.at(-1).status, 'ready', 'failed quit restores the live renderer')
+    assert.equal(harness.calls.published.at(-1).status, 'stopped', 'failed quit must keep renderer admission closed')
     assert.equal(harness.calls.errors.length, 1)
     assert.deepEqual(harness.calls.exits, [])
   }

@@ -700,6 +700,143 @@ try {
     authorization: 'Bearer clear-inflight-token',
     scopeId: `${scopeId}:clear-inflight`,
   })
+
+  const deferred = () => {
+    let resolve
+    const promise = new Promise(accept => { resolve = accept })
+    return { promise, resolve }
+  }
+  const leaseResponse = (suffix, expires = expiresAt) => new Response(JSON.stringify({
+    version: 1,
+    lease_id: `apl-shutdown_${suffix}`,
+    effective_mode: 'full',
+    launch_url: `${previewOrigin}/${suffix}.html`,
+    entrypoint: `${suffix}.html`,
+    expires_at: expires,
+    preview_origin: previewOrigin,
+    idle_timeout_seconds: 28_800,
+    source: {
+      kind: 'single_file',
+      collection_status: 'not_applicable',
+      file_count: 1,
+      total_bytes: 42,
+      warning_codes: [],
+    },
+  }), { status: 201, headers: { 'content-type': 'application/json' } })
+  const shutdownRequest = suffix => ({
+    version: 1,
+    artifactId: `art-shutdown-${suffix}`,
+    scopeId,
+    mode: 'full',
+  })
+  const grantFrom = payload => ({
+    launchUrl: payload.launch_url,
+    expectedOrigin: payload.preview_origin,
+    scopeId,
+    mode: 'full',
+  })
+  const postAfterAbort = deferred()
+  const shutdownCalls = []
+  const shutdownBroker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => gatewayUrl,
+    timeoutMs: 100,
+    fetchImpl: async (input, init) => {
+      const path = new URL(String(input)).pathname
+      shutdownCalls.push({ path, method: init.method, signal: init.signal })
+      if (path.includes('/art-shutdown-active/')) return leaseResponse('active')
+      if (path.includes('/art-shutdown-pending/')) return await postAfterAbort.promise
+      if (path.endsWith('/apl-shutdown_pending')) return new Response(null, { status: 204 })
+      // Deliberately ignore AbortSignal in both renewal and existing-lease DELETE.
+      return await new Promise(() => {})
+    },
+  })
+  const activeLease = await shutdownBroker.create(shutdownRequest('active'))
+  assert.equal(activeLease.ok, true)
+  const activeGrant = grantFrom(activeLease.payload)
+  assert.equal(shutdownBroker.authorizesSurface(activeGrant), true)
+  const renewalAtShutdown = shutdownBroker.renew({
+    version: 1,
+    leaseId: activeLease.payload.lease_id,
+    scopeId,
+  })
+  const createAtShutdown = shutdownBroker.create(shutdownRequest('pending'))
+  const quitBudget = new AbortController()
+  const shutdown = shutdownBroker.shutdown({ signal: quitBudget.signal })
+  assert.equal(shutdownBroker.shutdown(), shutdown, 'repeated shutdown must join its first budget')
+  assert.equal(shutdownBroker.authorizesSurface(activeGrant), false)
+  assert.equal(shutdownCalls.some(call => call.path.endsWith('/apl-shutdown_active')), true)
+  const requestCountAtShutdown = shutdownCalls.length
+  assert.equal((await shutdownBroker.create(shutdownRequest('rejected'))).code, 'PREVIEW_BROKER_SHUTTING_DOWN')
+  assert.equal((await shutdownBroker.renew({
+    version: 1,
+    leaseId: activeLease.payload.lease_id,
+    scopeId,
+  })).code, 'PREVIEW_BROKER_SHUTTING_DOWN')
+  assert.equal(shutdownCalls.length, requestCountAtShutdown)
+  quitBudget.abort()
+  await shutdown
+  assert.equal((await createAtShutdown).ok, false)
+  assert.equal((await renewalAtShutdown).ok, false)
+  assert.equal(shutdownCalls.every(call => call.signal.aborted), true)
+
+  postAfterAbort.resolve(leaseResponse('pending'))
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(shutdownCalls.at(-1).path, '/api/v1/artifact-preview-leases/apl-shutdown_pending')
+  assert.equal(shutdownCalls.at(-1).method, 'DELETE')
+  assert.equal(shutdownBroker.authorizesSurface({
+    ...activeGrant,
+    launchUrl: `${previewOrigin}/pending.html`,
+  }), false, 'a late creation must be revoked without restoring authority')
+  shutdownBroker.clear()
+  await shutdownBroker.revokeAll()
+  assert.equal((await shutdownBroker.create(shutdownRequest('still-rejected'))).code, 'PREVIEW_BROKER_SHUTTING_DOWN')
+
+  const pendingPost = deferred()
+  const pendingShutdownDeletes = []
+  const pendingShutdownBroker = new ArtifactPreviewLeaseBroker({
+    getOwnedGatewayUrl: () => gatewayUrl,
+    fetchImpl: async (input, init) => {
+      const path = new URL(String(input)).pathname
+      if (init.method === 'DELETE') {
+        pendingShutdownDeletes.push(path)
+        return new Response(null, { status: 204 })
+      }
+      return path.includes('/art-shutdown-existing/')
+        ? leaseResponse('existing')
+        : await pendingPost.promise
+    },
+  })
+  const existing = await pendingShutdownBroker.create(shutdownRequest('existing'))
+  assert.equal(existing.ok, true)
+  const pendingCreate = pendingShutdownBroker.create(shutdownRequest('inflight'))
+  const pendingShutdown = pendingShutdownBroker.shutdown()
+  pendingPost.resolve(leaseResponse('inflight'))
+  await pendingShutdown
+  assert.equal((await pendingCreate).code, 'PREVIEW_LEASE_RETIRED')
+  assert.deepEqual(pendingShutdownDeletes, [
+    '/api/v1/artifact-preview-leases/apl-shutdown_existing',
+    '/api/v1/artifact-preview-leases/apl-shutdown_inflight',
+  ])
+  assert.equal(pendingShutdownBroker.authorizesSurface({
+    ...activeGrant,
+    launchUrl: `${previewOrigin}/inflight.html`,
+  }), false)
+
+  for (const hungPhase of ['fetch', 'body']) {
+    const requestTimeoutBroker = new ArtifactPreviewLeaseBroker({
+      getOwnedGatewayUrl: () => gatewayUrl,
+      timeoutMs: 20,
+      fetchImpl: async () => hungPhase === 'fetch'
+        ? await new Promise(() => {})
+        : new Response(new ReadableStream({ start() {} }), {
+          status: 201,
+          headers: { 'content-type': 'application/json' },
+        }),
+    })
+    const timeoutResult = await requestTimeoutBroker.create(shutdownRequest(`timeout-${hungPhase}`))
+    assert.equal(timeoutResult.code, 'PREVIEW_BROKER_UNAVAILABLE', `${hungPhase} must obey the request deadline`)
+    await requestTimeoutBroker.shutdown()
+  }
 } finally {
   await new Promise(resolve => server.close(resolve))
 }

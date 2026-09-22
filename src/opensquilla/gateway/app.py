@@ -391,6 +391,62 @@ def create_gateway_app(
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    async def api_desktop_lifecycle(request: Request) -> JSONResponse:
+        """Inspect or close an owned instance using the versioned lifecycle protocol."""
+        from opensquilla.gateway.desktop_ownership import DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL
+
+        owner, error = _desktop_gateway_owner(request)
+        if error is not None:
+            return error
+        assert owner is not None
+        try:
+            body = await request.json()
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "invalid lifecycle request"}, status_code=400)
+        if body.get("lifecycle_protocol") != DESKTOP_GATEWAY_LIFECYCLE_PROTOCOL:
+            return JSONResponse({"error": "unsupported lifecycle protocol"}, status_code=400)
+        action = body.get("action")
+        fields: dict[str, Any] = {}
+        if action == "shutdown":
+            mode = body.get("mode")
+            remaining_ms = body.get("remaining_ms")
+            if (
+                mode not in ("quit", "drain")
+                or type(remaining_ms) is not int
+                or not 0 <= remaining_ms <= (10_000 if mode == "quit" else 600_000)
+            ):
+                return JSONResponse({"error": "invalid shutdown policy"}, status_code=400)
+            fields = {"mode": mode, "remaining_ms": remaining_ms}
+        elif action != "status":
+            return JSONResponse({"error": "invalid lifecycle action"}, status_code=400)
+        challenge = body.get("challenge")
+        proof = body.get("proof")
+        if not owner.verify_lifecycle_proof(challenge, proof, action, fields):
+            return JSONResponse({"error": "invalid ownership proof"}, status_code=403)
+        if action == "status":
+            inspect_activity = getattr(request.app.state, "desktop_shutdown_activity", None)
+            if not callable(inspect_activity):
+                inspect_activity = getattr(task_runtime, "shutdown_activity", None)
+            if not callable(inspect_activity):
+                return JSONResponse({"error": "activity unavailable"}, status_code=503)
+            activity = inspect_activity()
+            response_fields = {"activity": activity}
+            status_code = 200
+        else:
+            request_shutdown = getattr(request.app.state, "request_desktop_shutdown", None)
+            if not callable(request_shutdown):
+                return JSONResponse({"error": "shutdown unavailable"}, status_code=503)
+            response_fields = request_shutdown(fields["mode"], fields["remaining_ms"])
+            status_code = 202
+        response = JSONResponse(
+            owner.lifecycle_response(challenge, f"{action}_ack", response_fields),
+            status_code=status_code,
+        )
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     async def api_usage(request: Request) -> JSONResponse:
         ctx = _make_ctx(request)
         result = await dispatcher.dispatch("_http", "usage.status", None, ctx)
@@ -810,6 +866,7 @@ def create_gateway_app(
         Route("/api/system/shutdown", _same_origin(api_system_shutdown), methods=["POST"]),
         Route("/api/desktop/identity", _same_origin(api_desktop_identity), methods=["POST"]),
         Route("/api/desktop/shutdown", _same_origin(api_desktop_shutdown), methods=["POST"]),
+        Route("/api/desktop/lifecycle", _same_origin(api_desktop_lifecycle), methods=["POST"]),
         Route("/api/usage", api_usage, methods=["GET"]),
         Route("/api/v2/sandbox/policy", api_sandbox_policy_get, methods=["GET"]),
         Route(
