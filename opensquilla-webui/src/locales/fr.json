@@ -4260,7 +4260,7 @@
         "running": "En cours",
         "paused": "En pause",
         "blocked": "Bloqué",
-        "completed": "Terminé",
+        "completed": "Exécution terminée",
         "cancelled": "Annulé",
         "superseded": "Remplacé par un plan plus récent"
       },

@@ -4344,7 +4344,7 @@
         "running": "运行中",
         "paused": "已暂停",
         "blocked": "受阻",
-        "completed": "已完成",
+        "completed": "本轮执行已结束",
         "cancelled": "已取消",
         "superseded": "已由新方案替代"
       },

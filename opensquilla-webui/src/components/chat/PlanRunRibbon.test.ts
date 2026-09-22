@@ -35,7 +35,7 @@ const i18n = createI18n({
             running: 'Running',
             paused: 'Paused',
             blocked: 'Blocked',
-            completed: 'Completed',
+            completed: 'Execution ended',
             cancelled: 'Cancelled',
             superseded: 'Replaced by a newer plan',
           },
@@ -499,6 +499,31 @@ describe('PlanRunRibbon', () => {
     )
   })
 
+  it.each([
+    { reported: 'no list', statuses: [], count: '' },
+    { reported: 'no completed steps', statuses: ['pending', 'pending', 'pending', 'pending'], count: '0/4' },
+    { reported: 'partial progress', statuses: ['completed', 'in_progress', 'pending', 'pending'], count: '1/4' },
+    { reported: 'all steps completed', statuses: ['completed', 'completed', 'completed', 'completed'], count: '4/4' },
+  ] as const)('ends the turn neutrally with $reported, without changing step facts', async ({ statuses, count }) => {
+    const snapshot = run({
+      status: 'completed',
+      currentStepId: undefined,
+      steps: statuses.map((status, index) => ({
+        stepId: `step-${index}`, title: `Work ${index}`, status,
+      })),
+    })
+    const originalSteps = structuredClone(snapshot.steps)
+    const host = mountRibbon(snapshot)
+    await nextTick()
+
+    expect(host.querySelector('.plan-run__title')?.textContent).toBe('Execution ended')
+    expect(host.querySelector('.plan-run__static-status')?.textContent.trim() ?? '').toBe(count)
+    expect(host.querySelector('.execution-todo-marker--completed')).toBeNull()
+    expect(host.querySelector('.execution-todo-marker--pending')).not.toBeNull()
+    expect(host.querySelector('.plan-run__steps')).toBeNull()
+    expect(snapshot.steps).toEqual(originalSteps)
+  })
+
   it('counts completed and skipped todos in the completed summary', async () => {
     const host = mountRibbon(run({
       status: 'completed',
@@ -512,7 +537,8 @@ describe('PlanRunRibbon', () => {
     await nextTick()
 
     expect(host.querySelector('.plan-run__static-status')?.textContent.trim()).toBe('3/3')
-    expect(host.querySelector('.execution-todo-marker--completed')).not.toBeNull()
+    expect(host.querySelector('.execution-todo-marker--completed')).toBeNull()
+    expect(host.querySelector('.execution-todo-marker--pending')).not.toBeNull()
   })
 
   it('keeps terminal presentation when a stale running event arrives afterward', async () => {
@@ -593,7 +619,7 @@ describe('PlanRunRibbon', () => {
 
     expect(host.querySelector('.plan-run--completed')).not.toBeNull()
     expect(host.querySelector('.plan-run__summary')).toBeNull()
-    expect(host.textContent).toContain('Completed')
+    expect(host.textContent).toContain('Execution ended')
     expect(host.textContent).not.toMatch(/Step \d+\/\d+/)
   })
 

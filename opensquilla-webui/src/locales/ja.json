@@ -4260,7 +4260,7 @@
         "running": "実行中",
         "paused": "一時停止",
         "blocked": "ブロック中",
-        "completed": "完了",
+        "completed": "今回の実行は終了しました",
         "cancelled": "キャンセル済み",
         "superseded": "新しいプランに置き換え済み"
       },

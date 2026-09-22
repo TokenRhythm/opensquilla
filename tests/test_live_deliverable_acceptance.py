@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import io
 import json
+import ntpath
+import os
+import runpy
+import subprocess
+import sys
+import tomllib
 from collections.abc import Iterator
 from pathlib import Path
 from zipfile import BadZipFile
@@ -839,3 +846,713 @@ def test_changed_historical_html_snapshot_is_inconclusive_instead_of_wrong_title
     assert _check(result, "source_snapshot_available")["status"] == "inconclusive"
     assert not [check for check in result["checks"] if check["status"] == "failed"]
     assert source_path.read_text(encoding="utf-8") == current
+
+
+def _plan_docx(fixture, *, include_year=True, disclaimer_only=False):
+    from docx import Document
+
+    document = Document()
+    document.add_heading(fixture["title"], 0)
+    document.add_paragraph("虚构教学数据；" + "；".join(
+        (fixture["year"] + "年" if include_year else "")
+        + f"{row[0]}{row[3]}为{row[1]}{row[2]}" for row in fixture["rows"]
+    ) + "。")
+    table = document.add_table(rows=1, cols=5)
+    for cell, text in zip(table.rows[0].cells, ["城市", "人口", "单位", "统计口径", "数据年份"]):
+        cell.text = text
+    for row in fixture["rows"]:
+        values = row + [fixture["year"] if include_year else ""]
+        for cell, text in zip(table.add_row().cells, values):
+            cell.text = text
+    if disclaimer_only:
+        document.add_paragraph("部分数据可能为 " + fixture["year"] + " 年，以最新公报为准。")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_plan_suite_repeats_core_cases_without_reusing_session_groups() -> None:
+    cases = acceptance.plan_cases()
+    assert [case["id"] for case in cases if case["kind"] == "plan-first"] == [
+        "plan-first-1", "plan-first-2", "plan-first-3",
+    ]
+    assert [case["id"] for case in cases if case["kind"] == "plan-repair"] == [
+        "plan-repair-1", "plan-repair-2", "plan-repair-3",
+    ]
+    assert len({case["id"] for case in cases}) == len(cases)
+
+
+@pytest.mark.parametrize("count", [0, -1, 11, True, 1.5])
+def test_plan_suite_rejects_unbounded_repetition(count) -> None:
+    with pytest.raises(ValueError, match="plan repetitions"):
+        acceptance.plan_cases(count)
+
+
+def test_docx_structure_pass_does_not_satisfy_missing_fixture_year(tmp_path: Path) -> None:
+    case = {"kind": "plan-repair", "number": 2}
+    fixture = acceptance.plan_fixture(case)
+    draft = acceptance.seed_plan_draft(tmp_path, fixture, tmp_path / "evidence")
+    result = acceptance.check_plan_document(Path(draft["path"]).read_bytes(), fixture)
+    assert result["structure_passed"] is True
+    assert result["fixture_requirements_passed"] is False
+    assert result["rows_missing_required_fact"] == [row[0] for row in fixture["rows"]]
+    assert result["body_missing_required_fact"] == [row[0] for row in fixture["rows"]]
+    saved = (tmp_path / "evidence" / "before.docx").read_bytes()
+    assert hashlib.sha256(saved).hexdigest() == draft["sha256"]
+
+
+def test_docx_generic_disclaimer_cannot_replace_per_row_year() -> None:
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    result = acceptance.check_plan_document(
+        _plan_docx(fixture, include_year=False, disclaimer_only=True), fixture,
+    )
+    assert result["structure_passed"] is True
+    assert result["fixture_requirements_passed"] is False
+
+
+@pytest.mark.parametrize("number", [1, 2, 3])
+def test_docx_content_check_uses_current_fixture_facts_not_a_fixed_year(number) -> None:
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": number})
+    result = acceptance.check_plan_document(_plan_docx(fixture), fixture)
+    assert result["fixture_requirements_passed"]
+    wrong_fixture = {**fixture, "year": "1999"}
+    wrong_result = acceptance.check_plan_document(_plan_docx(fixture), wrong_fixture)
+    assert not wrong_result["fixture_requirements_passed"]
+
+
+def test_unverifiable_case_does_not_supply_an_answer_in_prompt_or_source(tmp_path: Path) -> None:
+    case = {"kind": "plan-unverifiable", "number": 1}
+    fixture = acceptance.plan_fixture(case)
+    assert fixture["year"] not in acceptance.plan_prompt(case, fixture)
+    acceptance.seed_plan_draft(tmp_path, fixture, tmp_path / "evidence")
+    assert "year" not in json.loads((tmp_path / "source.json").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("kind", ["plan-repair", "plan-flexible", "plan-unverifiable"])
+def test_draft_cases_disclose_input_handoff_before_planning(kind: str) -> None:
+    case = {"kind": kind, "number": 1}
+    prompt = acceptance.plan_prompt(case, acceptance.plan_fixture(case))
+    assert "当前工作区已提供 report.docx 草稿及 source.json" in prompt
+    assert "先检查草稿和资料，再规划如何依据要求修改" in prompt
+    assert "缺少年份" not in prompt  # The Agent must discover the fixture defect.
+
+
+def test_plan_fixture_does_not_overwrite_an_existing_output(tmp_path: Path) -> None:
+    existing = tmp_path / "report.docx"
+    existing.write_bytes(b"keep original work")
+    with pytest.raises(ValueError, match="do not overwrite"):
+        acceptance.seed_plan_draft(
+            tmp_path, acceptance.plan_fixture({"kind": "plan-repair", "number": 1}),
+            tmp_path / "evidence",
+        )
+    assert existing.read_bytes() == b"keep original work"
+
+
+def test_plan_fixture_does_not_overwrite_existing_source_or_partially_create_draft(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.json"
+    source.write_text('{"keep": "original source"}', encoding="utf-8")
+    with pytest.raises(ValueError, match="do not overwrite"):
+        acceptance.seed_plan_draft(
+            tmp_path, acceptance.plan_fixture({"kind": "plan-repair", "number": 1}),
+            tmp_path / "evidence",
+        )
+    assert json.loads(source.read_text(encoding="utf-8")) == {"keep": "original source"}
+    assert not (tmp_path / "report.docx").exists()
+
+
+def test_plan_public_input_preflight_requires_both_readable_files(tmp_path: Path) -> None:
+    def http(request):
+        assert request.headers["x-opensquilla-session-key"] == "owned-session"
+        if request.method == "POST":
+            assert set(json.loads(request.content)["paths"]) == {"report.docx", "source.json"}
+            return httpx.Response(200, json={"files": [{
+                "path": "report.docx",
+                "contentUrl": "/api/v1/workspace-files/content?path=report.docx",
+            }]})
+        return httpx.Response(200, content=b"document bytes")
+
+    with httpx.Client(base_url="http://127.0.0.1:1", transport=httpx.MockTransport(http)) as client:
+        with pytest.raises(RuntimeError, match="unavailable through the public file API"):
+            acceptance.read_plan_inputs(client, "owned-session", tmp_path, tmp_path, "input")
+    assert (tmp_path / "input-report.docx").read_bytes() == b"document bytes"
+
+
+def test_plan_offline_validation_rechecks_download_not_success_or_cached_structure(
+    tmp_path: Path, forbid_live_validation,
+) -> None:
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    workspace = tmp_path / "workspace.docx"
+    download = tmp_path / "download.docx"
+    workspace.write_bytes(_plan_docx(fixture))
+    download.write_bytes(_plan_docx(fixture, include_year=False))
+    case = {"id": "plan-repair-1", "kind": "plan-repair", "fixture": fixture,
+            "task": {"status": "succeeded"}, "failures": [],
+            "outputs": [{"kind": kind, "evidence_path": path.name,
+                         "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                         "cached_pass": True}
+                        for kind, path in [("workspace", workspace), ("download", download)]]}
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"suite": "plan", "cases": [case]}), encoding="utf-8")
+    before = report.read_bytes()
+    result = acceptance.validate_report(report)
+    assert result["status"] == "failed"
+    assert all(check["structure_passed"] for check in result["cases"][0]["checks"])
+    assert "fixture_content_not_satisfied" in result["cases"][0]["transport_failures"]
+    assert report.read_bytes() == before
+
+
+def test_plan_correct_fixture_still_requires_review_of_actual_completion_claim(
+    tmp_path: Path,
+) -> None:
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    path = tmp_path / "correct.docx"
+    path.write_bytes(_plan_docx(fixture))
+    case = {"id": "plan-repair-1", "kind": "plan-repair", "fixture": fixture,
+            "failures": [], "outputs": [{"kind": kind, "evidence_path": path.name,
+                                          "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+                                         for kind in ("workspace", "download")]}
+    result = acceptance.validate_plan_case(case, tmp_path)
+    assert result["status"] == "inconclusive"
+    assert result["review_required"]
+    assert acceptance.plan_report_exit_code({"cases": [{**case, "assessment": result}]}) == 2
+
+
+def test_custom_model_relay_preserves_exact_model_binding(tmp_path: Path) -> None:
+    request_log = FunctionalRequestLog(tmp_path / "model-requests.sqlite3", enabled=True)
+    request_log.select_phase(variant="new", case_id="custom-model")
+    with contextlib.ExitStack() as stack:
+        relay = BoundedRelay(None, {}, model="deepseek-flash", api_key="offline-only",
+                             request_log=request_log,
+                             transport=httpx.MockTransport(
+                                 lambda _request: httpx.Response(200, content=_REPLY),
+                             ))
+        stack.callback(relay.close)
+        _forward(relay, _body(model="deepseek-flash", max_tokens=1))
+        with pytest.raises(BudgetRejectedError, match="acceptance_request_limit"):
+            _forward(relay, _body(model=MODEL, max_tokens=1))
+    assert [item["model"] for item in request_log.snapshot()["requests"]] == ["deepseek-flash"]
+
+
+def test_resume_rejects_a_different_model(tmp_path: Path) -> None:
+    (tmp_path / "report.json").write_text(json.dumps({"model": "deepseek-flash", "cases": []}))
+    with pytest.raises(ValueError, match="model or cases"):
+        acceptance.load_report(tmp_path, resume=True)
+    resumed = acceptance.load_report(tmp_path, resume=True, model="deepseek-flash")
+    assert resumed["model"] == "deepseek-flash"
+
+
+@pytest.mark.parametrize("repair", [False, True])
+@pytest.mark.parametrize("kind", ["plan-repair", "plan-flexible", "plan-unverifiable"])
+def test_plan_runner_approves_via_public_rpc_and_retains_failed_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair: bool, kind: str,
+) -> None:
+    from opensquilla.gateway.adapters.turn_admission import GatewayTurnAdmissionAdapter
+
+    case_id = kind + "-1"
+    workspace = tmp_path / "profile" / "tasks" / "fixture"
+    workspace.mkdir(parents=True)
+    fixture = acceptance.plan_fixture({"kind": kind, "number": 1})
+    calls = []
+    implemented = False
+    planning = False
+    clarified = False
+
+    def rpc(_client, method, params):
+        nonlocal implemented, planning, clarified
+        calls.append((method, params))
+        if method == "sessions.create":
+            assert params == {"agentId": "main", "kind": "webchat"}
+            assert not (workspace / "report.docx").exists()
+            return {"key": "agent:main:webchat:created", "sessionId": "created-session"}
+        if method == "plans.setMode":
+            assert params == {"sessionKey": "agent:main:webchat:created", "mode": "plan",
+                              "expectedRevision": 0}
+            return {"collaboration": {"mode": "plan", "revision": 1}}
+        if method == "chat.send":
+            assert params["sessionKey"] == "agent:main:webchat:created"
+            assert params["intent"] == "continue"
+            assert "collaborationMode" not in params
+            assert GatewayTurnAdmissionAdapter._initial_collaboration_mode(params) is None
+            assert (workspace / "report.docx").is_file()
+            source = json.loads((workspace / "source.json").read_text(encoding="utf-8"))
+            assert ("year" in source) == fixture["verifiable"]
+            planning = True
+            return {"taskId": "planning-turn"}
+        if method == "chat.clarify_submit":
+            assert params["requestId"] == "input-location"
+            assert "当前工作区" in params["fields"]["source"]
+            if kind == "plan-unverifiable":
+                assert "没有额外来源或可核实年份" in params["fields"]["source"]
+                assert fixture["year"] not in params["fields"]["source"]
+            clarified = True
+            return {"resolved": True}
+        if method == "plans.implement":
+            assert params["planRevisionId"] == "real-rpc-proposal"
+            assert (workspace / "report.docx").is_file()
+            assert clarified
+            if repair:
+                (workspace / "report.docx").write_bytes(_plan_docx(fixture))
+            implemented = True
+            return {"turn_id": "implementation-turn"}
+        assert method == "sessions.bootstrap"
+        if not planning:
+            return {"session": {"workspace": str(workspace)},
+                    "collaboration": {"mode": "default", "revision": 0}, "tasks": []}
+        if not clarified:
+            return {"session": {"workspace": str(workspace), "pendingUserInputs": [{
+                "request_id": "input-location", "clarify_schema": {"fields": [{
+                    "name": "source", "type": "enum", "allow_other": True,
+                    "choices": ["另行上传", "使用工作区资料"],
+                }]},
+            }]}, "tasks": [{"task_id": "planning-turn", "status": "running"}]}
+        return {"session": {"workspace": str(workspace)},
+                "currentPlan": {"revisionId": "real-rpc-proposal"},
+                "tasks": [{"task_id": "implementation-turn" if implemented else "planning-turn",
+                           "status": "succeeded"}], "history": {"messages": ["full evidence"]}}
+
+    def http(request):
+        if request.method == "POST":
+            assert request.url.path == "/api/v1/workspace-files/resolve"
+            return httpx.Response(200, json={"files": [{"path": name,
+                "contentUrl": "/api/v1/workspace-files/content?path=" + name,
+            } for name in json.loads(request.content)["paths"]]})
+        name = request.url.params.get("path", "report.docx")
+        return httpx.Response(200, content=(workspace / name).read_bytes())
+
+    monkeypatch.setattr(acceptance, "plan_rpc", rpc)
+    monkeypatch.setattr(acceptance.time, "sleep", lambda _duration: None)
+    monkeypatch.setattr(acceptance, "snapshot", lambda *_: {"artifacts": [{
+        "id": "delivered-report", "name": "report.docx",
+        "sha256": hashlib.sha256((workspace / "report.docx").read_bytes()).hexdigest(),
+    }]})
+    log = FunctionalRequestLog(tmp_path / "calls.sqlite3", enabled=True)
+    report = {"suite": "plan", "model": MODEL, "repetitions": 3, "cases": []}
+    with httpx.Client(base_url="http://127.0.0.1:1", transport=httpx.MockTransport(http)) as client:
+        code = acceptance.run_plan_cases(client, tmp_path, report, {case_id}, log)
+        before_calls = list(calls)
+        assert acceptance.run_plan_cases(client, tmp_path, report, {case_id}, log) == code
+    assert calls == before_calls  # Resume does not silently rerun a failed attempt.
+    assert [method for method, _ in calls] == [
+        "sessions.create", "sessions.bootstrap", "plans.setMode", "chat.send",
+        "sessions.bootstrap", "chat.clarify_submit", "sessions.bootstrap",
+        "plans.implement", "sessions.bootstrap",
+    ]
+    entry = report["cases"][0]
+    assert entry["inputs_before_planning"]["files"]["report.docx"]["sha256"] == (
+        entry["seeded_draft"]["sha256"]
+    )
+    before_hashes = {
+        name: item["sha256"] for name, item in entry["inputs_before_planning"]["files"].items()
+    }
+    assert before_hashes == {
+        name: item["sha256"] for name, item in entry["inputs_after_planning"]["files"].items()
+    }
+    assert entry["seeded_draft"]["parsed"]["tables"]
+    assert not acceptance.check_plan_document(
+        (tmp_path / "plan-evidence" / case_id / "before.docx").read_bytes(), fixture,
+    )["fixture_requirements_passed"]
+    assert len(entry["outputs"]) == 2
+    assert entry["stages"][1]["bootstrap"]["history"]["messages"] == ["full evidence"]
+    needs_review = repair or kind == "plan-unverifiable"
+    assert entry["assessment"]["status"] == ("inconclusive" if needs_review else "failed")
+    assert code == (2 if needs_review else 1)
+
+
+def test_plan_first_original_prompt_answers_structured_questions_and_stops_at_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sessions = {}
+    calls = []
+
+    def rpc(_client, method, params):
+        calls.append((method, params))
+        if method == "chat.send":
+            assert params["message"] == "帮我写个文档介绍华北"
+            key = params["sessionKey"]
+            assert key not in sessions
+            sessions[key] = False
+            return {"taskId": key + "-turn"}
+        if method == "chat.clarify_submit":
+            sessions[params["sessionKey"]] = True
+            assert "2500" in params["fields"]["preferences"]
+            assert "内蒙古" in params["fields"]["preferences"]
+            return {"resolved": True}
+        assert method == "sessions.bootstrap"  # No plans.implement or artifact request.
+        key = params["key"]
+        answered = sessions[key]
+        pending = [] if answered else [{"request_id": key + "-question",
+                                       "clarify_schema": {"fields": [
+                                           {"name": "preferences", "type": "string"},
+                                       ]}}]
+        return {"session": {"pendingUserInputs": pending},
+                "tasks": [{"task_id": key + "-turn",
+                           "status": "succeeded" if answered else "running"}],
+                "currentPlan": {"revisionId": key + "-proposal"} if answered else None}
+
+    monkeypatch.setattr(acceptance, "plan_rpc", rpc)
+    monkeypatch.setattr(acceptance.time, "sleep", lambda _duration: None)
+    log = FunctionalRequestLog(tmp_path / "calls.sqlite3", enabled=True)
+    report = {"suite": "plan", "model": MODEL, "repetitions": 3, "cases": []}
+    selected = {"plan-first-1", "plan-first-2", "plan-first-3"}
+    code = acceptance.run_plan_cases(object(), tmp_path, report, selected, log)
+    assert code == 0
+    assert len(sessions) == 3
+    assert all(case["assessment"]["status"] == "passed" for case in report["cases"])
+    assert all(len(case["stages"]) == 1 for case in report["cases"])
+    assert all(len(case["stages"][0]["clarifications"]) == 1 for case in report["cases"])
+    assert "plans.implement" not in [method for method, _ in calls]
+
+
+def test_correct_table_does_not_hide_a_body_missing_required_year() -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    document = Document(io.BytesIO(_plan_docx(fixture)))
+    document.paragraphs[1].text = document.paragraphs[1].text.replace(fixture["year"] + "年", "")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = acceptance.check_plan_document(buffer.getvalue(), fixture)
+    assert result["rows_missing_required_fact"] == []
+    assert result["body_missing_required_fact"]
+    assert not result["fixture_requirements_passed"]
+
+
+def test_plan_first_without_proposal_is_not_accepted_as_success(tmp_path: Path) -> None:
+    result = acceptance.validate_plan_case({
+        "id": "plan-first-1", "kind": "plan-first", "failures": [],
+        "stages": [{"bootstrap": {"currentPlan": None, "tasks": [{"status": "succeeded"}]}}],
+    }, tmp_path)
+    assert result["status"] == "failed"
+    assert result["transport_failures"] == ["first_turn_missing_proposal"]
+
+
+def test_windows_child_home_supports_expanduser_without_real_profile_access(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_environment = dict(os.environ)
+    env = acceptance.child_environment(
+        "tokenrhythm", {"TOKENRHYTHM_API_KEY": "synthetic-placeholder"},
+        base_environment={"USERPROFILE": r"C:\real-user", "APPDATA": r"C:\real-roaming",
+                          "LOCALAPPDATA": r"C:\real-local"},
+    )
+    env.update(acceptance.isolated_windows_home(tmp_path, platform="nt"))
+    assert os.environ == original_environment
+    assert all(Path(env[name]).is_dir() and Path(env[name]).is_relative_to(tmp_path)
+               for name in ("USERPROFILE", "APPDATA", "LOCALAPPDATA"))
+    with monkeypatch.context() as patch:
+        patch.delenv("HOME", raising=False)
+        patch.delenv("HOMEDRIVE", raising=False)
+        patch.delenv("HOMEPATH", raising=False)
+        for name, value in env.items():
+            patch.setenv(name, value)
+        assert ntpath.expanduser("~") == str(tmp_path / "host-home")
+        if os.name == "nt":
+            assert Path.home() == tmp_path / "host-home"
+
+
+def test_windows_home_override_does_not_change_other_platforms(tmp_path: Path) -> None:
+    assert acceptance.isolated_windows_home(tmp_path, platform="posix") == {}
+    assert not (tmp_path / "host-home").exists()
+
+
+@pytest.mark.parametrize("old_corrupt", [False, True])
+def test_republished_correct_docx_preserves_old_failure_without_rejecting_final_repair(
+    tmp_path: Path, old_corrupt: bool,
+) -> None:
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    original = (b"invalid initial document" if old_corrupt
+                else _plan_docx(fixture, include_year=False))
+    corrected = _plan_docx(fixture)
+    outputs = []
+    for kind, name, data in [
+        ("workspace", "workspace.docx", corrected),
+        ("download", "first.docx", original),
+        ("download", "last.docx", corrected),
+    ]:
+        (tmp_path / name).write_bytes(data)
+        outputs.append({"kind": kind, "artifact_id": name, "evidence_path": name,
+                        "sha256": hashlib.sha256(data).hexdigest()})
+    case = {"id": "plan-repair-1", "kind": "plan-repair", "fixture": fixture,
+            "failures": [], "outputs": outputs}
+    result = acceptance.validate_plan_case(case, tmp_path)
+    assert result["status"] == "inconclusive"  # Final-reply version still needs review.
+    assert result["transport_failures"] == []
+    assert len(result["checks"]) == 3
+    first = result["checks"][1]
+    assert first["fixture_requirements_passed"] is False
+    assert first["final"] is False
+    assert first["artifact_id"] == "first.docx"
+    last = result["checks"][2]
+    assert last["fixture_requirements_passed"] is True
+    assert last["final"] is True
+    assert last["sha256"] == result["checks"][0]["sha256"]
+
+
+def test_correct_historical_docx_cannot_hide_an_incomplete_final_delivery(tmp_path: Path) -> None:
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    corrected = _plan_docx(fixture)
+    incomplete = _plan_docx(fixture, include_year=False)
+    outputs = []
+    for kind, name, data in [
+        ("workspace", "workspace.docx", corrected),
+        ("download", "first.docx", corrected),
+        ("download", "last.docx", incomplete),
+    ]:
+        (tmp_path / name).write_bytes(data)
+        outputs.append({"kind": kind, "evidence_path": name,
+                        "sha256": hashlib.sha256(data).hexdigest()})
+    result = acceptance.validate_plan_case({
+        "id": "plan-repair-1", "kind": "plan-repair", "fixture": fixture,
+        "failures": [], "outputs": outputs,
+    }, tmp_path)
+    assert result["status"] == "failed"
+    assert "fixture_content_not_satisfied" in result["transport_failures"]
+    assert "final_download_workspace_mismatch" in result["transport_failures"]
+    assert result["checks"][1]["final"] is False
+    assert result["checks"][2]["final"] is True
+
+
+def test_semantically_correct_but_different_final_bytes_require_explicit_version_match(
+    tmp_path: Path,
+) -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    workspace = _plan_docx(fixture)
+    document = Document(io.BytesIO(workspace))
+    document.add_paragraph("这是另一版本，不能暗中当成最终工作区版本。")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    download = buffer.getvalue()
+    outputs = []
+    for kind, data in [("workspace", workspace), ("download", download)]:
+        path = tmp_path / (kind + ".docx")
+        path.write_bytes(data)
+        outputs.append({"kind": kind, "evidence_path": path.name,
+                        "sha256": hashlib.sha256(data).hexdigest()})
+    result = acceptance.validate_plan_case({
+        "id": "plan-repair-1", "kind": "plan-repair", "fixture": fixture,
+        "failures": [], "outputs": outputs,
+    }, tmp_path)
+    assert all(check["fixture_requirements_passed"] for check in result["checks"])
+    assert result["status"] == "failed"
+    assert result["transport_failures"] == ["final_download_workspace_mismatch"]
+
+
+@pytest.mark.parametrize("plan_suite", [False, True])
+def test_plan_budget_removes_internal_smoke_limits_but_preserves_external_bounds(
+    plan_suite: bool,
+) -> None:
+    base = (
+        'agent_max_iterations = 16\nagent_runtime_timeout_seconds = 240\n'
+        'agent_max_provider_retries = 0\n'
+        'llm_request_timeout_seconds = 90\n[task_runtime]\nturn_hard_deadline_s = 270\n'
+    )
+    budgets = acceptance.acceptance_budgets(plan_suite)
+    rendered = acceptance.configure_acceptance_budgets(base, budgets)
+    config = tomllib.loads(rendered)
+    assert config["agent_max_iterations"] == (0 if plan_suite else 16)
+    assert config.get("agent_runtime_timeout_seconds") == (None if plan_suite else 240)
+    assert config.get("agent_max_provider_retries") == (None if plan_suite else 0)
+    assert config["task_runtime"].get("turn_hard_deadline_s") == (None if plan_suite else 270)
+    assert config["llm_request_timeout_seconds"] == 90
+    assert budgets["harness_turn_deadline_s"] == (600 if plan_suite else 285)
+    if not plan_suite:
+        assert rendered == base
+
+
+def test_plan_provider_retry_report_matches_unmodified_product_default() -> None:
+    from opensquilla.engine.types import AgentConfig
+    from opensquilla.gateway.config import GatewayConfig
+
+    budgets = acceptance.acceptance_budgets(True)
+    config = GatewayConfig.model_validate(tomllib.loads(
+        acceptance.configure_acceptance_budgets('agent_max_provider_retries = 0\n', budgets),
+    ))
+    assert config.agent_max_provider_retries is None
+    assert budgets["agent_max_provider_retries"] is None
+    assert budgets["provider_retry_policy"] == "product_default"
+    assert budgets["effective_agent_max_provider_retries"] == AgentConfig().max_provider_retries
+    smoke_budgets = acceptance.acceptance_budgets(False)
+    assert smoke_budgets["effective_agent_max_provider_retries"] == 0
+    assert smoke_budgets["provider_retry_policy"] == "smoke_override"
+
+
+def test_acceptance_deadline_aborts_owned_task_and_does_not_start_another_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+
+    def rpc(_client, method, params):
+        calls.append((method, params))
+        if method == "chat.send":
+            return {"task_id": "deadline-task"}
+        assert method == "chat.abort"
+        assert params["runId"] == "deadline-task"
+        return {"aborted": True}
+
+    ticks = iter([0, 601])
+    monkeypatch.setattr(acceptance, "plan_rpc", rpc)
+    monkeypatch.setattr(acceptance.time, "monotonic", lambda: next(ticks))
+    log = FunctionalRequestLog(tmp_path / "calls.sqlite3", enabled=True)
+    report = {"suite": "plan", "model": MODEL, "repetitions": 3, "cases": [],
+              "budget_config": acceptance.acceptance_budgets(True)}
+    code = acceptance.run_plan_cases(
+        object(), tmp_path, report, {"plan-first-1", "plan-first-2"}, log,
+    )
+    assert code == 2
+    assert [method for method, _params in calls] == ["chat.send", "chat.abort"]
+    assert len(report["cases"]) == 1
+    case = report["cases"][0]
+    assert case["status"] == "acceptance_limit"
+    assert case["budget_config"]["agent_max_iterations"] == 0
+    assert case["budget_config"]["harness_turn_deadline_s"] == 600
+    assert case["stages"][0]["acceptance_limit"] == {"kind": "wall_time", "seconds": 600}
+    assert case["assessment"]["status"] == "inconclusive"
+    assert case["assessment"]["reason"] == "acceptance_limit"
+
+
+def test_resume_archives_budget_settings_without_rewriting_old_cases(tmp_path: Path) -> None:
+    old_case = {"id": "plan-first-2", "budget_config": acceptance.acceptance_budgets(False),
+                "failures": ["first_turn_missing_proposal"]}
+    before = {"model": MODEL, "cases": [old_case],
+              "budget_config": acceptance.acceptance_budgets(False)}
+    (tmp_path / "report.json").write_text(json.dumps(before), encoding="utf-8")
+    report = acceptance.load_report(tmp_path, resume=True)
+    report["budget_config"] = acceptance.acceptance_budgets(True)
+    assert report["attempts"][-1]["budget_config"]["agent_max_iterations"] == 16
+    assert report["cases"] == [old_case]
+    assert report["cases"][0]["budget_config"]["agent_max_iterations"] == 16
+
+
+@pytest.mark.parametrize("wrong_number", ["3110", "1311", "311.5", "311,000", "-311"])
+def test_plan_docx_rejects_population_substrings_in_body_and_table(wrong_number: str) -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    document = Document(io.BytesIO(_plan_docx(fixture)))
+    document.paragraphs[1].text = document.paragraphs[1].text.replace("311", wrong_number)
+    document.tables[0].rows[1].cells[1].text = wrong_number
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = acceptance.check_plan_document(buffer.getvalue(), fixture)
+    assert result["rows_missing_required_fact"] == ["海岬市"]
+    assert result["body_missing_required_fact"] == ["海岬市"]
+
+
+def test_plan_docx_accepts_shared_paragraph_year_and_same_table_header() -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    document = Document(io.BytesIO(_plan_docx(fixture)))
+    document.paragraphs[1].text = (
+        f"{fixture['year']}年年末常住人口：海岬市311.0万人，青湾市421万人。"
+    )
+    document.tables[0].rows[0].cells[1].text = f"{fixture['year']}年年末常住人口（万人）"
+    for row in document.tables[0].rows[1:]:
+        row.cells[2].text = ""
+        row.cells[3].text = ""
+        row.cells[4].text = ""
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = acceptance.check_plan_document(buffer.getvalue(), fixture)
+    assert result["fixture_requirements_passed"] is True
+
+
+def test_plan_docx_cannot_borrow_year_from_body_or_a_different_table() -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    document = Document(io.BytesIO(_plan_docx(fixture)))
+    for row in document.tables[0].rows[1:]:
+        row.cells[4].text = ""
+    other_table = document.add_table(rows=1, cols=1)
+    other_table.cell(0, 0).text = f"其他资料，年份{fixture['year']}"
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = acceptance.check_plan_document(buffer.getvalue(), fixture)
+    assert result["body_missing_required_fact"] == []
+    assert result["rows_missing_required_fact"] == ["海岬市", "青湾市"]
+
+
+def test_plan_docx_cannot_borrow_year_from_another_city_row() -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    document = Document(io.BytesIO(_plan_docx(fixture)))
+    document.tables[0].rows[2].cells[4].text = ""
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = acceptance.check_plan_document(buffer.getvalue(), fixture)
+    assert result["rows_missing_required_fact"] == ["青湾市"]
+
+
+def test_plan_docx_rejects_year_substrings_instead_of_matching_another_number() -> None:
+    from docx import Document
+
+    fixture = acceptance.plan_fixture({"kind": "plan-repair", "number": 1})
+    document = Document(io.BytesIO(_plan_docx(fixture)))
+    document.paragraphs[1].text = document.paragraphs[1].text.replace("2021", "20210")
+    for row in document.tables[0].rows[1:]:
+        row.cells[4].text = "20210"
+    buffer = io.BytesIO()
+    document.save(buffer)
+    result = acceptance.check_plan_document(buffer.getvalue(), fixture)
+    assert not result["fixture_requirements_passed"]
+    assert result["body_missing_required_fact"] == ["海岬市", "青湾市"]
+    assert result["rows_missing_required_fact"] == ["海岬市", "青湾市"]
+
+
+def test_gateway_bootstrap_installs_relay_before_importing_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import live_tokenrhythm_transport
+
+    events = []
+    launcher, pythonpath = acceptance.prepare_gateway_bootstrap(tmp_path)
+    monkeypatch.setattr(live_tokenrhythm_transport, "install_from_env",
+                        lambda: events.append("relay_installed"))
+    monkeypatch.setattr(runpy, "run_module",
+                        lambda name, **kwargs: events.append((name, kwargs)))
+    runpy.run_path(str(launcher))
+    assert events == ["relay_installed", ("opensquilla.cli.main", {"run_name": "__main__"})]
+    assert str(tmp_path / "transport") not in pythonpath.split(os.pathsep)
+
+
+def test_gateway_bootstrap_fails_closed_before_cli_when_relay_installation_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import live_tokenrhythm_transport
+
+    def reject():
+        raise RuntimeError("synthetic invalid relay")
+
+    launcher, _pythonpath = acceptance.prepare_gateway_bootstrap(tmp_path)
+    monkeypatch.setattr(live_tokenrhythm_transport, "install_from_env", reject)
+    monkeypatch.setattr(runpy, "run_module", lambda *_args, **_kwargs: pytest.fail("CLI started"))
+    with pytest.raises(SystemExit, match="acceptance transport unavailable"):
+        runpy.run_path(str(launcher))
+
+
+def test_tool_python_does_not_inherit_legacy_sitecustomize_or_transport_import(
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "transport"
+    legacy.mkdir()
+    marker = legacy / "sitecustomize.py"
+    marker.write_text("raise SystemExit('legacy injection must not run')\n", encoding="utf-8")
+    _launcher, pythonpath = acceptance.prepare_gateway_bootstrap(tmp_path)
+    env = acceptance.child_environment("tokenrhythm", {}, base_environment=os.environ)
+    env.update(acceptance.isolated_windows_home(tmp_path))
+    env["PYTHONPATH"] = pythonpath
+    env["OPENSQUILLA_LIVE_TRANSPORT"] = "1"
+    result = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; print('scripts.live_tokenrhythm_transport' in sys.modules)"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=10, check=True,
+    )
+    assert result.stdout.strip() == "False"
+    assert result.stderr == ""
+    assert marker.is_file()  # Historical startup evidence is preserved.
