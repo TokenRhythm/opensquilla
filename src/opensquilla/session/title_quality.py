@@ -20,7 +20,8 @@ _REFUSAL = re.compile(
     r"(?:assist|help)(?:\s+you)?\s+with\s+" + _REQUEST
     + r"|provide\s+assistance\s+with\s+" + _REQUEST
     + r"|(?:generate|create|provide)\s+(?:a\s+)?"
-    r"(?:(?:session|conversation)\s+)?title(?:\s+for\s+" + _REQUEST + r")?"
+    r"(?:(?:session|conversation)\s+)?title"
+    r"(?:\s+(?:for|from)\s+.+)?"
     r")(?:[.!?,;:].*|\s+(?:because|as)\s+.+)?$"
 )
 _CHINESE_REFUSAL = re.compile(

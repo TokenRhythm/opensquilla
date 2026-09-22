@@ -126,6 +126,13 @@ async def test_historical_refusal_recovers_list_search_and_fork_without_rewrite(
     ("key", "display_name", "derived_title", "expected", "recover"),
     [
         ("agent:main:webchat:example", None, _REFUSALS[0], "Example first message", True),
+        (
+            "agent:main:webchat:example",
+            None,
+            "I'm sorry, but I can't generate a title from jus",
+            "Example first message",
+            True,
+        ),
         ("agent:main:webchat:example", "WebChat", _REFUSALS[0], "Example first message", True),
         ("agent:main:cli:example", None, _REFUSALS[0], "Example first message", True),
         ("agent:main:feishu:direct:example", None, _REFUSALS[0], "Example first message", True),

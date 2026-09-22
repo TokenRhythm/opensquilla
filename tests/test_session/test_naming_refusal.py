@@ -123,6 +123,10 @@ async def _display_title(storage: SessionStorage) -> str:
             _payload("I'm sorry, but I can't help with that request"), id="sorry-cannot-help"
         ),
         pytest.param(
+            _payload("I'm sorry, but I can't generate a title from just ?"),
+            id="sorry-cannot-generate-from-fragment",
+        ),
+        pytest.param(
             _payload("I'm unable to provide assistance with this request"), id="unable-to-assist"
         ),
         pytest.param(_payload("抱歉，我无法协助处理该请求"), id="chinese-refusal"),

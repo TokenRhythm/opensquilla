@@ -4337,7 +4337,7 @@
         "running": "Running",
         "paused": "Paused",
         "blocked": "Blocked",
-        "completed": "Completed",
+        "completed": "Execution ended",
         "cancelled": "Cancelled",
         "superseded": "Replaced by a newer plan"
       },

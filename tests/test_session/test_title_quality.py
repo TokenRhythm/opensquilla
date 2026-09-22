@@ -10,6 +10,8 @@ from opensquilla.session.title_quality import is_refusal_title
     "value",
     [
         "I cannot generate a title for this request",
+        "I'm sorry, but I can't generate a title from just ?",
+        "I'm sorry, but I can't generate a title from the provided message.",
         "I cannot assist with that request",
         "I'm sorry, but I can't help with that request.",
         "I'm unable to provide assistance with this request.",

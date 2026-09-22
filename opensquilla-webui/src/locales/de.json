@@ -4252,7 +4252,7 @@
         "running": "Wird ausgeführt",
         "paused": "Pausiert",
         "blocked": "Blockiert",
-        "completed": "Abgeschlossen",
+        "completed": "Ausführung beendet",
         "cancelled": "Abgebrochen",
         "superseded": "Durch einen neueren Plan ersetzt"
       },
