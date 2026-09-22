@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -857,16 +858,33 @@ def test_icacls_wildcard_reset_is_recursive_without_touching_root_or_link_target
 
     request.addfinalizer(restore_outside_acl)
 
+    # Resolve the inbox Windows PowerShell explicitly.  On developer machines
+    # and CI runners, PATH may put PowerShell 7 first; its compatibility module
+    # can fail to load Microsoft.PowerShell.Security under ``-NoProfile``,
+    # returning null ACL properties while still exiting with code 0.
+    powershell = (
+        Path(os.environ.get("SystemRoot", r"C:\Windows"))
+        / "System32"
+        / "WindowsPowerShell"
+        / "v1.0"
+        / "powershell.exe"
+    )
+    powershell_env = os.environ.copy()
+    # Keep PowerShell 7's compatibility modules out of Windows PowerShell
+    # resolution.  They share assembly/type names and can make Get-Acl fail to
+    # autoload when both module trees are present on PSModulePath.
+    powershell_env["PSModulePath"] = str(powershell.parent / "Modules")
+
     def acl_state(path: Path) -> dict[str, object]:
         script = (
             "& { param($itemPath) $acl = Get-Acl -LiteralPath $itemPath; "
             "[pscustomobject]@{ "
-            "Sddl = $acl.Sddl; Protected = $acl.AreAccessRulesProtected "
+            "Sddl = $acl.Sddl "
             "} | ConvertTo-Json -Compress }"
         )
         completed = subprocess.run(
             [
-                "powershell",
+                str(powershell),
                 "-NoProfile",
                 "-ExecutionPolicy",
                 "Bypass",
@@ -877,26 +895,44 @@ def test_icacls_wildcard_reset_is_recursive_without_touching_root_or_link_target
             capture_output=True,
             text=True,
             check=False,
+            env=powershell_env,
         )
         assert completed.returncode == 0, completed.stderr or completed.stdout
         return json.loads(completed.stdout)
+
+    def acl_is_protected(state: dict[str, object]) -> bool:
+        """Read DACL protection from SDDL, independent of PowerShell ACL shape.
+
+        ``Get-Acl.AreAccessRulesProtected`` is not consistently exposed by the
+        Windows PowerShell/.NET combinations used by our runners.  The SDDL
+        control flags are the stable representation: ``P`` means the DACL is
+        protected from inheritance.
+        """
+
+        sddl = state.get("Sddl")
+        assert isinstance(sddl, str) and sddl, state
+        try:
+            dacl_flags = sddl.split("D:", 1)[1].split("(", 1)[0]
+        except IndexError as exc:
+            raise AssertionError(f"ACL SDDL has no DACL: {sddl!r}") from exc
+        return "P" in dacl_flags
 
     icacls(str(nested), "/inheritance:r", "/L")
     icacls(str(outside), "/inheritance:d", "/L")
     root_before = acl_state(root)
     outside_before = acl_state(outside)
-    assert acl_state(nested)["Protected"] is True
+    assert acl_is_protected(acl_state(nested)) is True
 
     icacls(str(root / "*"), "/reset", "/t", "/L")
 
     assert acl_state(root) == root_before
-    assert acl_state(nested)["Protected"] is False
+    assert acl_is_protected(acl_state(nested)) is False
     assert acl_state(outside) == outside_before
 
     link = root / "outside-link"
     junction = subprocess.run(
         [
-            "powershell",
+            str(powershell),
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
@@ -912,6 +948,7 @@ def test_icacls_wildcard_reset_is_recursive_without_touching_root_or_link_target
         capture_output=True,
         text=True,
         check=False,
+        env=powershell_env,
     )
     assert junction.returncode == 0, junction.stderr or junction.stdout
     linked_reset = subprocess.run(

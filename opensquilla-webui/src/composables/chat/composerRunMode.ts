@@ -20,8 +20,14 @@ export function composerRunModeSelectionAction(
 ): ComposerRunModeSelectionAction {
   if (mode === 'full') return 'persist'
   if (!setupResolved || setupStatus === null) return 'ignore'
-  if (setupStatus.state === 'ready') return 'persist'
-  return setupStatus.state === 'not_setup' && canSetup ? 'setup' : 'ignore'
+  const isWindows = setupStatus.platform.toLowerCase().startsWith('win')
+  // Windows startup is passive and may report a stale marker as ready. Route
+  // an explicit Safe selection through setup so the offline identity is
+  // revalidated/repaired; portable ready states remain a cheap persistence.
+  if (setupStatus.state === 'ready' && !(isWindows && canSetup)) return 'persist'
+  return ['not_setup', 'failed', 'ready'].includes(setupStatus.state) && canSetup
+    ? 'setup'
+    : 'ignore'
 }
 
 export async function completeComposerSafeSetup(

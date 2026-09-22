@@ -92,7 +92,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
           Push-Location desktop/electron
           try {
-            npm run verify:gateway-smoke
+            npm run verify:gateway-smoke -- --provision-windows-sandbox
             if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
             node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
             $probeExitCode = $LASTEXITCODE

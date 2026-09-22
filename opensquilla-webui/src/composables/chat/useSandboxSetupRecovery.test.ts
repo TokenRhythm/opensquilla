@@ -194,7 +194,7 @@ describe('useSandboxSetupRecovery', () => {
     scope.stop()
   })
 
-  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+  it.each(['unavailable', 'setting_up'] as const)(
     'does not offer setup for %s',
     async state => {
       const sandbox = runtime({
@@ -211,6 +211,33 @@ describe('useSandboxSetupRecovery', () => {
       expect(recovery.canSetup.value).toBe(false)
       await expect(recovery.ensureSetup()).resolves.toBe(false)
       expect(sandbox.ensureReady).not.toHaveBeenCalled()
+      scope.stop()
+    },
+  )
+
+  it.each(['failed', 'ready'] as const)(
+    'allows Windows setup retry/repair while status is %s',
+    async state => {
+      const sandbox = runtime({
+        readiness: async () => ({ status: status(state), capability: null }),
+        ensureReady: async () => ({
+          ready: true,
+          status: status('ready'),
+          capability: null,
+          outcome: 'ready',
+        }),
+      })
+      const scope = effectScope()
+      const recovery = scope.run(() => useSandboxSetupRecovery({
+        sandbox,
+        connectionState: ref('connected'),
+        runMode: ref('safe'),
+      }))!
+
+      await vi.waitFor(() => expect(recovery.resolved.value).toBe(true))
+      expect(recovery.canSetup.value).toBe(true)
+      await expect(recovery.ensureSetup()).resolves.toBe(true)
+      expect(sandbox.ensureReady).toHaveBeenCalledOnce()
       scope.stop()
     },
   )

@@ -38,7 +38,8 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
-    isWindows.value && status.value?.state === 'not_setup')
+    isWindows.value
+    && ['not_setup', 'failed', 'ready'].includes(status.value?.state ?? ''))
 
   function clearPoll() {
     if (pollTimer) clearTimeout(pollTimer)

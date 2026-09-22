@@ -665,7 +665,11 @@ function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
 function selectSafeMode(): void {
   sandboxSetupStore.resetOutcome()
   sandboxSetupStore.noteRunModeSelection('safe')
-  if (capability.value?.available) {
+  const windowsNeedsExplicitSetup = (
+    capability.value?.available === true
+    && capability.value.platform === 'win32'
+  )
+  if (capability.value?.available && !windowsNeedsExplicitSetup) {
     void setDefaultRunMode('safe')
     return
   }
