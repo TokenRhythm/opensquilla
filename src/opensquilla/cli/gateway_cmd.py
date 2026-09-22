@@ -432,6 +432,7 @@ def run_gateway(
         def _request_shutdown(reason: str) -> None:
             nonlocal shutdown_reason
             if not shutdown.is_set():
+                log.info("gateway.shutdown_requested", reason=reason)
                 shutdown_reason = reason
                 shutdown.set()
 
