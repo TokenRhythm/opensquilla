@@ -3802,7 +3802,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Connect a model service, or finish later in Settings.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
-    'onboarding.step2.tokenrhythmRegistration': 'Register to claim ¥68 in free tokens.',
     'onboarding.step2.tokenrhythmCta': 'Claim for free',
     'onboarding.step2.tokenrhythmCtaExternalLabel': 'Claim for free (opens in external browser)',
     'onboarding.step2.otherProviders': 'Other providers',
@@ -3940,9 +3939,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "连接模型服务，或稍后在设置中完成。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
-    'onboarding.step2.tokenrhythmRegistration': '注册即领价值 68 元 Token',
     'onboarding.step2.tokenrhythmCta': '免费领取',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费领取价值 68 元 TokenRhythm Token（在外部浏览器中打开）',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费领取（在外部浏览器中打开）',
     'onboarding.step2.otherProviders': '其他提供商',
     'onboarding.step2.apiKey': 'API 密钥',
     'onboarding.step2.endpointSummary': '端点和直连模型',
@@ -4073,7 +4071,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "モデルサービスに接続するか、後で設定できます。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
-    'onboarding.step2.tokenrhythmRegistration': '登録で68元相当のTokenを無料進呈',
     'onboarding.step2.tokenrhythmCta': '無料で受け取る',
     'onboarding.step2.tokenrhythmCtaExternalLabel': '無料で受け取る（外部ブラウザーで開きます）',
     'onboarding.step2.otherProviders': 'その他のプロバイダー',
@@ -4208,7 +4205,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Connectez un service de modèles ou configurez-le plus tard.",
     'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
-    'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous pour recevoir 68 ¥ de tokens gratuits.',
     'onboarding.step2.tokenrhythmCta': 'Obtenir gratuitement',
     'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtenir gratuitement (s’ouvre dans le navigateur externe)',
     'onboarding.step2.otherProviders': 'Autres fournisseurs',
@@ -4343,7 +4339,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Verbinde einen Modelldienst oder richte ihn später ein.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
-    'onboarding.step2.tokenrhythmRegistration': 'Registrieren und 68 ¥ Gratis-Token erhalten.',
     'onboarding.step2.tokenrhythmCta': 'Kostenlos erhalten',
     'onboarding.step2.tokenrhythmCtaExternalLabel': 'Kostenlos erhalten (wird im externen Browser geöffnet)',
     'onboarding.step2.otherProviders': 'Weitere Anbieter',
@@ -4478,7 +4473,6 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Conecta un servicio de modelos o configúralo más tarde.",
     'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
-    'onboarding.step2.tokenrhythmRegistration': 'Regístrate y recibe 68 ¥ en tokens gratis.',
     'onboarding.step2.tokenrhythmCta': 'Obtener gratis',
     'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtener gratis (se abre en el navegador externo)',
     'onboarding.step2.otherProviders': 'Otros proveedores',
@@ -5487,12 +5481,6 @@ function onboardingHtml(
       font-size: 10.5px;
       font-weight: 560;
       line-height: 1.35;
-    }
-    .provider-promo-copy span {
-      color: var(--accent);
-      font-size: 10.5px;
-      font-weight: 420;
-      line-height: 1.4;
     }
     .provider-promo-cta {
       display: inline-flex;
@@ -6529,7 +6517,6 @@ function onboardingHtml(
             </label>
             <div class="provider-promo-copy">
               <strong data-i18n="onboarding.step2.tokenrhythmTitle">${ot('onboarding.step2.tokenrhythmTitle')}</strong>
-              <span data-i18n="onboarding.step2.tokenrhythmRegistration">${ot('onboarding.step2.tokenrhythmRegistration')}</span>
             </div>
             <a class="provider-promo-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
           </div>

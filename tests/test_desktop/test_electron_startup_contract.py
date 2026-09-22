@@ -1506,7 +1506,6 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
     )
     for key in (
         "onboarding.step2.tokenrhythmTitle",
-        "onboarding.step2.tokenrhythmRegistration",
         "onboarding.step2.tokenrhythmCta",
         "onboarding.step2.tokenrhythmCtaExternalLabel",
     ):
