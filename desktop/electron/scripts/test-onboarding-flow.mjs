@@ -1262,7 +1262,7 @@ try {
   assert.equal(await providerScreen.locator('.provider-promo-copy span').count(), 0)
   assert.equal(
     await providerScreen.locator('#tokenrhythmRegister').getAttribute('aria-label'),
-    '免费领取（在外部浏览器中打开）',
+    '限时福利（在外部浏览器中打开）',
   )
   assert.equal(
     await providerScreen.locator('.provider-promo-copy strong').evaluate((copy) => getComputedStyle(copy).color),
@@ -1401,7 +1401,7 @@ try {
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
   const tokenRhythmCta = page.locator('#tokenrhythmRegister')
-  assert.equal(await tokenRhythmCta.innerText(), '免费领取')
+  assert.equal(await tokenRhythmCta.innerText(), '限时福利')
   assert.equal(
     await tokenRhythmCta.evaluate((link) => getComputedStyle(link, '::after').content),
     '"↗"',
