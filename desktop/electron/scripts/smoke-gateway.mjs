@@ -266,11 +266,12 @@ function documentFixture() {
 }
 
 function functionalProbe(gatewayBinary, env, args, options = {}) {
+  const { label = args[0], ...spawnOptions } = options
   const result = spawnSync(gatewayBinary, args, {
     cwd: dirname(gatewayBinary), env, encoding: 'utf8', windowsHide: true, timeout: 60_000,
-    ...options,
+    ...spawnOptions,
   })
-  if (result.error) throw result.error
+  if (result.error) throw new Error(`Packaged ${label} failed: ${result.error.message}`)
   if (result.status !== 0) {
     throw new Error(`Packaged ${args[0]} failed with exit ${result.status ?? 'null'}.`
       + formatTail(result.stdout?.trim().split(/\r?\n/) || [], result.stderr?.trim().split(/\r?\n/) || []))
@@ -303,7 +304,7 @@ async function verifyGatewayCodeExecution(gatewayBinary, env, tempHome) {
   await mkdir(probeEnv.TMP, { recursive: true })
   assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
     '--internal-child', 'python-code', code,
-  ]), {
+  ], { label: 'code-execution' }), {
     probe: 'opensquilla-desktop-code-execution', frozen: true,
     pythonExit: 0, errorExit: 7, pages: 1, title: 'Packaged Python tool smoke',
     documents: { csvRows: 2, xlsxValue: 42, pdfText: '中文文件验收 样本 42' },
@@ -323,7 +324,7 @@ async function verifyGatewaySafeExecution(gatewayBinary, env, tempHome) {
   const backend = { darwin: 'seatbelt', win32: 'windows_default', linux: 'bubblewrap' }[process.platform]
   assert.deepEqual(functionalProbe(gatewayBinary, probeEnv, [
     '--internal-child', 'python-code', code,
-  ], { cwd: tempHome, timeout: 180_000 }), {
+  ], { label: 'safe-execution', cwd: tempHome, timeout: 180_000 }), {
     probe: 'opensquilla-desktop-safe-execution', frozen: true, backend,
     read: true, write: true, readonlyChild: true, writeDenied: true, networkDenied: true,
   })
