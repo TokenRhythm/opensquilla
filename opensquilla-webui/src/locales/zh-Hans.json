@@ -3409,6 +3409,7 @@
       "retryAfter": "建议重试时间：{value}",
       "installResultUnknown": "安装结果未知",
       "viewDetails": "查看详情",
+      "viewInstallDetails": "查看安装详情",
       "notInstalled": "未安装",
       "existingInstallPreserved": "已保留现有安装",
       "diagnostics": "诊断（{count}）",

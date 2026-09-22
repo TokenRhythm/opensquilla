@@ -561,6 +561,7 @@ export function useSkillRegistry(
       return {
         ...registryResult,
         installed: installResult.installed ?? installResult.success,
+        ...(installResult.installId ? { installId: installResult.installId } : {}),
         lifecycle: installResult.lifecycle,
         instruction_usable: installResult.instruction_usable,
         diagnostics: installResult.diagnostics ? [...installResult.diagnostics] : undefined,

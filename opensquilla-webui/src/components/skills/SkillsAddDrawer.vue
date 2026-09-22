@@ -141,7 +141,10 @@
                   v-for="item in queueRows"
                   :key="item.id"
                   class="sk-add-queue-item"
+                  :class="{ 'is-focused': focusedQueueId === item.id }"
                   :data-status="item.status"
+                  :id="queueItemDomId(item.id)"
+                  tabindex="-1"
                 >
                   <span class="sk-add-queue-item__icon" aria-hidden="true">
                     <span v-if="item.status === 'installing' || item.status === 'waiting' || item.status === 'cancelling'" class="sk-spinner" aria-hidden="true" />
@@ -187,7 +190,12 @@
                         @click="emit('retry', item.id, false, candidate.identifier)"
                       >{{ candidate.path || candidate.name }}</button>
                     </div>
-                    <details v-if="item.diagnostics.length" class="sk-add-diagnostics">
+                    <details
+                      v-if="item.diagnostics.length"
+                      class="sk-add-diagnostics"
+                      :open="diagnosticsOpen[item.id]"
+                      @toggle="updateDiagnosticsOpen(item.id, $event)"
+                    >
                       <summary>{{ t('cronSkills.registry.diagnostics', { count: item.diagnostics.length }) }}</summary>
                       <div v-for="diagnostic in item.diagnostics" :key="`${diagnostic.phase}:${diagnostic.code}`">
                         <strong>{{ diagnostic.code }}</strong>
@@ -340,8 +348,8 @@
                   :data-status="row.queueStatus || undefined"
                 >
                   <div class="sk-add-result__body">
-                    <strong>{{ row.name }}</strong>
-                    <p>{{ row.description }}</p>
+                    <strong :title="row.name">{{ row.name }}</strong>
+                    <p v-if="row.description" :title="row.description">{{ row.description }}</p>
                     <div class="sk-add-result__meta">
                       <span v-if="row.author">{{ row.author }}</span>
                       <span v-if="row.version">{{ row.version }}</span>
@@ -352,6 +360,9 @@
                       </span>
                       <span v-if="row.lifecycleLabel" :data-tone="row.lifecycleTone">
                         {{ row.lifecycleLabel }}
+                      </span>
+                      <span v-if="row.diagnosticCount" data-tone="danger">
+                        {{ t('cronSkills.registry.diagnostics', { count: row.diagnosticCount }) }}
                       </span>
                     </div>
                   </div>
@@ -365,8 +376,12 @@
                     type="button"
                     :disabled="resultActionDisabled(row)"
                     :aria-busy="row.queueStatus === 'installing'"
+                    :aria-controls="row.queueStatus === 'failed' || row.queueStatus === 'unknown'
+                      ? queueItemDomId(row.operationKey)
+                      : undefined"
                     @click="handleResultAction(row)"
                   >
+                    <Icon v-if="row.installed" name="chevronRight" :size="14" />
                     <span>{{ resultActionLabel(row) }}</span>
                   </button>
                 </article>
@@ -424,6 +439,7 @@ const emit = defineEmits<{
   search: []
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
+  viewDetails: [identifier: string, source: string, displayName: string]
   retry: [id: string, acknowledgeRisk?: boolean, candidateIdentifier?: string]
   cancelInstall: [source: SkillInstallSource]
   clearActivity: [source: SkillInstallSource]
@@ -438,6 +454,8 @@ const activityExpanded = ref<Record<SkillInstallSource, boolean>>({
 const drawerRef = ref<HTMLElement | null>(null)
 const closeButtonRef = ref<HTMLButtonElement | null>(null)
 const queueRef = ref<HTMLElement | null>(null)
+const focusedQueueId = ref('')
+const diagnosticsOpen = ref<Record<string, boolean>>({})
 useDialogA11y(drawerRef, toRef(props, 'open'), () => emit('close'), {
   initialFocus: closeButtonRef,
 })
@@ -620,9 +638,11 @@ const resultRows = computed(() => props.results.map((result) => {
     || result.name
   const operationKey = skillRegistryOperationKey(installId, installSource)
   const queueItem = activityForSource(installSource).items.find(item => item.id === operationKey)
+  const detailInstallId = queueItem?.result?.installId || result.installId || installId
   const operationFailed = queueItem?.status === 'failed'
   const operationUnknown = queueItem?.status === 'unknown'
   const operationPreserved = operationFailed && Boolean(queueItem?.result?.installed)
+  const diagnosticCount = queueItem?.result?.diagnostics?.length || 0
   const presentation = lifecycle && (
     operationPreserved
     || (!operationFailed && (result.installed || showLifecycleWithoutInstall))
@@ -636,10 +656,10 @@ const resultRows = computed(() => props.results.map((result) => {
       : ''
   const operationTone = operationUnknown ? 'warning' : 'danger'
   return {
-    name: result.name,
-    description: (result.description || '').slice(0, 180),
-    author: result.author || '',
-    version: result.version || '',
+    name: registryDisplayText(result.name) || result.name || installId,
+    description: registryDisplayText(result.description || '').slice(0, 180),
+    author: registryDisplayText(result.author || ''),
+    version: registryDisplayText(result.version || ''),
     source: installSource,
     trustLevel: result.trust_level || t('cronSkills.registry.community'),
     installed: Boolean(result.installed),
@@ -648,9 +668,11 @@ const resultRows = computed(() => props.results.map((result) => {
     lifecycleLabel: presentation?.label || '',
     lifecycleTone: presentation?.tone || 'neutral',
     installId,
+    detailInstallId,
     installSource,
     operationKey,
     queueStatus: queueItem?.status,
+    diagnosticCount,
   }
 }))
 
@@ -664,19 +686,30 @@ function resultActionLabel(row: ResultRow): string {
   }
   if (row.queueStatus === 'cancelled') return t('cronSkills.registry.retry')
   if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') {
-    return t('cronSkills.registry.viewDetails')
+    return t('cronSkills.registry.viewInstallDetails')
   }
-  if (row.installed) return t('cronSkills.registry.installed')
+  if (row.installed) return t('cronSkills.registry.viewDetails')
   if (row.queueStatus) return t(`cronSkills.registry.queueStatus.${row.queueStatus}`)
   return t('cronSkills.registry.install')
 }
 
 function handleResultAction(row: ResultRow) {
+  if (row.installed) {
+    emit('viewDetails', row.detailInstallId, row.installSource, row.name)
+    return
+  }
   if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') {
     const source = row.installSource === 'github' ? 'github' : 'clawhub'
     sourceMode.value = source
     activityExpanded.value[source] = true
-    void nextTick(() => queueRef.value?.scrollIntoView({ block: 'nearest' }))
+    focusedQueueId.value = row.operationKey
+    if (row.diagnosticCount) diagnosticsOpen.value[row.operationKey] = true
+    void nextTick(() => {
+      const queueItem = document.getElementById(queueItemDomId(row.operationKey))
+      queueItem?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
+      queueItem?.focus({ preventScroll: true })
+      if (!queueItem) queueRef.value?.scrollIntoView?.({ behavior: 'smooth', block: 'center' })
+    })
     return
   }
   emit('install', row.installId, row.installSource, row.name)
@@ -684,7 +717,27 @@ function handleResultAction(row: ResultRow) {
 
 function resultActionDisabled(row: ResultRow): boolean {
   if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') return false
-  return row.installed || installControlsBlocked.value || row.queueStatus === 'queued'
+  if (row.installed) return false
+  return installControlsBlocked.value || row.queueStatus === 'queued'
+}
+
+function registryDisplayText(value: string): string {
+  return value
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/^\s*---[\s\S]*?---\s*/m, ' ')
+    .replace(/(^|\s)#{1,6}\s+/g, '$1')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[`*_~]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function queueItemDomId(id: string): string {
+  return `skills-install-item-${id.replace(/[^a-zA-Z0-9_-]/g, '-')}`
+}
+
+function updateDiagnosticsOpen(id: string, event: Event) {
+  diagnosticsOpen.value[id] = (event.target as HTMLDetailsElement).open
 }
 
 const queueRows = computed(() => currentItems.value.map((item) => {
@@ -828,6 +881,9 @@ function effectiveFromLabel(value: string | undefined): string {
   display: grid;
   grid-template-columns: 1fr 1fr;
   padding: 3px;
+  position: sticky;
+  top: -20px;
+  z-index: 2;
 }
 
 .sk-add-source-status {
@@ -1013,6 +1069,7 @@ function effectiveFromLabel(value: string | undefined): string {
 }
 
 .sk-add-queue {
+  flex: 0 0 auto;
   max-height: min(46dvh, 520px);
   overflow-y: auto;
   overscroll-behavior: contain;
@@ -1064,6 +1121,13 @@ function effectiveFromLabel(value: string | undefined): string {
 .sk-add-result[data-status="failed"] {
   background: color-mix(in srgb, var(--danger) 5%, var(--bg));
   border-color: color-mix(in srgb, var(--danger) 28%, var(--border));
+}
+
+.sk-add-result .btn {
+  align-items: center;
+  display: inline-flex;
+  flex: 0 0 auto;
+  gap: 5px;
 }
 
 .sk-add-result__meta,
@@ -1159,6 +1223,11 @@ function effectiveFromLabel(value: string | undefined): string {
 
 .sk-add-queue-item[data-status="cancelled"] {
   background: color-mix(in srgb, var(--text-muted) 5%, var(--bg));
+}
+
+.sk-add-queue-item.is-focused {
+  border-color: var(--accent);
+  box-shadow: var(--focus-ring);
 }
 
 .sk-add-queue-item[data-status="installed"] .sk-add-queue-item__icon,

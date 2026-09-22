@@ -3327,6 +3327,7 @@
       "retryAfter": "再試行まで: {value}",
       "installResultUnknown": "インストール結果が不明",
       "viewDetails": "詳細を表示",
+      "viewInstallDetails": "インストール詳細を表示",
       "notInstalled": "未インストール",
       "existingInstallPreserved": "既存のインストールを保持しました",
       "diagnostics": "診断（{count}）",

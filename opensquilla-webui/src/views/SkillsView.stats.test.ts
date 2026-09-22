@@ -24,7 +24,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
   const ready = vi.fn(async () => {})
   const pushToast = vi.fn()
   const routeState = ref<{ query: { skill?: string } }>({ query: {} })
-  const allSkills = ref<Array<{ name: string; active?: boolean }>>([])
+  const allSkills = ref<Array<{ name: string; active?: boolean; install_id?: string }>>([])
   const detail = vi.fn(async (skill: { name: string }) => ({ ...skill, content: 'Synthetic content' }))
   const push = vi.fn(async () => undefined)
   const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [{ name: 'synthetic-target', instanceId: 'skill:synthetic', digest: 'a'.repeat(64), kind: 'skill', disabled: false, ready: true }] }))
@@ -84,9 +84,17 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
     default: defineComponent({
       name: 'SkillsAddDrawerStub',
       props: { open: Boolean },
-      setup(props) {
+      emits: ['viewDetails'],
+      setup(props, { emit }) {
         return () => props.open
-          ? h('section', { 'data-testid': 'skills-add-drawer' }, 'add skill')
+          ? h('section', { 'data-testid': 'skills-add-drawer' }, [
+              'add skill',
+              h('button', {
+                'data-testid': 'registry-view-details',
+                type: 'button',
+                onClick: () => emit('viewDetails', 'install:synthetic', 'clawhub', 'synthetic-installed'),
+              }, 'View details'),
+            ])
           : null
       },
     }),
@@ -276,6 +284,25 @@ afterEach(() => {
 })
 
 describe('SkillsView stats navigation', () => {
+  it('opens the catalog detail dialog from an installed registry result', async () => {
+    const { app, el, allSkills, detail, nextTick } = await mountSkillsView()
+    allSkills.value = [{ name: 'synthetic-installed', install_id: 'install:synthetic', active: true }]
+
+    el.querySelector<HTMLButtonElement>('[data-testid="skills-add-trigger"]')!.click()
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('[data-testid="registry-view-details"]')!.click()
+    await nextTick()
+    await nextTick()
+
+    expect(detail).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'synthetic-installed',
+      install_id: 'install:synthetic',
+    }))
+    expect(el.querySelector('[data-testid="skill-detail-dialog"]')?.textContent)
+      .toContain('Close')
+    app.unmount()
+  })
+
   it('resolves candidates only on launch and hands the selected skill to an unsent draft', async () => {
     const { app, el, routeState, allSkills, listCandidates, push, nextTick } = await mountSkillsView()
     allSkills.value = [{ name: 'synthetic-target', active: true }]

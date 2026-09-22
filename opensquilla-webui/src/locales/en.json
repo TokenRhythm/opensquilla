@@ -3410,6 +3410,7 @@
       "retryAfter": "Retry after: {value}",
       "installResultUnknown": "Installation result unknown",
       "viewDetails": "View details",
+      "viewInstallDetails": "View installation details",
       "notInstalled": "Not installed",
       "existingInstallPreserved": "Existing installation preserved",
       "diagnostics": "Diagnostics ({count})",

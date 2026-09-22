@@ -174,6 +174,7 @@
       @search="searchRegistry"
       @install-github="installGithub"
       @install="installSkill"
+      @view-details="openRegistryResultDetails"
       @retry="retryQueueItem"
       @cancel-install="cancelInstall"
       @clear-activity="clearInstallActivity"
@@ -489,6 +490,45 @@ async function showProposalsFromStats() {
 async function openSkillDialog(skill: Skill) {
   selectedProposal.value = null
   await openSkill(skill)
+}
+
+function findCatalogSkill(name: string, installId: string): Skill | undefined {
+  const normalizedInstallId = installId.trim()
+  const normalizedName = name.trim()
+  return catalog.allSkills.value.find(skill => normalizedInstallId
+    && skill.install_id === normalizedInstallId)
+    || catalog.allSkills.value.find(skill => normalizedName && skill.name === normalizedName)
+}
+
+async function openRegistryResultDetails(
+  installId: string,
+  source: string,
+  displayName: string,
+) {
+  let skill = findCatalogSkill(displayName, installId)
+  if (!skill) {
+    // Installation refresh normally populates the exact install_id. Retry once
+    // here for a slow Gateway so the button never depends on stale catalog data.
+    await loadData()
+    skill = findCatalogSkill(displayName, installId)
+  }
+
+  addSkillOpen.value = false
+  selectedProposal.value = null
+  if (skill) {
+    await openSkill(skill)
+    return
+  }
+
+  // Keep the detail dialog useful even when the follow-up list refresh is
+  // unavailable. skills.get remains authoritative and will surface a visible
+  // error if the Gateway cannot resolve this installed skill.
+  await openSkill({
+    name: displayName || installId,
+    install_id: installId || undefined,
+    source: source || undefined,
+    installed: true,
+  })
 }
 
 async function openProposalDialog(proposalId: string) {

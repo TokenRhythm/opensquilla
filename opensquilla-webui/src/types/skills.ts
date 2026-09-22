@@ -264,6 +264,7 @@ export interface RegistryResult {
   source?: string
   trust_level?: string
   installed?: boolean
+  installId?: string
   install_reference?: string
   installReference?: string
   lifecycle?: SkillLifecycle

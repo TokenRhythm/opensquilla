@@ -3327,6 +3327,7 @@
       "retryAfter": "Reintentar después de: {value}",
       "installResultUnknown": "Resultado de instalación desconocido",
       "viewDetails": "Ver detalles",
+      "viewInstallDetails": "Ver detalles de la instalación",
       "notInstalled": "No instalado",
       "existingInstallPreserved": "Se conservó la instalación existente",
       "diagnostics": "Diagnósticos ({count})",

@@ -48,6 +48,7 @@ function mountDrawer(options: {
   const runningSource = ref<SkillInstallSource | null>(options.runningSource ?? null)
   const cancellingSource = ref<SkillInstallSource | null>(options.cancellingSource ?? null)
   const installed: Array<[string, string, string]> = []
+  const viewed: Array<[string, string, string]> = []
   const retried: Array<[string, boolean | undefined]> = []
   const cleared: SkillInstallSource[] = []
   const cancelled: SkillInstallSource[] = []
@@ -77,6 +78,9 @@ function mountDrawer(options: {
           onClose: () => { open.value = false },
           onInstall: (identifier: string, source: string, name: string) => {
             installed.push([identifier, source, name])
+          },
+          onViewDetails: (identifier: string, source: string, name: string) => {
+            viewed.push([identifier, source, name])
           },
           onRetry: (id: string, acknowledgeRisk?: boolean) => {
             retried.push([id, acknowledgeRisk])
@@ -109,6 +113,7 @@ function mountDrawer(options: {
     runningSource,
     cancellingSource,
     installed,
+    viewed,
     retried,
     cleared,
     cancelled,
@@ -411,6 +416,26 @@ describe('SkillsAddDrawer', () => {
     expect(installed).toEqual([['@verified/demo@1.2.3', 'clawhub', 'Demo']])
   })
 
+  it('keeps registry cards readable when the source summary contains markers', async () => {
+    mountDrawer({
+      results: [{
+        name: '<!-- TYPEUI_SH_MANAGED_START --> # Paper Design Design System Skill (Universal)',
+        description: '<!-- TYPEUI_SH_MANAGED_START -->\n---\ntitle: Paper\n---\n## Build polished UI',
+        source: 'clawhub',
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const result = document.querySelector<HTMLElement>('.sk-add-result')!
+    expect(result.querySelector('strong')?.textContent)
+      .toBe('Paper Design Design System Skill (Universal)')
+    expect(result.querySelector('p')?.textContent).toBe('Build polished UI')
+    expect(result.textContent).not.toContain('TYPEUI_SH_MANAGED_START')
+  })
+
   it('shows install activity before long ClawHub search results', async () => {
     const queue: SkillInstallQueueItem[] = [{
       id: '["clawhub","@verified/demo"]',
@@ -481,7 +506,7 @@ describe('SkillsAddDrawer', () => {
     await nextTick()
 
     expect(result.dataset.status).toBe('failed')
-    expect(action.textContent).toContain('View details')
+    expect(action.textContent).toContain('View installation details')
     expect(result.textContent).toContain('Failed')
     expect(result.textContent).not.toContain('Manifest rejected')
     expect(result.textContent).not.toContain('Not installed')
@@ -497,6 +522,30 @@ describe('SkillsAddDrawer', () => {
     expect(activity.querySelector<HTMLElement>('.sk-add-activity-body')?.style.display)
       .not.toBe('none')
     expect(mounted.retried).toEqual([])
+    expect(action.getAttribute('aria-controls')).toMatch(/^skills-install-item-/)
+    expect(document.querySelector<HTMLElement>('.sk-add-queue-item')?.classList.contains('is-focused'))
+      .toBe(true)
+  })
+
+  it('opens details for an already installed registry result', async () => {
+    const { viewed } = mountDrawer({
+      results: [{
+        name: 'Installed demo',
+        installReference: '@verified/demo@1.2.3',
+        source: 'clawhub',
+        installed: true,
+      }],
+    })
+    document.querySelector<HTMLButtonElement>('#drawer-trigger')?.click()
+    await nextTick()
+    document.querySelector<HTMLButtonElement>('#skills-add-tab-clawhub')?.click()
+    await nextTick()
+
+    const action = document.querySelector<HTMLButtonElement>('.sk-add-result .btn')!
+    expect(action.textContent).toContain('View details')
+    expect(action.disabled).toBe(false)
+    action.click()
+    expect(viewed).toEqual([['@verified/demo@1.2.3', 'clawhub', 'Installed demo']])
   })
 
   it('keeps source activity isolated and exposes inactive failures on the source tab only', async () => {
@@ -850,7 +899,7 @@ describe('SkillsAddDrawer', () => {
     expect(activity.querySelector('.sk-add-retry')).toBeNull()
     expect(activity.querySelector('.sk-spinner')).toBeNull()
     expect(result.textContent).toContain('Installation result unknown')
-    expect(result.textContent).toContain('View details')
+    expect(result.textContent).toContain('View installation details')
     expect(result.textContent).not.toContain('connection closed')
   })
 })
