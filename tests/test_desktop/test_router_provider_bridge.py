@@ -14,7 +14,6 @@ import pytest
 
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.onboarding.mutations import (
-    LlmProfileActivationError,
     upsert_llm_provider,
     upsert_router,
 )
@@ -188,7 +187,7 @@ def test_new_desktop_recommendations_follow_first_usable_primary(desktop_router_
 
 
 @pytest.mark.parametrize("binding", [None, "custom"])
-def test_identical_historical_or_custom_presets_need_explicit_resolution(
+def test_curated_primary_switch_replaces_historical_or_custom_presets(
     desktop_router_toml, binding: str | None,
 ) -> None:
     raw = desktop_router_toml(binding)
@@ -196,10 +195,12 @@ def test_identical_historical_or_custom_presets_need_explicit_resolution(
         assert "preset_binding" not in raw
     source = config_from_desktop(raw)
     before = source.model_dump()
-    with pytest.raises(LlmProfileActivationError) as caught:
-        upsert_llm_provider(source, provider_id="tokenrhythm", api_key="synthetic-bridge-key")
-    assert caught.value.reason == "router_provider_conflict"
-    assert caught.value.details["conflictProviders"] == ["openrouter"]
+    replaced = upsert_llm_provider(
+        source, provider_id="tokenrhythm", api_key="synthetic-bridge-key"
+    ).config
+    assert replaced.llm.provider == "tokenrhythm"
+    assert replaced.squilla_router.preset_binding == "follow_primary"
+    assert replaced.squilla_router.tiers["c1"]["provider"] == "tokenrhythm"
     assert source.model_dump() == before
     disabled = upsert_llm_provider(
         source, provider_id="tokenrhythm", api_key="synthetic-bridge-key", router_action="disable",
