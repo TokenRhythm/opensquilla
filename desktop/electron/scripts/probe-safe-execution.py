@@ -37,7 +37,8 @@ async def verify_safe_execution() -> dict[str, object]:
     )
 
     root = Path(os.environ["OPENSQUILLA_STATE_DIR"]).resolve()
-    workspace = root / "safe-execution"
+    workspace_root = Path(os.environ.get("OPENSQUILLA_SMOKE_WORKSPACE_ROOT", str(root))).resolve()
+    workspace = workspace_root / "safe-execution"
     workspace.mkdir()
     target = workspace / "read-only.txt"
     target.write_text("synthetic Safe fixture\n", encoding="utf-8")
