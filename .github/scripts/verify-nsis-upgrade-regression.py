@@ -112,6 +112,46 @@ def require(condition: object, message: str) -> None:
         raise RuntimeError(message)
 
 
+def sample_nsis_plugin_directory(
+    directory: Path, observed_dirs: dict[str, dict], errors: list[dict], seconds: float,
+) -> dict | None:
+    """Supplement directory events without aborting on a Windows TEMP stat race.
+
+    Access-denied samples are diagnostic only, never positive path evidence.
+    Required event observation and final installer assertions remain separate.
+    """
+    def sample(path: Path, method: str) -> bool:
+        try:
+            return path.is_dir() if method == 'is_dir' else path.is_file()
+        except PermissionError as error:
+            if getattr(error, 'winerror', None) != 5:
+                raise
+            # An NSIS temporary directory can become inaccessible while it is
+            # being removed. Keep bounded diagnostics and try on the next poll.
+            diagnostic = next((item for item in errors
+                               if item['path'] == str(path) and item['sample'] == method), None)
+            if diagnostic is None:
+                diagnostic = {
+                    'path': str(path), 'sample': method, 'errno': error.errno, 'winerror': 5,
+                    'firstObservedSeconds': seconds, 'observations': 0,
+                }
+                errors.append(diagnostic)
+            diagnostic['lastObservedSeconds'] = seconds
+            diagnostic['observations'] += 1
+            return False
+
+    if not sample(directory, 'is_dir'):
+        return None
+    record = observed_dirs.setdefault(str(directory), {
+        'path': str(directory), 'firstObservedSeconds': seconds,
+        'oldInstallObserved': False, 'oldUninstallerObserved': False,
+    })
+    record['lastObservedSeconds'] = seconds
+    record['oldInstallObserved'] |= sample(directory / 'old-install', 'is_dir')
+    record['oldUninstallerObserved'] |= sample(directory / 'old-uninstaller.exe', 'is_file')
+    return record
+
+
 class FILETIME(ctypes.Structure):
     _fields_ = [('low', wintypes.DWORD), ('high', wintypes.DWORD)]
 
@@ -873,6 +913,7 @@ class Audit:
         require(executable.is_file(), f'Missing executable: {executable}')
         require(within(temp, self.root), 'Child TEMP must be inside this audit task root')
         operation = {'label': label, 'executable': str(executable), 'arguments': arguments, 'childTemp': str(temp), 'processes': [], 'pluginDirectories': [], 'directoryEvents': [], 'dialogs': [], 'timedOut': False, 'tempEnvironmentSamples': [], 'tempEnvironmentErrors': [], 'oldUninstallerEnvironmentPairs': []}
+        operation['pluginPathObservationErrors'] = []
         self.report['operations'].append(operation)
         self.report['stage'] = label
         self.save()
@@ -974,13 +1015,16 @@ class Audit:
                             item['observedExitCode'] = exit_code.value
                 for root in watch_roots:
                     for directory in root.iterdir():
-                        if directory.name in existing_temp[root] or not directory.name.casefold().startswith('ns') or not directory.name.casefold().endswith('.tmp') or not directory.is_dir():
+                        if (directory.name in existing_temp[root]
+                                or not directory.name.casefold().startswith('ns')
+                                or not directory.name.casefold().endswith('.tmp')):
                             continue
-                        key = str(directory)
-                        record = observed_dirs.setdefault(key, {'path': key, 'firstObservedSeconds': round(now - started, 3), 'oldInstallObserved': False, 'oldUninstallerObserved': False})
-                        record['lastObservedSeconds'] = round(now - started, 3)
-                        record['oldInstallObserved'] |= (directory / 'old-install').is_dir()
-                        record['oldUninstallerObserved'] |= (directory / 'old-uninstaller.exe').is_file()
+                        record = sample_nsis_plugin_directory(
+                            directory, observed_dirs, operation['pluginPathObservationErrors'],
+                            round(now - started, 3),
+                        )
+                        if record is None:
+                            continue
                         if self.fault_relative is not None:
                             destination = directory / 'old-install' / self.fault_relative
                             record['faultDestination'] = str(destination)
