@@ -650,7 +650,7 @@ async def test_process_crash_recovers_committed_ingress_once_without_resending_u
             process.kill()
             await process.communicate()
     assert process.returncode == 31, stderr.decode()
-    assert b"accept-and-unknown-committed\n" in stdout
+    assert b"accept-and-unknown-committed" in stdout.splitlines()
 
     reopened = await channel_store(path)
     queue = asyncio.Queue()
