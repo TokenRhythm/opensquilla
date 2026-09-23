@@ -2303,6 +2303,7 @@ const chatSessionModel = useChatSessionModel({
   isDraft: isDraftSurface,
   available: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
+  allowed: optionalSessionRpcAllowed,
 })
 const { modelName: storedSessionModelName } = chatSessionModel
 
