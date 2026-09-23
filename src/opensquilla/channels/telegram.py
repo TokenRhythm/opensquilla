@@ -24,6 +24,8 @@ from opensquilla.channels._attachment_io import (
 from opensquilla.channels._util import (
     ChannelAccessPolicy,
     EventDedupeCache,
+    FloodStrikeBackoff,
+    StreamThrottle,
     split_text_for_channel,
 )
 from opensquilla.channels.contract import (
@@ -70,6 +72,16 @@ _DEDUPE_SIZE = 4096
 _ALLOWED_UPDATES = ("message", "channel_post")
 # Telegram Bot API hard limit on sendMessage text length.
 _TELEGRAM_MAX_MESSAGE_CHARS = 4096
+
+
+def _telegram_text_exceeds(text: str) -> bool:
+    """True when *text* would exceed Telegram's 4096 UTF-16 unit cap.
+
+    Telegram measures message length in UTF-16 code units (astral chars such
+    as emoji count as two), matching ``split_text_for_channel`` with
+    ``ChannelLengthUnit.UTF16_UNITS`` used by ``send``.
+    """
+    return len(text.encode("utf-16-le")) // 2 > _TELEGRAM_MAX_MESSAGE_CHARS
 
 
 class TelegramApiError(RuntimeError):
@@ -171,6 +183,7 @@ class TelegramChannel:
             thread_reply=True,
             edit=True,
             delete=True,
+            streamed_message_replacement=True,
             transports=(self.config.transport_name,),
         )
 
@@ -780,6 +793,8 @@ class TelegramChannel:
         if not chat_id:
             raise ValueError("telegram.send requires chat_id via metadata, reply_to, or config")
         payload: dict[str, Any] = {"chat_id": str(chat_id), "text": message.content}
+        if message.metadata.get("disable_notification"):
+            payload["disable_notification"] = True
         thread_id = message.metadata.get("thread_id") or message.metadata.get("message_thread_id")
         if thread_id:
             payload["message_thread_id"] = _coerce_telegram_int(thread_id)
@@ -791,7 +806,20 @@ class TelegramChannel:
             payload["parse_mode"] = str(parse_mode)
         return payload
 
-    async def edit(self, message_id: str, content: str) -> None:
+    async def edit(self, message_id: str, content: str, *, chat_id: str | None = None) -> None:
+        if chat_id is not None and "|" not in message_id:
+            # Route kwargs from streaming_reply_kwargs carry the chat target
+            # explicitly (terminal reconcile path); keep the pipe-ref form
+            # authoritative when both are present.
+            await self._api(
+                "editMessageText",
+                {
+                    "chat_id": str(chat_id),
+                    "message_id": _coerce_telegram_int(message_id),
+                    "text": content,
+                },
+            )
+            return
         chat_id, raw_message_id = self._split_message_ref(message_id)
         await self._api(
             "editMessageText",
@@ -801,6 +829,110 @@ class TelegramChannel:
                 "text": content,
             },
         )
+
+    # ------------------------------------------------------------------
+    # Streaming (edit-throttled)
+    # ------------------------------------------------------------------
+
+    def streaming_reply_kwargs(self, inbound: IncomingMessage) -> dict[str, Any]:
+        """Route a streamed reply into the chat that triggered the turn.
+
+        Without this, ``send_streaming`` falls back to
+        ``config.default_chat_id`` and every streamed reply lands in one
+        static chat regardless of who asked.
+        """
+        kwargs: dict[str, Any] = {"chat_id": inbound.channel_id}
+        thread_id = inbound.metadata.get("thread_id") or inbound.metadata.get("message_thread_id")
+        if thread_id:
+            kwargs["thread_id"] = str(thread_id)
+        return kwargs
+
+    async def send_streaming(
+        self,
+        chunks: Any,
+        *,
+        chat_id: str | None = None,
+        thread_id: str | None = None,
+        update_interval_ms: int = 800,
+    ) -> str | None:
+        """Stream a message: post first chunk, ``editMessageText`` for the rest.
+
+        Telegram Bot API has no hard per-minute edit cap for this pattern, but
+        edits are network round trips; ``StreamThrottle`` coalesces micro-deltas
+        so at most one edit lands per ``update_interval_ms`` window and a
+        transient failure never loses accumulated text (next flush retries the
+        same snapshot).
+
+        The first chunk is sent as a fresh ``sendMessage``; subsequent chunks
+        rewrite that message in place. If the accumulated text would exceed
+        Telegram's 4096 UTF-16 cap, ``TelegramApiError`` is raised and the
+        dispatcher's relay falls back to the batch ``send`` path so the full
+        reply is still delivered (split into multiple messages by ``send``).
+
+        Returns the originating ``message_id`` (``<chat_id>|<message_id>``) or
+        ``None`` if the iterator was empty.
+        """
+        target = chat_id or self.config.default_chat_id
+        if not target:
+            raise RuntimeError("Telegram stream has no chat target")
+        target = str(target)
+        throttle = StreamThrottle(interval_s=update_interval_ms / 1000.0)
+        flood = FloodStrikeBackoff(cap=4, decay_s=30.0, adapter="telegram.stream")
+        resolved_chat: str | None = None
+        message_id: str | None = None
+
+        async def _post(text: str) -> None:
+            nonlocal resolved_chat, message_id
+            if _telegram_text_exceeds(text):
+                raise TelegramApiError(
+                    f"telegram.stream: text exceeds {_TELEGRAM_MAX_MESSAGE_CHARS} UTF-16 units"
+                )
+            payload: dict[str, Any] = {"chat_id": target, "text": text}
+            if thread_id:
+                payload["message_thread_id"] = _coerce_telegram_int(thread_id)
+            result = await self._api("sendMessage", payload)
+            resolved_chat = str(result.get("chat", {}).get("id", target))
+            raw_id = result.get("message_id")
+            message_id = str(raw_id) if raw_id is not None else None
+            flood.record_success()
+
+        async def _edit(text: str) -> None:
+            if _telegram_text_exceeds(text):
+                raise TelegramApiError(
+                    f"telegram.stream: text exceeds {_TELEGRAM_MAX_MESSAGE_CHARS} UTF-16 units"
+                )
+            if message_id is None or resolved_chat is None:
+                return
+            try:
+                await self._api(
+                    "editMessageText",
+                    {
+                        "chat_id": resolved_chat,
+                        "message_id": _coerce_telegram_int(message_id),
+                        "text": text,
+                    },
+                )
+                flood.record_success()
+            except TelegramApiError as exc:
+                if exc.error_code == 429 and exc.retry_after is not None:
+                    flood.record_429()
+                if flood.should_fallback():
+                    raise
+                # Single transient edit failure: accumulated text stays in the
+                # throttle so the next flush retries with the same snapshot.
+                log.warning(
+                    "channel.telegram.stream_edit_retry",
+                    error_code=exc.error_code,
+                    error=str(exc),
+                )
+
+        async for chunk in chunks:
+            throttle.add(chunk)
+            await throttle.maybe_flush(post=_post, edit=_edit)
+        await throttle.force_flush(post=_post, edit=_edit)
+        if message_id is None:
+            return None
+        return f"{resolved_chat or target}|{message_id}"
 
     async def delete(self, message_id: str) -> None:
         chat_id, raw_message_id = self._split_message_ref(message_id)
