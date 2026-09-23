@@ -47,8 +47,8 @@ const bundled = await build({
     resolveId: id => id === entry ? entry : undefined,
     load: id => id === entry ? `
       import { createPendingInputWal } from ${source(resolve(sourceRoot, 'src/utils/chat/pendingInputWal.ts'))};
-      import { seedRecoveryRows, measureRecoveryTraversal } from ${source(resolve(ownRoot, 'e2e/support/recovery-pagination.ts'))};
-      window.recoveryBenchmark = { wal: createPendingInputWal(), seedRecoveryRows, measureRecoveryTraversal };
+      import { seedRecoveryRows, measureRecoveryTraversal, traverseRecoveryPages } from ${source(resolve(ownRoot, 'e2e/support/recovery-pagination.ts'))};
+      window.recoveryBenchmark = { wal: createPendingInputWal(), seedRecoveryRows, measureRecoveryTraversal, traverseRecoveryPages };
     ` : undefined,
   }],
   build: { write: false, minify: false, rollupOptions: { input: entry, output: { format: 'es' } } },
@@ -62,6 +62,7 @@ const evidence = {
   sourceDirty: execFileSync('git', ['status', '--porcelain'], { cwd: sourceRoot, encoding: 'utf8' }).trim().length > 0,
   sourceWalSha256: createHash('sha256').update(await readFile(resolve(sourceRoot, 'src/utils/chat/pendingInputWal.ts'))).digest('hex'),
   node: process.version, platform: process.platform, rounds, iterations, timeoutMs,
+  warmups: 2, timingInstrumentation: 'none; structure is measured in a separate traversal',
   browser: '', scenarios: [],
 }
 const browser = await chromium.launch({
@@ -72,7 +73,7 @@ let failed = false
 let incomplete = false
 try {
   for (const count of counts) {
-    const scenario = { pendingCount: count, status: 'running', samples: [] }
+    const scenario = { pendingCount: count, status: 'running', timing: [] }
     evidence.scenarios.push(scenario)
     const context = await browser.newContext()
     try {
@@ -87,34 +88,44 @@ try {
         fixture.expected = Array.from({ length: count }, (_, index) => `pending-${String(index).padStart(6, '0')}`)
         await fixture.seedRecoveryRows(fixture.wal, fixture.expected)
       }, count)
-      for (let round = 0; round < rounds; round += 1) {
-        for (let iteration = 0; iteration < iterations; iteration += 1) {
-          let timer
-          try {
-            const sample = await Promise.race([
-              page.evaluate(async () => {
+      async function traverse(mode) {
+        let timer
+        try {
+          return await Promise.race([
+              page.evaluate(async mode => {
                 const fixture = window.recoveryBenchmark
-                const measured = await fixture.measureRecoveryTraversal(fixture.wal)
+                const started = performance.now()
+                const measured = mode === 'structure'
+                  ? await fixture.measureRecoveryTraversal(fixture.wal)
+                  : await fixture.traverseRecoveryPages(fixture.wal)
+                const wallMs = performance.now() - started
                 if (measured.ids.length !== fixture.expected.length || measured.ids.some((id, index) => id !== fixture.expected[index])) {
                   throw new Error('Traversal omitted, repeated, or reordered a pending record')
                 }
                 return { records: measured.ids.length, pages: measured.pageSizes.length,
-                  cursorCallbacks: measured.cursorCallbacks, seekCalls: measured.seekCalls, wallMs: measured.wallMs }
-              }),
+                  ...(mode === 'structure' ? { cursorCallbacks: measured.cursorCallbacks, seekCalls: measured.seekCalls } : { wallMs }) }
+              }, mode),
               new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('traversal_deadline')), timeoutMs) }),
-            ])
-            scenario.samples.push({ round, iteration, ...sample })
-          } finally {
-            clearTimeout(timer)
-          }
+          ])
+        } finally {
+          clearTimeout(timer)
         }
       }
-      const sorted = scenario.samples.map(sample => sample.wallMs).sort((left, right) => left - right)
+      scenario.phase = 'structure'
+      scenario.structure = await traverse('structure')
+      scenario.phase = 'warmup'
+      for (let iteration = 0; iteration < evidence.warmups; iteration += 1) await traverse('timing')
+      scenario.phase = 'timing'
+      for (let round = 0; round < rounds; round += 1) {
+        for (let iteration = 0; iteration < iterations; iteration += 1) {
+          scenario.timing.push({ round, iteration, ...await traverse('timing') })
+        }
+      }
+      const sorted = scenario.timing.map(sample => sample.wallMs).sort((left, right) => left - right)
       scenario.summary = { medianMs: sorted[Math.floor(sorted.length / 2)],
-        p95Ms: sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)],
-        minCursorCallbacks: Math.min(...scenario.samples.map(sample => sample.cursorCallbacks)),
-        maxCursorCallbacks: Math.max(...scenario.samples.map(sample => sample.cursorCallbacks)) }
+        p95Ms: sorted[Math.max(0, Math.ceil(sorted.length * 0.95) - 1)] }
       scenario.status = 'complete'
+      delete scenario.phase
     } catch (error) {
       scenario.status = error.message === 'traversal_deadline' ? 'deadline' : 'error'
       scenario.error = error.message
@@ -128,4 +139,5 @@ try {
 } finally {
   await browser.close()
 }
+process.stdout.write(`${JSON.stringify(evidence, null, 2)}\n`)
 process.exitCode = failed ? 1 : incomplete ? 2 : 0

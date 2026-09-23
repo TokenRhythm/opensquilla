@@ -42,7 +42,24 @@ export async function seedRecoveryRows(
   }
 }
 
-/** Count actual native IDB callbacks, including the end-of-range callback. */
+/** Traverse production pages without instrumentation; also used for timing. */
+export async function traverseRecoveryPages(wal: PendingInputWal, limit = 16) {
+  const ids: string[] = []
+  const pageSizes: number[] = []
+  let after: string | undefined
+  do {
+    const page = await wal.listRecoveryDeliveries!(after, limit)
+    ids.push(...page.records.map(record => record.ownerRequestId))
+    pageSizes.push(page.records.length)
+    if (page.next && after && indexedDB.cmp(page.next, after) <= 0) {
+      throw new Error('Recovery pagination failed to advance')
+    }
+    after = page.next
+  } while (after)
+  return { ids, pageSizes }
+}
+
+/** Count actual native IDB callbacks separately from all timing samples. */
 export async function measureRecoveryTraversal(wal: PendingInputWal, limit = 16) {
   const originalOpen = IDBIndex.prototype.openCursor
   const originalSeek = IDBCursor.prototype.continuePrimaryKey
@@ -59,21 +76,8 @@ export async function measureRecoveryTraversal(wal: PendingInputWal, limit = 16)
     seekCalls += 1
     return originalSeek.apply(this, args)
   }
-  const ids: string[] = []
-  const pageSizes: number[] = []
-  const started = performance.now()
   try {
-    let after: string | undefined
-    do {
-      const page = await wal.listRecoveryDeliveries!(after, limit)
-      ids.push(...page.records.map(record => record.ownerRequestId))
-      pageSizes.push(page.records.length)
-      if (page.next && after && indexedDB.cmp(page.next, after) <= 0) {
-        throw new Error('Recovery pagination failed to advance')
-      }
-      after = page.next
-    } while (after)
-    return { ids, pageSizes, cursorCallbacks, seekCalls, wallMs: performance.now() - started }
+    return { ...await traverseRecoveryPages(wal, limit), cursorCallbacks, seekCalls }
   } finally {
     IDBIndex.prototype.openCursor = originalOpen
     IDBCursor.prototype.continuePrimaryKey = originalSeek
