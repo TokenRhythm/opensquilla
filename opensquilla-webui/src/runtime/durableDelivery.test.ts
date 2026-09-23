@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { reactive } from 'vue'
 import { createDurableDelivery } from './durableDelivery'
 import { TurnCommandError } from '@/modules/turnCommands'
-import type { TurnCommands, TurnSendRequest, TurnReceiptResult, TurnSendResponse, TurnSteerResponse } from '@/modules/turnCommands'
+import type { TurnCommands, TurnSendRequest, TurnReceiptResult, TurnSendResponse, TurnSteerResponse, TurnCancelResponse } from '@/modules/turnCommands'
 import type { DeliveryWalRecord, PendingInputWal } from '@/utils/chat/pendingInputWal'
 
 function memoryWal() {
@@ -57,6 +57,168 @@ async function flush() { for (let index = 0; index < 60; index += 1) await Promi
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  it.each([
+    { aborted: true },
+    { aborted: false, reason: 'task_not_active' },
+    { aborted: false, reason: 'task_mismatch' },
+  ])('settles a known exact Stop despite failed initial WAL persistence: %j', async response => {
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    storage.wal.prepareDelivery = async () => { throw new Error('Synthetic quota failure') }
+    const test = harness({ cancel: vi.fn(async () => response) }, storage)
+    try {
+      await expect(test.owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' })).resolves.toEqual(response)
+      const summary = test.owner.snapshots()[0]!
+      expect(summary).toMatchObject({ stopPending: false, waitReason: 'storage' })
+      test.identity('other-identity')
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false, waitReason: 'identity', stopAvailable: false })
+      await test.owner.retry(summary.id)
+      expect(test.commands.cancel).toHaveBeenCalledTimes(1)
+      expect(storage.records.size).toBe(0)
+      test.identity('synthetic-identity')
+      storage.wal.prepareDelivery = prepare
+      await test.owner.wake()
+      expect(storage.records.get(summary.id)?.stop).toMatchObject({ completed: true, request: { taskId: 'known-task' } })
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false })
+      expect(test.owner.snapshots()[0]?.waitReason).toBeUndefined()
+      expect(test.commands.cancel).toHaveBeenCalledTimes(1)
+    } finally { test.owner.dispose() }
+  })
+
+  it('retries an unknown exact Stop with the same task after storage recovers', async () => {
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    storage.wal.prepareDelivery = async () => { throw new Error('Synthetic quota failure') }
+    const cancel = vi.fn().mockResolvedValueOnce({ aborted: false, reason: 'task_cancel_unknown' }).mockResolvedValue({ aborted: true })
+    const test = harness({ cancel }, storage)
+    try {
+      await test.owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' })
+      const summary = test.owner.snapshots()[0]!
+      await test.owner.wake()
+      expect(cancel).toHaveBeenCalledTimes(1)
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: true, waitReason: 'storage' })
+      storage.wal.prepareDelivery = prepare
+      await test.owner.retry(summary.id)
+      expect(cancel).toHaveBeenCalledTimes(2)
+      expect(cancel).toHaveBeenLastCalledWith(expect.objectContaining({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' }), expect.any(Object))
+      expect(storage.records.get(summary.id)?.stop?.completed).toBe(true)
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false })
+      expect(test.owner.snapshots()[0]?.waitReason).toBeUndefined()
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
+  it('shares the in-flight exact Stop with wake when an existing delivery CAS fails', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'accepted',
+      request: { kind: 'send', request: request() }, response: { taskId: 'known-task' },
+      revision: 1, createdAt: 1, updatedAt: 1 })
+    const compare = storage.wal.compareAndSwapDelivery!
+    storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
+    let finish!: (response: TurnCancelResponse) => void
+    const test = harness({ cancel: vi.fn(() => new Promise<TurnCancelResponse>(resolve => { finish = resolve })) }, storage)
+    try {
+      const stopping = test.owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' })
+      await flush()
+      const waking = test.owner.wake()
+      await flush()
+      expect(test.commands.cancel).toHaveBeenCalledTimes(1)
+      finish({ aborted: true })
+      await Promise.all([stopping, waking])
+      expect(test.owner.snapshots()).toEqual([expect.objectContaining({ id: 'synthetic-request', stopPending: false, waitReason: 'storage' })])
+      storage.wal.compareAndSwapDelivery = compare
+      await test.owner.wake()
+      expect(storage.records.size).toBe(1)
+      expect(storage.records.get('synthetic-request')?.stop?.completed).toBe(true)
+      expect(test.owner.snapshots()[0]?.waitReason).toBeUndefined()
+      expect(test.commands.cancel).toHaveBeenCalledTimes(1)
+    } finally { test.owner.dispose() }
+  })
+
+  it('recovers a volatile exact Stop on a new connection even while WAL is unavailable', async () => {
+    const storage = memoryWal()
+    storage.wal.prepareDelivery = undefined
+    const cancel = vi.fn().mockResolvedValueOnce({ aborted: false, reason: 'task_cancel_unknown' }).mockResolvedValue({ aborted: true })
+    const test = harness({ cancel }, storage)
+    try {
+      await test.owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' })
+      await test.owner.wake()
+      expect(cancel).toHaveBeenCalledTimes(1)
+      test.identity('synthetic-identity')
+      await test.owner.wake()
+      expect(cancel).toHaveBeenCalledTimes(2)
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false, waitReason: 'storage' })
+      expect(storage.records.size).toBe(0)
+    } finally { test.owner.dispose() }
+  })
+
+  it.each([true, false])('does not overlap a volatile exact Stop when WAL recovers before its %s response', async aborted => {
+    const storage = memoryWal()
+    const prepare = storage.wal.prepareDelivery!
+    storage.wal.prepareDelivery = async () => { throw new Error('Synthetic quota failure') }
+    let finish!: (response: TurnCancelResponse) => void
+    const cancel = vi.fn().mockImplementationOnce(() => new Promise<TurnCancelResponse>(resolve => { finish = resolve }))
+      .mockResolvedValue({ aborted: true })
+    const test = harness({ cancel }, storage)
+    try {
+      const stopping = test.owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' })
+      await flush()
+      const id = test.owner.snapshots()[0]!.id
+      storage.wal.prepareDelivery = prepare
+      const waking = test.owner.wake()
+      await flush()
+      expect(storage.records.get(id)?.stop).toMatchObject({ requested: true, completed: false })
+      expect(cancel).toHaveBeenCalledTimes(1)
+      finish({ aborted, ...(aborted ? {} : { reason: 'task_cancel_unknown' }) })
+      await Promise.all([stopping, waking])
+      expect(cancel).toHaveBeenCalledTimes(1)
+      expect(test.owner.snapshots()[0]?.stopPending).toBe(!aborted)
+      if (!aborted) {
+        await test.owner.retry(id)
+        expect(cancel).toHaveBeenCalledTimes(2)
+      } else await test.owner.wake()
+      expect(storage.records.get(id)?.stop?.completed).toBe(true)
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false })
+      expect(test.owner.snapshots()[0]?.waitReason).toBeUndefined()
+      expect(cancel).toHaveBeenCalledTimes(aborted ? 1 : 2)
+    } finally { test.owner.dispose() }
+  })
+
+  it('keeps late exact Stop results separate when identities share session and task coordinates', async () => {
+    const storage = memoryWal()
+    storage.wal.prepareDelivery = async () => { throw new Error('Synthetic quota failure') }
+    let resolveFirst!: (response: TurnCancelResponse) => void
+    const cancel = vi.fn().mockImplementationOnce(() => new Promise<TurnCancelResponse>(resolve => { resolveFirst = resolve }))
+      .mockResolvedValue({ aborted: true })
+    const test = harness({ cancel }, storage)
+    const exact = { sessionKey: 'synthetic-session', taskId: 'known-task', scope: 'task' as const }
+    try {
+      const first = test.owner.commands.cancel(exact)
+      await flush()
+      const firstId = test.owner.snapshots()[0]!.id
+      test.identity('other-identity')
+      await test.owner.wake()
+      const second = test.owner.commands.cancel(exact)
+      await flush()
+      resolveFirst({ aborted: false, reason: 'task_cancel_unknown' })
+      await Promise.all([first, second])
+      const snapshots = test.owner.snapshots()
+      expect(snapshots).toHaveLength(2)
+      expect(snapshots.find(item => item.id === firstId)).toMatchObject({ stopPending: true, waitReason: 'identity' })
+      expect(snapshots.find(item => item.id !== firstId)).toMatchObject({ stopPending: false, waitReason: 'storage' })
+      await test.owner.retry(firstId)
+      expect(cancel).toHaveBeenCalledTimes(2)
+      test.identity('synthetic-identity')
+      await test.owner.retry(firstId)
+      expect(cancel).toHaveBeenCalledTimes(3)
+      expect(cancel).toHaveBeenLastCalledWith(expect.objectContaining(exact), expect.objectContaining({ expectedGeneration: 3 }))
+      expect(test.owner.snapshots().find(item => item.id === firstId)).toMatchObject({ stopPending: false, waitReason: 'storage' })
+    } finally { test.owner.dispose() }
+  })
+
   it('bounds completed not-sent notifications without evicting an unresolved delivery', async () => {
     const storage = memoryWal()
     const seed = (id: string, phase: DeliveryWalRecord['phase']): DeliveryWalRecord => ({
@@ -944,7 +1106,7 @@ describe('application-owned durable delivery', () => {
     test.owner.dispose()
   })
 
-  it('refreshes an inactive volatile Steer target instead of reusing the old persisted steering receipt', async () => {
+  it.each(['request', 'exact'] as const)('refreshes an inactive volatile Steer target after %s Stop instead of reusing the old persisted steering receipt', async method => {
     const storage = memoryWal()
     storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
       requestSessionKey: 'synthetic-session', request: { kind: 'steer', request: { key: 'synthetic-session', clientRequestId: 'synthetic-request',
@@ -953,7 +1115,8 @@ describe('application-owned durable delivery', () => {
     storage.wal.compareAndSwapDelivery = async () => { throw new Error('Synthetic quota failure') }
     const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response: { accepted: true, disposition: 'promoted' as const, taskId: 'old-task', promotedTurnId: 'promoted-task' } })),
       cancel: vi.fn().mockResolvedValueOnce({ aborted: false, reason: 'task_not_active' }).mockResolvedValue({ aborted: true }) }, storage)
-    await test.owner.requestStop('synthetic-request')
+    if (method === 'request') await test.owner.requestStop('synthetic-request')
+    else await test.owner.commands.cancel({ sessionKey: 'synthetic-session', taskId: 'old-task', scope: 'task' })
     await test.owner.wake()
     expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
     expect(test.commands.cancel).toHaveBeenCalledTimes(1)
@@ -1118,5 +1281,54 @@ describe('application-owned durable delivery', () => {
     expect(observed).toHaveBeenCalledTimes(notifications)
     expect(observed.mock.calls[0]?.[0]).not.toHaveProperty('request')
     test.owner.dispose()
+  })
+})
+
+
+describe('settled delivery notifications', () => {
+  it('clears the offline wait reason when the saved exact Stop succeeds after reconnect', async () => {
+    const test = harness()
+    try {
+      await test.owner.commands.send(request())
+      test.available(false)
+      await test.owner.requestStop('synthetic-request')
+      await test.owner.wake()
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: true, waitReason: 'offline' })
+      test.available(true)
+      await test.owner.wake()
+      await vi.waitFor(() => expect(test.records.get('synthetic-request')?.stop?.completed).toBe(true))
+      expect(test.owner.snapshots()[0]).toMatchObject({ stopPending: false })
+      expect(test.owner.snapshots()[0]?.waitReason).toBeUndefined()
+    } finally { test.owner.dispose() }
+  })
+  it('observes another window settling a leased delivery on its next wake', async () => {
+    const storage = memoryWal()
+    storage.records.set('synthetic-request', { schemaVersion: 2, ownerRequestId: 'synthetic-request',
+      deliveryIdentity: 'synthetic-identity', requestSessionKey: 'synthetic-session', phase: 'unknown',
+      request: { kind: 'send', request: request() }, revision: 1, createdAt: 1, updatedAt: 1 })
+    let settle!: (value: TurnReceiptResult) => void
+    const a = harness({ lookupReceipt: vi.fn(() => new Promise<TurnReceiptResult>(resolve => { settle = resolve })) }, storage)
+    const b = harness({}, storage)
+    const observer = vi.fn()
+    b.owner.observe(observer)
+    try {
+      const recovering = a.owner.wake()
+      await flush()
+      await b.owner.wake()
+      expect(b.owner.snapshots()[0]).toMatchObject({ phase: 'unknown', waitReason: 'lease' })
+      settle({ status: 'found', response: { taskId: 'synthetic-task', sessionKey: 'synthetic-session' } })
+      await recovering
+      expect((await b.owner.get('synthetic-request'))?.phase).toBe('accepted')
+      await b.owner.wake()
+      expect(b.owner.snapshots()[0]?.phase).toBe('accepted')
+      expect(b.owner.snapshots()[0]?.waitReason).toBeUndefined()
+      expect(observer).toHaveBeenLastCalledWith(expect.objectContaining({ phase: 'accepted' }))
+      expect(b.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect(b.commands.send).not.toHaveBeenCalled()
+      expect(b.commands.cancel).not.toHaveBeenCalled()
+      const reads = vi.spyOn(storage.wal, 'getDelivery')
+      await b.owner.wake()
+      expect(reads).not.toHaveBeenCalled()
+    } finally { a.owner.dispose(); b.owner.dispose() }
   })
 })

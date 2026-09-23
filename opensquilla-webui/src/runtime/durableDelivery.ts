@@ -75,6 +75,11 @@ function terminalReceipt(record: DeliveryWalRecord, response: TurnSendResponse |
     || (record.request?.kind === 'steer' && 'disposition' in response && ['cancelled', 'rejected'].includes(response.disposition || ''))
 }
 
+function hasPendingSteer(record: DeliveryWalRecord): boolean {
+  return record.request?.kind === 'steer' && (!record.response || !('disposition' in record.response)
+    || !['applied', 'promoted', 'cancelled', 'rejected'].includes(record.response.disposition || ''))
+}
+
 /** Delivery owns only admission and exact Stop; socket, reads and event recovery keep their existing owners. */
 export function createDurableDelivery(options: DeliveryOptions): DurableDelivery {
   const now = options.now || Date.now
@@ -125,7 +130,8 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   function publish(record: DeliveryWalRecord, waitReason?: DeliveryWaitReason | null) {
     const previous = summaries.get(record.ownerRequestId)
     const intent = stopIntents.get(record.ownerRequestId)
-    const reason = intent?.storageFailed ? 'storage' : waitReason === undefined && previous?.phase === record.phase
+    const reason = intent?.storageFailed ? 'storage' : !unfinished(record) ? undefined
+      : waitReason === undefined && previous?.phase === record.phase
       ? previous.waitReason : waitReason
     summaryIdentities.set(record.ownerRequestId, record.deliveryIdentity)
     const params = record.request?.kind === 'send' ? record.request.request.params : record.request?.request
@@ -419,6 +425,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
 
   function reportStopStorage(id: string, intent: PendingStopIntent) {
     intent.storageFailed = true
+    summaryIdentities.set(id, intent.identity)
     const previous = summaries.get(id)
     summaries.set(id, { id, sessionKey: intent.record?.requestSessionKey || previous?.sessionKey || '',
       phase: intent.record?.phase || previous?.phase || 'unknown', stopPending: !intent.completed, waitReason: 'storage' })
@@ -426,6 +433,13 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   }
 
   async function persistStopIntent(id: string, intent: PendingStopIntent): Promise<void> {
+    // An exact Stop may have no delivery row when its first WAL write failed.
+    // Prepare only this standalone control record; never recreate a lost send.
+    if (intent.record && !intent.record.request && intent.record.stop?.request) {
+      storageReady()
+      if (disposed || invalidated || options.access.identity() !== intent.identity) return
+      await wal!.prepareDelivery!(intent.record)
+    }
     let matched = false
     const record = await update(id, current => {
       matched = !disposed && !invalidated && options.access.identity() === intent.identity
@@ -503,7 +517,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       const deadline = setTimeout(() => controller.abort(), ROUND_MS)
       try {
         let current = intent.record!
-        if (intent.needsReceipt || !taskIdentity(current)) {
+        if (intent.needsReceipt || !(taskIdentity(current) || current.stop?.request?.taskId)) {
           if (!current.request || !options.commands.lookupReceipt || options.commands.supportsReceiptLookup?.() === false) return
           const receipt = await slot(false, () => fenced(current, controller.signal, opts => options.commands.lookupReceipt!(current.request!, opts)))
           if (receipt.status !== 'found') return
@@ -517,14 +531,13 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           try { await persistStopIntent(id, intent) } catch { /* Keep the storage warning until committed. */ }
           return
         }
-        const taskId = taskIdentity(current)
+        const taskId = taskIdentity(current) || current.stop?.request?.taskId
         if (!taskId) return
-        const request: TurnCancelRequest = { sessionKey: current.response?.sessionKey || current.response?.key || current.requestSessionKey,
+        const request: TurnCancelRequest = { sessionKey: current.response?.sessionKey || current.response?.key || current.stop?.request?.sessionKey || current.requestSessionKey,
           taskId, source: 'webui_stop', scope: 'task' }
         const response = await slot(true, () => fenced(current, controller.signal, opts => options.commands.cancel(request, opts)))
         const inactive = ['task_not_active', 'task_mismatch'].includes(response.reason || '')
-        const pendingSteer = current.request?.kind === 'steer' && (!current.response || !('disposition' in current.response)
-          || !['applied', 'promoted', 'cancelled', 'rejected'].includes(current.response.disposition || ''))
+        const pendingSteer = hasPendingSteer(current)
         if (response.aborted || (inactive && !pendingSteer)) { intent.completed = true; intent.request = request }
         else if (inactive && pendingSteer) {
           intent.needsReceipt = true
@@ -599,8 +612,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     }
     const response = await slot(true, () => fenced(record, signal, opts => options.commands.cancel(request, opts)))
     const inactive = ['task_not_active', 'task_mismatch'].includes(response.reason || '')
-    const pendingSteer = record.request?.kind === 'steer' && (!record.response
-      || !('disposition' in record.response) || !['applied', 'promoted', 'cancelled', 'rejected'].includes(record.response.disposition || ''))
+    const pendingSteer = hasPendingSteer(record)
     if (!response.aborted && inactive && pendingSteer) {
       // The old turn ending does not prove that a queued Steer was cancelled:
       // its receipt can move to a promoted task after this exact Stop answer.
@@ -638,10 +650,33 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     } catch {
       // A known exact task Stop remains best effort if durable storage fails.
       if (identity !== options.access.identity()) throw new TurnCommandError('session-changed', 'Stop identity changed', 'DELIVERY_IDENTITY_CHANGED', null)
-      const id = `volatile-stop:${request.sessionKey}:${request.taskId}`
-      summaries.set(id, { id, sessionKey: request.sessionKey, phase: 'accepted', stopPending: true, waitReason: 'storage' })
-      for (const listener of changes) listener()
-      return slot(true, () => options.commands.cancel(request, { ...commandOptions, expectedGeneration: generation }))
+      if (!identity) throw new TurnCommandError('unavailable', 'Stop identity unavailable', 'DELIVERY_IDENTITY_CHANGED', null)
+      const id = record?.ownerRequestId || `stop:${crypto.randomUUID()}`
+      const frozen = structuredClone(request)
+      const control: DeliveryWalRecord = { ...(record || { schemaVersion: 2, ownerRequestId: id,
+        deliveryIdentity: identity, requestSessionKey: frozen.sessionKey, phase: 'accepted',
+        revision: 1, createdAt: now(), updatedAt: now() }), stop: { requested: true, request: frozen } }
+      const intent: PendingStopIntent = { identity, record: control, request: frozen }
+      stopIntents.set(id, intent)
+      reportStopStorage(id, intent)
+      roundTriggers.set(id, `${identity}:${generation}`)
+      const operation = (async () => {
+        try {
+          const response = await slot(true, () => fenced(control, commandOptions?.signal,
+            opts => options.commands.cancel(frozen, { ...opts, expectedGeneration: generation })))
+          const inactive = ['task_not_active', 'task_mismatch'].includes(response.reason || '')
+          if (!response.aborted && inactive && hasPendingSteer(control)) {
+            intent.needsReceipt = true
+            intent.record = { ...control, response: undefined, phase: 'unknown' }
+          } else if (response.aborted || inactive) intent.completed = true
+          return response
+        } finally {
+          try { await persistStopIntent(id, intent) } catch { /* The in-process result cannot promise restart recovery. */ }
+          if (stopIntents.get(id) === intent) reportStopStorage(id, intent)
+        }
+      })()
+      volatileStopFlights.set(id, operation.then(() => {}, () => {}))
+      try { return await operation } finally { volatileStopFlights.delete(id) }
     }
     if (!record) return { aborted: false, reason: 'task_cancel_unknown' }
     try {
@@ -670,7 +705,7 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     }
     const waitReason = allowed(record)
     if (waitReason) { publish(record, waitReason); return }
-    if (flights.has(record.ownerRequestId)) return
+    if (flights.has(record.ownerRequestId) || volatileStopFlights.has(record.ownerRequestId)) return
     if (record.paused) { publish(record, record.paused === 'authority' ? 'permission' : 'conflict'); return }
     const trigger = `${record.deliveryIdentity}:${options.access.generation()}`
     if (!manualRetries.has(record.ownerRequestId) && roundTriggers.get(record.ownerRequestId) === trigger) return
@@ -734,12 +769,12 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     if (recovery) { recoveryAgain = true; return recovery }
     const operation = (async () => {
       try {
-        storageReady()
         for (const [id, intent] of stopIntents) {
           if (intent.identity !== options.access.identity()) continue
           try { await persistStopIntent(id, intent) } catch { reportStopStorage(id, intent) }
           if (stopIntents.get(id) === intent) await recoverVolatileStop(id, intent)
         }
+        storageReady()
         if (!quarantineChecked && wal!.countQuarantinedDeliveries) {
           quarantineChecked = true
           if (await wal!.countQuarantinedDeliveries() > 0) {
@@ -747,11 +782,17 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
             for (const listener of changes) listener()
           }
         }
+        // Settled records leave the recovery index. Refresh only unresolved
+        // notifications already held by this window, without scanning history.
+        const unseen = new Set([...summaries.values()].filter(item => summaryIdentities.has(item.id)
+          && (item.phase === 'prepared' || item.phase === 'submitting' || item.phase === 'unknown' || item.stopPending))
+          .map(item => item.id))
         let after: string | undefined
         do {
           const page = wal!.listRecoveryDeliveries ? await wal!.listRecoveryDeliveries(after, 16)
             : { records: (await wal!.listDeliveries!()).filter(unfinished), next: undefined }
           const pending = page.records
+          for (const record of pending) unseen.delete(record.ownerRequestId)
           const stops = pending.filter(record => record.phase === 'accepted' && record.stop)
           const admissions = pending.filter(record => !(record.phase === 'accepted' && record.stop))
           async function consume(queue: DeliveryWalRecord[]) {
@@ -760,6 +801,11 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           await Promise.all([consume(stops), consume(admissions), consume(admissions)])
           after = page.next
         } while (after && !disposed && !invalidated)
+        for (const id of unseen) {
+          if (disposed || invalidated) break
+          const current = await wal!.getDelivery!(id)
+          if (current && !disposed && !invalidated) publish(current)
+        }
       } catch { /* Admission reports storage failures; wake does not break app startup. */ }
     })().finally(() => {
       recovery = null

@@ -640,3 +640,60 @@ test('500 real pending queues obey retention budgets and recover evicted attachm
     }
   } finally { await reopened.close() }
 })
+
+
+test('follower notices acceptance committed by another window', async ({ context }) => {
+  const first = await fixturePage(context)
+  const second = await fixturePage(context)
+  await second.clock.install()
+  await first.evaluate(async record => (window as any).deliveryFixture.wal.prepareDelivery(record), deliveryRecord())
+  await installOwner(first, 'synthetic-identity', true)
+  await installOwner(second)
+  await first.evaluate(() => { void (window as any).deliveryFixture.owner.wake() })
+  await first.waitForFunction(() => (window as any).deliveryFixture.calls.lookups === 1)
+  await second.evaluate(() => (window as any).deliveryFixture.owner.wake())
+  const before = await second.evaluate(() => (window as any).deliveryFixture.owner.snapshots()[0])
+  expect(before).toMatchObject({ phase: 'unknown', waitReason: 'lease' })
+  await first.evaluate(async () => {
+    const f = (window as any).deliveryFixture
+    f.resolveLookup()
+    await f.owner.wake()
+  })
+  // The existing lease wake must observe completion even though the record
+  // has left the pending index; no focus event or manual retry is needed.
+  await second.clock.fastForward(60_100)
+  await second.waitForFunction(() => (window as any).deliveryFixture.owner.snapshots()[0]?.phase === 'accepted')
+  const result = await second.evaluate(async () => {
+    const f = (window as any).deliveryFixture
+    return { disk: (await f.wal.getDelivery('synthetic-delivery')).phase, ui: f.owner.snapshots()[0], calls: f.calls }
+  })
+  expect(result.disk).toBe('accepted')
+  expect(result.ui.phase).toBe('accepted')
+  expect(result.ui.waitReason).toBeUndefined()
+  expect(result.calls).toEqual({ sends: 0, lookups: 0, cancels: [] })
+})
+
+test('finished Stop clears the stale offline notification', async ({ context }) => {
+  const page = await fixturePage(context)
+  const result = await page.evaluate(async record => {
+    const f = (window as any).deliveryFixture
+    let available = false
+    await f.wal.prepareDelivery({...record, phase: 'accepted', response: { taskId: 'synthetic-task', sessionKey: 'synthetic-session' }, stop: {requested: true}})
+    const owner = f.createDurableDelivery({ wal: f.wal,
+      access: {identity: () => 'synthetic-identity', available: () => available, generation: () => 1},
+      commands: {send: async () => { throw new Error('No send permitted') }, steer: async () => {throw new Error('No steer permitted')},
+        supports: () => true, cancel: async () => ({aborted: true})} })
+    await owner.wake()
+    const before = owner.snapshots()[0]
+    available = true
+    await owner.wake()
+    const stored = await f.wal.getDelivery(record.ownerRequestId)
+    const after = owner.snapshots()[0]
+    owner.dispose()
+    return {before, completed: stored.stop.completed, after}
+  }, deliveryRecord())
+  expect(result.before.waitReason).toBe('offline')
+  expect(result.completed).toBe(true)
+  expect(result.after.stopPending).toBe(false)
+  expect(result.after.waitReason).toBeUndefined()
+})
