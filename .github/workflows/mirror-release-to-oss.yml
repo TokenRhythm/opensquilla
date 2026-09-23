@@ -277,6 +277,11 @@ jobs:
               --retry-times 3
               --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
             )
+            if [[ "${source}" == oss://* && ( -n "${cache_control}" || -n "${content_type}" ) ]]; then
+              # Otherwise ossutil copies the source's immutable cache policy
+              # even when a different --cache-control value is supplied.
+              options+=(--metadata-directive REPLACE --copy-props none)
+            fi
             if [[ -n "${cache_control}" ]]; then
               options+=(--cache-control "${cache_control}")
             fi

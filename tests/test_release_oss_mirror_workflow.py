@@ -557,3 +557,6 @@ def test_installer_alias_uses_verified_oss_object_without_local_reupload(tmp_pat
     assert len(calls) == 1
     assert calls[0][-2] == f"oss://release-bucket/releases/v0.5.0rc4/{original}"
     assert calls[0][calls[0].index("--cache-control") + 1] == "no-cache,max-age=0,must-revalidate"
+
+    assert calls[0][calls[0].index("--metadata-directive") + 1] == "REPLACE"
+    assert calls[0][calls[0].index("--copy-props") + 1] == "none"
