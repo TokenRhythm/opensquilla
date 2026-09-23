@@ -97,6 +97,8 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   async function ensureSetup(): Promise<boolean> {
     if (!canSetup.value || ensuring.value) return false
     const generation = ++requestGeneration
+    // Setup owns this generation; an older read can no longer clear its flag.
+    loading.value = false
     ensuring.value = true
     error.value = ''
     clearPoll()
