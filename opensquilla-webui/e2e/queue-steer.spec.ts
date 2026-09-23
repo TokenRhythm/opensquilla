@@ -32,7 +32,7 @@ type RpcError = {
   retryable?: boolean
 }
 
-type CapturedSteer = {
+type CapturedRequest = {
   params: Record<string, unknown>
   reject: (error: RpcError) => void
   resolve: (payload: Record<string, unknown>) => void
@@ -46,7 +46,8 @@ type MockGateway = {
   hydrateCalls: number
   holdHistory: boolean
   heldHistory: Array<() => void>
-  steerRequests: CapturedSteer[]
+  steerRequests: CapturedRequest[]
+  receiptRequests: CapturedRequest[]
 }
 
 function successResponse(id: string | number | undefined, payload: unknown) {
@@ -89,6 +90,7 @@ async function installMockGateway(
     capabilityFromHydration?: boolean
     legacyHistory?: boolean
     routerEnabled?: boolean
+    receiptLookup?: boolean
   } = {},
 ): Promise<MockGateway> {
   const state: MockGateway = {
@@ -100,6 +102,7 @@ async function installMockGateway(
     holdHistory: false,
     heldHistory: [],
     steerRequests: [],
+    receiptRequests: [],
   }
 
   await page.route('**/api/approvals', route => route.fulfill({
@@ -127,7 +130,7 @@ async function installMockGateway(
       if (method === 'connect') {
         ws.send(helloOkResponse({
           policy: { concurrent_history_reads: true },
-          features: { methods: ['sessions.steer.v2'] },
+          features: { methods: ['sessions.steer.v2', ...(options.receiptLookup ? ['turns.receipt.get'] : [])] },
           auth: {
             principal: {
               role: 'operator', isOwner: true, authenticated: true, authState: 'authenticated',
@@ -174,8 +177,9 @@ async function installMockGateway(
         return
       }
 
-      if (method === 'sessions.steer.v2') {
-        state.steerRequests.push({
+      if (method === 'sessions.steer.v2' || method === 'turns.receipt.get') {
+        const requests = method === 'sessions.steer.v2' ? state.steerRequests : state.receiptRequests
+        requests.push({
           params: { ...(frame.params || {}) },
           reject: error => ws.send(errorResponse(frame.id, error)),
           resolve: payload => ws.send(successResponse(frame.id, payload)),
@@ -262,7 +266,7 @@ async function queueAndSteer(page: Page, state: MockGateway, text: string) {
 }
 
 function acceptedSteer(
-  request: CapturedSteer,
+  request: CapturedRequest,
   disposition: 'applied' | 'promoted',
 ): Record<string, unknown> {
   const promoted = disposition === 'promoted'
@@ -476,8 +480,8 @@ test.describe('Queue/Steer composer semantics', () => {
     })
   }
 
-  test('STORAGE_BUSY and an unknown response retain one exact-id Retry', async ({ page }) => {
-    const state = await installMockGateway(page)
+  test('STORAGE_BUSY retries the exact request and an unknown response checks its receipt', async ({ page }) => {
+    const state = await installMockGateway(page, { receiptLookup: true })
     await openRunningSession(page)
 
     const steerText = 'Apply this adjustment to the active turn'
@@ -510,8 +514,8 @@ test.describe('Queue/Steer composer semantics', () => {
     await expect(card.getByRole('button', { name: RETRY_UNKNOWN_NAME })).toBeEnabled()
     await expect(userBubble).toHaveCount(0)
 
+    await expect.poll(() => state.receiptRequests.length).toBe(1)
     await card.getByRole('button', { name: RETRY_UNKNOWN_NAME }).click()
-    await expect.poll(() => state.steerRequests.length).toBe(3)
     const attempts = state.steerRequests
     expect(attempts[0]!.params).toMatchObject({
       key: SESSION_KEY,
@@ -521,13 +525,34 @@ test.describe('Queue/Steer composer semantics', () => {
       client_message_id: expect.any(String),
     })
     expect(attempts[1]!.params).toEqual(attempts[0]!.params)
-    expect(attempts[2]!.params).toEqual(attempts[0]!.params)
-    attempts[2]!.resolve(acceptedSteer(attempts[2]!, 'applied'))
+    expect(state.receiptRequests[0]!.params).toEqual({
+      operation: 'sessions.steer.v2', originalRequest: attempts[0]!.params,
+    })
+    // The acceptance was committed before its ACK was lost. Checking it must
+    // join the owner's read-only lookup, never execute the Steer a third time.
+    state.receiptRequests[0]!.resolve({
+      status: 'found', accepted: true, requestFingerprint: `sha256:${'a'.repeat(64)}`,
+      receipt: {
+        requestSessionKey: SESSION_KEY, sessionKey: SESSION_KEY, sessionId: 'synthetic-steer-session',
+        clientRequestId: attempts[0]!.params.client_request_id, messageId: 'message-e2e-steer',
+        sessionEpoch: 1, taskId: TURN_ID, taskStatus: 'running',
+        steer: {
+          key: SESSION_KEY, session_key: SESSION_KEY, session_id: 'synthetic-steer-session',
+          task_id: TURN_ID, turn_id: TURN_ID,
+          client_request_id: attempts[0]!.params.client_request_id,
+          client_message_id: attempts[0]!.params.client_message_id,
+          user_message_id: 'message-e2e-steer', surface_id: null, disposition: 'applied',
+          status: 'accepted', accepted: true, replayed: true, revision: 2, fallback_safe: false,
+        },
+      },
+    })
 
     await expect(card).toHaveCount(0)
     await expect(userBubble).toHaveCount(1)
     await expect(userBubble.locator('.msg-user-steer-status--applied')).toHaveText(/^(Steer|引导)$/)
     await expect(composer).toHaveValue(unrelatedDraft)
+    expect(state.steerRequests).toHaveLength(2)
+    expect(state.receiptRequests).toHaveLength(1)
     expect(state.chatSendCalls).toBe(0)
   })
 
@@ -554,7 +579,9 @@ test.describe('Queue/Steer composer semantics', () => {
     })
     await expect.poll(() => state.historyCalls).toBeGreaterThan(historyCallsBeforeTerminal)
     await expect(userBubble).toHaveCount(0)
-    await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toHaveCount(0)
+    // The original turn ended, but the in-flight Steer may still be promoted.
+    // Its request-bound Stop must remain available until acceptance resolves.
+    await expect(page.getByRole('button', { name: /^(Stop .*response|停止.*回复)$/ })).toBeEnabled()
 
     const request = state.steerRequests[0]!
     request.resolve(acceptedSteer(request, 'promoted'))
