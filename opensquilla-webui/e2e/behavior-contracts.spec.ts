@@ -1,12 +1,36 @@
 import { expect, test, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2ebehaviorcontracts'
+const MACOS_SANDBOX_STATUS = {
+  state: 'ready',
+  platform: 'darwin',
+  message: 'The built-in macOS sandbox is ready.',
+  requiresAdmin: false,
+}
+const MACOS_SANDBOX_CAPABILITY = {
+  available: true,
+  backend: 'seatbelt',
+  platform: 'darwin',
+  code: 'ready',
+  reason: 'The built-in macOS sandbox is available.',
+  setupSupported: false,
+  restartRequired: false,
+  probeVersion: 1,
+  capabilities: ['filesystem', 'network', 'process'],
+}
 
 type RpcFrame = {
   id?: string | number
   method?: string
+  nonce?: unknown
   params?: Record<string, unknown>
   type?: string
 }
@@ -15,16 +39,19 @@ type EventSender = (event: string, payload: Record<string, unknown>) => void
 
 type MockGatewayOptions = {
   abortCalls?: Array<Record<string, unknown>>
+  connectionCalls?: { value: number }
   afterSubscribe?: (sendEvent: EventSender) => void
   history?: () => Array<Record<string, unknown>>
   historyCalls?: { value: number }
   pendingApprovals?: Array<Record<string, unknown>>
   runStatus?: 'idle' | 'running' | 'approval_pending'
+  sandboxCapability?: () => Record<string, unknown>
   sandboxEnsure?: () => Record<string, unknown>
   sandboxEnsureCalls?: { value: number }
   sandboxStatus?: () => Record<string, unknown>
   sandboxStatusCalls?: { value: number }
   runModeSetCalls?: Array<Record<string, unknown>>
+  transportProbe?: (reply: () => void) => void
 }
 
 function response(id: string | number | undefined, payload: unknown) {
@@ -32,6 +59,8 @@ function response(id: string | number | undefined, payload: unknown) {
 }
 
 async function installMockGateway(page: Page, options: MockGatewayOptions = {}) {
+  await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
+  await page.route('**/api/elevated-mode', route => route.fulfill({ json: { mode: 'prompt' } }))
   await page.route('**/api/approvals', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
@@ -44,6 +73,7 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
   }))
 
   await page.routeWebSocket(/\/ws$/, ws => {
+    if (options.connectionCalls) options.connectionCalls.value += 1
     let subscribeCallbackSent = false
     const sendEvent: EventSender = (event, payload) => {
       ws.send(JSON.stringify({ type: 'event', event, payload }))
@@ -57,11 +87,27 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
       } catch {
         return
       }
+      if (frame.type === 'ping') {
+        const reply = () => ws.send(JSON.stringify({ type: 'pong', nonce: frame.nonce }))
+        if (options.transportProbe) options.transportProbe(reply)
+        else reply()
+        return
+      }
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
 
       if (method === 'connect') {
         ws.send(helloOkResponse({
+          policy: { transport_probe_nonce: true },
+          features: {
+            methods: [
+              'sandbox.setup.status',
+              'sandbox.setup.ensure',
+              'sandbox.capability.status',
+              'sandbox.run_mode.preference.get',
+              'sandbox.run_mode.preference.set',
+            ],
+          },
           auth: {
             runModePolicy: {
               allowedRunModes: ['safe', 'full'],
@@ -74,25 +120,19 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
 
       if (method === 'chat.history') {
         if (options.historyCalls) options.historyCalls.value += 1
-        ws.send(response(frame.id, {
-          messages: options.history?.() || [],
-          has_more: false,
-          canonical_complete: true,
-        }))
+        ws.send(response(frame.id, chatHistoryPayload(options.history?.() || [])))
         return
       }
 
       if (method === 'sessions.messages.subscribe') {
         const runStatus = options.runStatus || 'idle'
-        ws.send(response(frame.id, {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
+        const key = String(frame.params?.key || SESSION_KEY)
+        ws.send(response(frame.id, sessionMessagesSubscribePayload(key, {
           run_status: runStatus,
           active_task: runStatus === 'idle'
             ? null
             : { task_id: 'task-e2e-running', status: runStatus },
-        }))
+        })))
         if (!subscribeCallbackSent && options.afterSubscribe) {
           subscribeCallbackSent = true
           setTimeout(() => options.afterSubscribe?.(sendEvent), 20)
@@ -111,6 +151,8 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
         ws.send(response(frame.id, options.sandboxStatus?.() || {
           state: 'ready',
           platform: 'linux',
+          message: 'The sandbox is ready.',
+          requiresAdmin: false,
         }))
         return
       }
@@ -120,12 +162,24 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
         ws.send(response(frame.id, options.sandboxEnsure?.() || {
           state: 'setting_up',
           platform: 'windows',
+          message: 'Setting up Windows Sandbox.',
+          requiresAdmin: true,
         }))
         return
       }
 
       if (method === 'sandbox.capability.status') {
-        ws.send(response(frame.id, { available: false }))
+        ws.send(response(frame.id, options.sandboxCapability?.() || {
+          available: false,
+          backend: '',
+          platform: 'linux',
+          code: 'sandbox_unavailable',
+          reason: 'Synthetic sandbox capability is unavailable.',
+          setupSupported: false,
+          restartRequired: false,
+          probeVersion: 1,
+          capabilities: [],
+        }))
         return
       }
 
@@ -148,6 +202,7 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
         return
       }
 
+      const key = String(frame.params?.key || frame.params?.sessionKey || SESSION_KEY)
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -159,6 +214,8 @@ async function installMockGateway(page: Page, options: MockGatewayOptions = {}) 
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'sessions.messages.unsubscribe': { subscribed: false },
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
         'usage.status': { sessions: [] },
       }
       ws.send(response(frame.id, payloads[method] ?? {}))
@@ -191,11 +248,11 @@ test.describe('Vue behavior contracts', () => {
       .toBe('/chat')
 
     await notFound.getByRole('button', { name: 'Go to Chat' }).click()
-    await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
+    await expect(page).toHaveURL(/\/control\/chat\/new$/)
 
     await page.goto(CONTROL_URL + 'still-not-a-route')
     await page.locator('.not-found').getByRole('button', { name: 'Go to Chat' }).click()
-    await expect(page).toHaveURL(/\/control\/chat(?:\?|$)/)
+    await expect(page).toHaveURL(/\/control\/chat\/new$/)
   })
 
   test('drawer, nested preview, and lightbox own Escape while composer Escape aborts once', async ({ page }) => {
@@ -380,6 +437,110 @@ test.describe('Vue behavior contracts', () => {
     await expect(cronMessage).toHaveCount(1)
   })
 
+  test('macOS Safe remains selectable after a same-socket pageshow health recovery', async ({ page }) => {
+    const readinessCalls = { value: 0 }
+    const ensureCalls = { value: 0 }
+    const connectionCalls = { value: 0 }
+    const runModeSetCalls: Array<Record<string, unknown>> = []
+    let releaseProbe: (() => void) | undefined
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+    await installMockGateway(page, {
+      connectionCalls,
+      sandboxStatusCalls: readinessCalls,
+      sandboxEnsureCalls: ensureCalls,
+      runModeSetCalls,
+      sandboxStatus: () => MACOS_SANDBOX_STATUS,
+      sandboxCapability: () => MACOS_SANDBOX_CAPABILITY,
+      transportProbe: reply => { releaseProbe = reply },
+    })
+    await openChat(page)
+    await expect.poll(() => readinessCalls.value).toBeGreaterThanOrEqual(1)
+
+    const runModeButton = page.locator('.chat-run-mode-btn')
+    const safeOption = page.getByRole('radio', { name: /^Safe/ })
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    await runModeButton.click()
+    await expect(safeOption).toBeEnabled()
+    await safeOption.click()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--safe/)
+    await expect.poll(() => runModeSetCalls.map(call => call.runMode)).toEqual(['safe'])
+
+    await runModeButton.click()
+    await page.getByRole('radio', { name: /^Full access/i }).click()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    await expect.poll(() => runModeSetCalls.map(call => call.runMode)).toEqual(['safe', 'full'])
+    // The explicit mode writes each trigger their existing readiness reread.
+    // Account for those before measuring the separate automatic wake refresh.
+    await expect.poll(() => readinessCalls.value).toBeGreaterThanOrEqual(3)
+    const readinessBeforeResume = readinessCalls.value
+    const urlBeforeResume = page.url()
+
+    // A BFCache-style pageshow probes the existing socket. Pause its pong so
+    // the UI really observes checking before the same transport recovers.
+    await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pageshow', {
+      persisted: true,
+    })))
+    await expect.poll(() => typeof releaseProbe).toBe('function')
+    await runModeButton.click()
+    await expect(safeOption).toBeDisabled()
+    releaseProbe!()
+
+    await expect.poll(() => readinessCalls.value).toBeGreaterThan(readinessBeforeResume)
+    await expect(safeOption).toBeEnabled()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    expect(runModeSetCalls.map(call => call.runMode)).toEqual(['safe', 'full'])
+    expect(connectionCalls.value).toBe(1)
+    expect(page.url()).toBe(urlBeforeResume)
+    expect(ensureCalls.value).toBe(0)
+    await expect(page.getByTestId('sandbox-setup-confirm')).toHaveCount(0)
+
+    await safeOption.click()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--safe/)
+    await expect.poll(() => runModeSetCalls.map(call => call.runMode))
+      .toEqual(['safe', 'full', 'safe'])
+    expect(ensureCalls.value).toBe(0)
+  })
+
+  test('opening the macOS Safe picker retries an empty readiness response without changing mode', async ({ page }) => {
+    const readinessCalls = { value: 0 }
+    const ensureCalls = { value: 0 }
+    const connectionCalls = { value: 0 }
+    const runModeSetCalls: Array<Record<string, unknown>> = []
+    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
+    await installMockGateway(page, {
+      connectionCalls,
+      sandboxStatusCalls: readinessCalls,
+      sandboxEnsureCalls: ensureCalls,
+      runModeSetCalls,
+      sandboxStatus: () => readinessCalls.value === 1 ? {} : MACOS_SANDBOX_STATUS,
+      sandboxCapability: () => MACOS_SANDBOX_CAPABILITY,
+    })
+    await openChat(page)
+    await expect.poll(() => readinessCalls.value).toBe(1)
+
+    const runModeButton = page.locator('.chat-run-mode-btn')
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    await runModeButton.click()
+    await expect.poll(() => readinessCalls.value).toBe(2)
+    const safeOption = page.getByRole('radio', { name: /^Safe/ })
+    await expect(safeOption).toBeEnabled()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--full/)
+    expect(runModeSetCalls).toHaveLength(0)
+    expect(ensureCalls.value).toBe(0)
+    expect(connectionCalls.value).toBe(1)
+    await expect(page.getByTestId('sandbox-setup-confirm')).toHaveCount(0)
+
+    await runModeButton.click()
+    await expect(safeOption).toHaveCount(0)
+    await runModeButton.click()
+    await expect(safeOption).toBeEnabled()
+    expect(readinessCalls.value).toBe(2)
+    await safeOption.click()
+    await expect(runModeButton).toHaveClass(/chat-run-mode-btn--safe/)
+    await expect.poll(() => runModeSetCalls.map(call => call.runMode)).toEqual(['safe'])
+    expect(ensureCalls.value).toBe(0)
+  })
+
   test('Windows Safe mode requests setup and keeps Full until verification succeeds', async ({ page }) => {
     const statusCalls = { value: 0 }
     const ensureCalls = { value: 0 }
@@ -392,11 +553,13 @@ test.describe('Vue behavior contracts', () => {
         state: 'not_setup',
         platform: 'windows',
         message: 'Windows Sandbox needs setup.',
+        requiresAdmin: true,
       }),
       sandboxEnsure: () => ({
         state: 'setting_up',
         platform: 'windows',
         message: 'Installing Windows Sandbox.',
+        requiresAdmin: true,
       }),
     })
     await openChat(page)

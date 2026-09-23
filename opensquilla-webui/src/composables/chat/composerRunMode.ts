@@ -1,5 +1,15 @@
 import type { SandboxRunMode, SandboxSetupStatusPayload } from '@/types/sandbox'
 
+export function allowedComposerRunModes(
+  allowed: SandboxRunMode[],
+  setupStatus: SandboxSetupStatusPayload | null,
+  setupResolved: boolean,
+): SandboxRunMode[] {
+  return setupResolved && setupStatus?.state === 'ready'
+    ? allowed
+    : allowed.filter(mode => mode !== 'safe')
+}
+
 export function effectiveComposerRunMode(
   preference: SandboxRunMode,
   _setupStatus: SandboxSetupStatusPayload | null,

@@ -63,7 +63,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   async function refresh() {
     if (!active.value) return
     const generation = ++requestGeneration
-    loading.value = status.value === null
+    loading.value = true
     clearPoll()
     try {
       const payload = (await options.sandbox.readiness()).status

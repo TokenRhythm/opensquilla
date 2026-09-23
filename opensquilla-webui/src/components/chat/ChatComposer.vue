@@ -646,6 +646,7 @@ const emit = defineEmits<{
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
+  refreshRunModeAvailability: []
   setSessionRoutingMode: [mode: ModelRoutingMode]
   selectModel: [selection: { model: string; provider: string } | null]
   refreshModels: []
@@ -904,6 +905,7 @@ function toggleRunMode() {
   if (props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
+    emit('refreshRunModeAvailability')
     addMenuOpen.value = false
     modelRoutingOpen.value = false
     moreActionsOpen.value = false

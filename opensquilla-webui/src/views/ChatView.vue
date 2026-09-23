@@ -721,6 +721,7 @@
       @preview-image="previewPendingImage"
       @set-busy-send-mode="busySendMode = $event"
       @set-run-mode="setComposerRunMode"
+      @refresh-run-mode-availability="sandboxReadinessRefresh.refreshOnOpen"
       @set-session-routing-mode="setComposerSessionRoutingMode"
       @select-model="setComposerModel"
       @refresh-models="refreshComposerModels"
@@ -947,9 +948,11 @@ import { useChatSend, type ChatSendOutcome } from '@/composables/chat/useChatSen
 import { useChatSteerDelivery } from '@/composables/chat/useChatSteerDelivery'
 import { chatTaskId, useChatTaskOwnership } from '@/composables/chat/useChatTaskOwnership'
 import {
+  allowedComposerRunModes,
   composerRunModeSelectionAction,
   effectiveComposerRunMode,
 } from '@/composables/chat/composerRunMode'
+import { useSandboxReadinessRefresh } from '@/composables/chat/useSandboxReadinessRefresh'
 import { useSandboxSetupRecovery } from '@/composables/chat/useSandboxSetupRecovery'
 import { useChatStallWatchdog } from '@/composables/chat/useChatStallWatchdog'
 import { useArtifactImageLightbox } from '@/composables/chat/useArtifactImageLightbox'
@@ -1698,6 +1701,11 @@ const sandboxSetupRecovery = useSandboxSetupRecovery({
   runMode: requestedRunMode,
   autoRefresh: false,
 })
+const sandboxReadinessRefresh = useSandboxReadinessRefresh({
+  connectionState: gatewayConnectionState,
+  allowed: optionalSessionRpcAllowed,
+  recovery: sandboxSetupRecovery,
+})
 const {
   status: sandboxSetupStatus,
 } = sandboxSetupRecovery
@@ -1707,19 +1715,11 @@ const runMode = computed<SandboxRunMode>(() => effectiveComposerRunMode(
   activeRunModeLock.value,
   sandboxSetupRecovery.resolved.value,
 ))
-const composerAllowedRunModes = computed<SandboxRunMode[]>(() => {
-  if (!sandboxSetupRecovery.resolved.value) {
-    return allowedRunModes.value.filter((mode) => mode !== 'safe')
-  }
-  const status = sandboxSetupStatus.value
-  if (
-    status === null
-    || status.state !== 'ready'
-  ) {
-    return allowedRunModes.value.filter((mode) => mode !== 'safe')
-  }
-  return allowedRunModes.value
-})
+const composerAllowedRunModes = computed<SandboxRunMode[]>(() => allowedComposerRunModes(
+  allowedRunModes.value,
+  sandboxSetupStatus.value,
+  sandboxSetupRecovery.resolved.value,
+))
 const composerSafeSetupAvailable = computed(() =>
   !sandboxSetupPending.value && sandboxSetupRecovery.canSetup.value)
 const composerSandboxSetupOpen = ref(false)
@@ -1727,7 +1727,7 @@ const composerSandboxSetupOpen = ref(false)
 async function refreshPostBootstrapMetadata() {
   await refreshRunModePreference()
   if (!chatViewDisposed && gatewayAccess.isAvailable) {
-    await sandboxSetupRecovery.refresh()
+    await sandboxReadinessRefresh.refreshAfterBootstrap()
   }
 }
 
