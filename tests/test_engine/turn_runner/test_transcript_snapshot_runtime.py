@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
@@ -319,6 +320,31 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str, hard_overflow: bool,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
+    compaction_clock = SimpleNamespace(now=100.0)
+    active_timeouts: list[asyncio.Timeout] = []
+    summary_cancelled = False
+    if failure == "timeout":
+        # Expire the shared deadline after the paid call starts. Preparation
+        # speed must not turn this into a different, zero-provider-call case.
+        monkeypatch.setattr(
+            "opensquilla.session.compaction.time",
+            SimpleNamespace(monotonic=lambda: compaction_clock.now),
+        )
+
+        @asynccontextmanager
+        async def controlled_timeout(delay: float) -> AsyncIterator[asyncio.Timeout]:
+            assert delay == pytest.approx(1.0)
+            async with asyncio.timeout(None) as timeout:
+                active_timeouts.append(timeout)
+                try:
+                    yield timeout
+                finally:
+                    active_timeouts.pop()
+
+        monkeypatch.setattr(
+            "opensquilla.session.compaction.asyncio",
+            SimpleNamespace(**(vars(asyncio) | {"timeout": controlled_timeout})),
+        )
 
     class Provider(_CountingProvider):
         def __init__(self):
@@ -351,8 +377,16 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
             )
 
         async def summary(self):
+            nonlocal summary_cancelled
             if failure == "timeout":
-                await asyncio.sleep(5)
+                compaction_clock.now += 2.0
+                active_timeouts[-1].reschedule(asyncio.get_running_loop().time())
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    summary_cancelled = True
+                    raise
+                raise AssertionError("expired summary stream must be cancelled")
             yield ProviderText(text="synthetic oversized summary " * 2_000)
             yield ProviderDone(stop_reason="stop", output_tokens=5_000)
 
@@ -392,6 +426,7 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     try:
         events = await _run(runner, key)
         assert provider.summary_calls == (0 if failure == "circuit" else 1)
+        assert summary_cancelled is (failure == "timeout")
         assert provider.main_calls == (0 if hard_overflow else 1)
         assert any(isinstance(event, ErrorEvent) for event in events) is hard_overflow
         if hard_overflow:
