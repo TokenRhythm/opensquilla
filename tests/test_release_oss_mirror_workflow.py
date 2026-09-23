@@ -115,7 +115,8 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 destination = remote_root / option("--bucket") / option("--key")
                 source = remote_root / option("--copy-source").lstrip("/")
                 assert option("--forbid-overwrite") == "true"
-                assert option("--metadata-directive") == "REPLACE"
+                assert option("--metadata-directive") == "COPY"
+                assert "--cache-control" not in args
                 versioning = os.environ.get("FAKE_OSS_VERSIONING_STATUS", "")
                 if destination.exists() and versioning not in ("Enabled", "Suspended"):
                     raise SystemExit(9)
@@ -126,6 +127,8 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
             if args[0] == "cp":
                 source = mapped(args[-2])
                 destination = mapped(args[-1])
+                if ".upload-staging/" in args[-1]:
+                    assert option("--cache-control") == "public,max-age=31536000,immutable"
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
                 if ".upload-staging/" in args[-1] and os.environ.get("FAKE_OSS_CORRUPT_STAGE"):

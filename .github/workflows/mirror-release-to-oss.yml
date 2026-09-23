@@ -367,6 +367,7 @@ jobs:
             local cache_control="${3:-}"
             local content_type="${4:-}"
             local source_path source_size staging_key staging_object exists_status
+            local -a staging_options=()
             local -a options=(
               api
               put-object
@@ -384,11 +385,13 @@ jobs:
               staging_key="${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${name}"
               staging_object="oss://${ALIYUN_OSS_BUCKET}/${staging_key}"
               echo "Uploading multipart staging object: ${name} (${source_size} bytes)"
+              [[ -z "${cache_control}" ]] || staging_options+=(--cache-control "${cache_control}")
+              [[ -z "${content_type}" ]] || staging_options+=(--content-type "${content_type}")
               ossutil cp \
                 --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
                 --parallel 64 --part-size 262144 --bigfile-threshold 8388608 \
                 --read-timeout 30 --retry-times 3 \
-                "${source_path}" "${staging_object}" || return 1
+                "${staging_options[@]}" "${source_path}" "${staging_object}" || return 1
               verify_immutable_asset "${source}" "staging/${name}" "${staging_object}" || return 1
               # Recheck after the potentially long transfer, including for
               # versioned buckets where the server condition is advisory.
@@ -400,14 +403,16 @@ jobs:
                 (( exists_status == 1 )) || return "${exists_status}"
               fi
               options[1]=copy-object
-              options+=(--copy-source "/${ALIYUN_OSS_BUCKET}/${staging_key}" --metadata-directive REPLACE)
+              # copy-object in ossutil 2.3 has no --cache-control flag.
+              # Inherit the cache and content metadata set on the staged upload.
+              options+=(--copy-source "/${ALIYUN_OSS_BUCKET}/${staging_key}" --metadata-directive COPY)
             else
               options+=(--body "file://${source_path}")
             fi
-            if [[ -n "${cache_control}" ]]; then
+            if (( source_size < 8388608 )) && [[ -n "${cache_control}" ]]; then
               options+=(--cache-control "${cache_control}")
             fi
-            if [[ -n "${content_type}" ]]; then
+            if (( source_size < 8388608 )) && [[ -n "${content_type}" ]]; then
               options+=(--content-type "${content_type}")
             fi
             # The server-side forbid-overwrite condition closes the gap between
