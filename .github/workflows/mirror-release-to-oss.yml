@@ -277,18 +277,22 @@ jobs:
               --retry-times 3
               --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
             )
-            if [[ "${source}" == oss://* && ( -n "${cache_control}" || -n "${content_type}" ) ]]; then
-              # Otherwise ossutil copies the source's immutable cache policy
-              # even when a different --cache-control value is supplied.
-              options+=(--metadata-directive REPLACE --copy-props none)
-            fi
             if [[ -n "${cache_control}" ]]; then
               options+=(--cache-control "${cache_control}")
             fi
             if [[ -n "${content_type}" ]]; then
               options+=(--content-type "${content_type}")
             fi
-            ossutil "${options[@]}" "${source}" "${destination}/${name}"
+            ossutil "${options[@]}" "${source}" "${destination}/${name}" || return 1
+            if [[ "${source}" == oss://* && ( -n "${cache_control}" || -n "${content_type}" ) ]]; then
+              # ossutil 2.3 copies source cache headers during a server-side
+              # copy. Apply the moving-object policy with its metadata API.
+              local -a property_options=(set-props --force --metadata-directive update
+                --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}")
+              [[ -z "${cache_control}" ]] || property_options+=(--cache-control "${cache_control}")
+              [[ -z "${content_type}" ]] || property_options+=(--content-type "${content_type}")
+              ossutil "${property_options[@]}" "${destination}/${name}" || return 1
+            fi
           }
           upload_installer_alias() {
             local name="$1"
@@ -706,8 +710,10 @@ jobs:
               fi
             done
             for name in "${latest_aliases[@]}"; do
-              upload_installer_alias "${name}"
+              # Record before copying: metadata update failure must also
+              # restore an alias whose bytes were already replaced.
               promoted_aliases+=("${name}")
+              upload_installer_alias "${name}"
             done
           fi
 

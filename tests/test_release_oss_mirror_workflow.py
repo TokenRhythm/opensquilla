@@ -135,6 +135,14 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                     destination.write_bytes(b"corrupted-staging-object")
                 raise SystemExit(0)
 
+            if args[0] == "set-props":
+                assert mapped(args[-1]).is_file()
+                assert option("--metadata-directive") == "update"
+                assert option("--cache-control") == "no-cache,max-age=0,must-revalidate"
+                if os.environ.get("FAKE_OSS_FAIL_SET_PROPS"):
+                    raise SystemExit(17)
+                raise SystemExit(0)
+
             if args[0] == "ls":
                 object_url = args[-1]
                 destination = mapped(object_url)
@@ -554,9 +562,21 @@ def test_installer_alias_uses_verified_oss_object_without_local_reupload(tmp_pat
         remote_root / "release-bucket/releases/latest" / alias
     ).read_bytes() == source.read_bytes()
     calls = [json.loads(line) for line in call_log.read_text().splitlines()]
-    assert len(calls) == 1
+    assert len(calls) == 2
     assert calls[0][-2] == f"oss://release-bucket/releases/v0.5.0rc4/{original}"
     assert calls[0][calls[0].index("--cache-control") + 1] == "no-cache,max-age=0,must-revalidate"
 
-    assert calls[0][calls[0].index("--metadata-directive") + 1] == "REPLACE"
-    assert calls[0][calls[0].index("--copy-props") + 1] == "none"
+    assert calls[1][0] == "set-props"
+    assert calls[1][calls[1].index("--metadata-directive") + 1] == "update"
+    assert calls[1][calls[1].index("--cache-control") + 1] == "no-cache,max-age=0,must-revalidate"
+
+    env["FAKE_OSS_FAIL_SET_PROPS"] = "1"
+    failed = subprocess.run(
+        [_bash_executable(), script_path.as_posix()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert failed.returncode != 0
