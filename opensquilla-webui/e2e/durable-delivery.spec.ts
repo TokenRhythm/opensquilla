@@ -25,6 +25,7 @@ test.beforeAll(async () => {
         import { TurnCommandError } from ${source('src/modules/turnCommands.ts')};
         import { useChatPendingQueue } from ${source('src/composables/chat/useChatPendingQueue.ts')};
         import { PARKED_PENDING_QUEUE_LIMITS } from ${source('src/utils/chat/parkedPendingQueueCache.ts')};
+        import * as recoveryPagination from ${source('e2e/support/recovery-pagination.ts')};
         import { effectScope, nextTick, ref } from 'vue';
         function createOfflinePendingQueue(initialSessionKey) {
           const scope = effectScope();
@@ -53,7 +54,7 @@ test.beforeAll(async () => {
           };
         }
         window.deliveryFixture = { createPendingInputWal, createDurableDelivery, TurnCommandError,
-          createOfflinePendingQueue, PARKED_PENDING_QUEUE_LIMITS, nextTick };
+          createOfflinePendingQueue, PARKED_PENDING_QUEUE_LIMITS, recoveryPagination, nextTick };
         window.deliveryFixture.wal = createPendingInputWal();
       ` : undefined,
     }],
@@ -99,6 +100,115 @@ function deliveryRecord(id = 'synthetic-delivery') {
     } } },
   }
 }
+
+for (const count of [1_000, 10_000]) {
+  test(`native recovery pagination visits ${count} persistent pending rows linearly after reopening`, async ({ context }) => {
+    const page = await fixturePage(context)
+    const result = await page.evaluate(async count => {
+      const fixture = (window as any).deliveryFixture
+      const ids = Array.from({ length: count }, (_, index) => `pending-${String(index).padStart(6, '0')}`)
+      await fixture.recoveryPagination.seedRecoveryRows(fixture.wal, ids)
+      fixture.wal.close()
+      fixture.wal = fixture.createPendingInputWal()
+      return { expected: ids, measured: await fixture.recoveryPagination.measureRecoveryTraversal(fixture.wal) }
+    }, count)
+    expect(result.measured.ids).toEqual(result.expected)
+    expect(new Set(result.measured.ids).size).toBe(count)
+    expect(result.measured.pageSizes).toHaveLength(Math.ceil(count / 16))
+    expect(result.measured.pageSizes.every((size: number) => size > 0 && size <= 16)).toBe(true)
+    expect(result.measured.cursorCallbacks).toBeLessThanOrEqual(count + 3 * Math.ceil(count / 16))
+    expect(result.measured.seekCalls).toBeGreaterThan(0)
+  })
+}
+
+test('settled history does not amplify a fixed pending recovery page', async ({ context }) => {
+  const page = await fixturePage(context)
+  const result = await page.evaluate(async () => {
+    const fixture = (window as any).deliveryFixture
+    const ids = Array.from({ length: 16 }, (_, index) => `pending-${index}`)
+      .sort((left, right) => indexedDB.cmp(left, right))
+    await fixture.recoveryPagination.seedRecoveryRows(fixture.wal, ids)
+    const before = await fixture.recoveryPagination.measureRecoveryTraversal(fixture.wal)
+    const settled = Array.from({ length: 10_000 }, (_, index) => `${index % 2 ? 'a' : 'z'}-settled-${index}`)
+    await fixture.recoveryPagination.seedRecoveryRows(fixture.wal, ids, settled)
+    const after = await fixture.recoveryPagination.measureRecoveryTraversal(fixture.wal)
+    return { ids, before, after }
+  })
+  expect(result.before.ids).toEqual(result.ids)
+  expect(result.after.ids).toEqual(result.ids)
+  expect(result.after.cursorCallbacks).toBe(result.before.cursorCallbacks)
+})
+
+test('native recovery seek handles absent, removed and settled page boundaries', async ({ context }) => {
+  const page = await fixturePage(context)
+  const results = await page.evaluate(async () => {
+    const fixture = (window as any).deliveryFixture
+    const wal = fixture.wal
+    const ids = ['a', 'c', 'e', 'g', 'i']
+    const outcomes = []
+    for (const mutation of ['delete', 'settle']) {
+      await fixture.recoveryPagination.seedRecoveryRows(wal, ids)
+      const first = await wal.listRecoveryDeliveries(undefined, 2)
+      const boundary = await wal.getDelivery(first.next)
+      await wal.compareAndSwapDelivery(boundary.ownerRequestId, boundary.revision,
+        mutation === 'delete' ? null : { ...boundary, phase: 'not-sent', revision: boundary.revision + 1 })
+      const second = await wal.listRecoveryDeliveries(first.next, 2)
+      const third = await wal.listRecoveryDeliveries(second.next, 2)
+      outcomes.push({ first: first.records.map((r: any) => r.ownerRequestId),
+        second: second.records.map((r: any) => r.ownerRequestId),
+        third: third.records.map((r: any) => r.ownerRequestId), next: third.next })
+    }
+    await fixture.recoveryPagination.seedRecoveryRows(wal, ids)
+    const gaps = []
+    for (const after of ['0', 'd', 'i', 'z']) {
+      const page = await wal.listRecoveryDeliveries(after, 2)
+      gaps.push(page.records.map((r: any) => r.ownerRequestId))
+    }
+    return { outcomes, gaps }
+  })
+  expect(results.outcomes).toEqual(Array(2).fill({ first: ['a', 'c'], second: ['e', 'g'], third: ['i'], next: undefined }))
+  expect(results.gaps).toEqual([['a', 'c'], ['e', 'g'], [], []])
+})
+
+test('recovery pagination sees later inserts and revisits earlier inserts on the next sweep', async ({ context }) => {
+  const page = await fixturePage(context)
+  const result = await page.evaluate(async () => {
+    const fixture = (window as any).deliveryFixture
+    const wal = fixture.wal
+    await fixture.recoveryPagination.seedRecoveryRows(wal, ['a', 'c', 'e', 'g'])
+    const first = await wal.listRecoveryDeliveries(undefined, 2)
+    for (const id of ['b', 'd']) await wal.prepareDelivery(fixture.recoveryPagination.recoveryRecord(id))
+    const tail = await wal.listRecoveryDeliveries(first.next, 16)
+    const nextSweep = await fixture.recoveryPagination.measureRecoveryTraversal(wal)
+    return { first: first.records.map((r: any) => r.ownerRequestId), tail: tail.records.map((r: any) => r.ownerRequestId), nextSweep }
+  })
+  expect(result.first).toEqual(['a', 'c'])
+  expect(result.tail).toEqual(['d', 'e', 'g'])
+  expect(result.nextSweep.ids).toEqual(['a', 'b', 'c', 'd', 'e', 'g'])
+})
+
+test('native recovery pagination preserves empty pages, limit clamps and IndexedDB key order', async ({ context }) => {
+  const page = await fixturePage(context)
+  const results = await page.evaluate(async () => {
+    const fixture = (window as any).deliveryFixture
+    const outcomes = []
+    for (const count of [0, 1, 15, 16, 17, 80]) {
+      const ids = Array.from({ length: count }, (_, index) => `${['a', 'é', '中', '😀'][index % 4]}-${index}`)
+        .sort((left, right) => indexedDB.cmp(left, right))
+      await fixture.recoveryPagination.seedRecoveryRows(fixture.wal, ids)
+      for (const limit of [-1, 0, 1, 15, 16, 17, 64, 65]) {
+        const measured = await fixture.recoveryPagination.measureRecoveryTraversal(fixture.wal, limit)
+        outcomes.push({ count, limit, expected: ids, measured })
+      }
+    }
+    return outcomes
+  })
+  for (const result of results) {
+    expect(result.measured.ids).toEqual(result.expected)
+    expect(result.measured.pageSizes.every((size: number) => size <= Math.max(1, Math.min(result.limit, 64)))).toBe(true)
+    expect(result.measured.pageSizes).toHaveLength(Math.max(1, Math.ceil(result.count / Math.max(1, Math.min(result.limit, 64)))))
+  }
+})
 
 async function installOwner(page: Page, identity = 'synthetic-identity', holdLookup = false) {
   await page.evaluate(({ identity, holdLookup }) => {

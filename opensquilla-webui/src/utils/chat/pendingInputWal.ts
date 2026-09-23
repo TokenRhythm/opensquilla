@@ -707,8 +707,13 @@ class BrowserPendingInputWal implements PendingInputWal {
       request.onsuccess = () => {
         const cursor = request.result
         if (!cursor) { resolve(); return }
-        const id = String(cursor.primaryKey)
-        if (after && id <= after) { cursor.continue(); return }
+        if (after) {
+          const position = this.indexedDb.cmp(cursor.primaryKey, after)
+          // Every page opens the same index range. Seek to its primary-key
+          // boundary instead of reading the entire pending prefix again.
+          if (position < 0) { cursor.continuePrimaryKey('pending', after); return }
+          if (position === 0) { cursor.continue(); return }
+        }
         if (records.length >= Math.max(1, Math.min(limit, 64))) {
           next = records[records.length - 1]?.ownerRequestId
           resolve()
