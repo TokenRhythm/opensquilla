@@ -33,7 +33,7 @@ function positiveInteger(name, fallback) {
   return value
 }
 const counts = (options.get('--counts') || '100').split(',').map(Number)
-if (counts.some(count => !Number.isSafeInteger(count) || count < 1)) throw new Error('--counts must contain positive integers')
+if (counts.some(count => !Number.isSafeInteger(count) || count < 0)) throw new Error('--counts must contain nonnegative integers')
 const rounds = positiveInteger('--rounds', 5)
 const iterations = positiveInteger('--iterations', 20)
 const timeoutMs = positiveInteger('--timeout-ms', 30_000)
