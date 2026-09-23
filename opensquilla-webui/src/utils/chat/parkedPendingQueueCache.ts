@@ -1,4 +1,3 @@
-import { toRaw } from 'vue'
 import type { Attachment, ChatPendingItem } from '@/types/chat'
 
 export const PARKED_PENDING_QUEUE_LIMITS = Object.freeze({
@@ -39,11 +38,17 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
   private readonly committed = new WeakMap<ChatPendingItem, Record<string, unknown>>()
   private readonly ownedUrls = new Set<string>()
   private urlPruneQueued = false
+  private readonly unwrapObject: <T extends object>(value: T) => T
 
   constructor(private readonly options: {
     isPinned: (item: ChatPendingItem) => boolean
     isUrlRetained: (url: string) => boolean
-  }) { super() }
+    /** Return a stable underlying object, never a copy. */
+    unwrapObject?: <T extends object>(value: T) => T
+  }) {
+    super()
+    this.unwrapObject = options.unwrapObject ?? (value => value)
+  }
 
   snapshotForCommit(item: ChatPendingItem): Record<string, unknown> {
     return snapshot(persistentFields(item))
@@ -80,7 +85,7 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
   }
 
   rememberCommitted(item: ChatPendingItem, committed: Record<string, unknown>): void {
-    const key = toRaw(item)
+    const key = this.unwrapObject(item)
     if (same(persistentFields(item), committed)) this.committed.set(key, committed)
     else this.committed.delete(key)
     this.trim()
@@ -88,7 +93,7 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
 
   private canEvict(items: ChatPendingItem[]): boolean {
     return items.every(item => {
-      const saved = this.committed.get(toRaw(item))
+      const saved = this.committed.get(this.unwrapObject(item))
       return Boolean(item.pendingInputId && saved && same(persistentFields(item), saved)
         && !this.options.isPinned(item)
         && item.attachments.every(attachment => (
@@ -104,7 +109,7 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
     const count = (value: unknown): void => {
       if (typeof value === 'string') { payloadBytes += value.length * 2; return }
       if (!value || typeof value !== 'object') { payloadBytes += 8; return }
-      const raw = toRaw(value)
+      const raw = this.unwrapObject(value)
       if (seen.has(raw)) return
       seen.add(raw)
       if (raw instanceof Blob) { blobBytes += raw.size; return }

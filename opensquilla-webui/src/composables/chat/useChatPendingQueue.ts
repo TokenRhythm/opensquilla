@@ -177,6 +177,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
   const parkedQueues: ParkedPendingQueueCache = new ParkedPendingQueueCache({
+    unwrapObject: toRaw,
     isPinned: item => Boolean(item.hiddenControl || item.steerAttempt || item.deliveryState
       || item.ownerRequestId || item.pendingPersistenceState === 'cancelling' || (item.pendingInputId && (
         locallyCreatingIds.has(item.pendingInputId) || stagingOperations.has(item.pendingInputId)

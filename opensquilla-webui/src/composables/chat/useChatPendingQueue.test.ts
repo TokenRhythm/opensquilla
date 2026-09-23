@@ -1,4 +1,4 @@
-import { nextTick, ref } from 'vue'
+import { nextTick, reactive, ref, toRaw } from 'vue'
 import { describe, expect, it, vi } from 'vitest'
 
 import {
@@ -11,6 +11,7 @@ import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
 import type { Attachment, ChatPendingItem, HiddenControlDispatchResult } from '@/types/chat'
+import { ParkedPendingQueueCache } from '@/utils/chat/parkedPendingQueueCache'
 import {
   createPendingInputWal,
   type PendingInputWal,
@@ -213,6 +214,37 @@ function memoryWal(initial: PendingInputWalRecord[] = []) {
   }
   return { records, handoffs, wal }
 }
+
+describe('parked queue Vue boundary', () => {
+  const cache = () => new ParkedPendingQueueCache({
+    unwrapObject: toRaw, isPinned: () => false, isUrlRetained: () => false,
+  })
+
+  it.each([false, true])('preserves commit identity across raw/proxy boundaries (commit proxy=%s)', commitProxy => {
+    const target = cache()
+    const raw: ChatPendingItem = { pendingUiId: 'proxy-draft', pendingInputId: 'proxy-draft',
+      text: 'x'.repeat(9 * 1024 * 1024), intent: null, attachments: [] }
+    const proxy = reactive(raw)
+    const committed = commitProxy ? proxy : raw
+    target.rememberCommitted(committed, target.snapshotForCommit(committed))
+    target.set('synthetic-session', [commitProxy ? raw : proxy])
+    expect(target.size).toBe(0)
+  })
+
+  it('counts nested raw/proxy aliases and their shared Blob once per session', () => {
+    const attachment: Attachment = { kind: 'staged', local_id: 1, name: 'synthetic.txt', mime: 'text/plain',
+      file: new File(['synthetic bytes'], 'synthetic.txt') }
+    const raw: ChatPendingItem = { pendingUiId: 'shared-blob', text: 'draft', intent: null,
+      attachments: [attachment, attachment] }
+    const plain = cache()
+    plain.set('synthetic-session', [raw, raw])
+    const mixed = cache()
+    mixed.set('synthetic-session', [raw, reactive(raw)])
+    expect(mixed.usage()).toEqual(plain.usage())
+    expect(mixed.usage().blobBytes).toBe(attachment.file!.size)
+    expect(toRaw(mixed.get('synthetic-session')![1]!)).toBe(raw)
+  })
+})
 
 it('bounds 500 parked sessions and restores an evicted draft with its original WAL identities', async () => {
   const { wal, records } = memoryWal()

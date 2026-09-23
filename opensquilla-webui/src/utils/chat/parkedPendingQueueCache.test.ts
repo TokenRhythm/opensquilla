@@ -90,6 +90,35 @@ describe('durable parked queue resource budget', () => {
     expect(target.usage().protectedSessions).toBe(3)
   })
 
+  it('does not transfer a committed marker to a replacement with the same pending id', () => {
+    const target = cache()
+    const original = item('same-id', 'x'.repeat(9 * 1024 * 1024))
+    target.rememberCommitted(original, target.snapshotForCommit(original))
+    const replacement = { ...original }
+    target.set('same-id', [replacement])
+    expect(target.get('same-id')?.[0]).toBe(replacement)
+    expect(target.usage().protectedSessions).toBe(1)
+    target.rememberCommitted(replacement, target.snapshotForCommit(replacement))
+    expect(target.size).toBe(0)
+  })
+
+  it('retains an edit made during a WAL write until the edited snapshot commits', async () => {
+    const target = cache()
+    const draft = item('in-flight', 'original')
+    const snapshot = target.snapshotForCommit(draft)
+    let finishWrite!: () => void
+    const write = new Promise<void>(resolve => { finishWrite = resolve })
+      .then(() => target.rememberCommitted(draft, snapshot))
+    target.set('in-flight', [draft])
+    draft.text = 'edited'.repeat(2 * 1024 * 1024)
+    finishWrite()
+    await write
+    expect(target.get('in-flight')?.[0]).toBe(draft)
+    expect(target.usage().protectedSessions).toBe(1)
+    target.rememberCommitted(draft, target.snapshotForCommit(draft))
+    expect(target.size).toBe(0)
+  })
+
   it('rebuilds persisted object URLs and releases unused hydration handles and owned handles on disposal', async () => {
     const create = vi.spyOn(URL, 'createObjectURL').mockReturnValueOnce('blob:restored').mockReturnValueOnce('blob:unused')
     const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
