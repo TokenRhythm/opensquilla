@@ -37,6 +37,7 @@ function persistentFields(item: ChatPendingItem): Record<string, unknown> {
 export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
   private readonly committed = new WeakMap<ChatPendingItem, Record<string, unknown>>()
   private readonly ownedUrls = new Set<string>()
+  private readonly retiredUrls = new Set<string>()
   private urlPruneQueued = false
   private readonly unwrapObject: <T extends object>(value: T) => T
 
@@ -68,17 +69,25 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
 
   private releaseUrl(url: string): void {
     this.ownedUrls.delete(url)
+    this.retiredUrls.delete(url)
     try { URL.revokeObjectURL(url) } catch {}
   }
 
-  private pruneUrlsAfterMutation(): void {
+  private pruneUrlsAfterMutation(items: ChatPendingItem[] = []): void {
+    for (const item of items) {
+      for (const attachment of item.attachments) {
+        if (attachment.dataUrl?.startsWith('blob:')) this.retiredUrls.add(attachment.dataUrl)
+      }
+    }
     if (this.urlPruneQueued) return
     this.urlPruneQueued = true
     // Hydration/handoff builds records before installing them in an array.
     // Prune after that synchronous mutation, including unused reconciliation rows.
     queueMicrotask(() => {
       this.urlPruneQueued = false
-      for (const url of this.ownedUrls) {
+      const candidates = new Set([...this.ownedUrls, ...this.retiredUrls])
+      this.retiredUrls.clear()
+      for (const url of candidates) {
         if (!this.options.isUrlRetained(url)) this.releaseUrl(url)
       }
     })
@@ -153,10 +162,21 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
 
   override set(sessionKey: string, items: ChatPendingItem[]): this {
     // Parking or updating a queue makes it the most recently retained session.
-    super.delete(sessionKey)
+    this.delete(sessionKey)
     super.set(sessionKey, items)
     this.trim()
     return this
+  }
+
+  override delete(sessionKey: string): boolean {
+    const items = super.get(sessionKey)
+    const deleted = super.delete(sessionKey)
+    if (items) this.pruneUrlsAfterMutation(items)
+    return deleted
+  }
+
+  override clear(): void {
+    for (const sessionKey of this.keys()) this.delete(sessionKey)
   }
 
   trim(): void {
@@ -172,17 +192,10 @@ export class ParkedPendingQueueCache extends Map<string, ChatPendingItem[]> {
         && blobBytes <= PARKED_PENDING_QUEUE_LIMITS.blobBytes) return
       // Memory budgets never authorize dropping a draft or an in-flight owner.
       if (entry.protected) continue
-      super.delete(entry.sessionKey)
+      this.delete(entry.sessionKey)
       sessions--
       payloadBytes -= entry.payloadBytes
       blobBytes -= entry.blobBytes
-      const urls = new Set(entry.items.map(item => item.attachments).flat()
-        .map(attachment => attachment.dataUrl).filter((url): url is string => Boolean(url?.startsWith('blob:'))))
-      for (const url of urls) {
-        if (!this.options.isUrlRetained(url)) {
-          this.releaseUrl(url)
-        }
-      }
     }
   }
 

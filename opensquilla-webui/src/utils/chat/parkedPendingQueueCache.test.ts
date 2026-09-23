@@ -52,7 +52,7 @@ describe('durable parked queue resource budget', () => {
     expect(target.has('large')).toBe(false)
   })
 
-  it('releases Blob handles only after commit and preserves shared active handles', () => {
+  it('releases Blob handles only after commit and preserves shared active handles', async () => {
     const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
     try {
       const target = cache()
@@ -66,10 +66,12 @@ describe('durable parked queue resource budget', () => {
       expect(revoke).not.toHaveBeenCalled()
       target.rememberCommitted(draft, target.snapshotForCommit(draft))
       expect(target.usage().blobBytes).toBe(0)
+      await Promise.resolve()
       expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:synthetic-attachment')
       const shared = cache(() => false, url => url === 'blob:synthetic-attachment')
       park(shared, draft)
       expect(shared.size).toBe(0)
+      await Promise.resolve()
       expect(revoke).toHaveBeenCalledTimes(1)
     } finally { revoke.mockRestore() }
   })
@@ -100,6 +102,39 @@ describe('durable parked queue resource budget', () => {
     expect(target.usage().protectedSessions).toBe(1)
     target.rememberCommitted(replacement, target.snapshotForCommit(replacement))
     expect(target.size).toBe(0)
+  })
+
+  it.each(['delete', 'clear'] as const)('releases unretained URLs after %s without revoking a synchronous transfer', async mutation => {
+    const create = vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:restored-for-transfer')
+    const revoke = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+    const activeUrls = new Set<string>()
+    const target: ParkedPendingQueueCache = new ParkedPendingQueueCache({
+      isPinned: () => false,
+      isUrlRetained: url => activeUrls.has(url) || [...target.values()].some(items => (
+        items.some(value => value.attachments.some(attachment => attachment.dataUrl === url))
+      )),
+    })
+    try {
+      const draft = item('transfer')
+      draft.attachments = [target.restoreAttachment({ kind: 'staged', local_id: 1,
+        name: 'synthetic.txt', mime: 'text/plain', dataUrl: 'blob:old-renderer',
+        file: new File(['synthetic'], 'synthetic.txt') })]
+      park(target, draft)
+      await Promise.resolve()
+      if (mutation === 'delete') target.delete('transfer')
+      else target.clear()
+      expect(revoke).not.toHaveBeenCalled()
+      activeUrls.add('blob:restored-for-transfer')
+      await Promise.resolve()
+      expect(revoke).not.toHaveBeenCalled()
+      activeUrls.clear()
+      target.set('transfer', [draft])
+      await Promise.resolve()
+      if (mutation === 'delete') target.delete('transfer')
+      else target.clear()
+      await Promise.resolve()
+      expect(revoke).toHaveBeenCalledExactlyOnceWith('blob:restored-for-transfer')
+    } finally { target.dispose(); create.mockRestore(); revoke.mockRestore() }
   })
 
   it('retains an edit made during a WAL write until the edited snapshot commits', async () => {

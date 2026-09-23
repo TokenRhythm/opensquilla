@@ -1527,7 +1527,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return []
     })
     pendingQueue.value = updateOwned(pendingQueue.value)
-    for (const [sessionKey, items] of parkedQueues) {
+    // Updating the LRU cache reinserts keys; a live Map iterator would revisit them.
+    for (const [sessionKey, items] of [...parkedQueues]) {
       const retained = updateOwned(items)
       if (retained.length > 0) parkedQueues.set(sessionKey, retained)
       else parkedQueues.delete(sessionKey)
