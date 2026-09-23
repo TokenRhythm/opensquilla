@@ -562,6 +562,10 @@ class GitHubSource(SkillSource):
     def trust_level(self) -> str:
         return "community"
 
+    @property
+    def requires_immutable_resolution(self) -> bool:
+        return True
+
     def _headers(self) -> dict[str, str]:
         h: dict[str, str] = {"Accept": "application/vnd.github.v3+json"}
         if self._token:

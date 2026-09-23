@@ -103,6 +103,7 @@ declare global {
     cancelAttachmentSelections?: PlatformFilesApi['cancelAttachmentSelections']
     saveArtifact?: PlatformFilesApi['saveArtifact']
     sourceFileAction?: PlatformFilesApi['sourceFileAction']
+    workspaceFileAction?: PlatformFilesApi['workspaceFileAction']
     chooseProjectDirectory: (
       request?: ProjectDirectoryPickerRequest,
     ) => Promise<{ path: string } | null>

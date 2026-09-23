@@ -266,8 +266,8 @@ opensquilla skills list
 opensquilla skills search pdf
 opensquilla skills search pdf --json --include-diagnostics
 opensquilla skills view pdf-toolkit
-opensquilla skills install <install-reference> --source <clawhub|github>
-opensquilla skills install <install-reference> --source <clawhub|github> \
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github>
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github> \
   --force --risk-confirmation <token>
 opensquilla skills update --install-id <install-id>
 opensquilla skills update --all

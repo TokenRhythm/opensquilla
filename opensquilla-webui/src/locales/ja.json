@@ -51,7 +51,12 @@
     "refresh": "ファイルを再確認",
     "lines": "{total} 行中 {start}–{end} 行",
     "previous": "前の行を表示",
-    "next": "さらに表示"
+    "next": "さらに表示",
+    "search": "ソースを検索",
+    "searchPlaceholder": "テキストを検索…",
+    "noMatches": "一致する行がありません",
+    "jumpToLine": "行へ移動",
+    "copyContents": "ファイル内容をコピー"
   },
   "resourceActions": {
     "more": "ファイル操作", "preview": "アプリ内でプレビュー", "openSource": "既定のアプリで開く",
@@ -293,6 +298,7 @@
       "restoreDefaultMode": "既定のプレビューモードに戻す",
       "defaultModeSaved": "既定のプレビューモードを保存しました。",
       "offlineWebLimits": "制限付きプレビューでは、一部の外部コンテンツや高度な Web 機能を利用できない場合があります。",
+      "pdfViewerUnavailable": "現在の環境ではアプリ内で PDF を表示できません。外部で開くか、ダウンロードしてください。",
       "compatibilityFallback": "この Desktop バージョンでは従来の単一ファイルプレビューのみ利用できます。",
       "upgradeDesktopShort": "Desktop を更新",
       "permissionTitle": "ページの権限を許可しますか？",
@@ -3277,6 +3283,7 @@
       "sourceLabel": "コミュニティスキルのソース",
       "sourceClawHub": "ClawHub カタログ",
       "sourceGitHub": "GitHub リポジトリ",
+      "sourceSkillHub": "SkillHub カタログ",
       "githubReferencesLabel": "GitHub 参照",
       "githubReferencesPlaceholder": "1 行に 1 つの正確な GitHub スキル URL または参照",
       "githubReferencesHint": "1 行に 1 つ入力します。カンマ、セミコロン、空白では参照を区切れません。変更可能なブランチはインストール前に Gateway が解決します。",
@@ -3342,6 +3349,7 @@
       "installGithub": "GitHub URL をインストール",
       "searching": "ClawHub を検索中...",
       "hintBrowse": "ClawHub のスキルを検索して閲覧・インストールします。",
+      "hintBrowseSkillHub": "SkillHub のスキルを検索して閲覧・インストールします。",
       "hintGithub": "直接インストールするには、上に GitHub のスキル URL を貼り付けてください。",
       "colName": "名前",
       "colDescription": "説明",

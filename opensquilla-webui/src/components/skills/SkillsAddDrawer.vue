@@ -53,6 +53,29 @@
                 >{{ sourceAttentionCount('clawhub') }}</span>
               </button>
               <button
+                id="skills-add-tab-skillhub"
+                class="sk-add-source-tab"
+                :class="{ 'is-active': sourceMode === 'skillhub' }"
+                type="button"
+                :aria-pressed="sourceMode === 'skillhub'"
+                @click="sourceMode = 'skillhub'"
+              >
+                <Icon name="download" :size="16" />
+                <span>{{ t('cronSkills.registry.sourceSkillHub') }}</span>
+                <span
+                  v-if="runningSource === 'skillhub' && sourceMode !== 'skillhub'"
+                  class="sk-add-source-status"
+                >
+                  <span class="sk-spinner" aria-hidden="true" />
+                  <span class="sk-add-sr-only">{{ sourceRunningLabel('skillhub') }}</span>
+                </span>
+                <span
+                  v-else-if="sourceAttentionCount('skillhub')"
+                  class="sk-add-source-failures"
+                  :aria-label="sourceAttentionLabel('skillhub')"
+                >{{ sourceAttentionCount('skillhub') }}</span>
+              </button>
+              <button
                 id="skills-add-tab-github"
                 class="sk-add-source-tab"
                 :class="{ 'is-active': sourceMode === 'github' }"
@@ -286,24 +309,24 @@
             </section>
 
             <section
-              v-if="sourceMode === 'clawhub'"
-              id="skills-add-panel-clawhub"
+              v-if="sourceMode === 'clawhub' || sourceMode === 'skillhub'"
+              :id="`skills-add-panel-${sourceMode}`"
               class="sk-add-source-panel"
             >
-              <label class="sk-add-field-label" for="skills-add-clawhub-query">
-                {{ t('cronSkills.registry.searchLabel') }}
+              <label class="sk-add-field-label" :for="registryQueryInputId">
+                {{ registrySearchLabel }}
               </label>
               <div class="sk-add-search-row">
                 <div class="sk-add-input-wrap">
                   <Icon name="search" :size="16" />
                   <input
-                    id="skills-add-clawhub-query"
+                    :id="registryQueryInputId"
                     :value="registryQuery"
                     type="search"
                     autocomplete="off"
                     :placeholder="t('cronSkills.registry.searchPlaceholder')"
                     @input="emit('update:registryQuery', ($event.target as HTMLInputElement).value)"
-                    @keydown.enter="emit('search')"
+                    @keydown.enter="emit('search', sourceMode)"
                   />
                 </div>
                 <button
@@ -311,7 +334,7 @@
                   type="button"
                   :disabled="loading || !registryQuery.trim()"
                   :aria-busy="loading"
-                  @click="emit('search')"
+                  @click="emit('search', sourceMode)"
                 >
                   {{ loading ? t('cronSkills.registry.searchingShort') : t('cronSkills.registry.search') }}
                 </button>
@@ -340,55 +363,120 @@
                 <span class="sk-spinner" aria-hidden="true" />
                 <span>{{ t('cronSkills.registry.searching') }}</span>
               </div>
-              <div v-else-if="results.length" class="sk-add-results">
-                <article
-                  v-for="row in resultRows"
-                  :key="row.operationKey"
-                  class="sk-add-result"
-                  :data-status="row.queueStatus || undefined"
+              <div v-else-if="resultRows.length" class="sk-add-results-layout">
+                <TransitionGroup
+                  name="sk-add-result"
+                  tag="div"
+                  class="sk-add-results"
+                  role="list"
+                  :aria-label="registrySearchLabel"
                 >
-                  <div class="sk-add-result__body">
-                    <strong :title="row.name">{{ row.name }}</strong>
-                    <p v-if="row.description" :title="row.description">{{ row.description }}</p>
-                    <div class="sk-add-result__meta">
-                      <span v-if="row.author">{{ row.author }}</span>
-                      <span v-if="row.version">{{ row.version }}</span>
-                      <span>{{ row.source }}</span>
-                      <span>{{ row.trustLevel }}</span>
-                      <span v-if="row.operationLabel" :data-tone="row.operationTone">
-                        {{ row.operationLabel }}
-                      </span>
-                      <span v-if="row.lifecycleLabel" :data-tone="row.lifecycleTone">
-                        {{ row.lifecycleLabel }}
-                      </span>
-                      <span v-if="row.diagnosticCount" data-tone="danger">
-                        {{ t('cronSkills.registry.diagnostics', { count: row.diagnosticCount }) }}
-                      </span>
-                    </div>
-                  </div>
-                  <button
-                    class="btn btn--sm"
-                    :class="[
-                      row.installed || row.queueStatus === 'failed' || row.queueStatus === 'unknown'
-                        ? 'btn--ghost'
-                        : 'btn--primary',
-                    ]"
-                    type="button"
-                    :disabled="resultActionDisabled(row)"
-                    :aria-busy="row.queueStatus === 'installing'"
-                    :aria-controls="row.queueStatus === 'failed' || row.queueStatus === 'unknown'
-                      ? queueItemDomId(row.operationKey)
-                      : undefined"
-                    @click="handleResultAction(row)"
+                  <article
+                    v-for="row in resultRows"
+                    :key="row.operationKey"
+                    class="sk-add-result"
+                    :class="{ 'is-selected': selectedResult?.operationKey === row.operationKey }"
+                    :data-status="row.queueStatus || undefined"
+                    :data-selected="selectedResult?.operationKey === row.operationKey || undefined"
+                    :aria-current="selectedResult?.operationKey === row.operationKey ? 'true' : undefined"
+                    role="listitem"
+                    tabindex="0"
+                    @click="selectResult(row)"
+                    @keydown.enter.self.prevent="selectResult(row)"
+                    @keydown.space.self.prevent="selectResult(row)"
                   >
-                    <Icon v-if="row.installed" name="chevronRight" :size="14" />
-                    <span>{{ resultActionLabel(row) }}</span>
-                  </button>
-                </article>
+                    <div class="sk-add-result__body">
+                      <strong :title="row.name">{{ row.name }}</strong>
+                      <p v-if="row.description" :title="row.description">{{ row.description }}</p>
+                      <div class="sk-add-result__meta">
+                        <span v-if="row.author">{{ row.author }}</span>
+                        <span v-if="row.version">{{ row.version }}</span>
+                        <span>{{ row.source }}</span>
+                        <span>{{ row.trustLevel }}</span>
+                        <span v-if="row.license">{{ row.license }}</span>
+                        <span v-if="row.originSource">{{ row.originSource }}</span>
+                        <span v-if="row.signatureStatus">{{ row.signatureStatus }}</span>
+                        <span v-if="row.operationLabel" :data-tone="row.operationTone">
+                          {{ row.operationLabel }}
+                        </span>
+                        <span v-if="row.lifecycleLabel" :data-tone="row.lifecycleTone">
+                          {{ row.lifecycleLabel }}
+                        </span>
+                        <span v-if="row.diagnosticCount" data-tone="danger">
+                          {{ t('cronSkills.registry.diagnostics', { count: row.diagnosticCount }) }}
+                        </span>
+                      </div>
+                    </div>
+                    <button
+                      class="btn btn--sm"
+                      :class="[
+                        row.installed || row.queueStatus === 'failed' || row.queueStatus === 'unknown'
+                          ? 'btn--ghost'
+                          : 'btn--primary',
+                      ]"
+                      type="button"
+                      :disabled="resultActionDisabled(row)"
+                      :aria-busy="row.queueStatus === 'installing'"
+                      :aria-controls="row.queueStatus === 'failed' || row.queueStatus === 'unknown'
+                        ? queueItemDomId(row.operationKey)
+                        : undefined"
+                      @click.stop="handleResultAction(row)"
+                    >
+                      <Icon v-if="row.installed" name="chevronRight" :size="14" />
+                      <span>{{ resultActionLabel(row) }}</span>
+                    </button>
+                  </article>
+                </TransitionGroup>
+
+                <Transition name="sk-add-preview" mode="out-in">
+                  <aside
+                    v-if="selectedResult"
+                    :key="selectedResult.operationKey"
+                    class="sk-add-preview"
+                    aria-live="polite"
+                    :aria-label="selectedResult.name"
+                  >
+                    <div class="sk-add-preview__head">
+                      <div class="sk-add-preview__eyebrow">
+                        <span>{{ selectedResult.source }}</span>
+                        <span v-if="selectedResult.trustLevel">{{ selectedResult.trustLevel }}</span>
+                      </div>
+                      <h3>{{ selectedResult.name }}</h3>
+                      <p v-if="selectedResult.description">{{ selectedResult.description }}</p>
+                    </div>
+                    <div class="sk-add-preview__meta">
+                      <span v-if="selectedResult.author">{{ selectedResult.author }}</span>
+                      <span v-if="selectedResult.version">{{ selectedResult.version }}</span>
+                      <span v-if="selectedResult.license">{{ selectedResult.license }}</span>
+                      <span v-if="selectedResult.originSource">{{ selectedResult.originSource }}</span>
+                      <span v-if="selectedResult.signatureStatus">{{ selectedResult.signatureStatus }}</span>
+                    </div>
+                    <div class="sk-add-preview__footer">
+                      <span v-if="selectedResult.lifecycleLabel" class="sk-add-lifecycle" :data-tone="selectedResult.lifecycleTone">
+                        {{ selectedResult.lifecycleLabel }}
+                      </span>
+                      <button
+                        class="btn"
+                        :class="selectedResult.installed || selectedResult.queueStatus === 'failed' || selectedResult.queueStatus === 'unknown'
+                          ? 'btn--ghost'
+                          : 'btn--primary'"
+                        type="button"
+                        :disabled="resultActionDisabled(selectedResult)"
+                        :aria-busy="selectedResult.queueStatus === 'installing'"
+                        @click="handleResultAction(selectedResult)"
+                      >
+                        <Icon v-if="selectedResult.installed" name="chevronRight" :size="14" />
+                        <span>{{ resultActionLabel(selectedResult) }}</span>
+                      </button>
+                    </div>
+                  </aside>
+                </Transition>
               </div>
               <div v-else class="sk-add-empty">
                 <Icon name="skills" :size="30" />
-                <span>{{ t('cronSkills.registry.hintBrowse') }}</span>
+                <span>{{ sourceMode === 'skillhub'
+                  ? t('cronSkills.registry.hintBrowseSkillHub')
+                  : t('cronSkills.registry.hintBrowse') }}</span>
               </div>
             </section>
 
@@ -436,7 +524,8 @@ const emit = defineEmits<{
   close: []
   'update:registryQuery': [value: string]
   'update:githubUrl': [value: string]
-  search: []
+  search: [source?: SkillInstallSource]
+  sourceChange: [source: SkillInstallSource]
   installGithub: []
   install: [identifier: string, source: string, displayName: string]
   viewDetails: [identifier: string, source: string, displayName: string]
@@ -446,9 +535,11 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
-const sourceMode = ref<'github' | 'clawhub'>('github')
+const sourceMode = ref<SkillInstallSource>('github')
+watch(sourceMode, source => emit('sourceChange', source))
 const activityExpanded = ref<Record<SkillInstallSource, boolean>>({
   clawhub: false,
+  skillhub: false,
   github: false,
 })
 const drawerRef = ref<HTMLElement | null>(null)
@@ -456,6 +547,7 @@ const closeButtonRef = ref<HTMLButtonElement | null>(null)
 const queueRef = ref<HTMLElement | null>(null)
 const focusedQueueId = ref('')
 const diagnosticsOpen = ref<Record<string, boolean>>({})
+const emptyActivity = { items: [], refreshWarning: '', phase: 'terminal' as const }
 useDialogA11y(drawerRef, toRef(props, 'open'), () => emit('close'), {
   initialFocus: closeButtonRef,
 })
@@ -465,10 +557,10 @@ watch([() => props.runningSource, sourceMode], ([running, source]) => {
   void nextTick(() => queueRef.value?.scrollIntoView({ block: 'nearest' }))
 })
 
-for (const source of ['clawhub', 'github'] as const) {
+for (const source of ['clawhub', 'skillhub', 'github'] as const) {
   watch(
     [
-      () => props.activities[source].items.map(item => item.status).join('|'),
+      () => activityForSource(source).items.map(item => item.status).join('|'),
       () => props.runningSource,
     ],
     () => settleActivityExpansion(source),
@@ -477,7 +569,7 @@ for (const source of ['clawhub', 'github'] as const) {
 }
 
 function settleActivityExpansion(source: SkillInstallSource) {
-  const items = props.activities[source].items
+  const items = activityForSource(source).items
   if (props.runningSource === source
     || items.some(item => item.status === 'queued'
       || item.status === 'installing'
@@ -489,7 +581,7 @@ function settleActivityExpansion(source: SkillInstallSource) {
     item.status === 'failed' || item.status === 'unknown' || item.status === 'selection_required')
 }
 
-const currentActivity = computed(() => props.activities[sourceMode.value])
+const currentActivity = computed(() => activityForSource(sourceMode.value))
 const currentItems = computed(() => currentActivity.value.items)
 const currentRefreshWarning = computed(() => currentActivity.value.refreshWarning)
 const currentQueueRunning = computed(() => props.runningSource === sourceMode.value)
@@ -497,7 +589,7 @@ const anyQueueRunning = computed(() => props.runningSource !== null)
 const installControlsBlocked = computed(() => anyQueueRunning.value || Boolean(props.mutationBlocked))
 
 function activityPhase(source: SkillInstallSource) {
-  const activity = props.activities[source]
+  const activity = activityForSource(source)
   if (activity.phase) return activity.phase
   if (props.runningSource !== source) return 'terminal'
   return activity.items.some(item => item.status === 'queued'
@@ -508,6 +600,18 @@ function activityPhase(source: SkillInstallSource) {
 }
 
 const currentActivityPhase = computed(() => activityPhase(sourceMode.value))
+
+const registryQueryInputId = computed(() => `skills-add-${sourceMode.value}-query`)
+
+function sourceLabel(source: SkillInstallSource): string {
+  if (source === 'github') return t('cronSkills.registry.sourceGitHub')
+  if (source === 'skillhub') return t('cronSkills.registry.sourceSkillHub')
+  return t('cronSkills.registry.sourceClawHub')
+}
+
+const registrySearchLabel = computed(() => sourceMode.value === 'skillhub'
+  ? `${t('cronSkills.registry.search')} ${sourceLabel('skillhub')}`
+  : t('cronSkills.registry.searchLabel'))
 
 const githubReferences = computed(() => props.githubUrl
   .split(/\r?\n/)
@@ -594,12 +698,12 @@ const installAnnouncement = computed(() => {
 })
 
 function sourceAttentionCount(source: SkillInstallSource): number {
-  return props.activities[source].items.filter(item =>
+  return activityForSource(source).items.filter(item =>
     item.status === 'failed' || item.status === 'unknown' || item.status === 'selection_required').length
 }
 
 function sourceAttentionLabel(source: SkillInstallSource): string {
-  const items = props.activities[source].items
+  const items = activityForSource(source).items
   const failed = items.filter(item => item.status === 'failed').length
   const unknown = items.filter(item => item.status === 'unknown').length
   return [
@@ -609,18 +713,21 @@ function sourceAttentionLabel(source: SkillInstallSource): string {
 }
 
 function runningItemName(source: SkillInstallSource): string {
-  const activity = props.activities[source]
+  const activity = activityForSource(source)
   return activity.items.find(item => item.status === 'installing')?.displayName
     || activity.items.find(item => item.status === 'cancelling')?.displayName
     || activity.items.find(item => item.status === 'queued')?.displayName
-    || t(`cronSkills.registry.source${source === 'github' ? 'GitHub' : 'ClawHub'}`)
+    || sourceLabel(source)
 }
 
 function activityForSource(source: string) {
-  return props.activities[source === 'github' ? 'github' : 'clawhub']
+  const activitySource = source === 'github' || source === 'skillhub' ? source : 'clawhub'
+  return props.activities[activitySource] || emptyActivity
 }
 
-const resultRows = computed(() => props.results.map((result) => {
+const resultRows = computed(() => props.results
+  .filter(result => (result.source || 'clawhub') === sourceMode.value)
+  .map((result) => {
   const lifecycle = result.lifecycle
   const showLifecycleWithoutInstall = lifecycle
     && (
@@ -662,6 +769,9 @@ const resultRows = computed(() => props.results.map((result) => {
     version: registryDisplayText(result.version || ''),
     source: installSource,
     trustLevel: result.trust_level || t('cronSkills.registry.community'),
+    license: registryDisplayText(result.license || ''),
+    originSource: registryDisplayText(result.origin_source || ''),
+    signatureStatus: registryDisplayText(result.signature_status || ''),
     installed: Boolean(result.installed),
     operationLabel,
     operationTone,
@@ -674,9 +784,31 @@ const resultRows = computed(() => props.results.map((result) => {
     queueStatus: queueItem?.status,
     diagnosticCount,
   }
-}))
+  }))
 
 type ResultRow = (typeof resultRows.value)[number]
+const selectedResultKey = ref('')
+const selectedResult = computed(() => resultRows.value.find(row => row.operationKey === selectedResultKey.value)
+  || resultRows.value[0]
+  || null)
+
+watch(
+  [sourceMode, () => resultRows.value.map(row => row.operationKey).join('|')],
+  () => {
+    if (!resultRows.value.length) {
+      selectedResultKey.value = ''
+      return
+    }
+    if (!resultRows.value.some(row => row.operationKey === selectedResultKey.value)) {
+      selectedResultKey.value = resultRows.value[0].operationKey
+    }
+  },
+  { immediate: true },
+)
+
+function selectResult(row: ResultRow) {
+  selectedResultKey.value = row.operationKey
+}
 
 function resultActionLabel(row: ResultRow): string {
   if (row.queueStatus === 'queued'
@@ -698,8 +830,14 @@ function handleResultAction(row: ResultRow) {
     emit('viewDetails', row.detailInstallId, row.installSource, row.name)
     return
   }
+  if (row.queueStatus === 'cancelled') {
+    emit('retry', row.operationKey, false)
+    return
+  }
   if (row.queueStatus === 'failed' || row.queueStatus === 'unknown') {
-    const source = row.installSource === 'github' ? 'github' : 'clawhub'
+    const source = row.installSource === 'github' || row.installSource === 'skillhub'
+      ? row.installSource
+      : 'clawhub'
     sourceMode.value = source
     activityExpanded.value[source] = true
     focusedQueueId.value = row.operationKey
@@ -813,7 +951,11 @@ function effectiveFromLabel(value: string | undefined): string {
 .sk-add-overlay {
   --sk-add-scrim: color-mix(in srgb, var(--scrim) 45%, transparent);
 
+  align-items: center;
+  display: flex;
   inset: 0;
+  justify-content: center;
+  padding: 24px;
   position: fixed;
   z-index: 1200;
 }
@@ -826,26 +968,27 @@ function effectiveFromLabel(value: string | undefined): string {
 
 .sk-add-drawer {
   background: var(--bg-surface);
-  border-left: 1px solid var(--border);
-  bottom: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
   box-shadow: var(--elev-3);
   color: var(--text);
   display: flex;
   flex-direction: column;
-  max-width: 100vw;
-  position: absolute;
-  right: 0;
-  top: 0;
-  width: 460px;
+  max-height: min(760px, calc(100dvh - 48px));
+  max-width: 1040px;
+  overflow: hidden;
+  position: relative;
+  width: min(100%, 980px);
 }
 
 .sk-add-drawer__head {
   align-items: flex-start;
+  background: var(--bg-surface);
   border-bottom: 1px solid var(--border);
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
-  padding: 24px;
+  padding: 24px 28px 18px;
 }
 
 .sk-add-drawer__head h2 {
@@ -871,7 +1014,7 @@ function effectiveFromLabel(value: string | undefined): string {
   gap: var(--sp-4);
   min-height: 0;
   overflow-y: auto;
-  padding: 20px 24px 32px;
+  padding: 18px 28px 28px;
 }
 
 .sk-add-source-tabs {
@@ -879,10 +1022,10 @@ function effectiveFromLabel(value: string | undefined): string {
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   padding: 3px;
   position: sticky;
-  top: -20px;
+  top: 0;
   z-index: 2;
 }
 
@@ -1061,11 +1204,27 @@ function effectiveFromLabel(value: string | undefined): string {
   text-align: center;
 }
 
+.sk-add-results-layout {
+  align-items: stretch;
+  display: grid;
+  gap: var(--sp-3);
+  grid-template-columns: minmax(0, 1.05fr) minmax(280px, .95fr);
+}
+
 .sk-add-results,
 .sk-add-queue {
   display: flex;
   flex-direction: column;
   gap: var(--sp-2);
+}
+
+.sk-add-results {
+  max-height: min(44dvh, 410px);
+  min-height: 180px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 4px 2px 0;
+  position: relative;
 }
 
 .sk-add-queue {
@@ -1087,10 +1246,49 @@ function effectiveFromLabel(value: string | undefined): string {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
+  cursor: pointer;
   display: flex;
   gap: var(--sp-3);
   justify-content: space-between;
   padding: 12px;
+  transition: border-color var(--dur-fast) var(--ease-standard),
+    box-shadow var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-standard),
+    background var(--dur-fast) var(--ease-standard);
+}
+
+.sk-add-result:hover {
+  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
+  transform: translateY(-1px);
+}
+
+.sk-add-result:focus-visible {
+  box-shadow: var(--focus-ring);
+  outline: 0;
+}
+
+.sk-add-result.is-selected {
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg));
+  border-color: color-mix(in srgb, var(--accent) 62%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent);
+}
+
+.sk-add-result-enter-active,
+.sk-add-result-leave-active,
+.sk-add-result-move {
+  transition: opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-standard);
+}
+
+.sk-add-result-enter-from,
+.sk-add-result-leave-to {
+  opacity: 0;
+  transform: translateY(5px);
+}
+
+.sk-add-result-leave-active {
+  position: absolute;
+  width: calc(100% - 4px);
 }
 
 .sk-add-result__body {
@@ -1128,6 +1326,101 @@ function effectiveFromLabel(value: string | undefined): string {
   display: inline-flex;
   flex: 0 0 auto;
   gap: 5px;
+}
+
+.sk-add-preview {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  display: flex;
+  flex-direction: column;
+  min-height: 280px;
+  padding: 18px;
+}
+
+.sk-add-preview__head {
+  min-width: 0;
+}
+
+.sk-add-preview__eyebrow {
+  align-items: center;
+  color: var(--text-dim);
+  display: flex;
+  flex-wrap: wrap;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  gap: 6px;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.sk-add-preview__eyebrow span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 7px;
+}
+
+.sk-add-preview h3 {
+  font-size: 1.1rem;
+  margin: 12px 0 7px;
+  overflow-wrap: anywhere;
+}
+
+.sk-add-preview__head p {
+  color: var(--text-muted);
+  font-size: var(--fs-sm);
+  line-height: 1.55;
+  margin: 0;
+  max-height: 8.4em;
+  overflow: auto;
+}
+
+.sk-add-preview__meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 18px;
+}
+
+.sk-add-preview__meta span {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  padding: 3px 6px;
+}
+
+.sk-add-preview__meta span[data-tone="warning"] {
+  border-color: color-mix(in srgb, var(--warn) 45%, var(--border));
+  color: var(--warn);
+}
+
+.sk-add-preview__footer {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp-2);
+  justify-content: space-between;
+  margin-top: auto;
+  padding-top: 22px;
+}
+
+.sk-add-preview__footer .btn {
+  justify-content: center;
+  min-width: 136px;
+}
+
+.sk-add-preview-enter-active,
+.sk-add-preview-leave-active {
+  transition: opacity var(--dur-fast) var(--ease-standard),
+    transform var(--dur-fast) var(--ease-standard);
+}
+
+.sk-add-preview-enter-from,
+.sk-add-preview-leave-to {
+  opacity: 0;
+  transform: translateY(4px);
 }
 
 .sk-add-result__meta,
@@ -1350,7 +1643,8 @@ function effectiveFromLabel(value: string | undefined): string {
 
 .sk-add-drawer-enter-active .sk-add-drawer,
 .sk-add-drawer-leave-active .sk-add-drawer {
-  transition: transform var(--dur-base) var(--ease-standard);
+  transition: opacity var(--dur-base) var(--ease-standard),
+    transform var(--dur-base) var(--ease-standard);
 }
 
 .sk-add-drawer-enter-from,
@@ -1360,13 +1654,33 @@ function effectiveFromLabel(value: string | undefined): string {
 
 .sk-add-drawer-enter-from .sk-add-drawer,
 .sk-add-drawer-leave-to .sk-add-drawer {
-  transform: translateX(100%);
+  opacity: 0;
+  transform: translateY(10px) scale(.98);
+}
+
+@media (max-width: 820px) {
+  .sk-add-results-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .sk-add-results {
+    max-height: 32dvh;
+  }
+
+  .sk-add-preview {
+    min-height: 230px;
+  }
 }
 
 @media (max-width: 720px) {
+  .sk-add-overlay {
+    align-items: flex-end;
+    padding: 0;
+  }
+
   .sk-add-drawer {
-    border-left: 0;
-    height: 100dvh;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    max-height: 92dvh;
     width: 100vw;
   }
 
@@ -1376,6 +1690,44 @@ function effectiveFromLabel(value: string | undefined): string {
 
   .sk-add-drawer__body {
     padding: 16px 18px 28px;
+  }
+
+  .sk-add-search-row {
+    grid-template-columns: 1fr;
+  }
+
+  .sk-add-search-row .btn {
+    justify-content: center;
+  }
+
+  .sk-add-result {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .sk-add-result .btn {
+    align-self: stretch;
+    justify-content: center;
+  }
+
+  .sk-add-preview__footer .btn {
+    flex: 1 1 160px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sk-add-drawer-enter-active,
+  .sk-add-drawer-leave-active,
+  .sk-add-drawer-enter-active .sk-add-drawer,
+  .sk-add-drawer-leave-active .sk-add-drawer,
+  .sk-add-result,
+  .sk-add-result-enter-active,
+  .sk-add-result-leave-active,
+  .sk-add-result-move,
+  .sk-add-preview-enter-active,
+  .sk-add-preview-leave-active,
+  .sk-add-activity-toggle svg {
+    transition: none;
   }
 }
 </style>

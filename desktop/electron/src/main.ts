@@ -9,7 +9,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
-import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -1531,7 +1531,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "font-src 'self' opensquilla-app://desktop data:",
       "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
-      "frame-src blob: http: https:",
+      "frame-src blob: data: http: https:",
       "worker-src 'self' opensquilla-app://desktop blob:",
     ].join('; '),
   )
@@ -9539,6 +9539,10 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Electron disables Chromium's built-in PDF plugin by default. The
+      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
+      // keep the renderer sandboxed while enabling that viewer.
+      plugins: true,
     },
   })
   mainWindow = window
@@ -12492,6 +12496,24 @@ ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileAc
         url: snapshot.httpUrl, authToken: snapshot.authToken }
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  })
+})
+ipcMain.handle('desktop:workspace-file:action', async (event, payload: WorkspaceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted workspace file request.')
+  return performWorkspaceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcess ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce : null
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  }).catch(() => {
+    // Native filesystem errors can embed host paths. Only the main process
+    // receives controlled metadata; renderer errors remain path-free.
+    throw new Error('Workspace file action failed')
   })
 })
 // File paths enter this broker only from the native picker or isolated preload's

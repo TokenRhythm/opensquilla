@@ -23,6 +23,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
   sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
+  workspaceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:workspace-file:action', payload),
   chooseAttachments: (request: unknown) => ipcRenderer.invoke('desktop:attachments:choose', request),
   selectAttachmentFile: (request: unknown, file: File) => {
     // Electron validates the actual browser File backing store. Constructed

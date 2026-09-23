@@ -233,6 +233,14 @@ export interface PlatformFilesApi {
     pagePath?: string
     action: 'open' | 'reveal'
   }) => Promise<void>
+  /** Open or reveal a validated file in the current local workspace. */
+  workspaceFileAction?: (payload: {
+    gatewayInstanceId: string
+    sessionKey: string
+    path: string
+    workspaceBinding: string
+    action: 'open' | 'reveal'
+  }) => Promise<{ ok: boolean; message?: string }>
   /** Write the bytes to a temp file and open it with the OS default app. */
   openArtifact?: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
   /** Open the trusted host's native folder picker. Undefined on the web. */

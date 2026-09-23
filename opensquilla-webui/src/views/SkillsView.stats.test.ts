@@ -171,6 +171,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
         registrySearchError: ref(''),
         installingId: ref(null),
         installActivities: ref({
+          skillhub: { items: [], refreshWarning: '' },
           clawhub: { items: [], refreshWarning: '' },
           github: { items: [], refreshWarning: '' },
         }),
@@ -180,6 +181,7 @@ async function mountSkillsView(reloadResult: Record<string, unknown> | Promise<R
         installingDepsId: ref(null),
         uninstallingName: ref(null),
         searchRegistry: vi.fn(async () => {}),
+        resetRegistrySearch: vi.fn(),
         installGithub: vi.fn(async () => {}),
         installSkill: vi.fn(async () => {}),
         retryQueueItem: vi.fn(async () => {}),

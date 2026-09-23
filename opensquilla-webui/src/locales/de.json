@@ -51,7 +51,12 @@
     "refresh": "Datei erneut prüfen",
     "lines": "Zeilen {start}–{end} von {total}",
     "previous": "Vorherige Zeilen anzeigen",
-    "next": "Weitere Zeilen anzeigen"
+    "next": "Weitere Zeilen anzeigen",
+    "search": "Quelltext durchsuchen",
+    "searchPlaceholder": "Text suchen…",
+    "noMatches": "Keine passenden Zeilen",
+    "jumpToLine": "Zu Zeile springen",
+    "copyContents": "Dateiinhalt kopieren"
   },
   "resourceActions": {
     "more": "Dateiaktionen", "preview": "Vorschau in der App", "openSource": "Mit Standard-App öffnen",
@@ -293,6 +298,7 @@
       "restoreDefaultMode": "Standard-Vorschaumodus wiederherstellen",
       "defaultModeSaved": "Standard-Vorschaumodus gespeichert.",
       "offlineWebLimits": "Einige externe Inhalte und erweiterte Webfunktionen sind in der eingeschränkten Vorschau möglicherweise nicht verfügbar.",
+      "pdfViewerUnavailable": "Die aktuelle Umgebung kann PDFs nicht in der App anzeigen. Öffnen Sie die Datei extern oder laden Sie sie herunter.",
       "compatibilityFallback": "Diese Desktop-Version unterstützt nur die ältere Einzeldateivorschau.",
       "upgradeDesktopShort": "Desktop aktualisieren",
       "permissionTitle": "Seitenberechtigung zulassen?",
@@ -3277,6 +3283,7 @@
       "sourceLabel": "Quelle des Community-Skills",
       "sourceClawHub": "ClawHub-Katalog",
       "sourceGitHub": "GitHub-Repository",
+      "sourceSkillHub": "SkillHub-Katalog",
       "githubReferencesLabel": "GitHub-Referenzen",
       "githubReferencesPlaceholder": "Eine exakte GitHub-Skill-URL oder Referenz pro Zeile",
       "githubReferencesHint": "Eine Referenz pro Zeile. Kommas, Semikolons und Leerzeichen trennen keine Referenzen. Veränderliche Branches werden vor der Installation vom Gateway aufgelöst.",
@@ -3342,6 +3349,7 @@
       "installGithub": "GitHub-URL installieren",
       "searching": "ClawHub wird durchsucht...",
       "hintBrowse": "Durchsuchen Sie ClawHub-Fähigkeiten zum Stöbern und Installieren.",
+      "hintBrowseSkillHub": "Durchsuchen Sie SkillHub-Fähigkeiten zum Stöbern und Installieren.",
       "hintGithub": "Fügen Sie oben eine GitHub-Fähigkeits-URL für die direkte Installation ein.",
       "colName": "Name",
       "colDescription": "Beschreibung",

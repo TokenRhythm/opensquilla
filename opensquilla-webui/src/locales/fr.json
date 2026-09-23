@@ -51,7 +51,12 @@
     "refresh": "Vérifier à nouveau",
     "lines": "Lignes {start}–{end} sur {total}",
     "previous": "Afficher les lignes précédentes",
-    "next": "Afficher plus de lignes"
+    "next": "Afficher plus de lignes",
+    "search": "Rechercher dans le code",
+    "searchPlaceholder": "Rechercher du texte…",
+    "noMatches": "Aucune ligne correspondante",
+    "jumpToLine": "Aller à la ligne",
+    "copyContents": "Copier le contenu du fichier"
   },
   "resourceActions": {
     "more": "Actions du fichier", "preview": "Aperçu dans l’application", "openSource": "Ouvrir avec l’application par défaut",
@@ -293,6 +298,7 @@
       "restoreDefaultMode": "Rétablir le mode d’aperçu par défaut",
       "defaultModeSaved": "Mode d’aperçu par défaut enregistré.",
       "offlineWebLimits": "Certains contenus externes et certaines fonctions web avancées peuvent être indisponibles dans l’aperçu restreint.",
+      "pdfViewerUnavailable": "L’environnement actuel ne peut pas afficher les PDF dans l’application. Ouvrez le fichier à l’extérieur ou téléchargez-le.",
       "compatibilityFallback": "Cette version Desktop ne prend en charge que l’ancien aperçu à fichier unique.",
       "upgradeDesktopShort": "Mettre Desktop à jour",
       "permissionTitle": "Autoriser la permission de la page ?",
@@ -3277,6 +3283,7 @@
       "sourceLabel": "Source du Skill communautaire",
       "sourceClawHub": "Catalogue ClawHub",
       "sourceGitHub": "Dépôt GitHub",
+      "sourceSkillHub": "Catalogue SkillHub",
       "githubReferencesLabel": "Références GitHub",
       "githubReferencesPlaceholder": "Une URL ou référence exacte de Skill GitHub par ligne",
       "githubReferencesHint": "Une référence par ligne. Les virgules, points-virgules et espaces ne séparent pas les références. Les branches modifiables sont résolues par le Gateway avant l’installation.",
@@ -3342,6 +3349,7 @@
       "installGithub": "Installer une URL GitHub",
       "searching": "Recherche sur ClawHub...",
       "hintBrowse": "Recherchez des compétences ClawHub pour parcourir et installer.",
+      "hintBrowseSkillHub": "Recherchez des compétences SkillHub pour parcourir et installer.",
       "hintGithub": "Collez une URL de compétence GitHub ci-dessus pour une installation directe.",
       "colName": "Nom",
       "colDescription": "Description",

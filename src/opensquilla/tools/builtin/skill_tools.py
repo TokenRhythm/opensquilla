@@ -319,7 +319,7 @@ def _find_install_spec(skill_name: str, install_id: str) -> SkillInstallSpec:
 def _community_result_to_dict(row: Any, installed: Any) -> dict[str, Any]:
     identifier = getattr(row, "identifier", "") or getattr(row, "name", "")
     name = getattr(row, "name", "")
-    return {
+    result = {
         "name": name,
         "description": getattr(row, "description", ""),
         "version": getattr(row, "version", ""),
@@ -330,6 +330,20 @@ def _community_result_to_dict(row: Any, installed: Any) -> dict[str, Any]:
         "installReference": getattr(row, "canonical_identifier", "") or identifier,
         "installed": is_skill_meta_installed(row, installed),
     }
+    # Keep the legacy tool response shape for sources that do not publish
+    # provenance, while exposing every non-empty field from modern registries.
+    for field in (
+        "license",
+        "homepage",
+        "upstream_url",
+        "origin_source",
+        "signature_status",
+        "content_hash",
+    ):
+        value = getattr(row, field, "")
+        if value:
+            result[field] = value
+    return result
 
 
 async def _run_install_argv(argv: list[str]) -> tuple[int, str, str, bool]:
@@ -628,7 +642,8 @@ def create_skill_tools(
     @tool(
         name="skill_install_community",
         description=(
-            "Install a Community skill from a GitHub URL, ClawHub, or another configured source. "
+            "Install a Community skill from a GitHub URL, ClawHub, SkillHub, or "
+            "another configured source. "
             "Use only when the user clearly asked to install a specific skill identifier "
             "or chose one exact result from skill_search_community. Do not use skill_create "
             "for Community installs. The receipt is authoritative: after success, report it "
@@ -645,7 +660,10 @@ def create_skill_tools(
             },
             "source": {
                 "type": "string",
-                "description": "Optional source id. GitHub URLs infer github; slugs infer clawhub.",
+                "description": (
+                    "Optional source id: clawhub, skillhub, github, or another configured source. "
+                    "GitHub URLs infer github; bare slugs default to clawhub."
+                ),
             },
             "force": {
                 "type": "boolean",
