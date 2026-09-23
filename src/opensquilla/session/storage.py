@@ -10213,28 +10213,38 @@ class SessionStorage:
         if not keys or limit_per_session <= 0:
             return grouped
 
-        for index in range(0, len(keys), _SQLITE_VARIABLE_CHUNK_SIZE):
-            chunk = keys[index : index + _SQLITE_VARIABLE_CHUNK_SIZE]
-            placeholders = ", ".join("?" for _ in chunk)
+        # Reserve one binding for the per-session limit.
+        chunk_size = _SQLITE_VARIABLE_CHUNK_SIZE - 1
+        for index in range(0, len(keys), chunk_size):
+            chunk = keys[index : index + chunk_size]
+            values = ", ".join("(?)" for _ in chunk)
             # Session-list/subagent summaries never inspect task details. Keep
             # durable channel outbox content out of this high-fanout batch read;
             # exact replay still uses get_agent_task(), which selects all fields.
             summary_columns = ", ".join(
-                name for name in AgentTaskRecord.model_fields if name != "details"
+                f"task.{name}" for name in AgentTaskRecord.model_fields if name != "details"
             )
-            sql = (
-                f"SELECT {summary_columns} FROM agent_tasks "
-                f"WHERE session_key IN ({placeholders}) "
-                "ORDER BY session_key ASC, created_at DESC, rowid DESC"
-            )
-            async with self.conn.execute(sql, chunk) as cur:
+            # Bound returned rows before Python deserialization. The existing
+            # session/status index locates each session's candidates; rowid
+            # preserves the existing insertion-order tie-break for equal dates.
+            sql = f"""
+                WITH requested(session_key) AS (VALUES {values})
+                SELECT {summary_columns}
+                FROM requested
+                JOIN agent_tasks AS task ON task.rowid IN (
+                    SELECT rowid FROM agent_tasks
+                    WHERE session_key = requested.session_key
+                    ORDER BY created_at DESC, rowid DESC
+                    LIMIT ?
+                )
+                ORDER BY task.session_key ASC, task.created_at DESC, task.rowid DESC
+            """
+            async with self.conn.execute(sql, [*chunk, limit_per_session]) as cur:
                 rows = await cur.fetchall()
 
             for row in rows:
                 task = AgentTaskRecord(**_deserialize_row(dict(row)))
-                bucket = grouped.setdefault(task.session_key, [])
-                if len(bucket) < limit_per_session:
-                    bucket.append(task)
+                grouped[task.session_key].append(task)
         return grouped
 
     async def mark_abandoned_agent_tasks(
