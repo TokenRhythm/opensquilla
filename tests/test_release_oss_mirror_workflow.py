@@ -116,7 +116,8 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 source = remote_root / option("--copy-source").lstrip("/")
                 assert option("--forbid-overwrite") == "true"
                 assert option("--metadata-directive") == "REPLACE"
-                if destination.exists():
+                versioning = os.environ.get("FAKE_OSS_VERSIONING_STATUS", "")
+                if destination.exists() and versioning not in ("Enabled", "Suspended"):
                     raise SystemExit(9)
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
@@ -484,6 +485,13 @@ def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, mon
         call[:2] == ["api", "put-object"] and "large.bin" in call
         for call in calls
     )
+
+    call_log.write_text("", encoding="utf-8")
+    repeated = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=4)
+    assert repeated.returncode == 0, repeated.stderr
+    repeat_calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+    assert not any(call[:2] == ["api", "copy-object"] for call in repeat_calls)
+    assert not any(call[0] == "cp" and ".upload-staging/" in call[-1] for call in repeat_calls)
 
     # A different writer appearing during the transfer must survive untouched.
     final.unlink()

@@ -52,14 +52,21 @@ the bucket state, lists aliases, copies existing aliases to a short-lived
 backup, uploads versioned assets, aliases, and channel manifests, and removes
 backups and legacy `latest.html`. Do not use a full-access account key.
 
-Keep OSS bucket versioning disabled for this mirror. Before uploading, the
-workflow queries the versioning state through the standard regional OSS
-endpoint and fails closed unless the bucket is unversioned. Version-scoped
-uploads then use the OSS `x-oss-forbid-overwrite` condition so a concurrent
-writer cannot replace an object between the workflow's existence check and
-upload; OSS ignores that condition when bucket versioning is enabled or
-suspended. Moving `latest/` and `channels/` objects retain their explicit
-backup-and-rollback behavior.
+The workflow records the bucket's versioning state without changing it. It
+checks existing version-scoped objects byte-for-byte and refuses changed
+contents. The OSS `x-oss-forbid-overwrite` condition also protects writes on
+unversioned buckets; OSS ignores that condition when versioning is enabled or
+suspended. Release jobs share a concurrency group, and other writers must not
+modify version-scoped release objects. Moving `latest/` and `channels/` objects
+retain their explicit backup-and-rollback behavior.
+
+Large assets use parallel multipart uploads to an attempt-specific temporary
+prefix. The workflow downloads and verifies the staged bytes, rechecks whether
+the final object already exists, and uses a conditional server-side copy to
+commit the versioned object. It verifies that object again before advancing
+channels. Small parts avoid restarting an entire installer transfer on an
+unreliable upload link. Completed staging versions and incomplete multipart
+uploads are cleaned only within the current attempt's temporary prefix.
 
 ## Destination layout
 
