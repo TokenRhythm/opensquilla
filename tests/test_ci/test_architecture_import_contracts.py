@@ -55,6 +55,10 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "migration"),
     ("cli", "observability"),
     ("cli", "onboarding"),
+    # The `opensquilla openai-bridge` subcommand drives the bridge server
+    # through a lazy import; the bridge resolves its gateway token against
+    # the gateway package, never the CLI, so no cycle forms.
+    ("cli", "openai_bridge"),
     ("cli", "persistence"),
     # CLI maintenance commands attach the same typed provider-correlation
     # envelope as the shared turn loop; provider remains a lower-level leaf.
@@ -202,6 +206,9 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("onboarding", "gateway"),
     ("onboarding", "provider"),
     ("onboarding", "search"),
+    # The OpenAI-compatible bridge resolves the gateway auth token from
+    # GatewayConfig (lazy import); gateway never imports the bridge back.
+    ("openai_bridge", "gateway"),
     # Runtime writers acquire the hardened profile-operation lock through a
     # narrow top-level facade. Recovery owns the platform-specific mechanics;
     # lower-level packages must not import the recovery package directly.
