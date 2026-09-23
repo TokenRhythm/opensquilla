@@ -169,8 +169,12 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
         newline="\n",
     )
     fake = fake_bin / "ossutil"
+    # The workflow runs on Linux. Preserve OSS /bucket/key arguments when
+    # Git Bash launches the native Python fake on Windows; local POSIX paths
+    # are handled explicitly by native_path() above.
     fake.write_text(
-        '#!/usr/bin/env bash\nexec "$FAKE_OSS_PYTHON" "$FAKE_OSS_SCRIPT" "$@"\n',
+        '#!/usr/bin/env bash\nexport MSYS2_ARG_CONV_EXCL="*"\n'
+        'exec "$FAKE_OSS_PYTHON" "$FAKE_OSS_SCRIPT" "$@"\n',
         encoding="utf-8",
         newline="\n",
     )
