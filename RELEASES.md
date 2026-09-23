@@ -177,7 +177,7 @@ README install commands must use tag-pinned URLs such as:
 10. Publish the GitHub Release only after maintainer confirmation, then verify
    the OSS mirror workflow has consumed the canonical `TokenRhythm/opensquilla`
    release. Check the versioned OSS objects and the promoted aliases/manifests
-   before running the post-publish GitHub tag URL checks:
+   before running the post-publish tag URL checks:
 
    ```sh
    curl --fail --head --location https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg
