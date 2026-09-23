@@ -506,3 +506,54 @@ def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, mon
     )
     assert raced.returncode != 0
     assert final.read_bytes() == b"concurrent-writer"
+
+
+def test_installer_alias_uses_verified_oss_object_without_local_reupload(tmp_path: Path) -> None:
+    fake_bin, remote_root, call_log = _install_fake_ossutil(tmp_path)
+    channel_assets = tmp_path / "channel-assets"
+    channel_assets.mkdir()
+    alias = "OpenSquilla-mac-arm64.dmg"
+    original = "OpenSquilla-0.5.0-rc4-mac-arm64.dmg"
+    (channel_assets / f"{alias}.source").write_text(original + "\n", encoding="utf-8", newline="\n")
+    source = remote_root / "release-bucket/releases/v0.5.0rc4" / original
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"verified-installer-bytes")
+    # There is intentionally no local installer: promotion must use an OSS copy.
+    env = os.environ.copy()
+    env.update(
+        {
+            "ALIYUN_OSS_BUCKET": "release-bucket",
+            "ALIYUN_OSS_PREFIX_NORMALIZED": "releases",
+            "FAKE_OSS_LOG": str(call_log),
+            "FAKE_OSS_PYTHON": Path(sys.executable).as_posix(),
+            "FAKE_OSS_ROOT": str(remote_root),
+            "FAKE_OSS_SCRIPT": (fake_bin / "ossutil.py").as_posix(),
+            "OSS_ADDRESSING_STYLE_NORMALIZED": "virtual",
+            "TAG": "v0.5.0rc4",
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        }
+    )
+    script = _upload_step_script().split("          download_object()".strip(), 1)[0]
+    script += (
+        '\nlatest_prefix="oss://release-bucket/releases/latest"\n'
+        'moving_cache_control="no-cache,max-age=0,must-revalidate"\n'
+        f'upload_installer_alias "{alias}"\n'
+    )
+    script_path = tmp_path / "promote-alias.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_bash_executable(), script_path.as_posix()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        remote_root / "release-bucket/releases/latest" / alias
+    ).read_bytes() == source.read_bytes()
+    calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+    assert len(calls) == 1
+    assert calls[0][-2] == f"oss://release-bucket/releases/v0.5.0rc4/{original}"
+    assert calls[0][calls[0].index("--cache-control") + 1] == "no-cache,max-age=0,must-revalidate"

@@ -237,6 +237,7 @@ jobs:
               exit 1
             fi
             cp -- "${matches[0]}" "${root}/${alias}"
+            printf '%s\n' "${matches[0]##*/}" > "channel-assets/${alias}.source"
           }
           make_alias "OpenSquilla-*-mac-arm64.dmg" "OpenSquilla-mac-arm64.dmg"
           make_alias "OpenSquilla-*-win-x64.exe" "OpenSquilla-win-x64.exe"
@@ -283,6 +284,15 @@ jobs:
               options+=(--content-type "${content_type}")
             fi
             ossutil "${options[@]}" "${source}" "${destination}/${name}"
+          }
+          upload_installer_alias() {
+            local name="$1"
+            local versioned_name
+            versioned_name="$(cat "channel-assets/${name}.source")" || return 1
+            # Every versioned object was verified before promotion began.
+            # Reuse it inside OSS instead of uploading the same bytes again.
+            upload_asset "${dest_prefix}/${versioned_name}" "${name}" \
+              "${latest_prefix}" "${moving_cache_control}"
           }
           download_object() {
             local object="$1"
@@ -691,9 +701,7 @@ jobs:
               fi
             done
             for name in "${latest_aliases[@]}"; do
-              upload_asset \
-                "release-assets/${name}" "${name}" \
-                "${latest_prefix}" "${moving_cache_control}"
+              upload_installer_alias "${name}"
               promoted_aliases+=("${name}")
             done
           fi
