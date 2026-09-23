@@ -7,10 +7,10 @@ import {
 } from '@/composables/chat/useChatPendingQueue'
 import type { Attachment, ChatMessage } from '@/types/chat'
 import {
-  useChatSend,
   type ChatSendOutcome,
   type UseChatSendOptions as DomainUseChatSendOptions,
 } from './useChatSend'
+import { createChatSendHarness, memoryDeliveryWal } from './chatSendTestHarness'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
@@ -81,7 +81,7 @@ describe('chat send session handoff', () => {
       const pendingSessionIntent = ref<string | null>(null)
       const isStreaming = ref(false)
       const sendCurrentInput = vi.fn()
-      const pendingInputWal = memoryPendingWal()
+      const pendingInputWal = { ...memoryDeliveryWal(), ...memoryPendingWal() }
       const pendingQueue = useChatPendingQueue({
         sessionKey,
         ownerContext,
@@ -186,7 +186,7 @@ describe('chat send session handoff', () => {
       trace.push(`reset:${sessionKey.value}`)
       isStreaming.value = false
     })
-    const pendingInputWal = memoryPendingWal()
+    const pendingInputWal = { ...memoryDeliveryWal(), ...memoryPendingWal() }
     const pendingQueueRuntime = useChatPendingQueue({
       sessionKey,
       ownerContext: pendingQueueOwnerContext,
@@ -291,7 +291,7 @@ describe('chat send session handoff', () => {
       checkpointForUserMessage: stream.checkpointForUserMessage,
       scheduleHistorySync,
     })
-    const send = useChatSend({
+    const { api: send } = createChatSendHarness({
       turnCommands,
       inputText,
       messages,
@@ -339,7 +339,7 @@ describe('chat send session handoff', () => {
     const firstSend = send.onSend()
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
       'chat.send',
-      expect.objectContaining({ sessionKey: parentSessionKey }),
+      expect.objectContaining({ sessionKey: parentSessionKey }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }),
     ))
 
     inputText.value = 'queued follow-up'
@@ -364,7 +364,7 @@ describe('chat send session handoff', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       sessionKey: parentSessionKey,
       forkBeforeMessageId: 'msg-B',
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     expect(trace).toEqual([
       `unsubscribe:${parentSessionKey}`,
       `persist:${childSessionKey}`,

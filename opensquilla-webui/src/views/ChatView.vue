@@ -1251,7 +1251,9 @@ const sessionLifecycle = injectedSessionLifecycle
 const injectedTurnCommands = inject(TURN_COMMANDS_KEY)
 if (!injectedTurnCommands) throw new Error('TurnCommands was not provided')
 const turnCommands: TurnCommands = injectedTurnCommands
-const durableDelivery = inject(DURABLE_DELIVERY_KEY)
+const injectedDurableDelivery = inject(DURABLE_DELIVERY_KEY)
+if (!injectedDurableDelivery) throw new Error('DurableDelivery was not provided')
+const durableDelivery = injectedDurableDelivery
 const injectedApprovalCenter = inject(APPROVAL_CENTER_KEY)
 if (!injectedApprovalCenter) throw new Error('ApprovalCenter was not provided')
 const approvalCenter: ApprovalCenter = injectedApprovalCenter
@@ -3693,7 +3695,6 @@ const chatSend = useChatSend({
   initialRoutingMode,
   initialModel: newTaskModel.initialModel,
   initialProvider: newTaskModel.initialProvider,
-  restoreInitialModel: newTaskModel.restore,
   elevatedMode,
   runMode,
   pendingAttachments,
