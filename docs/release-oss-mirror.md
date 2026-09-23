@@ -66,7 +66,9 @@ the final object already exists, and uses a conditional server-side copy to
 commit the versioned object. It verifies that object again before advancing
 channels. Small parts avoid restarting an entire installer transfer on an
 unreliable upload link. Completed staging versions and incomplete multipart
-uploads are cleaned only within the current attempt's temporary prefix.
+uploads are cleaned only within the current attempt's temporary prefix. Moving
+installer aliases are copied from the verified versioned objects inside OSS,
+without a second upload of the installer bytes.
 
 ## Destination layout
 
