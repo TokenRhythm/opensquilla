@@ -53,8 +53,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Changed
 
 - Default multi-model fusion uses the C5 lineup for OpenRouter and TokenRhythm,
-  with four candidate models and a tool-capable aggregator. Router presets stay
-  aligned with the primary provider while preserving custom configuration.
+  with four candidate models and a tool-capable aggregator.
+- The one-time configuration version 2 migration replaces C0–C3 Router text
+  tiers with the OpenRouter or TokenRhythm primary provider's recommendations,
+  including custom or mixed tiers and configurations with Router disabled.
+  The previous configuration is backed up first; reapply custom tiers after
+  upgrading. Custom edits made after this migration remain intact.
 - New Windows installers are Authenticode signed and support verified installer
   handoff and cached update recovery. Existing releases keep their signing status.
 - Sandboxed channel document authoring uses generic tools and Skills. The
