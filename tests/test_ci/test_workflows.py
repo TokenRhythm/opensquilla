@@ -2439,6 +2439,7 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "auth-connection-recovery.spec.ts",
         "chat-send-lifecycle.spec.ts",
         "chat-send-lifecycle.real.spec.ts",
+        "cross-window-sync.real.spec.ts",
         "composer-paste.spec.ts",
         "ensemble-new-task-legacy-turn.spec.ts",
         "goal-mode.spec.ts",
@@ -2459,6 +2460,35 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
     }
     assert selected_specs == required_specs
     for spec in required_specs:
+        assert (Path("opensquilla-webui/e2e") / spec).is_file()
+
+
+def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
+    job = _workflow("ci.yml")["jobs"]["webui-chat-recovery"]
+    run = next(
+        step
+        for step in job["steps"]
+        if step.get("name") == "Run production-dist long-list virtualization contracts"
+    )
+    assert run["working-directory"] == "opensquilla-webui"
+    assert "if" not in run
+    assert not run.get("continue-on-error")
+    assert "--workers=1" in run["run"]
+    assert "--retries=0" in run["run"]
+    assert "--output=test-results/virtualization" in run["run"]
+    selected_specs = {arg for arg in run["run"].split() if arg.endswith(".spec.ts")}
+    assert selected_specs == {
+        "chat-virtualization.spec.ts",
+        "conversation-minimap.spec.ts",
+        "floating-composer.spec.ts",
+        "virtualized-logs.spec.ts",
+        "long-task-resilience.spec.ts",
+        "native-gateway.spec.ts",
+        "sidebar-drag.spec.ts",
+        "sidebar-hover-geometry.spec.ts",
+        "sidebar-virtualization.spec.ts",
+    }
+    for spec in selected_specs:
         assert (Path("opensquilla-webui/e2e") / spec).is_file()
 
 

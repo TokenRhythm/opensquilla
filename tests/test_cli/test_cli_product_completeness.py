@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from opensquilla.cli import gateway_lifecycle
 from opensquilla.cli.main import app
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 
 runner = CliRunner()
 
@@ -362,6 +363,7 @@ def test_config_set_ensemble_toggle_rejects_custom_foreign_router_without_writes
 
     target = tmp_path / "custom-routing.toml"
     original = '\n'.join([
+        f'config_version = {LATEST_CONFIG_VERSION}',
         '[llm]',
         'provider = "tokenrhythm"',
         '[llm_ensemble]',

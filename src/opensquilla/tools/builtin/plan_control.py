@@ -87,8 +87,10 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
         "markdown": {
             "type": "string",
             "description": (
-                "Complete human-readable plan. Do not use Markdown task-list "
-                "checkboxes as execution state."
+                "Complete human-readable plan, including the requested deliverables "
+                "and acceptance requirements. Methods and step order may adapt during "
+                "implementation without dropping those requirements. Do not use "
+                "Markdown task-list checkboxes as execution state."
             ),
             "minLength": 1,
             "maxLength": MAX_PLAN_MARKDOWN_CHARS,
@@ -342,12 +344,16 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
 @tool(
     name="update_plan",
     description=(
-        "Replace the optional progress list for this task. Use only when a concise "
-        "progress view helps with substantive multi-step work. Skip simple questions "
-        "and single-step tasks. Update only when steps or their status materially "
-        "change; batch related changes instead of updating after every tool call, "
-        "and do not resend an unchanged list. Add, remove, reorder or reopen steps "
-        "as the work changes. This does not enter Plan mode or create a Goal. "
+        "Replace the optional progress list for this task. Use a concise progress "
+        "view for substantive multi-step work, including approved-plan implementation. "
+        "Start the list before substantive implementation, with current work in progress; "
+        "do not defer all reporting until the end. Skip simple questions and single-step "
+        "tasks. Once used, keep it aligned "
+        "with actual work at meaningful milestones and before the final response "
+        "when an update is needed. Batch related changes instead of updating after "
+        "every tool call, and do not resend an unchanged list. Add, remove, reorder "
+        "or reopen steps as the work changes; do not mark unperformed or unverified "
+        "work complete. This does not enter Plan mode or create a Goal. "
         "Progress describes actual work and does not control tool permissions, "
         "execution order or task completion."
     ),

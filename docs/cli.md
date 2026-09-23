@@ -10,7 +10,7 @@ users should launch OpenSquilla from the Start menu or taskbar.
 To install the command-line interface separately from OpenSquilla Desktop:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl"
 ```
 
 Run:
@@ -266,8 +266,8 @@ opensquilla skills list
 opensquilla skills search pdf
 opensquilla skills search pdf --json --include-diagnostics
 opensquilla skills view pdf-toolkit
-opensquilla skills install <install-reference> --source <clawhub|github>
-opensquilla skills install <install-reference> --source <clawhub|github> \
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github>
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github> \
   --force --risk-confirmation <token>
 opensquilla skills update --install-id <install-id>
 opensquilla skills update --all

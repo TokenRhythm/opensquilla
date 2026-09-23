@@ -458,6 +458,67 @@ describe('useChatPlans', () => {
     })
   })
 
+  it('keeps a terminal watermark across an empty bootstrap snapshot', () => {
+    const { api, handlers } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+    })
+    api.subscribe()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('completed', {
+        stateRevision: 6,
+        updatedAt: 306,
+        terminalReason: 'all_steps_completed',
+      }),
+    })
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: null,
+    })
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('running', { stateRevision: 7, updatedAt: 307 }),
+    })
+
+    expect(api.activePlanRun.value).toMatchObject({
+      status: 'completed',
+      stateRevision: 6,
+      terminalReason: 'all_steps_completed',
+    })
+  })
+
+  it('treats an explicit empty active-run snapshot as a replay fence', () => {
+    const { api, handlers } = harness()
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: null,
+    })
+    api.subscribe()
+
+    handlers.get('session.event.plan_run')?.({
+      session_key: SESSION_ONE,
+      plan_run: run('running', { stateRevision: 7 }),
+    })
+    expect(api.activePlanRun.value).toBeNull()
+
+    // A later mutation/bootstrap with a real run reopens the lane for the
+    // current execution; only historical events are fenced.
+    api.applyBootstrap({
+      key: SESSION_ONE,
+      currentPlan: revision(),
+      activePlanRun: run('running', { stateRevision: 8 }),
+    })
+    expect(api.activePlanRun.value).toMatchObject({
+      status: 'running',
+      stateRevision: 8,
+    })
+  })
+
   it('uses the server-disambiguated creation order without inventing UUID order', () => {
     const { api, handlers } = harness()
     api.applyBootstrap({

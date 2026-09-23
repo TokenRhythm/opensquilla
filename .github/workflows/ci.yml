@@ -866,6 +866,7 @@ jobs:
           auth-connection-recovery.spec.ts
           chat-send-lifecycle.spec.ts
           chat-send-lifecycle.real.spec.ts
+          cross-window-sync.real.spec.ts
           composer-paste.spec.ts
           history-hydration.spec.ts
           idle-chat-recovery.spec.ts
@@ -885,6 +886,25 @@ jobs:
           share.spec.ts
           --project=chromium
           --workers=2
+
+      # Keep absolute performance gates isolated from other renderer processes.
+      - name: Run production-dist long-list virtualization contracts
+        working-directory: opensquilla-webui
+        run: >-
+          npm run test:e2e --
+          chat-virtualization.spec.ts
+          conversation-minimap.spec.ts
+          floating-composer.spec.ts
+          virtualized-logs.spec.ts
+          long-task-resilience.spec.ts
+          native-gateway.spec.ts
+          sidebar-drag.spec.ts
+          sidebar-hover-geometry.spec.ts
+          sidebar-virtualization.spec.ts
+          --project=chromium
+          --workers=1
+          --retries=0
+          --output=test-results/virtualization
 
       - name: Upload chat recovery traces
         id: chat-traces
@@ -993,6 +1013,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs

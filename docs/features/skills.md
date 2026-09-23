@@ -60,8 +60,13 @@ Install a managed skill:
 
 ```sh
 opensquilla skills install <clawhub-install-reference> --source clawhub
+opensquilla skills install <skillhub-slug>[@version] --source skillhub
 opensquilla skills install <owner/repo[@ref][:subpath]> --source github
 ```
+
+The default SkillHub endpoint is `https://api.skillhub.cn`. Set
+`SKILLHUB_BASE_URL` for a compatible mirror and `SKILLHUB_API_KEY` when the
+registry requires an API key.
 
 Update one skill or all managed skills:
 
@@ -86,8 +91,12 @@ opensquilla skills uninstall --install-id <install-id>
 ```
 
 OpenSquilla currently supports single-root, instruction-first Community Skills
-from ClawHub and GitHub. A flat package or one wrapper directory is accepted. A
-GitHub branch or tag is resolved to an immutable commit before files are fetched.
+from ClawHub, Tencent SkillHub, and GitHub. A flat package or one wrapper
+directory is accepted. Registry versions and GitHub branches or tags are
+resolved to immutable revisions before files are fetched. SkillHub provenance,
+license, signature, and content-hash metadata is retained when the registry
+publishes it. Missing registry license metadata does not block installation;
+users are responsible for complying with each downloaded Skill's license.
 An install commits content and provenance; it does not install declared runtime
 dependencies.
 

@@ -99,6 +99,44 @@ describe('ChatComposer popovers', () => {
     app.unmount()
   })
 
+  it('requests availability when opening the run-mode menu without selecting a mode', async () => {
+    const refresh = vi.fn(), select = vi.fn()
+    const { app, el } = await mountComposer({
+      runMode: 'full',
+      allowedRunModes: ['full'],
+      onRefreshRunModeAvailability: refresh,
+      onSetRunMode: select,
+    })
+    const trigger = el.querySelector<HTMLButtonElement>('.chat-run-mode-btn')!
+    trigger.click()
+    await nextTick()
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(el.querySelector<HTMLButtonElement>('[role="radio"]')?.disabled).toBe(true)
+    expect(select).not.toHaveBeenCalled()
+
+    trigger.click()
+    await nextTick()
+    expect(refresh).toHaveBeenCalledOnce()
+    trigger.click()
+    await nextTick()
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(select).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('does not request run-mode availability while the task locks the menu', async () => {
+    const refresh = vi.fn()
+    const { app, el } = await mountComposer({
+      runModeLocked: true,
+      onRefreshRunModeAvailability: refresh,
+    })
+    el.querySelector<HTMLButtonElement>('.chat-run-mode-btn')!.click()
+    await nextTick()
+    expect(refresh).not.toHaveBeenCalled()
+    expect(el.querySelector('.composer-run-mode')).toBeNull()
+    app.unmount()
+  })
+
   it('shows a persisted session model without a default badge or new-task selector', async () => {
     const { app, el } = await mountComposer({ modelSelectionAvailable: false, sessionModelName: 'bound-model' })
     expect(el.querySelector('.chat-model-routing-btn__label')?.textContent).toBe('bound-model')

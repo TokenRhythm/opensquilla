@@ -6,7 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.5.5] - 2026-09-23
+
 ### Added
+
+- Tencent SkillHub is available for Community Skill search and installation in
+  the Web UI, CLI, and Agent tools, with clearer source browsing and install results.
+- Persistent task workspaces support local HTML previews, inline file actions,
+  and read-only source previews with search, paging, and local Desktop open/reveal.
+- Model settings expose per-model context and output limits; custom providers
+  support additional request-body fields through TOML configuration.
+- Managed commands support interactive terminal input and background processes;
+  recommended and Desktop installations include platform PTY support.
 
 - The WebUI and Desktop composer can recover unsent attachment drafts across
   reloads, with conversation and account/profile scoping, local storage limits,
@@ -40,6 +51,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   never accepted, and existing CORS response-header behavior is unchanged.
 
 ### Changed
+
+- Default multi-model fusion uses the C5 lineup for OpenRouter and TokenRhythm,
+  with four candidate models and a tool-capable aggregator.
+- The one-time configuration version 2 migration replaces C0–C3 Router text
+  tiers with the OpenRouter or TokenRhythm primary provider's recommendations,
+  including custom or mixed tiers and configurations with Router disabled.
+  The previous configuration is backed up first; reapply custom tiers after
+  upgrading. Custom edits made after this migration remain intact.
+- New Windows installers are Authenticode signed and support verified installer
+  handoff and cached update recovery. Existing releases keep their signing status.
+- Sandboxed channel document authoring uses generic tools and Skills. The
+  format-specific `create_csv`, `create_xlsx`, `create_pptx`, and
+  `create_pdf_report` tools are retired; ordinary channel authoring requires a
+  supported managed sandbox and is unavailable on Windows.
+- Workspace `BOOTSTRAP.md`, `HEARTBEAT.md`, and `TOOLS.md` integration and the
+  legacy memory flush/repair pipelines are retired. Existing user files remain
+  in place; move instructions still needed at runtime into `AGENTS.md`.
+- Source wheel builds require a verified WebUI bundle built with Node.js 22.12+
+  and npm. Published wheels, Desktop installers, and containers include it.
 
 - Removed per-Goal Token budgets and foreground/background execution settings.
   Existing Goal history and usage totals remain readable. Previously paused
@@ -101,6 +131,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Gateway startup, sleep/wake recovery, clean-exit restart, Windows Safe mode,
+  session ownership, and shared storage recovery are more reliable.
+- Cross-window chat state, unsent drafts, attachment lifetime, image history,
+  embedded PDF previews, and tool-result presentation recover more consistently.
+- Context compaction uses the selected model's actual capacity and preserves
+  history when a summary is incomplete. Model reasoning survives tool calls
+  and replay, and MCP stdio accepts large responses.
+- One-shot schedules reject expired times before saving, and concurrent edits
+  retain their intended next run.
+
 - Ordinary task progress now uses the same compact ribbon as Plan execution and
   disappears when the task ends, including after reconnecting or refreshing.
   The optional `update_plan` tool is discovered on demand in ordinary Default
@@ -112,14 +152,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   preventing unanswered questions from starting extra Goal turns. Pending
   questions recover on reconnect, and replies support safe retries and cancellation.
   Ordinary Goal continuations also respect the session's selected model-routing mode.
-- Source clients now report TUI launches and active use through the default
-  local Gateway, and short commands attempt a bounded final V2 upload before
-  exiting. Standalone CLI/TUI V1 installation reporting is enabled and daily
-  counters survive temporary sessions in a dedicated counts-only database;
-  later clients or Gateways can upload completed days. Source Gateway startup
-  results are reported without duplicating Desktop-owned startup events.
-  Existing reporting preferences, queued event identities and historical daily
-  acknowledgements remain in effect.
 - DeepSeek settings now discover official models for the model picker and expose
   refresh, loading, and discovery errors in the provider editor. New configurations
   use `deepseek-flash` with current vision support and peak-rate cost estimates;
@@ -133,14 +165,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   naming model refuses. Known historical refusal titles also use this display
   fallback, including the original message archived by context compaction;
   manual names and stored title data remain unchanged.
-- Restored V1 installation/version reporting and daily conversation/token
-  aggregation and uploads alongside V2 telemetry. Uploads start after Gateway
-  readiness, retain installation state, and honor reporting opt-outs. Daily
-  deduplication now uses a persistent identity per aggregate database so separate
-  profiles do not lose each other's totals. Already acknowledged days remain
-  untouched; pending legacy days adopt the new keys, which can replay an old
-  accepted upload if its acknowledgment was lost before this upgrade.
-  V2 events and the retired provider install-ID header are unchanged.
+- Improved anonymous stability telemetry across Desktop, CLI, and TUI, honoring
+  existing privacy controls.
 - Default Gateway, CLI, decision, trace and safety logs no longer retain
   prompt/conversation previews, tool output or exception payloads. Gateway
   operational logs keep their level prefix and use JSON metadata with event

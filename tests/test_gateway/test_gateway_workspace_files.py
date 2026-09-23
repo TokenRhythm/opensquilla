@@ -34,6 +34,10 @@ async def files(tmp_path):
         session = await manager.create("agent:main:webchat:workspace-files")
         root = Path(session.execution_workspace["root"])
         app = Starlette()
+        app.state.desktop_gateway_ownership = SimpleNamespace(
+            instance_id="fixture-instance",
+            instance_nonce="fixture-instance-nonce",
+        )
         register_artifact_routes(app, config=config, session_manager=manager)
         app.add_middleware(AuthMiddleware, config=config)
         headers = {
@@ -63,6 +67,28 @@ async def resolve(files, paths, **kwargs):
     )
 
 
+async def read_page(files, *, path="source.py", binding=None, start=1, end=200, **kwargs):
+    if binding is None:
+        binding = (await resolve(files, [path])).json()["workspaceBinding"]
+    return await files.client.get(
+        "/api/v1/workspace-files/page",
+        params={"path": path, "workspaceBinding": binding, "startLine": start, "endLine": end},
+        **kwargs,
+    )
+
+
+def metadata_headers(files, *, path: str, binding: str, session_key: str | None = None):
+    key = session_key or files.session.session_key
+    owner = files.app.state.desktop_gateway_ownership
+    return {
+        **files.headers,
+        "x-opensquilla-session-key": key,
+        "x-opensquilla-native-signature": workspace_files._workspace_metadata_signature(
+            owner.instance_id, owner.instance_nonce, key, path, binding
+        ),
+    }
+
+
 async def test_resolve_and_read_unpublished_files_preserves_current_bytes(files):
     contents = {
         "图表.svg": b"<svg><script>alert(1)</script></svg>",
@@ -84,6 +110,8 @@ async def test_resolve_and_read_unpublished_files_preserves_current_bytes(files)
     for entry in entries:
         assert entry["requestedPath"] in requested
         assert entry["size"] == len(contents[entry["name"]])
+        assert entry["textPaging"] is (entry["kind"] == "text")
+        assert entry["nativeActions"] is True
         response = await files.client.get(entry["contentUrl"])
         assert response.status_code == 200, response.text
         assert response.content == contents[entry["name"]]
@@ -94,6 +122,365 @@ async def test_resolve_and_read_unpublished_files_preserves_current_bytes(files)
     (files.root / "empty.txt").write_text("edited after resolve")
     entry = next(item for item in entries if item["requestedPath"] == "empty.txt")
     assert (await files.client.get(entry["contentUrl"])).text == "edited after resolve"
+
+
+async def test_ordinary_gateway_does_not_advertise_native_actions(files):
+    (files.root / "source.py").write_text("pass\n")
+    files.app.state.desktop_gateway_ownership = None
+    entry = (await resolve(files, ["source.py"])).json()["files"][0]
+    assert entry["nativeActions"] is False
+    assert entry["textPaging"] is True
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+async def test_read_page_streams_text_ranges_without_returning_absolute_paths(files, newline):
+    target = files.root / "large.py"
+    target.write_bytes("".join(f"line {index}{newline}" for index in range(1, 451)).encode())
+    resolved = (await resolve(files, ["large.py"])).json()
+    entry = resolved["files"][0]
+    response = await files.client.get(
+        "/api/v1/workspace-files/page",
+        params={
+            "path": entry["path"],
+            "workspaceBinding": resolved["workspaceBinding"],
+            "startLine": 201,
+            "endLine": 400,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == {
+        "relativePath": "large.py",
+        "content": "".join(f"line {index}{newline}" for index in range(201, 401)),
+        "totalLines": 450,
+        "startLine": 201,
+        "endLine": 400,
+    }
+    assert "sourcePath" not in response.json()
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/page",
+            params={
+                "path": "large.py",
+                "workspaceBinding": resolved["workspaceBinding"],
+                "startLine": 1,
+                "endLine": 201,
+            },
+        )
+    ).status_code == 400
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+async def test_read_page_handles_source_larger_than_two_mib(files, newline):
+    line = "text source " + "x" * 64 + newline
+    count = 40_000
+    content = line * count
+    assert len(content) > 2 * 1024 * 1024
+    (files.root / "source.py").write_bytes(content.encode())
+    response = await read_page(files, start=20_001, end=20_200)
+    assert response.status_code == 200, response.text
+    assert response.json()["content"] == line * 200
+    assert response.json()["totalLines"] == count
+    assert len(response.content) < workspace_files.MAX_TEXT_PAGE_BYTES
+
+
+@pytest.mark.parametrize(
+    "content", ["", "a", "a\n", "a\r\nb\rc\n", "a\vb\fc\x1cd\x1de\x1ff\x85g\u2028h\u2029"]
+)
+async def test_page_line_boundaries_match_python_splitlines(files, monkeypatch, content):
+    # Two bytes per read exercises CRLF and multi-byte Unicode boundaries.
+    monkeypatch.setattr(workspace_files, "_READ_CHUNK_BYTES", 2)
+    (files.root / "source.py").write_bytes(content.encode("utf-8"))
+    lines = content.splitlines(keepends=True)
+    response = await read_page(files)
+    assert response.status_code == 200, response.text
+    assert response.json()["content"] == content
+    assert response.json()["totalLines"] == max(1, len(lines))
+    for index, line in enumerate(lines, 1):
+        response = await read_page(files, start=index, end=index)
+        assert response.status_code == 200, response.text
+        assert response.json()["content"] == line
+        assert response.json()["startLine"] == index
+        assert response.json()["endLine"] == index
+
+
+@pytest.mark.parametrize("content", [b"line\ninvalid\xff", b"line\nnul\x00"])
+async def test_page_rejects_invalid_text_even_outside_requested_page(files, content):
+    (files.root / "source.py").write_bytes(content)
+    assert (await read_page(files, start=1, end=1)).status_code == 404
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        b"x" * (workspace_files.MAX_TEXT_LINE_BYTES + 1),
+        (b"x" * (workspace_files.MAX_TEXT_LINE_BYTES - 1) + b"\n") * 5,
+        ("文" * (workspace_files.MAX_TEXT_LINE_BYTES // 3 + 1)).encode(),
+    ],
+    ids=["oversized-line", "oversized-page", "oversized-utf8-line"],
+)
+async def test_page_has_byte_limits_for_lines_and_response(files, content):
+    (files.root / "source.py").write_bytes(content)
+    assert (await read_page(files)).status_code == 404
+
+
+async def test_page_rechecks_session_and_current_binding(files):
+    (files.root / "source.py").write_text("private source\n")
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    assert (await read_page(files, binding="stale")).status_code == 404
+    other = await files.manager.create("agent:main:webchat:page-other")
+    assert (
+        await read_page(
+            files, binding=binding, headers={"x-opensquilla-session-key": other.session_key}
+        )
+    ).status_code == 404
+    await files.storage.upsert_session(
+        files.session.model_copy(update={"epoch": files.session.epoch + 1})
+    )
+    assert (await read_page(files, binding=binding)).status_code == 404
+
+
+async def test_page_discards_result_when_workspace_authority_changes_during_scan(
+    files, monkeypatch
+):
+    (files.root / "source.py").write_text("private source\n")
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    scan = workspace_files._read_file_page
+    loop = asyncio.get_running_loop()
+
+    async def revoke():
+        await files.storage.upsert_session(
+            files.session.model_copy(update={"epoch": files.session.epoch + 1})
+        )
+
+    def racing_scan(*args):
+        result = scan(*args)
+        asyncio.run_coroutine_threadsafe(revoke(), loop).result(timeout=5)
+        return result
+
+    monkeypatch.setattr(workspace_files, "_read_file_page", racing_scan)
+    assert (await read_page(files, binding=binding)).status_code == 404
+
+
+async def test_page_discards_file_changed_during_read_even_with_restored_mtime(files, monkeypatch):
+    target = files.root / "source.py"
+    target.write_text("original\n")
+    before = target.stat()
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    original_fstat = workspace_files.os.fstat
+    calls = 0
+
+    def mutate_before_final_stat(fd):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            target.write_text("mutated!\n")
+            os.utime(target, ns=(before.st_atime_ns, before.st_mtime_ns))
+        return original_fstat(fd)
+
+    monkeypatch.setattr(workspace_files.os, "fstat", mutate_before_final_stat)
+    assert (await read_page(files, binding=binding)).status_code == 404
+
+
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+async def test_page_does_not_follow_file_growth_past_initial_size(files, monkeypatch, newline):
+    target = files.root / "source.py"
+    content = b"original" + newline
+    target.write_bytes(content)
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    original_open = workspace_files.os.fdopen
+    reads = []
+
+    class GrowingStream:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.stream.close()
+
+        def fileno(self):
+            return self.stream.fileno()
+
+        def read(self, size):
+            reads.append(size)
+            with target.open("ab") as writer:
+                writer.write(b"growth\n" * 1000)
+            return self.stream.read(size)
+
+    monkeypatch.setattr(
+        workspace_files.os, "fdopen", lambda *args: GrowingStream(original_open(*args))
+    )
+    assert (await read_page(files, binding=binding)).status_code == 404
+    assert reads == [len(content) + 1]
+
+
+async def test_search_scans_once_and_obeys_text_and_binding_guards(files, monkeypatch):
+    (files.root / "source.py").write_text("before\n" * 500 + "Chosen Match\nlast\n")
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    params = {"path": "source.py", "workspaceBinding": binding, "query": "chosen MATCH"}
+    original = workspace_files._scan_text_file
+    calls = []
+
+    def counted_scan(*args, **kwargs):
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(workspace_files, "_scan_text_file", counted_scan)
+    response = await files.client.get("/api/v1/workspace-files/search", params=params)
+    assert response.status_code == 200, response.text
+    assert response.json() == {"relativePath": "source.py", "totalLines": 502, "matchLine": 501}
+    assert len(calls) == 1
+    for query in ["", " ", "x" * 513, "\x00"]:
+        assert (
+            await files.client.get(
+                "/api/v1/workspace-files/search", params={**params, "query": query}
+            )
+        ).status_code == 400
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/search", params={**params, "workspaceBinding": "stale"}
+        )
+    ).status_code == 404
+    (files.root / "source.py").write_bytes(b"chosen Match\n\xff")
+    assert (
+        await files.client.get("/api/v1/workspace-files/search", params=params)
+    ).status_code == 404
+
+
+async def test_metadata_returns_verified_native_identity_only_for_current_binding(files):
+    target = files.root / "build.py"
+    target.write_text("print('fixture')\n")
+    resolved = (await resolve(files, ["build.py"])).json()
+    entry = resolved["files"][0]
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": entry["path"], "workspaceBinding": resolved["workspaceBinding"]},
+    )
+    assert response.status_code == 403
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": entry["path"], "workspaceBinding": resolved["workspaceBinding"]},
+        headers=metadata_headers(
+            files, path=entry["path"], binding=resolved["workspaceBinding"]
+        ),
+    )
+    assert response.status_code == 200, response.text
+    metadata = response.json()
+    assert metadata["relativePath"] == "build.py"
+    assert metadata["workspaceBinding"] == resolved["workspaceBinding"]
+    assert metadata["sourcePath"] == str(target)
+    assert metadata["workspace"] == str(files.root)
+    assert metadata["size"] == target.stat().st_size
+    identity = target.stat()
+    assert metadata["identity"] == {
+        "dev": str(identity.st_dev & 0xFFFFFFFF if os.name == "nt" else identity.st_dev),
+        "ino": str(identity.st_ino),
+        "size": str(identity.st_size),
+        "mtimeNs": str(identity.st_mtime_ns),
+        "ctimeNs": str(identity.st_ctime_ns),
+    }
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/metadata",
+            params={"path": "build.py", "workspaceBinding": "stale"},
+            headers=metadata_headers(files, path="build.py", binding="stale"),
+        )
+    ).status_code == 404
+    await files.storage.upsert_session(
+        files.session.model_copy(update={"epoch": files.session.epoch + 1})
+    )
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/metadata",
+            params={"path": "build.py", "workspaceBinding": resolved["workspaceBinding"]},
+            headers=metadata_headers(
+                files, path="build.py", binding=resolved["workspaceBinding"]
+            ),
+        )
+    ).status_code == 404
+
+
+def test_windows_native_identity_matches_libuv_volume_serial_without_truncating_inode(monkeypatch):
+    monkeypatch.setattr(workspace_files, "_WINDOWS", True)
+    metadata = SimpleNamespace(
+        st_dev=0x12345678ABCDEF01,
+        st_ino=0x123456789ABCDEF0,
+        st_size=17,
+        st_mtime_ns=1_700_000_001_000_000_000,
+        st_ctime_ns=1_700_000_000_000_000_000,
+    )
+    assert workspace_files._native_file_identity(metadata) == {
+        "dev": str(0xABCDEF01),
+        "ino": str(0x123456789ABCDEF0),
+        "size": "17",
+        "mtimeNs": "1700000001000000000",
+        "ctimeNs": "1700000000000000000",
+    }
+    assert workspace_files._native_identity_supported(metadata)
+    metadata.st_ino = 1 << 80
+    assert not workspace_files._native_identity_supported(metadata)
+
+
+def test_windows_cross_stat_comparison_does_not_confuse_creation_and_change_time(monkeypatch):
+    monkeypatch.setattr(workspace_files, "_WINDOWS", True)
+    metadata = dict(st_dev=1, st_ino=2, st_size=17, st_mtime_ns=200)
+    before = SimpleNamespace(**metadata, st_ctime_ns=100)
+    opened = SimpleNamespace(**metadata, st_ctime_ns=300)
+    assert workspace_files._same_file_snapshot(before, opened)
+    opened.st_size = 18
+    assert not workspace_files._same_file_snapshot(before, opened)
+    opened.st_size = before.st_size
+    monkeypatch.setattr(workspace_files, "_WINDOWS", False)
+    assert not workspace_files._same_file_snapshot(before, opened)
+
+
+async def test_metadata_requires_an_active_desktop_owner(files):
+    target = files.root / "build.py"
+    target.write_text("print('fixture')\n")
+    resolved = (await resolve(files, ["build.py"])).json()
+    headers = metadata_headers(
+        files, path="build.py", binding=resolved["workspaceBinding"]
+    )
+    files.app.state.desktop_gateway_ownership = None
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": "build.py", "workspaceBinding": resolved["workspaceBinding"]},
+        headers=headers,
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("nonce", [None, "", "non-ascii-密钥", 123])
+async def test_invalid_native_owner_cannot_bypass_metadata_signature(files, nonce):
+    (files.root / "source.py").write_text("pass\n")
+    files.app.state.desktop_gateway_ownership.instance_nonce = nonce
+    resolved = (await resolve(files, ["source.py"])).json()
+    assert resolved["files"][0]["nativeActions"] is False
+    response = await files.client.get(
+        "/api/v1/workspace-files/metadata",
+        params={"path": "source.py", "workspaceBinding": resolved["workspaceBinding"]},
+    )
+    assert response.status_code == 403
+
+
+async def test_native_signature_binds_session_path_and_workspace(files):
+    (files.root / "source.py").write_text("pass\n")
+    (files.root / "other.py").write_text("private\n")
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    headers = metadata_headers(files, path="source.py", binding=binding)
+    for path, supplied_binding, session in [
+        ("other.py", binding, files.session.session_key),
+        ("source.py", "other-binding", files.session.session_key),
+        ("source.py", binding, "agent:main:webchat:other"),
+    ]:
+        response = await files.client.get(
+            "/api/v1/workspace-files/metadata",
+            params={"path": path, "workspaceBinding": supplied_binding},
+            headers={**headers, "x-opensquilla-session-key": session},
+        )
+        assert response.status_code == 403
 
 
 @pytest.mark.parametrize(
@@ -132,6 +519,20 @@ async def test_auth_owner_and_origin_guard_apply_to_both_endpoints(files):
     ]:
         assert (await resolve(files, ["report.txt"], headers=headers)).status_code == status
         assert (await files.client.get(entry["contentUrl"], headers=headers)).status_code == status
+        for endpoint, extra in [
+            ("page", {"startLine": 1, "endLine": 1}),
+            ("search", {"query": "p"}),
+        ]:
+            response = await files.client.get(
+                f"/api/v1/workspace-files/{endpoint}",
+                params={
+                    "path": entry["path"],
+                    "workspaceBinding": entry["contentUrl"].split("workspaceBinding=", 1)[1],
+                    **extra,
+                },
+                headers=headers,
+            )
+            assert response.status_code == status
     # A valid API credential from a remote peer is not proof of local ownership.
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=files.app, client=("192.168.1.4", 1234)),
@@ -235,6 +636,51 @@ async def test_symlink_files_never_resolve(files):
     except OSError:
         pytest.skip("symlink creation is unavailable")
     assert (await resolve(files, ["link.txt"])).json()["files"] == []
+
+
+async def test_native_metadata_and_text_routes_reject_new_symlinks(files):
+    target = files.root / "source.py"
+    target.write_text("original\n")
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    replacement = files.root / "replacement.py"
+    replacement.write_text("replacement\n")
+    target.unlink()
+    try:
+        target.symlink_to(replacement)
+    except OSError:
+        pytest.skip("symlink creation is unavailable")
+    assert (await read_page(files, binding=binding)).status_code == 404
+    params = {"path": "source.py", "workspaceBinding": binding}
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/search", params={**params, "query": "replacement"}
+        )
+    ).status_code == 404
+    assert (
+        await files.client.get(
+            "/api/v1/workspace-files/metadata",
+            params=params,
+            headers=metadata_headers(files, path="source.py", binding=binding),
+        )
+    ).status_code == 404
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO swapping regression")
+async def test_page_fifo_replacement_cannot_block_open(files, monkeypatch):
+    target = files.root / "source.py"
+    target.write_text("original\n")
+    binding = (await resolve(files, ["source.py"])).json()["workspaceBinding"]
+    original_open = workspace_files.os.open
+
+    def replace_before_open(path, flags, *args, **kwargs):
+        if str(path) == str(native_io_path(target)):
+            assert flags & os.O_NONBLOCK
+            target.unlink()
+            os.mkfifo(target)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(workspace_files.os, "open", replace_before_open)
+    assert (await read_page(files, binding=binding)).status_code == 404
 
 
 async def test_reparse_files_never_resolve(files, monkeypatch):

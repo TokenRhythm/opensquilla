@@ -322,6 +322,30 @@ def test_release_wheel_allows_router_provenance_markdown() -> None:
     assert skill_card in violations
 
 
+def test_release_wheel_allows_only_canonical_distribution_license_notices() -> None:
+    module = load_script()
+    notice = "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md"
+    forbidden = [
+        "THIRD_PARTY_NOTICES.md",
+        "opensquilla/skills/bundled/example/THIRD_PARTY_NOTICES.md",
+        "opensquilla-0.5.4.dist-info/licenses/private-notes.md",
+        "opensquilla-0.5.4.dist-info/licenses/nested/THIRD_PARTY_NOTICES.md",
+        "other-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md",
+        "docs/opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md",
+    ]
+    assert module.forbidden_release_wheel_entries([notice, *forbidden]) == forbidden
+
+
+def test_release_wheel_notice_still_undergoes_sensitive_text_scanning(tmp_path: Path) -> None:
+    module = load_script()
+    wheel = tmp_path / "notice-probe.whl"
+    notice = "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md"
+    marker = module.FORBIDDEN_RELEASE_TEXT_MARKERS[0]
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr(notice, marker)
+    assert module.forbidden_release_text_hits(wheel) == [f"{notice}: {marker}"]
+
+
 def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> None:
     module = load_script()
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))

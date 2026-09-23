@@ -9,6 +9,22 @@ workflow downloads release assets from GitHub, verifies `SHA256SUMS`, then
 uploads version-scoped assets, moving installer aliases, and strict JSON
 channel manifests used by update clients.
 
+## Repository transfer boundary
+
+New releases are sourced from the canonical GitHub repository
+`TokenRhythm/opensquilla`. The organization transfer does not rename the OSS
+bucket, object prefix, versioned release paths, or moving aliases: the mirror
+continues to use `ALIYUN_OSS_BUCKET`, the `releases` prefix, and the existing
+`latest/` and `channels/` objects. The workflow fails closed when it runs from
+another GitHub repository, so a release from the pre-transfer repository cannot
+silently populate the mirror.
+
+The channel manifest intentionally keeps the legacy v1 `releaseUrl` spelling
+(`github.com/opensquilla/opensquilla`) for already-shipped clients while new
+GitHub API and download operations use `TokenRhythm/opensquilla`. Do not rewrite
+existing OSS object keys or moving aliases solely because the GitHub owner
+changed.
+
 ## Repository configuration
 
 Configure these GitHub repository secrets:

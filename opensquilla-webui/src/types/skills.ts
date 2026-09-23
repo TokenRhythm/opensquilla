@@ -262,8 +262,15 @@ export interface RegistryResult {
   author?: string
   identifier?: string
   source?: string
+  license?: string
+  homepage?: string
+  upstream_url?: string
+  origin_source?: string
+  signature_status?: string
+  content_hash?: string
   trust_level?: string
   installed?: boolean
+  installId?: string
   install_reference?: string
   installReference?: string
   lifecycle?: SkillLifecycle

@@ -762,6 +762,40 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     assert "secrets." not in json.dumps(audit)
 
 
+def test_macos_release_backports_keychain_fix_before_loading_builder_and_requires_signing() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
+    step = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+                if step.get("name") == "Build signed macOS installer")
+    preparation = "node scripts/prepare-macos-keychain.cjs"
+    build = (
+        "npx electron-builder --mac --publish never "
+        "--config.forceCodeSigning=true --config.dmg.sign=true"
+    )
+    assert step["run"].index(preparation) < step["run"].index("npm run build:gateway")
+    assert step["run"].index(preparation) < step["run"].index(build)
+    assert step["env"]["CSC_LINK"] == "${{ secrets.MAC_CSC_LINK }}"
+    assert step["env"]["APPLE_ID"] == "${{ secrets.APPLE_ID }}"
+    assert step["env"]["APPLE_APP_SPECIFIC_PASSWORD"] == (
+        "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}"
+    )
+    assert step["env"]["APPLE_TEAM_ID"] == "${{ secrets.APPLE_TEAM_ID }}"
+    assert "continue-on-error" not in step
+    verify = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+                  if step.get("name") == "Verify macOS signatures and notarization")
+    assert 'codesign --verify --deep --strict --verbose=2 "${apps[0]}"' in verify["run"]
+    assert 'spctl --assess --type execute --verbose=2 "${apps[0]}"' in verify["run"]
+    assert 'xcrun stapler validate "${apps[0]}"' in verify["run"]
+    assert 'codesign --verify --strict --verbose=2 "${dmgs[0]}"' in verify["run"]
+    assert "set -euo pipefail" in verify["run"]
+    assert "continue-on-error" not in verify
+    assert "if" not in verify
+    ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    unit = next(step for step in ci["jobs"]["desktop-check"]["steps"]
+                if step.get("name") == "Run desktop unit tests")
+    assert "node scripts/test-macos-keychain-patch.cjs" in unit["run"]
+    assert "continue-on-error" not in unit
+
+
 def test_windows_only_input_skips_unrelated_jobs_and_keeps_signed_windows_audits() -> None:
     workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
     triggers = workflow.get("on", workflow.get(True))

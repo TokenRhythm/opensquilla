@@ -161,6 +161,38 @@ def test_persistent_sandbox_dirs_remove_inheritance_and_limit_control(
         assert "/remove:g" in calls[index + 2]
 
 
+def test_offline_identity_setup_uses_inbox_windows_powershell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from opensquilla.sandbox.backend import windows_default_identity as identity_mod
+    from opensquilla.sandbox.backend import windows_default_setup as mod
+
+    calls: list[list[str]] = []
+    environments: list[dict[str, str]] = []
+    monkeypatch.setenv("SystemRoot", r"C:\Windows")
+    monkeypatch.setattr(mod, "_generate_offline_user_password", lambda: "A1!test-password")
+    monkeypatch.setattr(identity_mod, "protect_password", lambda password: f"protected:{password}")
+    monkeypatch.setattr(
+        mod.subprocess,
+        "run",
+        lambda command, **kwargs: (
+            calls.append(command)
+            or environments.append(kwargs["env"])
+            or type("Result", (), {"returncode": 0, "stderr": "", "stdout": "S-1-5-21-1-2-3-4\n"})()
+        ),
+    )
+
+    result = mod.ensure_offline_sandbox_user(tmp_path / "sandbox")
+
+    assert result["sid"] == "S-1-5-21-1-2-3-4"
+    assert calls[0][0].replace("/", "\\") == (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+    )
+    assert environments[0]["PSModulePath"].replace("/", "\\") == (
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\Modules"
+    )
+
+
 def test_support_probe_requires_network_marker_for_proxy_enforcement(
     monkeypatch,
     tmp_path: Path,

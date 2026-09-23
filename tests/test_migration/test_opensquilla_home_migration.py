@@ -34,6 +34,7 @@ from opensquilla.attachment_refs import (
     read_attachment_ref_bytes,
     write_transcript_material,
 )
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.migration import orchestrator
 from opensquilla.migration.opensquilla_home import (
     IMPORT_MARKER_FILENAME,
@@ -532,10 +533,9 @@ def test_profile_import_preserves_unmodified_toml_bytes_and_comments(
 ) -> None:
     source = _build_source_home(tmp_path)
     source_config = (
-        b"# operator header\n"
-        b"port = 18791  # keep exact spacing\n"
-        b"config_version = 1\n"
-    )
+        f"# operator header\nport = 18791  # keep exact spacing\n"
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
+    ).encode()
     (source / "config.toml").write_bytes(source_config)
     target = tmp_path / "target-home"
 

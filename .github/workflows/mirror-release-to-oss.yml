@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # New releases are sourced from the transferred canonical repository. The
+  # OSS bucket and object layout remain independent of the GitHub owner.
+  CANONICAL_GITHUB_REPOSITORY: TokenRhythm/opensquilla
   OSSUTIL_VERSION: "2.3.0"
   OSSUTIL_ZIP: ossutil-2.3.0-linux-amd64.zip
   OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
@@ -62,6 +65,16 @@ jobs:
             exit 1
           fi
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify canonical GitHub repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "${CANONICAL_GITHUB_REPOSITORY}" ]]; then
+            echo "Refusing to mirror from non-canonical GitHub repository: ${GITHUB_REPOSITORY}" >&2
+            echo "Expected: ${CANONICAL_GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
 
       - name: Validate OSS configuration
         shell: bash
@@ -115,7 +128,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           gh release download "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${CANONICAL_GITHUB_REPOSITORY}" \
             --dir release-assets \
             --clobber
           asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
@@ -134,11 +147,11 @@ jobs:
           set -euo pipefail
           mkdir -p channel-assets
           gh release view "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${CANONICAL_GITHUB_REPOSITORY}" \
             --json tagName,isDraft,isPrerelease,publishedAt,url \
             > channel-assets/release.json
           gh release list \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${CANONICAL_GITHUB_REPOSITORY}" \
             --limit 1000 \
             --json tagName,isDraft,isPrerelease,publishedAt \
             > channel-assets/releases.json

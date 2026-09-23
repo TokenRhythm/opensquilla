@@ -1,8 +1,9 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, defineComponent, h, nextTick, ref, type App } from 'vue'
+import { createApp, defineComponent, h, nextTick, ref, type App, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import ConversationMinimap from './ConversationMinimap.vue'
 
@@ -10,6 +11,8 @@ interface ThreadFixture {
   container: HTMLElement
   offsets: number[]
   scrollTo: ReturnType<typeof vi.fn>
+  virtualizer: ChatMessageListVirtualizer
+  geometryVersion: Ref<number>
 }
 
 interface MountOptions {
@@ -19,7 +22,6 @@ interface MountOptions {
   onNavigateEnd?: ReturnType<typeof vi.fn>
   ensureMessageVisible?: (sourceIndex: number) => Promise<HTMLElement | null>
   releaseEnsuredMessage?: (sourceIndex?: number) => void
-  messageOffset?: (sourceIndex: number) => number | null
 }
 
 interface ThreadDimensions {
@@ -136,8 +138,26 @@ function makeThread(
     container.dispatchEvent(new Event('scroll'))
   })
   container.scrollTo = scrollTo as unknown as typeof container.scrollTo
+  const geometryVersion = ref(0)
+  const virtualizer: ChatMessageListVirtualizer = {
+    ensureMessageVisible: vi.fn(async index => container.querySelector<HTMLElement>(`#chat-turn-${index}`)),
+    releaseEnsuredMessage: vi.fn(),
+    messageIndexAtOffset: vi.fn(offset => Math.max(0, Math.floor(offset / 200))),
+    scrollToMessage: vi.fn((index, options) => {
+      const top = Math.min(container.scrollHeight - container.clientHeight, Math.max(0, index * 200 - 16))
+      if (top !== container.scrollTop) container.scrollTo({ top, behavior: options?.behavior })
+    }),
+    scrollToEnd: vi.fn(),
+    getDistanceFromEnd: () => Math.max(0, container.scrollHeight - container.scrollTop - container.clientHeight),
+    hasPendingLayout: () => false,
+    cancelScroll: vi.fn(),
+    beginScrollHandoff: () => () => {},
+    geometryVersion: () => geometryVersion.value,
+    remeasure: vi.fn(),
+    isVirtualized: () => true,
+  }
   document.body.appendChild(container)
-  return { container, offsets, scrollTo }
+  return { container, offsets, scrollTo, virtualizer, geometryVersion }
 }
 
 async function mountMinimap(
@@ -147,6 +167,8 @@ async function mountMinimap(
 ) {
   const rendered = messages(turnCount)
   const thread = makeThread(rendered, dimensions.clientWidth ?? 1200, dimensions)
+  if (options.ensureMessageVisible) thread.virtualizer.ensureMessageVisible = options.ensureMessageVisible
+  if (options.releaseEnsuredMessage) thread.virtualizer.releaseEnsuredMessage = options.releaseEnsuredMessage
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp(ConversationMinimap, {
@@ -157,9 +179,7 @@ async function mountMinimap(
     historyHasMore: options.historyHasMore,
     onNavigate: options.onNavigate,
     onNavigateEnd: options.onNavigateEnd,
-    ensureMessageVisible: options.ensureMessageVisible,
-    releaseEnsuredMessage: options.releaseEnsuredMessage,
-    messageOffset: options.messageOffset,
+    virtualizer: thread.virtualizer,
   })
   app.use(i18n)
   const instance = app.mount(host) as unknown as { cancelNavigation: () => void }
@@ -173,6 +193,35 @@ function markers(host: HTMLElement): HTMLButtonElement[] {
   return Array.from(host.querySelectorAll<HTMLButtonElement>('[data-testid="conversation-minimap-marker"]'))
 }
 
+async function animationFrames(count: number) {
+  for (let index = 0; index < count; index += 1) {
+    await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
+  }
+}
+
+async function mountChangingHistory() {
+  const initialMessages = messages(8)
+  const messageState = ref(initialMessages)
+  const thread = makeThread(initialMessages)
+  vi.mocked(thread.virtualizer.scrollToMessage).mockImplementation(() => {})
+  const onNavigateEnd = vi.fn()
+  const host = document.createElement('div')
+  document.body.appendChild(host)
+  const Root = defineComponent(() => () => h(ConversationMinimap, {
+    messages: messageState.value,
+    scrollContainer: thread.container,
+    virtualizer: thread.virtualizer,
+    stripTimePrefix: (value: string) => value,
+    onNavigateEnd,
+  }))
+  const app = createApp(Root)
+  app.use(i18n)
+  app.mount(host)
+  mountedApps.push(app)
+  await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
+  return { host, thread, messageState, initialMessages, onNavigateEnd }
+}
+
 beforeEach(() => {
   i18n.global.locale.value = 'en'
 })
@@ -180,6 +229,7 @@ beforeEach(() => {
 afterEach(() => {
   mountedApps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
+  vi.useRealTimers()
   vi.restoreAllMocks()
   vi.unstubAllGlobals()
 })
@@ -304,6 +354,7 @@ describe('ConversationMinimap', () => {
     const onNavigateEnd = vi.fn()
     const { host, thread } = await mountMinimap(8, { onNavigate, onNavigateEnd })
     markers(host)[3].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
 
     expect(onNavigate).toHaveBeenCalledWith(3)
     expect(onNavigate.mock.invocationCallOrder[0]).toBeLessThan(thread.scrollTo.mock.invocationCallOrder[0])
@@ -315,7 +366,7 @@ describe('ConversationMinimap', () => {
     thread.container.dispatchEvent(new Event('scroll'))
     expect(onNavigateEnd).not.toHaveBeenCalled()
     thread.container.dispatchEvent(new Event('scrollend'))
-    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(onNavigateEnd).toHaveBeenCalledOnce())
     expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(true)
   })
 
@@ -334,7 +385,6 @@ describe('ConversationMinimap', () => {
     const mounted = await mountMinimap(8, {
       ensureMessageVisible,
       releaseEnsuredMessage,
-      messageOffset: sourceIndex => (sourceIndex / 2) * 400,
     })
     threadContainer = mounted.thread.container
     mounted.thread.container.querySelector('[data-chat-turn-key="user-3"]')?.remove()
@@ -345,7 +395,7 @@ describe('ConversationMinimap', () => {
     expect(ensureMessageVisible).toHaveBeenCalledWith(6)
     expect(mounted.thread.scrollTo).toHaveBeenLastCalledWith({ top: 1_184, behavior: 'smooth' })
     mounted.thread.container.dispatchEvent(new Event('scrollend'))
-    expect(releaseEnsuredMessage).toHaveBeenCalledWith(6)
+    await vi.waitFor(() => expect(releaseEnsuredMessage).toHaveBeenCalledWith(6))
   })
 
   it('pairs navigation lifecycle when deferred materialization is cancelled', async () => {
@@ -371,6 +421,7 @@ describe('ConversationMinimap', () => {
 
     mounted.instance.cancelNavigation()
     expect(onNavigateEnd).toHaveBeenCalledOnce()
+    expect(mounted.thread.virtualizer.cancelScroll).toHaveBeenCalledOnce()
 
     const lateAnchor = document.createElement('div')
     deferred.resolve!(lateAnchor)
@@ -380,20 +431,218 @@ describe('ConversationMinimap', () => {
     expect(onNavigateEnd).toHaveBeenCalledOnce()
   })
 
-  it('completes immediately when the selected prompt is already in place', async () => {
+  it('keeps the target leased through measurement changes and intermediate scrollend events', async () => {
+    const onNavigateEnd = vi.fn()
+    const { host, thread } = await mountMinimap(8, { onNavigateEnd })
+    const target = thread.container.querySelector<HTMLElement>('[data-chat-turn-key="user-3"]')!
+    markers(host)[3].click()
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledWith(6, {
+      align: 'start', behavior: 'smooth',
+    })
+
+    // A row measured during the seek moves the destination. The old pixel
+    // offset and an intermediate scrollend must not complete the product lease.
+    thread.offsets[3] += 400
+    thread.geometryVersion.value += 1
+    thread.container.dispatchEvent(new Event('scrollend'))
+    await animationFrames(4)
+    expect(onNavigateEnd).not.toHaveBeenCalled()
+    expect(thread.virtualizer.releaseEnsuredMessage).not.toHaveBeenCalled()
+    expect(target.classList.contains('is-history-target')).toBe(false)
+    expect(markers(host)[3].getAttribute('aria-current')).toBe('location')
+
+    thread.container.scrollTop = thread.offsets[3] - 16
+    thread.container.dispatchEvent(new Event('scrollend'))
+    await animationFrames(2)
+    expect(onNavigateEnd).not.toHaveBeenCalled()
+    await vi.waitFor(() => expect(onNavigateEnd).toHaveBeenCalledOnce())
+    expect(thread.virtualizer.releaseEnsuredMessage).toHaveBeenCalledExactlyOnceWith(6)
+    expect(target.classList.contains('is-history-target')).toBe(true)
+  })
+
+  it('cancels the underlying seek when an unreachable destination times out', async () => {
+    vi.useFakeTimers()
+    const onNavigateEnd = vi.fn()
+    const { host, thread } = await mountMinimap(8, { onNavigateEnd })
+    vi.mocked(thread.virtualizer.scrollToMessage).mockImplementation(() => {})
+    markers(host)[3].click()
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledOnce()
+
+    await vi.advanceTimersByTimeAsync(1999)
+    expect(onNavigateEnd).not.toHaveBeenCalled()
+    expect(thread.virtualizer.cancelScroll).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(thread.virtualizer.cancelScroll).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.releaseEnsuredMessage).toHaveBeenCalledExactlyOnceWith(6)
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(false)
+
+    thread.container.dispatchEvent(new Event('scrollend'))
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledOnce()
+  })
+
+  it('cancels and releases a pending navigation on unmount without late completion', async () => {
+    vi.useFakeTimers()
+    const onNavigateEnd = vi.fn()
+    const { host, thread } = await mountMinimap(8, { onNavigateEnd })
+    vi.mocked(thread.virtualizer.scrollToMessage).mockImplementation(() => {})
+    markers(host)[3].click()
+    await nextTick()
+    mountedApps.pop()!.unmount()
+    expect(thread.virtualizer.cancelScroll).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.releaseEnsuredMessage).toHaveBeenCalledExactlyOnceWith(6)
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    await vi.advanceTimersByTimeAsync(3000)
+    thread.container.dispatchEvent(new Event('scrollend'))
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledOnce()
+  })
+
+  it('cancels a pending navigation when the same session receives a replacement scroll container', async () => {
+    vi.useFakeTimers()
+    const rendered = messages(8)
+    const thread = makeThread(rendered)
+    const replacement = makeThread(rendered)
+    const scrollContainer = ref(thread.container)
+    const onNavigateEnd = vi.fn()
+    vi.mocked(thread.virtualizer.scrollToMessage).mockImplementation(() => {})
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const Root = defineComponent(() => () => h(ConversationMinimap, {
+      messages: rendered,
+      sessionKey: 'same-session',
+      scrollContainer: scrollContainer.value,
+      virtualizer: thread.virtualizer,
+      stripTimePrefix: (value: string) => value,
+      onNavigateEnd,
+    }))
+    const app = createApp(Root)
+    app.use(i18n)
+    app.mount(host)
+    mountedApps.push(app)
+    await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
+    expect(onNavigateEnd).not.toHaveBeenCalled()
+    expect(thread.virtualizer.cancelScroll).not.toHaveBeenCalled()
+
+    markers(host)[3].click()
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledOnce()
+    scrollContainer.value = replacement.container
+    await nextTick()
+    expect(thread.virtualizer.cancelScroll).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.releaseEnsuredMessage).toHaveBeenCalledExactlyOnceWith(6)
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    thread.container.dispatchEvent(new Event('scrollend'))
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledOnce()
+    expect(replacement.scrollTo).not.toHaveBeenCalled()
+  })
+
+  it('resolves a pending destination by stable key when earlier messages are prepended', async () => {
+    const initialMessages = messages(8)
+    const messageState = ref(initialMessages)
+    const thread = makeThread(initialMessages)
+    let resolveTarget!: (element: HTMLElement | null) => void
+    thread.virtualizer.ensureMessageVisible = vi.fn(() => new Promise<HTMLElement | null>(resolve => { resolveTarget = resolve }))
+    const target = thread.container.querySelector<HTMLElement>('[data-chat-turn-key="user-3"]')!
+    const host = document.createElement('div')
+    document.body.appendChild(host)
+    const onNavigateEnd = vi.fn()
+    const Root = defineComponent(() => () => h(ConversationMinimap, {
+      messages: messageState.value,
+      scrollContainer: thread.container,
+      virtualizer: thread.virtualizer,
+      stripTimePrefix: (value: string) => value,
+      onNavigateEnd,
+    }))
+    const app = createApp(Root)
+    app.use(i18n)
+    app.mount(host)
+    mountedApps.push(app)
+    await vi.waitFor(() => expect(markers(host)).toHaveLength(8))
+    markers(host)[3].click()
+    expect(thread.virtualizer.ensureMessageVisible).toHaveBeenCalledWith(6)
+
+    messageState.value = [message('user', 99), message('assistant', 99), ...initialMessages]
+    thread.container.querySelectorAll<HTMLElement>('[data-chat-turn-key]').forEach((anchor, index) => {
+      anchor.id = `chat-turn-${index * 2 + 2}`
+      thread.offsets[index] += 400
+    })
+    await nextTick()
+    resolveTarget(target)
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledExactlyOnceWith(8, {
+      align: 'start', behavior: 'smooth',
+    })
+    await vi.waitFor(() => expect(onNavigateEnd).toHaveBeenCalledOnce())
+    expect(thread.virtualizer.releaseEnsuredMessage).toHaveBeenCalledWith(8)
+    expect(target.classList.contains('is-history-target')).toBe(true)
+  })
+
+  it.each([false, true])('retargets a started seek once after prepend without extending its deadline (reduced motion=%s)', async reducedMotion => {
+    vi.useFakeTimers()
+    vi.stubGlobal('matchMedia', vi.fn((query: string) => (
+      mediaQueryList(query, reducedMotion && query === '(prefers-reduced-motion: reduce)')
+    )))
+    const { host, thread, messageState, initialMessages, onNavigateEnd } = await mountChangingHistory()
+    const behavior = reducedMotion ? 'auto' : 'smooth'
+    markers(host)[3].click()
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledExactlyOnceWith(6, { align: 'start', behavior })
+    await vi.advanceTimersByTimeAsync(1500)
+
+    messageState.value = [message('user', 99), message('assistant', 99), ...initialMessages]
+    thread.container.querySelectorAll<HTMLElement>('[data-chat-turn-key]').forEach((anchor, index) => {
+      anchor.id = `chat-turn-${index * 2 + 2}`
+      thread.offsets[index] += 400
+    })
+    await nextTick()
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledTimes(2)
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenLastCalledWith(8, { align: 'start', behavior })
+
+    await vi.advanceTimersByTimeAsync(499)
+    expect(onNavigateEnd).not.toHaveBeenCalled()
+    await vi.advanceTimersByTimeAsync(1)
+    expect(thread.virtualizer.cancelScroll).toHaveBeenCalledOnce()
+    expect(thread.virtualizer.releaseEnsuredMessage).toHaveBeenCalledExactlyOnceWith(8)
+    expect(onNavigateEnd).toHaveBeenCalledOnce()
+  })
+
+  it('does not restart a pending seek when only message content changes', async () => {
+    const { host, thread, messageState } = await mountChangingHistory()
+    markers(host)[3].click()
+    await nextTick()
+    messageState.value = messageState.value.map(entry => ({ ...entry, text: `${entry.text} updated` }))
+    await nextTick()
+    await nextTick()
+    expect(thread.virtualizer.scrollToMessage).toHaveBeenCalledExactlyOnceWith(6, {
+      align: 'start', behavior: 'smooth',
+    })
+    expect(thread.virtualizer.releaseEnsuredMessage).not.toHaveBeenCalled()
+  })
+
+  it('settles an already-positioned prompt without an unnecessary native scroll', async () => {
     const onNavigateEnd = vi.fn()
     const { host, thread } = await mountMinimap(8, { onNavigateEnd })
 
     markers(host)[0].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
 
     expect(thread.scrollTo).not.toHaveBeenCalled()
-    expect(onNavigateEnd).toHaveBeenCalledOnce()
+    await vi.waitFor(() => expect(onNavigateEnd).toHaveBeenCalledOnce())
     expect(thread.container.querySelector('[data-chat-turn-key="user-0"]')?.classList.contains('is-history-target')).toBe(true)
   })
 
-  it('keeps the selected marker stable during navigation and reconciles after arrival', async () => {
-    const { host, thread } = await mountMinimap()
+  it('keeps the selected marker stable during navigation and reconciles after cancellation', async () => {
+    const { host, instance, thread } = await mountMinimap()
     markers(host)[3].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
 
     thread.container.scrollTop = 400
     thread.container.dispatchEvent(new Event('scroll'))
@@ -401,6 +650,9 @@ describe('ConversationMinimap', () => {
     expect(markers(host)[3].getAttribute('aria-current')).toBe('location')
 
     thread.container.dispatchEvent(new Event('scrollend'))
+    await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
+    expect(markers(host)[3].getAttribute('aria-current')).toBe('location')
+    instance.cancelNavigation()
     await vi.waitFor(() => expect(markers(host)[1].getAttribute('aria-current')).toBe('location'))
     expect(thread.container.querySelector('[data-chat-turn-key="user-3"]')?.classList.contains('is-history-target')).toBe(false)
   })
@@ -410,6 +662,7 @@ describe('ConversationMinimap', () => {
     const firstTarget = thread.container.querySelector('[data-chat-turn-key="user-3"]')!
 
     markers(host)[3].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
     thread.container.scrollTop = 200
     markers(host)[4].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
 
@@ -419,6 +672,7 @@ describe('ConversationMinimap', () => {
   it('uses native smooth scrolling at both distances and auto with reduced motion', async () => {
     const far = await mountMinimap()
     markers(far.host)[7].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
     expect(far.thread.scrollTo).toHaveBeenLastCalledWith({
       top: far.thread.offsets[7] - 16,
       behavior: 'smooth',
@@ -429,12 +683,13 @@ describe('ConversationMinimap', () => {
     )))
     const reduced = await mountMinimap()
     markers(reduced.host)[1].dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }))
+    await nextTick()
     expect(reduced.thread.scrollTo).toHaveBeenLastCalledWith({
       top: reduced.thread.offsets[1] - 16,
       behavior: 'auto',
     })
     reduced.thread.container.dispatchEvent(new Event('scrollend'))
-    expect(reduced.thread.container.querySelector('[data-chat-turn-key="user-1"]')?.classList.contains('is-history-target')).toBe(true)
+    await vi.waitFor(() => expect(reduced.thread.container.querySelector('[data-chat-turn-key="user-1"]')?.classList.contains('is-history-target')).toBe(true))
   })
 
   it('tracks the current prompt and supports roving keyboard focus', async () => {
@@ -464,6 +719,7 @@ describe('ConversationMinimap', () => {
       next.style.getPropertyValue('--conversation-minimap-line-scale-y'),
     )).toBe(0.5)
     next.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }))
+    await nextTick()
     expect(thread.scrollTo).toHaveBeenLastCalledWith({ top: thread.offsets[3] - 16, behavior: 'smooth' })
     expect(document.activeElement).toBe(thread.container.querySelector('[data-chat-turn-key="user-3"]'))
   })
@@ -488,6 +744,7 @@ describe('ConversationMinimap', () => {
     const Root = defineComponent(() => () => h(ConversationMinimap, {
       messages: messageState.value,
       scrollContainer: thread.container,
+      virtualizer: thread.virtualizer,
       stripTimePrefix: (value: string) => value,
     }))
     const app = createApp(Root)
@@ -518,6 +775,7 @@ describe('ConversationMinimap', () => {
     const app = createApp(ConversationMinimap, {
       messages: rendered,
       scrollContainer: thread.container,
+      virtualizer: thread.virtualizer,
       stripTimePrefix: (value: string) => value,
     })
     app.use(i18n)
@@ -534,6 +792,7 @@ describe('ConversationMinimap', () => {
     const nonScrollingApp = createApp(ConversationMinimap, {
       messages: nonScrollingMessages,
       scrollContainer: nonScrollingThread.container,
+      virtualizer: nonScrollingThread.virtualizer,
       stripTimePrefix: (value: string) => value,
     })
     nonScrollingApp.use(i18n)
@@ -557,6 +816,7 @@ describe('ConversationMinimap', () => {
     const narrowApp = createApp(ConversationMinimap, {
       messages: rendered,
       scrollContainer: narrowThread.container,
+      virtualizer: narrowThread.virtualizer,
       stripTimePrefix: (value: string) => value,
     })
     narrowApp.use(i18n)
@@ -590,15 +850,11 @@ describe('ConversationMinimap', () => {
   })
 
   it('uses a lower exit threshold so small layout changes do not flicker the rail', async () => {
-    const observers = stubResizeObservers()
     const { host, thread } = await mountMinimap(8, {}, { scrollHeight: 1500 })
-    const threadObserver = observers.find(observer => observer.targets.size > 1)!
     const resizeThread = async (scrollHeight: number) => {
       Object.defineProperty(thread.container, 'scrollHeight', { configurable: true, value: scrollHeight })
-      threadObserver.callback(
-        [{ target: thread.container } as unknown as ResizeObserverEntry],
-        threadObserver as unknown as ResizeObserver,
-      )
+      thread.geometryVersion.value += 1
+      await nextTick()
       await new Promise(resolve => window.requestAnimationFrame(() => resolve(undefined)))
       await nextTick()
     }
@@ -627,6 +883,7 @@ describe('ConversationMinimap', () => {
     const Root = defineComponent(() => () => h(ConversationMinimap, {
       messages: messageState.value,
       scrollContainer: thread.container,
+      virtualizer: thread.virtualizer,
       stripTimePrefix: (value: string) => value,
       sessionKey: sessionKey.value,
     }))
@@ -653,6 +910,7 @@ describe('ConversationMinimap', () => {
     const app = createApp(ConversationMinimap, {
       messages: rendered,
       scrollContainer: thread.container,
+      virtualizer: thread.virtualizer,
       stripTimePrefix,
     })
     app.use(i18n)
@@ -678,6 +936,7 @@ describe('ConversationMinimap', () => {
     const app = createApp(ConversationMinimap, {
       messages: rendered,
       scrollContainer: thread.container,
+      virtualizer: thread.virtualizer,
       stripTimePrefix,
     })
     app.use(i18n)

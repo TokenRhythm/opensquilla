@@ -1506,7 +1506,6 @@ def test_desktop_onboarding_defaults_to_tokenrhythm_with_trusted_registration_ct
     )
     for key in (
         "onboarding.step2.tokenrhythmTitle",
-        "onboarding.step2.tokenrhythmRegistration",
         "onboarding.step2.tokenrhythmCta",
         "onboarding.step2.tokenrhythmCtaExternalLabel",
     ):
@@ -1851,6 +1850,11 @@ def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restar
         "async function stopAndJoinAllLifecycleOwnedGateways",
         "function restoreDownloadedUpdateRetryState",
     )
+    stopping_marker = _section(
+        main_ts,
+        "function trackStoppingGatewayProcess",
+        "function liveLifecycleOwnedGatewayProcesses",
+    )
     migration = _section(
         main_ts,
         "ipcMain.handle('desktop:migration:run'",
@@ -1878,15 +1882,22 @@ def test_ready_desktop_gateway_unexpected_exit_has_bounded_cross_platform_restar
     )
     assert "gateway_child_process_error" in post_spawn_error
     assert "return" in post_spawn_error
-    abnormal_exit = _section(
-        start,
-        "if (abnormalExit)",
-        "publishTerminalGatewayExitError(classifiedMessage)",
-    )
-    assert "scheduleGatewayUnexpectedExitRestart" in abnormal_exit
-    assert "childWasReady" in abnormal_exit
-    assert "childReadyAuthority" in abnormal_exit
-    assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in abnormal_exit
+    assert "const unexpectedReadyExit = isCurrentGateway" in start
+    assert "&& childWasReady" in start
+    assert "&& !isQuitting" in start
+    assert "&& !gatewayStoppingProcesses.has(child)" in start
+    assert "if (abnormalExit || unexpectedReadyExit)" in start
+    assert "scheduleGatewayUnexpectedExitRestart" in start
+    assert "childReadyAuthority" in start
+    assert "if (unexpectedReadyExit && abnormalExit)" in start
+    # Clean exits that are not unexpected ready-child exits (for example an
+    # intentional stop before readiness) still cancel any pending recovery.
+    assert "cancelGatewayUnexpectedExitRestart('Gateway exited normally')" in start
+    assert "child.once('close'," in stopping_marker
+    assert "child.once('exit'," not in stopping_marker
+    assert "function isCurrentGatewayShutdownRequest" in main_ts
+    assert "session.webRequest.onBeforeRequest" in main_ts
+    assert "Gateway shutdown endpoint requested" in main_ts
     assert (
         "scheduleGatewayUnexpectedExitRestart(message, gatewayReadyProcesses.has(child))"
         in start
@@ -1932,6 +1943,33 @@ def test_start_gateway_preserves_host_path_without_static_runtime_injection() ->
     assert "OPENSQUILLA_NODE_BIN_DIR" not in start
     assert "optional Runtime Packs are resolved inside Gateway" in main_ts
     assert "PATH: childPath" in start
+
+
+def test_gateway_runtime_selection_validates_cwd_and_keeps_dev_on_checkout() -> None:
+    main_ts = _read("desktop/electron/src/main.ts")
+    resolver = _section(
+        main_ts,
+        "async function resolveGatewayRuntime(): Promise<RuntimeLaunch>",
+        "const ONBOARDING_PROBE_STDOUT_LIMIT",
+    )
+    start = _section(
+        main_ts,
+        "async function startGateway",
+        "async function startGatewayWithPortRecovery",
+    )
+
+    # A staged runtime is owned by packaged Electron only. Development must
+    # run from the selected checkout so worktree cleanup cannot orphan a child
+    # whose helper still points at that staged directory.
+    assert "if (app.isPackaged && await pathIsFile(bundledBinary))" in resolver
+    assert "await assertRepoRoot()" in resolver
+    assert "command: 'uv'" in resolver
+    assert "mode: 'dev'" in resolver
+    assert "async function validateGatewayRuntime(runtime: RuntimeLaunch)" in main_ts
+    assert "runtime_root_missing: Gateway cwd does not exist" in main_ts
+    assert "cwd: runtime.cwd" in start
+    assert "runtimeMode: runtime.mode" in start
+    assert "runtimeCwd: runtime.cwd" in start
 
 
 def test_desktop_python_children_force_utf8_stdio() -> None:

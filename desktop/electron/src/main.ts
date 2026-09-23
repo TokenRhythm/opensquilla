@@ -9,7 +9,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
-import { saveArtifactFile, performSourceFileAction, type SaveArtifactRequest, type SourceFileActionRequest } from './resource-file-actions.js'
+import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
   normalizeGatewayLocale,
@@ -580,6 +580,7 @@ function applyDesktopNativeTheme(source: DesktopNativeThemeSource): { source: De
 let gatewayProcess: ChildProcessWithoutNullStreams | null = null
 let gatewayProfileKey: string | null = null
 let isQuitting = false
+let gatewayShutdownRequestInterceptorInstalled = false
 // A child remains lifecycle-owned until its exit event, even after stopGateway
 // clears the current slot so a replacement cannot accidentally reuse it. Quit,
 // update, cleanup, and recovery all join this set before Electron may exit.
@@ -1485,6 +1486,13 @@ async function proxyDesktopRendererRequest(
   const body = method === 'GET' || method === 'HEAD'
     ? undefined
     : new Uint8Array(await request.arrayBuffer())
+  if (isCurrentGatewayShutdownRequest(`${gatewayState.url}${pathAndQuery}`, method)) {
+    const child = gatewayProcess
+    if (child && gatewayState.owned) {
+      trackStoppingGatewayProcess(child)
+      cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+    }
+  }
   const response = await electronNet.fetch(`${gatewayState.url}${pathAndQuery}`, {
     method,
     headers,
@@ -1523,7 +1531,7 @@ function secureDesktopRendererDocument(response: Response): Response {
       "font-src 'self' opensquilla-app://desktop data:",
       "media-src 'self' opensquilla-app://desktop blob: data: http: https:",
       "connect-src 'self' opensquilla-app://desktop http: https: ws: wss:",
-      "frame-src blob: http: https:",
+      "frame-src blob: data: http: https:",
       "worker-src 'self' opensquilla-app://desktop blob:",
     ].join('; '),
   )
@@ -3802,9 +3810,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Connect a model service, or finish later in Settings.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm limited-time offer',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API calls are free for a limited time.',
-    'onboarding.step2.tokenrhythmRegistration': 'Register to claim ¥68 in free tokens.',
-    'onboarding.step2.tokenrhythmCta': 'Claim for free',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Claim for free (opens in external browser)',
+    'onboarding.step2.tokenrhythmCta': 'Limited-time offer',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Limited-time offer (opens in external browser)',
     'onboarding.step2.otherProviders': 'Other providers',
     'onboarding.step2.apiKey': 'API key',
     'onboarding.step2.endpointSummary': 'Endpoint and direct model',
@@ -3940,9 +3947,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "连接模型服务，或稍后在设置中完成。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 限时福利',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API 调用限时免费。',
-    'onboarding.step2.tokenrhythmRegistration': '注册即领价值 68 元 Token',
-    'onboarding.step2.tokenrhythmCta': '免费领取',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '免费领取价值 68 元 TokenRhythm Token（在外部浏览器中打开）',
+    'onboarding.step2.tokenrhythmCta': '限时福利',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '限时福利（在外部浏览器中打开）',
     'onboarding.step2.otherProviders': '其他提供商',
     'onboarding.step2.apiKey': 'API 密钥',
     'onboarding.step2.endpointSummary': '端点和直连模型',
@@ -4073,9 +4079,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "モデルサービスに接続するか、後で設定できます。",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm 期間限定特典',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm API は期間限定で無料です。',
-    'onboarding.step2.tokenrhythmRegistration': '登録で68元相当のTokenを無料進呈',
-    'onboarding.step2.tokenrhythmCta': '無料で受け取る',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': '無料で受け取る（外部ブラウザーで開きます）',
+    'onboarding.step2.tokenrhythmCta': '期間限定特典',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': '期間限定特典（外部ブラウザーで開きます）',
     'onboarding.step2.otherProviders': 'その他のプロバイダー',
     'onboarding.step2.apiKey': 'API キー',
     'onboarding.step2.endpointSummary': 'エンドポイントと直接モデル',
@@ -4208,9 +4213,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Connectez un service de modèles ou configurez-le plus tard.",
     'onboarding.step2.tokenrhythmTitle': 'Offre limitée TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Les appels à l’API TokenRhythm sont gratuits pendant une durée limitée.',
-    'onboarding.step2.tokenrhythmRegistration': 'Inscrivez-vous pour recevoir 68 ¥ de tokens gratuits.',
-    'onboarding.step2.tokenrhythmCta': 'Obtenir gratuitement',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtenir gratuitement (s’ouvre dans le navigateur externe)',
+    'onboarding.step2.tokenrhythmCta': 'Offre limitée',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Offre limitée (s’ouvre dans le navigateur externe)',
     'onboarding.step2.otherProviders': 'Autres fournisseurs',
     'onboarding.step2.apiKey': 'Clé API',
     'onboarding.step2.endpointSummary': 'Point de terminaison et modèle direct',
@@ -4343,9 +4347,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Verbinde einen Modelldienst oder richte ihn später ein.",
     'onboarding.step2.tokenrhythmTitle': 'TokenRhythm-Aktion',
     'onboarding.step2.tokenrhythmValue': 'TokenRhythm-API-Aufrufe sind für kurze Zeit kostenlos.',
-    'onboarding.step2.tokenrhythmRegistration': 'Registrieren und 68 ¥ Gratis-Token erhalten.',
-    'onboarding.step2.tokenrhythmCta': 'Kostenlos erhalten',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Kostenlos erhalten (wird im externen Browser geöffnet)',
+    'onboarding.step2.tokenrhythmCta': 'Zeitlich begrenztes Angebot',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Zeitlich begrenztes Angebot (wird im externen Browser geöffnet)',
     'onboarding.step2.otherProviders': 'Weitere Anbieter',
     'onboarding.step2.apiKey': 'API-Schlüssel',
     'onboarding.step2.endpointSummary': 'Endpunkt und direktes Modell',
@@ -4478,9 +4481,8 @@ const DESKTOP_MESSAGES: Record<DesktopLocale, Record<string, string>> = {
     'onboarding.step2.subtitle': "Conecta un servicio de modelos o configúralo más tarde.",
     'onboarding.step2.tokenrhythmTitle': 'Oferta limitada de TokenRhythm',
     'onboarding.step2.tokenrhythmValue': 'Las llamadas a la API de TokenRhythm son gratis por tiempo limitado.',
-    'onboarding.step2.tokenrhythmRegistration': 'Regístrate y recibe 68 ¥ en tokens gratis.',
-    'onboarding.step2.tokenrhythmCta': 'Obtener gratis',
-    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Obtener gratis (se abre en el navegador externo)',
+    'onboarding.step2.tokenrhythmCta': 'Oferta limitada',
+    'onboarding.step2.tokenrhythmCtaExternalLabel': 'Oferta limitada (se abre en el navegador externo)',
     'onboarding.step2.otherProviders': 'Otros proveedores',
     'onboarding.step2.apiKey': 'Clave API',
     'onboarding.step2.endpointSummary': 'Endpoint y modelo directo',
@@ -5487,12 +5489,6 @@ function onboardingHtml(
       font-size: 10.5px;
       font-weight: 560;
       line-height: 1.35;
-    }
-    .provider-promo-copy span {
-      color: var(--accent);
-      font-size: 10.5px;
-      font-weight: 420;
-      line-height: 1.4;
     }
     .provider-promo-cta {
       display: inline-flex;
@@ -6529,7 +6525,6 @@ function onboardingHtml(
             </label>
             <div class="provider-promo-copy">
               <strong data-i18n="onboarding.step2.tokenrhythmTitle">${ot('onboarding.step2.tokenrhythmTitle')}</strong>
-              <span data-i18n="onboarding.step2.tokenrhythmRegistration">${ot('onboarding.step2.tokenrhythmRegistration')}</span>
             </div>
             <a class="provider-promo-cta" id="tokenrhythmRegister" href="${TOKENRHYTHM_REGISTER_URL}" target="_blank" rel="noopener noreferrer" data-i18n="onboarding.step2.tokenrhythmCta" data-i18n-aria="onboarding.step2.tokenrhythmCtaExternalLabel" aria-label="${ot('onboarding.step2.tokenrhythmCtaExternalLabel')}">${ot('onboarding.step2.tokenrhythmCta')}</a>
           </div>
@@ -7331,6 +7326,14 @@ async function pathIsFile(path: string): Promise<boolean> {
   }
 }
 
+async function pathIsDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory()
+  } catch {
+    return false
+  }
+}
+
 async function assertRepoRoot(): Promise<void> {
   const pyprojectPath = join(repoRoot, 'pyproject.toml')
   const webuiPath = join(repoRoot, 'src', 'opensquilla', 'gateway', 'static', 'dist', 'index.html')
@@ -7342,6 +7345,19 @@ async function assertRepoRoot(): Promise<void> {
       `Built Control UI not found at ${webuiPath}. Run "cd opensquilla-webui && npm run build" first.`
     )
   }
+}
+
+async function validateGatewayRuntime(runtime: RuntimeLaunch): Promise<RuntimeLaunch> {
+  if (typeof runtime.command !== 'string' || runtime.command.trim() === '') {
+    throw new Error('runtime_root_missing: Gateway command is empty')
+  }
+  if (!(await pathIsDirectory(runtime.cwd))) {
+    throw new Error(`runtime_root_missing: Gateway cwd does not exist: ${runtime.cwd}`)
+  }
+  if (runtime.mode === 'bundled' && !(await pathIsFile(runtime.command))) {
+    throw new Error(`runtime_root_missing: Gateway binary does not exist: ${runtime.command}`)
+  }
+  return runtime
 }
 
 function packagedRuntimeRoot(): string {
@@ -7395,22 +7411,30 @@ async function resolveGatewayRuntime(): Promise<RuntimeLaunch> {
   const onedirBinary = join(runtimeRoot, 'opensquilla-gateway', binaryName)
   const flatBinary = join(runtimeRoot, binaryName)
   const bundledBinary = (await pathIsFile(onedirBinary)) ? onedirBinary : flatBinary
-  if (await pathIsFile(bundledBinary)) {
-    return {
+  // Development must always use the selected checkout. A staged runtime under
+  // packageRoot can be removed by worktree cleanup while the Gateway is still
+  // alive; only packaged applications own that runtime for the child lifetime.
+  if (app.isPackaged && await pathIsFile(bundledBinary)) {
+    return await validateGatewayRuntime({
       command: bundledBinary,
       args: ['gateway', 'run'],
       cwd: dirname(bundledBinary),
       mode: 'bundled',
-    }
+    })
   }
 
-  await assertRepoRoot()
-  return {
+  try {
+    await assertRepoRoot()
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error)
+    throw new Error(`runtime_root_missing: ${detail}`)
+  }
+  return await validateGatewayRuntime({
     command: 'uv',
     args: ['run', 'opensquilla', 'gateway', 'run'],
     cwd: repoRoot,
     mode: 'dev',
-  }
+  })
 }
 
 const ONBOARDING_PROBE_STDOUT_LIMIT = 256 * 1024
@@ -8810,10 +8834,43 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
-  child.once('exit', () => {
+  // The close handler classifies the child's final status. Keep the explicit
+  // stop marker until close because Node emits exit before close; clearing it
+  // on exit would make an intentional clean stop look like an unexpected
+  // ready-child disconnect and schedule a replacement.
+  child.once('close', () => {
     gatewayStoppingProcesses.delete(child)
     if (updateGatewayShutdownProcess === child) updateGatewayShutdownProcess = null
   })
+}
+
+function isCurrentGatewayShutdownRequest(url: string, method: string): boolean {
+  if (method !== 'POST' || !gatewayState.url) return false
+  try {
+    const request = new URL(url)
+    const gateway = new URL(gatewayState.url)
+    return request.origin === gateway.origin && request.pathname === '/api/system/shutdown'
+  } catch {
+    return false
+  }
+}
+
+function installGatewayShutdownRequestInterceptor(window: BrowserWindow): void {
+  if (gatewayShutdownRequestInterceptorInstalled) return
+  gatewayShutdownRequestInterceptorInstalled = true
+  window.webContents.session.webRequest.onBeforeRequest(
+    { urls: ['<all_urls>'] },
+    (details, callback) => {
+      if (isCurrentGatewayShutdownRequest(details.url, details.method)) {
+        const child = gatewayProcess
+        if (child && gatewayState.owned) {
+          trackStoppingGatewayProcess(child)
+          cancelGatewayUnexpectedExitRestart('Gateway shutdown endpoint requested')
+        }
+      }
+      callback({})
+    },
+  )
 }
 
 function liveLifecycleOwnedGatewayProcesses(): ChildProcessWithoutNullStreams[] {
@@ -9151,6 +9208,15 @@ async function startGateway(): Promise<GatewayState> {
     advanceGatewayStartTelemetry('spawn', 'runtime_unavailable')
     throw error
   }
+  if (!(await pathIsDirectory(runtime.cwd))) {
+    advanceGatewayStartTelemetry('spawn', 'runtime_unavailable')
+    throw new Error(`runtime_root_missing: Gateway cwd does not exist: ${runtime.cwd}`)
+  }
+  desktopLog('gateway_runtime_resolved', {
+    mode: runtime.mode,
+    command: runtime.command,
+    cwd: runtime.cwd,
+  })
 
   // Start the main-process-only bridge before the final port-selection await.
   // Its random endpoint and 256-bit token are injected only into this owned
@@ -9261,6 +9327,9 @@ async function startGateway(): Promise<GatewayState> {
     profileKind: activeProfile.kind,
     pid: child.pid,
     port,
+    runtimeMode: runtime.mode,
+    runtimeCommand: runtime.command,
+    runtimeCwd: runtime.cwd,
   })
   if (runtime.mode === 'dev') gatewayProcessTreeChildren.add(child)
 
@@ -9287,11 +9356,20 @@ async function startGateway(): Promise<GatewayState> {
     const childWasReady = childReadyAuthority !== null
     const unexpectedReadyExit = isCurrentGateway
       && childWasReady
-      && abnormalExit
       && !isQuitting
       && !gatewayStoppingProcesses.has(child)
+    desktopLog('gateway_exited', {
+      pid: child.pid,
+      code,
+      signal,
+      abnormalExit,
+      current: isCurrentGateway,
+      ready: childWasReady,
+      quitting: isQuitting,
+      gatewayStopping: gatewayStoppingProcesses.has(child),
+    })
     gatewayReadyProcesses.delete(child)
-    if (unexpectedReadyExit) {
+    if (unexpectedReadyExit && abnormalExit) {
       desktopReliabilityTelemetry.recordCrash({
         component: 'gateway',
         errorCode: 'gateway_unexpected_exit',
@@ -9317,7 +9395,12 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       return
     }
-    if (abnormalExit) {
+    // A ready Gateway can receive SIGTERM and exit cleanly (code=0). That is
+    // still an unexpected disconnect while the Desktop app is alive. Treat it
+    // like an abnormal ready exit so the bounded recovery series can restore
+    // the child. The stopping set and lifecycle authority checks above/below
+    // keep explicit quit, update, and profile recovery drains excluded.
+    if (abnormalExit || unexpectedReadyExit) {
       if (scheduleGatewayUnexpectedExitRestart(
         classifiedMessage,
         childWasReady,
@@ -9456,9 +9539,14 @@ async function createMainWindow(): Promise<BrowserWindow> {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Electron disables Chromium's built-in PDF plugin by default. The
+      // Workbench intentionally uses the native PDF viewer for PDF artifacts;
+      // keep the renderer sandboxed while enabling that viewer.
+      plugins: true,
     },
   })
   mainWindow = window
+  installGatewayShutdownRequestInterceptor(window)
   trackDesktopReliabilityWindow(window)
   installDesktopZoomShortcuts(
     window.webContents,
@@ -12408,6 +12496,24 @@ ipcMain.handle('desktop:source-file:action', async (event, payload: SourceFileAc
         url: snapshot.httpUrl, authToken: snapshot.authToken }
     },
     openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  })
+})
+ipcMain.handle('desktop:workspace-file:action', async (event, payload: WorkspaceFileActionRequest) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted workspace file request.')
+  return performWorkspaceFileAction(payload, {
+    connection: () => {
+      if (!trustedControlUiIpc(event) || !gatewayState.owned || gatewayState.status !== 'ready') return null
+      const snapshot = desktopGatewayConnectionSnapshot()
+      const nonce = gatewayProcess ? gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce : null
+      if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+      return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+        url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+    },
+    openPath: path => shell.openPath(path), reveal: path => shell.showItemInFolder(path),
+  }).catch(() => {
+    // Native filesystem errors can embed host paths. Only the main process
+    // receives controlled metadata; renderer errors remain path-free.
+    throw new Error('Workspace file action failed')
   })
 })
 // File paths enter this broker only from the native picker or isolated preload's

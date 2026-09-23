@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
-import { test } from 'node:test'
 import {
   SHUTDOWN_CANCELLATION,
   evaluateFirstSendEvidence,
@@ -63,6 +62,11 @@ if (process.argv.includes('--fixture-json')) {
     consoleSource: logText(result.observation.journal.records),
   }))
 } else {
+  // Keep the cross-language fixture path independent from node:test.  The
+  // fixture is consumed as a one-shot JSON subprocess by Windows CI, so it
+  // should not initialize the test runner before emitting its JSON payload.
+  const { test } = await import('node:test')
+
   test('normal zero-error and exact one-to-one shutdown observations pass', () => {
     for (const count of [0, 1, 2]) {
       const fixture = evidenceFixture(count)

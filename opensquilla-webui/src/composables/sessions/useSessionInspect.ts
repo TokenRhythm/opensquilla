@@ -68,7 +68,6 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
     seq: number,
     signal: AbortSignal,
     before?: string | number | null,
-    beforeApply?: () => void,
   ) {
     const historyOptions = {
       limit: SESSION_INSPECT_PAGE_SIZE,
@@ -94,7 +93,6 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
         && (before == null || nextOldestCursor !== String(before))
       oldestCursor.value = nextOldestCursor
     }
-    beforeApply?.()
     if (before != null) {
       const seen = new Set(messages.value.map(transcriptMessageKey))
       messages.value = [
@@ -135,14 +133,14 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
     if (seq === requestSeq) loading.value = false
   }
 
-  async function requestEarlier(cursor: string | number, beforeApply?: () => void) {
+  async function requestEarlier(cursor: string | number) {
     if (loadingEarlier.value || loading.value || !currentKey) return
     const seq = requestSeq
     loadingEarlier.value = true
     loadEarlierError.value = false
     try {
       const signal = activeController?.signal ?? new AbortController().signal
-      const applied = await fetchTranscript(currentKey, seq, signal, cursor, beforeApply)
+      const applied = await fetchTranscript(currentKey, seq, signal, cursor)
       if (seq === requestSeq && applied === true) {
         loadedEarlierCursors.add(String(cursor))
       }
@@ -158,23 +156,23 @@ export function useSessionInspect(sessionInspection: SessionInspection) {
     }
   }
 
-  function loadEarlier(beforeApply?: () => void) {
+  function loadEarlier() {
     if (!hasEarlier.value || loadingEarlier.value || loading.value || !currentKey) return
     const cursor = oldestCursor.value
     if (cursor == null || loadedEarlierCursors.has(String(cursor))) return
-    return requestEarlier(cursor, beforeApply)
+    return requestEarlier(cursor)
   }
 
-  function retryHistory(beforeApply?: () => void) {
+  function retryHistory() {
     const failed = failedTranscriptRequest
     if (failed?.key === currentKey) {
       if (failed.reloadLatest) return load(currentKey)
-      if (failed.before != null) return requestEarlier(failed.before, beforeApply)
+      if (failed.before != null) return requestEarlier(failed.before)
     }
     if (canonicalAvailable.value === false) {
       return currentKey ? load(currentKey) : undefined
     }
-    return loadEarlier(beforeApply)
+    return loadEarlier()
   }
 
   function reset() {

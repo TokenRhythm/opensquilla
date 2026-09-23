@@ -2642,7 +2642,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
     app.unmount()
   })
 
-  it('re-enables an inline provider preset without leaking materialized OpenRouter tiers', async () => {
+  it('re-enables an inline provider preset when the saved router has no tiers', async () => {
     mockProviderState(
       {
         ...configuredProviderStatus('tokenrhythm'),
@@ -2654,9 +2654,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
         llm: { provider: 'tokenrhythm', model: 'deepseek-v4-flash' },
         squilla_router: {
           enabled: false,
-          tiers: {
-            c0: { provider: 'openrouter', model: 'materialized-default' },
-          },
+          tiers: {},
         },
         llm_ensemble: { enabled: false },
       },
@@ -2705,9 +2703,7 @@ describe('useSetupCatalog fresh-install provider semantics', () => {
         llm: { provider: 'anthropic', model: 'claude-sonnet-4' },
         squilla_router: {
           enabled: false,
-          tiers: {
-            c0: { provider: 'openrouter', model: 'materialized-default' },
-          },
+          tiers: {},
         },
         llm_ensemble: { enabled: false },
       },
@@ -7237,6 +7233,157 @@ describe('useSetupCatalog image-generation onboarding intent', () => {
 
 
 describe('recommended Router reset and activation safety', () => {
+  it.each(['openrouter', 'tokenrhythm'])('resets foreign tiers to the saved %s primary', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    const foreignProvider = provider === 'openrouter' ? 'tokenrhythm' : 'openrouter'
+    saved.llm.provider = provider
+    saved.squilla_router.tiers.c0 = { provider: foreignProvider, model: 'custom-fast-model' }
+    saved.squilla_router.tiers.c1 = { provider: foreignProvider, model: 'custom-balanced-model' }
+    await api.loadData()
+
+    expect(api.modelStrategyPanel.value.routingSummary).toMatchObject({
+      providerId: provider,
+      recommendedProviderId: provider,
+    })
+    expect(api.modelStrategyPanel.value.router.tierRows[0]).toMatchObject({
+      provider: foreignProvider, model: 'custom-fast-model',
+    })
+    expect(await api.resetRecommendedRouter()).toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', {
+      providerId: provider, activateRouter: false,
+    })
+    expect(confirmAction).toHaveBeenCalledWith(expect.objectContaining({
+      title: expect.stringContaining(provider),
+    }))
+    expect(saved.llm.provider).toBe(provider)
+    app.unmount()
+  })
+
+  it.each(['openai', 'mixed'])('offers the saved primary recommendation for %s tiers', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    saved.squilla_router.tiers.c0.provider = provider === 'mixed' ? 'tokenrhythm' : provider
+    saved.squilla_router.tiers.c1.provider = provider === 'mixed' ? 'openrouter' : provider
+    await api.loadData()
+
+    expect(api.modelStrategyPanel.value.routingSummary?.recommendedProviderId).toBe('openrouter')
+    expect(await api.resetRecommendedRouter()).toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', {
+      providerId: 'openrouter', activateRouter: false,
+    })
+    app.unmount()
+  })
+
+  it.each(['openrouter', 'tokenrhythm'])('does not offer a reset for an unsupported primary with %s tiers', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    saved.llm.provider = 'openai'
+    saved.squilla_router.tiers.c0.provider = provider
+    saved.squilla_router.tiers.c1.provider = provider
+    await api.loadData()
+
+    expect(api.modelStrategyPanel.value.routingSummary?.recommendedProviderId).toBe('')
+    expect(await api.resetRecommendedRouter()).toBe(false)
+    expect(confirmAction).not.toHaveBeenCalled()
+    expect(rpcCall).not.toHaveBeenCalledWith('models.routing.resetRecommended', expect.anything())
+    app.unmount()
+  })
+
+  it.each(['openrouter', 'tokenrhythm'])('keeps the saved %s recommendation while provider and tier drafts change', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    const draftProvider = provider === 'openrouter' ? 'tokenrhythm' : 'openrouter'
+    saved.llm.provider = provider
+    saved.squilla_router.tiers.c0.provider = provider
+    saved.squilla_router.tiers.c1.provider = provider
+    await api.loadData()
+
+    api.selectProvider(draftProvider)
+    api.updateTierField('c0', 'provider', draftProvider)
+    api.updateTierField('c1', 'provider', draftProvider)
+    await nextTick()
+    expect(api.modelStrategyPanel.value.routingSummary).toMatchObject({
+      providerId: provider,
+      recommendedProviderId: provider,
+      hasUnsavedChanges: true,
+    })
+    expect(await api.resetRecommendedRouter()).toBe(true)
+    expect(rpcCall).toHaveBeenCalledWith('models.routing.resetRecommended', {
+      providerId: provider, activateRouter: false,
+    })
+    app.unmount()
+  })
+
+  it.each(['activate', 'save-and-activate'])('refreshes the summary, recommendation and dirty tiers after %s in either direction', async action => {
+    const { api, app, saved } = await primaryTransitionScenario(false, async (method, params) => {
+      if (method === 'onboarding.llmProfile.activate' || method === 'onboarding.llmProfile.upsertAndActivate') {
+        saved.llm.provider = String(params?.providerId)
+        saved.squilla_router.preset_binding = 'follow_primary'
+        saved.squilla_router.tiers.c0 = { provider: saved.llm.provider, model: `${saved.llm.provider}-recommended-fast` }
+        saved.squilla_router.tiers.c1 = { provider: saved.llm.provider, model: `${saved.llm.provider}-recommended-balanced` }
+        // A status refresh can observe the committed primary before the
+        // mutation acknowledgement arrives. It must not hide the switch.
+        await api.loadData({ preserveDirtySectionDrafts: true })
+      }
+      return { changed: true }
+    })
+    const originalRpc = rpcCall.getMockImplementation()!
+    Object.assign(saved.llm_profiles, { openrouter: { model: 'openai/gpt-4.1-mini' } })
+    Object.assign(saved.squilla_router, { cross_provider_tiers: true })
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (method === 'onboarding.status') return {
+        hasConfig: true,
+        llmConfigured: true,
+        llmCredentialStatus: { provider: saved.llm.provider, available: true, source: 'explicit' },
+        llmProfileStatus: ['openrouter', 'tokenrhythm'].map(provider => ({
+          provider, ready: true, primaryEligible: provider !== saved.llm.provider,
+          primaryBlockReason: provider === saved.llm.provider ? 'already_active' : '',
+          credentialSource: 'profile',
+        })),
+      }
+      return originalRpc(method, params)
+    })
+    await api.loadData()
+
+    for (const provider of ['tokenrhythm', 'openrouter']) {
+      api.updateTierField('c0', 'model', 'stale-unsaved-model')
+      api.setEnsembleMinSuccessful(2)
+      if (action === 'activate') {
+        await api.activateProvider(provider)
+        expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.activate', {
+          providerId: provider, imageGenerationIntent: 'preserve',
+        })
+      } else {
+        api.selectConfiguredProvider(provider)
+        expect(await api.saveProviderAndActivate()).toBe(true)
+        expect(rpcCall).toHaveBeenCalledWith('onboarding.llmProfile.upsertAndActivate', expect.objectContaining({
+          providerId: provider,
+        }))
+      }
+      expect(api.modelStrategyPanel.value.routingSummary).toMatchObject({
+        providerId: provider,
+        recommendedProviderId: provider,
+        enabled: true,
+        binding: 'follow_primary',
+      })
+      expect(api.modelStrategyPanel.value.router.tierRows[0]).toMatchObject({
+        provider, model: `${provider}-recommended-fast`,
+      })
+      expect(api.modelStrategyPanel.value.ensemble.minSuccessfulProposers).toBe(2)
+      expect(api.providerPanel.value.configuredProviders.find(row => row.providerId === provider)?.active).toBe(true)
+    }
+    app.unmount()
+  })
+
+  it.each(['openrouter', 'tokenrhythm', 'openai'])('uses only a supported %s primary when there are no saved text tiers', async provider => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    saved.llm.provider = provider
+    saved.squilla_router.tiers = {} as typeof saved.squilla_router.tiers
+    Object.assign(saved.squilla_router.tiers, {
+      image_model: { provider: 'another-image-provider', model: 'vision-model' },
+    })
+    await api.loadData()
+    expect(api.modelStrategyPanel.value.routingSummary?.recommendedProviderId).toBe(provider === 'openai' ? '' : provider)
+    app.unmount()
+  })
+
   it('requires explicit reset support and leaves ordinary single-mode operations available', async () => {
     hasRpcMethod.mockImplementation(method => method !== 'models.routing.resetRecommended')
     const { api, app } = await primaryTransitionScenario()

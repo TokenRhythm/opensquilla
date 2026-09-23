@@ -41,9 +41,6 @@ class ProtectedCreateRegistration:
     marker_dir: Path
 
 
-_SYNTHETIC_MARKER_ROOT = Path(tempfile.gettempdir()) / "opensquilla-bwrap-markers"
-
-
 def register_synthetic_mount_targets(
     targets: Iterable[SyntheticMountCleanupTarget],
 ) -> tuple[SyntheticMountRegistration, ...]:
@@ -159,7 +156,9 @@ def _protected_create_message(target: Path) -> str:
 
 def _marker_dir(target: Path) -> Path:
     digest = hashlib.sha256(str(target).encode("utf-8")).hexdigest()
-    return _SYNTHETIC_MARKER_ROOT / digest
+    # gettempdir() may write a canary. Never run it while importing the sandbox
+    # package: read-only workers on every platform import this module too.
+    return Path(tempfile.gettempdir()) / "opensquilla-bwrap-markers" / digest
 
 
 def _marker_name() -> str:

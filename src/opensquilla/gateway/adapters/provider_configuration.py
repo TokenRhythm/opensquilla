@@ -418,14 +418,22 @@ class GatewayModelRoutingPolicyPort:
             PrimaryProviderChangedError,
             reconcile_recommended_router,
             validate_router_candidate,
+            validate_router_reactivation,
         )
-
-        if provider_id.strip().lower() != str(config.llm.provider).strip().lower():
+        primary = str(config.llm.provider).strip().lower()
+        # Both the summary and recommendation action follow the saved primary.
+        # A foreign/custom ladder must be replaceable with its recommendation;
+        # the expected primary also rejects a stale client after a switch.
+        if provider_id.strip().lower() != primary:
             raise PrimaryProviderChangedError(
-                "The saved primary provider changed; reload before resetting Router"
+                "The primary provider changed; reload before resetting Router",
             )
         candidate = config.model_copy(deep=True)
-        reconcile_recommended_router(candidate, str(config.llm.provider))
+        reconcile_recommended_router(candidate, primary)
+        # A first sparse save must retain the chosen primary even when it
+        # equals the default; otherwise a provider-less reload may infer the
+        # legacy provider from the direct model and retarget this ladder.
+        candidate.mark_force_persist("llm.provider")
         patched = [
             "squilla_router.tiers",
             "squilla_router.tier_profile",
@@ -436,6 +444,8 @@ class GatewayModelRoutingPolicyPort:
         if activate_router:
             patched.extend(apply_model_routing_mode(candidate, "router", activation_config=config))
             validate_router_candidate(candidate)
+        else:
+            validate_router_reactivation(config, candidate)
         return PreparedModelRouting(candidate, tuple(patched))
 
 

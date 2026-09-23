@@ -1259,16 +1259,10 @@ try {
   assert.equal(await providerScreen.locator('.provider-promo-token').count(), 0)
   assert.equal(await providerScreen.locator('.provider-promo-copy').isVisible(), true)
   assert.equal(await providerScreen.locator('.provider-promo-copy strong').innerText(), 'TokenRhythm 限时福利')
-  assert.equal(await providerScreen.locator('.provider-promo-copy span').innerText(), '注册即领价值 68 元 Token')
-  const promoTitleBox = await page.locator('.provider-promo-copy strong').boundingBox()
-  const promoCopyBox = await page.locator('.provider-promo-copy span').boundingBox()
-  assert.ok(
-    promoTitleBox && promoCopyBox
-      && Math.abs(
-        (promoTitleBox.y + promoTitleBox.height / 2)
-        - (promoCopyBox.y + promoCopyBox.height / 2),
-    ) <= 2,
-    'the limited-time promotion copy should render on one line',
+  assert.equal(await providerScreen.locator('.provider-promo-copy span').count(), 0)
+  assert.equal(
+    await providerScreen.locator('#tokenrhythmRegister').getAttribute('aria-label'),
+    '限时福利（在外部浏览器中打开）',
   )
   assert.equal(
     await providerScreen.locator('.provider-promo-copy strong').evaluate((copy) => getComputedStyle(copy).color),
@@ -1329,6 +1323,7 @@ try {
   assert.equal(await page.locator('#probe').innerText(), '测试连接（可选）')
   const apiKeyLabelBox = await page.locator('.api-key-label').boundingBox()
   const providerLabelBox = await page.locator('#providerSelectLabel').boundingBox()
+  const promoTitleBox = await page.locator('.provider-promo-copy strong').boundingBox()
   const claimButtonBox = await page.locator('#tokenrhythmRegister').boundingBox()
   const initialApiKeyBox = await page.locator('#apiKey').boundingBox()
   assert.ok(
@@ -1337,14 +1332,10 @@ try {
     'the API-key heading should align with the inset provider label',
   )
   assert.ok(
-    apiKeyLabelBox && promoTitleBox && promoCopyBox
+    apiKeyLabelBox && promoTitleBox
       && Math.abs(
         (apiKeyLabelBox.y + apiKeyLabelBox.height / 2)
         - (promoTitleBox.y + promoTitleBox.height / 2),
-      ) <= 3
-      && Math.abs(
-        (apiKeyLabelBox.y + apiKeyLabelBox.height / 2)
-        - (promoCopyBox.y + promoCopyBox.height / 2),
       ) <= 3,
     'the limited-time promotion should share the API-key heading row',
   )
@@ -1410,7 +1401,7 @@ try {
   assert.equal(await page.locator('#routerMode').inputValue(), 'recommended')
 
   const tokenRhythmCta = page.locator('#tokenrhythmRegister')
-  assert.equal(await tokenRhythmCta.innerText(), '免费领取')
+  assert.equal(await tokenRhythmCta.innerText(), '限时福利')
   assert.equal(
     await tokenRhythmCta.evaluate((link) => getComputedStyle(link, '::after').content),
     '"↗"',

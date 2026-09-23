@@ -5,6 +5,7 @@ import composerSource from './ChatComposer.vue?raw'
 import viewSource from '../../views/ChatView.vue?raw'
 import appearanceSource from '../settings/SettingsAppearancePanel.vue?raw'
 import slashSource from '../../composables/chat/useChatSlashCommands.ts?raw'
+import { allowedComposerRunModes } from '../../composables/chat/composerRunMode'
 import en from '../../locales/en.json'
 import zhHans from '../../locales/zh-Hans.json'
 
@@ -65,8 +66,12 @@ describe('ChatComposer control hierarchy', () => {
   })
 
   it('offers Safe from the composer only after sandbox setup is ready', () => {
-    expect(viewSource).toContain("status.state !== 'ready'")
-    expect(viewSource).toContain("allowedRunModes.value.filter((mode) => mode !== 'safe')")
+    expect(viewSource).toContain('allowedComposerRunModes(')
+    const ready = { state: 'ready', platform: 'darwin', message: '', requiresAdmin: false } as const
+    expect(allowedComposerRunModes(['safe', 'full'], null, true)).toEqual(['full'])
+    expect(allowedComposerRunModes(['safe', 'full'], ready, false)).toEqual(['full'])
+    expect(allowedComposerRunModes(['safe', 'full'], ready, true)).toEqual(['safe', 'full'])
+    expect(allowedComposerRunModes(['full'], ready, true)).toEqual(['full'])
   })
 
   it('moves visual effects to Appearance settings', () => {

@@ -7,6 +7,8 @@ export type ModelStrategy = 'router' | 'ensemble' | 'single'
 export interface SavedRoutingSummary {
   providerId: string
   providerLabel: string
+  recommendedProviderId: string
+  recommendedProviderLabel: string
   enabled: boolean
   binding: 'follow_primary' | 'custom' | 'legacy'
   crossProviderEnabled: boolean

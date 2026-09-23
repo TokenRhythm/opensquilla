@@ -86,6 +86,12 @@ describe('Native cascading model routing menu', () => {
     await nextTick()
     expect(query('[role="listbox"]')).toBeNull()
   })
+  it('shows concise theme-colored benefit tags for each routing mode', async () => {
+    await mount({}, false)
+    expect([...document.querySelectorAll('.routing-mode__benefit')].map((el) => el.textContent))
+      .toEqual(['Token-efficient', 'Capability-first'])
+    expect(document.querySelector('.routing-mode__label')?.textContent).toBe('Fixed model')
+  })
   it('preserves provider identity when two providers expose the same model id', async () => {
     const { selected } = await mount()
     expect(document.querySelectorAll('[role="option"]')).toHaveLength(3)
@@ -133,6 +139,28 @@ describe('Native cascading model routing menu', () => {
     expect(document.querySelectorAll('[role="option"]')).toHaveLength(25)
     expect(query('.routing-show-all').textContent).toBe('View all models')
   })
+  it.each([360, 390, 768, 1366])(
+    'keeps the expansion action outside the scrollable model list at %ipx',
+    async (width) => {
+      vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(width)
+      await mount({
+        availableModels: Array.from({ length: 15 }, (_, index) => ({
+          id: `m-${index}`,
+          name: `Model ${index}`,
+          provider: 'provider-a',
+        })),
+      })
+      const listArea = query('.routing-models')
+      const listbox = query('[role="listbox"]')
+      const showAll = query<HTMLButtonElement>('.routing-show-all')
+      expect(listArea.contains(listbox)).toBe(true)
+      expect(listArea.children).toHaveLength(1)
+      expect(listArea.firstElementChild).toBe(listbox)
+      expect(listArea.contains(showAll)).toBe(false)
+      expect(showAll.parentElement).toBe(listArea.parentElement)
+      expect(showAll.tabIndex).toBe(0)
+    },
+  )
   it.each(['m-14', 'private-model'])('keeps selected %s visible within its provider budget', async (model) => {
     const { selected } = await mount({
       availableModels: Array.from({ length: 15 }, (_, index) => ({

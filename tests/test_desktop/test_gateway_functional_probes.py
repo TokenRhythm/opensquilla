@@ -155,7 +155,10 @@ def test_pty_probe_cleans_child_after_failure(
     monkeypatch.setattr(pty_backend, "wait_pty", wait)
     namespace = runpy.run_path(str(ENTRY))
     probe = namespace["_run_desktop_pty_probe"]
-    monkeypatch.setitem(probe.__globals__, "_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setitem(
+        probe.__globals__, "_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS",
+        1.0 if failure == "read" else 0.01,
+    )
 
     assert probe() == 1
     result = json.loads(capsys.readouterr().out)
@@ -167,6 +170,68 @@ def test_pty_probe_cleans_child_after_failure(
     }[failure]
     assert terminated == [handle]
     assert waited == [handle]
+
+
+def test_pty_probe_drains_tail_after_process_exit(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    handle = object()
+    chunks = iter([b"opensquilla-pty-ok\n", b"late-tail\n", b""])
+
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+
+    async def read(current):
+        assert current is handle
+        return next(chunks)
+
+    async def wait(current):
+        assert current is handle
+        return 0
+
+    monkeypatch.setattr(pty_backend, "read_pty", read)
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", lambda current: asyncio.sleep(0))
+    namespace = runpy.run_path(str(ENTRY))
+    probe = namespace["_run_desktop_pty_probe"]
+
+    assert probe() == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "probe": "opensquilla-desktop-pty",
+        "available": True,
+        "ioMode": "pty",
+        "returncode": 0,
+    }
+
+
+def test_pty_probe_waits_for_process_when_reader_eof_arrives_first(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from opensquilla.tools import pty_backend
+
+    handle = object()
+    chunks = iter([b"opensquilla-pty-ok\n", b""])
+
+    monkeypatch.setattr(pty_backend, "spawn_pty", lambda *args, **kwargs: handle)
+
+    async def read(current):
+        assert current is handle
+        return next(chunks)
+
+    async def wait(current):
+        assert current is handle
+        await asyncio.sleep(0.01)
+        return 0
+
+    monkeypatch.setattr(pty_backend, "read_pty", read)
+    monkeypatch.setattr(pty_backend, "wait_pty", wait)
+    monkeypatch.setattr(pty_backend, "terminate_pty", lambda current: asyncio.sleep(0))
+    namespace = runpy.run_path(str(ENTRY))
+    probe = namespace["_run_desktop_pty_probe"]
+
+    assert probe() == 0
+    assert json.loads(capsys.readouterr().out)["returncode"] == 0
 
 
 # Fresh-profile migrations and a real stdio server share the runner's process

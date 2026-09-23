@@ -256,7 +256,8 @@ describe('createArtifactPreviewResource', () => {
     )
     expect(controller.state.value).toBe('ready')
     if (mime === 'application/pdf') {
-      expect(controller.objectUrl.value).toBe('blob:desktop-preview')
+      expect(controller.objectUrl.value).toMatch(/^data:application\/pdf;base64,JVBERg==$/)
+      expect(createObjectUrl).not.toHaveBeenCalled()
     }
   })
 
@@ -438,6 +439,25 @@ describe('createArtifactPreviewResource', () => {
     expect(controller.state.value).toBe('ready')
     expect(controller.objectUrl.value).toBe('blob:pdf-preview')
     expect(observed.blob?.type).toBe('application/pdf')
+  })
+
+  it('uses a data URL for PDF previews in the Electron custom renderer origin', async () => {
+    const createObjectUrl = vi.fn(() => 'blob:should-not-be-used')
+    const controller = createArtifactPreviewResource(httpTransport(vi.fn().mockResolvedValue(response(
+      new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+      'application/pdf',
+    ))), {
+      artifact: () => artifact({ name: 'report.pdf', mime: 'application/pdf' }),
+      baseOrigin: () => 'opensquilla-app://desktop',
+      createObjectUrl,
+      revokeObjectUrl: vi.fn(),
+    })
+
+    await controller.load()
+
+    expect(controller.state.value).toBe('ready')
+    expect(controller.objectUrl.value).toMatch(/^data:application\/pdf;base64,JVBERg==$/)
+    expect(createObjectUrl).not.toHaveBeenCalled()
   })
 
   it('uses the file extension to type a generic image response', async () => {

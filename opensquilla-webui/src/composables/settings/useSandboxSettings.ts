@@ -116,11 +116,19 @@ export function useSandboxSettings() {
   let sandboxStartupPending = false
 
   const ready = computed(() => Boolean(baseline.value && draft.value))
-  const canRequestSandboxSetup = computed(() => (
-    platform.capabilities.isDesktop
-    && capability.value?.setupSupported !== false
-    && sandboxSetupStatus.value?.state === 'not_setup'
-  ))
+  const canRequestSandboxSetup = computed(() => {
+    const state = sandboxSetupStatus.value?.state
+    const isWindows = sandboxSetupStatus.value?.platform === 'win32'
+    // Windows startup is intentionally passive. A marker can therefore look
+    // ready while its offline-account password is stale; an explicit Safe
+    // selection must be allowed to revalidate/repair it. Failed setup is also
+    // retryable, while an active or permanently unavailable setup is not.
+    return Boolean(
+      platform.capabilities.isDesktop
+      && capability.value?.setupSupported !== false
+      && (state === 'not_setup' || (isWindows && (state === 'failed' || state === 'ready')))
+    )
+  })
 
   function sectionDirty(section: SandboxPolicySection): boolean {
     if (!baseline.value || !draft.value) return false

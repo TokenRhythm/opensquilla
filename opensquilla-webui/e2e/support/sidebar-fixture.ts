@@ -28,6 +28,7 @@ type RpcFrame = {
   method?: string
   params?: Record<string, unknown>
   type?: string
+  nonce?: string
 }
 
 /** Synthetic, offline gateway shared by interaction tests and visual checks. */
@@ -50,12 +51,13 @@ export async function installSidebarFixture(page: Page, rpcPayloads: Record<stri
         return
       }
       if (frame.type === 'ping') {
-        ws.send(JSON.stringify({ type: 'pong' }))
+        ws.send(JSON.stringify({ type: 'pong', nonce: frame.nonce }))
         return
       }
       if (frame.type !== 'req') return
       if (frame.method === 'connect') {
         ws.send(helloOkResponse({
+          features: { methods: Object.keys(rpcPayloads) },
           auth: {
             principal: { isOwner: true, authenticated: true, authState: 'authenticated' },
             runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
@@ -101,11 +103,13 @@ export async function installSidebarFixture(page: Page, rpcPayloads: Record<stri
         },
         'usage.status': { sessions: [] },
       }
+      const override = rpcPayloads[String(frame.method)]
       ws.send(JSON.stringify({
         type: 'res',
         id: frame.id,
         ok: true,
-        payload: rpcPayloads[String(frame.method)] ?? payloads[String(frame.method)] ?? {},
+        payload: typeof override === 'function' ? override(frame.params || {})
+          : override ?? payloads[String(frame.method)] ?? {},
       }))
     })
   })

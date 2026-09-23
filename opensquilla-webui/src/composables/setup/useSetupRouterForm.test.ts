@@ -66,14 +66,12 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
     expect(f.mode.value).toBe('recommended')
   })
 
-  it('uses the active provider preset instead of materialized defaults for follow-primary', () => {
+  it('fills absent follow-primary tiers from the active provider preset', () => {
     const f = useSetupRouterForm()
     f.initFromConfig(
       {
         enabled: false,
-        tiers: {
-          c0: { provider: 'openrouter', model: 'materialized-default' },
-        },
+        tiers: {},
       },
       {
         c0: { provider: 'deepseek', model: 'deepseek-chat' },
@@ -91,6 +89,33 @@ describe('useSetupRouterForm — openrouter-mix round-trip', () => {
         c0: { provider: 'deepseek', model: 'deepseek-chat' },
       },
     })
+  })
+
+  it('shows effective saved tiers and customized models despite a follow-primary binding', () => {
+    const f = useSetupRouterForm()
+    f.initFromConfig(
+      {
+        enabled: true,
+        preset_binding: 'follow_primary',
+        tiers: {
+          c0: { provider: 'tokenrhythm', model: 'saved-custom-model' },
+          c1: { provider: 'tokenrhythm', model: 'saved-balanced-model' },
+        },
+      },
+      {
+        c0: { provider: 'openrouter', model: 'preset-fast-model' },
+        c1: { provider: 'openrouter', model: 'preset-balanced-model' },
+      },
+      'openrouter',
+    )
+
+    expect(f.payload()).toMatchObject({
+      tiers: {
+        c0: { provider: 'tokenrhythm', model: 'saved-custom-model' },
+        c1: { provider: 'tokenrhythm', model: 'saved-balanced-model' },
+      },
+    })
+    expect(f.isDirty.value).toBe(false)
   })
 
   it('preserves explicit historical tiers when re-enabling a legacy router', () => {

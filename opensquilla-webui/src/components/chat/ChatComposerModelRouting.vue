@@ -50,26 +50,31 @@ const submenuSide = ref<'left' | 'right' | 'compact'>('right')
 const hasModelPicker = computed(() =>
   Boolean(props.modelSelectionAvailable || props.modelSelection),
 )
-const modes = computed(
-  () =>
-    [
-      {
-        value: 'off',
-        label: t('chat.modelRouting.direct'),
-        description: t('chat.composer.modelRoutingOffDesc'),
-      },
-      {
-        value: 'squilla_router',
-        label: t('chat.modelRouting.router'),
-        description: t('chat.composer.modelRoutingSquillaRouterDesc'),
-      },
-      {
-        value: 'llm_ensemble',
-        label: t('chat.modelRouting.ensemble'),
-        description: t('chat.composer.modelRoutingEnsembleDesc'),
-      },
-    ] as const,
-)
+type RoutingModeOption = {
+  value: ModelRoutingMode
+  label: string
+  badge?: string
+  description: string
+}
+const modes = computed<readonly RoutingModeOption[]>(() => [
+  {
+    value: 'off',
+    label: t('chat.modelRouting.direct'),
+    description: t('chat.composer.modelRoutingOffDesc'),
+  },
+  {
+    value: 'squilla_router',
+    label: t('chat.modelRouting.router'),
+    badge: t('setup.modelStrategy.cards.router.badge'),
+    description: t('chat.composer.modelRoutingSquillaRouterDesc'),
+  },
+  {
+    value: 'llm_ensemble',
+    label: t('chat.modelRouting.ensemble'),
+    badge: t('setup.modelStrategy.cards.ensemble.badge'),
+    description: t('chat.composer.modelRoutingEnsembleDesc'),
+  },
+])
 const key = (model: { model: string; provider: string | null }) =>
   JSON.stringify([model.provider, model.model])
 const selectedKey = computed(() =>
@@ -465,7 +470,10 @@ defineExpose({ element: () => rootRef.value })
               @click="index === 0 && hasModelPicker ? openModels(true) : selectMode(option.value)"
             >
               <span class="routing-mode__top">
-                <span>{{ option.label }}</span>
+                <span class="routing-mode__label-group">
+                  <span class="routing-mode__label">{{ option.label }}</span>
+                  <span v-if="option.badge" class="routing-mode__benefit">{{ option.badge }}</span>
+                </span>
                 <span class="routing-mode__indicators">
                   <Icon v-if="modelRoutingMode === option.value" name="check" :size="14" />
                   <Icon
@@ -598,14 +606,14 @@ defineExpose({ element: () => rootRef.value })
               }}
             </p>
           </div>
-          <button
-            v-if="hasHiddenModels"
-            ref="showAllRef"
-            type="button"
-            class="routing-show-all"
-            @click="showAllModels"
-          >{{ t('chat.newTaskModel.showAll') }}</button>
         </div>
+        <button
+          v-if="hasHiddenModels"
+          ref="showAllRef"
+          type="button"
+          class="routing-show-all"
+          @click="showAllModels"
+        >{{ t('chat.newTaskModel.showAll') }}</button>
         <div v-if="issue || (modelsLoading && !availableModels?.length)" class="routing-issue" role="status">
           <span>{{ modelsLoading && !availableModels?.length ? t('chat.newTaskModel.loading') : issue }}</span>
           <button
@@ -652,6 +660,7 @@ defineExpose({ element: () => rootRef.value })
   position: fixed;
   width: 316px;
   height: min(360px, var(--routing-height));
+  container: model-routing-menu / size;
   animation: routing-submenu-in var(--dur-fast) var(--ease-out);
 }
 .routing-heading {
@@ -715,11 +724,36 @@ defineExpose({ element: () => rootRef.value })
 .routing-mode__top {
   width: 100%;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 8px;
   font-size: var(--fs-sm);
   font-weight: 500;
+}
+.routing-mode__label-group {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  flex: 1 1 auto;
+  min-width: 0;
+  gap: 6px;
+}
+.routing-mode__label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+.routing-mode__benefit {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid color-mix(in srgb, var(--accent) 28%, var(--border));
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--accent) 9%, var(--bg-surface));
+  color: color-mix(in srgb, var(--accent) 80%, var(--text));
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 1.35;
+  white-space: nowrap;
 }
 .routing-mode__indicators {
   display: flex;
@@ -848,11 +882,14 @@ defineExpose({ element: () => rootRef.value })
   overscroll-behavior: contain;
 }
 .routing-show-all {
+  flex-shrink: 0;
   width: 100%;
-  padding: 10px;
+  min-height: 40px;
+  padding: 10px 14px;
   border: 0;
-  border-radius: var(--radius-control);
-  background: transparent;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+  background: var(--bg-surface);
   color: var(--text-muted);
   font: inherit;
   font-size: var(--fs-xs);
@@ -953,6 +990,25 @@ button:focus-visible {
 .is-compact .new-task-model-menu {
   position: static;
   width: 100%;
+}
+@container model-routing-menu (max-height: 220px) {
+  .routing-model-scope {
+    display: none;
+  }
+}
+@container model-routing-menu (max-height: 150px) {
+  .routing-heading {
+    min-height: 32px;
+    padding-block: 4px;
+  }
+  .routing-search {
+    height: 32px;
+    margin-bottom: 4px;
+  }
+  .routing-show-all {
+    min-height: 36px;
+    padding-block: 8px;
+  }
 }
 .is-drilled .routing-primary {
   display: none;

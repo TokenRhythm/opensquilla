@@ -30,7 +30,11 @@ def package_identity_for_meta(meta: SkillMeta) -> str:
         return f"github:{package}" if package else ""
     if meta.source_id == "clawhub":
         return _clawhub_package_identifier(identifier)
-    return ""
+    # Modern registry adapters use ``slug@version`` canonical identifiers.
+    # Keep the package identity version-independent while preserving the
+    # source namespace so two registries cannot shadow one another.
+    package = identifier.rsplit("@", 1)[0] if "@" in identifier else identifier
+    return f"{meta.source_id}:{package}" if package else ""
 
 
 def _entry_identifiers(entry: LockEntry) -> set[str]:

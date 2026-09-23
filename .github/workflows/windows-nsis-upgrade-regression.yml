@@ -86,13 +86,14 @@ jobs:
       - name: Audit frozen dependencies and verify packaged first interaction
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: '1'
+          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: '1'
         run: |
           $inventory = 'dist/desktop-electron/win-unpacked/resources/runtime/gateway/dependency-inventory.json'
           python .github/scripts/audit_dependencies.py --repo . --python-only --python-inventory $inventory --output-dir "$env:RUNNER_TEMP/frozen-dependency-audit"
           if ($LASTEXITCODE -ne 0) { throw 'Frozen dependency audit failed' }
           Push-Location desktop/electron
           try {
-            npm run verify:gateway-smoke
+            npm run verify:gateway-smoke -- --provision-windows-sandbox
             if ($LASTEXITCODE -ne 0) { throw 'Frozen Gateway smoke failed' }
             node scripts/test-packaged-first-send-renderer.mjs --executable "$env:GITHUB_WORKSPACE/dist/desktop-electron/win-unpacked/OpenSquilla.exe" --user-data-dir "$env:RUNNER_TEMP/security-first-send" 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP/security-first-send-report.log"
             $probeExitCode = $LASTEXITCODE

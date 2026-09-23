@@ -81,7 +81,9 @@ import {
 } from 'vue'
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
+import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
+import { readDistanceFromEnd } from '@/utils/virtualizerLayout'
 
 const MIN_TURNS = 8
 const ENTER_SCROLL_RANGE_RATIO = 1.5
@@ -125,12 +127,7 @@ const props = defineProps<{
   stripTimePrefix: (text: string) => string
   sessionKey?: string
   historyHasMore?: boolean
-  /** Mount a logical history row before DOM-dependent focus/highlight work. */
-  ensureMessageVisible?: (sourceIndex: number) => Promise<HTMLElement | null>
-  /** Release a row pinned only for navigation once the destination settles. */
-  releaseEnsuredMessage?: (sourceIndex?: number) => void
-  /** Absolute offset in the scroll container for an unmounted logical row. */
-  messageOffset?: (sourceIndex: number) => number | null
+  virtualizer: ChatMessageListVirtualizer | null
 }>()
 const emit = defineEmits<{
   navigate: [index: number]
@@ -150,15 +147,11 @@ const previewTop = ref(0)
 const hasLongHistory = ref(false)
 const isWideEnough = ref(false)
 const supportsRailInput = ref(true)
-const anchorOffsets = ref<number[]>([])
 const tooltipId = `conversation-minimap-tooltip-${Math.random().toString(36).slice(2, 9)}`
 
 let shellResizeObserver: ResizeObserver | null = null
-let threadResizeObserver: ResizeObserver | null = null
-let mutationObserver: MutationObserver | null = null
 let coarsePointerMedia: MediaQueryList | null = null
 let fineInputMedia: MediaQueryList | null = null
-let measureFrame = 0
 let overflowFrame = 0
 let activeFrame = 0
 let pointerFrame = 0
@@ -168,12 +161,14 @@ let navigationPending = false
 let navigationContainer: HTMLElement | null = null
 let navigationEndTimer = 0
 let navigationTarget: HTMLElement | null = null
-let navigationTargetTop = 0
-let navigationTargetSourceIndex: number | null = null
+let navigationTargetKey: string | null = null
+let navigationSeekIndex: number | null = null
+let navigationBehavior: 'auto' | 'smooth' = 'auto'
+let navigationArrivalFrame = 0
+let arrivalSamples = 0
 let navigationGeneration = 0
 let arrivalElement: HTMLElement | null = null
 let arrivalTimer = 0
-let lastAnchorElement: HTMLElement | null = null
 
 const turns = computed<ConversationTurn[]>(() => {
   // Phones and narrow panes use the native conversation flow. Avoid rebuilding
@@ -241,15 +236,8 @@ function markerStyle(index: number): Record<string, string> {
   }
 }
 
-function anchorElements(): Map<string, HTMLElement> {
-  const container = props.scrollContainer
-  const anchors = new Map<string, HTMLElement>()
-  if (!container) return anchors
-  container.querySelectorAll<HTMLElement>('[data-chat-turn-key]').forEach(element => {
-    const key = element.dataset.chatTurnKey
-    if (key) anchors.set(key, element)
-  })
-  return anchors
+function turnElement(sourceIndex: number): HTMLElement | null {
+  return props.scrollContainer?.querySelector<HTMLElement>('#chat-turn-' + sourceIndex) ?? null
 }
 
 function updateOverflowState() {
@@ -267,63 +255,22 @@ function updateOverflowState() {
   updateActiveTurn()
 }
 
-function measureLayout() {
-  const container = props.scrollContainer
-  if (!container || !isWideEnough.value) {
-    hasLongHistory.value = false
-    anchorOffsets.value = []
-    return
-  }
-
-  updateOverflowState()
-
-  const containerRect = container.getBoundingClientRect()
-  const anchors = anchorElements()
-  lastAnchorElement = anchors.get(turns.value[turns.value.length - 1]?.key || '') || null
-  anchorOffsets.value = turns.value.map(turn => {
-    const anchor = anchors.get(turn.key)
-    if (anchor) {
-      return anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
-    }
-    const logicalOffset = props.messageOffset?.(turn.sourceIndex)
-    return logicalOffset !== null
-      && logicalOffset !== undefined
-      && Number.isFinite(logicalOffset)
-      ? logicalOffset
-      : Number.POSITIVE_INFINITY
-  })
-  updateActiveTurn()
-}
-
 function updateActiveTurn() {
   // Keep the selected destination visually stable while the scroll viewport
   // crosses intermediate prompts. Reconcile to the reading line on arrival.
   if (navigationPending) return
   const container = props.scrollContainer
-  const offsets = anchorOffsets.value
-  if (!container || offsets.length === 0) {
+  if (!container || !turns.value.length) {
     activeIndex.value = 0
     return
   }
 
-  const bottomGap = container.scrollHeight - container.scrollTop - container.clientHeight
-  let nextIndex = 0
-  if (bottomGap <= 2) {
-    nextIndex = offsets.length - 1
-  } else {
-    const readingLine = container.scrollTop + Math.min(180, container.clientHeight * 0.3)
-    let low = 0
-    let high = offsets.length - 1
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2)
-      if (offsets[mid] <= readingLine) {
-        nextIndex = mid
-        low = mid + 1
-      } else {
-        high = mid - 1
-      }
-    }
-  }
+  const bottomGap = props.virtualizer?.getDistanceFromEnd() ?? readDistanceFromEnd(container)
+  const readingLine = container.scrollTop + Math.min(180, container.clientHeight * 0.3)
+  const sourceIndex = props.virtualizer?.messageIndexAtOffset(readingLine) ?? 0
+  const nextTurn = turns.value.findIndex(turn => turn.sourceIndex > sourceIndex)
+  const nextIndex = bottomGap <= 2 ? turns.value.length - 1
+    : nextTurn < 0 ? turns.value.length - 1 : Math.max(0, nextTurn - 1)
 
   if (nextIndex !== activeIndex.value) {
     activeIndex.value = nextIndex
@@ -341,15 +288,6 @@ function keepActiveMarkerVisible() {
   else if (markerBottom > list.scrollTop + list.clientHeight) {
     list.scrollTop = markerBottom - list.clientHeight
   }
-}
-
-function scheduleMeasure() {
-  if (!observersActive) return
-  if (measureFrame) return
-  measureFrame = requestFrame(() => {
-    measureFrame = 0
-    measureLayout()
-  })
 }
 
 function scheduleOverflowUpdate() {
@@ -383,32 +321,6 @@ function cancelFrame(frame: number) {
   else window.clearTimeout(frame)
 }
 
-function elementNeedsAnchorRemeasure(element: Element): boolean {
-  if (!lastAnchorElement || element === lastAnchorElement) return true
-  // The minimap observes direct thread children. When the list root contains
-  // the current last prompt, its own late height change must invalidate the
-  // cached anchor even though document position reports the anchor as a
-  // descendant rather than a following sibling.
-  if (element.contains(lastAnchorElement)) return true
-  return Boolean(element.compareDocumentPosition(lastAnchorElement) & Node.DOCUMENT_POSITION_FOLLOWING)
-}
-
-function onThreadResize(entries: ResizeObserverEntry[]) {
-  const container = props.scrollContainer
-  if (!container) return
-  if (entries.some(entry => entry.target === container || elementNeedsAnchorRemeasure(entry.target))) {
-    scheduleMeasure()
-  } else {
-    // The streaming tail grows after the last prompt. Its height changes the
-    // overflow state but cannot move any cached prompt anchor.
-    scheduleOverflowUpdate()
-  }
-}
-
-function observeDirectChildren(container: HTMLElement) {
-  Array.from(container.children).forEach(child => threadResizeObserver?.observe(child))
-}
-
 function activateThreadObservers() {
   if (observersActive) return
   const container = props.scrollContainer
@@ -416,49 +328,20 @@ function activateThreadObservers() {
   observersActive = true
   container.addEventListener('scroll', scheduleActiveUpdate, { passive: true })
 
-  if (typeof ResizeObserver !== 'undefined') {
-    threadResizeObserver = new ResizeObserver(onThreadResize)
-    threadResizeObserver.observe(container)
-    observeDirectChildren(container)
-  }
-  if (typeof MutationObserver !== 'undefined') {
-    mutationObserver = new MutationObserver(records => {
-      for (const record of records) {
-        record.removedNodes.forEach(node => {
-          if (node instanceof Element) threadResizeObserver?.unobserve(node)
-        })
-        record.addedNodes.forEach(node => {
-          if (node instanceof Element) threadResizeObserver?.observe(node)
-        })
-      }
-      scheduleMeasure()
-    })
-    // Only top-level thread structure can add or remove prompt anchors. Nested
-    // live-token mutations are covered by the direct child's ResizeObserver.
-    mutationObserver.observe(container, { childList: true })
-  }
-  scheduleMeasure()
+  scheduleOverflowUpdate()
 }
 
 function deactivateThreadObservers() {
   const container = props.scrollContainer
   container?.removeEventListener('scroll', scheduleActiveUpdate)
-  threadResizeObserver?.disconnect()
-  mutationObserver?.disconnect()
-  threadResizeObserver = null
-  mutationObserver = null
   observersActive = false
-  cancelFrame(measureFrame)
   cancelFrame(overflowFrame)
   cancelFrame(activeFrame)
   cancelFrame(pointerFrame)
-  measureFrame = 0
   overflowFrame = 0
   activeFrame = 0
   pointerFrame = 0
   hasLongHistory.value = false
-  anchorOffsets.value = []
-  lastAnchorElement = null
   hoveredIndex.value = null
   focusedIndex.value = null
   pointerLensIndex.value = null
@@ -509,6 +392,7 @@ function detachInputEligibility() {
 }
 
 function attachContainer(next: HTMLElement | null, previous: HTMLElement | null) {
+  if (next !== previous) cancelNavigation()
   previous?.removeEventListener('scroll', scheduleActiveUpdate)
   deactivateThreadObservers()
   shellResizeObserver?.disconnect()
@@ -528,6 +412,9 @@ function clearNavigationEnd() {
   navigationContainer = null
   if (navigationEndTimer) window.clearTimeout(navigationEndTimer)
   navigationEndTimer = 0
+  cancelFrame(navigationArrivalFrame)
+  navigationArrivalFrame = 0
+  arrivalSamples = 0
 }
 
 function clearArrivalHighlight() {
@@ -544,118 +431,109 @@ function showArrivalHighlight(target: HTMLElement) {
   arrivalTimer = window.setTimeout(clearArrivalHighlight, ARRIVAL_HIGHLIGHT_MS)
 }
 
+function navigationTurn() {
+  return turns.value.find(turn => turn.key === navigationTargetKey)
+}
+
+function hasArrived(): boolean {
+  const container = navigationContainer
+  const turn = navigationTurn()
+  const target = turn ? turnElement(turn.sourceIndex) : null
+  if (!container || !target) return false
+  navigationTarget = target
+  const targetTop = Math.min(
+    Math.max(0, container.scrollHeight - container.clientHeight),
+    Math.max(0, target.getBoundingClientRect().top - container.getBoundingClientRect().top
+      + container.scrollTop - 16),
+  )
+  return Math.abs(container.scrollTop - targetTop) <= ARRIVAL_TOLERANCE_PX
+}
+
 function settleNavigation(showArrival: boolean) {
   if (!navigationPending) return
+  const arrived = showArrival && hasArrived()
   const target = navigationTarget
-  const container = navigationContainer
-  const sourceIndex = navigationTargetSourceIndex
-  const arrived = showArrival
-    && Boolean(container)
-    && Math.abs((container?.scrollTop || 0) - navigationTargetTop) <= ARRIVAL_TOLERANCE_PX
+  const turn = navigationTurn()
   navigationPending = false
   navigationTarget = null
-  navigationTargetTop = 0
-  navigationTargetSourceIndex = null
+  navigationTargetKey = null
+  navigationSeekIndex = null
   clearNavigationEnd()
   if (target && arrived) showArrivalHighlight(target)
-  if (sourceIndex !== null) props.releaseEnsuredMessage?.(sourceIndex)
+  props.virtualizer?.releaseEnsuredMessage(turn?.sourceIndex)
   scheduleActiveUpdate()
   emit('navigateEnd')
 }
 
 function finishNavigation() {
-  settleNavigation(true)
+  // Measurements can trigger intermediate scrollend events. Release the
+  // target only after arrival stays correct through three layout frames.
+  if (!navigationPending || navigationArrivalFrame) return
+  navigationArrivalFrame = requestFrame(() => {
+    navigationArrivalFrame = 0
+    arrivalSamples = hasArrived() ? arrivalSamples + 1 : 0
+    if (arrivalSamples >= 3) settleNavigation(true)
+    else finishNavigation()
+  })
 }
 
 function cancelNavigation() {
-  const container = navigationContainer
-  const shouldCancelSmoothScroll = navigationPending && Boolean(container)
+  const wasPending = navigationPending
   navigationGeneration += 1
+  if (wasPending) props.virtualizer?.cancelScroll()
   settleNavigation(false)
-  if (shouldCancelSmoothScroll && container) {
-    container.scrollTo({ top: container.scrollTop, behavior: 'auto' })
-  }
 }
 
 defineExpose({ cancelNavigation })
 
-function armNavigationEnd(container: HTMLElement, smooth: boolean) {
-  navigationPending = true
-  navigationContainer = container
-  container.addEventListener('scrollend', finishNavigation, { once: true })
-  // scrollend is not universal yet. The safety net is deliberately longer
-  // than a long native smooth scroll so slower engines cannot settle early.
-  navigationEndTimer = window.setTimeout(finishNavigation, smooth ? 2000 : 180)
+function armNavigationEnd(container: HTMLElement) {
+  container.addEventListener('scrollend', finishNavigation)
+  navigationEndTimer = window.setTimeout(cancelNavigation, 2000)
+  finishNavigation()
 }
 
 async function navigateTo(index: number, focusTarget = false) {
   const container = props.scrollContainer
+  const virtualizer = props.virtualizer
   const turn = turns.value[index]
-  if (!container || !turn) return
+  if (!container || !virtualizer || !turn) return
   cancelNavigation()
   const generation = ++navigationGeneration
   if (focusTarget) {
     focusedIndex.value = index
   } else {
-    // Pointer activation focuses the button before click. Clear both preview
-    // sources so the floating card does not linger over the destination; the
-    // DOM focus itself stays put for keyboard continuity.
     closeHoverPreview()
     focusedIndex.value = null
   }
-  // Open the lifecycle before awaiting a virtualized row. Session changes,
-  // unmounts, or reader input during that await must still emit navigateEnd
-  // and invalidate the eventual continuation.
+  // Product owns intent, focus and cancellation; TanStack owns the seek and
+  // its correction as estimated rows become measured along the way.
   navigationPending = true
+  navigationContainer = container
+  navigationTargetKey = turn.key
   emit('navigate', index)
   activeIndex.value = index
-  let anchor = anchorElements().get(turn.key) || null
-  if (!anchor) {
-    try {
-      anchor = await props.ensureMessageVisible?.(turn.sourceIndex) || null
-    } catch {
-      if (generation === navigationGeneration) settleNavigation(false)
-      return
-    }
-  }
-  if (generation !== navigationGeneration) {
-    props.releaseEnsuredMessage?.(turn.sourceIndex)
+  try {
+    navigationTarget = await virtualizer.ensureMessageVisible(turn.sourceIndex)
+  } catch {
+    if (generation === navigationGeneration) settleNavigation(false)
     return
   }
-  const containerRect = container.getBoundingClientRect()
-  const anchorTop = anchor
-    ? anchor.getBoundingClientRect().top - containerRect.top + container.scrollTop
-    : props.messageOffset?.(turn.sourceIndex)
-  if (anchorTop === null || anchorTop === undefined || !Number.isFinite(anchorTop)) {
-    props.releaseEnsuredMessage?.(turn.sourceIndex)
+  if (generation !== navigationGeneration) return
+  const currentTurn = navigationTurn()
+  if (!currentTurn) {
     settleNavigation(false)
     return
   }
-  const targetTop = Math.min(
-    Math.max(0, container.scrollHeight - container.clientHeight),
-    Math.max(0, anchorTop - 16),
-  )
-  const distance = Math.abs(targetTop - container.scrollTop)
+  if (focusTarget) navigationTarget?.focus({ preventScroll: true })
   const reduceMotion = typeof window !== 'undefined'
     && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches
-  // Keep one spatially continuous motion model at every distance. The old
-  // long-jump branch teleported the thread and then flashed the destination,
-  // which read as a rendering glitch rather than navigation. Native smooth
-  // scrolling stays interruptible by wheel/touch input and avoids per-frame
-  // Vue work; reduced-motion remains an immediate jump.
-  const smooth = !reduceMotion
-  if (focusTarget) anchor?.focus({ preventScroll: true })
-  if (distance <= ARRIVAL_TOLERANCE_PX) {
-    if (anchor) showArrivalHighlight(anchor)
-    props.releaseEnsuredMessage?.(turn.sourceIndex)
-    settleNavigation(false)
-    return
-  }
-  navigationTarget = anchor
-  navigationTargetTop = targetTop
-  navigationTargetSourceIndex = turn.sourceIndex
-  armNavigationEnd(container, smooth)
-  container.scrollTo({ top: targetTop, behavior: smooth ? 'smooth' : 'auto' })
+  navigationSeekIndex = currentTurn.sourceIndex
+  navigationBehavior = reduceMotion ? 'auto' : 'smooth'
+  armNavigationEnd(container)
+  virtualizer.scrollToMessage(currentTurn.sourceIndex, {
+    align: 'start',
+    behavior: navigationBehavior,
+  })
 }
 
 function showHoverPreview(index: number, target: EventTarget | null) {
@@ -747,6 +625,7 @@ function onMarkerKeydown(index: number, event: KeyboardEvent) {
 }
 
 watch(() => props.scrollContainer, attachContainer)
+watch(() => props.virtualizer?.geometryVersion(), scheduleOverflowUpdate)
 watch(() => props.sessionKey, () => {
   cancelNavigation()
   clearArrivalHighlight()
@@ -756,7 +635,7 @@ watch(() => props.sessionKey, () => {
   focusedIndex.value = null
   pointerLensIndex.value = null
   markerRefs.value = []
-  if (observersActive) void nextTick(scheduleMeasure)
+  if (observersActive) void nextTick(scheduleOverflowUpdate)
 })
 watch(turns, (nextTurns, previousTurns) => {
   if (nextTurns.length < MIN_TURNS) hasLongHistory.value = false
@@ -772,11 +651,23 @@ watch(turns, (nextTurns, previousTurns) => {
   activeIndex.value = remap(activeIndex.value) ?? 0
   pointerLensIndex.value = null
   markerRefs.value = []
+  const generation = navigationGeneration
   void nextTick(() => {
-    if (observersActive) {
-      observeDirectChildren(props.scrollContainer!)
-      scheduleMeasure()
+    if (observersActive) scheduleOverflowUpdate()
+    if (!navigationPending || generation !== navigationGeneration || navigationSeekIndex === null) return
+    const target = navigationTurn()
+    if (!target) {
+      cancelNavigation()
+      return
     }
+    if (target.sourceIndex === navigationSeekIndex) return
+    // TanStack reconciles an index seek numerically. A prepend changes that
+    // index, while the product destination stays keyed to the same message.
+    navigationSeekIndex = target.sourceIndex
+    arrivalSamples = 0
+    props.virtualizer?.scrollToMessage(target.sourceIndex, {
+      align: 'start', behavior: navigationBehavior,
+    })
   })
 }, { deep: false })
 

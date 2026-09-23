@@ -457,14 +457,31 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          node scripts/prepare-macos-keychain.cjs
           npm run build:gateway
           npm run build
           npm run verify:prepared
-          npx electron-builder --mac --publish never
+          npx electron-builder --mac --publish never --config.forceCodeSigning=true --config.dmg.sign=true
 
       - name: Verify Electron package
         working-directory: desktop/electron
         run: npm run verify:package
+
+      - name: Verify macOS signatures and notarization
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(dist/desktop-electron/mac*/OpenSquilla.app)
+          dmgs=(dist/desktop-electron/OpenSquilla-*-mac-arm64.dmg)
+          if [[ "${#apps[@]}" -ne 1 || "${#dmgs[@]}" -ne 1 ]]; then
+            echo "Expected exactly one macOS app and signed DMG" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+          spctl --assess --type execute --verbose=2 "${apps[0]}"
+          xcrun stapler validate "${apps[0]}"
+          codesign --verify --strict --verbose=2 "${dmgs[0]}"
 
       - name: Enforce slim macOS artifact size budgets
         run: >-
@@ -700,7 +717,8 @@ jobs:
         working-directory: desktop/electron
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
-        run: npm run verify:gateway-smoke
+          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: "1"
+        run: npm run verify:gateway-smoke -- --provision-windows-sandbox
 
       - name: Record signed candidate identity
         shell: pwsh

@@ -39,6 +39,9 @@ _STRING_ENTRY_FIELDS = (
     "license",
     "upstream_url",
     "source_trust",
+    "origin_source",
+    "signature_status",
+    "content_hash",
     "scan_verdict",
     "scan_strategy",
     "install_id",
@@ -121,6 +124,9 @@ class LockEntry:
     license: str = ""
     upstream_url: str = ""
     source_trust: str = ""
+    origin_source: str = ""
+    signature_status: str = ""
+    content_hash: str = ""
     scan_verdict: str = ""
     scan_strategy: str = ""
     scan_findings: list[dict[str, Any]] = field(default_factory=list)

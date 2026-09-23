@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.recovery import RecoveryError, inspect_profile, recover_config
 
 
@@ -25,7 +26,7 @@ def _profile(tmp_path: Path) -> Path:
 
 def _valid_config(home: Path) -> str:
     return (
-        "config_version = 1\n"
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
         f"state_dir = {json.dumps(str(home / 'state'))}\n"
         f"workspace_dir = {json.dumps(str(home / 'workspace'))}\n"
     )
@@ -84,7 +85,9 @@ def test_recover_config_without_backup_keeps_evidence_and_writes_defaults(
     report = recover_config(home)
 
     assert report.outcome == "ready"
-    assert (home / "config.toml").read_text(encoding="utf-8") == "config_version = 1\n"
+    assert (home / "config.toml").read_text(encoding="utf-8") == (
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
+    )
     corrupt = _corrupt_configs(home)
     assert len(corrupt) == 1
     assert corrupt[0].read_text(encoding="utf-8") == "state_dir = 7\n"
@@ -101,7 +104,9 @@ def test_recover_config_ignores_link_shaped_backups(tmp_path: Path) -> None:
     report = recover_config(home)
 
     assert report.outcome == "ready"
-    assert (home / "config.toml").read_text(encoding="utf-8") == "config_version = 1\n"
+    assert (home / "config.toml").read_text(encoding="utf-8") == (
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
+    )
 
 
 def test_recover_config_refuses_schema_too_new(tmp_path: Path) -> None:
@@ -109,7 +114,8 @@ def test_recover_config_refuses_schema_too_new(tmp_path: Path) -> None:
     (home / "config.toml.backup.20260101000000000000").write_text(
         _valid_config(home), encoding="utf-8"
     )
-    (home / "config.toml").write_text("config_version = 99\n", encoding="utf-8")
+    future_config = f"config_version = {LATEST_CONFIG_VERSION + 1}\n"
+    (home / "config.toml").write_text(future_config, encoding="utf-8")
 
     before = inspect_profile(home)
     assert before.stable_code == "config_schema_too_new"
@@ -118,7 +124,7 @@ def test_recover_config_refuses_schema_too_new(tmp_path: Path) -> None:
     with pytest.raises(RecoveryError) as excinfo:
         recover_config(home)
     assert excinfo.value.stable_code == "config_recovery_not_applicable"
-    assert (home / "config.toml").read_text(encoding="utf-8") == "config_version = 99\n"
+    assert (home / "config.toml").read_text(encoding="utf-8") == future_config
     assert _corrupt_configs(home) == []
 
 

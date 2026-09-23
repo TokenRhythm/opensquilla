@@ -46,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION  # noqa: E402
 from opensquilla.gateway_client import GatewayRPCClient  # noqa: E402
 from opensquilla.provider.registry import get_provider_spec  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
@@ -464,6 +465,7 @@ def render_gateway_config(
     lines = [
         'host = "127.0.0.1"',
         "debug = false",
+        f"config_version = {LATEST_CONFIG_VERSION}",
         "log_file_enabled = false",
         f"workspace_dir = {_toml_string(workspace_dir)}",
         "llm_request_timeout_seconds = 900",

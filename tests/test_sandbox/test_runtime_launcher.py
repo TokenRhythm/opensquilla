@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +14,33 @@ from opensquilla.sandbox.runtime_launcher import (
     dispatch_internal_child,
     internal_child_argv,
 )
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_internal_child_import_never_probes_writable_temp(tmp_path, frozen):
+    # A fresh interpreter is essential: an already imported sandbox package
+    # hides import-time gettempdir() writes in read-only/frozen children.
+    source_root = Path(__file__).resolve().parents[2] / "src"
+    code = f"""
+import sys
+import tempfile
+def forbidden():
+    raise AssertionError('internal child import must not probe temporary storage')
+tempfile.gettempdir = forbidden
+sys.frozen = {frozen!r}
+from opensquilla.sandbox.runtime_launcher import dispatch_internal_child
+raise SystemExit(dispatch_internal_child(['python-code', 'print("child-ready")']))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(source_root), "PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "child-ready"
 
 
 @pytest.mark.parametrize(

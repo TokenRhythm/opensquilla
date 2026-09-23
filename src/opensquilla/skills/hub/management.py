@@ -577,7 +577,7 @@ def _normalize_legacy_manifest(
     resolution: SourceResolution,
     source_id: str,
 ) -> tuple[Path, bool]:
-    allow_community_legacy = source_id in {"clawhub", "github"}
+    allow_community_legacy = source_id in {"clawhub", "skillhub", "github"}
     manifests = [
         child
         for child in candidate_dir.iterdir()
@@ -691,7 +691,13 @@ def _normalize_legacy_manifest(
             sort_keys=False,
             width=1_000,
         ).rstrip()
-        manifest.write_text(f"---\n{rendered}\n---\n{body.strip()}\n", encoding="utf-8")
+        # Keep the normalized bytes identical across platforms; Windows text
+        # translation must not change the installed manifest or its digest.
+        manifest.write_text(
+            f"---\n{rendered}\n---\n{body.strip()}\n",
+            encoding="utf-8",
+            newline="\n",
+        )
     return final_dir, changed
 
 
@@ -1413,9 +1419,26 @@ class SkillManagementService:
                 )
         if any(item.blocking for item in diagnostics):
             return resolution, None, diagnostics
+        requires_immutable = bool(
+            getattr(source, "requires_immutable_resolution", False)
+        )
+        # Preserve the historical policy for injected ClawHub/GitHub adapters
+        # that predate the capability property.  A fetch-only adapter still
+        # remains compatible because ``modern_resolution`` is false for the
+        # base SkillSource.resolve implementation.
         if (
             modern_resolution
+            and source is not None
+            and not requires_immutable
             and source_id in {"clawhub", "github"}
+            and getattr(type(source), "requires_immutable_resolution", None)
+            is getattr(SkillSource, "requires_immutable_resolution")
+        ):
+            requires_immutable = True
+        if (
+            modern_resolution
+            and source is not None
+            and requires_immutable
             and not resolution.immutable
         ):
             diagnostics.append(
@@ -1478,7 +1501,8 @@ class SkillManagementService:
             return resolution, None, diagnostics
         if (
             modern_resolution
-            and source_id in {"clawhub", "github"}
+            and source is not None
+            and requires_immutable
             and not resolution.immutable
         ):
             diagnostics.append(
@@ -2748,6 +2772,15 @@ class SkillManagementService:
                                 getattr(resolution, "trust_state", "")
                                 or getattr(meta, "trust_level", "")
                                 or "community"
+                            ),
+                            origin_source=str(
+                                getattr(meta, "origin_source", "") or ""
+                            ),
+                            signature_status=str(
+                                getattr(meta, "signature_status", "") or ""
+                            ),
+                            content_hash=str(
+                                getattr(meta, "content_hash", "") or ""
                             ),
                             scan_verdict=scan_result.verdict,
                             scan_strategy=scan_result.strategy,

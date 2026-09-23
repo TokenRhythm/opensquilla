@@ -158,6 +158,7 @@
             :sources="message.sources ?? []"
             :workspace-previews="workspacePreviews"
             :session-key="sessionKey"
+            :prefer-workspace-workbench="workbenchEnabled"
             @open-resource="emit('openArtifact', $event)"
             @citation="onCitation"
             @workspace-preview="openWorkspacePreview"
@@ -217,6 +218,7 @@
         :sources="message.sources ?? []"
         :workspace-previews="workspacePreviews"
         :session-key="sessionKey"
+        :prefer-workspace-workbench="workbenchEnabled"
         @open-resource="emit('openArtifact', $event)"
         @citation="onCitation"
         @workspace-preview="openWorkspacePreview"
@@ -227,6 +229,7 @@
         :part="{ type: 'text', key: 'workspace-preview-fallback', rawText: '', html: '' }"
         :workspace-previews="workspacePreviews"
         :session-key="sessionKey"
+        :prefer-workspace-workbench="workbenchEnabled"
         @open-resource="emit('openArtifact', $event)"
         @workspace-preview="openWorkspacePreview"
       />

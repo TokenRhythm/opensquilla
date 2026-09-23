@@ -6,6 +6,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import logging
 import ntpath
 import os
 import secrets
@@ -63,8 +64,14 @@ from opensquilla.sandbox.permissions import (
 )
 from opensquilla.sandbox.run_mode import normalize_run_mode
 from opensquilla.sandbox.runtime_launcher import ChildRole, internal_child_argv
-from opensquilla.sandbox.types import SandboxBackendError, SandboxRequest, SandboxResult
+from opensquilla.sandbox.types import (
+    SandboxBackendError,
+    SandboxRequest,
+    SandboxResult,
+)
 from opensquilla.subprocess_encoding import decode_subprocess_output
+
+log = logging.getLogger(__name__)
 
 _OUTPUT_BYTE_CAP = 1_048_576
 _HELPER_PAYLOAD_ENV = "OPENSQUILLA_WINDOWS_DEFAULT_PAYLOAD"
@@ -105,6 +112,7 @@ class WindowsDefaultBackend(Backend):
     def available(self) -> bool:
         return _support_ready()
 
+
     def operation_domains_supported(self) -> frozenset[SandboxOperationDomain]:
         return frozenset({"filesystem"})
 
@@ -119,7 +127,8 @@ class WindowsDefaultBackend(Backend):
         _filesystem_request(operation)
         if not _support_ready():
             raise SandboxBackendError(
-                "windows_default backend unavailable: administrator setup or Windows "
+                "sandbox_setup_required: Windows Safe helper setup is not ready; "
+                "administrator setup or Windows "
                 "support checks are not ready"
             )
         if operation.workspace is None:
@@ -154,7 +163,8 @@ class WindowsDefaultBackend(Backend):
     ) -> SandboxResult:
         if not _support_ready():
             raise SandboxBackendError(
-                "windows_default backend unavailable: administrator setup or Windows "
+                "sandbox_setup_required: Windows Safe helper setup is not ready; "
+                "administrator setup or Windows "
                 "support checks are not ready"
             )
 
@@ -186,7 +196,7 @@ class WindowsDefaultBackend(Backend):
                 env=helper_env,
             )
         except (FileNotFoundError, OSError) as exc:
-            raise SandboxBackendError(f"windows_default helper launch failed: {exc}") from exc
+            raise SandboxBackendError(f"helper_launch_failed: {exc}") from exc
 
         try:
             stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -224,8 +234,11 @@ class WindowsDefaultBackend(Backend):
             expected_nonce=str(payload["helperNonce"]),
         )
         if proc.returncode not in {None, 0} and helper_error is not None:
+            if "helper_root_unavailable:" in helper_error:
+                detail = helper_error.split("helper_root_unavailable:", 1)[1].strip()
+                raise SandboxBackendError(f"helper_root_unavailable: {detail}")
             raise SandboxBackendError(
-                f"windows_default helper infrastructure failed: {helper_error}"
+                f"helper_launch_failed: {helper_error}"
             )
         return SandboxResult(
             returncode=proc.returncode if proc.returncode is not None else -1,

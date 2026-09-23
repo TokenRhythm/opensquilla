@@ -1122,10 +1122,6 @@ pre {
   transform: none;
 }
 
-.sidebar-history-row.sidebar-row-move {
-  transition: transform var(--sidebar-reorder-duration) var(--sidebar-reorder-ease);
-}
-
 .sidebar-history {
   --sidebar-reorder-duration: 360ms;
   --sidebar-reorder-ease: cubic-bezier(.22, 1, .36, 1);
