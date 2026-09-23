@@ -999,7 +999,7 @@ def test_release_workflow_publishes_wheel_and_electron_assets_without_portable()
     assert "OpenSquilla-{desktop_version}-mac-arm64.dmg" in workflow
     assert "OpenSquilla-{desktop_version}-win-x64.exe" in workflow
     assert "opensquilla-latest-py3-none-any.whl" not in workflow
-    assert "gh release upload \"${TAG}\" dist/* --clobber" in workflow
+    assert 'gh release upload "${TAG}" dist/public/* --clobber' in workflow
     assert "dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS" not in workflow
     assert "Git LFS pointer leaked into wheel" in workflow
     assert "Verify GitHub Release assets" in workflow

@@ -907,6 +907,7 @@ jobs:
           import hashlib
           import os
           import re
+          import shutil
           from pathlib import Path
 
           def desktop_asset_version(version: str) -> str:
@@ -942,13 +943,18 @@ jobs:
               for path in assets
           ]
           assert sha256s.read_text(encoding="utf-8").splitlines() == expected
+          # Internal build evidence must stay out of release downloads.
+          public = dist / "public"
+          public.mkdir()
+          for path in [*assets, sha256s]:
+              shutil.copyfile(path, public / path.name)
           PY
 
       - name: Upload aggregate workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: opensquilla-release-assets-${{ env.RELEASE_PROFILE }}
-          path: dist/*
+          path: dist/public/*
           overwrite: true
 
       - name: Checkout publication validation tooling
@@ -1067,7 +1073,7 @@ jobs:
                   )
           PY
           assert_release_is_safe_draft
-          gh release upload "${TAG}" dist/* --clobber
+          gh release upload "${TAG}" dist/public/* --clobber
           assert_release_is_safe_draft
 
       - name: Verify GitHub Release assets
