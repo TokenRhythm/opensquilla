@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.4"
-CURRENT_DESKTOP_VERSION = "0.5.4"
+CURRENT_VERSION = "0.5.5"
+CURRENT_DESKTOP_VERSION = "0.5.5"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -1016,7 +1016,7 @@ def test_release_docs_describe_signed_windows_policy() -> None:
 
     assert "Code signing policy:" in readme
     assert "v0.5.4 Windows installer remains unsigned" in readme
-    assert "Authenticode signs new Windows installers" in readme
+    assert f"{CURRENT_VERSION} Windows installer is Authenticode signed" in readme
     assert "must Authenticode sign each new installer" in releases
     assert "Release Assets workflow signs new Windows builds" in signing_policy
     assert "windows-code-signing" in signing_policy
@@ -1028,7 +1028,7 @@ def test_release_docs_describe_signed_windows_policy() -> None:
     for text in [readme, releases, release_notes]:
         assert "code-signing-policy.md" in text
 
-    assert "Windows desktop installer is currently unsigned" in release_notes
+    assert "Windows desktop installer is Authenticode signed" in release_notes
 
     assert "PRIVACY.md" in readme
     assert "THIRD_PARTY_NOTICES.md" in readme
@@ -1359,63 +1359,47 @@ def test_historical_040_release_notes_remain_available() -> None:
     assert "OpenSquilla-0.4.0-mac-arm64.dmg" in notes
 
 
-def test_current_release_notes_cover_documents_runtimes_upgrade_and_containers() -> None:
+def test_current_release_notes_cover_upgrade_and_containers() -> None:
     notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
+    normalized = " ".join(notes.split())
 
     assert "## Downloads" in notes
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg" in notes
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip" in notes
-    assert f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe" in notes
-    assert f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl" in notes
-    assert notes.index("### HTML document editing beta") < notes.index(
-        "### Runtime Packs and slimmer Desktop installers"
-    )
-    assert notes.index("### Model routing, Ensemble, and providers") < notes.index(
-        "### Chats, tasks, and attachments"
-    )
+    for name in (
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.dmg",
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-mac-arm64.zip",
+        f"OpenSquilla-{CURRENT_DESKTOP_VERSION}-win-x64.exe",
+        f"opensquilla-{CURRENT_VERSION}-py3-none-any.whl",
+        "SHA256SUMS",
+        "latest-mac.yml",
+        "latest.yml",
+    ):
+        assert name in notes
     assert notes.index("## ✨ What's Improved") < notes.index("## Downloads")
-    assert "no\nmanual data transfer is required" in notes
-    assert "Additive database\nmigrations run automatically" in notes
-    assert "early beta" in notes
-    assert "limited to single-file UTF-8 HTML" in notes
-    assert "The 0.5.3 bundled\n  runtimes are intentionally not migrated" in notes
-    assert "No Windows Portable assets are published for 0.5.4" in notes
-    assert "0.5.4 Portable zip" in notes
-    assert "## Upgrading from 0.5.3" in notes
+    assert "no manual data transfer is required" in normalized
+    assert "Supported database migrations run automatically" in normalized
+    assert f"No Windows Portable assets are published for {CURRENT_VERSION}" in notes
+    assert f"{CURRENT_VERSION} Portable zip" in notes
+    assert "## Upgrading from 0.5.4" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
-    assert "ghcr.io/opensquilla/opensquilla:v0.5.4" in notes
+    assert f"ghcr.io/tokenrhythm/opensquilla:{CURRENT_TAG}" in notes
     assert "`latest` tag follows the most recently verified release tag" in notes
     assert (
-        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
-        "OpenSquilla-mac-arm64.dmg" in notes
+        "Goal Token budgets and foreground/background execution settings are retired" in normalized
     )
-    assert (
-        "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
-        "OpenSquilla-win-x64.exe" in notes
-    )
+    assert "Ordinary channel authoring is unavailable on Windows" in normalized
+    assert "Node.js 22.12+" in notes
+    for asset in ("OpenSquilla-mac-arm64.dmg", "OpenSquilla-win-x64.exe"):
+        assert (
+            "https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/"
+            + asset
+        ) in notes
+    for doc in ("PRIVACY.md", "THIRD_PARTY_NOTICES.md", "CONTRIBUTORS.md"):
+        assert f"https://github.com/TokenRhythm/opensquilla/blob/{CURRENT_TAG}/{doc}" in notes
     assert "releases/latest.html" not in notes
     assert "Synthetic fixtures" not in notes
     assert "release gate" not in notes
     assert "## Acknowledgements" in notes
-    for login in [
-        "@AmirF194",
-        "@Kiuyor",
-        "@Liu-RK",
-        "@LiuXinchen1997",
-        "@Sanjays2402",
-        "@ab2ence",
-        "@freeaccount-create",
-        "@jiaoqingrui",
-        "@kriptoburak",
-        "@lifelmy",
-        "@lihongguang-0014",
-        "@openvictory",
-        "@shixi-li",
-        "@xfjsssq",
-    ]:
-        assert login in notes
-    assert "CONTRIBUTORS.md" in notes
 
 
 def test_docs_index_links_current_release_notes() -> None:
@@ -1425,29 +1409,43 @@ def test_docs_index_links_current_release_notes() -> None:
     assert "releases/0.4.0.md" in index
 
 
-def test_current_contributor_ledger_records_054_attribution() -> None:
+def test_current_contributor_ledger_records_055_attribution() -> None:
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    section = ledger.split("## OpenSquilla 0.5.4", 1)[1].split("## OpenSquilla 0.5.3", 1)[0]
+    notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
+    section = ledger.split(f"## OpenSquilla {CURRENT_VERSION}", 1)[1].split(
+        "## OpenSquilla 0.5.4", 1
+    )[0]
 
     expected = {
-        "@AmirF194": "#1193",
-        "@Kiuyor": "#1185",
-        "@Liu-RK": "#1267",
-        "@LiuXinchen1997": "#1199",
-        "@Sanjays2402": "#1214",
-        "@ab2ence": "#1300",
-        "@freeaccount-create": "#1264",
-        "@jiaoqingrui": "#1350",
-        "@kriptoburak": "#1367",
-        "@lifelmy": "#1215",
-        "@lihongguang-0014": "#1355",
-        "@openvictory": "#1351",
-        "@shixi-li": "#1184",
-        "@xfjsssq": "#1176",
+        "@Elioooon": "#1540",
+        "@GuddXzy": "#1562",
+        "@Kiuyor": "#1022",
+        "@Kuang-xianxin": "#1752",
+        "@LHMQ878": "#1056",
+        "@Liu-RK": "#1671",
+        "@LiuXinchen1997": "#1709",
+        "@QinLuza": "#1137",
+        "@Ramnath0521": "#1600",
+        "@RickyYii": "#1422",
+        "@ShaunMX": "#1532",
+        "@YIKUAIBANZI": "#1715",
+        "@freeaccount-create": "#1411",
+        "@kingxiao630": "#1682",
+        "@lifelmy": "#1684",
+        "@lihongguang-0014": "#1754",
+        "@lihongguang0014": "#1506",
+        "@mengchao99": "#953",
+        "@mikemikimike": "#1598",
+        "@openvictory": "#1459",
+        "@ptterjgf": "#1692",
+        "@qiaoye2024": "#793",
+        "@superbigcup325": "#1720",
+        "@wanglei1346": "#1585",
+        "@xiaohuzai": "#1570",
     }
     for login, evidence in expected.items():
         assert login in section
+        assert login in notes
         assert evidence in section
-    assert "#1179" in section
     assert "Codex" not in section
     assert "Claude Code" not in section

@@ -16,7 +16,7 @@ Upgrading only the MCP SDK in an older OpenSquilla installation does not migrate
 the application.
 
 Packaged installations use the MCP implementation shipped in the
-[release wheel](https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl).
+[release wheel](https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl).
 For a source installation, follow [Install from source](../README.md#install-from-source).
 From the prepared checkout, install the core profile on macOS/Linux:
 
