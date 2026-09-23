@@ -269,6 +269,11 @@ jobs:
             local -a options=(
               cp
               --force
+              --parallel 64
+              --part-size 262144
+              --bigfile-threshold 8388608
+              --read-timeout 30
+              --retry-times 3
               --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
             )
             if [[ -n "${cache_control}" ]]; then
@@ -361,7 +366,7 @@ jobs:
             local name="$2"
             local cache_control="${3:-}"
             local content_type="${4:-}"
-            local source_path
+            local source_path source_size staging_key staging_object exists_status
             local -a options=(
               api
               put-object
@@ -374,7 +379,31 @@ jobs:
               echo "Unable to resolve local release asset: ${source}" >&2
               return 1
             fi
-            options+=(--body "file://${source_path}")
+            source_size="$(wc -c < "${source_path}")" || return 1
+            if (( source_size >= 8388608 )); then
+              staging_key="${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${name}"
+              staging_object="oss://${ALIYUN_OSS_BUCKET}/${staging_key}"
+              echo "Uploading multipart staging object: ${name} (${source_size} bytes)"
+              ossutil cp \
+                --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+                --parallel 64 --part-size 262144 --bigfile-threshold 8388608 \
+                --read-timeout 30 --retry-times 3 \
+                "${source_path}" "${staging_object}" || return 1
+              verify_immutable_asset "${source}" "staging/${name}" "${staging_object}" || return 1
+              # Recheck after the potentially long transfer, including for
+              # versioned buckets where the server condition is advisory.
+              if object_exists "${dest_prefix}/${name}"; then
+                verify_immutable_asset "${source}" "${name}" "${dest_prefix}/${name}"
+                return "$?"
+              else
+                exists_status="$?"
+                (( exists_status == 1 )) || return "${exists_status}"
+              fi
+              options[1]=copy-object
+              options+=(--copy-source "/${ALIYUN_OSS_BUCKET}/${staging_key}" --metadata-directive REPLACE)
+            else
+              options+=(--body "file://${source_path}")
+            fi
             if [[ -n "${cache_control}" ]]; then
               options+=(--cache-control "${cache_control}")
             fi
@@ -385,7 +414,8 @@ jobs:
             # the preceding existence check and this write. If the request lost
             # a race, or its response was lost after committing, the caller
             # verifies the now-existing object before deciding whether to fail.
-            ossutil "${options[@]}"
+            echo "Committing immutable OSS release object: ${name}"
+            ossutil "${options[@]}" || return 1
           }
           upload_immutable_asset() {
             local source="$1"
@@ -697,3 +727,20 @@ jobs:
               echo "::warning::Promotion succeeded, but temporary OSS backups could not be removed."
             fi
           fi
+
+      - name: Remove this attempt's temporary multipart staging
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${ALIYUN_OSS_PREFIX_NORMALIZED:-}" ]] || exit 0
+          command -v ossutil >/dev/null || exit 0
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          staging_prefix="oss://${ALIYUN_OSS_BUCKET}/${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
+          ossutil rm --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+            --force --recursive --all-versions "$staging_prefix" \
+            || echo "::warning::Temporary staging versions could not be removed: $staging_prefix"
+          ossutil rm --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+            --force --recursive --multipart "$staging_prefix" \
+            || echo "::warning::Temporary multipart uploads could not be removed: $staging_prefix"

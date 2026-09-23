@@ -111,11 +111,24 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 shutil.copyfile(native_path(source_url.removeprefix("file://")), destination)
                 raise SystemExit(0)
 
+            if args[:2] == ["api", "copy-object"]:
+                destination = remote_root / option("--bucket") / option("--key")
+                source = remote_root / option("--copy-source").lstrip("/")
+                assert option("--forbid-overwrite") == "true"
+                assert option("--metadata-directive") == "REPLACE"
+                if destination.exists():
+                    raise SystemExit(9)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                raise SystemExit(0)
+
             if args[0] == "cp":
                 source = mapped(args[-2])
                 destination = mapped(args[-1])
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
+                if ".upload-staging/" in args[-1] and os.environ.get("FAKE_OSS_CORRUPT_STAGE"):
+                    destination.write_bytes(b"corrupted-staging-object")
                 raise SystemExit(0)
 
             if args[0] == "ls":
@@ -432,3 +445,52 @@ def test_version_scoped_oss_objects_are_write_once_and_race_safe(tmp_path: Path)
     assert tampered.returncode != 0
     assert "Refusing to replace immutable OSS release object" in tampered.stderr
     assert (remote_release / "racy.bin").read_bytes() == b"concurrent-writer"
+
+
+def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, monkeypatch) -> None:
+    fake_bin, remote_root, call_log = _install_fake_ossutil(tmp_path)
+    release_assets = tmp_path / "release-assets"
+    channel_assets = tmp_path / "channel-assets"
+    release_assets.mkdir()
+    channel_assets.mkdir()
+    payload = release_assets / "large.bin"
+    payload.write_bytes(b"synthetic-release-data" * 400_000)
+    (release_assets / "SHA256SUMS").write_text("synthetic checksums\n", encoding="utf-8")
+    (release_assets / "CHECKSUMMED_ASSETS").write_text("large.bin\n", encoding="utf-8")
+    (channel_assets / "TARGETS").write_text("", encoding="utf-8")
+
+    monkeypatch.setenv("FAKE_OSS_CORRUPT_STAGE", "1")
+    corrupt = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=1)
+    assert corrupt.returncode != 0
+    final = remote_root / "release-bucket/releases/v0.5.0rc4/large.bin"
+    assert not final.exists()
+    assert not any(
+        json.loads(line)[:2] == ["api", "copy-object"]
+        for line in call_log.read_text().splitlines()
+    )
+
+    monkeypatch.delenv("FAKE_OSS_CORRUPT_STAGE")
+    call_log.write_text("", encoding="utf-8")
+    passed = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=2)
+    assert passed.returncode == 0, passed.stderr
+    assert final.read_bytes() == payload.read_bytes()
+    calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+    copy_index = next(i for i, call in enumerate(calls) if call[:2] == ["api", "copy-object"])
+    assert any(
+        call[0] == "cp" and ".upload-staging/" in call[-2]
+        for call in calls[:copy_index]
+    )
+    assert not any(
+        call[:2] == ["api", "put-object"] and "large.bin" in call
+        for call in calls
+    )
+
+    # A different writer appearing during the transfer must survive untouched.
+    final.unlink()
+    raced = _run_upload_step(
+        tmp_path, fake_bin, remote_root, call_log, attempt=3,
+        race_object="oss://release-bucket/releases/v0.5.0rc4/large.bin",
+        versioning_status="Enabled",
+    )
+    assert raced.returncode != 0
+    assert final.read_bytes() == b"concurrent-writer"
