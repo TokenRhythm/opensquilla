@@ -1048,8 +1048,18 @@ def _looks_like_installer_artifact(value: str) -> bool:
 
 
 def _shell_script(parts: tuple[str, ...]) -> str:
+    shell_name = _command_name(parts[0]).lower() if parts else ""
+    is_powershell = shell_name in {"powershell", "pwsh"}
     for index, part in enumerate(parts[1:], start=1):
-        if _is_shell_command_option(part.lower()):
+        option = part.lower()
+        if is_powershell:
+            # PowerShell's command payload follows -c / -Command.  Other
+            # single-dash flags (e.g. -NonInteractive, -ExecutionPolicy) also
+            # contain a "c" but are options, not the command token, so they must
+            # not be mistaken for it.
+            if option in {"-c", "-command"}:
+                return " ".join(parts[index + 1 :])
+        elif _is_shell_command_option(option):
             return " ".join(parts[index + 1 :])
     return " ".join(parts[1:])
 
