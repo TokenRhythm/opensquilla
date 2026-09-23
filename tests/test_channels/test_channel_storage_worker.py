@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sqlite3
+import sys
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -12,10 +16,15 @@ import pytest
 from opensquilla.channels._util import EventDedupeCache
 from opensquilla.channels.delivery_store import (
     ChannelDeliveryStore,
+    deliver_operation_with_outbox,
     deliver_with_outbox,
 )
 from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore, ChannelStorageClosedError
-from opensquilla.channels.types import IncomingMessage, OutgoingMessage
+from opensquilla.channels.types import (
+    ChannelArtifactDeliveryRequest,
+    IncomingMessage,
+    OutgoingMessage,
+)
 
 
 def message(event: str = "one") -> IncomingMessage:
@@ -562,3 +571,111 @@ async def test_success_receipt_wins_over_late_failure_in_either_order(
     assert record["state"] == state
     if result is not None:
         assert record["provider_message_id"] == "ack"
+
+
+async def test_process_crash_recovers_committed_ingress_once_without_resending_unknown(
+    channel_store, tmp_path
+):
+    path = tmp_path / "crashed.sqlite"
+    inbound = message("crash-event")
+    artifact = {
+        "artifact_id": "crash-artifact",
+        "file_path": "/synthetic/report.txt",
+        "name": "report.txt",
+        "mime_type": "text/plain",
+        "size": 6,
+        "session_id": "crash-session",
+        "delivery_id": "crash-delivery",
+    }
+    script = textwrap.dedent("""\
+        import asyncio
+        import json
+        import os
+        import sys
+        from types import SimpleNamespace
+        from opensquilla.channels.delivery_store import deliver_operation_with_outbox
+        from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore
+        from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
+
+        async def main():
+            payload = json.load(sys.stdin)
+            store = AsyncChannelDeliveryStore(payload["path"])
+            await store.open()
+            inbound = IncomingMessage.model_validate(payload["inbound"])
+            assert await store.accept_inbound("channel", inbound)
+            channel = SimpleNamespace(_delivery_store=store, _delivery_channel_name="channel")
+            request = ChannelArtifactDeliveryRequest(inbound=inbound, **payload["artifact"])
+
+            async def ambiguous_provider(request):
+                raise TimeoutError("provider response lost after upload")
+
+            try:
+                await deliver_operation_with_outbox(
+                    channel, "deliver_artifact", ambiguous_provider, (request,), {}
+                )
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("provider must have an ambiguous outcome")
+            record = await store.send_record(request.delivery_id)
+            assert record["state"] == "unknown"
+            print("accept-and-unknown-committed", flush=True)
+            # No worker.close, asyncio teardown, or Python exit handlers may run.
+            os._exit(31)
+
+        asyncio.run(main())
+        """)
+    root = Path(__file__).resolve().parents[2]
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        script,
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root / "src")},
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(json.dumps({
+                "path": str(path),
+                "inbound": inbound.model_dump(mode="json"),
+                "artifact": artifact,
+            }).encode()),
+            timeout=20,
+        )
+    finally:
+        if process.returncode is None:
+            process.kill()
+            await process.communicate()
+    assert process.returncode == 31, stderr.decode()
+    assert b"accept-and-unknown-committed\n" in stdout
+
+    reopened = await channel_store(path)
+    queue = asyncio.Queue()
+    recovered = await reopened.recover_inbound("channel")
+    assert len(recovered) == 1
+    assert await reopened.enqueue("channel", recovered[0], queue)
+    assert not await reopened.enqueue("channel", inbound, queue)
+    assert queue.qsize() == 1
+    restored = queue.get_nowait()
+    claim = await reopened.claim_inbound("channel", restored)
+    assert claim is not None
+    assert await reopened.claim_inbound("channel", restored) is None
+    await reopened.complete_inbound(claim, "dispatched")
+    assert await reopened.recover_inbound("channel") == []
+
+    from unittest.mock import AsyncMock
+
+    provider = AsyncMock(side_effect=AssertionError("unknown must not resend"))
+    channel = SimpleNamespace(_delivery_store=reopened, _delivery_channel_name="channel")
+    request = ChannelArtifactDeliveryRequest(inbound=inbound, **artifact)
+    replay = await deliver_operation_with_outbox(
+        channel, "deliver_artifact", provider, (request,), {}
+    )
+    assert not replay.is_delivered()
+    assert replay.retryable is False
+    assert "unknown" in replay.reason
+    provider.assert_not_awaited()
+    assert (await reopened.send_record(request.delivery_id))["state"] == "unknown"
