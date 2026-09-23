@@ -459,9 +459,13 @@ def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, mon
     channel_assets.mkdir()
     payload = release_assets / "large.bin"
     payload.write_bytes(b"synthetic-release-data" * 400_000)
-    (release_assets / "SHA256SUMS").write_text("synthetic checksums\n", encoding="utf-8")
-    (release_assets / "CHECKSUMMED_ASSETS").write_text("large.bin\n", encoding="utf-8")
-    (channel_assets / "TARGETS").write_text("", encoding="utf-8")
+    (release_assets / "SHA256SUMS").write_text(
+        "synthetic checksums\n", encoding="utf-8", newline="\n"
+    )
+    (release_assets / "CHECKSUMMED_ASSETS").write_text(
+        "large.bin\n", encoding="utf-8", newline="\n"
+    )
+    (channel_assets / "TARGETS").write_text("", encoding="utf-8", newline="\n")
 
     monkeypatch.setenv("FAKE_OSS_CORRUPT_STAGE", "1")
     corrupt = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=1)
@@ -469,27 +473,20 @@ def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, mon
     final = remote_root / "release-bucket/releases/v0.5.0rc4/large.bin"
     assert not final.exists()
     assert not any(
-        json.loads(line)[:2] == ["api", "copy-object"]
-        for line in call_log.read_text().splitlines()
+        json.loads(line)[:2] == ["api", "copy-object"] for line in call_log.read_text().splitlines()
     )
 
     monkeypatch.delenv("FAKE_OSS_CORRUPT_STAGE")
-    call_log.write_text("", encoding="utf-8")
+    call_log.write_text("", encoding="utf-8", newline="\n")
     passed = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=2)
     assert passed.returncode == 0, passed.stderr
     assert final.read_bytes() == payload.read_bytes()
     calls = [json.loads(line) for line in call_log.read_text().splitlines()]
     copy_index = next(i for i, call in enumerate(calls) if call[:2] == ["api", "copy-object"])
-    assert any(
-        call[0] == "cp" and ".upload-staging/" in call[-2]
-        for call in calls[:copy_index]
-    )
-    assert not any(
-        call[:2] == ["api", "put-object"] and "large.bin" in call
-        for call in calls
-    )
+    assert any(call[0] == "cp" and ".upload-staging/" in call[-2] for call in calls[:copy_index])
+    assert not any(call[:2] == ["api", "put-object"] and "large.bin" in call for call in calls)
 
-    call_log.write_text("", encoding="utf-8")
+    call_log.write_text("", encoding="utf-8", newline="\n")
     repeated = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=4)
     assert repeated.returncode == 0, repeated.stderr
     repeat_calls = [json.loads(line) for line in call_log.read_text().splitlines()]
@@ -499,7 +496,11 @@ def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, mon
     # A different writer appearing during the transfer must survive untouched.
     final.unlink()
     raced = _run_upload_step(
-        tmp_path, fake_bin, remote_root, call_log, attempt=3,
+        tmp_path,
+        fake_bin,
+        remote_root,
+        call_log,
+        attempt=3,
         race_object="oss://release-bucket/releases/v0.5.0rc4/large.bin",
         versioning_status="Enabled",
     )
