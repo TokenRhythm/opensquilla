@@ -59,35 +59,38 @@ class _Channel:
     policy: ChannelAccessPolicy = field(default_factory=ChannelAccessPolicy)
 
 
-def test_authenticated_dm_defaults_to_durable_pending_pairing(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+async def test_authenticated_dm_defaults_to_durable_pending_pairing(
+    channel_store, tmp_path: Path
+) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
     channel = _Channel()
     channel._delivery_store = store
     channel._delivery_channel_name = "telegram-main"
 
-    decision = decide_channel_admission(channel, _message(), "agent:main:telegram:dm:user-42")
+    decision = await decide_channel_admission(channel, _message(), "agent:main:telegram:dm:user-42")
 
     assert decision.admit is False
     assert decision.reason == "pairing_required"
     assert decision.pairing_id
     assert decision.pairing_notice is True
-    record = store.list_pairings(channel_name="telegram-main")[0]
+    record = (await store.list_pairings(channel_name="telegram-main"))[0]
     assert record.status == "pending"
     assert record.sender_id == "user-42"
     assert record.sender_name == "Alice"
-    store.close()
+    (await store.close())
 
 
-def test_authenticated_configured_admin_skips_pairing_without_creating_a_row(
+async def test_authenticated_configured_admin_skips_pairing_without_creating_a_row(
+    channel_store,
     tmp_path: Path,
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    store = await channel_store(tmp_path / "delivery.sqlite")
     channel = _Channel()
     channel._delivery_store = store
     channel._delivery_channel_name = "telegram-main"
     config = SimpleNamespace(channel_admin_senders={"telegram-main": ["user-42"]})
 
-    decision = decide_channel_admission(
+    decision = await decide_channel_admission(
         channel,
         _message(),
         "agent:main:telegram:dm:user-42",
@@ -97,8 +100,8 @@ def test_authenticated_configured_admin_skips_pairing_without_creating_a_row(
 
     assert decision.admit is True
     assert decision.reason == "dm_admitted"
-    assert store.list_pairings(channel_name="telegram-main") == []
-    store.close()
+    assert (await store.list_pairings(channel_name="telegram-main")) == []
+    (await store.close())
 
 
 @pytest.mark.parametrize(
@@ -150,13 +153,15 @@ def test_channel_admin_requires_authenticated_matching_provenance(
     )
 
 
-def test_wrong_channel_admin_entry_still_creates_a_pairing_request(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+async def test_wrong_channel_admin_entry_still_creates_a_pairing_request(
+    channel_store, tmp_path: Path
+) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
     channel = _Channel()
     channel._delivery_store = store
     channel._delivery_channel_name = "telegram-main"
 
-    decision = decide_channel_admission(
+    decision = await decide_channel_admission(
         channel,
         _message(),
         "agent:main:telegram:dm:user-42",
@@ -166,58 +171,63 @@ def test_wrong_channel_admin_entry_still_creates_a_pairing_request(tmp_path: Pat
 
     assert decision.admit is False
     assert decision.reason == "pairing_required"
-    assert [record.sender_id for record in store.list_pairings(channel_name="telegram-main")] == [
-        "user-42"
-    ]
-    store.close()
+    assert [
+        record.sender_id for record in (await store.list_pairings(channel_name="telegram-main"))
+    ] == ["user-42"]
+    (await store.close())
 
 
-def test_pairing_persists_approval_and_revocation_without_message_content(
+async def test_pairing_persists_approval_and_revocation_without_message_content(
+    channel_store,
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "delivery.sqlite"
     secret_content = "do not persist this inbound message"
-    store = ChannelDeliveryStore(path)
+    store = await channel_store(path)
     channel = _Channel()
     channel._delivery_store = store
     channel._delivery_channel_name = "telegram-main"
-    pending = decide_channel_admission(
+    pending = await decide_channel_admission(
         channel,
         _message(content=secret_content),
         "agent:main:telegram:dm:user-42",
     )
     assert pending.pairing_id
-    store.set_pairing_status(
-        channel_name="telegram-main",
-        pairing_id=pending.pairing_id,
-        status="approved",
+    (
+        await store.set_pairing_status(
+            channel_name="telegram-main",
+            pairing_id=pending.pairing_id,
+            status="approved",
+        )
     )
-    store.close()
+    (await store.close())
 
-    reopened = ChannelDeliveryStore(path)
+    reopened = await channel_store(path)
     channel = _Channel()
     # The fresh adapter must be connected to the reopened durable store.
     channel._delivery_store = reopened
     channel._delivery_channel_name = "telegram-main"
-    approved = decide_channel_admission(
+    approved = await decide_channel_admission(
         channel,
         _message(event_id="event-2", content=secret_content),
         "agent:main:telegram:dm:user-42",
     )
     assert approved.admit is True
-    reopened.set_pairing_status(
-        channel_name="telegram-main",
-        pairing_id=pending.pairing_id,
-        status="revoked",
+    (
+        await reopened.set_pairing_status(
+            channel_name="telegram-main",
+            pairing_id=pending.pairing_id,
+            status="revoked",
+        )
     )
-    revoked = decide_channel_admission(
+    revoked = await decide_channel_admission(
         channel,
         _message(event_id="event-3", content=secret_content),
         "agent:main:telegram:dm:user-42",
     )
     assert revoked.admit is False
     assert revoked.reason == "pairing_revoked"
-    reopened.close()
+    (await reopened.close())
 
     with sqlite3.connect(path) as connection:
         row = connection.execute(
@@ -249,7 +259,7 @@ def test_pairing_persists_approval_and_revocation_without_message_content(
         ),
     ],
 )
-def test_explicit_open_and_allowlist_modes(
+async def test_explicit_open_and_allowlist_modes(
     policy: ChannelAccessPolicy,
     sender_id: str,
     admitted: bool,
@@ -265,7 +275,7 @@ def test_explicit_open_and_allowlist_modes(
             ),
         }
     )
-    decision = decide_channel_admission(
+    decision = await decide_channel_admission(
         _Channel(policy=policy),
         message,
         f"agent:main:telegram:dm:{sender_id}",
@@ -307,7 +317,7 @@ def test_explicit_open_and_allowlist_modes(
     ],
     ids=["declared-policy", "dingtalk", "matrix", "qq"],
 )
-def test_manager_wires_entry_access_fields_without_leaking_them_to_adapter_config(
+async def test_manager_wires_entry_access_fields_without_leaking_them_to_adapter_config(
     tmp_path: Path,
     entry: Any,
 ) -> None:
@@ -323,7 +333,7 @@ def test_manager_wires_entry_access_fields_without_leaking_them_to_adapter_confi
         assert adapter.policy.dm_access == ChannelDmAccess.ALLOWLIST
         assert adapter.policy.allowlist == frozenset({"user-42", "user-7"})
     finally:
-        manager._delivery_store.close()
+        (await manager._delivery_store.close())
 
 
 @dataclass
@@ -350,11 +360,12 @@ class _DispatchChannel:
 
 @pytest.mark.asyncio
 async def test_pending_pairing_notice_precedes_all_session_and_tool_side_effects(
+    channel_store,
     tmp_path: Path,
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    store = await channel_store(tmp_path / "delivery.sqlite")
     message = _message()
-    assert store.accept_inbound("telegram-main", message) is True
+    assert (await store.accept_inbound("telegram-main", message)) is True
     channel = _DispatchChannel(message=message, store=store)
 
     class Forbidden:
@@ -384,13 +395,13 @@ async def test_pending_pairing_notice_precedes_all_session_and_tool_side_effects
     # The payload is scrubbed but the WHY survives: the specific admission
     # reason is kept as a code so operators can explain the silence later.
     assert persisted == ("completed", "admission_denied", "pairing_required", "{}")
-    store.close()
+    (await store.close())
 
 
 @pytest.mark.asyncio
-async def test_pairing_rpc_contract_and_scope(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
-    pending = store.request_pairing(
+async def test_pairing_rpc_contract_and_scope(channel_store, tmp_path: Path) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
+    pending = await store.request_pairing(
         channel_name="telegram-main",
         provider="telegram",
         account_id="bot-account",
@@ -468,7 +479,7 @@ async def test_pairing_rpc_contract_and_scope(tmp_path: Path) -> None:
     )
     assert denied.error is not None
     assert denied.error.code == "UNAUTHORIZED"
-    store.close()
+    (await store.close())
 
 
 def test_pairing_store_adds_reply_to_column_to_a_preexisting_database(tmp_path):
@@ -557,17 +568,17 @@ def test_pairing_request_captures_and_refreshes_the_reply_address(tmp_path):
         store.close()
 
 
-def test_full_pairing_queue_denies_without_code_or_notice(tmp_path: Path) -> None:
+async def test_full_pairing_queue_denies_without_code_or_notice(
+    channel_store, tmp_path: Path
+) -> None:
     # A refused pairing (queue full) must deny exactly like an unapproved one
     # — same reason code, but no pairing code to approve and no outbound
     # notice — and must never raise into the dispatch loop.
-    store = ChannelDeliveryStore(
-        tmp_path / "delivery.sqlite", max_pending_pairings_per_channel=1
-    )
+    store = await channel_store(tmp_path / "delivery.sqlite", max_pending_pairings_per_channel=1)
     channel = _Channel()
     channel._delivery_store = store
     channel._delivery_channel_name = "telegram-main"
-    first = decide_channel_admission(channel, _message(), "agent:main:telegram:dm:user-42")
+    first = await decide_channel_admission(channel, _message(), "agent:main:telegram:dm:user-42")
     assert first.reason == "pairing_required" and first.pairing_id
 
     overflow = IncomingMessage(
@@ -584,27 +595,31 @@ def test_full_pairing_queue_denies_without_code_or_notice(tmp_path: Path) -> Non
             principal=AuthenticatedPrincipal(subject_id="user-99", display_name="Bob"),
         ),
     )
-    decision = decide_channel_admission(channel, overflow, "agent:main:telegram:dm:user-99")
+    decision = await decide_channel_admission(channel, overflow, "agent:main:telegram:dm:user-99")
 
     assert decision.admit is False
     assert decision.reason == "pairing_required"
     assert decision.pairing_id is None
     assert decision.pairing_notice is False
     # The refused sender left no durable row behind.
-    senders = {p.sender_id for p in store.list_pairings(channel_name="telegram-main")}
+    senders = {p.sender_id for p in (await store.list_pairings(channel_name="telegram-main"))}
     assert senders == {"user-42"}
-    store.close()
+    (await store.close())
 
 
 @pytest.mark.asyncio
-async def test_pairing_rpc_accepts_status_filter_pagination_and_code(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+async def test_pairing_rpc_accepts_status_filter_pagination_and_code(
+    channel_store, tmp_path: Path
+) -> None:
+    store = await channel_store(tmp_path / "delivery.sqlite")
     records = [
-        store.request_pairing(
-            channel_name="telegram-main",
-            provider="telegram",
-            account_id="bot-account",
-            sender_id=f"user-{i}",
+        (
+            await store.request_pairing(
+                channel_name="telegram-main",
+                provider="telegram",
+                account_id="bot-account",
+                sender_id=f"user-{i}",
+            )
         )
         for i in range(3)
     ]
@@ -653,4 +668,4 @@ async def test_pairing_rpc_accepts_status_filter_pagination_and_code(tmp_path: P
         admin,
     )
     assert unknown.error is not None
-    store.close()
+    (await store.close())

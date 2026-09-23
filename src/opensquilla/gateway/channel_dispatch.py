@@ -564,7 +564,7 @@ async def run_channel_dispatch(
         )
         ingress_claim = None
         if delivery_store is not None:
-            ingress_claim = delivery_store.claim_inbound(delivery_channel_name, msg)
+            ingress_claim = await delivery_store.claim_inbound(delivery_channel_name, msg)
             if ingress_claim is None:
                 log.info(
                     "channel.ingress_duplicate_skipped",
@@ -572,7 +572,7 @@ async def run_channel_dispatch(
                 )
                 continue
         session_key = session_key_builder(msg)
-        admission = decide_channel_admission(
+        admission = await decide_channel_admission(
             channel,
             msg,
             session_key,
@@ -618,7 +618,7 @@ async def run_channel_dispatch(
                         error_type=type(exc).__name__,
                     )
             if delivery_store is not None:
-                delivery_store.complete_inbound(
+                await delivery_store.complete_inbound(
                     ingress_claim,
                     "admission_denied",
                     reason=admission.reason,
@@ -654,7 +654,7 @@ async def run_channel_dispatch(
                     error_type=type(exc).__name__,
                 )
             if delivery_store is not None:
-                delivery_store.complete_inbound(
+                await delivery_store.complete_inbound(
                     ingress_claim, "approval_resolved", reason=admission.reason
                 )
             continue
@@ -681,7 +681,7 @@ async def run_channel_dispatch(
                     session_key=session_key,
                 )
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "command_dispatched", reason=admission.reason
                     )
                 continue
@@ -822,7 +822,7 @@ async def run_channel_dispatch(
                     )
                 await status_reactor.completed(msg)
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "capacity_rejected", reason=admission.reason
                     )
                 continue
@@ -911,7 +911,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if isinstance(exc, StaleEpochError):
                     await status_reactor.failed(msg)
@@ -922,7 +922,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if isinstance(exc, TurnIngressConflictError):
                     await status_reactor.failed(msg)
@@ -937,7 +937,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.complete_inbound(
+                        await delivery_store.complete_inbound(
                             ingress_claim, "ingress_conflict", reason=admission.reason
                         )
                     continue
@@ -955,7 +955,7 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if isinstance(exc, TaskRuntimeShuttingDownError):
                     await status_reactor.failed(msg)
@@ -966,11 +966,11 @@ async def run_channel_dispatch(
                         )
                     )
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     continue
                 if not isinstance(exc, TaskQueueFullError):
                     if delivery_store is not None:
-                        delivery_store.fail_inbound(ingress_claim, exc)
+                        await delivery_store.fail_inbound(ingress_claim, exc)
                     raise
                 await status_reactor.failed(msg)
                 await channel.send(
@@ -983,14 +983,14 @@ async def run_channel_dispatch(
                     )
                 )
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "queue_rejected", reason=admission.reason
                     )
             else:
                 if replayed and handle is None:
                     await status_reactor.completed(msg)
                     if delivery_store is not None:
-                        delivery_store.complete_inbound(
+                        await delivery_store.complete_inbound(
                             ingress_claim, "turn_replayed", reason=admission.reason
                         )
                     continue
@@ -1067,7 +1067,7 @@ async def run_channel_dispatch(
 
                 reply_task.add_done_callback(_reply_done)
                 if delivery_store is not None:
-                    delivery_store.complete_inbound(
+                    await delivery_store.complete_inbound(
                         ingress_claim, "turn_dispatched", reason=admission.reason
                     )
             continue
@@ -1091,7 +1091,7 @@ async def run_channel_dispatch(
             )
         except BaseException as exc:
             if delivery_store is not None:
-                delivery_store.fail_inbound(ingress_claim, exc)
+                await delivery_store.fail_inbound(ingress_claim, exc)
             raise
         finally:
             if typing_task is not None:
@@ -1105,7 +1105,7 @@ async def run_channel_dispatch(
                 "turn_complete",
             )
         if delivery_store is not None:
-            delivery_store.complete_inbound(
+            await delivery_store.complete_inbound(
                 ingress_claim, "turn_completed", reason=admission.reason
             )
 
@@ -1597,7 +1597,7 @@ async def _dispatch_combined_message_after_debounce(channel: Any, combined: Any,
     from opensquilla.gateway.routing import build_channel_route_envelope
 
     msg = combined.message
-    admission = admission_decision or decide_channel_admission(
+    admission = admission_decision or await decide_channel_admission(
         channel,
         msg,
         session_key,

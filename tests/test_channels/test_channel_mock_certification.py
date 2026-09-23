@@ -237,38 +237,39 @@ def test_ingress_event_namespace_isolated_by_provider_and_account(tmp_path: Path
         store.close()
 
 
-def test_duplicate_accepted_event_is_not_enqueued_twice_and_recovers_once(
+async def test_duplicate_accepted_event_is_not_enqueued_twice_and_recovers_once(
+    channel_store,
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "channel_delivery.sqlite"
     message = _inbound("slack")
-    first = ChannelDeliveryStore(path)
+    first = await channel_store(path)
     queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
     channel = SimpleNamespace(
         _delivery_store=first,
         _delivery_channel_name="slack-main",
     )
     try:
-        assert durable_enqueue(channel, message, queue) is True
-        assert durable_enqueue(channel, message, queue) is False
+        assert (await durable_enqueue(channel, message, queue)) is True
+        assert (await durable_enqueue(channel, message, queue)) is False
         assert queue.qsize() == 1
     finally:
-        first.close()
+        (await first.close())
 
-    restarted = ChannelDeliveryStore(path)
+    restarted = await channel_store(path)
     recovered_queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
     restarted_channel = SimpleNamespace(
         _delivery_store=restarted,
         _delivery_channel_name="slack-main",
     )
     try:
-        recovered = restarted.recover_inbound("slack-main")
+        recovered = await restarted.recover_inbound("slack-main")
         assert len(recovered) == 1
-        assert durable_enqueue(restarted_channel, recovered[0], recovered_queue) is True
-        assert durable_enqueue(restarted_channel, message, recovered_queue) is False
+        assert (await durable_enqueue(restarted_channel, recovered[0], recovered_queue)) is True
+        assert (await durable_enqueue(restarted_channel, message, recovered_queue)) is False
         assert recovered_queue.qsize() == 1
     finally:
-        restarted.close()
+        (await restarted.close())
 
 
 @pytest.mark.parametrize(
@@ -301,11 +302,12 @@ def test_duplicate_accepted_event_is_not_enqueued_twice_and_recovers_once(
 )
 @pytest.mark.asyncio
 async def test_outbox_records_explicit_provider_outcomes_without_retry(
+    channel_store,
     tmp_path: Path,
     result: ChannelSendResult | None,
     expected_state: str,
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     calls = 0
 
     class Channel:
@@ -328,14 +330,14 @@ async def test_outbox_records_explicit_provider_outcomes_without_retry(
             is result
         )
         assert calls == 1
-        assert store.diagnostics("mock-main")["outbox"][expected_state]["count"] == 1
+        assert (await store.diagnostics("mock-main"))["outbox"][expected_state]["count"] == 1
     finally:
-        store.close()
+        (await store.close())
 
 
 @pytest.mark.asyncio
-async def test_install_outbox_is_idempotent(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_install_outbox_is_idempotent(channel_store, tmp_path: Path) -> None:
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     calls = 0
 
     class Channel:
@@ -355,9 +357,9 @@ async def test_install_outbox_is_idempotent(tmp_path: Path) -> None:
 
         await channel.send(OutgoingMessage(content="hello", reply_to="chat-origin"))
         assert calls == 1
-        assert store.diagnostics("mock-main")["outbox"]["sent_unconfirmed"]["count"] == 1
+        assert (await store.diagnostics("mock-main"))["outbox"]["sent_unconfirmed"]["count"] == 1
     finally:
-        store.close()
+        (await store.close())
 
 
 @pytest.mark.asyncio
@@ -565,8 +567,7 @@ def test_retryable_outbox_failure_is_recorded_without_implicit_retry(tmp_path: P
         )
         with sqlite3.connect(store.path) as connection:
             row = connection.execute(
-                "SELECT state, retryable, error_message FROM channel_outbox "
-                "WHERE send_id = ?",
+                "SELECT state, retryable, error_message FROM channel_outbox WHERE send_id = ?",
                 (send_id,),
             ).fetchone()
         assert row == ("failed", 1, "provider rate limit")

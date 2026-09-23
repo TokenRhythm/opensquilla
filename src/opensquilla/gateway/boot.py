@@ -12,7 +12,7 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, MutableMapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import partial
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -2352,7 +2352,12 @@ def _cancel_and_detach_websocket_close_tasks(
             _consume_websocket_close_task(task)
 
 
-async def _close_gateway_websocket_connections(connections: list[Any]) -> None:
+async def _close_gateway_websocket_connections(
+    connections: list[Any], *, deadline: float | None = None,
+) -> None:
+    def remaining(limit: float) -> float:
+        return limit if deadline is None else min(limit, max(0.0, deadline - time.monotonic()))
+
     tasks: set[asyncio.Task[None]] = set()
     try:
         for index, connection in enumerate(connections):
@@ -2367,7 +2372,7 @@ async def _close_gateway_websocket_connections(connections: list[Any]) -> None:
 
         done, pending = await asyncio.wait(
             tasks,
-            timeout=_WS_SHUTDOWN_CLOSE_TIMEOUT_S,
+            timeout=remaining(_WS_SHUTDOWN_CLOSE_TIMEOUT_S),
         )
         for task in done:
             task.result()
@@ -2383,7 +2388,7 @@ async def _close_gateway_websocket_connections(connections: list[Any]) -> None:
             task.cancel()
         cancelled, lingering = await asyncio.wait(
             pending,
-            timeout=_WS_SHUTDOWN_CANCEL_GRACE_S,
+            timeout=remaining(_WS_SHUTDOWN_CANCEL_GRACE_S),
         )
         for task in cancelled:
             _consume_websocket_close_task(task)
@@ -2431,6 +2436,11 @@ class GatewayServer:
         reason: str = "shutdown",
     ) -> TaskRuntimeShutdownResult | None:
         """Gracefully shut down: stop channels, broadcast shutdown, close WS, stop server."""
+        deadline = time.monotonic() + gateway_shutdown_deadline()
+        def remaining(limit: float | None = None) -> float:
+            budget = max(0.0, deadline - time.monotonic())
+            return budget if limit is None else min(limit, budget)
+
         runtime_shutdown_result: TaskRuntimeShutdownResult | None = None
         runtime_shutdown_clean = bool(
             self._services is None or getattr(self._services, "task_runtime", None) is None
@@ -2454,7 +2464,7 @@ class GatewayServer:
             if self._services is not None and self._services.task_runtime is not None:
                 try:
                     runtime_shutdown_result = await self._services.task_runtime.shutdown(
-                        graceful=True, graceful_timeout=drain_budget
+                        graceful=True, graceful_timeout=remaining(drain_budget)
                     )
                     runtime_shutdown_clean = (
                         runtime_shutdown_result is None or runtime_shutdown_result.clean
@@ -2483,7 +2493,7 @@ class GatewayServer:
 
             if self._background_completion_manager is not None and runtime_shutdown_clean:
                 try:
-                    await self._background_completion_manager.close(timeout=drain_budget)
+                    await self._background_completion_manager.close(timeout=remaining(drain_budget))
                 except Exception:
                     log.debug("gateway.background_completion_close_failed", exc_info=True)
                 try:
@@ -2503,14 +2513,29 @@ class GatewayServer:
             if live_channel_manager is None and self._channel_manager_ref is not None:
                 live_channel_manager = self._channel_manager_ref()
             if live_channel_manager is not None:
-                await live_channel_manager.stop_all()
-                log.info("gateway.channels_stopped")
+                # Preserve time for bounded WS teardown and both existing
+                # server joins; every phase shares the same absolute deadline.
+                reserve = 10.0 + _WS_SHUTDOWN_CLOSE_TIMEOUT_S + _WS_SHUTDOWN_CANCEL_GRACE_S
+                try:
+                    await live_channel_manager.stop_all(timeout=max(0.0, remaining() - reserve))
+                    log.info("gateway.channels_stopped")
+                except TimeoutError:
+                    runtime_shutdown_clean = False
+                    if runtime_shutdown_result is not None:
+                        runtime_shutdown_result = replace(runtime_shutdown_result, clean=False)
+                    else:
+                        runtime_shutdown_result = TaskRuntimeShutdownResult(
+                            clean=False, elapsed_ms=0, abandoned_task_count=0,
+                            remaining_driver_count=0, remaining_reservation_count=0,
+                            remaining_auxiliary_count=0,
+                        )
+                    log.error("gateway.channel_shutdown_incomplete")
 
             registry = get_registry()
             await registry.broadcast("shutdown", {"reason": reason})
 
             # Close all active WS connections
-            await _close_gateway_websocket_connections(registry.all())
+            await _close_gateway_websocket_connections(registry.all(), deadline=deadline)
 
             # Close MCP clients
             if runtime_shutdown_clean:
@@ -2547,7 +2572,8 @@ class GatewayServer:
                 if self._task is not None:
                     try:
                         await asyncio.wait_for(
-                            asyncio.gather(self._task, return_exceptions=True), timeout=5.0
+                            asyncio.gather(self._task, return_exceptions=True),
+                            timeout=remaining(5.0),
                         )
                     except TimeoutError:
                         self._task.cancel()
@@ -2563,7 +2589,8 @@ class GatewayServer:
                 if preview_task is not None:
                     try:
                         await asyncio.wait_for(
-                            asyncio.gather(preview_task, return_exceptions=True), timeout=5.0
+                            asyncio.gather(preview_task, return_exceptions=True),
+                            timeout=remaining(5.0),
                         )
                     except TimeoutError:
                         preview_task.cancel()

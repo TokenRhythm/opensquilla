@@ -257,6 +257,7 @@ class DingTalkChannel:
     _run_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _stop_event: asyncio.Event | None = field(default=None, init=False, repr=False)
     _loop: asyncio.AbstractEventLoop | None = field(default=None, init=False, repr=False)
+    _callback_tasks: set[asyncio.Task[Any]] = field(default_factory=set, init=False, repr=False)
     _last_incoming: Any = field(default=None, init=False, repr=False)
     _msg_by_id: OrderedDict[str, Any] = field(
         default_factory=OrderedDict, init=False, repr=False
@@ -449,10 +450,22 @@ class DingTalkChannel:
             ),
         )
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    def _schedule_inbound(self, message: IncomingMessage) -> None:
+        """SDK callback bridge; keep ownership and observe async enqueue errors."""
+        task = asyncio.create_task(self.enqueue(message), name="dingtalk:ingress")
+        self._callback_tasks.add(task)
+
+        def settled(done: asyncio.Task[Any]) -> None:
+            self._callback_tasks.discard(done)
+            if not done.cancelled() and (error := done.exception()) is not None:
+                log.warning("dingtalk.ingress_failed", error_type=type(error).__name__)
+
+        task.add_done_callback(settled)
+
+    async def enqueue(self, message: IncomingMessage) -> None:
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, message, self._queue)
+        await durable_enqueue(self, message, self._queue)
         self._last_message_at = datetime.now(UTC)
         self._msg_count += 1
 
@@ -727,6 +740,10 @@ class DingTalkChannel:
                     await task
             else:
                 task.add_done_callback(self._consume_task_result)
+        for callback in tuple(self._callback_tasks):
+            callback.cancel()
+        if self._callback_tasks:
+            await asyncio.gather(*tuple(self._callback_tasks), return_exceptions=True)
         self._client = None
         self._handler = None
         self._loop = None
@@ -1586,11 +1603,11 @@ def _build_callback_handler_class() -> type:
                 if parsed is not None:
                     loop = self._channel._loop
                     if loop is not None:
-                        loop.call_soon_threadsafe(self._channel.enqueue, parsed)
+                        loop.call_soon_threadsafe(self._channel._schedule_inbound, parsed)
                     else:
                         # Same-thread fallback (covers tests that invoke the
                         # handler directly without going through ``start_forever``).
-                        self._channel.enqueue(parsed)
+                        self._channel._schedule_inbound(parsed)
             except Exception as exc:  # pragma: no cover — defensive
                 log.error("dingtalk.dispatch_error", error=str(exc))
             return AckMessage.STATUS_OK, "OK"

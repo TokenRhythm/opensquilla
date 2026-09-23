@@ -136,13 +136,13 @@ def _diagnostics_payload(
     return payload
 
 
-def _delivery_diagnostics(manager: Any | None, name: str) -> dict[str, Any] | None:
+async def _delivery_diagnostics(manager: Any | None, name: str) -> dict[str, Any] | None:
     store = getattr(manager, "_delivery_store", None)
     diagnostics = getattr(store, "diagnostics", None)
     if not callable(diagnostics):
         return None
     try:
-        result = diagnostics(name)
+        result = await diagnostics(name)
     except Exception:
         return None
     return result if isinstance(result, dict) else None
@@ -157,7 +157,9 @@ def _iso_timestamp(value: Any) -> str | None:
     return datetime.fromtimestamp(float(value), tz=UTC).isoformat()
 
 
-def _admission_diagnostics(manager: Any | None, name: str, adapter: Any) -> dict[str, Any] | None:
+async def _admission_diagnostics(
+    manager: Any | None, name: str, adapter: Any
+) -> dict[str, Any] | None:
     payload: dict[str, Any] = {}
     if adapter is not None:
         policy = getattr(adapter, "policy", None)
@@ -173,7 +175,7 @@ def _admission_diagnostics(manager: Any | None, name: str, adapter: Any) -> dict
     counts = getattr(store, "admission_reason_counts", None)
     if callable(counts):
         try:
-            tallies = counts(name)
+            tallies = await counts(name)
         except Exception:
             tallies = None
         if isinstance(tallies, dict) and tallies:
@@ -209,14 +211,14 @@ def _admission_diagnostics(manager: Any | None, name: str, adapter: Any) -> dict
     return payload or None
 
 
-def _pending_pairings_by_channel(manager: Any | None) -> dict[str, int]:
+async def _pending_pairings_by_channel(manager: Any | None) -> dict[str, int]:
     store = getattr(manager, "_delivery_store", None)
     list_pairings = getattr(store, "list_pairings", None)
     if not callable(list_pairings):
         return {}
     counts: dict[str, int] = {}
     try:
-        for record in list_pairings(status="pending"):
+        for record in await list_pairings(status="pending"):
             name = str(getattr(record, "channel_name", "") or "")
             if name:
                 counts[name] = counts.get(name, 0) + 1
@@ -236,7 +238,7 @@ async def read_channel_status(
     health_map = await channel_manager.health() if channel_manager else {}
     start_errors = _manager_start_errors(channel_manager)
     manager_types = getattr(channel_manager, "_channel_types", {}) if channel_manager else {}
-    pending_pairings = _pending_pairings_by_channel(channel_manager)
+    pending_pairings = await _pending_pairings_by_channel(channel_manager)
     channels: list[dict[str, Any]] = []
     seen: set[str] = set()
 
@@ -273,8 +275,8 @@ async def read_channel_status(
                 "diagnostics": _diagnostics_payload(
                     extra=extra,
                     start_error=start_errors.get(name),
-                    delivery=_delivery_diagnostics(channel_manager, name),
-                    admission=_admission_diagnostics(channel_manager, name, adapter),
+                    delivery=await _delivery_diagnostics(channel_manager, name),
+                    admission=await _admission_diagnostics(channel_manager, name, adapter),
                 ),
             }
         )
@@ -310,8 +312,8 @@ async def read_channel_status(
                 "diagnostics": _diagnostics_payload(
                     extra=extra,
                     start_error=start_errors.get(name),
-                    delivery=_delivery_diagnostics(channel_manager, name),
-                    admission=_admission_diagnostics(channel_manager, name, adapter),
+                    delivery=await _delivery_diagnostics(channel_manager, name),
+                    admission=await _admission_diagnostics(channel_manager, name, adapter),
                 ),
             }
         )

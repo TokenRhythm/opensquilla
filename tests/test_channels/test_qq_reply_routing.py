@@ -35,7 +35,7 @@ def _raw_group(msg_id: str, member_openid: str, group_openid: str, content: str)
 
 async def test_qq_streaming_reply_kwargs_pin_c2c_target() -> None:
     channel = _make_channel()
-    channel._enqueue_message(_raw_c2c("m-1", "openid-1", "hi"), is_group=False)
+    (await channel._enqueue_message(_raw_c2c("m-1", "openid-1", "hi"), is_group=False))
 
     msg = await channel.receive()
 
@@ -48,7 +48,7 @@ async def test_qq_streaming_reply_kwargs_pin_c2c_target() -> None:
 
 async def test_qq_streaming_reply_kwargs_pin_group_target() -> None:
     channel = _make_channel()
-    channel._enqueue_message(_raw_group("m-2", "member-1", "group-1", "hi"), is_group=True)
+    (await channel._enqueue_message(_raw_group("m-2", "member-1", "group-1", "hi"), is_group=True))
 
     msg = await channel.receive()
 
@@ -63,7 +63,7 @@ async def test_qq_streamed_reply_targets_sender_even_after_newer_inbound() -> No
     channel = _make_channel()
     channel.api = SimpleNamespace(post_c2c_message=AsyncMock(), post_group_message=AsyncMock())
 
-    channel._enqueue_message(_raw_c2c("m-a", "openid-a", "question from a"), is_group=False)
+    (await channel._enqueue_message(_raw_c2c("m-a", "openid-a", "question from a"), is_group=False))
     msg_a = await channel.receive()
 
     mid_stream = asyncio.Event()
@@ -81,7 +81,7 @@ async def test_qq_streamed_reply_targets_sender_even_after_newer_inbound() -> No
     await mid_stream.wait()
 
     # Another user's message is received while A's answer is still streaming.
-    channel._enqueue_message(_raw_c2c("m-b", "openid-b", "unrelated"), is_group=False)
+    (await channel._enqueue_message(_raw_c2c("m-b", "openid-b", "unrelated"), is_group=False))
     await channel.receive()
 
     release.set()
@@ -117,9 +117,9 @@ async def test_qq_media_reply_uses_sdk_url_upload_and_original_target(
         _raw_group("m-original", "user-original", "group-original", "request")
         if is_group else _raw_c2c("m-original", "user-original", "request")
     )
-    channel._enqueue_message(raw, is_group=is_group)
+    (await channel._enqueue_message(raw, is_group=is_group))
     original = await channel.receive()
-    channel._enqueue_message(_raw_c2c("m-other", "user-other", "other"), is_group=False)
+    (await channel._enqueue_message(_raw_c2c("m-other", "user-other", "other"), is_group=False))
     await channel.receive()
     message = channel.build_reply_message("media reply", original)
     message.attachments = [Attachment(
@@ -205,12 +205,14 @@ async def test_qq_local_artifact_is_explicitly_unsupported_without_public_hostin
     assert result.retryable is False
 
 
-async def test_qq_artifact_outbox_records_one_safe_unsupported_delivery(tmp_path: Path) -> None:
+async def test_qq_artifact_outbox_records_one_safe_unsupported_delivery(
+    channel_store, tmp_path: Path
+) -> None:
     from opensquilla.channels.contract import ChannelSendStatus
-    from opensquilla.channels.delivery_store import ChannelDeliveryStore, install_outbox
+    from opensquilla.channels.delivery_store import install_outbox
     from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
 
-    store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    store = await channel_store(tmp_path / "delivery.sqlite")
     channel = _make_channel()
     channel.api = SimpleNamespace()
     channel._delivery_store = store
@@ -235,4 +237,4 @@ async def test_qq_artifact_outbox_records_one_safe_unsupported_delivery(tmp_path
         assert str(path) not in rows[0][2]
         assert rows[0][3] == ""
     finally:
-        store.close()
+        (await store.close())

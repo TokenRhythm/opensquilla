@@ -198,7 +198,7 @@ def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> No
             released.append("released")
 
     class FailingChannelManager:
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             raise RuntimeError("channel stop failed")
 
     server = boot.GatewayServer(
@@ -546,7 +546,7 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
             assert "daily_usage" not in call_order
             return {}
 
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             return None
 
     class FakeStorage:
@@ -1734,7 +1734,7 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
         def start_errors(self) -> dict[str, dict[str, str]]:
             return {}
 
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             return None
 
     class FakeServer:
