@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -99,7 +100,7 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "latest.yml" in workflow
     assert 'NOTES_FILE="docs/releases/${TAG#v}.md"' in workflow
     assert '--notes-file "${NOTES_FILE}"' in workflow
-    assert 'gh release upload "${TAG}" dist/* --clobber' in workflow
+    assert 'gh release upload "${TAG}" dist/public/* --clobber' in workflow
     assert "& node scripts/test-packaged-first-send-renderer.mjs `" in workflow
     assert "--executable $candidate.Path `" in workflow
     assert "npm run test:packaged-first-send-renderer -- `" not in workflow
@@ -141,6 +142,62 @@ def test_release_workflow_builds_desktop_installers() -> None:
     assert "timeout: SEND_TIMEOUT_MS" in first_send_gate[current_probe_install:]
     assert "PLAYWRIGHT_ELECTRON_SANDBOX_ERRORS" in first_send_evidence
     assert "unexpectedRendererErrorCount" in first_send_evidence
+
+
+@pytest.mark.parametrize(
+    ("tag", "version", "desktop_version"),
+    [
+        ("v0.5.5", "0.5.5", "0.5.5"),
+        ("v0.5.5rc1", "0.5.5rc1", "0.5.5-rc1"),
+        ("", "0.5.5", "0.5.5"),
+    ],
+)
+def test_release_artifact_staging_excludes_internal_files(
+    tmp_path: Path, tag: str, version: str, desktop_version: str
+) -> None:
+    workflow = yaml.safe_load(
+        Path(".github/workflows/wheelhouse-release.yml").read_text(encoding="utf-8")
+    )
+    steps = {step["name"]: step for step in workflow["jobs"]["publish-release"]["steps"]}
+    verify = steps["Verify release asset set"]["run"]
+    script = verify.split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    names = [
+        f"OpenSquilla-{desktop_version}-mac-arm64.dmg",
+        f"OpenSquilla-{desktop_version}-mac-arm64.zip",
+        f"OpenSquilla-{desktop_version}-mac-arm64.dmg.blockmap",
+        f"OpenSquilla-{desktop_version}-mac-arm64.zip.blockmap",
+        "latest-mac.yml",
+        f"OpenSquilla-{desktop_version}-win-x64.exe",
+        f"OpenSquilla-{desktop_version}-win-x64.exe.blockmap",
+        "latest.yml",
+        f"opensquilla-{version}-py3-none-any.whl",
+    ]
+    checksums = []
+    for name in names:
+        content = f"synthetic release asset: {name}\n".encode()
+        (dist / name).write_bytes(content)
+        checksums.append(f"{hashlib.sha256(content).hexdigest()}  {name}")
+    (dist / "SHA256SUMS").write_text("\n".join(checksums) + "\n", encoding="utf-8")
+    (dist / "audit-candidate.json").write_text('{"version": "synthetic"}', encoding="utf-8")
+    (dist / "build.log").write_text("synthetic internal build log", encoding="utf-8")
+
+    subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=tmp_path,
+        env={**os.environ, "RELEASE_TAG": tag},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    pattern = steps["Upload aggregate workflow artifact"]["with"]["path"]
+    staged = {path.name: path for path in tmp_path.glob(pattern)}
+    assert set(staged) == {*names, "SHA256SUMS"}
+    for name, path in staged.items():
+        assert path.read_bytes() == (dist / name).read_bytes()
+    assert (dist / "audit-candidate.json").is_file()
 
 
 def test_release_workflow_runs_v053_windows_upgrade_checks_on_server_2022() -> None:
