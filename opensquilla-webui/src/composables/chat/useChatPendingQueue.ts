@@ -1479,11 +1479,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): void | Promise<void> {
     if (reorderCommitPromise) {
       return reorderCommitPromise.then(() => {
-        if (!shouldCommit()) return
+        if (disposed || !shouldCommit()) return
         return switchPendingQueue(targetSessionKey, shouldCommit, handoffSignal)
       })
     }
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
@@ -1547,13 +1547,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldApply: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ): Promise<boolean> {
-    if (!options.pendingInputWal?.acceptHandoff) return false
+    if (disposed || !options.pendingInputWal?.acceptHandoff) return false
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
-      if (!shouldApply()) return false
+      if (disposed || !shouldApply()) return false
       if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
     }
-    if (!shouldApply()) return false
+    if (disposed || !shouldApply()) return false
     const commit = await options.pendingInputWal.acceptHandoff(
       ownerRequestId,
       targetSessionKey,
@@ -1561,7 +1561,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       handoffSignal,
     )
     if (!commit) return false
-    if (shouldApply()) {
+    // A WAL transaction already in progress may finish after page cleanup.
+    // Its committed rows belong to the next queue owner; do not reconstruct
+    // attachments or install them into this disposed page's cache.
+    if (!disposed && shouldApply()) {
       applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
     }
     return true
@@ -1572,9 +1575,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     targetSessionKey: string,
     ownerRequestId: string,
   ): Promise<void> {
-    if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return
+    if (disposed || !sourceSessionKey || !targetSessionKey || !ownerRequestId) return
     const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
-    if (!committed) return
+    if (!committed || disposed) return
     if (options.sessionKey.value === targetSessionKey) {
       const restored = parkedQueues.get(targetSessionKey) || []
       parkedQueues.delete(targetSessionKey)
@@ -1605,9 +1608,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldCommit: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ) {
+    if (disposed) return
     if (reorderCommitPromise) await reorderCommitPromise
     else cancelPendingReorder()
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
     const durableCommitApplied = await acceptDurableHandoff(
       targetSessionKey,
@@ -1615,7 +1619,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       shouldCommit,
       handoffSignal,
     )
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     // The source queue still owns its terminal drain signal until the durable
     // handoff has committed and this epoch is current. Clearing it before the
     // await would strand A if IndexedDB failed or A→B was superseded by A.

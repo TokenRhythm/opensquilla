@@ -41,7 +41,7 @@ import {
 } from '@/utils/chat/metaDiscardOutbox'
 import { RpcTransportError } from '@/lib/rpc'
 import { createDurableDelivery } from '@/runtime/durableDelivery'
-import { TurnCommandError, type TurnCommands, type TurnSendResponse, type TurnSteerResponse } from '@/modules/turnCommands'
+import { TurnCommandError, type TurnCommands, type TurnReceiptResult, type TurnSendResponse, type TurnSteerResponse } from '@/modules/turnCommands'
 import {
   readSessionNavigationDiag,
   setSessionNavigationDiagStorageForTest,
@@ -9240,5 +9240,233 @@ describe('new-task model pin delivery', () => {
     expect(materializeDraftSession).toHaveBeenCalledExactlyOnceWith(h.options.sessionKey.value)
     expect(h.options.pendingSessionIntent.value).toBeNull()
     expect(h.options.inputText.value).toBe('hello')
+  })
+})
+
+describe('application delivery result projection', () => {
+  it('sends a new message after the owner has recovered a lost ordinary ACK', async () => {
+    let resolveReceipt!: (value: TurnReceiptResult) => void
+    const commands: TurnCommands = {
+      send: vi.fn().mockRejectedValueOnce(new TurnCommandError('transport', 'synthetic lost ACK', undefined, null))
+        .mockResolvedValue({ sessionKey: 'agent:main:webchat:test', taskId: 'next-task' }),
+      steer: vi.fn(), cancel: vi.fn(), supports: () => true, supportsReceiptLookup: () => true,
+      lookupReceipt: vi.fn(() => new Promise<TurnReceiptResult>(resolve => { resolveReceipt = resolve })),
+    }
+    const h = makeOptions({ turnCommands: commands })
+    await h.api.onSend()
+    await flushDelivery()
+    expect(commands.lookupReceipt).toHaveBeenCalledOnce()
+    resolveReceipt({ status: 'found', response: { sessionKey: h.options.sessionKey.value, taskId: 'first-task', taskStatus: 'succeeded' } })
+    await h.options.durableDelivery.wake()
+    expect(h.options.durableDelivery.snapshots()[0]?.phase).toBe('accepted')
+    h.options.inputText.value = 'second synthetic message'
+    await h.api.onSend()
+    expect(commands.send).toHaveBeenCalledTimes(2)
+    expect(commands.send).toHaveBeenLastCalledWith(expect.objectContaining({
+      params: expect.objectContaining({ message: 'second synthetic message' }),
+    }), expect.anything())
+    expect(commands.lookupReceipt).toHaveBeenCalledOnce()
+  })
+
+  it.each([false, true])('preserves a new matching draft on remount after an ordinary acceptance (lost ACK: %s)', async lostAck => {
+    const skill = { name: 'synthetic', instanceId: 'synthetic-skill', digest: 'a'.repeat(64) }
+    const wal = memoryHandoffWal()
+    const rpc = { call: vi.fn().mockResolvedValue({ sessionKey: 'agent:main:webchat:test' }) }
+    if (lostAck) rpc.call.mockRejectedValueOnce(new RpcTransportError('synthetic lost ACK', null))
+    const first = makeOptions({ rpc, pendingInputWal: wal, selectedSkills: ref([skill]), methodAvailability: () => true })
+    await first.api.onSend()
+    await first.options.durableDelivery.wake()
+    await flushDelivery()
+    expect(first.options.inputText.value).toBe('')
+    expect(first.options.selectedSkills?.value).toEqual([])
+    expect(await wal.listHandoffs!()).toEqual([])
+    expect(await wal.listDeliveries!()).toEqual([expect.objectContaining({ phase: 'accepted' })])
+    first.api.dispose()
+    const second = makeOptions({ pendingInputWal: wal, selectedSkills: ref([skill]), methodAvailability: () => true,
+      durableDelivery: first.options.durableDelivery, turnCommands: first.options.turnCommands })
+    expect(second.options.inputText.value).toBe('hello')
+    await second.api.recoverResponseHandoffs()
+    expect(second.options.inputText.value).toBe('hello')
+    expect(second.options.selectedSkills?.value).toEqual([skill])
+  })
+
+  it('keeps the unobserved ordinary handoff recoverable when the page unmounts before acceptance', async () => {
+    const skill = { name: 'synthetic', instanceId: 'synthetic-skill', digest: 'a'.repeat(64) }
+    const wal = memoryHandoffWal()
+    let accept!: (response: TurnSendResponse) => void
+    const rpc = { call: vi.fn(() => new Promise<TurnSendResponse>(resolve => { accept = resolve })) }
+    const first = makeOptions({ rpc, pendingInputWal: wal, selectedSkills: ref([skill]), methodAvailability: () => true })
+    const sending = first.api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    first.api.dispose()
+    accept({ sessionKey: first.options.sessionKey.value })
+    await sending
+    expect(first.options.inputText.value).toBe('hello')
+    expect(first.options.selectedSkills?.value).toEqual([skill])
+    expect(await wal.listHandoffs!()).toHaveLength(1)
+
+    const second = makeOptions({ pendingInputWal: wal, selectedSkills: ref([skill]),
+      durableDelivery: first.options.durableDelivery, turnCommands: first.options.turnCommands })
+    await second.api.recoverResponseHandoffs()
+    expect(second.options.inputText.value).toBe('')
+    expect(second.options.selectedSkills?.value).toEqual([])
+    expect(await wal.listHandoffs!()).toEqual([])
+    expect(rpc.call).toHaveBeenCalledOnce()
+  })
+
+  it.each(['provider', 'display'] as const)('keeps the accepted hidden payload immutable after retiring its outbox: %s', async changed => {
+    const h = makeOptions()
+    h.rpc.call.mockRejectedValueOnce(new RpcTransportError('synthetic lost ACK', null))
+    await h.api.dispatchHiddenSend('/meta first', 'First control', 'synthetic-hidden')
+    await h.options.durableDelivery.wake()
+    await flushDelivery()
+    expect(listHiddenControls(h.options.sessionKey.value, h.options.hiddenControlStorage)).toEqual([])
+    expect(await h.options.pendingInputWal!.listHandoffs!()).toEqual([])
+    await expect(h.api.dispatchHiddenSend(
+      changed === 'provider' ? '/meta second' : '/meta first',
+      changed === 'display' ? 'Second control' : 'First control', 'synthetic-hidden',
+    )).resolves.toMatchObject({ status: 'rejected', reason: 'outbox_conflict' })
+    expect(h.rpc.call.mock.calls.filter(([method]: unknown[]) => method === 'chat.send')).toHaveLength(1)
+    expect(listHiddenControls(h.options.sessionKey.value, h.options.hiddenControlStorage)).toEqual([])
+  })
+})
+
+
+describe('disposed send view continuations', () => {
+  it.each([
+    ['ordinary', false], ['ordinary', null],
+    ['hidden', false], ['hidden', null],
+    ['steer', false], ['steer', null],
+  ] as const)('keeps %s rejection (%s) in the owner without changing the disposed view', async (kind, accepted) => {
+    let reject!: (error: unknown) => void
+    const raw: TurnCommands = {
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, failure) => { reject = failure })),
+      steer: vi.fn(() => new Promise<TurnSteerResponse>((_, failure) => { reject = failure })),
+      cancel: vi.fn(async () => ({ aborted: true })),
+      supports: () => true, supportsReceiptLookup: () => false,
+    }
+    const h = makeOptions({ turnCommands: raw,
+      ...(kind === 'steer' ? { ...sameTurnSteerOptions(), busySendMode: ref('steer' as const) } : {}) })
+    if (kind === 'steer') h.stream.isStreaming.value = true
+    const sending = kind === 'hidden'
+      ? h.api.dispatchHiddenSend('/meta synthetic', 'Synthetic hidden request', 'disposed-hidden')
+      : h.api.onSend()
+    await vi.waitFor(() => expect(kind === 'steer' ? raw.steer : raw.send).toHaveBeenCalledOnce())
+    h.api.dispose()
+    const state = () => JSON.stringify({ text: h.options.inputText.value,
+      messages: h.options.messages.value, pending: h.pendingQueue.value,
+      stream: h.options.activeStreamTaskId.value })
+    const before = state()
+    pushToast.mockClear()
+    vi.mocked(h.stream.endStreaming).mockClear()
+    vi.mocked(h.options.scheduleHistorySync).mockClear()
+    reject(new TurnCommandError(accepted === false ? 'rejected' : 'transport',
+      'Synthetic response after page disposal', accepted === false ? 'SYNTHETIC_REJECTION' : undefined, accepted, false))
+    await sending
+    await h.options.durableDelivery.wake()
+    expect(state()).toBe(before)
+    expect(pushToast).not.toHaveBeenCalled()
+    expect(h.stream.endStreaming).not.toHaveBeenCalled()
+    expect(h.options.scheduleHistorySync).not.toHaveBeenCalled()
+    const records = await h.options.pendingInputWal!.listDeliveries!()
+    expect(records).toHaveLength(1)
+    expect(records[0]?.phase).toBe(accepted === false ? 'not-sent' : 'unknown')
+    expect(kind === 'steer' ? raw.steer : raw.send).toHaveBeenCalledOnce()
+  })
+
+  it.each(['ordinary', 'hidden'] as const)('recovers and stops a %s send rejected after disposal using only its original receipt', async kind => {
+    const wal = memoryDeliveryWal()
+    let available = true
+    let reject!: (error: unknown) => void
+    const raw: TurnCommands = {
+      send: vi.fn(() => new Promise<TurnSendResponse>((_, failure) => { reject = failure })),
+      steer: vi.fn(), cancel: vi.fn(async () => ({ aborted: true })),
+      lookupReceipt: vi.fn(async () => ({ status: 'found' as const,
+        response: { taskId: 'disposed-original-task', sessionKey: 'agent:main:webchat:test' } })),
+      supports: () => true, supportsReceiptLookup: () => true,
+    }
+    const owner = createDurableDelivery({ wal, commands: raw,
+      access: { identity: () => 'synthetic-identity', available: () => available, generation: () => 1 } })
+    const h = makeOptions({ durableDelivery: owner, turnCommands: owner.commands, pendingInputWal: wal })
+    try {
+      const sending = kind === 'hidden'
+        ? h.api.dispatchHiddenSend('/meta synthetic', 'Synthetic hidden request', 'disposed-stopped-hidden')
+        : h.api.onSend()
+      await vi.waitFor(() => expect(raw.send).toHaveBeenCalledOnce())
+      h.stream.isStreaming.value = true
+      h.api.onStop()
+      const id = (await wal.listDeliveries!())[0]!.ownerRequestId
+      await vi.waitFor(async () => expect((await wal.getDelivery!(id))?.stop?.requested).toBe(true))
+      available = false
+      h.api.dispose()
+      const messages = JSON.stringify(h.options.messages.value)
+      vi.mocked(h.options.scheduleHistorySync).mockClear()
+      reject(new TurnCommandError('transport', 'Synthetic lost ACK after disposal', undefined, null))
+      await sending
+      expect((await wal.getDelivery!(id))?.stop).toMatchObject({ requested: true, completed: false })
+      available = true
+      await owner.wake()
+      await vi.waitFor(async () => expect((await wal.getDelivery!(id))?.stop?.completed).toBe(true))
+      expect(raw.send).toHaveBeenCalledOnce()
+      expect(raw.lookupReceipt).toHaveBeenCalledOnce()
+      expect(raw.cancel).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+        sessionKey: 'agent:main:webchat:test', taskId: 'disposed-original-task', scope: 'task',
+      }), expect.anything())
+      expect(h.options.scheduleHistorySync).not.toHaveBeenCalled()
+      expect(JSON.stringify(h.options.messages.value)).toBe(messages)
+    } finally { h.api.dispose(); owner.dispose() }
+  })
+
+  it('retains an accepted handoff when the page is disposed during its WAL commit', async () => {
+    const wal = memoryDeliveryWal()
+    const originalCas = wal.compareAndSwapHandoff!
+    let release!: () => void
+    let committing = false
+    wal.compareAndSwapHandoff = async (...args) => {
+      if (args[3]?.state === 'accepted') {
+        committing = true
+        await new Promise<void>(resolve => { release = resolve })
+      }
+      return originalCas(...args)
+    }
+    const raw: TurnCommands = {
+      send: vi.fn(async () => ({ sessionKey: 'synthetic-child', taskId: 'synthetic-child-task' })),
+      steer: vi.fn(), cancel: vi.fn(), supports: () => true,
+    }
+    const h = makeOptions({ pendingInputWal: wal, turnCommands: raw,
+      pendingForkBeforeMessageId: ref('synthetic-fork-anchor') })
+    const sending = h.api.onSend()
+    await vi.waitFor(() => expect(committing).toBe(true))
+    h.api.dispose()
+    release()
+    await sending
+    expect(h.options.adoptResponseSession).not.toHaveBeenCalled()
+    expect(h.options.flushDeferredPendingDrain).not.toHaveBeenCalled()
+    expect((await wal.listHandoffs!())[0]).toMatchObject({ state: 'accepted', acceptedSessionKey: 'synthetic-child' })
+    wal.compareAndSwapHandoff = originalCas
+    const replacement = makeOptions({ pendingInputWal: wal, turnCommands: h.options.turnCommands,
+      durableDelivery: h.options.durableDelivery })
+    await replacement.api.recoverResponseHandoffs()
+    expect(replacement.options.adoptResponseSession).toHaveBeenCalledWith('synthetic-child', expect.any(String))
+    expect(await wal.listHandoffs!()).toEqual([])
+    expect(raw.send).toHaveBeenCalledOnce()
+  })
+
+  it.each(['ordinary', 'hidden'] as const)('does not dispatch %s work after its preflight outlives the page', async kind => {
+    let release!: (reason: string | null) => void
+    const preflight = vi.fn(() => new Promise<string | null>(resolve => { release = resolve }))
+    const h = makeOptions({ validateActiveProjectBeforeSend: preflight })
+    const sending = kind === 'hidden'
+      ? h.api.dispatchHiddenSend('/meta synthetic', 'Synthetic hidden request', 'disposed-preflight')
+      : h.api.onSend()
+    await vi.waitFor(() => expect(preflight).toHaveBeenCalledOnce())
+    h.api.dispose()
+    release(null)
+    await sending
+    expect(h.rpc.call).not.toHaveBeenCalled()
+    expect(h.options.messages.value).toEqual([])
+    expect(h.options.inputText.value).toBe('hello')
+    if (kind === 'hidden') expect(listHiddenControls(h.options.sessionKey.value, h.options.hiddenControlStorage))
+      .toHaveLength(1)
   })
 })

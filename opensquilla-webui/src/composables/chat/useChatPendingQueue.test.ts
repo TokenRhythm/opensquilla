@@ -3247,3 +3247,71 @@ it('retains attachment URLs while an accepted handoff releases a parked queue un
     expect(revoke).not.toHaveBeenCalledWith(moved.attachments[0]!.dataUrl)
   } finally { h.queue.cleanup(); create.mockRestore(); revoke.mockRestore() }
 })
+
+
+it.each([
+  ['recover', 'before'], ['recover', 'after'],
+  ['adopt', 'before'], ['adopt', 'after'],
+] as const)('keeps a %s handoff durable without restoring a disposed queue (%s commit)', async (path, timing) => {
+  const parent = 'agent:main:webchat:test'
+  const child = 'agent:main:webchat:disposed-child'
+  const ownerRequestId = 'synthetic-disposed-handoff'
+  const { wal, records, handoffs } = memoryWal([{
+    schemaVersion: 1, pendingInputId: 'synthetic-disposed-pending', sessionKey: parent,
+    clientRequestId: 'synthetic-disposed-pending-request', clientMessageId: 'synthetic-disposed-pending-message',
+    ownerRequestId, text: 'Synthetic handoff follow-up', intent: null, state: 'local_only',
+    attachments: [{ kind: 'staged', local_id: 1, name: 'synthetic.txt', mime: 'text/plain',
+      dataUrl: 'blob:synthetic-previous-page', file: new File(['Synthetic handoff bytes'], 'synthetic.txt') }],
+    createdAt: 1, updatedAt: 1,
+  }])
+  await wal.putHandoff!({ schemaVersion: 1, ownerRequestId, requestSessionKey: parent,
+    clientRequestId: ownerRequestId, clientMessageId: 'synthetic-disposed-message',
+    composerText: 'Synthetic fork', recoveryAttachments: [],
+    params: { sessionKey: parent, message: 'Synthetic fork' },
+    state: 'submitting', createdAt: 1, updatedAt: 1 })
+  const createUrl = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:synthetic-disposed')
+  const revokeUrl = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {})
+  const h = makeQueue(undefined, () => true, undefined, undefined, {
+    pendingInputWal: wal, connectionState: ref('disconnected'),
+  })
+  let replacement: ReturnType<typeof makeQueue> | undefined
+  try {
+    await h.queue.hydratePendingQueue(parent)
+    const accept = wal.acceptHandoff!
+    let release!: () => void
+    let waiting = false
+    wal.acceptHandoff = async (...args) => {
+      const committed = timing === 'after' ? await accept(...args) : null
+      waiting = true
+      await new Promise<void>(resolve => { release = resolve })
+      return committed || accept(...args)
+    }
+    const recovering = path === 'recover'
+      ? h.queue.recoverPendingQueueHandoff(parent, child, ownerRequestId)
+      : h.queue.adoptPendingQueue(child, ownerRequestId)
+    await vi.waitFor(() => expect(waiting).toBe(true))
+    h.queue.cleanup()
+    const snapshot = JSON.stringify(h.queue.pendingQueue.value)
+    const createdBefore = createUrl.mock.calls.length
+    expect(createdBefore).toBeGreaterThan(0)
+    release()
+    await recovering
+    expect(JSON.stringify(h.queue.pendingQueue.value)).toBe(snapshot)
+    expect(h.queue.getParkedQueueUsage().sessions).toBe(0)
+    expect(createUrl).toHaveBeenCalledTimes(createdBefore)
+    expect(records.get('synthetic-disposed-pending')).toMatchObject({ sessionKey: child, ownerRequestId: undefined })
+    expect(handoffs.get(ownerRequestId)).toMatchObject({ state: 'accepted', acceptedSessionKey: child })
+
+    wal.acceptHandoff = accept
+    replacement = makeQueue(undefined, () => true, undefined, undefined, {
+      pendingInputWal: wal, connectionState: ref('disconnected'),
+    })
+    replacement.sessionKey.value = child
+    await replacement.queue.hydratePendingQueue(child)
+    expect(replacement.queue.pendingQueue.value).toHaveLength(1)
+    const restored = replacement.queue.pendingQueue.value[0]!
+    expect(restored).toMatchObject({ text: 'Synthetic handoff follow-up', ownerSessionKey: child })
+    expect(restored.ownerRequestId).toBeUndefined()
+    expect(await restored.attachments[0]!.file!.text()).toBe('Synthetic handoff bytes')
+  } finally { h.queue.cleanup(); replacement?.queue.cleanup(); createUrl.mockRestore(); revokeUrl.mockRestore() }
+})
