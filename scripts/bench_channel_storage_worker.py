@@ -119,6 +119,11 @@ async def sample(mode, active, lock_ms):
             "heartbeat_lag_ms": distribution(lag),
             "unrelated_request_ms": distribution(reads),
             "storage_response_ms": distribution(elapsed_calls),
+            "raw_ms": {
+                "heartbeat_lag": lag,
+                "unrelated_request": reads,
+                "storage_response": elapsed_calls,
+            },
             "close_ms": round(close_ms, 3),
             "worker": metrics,
         }
