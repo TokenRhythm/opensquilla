@@ -7,6 +7,7 @@ def test_audio_config_defaults_are_disabled_and_elevenlabs_ready() -> None:
     cfg = GatewayConfig()
 
     assert cfg.audio.enabled is False
+    assert cfg.audio.provider == "elevenlabs"
     assert cfg.audio.tts.model == "eleven_multilingual_v2"
     assert cfg.audio.tts.voice == "21m00Tcm4TlvDq8ikWAM"
     assert cfg.audio.tts.output_format == "mp3_44100_128"
@@ -17,6 +18,10 @@ def test_audio_config_defaults_are_disabled_and_elevenlabs_ready() -> None:
     )
     assert cfg.audio.providers.elevenlabs.music_model == "music_v1"
     assert cfg.audio.providers.elevenlabs.music_output_format == "mp3_44100_128"
+    assert cfg.audio.providers.atlascloud.base_url == "https://api.atlascloud.ai"
+    assert cfg.audio.providers.atlascloud.api_key_env == "ATLASCLOUD_API_KEY"
+    assert cfg.audio.providers.atlascloud.tts_model == "elevenlabs/v3/text-to-speech"
+    assert cfg.audio.providers.atlascloud.music_model == "minimax/music-2.6"
 
 
 def test_audio_config_accepts_nested_elevenlabs_overrides() -> None:
@@ -62,3 +67,16 @@ def test_audio_config_to_toml_dict_omits_env_sourced_elevenlabs_api_key(
     assert cfg.audio.providers.elevenlabs.api_key == "el-env"
     assert "api_key" not in audio["providers"]["elevenlabs"]
     assert audio["providers"]["elevenlabs"]["api_key_env"] == "ELEVENLABS_API_KEY"
+
+
+def test_audio_config_to_toml_dict_omits_env_sourced_atlascloud_api_key(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_AUDIO_PROVIDERS__ATLASCLOUD__API_KEY", "atlas-env")
+
+    cfg = GatewayConfig()
+    audio = cfg.to_toml_dict()["audio"]
+
+    assert cfg.audio.providers.atlascloud.api_key == "atlas-env"
+    assert "api_key" not in audio["providers"]["atlascloud"]
+    assert audio["providers"]["atlascloud"]["api_key_env"] == "ATLASCLOUD_API_KEY"
