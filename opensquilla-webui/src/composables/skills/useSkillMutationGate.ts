@@ -5,7 +5,6 @@ export type SkillMutationOwner =
   | 'dependency_install'
   | 'uninstall'
   | 'reload'
-  | 'proposal'
   | 'allow_use'
 
 export interface SkillMutationGate {

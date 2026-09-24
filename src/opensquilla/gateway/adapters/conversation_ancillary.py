@@ -160,14 +160,14 @@ class GatewayConversationAncillaryAdapter:
         if not isinstance(key, str):
             raise ValueError("params.sessionKey must be a string")
         request_id = params.get("request_id", params.get("requestId"))
-        run_id = params.get("run_id")
+        if not isinstance(request_id, str) or not request_id.strip():
+            raise ValueError("params.request_id must be a non-empty string")
         return dict(
             await self._require(self._clarification, "clarification").submit(
                 SubmitClarification(
                     session_key=key,
                     fields=fields,
-                    request_id=str(request_id) if request_id is not None else None,
-                    run_id=run_id if isinstance(run_id, str) else None,
+                    request_id=request_id,
                 )
             )
         )

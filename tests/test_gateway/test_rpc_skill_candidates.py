@@ -135,8 +135,8 @@ async def test_set_enabled_changes_only_requested_name(skill_context):
     assert skill_context.config.skills.disabled == ["disabled"]
 
 
-async def test_allow_use_cannot_override_coding_mode_or_unknown_skill(skill_context):
-    with pytest.raises(ValueError, match="Coding mode"):
+async def test_allow_use_rejects_retired_or_unknown_skill(skill_context):
+    with pytest.raises(KeyError, match="not found"):
         await rpc_skills._handle_skills_set_enabled(
             {"name": "code-task", "enabled": True}, skill_context,
         )
@@ -144,3 +144,35 @@ async def test_allow_use_cannot_override_coding_mode_or_unknown_skill(skill_cont
         await rpc_skills._handle_skills_set_enabled(
             {"name": "unknown", "enabled": True}, skill_context,
         )
+
+
+@pytest.mark.parametrize("name,kind,retired_fields", [
+    ("old-workflow", "meta", ""),
+    ("code-task", "skill", ""),
+    ("old-helper", "skill", "visibility: internal\ninvocation: meta_only\n"),
+    ("old-coding", "skill", "invocation: coding_only\n"),
+    ("old-meta", "skill", "visibility: meta\n"),
+])
+async def test_lifecycle_list_does_not_reintroduce_retired_managed_workflows(
+    skill_context, tmp_path, name, kind, retired_fields,
+):
+    managed = tmp_path / "managed"
+    retired = managed / name / "SKILL.md"
+    retired.parent.mkdir(parents=True)
+    retired.write_text(
+        f"---\nname: {name}\ndescription: Synthetic old workflow\nkind: {kind}\n"
+        f"{retired_fields}---\nHistorical instructions.\n",
+    )
+    original = retired.read_bytes()
+    repairable = managed / "needs-repair" / "SKILL.md"
+    repairable.parent.mkdir(parents=True)
+    repairable.write_text("Incomplete ordinary skill manifest.\n")
+    skill_context.skill_loader = SkillLoader(
+        managed_dir=managed,
+        snapshot_path=tmp_path / "managed-cache.json",
+        lockfile_path=tmp_path / "skills-lock.json",
+    )
+    result = await rpc_skills._handle_skills_list({"includeLifecycle": True}, skill_context)
+    assert [row["name"] for row in result["skills"]] == ["needs-repair"]
+    assert result["skills"][0]["instruction_usable"] is False
+    assert retired.read_bytes() == original

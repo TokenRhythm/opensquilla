@@ -10,7 +10,6 @@ import {
   useSkillRegistry as useSkillRegistryModel,
 } from './useSkillRegistry'
 import { createSkillMutationGate } from './useSkillMutationGate'
-import { useSkillProposals as useSkillProposalsModel } from './useSkillProposals'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 
 const pushToast = vi.hoisted(() => vi.fn())
@@ -66,19 +65,6 @@ function catalogFromCall(
       ...(request.name ? { name: request.name } : {}),
       ...(request.installId ? { installId: request.installId } : {}),
     }),
-    proposals: async () => ({
-      proposals: (await call('exec.proposals.list')).proposals || [],
-      autoEnabledSkills: (await call('exec.proposals.auto_enabled.list')).skills || [],
-      settings: (await call('exec.proposals.settings.get')).settings || null,
-    }),
-    updateProposalSettings: changes => call('exec.proposals.settings.set', { ...changes }),
-    proposal: proposalId => call('exec.proposals.show', { proposal_id: proposalId }),
-    acceptProposal: (proposalId, options) => call('exec.proposals.accept', {
-      proposal_id: proposalId,
-      ...(options?.force ? { force: true } : {}),
-    }),
-    rejectProposal: proposalId => call('exec.proposals.reject', { proposal_id: proposalId }),
-    disableAutoEnabledSkill: name => call('exec.proposals.auto_enabled.disable', { name }),
   }
 }
 
@@ -93,13 +79,6 @@ function useSkillRegistry(
   ...rest: Parameters<typeof useSkillRegistryModel> extends [unknown, ...infer Tail] ? Tail : never
 ) {
   return useSkillRegistryModel(asCatalog(source), ...rest)
-}
-
-function useSkillProposals(
-  source: SkillCatalog | { call: RpcCall; hasRpcMethod?: (method: string) => boolean },
-  ...rest: Parameters<typeof useSkillProposalsModel> extends [unknown, ...infer Tail] ? Tail : never
-) {
-  return useSkillProposalsModel(asCatalog(source), ...rest)
 }
 
 afterEach(() => {
@@ -619,37 +598,6 @@ describe('useSkillRegistry install state', () => {
     finishInstall?.({ success: true, installed: true })
     await queue
     expect(gate.owner.value).toBeNull()
-  })
-
-  it('shares proposal mutation ownership with the install queue', async () => {
-    let finishProposal: ((value: { settings: Record<string, unknown> }) => void) | undefined
-    const proposalPending = new Promise<{ settings: Record<string, unknown> }>((resolve) => {
-      finishProposal = resolve
-    })
-    const call = vi.fn(async (method: string) => {
-      if (method === 'exec.proposals.settings.set') return proposalPending
-      if (method === 'skills.install') return { success: true, installed: true }
-      throw new Error(`Unexpected method ${method}`)
-    })
-    const gate = createSkillMutationGate()
-    const proposals = useSkillProposals({ call } as never, vi.fn(async () => {}), gate)
-    const registry = useSkillRegistry({ call } as never, vi.fn(async () => true), gate)
-
-    const proposal = proposals.toggleAutoPropose('enabled', true)
-    expect(gate.owner.value).toBe('proposal')
-    await registry.installSkill('@acme/during-proposal', 'clawhub')
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['exec.proposals.settings.set'])
-
-    finishProposal?.({ settings: { enabled: true } })
-    await proposal
-
-    expect(gate.acquire('install_queue')).toBe(true)
-    await proposals.setAutoEnableRisk('low')
-    expect(call.mock.calls.map(([method]) => method)).toEqual(['exec.proposals.settings.set'])
-    gate.release('install_queue')
-
-    await registry.installSkill('@acme/after-proposal', 'clawhub')
-    expect(call.mock.calls[call.mock.calls.length - 1]?.[0]).toBe('skills.install')
   })
 
   it('keeps terminal results and retries only the selected source item', async () => {

@@ -354,11 +354,12 @@ test.describe('Vue behavior contracts', () => {
         task_id: 'task-e2e-running',
         stream_seq: 1,
         tool_use_id: 'tool-e2e-clarify',
-        name: 'meta-step:project_clarify',
+        name: 'request_user_input',
         result: 'paused: awaiting user input',
         arguments: {
           kind: 'user_input',
           paused: true,
+          request_id: 'request-e2e',
           run_id: 'run-e2e',
           step: 'project_clarify',
           clarify_schema: {

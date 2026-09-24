@@ -2,8 +2,6 @@ import { computed, ref, type ComputedRef, type Ref } from 'vue'
 import i18n from '@/i18n'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type {
-  AutoEnabledSkill,
-  ProposalsSettings,
   Skill,
   SkillDependencyCounts,
   SkillDependencySummary,
@@ -12,19 +10,11 @@ import type {
   SkillStatTile,
 } from '@/types/skills'
 
-export interface SkillsCatalogOptions {
-  proposals: Ref<unknown[]>
-  autoEnabledSkills: Ref<AutoEnabledSkill[]>
-  proposalsSettings: Ref<ProposalsSettings>
-  loadProposals: () => Promise<void>
-}
-
 export interface SkillsCatalog {
   allSkills: Ref<Skill[]>
   filterText: Ref<string>
   statusFilter: Ref<string>
   filteredSkills: ComputedRef<Skill[]>
-  metaSkills: ComputedRef<Skill[]>
   visibleLayerGroups: ComputedRef<SkillLayerGroup[]>
   installedEmpty: ComputedRef<boolean>
   emptyMessage: ComputedRef<string>
@@ -63,10 +53,6 @@ function text(value: unknown): string {
   return typeof value === 'string' ? value : ''
 }
 
-function number(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0
-}
-
 function boolean(value: unknown): boolean {
   return value === true
 }
@@ -78,7 +64,6 @@ function unique(values: string[]): string[] {
 function normalizeDependencySummary(
   raw: unknown,
   fallback: Pick<Skill, 'missing_bins' | 'missing_env' | 'missing_env_any'> = {},
-  depth = 0,
 ): SkillDependencySummary {
   const root = asRecord(raw)
   const declared = asRecord(root.declared)
@@ -88,7 +73,6 @@ function normalizeDependencySummary(
   const missingBinaries = asRecord(missing.binaries)
   const missingApiEnv = asRecord(missing.api_env)
   const inferred = asRecord(root.inferred)
-  const subSkills = asRecord(root.sub_skill_dependencies)
 
   const legacyBins = stringList(fallback.missing_bins)
   const legacyEnv = stringList(fallback.missing_env)
@@ -139,21 +123,6 @@ function normalizeDependencySummary(
     }).filter(item => item.name)
     : []
 
-  // Dependency summaries can recursively contain sub-skill summaries. Bound
-  // client-side recursion so a malformed Gateway payload cannot grow the UI
-  // tree without limit; the current backend emits one-hop composition here.
-  const childSkills = depth >= 4 || !Array.isArray(subSkills.skills)
-    ? []
-    : subSkills.skills.map((item) => {
-      const child = asRecord(item)
-      const name = text(child.name)
-      if (!name) return null
-      return {
-        name,
-        summary: normalizeDependencySummary(child.summary, {}, depth + 1),
-      }
-    }).filter((item): item is NonNullable<typeof item> => item !== null)
-
   const declaredBinAll = stringList(declaredBinaries.all)
   const declaredBinAny = stringList(declaredBinaries.any)
   const declaredEnvAll = stringList(declaredApiEnv.all)
@@ -189,12 +158,6 @@ function normalizeDependencySummary(
       python_imports: pythonImports,
       api_env: inferredApiEnv,
       scan_errors: stringList(inferred.scan_errors),
-    },
-    sub_skill_dependencies: {
-      skills: childSkills,
-      missing_count: number(subSkills.missing_count),
-      inferred_count: number(subSkills.inferred_count),
-      missing_references: stringList(subSkills.missing_references),
     },
     declaration_quality: text(root.declaration_quality) || (
       legacyBins.length || legacyEnv.length || legacyEnvAny.length ? 'declared' : 'none'
@@ -234,8 +197,6 @@ export function skillDependencyCounts(skill: Skill): SkillDependencyCounts {
     advisory: summary.inferred.python_imports.length
       + summary.inferred.api_env.length
       + summary.inferred.scan_errors.length
-      + summary.sub_skill_dependencies.inferred_count
-      + summary.sub_skill_dependencies.missing_references.length,
   }
 }
 
@@ -268,10 +229,6 @@ export function installActionsForCurrentDependencies(skill: Skill): SkillInstall
   })
 }
 
-export function isMetaSkill(skill: Skill): boolean {
-  return skill.kind === 'meta' || skill.kind === 'meta_sop'
-}
-
 // Pick the description matching the active UI locale, falling back to the
 // English `description` when no localized variant exists. Only Simplified
 // Chinese has a dedicated field today (`description_zh`); other locales and
@@ -300,13 +257,6 @@ export function sortSkillsByReady(list: Skill[]): Skill[] {
   })
 }
 
-export function skillProviderCheckAtLaunch(skill: Skill): boolean {
-  const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
-  return skill.provider_check_at_launch === true && (
-    status === 'ready' || status === 'not_declared'
-  )
-}
-
 export function skillCatalogKey(skill: Skill): string {
   const instanceId = (skill.instance_id || '').trim()
   if (instanceId) return `instance:${instanceId}`
@@ -317,22 +267,17 @@ export function skillCatalogKey(skill: Skill): string {
 
 export function skillStatusDotClass(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
-  if (skillProviderCheckAtLaunch(skill)) return 'is-provider-check'
   if (status === 'ready') return 'is-ready'
   if (status === 'needs_setup') return 'is-needs'
   return 'is-unverified'
 }
 
 export function skillStatusDotTitle(skill: Skill): string {
-  if (skillProviderCheckAtLaunch(skill)) {
-    return i18n.global.t('cronSkills.skills.statusProviderAtLaunch')
-  }
   return skill.status_detail || (skill.eligible ? i18n.global.t('cronSkills.skills.dotReady') : i18n.global.t('cronSkills.skills.dotNeedsSetup'))
 }
 
 export function skillStatusChipClass(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
-  if (skillProviderCheckAtLaunch(skill)) return 'sk-chip--unverified'
   if (status === 'ready') return 'sk-chip--ok'
   if (status === 'not_declared') return 'sk-chip--unverified'
   return 'sk-chip--warn'
@@ -340,9 +285,6 @@ export function skillStatusChipClass(skill: Skill): string {
 
 export function skillStatusChipText(skill: Skill): string {
   const status = skill.status || (skill.eligible ? 'ready' : 'needs_setup')
-  if (skillProviderCheckAtLaunch(skill)) {
-    return i18n.global.t('cronSkills.skills.statusProviderAtLaunch')
-  }
   if (status === 'ready') return i18n.global.t('cronSkills.skills.statusReady')
   if (status === 'not_declared') return i18n.global.t('cronSkills.skills.statusNoDeps')
   return i18n.global.t('cronSkills.skills.statusNeedsDeps')
@@ -452,7 +394,6 @@ export function skillLayerHelp(layer: string | undefined): string {
 
 export function useSkillsCatalog(
   catalog: SkillCatalog,
-  options: SkillsCatalogOptions,
 ): SkillsCatalog {
   const t = i18n.global.t
   const allSkills = ref<Skill[]>([])
@@ -479,12 +420,10 @@ export function useSkillsCatalog(
     return skills
   })
 
-  const metaSkills = computed(() => sortSkillsByReady(filteredSkills.value.filter(s => isMetaSkill(s))))
 
   const layerGroups = computed(() => {
     const groups: Record<string, Skill[]> = {}
     filteredSkills.value.forEach(s => {
-      if (isMetaSkill(s)) return
       const l = s.layer || 'extra'
       if (!groups[l]) groups[l] = []
       groups[l].push(s)
@@ -498,12 +437,7 @@ export function useSkillsCatalog(
       .filter(g => g.skills.length > 0)
   })
 
-  const installedEmpty = computed(() => {
-    return filteredSkills.value.length === 0 &&
-      !options.proposals.value.length &&
-      !options.autoEnabledSkills.value.length &&
-      !options.proposalsSettings.value.available
-  })
+  const installedEmpty = computed(() => filteredSkills.value.length === 0)
 
   const emptyMessage = computed(() => {
     if (filterText.value) return t('cronSkills.skills.emptyFilter')
@@ -536,7 +470,6 @@ export function useSkillsCatalog(
     try {
       const skills = await catalog.list()
       allSkills.value = skills.map(normalizeSkill)
-      await options.loadProposals()
       return true
     } catch (err) {
       console.warn('Failed to load skills:', (err as Error).message)
@@ -549,7 +482,6 @@ export function useSkillsCatalog(
     filterText,
     statusFilter,
     filteredSkills,
-    metaSkills,
     visibleLayerGroups,
     installedEmpty,
     emptyMessage,

@@ -519,9 +519,6 @@ Los detalles de cada versión están en [`CHANGELOG.md`](CHANGELOG.md) y [`docs/
 | **Sesiones duraderas, subagentes y programación** | Almacenamiento de sesiones, transcripciones y repetición respaldado por SQLite, con espacios de trabajo por agente. Los agentes generan subagentes con profundidad acotada, y un `SchedulerEngine` con un parser de cron incorporado ejecuta trabajos recurrentes mediante `opensquilla cron`. |
 | **Controles del operador** | Las aprobaciones con humano en el bucle (human-in-the-loop) pueden pausar llamadas de herramienta sensibles a la espera de una decisión; los resúmenes de tokens y coste por turno y por sesión (`opensquilla cost`) y los diagnósticos están disponibles desde la CLI y la Web UI. |
 
-Documentación de MetaSkill: [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md)
-y [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md).
 
 ---
 

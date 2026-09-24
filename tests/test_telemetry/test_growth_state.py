@@ -8,11 +8,9 @@ from types import SimpleNamespace
 import pytest
 
 from opensquilla.telemetry.growth.state import (
-    CODING_MODE_USAGE_STATE_NAME,
     DESKTOP_GROWTH_MILESTONE_STATE_NAME,
     GATEWAY_GROWTH_MILESTONE_STATE_NAME,
     GROWTH_COHORT_STATE_NAME,
-    METASKILL_USAGE_STATE_NAME,
     PRODUCT_ACTIVE_STATE_NAME,
     GrowthStateError,
     delete_growth_cohort_state,
@@ -91,15 +89,16 @@ def test_cleanup_targets_only_growth_cohort_and_gateway_marker(tmp_path) -> None
     config = SimpleNamespace(state_dir=str(tmp_path))
     cohort = growth_cohort_state_path(config=config)
     gateway = gateway_growth_milestone_state_path(config=config)
-    metaskill = cohort.parent / METASKILL_USAGE_STATE_NAME
-    coding_mode = cohort.parent / CODING_MODE_USAGE_STATE_NAME
+    retired = [cohort.parent / name for name in (
+        "growth_metaskill_usage.json", "growth_coding_mode_usage.json",
+    )]
     product_active = cohort.parent / PRODUCT_ACTIVE_STATE_NAME
     desktop = cohort.parent / DESKTOP_GROWTH_MILESTONE_STATE_NAME
     cohort.parent.mkdir(parents=True)
+    for path in retired:
+        path.write_text("{}", encoding="utf-8")
     cohort.write_text("{}", encoding="utf-8")
     gateway.write_text("{}", encoding="utf-8")
-    metaskill.write_text("{}", encoding="utf-8")
-    coding_mode.write_text("{}", encoding="utf-8")
     product_active.write_text("{}", encoding="utf-8")
     desktop.write_text("{}", encoding="utf-8")
     keep = cohort.parent / "reliability-outbox.sqlite3"
@@ -107,11 +106,9 @@ def test_cleanup_targets_only_growth_cohort_and_gateway_marker(tmp_path) -> None
 
     removed = delete_growth_cohort_state(config=config)
 
-    assert set(removed) == {cohort, gateway, metaskill, coding_mode, product_active, desktop}
+    assert set(removed) == {cohort, gateway, product_active, desktop, *retired}
     assert not cohort.exists()
     assert not gateway.exists()
-    assert not metaskill.exists()
-    assert not coding_mode.exists()
     assert not product_active.exists()
     assert not desktop.exists()
     assert keep.read_text(encoding="utf-8") == "keep"

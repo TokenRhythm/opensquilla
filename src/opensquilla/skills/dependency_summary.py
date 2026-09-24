@@ -44,17 +44,9 @@ def build_dependency_summary(
     loader: SkillLoader | None = None,
     ctx: EligibilityContext | None = None,
     report: EligibilityReport | None = None,
-    _seen: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build a manifest-led dependency summary with advisory static hints."""
     ctx = ctx or EligibilityContext.auto()
-    seen = set(_seen or ())
-    if spec.name in seen:
-        summary = _empty_summary()
-        summary["inferred"]["scan_errors"].append(f"Cyclic sub-skill reference: {spec.name}")
-        return summary
-    seen.add(spec.name)
-
     requires = spec.metadata.requires if spec.metadata and spec.metadata.requires else None
     report = report or diagnose_eligibility(spec, ctx)
 
@@ -68,12 +60,6 @@ def build_dependency_summary(
         spec,
         declared_python_packages=declared_python_packages,
         declared_api_env=set(declared_all_env) | set(declared_any_env),
-    )
-    sub_skill_dependencies = _build_sub_skill_dependencies(
-        spec,
-        loader=loader,
-        ctx=ctx,
-        seen=seen,
     )
 
     summary = _empty_summary()
@@ -97,12 +83,10 @@ def build_dependency_summary(
     summary["inferred"]["python_imports"] = inferred_python_imports
     summary["inferred"]["api_env"] = inferred_api_env
     summary["inferred"]["scan_errors"] = scan_errors
-    summary["sub_skill_dependencies"] = sub_skill_dependencies
     summary["declaration_quality"] = _declaration_quality(
         report_declared=report.declared,
         inferred_python_imports=inferred_python_imports,
         inferred_api_env=inferred_api_env,
-        sub_skill_dependencies=sub_skill_dependencies,
     )
     return summary
 
@@ -123,12 +107,6 @@ def _empty_summary() -> dict[str, Any]:
             "python_imports": [],
             "api_env": [],
             "scan_errors": [],
-        },
-        "sub_skill_dependencies": {
-            "skills": [],
-            "missing_count": 0,
-            "inferred_count": 0,
-            "missing_references": [],
         },
         "declaration_quality": "none",
     }
@@ -346,71 +324,10 @@ def _markdown_env_candidates(spec: SkillSpec) -> set[str]:
     }
 
 
-def _build_sub_skill_dependencies(
-    spec: SkillSpec,
-    *,
-    loader: SkillLoader | None,
-    ctx: EligibilityContext,
-    seen: set[str],
-) -> dict[str, Any]:
-    referenced_skills = _referenced_skill_names(spec)
-    skills: list[dict[str, Any]] = []
-    missing_references: list[str] = []
-    missing_count = 0
-    inferred_count = 0
-
-    for name in referenced_skills:
-        child = loader.get_by_name(name) if loader is not None else None
-        if child is None:
-            missing_references.append(name)
-            continue
-        child_summary = build_dependency_summary(child, loader=loader, ctx=ctx, _seen=seen)
-        skills.append({"name": name, "summary": child_summary})
-        if child_summary["missing"]["count"] > 0:
-            missing_count += 1
-        if (
-            child_summary["inferred"]["python_imports"]
-            or child_summary["inferred"]["api_env"]
-            or child_summary["inferred"]["scan_errors"]
-            or child_summary["sub_skill_dependencies"]["inferred_count"] > 0
-        ):
-            inferred_count += 1
-
-    return {
-        "skills": skills,
-        "missing_count": missing_count,
-        "inferred_count": inferred_count,
-        "missing_references": missing_references,
-    }
 
 
-def _referenced_skill_names(spec: SkillSpec) -> list[str]:
-    composition = spec.composition_raw
-    if not isinstance(composition, dict):
-        return []
-    steps = composition.get("steps")
-    if not isinstance(steps, list):
-        return []
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-        _append_skill_ref(step.get("skill"), seen, ordered)
-        routes = step.get("routes")
-        if not isinstance(routes, list):
-            continue
-        for route in routes:
-            if isinstance(route, dict):
-                _append_skill_ref(route.get("skill"), seen, ordered)
-    return ordered
 
 
-def _append_skill_ref(raw: object, seen: set[str], ordered: list[str]) -> None:
-    if not isinstance(raw, str) or not raw or raw in seen:
-        return
-    seen.add(raw)
-    ordered.append(raw)
 
 
 def _declaration_quality(
@@ -418,13 +335,10 @@ def _declaration_quality(
     report_declared: bool,
     inferred_python_imports: list[dict[str, Any]],
     inferred_api_env: list[dict[str, Any]],
-    sub_skill_dependencies: dict[str, Any],
 ) -> str:
     has_inferred = bool(
         inferred_python_imports
         or inferred_api_env
-        or sub_skill_dependencies["inferred_count"]
-        or sub_skill_dependencies["missing_references"]
     )
     if report_declared and has_inferred:
         return "partial"

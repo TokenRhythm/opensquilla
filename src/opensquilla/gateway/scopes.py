@@ -51,7 +51,6 @@ ADMIN_SCOPE = "operator.admin"
 READ_SCOPE = "operator.read"
 WRITE_SCOPE = "operator.write"
 APPROVALS_SCOPE = "operator.approvals"
-PROPOSALS_SCOPE = "operator.proposals"
 PAIRING_SCOPE = "operator.pairing"
 NODE_SCOPE = "node"
 
@@ -89,16 +88,13 @@ CLI_DEFAULT_OPERATOR_SCOPES: frozenset[str] = frozenset(
         READ_SCOPE,
         WRITE_SCOPE,
         APPROVALS_SCOPE,
-        PROPOSALS_SCOPE,
         PAIRING_SCOPE,
     }
 )
 
 # Default scope set for a remote / unproven operator under no-auth mode.
 # Notably excludes ``operator.admin``: unauthenticated remote callers must
-# not get destructive privileges. Pairing and proposals are also excluded:
-# proposal mutation promotes generated SKILL.md files into the managed skill
-# layer, so remote callers need an authenticated/admin path for that surface.
+# not get destructive privileges. Pairing is also excluded.
 REMOTE_OPERATOR_SCOPES: frozenset[str] = frozenset({READ_SCOPE, WRITE_SCOPE})
 
 # Default scopes for the node role (separate scope namespace).
@@ -231,13 +227,6 @@ METHOD_SCOPES: dict[str, str] = {
     "usage.status": READ_SCOPE,
     "usage.cost": READ_SCOPE,
     "usage.query": READ_SCOPE,
-    "meta.list": READ_SCOPE,  # OpenSquilla-only; invokable meta-skill catalog.
-    "meta.inspect": READ_SCOPE,  # OpenSquilla-only; body-free stable dependency tree.
-    "meta.setup.plan": READ_SCOPE,  # OpenSquilla-only; dependency setup preview.
-    "meta.setup.status": READ_SCOPE,  # OpenSquilla-only; background setup progress.
-    "meta.runs.list": READ_SCOPE,
-    "meta.runs.failures": READ_SCOPE,
-    "meta.runs.cost": READ_SCOPE,
     # OpenSquilla-only — persisted per-turn router decision records (V017
     # router_decisions). The table stores enum tokens and numbers only (no
     # prompt text), so the listing is a plain operator read.
@@ -336,13 +325,6 @@ METHOD_SCOPES: dict[str, str] = {
     "telemetry.consent.set": WRITE_SCOPE,
     "telemetry.client_launch.record": WRITE_SCOPE,
     "telemetry.product_active.record": WRITE_SCOPE,
-    # OpenSquilla-only; manual ``/meta`` command launch stamp.
-    "meta.run": WRITE_SCOPE,
-    # Raw prompts remain owner/admin-gated inside the handlers. WRITE_SCOPE is
-    # the dispatch envelope so a locally-proven owner using a least-privilege
-    # token can reach that second, transport-proven authorization check.
-    "meta.drafts.list": WRITE_SCOPE,
-    "meta.drafts.discard": WRITE_SCOPE,
     # ----- approvals -----
     # Policy getters/setters explicitly override the ``exec.approvals.`` prefix
     # so that approval workers (which hold operator.approvals) can read/set the
@@ -360,13 +342,6 @@ METHOD_SCOPES: dict[str, str] = {
     "plugin.approval.status": APPROVALS_SCOPE,
     "plugin.approval.resolve": APPROVALS_SCOPE,
     "plugin.approval.extend": APPROVALS_SCOPE,
-    # ----- proposals (auto-propose UI: list/show) -----
-    # ``exec.proposals.*`` prefix sits OUTSIDE the ``exec.approvals.``
-    # admin prefix so that proposal browsing can remain operator-visible.
-    "exec.proposals.pending_count": PROPOSALS_SCOPE,
-    "exec.proposals.list": PROPOSALS_SCOPE,
-    "exec.proposals.show": PROPOSALS_SCOPE,
-    "exec.proposals.settings.get": PROPOSALS_SCOPE,
     # Channel identity pairing is a dedicated operator capability. Admin
     # implies this scope, while remote no-auth operators do not receive it.
     "channels.pairings": PAIRING_SCOPE,
@@ -376,7 +351,6 @@ METHOD_SCOPES: dict[str, str] = {
     # pairing: an operator managing a channel's members may promote or demote
     # its senders, but this is not an arbitrary config write.
     "channels.admin.set": PAIRING_SCOPE,
-    "exec.proposals.auto_enabled.list": PROPOSALS_SCOPE,
     # ----- admin -----
     # OpenSquilla-only; re-reads the on-disk TOML and swaps the ENTIRE runtime
     # config (values + runtime-secret markers), so it stays admin even though
@@ -403,27 +377,11 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.runtime.cancel": ADMIN_SCOPE,
     "sandbox.runtime.discard_download": ADMIN_SCOPE,
     "sandbox.runtime.remove": ADMIN_SCOPE,
-    "meta.setup.install": ADMIN_SCOPE,
-    "meta.runs.show": ADMIN_SCOPE,
-    "meta.runs.draft": ADMIN_SCOPE,
-    "meta.runs.confirm_preflight": ADMIN_SCOPE,
-    "meta.runs.recovery": ADMIN_SCOPE,
-    "meta.runs.diff": ADMIN_SCOPE,
-    "meta.runs.replay": ADMIN_SCOPE,
-    "meta.runs.validate": ADMIN_SCOPE,
-    "meta.runs.eval_baseline": ADMIN_SCOPE,
     # OpenSquilla-only — live feedback intake (F7). Resolves a decision id and
     # appends a rating to the per-agent self-learning feedback sidecar. Write
     # scope: chat surfaces submit ratings on behalf of the user; it never
     # mutates routing state directly (consumption is offline, at training).
     "router.feedback.submit": WRITE_SCOPE,
-    # Proposal mutation changes the managed skill layer or unattended
-    # synthesis state, so require authenticated admin rather than remote
-    # no-auth operator.proposals.
-    "exec.proposals.accept": ADMIN_SCOPE,
-    "exec.proposals.reject": ADMIN_SCOPE,
-    "exec.proposals.settings.set": ADMIN_SCOPE,
-    "exec.proposals.auto_enabled.disable": ADMIN_SCOPE,
     "channels.logout": ADMIN_SCOPE,
     "channels.restart": ADMIN_SCOPE,  # OpenSquilla-only.
     "channels.get": ADMIN_SCOPE,  # Redacted editable config still exposes secret presence.

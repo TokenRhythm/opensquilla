@@ -3,7 +3,7 @@
 - web_discover is a registered tool, so it must stay in the cron-agent and
   concurrency allowlists (dropping it loses the tool for cron agents and
   serializes parallel calls).
-- background_process must allow the same 90-minute ceiling that coding-mode
+- background_process must allow the same 90-minute ceiling that
   process(wait) expects; a lower background ceiling kills long builds early.
 """
 
@@ -20,7 +20,7 @@ def test_web_discover_stays_in_allowlists() -> None:
 
 
 def test_background_timeout_ceiling_covers_coding_wait() -> None:
-    # background_process must not clamp below the coding-mode process(wait)
-    # ceiling, or code-task builds get killed before the wait contract expects.
+    # background_process must not clamp below the process(wait)
+    # ceiling, or long-running builds get killed before the wait contract expects.
     assert shell._MAX_BACKGROUND_TIMEOUT >= shell._CODING_PROCESS_WAIT_TIMEOUT
     assert shell._MAX_BACKGROUND_TIMEOUT == 5400.0

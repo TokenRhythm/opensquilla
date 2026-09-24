@@ -407,6 +407,7 @@ def migrate_config_payload(
     """
     builder = _MigrationBuilder(payload=copy.deepcopy(data))
 
+    _strip_retired_product_features(builder)
     _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
@@ -434,6 +435,22 @@ def migrate_config_payload(
     builder.payload["config_version"] = LATEST_CONFIG_VERSION
 
     return builder.result()
+
+
+def _strip_retired_product_features(builder: _MigrationBuilder) -> None:
+    """Discard obsolete mode settings without inspecting or logging their values."""
+    if "meta_skill" in builder.payload:
+        builder.payload.pop("meta_skill")
+        builder.removed_fields.append("meta_skill")
+    skills = builder.payload.get("skills")
+    if isinstance(skills, dict) and "coding_mode" in skills:
+        skills.pop("coding_mode")
+        builder.removed_fields.append("skills.coding_mode")
+    if {"meta_skill", "skills.coding_mode"}.intersection(builder.removed_fields):
+        builder.warnings.append(
+            "MetaSkill and Coding Mode were removed; ordinary agents, coding tools "
+            "and skills use the normal tool and skill permissions."
+        )
 
 
 def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:

@@ -1522,8 +1522,8 @@ def build_tool_handler(
 
     # Agent-side lossy projection is only safe when the callable can actually
     # dispatch the provider-visible recovery tool.  Keep this capability on
-    # the handler itself so embedded Agents and wrapped Meta children do not
-    # mistake an arbitrary non-null callback for a retrieval implementation.
+    # the handler itself so embedded Agents do not mistake an arbitrary non-null
+    # callback for a retrieval implementation.
     setattr(
         _handler,
         "_opensquilla_available_tools",

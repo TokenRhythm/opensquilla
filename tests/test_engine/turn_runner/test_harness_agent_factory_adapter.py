@@ -19,7 +19,7 @@ from opensquilla.provider.tokenrhythm_catalog import (
 
 
 def test_agent_factory_adapter_passes_runner_tool_registry(monkeypatch) -> None:
-    """Meta-skill execution needs the per-runner registry on constructed Agents."""
+    """Constructed Agents receive their runner's tool registry and correlation."""
 
     captured: dict[str, Any] = {}
 

@@ -192,7 +192,7 @@ def _failing_dispatch_channel(*, supports_slash_commands: bool) -> SimpleNamespa
             return IncomingMessage(
                 sender_id="user-1",
                 channel_id="chat-1",
-                content="/meta" if supports_slash_commands else "hello",
+                content="/skills" if supports_slash_commands else "hello",
                 metadata={"is_group": False, "message_id": "m-1"},
             )
         raise asyncio.CancelledError
@@ -213,9 +213,9 @@ async def test_command_reply_send_failure_does_not_escape_dispatch_loop() -> Non
     """A failed slash-command reply must not burn dispatch restart budget."""
     channel = _failing_dispatch_channel(supports_slash_commands=True)
     command_reply = OutgoingMessage(
-        content="meta output",
+        content="skill output",
         reply_to="chat-1",
-        metadata={"command": "/meta", "method": "meta.get"},
+        metadata={"command": "/skills", "method": "skills.list"},
     )
 
     with (

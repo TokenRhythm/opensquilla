@@ -31,7 +31,7 @@ _IDENTIFIERS = frozenset("""
     tool_profile tool_choice tool_name tool model provider model_id
     provider_id resolved_model routed_model baseline_model provider_after_rewrite
     target_provider target_model target_source target_fingerprint route tier
-    routed_tier routing_source skill meta_skill skill_name skills_invoked
+    routed_tier routing_source skill skill_name skills_invoked
     skill_catalog_ids alias_resolution_chain activation_mode input_mode run_kind
     channel channel_id transport protocol backend platform architecture version
     format summary_format summary_source coverage_status

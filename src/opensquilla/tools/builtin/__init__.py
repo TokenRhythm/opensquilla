@@ -18,7 +18,6 @@ _NAMES = [
     "goal_control",
     "media",
     "messaging",
-    "meta_tools",
     "nodes",
     "patch",
     "plan_control",

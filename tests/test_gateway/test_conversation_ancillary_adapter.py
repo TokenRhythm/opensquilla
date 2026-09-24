@@ -103,7 +103,6 @@ async def test_adapter_projects_clarification_aliases_to_domain_command() -> Non
             "key": "agent:main:webchat:test",
             "fields": {"choice": "continue"},
             "request_id": "request-1",
-            "run_id": "run-1",
         }
     )
 
@@ -112,4 +111,3 @@ async def test_adapter_projects_clarification_aliases_to_domain_command() -> Non
     assert cast(Any, command).session_key == "agent:main:webchat:test"
     assert dict(cast(Any, command).fields) == {"choice": "continue"}
     assert cast(Any, command).request_id == "request-1"
-    assert cast(Any, command).run_id == "run-1"

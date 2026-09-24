@@ -2941,7 +2941,7 @@ describe('useChatRenderedMessages per-turn usage', () => {
 })
 
 describe('useChatRenderedMessages clarify history recovery', () => {
-  it('restores a clarify interrupt from persisted meta-step tool input', () => {
+  it('keeps retired workflow history as ordinary transcript without an actionable form', () => {
     const api = renderedMessagesFor([
       {
         role: 'assistant',
@@ -2995,14 +2995,8 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       interruptKind: 'clarify'
     } => part.type === 'interrupt' && part.interruptKind === 'clarify')
 
-    expect(clarify).toBeTruthy()
-    expect(clarify?.key).toBe('m-clarify:interrupt:run-1|project_clarify')
-    expect(clarify?.clarify?.intro).toBe('A few details.')
-    expect(clarify?.clarify?.fields.map(field => field.name)).toEqual([
-      'topic',
-      'age_band',
-    ])
-    expect(clarify?.clarify?.fields[1].choices).toEqual(['PRE_K', 'EARLY_GRADE'])
+    expect(clarify).toBeUndefined()
+    expect(message.text).toContain('Please reply with these fields.')
   })
 
   it('restores request_user_input from persisted tool_result JSON without arguments', () => {
@@ -3020,6 +3014,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
             result: JSON.stringify({
               kind: 'user_input',
               paused: true,
+              request_id: 'request-history-2',
               run_id: 'plan-run-2',
               step: 'choose_target',
               clarify_schema: {
@@ -3043,7 +3038,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
       interruptKind: 'clarify'
     } => part.type === 'interrupt' && part.interruptKind === 'clarify')
 
-    expect(clarify?.key).toBe('m-request-user-input:interrupt:plan-run-2|choose_target')
+    expect(clarify?.key).toBe('m-request-user-input:interrupt:request-history-2')
     expect(clarify?.clarify).toEqual({
       intro: 'Choose where to implement.',
       fields: [{
@@ -3054,6 +3049,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
         defaultValue: '',
         choices: ['current', 'new'],
       }],
+      requestId: 'request-history-2',
       runId: 'plan-run-2',
       step: 'choose_target',
     })
@@ -3156,7 +3152,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
             part.type === 'interrupt' && part.interruptKind === 'clarify',
         ) ?? []
         expect(clarifies.map(part => part.resolution)).toEqual([
-          'expired', 'replied', null, null,
+          'expired', 'replied', null,
         ])
       }
     },
@@ -3287,7 +3283,7 @@ describe('useChatRenderedMessages clarify history recovery', () => {
 
   it('applies clarify submit state to recovered historical interrupt cards', () => {
     const interruptState = ref<ReadonlyMap<string, InterruptViewState>>(new Map([
-      ['run-1|project_clarify', {
+      ['request-history-1', {
         resolution: 'replied',
         busy: true,
         error: '',
@@ -3302,10 +3298,11 @@ describe('useChatRenderedMessages clarify history recovery', () => {
         tool_calls: [
           {
             type: 'tool_use',
-            tool_use_id: 'meta_step_project_clarify',
-            name: 'meta-step:project_clarify',
+            tool_use_id: 'request-input-history-1',
+            name: 'request_user_input',
             input: {
               kind: 'user_input',
+              request_id: 'request-history-1',
               paused: true,
               step: 'project_clarify',
               run_id: 'run-1',

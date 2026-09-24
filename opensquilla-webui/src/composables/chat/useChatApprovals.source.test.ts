@@ -8,7 +8,7 @@ describe('useChatApprovals clarify submit source contract', () => {
     expect(source).toContain('const request = requestOverride || pendingClarify.value')
     expect(source).toContain('if (!requestOverride && clarifySubmitted.value) return')
     expect(source).toContain('await clarificationSubmission.submit({')
-    expect(source).toContain('...(request.runId ? { runId: request.runId } : {})')
+    expect(source).toContain('requestId: request.requestId')
   })
 
   it('shows a pending send without acknowledging an answer before the Gateway', () => {

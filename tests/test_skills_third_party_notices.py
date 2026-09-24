@@ -9,41 +9,8 @@ ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
 NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 ORIGINALS = {
-    "AwesomeWebpageMetaSkill",
-    "awesome-webpage-image-download",
-    "awesome-webpage-research",
-    "code-task",
-    "deep-research",
-    "docx",
-    "github",
-    "history-explorer",
-    "meta-kid-project-planner",
-    "meta-paper-write",
-    "meta-short-drama",
-    "meta-skill-creator",
-    "multi-search-engine",
-    "openrouter-video-generator",
-    "paper-artifact-runtime",
-    "paper-citation-integrity-gate",
-    "paper-delivery-summary",
-    "paper-latex-sanitizer",
-    "paper-length-gate",
-    "paper-quality-gate",
-    "paper-refbib-stub",
-    "paper-section-author",
-    "paper-source-readiness-gate",
-    "pdf-toolkit",
-    "pptx",
-    "skill-creator",
-    "short-drama-delivery-audit",
-    "short-drama-review-normalizer",
-    "sub-agent",
-    "srt-from-script",
-    "subtitle-burner",
-    "text-file-read",
-    "title-card-image",
-    "video-still-animator",
-    "xlsx",
+    "deep-research", "docx", "github", "pdf-toolkit", "pptx",
+    "skill-creator", "sub-agent", "xlsx",
 }
 
 
@@ -121,19 +88,6 @@ def test_third_party_notices_match_bundled_provenance(tmp_path: Path) -> None:
     if "filesystem" in clawhub_mit:
         assert "Copyright (c) 2026 Clawdbot Community" in text
         assert "clawdbot-filesystem" in text
-
-
-def test_filesystem_skill_records_mit_notice_provenance(tmp_path: Path) -> None:
-    text = NOTICES.read_text(encoding="utf-8")
-    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
-    filesystem = loader.get_by_name("filesystem")
-
-    assert filesystem is not None
-    assert filesystem.provenance.origin == "clawhub-mit"
-    assert filesystem.provenance.license == "MIT"
-    assert "## ClawHub MIT bundled skill descriptors" in text
-    assert "- `filesystem`" in text
-    assert "Copyright (c) 2026 Clawdbot Community" in text
 
 
 def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:

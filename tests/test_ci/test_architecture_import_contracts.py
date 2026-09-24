@@ -43,8 +43,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("channels", "tools"),
     ("cli", "agents"),
     ("cli", "contracts"),
-    # The code-task CLI drives its contrib host workflow through lazy imports.
-    ("cli", "contrib"),
     ("cli", "dist"),
     ("cli", "engine"),
     ("cli", "eval"),
@@ -71,22 +69,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("cli", "telemetry"),
     ("cli", "tools"),
     ("cli", "uninstall"),
-    # code-task assembles the subagent's per-run config from the operator's
-    # own provider sections and validates it against the gateway config
-    # schema before spawning (lazy import; gateway never imports contrib, so
-    # no cycle).
-    ("contrib", "gateway"),
-    # code-task's credential preflight reuses the onboarding provider probe and
-    # the provider failure taxonomy / registry to classify results; neither
-    # onboarding nor provider imports contrib, so no cycle.
-    ("contrib", "onboarding"),
-    ("contrib", "provider"),
-    # CodeTask resolves an explicitly selected Runtime Pack against the active
-    # sandbox/run-mode policy at execution time.  These imports remain lazy so
-    # ordinary CLI and Gateway startup do not initialize optional runtimes.
-    ("contrib", "runtime_packs"),
-    ("contrib", "sandbox"),
-    ("contrib", "tools"),
     # The diagnostics-bundle shim composes gateway redaction, the offline
     # doctor, and onboarding config resolution lazily for the bundle
     # generator; a top-level module (permissions.py precedent) so the

@@ -11,7 +11,7 @@ of erroring.
 
 Privacy: the table stores enum tokens and numbers only — no prompt text
 (V017 contract, test-enforced) — so every value surfaced here is already
-operator-safe and, unlike ``meta.runs.list``, read-only principals need no
+operator-safe, and read-only principals need no
 per-session gating. These handlers observe routing; they never change it.
 """
 

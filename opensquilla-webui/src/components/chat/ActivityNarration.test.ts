@@ -56,7 +56,7 @@ describe('ActivityNarration visible commentary', () => {
   })
 
   it.each([
-    'code-task failed with exit_code=1 and stderr=permission denied',
+    'shell command failed with exit_code=1 and stderr=permission denied',
     '当前环境没有 `nano-banana` skill，因此无法调用 nano-banana CLI。我会用已有的 SVG + cairosvg 生成信息图，全部保存到 `outputs/T1/`。',
   ])('keeps assistant explanations visible when they mention technical terms: %s', (text) => {
     const host = mount(text)

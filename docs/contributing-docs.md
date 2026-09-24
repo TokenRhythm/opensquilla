@@ -61,7 +61,7 @@ Most user-facing pages should answer:
 5. Where should I go next?
 
 Independent features should stay on independent pages. For example, memory,
-skills, meta-skills, SquillaRouter, tool compression, compaction, channels, and
+skills, SquillaRouter, tool compression, compaction, channels, and
 artifacts should not be merged into one broad mechanism page.
 
 ---

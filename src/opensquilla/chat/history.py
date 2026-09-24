@@ -18,10 +18,6 @@ from opensquilla.contracts.tool_presentation import (
     project_tool_arguments_payload,
     resolve_tool_presentation_fields,
 )
-from opensquilla.meta_preflight_protocol import (
-    display_text_from_preflight_confirmation,
-    strip_preflight_confirmation_protocol_text,
-)
 from opensquilla.silent_reply import sanitize_historical_silent_reply
 from opensquilla.turn_outcome_projection import public_turn_context
 
@@ -47,8 +43,7 @@ def _legacy_tool_presentation(segment: dict[str, Any]) -> dict[str, Any] | None:
 
 def _sanitize_display_protocol_payload(value: Any) -> Any:
     if isinstance(value, str):
-        clean = strip_preflight_confirmation_protocol_text(value)
-        return clean if clean is not None else value
+        return value
     if isinstance(value, list):
         return [_sanitize_display_protocol_payload(item) for item in value]
     if isinstance(value, dict):
@@ -364,10 +359,7 @@ def transcript_entries_to_chat_messages(
                     continue
                 content = cleaned
         if projected_role == "user":
-            display_text = display_text_from_preflight_confirmation(content)
-            if display_text is not None:
-                content = display_text
-            elif _is_legacy_generated_plan_implementation(
+            if _is_legacy_generated_plan_implementation(
                 content,
                 getattr(projected_entry, "turn_context", None),
             ):

@@ -71,7 +71,6 @@ describe('conversation ancillary v4 adapters', () => {
       sessionKey: 'agent:main:webchat:test',
       fields: { scope: 'complete' },
       requestId: 'request-1',
-      runId: 'run-1',
     })
 
     expect(rpc.request.mock.calls.map(call => call[0])).toEqual([
@@ -88,7 +87,6 @@ describe('conversation ancillary v4 adapters', () => {
       sessionKey: 'agent:main:webchat:test',
       fields: { scope: 'complete' },
       requestId: 'request-1',
-      run_id: 'run-1',
     })
   })
 

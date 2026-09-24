@@ -10,8 +10,14 @@ requires typing a confirmation phrase in interactive mode, and any non-TTY /
 from __future__ import annotations
 
 import os
+import sys
 
 import typer
+
+
+def _stdin_is_tty() -> bool:
+    """Return whether stdin can safely accept a confirmation prompt."""
+    return bool(getattr(sys.stdin, "isatty", lambda: False)())
 
 
 def _lifecycle_stop(
@@ -70,7 +76,6 @@ def uninstall_command(
     ),
 ) -> None:
     """Uninstall OpenSquilla. By default removes the program and keeps your data."""
-    from opensquilla.cli.codetask_cmd import _stdin_is_tty
     from opensquilla.cli.output import emit_error, print_json
     from opensquilla.cli.ui import console
     from opensquilla.uninstall.actions import execute
@@ -127,7 +132,7 @@ def uninstall_command(
             )
             raise typer.Exit(2)
     else:
-        # Non-interactive safety gate (mirrors code-task): never act without --yes
+        # Non-interactive safety gate: never act without --yes
         # on a --json or non-TTY surface where we cannot prompt.
         if not yes and (json_output or not _stdin_is_tty()):
             emit_error(

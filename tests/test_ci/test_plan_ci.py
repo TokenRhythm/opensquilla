@@ -467,11 +467,11 @@ def test_test_helper_dependency_closure_is_recursive_and_cycle_safe(
 ) -> None:
     core = "tests/test_skills/test_hub_management_service.py"
     recovery = "tests/test_skills_hash_consumers.py"
-    desktop = "tests/test_engine/test_runtime_meta_invoke_surfacing.py"
+    desktop = "tests/test_engine/test_runtime_router_fallback.py"
     _write_test_module(
         tmp_path,
         core,
-        "from tests.test_engine.test_runtime_meta_invoke_surfacing import DesktopHelper\n",
+        "from tests.test_engine.test_runtime_router_fallback import DesktopHelper\n",
     )
     _write_test_module(
         tmp_path,
@@ -1225,66 +1225,10 @@ def test_toolchain_and_packaging_changes_select_dedicated_suites(
 
 
 @pytest.mark.parametrize(
-    ("path", "domain_targets"),
-    [
-        (
-            "src/opensquilla/skills/bundled/meta-paper-write/SKILL.md",
-            {
-                "tests/test_skills/test_meta_paper*.py",
-                "tests/test_skills/test_paper_*.py",
-            },
-        ),
-        (
-            "src/opensquilla/skills/bundled/paper-quality-gate/scripts/audit.py",
-            {
-                "tests/test_skills/test_meta_paper*.py",
-                "tests/test_skills/test_paper_*.py",
-            },
-        ),
-        (
-            "src/opensquilla/skills/bundled/meta-short-drama/SKILL.md",
-            {"tests/test_skills/test_meta_short_drama*.py"},
-        ),
-        (
-            "src/opensquilla/skills/bundled/subtitle-burner/scripts/burn.py",
-            {"tests/test_skills/test_subtitle_burner.py"},
-        ),
-        (
-            "src/opensquilla/skills/bundled/video-still-animator/scripts/animate.py",
-            set(),
-        ),
-    ],
-)
-def test_bundled_managed_toolchain_domains_select_artifact_and_targeted_tests(
-    tmp_path: Path,
-    suite_config: dict[str, Any],
-    path: str,
-    domain_targets: set[str],
-) -> None:
-    plan = _plan(tmp_path, suite_config, path)
-
-    assert plan["full_fallback"] is False
-    assert {"managed-toolchain", "python-targeted", "windows-high-risk"} <= set(
-        plan["required_suites"]
-    )
-    assert {
-        "tests/test_skills/test_managed_toolchains.py",
-        "tests/test_skills/test_toolchain_runtime_integration.py",
-        "tests/test_skills/test_toolchain_state_scope.py",
-        *domain_targets,
-    } <= set(plan["python_targets"])
-    assert "toolchain_changed" in plan["reason_codes"]
-
-
-@pytest.mark.parametrize(
     "path",
     [
         "tests/test_skills/test_managed_toolchains.py",
         "tests/test_skills/test_toolchain_runtime_integration.py",
-        "tests/test_skills/test_meta_paper_write_e2e.py",
-        "tests/test_skills/test_paper_quality_gate.py",
-        "tests/test_skills/test_meta_short_drama_delivery_audit.py",
-        "tests/test_skills/test_subtitle_burner.py",
     ],
 )
 def test_managed_toolchain_domain_tests_retain_the_artifact_e2e_suite(
@@ -1564,7 +1508,6 @@ def test_unregistered_dependency_manifest_fails_closed_inside_known_domains(
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
-        "src/opensquilla/cli/skills_meta_cmd.py",
         "src/opensquilla/tools/builtin/skill_tools.py",
         "src/opensquilla/tools/registry.py",
     ],
@@ -1592,11 +1535,9 @@ def test_skill_hub_inputs_select_all_three_contract_platforms(
         "tests/test_skills/test_loader_turn_snapshot.py",
         "tests/test_cli/test_skills_reload_cmd.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
     ],
 )
@@ -2047,21 +1988,17 @@ def test_release_packaging_inputs_cover_root_readmes(
     assert "README*.md" in inputs
 
 
-def test_managed_toolchain_inputs_cover_bundled_consumers_and_tests(
+def test_managed_toolchain_inputs_cover_runtime_and_tests(
     suite_config: dict[str, Any],
 ) -> None:
     inputs = set(suite_config["suites"]["managed-toolchain"]["execution_inputs"])
 
     assert {
-        "src/opensquilla/skills/bundled/meta-paper-write/**",
-        "src/opensquilla/skills/bundled/meta-short-drama/**",
-        "src/opensquilla/skills/bundled/paper-*/**",
-        "src/opensquilla/skills/bundled/subtitle-burner/**",
-        "src/opensquilla/skills/bundled/video-still-animator/**",
-        "tests/test_skills/test_meta_paper*.py",
-        "tests/test_skills/test_meta_short_drama*.py",
-        "tests/test_skills/test_paper_*.py",
-        "tests/test_skills/test_subtitle_burner.py",
+        "scripts/validate_managed_toolchain_artifacts*.py",
+        "src/opensquilla/skills/runtime_env.py",
+        "src/opensquilla/skills/toolchains/**",
+        "tests/test_skills/test_managed_toolchains.py",
+        "tests/test_skills/test_toolchain_*.py",
     } <= inputs
 
 

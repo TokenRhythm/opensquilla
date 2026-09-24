@@ -118,7 +118,7 @@ CREATE TABLE IF NOT EXISTS telemetry_contract_recoveries (
 """
 
 _RECOVERABLE_GROWTH_EVENTS = frozenset({
-    "product_active", "client_launch", "metaskill_usage", "coding_mode_usage",
+    "product_active", "client_launch",
     "first_turn_started", "first_turn_result",
     "onboarding_result", "first_app_ready",
 })
