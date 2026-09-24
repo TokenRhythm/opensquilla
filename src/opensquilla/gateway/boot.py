@@ -246,11 +246,24 @@ def _resolve_migrations_dir() -> Path:
 
 async def _disable_retired_skill_jobs(scheduler: Any) -> None:
     """Disable legacy workflow schedules without deleting the user's history."""
-    for job in await scheduler.list_jobs():
+    try:
+        jobs = await scheduler.list_jobs()
+    except Exception as exc:  # noqa: BLE001 - retired cleanup must not block boot.
+        log.warning("boot.retired_skill_jobs.list_failed", error=str(exc))
+        return
+
+    for job in jobs:
         if (getattr(job, "handler_key", "") == "auto_propose"
                 or getattr(job, "name", "").startswith("auto_propose:")):
             if getattr(job, "enabled", False):
-                await scheduler.update_job(job.id, enabled=False)
+                try:
+                    await scheduler.update_job(job.id, enabled=False)
+                except Exception as exc:  # noqa: BLE001 - continue boot for one bad row.
+                    log.warning(
+                        "boot.retired_skill_jobs.disable_failed",
+                        job_id=getattr(job, "id", ""),
+                        error=str(exc),
+                    )
 
 
 class TaskRuntimeStreamError(RuntimeError):
