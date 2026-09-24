@@ -2229,6 +2229,7 @@ def test_windows_registry_retries_main_file_identity_change_before_acl(
         directory: bool,
         expected_device: int,
         expected_inode: int,
+        **_kwargs: object,
     ) -> None:
         nonlocal attempts
         if directory:
@@ -2332,6 +2333,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     state_dir = tmp_path / "synthetic-runtime-state"
     state_dir.mkdir()
     directory_attempts = 0
+    directory_fast_path_flags: list[object] = []
 
     def apply_acl(
         *_args: object,
@@ -2342,6 +2344,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
         if not directory:
             return
         directory_attempts += 1
+        directory_fast_path_flags.append(_kwargs.get("skip_if_private_directory"))
         if directory_attempts < 3:
             error = PermissionError("synthetic sharing violation")
             error.winerror = 32
@@ -2355,6 +2358,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     process_tree._prepare_private_file(database_path)
 
     assert directory_attempts == 3
+    assert directory_fast_path_flags == [True, True, True]
     assert database_path.is_file()
 
 
