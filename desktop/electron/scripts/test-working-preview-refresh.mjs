@@ -95,6 +95,52 @@ function fixture({ immutable = false } = {}) {
   assert.equal(f.timers.size, 0)
 }
 
+for (const immutable of [false, true]) {
+  const f = fixture({ immutable })
+  // loadURL resolves at did-finish-load, before isLoading necessarily clears.
+  f.record.view.webContents.isLoading = () => true
+  await f.manager.watchWorkingPreview(f.record)
+  assert.equal(f.heads, 1, 'a ready hidden document must receive its initial classification')
+  assert.equal(f.record.revisionKind, immutable ? 'immutable' : 'working')
+  assert.equal(f.reloads, 0)
+  assert.equal(f.timers.size, 0)
+  f.revision = '2'
+  f.manager.updateWorkingPreviewVisibility(f.record, true)
+  await f.tick(1000)
+  await f.manager.checkWorkingPreview(f.record, false, () => {})
+  assert.equal(f.heads, 1, 'a known preview must still defer checks while loading')
+  assert.equal(f.reloads, 0, 'initial classification must not reload a loading document')
+  f.manager.updateWorkingPreviewVisibility(f.record, false)
+}
+
+{
+  const f = fixture()
+  f.record.browserDocumentReady = false
+  f.record.view.webContents.isLoading = () => true
+  await f.manager.watchWorkingPreview(f.record)
+  assert.equal(f.heads, 0, 'a document that is not ready must not classify while loading')
+  assert.equal(f.record.revisionKind, 'unknown')
+  assert.equal(f.reloads, 0)
+  assert.equal(f.timers.size, 0)
+}
+
+for (const interrupt of ['navigate', 'dispose']) {
+  const f = fixture({ immutable: true })
+  f.record.view.webContents.isLoading = () => true
+  let release
+  f.fetch = () => new Promise(resolve => { release = resolve })
+  const watching = f.manager.watchWorkingPreview(f.record)
+  await f.flush()
+  if (interrupt === 'navigate') f.record.annotationDocumentGeneration++
+  else f.record.disposed = true
+  release(f.response())
+  await watching
+  assert.equal(f.heads, 1)
+  assert.equal(f.record.revisionKind, 'unknown', `${interrupt}: ignore a stale initial classification`)
+  assert.equal(f.reloads, 0)
+  assert.equal(f.timers.size, 0)
+}
+
 for (const protection of ['revisionInteracted', 'annotationPickerActive', 'annotationCandidate',
   'annotationFallbackActive', 'annotationFocusTimer', 'pendingPermissions', 'pendingAuthentication']) {
   const f = fixture()
