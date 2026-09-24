@@ -2,39 +2,42 @@ import { describe, expect, it, vi } from 'vitest'
 import { createV4AgentCatalog } from './agentCatalogV4'
 
 describe('v4 AgentCatalog Adapter', () => {
-  it('projects the catalog and maps semantic mutations', async () => {
-    const agentRequestMock = vi.fn(async (method: string) => {
-      if (method === 'agents.list') return { agents: [{ id: 'main', name: 'Main Agent' }] }
-      if (method === 'agents.delete') return null
-      return { id: 'researcher', name: 'Researcher', enabled: false }
+  it('waits for the connection and lists existing runtime profiles', async () => {
+    const profiles = [
+      { id: 'main', name: 'Main Agent' },
+      { id: 'ops', name: 'Operations', model: 'openai/test' },
+    ]
+    const request = vi.fn().mockResolvedValue({ agents: profiles })
+    const ready = vi.fn(async () => {
+      expect(request).not.toHaveBeenCalled()
     })
+    const catalog = createV4AgentCatalog({ request, ready })
+    const signal = new AbortController().signal
+
+    await expect(catalog.list({ signal })).resolves.toEqual(profiles)
+    expect(ready).toHaveBeenCalledWith({ signal })
+    expect(request).toHaveBeenCalledWith('agents.list', {}, expect.objectContaining({ signal }))
+  })
+
+  it('rejects invalid catalog responses', async () => {
     const catalog = createV4AgentCatalog({
-      request: agentRequestMock,
+      request: vi.fn().mockResolvedValue({ agents: 'invalid' }),
       ready: vi.fn(async () => {}),
-    } as Parameters<typeof createV4AgentCatalog>[0])
-
-    await expect(catalog.list()).resolves.toEqual([{ id: 'main', name: 'Main Agent' }])
-    await expect(catalog.create({ id: 'researcher', name: 'Researcher' })).resolves.toMatchObject({
-      id: 'researcher',
     })
-    await expect(catalog.update({ id: 'researcher', enabled: false })).resolves.toMatchObject({
-      enabled: false,
-    })
-    await expect(catalog.remove('researcher')).resolves.toBeUndefined()
 
-    expect(agentRequestMock).toHaveBeenNthCalledWith(2, 'agents.create', {
-      id: 'researcher',
-      name: 'Researcher',
-    }, expect.any(Object))
-    expect(agentRequestMock).toHaveBeenNthCalledWith(3, 'agents.update', {
-      id: 'researcher',
-      enabled: false,
-    }, expect.any(Object))
-    expect(agentRequestMock).toHaveBeenNthCalledWith(
-      4,
-      'agents.delete',
-      { id: 'researcher' },
-      expect.any(Object),
-    )
+    await expect(catalog.list()).rejects.toMatchObject({ kind: 'invalid' })
+  })
+
+  it('preserves connection failures without sending a request', async () => {
+    const request = vi.fn()
+    const catalog = createV4AgentCatalog({
+      request,
+      ready: vi.fn(async () => { throw new Error('Connection unavailable') }),
+    })
+
+    await expect(catalog.list()).rejects.toMatchObject({
+      kind: 'unavailable', message: 'Connection unavailable',
+    })
+    expect(request).not.toHaveBeenCalled()
   })
 })

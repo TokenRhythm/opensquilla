@@ -1281,8 +1281,6 @@ watch(sidebarDynamicMaximum, () => {
 })
 
 // Primary new-chat path: ordinary tasks always start against the default Agent.
-// Explicit custom-Agent launches still receive their Agent-scoped session key
-// from advanced Agent administration.
 function openDefaultDraft() {
   freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })

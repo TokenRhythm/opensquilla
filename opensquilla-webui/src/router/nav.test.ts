@@ -3,8 +3,7 @@ import { getNavigationItems, getWorkNavigationSection } from './nav'
 import { sharedRoutes } from './sharedRoutes'
 
 // Guards the flat route taxonomy shared by the sidebar rail, mobile drawer,
-// and command palette. Long-lived Agent administration remains a direct route,
-// but is intentionally outside this primary navigation source.
+// and command palette. Retired administration pages have no active route.
 
 describe('getWorkNavigationSection', () => {
   it('returns the flat sidebar order after the dedicated chat action', () => {
@@ -53,12 +52,8 @@ describe('navigation taxonomy invariants', () => {
     ])
   })
 
-  it('keeps the /agents deep link while omitting primary-nav metadata', () => {
-    const agentsRoute = sharedRoutes.find((route) => route.path === '/agents')
-    expect(agentsRoute).toBeDefined()
-    expect(agentsRoute?.name).toBe('agents')
-    expect(agentsRoute?.component).toBeDefined()
-    expect(agentsRoute?.meta?.nav).toBeUndefined()
+  it('does not route to retired Agent administration', () => {
+    expect(sharedRoutes.some(route => route.path === '/agents')).toBe(false)
   })
 
   it('keeps retired and hub-hosted routes out of the flat navigation', () => {

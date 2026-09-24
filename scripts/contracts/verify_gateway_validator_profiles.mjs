@@ -118,7 +118,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 830)
+  assert.equal(result.roles, 818)
   // A complete baseline omits only the frozen sessions.list params validator.
   assert.equal(result.comparedRoles, baselineRoot ? result.roles - 1 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')

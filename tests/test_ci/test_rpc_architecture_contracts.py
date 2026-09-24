@@ -131,8 +131,9 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Add session-owned managed process list, output preview and stop.
 # Retire 19 generated MetaSkill methods and nine legacy workflow methods.
 # Retire router learning status and training feedback (two generated methods).
-RUNTIME_RPC_METHOD_BASELINE = 272
-RUNTIME_RPC_METHOD_DIGEST = "d27fe3c4751790915d807df7c4895100c04ed479437c3342ceb98e8553187242"
+# Retire the three advanced agent administration methods.
+RUNTIME_RPC_METHOD_BASELINE = 269
+RUNTIME_RPC_METHOD_DIGEST = "0a318497edc7647e3feedc807972b62622e74403386b1aaf1c166278b58c31d9"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1262,9 +1263,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.promptCacheKeepalive.set",
             "chat.clarify_submit",
             "agents.list",
-            "agents.create",
-            "agents.update",
-            "agents.delete",
             "channels.status",
             "channels.get",
             "channels.probe",

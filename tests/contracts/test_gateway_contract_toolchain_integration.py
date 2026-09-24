@@ -163,7 +163,6 @@ def test_required_alternatives_preserve_actual_params_types(tmp_path: Path) -> N
     }
     session_keys = ("sessionKey", "session_key", "key")
     cases = [
-        ("agents.create", {}, ("id", "agentId", "name")),
         ("cron.runs", {"limit": 1}, ("id", "job_id")),
         ("goals.capabilities", {}, session_keys),
         ("goals.clear", goal_revision, session_keys),
@@ -216,8 +215,6 @@ def test_required_alternatives_preserve_actual_params_types(tmp_path: Path) -> N
             invalid_values.append({**values[0], "futureField": True})
         else:
             values.append({**values[0], "futureField": True})
-        if method == "agents.create":
-            values.append({"id": None, "enabled": None})
         if method == "config.patch":
             values.append({"patch": {}, "patches": {}})
             invalid_values.append({"patch": None})

@@ -4,7 +4,6 @@ import { readLastRoute } from './lastRoute'
 
 const ChatView = () => import('@/views/ChatView.vue')
 const CronView = () => import('@/views/CronView.vue')
-const AgentsView = () => import('@/views/AgentsView.vue')
 const ChangelogView = () => import('@/views/ChangelogView.vue')
 const OverviewHubView = () => import('@/views/OverviewHubView.vue')
 const LogsView = () => import('@/views/LogsView.vue')
@@ -41,9 +40,6 @@ export const sharedRoutes: RouteRecordRaw[] = [
   { path: '/logs',      name: 'logs',      component: LogsView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true } },
   // Approvals resolve inline in the chat transcript and via the topbar pill.
   { path: '/approvals', redirect: '/chat' },
-  // Agent administration remains available as an advanced deep link, but is
-  // intentionally absent from primary navigation and cold-start restoration.
-  { path: '/agents',    name: 'agents',    component: AgentsView,    meta: { title: 'Agents', icon: 'agents', platforms: ['web', 'desktop'], keepAlive: true } },
   // Skills and Channels form one primary destination. /skills remains the
   // rail target while both canonical routes share the same kept-alive hub.
   { path: '/skills',    name: 'skills',    component: SkillsChannelsHubView, meta: { title: 'Skills', group: 'Work', icon: 'skills', nav: 'primary', navOrder: 40, navLabelKey: 'nav.skillsChannels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },

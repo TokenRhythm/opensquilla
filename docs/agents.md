@@ -7,6 +7,11 @@ workspace, or a channel-facing assistant.
 The built-in `main` agent is always available. Additional agents are configured
 with `opensquilla agents`.
 
+The WebUI and desktop client no longer provide an agent administration page.
+The `agents.create`, `agents.update`, and `agents.delete` Gateway RPCs are retired;
+use the CLI commands below to manage profiles. Existing profiles remain available
+to sessions and subagent execution; `agents.list` continues to supply client metadata.
+
 ## When to Create an Agent
 
 Create a durable agent when you want a stable identity for:

@@ -23,7 +23,7 @@ const labels: Partial<Record<SettingsRailSectionId, string[]>> = {
   interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel'],
   securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel'],
   memory: ['settings.memoryOverview.title'],
-  advanced: ['settings.memoryOverview.autoCaptureLabel', 'setup.advanced.configFileLabel', 'setup.advanced.dataMaintenanceLabel', 'setup.advanced.agentConfigLabel'],
+  advanced: ['settings.memoryOverview.autoCaptureLabel', 'setup.advanced.configFileLabel', 'setup.advanced.dataMaintenanceLabel'],
 }
 const results = computed(() => {
   const terms = query.value.trim().toLocaleLowerCase().split(/\s+/).filter(Boolean)
