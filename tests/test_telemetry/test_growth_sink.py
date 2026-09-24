@@ -376,13 +376,18 @@ async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_uplo
     )
     entered = asyncio.Event()
     release = asyncio.Event()
+    cancelled = asyncio.Event()
     requests = 0
 
     async def stalled(request: httpx.Request) -> httpx.Response:
         nonlocal requests
         requests += 1
         entered.set()
-        await release.wait()
+        try:
+            await release.wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         return httpx.Response(503)
 
     monkeypatch.setattr(runtime_module, "SHUTDOWN_UPLOAD_TIMEOUT_SECONDS", 0.05)
@@ -394,6 +399,7 @@ async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_uplo
             config=config, base_url="https://telemetry.invalid", env={},
         )
         sink = GrowthEventSink(runtime, config=config)
+        shutdown_task = None
         try:
             assert await sink.record_product_active(surface=ClientSurface.TUI)
             # Keep unrelated Reliability outbox setup outside the shutdown race watchdog.
@@ -405,16 +411,22 @@ async def test_shutdown_preserves_growth_observation_blocked_behind_stalled_uplo
             # A pending observation needs the same consent lock as the in-flight
             # send. Begin the network deadline before draining producer tasks.
             runtime.prepare_shutdown()
-            await asyncio.wait_for(sink.close(), timeout=1)
+            shutdown_task = asyncio.create_task(sink.close())
+            await asyncio.wait_for(cancelled.wait(), timeout=1)
+            # The network deadline must release the consent lock promptly, but
+            # durable JSON/SQLite writes are allowed to finish after that deadline.
+            await shutdown_task
             record = next(
                 record for record in read_product_active_state(sink.product_active_path).values()
                 if record.event.surface == ClientSurface.CLI
             )
             assert record.status is GrowthMilestoneStatus.ENQUEUED
-            await asyncio.wait_for(runtime.close(), timeout=1)
+            await runtime.close()
             assert requests == 1
         finally:
             release.set()
+            if shutdown_task is not None:
+                await asyncio.gather(shutdown_task, return_exceptions=True)
             await sink.close()
             await runtime.close(flush=False)
 
