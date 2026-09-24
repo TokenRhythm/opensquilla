@@ -418,12 +418,12 @@ async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(
 
 
 @pytest.mark.asyncio
-async def test_question_answer_submit_implement_and_first_checkpoint_chain(
+async def test_question_answer_submit_implement_and_progress_chain(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     storage_ref: SessionStorage | None = None
-    checkpointed: list[str] = []
+    progress_recorded: list[str] = []
 
     async def handler(run: TaskRun) -> None:
         assert storage_ref is not None
@@ -432,16 +432,24 @@ async def test_question_answer_submit_implement_and_first_checkpoint_chain(
         assert current is not None
         assert current.status == "running"
         assert current.current_step_id is None
-        from opensquilla.tools.builtin.plan_control import plan_run_checkpoint
+        from opensquilla.tools.builtin.plan_control import update_plan
         from opensquilla.tools.types import current_tool_context
 
         token = current_tool_context.set(run.envelope.tool_context(is_owner=True))
         try:
-            await plan_run_checkpoint("inspect", "completed")
+            result = json.loads(await update_plan([
+                {"step": "Inspect the accepted state", "status": "completed"},
+                {"step": "Verify the implementation", "status": "pending"},
+            ]))
+            assert result["status"] == "accepted"
+            assert result["progress"]["steps"] == [
+                {"step": "Inspect the accepted state", "status": "completed"},
+                {"step": "Verify the implementation", "status": "pending"},
+            ]
         finally:
             current_tool_context.reset(token)
         advanced = await storage_ref.get_plan_run(run_id)
-        checkpointed.append(str(advanced.current_step_id))
+        progress_recorded.append(str(advanced.current_step_id))
 
     monkeypatch.setattr(
         "opensquilla.gateway.rpc_sessions._emit_to_subscribers",
@@ -545,7 +553,7 @@ async def test_question_answer_submit_implement_and_first_checkpoint_chain(
         )
         await stack.runtime.wait(response["turn_id"], timeout=2.0)
 
-        assert checkpointed == ["None"]
+        assert progress_recorded == ["None"]
         run = await stack.storage.get_plan_run(response["planRun"]["runId"])
         assert run is not None
         assert run.status == "completed"

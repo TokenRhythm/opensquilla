@@ -657,7 +657,7 @@ async def test_parallel_calls_each_settle_exactly_once() -> None:
 async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
     provider = _ToolBatchProvider(
         [
-            ("checkpoint", "plan_run_checkpoint", {}),
+            ("terminal", "terminal_control", {}),
             ("trailing-write", "write_file", {}),
         ]
     )
@@ -669,7 +669,7 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
             tc.tool_use_id,
             tc.tool_name,
             "boundary",
-            terminates_turn=tc.tool_name == "plan_run_checkpoint",
+            terminates_turn=tc.tool_name == "terminal_control",
         )
 
     facts: list[ToolCallReliabilityFacts] = []
@@ -677,7 +677,7 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
         provider=provider,
         config=AgentConfig(max_iterations=2),
         tool_definitions=[
-            _definition("plan_run_checkpoint"),
+            _definition("terminal_control"),
             _definition("write_file"),
         ],
         tool_handler=handler,
@@ -686,7 +686,7 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
 
     events = await _collect_agent(agent)
 
-    assert dispatched == ["plan_run_checkpoint"]
+    assert dispatched == ["terminal_control"]
     assert len(facts) == 1
     assert facts[0].outcome is ToolOutcome.SUCCESS
     trailing = next(

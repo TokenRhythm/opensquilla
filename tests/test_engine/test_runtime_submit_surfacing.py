@@ -78,11 +78,11 @@ def test_plan_run_preserves_repository_tool_policy(
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(td, "name", "") for td in tool_defs}
 
-    assert "plan_run_checkpoint" not in names
+    assert "update_plan" not in names
     assert "publish_artifact" not in names
     assert names == _MODEL_REPOSITORY_TOOLS
     assert ctx.surfaced_tools is not None
-    assert "plan_run_checkpoint" in ctx.surfaced_tools
+    assert "update_plan" in ctx.surfaced_tools
 
 
 async def _preview_opener(*args, **kwargs):
@@ -162,7 +162,7 @@ def test_build_tools_plan_run_ignores_retired_submit_env(
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(td, "name", "") for td in tool_defs}
 
-    assert {"plan_run_checkpoint", "publish_artifact"}.isdisjoint(names)
+    assert {"update_plan", "publish_artifact"}.isdisjoint(names)
     assert "submit" not in names
     assert ctx.surfaced_tools is not None
     assert "submit" not in ctx.surfaced_tools
@@ -184,7 +184,7 @@ def test_goal_controls_preserve_repository_tool_policy(
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(definition, "name", "") for definition in tool_defs}
 
-    goal_tools = {"update_goal", "update_goal_progress"}
+    goal_tools = {"update_goal", "update_plan"}
     assert goal_tools.isdisjoint(names)
     assert names == _MODEL_REPOSITORY_TOOLS
     assert ctx.surfaced_tools is not None
@@ -209,7 +209,7 @@ def test_build_tools_goal_control_explicit_deny_remains_authoritative(
     names = {getattr(definition, "name", "") for definition in tool_defs}
 
     assert "update_goal" not in names
-    assert "update_goal_progress" not in names
+    assert "update_plan" not in names
 
 
 @pytest.mark.parametrize("allowed_tools", [{"submit"}, set()])

@@ -21,6 +21,7 @@ from opensquilla.provider import (
     ToolUseEndEvent,
     ToolUseStartEvent,
 )
+from opensquilla.tools.dispatch import build_tool_handler
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext
 
@@ -157,6 +158,65 @@ async def test_progress_discovery_and_dispatch_preserve_authorization(
         tool_use_id="progress-denied", tool_name="update_plan", arguments={"steps": []},
     ))
     assert rejected.is_error is True
+    assert updates == []
+
+
+@pytest.mark.parametrize("tool_name", ["update_goal_progress", "plan_run_checkpoint"])
+async def test_removed_progress_tools_cannot_be_discovered_or_dispatched(tool_name: str) -> None:
+    registry = get_default_registry()
+    ctx = ToolContext(
+        is_owner=True, caller_kind=CallerKind.WEB,
+        allowed_tools={tool_name}, surfaced_tools={tool_name},
+        plan_run_id="synthetic-run", goal_context={"goalId": "synthetic-goal"},
+    )
+    definitions, handler = _runner()._build_tools(ctx)
+    assert handler is not None
+    assert registry.get(tool_name) is None
+    assert {definition.name for definition in definitions} == {"tool_search"}
+    assert tool_name not in ctx.authorized_tool_names
+
+    search = await handler(ToolCall(
+        tool_use_id="search-removed", tool_name="tool_search", arguments={"query": tool_name},
+    ))
+    assert search.is_error is False
+    assert all(match["name"] != tool_name for match in json.loads(search.content)["matches"])
+    assert tool_name not in ctx.disclosed_tool_names
+    result = await handler(ToolCall(
+        tool_use_id="call-removed", tool_name=tool_name, arguments={},
+    ))
+    assert result.is_error is True
+
+
+@pytest.mark.parametrize(
+    "context",
+    [
+        pytest.param({"collaboration_mode": "plan"}, id="plan-mode"),
+        pytest.param(
+            {"caller_kind": CallerKind.SUBAGENT, "subagent_depth": 1}, id="subagent",
+        ),
+        pytest.param({"subagent_depth": 1}, id="nested-agent"),
+    ],
+)
+async def test_progress_handler_rejects_ineligible_context_even_when_explicitly_allowed(
+    context: dict[str, Any],
+) -> None:
+    updates = []
+
+    async def update_progress(steps, explanation):
+        updates.append((steps, explanation))
+        return {"revision": 1, "steps": steps}
+
+    ctx = ToolContext(
+        **{"is_owner": True, "caller_kind": CallerKind.WEB, **context},
+        allowed_tools={"update_plan"}, surfaced_tools={"update_plan"},
+        update_progress=update_progress,
+    )
+    handler = build_tool_handler(get_default_registry(), ctx)
+    result = await handler(ToolCall(
+        tool_use_id="ineligible-progress", tool_name="update_plan",
+        arguments={"steps": [{"step": "Inspect the synthetic input", "status": "in_progress"}]},
+    ))
+    assert result.is_error is True
     assert updates == []
 
 
