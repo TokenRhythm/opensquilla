@@ -362,7 +362,7 @@ describe('SetupProviderPanel — visible verification dialog', () => {
       const dialog = await openConfiguredEditor(el)
       const refresh = dialog.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')!
       const status = () => dialog.querySelector('[data-testid="setup-model-catalog-sync"]')
-      expect(status()?.textContent).toBe('Discovering models…')
+      expect(status()?.textContent).toBe('Loading models…')
       expect(status()?.getAttribute('role')).toBe('status')
       expect(refresh.disabled).toBe(true)
       expect(dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')?.disabled)
@@ -370,15 +370,41 @@ describe('SetupProviderPanel — visible verification dialog', () => {
 
       panelState.connection = connection({ discoverError: 'HTTP 401' })
       await nextTick()
-      expect(status()?.textContent).toContain('Couldn\'t list models — type a model id.')
-      expect(status()?.textContent).toContain('HTTP 401')
+      expect(status()?.textContent).toBe('Could not load models. Retry or enter a model ID.')
+      expect(status()?.textContent).not.toContain('HTTP 401')
       expect(refresh.disabled).toBe(false)
       refresh.click()
       expect(onRefreshModels).toHaveBeenCalledOnce()
 
       panelState.connection = connection({ modelSource: 'live' })
       await nextTick()
-      expect(status()?.textContent).toBe('Available · 0')
+      expect(status()?.textContent).toBe('No models returned. You can enter a model ID.')
+    } finally { app.unmount() }
+  })
+
+  it('retains an editable model and explains transient versus access failures without raw errors', async () => {
+    const { app, el, panelState } = await mountPanel({
+      connection: connection({ models: DISCOVERED, modelSource: 'live', discovering: true }),
+    })
+    try {
+      const dialog = await openConfiguredEditor(el)
+      const status = () => dialog.querySelector('[data-testid="setup-model-catalog-sync"]')
+      const input = dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')!
+      expect(status()?.textContent).toBe('Refreshing models…')
+      expect(input.disabled).toBe(false)
+      expect(input.getAttribute('aria-describedby')).toContain('setup-model-catalog-sync-editor')
+      panelState.connection = connection({ models: DISCOVERED, modelSource: 'live', discoverError: 'upstream private detail' })
+      await nextTick()
+      expect(status()?.textContent).toBe('Refresh failed. Showing the previous list.')
+      expect(input.disabled).toBe(false)
+      panelState.connection = connection({
+        discoverError: 'upstream private detail',
+        catalog: { lastSyncedAt: null, stale: true, accessRejected: true },
+      })
+      await nextTick()
+      expect(status()?.textContent).toBe('Could not read models. Check your API key or access permissions.')
+      expect(dialog.textContent).not.toContain('upstream private detail')
+      expect(input.disabled).toBe(false)
     } finally { app.unmount() }
   })
 
@@ -2423,7 +2449,7 @@ describe('SetupProviderPanel — effective output limit', () => {
     }, { onRefreshModels })
 
     const status = el.querySelector('[data-testid="setup-model-catalog-sync"]')
-    expect(status?.textContent).toContain('Model metadata may be stale')
+    expect(status?.textContent).toContain('Showing the saved model list')
     expect(status?.classList.contains('is-stale')).toBe(true)
 
     const refresh = el.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')

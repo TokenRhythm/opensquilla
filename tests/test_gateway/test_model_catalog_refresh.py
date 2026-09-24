@@ -27,6 +27,119 @@ class FakeClock:
         return self.value
 
 
+@pytest.mark.asyncio
+async def test_discovery_reports_transient_failure_with_last_good_rows(monkeypatch, tmp_path):
+    import httpx
+
+    import opensquilla.gateway.model_catalog_refresh as refresh_module
+
+    _patch_fetches(monkeypatch, [])
+    config = _config(tmp_path)
+    coordinator = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=FakeClock())
+    monkeypatch.setattr(refresh_module, "_coordinator", coordinator)
+    kwargs = dict(provider_id="tokenrhythm", api_key=config.llm.api_key,
+                  base_url=config.llm.base_url, config=config, persist_entitlement=True)
+    try:
+        first = await refresh_module.discover_tokenrhythm_models(**kwargs)
+
+        async def unavailable(*_args, **_kwargs):
+            raise httpx.ConnectError("Synthetic outage")
+
+        monkeypatch.setattr(refresh_module, "fetch_tokenrhythm_declared", unavailable)
+        failed = await refresh_module.discover_tokenrhythm_models(**kwargs, force=True)
+        assert not failed.ok
+        assert failed.models == first.models
+        assert failed.catalog["stale"] is True
+        assert failed.catalog["accessRejected"] is False
+    finally:
+        await coordinator.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("empty", [False, True])
+async def test_cache_only_reads_persisted_identity_without_network(monkeypatch, tmp_path, empty):
+    import opensquilla.gateway.model_catalog_refresh as refresh_module
+
+    calls = []
+    _patch_fetches(monkeypatch, calls)
+    config = _config(tmp_path)
+    clock = FakeClock()
+    coordinator = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=clock)
+    monkeypatch.setattr(refresh_module, "_coordinator", coordinator)
+
+    async def declared(*_args, **_kwargs):
+        calls.append("declared")
+        return _declared(empty=empty)
+
+    monkeypatch.setattr(refresh_module, "fetch_tokenrhythm_declared", declared)
+    kwargs = dict(provider_id="tokenrhythm", api_key=config.llm.api_key,
+                  base_url=config.llm.base_url, config=config, persist_entitlement=True)
+    first = await refresh_module.discover_tokenrhythm_models(**kwargs)
+    await coordinator.close()
+    restarted = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=clock)
+    monkeypatch.setattr(refresh_module, "_coordinator", restarted)
+    calls.clear()
+    try:
+        cached = await refresh_module.discover_tokenrhythm_models(**kwargs, cache_only=True)
+        assert cached.models == first.models
+        assert cached.catalog["cacheHit"] is True
+        assert cached.catalog["stale"] is False
+        assert calls == []
+        clock.value += refresh_module.TOKENRHYTHM_SUCCESS_TTL_SECONDS + 1
+        stale = await refresh_module.discover_tokenrhythm_models(**kwargs, cache_only=True)
+        assert stale.models == first.models
+        assert stale.catalog["stale"] is True
+        assert calls == []
+        other = await refresh_module.discover_tokenrhythm_models(
+            **{**kwargs, "api_key": "different-dummy-key", "persist_entitlement": False},
+            cache_only=True,
+        )
+        assert other.models == []
+        assert other.catalog["cacheHit"] is False
+        assert calls == []
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_cache_only_does_not_join_an_inflight_upstream_refresh(monkeypatch, tmp_path):
+    import opensquilla.gateway.model_catalog_refresh as refresh_module
+
+    _patch_fetches(monkeypatch, [])
+    config = _config(tmp_path)
+    coordinator = TokenRhythmCatalogCoordinator(ModelCatalog(), clock=FakeClock())
+    monkeypatch.setattr(refresh_module, "_coordinator", coordinator)
+    kwargs = dict(provider_id="tokenrhythm", api_key=config.llm.api_key,
+                  base_url=config.llm.base_url, config=config, persist_entitlement=True)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    refresh = None
+    try:
+        first = await refresh_module.discover_tokenrhythm_models(**kwargs)
+
+        async def delayed(*_args, **_kwargs):
+            started.set()
+            await release.wait()
+            return _declared()
+
+        monkeypatch.setattr(refresh_module, "fetch_tokenrhythm_declared", delayed)
+        refresh = asyncio.create_task(
+            refresh_module.discover_tokenrhythm_models(**kwargs, force=True),
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        snapshot = await asyncio.wait_for(
+            refresh_module.discover_tokenrhythm_models(**kwargs, cache_only=True), timeout=2,
+        )
+        assert not refresh.done()
+        assert snapshot.models == first.models
+        assert snapshot.catalog["cacheHit"] is True
+    finally:
+        release.set()
+        if refresh is not None:
+            await refresh
+        await coordinator.close()
+
+
 def _config(tmp_path: Path, *, key: str = "dummy-tokenrhythm-key") -> GatewayConfig:
     config = GatewayConfig(state_dir=str(tmp_path))
     config.llm.provider = "tokenrhythm"
@@ -57,14 +170,14 @@ def _profile_config(
     )
 
 
-def _published(*, include_public_only: bool = False):
+def _published(*, include_public_only: bool = False, status: str = "online"):
     rows = [
         {
             "id": "qwen3.8-max",
             "name": "Qwen 3.8 Max",
             "providerDisplayName": "Qwen",
             "type": "chat",
-            "status": "online",
+            "status": status,
             "contextWindow": 1_000_000,
             "maxOutputTokens": 131_072,
             "capabilities": {
@@ -106,10 +219,12 @@ def _declared(*, empty: bool = False):
     return parse_tokenrhythm_declared({"data": rows})
 
 
-def _patch_fetches(monkeypatch: pytest.MonkeyPatch, calls: list[str]) -> None:
+def _patch_fetches(
+    monkeypatch: pytest.MonkeyPatch, calls: list[str], *, status: str = "online",
+) -> None:
     async def fetch_published(**_kwargs):
         calls.append("published")
-        return _published(include_public_only=True)
+        return _published(include_public_only=True, status=status)
 
     async def fetch_declared(*_args, **_kwargs):
         calls.append("declared")
@@ -132,6 +247,45 @@ def _profile_request(config: GatewayConfig):
     requests = module._profile_requests(config, "tokenrhythm")
     assert len(requests) == 1
     return next(iter(requests.values()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["special_offer", "future-status", "offline"])
+async def test_discovery_and_restart_preserve_models_with_descriptive_status(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, status: str,
+) -> None:
+    from opensquilla.gateway import model_catalog_refresh as refresh_module
+    from opensquilla.onboarding.probe import discover_selectable_provider_models
+
+    calls: list[str] = []
+    _patch_fetches(monkeypatch, calls, status=status)
+    config = _config(tmp_path)
+    catalog = ModelCatalog()
+    coordinator = TokenRhythmCatalogCoordinator(catalog)
+    monkeypatch.setattr(refresh_module, "_coordinator", coordinator)
+
+    result = await discover_selectable_provider_models(
+        provider_id="tokenrhythm", api_key=config.llm.api_key,
+        base_url=config.llm.base_url, persist_catalog=True, catalog_config=config,
+    )
+    assert result.ok
+    assert result.source == "live"
+    assert [row["id"] for row in result.models] == ["qwen3.8-max"]
+    assert result.models[0]["metadata"]["published"]["status"] == status
+    assert result.models[0]["maxOutputTokens"] == 131_072
+    assert catalog.resolve_entry("qwen3.8-max", provider="tokenrhythm").source == "live"
+    await coordinator.close()
+
+    restarted = TokenRhythmCatalogCoordinator(ModelCatalog())
+    try:
+        await restarted.hydrate(config)
+        models = restarted.cached(config)
+        assert [model.model_id for model in models] == ["qwen3.8-max"]
+        assert models[0].metadata["published"]["status"] == status
+        assert models[0].max_output_tokens == 131_072
+        assert calls == ["published", "declared"]
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

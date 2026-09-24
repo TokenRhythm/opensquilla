@@ -1550,7 +1550,11 @@ export class NativeWorkbenchSurfaceManager {
       && !record.crashed && !contents.isDestroyed()
       && generation === record.annotationDocumentGeneration
       && (!background || (record.revisionVisible && epoch === record.revisionEpoch))
-    if (!current() || contents.isLoading()
+    // loadURL resolves at did-finish-load, before isLoading necessarily clears.
+    // Classifying that ready document cannot reload it (revisionLast is null).
+    // Otherwise a hidden preview can miss its only initial probe indefinitely.
+    const initialClassification = record.revisionKind === 'unknown' && record.browserDocumentReady
+    if (!current() || (contents.isLoading() && !initialClassification)
       || (background && this.workingPreviewProtected(record))) return
     assertCurrent?.()
     const controller = new AbortController()

@@ -1387,6 +1387,7 @@ describe('useSetupCatalog effective model limits', () => {
     expect(rpcCall).toHaveBeenLastCalledWith('onboarding.models.discover', {
       providerId: 'tokenrhythm',
       model: 'qwen3.8-max',
+      cacheOnly: true,
     })
     app.unmount()
   })
@@ -1527,6 +1528,7 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'tokenrhythm',
       model: 'deepseek-v4-pro',
+      cacheOnly: true,
     })
     expect(api.routerPanel.value.discoveredModelsByProvider.tokenrhythm?.models).toHaveLength(1)
     expect(api.routerPanel.value.discoveredModelsByProvider.tokenrhythm?.models[0]?.id).toBe('deepseek-v4-flash')
@@ -1693,14 +1695,16 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(requests).toContainEqual({
       providerId: 'tokenrhythm',
       model: 'deepseek-v4-pro',
+      cacheOnly: true,
     })
     expect(requests).toContainEqual({
       providerId: 'tokenrhythm',
       apiKey: 'unsaved-selected-provider-key',
       model: 'deepseek-v4-pro',
+      cacheOnly: true,
     })
-    expect(requests).toContainEqual({ providerId: 'openrouter' })
-    expect(requests).toContainEqual({ providerId: 'anthropic' })
+    expect(requests).toContainEqual({ providerId: 'openrouter', cacheOnly: true })
+    expect(requests).toContainEqual({ providerId: 'anthropic', cacheOnly: true })
     expect(requests.filter(request => request.apiKey !== undefined)).toHaveLength(1)
     expect(discoveryMethods.filter(method => method === 'onboarding.models.discover')).toHaveLength(2)
     expect(discoveryMethods.filter(method => method === 'onboarding.llmProfile.models.discover')).toHaveLength(2)
@@ -1709,7 +1713,7 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(Object.keys(byProvider).sort()).toEqual(['anthropic', 'openrouter', 'tokenrhythm'])
     expect(byProvider.tokenrhythm?.models[0]?.id).toBe('deepseek-v4-flash')
     expect(byProvider.openrouter?.models[0]?.id).toBe('deepseek/deepseek-v4-pro')
-    expect(byProvider.anthropic).toEqual({ models: [], source: 'none' })
+    expect(byProvider.anthropic).toMatchObject({ models: [], source: 'none', discovering: false })
     app.unmount()
   })
 
@@ -1762,8 +1766,8 @@ describe('useSetupCatalog model strategy IA', () => {
     expect(requests.sort()).toEqual(['openrouter', 'tokenrhythm'])
     releaseDiscoveries()
     await vi.waitFor(() => expect(
-      Object.keys(api.routerPanel.value.discoveredModelsByProvider),
-    ).toHaveLength(2))
+      api.routerPanel.value.discoveredModelsByProvider.openrouter?.discovering,
+    ).toBe(false))
 
     api.setSection('provider')
     await nextTick()
@@ -3605,7 +3609,7 @@ describe('useSetupCatalog configured provider management', () => {
     api.selectConfiguredProvider('deepseek')
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.models.discover',
-      { providerId: 'deepseek' },
+      { providerId: 'deepseek', cacheOnly: true },
     ))
     expect(api.providerDraftDirty.value).toBe(false)
     rpcCall.mockClear()
@@ -3734,7 +3738,7 @@ describe('useSetupCatalog configured provider management', () => {
       if (method === 'channels.status') return { channels: [] }
       if (method === 'config.get') return configWithProfiles('deepseek')
       if (method === 'onboarding.models.discover') {
-        expect(params).toEqual({ providerId: 'openai', model: 'gpt-4.1-mini' })
+        expect(params).toEqual({ providerId: 'openai', model: 'gpt-4.1-mini', cacheOnly: true })
         return {
           ok: true,
           source: 'live',
@@ -3765,7 +3769,7 @@ describe('useSetupCatalog configured provider management', () => {
         return { ok: true, source: 'live', models: [{ id: 'gpt-4.1-mini', name: 'GPT-4.1 mini' }] }
       }
       if (method === 'onboarding.llmProfile.models.discover') {
-        expect(params).toEqual({ providerId: 'deepseek' })
+        expect(params).toEqual({ providerId: 'deepseek', cacheOnly: true })
         return { ok: true, source: 'live', models: [{ id: 'deepseek-chat', name: 'DeepSeek Chat' }] }
       }
       throw new Error(`Unexpected RPC method: ${method}`)
@@ -5212,11 +5216,12 @@ describe('useSetupCatalog configured provider management', () => {
 
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.models.discover',
-      { providerId: 'deepseek' },
+      { providerId: 'deepseek', cacheOnly: true },
     ))
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'openai',
       model: 'gpt-4.1-mini',
+      cacheOnly: true,
     })
     await vi.waitFor(() => expect(
       api.routerPanel.value.discoveredModelsByProvider.deepseek?.models[0]?.id,
@@ -5251,11 +5256,12 @@ describe('useSetupCatalog configured provider management', () => {
     api.setSection('modelStrategy')
     await vi.waitFor(() => expect(rpcCall).toHaveBeenCalledWith(
       'onboarding.llmProfile.models.discover',
-      { providerId: 'deepseek' },
+      { providerId: 'deepseek', cacheOnly: true },
     ))
     await vi.waitFor(() => expect(
       api.routerPanel.value.discoveredModelsByProvider.deepseek,
-    ).toEqual({ models: [], source: 'none' }))
+    ).toMatchObject({ models: [], source: 'none', discovering: false,
+      discoverError: '401 unauthorized profile deployment' }))
     expect(rpcCall.mock.calls.some(([method, params]) => (
       method === 'onboarding.models.discover'
       && (params as Record<string, unknown> | undefined)?.providerId === 'deepseek'
@@ -5297,6 +5303,7 @@ describe('useSetupCatalog configured provider management', () => {
     ).toBe('legacy-model'))
     expect(rpcCall).toHaveBeenCalledWith('onboarding.models.discover', {
       providerId: 'deepseek',
+      cacheOnly: true,
     })
     app.unmount()
   })

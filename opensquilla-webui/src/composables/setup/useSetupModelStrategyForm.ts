@@ -158,6 +158,7 @@ export function useSetupModelStrategyForm(
         model: fixedModel.value,
         models: context.fixedModelCatalog.value.models,
         modelSource: context.fixedModelCatalog.value.source,
+        catalogState: context.fixedModelCatalog.value,
       },
       cards: [
         {
