@@ -1,7 +1,7 @@
 """RouterDecisionWriter — persistence facade for per-turn router decisions.
 
 One row per routed user message into the yoyo-owned ``router_decisions``
-table (V017). Mirrors the ``MetaRunWriter`` contract:
+table (V017). Writer contract:
 
 Connection contract:
     * ``check_same_thread=False`` — allows cross-thread access.

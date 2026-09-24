@@ -27,14 +27,6 @@ metadata:
           ],
       },
   }
-entrypoint:
-  command: python {baseDir}/scripts/export_markdown_docx.py
-  args:
-    - --out
-    - "{{ with.output_path }}"
-  stdin: "{{ with.markdown }}"
-  parse: text
-  timeout: 60
 ---
 
 # docx
@@ -142,6 +134,14 @@ success — silent failures are common.
 ---
 
 ## Path C: Create from scratch
+
+For a simple Markdown source, run the export script with the Markdown on stdin:
+
+```bash
+python {baseDir}/scripts/export_markdown_docx.py --out out.docx < draft.md
+```
+
+For structured content, use a JSON specification:
 
 ```bash
 python {baseDir}/scripts/create_docx.py spec.json --out out.docx

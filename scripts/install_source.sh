@@ -242,8 +242,7 @@ elif command -v python3 >/dev/null 2>&1 \
 else
     # No uv, and the ambient python3 is missing or older than 3.12. Do NOT
     # silently pip-install onto an unsupported interpreter: that leaves a
-    # broken `opensquilla` on PATH and makes coding mode fall back to manual
-    # edits. Fail loud and point at uv, which provisions its own 3.12.
+    # broken `opensquilla` on PATH. Point at uv, which provisions its own 3.12.
     if command -v python3 >/dev/null 2>&1; then
         _ambient_py="$(python3 -V 2>&1)"
     else
@@ -287,8 +286,7 @@ WARNING
 }
 
 verify_install() {
-    # Catch a broken/partial install now, not mid-task. A non-runnable
-    # code-task is exactly what makes coding mode silently degrade.
+    # Catch a broken or partial install before the first agent turn.
     # Prefer the JUST-installed binary over any stale `opensquilla` earlier
     # on PATH (uv tool / pip --user land outside the default PATH).
     local bin=""
@@ -303,15 +301,14 @@ verify_install() {
     if [[ -z "${bin}" ]] && command -v opensquilla >/dev/null 2>&1; then
         bin="opensquilla"
     fi
-    # Coding mode requires `opensquilla code-task`, so verify THAT, not just --version.
-    if [[ -n "${bin}" ]] && "${bin}" code-task --help >/dev/null 2>&1; then
-        echo "install_source.sh: verified - 'opensquilla code-task' is runnable"
+    if [[ -n "${bin}" ]] && "${bin}" agent --help >/dev/null 2>&1; then
+        echo "install_source.sh: verified - 'opensquilla agent' is runnable"
     else
-        echo "install_source.sh: WARNING - 'opensquilla code-task' is not runnable yet." >&2
-        echo "install_source.sh: run 'uv tool update-shell' (or open a new shell), then: opensquilla code-task --help" >&2
+        echo "install_source.sh: WARNING - 'opensquilla agent' is not runnable yet." >&2
+        echo "install_source.sh: run 'uv tool update-shell' (or open a new shell), then: opensquilla agent --help" >&2
     fi
-    command -v git  >/dev/null 2>&1 || echo "install_source.sh: WARNING - 'git' not found; code-task cannot clone repositories without it." >&2
-    command -v node >/dev/null 2>&1 || echo "install_source.sh: WARNING - 'node' is no longer available; future source installs, Web UI rebuilds, and code-task build-mode apps require it." >&2
+    command -v git  >/dev/null 2>&1 || echo "install_source.sh: WARNING - 'git' not found; repository tools require it." >&2
+    command -v node >/dev/null 2>&1 || echo "install_source.sh: WARNING - 'node' is no longer available; future source installs and Web UI rebuilds require it." >&2
 }
 
 if [[ "${dry_run}" = "1" ]]; then

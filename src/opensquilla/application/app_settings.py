@@ -102,7 +102,6 @@ _READONLY_PATH_SEGMENTS = frozenset(tuple(path.split(".")) for path in _READONLY
 _SAFE_WRITE_PATCH_PATHS = frozenset(
     {
         "skills.disabled",
-        "skills.coding_mode",
         "llm_ensemble.enabled",
         "llm_ensemble.selection_mode",
         "llm_ensemble.candidates",

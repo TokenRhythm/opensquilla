@@ -51,7 +51,6 @@ describe('Gateway Adapter composition', () => {
       'goalCenter',
       'goalContinuity',
       'planCenter',
-      'metaRunCenter',
       'appSettings',
       'productActivity',
       'providerConfiguration',

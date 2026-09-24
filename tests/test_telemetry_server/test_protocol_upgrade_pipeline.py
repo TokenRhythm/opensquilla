@@ -104,10 +104,6 @@ def test_legacy_collector_upgrade_preserves_history_and_accepts_current_metrics(
         historical_rows[scope] = _rows(config.database_path, "events")
 
     growth_events = []
-    for number, name in enumerate(["metaskill_usage", "coding_mode_usage"], start=10):
-        event = _event(number, ConsentScope.GROWTH, platform)
-        event.update(event_name=name, source="runtime")
-        growth_events.append(event)
     for number, (surface, entrypoint) in enumerate([("tui", "chat"), ("cli", "agent")], start=12):
         event = _event(number, ConsentScope.GROWTH, platform)
         event.update(
@@ -175,7 +171,7 @@ def test_legacy_collector_upgrade_preserves_history_and_accepts_current_metrics(
             if scope is ConsentScope.GROWTH:
                 repeated_launches = [
                     {**event, "event_id": _uuid(30 + index)}
-                    for index, event in enumerate(growth_events[2:])
+                    for index, event in enumerate(growth_events)
                 ]
                 receipt = client.post(config.endpoint_path, json=_batch(202, repeated_launches))
                 assert receipt.status_code == 202
@@ -225,8 +221,8 @@ def test_legacy_collector_upgrade_preserves_history_and_accepts_current_metrics(
         },
     ]
     growth = summary["growth"]
-    assert growth["metaskillUsage"]["totalUses"] == 1
-    assert growth["codingModeUsage"]["totalUses"] == 1
+    assert "metaskillUsage" not in growth
+    assert "codingModeUsage" not in growth
     assert growth["clientUsage"]["totals"]["tuiUsers"] == 1
     assert growth["clientUsage"]["totals"]["cliUsers"] == 1
     assert growth["clientUsage"]["totals"]["terminalUsers"] == 1

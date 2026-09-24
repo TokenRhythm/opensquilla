@@ -1,3 +1,4 @@
+import { isRetiredControlMessage } from '@/utils/retiredFeatureState'
 import { TurnCommandError } from '@/modules/turnCommands'
 import type {
   TurnCommands, TurnCommandRequestOptions, TurnReceiptRequest, TurnReceiptResult,
@@ -686,6 +687,13 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   }
 
   async function round(record: DeliveryWalRecord): Promise<void> {
+    if (record.request?.kind === 'send'
+      && record.request.request.kind === 'new-turn'
+      && isRetiredControlMessage(record.request.request.params.clientMessageId)) {
+      // Retired workflow controls must never re-enter ordinary Agent delivery.
+      await wal?.compareAndSwapDelivery?.(record.ownerRequestId, record.revision, null).catch(() => {})
+      return
+    }
     const intent = stopIntents.get(record.ownerRequestId)
     if (intent?.storageFailed) { await recoverVolatileStop(record.ownerRequestId, intent); return }
     if (record.phase === 'prepared' && !record.stop) { publish(record, 'not-sent'); return }

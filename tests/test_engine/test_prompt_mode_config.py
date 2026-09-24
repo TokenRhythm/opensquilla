@@ -22,32 +22,29 @@ def test_identity_prompt_mode_auto_preserves_memory_only_minimal() -> None:
 
 
 def test_identity_prompt_mode_explicit_value_overrides_auto_tool_profile() -> None:
-    cfg = GatewayConfig(
-        prompt={"mode": "headless_source_edit"},
-        tools={"profile": "memory_only"},
-    )
+    cfg = GatewayConfig(prompt={"mode": "full"}, tools={"profile": "memory_only"})
 
-    assert _resolve_identity_prompt_mode(cfg) == "headless_source_edit"
+    assert _resolve_identity_prompt_mode(cfg) == "full"
 
 
-def test_identity_prompt_mode_accepts_headless_repo_coding_scaffold() -> None:
-    cfg = GatewayConfig(prompt={"mode": "headless_repo_coding_scaffold"})
+@pytest.mark.parametrize("mode", ["headless_source_edit", "headless_repo_coding_scaffold"])
+def test_retired_prompt_modes_use_ordinary_default(mode: str) -> None:
+    cfg = GatewayConfig(prompt={"mode": mode})
 
-    assert _resolve_identity_prompt_mode(cfg) == "headless_repo_coding_scaffold"
+    assert _resolve_identity_prompt_mode(cfg) == "full"
 
 
 def test_identity_prompt_mode_short_env_alias_overrides_config(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_PROMPT_MODE", "headless_source_edit")
-    cfg = GatewayConfig(prompt={"mode": "auto"})
+    monkeypatch.setenv("OPENSQUILLA_PROMPT_MODE", "minimal")
 
-    assert _resolve_identity_prompt_mode(cfg) == "headless_source_edit"
+    assert _resolve_identity_prompt_mode(GatewayConfig()) == "minimal"
 
 
-def test_identity_prompt_mode_env_accepts_headless_repo_coding_scaffold(monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_PROMPT_MODE", "headless_repo_coding_scaffold")
-    cfg = GatewayConfig(prompt={"mode": "auto"})
+@pytest.mark.parametrize("mode", ["headless_source_edit", "headless_repo_coding_scaffold"])
+def test_retired_prompt_mode_env_uses_ordinary_default(monkeypatch, mode: str) -> None:
+    monkeypatch.setenv("OPENSQUILLA_PROMPT_MODE", mode)
 
-    assert _resolve_identity_prompt_mode(cfg) == "headless_repo_coding_scaffold"
+    assert _resolve_identity_prompt_mode(GatewayConfig()) == "full"
 
 
 @pytest.mark.parametrize("env_value", [None, "0", "1", "on", "garbage"])

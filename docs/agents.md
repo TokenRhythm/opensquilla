@@ -118,13 +118,11 @@ No cron tasks are created, moved, or changed by this upgrade.
 | Agent | Durable identity and defaults for a work stream. |
 | Session | Conversation history and active task continuity. |
 | Skill | Reusable workflow instructions or tool routines. |
-| Meta-skill | A composed workflow made from multiple skill steps. |
 
 Read next:
 
 - [`sessions.md`](sessions.md)
 - [`features/skills.md`](features/skills.md)
-- [`features/meta-skills.md`](features/meta-skills.md)
 - [`channels.md`](channels.md)
 
 ---

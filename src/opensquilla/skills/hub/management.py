@@ -285,7 +285,7 @@ def _selection_for_spec(
     if not is_skill_available_live(spec.name):
         return SkillSelectionState.DISABLED
     if spec.disable_model_invocation and not is_user_invocable_ordinary(
-        spec, coding_mode=is_skill_available_live("code-task"),
+        spec,
     ):
         return SkillSelectionState.HIDDEN
     return SkillSelectionState.ACTIVE

@@ -497,8 +497,8 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
     assert manifest["protocol"] == runner.GATEWAY_PROTOCOL
     assert manifest["wireVersion"] == 4
     assert manifest["source"] == {
-        "schemaCount": 236,
-        "methodCount": 226,
+        "schemaCount": 217,
+        "methodCount": 207,
         "eventFamilyCount": 10,
         "schemaTreeSha256": runner._schema_tree_digest(specs),
         "generatorSha256": runner._generator_digest(),
@@ -531,7 +531,7 @@ def test_compatibility_manifest_is_schema_derived_and_deterministic() -> None:
         {entry["name"] for entry in manifest["methods"]}
     )
     assert Counter(entry["lifecycle"] for entry in manifest["methods"]) == {
-        "stable": 223,
+        "stable": 204,
         "legacy": 3,
     }
     assert [

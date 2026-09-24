@@ -356,7 +356,6 @@ async def main() -> None:
     config.naming.enabled = False
     config.compaction.enabled = False
     config.memory.ttl_sweep_interval_minutes = 0
-    config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.goal.execution_enabled = True
     config.task_runtime.max_concurrency = 1

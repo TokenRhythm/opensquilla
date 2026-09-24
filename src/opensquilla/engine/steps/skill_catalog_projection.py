@@ -45,8 +45,7 @@ def _eligibility_ctx(skills_cfg: Any) -> EligibilityContext:
     from opensquilla.skills.eligibility import effective_disabled
 
     disabled = getattr(skills_cfg, "disabled", None) or []
-    coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
-    effective = effective_disabled(disabled, coding_mode)
+    effective = effective_disabled(disabled)
     if effective == _elig_ctx.disabled_set:
         return _elig_ctx
     return EligibilityContext(
@@ -63,7 +62,7 @@ def _deterministic_gate(
     available_tools: set[str],
     elig_ctx: EligibilityContext | None = None,
 ) -> list[SkillSpec]:
-    """Apply only capability, dependency, and explicit product-mode gates."""
+    """Apply only capability, dependency, and explicit availability gates."""
 
     resolved = elig_ctx or _elig_ctx
     gated: list[SkillSpec] = []
@@ -90,7 +89,7 @@ async def resolve_skill_catalog(ctx: TurnContext) -> TurnContext:
 
     This step never reads the current message, ranks by relevance, embeds text,
     or applies Top-K.  For a fixed catalog generation, model/tool profile, and
-    product mode, the rendered bytes are deterministic.
+    permissions, the rendered bytes are deterministic.
     """
 
     tools_cfg = getattr(ctx.config, "tools", None) if ctx.config else None
@@ -119,20 +118,7 @@ async def resolve_skill_catalog(ctx: TurnContext) -> TurnContext:
     if not all_skills:
         return ctx
 
-    from opensquilla.skills.meta.enabled import (
-        is_meta_auto_trigger_enabled,
-        is_meta_skill_enabled,
-    )
-
-    meta_enabled = is_meta_skill_enabled(ctx.config)
-    meta_auto = is_meta_auto_trigger_enabled(ctx.config)
-    ctx.metadata["meta_skill_enabled"] = meta_enabled
-    if not (meta_enabled and meta_auto):
-        for key in ("meta_match", "meta_match_trigger", "meta_match_candidates"):
-            ctx.metadata.pop(key, None)
-
     skills_cfg = getattr(ctx.config, "skills", None) if ctx.config else None
-    coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
     available_tools = {tool.name for tool in ctx.tool_defs} if ctx.tool_defs else set()
     gated = _deterministic_gate(
         all_skills,
@@ -141,8 +127,6 @@ async def resolve_skill_catalog(ctx: TurnContext) -> TurnContext:
     )
     projected = project_public_catalog(
         gated,
-        coding_mode=coding_mode,
-        include_stable_meta=meta_enabled and meta_auto,
     )
 
     # An explicit, already-authorized mention may lead under a constrained
@@ -201,7 +185,5 @@ async def resolve_skill_catalog(ctx: TurnContext) -> TurnContext:
         public_total=len(projected),
         rendered=report.rendered,
         omitted=report.omitted,
-        coding_mode=coding_mode,
-        meta_auto=meta_enabled and meta_auto,
     )
     return ctx

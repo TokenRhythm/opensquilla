@@ -106,7 +106,6 @@ async def test_feedback_and_clarification_validate_before_ports() -> None:
             session_key=" agent:main:webchat:test ",
             fields={"choice": "continue"},
             request_id=" request-1 ",
-            run_id=" run-1 ",
         )
     )
 
@@ -114,4 +113,3 @@ async def test_feedback_and_clarification_validate_before_ports() -> None:
     clarification = clarification_port.submit.await_args.args[0]
     assert clarification.session_key == "agent:main:webchat:test"
     assert clarification.request_id == "request-1"
-    assert clarification.run_id == "run-1"

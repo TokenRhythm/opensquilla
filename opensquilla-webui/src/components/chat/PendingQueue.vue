@@ -102,7 +102,7 @@
         >
           <Icon name="trash" :size="14" />
         </button>
-        <div v-if="!item.hiddenControl" class="chat-pending-more-wrap">
+        <div class="chat-pending-more-wrap">
           <button
             type="button"
             class="chat-pending-action chat-pending-action--icon"
@@ -172,8 +172,6 @@ interface PendingQueueItem {
   pendingUiId: string
   text: string
   pendingInputId?: string
-  displayTextOverride?: string
-  hiddenControl?: boolean
   retiredAnnotationInput?: boolean
   pageContext?: import('@/types/pageContext').ChatPageContext
   selectedSkills?: import('@/types/selectedSkills').SelectedSkillRef[]
@@ -249,21 +247,18 @@ const showSteerUnavailableStatus = computed(() => (
     || item.deliveryState === 'retryable'
     || isSteerRetry(item)
   ))
-  && props.items.some(item => (
-    !item.hiddenControl
-  ))
+  && props.items.length > 0
 ))
 
 function displayText(item: PendingQueueItem): string {
-  return item.displayTextOverride || item.text
+  return item.text
 }
 
 function queueCanReorder(): boolean {
   return props.reorderEnabled !== false
     && props.reorderPending !== true
     && props.items.length > 1 && props.items.every(item => (
-    !item.hiddenControl
-    && !item.deliveryState
+    !item.deliveryState
     && !item.steerAttempt
     && item.pendingPersistenceState !== 'saving'
     && item.pendingPersistenceState !== 'cancelling'
@@ -313,7 +308,7 @@ function removeLabel(item: PendingQueueItem, index: number): string {
 }
 
 function canShowSteer(item: PendingQueueItem): boolean {
-  return !item.hiddenControl && !item.retiredAnnotationInput && !item.pageContext
+  return !item.retiredAnnotationInput && !item.pageContext
     && !item.pendingDeliveryIdentity
 }
 

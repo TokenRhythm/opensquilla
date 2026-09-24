@@ -20,8 +20,6 @@ import { createV4GoalContinuity } from './goalContinuityV4'
 import type { GoalContinuity } from '@/modules/goalContinuity'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createV4PlanCenter } from './planCenterV4'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
-import { createV4MetaRunCenter } from './metaRunCenterV4'
 import type { AppSettings } from '@/modules/appSettings'
 import { createV4AppSettings } from './appSettingsV4'
 import type { ProductActivity } from '@/modules/productActivity'
@@ -100,7 +98,6 @@ export interface GatewayAdapters {
   readonly goalCenter: GoalCenter
   readonly goalContinuity: GoalContinuity
   readonly planCenter: PlanCenter
-  readonly metaRunCenter: MetaRunCenter
   readonly appSettings: AppSettings
   readonly productActivity: ProductActivity
   readonly providerConfiguration: ProviderConfiguration
@@ -183,7 +180,6 @@ export function createGatewayAdapters(
     goalCenter: createV4GoalCenter(transports.rpc),
     goalContinuity: createV4GoalContinuity(transports.rpc, transports.events),
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
-    metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
     appSettings: createV4AppSettings(transports.rpc),
     productActivity: createV4ProductActivity(transports.rpc),
     providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),

@@ -64,7 +64,6 @@ DEFAULT_MODEL_TOOL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-CODING_MODE_MODEL_TOOL_NAMES: frozenset[str] = frozenset()
 
 # Kept registered for old RPC/in-process callers, but never projected into a
 # model tool catalog (including progressive disclosure through tool_search).
@@ -386,8 +385,6 @@ class ToolRegistry:
         selected = set(DEFAULT_MODEL_TOOL_NAMES)
         selected.difference_update(_MODEL_HIDDEN_TOOL_NAMES)
         if ctx is not None:
-            if ctx.coding_mode:
-                selected.update(CODING_MODE_MODEL_TOOL_NAMES)
             selected.update(ctx.disclosed_tool_names)
             selected.update(ctx.surfaced_tools or set())
             ctx.authorized_tool_names = frozenset(authorized_by_name)

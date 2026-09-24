@@ -578,9 +578,6 @@ docker build -t opensquilla:local .
 | **持久会话、子 Agent 与调度** | 由 SQLite 支撑的会话、转录和回放存储，并带有按 Agent 隔离的工作区。Agent 可以派生深度受限的子 Agent；`SchedulerEngine` 内置了 cron 解析器，会通过 `opensquilla cron` 运行周期性作业。 |
 | **操作者控制** | 人在环路(human-in-the-loop)审批可以暂停敏感的工具调用，等人来决定；按轮次和按会话的 Token 与成本汇总(`opensquilla cost`)及诊断信息均可从 CLI 和 Web UI 获取。 |
 
-MetaSkill 文档:[`docs/features/meta-skills.md`](docs/features/meta-skills.md)、
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md)
-和 [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md)。
 
 ---
 

@@ -14,13 +14,6 @@ from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
-# Set only by the trusted Meta scheduler around its internal skill_view
-# preface. It is intentionally separate from model-supplied tool arguments.
-current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "current_meta_skill_owner",
-    default="",
-)
-
 # A fresh dictionary per dispatch keeps output references out of tool text and
 # isolates parallel calls. Reader workers can update the shared per-call value.
 current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
@@ -119,7 +112,6 @@ class ToolContext:
     scratch_file_writes: list[dict[str, Any]] = field(default_factory=list)
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = field(default_factory=set)
-    coding_mode: bool = False  # operator coding-mode toggle (affects tool defaults)
     on_memory_source_write: Callable[[str, str], None] | None = None
     on_bootstrap_source_write: Callable[[str, str], None] | None = None
     on_runtime_event: Callable[[dict[str, Any]], None] | None = None

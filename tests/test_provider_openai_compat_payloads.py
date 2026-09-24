@@ -38,89 +38,6 @@ from opensquilla.provider.types import (
     ToolInputSchema,
     ToolUseEndEvent,
 )
-from opensquilla.tools.policy_helpers import ToolPolicy, apply_tool_policy
-from opensquilla.tools.registry import get_default_registry
-from opensquilla.tools.types import ToolContext
-
-STRICT_SOURCE_EDIT_TOOL_NAMES = {
-    "read_source",
-    "edit_source",
-    "grep_search",
-    "glob_search",
-    "exec_command",
-    "process",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-SOURCE_EDIT_V2_TOOL_NAMES = {
-    "read_source",
-    "edit_source",
-    "source_symbols",
-    "grep_search",
-    "glob_search",
-    "exec_command",
-    "process",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-BALANCED_SOURCE_EDIT_TOOL_NAMES = {
-    "read_source",
-    "edit_source",
-    "create_source",
-    "write_scratch",
-    "source_symbols",
-    "read_file",
-    "grep_search",
-    "glob_search",
-    "list_dir",
-    "exec_command",
-    "process",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES = BALANCED_SOURCE_EDIT_TOOL_NAMES | {"apply_patch"}
-SCAFFOLD_EDIT_TOOL_NAMES = {
-    "exec_command",
-    "process",
-    "read_file",
-    "edit_file",
-    "write_file",
-    "glob_search",
-    "grep_search",
-    "list_dir",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-SCAFFOLD_PATCH_TOOL_NAMES = SCAFFOLD_EDIT_TOOL_NAMES | {"apply_patch"}
-STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES = {
-    "read_file",
-    "list_dir",
-    "write_file",
-    "edit_file",
-    "apply_patch",
-    "execute_code",
-    "background_process",
-    "git_log",
-}
-SCAFFOLD_FORBIDDEN_TOOL_NAMES = {
-    "background_process",
-    "execute_code",
-    "git_log",
-    "read_source",
-    "edit_source",
-    "source_symbols",
-}
-SCAFFOLD_EDIT_FORBIDDEN_DESCRIPTION_NAMES = SCAFFOLD_FORBIDDEN_TOOL_NAMES | {
-    "apply_patch",
-    "read_spreadsheet",
-}
-SCAFFOLD_PATCH_FORBIDDEN_DESCRIPTION_NAMES = SCAFFOLD_FORBIDDEN_TOOL_NAMES | {
-    "read_spreadsheet",
-}
 
 
 def _sse_body(model: str = "test-model") -> bytes:
@@ -252,13 +169,6 @@ def test_openrouter_normal_request_omits_keepalive_affinity_header(
     asyncio.run(run())
 
     assert "X-Session-Id" not in captured["headers"]
-
-
-def _payload_tool_descriptions(payload: dict[str, Any]) -> str:
-    return "\n".join(
-        str(tool["function"].get("description", ""))
-        for tool in payload.get("tools", [])
-    )
 
 
 def _assert_no_dashscope_duplicate_omission(messages: list[dict[str, Any]]) -> None:
@@ -1667,212 +1577,6 @@ def _assert_invalid_native_arguments_fail_closed(
     )
     assert raw_arguments not in error.message
     assert "_raw" not in error.message
-
-
-def test_strict_source_edit_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_strict"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == STRICT_SOURCE_EDIT_TOOL_NAMES
-    assert STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-
-
-def test_source_edit_v2_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_v2"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == SOURCE_EDIT_V2_TOOL_NAMES
-    assert STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-
-
-def test_balanced_source_edit_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_balanced"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == BALANCED_SOURCE_EDIT_TOOL_NAMES
-    assert {"write_file", "edit_file", "apply_patch", "execute_code"}.isdisjoint(tool_names)
-
-
-def test_patch_fallback_source_edit_profile_provider_payload_adds_only_apply_patch(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_patch_fallback"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES
-    assert {"write_file", "edit_file", "execute_code"}.isdisjoint(tool_names)
-
-
-def test_scaffold_edit_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_scaffold_edit"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-
-    _collect_events(provider, ChatConfig(), tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == SCAFFOLD_EDIT_TOOL_NAMES
-    assert SCAFFOLD_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-    assert "apply_patch" not in tool_names
-    descriptions = _payload_tool_descriptions(captured["payload"])
-    for hidden_name in SCAFFOLD_EDIT_FORBIDDEN_DESCRIPTION_NAMES:
-        assert hidden_name not in descriptions
-
-
-def test_scaffold_patch_profile_provider_payload_adds_only_apply_patch(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_scaffold_patch"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-
-    _collect_events(provider, ChatConfig(), tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == SCAFFOLD_PATCH_TOOL_NAMES
-    assert SCAFFOLD_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-    descriptions = _payload_tool_descriptions(captured["payload"])
-    assert "apply_patch" in descriptions
-    for hidden_name in SCAFFOLD_PATCH_FORBIDDEN_DESCRIPTION_NAMES:
-        assert hidden_name not in descriptions
 
 
 def test_tool_input_schema_omits_additional_properties_by_default() -> None:
@@ -6026,8 +5730,8 @@ def test_openai_compat_sends_required_tool_choice_when_configured(
         provider_kind="openrouter",
     )
     tool = ToolDefinition(
-        name="meta_invoke",
-        description="Invoke a meta-skill.",
+        name="lookup_record",
+        description="Look up a named record.",
         input_schema=ToolInputSchema(properties={"name": {"type": "string"}}, required=["name"]),
     )
 
@@ -6048,11 +5752,11 @@ def test_openai_compat_sends_named_function_tool_choice_when_configured(
         provider_kind="openrouter",
     )
     tool = ToolDefinition(
-        name="meta_invoke",
-        description="Invoke a meta-skill.",
+        name="lookup_record",
+        description="Look up a named record.",
         input_schema=ToolInputSchema(properties={"name": {"type": "string"}}, required=["name"]),
     )
-    tool_choice = {"type": "function", "function": {"name": "meta_invoke"}}
+    tool_choice = {"type": "function", "function": {"name": "lookup_record"}}
 
     _collect_events(provider, ChatConfig(tool_choice=tool_choice), tools=[tool])
 

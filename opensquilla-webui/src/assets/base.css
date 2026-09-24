@@ -254,7 +254,7 @@ pre {
 
 /* The one ambient "alive/working" pulse — opacity only (compositor-cheap, no
    paint), reused by the connection pill, the sidebar running dot, the work-card
-   dots and the meta-skill chip so the whole running view breathes together. */
+   dots so the whole running view breathes together. */
 @keyframes live-pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.45; }

@@ -1,7 +1,0 @@
-{
-  "expected_chain": ["history-explorer", "summarize"],
-  "minimum_frequency": 3,
-  "expected_risk": "low",
-  "expected_capabilities": ["local-history-read", "llm_text_generation"],
-  "must_not_include": ["meta-skill-creator", "github", "tmux"]
-}

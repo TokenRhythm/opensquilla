@@ -59,14 +59,6 @@ stuffing every old transcript into the active prompt.
 
 Read: [`features/memory.md`](features/memory.md)
 
-## MetaSkill
-
-A reusable, auditable workflow protocol that composes multiple skills, tools,
-LLM calls, checks, or output steps into one repeatable capability.
-
-Read: [`features/meta-skills.md`](features/meta-skills.md) and
-[`features/meta-skill-user-guide.md`](features/meta-skill-user-guide.md)
-
 ## Permission Profile
 
 The chosen tool-access posture for a run, such as `restricted`, `on`, `bypass`,

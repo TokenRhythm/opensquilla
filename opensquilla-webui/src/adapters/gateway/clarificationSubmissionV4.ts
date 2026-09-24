@@ -21,8 +21,7 @@ export function createV4ClarificationSubmission(
       const params: ClarificationParams = {
         sessionKey: command.sessionKey,
         fields: command.fields,
-        ...(command.requestId !== undefined ? { requestId: command.requestId } : {}),
-        ...(command.runId !== undefined ? { run_id: command.runId } : {}),
+        requestId: command.requestId,
       }
       const raw = await transport.request<ClarificationWireResult>(
         CHAT_CLARIFY_SUBMIT_METHOD,

@@ -28,7 +28,7 @@ function memoryWal() {
   return { records, wal }
 }
 
-function request(id = 'synthetic-request'): TurnSendRequest {
+function request(id = 'synthetic-request'): Extract<TurnSendRequest, { kind: 'new-turn' }> {
   return { kind: 'new-turn', params: { sessionKey: 'synthetic-session', message: 'synthetic message',
     clientRequestId: id, clientMessageId: `message-${id}` } }
 }
@@ -57,6 +57,24 @@ async function flush() { for (let index = 0; index < 60; index += 1) await Promi
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  it.each(['prepared', 'unknown'] as const)('drops a retired workflow %s record without sending or replaying', async phase => {
+    const storage = memoryWal()
+    const oldRequest = request('retired-workflow')
+    oldRequest.params.clientMessageId = 'hidden-control:retired-workflow'
+    storage.records.set('retired-workflow', {
+      schemaVersion: 2, ownerRequestId: 'retired-workflow', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: oldRequest },
+      phase, revision: 1, createdAt: 1, updatedAt: 1,
+    })
+    const test = harness({}, storage)
+    try {
+      await test.owner.wake()
+      expect(storage.records.size).toBe(0)
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
   it.each([
     { aborted: true },
     { aborted: false, reason: 'task_not_active' },

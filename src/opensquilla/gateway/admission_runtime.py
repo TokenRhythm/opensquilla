@@ -5,22 +5,15 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from typing import TYPE_CHECKING, Any, Literal, cast
+from typing import TYPE_CHECKING, Any
 
 from opensquilla.application.admission_errors import (
     AdmissionQueueFullError,
     AdmissionShuttingDownError,
 )
-from opensquilla.application.admission_views import AdmissionSessionIntent, MetaAdmissionControl
+from opensquilla.application.admission_views import AdmissionSessionIntent
 from opensquilla.application.turn_admission import AdmitTurn
 from opensquilla.engine.start_turn import reserve_turn_via_runtime, start_turn_via_runtime
-from opensquilla.engine.steps.meta_command import (
-    parse_meta_control_sentinel,
-    pending_meta_launch_cancel_accepted,
-    pending_meta_launch_peek,
-    pending_meta_launch_promote,
-    pending_meta_launch_restage,
-)
 from opensquilla.gateway import attachment_ingest
 from opensquilla.gateway.direct_turn_runtime import run_direct_turn
 from opensquilla.gateway.input_normalization import (
@@ -138,53 +131,10 @@ class GatewayAdmissionRuntime:
     materialize_normalized_attachments = staticmethod(materialize_generated_text_attachments)
     transcript_content = staticmethod(build_transcript_attachment_envelope)
 
-    @staticmethod
-    def parse_meta_control(
-        message: str,
-        semantic_message: str,
-        *,
-        client_request_id: str,
-    ) -> MetaAdmissionControl | None:
-        parsed = parse_meta_control_sentinel(
-            message, semantic_message, client_request_id=client_request_id
-        )
-        if parsed is None:
-            return None
-        return MetaAdmissionControl(
-            kind=cast(Literal["manual", "replay"], parsed["kind"]),
-            correlation_id=parsed["correlation_id"],
-            name=parsed.get("name"),
-        )
 
-    @staticmethod
-    def peek_meta_launch(key: str, *, client_request_id: str) -> str | None:
-        return pending_meta_launch_peek(key, client_request_id=client_request_id)
 
-    @staticmethod
-    def promote_meta_launch(
-        key: str,
-        *,
-        client_request_id: str,
-        message: str,
-        semantic_message: str,
-    ) -> Literal["promoted", "accepted"] | None:
-        return cast(
-            Literal["promoted", "accepted"] | None,
-            pending_meta_launch_promote(
-                key,
-                client_request_id=client_request_id,
-                message=message,
-                semantic_message=semantic_message,
-            ),
-        )
 
-    @staticmethod
-    def restage_meta_launch(key: str, *, client_request_id: str) -> bool:
-        return pending_meta_launch_restage(key, client_request_id=client_request_id)
 
-    @staticmethod
-    def cancel_accepted_meta_launch(key: str, *, client_request_id: str) -> bool:
-        return pending_meta_launch_cancel_accepted(key, client_request_id=client_request_id)
 
     @staticmethod
     def refine_route(

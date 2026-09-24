@@ -303,8 +303,7 @@ class PromptCacheLease:
 class SubmitClarification:
     session_key: str
     fields: Mapping[str, Any]
-    request_id: str | None = None
-    run_id: str | None = None
+    request_id: str
 
 
 class ClarificationSubmissionPort(Protocol):
@@ -321,12 +320,11 @@ class ClarificationSubmission:
             raise ValueError("session_key must be non-empty")
         if not command.fields:
             raise ValueError("fields must be non-empty")
-        request_id = command.request_id.strip() if command.request_id is not None else None
+        request_id = command.request_id.strip()
         if request_id == "":
             raise ValueError("request_id must be non-empty")
-        run_id = command.run_id.strip() if command.run_id is not None else None
         return await self._port.submit(
-            replace(command, session_key=key, request_id=request_id, run_id=run_id)
+            replace(command, session_key=key, request_id=request_id)
         )
 
 

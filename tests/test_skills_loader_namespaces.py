@@ -149,8 +149,8 @@ metadata:
     spec = loader.get_by_name("capability-risk")
     assert spec is not None
     assert spec.metadata is not None
-    assert spec.metadata.capabilities == ["filesystem-write", "network"]
-    assert spec.metadata.risk_level == "medium"
+    assert not hasattr(spec.metadata, "capabilities")
+    assert not hasattr(spec.metadata, "risk_level")
 
 
 def test_opensquilla_risk_metadata_preserves_platform_requires(
@@ -179,8 +179,8 @@ metadata:
     assert spec.metadata is not None
     assert spec.metadata.requires is not None
     assert spec.metadata.requires.any_bins == ["python"]
-    assert spec.metadata.risk_level == "low"
-    assert spec.metadata.capabilities == []
+    assert not hasattr(spec.metadata, "risk_level")
+    assert not hasattr(spec.metadata, "capabilities")
 
 
 def test_env_any_requires_parse(tmp_path: Path) -> None:
@@ -345,5 +345,5 @@ def test_loader_keeps_degraded_v2_entries_in_instruction_only_projection(
     assert spec.layer is SkillLayer.MANAGED
     assert spec.content == "Portable instruction body."
     assert spec.always is False
-    assert spec.entrypoint is None
-    assert spec.composition_raw is None
+    assert not hasattr(spec, "entrypoint")
+    assert not hasattr(spec, "composition_raw")

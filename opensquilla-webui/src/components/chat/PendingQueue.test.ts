@@ -30,8 +30,6 @@ async function mountQueue(
     deliveryState?: 'steering' | 'retryable'
     steerAttempt?: PendingSteerAttempt
     attachments?: Attachment[]
-    hiddenControl?: boolean
-    displayTextOverride?: string
   }> = [
     { text: 'Follow the latest instruction' },
   ],
@@ -336,30 +334,6 @@ describe('PendingQueue', () => {
     app.unmount()
   })
 
-  it('keeps hidden control input removable without exposing same-turn retry', async () => {
-    let retried = 0
-    let removed = 0
-    const { app, el } = await mountQueue({
-      onSteer: () => { retried += 1 },
-      onRemove: () => { removed += 1 },
-    }, [{
-      text: 'provider-only marker',
-      displayTextOverride: 'Confirmed',
-      hiddenControl: true,
-      deliveryState: 'retryable',
-    }])
-
-    expect(el.querySelector('.chat-pending-text')?.textContent).toContain('Confirmed')
-    const retry = [...el.querySelectorAll<HTMLButtonElement>('button')]
-      .find(button => button.textContent?.includes('Retry'))
-    expect(retry).toBeUndefined()
-    el.querySelector<HTMLButtonElement>('[aria-label="Remove pending message 1"]')?.click()
-
-    expect(retried).toBe(0)
-    expect(removed).toBe(1)
-    expect(el.querySelector('[aria-label="More"]')).toBeNull()
-    app.unmount()
-  })
 
   it.each(['/status', '!pwd'])(
     'keeps the original affordance disabled for queued control input %s',

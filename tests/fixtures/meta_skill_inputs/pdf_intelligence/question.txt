@@ -1,5 +1,0 @@
-Use meta-pdf-intelligence to analyze this local PDF:
-tests/fixtures/meta_skill_inputs/pdf_intelligence/router-evaluation-summary.pdf
-
-Question: What are the key findings, risks, and recommendation? Return a
-traceable evidence matrix in Chinese.

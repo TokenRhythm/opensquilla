@@ -504,9 +504,6 @@ docker build -t opensquilla:local .
 | **耐久性のあるセッション、サブエージェント、スケジューリング** | SQLite を基盤としたセッション、トランスクリプト、再生のストレージに、Agent ごとのワークスペースを備えます。Agent は深さの制限されたサブエージェントを生成でき、ツリー内蔵の cron パーサーを持つ `SchedulerEngine` が `opensquilla cron` 経由で定期ジョブを実行します。 |
 | **オペレーター制御** | ヒューマンインザループの承認により、機微なツール呼び出しを判断のために一時停止できます。ターンごと・セッションごとの Token とコストの集計（`opensquilla cost`）と診断は、CLI と Web UI から利用できます。 |
 
-MetaSkill ドキュメント: [`docs/features/meta-skills.md`](docs/features/meta-skills.md)、
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md)、
-[`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md)。
 
 ---
 

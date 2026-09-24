@@ -205,7 +205,7 @@ class UsageAccountingScope:
 
     A scope object is intentionally shared by copied asyncio contexts.  A
     synchronous increment cannot interleave on the event loop, so concurrent
-    tool/meta tasks still receive distinct call indices without a lock.
+    tool tasks still receive distinct call indices without a lock.
     """
 
     sink: UsageEventSink
@@ -417,8 +417,8 @@ async def account_provider_stream(
 ) -> AsyncGenerator[Any, None]:
     """Account exactly one physical ``provider.chat`` invocation.
 
-    The current scope is inherited through ``ContextVar`` by tool and meta
-    tasks.  Without a scope this is a byte-for-byte streaming pass-through.
+    Child tasks inherit the current scope through ``ContextVar``.
+    Without a scope this is a byte-for-byte streaming pass-through.
     """
 
     scope = current_usage_accounting_scope()

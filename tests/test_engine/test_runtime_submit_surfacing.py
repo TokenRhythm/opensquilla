@@ -11,8 +11,8 @@ from opensquilla.gateway.config import GatewayConfig
 from opensquilla.tools.registry import DEFAULT_MODEL_TOOL_NAMES, get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext
 
-# The active SWE profile: exactly these ten tools, no ``submit``.
-_SCAFFOLD_TOOLS = frozenset(
+# An explicit repository tool allowlist must remain authoritative.
+_REPOSITORY_TOOLS = frozenset(
     {
         "exec_command",
         "process",
@@ -27,18 +27,22 @@ _SCAFFOLD_TOOLS = frozenset(
         "retrieve_tool_result",
     }
 )
-_MODEL_SCAFFOLD_TOOLS = (_SCAFFOLD_TOOLS & DEFAULT_MODEL_TOOL_NAMES) | {"tool_search"}
+_MODEL_REPOSITORY_TOOLS = (_REPOSITORY_TOOLS & DEFAULT_MODEL_TOOL_NAMES) | {"tool_search"}
 
 
-def _runner_with_scaffold_profile() -> TurnRunner:
-    config = GatewayConfig(tools={"profile": "repo_coding_scaffold_edit"})
+def _runner_with_repository_allowlist() -> TurnRunner:
+    config = GatewayConfig(tools={
+        "profile": "minimal",
+        "allow": sorted(_REPOSITORY_TOOLS),
+        "deny": ["session_status"],
+    })
     runner = TurnRunner(provider_selector=None, config=config)
     runner._tool_registry = get_default_registry()
     return runner
 
 
 @pytest.mark.parametrize("retired_value", [None, "", "off", "on", "1"])
-def test_retired_submit_env_does_not_expand_scaffold_tool_surface(
+def test_retired_submit_env_does_not_expand_repository_tool_surface(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     retired_value: str | None,
@@ -47,24 +51,24 @@ def test_retired_submit_env_does_not_expand_scaffold_tool_surface(
         monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
     else:
         monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", retired_value)
-    runner = _runner_with_scaffold_profile()
+    runner = _runner_with_repository_allowlist()
 
     ctx = ToolContext(is_owner=True, workspace_dir=str(tmp_path))
     tool_defs, _handler = runner._build_tools(ctx)
     names = {getattr(td, "name", "") for td in tool_defs}
 
-    assert names == _MODEL_SCAFFOLD_TOOLS
+    assert names == _MODEL_REPOSITORY_TOOLS
     assert "submit" not in names
     assert ctx.surfaced_tools is None or "submit" not in ctx.surfaced_tools
     assert ctx.allowed_tools is None or "submit" not in ctx.allowed_tools
 
 
-def test_plan_run_preserves_scaffold_tool_policy(
+def test_plan_run_preserves_repository_tool_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
-    runner = _runner_with_scaffold_profile()
+    runner = _runner_with_repository_allowlist()
 
     ctx = ToolContext(
         is_owner=True,
@@ -76,7 +80,7 @@ def test_plan_run_preserves_scaffold_tool_policy(
 
     assert "plan_run_checkpoint" not in names
     assert "publish_artifact" not in names
-    assert names == _MODEL_SCAFFOLD_TOOLS
+    assert names == _MODEL_REPOSITORY_TOOLS
     assert ctx.surfaced_tools is not None
     assert "plan_run_checkpoint" in ctx.surfaced_tools
 
@@ -91,7 +95,7 @@ def test_preview_is_exposed_by_default_only_with_web_capability(
     tmp_path: Path, plan_run: bool, supported: bool
 ) -> None:
     runner = (
-        _runner_with_scaffold_profile()
+        _runner_with_repository_allowlist()
         if plan_run
         else TurnRunner(provider_selector=None, config=GatewayConfig())
     )
@@ -129,7 +133,7 @@ def test_preview_is_not_exposed_to_non_web_callers(caller_kind: CallerKind) -> N
 
 
 def test_preview_explicit_deny_wins_over_plan_run_surfacing() -> None:
-    runner = _runner_with_scaffold_profile()
+    runner = _runner_with_repository_allowlist()
     ctx = ToolContext(
         is_owner=True,
         caller_kind=CallerKind.WEB,
@@ -148,7 +152,7 @@ def test_build_tools_plan_run_ignores_retired_submit_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "on")
-    runner = _runner_with_scaffold_profile()
+    runner = _runner_with_repository_allowlist()
 
     ctx = ToolContext(
         is_owner=True,
@@ -164,12 +168,12 @@ def test_build_tools_plan_run_ignores_retired_submit_env(
     assert "submit" not in ctx.surfaced_tools
 
 
-def test_goal_controls_preserve_scaffold_tool_policy(
+def test_goal_controls_preserve_repository_tool_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
-    runner = _runner_with_scaffold_profile()
+    runner = _runner_with_repository_allowlist()
     ctx = ToolContext(
         is_owner=True,
         workspace_dir=str(tmp_path),
@@ -182,7 +186,7 @@ def test_goal_controls_preserve_scaffold_tool_policy(
 
     goal_tools = {"update_goal", "update_goal_progress"}
     assert goal_tools.isdisjoint(names)
-    assert names == _MODEL_SCAFFOLD_TOOLS
+    assert names == _MODEL_REPOSITORY_TOOLS
     assert ctx.surfaced_tools is not None
     assert goal_tools <= ctx.surfaced_tools
 
@@ -192,7 +196,7 @@ def test_build_tools_goal_control_explicit_deny_remains_authoritative(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("OPENSQUILLA_SUBMIT_REVIEW", raising=False)
-    runner = _runner_with_scaffold_profile()
+    runner = _runner_with_repository_allowlist()
     ctx = ToolContext(
         is_owner=True,
         workspace_dir=str(tmp_path),

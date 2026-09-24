@@ -1,3 +1,4 @@
+import { clearRetiredBrowserFeatureState } from './utils/retiredFeatureState'
 import { createApp, watch } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
@@ -20,7 +21,6 @@ import { APPROVAL_CENTER_KEY } from './modules/approvalCenter'
 import { GOAL_CENTER_KEY } from './modules/goalCenter'
 import { GOAL_CONTINUITY_KEY } from './modules/goalContinuity'
 import { PLAN_CENTER_KEY } from './modules/planCenter'
-import { META_RUN_CENTER_KEY } from './modules/metaRunCenter'
 import { APP_SETTINGS_KEY } from './modules/appSettings'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { PROVIDER_CONFIGURATION_KEY } from './modules/providerConfiguration'
@@ -58,6 +58,8 @@ import './styles/route-fx.css'
 import './styles/chat-markdown.css'
 import './styles/chat-shared.css'
 import './styles/apple-modern.css'
+
+clearRetiredBrowserFeatureState(window)
 
 const app = createApp(App)
 app.use(createPinia())
@@ -135,7 +137,6 @@ app.provide(APPROVAL_CENTER_KEY, gatewayAdapters.approvalCenter)
 app.provide(GOAL_CENTER_KEY, gatewayAdapters.goalCenter)
 app.provide(GOAL_CONTINUITY_KEY, gatewayAdapters.goalContinuity)
 app.provide(PLAN_CENTER_KEY, gatewayAdapters.planCenter)
-app.provide(META_RUN_CENTER_KEY, gatewayAdapters.metaRunCenter)
 app.provide(APP_SETTINGS_KEY, gatewayAdapters.appSettings)
 app.provide(PRODUCT_ACTIVITY_KEY, gatewayAdapters.productActivity)
 app.provide(PROVIDER_CONFIGURATION_KEY, gatewayAdapters.providerConfiguration)

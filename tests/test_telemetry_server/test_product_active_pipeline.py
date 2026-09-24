@@ -133,7 +133,7 @@ async def test_pre_activity_protocol_upgrade_preserves_old_events_and_accepts_mi
             "event_version": 1,
             "event_id": f"00000000-0000-4000-8000-{number:012d}",
             "occurred_at_utc": "2026-09-02T01:00:00.000Z",
-            "source": "runtime" if name == "metaskill_usage" else "gateway",
+            "source": "gateway",
             "app_version": "1.2.3",
             "platform": "macos",
             "outcome": None,
@@ -144,7 +144,7 @@ async def test_pre_activity_protocol_upgrade_preserves_old_events_and_accepts_mi
             "sample_rate": 1,
             "analytics_user_id": "00000000-0000-4000-8000-000000000900",
         }
-        if name != "metaskill_usage":
+        if name != "first_turn_started":
             payload["surface"] = "tui" if number == 1 else "cli"
         if name == "client_launch":
             payload.update(entrypoint="chat", execution_mode="gateway")
@@ -158,7 +158,7 @@ async def test_pre_activity_protocol_upgrade_preserves_old_events_and_accepts_mi
             "events": events,
         }
 
-    original = batch(100, [event(1, "client_launch"), event(2, "metaskill_usage")])
+    original = batch(100, [event(1, "client_launch"), event(2, "first_turn_started")])
     storage = await TelemetryIngestStorage.open(
         settings.database_path, ConsentScope.GROWTH, protocol_fingerprint=old_fingerprint
     )
@@ -187,7 +187,8 @@ async def test_pre_activity_protocol_upgrade_preserves_old_events_and_accepts_mi
         response = await client.post(
             settings.endpoint_path,
             json=batch(101, [
-                event(3, "client_launch"), event(4, "metaskill_usage"), event(5, "product_active")
+                event(3, "client_launch"), event(4, "first_turn_started"),
+                event(5, "product_active"),
             ]),
         )
         assert response.status_code == 202

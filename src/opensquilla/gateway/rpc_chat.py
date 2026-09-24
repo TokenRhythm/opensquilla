@@ -56,13 +56,9 @@ def bind_turn_admission_adapter_factory(
     _turn_admission_adapter_factory = factory
 
 
-
-
 def _canonical_webchat_session_key(value: object = None) -> str:
     """Map legacy WebChat defaults onto the canonical WebChat session."""
     return webchat_session_key(value)
-
-
 
 
 def _chat_turn_admission_adapter(ctx: RpcContext) -> GatewayTurnAdmissionAdapter:
@@ -90,8 +86,6 @@ async def _handle_chat_history(params: dict | None, ctx: RpcContext) -> dict[str
     return await read_chat_history_v4(params, ctx)
 
 
-
-
 _handle_chat_history_contract = register_chat_history_contract(
     _d,
     _handle_chat_history,
@@ -100,25 +94,11 @@ _handle_chat_history_contract = register_chat_history_contract(
 )
 
 
-def _clarify_fields_to_text(fields: dict[str, object]) -> str:
-    """Serialize a clarify form into the existing text reply protocol."""
-    lines: list[str] = []
-    for key, value in fields.items():
-        if value is None or value == "":
-            continue
-        if isinstance(value, bool):
-            rendered = "true" if value else "false"
-        else:
-            rendered = str(value)
-        lines.append(f"{key}: {rendered}")
-    return "\n".join(lines)
-
-
 async def _submit_clarification(
     request: SubmitClarification | dict | None,
     ctx: RpcContext,
 ) -> dict:
-    """Resolve or admit one typed command, retaining the legacy helper shape."""
+    """Resolve a structured user-input request within its original turn."""
 
     if isinstance(request, SubmitClarification):
         command = request
@@ -129,72 +109,43 @@ async def _submit_clarification(
         if not isinstance(fields, dict) or not fields:
             raise ValueError("params.fields must be a non-empty mapping")
         raw_request_id = request.get("request_id", request.get("requestId"))
-        request_id = str(raw_request_id).strip() if raw_request_id is not None else None
-        if request_id == "":
+        if not isinstance(raw_request_id, str) or not raw_request_id.strip():
             raise ValueError("params.request_id must be a non-empty string")
-        run_id = request.get("run_id")
         command = SubmitClarification(
             session_key=_canonical_webchat_session_key(request.get("sessionKey")),
             fields=fields,
-            request_id=request_id,
-            run_id=run_id if isinstance(run_id, str) else None,
+            request_id=raw_request_id.strip(),
         )
     fields = dict(command.fields)
     session_key = _canonical_webchat_session_key(command.session_key)
-    if command.request_id is not None:
-        request_id = command.request_id
-        task_runtime = getattr(ctx, "task_runtime", None)
-        resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
-        if not callable(resolve_user_input):
-            raise RpcUnavailableError("Deferred user-input resolution is not available")
-        try:
-            result = await resolve_user_input(
-                session_key=session_key,
-                request_id=request_id,
-                fields=fields,
-            )
-        except UserInputRequestNotFoundError as exc:
-            raise RpcHandlerError(
-                "USER_INPUT_EXPIRED",
-                "The user-input request is no longer available.",
-                retryable=False,
-                accepted=False,
-            ) from exc
-        log.info(
-            "chat.clarify_submit.deferred",
+    if not command.request_id.strip():
+        raise ValueError("params.request_id must be a non-empty string")
+    request_id = command.request_id
+    task_runtime = getattr(ctx, "task_runtime", None)
+    resolve_user_input = getattr(task_runtime, "resolve_user_input", None)
+    if not callable(resolve_user_input):
+        raise RpcUnavailableError("Deferred user-input resolution is not available")
+    try:
+        result = await resolve_user_input(
             session_key=session_key,
             request_id=request_id,
-            field_count=len(fields),
-            replayed=bool(result.get("replayed")),
+            fields=fields,
         )
-        return {"sessionKey": session_key, **result}
-
-    text = _clarify_fields_to_text(fields)
-    run_id = command.run_id
+    except UserInputRequestNotFoundError as exc:
+        raise RpcHandlerError(
+            "USER_INPUT_EXPIRED",
+            "The user-input request is no longer available.",
+            retryable=False,
+            accepted=False,
+        ) from exc
     log.info(
-        "chat.clarify_submit.params",
+        "chat.clarify_submit.deferred",
         session_key=session_key,
+        request_id=request_id,
         field_count=len(fields),
-        run_id=run_id if isinstance(run_id, str) and run_id else None,
+        replayed=bool(result.get("replayed")),
     )
-    send_params: dict[str, Any] = {
-        "message": text,
-        "sessionKey": session_key,
-        "inputProvenance": {"kind": "clarify_form", "source": "webui"},
-    }
-    if isinstance(run_id, str) and run_id:
-        send_params["_source"] = {
-            "caller_kind": "web",
-            "channel_kind": "webchat",
-            "channel_id": f"webchat:{session_key}",
-            "source_kind": "webui",
-            "source_name": "WebChat",
-            "clarify_run_id": run_id,
-        }
-    return cast(
-        dict,
-        await _chat_turn_admission_adapter(ctx).admit(send_params, surface="webchat"),
-    )
+    return {"sessionKey": session_key, **result}
 
 
 @_d.method("chat.inject", scope="operator.admin")

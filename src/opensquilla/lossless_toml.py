@@ -219,12 +219,14 @@ def _scan(
     dict[tuple[str | int, ...], _Assignment],
     dict[tuple[str | int, ...], int],
     dict[tuple[str | int, ...], tuple[int, int]],
+    dict[int, tuple[str | int, ...]],
 ]:
     assignments: dict[tuple[str | int, ...], _Assignment] = {}
     insertion_points: dict[tuple[str | int, ...], int] = {(): len(lines)}
     spanning: dict[tuple[str | int, ...], tuple[int, int]] = {}
+    headers: dict[int, tuple[str | int, ...]] = {}
     current: tuple[str | int, ...] = ()
-    array_counts: dict[tuple[str, ...], int] = {}
+    array_counts: dict[tuple[str | int, ...], int] = {}
     first_header = len(lines)
 
     index = 0
@@ -240,12 +242,18 @@ def _scan(
                 raise LosslessTomlPatchError("unsupported or multiline TOML table header")
             inner = header[2:-2] if is_array else header[1:-1]
             table = _key_path(inner.strip())
-            if is_array:
-                occurrence = array_counts.get(table, 0)
-                array_counts[table] = occurrence + 1
-                current = (*table, occurrence)
-            else:
-                current = table
+            current = ()
+            for offset, part in enumerate(table):
+                current = (*current, part)
+                if is_array and offset == len(table) - 1:
+                    occurrence = array_counts.get(current, 0)
+                    array_counts[current] = occurrence + 1
+                    current = (*current, occurrence)
+                elif current in array_counts:
+                    # Child tables belong to the latest element of every
+                    # array-table ancestor, including nested arrays.
+                    current = (*current, array_counts[current] - 1)
+            headers[index] = current
             insertion_points[current] = index + 1
             first_header = min(first_header, index)
             index += 1
@@ -298,7 +306,7 @@ def _scan(
         index += 1
 
     insertion_points[()] = min(insertion_points.get((), first_header), first_header)
-    return assignments, insertion_points, spanning
+    return assignments, insertion_points, spanning, headers
 
 
 def _spanning_owner(
@@ -324,7 +332,7 @@ def _path_value(payload: object, path: tuple[str | int, ...]) -> object:
     return payload
 
 
-def _remove_array_assignment(
+def _remove_complete_assignment(
     lines: list[str], first: int, last: int,
 ) -> dict[int, str]:
     """Remove a complete value while retaining its comments outside strings."""
@@ -398,7 +406,7 @@ def _remove_inline_table_members(
         if _path_value(transformed, member_path) is _MISSING:
             removed.add(member_path)
             member_lines = _physical_lines(member)
-            comments.extend(_remove_array_assignment(
+            comments.extend(_remove_complete_assignment(
                 member_lines, 0, len(member_lines) - 1,
             ).values())
         else:
@@ -452,7 +460,7 @@ def patch_import_config(
         return raw
 
     lines = _physical_lines(text)
-    assignments, insertion_points, spanning = _scan(lines)
+    assignments, insertion_points, spanning, headers = _scan(lines)
     original_leaves = _leaves(original)
     transformed_leaves = _leaves(transformed)
     removed = set(original_leaves) - set(transformed_leaves)
@@ -463,10 +471,35 @@ def patch_import_config(
         if original_leaves[path] != transformed_leaves[path]
     }
     replacements: dict[int, str] = {}
+    retained_headers = set(headers.values())
+    for index, path in headers.items():
+        if (
+            _path_value(original, path) is not _MISSING
+            and _path_value(transformed, path) is _MISSING
+        ):
+            line, newline = _split_newline(lines[index])
+            comment_index = _comment_start(line)
+            indent = line[: len(line) - len(line.lstrip())]
+            replacements[index] = (
+                indent + line[comment_index:] + newline if comment_index is not None else ""
+            )
+            # A child header can be the only declaration of a surviving empty
+            # parent table. Keep that parent's identity when removing the child.
+            for length in range(len(path) - 1, 0, -1):
+                parent = path[:length]
+                if parent not in retained_headers and _path_value(transformed, parent) == {}:
+                    header = ".".join(
+                        _render_key(part) for part in parent if isinstance(part, str)
+                    )
+                    replacements[index] = f"[{header}]{newline}" + replacements[index]
+                    retained_headers.add(parent)
+                    break
     removed_owners: set[tuple[str | int, ...]] = set()
     for path in (*assignments, *spanning):
         old_value = _path_value(original, path)
         new_value = _path_value(transformed, path)
+        if old_value is _MISSING:
+            continue
         if path in spanning:
             first, last = spanning[path]
         else:
@@ -483,13 +516,11 @@ def patch_import_config(
                 replacements.update(dict.fromkeys(range(first + 1, last + 1), ""))
                 removed_owners.update(members)
             continue
-        if not isinstance(old_value, list):
-            continue
         if new_value is not _MISSING:
             continue
         # Complete assignment deletion has a provable boundary. Partial edits
         # to array elements remain unsupported, including emptied arrays.
-        replacements.update(_remove_array_assignment(lines, first, last))
+        replacements.update(_remove_complete_assignment(lines, first, last))
         removed_owners.add(path)
     for path in sorted(removed, key=repr):
         if any(path[: len(owner)] == owner for owner in removed_owners):

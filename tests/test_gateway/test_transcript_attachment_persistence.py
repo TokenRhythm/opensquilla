@@ -75,22 +75,22 @@ def test_transcript_envelope_can_separate_provider_and_display_text(tmp_path: Pa
     assert parsed["attachments"][0]["name"] == "p.png"
 
 
-def test_meta_replay_history_persists_readable_text_without_capability_token(
+def test_text_only_transcript_preserves_distinct_display_text(
     tmp_path: Path,
 ) -> None:
     envelope, _writes = build_transcript_attachment_envelope(
-        text="/meta-replay",
-        display_text="Retry failed step · meta-paper-write",
+        text="Continue the previous request",
+        display_text="Retry draft",
         attachments=[],
-        session_id="replay-session",
+        session_id="ordinary-session",
         media_root=tmp_path,
         persist_enabled=True,
     )
 
     parsed = json.loads(envelope)
-    assert parsed["text"] == "/meta-replay"
-    assert parsed["display_text"] == "Retry failed step · meta-paper-write"
-    assert "token" not in envelope.lower()
+    assert parsed["text"] == "Continue the previous request"
+    assert parsed["display_text"] == "Retry draft"
+    assert parsed["attachments"] == []
 
 
 # ---------------------------------------------------------------------------

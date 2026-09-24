@@ -391,11 +391,6 @@ class SkillsConfig(BaseSettings):
     # Names of skills the operator has turned off (e.g. via the control-UI
     # plugin toggle). A disabled skill is gated out of the agent's view.
     disabled: list[str] = Field(default_factory=list)
-    # Coding mode (control-UI toggle). When ON, the agent operates in a
-    # locked coding mode: the code-task plugin is available and a directive
-    # steers every turn through it. When OFF, code-task is unreachable through
-    # every skill API. Default OFF — coding mode is opt-in.
-    coding_mode: bool = False
     max_skills_prompt_chars: int = 8000
     # "system" = full system prompt (default)
     # "user_context" = ephemeral user-role context, after history and before current user
@@ -406,7 +401,9 @@ class SkillsConfig(BaseSettings):
     @classmethod
     def _ignore_retired_filter_settings(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            return strip_deprecated_skill_filter_settings(data)
+            return strip_deprecated_skill_filter_settings(
+                {key: value for key, value in data.items() if key != "coding_mode"}
+            )
         return data
 
 
@@ -420,13 +417,6 @@ class ToolsConfig(BaseModel):
             "memory_only",
             "coding",
             "messaging",
-            "repo_coding_source_edit",
-            "repo_coding_source_edit_strict",
-            "repo_coding_source_edit_v2",
-            "repo_coding_source_edit_balanced",
-            "repo_coding_source_edit_patch_fallback",
-            "repo_coding_scaffold_edit",
-            "repo_coding_scaffold_patch",
         ]
         | None
     ) = None
@@ -439,6 +429,21 @@ class ToolsConfig(BaseModel):
     file_edit_requires_fresh_read: bool | None = None
     file_edit_flexible_recovery: bool | None = None
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _retire_repo_coding_profiles(cls, value: object) -> object:
+        if value in (
+            "repo_coding_source_edit",
+            "repo_coding_source_edit_strict",
+            "repo_coding_source_edit_v2",
+            "repo_coding_source_edit_balanced",
+            "repo_coding_source_edit_patch_fallback",
+            "repo_coding_scaffold_edit",
+            "repo_coding_scaffold_patch",
+        ):
+            return "coding"
+        return value
 
     @field_validator("trusted_fake_ip_cidrs")
     @classmethod
@@ -1080,8 +1085,6 @@ class PromptConfig(BaseModel):
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     ] = "auto"
     platform_hint_enabled: bool = True
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
@@ -1090,6 +1093,13 @@ class PromptConfig(BaseModel):
     finalize_evidence_gate: bool = False
     # Deprecated, unused. Accepted so existing configuration still loads.
     legacy_prompt_style: bool = False
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def retire_headless_modes(cls, value: object) -> object:
+        if value in ("headless_source_edit", "headless_repo_coding_scaffold"):
+            return "auto"
+        return value
 
 
 MemoryEmbeddingProvider = Literal[
@@ -2168,93 +2178,10 @@ class SubagentsGatewayConfig(BaseModel):
     """When enabled, subagent bootstrap prompts keep only AGENTS.md."""
 
 
-class MetaSkillPersistenceConfig(BaseSettings):
-    """Persistence/audit ledger for meta-skill executions (G4)."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_PERSISTENCE_",
-        extra="forbid",
-    )
-    enabled: bool = True
-    orphan_cleanup_age_seconds: int = 3600
-    # Per-DAG memory persist: when False the orchestrator skips any step
-    # whose ``skill`` is "memory" (the conventional last-step pattern that
-    # archives DAG output to memory/*.md). Defaults to True to preserve
-    # existing behaviour. Toggle off for exploratory runs where polluting
-    # the long-term memory store is undesirable.
-    memory_persist_enabled: bool = True
 
 
-class MetaSkillAutoProposeConfig(BaseSettings):
-    """Unattended synthesis: drive meta-skill-creator from co-occurrence
-    patterns observed in ``~/.opensquilla/logs/decisions-*.jsonl``.
-
-    Two independent triggers feed the same library function
-    (``skills.creator.auto_propose``):
-      * ``enabled`` schedules a recurring cron job
-      * ``on_dream_complete`` piggybacks on memory-consolidation dreams
-
-    Both default off. Operators flip them on after reviewing
-    meta-skill-creator's gated output once.
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_AUTO_PROPOSE_",
-        extra="forbid",
-    )
-
-    enabled: bool = False
-    """Path 1: schedule the auto-propose cron job. When false no
-    handler is registered at all (zero-impact code path)."""
-
-    cron: str = "0 5 * * *"
-    """Cron expression (5-field, local time) for the scheduled job."""
-
-    window_days: int = Field(default=30, ge=1, le=365)
-    """How many days of decision-log history to aggregate."""
-
-    min_freq: int = Field(default=3, ge=1)
-    """Drop co-occurrence chains observed fewer than this many times."""
-
-    top_k: int = Field(default=5, ge=1, le=50)
-    """At most this many distinct patterns considered per fire."""
-
-    on_dream_complete: bool = False
-    """Path 2: also run after a successful memory-consolidation dream.
-    Independent of ``enabled`` — either, both, or neither may be on."""
-
-    auto_enable: bool = False
-    """When true, eligible low-risk proposals are promoted to MANAGED
-    automatically after the creator gates pass. Defaults off."""
-
-    auto_enable_max_risk: Literal["low", "medium", "high"] = "low"
-    """Highest deterministic risk class that unattended promotion may accept."""
-
-    agent_ids: list[str] = Field(default_factory=list)
-    """Restrict to these agent IDs; empty = all configured agents."""
 
 
-class MetaSkillConfig(BaseSettings):
-    """Top-level meta-skill subsystem configuration."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_",
-        env_nested_delimiter="__",
-        extra="forbid",
-    )
-    enabled: bool = True
-    auto_trigger: bool = False
-    """When False (default), meta-skills are manual-only: no prompt guidance, no
-    keyword/semantic auto-trigger, ``meta_invoke`` is not exposed for automatic
-    invocation, and meta-skills are hidden from ``<available_skills>``. They run
-    only via the explicit ``/meta`` command. Set True to restore automatic
-    activation."""
-    persistence: MetaSkillPersistenceConfig = Field(
-        default_factory=MetaSkillPersistenceConfig,
-    )
-    auto_propose: MetaSkillAutoProposeConfig = Field(
-        default_factory=MetaSkillAutoProposeConfig,
-    )
 
 
 class TlsConfig(BaseSettings):
@@ -2541,13 +2468,19 @@ class GatewayConfig(BaseSettings):
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
-    meta_skill: MetaSkillConfig = Field(default_factory=MetaSkillConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     diagnostics_enabled: bool = False
     channel_admin_senders: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_product_features(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key != "meta_skill"}
+        return data
 
     @property
     def effective_run_mode(self) -> str:
@@ -2926,8 +2859,7 @@ class GatewayConfig(BaseSettings):
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
     agent_runtime_timeout_seconds: float | None = None
-    # Optional safety cap for ordinary interactive Web chat turns. Coding and
-    # meta turns retain the regular agent runtime budget. Disabled by default;
+    # Optional safety cap for interactive Web chat turns. Disabled by default;
     # an explicit TurnRunner timeout still has priority when the cap is enabled.
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
     # Deprecated, unused: provider inactivity and tool deadlines are separate.
