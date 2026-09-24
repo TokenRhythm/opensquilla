@@ -40,6 +40,27 @@ _AUTHORITY_ARGUMENTS = frozenset(
         "uploadFile",
     }
 )
+# Versioned diagnostic vocabulary, not a second browser argument validator.
+# Never expose a Desktop error's free-form message or supplied argument values.
+_VALIDATION_FIELDS = frozenset({
+    "operation", "targetRef", "url", "contextTargetRef", "ref", "maxChars", "downloadId",
+    "observationMode", "actions", "dialogId", "accept", "promptText", "tabAction", "action",
+    "text", "key", "direction", "amount", "button", "durationMs", "endRef", "fileId",
+    "chooserId", "observationId", "imageId", "x", "y", "toX", "toY",
+})
+_VALIDATION_EXPECTATIONS = {
+    "required": {"present": "a supplied value"},
+    "type": {
+        "object": "an object", "array": "an array", "string": "a string",
+        "boolean": "a boolean", "finite_number": "a finite number", "integer": "an integer",
+    },
+    "range": {"within_bounds": "a value within the declared bounds"},
+    "enum": {"supported_value": "one of the declared values"},
+    "unknown_field": {"known_fields": "only declared fields"},
+    "conflict": {"exclusive_fields": "mutually compatible fields"},
+    "dependency": {"related_fields": "the required related fields"},
+    "order": {"field_update_before_final": "only fill/select before the final action"},
+}
 log = structlog.get_logger(__name__)
 
 
@@ -91,6 +112,62 @@ def _coordinate_unavailable(code: str, message: str, recovery: str) -> MCPToolRe
     return MCPToolResult(
         text, True, content_blocks=[{"type": "text", "text": text}], structured_content=result,
     )
+
+
+def _validation_field_known(field: str) -> bool:
+    if field == "$" or field in _VALIDATION_FIELDS:
+        return True
+    parts = field.split(".")
+    return (
+        len(parts) in (2, 3) and parts[0] == "actions" and parts[1] in {"0", "1", "2"}
+        and (len(parts) == 2 or parts[2] in _VALIDATION_FIELDS)
+    )
+
+
+def _argument_validation_result(error: Any) -> dict[str, Any] | None:
+    """Decode only the bounded, value-free contract validation error format."""
+    if (
+        not isinstance(error, dict) or type(error.get("code")) is not int
+        or error["code"] != -32602 or not isinstance(error.get("message"), str)
+    ):
+        return None
+    data = error.get("data")
+    if not isinstance(data, dict) or set(data) != {
+        "code", "phase", "contractVersion", "outcome", "retryable", "issues",
+    }:
+        return None
+    if (
+        data["code"] != "INVALID_REQUEST" or data["phase"] != "argument_validation"
+        or type(data["contractVersion"]) is not int or data["contractVersion"] != 1
+        or data["outcome"] != "not_started" or data["retryable"] is not False
+        or not isinstance(data["issues"], list) or not 1 <= len(data["issues"]) <= 16
+    ):
+        return None
+    issues = []
+    descriptions = []
+    for issue in data["issues"]:
+        if not isinstance(issue, dict) or set(issue) != {"field", "rule", "expected"}:
+            return None
+        field, rule, expected = issue["field"], issue["rule"], issue["expected"]
+        if (
+            not isinstance(field, str) or len(field) > 64 or not _validation_field_known(field)
+            or not isinstance(rule, str) or rule not in _VALIDATION_EXPECTATIONS
+            or not isinstance(expected, str) or expected not in _VALIDATION_EXPECTATIONS[rule]
+        ):
+            return None
+        issues.append({"field": field, "rule": rule, "expected": expected})
+        descriptions.append(f"{field}: {rule}; expected {_VALIDATION_EXPECTATIONS[rule][expected]}")
+    result = {
+        "ok": False, "code": "INVALID_REQUEST", "phase": "argument_validation",
+        "contractVersion": 1, "outcome": "not_started", "retryable": False,
+        "issues": issues,
+        "message": "Browser arguments were rejected before execution. "
+        "Correct the listed fields using the tool schema: " + "; ".join(descriptions) + ".",
+    }
+    return {
+        "isError": True, "structuredContent": result,
+        "content": [{"type": "text", "text": json.dumps(result)}],
+    }
 
 
 def _transport_failure_result(error: RuntimeError) -> MCPToolResult:
@@ -231,6 +308,9 @@ class DesktopBrowserMCPClient(MCPClient):
                 )
             if "error" in parsed:
                 error = parsed["error"]
+                validation = _argument_validation_result(error) if method == "tools/call" else None
+                if validation is not None:
+                    return {"jsonrpc": "2.0", "id": request_id, "result": validation}
                 code = error.get("code") if isinstance(error, dict) else None
                 raise _DesktopBrowserTransportError(
                     "BROWSER_PROTOCOL_ERROR", "The Desktop browser rejected the MCP request.",

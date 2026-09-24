@@ -532,6 +532,178 @@ async def test_transport_errors_preserve_classification_without_replay_or_privat
         await client.close()
 
 
+def argument_validation_error():
+    return {
+        "code": -32602,
+        "message": "synthetic-private-response",
+        "data": {
+            "code": "INVALID_REQUEST", "phase": "argument_validation", "contractVersion": 1,
+            "outcome": "not_started", "retryable": False,
+            "issues": [{"field": "ref", "rule": "required", "expected": "present"}],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "rule", "expected", "description"),
+    [
+        ("ref", "required", "present", "a supplied value"),
+        ("actions.0", "type", "object", "an object"),
+        ("actions", "type", "array", "an array"),
+        ("actions.1.text", "type", "string", "a string"),
+        ("accept", "type", "boolean", "a boolean"),
+        ("x", "type", "finite_number", "a finite number"),
+        ("durationMs", "type", "integer", "an integer"),
+        ("actions.2.amount", "range", "within_bounds", "the declared bounds"),
+        ("action", "enum", "supported_value", "the declared values"),
+        ("$", "unknown_field", "known_fields", "only declared fields"),
+        ("ref", "conflict", "exclusive_fields", "mutually compatible fields"),
+        ("imageId", "dependency", "related_fields", "the required related fields"),
+        ("actions.0.action", "order", "field_update_before_final", "before the final action"),
+    ],
+)
+async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
+    browser, field, rule, expected, description,
+):
+    error = argument_validation_error()
+    issue = {"field": field, "rule": rule, "expected": expected}
+    error["data"]["issues"] = [issue]
+    error["message"] += browser.token
+    requests = []
+
+    async def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": json.loads(request.content)["id"], "error": error,
+        })
+
+    client = DesktopBrowserMCPClient(browser)
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    token = current_tool_context.set(context(browser))
+    call_token = current_mcp_call_context.set(MCPCallContext("validation-fixture"))
+    try:
+        result = await client.call_tool(
+            "browser_act", {"action": "fill", "text": "synthetic-private-argument"},
+        )
+        assert result.is_error
+        assert result.structured_content == {
+            **error["data"], "ok": False, "message": result.structured_content["message"],
+        }
+        assert description in result.structured_content["message"]
+        assert field in result.structured_content["message"]
+        assert result.content == json.dumps(result.structured_content)
+        assert "synthetic-private" not in result.content
+        assert browser.token not in result.content
+        assert len(requests) == 1
+    finally:
+        current_tool_context.reset(token)
+        current_mcp_call_context.reset(call_token)
+        await client.close()
+
+
+@pytest.mark.parametrize(
+    ("location", "changes"),
+    [
+        ("error", {"code": -32603}),
+        ("error", {"code": "-32602"}),
+        ("error", {"code": True}),
+        ("error", {"message": None}),
+        ("error", {"data": None}),
+        ("error", {"data": {}}),
+        ("data", {"code": "OTHER_ERROR"}),
+        ("data", {"phase": "execution"}),
+        ("data", {"contractVersion": 2}),
+        ("data", {"contractVersion": True}),
+        ("data", {"contractVersion": "1"}),
+        ("data", {"contractVersion": 1.0}),
+        ("data", {"outcome": "unknown"}),
+        ("data", {"retryable": True}),
+        ("data", {"retryable": 0}),
+        ("data", {"private": "synthetic-private-response"}),
+        ("data", {"issues": []}),
+        ("data", {"issues": "synthetic-private-response"}),
+        ("data", {"issues": [None]}),
+        ("data", {"issues": [{}]}),
+        ("data", {"issues": [
+            {"field": "ref", "rule": "required", "expected": "present"},
+        ] * 17}),
+        ("issue", {"field": "sessionKey"}),
+        ("issue", {"field": "_meta"}),
+        ("issue", {"field": "actions.3.ref"}),
+        ("issue", {"field": "actions.00.ref"}),
+        ("issue", {"field": "actions.0.ref.extra"}),
+        ("issue", {"field": "ref\nsynthetic-private-response"}),
+        ("issue", {"field": "synthetic-private-response" * 100}),
+        ("issue", {"field": []}),
+        ("issue", {"rule": "synthetic-private-response"}),
+        ("issue", {"rule": []}),
+        ("issue", {"expected": "synthetic-private-response"}),
+        ("issue", {"expected": "string"}),
+        ("issue", {"expected": []}),
+        ("issue", {"value": "synthetic-private-response"}),
+    ],
+)
+async def test_unrecognized_argument_diagnostics_remain_unknown_without_private_body(
+    browser, location, changes,
+):
+    error = argument_validation_error()
+    if location == "error":
+        error.update(changes)
+    elif location == "data":
+        error["data"].update(changes)
+    else:
+        error["data"]["issues"][0].update(changes)
+    requests = []
+
+    async def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json={
+            "jsonrpc": "2.0", "id": json.loads(request.content)["id"], "error": error,
+        })
+
+    client = DesktopBrowserMCPClient(browser)
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    token = current_tool_context.set(context(browser))
+    call_token = current_mcp_call_context.set(MCPCallContext("invalid-validation-fixture"))
+    try:
+        result = await client.call_tool("browser_act", {"action": "click"})
+        assert result.is_error
+        assert result.structured_content["code"] == "BROWSER_PROTOCOL_ERROR"
+        assert result.structured_content["outcome"] == "unknown"
+        assert result.structured_content["retryable"] is False
+        assert "issues" not in result.structured_content
+        assert "synthetic-private" not in result.content
+        assert browser.token not in result.content
+        assert len(requests) == 1
+    finally:
+        current_tool_context.reset(token)
+        current_mcp_call_context.reset(call_token)
+        await client.close()
+
+
+@pytest.mark.parametrize("failure", ["identity", "result_and_error", "tools_list"])
+async def test_argument_diagnostic_does_not_override_rpc_envelope_or_method(browser, failure):
+    async def respond(request):
+        payload = {
+            "jsonrpc": "2.0", "id": json.loads(request.content)["id"],
+            "error": argument_validation_error(),
+        }
+        if failure == "identity":
+            payload["id"] = "unrelated-request"
+        elif failure == "result_and_error":
+            payload["result"] = {"content": []}
+        return httpx.Response(200, json=payload)
+
+    client = DesktopBrowserMCPClient(browser)
+    client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
+    try:
+        with pytest.raises(RuntimeError) as raised:
+            await client._request("tools/list" if failure == "tools_list" else "tools/call", {})
+        assert "synthetic-private" not in str(raised.value)
+    finally:
+        await client.close()
+
+
 async def test_disconnected_bridge_is_classified(browser):
     client = DesktopBrowserMCPClient(browser)
     token = current_tool_context.set(context(browser))

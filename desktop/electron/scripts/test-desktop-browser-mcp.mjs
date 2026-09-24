@@ -170,6 +170,54 @@ try {
   ]) assert.equal((await rpc('tools/call', params)).error.code, -32602)
   assert.equal(calls.length, beforeInvalid, 'invalid metadata and model arguments must never execute')
 
+  const invalidArguments = await call('browser_act', { targetRef: 'opaque-primary-target', action: 'hold', ref: 'e1' })
+  assert.deepEqual(invalidArguments.error.data, { code: 'INVALID_REQUEST', phase: 'argument_validation',
+    contractVersion: 1, outcome: 'not_started', retryable: false,
+    issues: [{ field: 'durationMs', rule: 'required', expected: 'present' }] })
+  const hiddenInput = await call('browser_act', { targetRef: 'opaque-primary-target', action: 'fill', ref: 'e1',
+    'synthetic-sensitive-key': 'synthetic-sensitive-value' })
+  assert.equal(JSON.stringify(hiddenInput).includes('synthetic-sensitive'), false)
+  assert.deepEqual(hiddenInput.error.data.issues, [{ field: '$', rule: 'unknown_field', expected: 'known_fields' }])
+  const metadataFailure = await rpc('tools/call', { name: 'browser_tabs', arguments: {}, _meta: { sessionKey: '' } })
+  assert.equal(metadataFailure.error.data.phase, undefined)
+  assert.equal(metadataFailure.error.data.issues, undefined)
+  for (let index = 0; index < 5; index++) {
+    assert.equal((await call('browser_act', { targetRef: 'opaque-primary-target', action: 'click' }, 'validation-session')).error.data.phase, 'argument_validation')
+  }
+  assert.equal(count('validation-session'), 0)
+  const corrected = await call('browser_act', { targetRef: 'opaque-primary-target', action: 'click', ref: 'e1' }, 'validation-session')
+  assert.equal(corrected.result.isError, false, 'rejected arguments do not consume execution recovery state')
+  assert.equal(count('validation-session'), 1)
+  failures.set('runtime-invalid-session', () => {
+    throw new DesktopBrowserError('INVALID_REQUEST', 'Synthetic runtime rejection.', 400, { outcome: 'unknown' })
+  })
+  const runtimeInvalid = await call('browser_act', { targetRef: 'opaque-primary-target', action: 'click', ref: 'e1' }, 'runtime-invalid-session')
+  assert.equal(runtimeInvalid.result.structuredContent.code, 'INVALID_REQUEST')
+  assert.equal(runtimeInvalid.result.structuredContent.outcome, 'unknown')
+  assert.equal(runtimeInvalid.result.structuredContent.phase, undefined, 'runtime failures are not contract diagnostics')
+  assert.equal(runtimeInvalid.result.structuredContent.issues, undefined)
+  failures.delete('runtime-invalid-session')
+  const actionSchema = tools.find(tool => tool.name === 'browser_act').inputSchema
+  assert.equal(actionSchema.properties.ref.maxLength, 128)
+  assert.equal(actionSchema.properties.ref.minLength, 1)
+  assert.equal(actionSchema.properties.durationMs.maximum, 10000)
+  assert.equal(actionSchema.properties.amount.default, 600)
+  assert.equal(batchSchema.properties.actions.items.properties.x.maximum, 100000)
+  const batchDescription = tools.find(tool => tool.name === 'browser_batch').description
+  assert.match(batchDescription, /fill requires ref, text/)
+  assert.match(batchDescription, /press requires key/)
+  assert.match(batchDescription, /hold requires ref, durationMs/)
+  assert.match(batchDescription, /drag requires ref, endRef/)
+  assert.match(batchDescription, /Coordinate click\/scroll\/hover\/hold\/drag actions/)
+  assert.match(batchDescription, /ref\/endRef are replaced by image coordinates/)
+  assert.equal(tools.find(tool => tool.name === 'browser_navigate').description.includes('contextTargetRef'), false)
+  assert.equal(tools.find(tool => tool.name === 'browser_open').description.includes('not both'), false)
+
+  for (const tool of tools) {
+    assert.equal(JSON.stringify(tool.inputSchema).includes('oneOf'), false)
+    assert.equal(JSON.stringify(tool.inputSchema).includes('anyOf'), false)
+  }
+
   const extendedTarget = 'opaque-primary-target'
   for (const [tool, arguments_] of [
     ['browser_open', { url: 'https://example.test/related', contextTargetRef: extendedTarget }],
@@ -225,7 +273,10 @@ try {
   const replay = await call('browser_act', { text: 'Synthetic value', ref: 'element-1', action: 'fill', targetRef: 'opaque-primary-target' }, 'session-a', 'shared-operation')
   assert.deepEqual(replay.result, first.result)
   assert.equal(calls.length, beforeAction + 1, 'identical mutation retries must return the original receipt')
-  assert.equal((await call('browser_act', { ...action, text: 'Changed' }, 'session-a', 'shared-operation')).error.code, -32602)
+  const receiptConflict = (await call('browser_act', { ...action, text: 'Changed' }, 'session-a', 'shared-operation')).error
+  assert.equal(receiptConflict.code, -32602)
+  assert.equal(receiptConflict.data.phase, undefined, 'receipt conflicts are not argument-validation failures')
+  assert.equal(receiptConflict.data.outcome, undefined, 'a receipt conflict cannot claim the prior operation never started')
   assert.equal(calls.length, beforeAction + 1)
   await call('browser_act', { ...action, targetRef: 'opaque-secondary-target' }, 'session-b', 'shared-operation')
   assert.equal(calls.at(-1).sessionKey, 'session-b', 'operation receipts must be scoped by trusted session')

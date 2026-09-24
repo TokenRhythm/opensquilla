@@ -36,6 +36,11 @@ to browser tools.
 
 Use the tool names exactly as exposed by the MCP server:
 
+The connected client's advertised schema and parameter descriptions are the
+source for supported arguments and their combinations. An optional field may
+still be required for a particular action. Read those conditions before calling
+the tool; examples in this skill do not replace the current tool contract.
+
 - `mcp__desktop-browser__browser_tabs` — list conversation-owned pages.
 - `mcp__desktop-browser__browser_open` — open an HTTP(S) page and receive a
   `targetRef`.
@@ -139,6 +144,19 @@ reference when available and verify the region's content changed: the root
 viewport scroll position alone does not describe every nested scroll container.
 Use the exact key spelling exposed by the tool (for example `ArrowRight`, not
 `Right`). Read parameter errors and correct them before trying another action.
+
+When a tool returns `phase="argument_validation"` and `outcome="not_started"`,
+that request was rejected before browser execution. Use its structured `issues`
+to locate the invalid field and the expected constraint, check the advertised
+contract, and correct the arguments. Do not repeat the same invalid request or
+assume the page changed because validation failed. This result does not prove
+that a separate earlier request had no effect.
+
+A protocol error, timeout, or lost connection without that validation result
+does not establish whether an action ran. Keep an `unknown` outcome uncertain,
+inspect the page's current state, and decide what remains before submitting
+another action. A tool returning successfully proves only the operation's
+reported effect; verify the user's requested result separately.
 
 Navigation errors can return a retained `targetRef` even when the tool reports
 failure. Check that target's `pageState` and `navigationError` before opening
