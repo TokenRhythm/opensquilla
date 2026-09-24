@@ -48,6 +48,7 @@ def _make_task_runtime(*, delay: float = 0.0, succeed: bool = True) -> Any:
 
 def _make_channel() -> Any:
     ch = MagicMock()
+    ch._delivery_store = None
     ch.send = AsyncMock()
     ch.build_reply_message = None
     ch.streaming_reply_kwargs = None
@@ -475,6 +476,7 @@ async def test_cap_full_no_transcript_pollution() -> None:
     msg.id = "msg-1"
 
     channel = MagicMock()
+    channel._delivery_store = None
     channel.send = AsyncMock()
     channel.build_reply_message = None
     channel.streaming_reply_kwargs = None
@@ -581,6 +583,7 @@ async def test_debounce_reservation_enforced() -> None:
     ifs = _ChannelInFlightSet(cap=1)
 
     channel = MagicMock()
+    channel._delivery_store = None
     channel.send = AsyncMock()
     channel.build_reply_message = None
     channel.streaming_reply_kwargs = None
@@ -690,6 +693,7 @@ async def test_debounce_reservation_enforced() -> None:
 
 def _make_channel_with_id(channel_id: str) -> Any:
     ch = MagicMock()
+    ch._delivery_store = None
     ch.channel_id = channel_id
     return ch
 
@@ -744,6 +748,7 @@ async def test_apply_overflow_policy_invoked_when_channel_override_present() -> 
     msg.id = "msg-1"
 
     channel = MagicMock()
+    channel._delivery_store = None
     channel.channel_id = "feishu"
     channel.send = AsyncMock()
     channel.build_reply_message = None
@@ -854,6 +859,7 @@ async def test_apply_overflow_policy_not_invoked_without_channel_override() -> N
     msg.id = "msg-1"
 
     channel = MagicMock()
+    channel._delivery_store = None
     channel.channel_id = "discord"  # not in override map
     channel.send = AsyncMock()
     channel.build_reply_message = None

@@ -125,19 +125,21 @@ async def test_socket_mode_start_delegates_lifecycle_to_sdk() -> None:
     assert open_call[2] == {"Authorization": "Bearer xapp-valid"}
 
 
-def test_ingest_accepts_plain_user_message() -> None:
+async def test_ingest_accepts_plain_user_message() -> None:
     ch = _mk()
-    ch._ingest_event_callback(
-        {
-            "event_id": "Ev1",
-            "event": {
-                "type": "message",
-                "user": "UUSER",
-                "channel": "D123",
-                "text": "hi",
-                "ts": "1.1",
-            },
-        }
+    (
+        await ch._ingest_event_callback(
+            {
+                "event_id": "Ev1",
+                "event": {
+                    "type": "message",
+                    "user": "UUSER",
+                    "channel": "D123",
+                    "text": "hi",
+                    "ts": "1.1",
+                },
+            }
+        )
     )
     assert ch._queue.qsize() == 1
     msg = ch._queue.get_nowait()
@@ -145,19 +147,21 @@ def test_ingest_accepts_plain_user_message() -> None:
     assert msg.content == "hi"
 
 
-def test_ingest_accepts_app_mention_event() -> None:
+async def test_ingest_accepts_app_mention_event() -> None:
     ch = _mk()
-    ch._ingest_event_callback(
-        {
-            "event_id": "EvMention",
-            "event": {
-                "type": "app_mention",
-                "user": "UUSER",
-                "channel": "C123",
-                "text": "<@UBOT> hi",
-                "ts": "2.1",
-            },
-        }
+    (
+        await ch._ingest_event_callback(
+            {
+                "event_id": "EvMention",
+                "event": {
+                    "type": "app_mention",
+                    "user": "UUSER",
+                    "channel": "C123",
+                    "text": "<@UBOT> hi",
+                    "ts": "2.1",
+                },
+            }
+        )
     )
 
     assert ch._queue.qsize() == 1
@@ -176,48 +180,52 @@ def test_ingest_accepts_app_mention_event() -> None:
         {"type": "message", "subtype": "message_deleted", "channel": "D1", "ts": "6"},
     ],
 )
-def test_ingest_drops_self_echoes_and_non_user_subtypes(event: dict[str, Any]) -> None:
+async def test_ingest_drops_self_echoes_and_non_user_subtypes(event: dict[str, Any]) -> None:
     ch = _mk()
-    ch._ingest_event_callback({"event_id": f"e-{event.get('ts')}", "event": event})
+    (await ch._ingest_event_callback({"event_id": f"e-{event.get('ts')}", "event": event}))
     assert ch._queue.qsize() == 0
 
 
-def test_ingest_dedupes_replayed_event() -> None:
+async def test_ingest_dedupes_replayed_event() -> None:
     ch = _mk()
     payload = {
         "event_id": "Dup1",
         "event": {"type": "message", "user": "U", "channel": "D1", "text": "hi", "ts": "9"},
     }
-    ch._ingest_event_callback(payload)
-    ch._ingest_event_callback(payload)
+    (await ch._ingest_event_callback(payload))
+    (await ch._ingest_event_callback(payload))
     assert ch._queue.qsize() == 1
 
 
-def test_ingest_dedupes_app_mention_and_message_pair() -> None:
+async def test_ingest_dedupes_app_mention_and_message_pair() -> None:
     ch = _mk()
-    ch._ingest_event_callback(
-        {
-            "event_id": "EvMention",
-            "event": {
-                "type": "app_mention",
-                "user": "UUSER",
-                "channel": "C123",
-                "text": "<@UBOT> hi",
-                "ts": "10.1",
-            },
-        }
+    (
+        await ch._ingest_event_callback(
+            {
+                "event_id": "EvMention",
+                "event": {
+                    "type": "app_mention",
+                    "user": "UUSER",
+                    "channel": "C123",
+                    "text": "<@UBOT> hi",
+                    "ts": "10.1",
+                },
+            }
+        )
     )
-    ch._ingest_event_callback(
-        {
-            "event_id": "EvMessage",
-            "event": {
-                "type": "message",
-                "user": "UUSER",
-                "channel": "C123",
-                "text": "<@UBOT> hi",
-                "ts": "10.1",
-            },
-        }
+    (
+        await ch._ingest_event_callback(
+            {
+                "event_id": "EvMessage",
+                "event": {
+                    "type": "message",
+                    "user": "UUSER",
+                    "channel": "C123",
+                    "text": "<@UBOT> hi",
+                    "ts": "10.1",
+                },
+            }
+        )
     )
 
     assert ch._queue.qsize() == 1
