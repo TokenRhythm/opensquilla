@@ -34,6 +34,11 @@ from .types import (
 __all__ = ["DeliveryReport", "JobStore"]
 log = structlog.get_logger(__name__)
 
+# Keep retired workflows inert even when the best-effort boot cleanup fails.
+# GLOB preserves the case-sensitive literal prefix used by that cleanup.
+_RETIRED_HANDLER_KEY = "auto_propose"
+_RETIRED_JOB_NAME_PREFIX = "auto_propose:"
+
 _CREATE_RUNS_TABLE = """
 CREATE TABLE IF NOT EXISTS scheduler_runs (
     id TEXT PRIMARY KEY,
@@ -938,8 +943,13 @@ class JobStore:
             """
             SELECT MIN(next_run_at) FROM scheduler_jobs
             WHERE status = ? AND enabled = 1 AND next_run_at IS NOT NULL
+              AND handler_key != ? AND name NOT GLOB ?
             """,
-            (JobStatus.PENDING.value,),
+            (
+                JobStatus.PENDING.value,
+                _RETIRED_HANDLER_KEY,
+                f"{_RETIRED_JOB_NAME_PREFIX}*",
+            ),
         ) as cur:
             row = await cur.fetchone()
             if row and row[0]:
@@ -1041,9 +1051,16 @@ class JobStore:
             SELECT * FROM scheduler_jobs
             WHERE status = ? AND enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?
               AND (backoff_until IS NULL OR backoff_until <= ?)
+              AND handler_key != ? AND name NOT GLOB ?
             ORDER BY next_run_at
             """,
-            (JobStatus.PENDING.value, now_iso, now_iso),
+            (
+                JobStatus.PENDING.value,
+                now_iso,
+                now_iso,
+                _RETIRED_HANDLER_KEY,
+                f"{_RETIRED_JOB_NAME_PREFIX}*",
+            ),
         ) as cur:
             async for row in cur:
                 yield _row_to_job(row)
