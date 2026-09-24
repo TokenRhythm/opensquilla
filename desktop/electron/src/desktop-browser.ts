@@ -6,13 +6,16 @@ import { DesktopBrowserMcp } from './desktop-browser-mcp.js'
 export const DESKTOP_BROWSER_URL_ENV = 'OPENSQUILLA_DESKTOP_BROWSER_URL'
 export const DESKTOP_BROWSER_TOKEN_ENV = 'OPENSQUILLA_DESKTOP_BROWSER_TOKEN'
 const MAX_REQUEST_BYTES = 64 * 1024
+// The authenticated MCP channel can carry bounded, Gateway-resolved attachments.
+const MAX_MCP_REQUEST_BYTES = 16 * 1024 * 1024
 const MAX_RESPONSE_BYTES = 12 * 1024 * 1024
 const MAX_TIMEOUT_MS = 60_000
 
 export type DesktopBrowserOperation = 'list' | 'open' | 'snapshot' | 'act' | 'screenshot' | 'reload'
   | 'observe' | 'batch' | 'dialog' | 'tab'
 export interface DesktopBrowserAction {
-  action?: 'click' | 'fill' | 'press' | 'scroll' | 'hover' | 'select'
+  action?: 'click' | 'fill' | 'press' | 'scroll' | 'hover' | 'select' | 'hold' | 'drag'
+    | 'upload' | 'cancelUpload' | 'download'
   ref?: string
   text?: string
   key?: string
@@ -22,6 +25,20 @@ export interface DesktopBrowserAction {
   imageId?: string
   x?: number
   y?: number
+  button?: 'left' | 'right' | 'middle'
+  durationMs?: number
+  endRef?: string
+  toX?: number
+  toY?: number
+  fileId?: string
+  chooserId?: string
+}
+/** Authenticated Gateway attachment bytes, never model-supplied file paths. */
+export interface BrowserUploadFile {
+  fileId: string
+  name: string
+  mimeType: string
+  dataBase64: string
 }
 export interface DesktopBrowserRequest extends DesktopBrowserAction {
   sessionKey: string
@@ -34,6 +51,10 @@ export interface DesktopBrowserRequest extends DesktopBrowserAction {
   accept?: boolean
   promptText?: string
   tabAction?: 'switch' | 'close'
+  contextTargetRef?: string
+  maxChars?: number
+  downloadId?: string
+  uploadFile?: BrowserUploadFile
 }
 
 export type DesktopBrowserObservationReason = 'observation_missing' | 'observation_mismatch'
@@ -49,6 +70,7 @@ export interface DesktopBrowserFailureDetails {
   retryable?: boolean
   recovery?: string
   observationReason?: DesktopBrowserObservationReason
+  diagnostic?: 'element_obscured' | 'element_detached'
 }
 
 export class DesktopBrowserError extends Error {
@@ -75,8 +97,10 @@ export function parseDesktopBrowserRequest(value: unknown): DesktopBrowserReques
     throw new DesktopBrowserError('INVALID_REQUEST', 'Unknown browser operation.', 400)
   }
   const allowed = ['sessionKey', 'operation', ...(operation === 'list' ? [] : ['targetRef']),
-    ...(operation === 'open' ? ['url'] : []),
-    ...(operation === 'act' ? ['action', 'ref', 'text', 'key', 'direction', 'amount'] : []),
+    ...(operation === 'open' ? ['url', 'contextTargetRef'] : []),
+    ...(operation === 'act' ? ['action', 'ref', 'text', 'key', 'direction', 'amount',
+      'button', 'durationMs', 'endRef', 'fileId', 'chooserId'] : []),
+    ...(operation === 'snapshot' ? ['ref', 'maxChars', 'downloadId'] : []),
     ...(operation === 'observe' ? ['observationMode'] : []),
     ...(operation === 'batch' ? ['actions', 'observationMode'] : []),
     ...(operation === 'dialog' ? ['dialogId', 'accept', 'promptText', 'observationMode'] : []),
@@ -91,6 +115,24 @@ export function parseDesktopBrowserRequest(value: unknown): DesktopBrowserReques
     request.targetRef = boundedString(body.targetRef, 128, 'target reference')
   }
   if (operation === 'open') request.url = boundedString(body.url, 8192, 'URL')
+  if (body.contextTargetRef !== undefined) {
+    if (body.targetRef !== undefined) throw new DesktopBrowserError('INVALID_REQUEST', 'A related tab cannot also navigate an existing target.', 400)
+    request.contextTargetRef = boundedString(body.contextTargetRef, 128, 'context target reference')
+  }
+  if (operation === 'snapshot') {
+    if (body.ref !== undefined && body.downloadId !== undefined) {
+      throw new DesktopBrowserError('INVALID_REQUEST', 'Read an element or a downloaded artifact, not both.', 400)
+    }
+    if (body.ref !== undefined) request.ref = boundedString(body.ref, 128, 'element reference')
+    if (body.downloadId !== undefined) request.downloadId = boundedString(body.downloadId, 128, 'download identity')
+    if (body.maxChars !== undefined) {
+      if (typeof body.maxChars !== 'number' || !Number.isInteger(body.maxChars) || body.maxChars < 1 || body.maxChars > 65536) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'maxChars must be an integer from 1 to 65536.', 400)
+      }
+      if (!request.ref && !request.downloadId) throw new DesktopBrowserError('INVALID_REQUEST', 'maxChars requires an element or download identity.', 400)
+      request.maxChars = body.maxChars
+    }
+  }
   if (body.observationMode !== undefined) {
     if (typeof body.observationMode !== 'string' || !['auto', 'dom'].includes(body.observationMode)) {
       throw new DesktopBrowserError('INVALID_REQUEST', 'Invalid observation mode.', 400)
@@ -126,14 +168,44 @@ export function parseDesktopBrowserRequest(value: unknown): DesktopBrowserReques
     request.tabAction = body.tabAction
   }
   if (operation === 'act') {
-    if (!['click', 'fill', 'press', 'scroll', 'hover', 'select'].includes(body.action as string)) {
+    if (!['click', 'fill', 'press', 'scroll', 'hover', 'select', 'hold', 'drag', 'upload', 'cancelUpload', 'download'].includes(body.action as string)) {
       throw new DesktopBrowserError('INVALID_REQUEST', 'Unknown browser action.', 400)
     }
     request.action = body.action as DesktopBrowserRequest['action']
-    if (['click', 'fill', 'hover', 'select'].includes(request.action!)) {
+    if (['click', 'fill', 'hover', 'select', 'hold', 'drag', 'download'].includes(request.action!)) {
       request.ref = boundedString(body.ref, 128, 'element reference')
     } else if (body.ref !== undefined) {
       request.ref = boundedString(body.ref, 128, 'element reference')
+    }
+    if (body.button !== undefined) {
+      if (!['click', 'hold', 'drag'].includes(request.action!) || typeof body.button !== 'string'
+        || !['left', 'right', 'middle'].includes(body.button)) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'button is only valid for a click, hold or drag.', 400)
+      }
+      request.button = body.button as DesktopBrowserAction['button']
+    }
+    if (request.action === 'hold' || body.durationMs !== undefined) {
+      if (request.action !== 'hold' || typeof body.durationMs !== 'number' || !Number.isInteger(body.durationMs)
+        || body.durationMs < 1 || body.durationMs > 10000) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'A hold requires durationMs from 1 to 10000.', 400)
+      }
+      request.durationMs = body.durationMs
+    }
+    if (request.action === 'drag') request.endRef = boundedString(body.endRef, 128, 'drag destination reference')
+    else if (body.endRef !== undefined) throw new DesktopBrowserError('INVALID_REQUEST', 'endRef requires a drag.', 400)
+    if (request.action === 'upload') {
+      request.fileId = boundedString(body.fileId, 512, 'attachment identity')
+      if ((body.ref === undefined) === (body.chooserId === undefined)) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'Upload requires either an input ref or a pending chooser identity.', 400)
+      }
+      if (body.chooserId !== undefined) request.chooserId = boundedString(body.chooserId, 128, 'file chooser identity')
+    } else if (request.action === 'cancelUpload') {
+      if (body.ref !== undefined) throw new DesktopBrowserError('INVALID_REQUEST', 'Cancel the specific file chooser by identity.', 400)
+      request.chooserId = boundedString(body.chooserId, 128, 'file chooser identity')
+    }
+    if (request.action !== 'upload' && body.fileId !== undefined
+      || !['upload', 'cancelUpload'].includes(request.action!) && body.chooserId !== undefined) {
+      throw new DesktopBrowserError('INVALID_REQUEST', 'File fields require the corresponding file action.', 400)
     }
     if (request.action === 'fill' || request.action === 'select') {
       if (typeof body.text !== 'string' || body.text.length > 16_384 || body.text.includes('\0')) {
@@ -162,9 +234,13 @@ function parseBrowserAction(value: unknown, sessionKey: string, targetRef: strin
     throw new DesktopBrowserError('INVALID_REQUEST', 'Invalid batch action.', 400)
   }
   const action = value as Record<string, unknown>
-  const fields = ['action', 'ref', 'text', 'key', 'direction', 'amount', 'observationId', 'imageId', 'x', 'y']
+  const fields = ['action', 'ref', 'text', 'key', 'direction', 'amount', 'observationId', 'imageId', 'x', 'y',
+    'button', 'durationMs', 'endRef', 'toX', 'toY']
   if (Object.keys(action).some(key => !fields.includes(key))) {
     throw new DesktopBrowserError('INVALID_REQUEST', 'Unexpected batch action field.', 400)
+  }
+  if (['upload', 'cancelUpload', 'download'].includes(String(action.action))) {
+    throw new DesktopBrowserError('INVALID_REQUEST', 'File actions must run individually.', 400)
   }
   const coordinate = ['x', 'y', 'imageId', 'observationId'].some(key => action[key] !== undefined)
   if (!coordinate) {
@@ -172,19 +248,24 @@ function parseBrowserAction(value: unknown, sessionKey: string, targetRef: strin
       parseDesktopBrowserRequest({ ...action, sessionKey, targetRef, operation: 'act' })
     return parsed
   }
-  if (action.ref !== undefined || !['click', 'hover', 'scroll'].includes(String(action.action))) {
-    throw new DesktopBrowserError('INVALID_REQUEST', 'Coordinates support click, hover or scroll without an element ref.', 400)
+  if (action.ref !== undefined || action.endRef !== undefined || !['click', 'hover', 'scroll', 'hold', 'drag'].includes(String(action.action))) {
+    throw new DesktopBrowserError('INVALID_REQUEST', 'Coordinates support click, hover, scroll, hold or drag without element refs.', 400)
   }
-  for (const key of ['x', 'y']) {
+  if (action.action !== 'drag' && (action.toX !== undefined || action.toY !== undefined)) {
+    throw new DesktopBrowserError('INVALID_REQUEST', 'Destination coordinates require a drag.', 400)
+  }
+  for (const key of action.action === 'drag' ? ['x', 'y', 'toX', 'toY'] : ['x', 'y']) {
     if (typeof action[key] !== 'number' || !Number.isFinite(action[key]) || action[key] < 0 || action[key] > 100000) {
       throw new DesktopBrowserError('INVALID_REQUEST', 'Invalid image coordinate.', 400)
     }
   }
-  const { x, y, imageId, observationId, ...rest } = action
-  const { sessionKey: _session, operation: _operation, targetRef: _target, ref: _ref, ...parsed } =
-    parseDesktopBrowserRequest({ ...rest, ...(['click', 'hover'].includes(String(action.action)) ? { ref: 'coordinate' } : {}),
+  const { x, y, toX, toY, imageId, observationId, ...rest } = action
+  const { sessionKey: _session, operation: _operation, targetRef: _target, ref: _ref, endRef: _endRef, ...parsed } =
+    parseDesktopBrowserRequest({ ...rest, ...(['click', 'hover', 'hold', 'drag'].includes(String(action.action)) ? { ref: 'coordinate' } : {}),
+      ...(action.action === 'drag' ? { endRef: 'coordinate-destination' } : {}),
       sessionKey, targetRef, operation: 'act' })
   return { ...parsed, x: x as number, y: y as number,
+    ...(action.action === 'drag' ? { toX: toX as number, toY: toY as number } : {}),
     imageId: boundedString(imageId, 128, 'image identity'), observationId: boundedString(observationId, 128, 'observation identity') }
 }
 
@@ -323,15 +404,16 @@ export class DesktopBrowserServer {
       timeout = setTimeout(() => controller.abort(), deadline - started)
       timeout.unref()
       const work = (async () => {
+        const requestLimit = isMcp ? MAX_MCP_REQUEST_BYTES : MAX_REQUEST_BYTES
         const declared = request.headers['content-length']
-        if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > MAX_REQUEST_BYTES)) {
+        if (declared !== undefined && (!/^\d+$/.test(declared) || Number(declared) > requestLimit)) {
           throw new DesktopBrowserError('INVALID_REQUEST', 'Browser request is too large.', 413)
         }
         let size = 0
         const chunks: Buffer[] = []
         for await (const chunk of request) {
           size += chunk.length
-          if (size > MAX_REQUEST_BYTES) throw new DesktopBrowserError('INVALID_REQUEST', 'Browser request is too large.', 413)
+          if (size > requestLimit) throw new DesktopBrowserError('INVALID_REQUEST', 'Browser request is too large.', 413)
           chunks.push(Buffer.from(chunk))
         }
         let body: unknown
@@ -348,7 +430,11 @@ export class DesktopBrowserServer {
           return await this.mcp!.handle(body, controller.signal)
         }
         const parsed = parseDesktopBrowserRequest(body)
-        if (!['list', 'open', 'snapshot', 'act', 'screenshot', 'reload'].includes(parsed.operation)) {
+        if (!['list', 'open', 'snapshot', 'act', 'screenshot', 'reload'].includes(parsed.operation)
+          || parsed.contextTargetRef !== undefined || parsed.downloadId !== undefined
+          || parsed.operation === 'snapshot' && parsed.ref !== undefined
+          || parsed.action && !['click', 'fill', 'press', 'scroll', 'hover', 'select'].includes(parsed.action)
+          || parsed.button !== undefined) {
           throw new DesktopBrowserError('INVALID_REQUEST', 'This browser operation requires the MCP endpoint.', 400)
         }
         operation = parsed.operation

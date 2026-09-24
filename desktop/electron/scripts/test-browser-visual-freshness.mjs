@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { EventEmitter } from 'node:events'
 import { readFile } from 'node:fs/promises'
 import { mock, test } from 'node:test'
 import { DesktopBrowserError } from '../dist/desktop-browser.js'
@@ -15,7 +16,7 @@ function fixture() {
   const pointer = { currentPosition: () => undefined, update: async () => {} }
   const driver = new Driver({}, () => true, pointer)
   const state = { presses: 0, captures: 0, points: [], authorized: true, pixels: 'original pixels', beforePress: undefined, failureAfterPress: false }
-  const page = {
+  const page = Object.assign(new EventEmitter(), {
     evaluate: async () => ({ width: 200, height: 100, reducedMotion: true }),
     mouse: {
       click: async (x, y) => {
@@ -26,7 +27,7 @@ function fixture() {
         if (state.failureAfterPress) throw new Error('Synthetic response lost after input')
       },
     },
-  }
+  })
   driver.run = async (guard, _signal, work) => { guard(); return await work(page) }
   driver.isSurfaceVisible = () => true
   driver.viewport = async () => ({ ...viewport })
@@ -34,7 +35,7 @@ function fixture() {
     state.captures++
     return { width: 200, height: 100, dataBase64: Buffer.from(state.pixels).toString('base64') }
   }
-  driver.transport = {}
+  driver.transport = { releaseMouseButtons: async () => {} }
   driver.mousePositionPage = page
   driver.latestVisual = {
     observationId: 'observation-original', imageId: 'image-original', documentEpoch: 0, generation: 4,

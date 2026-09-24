@@ -110,7 +110,7 @@ try {
     assert.equal(initialized.result.protocolVersion, protocolVersion)
     assert.deepEqual(initialized.result.capabilities, {
       tools: {},
-      experimental: { 'opensquilla/browser': { version: 2, observation: true, batch: true, dialogs: true, jsPrompt: false, coordinateAuthority: 'browser-state' } },
+      experimental: { 'opensquilla/browser': { version: 2, observation: true, batch: true, dialogs: true, jsPrompt: false, coordinateAuthority: 'browser-state', attachmentUploads: true } },
     })
   }
   const notified = await invoke({ jsonrpc: '2.0', method: 'notifications/initialized' })
@@ -134,6 +134,7 @@ try {
     assert.equal('_meta' in tool.inputSchema.properties, false)
     assert.equal('nativeImageEvidence' in tool.inputSchema.properties, false)
     assert.equal('observationPolicy' in tool.inputSchema.properties, false)
+    assert.equal('uploadFile' in tool.inputSchema.properties, false)
     assert.equal(tool.annotations.readOnlyHint, ['browser_tabs', 'browser_inspect', 'browser_screenshot', 'browser_observe'].includes(tool.name))
   }
   const batchSchema = tools.find(tool => tool.name === 'browser_batch').inputSchema
@@ -168,6 +169,47 @@ try {
     toolParams('unknown_tool'),
   ]) assert.equal((await rpc('tools/call', params)).error.code, -32602)
   assert.equal(calls.length, beforeInvalid, 'invalid metadata and model arguments must never execute')
+
+  const extendedTarget = 'opaque-primary-target'
+  for (const [tool, arguments_] of [
+    ['browser_open', { url: 'https://example.test/related', contextTargetRef: extendedTarget }],
+    ['browser_inspect', { targetRef: extendedTarget, ref: 'element-1', maxChars: 65536 }],
+    ['browser_inspect', { targetRef: extendedTarget, downloadId: 'download-1', maxChars: 4000 }],
+    ['browser_act', { targetRef: extendedTarget, action: 'click', ref: 'element-1', button: 'right' }],
+    ['browser_act', { targetRef: extendedTarget, action: 'hold', ref: 'element-1', durationMs: 800 }],
+    ['browser_act', { targetRef: extendedTarget, action: 'drag', ref: 'element-1', endRef: 'element-2' }],
+    ['browser_act', { targetRef: extendedTarget, action: 'download', ref: 'element-1' }],
+    ['browser_act', { targetRef: extendedTarget, action: 'cancelUpload', chooserId: 'chooser-1' }],
+  ]) {
+    assert.equal((await call(tool, arguments_)).result.isError, false)
+  }
+  const uploadArguments = { targetRef: extendedTarget, action: 'upload', ref: 'element-1', fileId: 'att_synthetic_file' }
+  const uploadPacket = toolParams('browser_act', uploadArguments, 'upload-session', 'upload-receipt')
+  const largeAttachment = Buffer.alloc(8 * 1024 * 1024, 120).toString('base64')
+  uploadPacket._meta.uploadFile = { fileId: uploadArguments.fileId, name: 'sample.txt', mimeType: 'text/plain', dataBase64: largeAttachment }
+  const uploaded = await rpc('tools/call', uploadPacket)
+  assert.equal(uploaded.result.isError, false, 'bounded attachments larger than 64 KiB must reach the upload handler')
+  assert.equal(calls.at(-1).uploadFile.dataBase64, largeAttachment)
+  const uploadCount = count('upload-session')
+  assert.deepEqual((await rpc('tools/call', uploadPacket)).result, uploaded.result)
+  assert.equal(count('upload-session'), uploadCount, 'upload retries return a receipt without repeating the upload')
+  assert.equal((await rpc('tools/call', { ...uploadPacket,
+    _meta: { ...uploadPacket._meta, uploadFile: { ...uploadPacket._meta.uploadFile, dataBase64: 'YQ==' } },
+  })).error.code, -32602, 'the same upload receipt cannot be reused with changed attachment bytes')
+  const invalidUploadCount = calls.length
+  for (const params of [
+    toolParams('browser_act', uploadArguments),
+    toolParams('browser_act', { ...uploadArguments, uploadFile: uploadPacket._meta.uploadFile }),
+    ...[
+      { fileId: 'att_foreign_file' }, { name: '../secret.txt' }, { name: 'C:\\secret.txt' },
+      { dataBase64: 'YQ=!' }, { dataBase64: 'YR==' }, { dataBase64: Buffer.alloc(8 * 1024 * 1024 + 1).toString('base64') },
+    ].map(changes => ({ ...toolParams('browser_act', uploadArguments),
+      _meta: { ...toolParams('browser_act')._meta, uploadFile: { ...uploadPacket._meta.uploadFile, ...changes } } })),
+    { ...toolParams('browser_inspect', { targetRef: extendedTarget }),
+      _meta: { ...toolParams('browser_inspect')._meta, uploadFile: uploadPacket._meta.uploadFile } },
+    toolParams('browser_batch', { targetRef: extendedTarget, actions: [{ action: 'upload', ref: 'element-1', fileId: uploadArguments.fileId }] }),
+  ]) assert.equal((await rpc('tools/call', params)).error.code, -32602)
+  assert.equal(calls.length, invalidUploadCount, 'invalid upload authority must never execute')
 
   assert.equal((await call('browser_tabs')).result.structuredContent.targets[0].targetRef, 'opaque-primary-target')
   assert.equal((await call('browser_open', { url: 'https://example.test/' })).result.isError, false)

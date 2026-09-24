@@ -70,11 +70,44 @@ the same call ID cannot repeat a click. A timeout can leave the action outcome
 unknown: inspect the page before deciding whether to submit again. Receipt
 capacity is bounded to 4,096 mutations per Desktop server lifetime.
 
-This first version supports the main document's elements and viewport screenshots.
-It does not expose arbitrary JavaScript, browser-global commands, downloads,
-uploads, popup control, or cookie export. Explicit Gateway network restrictions
-are rejected in Safe mode because the attached renderer does not yet use the
-Gateway's network proxy. Screenshots use the existing model image-result channel.
+The browser advertises supported parameters in its MCP catalog. Existing tool
+names and required arguments remain compatible with older clients. In clients
+with the extended catalog:
+
+- `browser_act` supports `button` for clicks, bounded `hold` with `durationMs`,
+  and `drag` between element refs. Coordinate gestures use `browser_batch` with
+  the current screenshot identities; a drag additionally supplies `toX`/`toY`.
+  A gesture owns its complete press/move/release sequence and releases held
+  input when it is cancelled.
+- `browser_inspect` with a readable `ref` returns visible text and form values
+  without flattening whitespace. `maxChars` bounds the result and truncation
+  is explicit. The ordinary compact snapshot remains available for navigation.
+- `browser_open` with `contextTargetRef` creates a related tab in an owned
+  page's storage context. Omitting it preserves the independent-page behavior.
+  Context inheritance never permits access to another task's pages.
+- The `upload` action selects a current task attachment by `fileId`, using an
+  input `ref` or the reported `chooserId`. `cancelUpload` dismisses that chooser.
+  The Gateway resolves persisted user attachments and supplies their bytes;
+  model-provided local paths are not accepted. Available attachments are listed
+  in browser results when this capability is negotiated.
+- The `download` action clicks a ref with a managed capture already armed.
+  Its page-owned `downloadId` can be read through `browser_inspect`; UTF-8 text
+  is returned with explicit truncation, while binary artifacts return metadata.
+  Uploads and managed downloads are limited to 8 MiB. Download artifacts are
+  temporary, bounded, and cleaned up when the owning page closes. Ordinary
+  downloads outside this explicit action retain the native save dialog.
+
+File chooser interception is scoped to an automated action, preserving native
+pickers for manual clicks while idle. A chooser opened asynchronously after the
+action returns may still use the native picker. A managed download blocked by
+a JavaScript dialog returns the blocker immediately and disarms its capture;
+accepting that dialog can use the native save dialog and does not produce a
+managed `downloadId`.
+
+These extensions do not expose arbitrary JavaScript, browser-global commands,
+or cookie export. Explicit Gateway network restrictions are rejected in Safe
+mode because the attached renderer does not yet use the Gateway's network proxy.
+Screenshots use the existing model image-result channel.
 
 ```bash
 npm run test:browser-mcp

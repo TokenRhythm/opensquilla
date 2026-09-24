@@ -37,6 +37,7 @@ _AUTHORITY_ARGUMENTS = frozenset(
         "nativeImageEvidence",
         "observationPolicy",
         "recoveryScope",
+        "uploadFile",
     }
 )
 log = structlog.get_logger(__name__)
@@ -136,6 +137,7 @@ class DesktopBrowserMCPClient(MCPClient):
         self._next_id = 0
         self._available_tools = BROWSER_MCP_REQUIRED_TOOLS
         self._coordinate_authority = False
+        self._attachment_uploads = False
 
     async def connect(self) -> None:
         await self.close()
@@ -159,6 +161,9 @@ class DesktopBrowserMCPClient(MCPClient):
         self._coordinate_authority = (
             isinstance(browser, dict) and browser.get("coordinateAuthority") == "browser-state"
         )
+        self._attachment_uploads = (
+            isinstance(browser, dict) and browser.get("attachmentUploads") is True
+        )
         await self._request("notifications/initialized", {}, notification=True)
 
     async def close(self) -> None:
@@ -167,6 +172,7 @@ class DesktopBrowserMCPClient(MCPClient):
             self._http = None
         self._available_tools = BROWSER_MCP_REQUIRED_TOOLS
         self._coordinate_authority = False
+        self._attachment_uploads = False
 
     async def _request(
         self,
@@ -312,6 +318,25 @@ class DesktopBrowserMCPClient(MCPClient):
             return MCPToolResult(
                 "INVALID_REQUEST: Browser authority cannot be supplied as tool arguments.", True
             )
+        upload_file = None
+        if name == "browser_act" and arguments.get("action") == "upload":
+            if not self._attachment_uploads:
+                return _coordinate_unavailable(
+                    "BROWSER_UNSUPPORTED",
+                    "This Desktop does not support user attachment uploads. Update the client.",
+                    "update_client",
+                )
+            from opensquilla.tools.browser_attachments import (
+                BrowserAttachmentError,
+                resolve_browser_upload,
+            )
+
+            try:
+                upload_file = await resolve_browser_upload(context, arguments.get("fileId"))
+            except BrowserAttachmentError as error:
+                return _coordinate_unavailable(
+                    "BROWSER_ATTACHMENT_UNAVAILABLE", str(error), "choose_attachment",
+                )
         if _coordinate_batch(name, arguments):
             if not self._coordinate_authority:
                 return _coordinate_unavailable(
@@ -358,6 +383,7 @@ class DesktopBrowserMCPClient(MCPClient):
                             context.usage_root_turn_id or context.task_id or context.session_key
                         ),
                         "observationMode": requested_mode,
+                        **({"uploadFile": upload_file} if upload_file is not None else {}),
                     },
                 },
             )
@@ -370,6 +396,19 @@ class DesktopBrowserMCPClient(MCPClient):
             )
             return result
         result = MCPToolResult.from_response(response)
+        if self._attachment_uploads and name in {
+            "browser_tabs", "browser_open", "browser_navigate", "browser_reload",
+            "browser_inspect", "browser_observe", "browser_batch", "browser_tab",
+        }:
+            from opensquilla.tools.browser_attachments import browser_upload_descriptors
+
+            uploads = await browser_upload_descriptors(context)
+            if uploads:
+                descriptor_text = json.dumps({"availableUploads": uploads}, ensure_ascii=False)
+                result.content += "\n" + descriptor_text
+                result.content_blocks.append({"type": "text", "text": descriptor_text})
+                if result.structured_content is not None:
+                    result.structured_content["availableUploads"] = uploads
         log.info(
             "desktop_browser.tool_result", tool=name, operation_id=operation_id,
             image_block_count=sum(block.get("type") == "image" for block in result.content_blocks),

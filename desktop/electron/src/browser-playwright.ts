@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { BrowserWindow, WebContentsView, nativeImage, type WebContents } from 'electron'
-import { chromium, type Browser, type ConnectOverCDPTransport, type ElementHandle, type Page } from 'playwright-core'
+import { chromium, type Browser, type ConnectOverCDPTransport, type ElementHandle, type FileChooser, type Page } from 'playwright-core'
 import { DesktopBrowserError, type DesktopBrowserObservationReason, type DesktopBrowserRequest } from './desktop-browser.js'
 import { BrowserPointerController } from './browser-pointer-controller.js'
 import { planMouseTrajectory } from './browser-mouse-trajectory.js'
@@ -28,6 +28,9 @@ class RendererTransport implements ConnectOverCDPTransport {
   private readonly childSessions = new Set<string>()
   private readonly ownedAttachment: boolean
   private info: Record<string, unknown> = {}
+  private pressedMouse: MouseInput | undefined
+  private releasingMouse: Promise<void> | undefined
+  private closing: Promise<void> | undefined
 
   constructor(private readonly contents: WebContents) {
     this.ownedAttachment = !contents.debugger.isAttached()
@@ -150,7 +153,10 @@ class RendererTransport implements ConnectOverCDPTransport {
           mouseGuard?.()
         }
         if (this.closed) throw new Error('The mouse connection ended.')
+        if (point.type === 'mousePressed') this.pressedMouse = { ...point }
+        if (point.type === 'mouseMoved' && this.pressedMouse) this.pressedMouse = { ...this.pressedMouse, x: point.x, y: point.y }
         const result = await this.contents.debugger.sendCommand(method, point, this.nativeSessionId)
+        if (point.type === 'mouseReleased') this.pressedMouse = undefined
         // Display errors cannot change the receipt of accepted browser input.
         await observe?.(point).catch(() => {})
         return result
@@ -189,6 +195,19 @@ class RendererTransport implements ConnectOverCDPTransport {
     this.contents.emit('-cancel-dialogs')
   }
 
+  async releaseMouseButtons(): Promise<void> {
+    if (this.releasingMouse) return await this.releasingMouse
+    const pressed = this.pressedMouse
+    this.pressedMouse = undefined
+    if (!pressed || this.contents.isDestroyed() || !this.contents.debugger.isAttached()) return
+    // Cleanup may run after cancellation invalidates the ordinary action guard.
+    // It can only release input this transport already accepted.
+    this.releasingMouse = this.contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+      ...pressed, type: 'mouseReleased', buttons: 0, clickCount: 0,
+    }, this.nativeSessionId).then(() => {}, () => {})
+    try { await this.releasingMouse } finally { this.releasingMouse = undefined }
+  }
+
   close(): void {
     if (this.closed) return
     this.closed = true
@@ -199,14 +218,19 @@ class RendererTransport implements ConnectOverCDPTransport {
       for (const sessionId of this.childSessions) {
         void this.contents.debugger.sendCommand('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {})
       }
-      if (this.nativeSessionId) {
-        void this.contents.debugger.sendCommand('Target.detachFromTarget', { sessionId: this.nativeSessionId }).catch(() => {})
-      }
-      if (this.ownedAttachment) this.contents.debugger.detach()
+      this.closing = this.releaseMouseButtons().finally(async () => {
+        if (this.contents.isDestroyed() || !this.contents.debugger.isAttached()) return
+        if (this.nativeSessionId) {
+          await this.contents.debugger.sendCommand('Target.detachFromTarget', { sessionId: this.nativeSessionId }).catch(() => {})
+        }
+        if (this.ownedAttachment) this.contents.debugger.detach()
+      })
     }
     this.childSessions.clear()
     queueMicrotask(() => this.onclose?.('The attached renderer connection ended.'))
   }
+
+  async waitForClose(): Promise<void> { await this.closing }
 }
 
 type Anchor = { generation: number; element: ElementHandle<Element> }
@@ -218,6 +242,7 @@ export type BrowserDialogState = { id: string; type: string; message: string; de
 type VisualObservation = { observationId: string; imageId: string; documentEpoch: number; generation: number; viewport: ViewportState;
   capturedAt: number; imageWidth: number; imageHeight: number; dataBase64: string }
 type ActionResult = { action: DesktopBrowserRequest['action']; performed: boolean; execution?: Record<string, unknown>; browserState?: ReturnType<BrowserPlaywrightDriver['browserState']> }
+export type BrowserFileChooserState = { chooserId: string; multiple: boolean; documentEpoch: number }
 
 function staleObservation(reason: DesktopBrowserObservationReason, message: string): DesktopBrowserError {
   return new DesktopBrowserError('STALE_OBSERVATION', message, 409,
@@ -261,6 +286,7 @@ export class BrowserPlaywrightDriver {
   private readonly runningActions = new Set<Promise<unknown>>()
   private latestVisual: VisualObservation | undefined
   private resolvingDialog = false
+  private fileChooser: { state: BrowserFileChooserState; chooser: FileChooser } | undefined
   readonly pointer: BrowserPointerController
 
   constructor(private readonly contents: WebContents, private readonly pointerVisible: () => boolean = () => true,
@@ -273,6 +299,9 @@ export class BrowserPlaywrightDriver {
     if (this.page && !this.page.isClosed() && this.browser?.isConnected()) return this.page
     if (this.connecting) return await this.connecting
     this.connecting = (async () => {
+      // The previous transport may still be releasing a cancelled gesture.
+      // Finish its detach before assigning a new attachment to this renderer.
+      await this.transport?.waitForClose()
       const transport = new RendererTransport(this.contents)
       transport.onDialogOpening = (params, sessionId) => { this.dialogSessionId = sessionId; this.onDialog(params) }
       transport.onDialogClosed = sessionId => {
@@ -289,11 +318,19 @@ export class BrowserPlaywrightDriver {
         const page = pages[0]!
         page.setDefaultTimeout(ACTION_TIMEOUT_MS)
         this.page = page
-        page.on('framenavigated', frame => { if (frame === page.mainFrame()) this.documentEpoch++ })
-        browser.on('disconnected', () => { this.invalidate(); if (this.browser === browser) this.page = undefined })
+        page.on('framenavigated', frame => {
+          if (frame === page.mainFrame()) {
+            this.documentEpoch++
+            this.fileChooser = undefined
+            void transport.releaseMouseButtons()
+          }
+        })
+        browser.on('disconnected', () => {
+          if (this.browser === browser) { this.invalidate(); this.page = undefined; this.fileChooser = undefined }
+        })
         if (this.disposed) { await browser.close(); throw new Error('Browser driver was disposed during connection.') }
         return page
-      } catch (error) { transport.close(); throw error }
+      } catch (error) { transport.close(); await transport.waitForClose(); throw error }
       finally { this.connecting = undefined }
     })()
     return await this.connecting
@@ -309,7 +346,7 @@ export class BrowserPlaywrightDriver {
     // Playwright checks stable geometry across animation frames. A hidden
     // window can suspend those frames; keep only this operation's page awake.
     if (backgroundThrottling) this.contents.setBackgroundThrottling(false)
-    const abort = () => { this.transport?.close(); this.page = undefined; this.invalidate() }
+    const abort = () => { this.fileChooser = undefined; this.transport?.close(); this.page = undefined; this.invalidate() }
     signal.addEventListener('abort', abort, { once: true })
     try {
       const page = await this.connect()
@@ -324,6 +361,7 @@ export class BrowserPlaywrightDriver {
       throw new DesktopBrowserError('ACTION_UNAVAILABLE', error instanceof Error ? error.message.slice(0, 1000) : 'The browser action could not complete.')
     } finally {
       signal.removeEventListener('abort', abort)
+      if (signal.aborted) await this.transport?.waitForClose()
       if (this.transport?.guard === guard) this.transport.guard = () => {}
       if (backgroundThrottling && !this.contents.isDestroyed()) this.contents.setBackgroundThrottling(true)
     }
@@ -337,6 +375,13 @@ export class BrowserPlaywrightDriver {
   }
 
   get pendingDialog(): BrowserDialogState | undefined { return this.dialogState ? { ...this.dialogState } : undefined }
+  get pendingFileChooser(): BrowserFileChooserState | undefined { return this.fileChooser ? { ...this.fileChooser.state } : undefined }
+
+  private onFileChooser = (chooser: FileChooser): void => {
+    this.fileChooser = { chooser, state: { chooserId: `chooser-${randomUUID()}`,
+      multiple: chooser.isMultiple(), documentEpoch: this.documentEpoch } }
+    this.latestVisual = undefined
+  }
 
   async initialize(assertCurrent: Guard, signal: AbortSignal): Promise<void> {
     await this.run(assertCurrent, signal, async () => {})
@@ -354,7 +399,8 @@ export class BrowserPlaywrightDriver {
     })
   }
 
-  browserState() { return { capabilities: { jsPrompt: false }, dialogs: { pending: this.dialogState ? [{ ...this.dialogState }] : [] } } }
+  browserState() { return { capabilities: { jsPrompt: false }, dialogs: { pending: this.dialogState ? [{ ...this.dialogState }] : [] },
+    fileChoosers: { pending: this.fileChooser ? [{ ...this.fileChooser.state }] : [] } } }
 
   private onDialog(dialog: Record<string, unknown>): void {
     this.latestVisual = undefined
@@ -544,9 +590,16 @@ export class BrowserPlaywrightDriver {
             }
             const dialogs = Array.from(document.querySelectorAll('dialog:modal,[role="dialog"][aria-modal="true"],[role="alertdialog"]')).filter(visible)
             const root = dialogs.at(-1) ?? document
-            return Array.from(root.querySelectorAll(
-              'a,button,input,textarea,select,summary,[role],[contenteditable],h1,h2,h3,p,label',
-            )).slice(0, 2400).filter(visible).slice(0, limit)
+            // Readable blocks augment the observation without displacing a
+            // later control merely because a page contains many text nodes.
+            const controls = Array.from(root.querySelectorAll('a,button,input,textarea,select,summary,[role],[contenteditable],canvas'))
+              .slice(0, 2400).filter(visible)
+            const blocks = Array.from(root.querySelectorAll('h1,h2,h3,p,label,pre,blockquote,article,section'))
+              .slice(0, 2400).filter(visible)
+            const textNodes = Array.from(root.querySelectorAll('div,span')).slice(0, 2400).filter(node => visible(node)
+              && (Array.from(node.childNodes).some(child => child.nodeType === Node.TEXT_NODE && child.textContent?.trim())
+                || node.scrollWidth > node.clientWidth || node.scrollHeight > node.clientHeight))
+            return [...new Set([...controls, ...blocks, ...textNodes])].slice(0, limit)
           }, MAX_REFS - refs.length)
           for (const [key, handle] of await collection.getProperties()) {
             if (!/^\d+$/.test(key)) { await handle.dispose(); continue }
@@ -589,6 +642,12 @@ export class BrowserPlaywrightDriver {
                 : textarea?.value ?? select?.value
               return { tagName: node.localName, role: node.getAttribute('role') || implicitRole, name, disabled,
                 editable: Boolean(fillable) && !disabled && !readonly && !node.closest('[inert]'),
+                readable: node instanceof HTMLElement && !(input && ['password', 'hidden', 'file'].includes(input.type)),
+                ...((node.scrollHeight > node.clientHeight || node.scrollWidth > node.clientWidth) ? {
+                  scroll: { left: node.scrollLeft, top: node.scrollTop, width: node.scrollWidth, height: node.scrollHeight,
+                    clientWidth: node.clientWidth, clientHeight: node.clientHeight,
+                    overflowX: getComputedStyle(node).overflowX, overflowY: getComputedStyle(node).overflowY },
+                } : {}),
                 ...(type ? { type } : {}), ...(input || textarea ? { readonly } : {}),
                 ...(value !== undefined ? { value: value.slice(0, 1024) } : {}) }
             })
@@ -610,9 +669,117 @@ export class BrowserPlaywrightDriver {
     })
   }
 
+  private async requireAnchor(ref: string | undefined, generation: number): Promise<Anchor> {
+    const anchor = ref ? this.anchors.get(ref) : undefined
+    if (!anchor || anchor.generation !== generation
+      || !await anchor.element.evaluate(node => node.isConnected).catch(() => false)) {
+      throw new DesktopBrowserError('STALE_ELEMENT', 'The element reference expired. Request a new snapshot.', 409,
+        { outcome: 'not_started', retryable: false, recovery: 'observe' })
+    }
+    return anchor
+  }
+
+  async readText(request: DesktopBrowserRequest, generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<Record<string, unknown>> {
+    return await this.run(assertCurrent, signal, async () => {
+      const anchor = await this.requireAnchor(request.ref, generation)
+      const maxChars = request.maxChars ?? 16_384
+      if (!Number.isInteger(maxChars) || maxChars < 1 || maxChars > 65_536) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'maxChars must be an integer from 1 to 65536.', 400)
+      }
+      const result = await anchor.element.evaluate((node, limit) => {
+        if (!(node instanceof HTMLElement) || !node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) return { blocked: 'hidden' }
+        if (node instanceof HTMLInputElement && ['password', 'hidden', 'file'].includes(node.type)) return { blocked: 'protected' }
+        const value = node instanceof HTMLInputElement || node instanceof HTMLTextAreaElement || node instanceof HTMLSelectElement
+          ? node.value : undefined
+        if (value === undefined) {
+          const descendants = node.ownerDocument.createTreeWalker(node, NodeFilter.SHOW_ELEMENT)
+          let count = 0
+          for (let child = descendants.nextNode() as Element | null; child; child = descendants.nextNode() as Element | null) {
+            if (++count > 4096) return { blocked: 'too_large' }
+            // innerText excludes display/visibility-hidden text but includes
+            // transparent descendants. Refuse those blocks without rebuilding
+            // their whitespace or modifying the page to measure it.
+            if (getComputedStyle(child).opacity === '0' && child.getClientRects().length > 0
+              && (child instanceof HTMLElement ? child.innerText : child.textContent)?.trim()) return { blocked: 'transparent' }
+          }
+        }
+        const fullText = value ?? node.innerText
+        // Do not cut a UTF-16 surrogate pair at the response boundary.
+        const end = limit < fullText.length && /[\uD800-\uDBFF]/.test(fullText[limit - 1] ?? '') ? limit - 1 : limit
+        const text = fullText.slice(0, end)
+        return { text, ...(value === undefined ? {} : { value: text }), sourceLength: fullText.length,
+          truncated: text.length < fullText.length, textSource: value === undefined ? 'innerText' : 'value' }
+      }, maxChars)
+      if (result.blocked) throw new DesktopBrowserError('TEXT_UNAVAILABLE',
+        result.blocked === 'hidden' ? 'This element is no longer visible. Observe the page again.'
+          : result.blocked === 'transparent' ? 'This block contains transparent text. Select a visible child element.'
+            : result.blocked === 'too_large' ? 'This block has too many descendants. Select a smaller visible text element.'
+              : 'This control does not expose readable text.',
+        409, { outcome: 'not_started', retryable: false, recovery: 'observe' })
+      return { ref: request.ref, ...result, browserState: this.browserState() }
+    })
+  }
+
+  async uploadFile(request: DesktopBrowserRequest, generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<ActionResult & Record<string, unknown>> {
+    return await this.run(assertCurrent, signal, async () => {
+      const file = request.uploadFile
+      if (!file || !file.fileId || !file.name || /[/\\\u0000-\u001f]/.test(file.name) || typeof file.dataBase64 !== 'string'
+        || file.dataBase64.length > 12 * 1024 * 1024) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'Upload requires a trusted bounded file payload.', 400)
+      }
+      let element: ElementHandle<Element>
+      const pending = this.fileChooser
+      if (request.chooserId) {
+        if (!pending || pending.state.chooserId !== request.chooserId || pending.state.documentEpoch !== this.documentEpoch) {
+          throw new DesktopBrowserError('STALE_FILE_CHOOSER', 'The file chooser changed. Observe the page again.', 409,
+            { outcome: 'not_started', retryable: false, recovery: 'observe' })
+        }
+        element = pending.chooser.element() as ElementHandle<Element>
+      } else {
+        if (pending) throw new DesktopBrowserError('FILE_CHOOSER_PENDING', 'Complete or cancel the pending file chooser before selecting another input.')
+        element = (await this.requireAnchor(request.ref, generation)).element
+      }
+      const isFileInput = await element.evaluate(node => node.isConnected && node instanceof HTMLInputElement && node.type === 'file').catch(() => false)
+      if (!isFileInput) {
+        if (pending && this.fileChooser === pending) this.fileChooser = undefined
+        throw new DesktopBrowserError(request.chooserId ? 'STALE_FILE_CHOOSER' : 'INVALID_REQUEST',
+          'Upload requires an observed file input or a current file chooser.', 409,
+          { outcome: 'not_started', retryable: false, recovery: 'observe' })
+      }
+      const buffer = Buffer.from(file.dataBase64, 'base64')
+      if (buffer.length > 8 * 1024 * 1024 || buffer.toString('base64') !== file.dataBase64
+        || request.fileId && file.fileId !== request.fileId) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'Upload payload must match its file handle and contain at most 8 MiB.', 400)
+      }
+      await element.setInputFiles({ name: file.name, mimeType: file.mimeType, buffer }, { timeout: ACTION_TIMEOUT_MS })
+      if (this.fileChooser === pending) this.fileChooser = undefined
+      this.latestVisual = undefined
+      return { action: request.action, performed: true, uploaded: { fileId: file.fileId, name: file.name,
+        mimeType: file.mimeType, byteLength: buffer.length }, browserState: this.browserState() }
+    })
+  }
+
+  async cancelFileChooser(request: DesktopBrowserRequest, _generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<ActionResult & Record<string, unknown>> {
+    return await this.run(assertCurrent, signal, async () => {
+      const pending = this.fileChooser
+      if (!pending || pending.state.chooserId !== request.chooserId || pending.state.documentEpoch !== this.documentEpoch) {
+        throw new DesktopBrowserError('STALE_FILE_CHOOSER', 'The file chooser changed. Observe the page again.', 409,
+          { outcome: 'not_started', retryable: false, recovery: 'observe' })
+      }
+      // Interception already suppressed the native picker. Forget its handle
+      // without clearing an existing selection or synthesizing page events.
+      this.fileChooser = undefined
+      return { action: request.action, performed: true, cancelledChooserId: pending.state.chooserId, browserState: this.browserState() }
+    })
+  }
+
   async act(request: DesktopBrowserRequest, generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<ActionResult> {
     assertCurrent()
     if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The browser action was cancelled.')
+    if (request.action === 'upload') return await this.uploadFile(request, generation, assertCurrent, signal)
+    if (request.action === 'cancelUpload') return await this.cancelFileChooser(request, generation, assertCurrent, signal)
+    if (this.fileChooser) throw new DesktopBrowserError('FILE_CHOOSER_PENDING', 'Complete or cancel the pending file chooser before another action.',
+      409, { outcome: 'not_started', retryable: false, recovery: 'resolve_file_chooser' })
     const blockedResult = (): ActionResult => ({ action: request.action, performed: false,
       execution: { state: 'blocked', outcome: 'unknown', retryable: false, blockerId: this.dialogState?.id }, browserState: this.browserState() })
     if (this.dialogState) return blockedResult()
@@ -658,15 +825,22 @@ export class BrowserPlaywrightDriver {
           this.latestVisual = undefined
           throw staleObservation(viewportReason, 'The viewport or scroll position changed. Request a new observation.')
         }
-        if (!['click', 'hover', 'scroll'].includes(request.action ?? '') || request.ref
+        if (!['click', 'hover', 'scroll', 'hold', 'drag'].includes(request.action ?? '') || request.ref
           || !Number.isFinite(request.x) || !Number.isFinite(request.y)
           || request.x! < 0 || request.y! < 0 || request.x! >= observation.imageWidth || request.y! >= observation.imageHeight) {
           throw new DesktopBrowserError('INVALID_REQUEST', 'Coordinates must identify a point within the referenced screenshot.')
         }
-        const x = Math.max(0, Math.floor(request.x!) - 24), y = Math.max(0, Math.floor(request.y!) - 24)
-        const crop = { x, y, width: Math.min(49, observation.imageWidth - x), height: Math.min(49, observation.imageHeight - y) }
+        if (request.action === 'drag' && (!Number.isFinite(request.toX) || !Number.isFinite(request.toY)
+          || request.toX! < 0 || request.toY! < 0 || request.toX! >= observation.imageWidth || request.toY! >= observation.imageHeight)) {
+          throw new DesktopBrowserError('INVALID_REQUEST', 'Drag requires an endpoint within the referenced screenshot.', 400)
+        }
+        const points = [{ x: request.x!, y: request.y! }, ...(request.action === 'drag' ? [{ x: request.toX!, y: request.toY! }] : [])]
+        const crops = points.map(point => {
+          const x = Math.max(0, Math.floor(point.x) - 24), y = Math.max(0, Math.floor(point.y) - 24)
+          return { x, y, width: Math.min(49, observation.imageWidth - x), height: Math.min(49, observation.imageHeight - y) }
+        })
         const original = nativeImage.createFromBuffer(Buffer.from(observation.dataBase64, 'base64'))
-        const originalPixels = original.crop(crop).toBitmap()
+        const originalPixels = crops.map(crop => original.crop(crop).toBitmap())
         commitGuard = async () => {
           try {
             assertCurrent()
@@ -688,7 +862,7 @@ export class BrowserPlaywrightDriver {
               }
               if (!changed) {
                 const current = nativeImage.createFromBuffer(Buffer.from(fresh.dataBase64, 'base64'))
-                if (!originalPixels.equals(current.crop(crop).toBitmap())) changed = 'target_pixels_changed'
+                if (crops.some((crop, index) => !originalPixels[index]!.equals(current.crop(crop).toBitmap()))) changed = 'target_pixels_changed'
               }
               // Time and past unrelated DOM updates do not invalidate matching
               // target pixels, but each capture must be stable before input.
@@ -705,12 +879,17 @@ export class BrowserPlaywrightDriver {
         }
         await commitGuard()
         request = { ...request, x: request.x! * viewport.width / observation.imageWidth,
-          y: request.y! * viewport.height / observation.imageHeight }
+          y: request.y! * viewport.height / observation.imageHeight,
+          ...(request.action === 'drag' ? { toX: request.toX! * viewport.width / observation.imageWidth,
+            toY: request.toY! * viewport.height / observation.imageHeight } : {}) }
       }
-      const anchor = request.ref ? this.anchors.get(request.ref) : undefined
-      if (request.ref && (!anchor || anchor.generation !== generation
-        || !await anchor.element.evaluate(node => node.isConnected).catch(() => false))) {
-        throw new DesktopBrowserError('STALE_ELEMENT', 'The element reference expired. Request a new snapshot.')
+      const anchor = request.ref ? await this.requireAnchor(request.ref, generation) : undefined
+      const endAnchor = request.endRef ? await this.requireAnchor(request.endRef, generation) : undefined
+      if (request.action === 'hold' && (!Number.isInteger(request.durationMs) || request.durationMs! < 1 || request.durationMs! > 10_000)) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'Hold durationMs must be an integer from 1 to 10000.', 400)
+      }
+      if (request.action === 'drag' && !coordinate && (!anchor || !endAnchor)) {
+        throw new DesktopBrowserError('INVALID_REQUEST', 'DOM drag requires both ref and endRef.', 400)
       }
       const options = { timeout: ACTION_TIMEOUT_MS }
       this.latestVisual = undefined
@@ -719,7 +898,7 @@ export class BrowserPlaywrightDriver {
       const animateMouse = this.isSurfaceVisible()
       const moveSteps = 1
       if (animateMouse && this.mousePositionPage !== page
-        && ['click', 'hover', 'scroll'].includes(request.action ?? '')) {
+        && ['click', 'hover', 'scroll', 'hold', 'drag'].includes(request.action ?? '')) {
         const position = this.pointer.currentPosition()
         if (position) await page.mouse.move(position.x, position.y, { steps: 1 })
         this.mousePositionPage = page
@@ -760,9 +939,11 @@ export class BrowserPlaywrightDriver {
         } finally { motionTime += performance.now() - start }
       }
       let pressedPoint: { x: number; y: number } | undefined
+      let acceptedInput = false
       const observer = async (params: Record<string, unknown>) => {
         if (documentEpoch !== this.documentEpoch) return
         if (typeof params.x !== 'number' || typeof params.y !== 'number') return
+        if (params.type === 'mousePressed' || params.type === 'mouseWheel') acceptedInput = true
         this.mousePositionPage = page
         if (params.type === 'mousePressed') pressedPoint = { x: params.x, y: params.y }
         if (params.type === 'mouseReleased') pressedPoint = undefined
@@ -776,6 +957,10 @@ export class BrowserPlaywrightDriver {
       transport.mouseGuard = motionGuard
       transport.mouseCommitGuard = commitGuard
       if (animateMouse) transport.mouseMotion = motion
+      let scroll: Record<string, unknown> | undefined
+      // Intercept the picker only while an agent action is running. An idle
+      // controlled tab must retain its ordinary native picker for the user.
+      page.on('filechooser', this.onFileChooser)
       try {
         switch (request.action) {
           // Element clicks use Playwright Mouse internally, retaining its
@@ -783,8 +968,26 @@ export class BrowserPlaywrightDriver {
           // A nonzero delay makes Playwright await movement before pressing.
           // Hidden clicks retain its concurrent input path to wake the renderer.
           case 'click':
-            if (coordinate) await page.mouse.click(request.x!, request.y!, { delay: 1 })
-            else await anchor!.element.click({ ...options, ...(animateMouse ? { delay: 1 } : {}) })
+            if (coordinate) await page.mouse.click(request.x!, request.y!, { delay: 1, button: request.button ?? 'left' })
+            else await anchor!.element.click({ ...options, button: request.button ?? 'left', ...(animateMouse ? { delay: 1 } : {}) })
+            break
+          case 'hold':
+            if (coordinate) await page.mouse.click(request.x!, request.y!, { delay: request.durationMs!, button: request.button ?? 'left' })
+            else await anchor!.element.click({ timeout: ACTION_TIMEOUT_MS + request.durationMs!,
+              delay: request.durationMs!, button: request.button ?? 'left' })
+            break
+          case 'drag':
+            if (coordinate) await page.mouse.move(request.x!, request.y!, { steps: moveSteps })
+            else {
+              // Check both targets before pressing, then re-check the start at
+              // its current position. Hover retains Playwright's hit checks.
+              await endAnchor!.element.hover(options)
+              await anchor!.element.hover(options)
+            }
+            await page.mouse.down({ button: request.button ?? 'left' })
+            if (coordinate) await page.mouse.move(request.toX!, request.toY!, { steps: 16 })
+            else await endAnchor!.element.hover(options)
+            await page.mouse.up({ button: request.button ?? 'left' })
             break
           case 'hover':
             if (coordinate) { await page.mouse.move(request.x!, request.y!, { steps: moveSteps }); break }
@@ -809,11 +1012,18 @@ export class BrowserPlaywrightDriver {
               await page.mouse.move(center.x, center.y, { steps: moveSteps })
             }
             const amount = request.amount ?? 600
+            const position = this.pointer.currentPosition()
+            const before = await this.scrollContainers(page, anchor?.element, position)
             await page.mouse.wheel(request.direction === 'left' ? -amount : request.direction === 'right' ? amount : 0,
               request.direction === 'up' ? -amount : request.direction === 'down' ? amount : 0)
             // Hidden views acknowledge a wheel before painting its scroll.
             // Request a frame without showing or focusing the retained page.
             if (!this.isSurfaceVisible()) await this.wakeHiddenFrame()
+            await Promise.race([page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))),
+              new Promise<void>(resolve => setTimeout(resolve, 200))]).catch(() => {})
+            const after = await this.scrollContainers(page, anchor?.element, position).catch(() => [])
+            scroll = { before, after, changed: before.some((entry, index) => after[index]
+              && (entry.left !== after[index]!.left || entry.top !== after[index]!.top)) }
             break
           }
           default: throw new DesktopBrowserError('INVALID_REQUEST', 'Unsupported browser action.', 400)
@@ -827,11 +1037,22 @@ export class BrowserPlaywrightDriver {
             if (point) await this.pointer.update({ ...point, action: request.action ?? 'press' })
           } catch {}
         }
-        return { action: request.action, performed: true }
+        return { action: request.action, performed: true,
+          ...(scroll ? { execution: { scroll } } : {}), browserState: this.browserState() }
       } catch (error) {
         if (commitFailure) throw commitFailure
+        if (!(error instanceof DesktopBrowserError)) {
+          const message = error instanceof Error ? error.message : String(error)
+          const diagnostic = /intercepts pointer events|outside of the viewport|not visible/.test(message) ? 'element_obscured'
+            : /not attached|detached/.test(message) ? 'element_detached' : undefined
+          if (diagnostic) throw new DesktopBrowserError('ACTION_UNAVAILABLE', `${message.slice(0, 800)} Observe the page and choose a current visible target.`, 409,
+            { outcome: acceptedInput || ['fill', 'select', 'press'].includes(request.action ?? '') ? 'unknown' : 'not_started',
+              diagnostic, retryable: false, recovery: 'observe' })
+        }
         throw error
       } finally {
+        page.off('filechooser', this.onFileChooser)
+        await transport.releaseMouseButtons()
         if (transport.onMouseInput === observer) transport.onMouseInput = undefined
         if (transport.mouseMotion === motion) transport.mouseMotion = undefined
         if (transport.mouseGuard === motionGuard) transport.mouseGuard = undefined
@@ -850,6 +1071,24 @@ export class BrowserPlaywrightDriver {
     if (owner.webContents === this.contents) return true
     return owner.contentView.children.some(view => view instanceof WebContentsView
       && view.webContents === this.contents && view.getVisible())
+  }
+
+  private async scrollContainers(page: Page, element?: ElementHandle<Element>, point?: { x: number; y: number } | null): Promise<{
+    tagName: string; left: number; top: number; width: number; height: number; clientWidth: number; clientHeight: number
+  }[]> {
+    const read = (node: Element | null) => {
+      const doc = node?.ownerDocument ?? document
+      const containers: Element[] = []
+      for (let current = node; current && containers.length < 8; current = current.parentElement) {
+        if (current.scrollWidth > current.clientWidth || current.scrollHeight > current.clientHeight) containers.push(current)
+      }
+      if (doc.scrollingElement && !containers.includes(doc.scrollingElement)) containers.push(doc.scrollingElement)
+      return containers.map(current => ({ tagName: current.localName, left: current.scrollLeft, top: current.scrollTop,
+        width: current.scrollWidth, height: current.scrollHeight, clientWidth: current.clientWidth, clientHeight: current.clientHeight }))
+    }
+    if (element) return await element.evaluate(read)
+    const target = await page.evaluateHandle(position => document.elementFromPoint(position?.x ?? innerWidth / 2, position?.y ?? innerHeight / 2), point)
+    try { return await target.evaluate(read) } finally { await target.dispose() }
   }
 
   private async wakeHiddenFrame(): Promise<void> {
@@ -892,10 +1131,13 @@ export class BrowserPlaywrightDriver {
 
   async dispose(): Promise<void> {
     this.disposed = true
+    this.fileChooser = undefined
+    await this.transport?.releaseMouseButtons()
     await this.pointer.dispose()
     this.invalidate()
     this.transport?.close()
     await this.browser?.close().catch(() => {})
+    await this.transport?.waitForClose()
     this.page = undefined
   }
 }

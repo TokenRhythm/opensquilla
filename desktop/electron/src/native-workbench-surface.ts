@@ -53,6 +53,7 @@ import {
 import { DesktopBrowserError, type DesktopBrowserOperation, type DesktopBrowserRequest } from './desktop-browser.js'
 import { BrowserPlaywrightDriver } from './browser-playwright.js'
 import { BrowserPointerController } from './browser-pointer-controller.js'
+import { BrowserManagedDownloads } from './browser-managed-downloads.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
 
 function artifactHtmlCsp(allowRemoteResources: boolean): string {
@@ -119,6 +120,7 @@ interface NativeWorkbenchSurfaceRecord {
   /** A browser-opened page keeps its initial hidden viewport until UI adoption. */
   browserOpenedHidden: boolean
   openerTargetRef?: string
+  contextTargetRef?: string
   popupAnnounced?: boolean
   browserNavigationPromise?: Promise<void>
   browserNavigationGeneration: number
@@ -782,6 +784,7 @@ export class NativeWorkbenchSurfaceManager {
   private readonly unresponsiveWindows = new WeakSet<BrowserWindow>()
   private activeSurfaceId: string | null = null
   private readonly browserAutomationStates = new Map<string, { taskId: string; active: boolean }>()
+  private readonly browserDownloads = new BrowserManagedDownloads()
 
   constructor(private readonly options: NativeWorkbenchSurfaceManagerOptions) {}
 
@@ -812,6 +815,7 @@ export class NativeWorkbenchSurfaceManager {
     request: NativeWorkbenchCreateRequest,
     prepareBrowser = false,
     signal?: AbortSignal,
+    context?: { sessionKey: string; targetRef: string },
   ): Promise<NativeWorkbenchSurfaceResult> {
     const pending = this.surfaces.get(request.surfaceId)
     if (pending) {
@@ -824,7 +828,7 @@ export class NativeWorkbenchSurfaceManager {
     }
     return await this.queueSurfaceOperation(
       request.surfaceId,
-      () => this.createSurfaceNow(request, prepareBrowser, signal),
+      () => this.createSurfaceNow(request, prepareBrowser, signal, context),
     )
   }
 
@@ -944,6 +948,7 @@ export class NativeWorkbenchSurfaceManager {
     request: NativeWorkbenchCreateRequest,
     prepareBrowser = false,
     signal?: AbortSignal,
+    context?: { sessionKey: string; targetRef: string },
   ): Promise<NativeWorkbenchSurfaceResult> {
     const previous = this.surfaces.get(request.surfaceId)
     if (previous) await this.destroyRecord(previous)
@@ -958,8 +963,16 @@ export class NativeWorkbenchSurfaceManager {
       return { ok: false, message: 'The OpenSquilla window is unavailable.' }
     }
 
+    // Resolve inside the creation queue so a closed/replaced source cannot lend
+    // its Session to a later request. Only URL tabs owned by this task may share.
+    const source = context ? this.browserRecord(context.sessionKey, context.targetRef) : undefined
+    if (source && (source.kind !== 'url-preview' || source.mode !== 'full'
+      || request.kind !== 'url-preview' || request.payload.scopeId !== source.scopeId)) {
+      throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser context is not owned by this session.', 404)
+    }
     this.hookWindow(owner)
-    const record = this.allocateSurface(request, owner)
+    const record = this.allocateSurface(request, owner, source?.previewSession)
+    if (source) record.contextTargetRef = source.targetRef
     let interruptedNavigation: DesktopBrowserError | undefined
 
     try {
@@ -969,7 +982,7 @@ export class NativeWorkbenchSurfaceManager {
           request.payload.data,
           request.payload.allowRemoteResources,
         )
-      } else {
+      } else if (!source) {
         await this.configureV2Session(record)
       }
       if (request.version !== NATIVE_WORKBENCH_PROTOCOL_VERSION) {
@@ -1706,6 +1719,7 @@ export class NativeWorkbenchSurfaceManager {
           : record.browserDocumentReady ? 'ready' : 'loading',
       ...(record.browserNavigationError ? { navigationError: record.browserNavigationError } : {}),
       ...(record.openerTargetRef ? { openerTargetRef: record.openerTargetRef } : {}),
+      ...(record.contextTargetRef ? { contextTargetRef: record.contextTargetRef } : {}),
     }
   }
 
@@ -1777,6 +1791,8 @@ export class NativeWorkbenchSurfaceManager {
         origin: pending.origin, requiresUser: true,
       })),
       ...(record.pendingAuthentication ? [{ kind: 'authentication', requiresUser: true }] : []),
+      ...(record.playwright?.pendingFileChooser ? [{ kind: 'file_chooser', requiresUser: false,
+        ...record.playwright.pendingFileChooser }] : []),
     ]
   }
 
@@ -1821,6 +1837,11 @@ export class NativeWorkbenchSurfaceManager {
     if (record.kind !== 'url-preview') {
       throw new DesktopBrowserError('TARGET_NOT_FOUND', 'This MCP tool controls built-in URL pages only.', 404)
     }
+    if (request.operation === 'snapshot' && request.downloadId) {
+      return this.browserResult(record, { download: await this.browserDownloads.inspect({
+        sessionKey: record.scopeId, targetRef: record.targetRef, webContentsId: record.view.webContents.id,
+      }, request.downloadId, request.maxChars) })
+    }
     const assertCurrent = () => {
       check()
       if (this.browserRecord(request.sessionKey, request.targetRef) !== record) {
@@ -1844,9 +1865,13 @@ export class NativeWorkbenchSurfaceManager {
         return this.browserResult(record, { execution: { state: 'blocked', reason: 'dialog' },
           ...await record.playwright.observe(record.annotationDocumentGeneration, assertCurrent, signal, request.observationMode) })
       }
-      const hostBlockers = this.browserHostBlockers(record)
+      const canHandleChooser = ['observe', 'snapshot', 'screenshot', 'tab'].includes(request.operation)
+        || request.operation === 'act' && ['upload', 'cancelUpload'].includes(request.action ?? '')
+      const hostBlockers = this.browserHostBlockers(record).filter(blocker =>
+        blocker.kind !== 'file_chooser' || !canHandleChooser)
       if (hostBlockers.length) {
-        return this.browserResult(record, { execution: { state: 'blocked', reason: 'requires_user' },
+        return this.browserResult(record, { execution: { state: 'blocked', reason:
+          hostBlockers.some(blocker => blocker.requiresUser) ? 'requires_user' : 'file_chooser' },
           observation: { consistency: 'blocked', hostBlockers, imageStatus: 'unavailable' } })
       }
       return undefined
@@ -1949,11 +1974,36 @@ export class NativeWorkbenchSurfaceManager {
         } else if (request.operation === 'batch') {
           result = await page.batch(request, generation, assertCurrent, signal)
         } else if (request.operation === 'snapshot') {
-          result = await page.snapshot(generation, assertCurrent, signal)
+          result = request.ref ? await page.readText(request, generation, assertCurrent, signal)
+            : await page.snapshot(generation, assertCurrent, signal)
         } else if (request.operation === 'screenshot') {
           result = await page.screenshot(assertCurrent, signal)
         } else {
-          result = await page.act(request, generation, assertCurrent, signal)
+          if (request.action === 'upload') {
+            result = await page.uploadFile(request, generation, assertCurrent, signal)
+          } else if (request.action === 'cancelUpload') {
+            result = await page.cancelFileChooser(request, generation, assertCurrent, signal)
+          } else if (request.action === 'download') {
+            const download = await this.browserDownloads.arm({ sessionKey: record.scopeId,
+              targetRef: record.targetRef, webContentsId: record.view.webContents.id }, signal)
+            try {
+              assertCurrent()
+              const clicked = await page.act({ ...request, action: 'click' }, generation, assertCurrent, signal)
+              if (clicked.execution?.state === 'blocked') {
+                // Do not keep an armed capture across a dialog decision. A
+                // later accepted download follows the ordinary native save
+                // flow; the agent must not infer a completed artifact here.
+                download.cancel()
+                result = { ...clicked, action: 'download', download: { state: 'not_captured',
+                  managedCapture: false, reason: 'dialog_blocked',
+                  message: 'The dialog interrupted download capture. Resolve it according to the task; accepting may use the native save dialog. No managed artifact was created.' } }
+              } else {
+                result = { ...clicked, action: 'download', download: await download.completed }
+              }
+            } finally { download.cancel() }
+          } else {
+            result = await page.act(request, generation, assertCurrent, signal)
+          }
           if (request.observationMode) {
             try {
               result = { ...result, ...await page.observe(record.annotationDocumentGeneration,
@@ -1985,7 +2035,8 @@ export class NativeWorkbenchSurfaceManager {
       if (this.isPrivilegedGatewayTarget(url)) throw new DesktopBrowserError('NAVIGATION_BLOCKED', 'This URL is unavailable inside isolated previews.')
       const surfaceId = `browser-${randomUUID()}`
       const result = await this.createSurface({ version: NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
-        surfaceId, kind: 'url-preview', payload: { url, scopeId: request.sessionKey } }, true, signal)
+        surfaceId, kind: 'url-preview', payload: { url, scopeId: request.sessionKey } }, true, signal,
+        request.contextTargetRef ? { sessionKey: request.sessionKey, targetRef: request.contextTargetRef } : undefined)
       if (!result.ok) throw new DesktopBrowserError('OPEN_FAILED', result.message || 'The browser page could not open.')
       const record = this.surfaces.get(surfaceId)
       if (!record) throw new DesktopBrowserError('TARGET_NOT_FOUND', 'The browser page was closed.', 404)
@@ -3386,6 +3437,8 @@ export class NativeWorkbenchSurfaceManager {
   private async cleanupDisposedRecord(
     record: NativeWorkbenchSurfaceRecord,
   ): Promise<void> {
+    await this.browserDownloads.disposePage({ sessionKey: record.scopeId,
+      targetRef: record.targetRef, webContentsId: record.view.webContents.id })
     if (record.kind === 'artifact-html') {
       try {
         await record.previewSession.protocol.unhandle(NATIVE_WORKBENCH_ARTIFACT_SCHEME)
@@ -3658,6 +3711,8 @@ export class NativeWorkbenchSurfaceManager {
         })
         return
       }
+      if (this.browserDownloads.capture({ sessionKey: record.scopeId,
+        targetRef: record.targetRef, webContentsId: record.view.webContents.id }, item)) return
       // Leaving the save path unset makes Electron show its native confirmation
       // dialog. Supplying options here makes that contract explicit.
       item.setSaveDialogOptions({ title: 'Save preview download' })

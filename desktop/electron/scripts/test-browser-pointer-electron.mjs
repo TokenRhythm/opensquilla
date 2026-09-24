@@ -370,7 +370,20 @@ try {
   const taskEnd = await app.evaluate(async ({}, origin) => {
     const f = globalThis.pointerFixture
     await f.inspect()
-    await f.act('click', 'Near button')
+    await f.read(`window.taskEndClicks=[];document.addEventListener('click',event=>window.taskEndClicks.push({
+      target:event.target.id,x:event.clientX,y:event.clientY,trusted:event.isTrusted}),true)`)
+    const send = f.view.webContents.debugger.sendCommand.bind(f.view.webContents.debugger)
+    let acceptedRelease
+    f.view.webContents.debugger.sendCommand = async (method, params, sessionId) => {
+      const result = await send(method, params, sessionId)
+      if (method === 'Input.dispatchMouseEvent' && params.type === 'mouseReleased') {
+        acceptedRelease = { x: params.x, y: params.y }
+      }
+      return result
+    }
+    try { await f.act('click', 'Near button') }
+    finally { f.view.webContents.debugger.sendCommand = send }
+    const clicks = await f.read('window.taskEndClicks')
     const inactive = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
     await f.driver.pointer.setTask('synthetic-next-turn')
     await f.driver.pointer.touch()
@@ -392,12 +405,18 @@ try {
     const reconnected = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
     await f.driver.pointer.setTask('synthetic-untouched-turn')
     const untouchedTurn = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
-    return { inactive, activeAgain, activeAfterNavigation, stoppedDuringCapture, reconnected, untouchedTurn }
+    return { inactive, activeAgain, activeAfterNavigation, stoppedDuringCapture, reconnected, untouchedTurn,
+      acceptedRelease, clicks }
   }, origin)
   assert.equal(taskEnd.inactive, false, 'a completed task must not regain a cursor from late actions')
   assert.equal(taskEnd.activeAgain, true, 'a new task must be able to start a fresh cursor')
   assert.equal(taskEnd.activeAfterNavigation.present, true, 'the task cursor must return on its next document')
-  assert.equal(taskEnd.activeAfterNavigation.transform, 'translate3d(68px, 38px, 0px)',
+  assert.equal(taskEnd.clicks.length, 1)
+  assert.equal(taskEnd.clicks[0].target, 'near')
+  assert.equal(taskEnd.clicks[0].trusted, true)
+  assert.deepEqual(taskEnd.acceptedRelease, { x: taskEnd.clicks[0].x, y: taskEnd.clicks[0].y })
+  assert.equal(taskEnd.activeAfterNavigation.transform,
+    `translate3d(${taskEnd.acceptedRelease.x - 2}px, ${taskEnd.acceptedRelease.y - 2}px, 0px)`,
     'navigation must retain the actual viewport mouse position during the active task')
   assert.equal(taskEnd.activeAfterNavigation.animations, 0, 'navigation must not replay the previous click')
   assert.equal(taskEnd.stoppedDuringCapture, false, 'capture cleanup must not revive a finished task')

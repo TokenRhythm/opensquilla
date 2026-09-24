@@ -405,6 +405,11 @@ try {
   }
 
   let observed = await observe(first.targetRef)
+  // Restoring native bounds can resize the renderer during its first snapshot.
+  // The protocol deliberately withholds refs for that observation; obtain a
+  // current one before testing dialog input instead of assuming a synchronous resize.
+  if (observed.consistency === 'changed') observed = await observe(first.targetRef)
+  assert.equal(observed.consistency, 'consistent')
   const confirmArgs = { targetRef: first.targetRef, actions: [{ action: 'click', ref: actionRef(observed, 'Confirm step') }] }
   const confirmStarted = Date.now()
   const blocked = success(await call('browser_batch', confirmArgs, { mode: 'dom', operationId: 'confirm-once' }))

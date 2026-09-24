@@ -38,7 +38,7 @@ try {
     <button aria-label="Accessible caption">Visible caption</button>
   </body>`)
   const driver = new Driver({}, () => false, {})
-  driver.transport = {}
+  driver.transport = { releaseMouseButtons: async () => {} }
   driver.run = async (guard, signal, work) => {
     guard()
     signal.throwIfAborted()

@@ -68,6 +68,48 @@ client reports `jsPrompt: false`: it supports native alert/confirm handling, but
 cannot supply the browser's native `window.prompt()` UI. This limit does not
 apply to input dialogs built from normal page elements.
 
+The schemas of existing tools can also gain optional fields. Read the advertised
+schema before using the following features; older clients retain their existing
+operations and may not support these fields:
+
+- `browser_open(contextTargetRef=...)` opens another page in that owned page's
+  browser context, sharing cookies and storage. Use it when pages need to share
+  login state or communicate. Without it, the new page has an independent context.
+- `browser_inspect(ref=..., maxChars=...)` reads that element's exact visible text
+  and input value. Ordinary page observations are summaries: do not use them as
+  an exact copy when whitespace, blank lines, or Unicode characters matter. Check
+  `truncated` before copying and read the destination value afterward to verify.
+- `browser_act` supports `button="right"` or `"middle"` for a click,
+  `action="hold"` with `durationMs`, and `action="drag"` with `endRef`.
+  A hold or drag is one complete action, including release; repeated clicks do
+  not implement either gesture. Coordinate batches may expose `toX`/`toY` for
+  the drag destination in the same observed image.
+
+## Files and page context
+
+When advertised, `browser_act(action="upload", fileId=..., ref=...)` chooses a
+user attachment through a current file input or upload control. Use only an
+opaque `fileId` from `availableUploads`, never a local path or generated file
+name. The Gateway resolves the retained attachment in this conversation; each
+file must be at most 8 MiB. If no suitable attachment is available, explain the
+missing input. An attachment name is display text, not filesystem authority.
+
+If a pending file chooser is returned, pass its `chooserId` instead of a `ref`.
+Use `action="cancelUpload"` and that exact `chooserId` to cancel it. Do not keep
+clicking the page underneath a chooser or claim a chooser did not open merely
+because it is absent from the page screenshot.
+
+For a download control, use `browser_act(action="download", ref=...)`. Inspect
+its returned state before continuing; a completed download has a `downloadId`.
+Use `browser_inspect(downloadId=..., maxChars=...)` to read supported text from
+that task-owned download. A pending, failed, oversized, or binary download is
+not readable text. Do not infer its content from the filename or obtain it by
+guessing an internal path. File actions run individually, not inside a batch.
+If a download returns a dialog blocker and `managedCapture: false`, its capture
+has ended. Handle the dialog according to the task, but do not claim a managed
+artifact exists: accepting can open the native save dialog. A file chooser that
+opens after the automated action returns can likewise require native interaction.
+
 ## Required workflow
 
 1. Call `browser_tabs` first when a page may already be open.
@@ -89,6 +131,14 @@ apply to input dialogs built from normal page elements.
    visible errors instead of repeating the same action or blind wait.
 7. Verify the requested outcome from the final page state. Report an unknown
    outcome instead of repeating a submission blindly.
+
+For hover menus, hover the current parent, inspect the expanded menu, and use
+the fresh child reference. A detached or covered target requires another
+observation, not a loop of the same click. For a scrollable region, use its
+reference when available and verify the region's content changed: the root
+viewport scroll position alone does not describe every nested scroll container.
+Use the exact key spelling exposed by the tool (for example `ArrowRight`, not
+`Right`). Read parameter errors and correct them before trying another action.
 
 Navigation errors can return a retained `targetRef` even when the tool reports
 failure. Check that target's `pageState` and `navigationError` before opening
