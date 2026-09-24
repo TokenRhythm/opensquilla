@@ -8,7 +8,6 @@ export const DESKTOP_RENDERER_ENTRY = 'desktop.html'
 
 const DESKTOP_RENDERER_DOCUMENT_PATHS = new Set([
   '/',
-  '/agents',
   '/approvals',
   '/channels',
   '/changelog',

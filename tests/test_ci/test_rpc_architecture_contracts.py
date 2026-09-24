@@ -130,8 +130,8 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Add the owner-authorized workspace source reference reader.
 # Add session-owned managed process list, output preview and stop.
 # Retire 19 generated MetaSkill methods and nine legacy workflow methods.
-RUNTIME_RPC_METHOD_BASELINE = 274
-RUNTIME_RPC_METHOD_DIGEST = "48ae97da183f897ac08752040ba64550d9b535ad80f4b9558912ba39951ff9e2"
+RUNTIME_RPC_METHOD_BASELINE = 271
+RUNTIME_RPC_METHOD_DIGEST = "b13ad0097445b07c26d779c876d69a8c81413dff4d521820b360b11976d00fe9"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1265,9 +1265,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "sessions.promptCacheKeepalive.set",
             "chat.clarify_submit",
             "agents.list",
-            "agents.create",
-            "agents.update",
-            "agents.delete",
             "channels.status",
             "channels.get",
             "channels.probe",
