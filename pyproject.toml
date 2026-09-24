@@ -111,7 +111,7 @@ recommended = [
     # imports remain lazy so ordinary closed/pipe execution keeps its startup
     # path; the explicit ``pty`` extra below remains for core/minimal callers.
     "ptyprocess>=0.7,<1; sys_platform != 'win32'",
-    "pywinpty>=2.0,<3; sys_platform == 'win32'",
+    "pywinpty>=2.0,<4; sys_platform == 'win32'",
 ]
 matrix = ["matrix-nio>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
 matrix-e2e = ["matrix-nio[e2e]>=0.25,<0.26", "markdown>=3.10.3", "h2>=4.4.1"]
@@ -123,7 +123,7 @@ document-extras = [
 # default.  The runtime imports these packages lazily.
 pty = [
     "ptyprocess>=0.7,<1; sys_platform != 'win32'",
-    "pywinpty>=2.0,<3; sys_platform == 'win32'",
+    "pywinpty>=2.0,<4; sys_platform == 'win32'",
 ]
 
 [tool.uv.dependency-groups]
