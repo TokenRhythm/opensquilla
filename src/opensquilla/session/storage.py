@@ -2862,6 +2862,7 @@ class SessionStorage:
         """Run the same bounded retirement used by the versioned upgrade."""
         from opensquilla.persistence.product_retirement import (
             LEGACY_TABLES_SQL,
+            RETIREMENT_COLUMN_TABLES,
             product_retirement_statements,
         )
 
@@ -2872,7 +2873,12 @@ class SessionStorage:
         async with self._write_transaction("retire_product_features") as conn:
             async with conn.execute(LEGACY_TABLES_SQL) as cur:
                 tables = {row[0]: row[1] for row in await cur.fetchall()}
-            for statement in product_retirement_statements(tables):
+            columns: dict[str, set[str]] = {}
+            for table in RETIREMENT_COLUMN_TABLES:
+                if table in tables:
+                    async with conn.execute(f'PRAGMA table_info("{table}")') as cur:
+                        columns[table] = {row[1] for row in await cur.fetchall()}
+            for statement in product_retirement_statements(tables, columns=columns):
                 await conn.execute(statement)
 
     async def _retire_legacy_memory_flush_metadata(self) -> None:

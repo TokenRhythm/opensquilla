@@ -9,10 +9,110 @@ import pytest
 from yoyo import get_backend, read_migrations
 
 from opensquilla.persistence.migrator import apply_pending
+from opensquilla.persistence.product_retirement import (
+    LEGACY_TABLES_SQL,
+    RETIREMENT_COLUMN_TABLES,
+    product_retirement_statements,
+)
 from opensquilla.session.models import AgentTaskRecord, SessionNode, TranscriptEntry
 from opensquilla.session.storage import SessionStorage
 
 MIGRATIONS = Path(__file__).resolve().parents[2] / "migrations"
+
+
+@pytest.mark.parametrize("missing_columns", [
+    (), ("terminal_reason",), ("error_class",), ("error_message",), ("finished_at",),
+    ("updated_at",), ("details",), ("task_id",), ("session_key",), ("status",),
+    ("terminal_reason", "error_class", "error_message", "finished_at", "details"),
+    ("task_id", "terminal_reason", "details"),
+])
+@pytest.mark.parametrize("ordinary_status", [None, "queued", "running"])
+@pytest.mark.parametrize("control_has_task_id", [False, True])
+def test_retirement_handles_sparse_task_schemas(
+    tmp_path, missing_columns, ordinary_status, control_has_task_id,
+):
+    definitions = {
+        "task_id": "TEXT",
+        "session_key": "TEXT",
+        "status": "TEXT",
+        "updated_at": "INTEGER",
+        "terminal_reason": "TEXT",
+        "error_class": "TEXT",
+        "error_message": "TEXT",
+        "finished_at": "INTEGER",
+        "details": "TEXT",
+    }
+    fields = [name for name in definitions if name not in missing_columns]
+    with sqlite3.connect(tmp_path / "sparse.db") as conn:
+        conn.execute("CREATE TABLE sessions (session_key TEXT PRIMARY KEY, status TEXT)")
+        conn.executemany("INSERT INTO sessions VALUES (?, 'running')", [
+            ("active-session",), ("finished-session",),
+        ])
+        conn.execute(
+            "CREATE TABLE agent_tasks (row_id INTEGER PRIMARY KEY, "
+            + ", ".join(f"{name} {definitions[name]}" for name in fields) + ")"
+        )
+        control_column = "accepted_task_id" if control_has_task_id else "intent_id"
+        conn.execute(f"CREATE TABLE meta_control_intents ({control_column} TEXT)")
+        conn.execute("INSERT INTO meta_control_intents VALUES ('retired-task')")
+        rows = [{
+            "row_id": 1, "task_id": "retired-task", "session_key": "active-session",
+            "status": "running", "updated_at": 1,
+            "terminal_reason": "meta_control_restart_before_start",
+            "details": '{"metadata":{"meta_control":{"kind":"manual"}}}',
+        }, {
+            "row_id": 2, "task_id": "finished-task", "session_key": "finished-session",
+            "status": "cancelled", "updated_at": 1,
+            "terminal_reason": "meta_control_restart_before_start",
+            "details": '{"metadata":{"meta_control":{"kind":"manual"}}}',
+        }]
+        if ordinary_status:
+            rows.append({
+                "row_id": 3, "task_id": "ordinary-task", "session_key": "active-session",
+                "status": ordinary_status, "updated_at": 1,
+            })
+        for row in rows:
+            names = ["row_id", *fields]
+            conn.execute(
+                f"INSERT INTO agent_tasks ({', '.join(names)}) "
+                f"VALUES ({', '.join('?' for _ in names)})",
+                [row.get(name) for name in names],
+            )
+        before = conn.execute("SELECT * FROM agent_tasks ORDER BY row_id").fetchall()
+        for _ in range(2):
+            tables = {row[0]: row[1] for row in conn.execute(LEGACY_TABLES_SQL)}
+            columns = {
+                table: {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+                for table in RETIREMENT_COLUMN_TABLES if table in tables
+            }
+            for statement in product_retirement_statements(tables, columns=columns):
+                conn.execute(statement)
+        after = conn.execute("SELECT * FROM agent_tasks ORDER BY row_id").fetchall()
+        identifiable = (
+            (control_has_task_id and "task_id" in fields)
+            or "terminal_reason" in fields or "details" in fields
+        )
+        can_cancel = "status" in fields and identifiable
+        if can_cancel:
+            assert conn.execute("SELECT status FROM agent_tasks WHERE row_id=1").fetchone() == (
+                "cancelled",
+            )
+        else:
+            assert after[0] == before[0]
+        assert after[1:] == before[1:]
+        expected_status = (
+            "killed" if can_cancel and "session_key" in fields and not ordinary_status
+            else "running"
+        )
+        assert conn.execute(
+            "SELECT status FROM sessions WHERE session_key='active-session'"
+        ).fetchone() == (expected_status,)
+        assert conn.execute(
+            "SELECT status FROM sessions WHERE session_key='finished-session'"
+        ).fetchone() == ("running",)
+        assert conn.execute(
+            "SELECT name FROM sqlite_master WHERE name='meta_control_intents'"
+        ).fetchone() is None
 
 
 async def _legacy_database(path: Path) -> None:
@@ -62,9 +162,17 @@ async def _legacy_database(path: Path) -> None:
 
 
 @pytest.mark.parametrize("versioned", [False, True])
-async def test_upgrade_preserves_history_and_retires_execution(tmp_path, versioned):
+@pytest.mark.parametrize("session_status_column", [False, True])
+async def test_upgrade_preserves_history_and_retires_execution(
+    tmp_path, versioned, session_status_column,
+):
     path = tmp_path / "sessions.db"
     await _legacy_database(path)
+    if not session_status_column:
+        # Offline recovery applies versioned migrations before the current
+        # session initializer supplies this column to older profiles.
+        with sqlite3.connect(path) as conn:
+            conn.execute("ALTER TABLE sessions DROP COLUMN status")
     if versioned:
         assert "V047__retire_product_modes" in apply_pending(str(path), MIGRATIONS)
     for _ in range(2):

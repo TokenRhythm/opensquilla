@@ -2585,11 +2585,10 @@ jobs:
             tests/test_skills_bundled_baseline.py \
             tests/test_skills_hot_reload.py \
             tests/test_skill_catalog_projection.py \
-            tests/test_gateway/test_meta_catalog_compatibility.py \
+            tests/test_skills/test_retired_workflows.py \
             tests/test_gateway/test_rpc_commands.py \
             tests/test_migration/test_legacy_config_fixtures.py \
             tests/test_skills/test_catalog_upgrade_retirement.py \
-            tests/test_skills/test_sop_compiler.py \
             tests/unit/cli/tui/test_opentui_completion_catalog.py \
             tests/test_skills_loader_namespaces.py \
             tests/test_skills_tree.py \
@@ -2616,7 +2615,7 @@ jobs:
             tests/test_skills/test_hub_transaction_process_gates.py \
             tests/test_gateway/test_rpc_skills_install_visibility.py \
             tests/test_gateway/test_rpc_skills_exact_identity.py \
-            tests/test_gateway/test_rpc_skills_coding_gate.py \
+            tests/test_gateway/test_retired_product_config.py \
             tests/test_gateway/test_rpc_skills_reload.py \
             tests/test_gateway/test_skill_management_service_injection.py \
             tests/test_tools/test_skill_view_resources.py \

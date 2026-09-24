@@ -6,6 +6,7 @@ from yoyo import step
 
 from opensquilla.persistence.product_retirement import (
     LEGACY_TABLES_SQL,
+    RETIREMENT_COLUMN_TABLES,
     product_retirement_statements,
 )
 
@@ -14,7 +15,11 @@ __depends__: set[str] = {"V046__plan_presentation", "V032__meta_launch_discard_t
 
 def apply_step(conn) -> None:
     tables = {row[0]: row[1] for row in conn.execute(LEGACY_TABLES_SQL)}
-    for statement in product_retirement_statements(tables):
+    columns = {
+        table: {row[1] for row in conn.execute(f'PRAGMA table_info("{table}")')}
+        for table in RETIREMENT_COLUMN_TABLES if table in tables
+    }
+    for statement in product_retirement_statements(tables, columns=columns):
         conn.execute(statement)
 
 

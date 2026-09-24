@@ -19,45 +19,75 @@ SELECT name, sql FROM sqlite_master WHERE type = 'table' AND EXISTS (
 )
 """
 
+RETIREMENT_COLUMN_TABLES = ("agent_tasks", "sessions", "meta_control_intents")
 
-def product_retirement_statements(tables: Mapping[str, str]) -> list[str]:
+
+def product_retirement_statements(
+    tables: Mapping[str, str], *, columns: Mapping[str, set[str]],
+) -> list[str]:
     """Return an idempotent SQL plan for known historical tables only."""
-    statements: list[str] = []
-    if "agent_tasks" in tables:
-        control_match = (
-            "task_id IN (SELECT accepted_task_id FROM meta_control_intents) OR "
-            if "meta_control_intents" in tables else ""
-        )
-        statements.append(f"""
-            UPDATE agent_tasks SET status = 'cancelled',
-                terminal_reason = 'feature_retired',
-                error_class = 'FeatureRetired', error_message = 'MetaSkill was removed.',
-                finished_at = COALESCE(finished_at, CAST(strftime('%s','now') AS INTEGER)*1000),
-                updated_at = CAST(strftime('%s','now') AS INTEGER)*1000
-            WHERE status IN ('queued', 'running', 'abandoned') AND (
-                {control_match}
-                json_type(CASE WHEN json_valid(details) THEN details ELSE '{{}}' END,
-                          '$.metadata.meta_control') = 'object'
-                OR terminal_reason = 'meta_control_restart_before_start'
-            )
-        """)
-        if "sessions" in tables:
-            statements.append("""
-                UPDATE sessions SET status = 'killed'
-                WHERE status = 'running' AND session_key IN (
-                    SELECT session_key FROM agent_tasks
-                    WHERE terminal_reason = 'feature_retired'
-                ) AND NOT EXISTS (
-                    SELECT 1 FROM agent_tasks WHERE agent_tasks.session_key = sessions.session_key
-                    AND status IN ('queued', 'running')
-                )
-            """)
+    statements = _retire_task_statements(columns)
     statements.extend(_archive_history_statements(tables))
     for table in (
         "meta_launch_drafts", "meta_launch_discard_tombstones", "meta_control_intents",
     ):
         if table in tables:
             statements.append(f'DROP TABLE "{table}"')
+    return statements
+
+
+def _retire_task_statements(columns: Mapping[str, set[str]]) -> list[str]:
+    """Retire identifiable work even before legacy schema shims have run."""
+    task_columns = columns.get("agent_tasks", set())
+    if "status" not in task_columns:
+        return []
+    matches: list[str] = []
+    if (
+        "task_id" in task_columns
+        and "accepted_task_id" in columns.get("meta_control_intents", set())
+    ):
+        matches.append("task_id IN (SELECT accepted_task_id FROM meta_control_intents)")
+    if "details" in task_columns:
+        matches.append("""
+            json_type(CASE WHEN json_valid(details) THEN details ELSE '{}' END,
+                      '$.metadata.meta_control') = 'object'
+        """)
+    if "terminal_reason" in task_columns:
+        matches.append("terminal_reason = 'meta_control_restart_before_start'")
+    if not matches:
+        return []
+    control_match = f"COALESCE(({' OR '.join(matches)}), 0)"
+    statements: list[str] = []
+    if (
+        "session_key" in task_columns
+        and {"session_key", "status"} <= columns.get("sessions", set())
+    ):
+        # Select this upgrade's active controls before changing their status.
+        # NULL or absent markers must still count as ordinary active work.
+        statements.append(f"""
+            UPDATE sessions SET status = 'killed'
+            WHERE status = 'running' AND session_key IN (
+                SELECT session_key FROM agent_tasks
+                WHERE status IN ('queued', 'running', 'abandoned') AND {control_match}
+            ) AND NOT EXISTS (
+                SELECT 1 FROM agent_tasks WHERE agent_tasks.session_key = sessions.session_key
+                AND status IN ('queued', 'running') AND NOT {control_match}
+            )
+        """)
+    assignments = ["status = 'cancelled'"]
+    for column, value in (
+        ("terminal_reason", "'feature_retired'"),
+        ("error_class", "'FeatureRetired'"),
+        ("error_message", "'MetaSkill was removed.'"),
+        ("finished_at", "COALESCE(finished_at, CAST(strftime('%s','now') AS INTEGER)*1000)"),
+        ("updated_at", "CAST(strftime('%s','now') AS INTEGER)*1000"),
+    ):
+        if column in task_columns:
+            assignments.append(f"{column} = {value}")
+    statements.append(f"""
+        UPDATE agent_tasks SET {', '.join(assignments)}
+        WHERE status IN ('queued', 'running', 'abandoned') AND {control_match}
+    """)
     return statements
 
 
