@@ -35,7 +35,7 @@ const nativeWorkbenchSurfaceRuntime = await readFile(
   'utf8',
 )
 const annotationFocusStart = nativeWorkbenchSurfaceRuntime.indexOf('    async focusAnnotation(')
-const annotationFocusEnd = nativeWorkbenchSurfaceRuntime.indexOf('    async executeBrowser(', annotationFocusStart)
+const annotationFocusEnd = nativeWorkbenchSurfaceRuntime.indexOf('\n    }', annotationFocusStart + 1) + 6
 assert.ok(annotationFocusStart >= 0 && annotationFocusEnd > annotationFocusStart)
 const focusAnnotation = new Function(
   'DesktopBrowserError', 'randomUUID', 'NATIVE_WORKBENCH_ANNOTATION_SCROLL_FUNCTION',
@@ -139,6 +139,13 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
     surfaces: new Map([[foreground.id, foreground], [switched.id, switched]]),
     activeSurfaceId: foreground.id,
     initializeHiddenBrowserViewport,
+    async touchBrowserPointer() {},
+    browserHostBlockers: () => [],
+    noteBrowserNavigationFailure(record, url, code) { record.browserNavigationError = { url, code, message: code } },
+    browserNavigationFailure(record) {
+      return new DesktopBrowserError(record.browserNavigationError.code === 'ERR_TIMED_OUT' ? 'TIMEOUT' : 'PAGE_NOT_READY',
+        record.browserNavigationError.message, 409, { targetRef: record.targetRef })
+    },
     isPrivilegedGatewayTarget: () => false,
     async createSurface(request) {
       openingRecord = {
@@ -198,8 +205,7 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
   let target
   if (failure) {
     await assert.rejects(pending, error => {
-      if (failure === 'set' || failure === 'both') return error === setError
-      if (failure === 'clear') return error === clearError
+      if (failure === 'set' || failure === 'both' || failure === 'clear') return error.code === 'PAGE_NOT_READY'
       return error.code === (failure === 'cancel' ? 'TIMEOUT' : 'TARGET_NOT_FOUND')
     })
   } else target = await pending
@@ -222,8 +228,16 @@ async function assertBrowserOpenPreservesForeground(sessionKey, switchWhileOpeni
     }
   }
   if (failure) {
-    assert.deepEqual(events, [])
-    if (failure !== 'replace' && failure !== 'close') assert.deepEqual(destroyed, [openingRecord])
+    if (['replace', 'close', 'owner-close'].includes(failure)) {
+      assert.deepEqual(events, [])
+      if (failure === 'owner-close') assert.deepEqual(destroyed, [openingRecord])
+    } else {
+      assert.deepEqual(destroyed, [], 'initialization and timeout failures must retain a live tab')
+      assert.equal(manager.surfaces.get(openingRecord.id), openingRecord)
+      assert.equal(events.length, 1)
+      assert.equal(events[0].type, 'browser-opened')
+      assert.equal(events[0].detail.targetRef, openingRecord.targetRef)
+    }
     return
   }
   assert.deepEqual(destroyed, [])
@@ -272,7 +286,7 @@ assert.match(
 )
 assert.match(
   nativeWorkbenchSurfaceRuntime,
-  /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId \}/,
+  /surfaceInstanceId: randomUUID\(\)[\s\S]*?return \{ ok: true, surfaceInstanceId: record\.surfaceInstanceId[, }]/,
   'surface creation must return the exact instance identity used to fence late picker events',
 )
 assert.match(

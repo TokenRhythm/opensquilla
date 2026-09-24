@@ -35,9 +35,59 @@ runs.
 
 Desktop TypeScript uses Node 24 definitions to match Electron's embedded Node
 runtime. The Node.js version used to run build scripts is a separate requirement.
-Playwright stays on the 1.60 line while Electron 42 is supported: the hidden
-browser reload viewport check fails with Playwright 1.63 on Electron 42. Upgrade
-that pair only after the existing native viewport and rendering checks pass.
+The built-in browser driver uses the pinned `playwright-core` 1.63 dependency
+and its public CDP transport API. It attaches to an existing `WebContentsView`
+through an isolated debugger session; it does not download or launch a separate
+Chromium browser or enable a production remote-debugging port. When upgrading
+Electron or Playwright, run both the attachment and native viewport checks.
+
+## Built-in browser MCP
+
+The owned Gateway discovers the Desktop's authenticated local MCP endpoint at
+startup. No user-managed MCP configuration is needed. Owner conversations in
+the Desktop receive `mcp__desktop-browser__browser_*` tools for listing, opening,
+navigating, reloading, inspecting, interacting with, and capturing URL pages.
+Existing workspace artifact previews continue to use the native `browser` tool.
+Older Desktop shells without the MCP endpoint retain that native tool as a
+fallback. CLI, channel, guest and subagent contexts do not receive this capability.
+
+The workspace button is available throughout Desktop chat, including a new task
+with no open pages. Its empty panel accepts a web address, and the header's new-tab
+button opens another page. Closing the final browser tab leaves the address panel
+available. Manually opened pages belong to the current task, including its draft
+before the first message, so that task's browser tools can discover and operate
+them. Switching tasks hides their pages while retaining their in-memory state.
+
+Mouse movement uses Playwright's browser input, with a visible pointer following
+accepted movement and click events. Element clicks retain Playwright's visibility,
+stability, enabled-state and hit-target checks. The pointer does not move the
+operating-system cursor, intercept page input, or appear in tool screenshots.
+
+Session identity and operation IDs come from trusted Gateway context. Page refs
+identify actual conversation-owned views; element refs expire on navigation or
+replacement. Mutating calls retain receipts for the server lifetime so replaying
+the same call ID cannot repeat a click. A timeout can leave the action outcome
+unknown: inspect the page before deciding whether to submit again. Receipt
+capacity is bounded to 4,096 mutations per Desktop server lifetime.
+
+This first version supports the main document's elements and viewport screenshots.
+It does not expose arbitrary JavaScript, browser-global commands, downloads,
+uploads, popup control, or cookie export. Explicit Gateway network restrictions
+are rejected in Safe mode because the attached renderer does not yet use the
+Gateway's network proxy. Screenshots use the existing model image-result channel.
+
+```bash
+npm run test:browser-mcp
+```
+
+These offline fixtures use temporary profiles and synthetic local pages. The
+suite includes real Electron tests for existing storage, same-URL page identity,
+hidden views and windows, debugger coexistence, cancellation, reconnect and
+concurrent calls. It also uses the production dependency collector to build and
+run a temporary ASAR, without an installer or signing. Linux without a display
+requires `xvfb-run`.
+
+## Desktop startup
 
 On first run, the shell starts the client and Gateway with an explicitly
 unconfigured model profile, then offers a non-modal setup window. **Set up later**

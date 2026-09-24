@@ -33,16 +33,16 @@
 
     <header class="workbench-host__chrome">
       <div
-        v-if="store.hasMultipleItems"
+        v-if="showTabStrip"
         class="workbench-host__tabs"
         role="tablist"
         :aria-label="openItemsLabel"
       >
         <div
-          v-for="(item, index) in store.items"
+          v-for="(item, index) in store.visibleItems"
           :key="item.id"
           class="workbench-host__tab-wrap"
-          :class="{ 'is-active': item.id === store.activeItemId }"
+          :class="{ 'is-active': item.id === activeItem?.id }"
           role="presentation"
         >
           <button
@@ -50,9 +50,9 @@
             class="workbench-host__tab"
             role="tab"
             type="button"
-            :aria-selected="item.id === store.activeItemId"
+            :aria-selected="item.id === activeItem?.id"
             :aria-controls="panelId(item.id)"
-            :tabindex="item.id === store.activeItemId ? 0 : -1"
+            :tabindex="item.id === activeItem?.id || (!activeItem && index === 0) ? 0 : -1"
             @click="store.activateItem(item.id)"
             @keydown="onTabKeydown($event, index)"
           >
@@ -62,7 +62,7 @@
             class="workbench-host__tab-close"
             type="button"
             :aria-label="`${closeItemLabel}: ${item.title}`"
-            :tabindex="item.id === store.activeItemId ? 0 : -1"
+            :tabindex="item.id === activeItem?.id ? 0 : -1"
             @click="closeWorkbenchItem(item.id)"
           >
             <Icon name="x" :size="13" aria-hidden="true" />
@@ -71,15 +71,29 @@
       </div>
 
       <div v-else class="workbench-host__single-title">
-        <slot name="title" :item="store.activeItem">
-          <span class="workbench-host__title">{{ store.activeItem?.title }}</span>
+        <slot name="title" :item="activeItem">
+          <span class="workbench-host__title">{{ activeItem?.title }}</span>
         </slot>
       </div>
 
       <div class="workbench-host__actions">
-        <slot name="actions" :item="store.activeItem" />
+        <slot name="actions" :item="activeItem" />
         <button
-          v-if="store.activeItem"
+          v-if="layoutMode !== 'mobile-dialog'"
+          ref="maximizeButtonRef"
+          class="workbench-host__icon-button"
+          type="button"
+          :aria-label="store.maximized ? restoreLabel : maximizeLabel"
+          :title="store.maximized ? restoreLabel : maximizeLabel"
+          :aria-pressed="store.maximized"
+          :disabled="modalBlocked"
+          data-testid="workbench-maximize"
+          @click="toggleMaximized"
+        >
+          <Icon :name="store.maximized ? 'collapse' : 'expand'" :size="17" aria-hidden="true" />
+        </button>
+        <button
+          v-if="layoutMode === 'mobile-dialog' || !allowEmpty"
           ref="closeButtonRef"
           class="workbench-host__icon-button"
           type="button"
@@ -97,31 +111,32 @@
       class="workbench-host__surface"
       :class="{
         'workbench-host__surface--native':
-          store.activeItem?.hostKind === 'native-webcontents',
+          activeItem?.hostKind === 'native-webcontents',
       }"
       data-testid="workbench-surface"
     >
-      <template v-for="item in store.items" :key="item.id">
+      <slot v-if="!activeItem && allowEmpty" name="empty" />
+      <template v-for="item in mountedItems" :key="item.id">
         <div
           v-if="
             item.retention === 'keep-alive'
-              || (item.id === store.activeItemId && runtimeAvailable)
+              || (item.id === activeItem?.id && runtimeAvailable)
           "
-          v-show="item.id === store.activeItemId"
+          v-show="item.id === activeItem?.id"
           class="workbench-host__panel-layer"
           :id="panelId(item.id)"
           role="tabpanel"
-          :aria-labelledby="store.hasMultipleItems ? tabId(item.id) : undefined"
-          :aria-label="store.hasMultipleItems ? undefined : item.title"
+          :aria-labelledby="showTabStrip ? tabId(item.id) : undefined"
+          :aria-label="showTabStrip ? undefined : item.title"
           :data-workbench-item-id="item.id"
-          :aria-hidden="item.id === store.activeItemId ? undefined : 'true'"
-          :inert="item.id === store.activeItemId ? undefined : true"
+          :aria-hidden="item.id === activeItem?.id ? undefined : 'true'"
+          :inert="item.id === activeItem?.id ? undefined : true"
         >
           <slot
             v-if="item.hostKind === 'dom'"
             name="panel"
             :item="item"
-            :active="item.id === store.activeItemId"
+            :active="item.id === activeItem?.id"
             :layout-mode="layoutMode"
           >
             <div class="workbench-host__empty">{{ emptyLabel }}</div>
@@ -130,7 +145,7 @@
             v-else
             name="native-surface"
             :item="item"
-            :active="item.id === store.activeItemId"
+            :active="item.id === activeItem?.id"
             :layout-mode="layoutMode"
           >
             <div
@@ -162,6 +177,7 @@ import {
   workbenchDynamicMax,
   workbenchEffectiveWidth,
   workbenchLayoutMode,
+  type WorkbenchLayoutMode,
 } from '@/workbench/layout'
 import { useWorkbenchStore } from '@/workbench/store'
 import type { NativeSurfaceRect, WorkbenchItem } from '@/workbench/types'
@@ -171,6 +187,7 @@ type WorkbenchResizerHandle = { cancel: () => boolean }
 
 const props = withDefaults(defineProps<{
   enabled?: boolean
+  allowEmpty?: boolean
   routeActive?: boolean
   modalBlocked?: boolean
   availableWidth?: number
@@ -179,12 +196,15 @@ const props = withDefaults(defineProps<{
   emptyLabel?: string
   openItemsLabel?: string
   collapseLabel?: string
+  maximizeLabel?: string
+  restoreLabel?: string
   closeItemLabel?: string
   resizeLabel?: string
   pixelsLabel?: string
   beforeCloseItem?: (item: WorkbenchItem) => boolean | Promise<boolean>
 }>(), {
   enabled: true,
+  allowEmpty: false,
   routeActive: true,
   modalBlocked: false,
   availableWidth: undefined,
@@ -193,6 +213,8 @@ const props = withDefaults(defineProps<{
   emptyLabel: 'No preview is available for this item.',
   openItemsLabel: 'Open workbench items',
   collapseLabel: 'Collapse workbench',
+  maximizeLabel: 'Maximize workbench',
+  restoreLabel: 'Restore workbench size',
   closeItemLabel: 'Close tab',
   resizeLabel: 'Resize workbench',
   pixelsLabel: 'pixels',
@@ -201,7 +223,8 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   collapsed: []
   emptied: []
-  'layout-change': [mode: 'split' | 'overlay' | 'mobile-dialog']
+  'focus-return': []
+  'layout-change': [mode: WorkbenchLayoutMode]
   'surface-rect': [rect: NativeSurfaceRect]
 }>()
 
@@ -210,6 +233,7 @@ const hostRef = ref<HTMLElement | null>(null)
 const surfaceRef = ref<HTMLElement | null>(null)
 const resizerRef = ref<WorkbenchResizerHandle | null>(null)
 const closeButtonRef = ref<HTMLButtonElement | null>(null)
+const maximizeButtonRef = ref<HTMLButtonElement | null>(null)
 const viewportWidth = ref(typeof window === 'undefined' ? 0 : window.innerWidth)
 const containerWidth = ref(0)
 const containerRect = ref({ top: 0, right: viewportWidth.value, height: 0 })
@@ -222,6 +246,16 @@ let surfaceMutationObserver: MutationObserver | null = null
 let rectFrame = 0
 let lastNativeItemId: string | null = null
 const nativeSurfaceSlotSelector = '[data-workbench-native-surface-slot]'
+const showTabStrip = computed(() => store.hasMultipleItems
+  || store.visibleItems.some(item => item.kind === 'browser'))
+const activeItem = computed(() => store.visibleItems.find(
+  item => item.id === store.activeItemId,
+) ?? null)
+const mountedItems = computed(() => {
+  const visibleIds = new Set(store.visibleItems.map(item => item.id))
+  return store.items.filter(item => visibleIds.has(item.id)
+    || item.kind === 'browser' && item.retention === 'keep-alive')
+})
 
 const measuredAvailableWidth = computed(() => {
   const supplied = props.availableWidth
@@ -231,6 +265,7 @@ const measuredAvailableWidth = computed(() => {
 const layoutMode = computed(() => workbenchLayoutMode({
   availableWidth: measuredAvailableWidth.value,
   coarseOnly: props.coarseOnly ?? detectedCoarseOnly.value,
+  maximized: store.maximized,
 }))
 const dynamicMaximumWidth = computed(() =>
   workbenchDynamicMax(measuredAvailableWidth.value))
@@ -254,9 +289,10 @@ const hostStyle = computed(() => ({
   '--workbench-container-height': `${containerRect.value.height}px`,
 }))
 const shouldRender = computed(() =>
-  props.enabled && props.routeActive && store.expanded && store.activeItem !== null)
+  props.enabled && props.routeActive && store.expanded
+  && (activeItem.value !== null || props.allowEmpty))
 const shouldMount = computed(() =>
-  props.enabled && store.activeItem !== null)
+  props.enabled && (mountedItems.value.length > 0 || props.allowEmpty && store.expanded))
 const runtimeAvailable = computed(() =>
   props.enabled
   && props.routeActive
@@ -289,25 +325,32 @@ function collapseWorkbench() {
   emit('collapsed')
 }
 
+function toggleMaximized() {
+  if (props.modalBlocked) return
+  store.toggleMaximized()
+  void nextTick(() => maximizeButtonRef.value?.focus({ preventScroll: true }))
+}
+
 async function closeWorkbenchItem(id: string) {
   const item = store.items.find(candidate => candidate.id === id)
   if (!item || props.beforeCloseItem && !await props.beforeCloseItem(item)) return
   if (!store.closeItem(id)) return
   if (!store.activeItem) {
-    emit('emptied')
+    if (!props.allowEmpty) emit('emptied')
     return
   }
   void nextTick(() => {
     const activeTab = hostRef.value?.querySelector<HTMLElement>(
       '[role="tab"][aria-selected="true"]',
     )
-    ;(activeTab || closeButtonRef.value)
-      ?.focus({ preventScroll: true })
+    const target = activeTab || closeButtonRef.value
+    if (target) target.focus({ preventScroll: true })
+    else emit('focus-return')
   })
 }
 
 function onTabKeydown(event: KeyboardEvent, currentIndex: number) {
-  const count = store.items.length
+  const count = store.visibleItems.length
   if (count < 2) return
   let nextIndex: number | null = null
   if (event.key === 'ArrowLeft') nextIndex = (currentIndex - 1 + count) % count
@@ -316,7 +359,7 @@ function onTabKeydown(event: KeyboardEvent, currentIndex: number) {
   else if (event.key === 'End') nextIndex = count - 1
   if (nextIndex === null) return
   event.preventDefault()
-  const item = store.items[nextIndex]
+  const item = store.visibleItems[nextIndex]
   if (!item) return
   store.activateItem(item.id)
   void nextTick(() => {
@@ -413,7 +456,7 @@ function hiddenRect(itemId: string): NativeSurfaceRect {
 }
 
 function emitSurfaceRect() {
-  const item = store.activeItem
+  const item = activeItem.value
   const activeNativeId = item?.hostKind === 'native-webcontents' ? item.id : null
   if (lastNativeItemId && lastNativeItemId !== activeNativeId) {
     emit('surface-rect', hiddenRect(lastNativeItemId))
@@ -454,8 +497,8 @@ watch(runtimeAvailable, available => {
 }, { immediate: true })
 
 watch(() => props.modalBlocked, () => void nextTick(scheduleSurfaceRect))
-watch(() => store.activeItem?.id, () => void nextTick(scheduleSurfaceRect))
-watch(() => store.activeItem?.hostKind, () => void nextTick(scheduleSurfaceRect))
+watch(() => activeItem.value?.id, () => void nextTick(scheduleSurfaceRect))
+watch(() => activeItem.value?.hostKind, () => void nextTick(scheduleSurfaceRect))
 watch(effectiveWidth, scheduleSurfaceRect)
 watch([hostRef, surfaceRef], () => {
   reconnectObservers()
@@ -537,6 +580,12 @@ onBeforeUnmount(() => {
     auto;
   max-width: calc(100vw - var(--workbench-container-end) - 24px);
   height: var(--workbench-container-height);
+}
+
+.workbench-host--maximized {
+  flex: 1 1 0;
+  width: 100%;
+  border-inline-start: 0;
 }
 
 .workbench-host--mobile-dialog {

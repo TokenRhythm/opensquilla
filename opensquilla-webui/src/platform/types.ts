@@ -382,6 +382,7 @@ export interface NativeWorkbenchSurfaceResult {
   retryable?: boolean
   message?: string
   surfaceInstanceId?: string
+  navigationError?: { url: string; code: string; errorCode?: number; message: string }
 }
 
 export type NativeWorkbenchSurfaceEventType =
@@ -398,6 +399,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'crashed'
   | 'escape'
   | 'browser-opened'
+  | 'browser-closed'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
@@ -415,6 +417,8 @@ export interface NativeWorkbenchSurfaceEvent {
     url?: string
     title?: string
     loading?: boolean
+    pageState?: string
+    navigationError?: { url: string; code: string; errorCode?: number; message: string } | null
     canGoBack?: boolean
     canGoForward?: boolean
     action?: string
@@ -472,6 +476,12 @@ export type NativeArtifactPreviewLeaseBrokerResult = {
   message: string
 }
 
+export interface NativeBrowserAutomationState {
+  sessionKey: string
+  taskId: string
+  active: boolean
+}
+
 export interface NativeWorkbenchApi {
   getCapabilities?(): Promise<NativeWorkbenchCapabilities>
   getArtifactAnnotationCapabilities?(): Promise<NativeArtifactAnnotationCapabilities>
@@ -485,6 +495,7 @@ export interface NativeWorkbenchApi {
     request: NativeArtifactAnnotationOverlayCloseRequest,
   ): Promise<NativeWorkbenchSurfaceResult>
   getWorkbenchBrowserTarget?(request: { surfaceId: string }): Promise<NativeWorkbenchBrowserTarget>
+  setBrowserAutomationState?(request: NativeBrowserAutomationState): Promise<NativeWorkbenchSurfaceResult>
   focusWorkbenchAnnotation?(request: {
     surfaceId: string; targetRef: string; locatorHint: string; pagePath?: string
   }): Promise<NativeWorkbenchSurfaceResult>

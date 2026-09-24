@@ -1,18 +1,22 @@
 <template>
   <WorkbenchHost
     :enabled="enabled"
+    :allow-empty="Boolean(nativeApi)"
     :route-active="routeActive"
     :modal-blocked="surfaceBlocked"
     :aria-label="t('workbench.title')"
     :empty-label="t('workbench.empty')"
     :open-items-label="t('workbench.openItems')"
     :collapse-label="t('workbench.collapse')"
+    :maximize-label="t('workbench.maximize')"
+    :restore-label="t('workbench.restore')"
     :close-item-label="t('workbench.closeItem')"
     :resize-label="t('workbench.resize')"
     :pixels-label="t('workbench.pixels')"
     :before-close-item="beforeCloseItem"
     @collapsed="restoreWorkbenchFocus"
     @emptied="restoreWorkbenchFocus"
+    @focus-return="restoreWorkbenchFocus"
     @surface-rect="onSurfaceRect"
   >
     <template #title="{ item }">
@@ -33,6 +37,17 @@
     </template>
 
     <template #actions="{ item }">
+      <button
+        v-if="nativeApi"
+        type="button"
+        class="app-workbench__action"
+        :aria-label="t('workbench.browser.newTab')"
+        :title="t('workbench.browser.newTab')"
+        data-testid="workbench-new-browser-tab"
+        @click="openBrowserStart"
+      >
+        <Icon name="plus" :size="16" aria-hidden="true" />
+      </button>
       <ResourceActionsMenu v-if="item && resourceActionArtifact(item)" :key="item.id"
         :artifact="resourceActionArtifact(item)!" :session-key="sessionKeyFromWorkbenchItem(item)"
         :previewable="false" trigger />
@@ -142,6 +157,17 @@
       </template>
     </template>
 
+    <template #empty>
+      <BrowserStartPanel
+        :key="`${sessionId}:${browserStartSequence}`"
+        :ready="Boolean(sessionId) && store.activeSessionId === sessionId"
+        :can-reopen="store.closedBrowserItems.some(item => item.scope.type === 'session'
+          && item.scope.id === sessionId)"
+        @open="openBrowserUrl($event, true)"
+        @reopen="reopenBrowser"
+      />
+    </template>
+
     <template #panel="{ item, active }">
       <component
         :is="panelComponent(item)"
@@ -174,6 +200,7 @@ import {
   nextTick,
   onBeforeUnmount,
   onMounted,
+  ref,
   watch,
 } from 'vue'
 import { useI18n } from 'vue-i18n'
@@ -247,6 +274,7 @@ import {
 } from '@/workbench/promptAnnotations'
 import { PageAnnotationSendQueue } from '@/workbench/pageAnnotationSendQueue'
 import { useWorkbenchStore } from '@/workbench/store'
+import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import type {
   NativeSurfaceRect,
   WorkbenchBeforeCloseOptions,
@@ -265,6 +293,7 @@ import { WORKSPACE_FILES_KEY } from '@/modules/workspaceFiles'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
 import { createWorkspaceFileDefinition } from './workspaceFileProvider'
 import WorkbenchHost from './WorkbenchHost.vue'
+import BrowserStartPanel from './BrowserStartPanel.vue'
 import { downloadBlob } from '@/utils/browser'
 
 const props = withDefaults(defineProps<{
@@ -318,6 +347,7 @@ const baseOrigin = (() => {
   return window.location.origin
 })()
 const nativeApi = platform.workbench.native
+const browserStartSequence = ref(0)
 const runtimeManager = new WorkbenchRuntimeManager(workbenchPanelRegistry, {
   nativeWorkbenchApi: nativeApi,
   setExpanded: expanded => {
@@ -361,22 +391,70 @@ function openExternalUrl(value: string) {
   if (opened) opened.opener = null
 }
 
-function openBrowserUrl(value: string) {
-  const sessionId = store.activeSessionId || props.sessionId
-  if (!nativeApi || !sessionId) {
+function openBrowserUrl(value: string, newTab = false) {
+  const sessionId = props.sessionId
+  if (!sessionId || !nativeApi) {
     openExternalUrl(value)
     return
   }
-  const item = createBrowserWorkbenchItem({ scopeId: sessionId, url: value })
+  const item = createBrowserWorkbenchItem({
+    scopeId: sessionId,
+    url: value,
+    instanceId: createClientRequestId(),
+  })
   if (!item) return
+  const retained = store.findMostRecentItem(candidate =>
+    candidate.kind === 'browser'
+    && candidate.scope.type === 'session'
+    && candidate.scope.id === sessionId
+    && normalizeBrowserUrl(String(candidate.payload.initialUrl || '')) === item.payload.initialUrl,
+  )
+  if (retained && !newTab) {
+    store.activateItem(retained.id)
+    store.setExpanded(true)
+    return
+  }
   if (!store.openItem(item)) {
+    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
+  }
+}
+
+function openBrowserStart() {
+  browserStartSequence.value += 1
+  store.openEmpty()
+}
+
+function reopenBrowser() {
+  const closed = store.closedBrowserItems.find(item => item.scope.type === 'session'
+    && item.scope.id === props.sessionId)
+  if (!closed || !store.openItem(closed)) {
     pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   }
 }
 
 function onBrowserWorkbenchOpen(event: Event) {
   const detail = (event as CustomEvent<BrowserWorkbenchOpenEventDetail>).detail
-  if (detail && typeof detail.url === 'string') openBrowserUrl(detail.url)
+  if (!detail || typeof detail !== 'object') return
+  if ('url' in detail) {
+    if (typeof detail.url === 'string') openBrowserUrl(detail.url)
+    return
+  }
+  if (detail.action !== 'reveal' || !nativeApi || detail.sessionId !== props.sessionId
+    || store.activeSessionId !== props.sessionId
+    || !props.enabled || !props.routeActive || props.modalBlocked) return
+  const retained = store.findMostRecentItem(item => item.kind === 'browser'
+    && item.scope.type === 'session' && item.scope.id === props.sessionId)
+  if (retained) {
+    store.activateItem(retained.id)
+    store.setExpanded(true)
+    void nextTick(() => {
+      document.querySelector<HTMLInputElement>(
+        `[data-workbench-item-id="${CSS.escape(retained.id)}"] .browser-preview__address`,
+      )?.focus({ preventScroll: true })
+    })
+  } else {
+    openBrowserStart()
+  }
 }
 
 for (const definition of createArtifactWorkbenchDefinitions({
@@ -864,6 +942,7 @@ function performPanelSelection(
 function restoreWorkbenchFocus() {
   void nextTick(() => {
     const candidates = document.querySelectorAll<HTMLElement>([
+      '[data-testid="topbar-workbench-toggle"]',
       '[data-testid="chat-session-action-workbench"]',
       '[data-testid="chat-header-primary-action"][data-action="workbench"]',
       '[data-testid="chat-session-action-deliverables"]',
@@ -880,17 +959,35 @@ function onSurfaceRect(rect: NativeSurfaceRect) {
 }
 
 function onNativeSurfaceEvent(event: NativeWorkbenchSurfaceEvent) {
+  if (event.type === 'browser-closed') {
+    const item = store.items.find(candidate => candidate.id === event.surfaceId)
+    if (item?.kind === 'browser' && item.scope.type === 'session'
+      && item.scope.id === event.detail?.sessionKey) store.closeItem(item.id)
+    return
+  }
   if (event.type === 'browser-opened') {
     const detail = event.detail
-    if (!detail?.url || detail.sessionKey !== props.sessionId || !nativeApi) return
+    if (!detail?.url || !detail.sessionKey || !nativeApi) return
     const item = createBrowserWorkbenchItem({ scopeId: detail.sessionKey, url: detail.url })
     if (!item) return
     item.id = event.surfaceId
     item.title = detail.title || item.title
-    item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef }
-    store.openItem(item)
-    store.setExpanded(true)
+    item.payload = { ...item.payload, adoptedNativeSurface: true, targetRef: detail.targetRef,
+      ...(detail.navigationError ? { navigationError: detail.navigationError } : {}) }
+    store.openItem(item, { activate: detail.sessionKey === props.sessionId })
     return
+  }
+  if (event.type === 'navigation-state' && event.detail?.url) {
+    const item = store.items.find(candidate => candidate.id === event.surfaceId)
+    const url = normalizeBrowserUrl(event.detail.url)
+    if (item?.kind === 'browser' && url) {
+      store.updateItem({
+        ...item,
+        title: event.detail.title || item.title,
+        payload: { ...item.payload, initialUrl: url,
+          ...(event.detail.navigationError !== undefined ? { navigationError: event.detail.navigationError } : {}) },
+      })
+    }
   }
   runtimeManager.handleNativeSurfaceEvent(event)
 }

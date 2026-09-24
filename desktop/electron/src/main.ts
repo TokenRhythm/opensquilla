@@ -1003,7 +1003,9 @@ const nativeWorkbenchSurfaces = new NativeWorkbenchSurfaceManager({
 const desktopBrowser = new DesktopBrowserServer(
   (request, signal) => nativeWorkbenchSurfaces.executeBrowser(request, signal),
   entry => desktopLog(entry.event, { operation: entry.operation, outcome: entry.outcome,
-    code: entry.code, durationMs: entry.durationMs }),
+    code: entry.code, durationMs: entry.durationMs, operationId: entry.operationId,
+    targetRef: entry.targetRef, navigationCode: entry.navigationCode }),
+  (request, signal) => nativeWorkbenchSurfaces.executeBrowserMcp(request, signal),
 )
 
 function activeDesktopProfile(): DesktopProfilePaths {
@@ -12619,6 +12621,10 @@ ipcMain.handle('desktop:workbench:browser:target', (event, payload: unknown) => 
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
   const request = payload as { surfaceId?: unknown } | null
   return nativeWorkbenchSurfaces.getBrowserTarget(parseNativeWorkbenchSurfaceId(request?.surfaceId))
+})
+ipcMain.handle('desktop:workbench:browser:automation-state', async (event, payload: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted browser request.')
+  return await nativeWorkbenchSurfaces.setBrowserAutomationState(payload)
 })
 ipcMain.handle('desktop:workbench:annotation:focus', async (event, payload: unknown) => {
   if (!trustedControlUiIpc(event)) throw new Error('Untrusted annotation request.')

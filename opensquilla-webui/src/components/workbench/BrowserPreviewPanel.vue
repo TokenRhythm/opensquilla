@@ -30,11 +30,13 @@
       <input
         v-model="address"
         class="browser-preview__address"
-        type="url"
+        type="text"
         inputmode="url"
         autocomplete="off"
         spellcheck="false"
         :aria-label="t('workbench.browser.address')"
+        :aria-invalid="invalidAddress || undefined"
+        @input="invalidAddress = false"
       >
       <button type="submit" class="btn btn--ghost">
         {{ t('workbench.browser.go') }}
@@ -56,6 +58,9 @@
         <Icon name="externalLink" :size="15" />
       </button>
     </form>
+    <div v-if="invalidAddress" class="browser-preview__address-error" role="alert">
+      {{ t('workbench.browser.invalidAddress') }}
+    </div>
     <div
       v-if="errorMessage"
       class="browser-preview__error"
@@ -83,6 +88,7 @@ import { ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { copyTextWithFallback } from '@/utils/browser'
+import { normalizeBrowserAddress } from '@/workbench/browserItems'
 import type { WorkbenchComponentEvent } from '@/workbench/types'
 
 const props = withDefaults(defineProps<{
@@ -104,9 +110,11 @@ const emit = defineEmits<{
 }>()
 const { t } = useI18n()
 const address = ref(props.currentUrl)
+const invalidAddress = ref(false)
 
 watch(() => props.currentUrl, value => {
   address.value = value
+  invalidAddress.value = false
 })
 
 function emitAction(action: string, url = '') {
@@ -117,7 +125,9 @@ function emitAction(action: string, url = '') {
 }
 
 function navigate() {
-  emitAction('navigate', address.value)
+  const url = normalizeBrowserAddress(address.value)
+  invalidAddress.value = !url
+  if (url) emitAction('navigate', url)
 }
 
 async function copyUrl() {
@@ -166,6 +176,12 @@ async function copyUrl() {
   min-width: 0;
   min-height: 0;
   flex: 1;
+}
+
+.browser-preview__address-error {
+  padding: var(--sp-2) var(--sp-3);
+  color: var(--danger);
+  font-size: var(--fs-sm);
 }
 
 .browser-preview__error {

@@ -213,6 +213,8 @@
     "title": "工作区",
     "expand": "展开工作区",
     "collapse": "收起工作区",
+    "maximize": "最大化工作区",
+    "restore": "还原工作区",
     "close": "关闭工作区",
     "closeItem": "关闭标签",
     "refresh": "刷新",
@@ -231,6 +233,11 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "此 HTML 不是有效的 UTF-8，无法安全预览或编辑。", "htmlValidationFailed": "此 HTML 未通过安全校验，无法预览或编辑。", "htmlEditTooLarge": "此 HTML 过大，无法在应用内编辑；仍可下载。", "htmlPreviewTooLarge": "此 HTML 过大，无法在应用内安全预览；仍可下载。", "officeAdapterNotAvailable": "Office 编辑能力尚未启用。", "unsupported": "此资源暂不支持此操作。" }
     },
     "browser": {
+      "newTab": "新建标签页",
+      "startHint": "在任务旁边打开网页。",
+      "addressPlaceholder": "输入网址，例如 example.com",
+      "invalidAddress": "请输入有效的 HTTP 或 HTTPS 网址。",
+      "reopen": "重新打开关闭的标签页",
       "back": "后退",
       "forward": "前进",
       "stop": "停止加载",
@@ -4491,6 +4498,9 @@
     "composer": {
       "workStyleGroup": "工作方式",
       "contentGroup": "内容",
+      "browserUse": "Browser Use",
+      "browserWindowHint": "网页将在新窗口打开。如需在侧栏中操控网页，请使用客户端。",
+      "browserUseDescription": "打开网页",
       "executionMode": "执行模式",
       "ownerOnlyUnavailable": "此浏览器会话不支持仅限所有者模式。",
       "enabled": "已启用",

@@ -1,0 +1,6 @@
+{
+  "name": "opensquilla-browser-playwright-attach-fixture",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}

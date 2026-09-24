@@ -640,6 +640,7 @@
     </div>
 
     <ChatModelSetupNotice v-if="!shareMode" />
+    <BrowserWindowDialog :open="browserWindowOpen" @close="browserWindowOpen = false" />
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
@@ -686,6 +687,7 @@
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
       :goal-mode-existing="goalComposerExisting"
       :add-menu-avoid-element="goalRunDockRef"
+      :browser-use-available="workbenchEnabled && !shareMode"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -729,6 +731,7 @@
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
+      @open-browser-use="openBrowserUse"
       @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -837,6 +840,7 @@ import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnota
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
+import { useBrowserAutomationState } from '@/composables/chat/useBrowserAutomationState'
 import {
   focusArtifactPromptAnnotation,
   notifyPageAnnotationsSent,
@@ -849,6 +853,8 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
+import BrowserWindowDialog from '@/components/chat/BrowserWindowDialog.vue'
+import { requestBrowserWorkbenchReveal } from '@/workbench/browserItems'
 import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
@@ -1538,6 +1544,19 @@ const promptCacheKeepaliveAvailable = computed(() => (
   promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
+const browserWindowOpen = ref(false)
+
+function openBrowserUse() {
+  if (!workbenchEnabled.value || shareMode.value) return
+  if (platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native) {
+    requestBrowserWorkbenchReveal(sessionKey.value)
+  } else {
+    composerRef.value?.composerElement()?.querySelector<HTMLButtonElement>('.chat-plus-btn')
+      ?.focus({ preventScroll: true })
+    browserWindowOpen.value = true
+  }
+}
+
 const promptAnnotationDesktopAvailable = computed(() => (
   workbenchEnabled.value
   && promptAnnotationsEnabled.value
@@ -1912,6 +1931,16 @@ const {
   ensureInterruptBubble,
   completeReasoningPresentation,
 } = chatStream
+useBrowserAutomationState({
+  native: platform.workbench.native,
+  sessionKey,
+  connected: computed(() => gatewayAccess.isAvailable
+    && gatewayAccess.isAuthenticated && gatewayAccess.isLocalOwner),
+  isStreaming,
+  runStatus,
+  activeStreamTaskId,
+  activeStreamSessionKey,
+})
 watch(
   () => gatewayAccess.isAvailable,
   available => setStreamConnectionAvailable(available),
@@ -3918,8 +3947,14 @@ async function handleAuthoritativeSessionSubscription(
   ])
 }
 
+const draftHasBrowser = computed(() => [
+  ...workbenchStore.items, ...workbenchStore.closedBrowserItems,
+].some(item => item.kind === 'browser'
+  && item.scope.type === 'session' && item.scope.id === sessionKey.value))
+
 function isPristineDraftForRecovery(expectedSessionKey: string, agentId: string): boolean {
   return !provisionalDraftUsed
+    && !draftHasBrowser.value
     && sessionKey.value === expectedSessionKey
     && isDraftRoute()
     && draftAgentId() === agentId
@@ -3950,6 +3985,13 @@ function markProvisionalDraftUsed(): void {
   provisionalDraftUsed = true
   metaDraftRecovery.invalidate()
 }
+watch(
+  draftHasBrowser,
+  hasBrowser => {
+    if (hasBrowser && isDraftRoute()) markProvisionalDraftUsed()
+  },
+  { flush: 'sync', immediate: true },
+)
 const sameTurnSteerAvailable = computed(() => (
   isStreaming.value
   && chatSend.supportsSameTurnSteer()
@@ -6030,6 +6072,7 @@ async function copyGatewayLink() {
 // the header subtree. The owner token makes delayed teardown harmless.
 const chatRouteHeader = useChatRouteHeaderBridge()
 const chatRouteHeaderRegistration = chatRouteHeader.register({
+  sessionKey,
   visible: computed(() => !isNewChatLanding.value),
   title: currentChatTitle,
   copyState: sessionCopyState,

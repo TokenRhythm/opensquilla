@@ -133,6 +133,9 @@ declare global {
     getWorkbenchBrowserTarget?: (
       payload: { surfaceId: string },
     ) => Promise<import('./platform/types').NativeWorkbenchBrowserTarget>
+    setBrowserAutomationState?: (
+      payload: import('./platform/types').NativeBrowserAutomationState,
+    ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>
     focusWorkbenchAnnotation?: (
       payload: { surfaceId: string; targetRef: string; locatorHint: string },
     ) => Promise<import('./platform/types').NativeWorkbenchSurfaceResult>

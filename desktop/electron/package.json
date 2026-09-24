@@ -78,11 +78,13 @@
     "pack:prepared": "npm run build && npm run verify:prepared && electron-builder --dir && npm run verify:package",
     "dist:prepared": "npm run build && npm run verify:prepared && electron-builder && npm run verify:package",
     "test:desktop-browser": "npm run build && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-electron.mjs",
+    "test:browser-mcp": "npm run build && node scripts/test-browser-ref-semantics.mjs && node scripts/test-browser-mouse-trajectory.mjs && node scripts/test-desktop-browser.mjs && node scripts/test-desktop-browser-mcp.mjs && node scripts/test-browser-visual-freshness.mjs && node scripts/test-browser-visual-recovery.mjs && node scripts/test-browser-playwright-attach.mjs && node scripts/test-browser-pointer-electron.mjs && node scripts/test-desktop-browser-mcp-electron.mjs && node scripts/test-browser-native-dialog-electron.mjs && node scripts/test-browser-mcp-faults-electron.mjs && node scripts/test-browser-playwright-package.mjs",
     "test:live-html-harness": "node --test scripts/test-live-html-foreground.mjs scripts/test-live-html-diagnostics.mjs scripts/test-live-html-supplemental-scenarios.mjs",
     "test:live-html-browser": "node --test scripts/test-live-html-business.mjs"
   },
   "dependencies": {
     "electron-updater": "^6.6.2",
+    "playwright-core": "1.63.0",
     "smol-toml": "1.8.0"
   },
   "devDependencies": {

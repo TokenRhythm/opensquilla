@@ -213,6 +213,8 @@
     "title": "ワークベンチ",
     "expand": "ワークベンチを開く",
     "collapse": "ワークベンチを折りたたむ",
+    "maximize": "ワークスペースを最大化",
+    "restore": "ワークスペースを元に戻す",
     "close": "ワークベンチを閉じる",
     "closeItem": "タブを閉じる",
     "refresh": "更新",
@@ -231,6 +233,11 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "この HTML は有効な UTF-8 ではないため、安全にプレビューまたは編集できません。", "htmlValidationFailed": "この HTML は安全なプレビューまたは編集の検証に失敗しました。", "htmlEditTooLarge": "この HTML はアプリ内で編集するには大きすぎます。ダウンロードは引き続き可能です。", "htmlPreviewTooLarge": "この HTML はアプリ内で安全にプレビューするには大きすぎます。ダウンロードは引き続き可能です。", "officeAdapterNotAvailable": "Office の編集機能はまだ利用できません。", "unsupported": "この操作はこのリソースでは利用できません。" }
     },
     "browser": {
+      "newTab": "新しいタブ",
+      "startHint": "このタスクの横にウェブページを開きます。",
+      "addressPlaceholder": "URL を入力（例：example.com）",
+      "invalidAddress": "有効な HTTP または HTTPS のアドレスを入力してください。",
+      "reopen": "閉じたタブを再度開く",
       "back": "戻る",
       "forward": "進む",
       "stop": "読み込みを停止",
@@ -4407,6 +4414,9 @@
     "composer": {
       "workStyleGroup": "作業方法",
       "contentGroup": "コンテンツ",
+      "browserUse": "Browser Use",
+      "browserWindowHint": "ウェブページは新しいウィンドウで開きます。サイドバーでページを操作するには、デスクトップアプリをご利用ください。",
+      "browserUseDescription": "ウェブページを開く",
       "executionMode": "実行モード",
       "ownerOnlyUnavailable": "オーナー専用モードはこのブラウザーセッションでは利用できません。",
       "enabled": "有効",

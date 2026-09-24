@@ -150,6 +150,15 @@ def test_image_route_reason_preserves_only_producer_owned_codes(reason):
     assert log_metadata({"image_route_reason": "arbitrary-private-word"}) == {}
 
 
+@pytest.mark.parametrize("mode", ["auto", "dom", "invalid"])
+def test_browser_capture_mode_retains_only_bounded_values(mode):
+    fields = {"browser_requested_mode": mode}
+    assert log_metadata(fields) == fields
+    assert json.loads(scrub_log_artifact(json.dumps(fields))) == fields
+    for value in (PRIVATE, [mode], {"mode": mode}, True, None):
+        assert log_metadata({"browser_requested_mode": value}) == {}
+
+
 def test_uvicorn_own_error_handler_cannot_bypass_gateway_privacy(capsys):
     import uvicorn
 

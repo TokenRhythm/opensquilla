@@ -188,6 +188,7 @@ export type NativeWorkbenchSurfaceEventType =
   | 'capability-expired'
   | 'unresponsive'
   | 'browser-opened'
+  | 'browser-closed'
   | 'annotation-selected'
   | 'annotation-draft-change'
   | 'annotation-submit'
@@ -211,6 +212,8 @@ export interface NativeWorkbenchSurfaceEvent {
     url?: string
     title?: string
     loading?: boolean
+    pageState?: string
+    navigationError?: { url: string; code: string; errorCode?: number; message: string } | null
     canGoBack?: boolean
     canGoForward?: boolean
     requestId?: string

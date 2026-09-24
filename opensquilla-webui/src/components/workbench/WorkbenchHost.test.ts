@@ -54,12 +54,14 @@ async function mountHost(
   const routeActive = ref(true)
   const modalBlocked = ref(false)
   const onSurfaceRect = vi.fn()
+  const onFocusReturn = vi.fn()
   const Root = defineComponent(() => () => h(
     WorkbenchHost,
     {
       availableWidth,
       modalBlocked: modalBlocked.value,
       onSurfaceRect,
+      onFocusReturn,
       routeActive: routeActive.value,
       beforeCloseItem,
     },
@@ -80,10 +82,10 @@ async function mountHost(
   store.openItem(item('one'))
   app.mount(host)
   await nextTick()
-  return { host, modalBlocked, onSurfaceRect, routeActive, store }
+  return { host, modalBlocked, onSurfaceRect, onFocusReturn, routeActive, store }
 }
 
-async function mountHostWithDeferredNativeSlot() {
+async function mountHostWithDeferredNativeSlot(resizeWithMaximization = false) {
   const host = document.createElement('div')
   document.body.appendChild(host)
   const pinia = createPinia()
@@ -91,17 +93,21 @@ async function mountHostWithDeferredNativeSlot() {
   const onSurfaceRect = vi.fn()
   const setNativeSlotRect = (value: unknown) => {
     if (!(value instanceof HTMLElement)) return
-    value.getBoundingClientRect = () => ({
-      x: 500,
-      y: 50,
-      top: 50,
-      right: 1100,
-      bottom: 650,
-      left: 500,
-      width: 600,
-      height: 600,
-      toJSON: () => ({}),
-    })
+    value.getBoundingClientRect = () => {
+      const x = resizeWithMaximization ? store.maximized ? 0 : 600 : 500
+      const width = resizeWithMaximization && store.maximized ? 1200 : 600
+      return {
+        x,
+        y: 50,
+        top: 50,
+        right: x + width,
+        bottom: 650,
+        left: x,
+        width,
+        height: 600,
+        toJSON: () => ({}),
+      }
+    }
   }
   const Root = defineComponent(() => () => h(
     WorkbenchHost,
@@ -192,6 +198,66 @@ afterEach(() => {
 })
 
 describe('WorkbenchHost', () => {
+  it('maximizes and restores the same page and keyboard control without changing saved width', async () => {
+    const mounted = await mountHost(1200, undefined, true)
+    mounted.store.setWidth(614)
+    await nextTick()
+    const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
+    const content = mounted.host.querySelector('[data-testid="panel-one"]')!
+    const button = mounted.host.querySelector<HTMLButtonElement>(
+      '[data-testid="workbench-maximize"]',
+    )!
+    button.focus()
+    button.click()
+    await nextTick()
+    await nextTick()
+
+    expect(panel.classList.contains('workbench-host--maximized')).toBe(true)
+    expect(panel.style.getPropertyValue('--workbench-width')).toBe('1200px')
+    expect(mounted.host.querySelector('[data-testid="workbench-resizer"]')).toBeNull()
+    expect(mounted.host.querySelector('[data-testid="panel-one"]')).toBe(content)
+    expect(button.getAttribute('aria-pressed')).toBe('true')
+    expect(button.getAttribute('aria-label')).toBe('Restore workbench size')
+    expect(document.activeElement).toBe(button)
+
+    button.click()
+    await nextTick()
+    await nextTick()
+    expect(panel.classList.contains('workbench-host--split')).toBe(true)
+    expect(panel.style.getPropertyValue('--workbench-width')).toBe('614px')
+    expect(mounted.host.querySelector('[data-testid="workbench-resizer"]')).not.toBeNull()
+    expect(mounted.host.querySelector('[data-testid="panel-one"]')).toBe(content)
+    expect(button.getAttribute('aria-label')).toBe('Maximize workbench')
+    expect(document.activeElement).toBe(button)
+  })
+
+  it('keeps the mobile dialog free of a redundant maximize button', async () => {
+    const mounted = await mountHost(600)
+    expect(mounted.host.querySelector('[data-testid="workbench-maximize"]')).toBeNull()
+    expect(mounted.host.querySelector('[aria-label="Collapse workbench"]')).not.toBeNull()
+  })
+
+  it('remeasures the existing native page after maximize and restore', async () => {
+    const mounted = await mountHostWithDeferredNativeSlot(true)
+    mounted.ready.value = true
+    await nextTick()
+    const slot = mounted.host.querySelector<HTMLElement>('[data-workbench-native-surface-slot]')!
+    mounted.onSurfaceRect.mockClear()
+    mounted.store.setMaximized(true)
+    await nextTick()
+    await nextTick()
+    expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith({
+      itemId: 'native', x: 0, y: 50, width: 1200, height: 600, visible: true,
+    })
+    mounted.store.setMaximized(false)
+    await nextTick()
+    await nextTick()
+    expect(mounted.onSurfaceRect).toHaveBeenLastCalledWith({
+      itemId: 'native', x: 600, y: 50, width: 600, height: 600, visible: true,
+    })
+    expect(mounted.host.querySelector('[data-workbench-native-surface-slot]')).toBe(slot)
+  })
+
   it('opens with an even split and keeps an explicit user width', async () => {
     const mounted = await mountHost(1200)
     const panel = mounted.host.querySelector<HTMLElement>('[data-testid="workbench-host"]')!
@@ -229,7 +295,7 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.activeItemId).toBe('one')
   })
 
-  it('moves focus to the collapse control when closing from two tabs to one', async () => {
+  it('returns focus to the local collapse control when closing from two tabs to one', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('two'))
     await nextTick()
@@ -243,9 +309,7 @@ describe('WorkbenchHost', () => {
 
     expect(mounted.store.items).toHaveLength(1)
     expect(mounted.host.querySelector('[role="tablist"]')).toBeNull()
-    expect(document.activeElement).toBe(
-      mounted.host.querySelector('[aria-label="Collapse workbench"]'),
-    )
+    expect(document.activeElement).toBe(mounted.host.querySelector('[aria-label="Collapse workbench"]'))
   })
 
   it('keeps a tab mounted when its pending source save rejects close', async () => {
@@ -263,7 +327,7 @@ describe('WorkbenchHost', () => {
     expect(mounted.store.activeItemId).toBe('two')
   })
 
-  it('uses one desktop collapse control and preserves open tabs', async () => {
+  it('keeps a local collapse control without the empty browser entry and preserves open tabs', async () => {
     const mounted = await mountHost(1200)
     mounted.store.openItem(item('two'))
     await nextTick()
@@ -271,10 +335,9 @@ describe('WorkbenchHost', () => {
 
     expect(panel.querySelector('[aria-label="Close tab: one.html"]')).not.toBeNull()
     expect(panel.querySelector('[aria-label="Close tab: two.html"]')).not.toBeNull()
-    const collapse = panel.querySelector<HTMLButtonElement>(
-      '[aria-label="Collapse workbench"]',
-    )!
-    collapse.click()
+    const collapse = panel.querySelector<HTMLButtonElement>('[aria-label="Collapse workbench"]')
+    expect(collapse).not.toBeNull()
+    collapse?.click()
     await nextTick()
 
     expect(mounted.store.items).toHaveLength(2)
@@ -321,6 +384,47 @@ describe('WorkbenchHost', () => {
     expect(secondLayer.hasAttribute('inert')).toBe(true)
     expect(secondLayer.querySelector('[data-testid="panel-two"]')?.getAttribute('data-active'))
       .toBe('false')
+  })
+
+  it('retains web pages across session switches without revealing another session page', async () => {
+    const mounted = await mountHost(1200, undefined, true)
+    const browser = (id: string, session: string): WorkbenchItem => ({
+      ...item(id), kind: 'browser', scope: { type: 'session', id: session },
+    })
+    mounted.store.openItem(browser('page-a', 'session'))
+    await nextTick()
+    const page = mounted.host.querySelector('[data-testid="panel-page-a"]')!
+    const layer = mounted.host.querySelector<HTMLElement>('[data-workbench-item-id="page-a"]')!
+
+    mounted.store.setSessionScope('other-session')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-page-a"]')).toBe(page)
+    expect(layer.style.display).toBe('none')
+    expect(layer.hasAttribute('inert')).toBe(true)
+    expect(layer.getAttribute('aria-hidden')).toBe('true')
+
+    mounted.store.openItem(browser('page-b', 'other-session'))
+    await nextTick()
+    expect(mounted.host.querySelectorAll('[role="tab"]')).toHaveLength(1)
+    expect(mounted.host.querySelector('[role="tab"]')?.textContent).toContain('page-b')
+    expect(layer.style.display).toBe('none')
+
+    mounted.store.setSessionScope('session')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-page-a"]')).toBe(page)
+    expect(layer.style.display).not.toBe('none')
+    expect(layer.hasAttribute('inert')).toBe(false)
+    expect(mounted.host.querySelector('[role="tab"]')?.textContent).toContain('page-a')
+
+    mounted.store.activateItem('page-b')
+    await nextTick()
+    const otherLayer = mounted.host.querySelector<HTMLElement>('[data-workbench-item-id="page-b"]')!
+    expect(otherLayer.style.display).toBe('none')
+    expect(otherLayer.hasAttribute('inert')).toBe(true)
+
+    mounted.store.closeItem('page-a')
+    await nextTick()
+    expect(mounted.host.querySelector('[data-testid="panel-page-a"]')).toBeNull()
   })
 
   it('uses a non-modal overlay before switching to a mobile dialog', async () => {

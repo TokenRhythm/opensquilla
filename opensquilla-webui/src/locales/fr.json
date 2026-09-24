@@ -213,6 +213,8 @@
     "title": "Espace de travail",
     "expand": "Ouvrir l’espace de travail",
     "collapse": "Réduire l’espace de travail",
+    "maximize": "Agrandir l’espace de travail",
+    "restore": "Restaurer l’espace de travail",
     "close": "Fermer l’espace de travail",
     "closeItem": "Fermer l’onglet",
     "refresh": "Actualiser",
@@ -231,6 +233,11 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Ce HTML n’est pas un UTF-8 valide et ne peut pas être prévisualisé ou modifié en toute sécurité.", "htmlValidationFailed": "Ce HTML n’a pas pu être validé pour une prévisualisation ou une modification sûre.", "htmlEditTooLarge": "Ce HTML est trop volumineux pour être modifié dans l’application. Vous pouvez toujours le télécharger.", "htmlPreviewTooLarge": "Ce HTML est trop volumineux pour être prévisualisé en toute sécurité. Vous pouvez toujours le télécharger.", "officeAdapterNotAvailable": "L’édition Office n’est pas encore disponible.", "unsupported": "Cette action n’est pas disponible pour cette ressource." }
     },
     "browser": {
+      "newTab": "Nouvel onglet",
+      "startHint": "Ouvrez une page web à côté de cette tâche.",
+      "addressPlaceholder": "Saisissez une URL, par ex. example.com",
+      "invalidAddress": "Saisissez une adresse HTTP ou HTTPS valide.",
+      "reopen": "Rouvrir l’onglet fermé",
       "back": "Précédent",
       "forward": "Suivant",
       "stop": "Arrêter le chargement",
@@ -4407,6 +4414,9 @@
     "composer": {
       "workStyleGroup": "Méthode de travail",
       "contentGroup": "Contenu",
+      "browserUse": "Browser Use",
+      "browserWindowHint": "Les pages s’ouvrent dans une nouvelle fenêtre. Utilisez l’application de bureau pour les contrôler dans le panneau latéral.",
+      "browserUseDescription": "Ouvrir une page web",
       "executionMode": "Mode d'exécution",
       "ownerOnlyUnavailable": "Le mode propriétaire uniquement est indisponible pour cette session de navigateur.",
       "enabled": "Activé",

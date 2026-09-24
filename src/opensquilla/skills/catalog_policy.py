@@ -20,6 +20,7 @@ from opensquilla.skills.types import (
 
 # Deliberately tuples: their order is part of the prompt/cache contract.
 PUBLIC_BUNDLED_SKILLS: tuple[str, ...] = (
+    "browser-use",
     "deep-research",
     "docx",
     "github",

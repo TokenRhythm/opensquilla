@@ -52,6 +52,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.invoke('desktop:workbench:annotation:close-overlay', payload)
   ),
   getWorkbenchBrowserTarget: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:target', payload),
+  setBrowserAutomationState: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:automation-state', payload),
   focusWorkbenchAnnotation: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:annotation:focus', payload),
   captureWorkbenchScreenshot: (payload: unknown) => ipcRenderer.invoke('desktop:workbench:browser:screenshot', payload),
   createArtifactPreviewLease: (payload: unknown) => (

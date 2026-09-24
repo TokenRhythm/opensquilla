@@ -214,6 +214,8 @@
     "title": "Workbench",
     "expand": "Open workbench",
     "collapse": "Collapse workbench",
+    "maximize": "Maximize workbench",
+    "restore": "Restore workbench",
     "close": "Close workbench",
     "closeItem": "Close tab",
     "refresh": "Refresh",
@@ -232,6 +234,11 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "This HTML is not valid UTF-8 and cannot be previewed or edited safely.", "htmlValidationFailed": "This HTML could not be validated for safe preview or editing.", "htmlEditTooLarge": "This HTML is too large to edit in the app. You can still download it.", "htmlPreviewTooLarge": "This HTML is too large to preview safely in the app. You can still download it.", "officeAdapterNotAvailable": "Office editing is not available yet.", "unsupported": "This action is not available for this resource." }
     },
     "browser": {
+      "newTab": "New tab",
+      "startHint": "Open a webpage alongside this task.",
+      "addressPlaceholder": "Enter a URL, e.g. example.com",
+      "invalidAddress": "Enter a valid HTTP or HTTPS web address.",
+      "reopen": "Reopen closed tab",
       "back": "Back",
       "forward": "Forward",
       "stop": "Stop loading",
@@ -4492,6 +4499,9 @@
     "composer": {
       "workStyleGroup": "Work style",
       "contentGroup": "Content",
+      "browserUse": "Browser Use",
+      "browserWindowHint": "Webpages open in a new window. Use the desktop app to control pages in the sidebar.",
+      "browserUseDescription": "Open a webpage",
       "executionMode": "Execution mode",
       "ownerOnlyUnavailable": "Owner-only mode is unavailable for this browser session.",
       "enabled": "Enabled",

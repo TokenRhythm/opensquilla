@@ -3517,6 +3517,28 @@ async def build_services(
     else:
         await _configure_search_provider()
 
+    # The Desktop owns this local MCP capability; it requires no user-managed
+    # server configuration. Older Desktop shells retain their native browser tool.
+    from opensquilla.browser import get_desktop_browser
+
+    desktop_browser = get_desktop_browser()
+    if desktop_browser is not None:
+        from opensquilla.mcp.desktop_browser import DesktopBrowserMCPClient, browser_tool_policy
+        from opensquilla.mcp.discovery import close_active_clients, register_client_tools
+
+        try:
+            await close_active_clients(owner="desktop-browser")
+            names = await asyncio.wait_for(
+                register_client_tools(
+                    DesktopBrowserMCPClient(desktop_browser), tool_registry,
+                    spec_transform=browser_tool_policy,
+                ),
+                timeout=5,
+            )
+            log.info("build_services.desktop_browser_mcp_ready", tools=len(names))
+        except Exception:
+            log.info("build_services.desktop_browser_mcp_unavailable")
+
     # ── MCP discovery (boot order 22) ───────────────────────────────
     if config.mcp.enabled and config.mcp.servers:
         from opensquilla.mcp.discovery import discover_and_register

@@ -12,6 +12,23 @@ afterEach(() => {
 })
 
 describe('native Workbench platform bridge', () => {
+  it('forwards optional automation state while preserving older native clients', async () => {
+    const base = {
+      createWorkbenchSurface: vi.fn(),
+      setWorkbenchSurfaceRect: vi.fn(),
+      activateWorkbenchSurface: vi.fn(),
+      destroyWorkbenchSurface: vi.fn(),
+      onWorkbenchSurfaceEvent: vi.fn(),
+    }
+    setDesktopApi(base)
+    expect(createDesktopPlatform().workbench.native?.setBrowserAutomationState).toBeUndefined()
+    const update = vi.fn(async () => ({ ok: true }))
+    setDesktopApi({ ...base, setBrowserAutomationState: update })
+    const request = { sessionKey: 'session-fixture', taskId: 'task-fixture', active: true }
+    await createDesktopPlatform().workbench.native!.setBrowserAutomationState!(request)
+    expect(update).toHaveBeenCalledExactlyOnceWith(request)
+  })
+
   it('is absent on web and older desktop shells', () => {
     expect(createWebPlatform().workbench.native).toBeUndefined()
     expect(createWebPlatform().capabilities.hasNativeWorkbenchSurfaces).toBe(false)
@@ -130,6 +147,16 @@ describe('native Workbench platform bridge', () => {
       type: 'missing-resource',
       detail: { path: '/assets/app.css' },
     })
+    const navigationError = { url: 'https://example.test/unavailable', code: 'ERR_CONNECTION_REFUSED',
+      errorCode: -102, message: 'Connection refused.' }
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state',
+      detail: { pageState: 'navigation_failed', navigationError: { ...navigationError, ignored: 'value' } } })
+    expect(listener).toHaveBeenLastCalledWith({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state',
+      detail: { pageState: 'navigation_failed', navigationError } })
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: null } })
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: { navigationError: null } }))
+    emit?.({ version: 4, surfaceId: 'browser:fixture', type: 'navigation-state', detail: { navigationError: { code: 42 } } })
+    expect(listener).toHaveBeenLastCalledWith(expect.objectContaining({ detail: {} }))
   })
 
   it('fails closed when only part of the shell bridge exists', () => {

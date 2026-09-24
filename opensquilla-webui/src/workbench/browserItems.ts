@@ -2,9 +2,9 @@ import type { WorkbenchItem } from './types'
 
 export const BROWSER_WORKBENCH_OPEN_EVENT = 'opensquilla:open-side-browser'
 
-export interface BrowserWorkbenchOpenEventDetail {
-  url: string
-}
+export type BrowserWorkbenchOpenEventDetail =
+  | { url: string }
+  | { action: 'reveal'; sessionId: string }
 
 function urlDigest(value: string): string {
   const bytes = new TextEncoder().encode(value)
@@ -30,9 +30,23 @@ export function normalizeBrowserUrl(value: string): string {
   }
 }
 
+/** Address-bar input may omit the scheme; tool URLs remain strictly explicit. */
+export function normalizeBrowserAddress(value: string): string {
+  const trimmed = value.trim()
+  if (/^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/i.test(trimmed)) {
+    return normalizeBrowserUrl(`http://${trimmed}`)
+  }
+  if (/^(?:[^/:?#\s.]+(?:\.[^/:?#\s.]+)+|\[[a-f\d:]+\]):\d+(?:[/?#]|$)/i.test(trimmed)) {
+    return normalizeBrowserUrl(`https://${trimmed}`)
+  }
+  if (/^[a-z][a-z\d+.-]*:/i.test(trimmed)) return normalizeBrowserUrl(trimmed)
+  return trimmed ? normalizeBrowserUrl(`https://${trimmed}`) : ''
+}
+
 export function createBrowserWorkbenchItem(options: {
   scopeId: string
   url: string
+  instanceId?: string
 }): WorkbenchItem | null {
   const url = normalizeBrowserUrl(options.url)
   if (!url) return null
@@ -40,7 +54,8 @@ export function createBrowserWorkbenchItem(options: {
   if (!scopeId) return null
   const parsed = new URL(url)
   return {
-    id: `browser:${urlDigest(scopeId)}:${urlDigest(url)}`,
+    id: `browser:${urlDigest(scopeId)}:${urlDigest(url)}${options.instanceId
+      ? `:${urlDigest(options.instanceId)}` : ''}`,
     kind: 'browser',
     title: parsed.hostname,
     scope: { type: 'session', id: scopeId },
@@ -66,6 +81,15 @@ export function requestBrowserWorkbenchOpen(url: string): boolean {
   window.dispatchEvent(new CustomEvent<BrowserWorkbenchOpenEventDetail>(
     BROWSER_WORKBENCH_OPEN_EVENT,
     { detail: { url: normalized } },
+  ))
+  return true
+}
+
+export function requestBrowserWorkbenchReveal(sessionId: string): boolean {
+  if (!sessionId || typeof window === 'undefined') return false
+  window.dispatchEvent(new CustomEvent<BrowserWorkbenchOpenEventDetail>(
+    BROWSER_WORKBENCH_OPEN_EVENT,
+    { detail: { action: 'reveal', sessionId } },
   ))
   return true
 }

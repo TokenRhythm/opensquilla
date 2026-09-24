@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createPinia, setActivePinia } from 'pinia'
 import type {
   NativeWorkbenchApi,
   NativeWorkbenchCapabilities,
@@ -6,7 +7,8 @@ import type {
   Platform,
 } from '@/platform/types'
 import { createBrowserWorkbenchItem } from '@/workbench/browserItems'
-import { WorkbenchPanelRegistry, WorkbenchRuntimeManager } from '@/workbench/runtime'
+import { attachWorkbenchRuntime, WorkbenchPanelRegistry, WorkbenchRuntimeManager } from '@/workbench/runtime'
+import { useWorkbenchStore } from '@/workbench/store'
 import type {
   NativeSurfaceRect,
   WorkbenchItem,
@@ -252,6 +254,43 @@ describe('browser adoption through the Workbench runtime manager', () => {
     expect(onError).toHaveBeenCalledOnce()
   })
 
+  it('retains native page memory across task changes and safely recreates a closed tab', async () => {
+    setActivePinia(createPinia())
+    const store = useWorkbenchStore()
+    const detach = attachWorkbenchRuntime(store, manager)
+    const item = items[0]!
+    const original = instances.get(item.id)
+    store.setSessionScope('session-a')
+    store.openItem(item)
+    manager.handleSurfaceRect({ ...visibleRect, itemId: item.id })
+    await manager.flush()
+    expect(original?.visible).toBe(true)
+
+    store.setSessionScope('session-empty')
+    await manager.flush()
+    expect(instances.get(item.id)).toBe(original)
+    expect(original?.visible).toBe(false)
+    expect(api.destroySurface).not.toHaveBeenCalled()
+
+    store.setSessionScope('session-a')
+    expect(store.reopenBrowserForSession('session-a')).toBe(true)
+    manager.handleSurfaceRect({ ...visibleRect, itemId: item.id })
+    await manager.flush()
+    expect(instances.get(item.id)).toBe(original)
+    expect(original?.note).toBe(`${item.id} memory`)
+    expect(original?.visible).toBe(true)
+
+    store.closeItem(item.id)
+    expect(store.reopenBrowserForSession('session-a')).toBe(true)
+    manager.handleSurfaceRect({ ...visibleRect, itemId: item.id })
+    await manager.flush()
+    expect(instances.get(item.id)?.identity).not.toBe(original?.identity)
+    expect(instances.get(item.id)?.visible).toBe(true)
+    expect(api.createSurface).toHaveBeenCalledOnce()
+    expect(onError).not.toHaveBeenCalled()
+    await detach()
+  })
+
   it('retains the page when suspension rejects activation after positioning awaits', async () => {
     const item = items[0]!
     item.payload = { ...item.payload, adoptedNativeSurface: false }
@@ -292,6 +331,68 @@ describe('browser adoption through the Workbench runtime manager', () => {
 })
 
 describe('browser Workbench provider', () => {
+  const navigationError = { url: 'https://unavailable.example.test/', code: 'ERR_CONNECTION_REFUSED',
+    message: 'Page navigation failed (ERR_CONNECTION_REFUSED).' }
+
+  it('keeps a failed initial navigation available for retry in the same surface', async () => {
+    const api = nativeApi({
+      createSurface: vi.fn(async () => ({ ok: true, navigationError })),
+      navigateSurface: vi.fn(successfulResult),
+    })
+    const harness = await createHarness(api)
+    expect(harness.renderState).toMatchObject({ errorMessage: navigationError.message,
+      currentUrl: navigationError.url, loading: false })
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload: { action: 'reload' } }, harness.item)
+    expect(api.navigateSurface).toHaveBeenCalledWith(expect.objectContaining({ surfaceId: harness.item.id, action: 'reload' }))
+    expect(api.createSurface).toHaveBeenCalledOnce()
+    expect(api.destroySurface).not.toHaveBeenCalled()
+  })
+
+  it('retains a live tab after navigation failure and accepts a new address', async () => {
+    const navigateSurface = vi.fn().mockResolvedValueOnce({ ok: false, navigationError })
+      .mockResolvedValue({ ok: true })
+    const api = nativeApi({ navigateSurface })
+    const harness = await createHarness(api)
+    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload: {
+      action: 'navigate', url: navigationError.url } }, harness.item)
+    expect(harness.renderState.errorMessage).toBe(navigationError.message)
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    expect(harness.reportError).not.toHaveBeenCalled()
+    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload: {
+      action: 'navigate', url: 'https://example.test/recovered' } }, harness.item)
+    expect(harness.renderState.errorMessage).toBe('')
+    expect(api.createSurface).toHaveBeenCalledOnce()
+  })
+
+  it.each(['policy', 'transport'])('retains an existing page after a %s navigation rejection', async kind => {
+    const navigateSurface = vi.fn(async () => {
+      if (kind === 'transport') throw new Error('Navigation response was interrupted.')
+      return { ok: false, code: 'NAVIGATION_BLOCKED', message: 'This address is unavailable.' }
+    })
+    const api = nativeApi({ navigateSurface })
+    const harness = await createHarness(api)
+    await harness.runtime.handleSurfaceRect?.(visibleRect, harness.item)
+    await harness.runtime.handleComponentEvent?.({ type: 'browser-action', payload: {
+      action: 'navigate', url: 'https://example.test/blocked' } }, harness.item)
+    expect(harness.renderState.errorMessage).toBeTruthy()
+    expect(api.destroySurface).not.toHaveBeenCalled()
+    expect(harness.reportError).not.toHaveBeenCalled()
+    expect(api.setSurfaceRect).toHaveBeenLastCalledWith(expect.objectContaining({ visible: false }))
+  })
+
+  it('uses navigation state to display and clear recoverable errors without disposal', async () => {
+    const api = nativeApi()
+    const harness = await createHarness(api)
+    await harness.runtime.handleNativeSurfaceEvent?.({ version: 4, surfaceId: harness.item.id,
+      type: 'navigation-state', detail: { url: navigationError.url, loading: false, navigationError } }, harness.item)
+    expect(harness.renderState.errorMessage).toBe(navigationError.message)
+    await harness.runtime.handleNativeSurfaceEvent?.({ version: 4, surfaceId: harness.item.id,
+      type: 'navigation-state', detail: { url: 'https://example.test/recovered', loading: false, navigationError: null } }, harness.item)
+    expect(harness.renderState.errorMessage).toBe('')
+    expect(api.destroySurface).not.toHaveBeenCalled()
+  })
+
   it('shows an upgrade error instead of leaving an old Desktop shell loading', async () => {
     const api = nativeApi({
       getCapabilities: vi.fn(async (): Promise<NativeWorkbenchCapabilities> => ({
@@ -336,7 +437,7 @@ describe('browser Workbench provider', () => {
     expect(api.destroySurface).toHaveBeenCalledWith(harness.item.id)
   })
 
-  it.each(['navigate', 'rect', 'activate'] as const)(
+  it.each(['rect', 'activate'] as const)(
     'hides and destroys the native surface after a %s failure',
     async failingOperation => {
       const setSurfaceRect = vi.fn(async (request) => {
@@ -350,10 +451,7 @@ describe('browser Workbench provider', () => {
           ? { ok: false, message: 'activate failed' }
           : { ok: true }
       ))
-      const navigateSurface = vi.fn(async () => {
-        if (failingOperation === 'navigate') throw new Error('navigate failed')
-        return { ok: true }
-      })
+      const navigateSurface = vi.fn(successfulResult)
       const api = nativeApi({
         setSurfaceRect,
         activateSurface,
@@ -361,15 +459,7 @@ describe('browser Workbench provider', () => {
       })
       const harness = await createHarness(api)
 
-      if (failingOperation === 'navigate') {
-        await harness.runtime.handleSurfaceRect?.(visibleRect, harness.item)
-        await harness.runtime.handleComponentEvent?.({
-          type: 'browser-action',
-          payload: { action: 'navigate', url: 'https://example.test/next' },
-        }, harness.item)
-      } else {
-        await harness.runtime.handleSurfaceRect?.(visibleRect, harness.item)
-      }
+      await harness.runtime.handleSurfaceRect?.(visibleRect, harness.item)
 
       expect(harness.renderState).toMatchObject({
         errorMessage: `${failingOperation} failed`,

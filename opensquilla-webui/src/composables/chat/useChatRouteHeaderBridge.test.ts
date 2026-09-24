@@ -39,6 +39,7 @@ function owner(title: string): {
 } {
   return {
     model: {
+      sessionKey: ref(`session-${title}`),
       visible: ref(true),
       title: ref(title),
       copyState: ref(null),
@@ -61,6 +62,18 @@ function owner(title: string): {
 }
 
 describe('chat route header bridge', () => {
+  it('exposes the same draft session while the landing header is hidden and after materialization', () => {
+    const bridge = createBridge()
+    const draft = owner('draft')
+    draft.model.visible = ref(false)
+    const registration = bridge.register(draft.model, draft.commands)
+    expect(bridge.model.sessionKey.value).toBe('session-draft')
+    draft.model.visible = ref(true)
+    expect(bridge.model.sessionKey.value).toBe('session-draft')
+    registration.release()
+    expect(bridge.model.sessionKey.value).toBe('')
+  })
+
   it('keeps a newer owner when stale teardown arrives', () => {
     const bridge = createBridge()
     const first = owner('first')

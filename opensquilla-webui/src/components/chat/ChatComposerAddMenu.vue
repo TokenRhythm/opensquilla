@@ -24,6 +24,21 @@
           <strong>{{ t('chat.attachFiles') }}</strong>
         </span>
       </button>
+      <button
+        v-if="browserUseAvailable"
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        @click="openBrowserUse"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="languages" :size="17" />
+        </span>
+        <span class="composer-add-menu__copy">
+          <strong>{{ t('chat.composer.browserUse') }}</strong>
+          <span>{{ t('chat.composer.browserUseDescription') }}</span>
+        </span>
+      </button>
     </div>
     <div
       v-if="planModeAvailable || goalModeAvailable"
@@ -89,6 +104,7 @@ import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPla
 const props = defineProps<{
   avoidElement?: HTMLElement | null
   attachmentsDisabled?: boolean
+  browserUseAvailable?: boolean
   goalModeActive: boolean
   goalModeAvailable: boolean
   goalModeBusy: boolean
@@ -102,6 +118,7 @@ const emit = defineEmits<{
   activateGoalMode: []
   activatePlanMode: []
   attachFiles: []
+  openBrowserUse: []
   close: []
 }>()
 
@@ -149,6 +166,11 @@ function trackPlacement() {
 
 function attachFiles() {
   emit('attachFiles')
+  emit('close')
+}
+
+function openBrowserUse() {
+  emit('openBrowserUse')
   emit('close')
 }
 

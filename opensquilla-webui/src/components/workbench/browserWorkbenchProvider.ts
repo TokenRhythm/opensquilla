@@ -96,6 +96,10 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         if (!result.ok) {
           throw new Error(result.message || 'Could not open the side browser.')
         }
+        if (result.navigationError) this.showNavigationFailure(result.navigationError.message, result.navigationError.url)
+      } else {
+        const failure = this.item.payload.navigationError as { message?: string; url?: string } | undefined
+        if (failure?.message) this.showNavigationFailure(failure.message, failure.url)
       }
       if (!this.context.isItemOpen()) {
         await this.hideAndDestroySurface()
@@ -120,6 +124,7 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
     if (
       request.action === 'reload'
       && Boolean(this.context.getRenderState().errorMessage)
+      && !this.created
     ) {
       await this.hideAndDestroySurface()
       if (!this.context.isItemOpen()) return
@@ -143,11 +148,21 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         ...(url ? { url } : {}),
       })
       if (!result.ok) {
-        throw new Error(result.message || this.options.t('workbench.browser.failedDetail'))
+        if (result.navigationError) {
+          this.showNavigationFailure(result.navigationError.message, result.navigationError.url)
+          return
+        }
+        const error = new Error(result.message || this.options.t('workbench.browser.failedDetail'))
+        if (result.code === 'TARGET_NOT_FOUND' || result.code === 'BROWSER_CRASHED') {
+          await this.failSurface(error)
+          return
+        }
+        throw error
       }
       this.context.updateRenderState({ errorMessage: '' })
     } catch (error) {
-      await this.failSurface(error)
+      this.showNavigationFailure(error instanceof Error ? error.message : this.options.t('workbench.browser.failedDetail'))
+      if (this.rect) await this.setRect({ ...this.rect, visible: false })
     }
   }
 
@@ -172,6 +187,8 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
         currentUrl: event.detail?.url || '',
         loading: event.detail?.loading === true,
         pageTitle: event.detail?.title || '',
+        ...(event.detail?.navigationError !== undefined
+          ? { errorMessage: event.detail.navigationError?.message || '' } : {}),
       })
       return
     }
@@ -265,6 +282,11 @@ class BrowserWorkbenchRuntime implements WorkbenchPanelRuntime {
       this.context.reportError(error)
     }
     await this.hideAndDestroySurface()
+  }
+
+  private showNavigationFailure(message: string, url?: string) {
+    this.context.updateRenderState({ errorMessage: message, loading: false,
+      ...(url ? { currentUrl: url } : {}) })
   }
 
   private async hideAndDestroySurface() {

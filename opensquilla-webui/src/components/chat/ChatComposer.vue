@@ -197,6 +197,7 @@
                 v-if="addMenuOpen"
                 :avoid-element="addMenuAvoidElement"
                 :attachments-disabled="replanActive"
+                :browser-use-available="browserUseAvailable === true"
                 :goal-mode-active="goalDraftArmed"
                 :goal-mode-available="goalModeAvailable === true"
                 :goal-mode-busy="goalModeBusy === true"
@@ -207,6 +208,7 @@
                 @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
+                @open-browser-use="emit('openBrowserUse')"
                 @close="addMenuOpen = false"
               />
             </div>
@@ -591,6 +593,7 @@ const props = withDefaults(defineProps<{
   codingModeEnabled?: boolean
   codingModeSettingsBusy?: boolean
   addMenuAvoidElement?: HTMLElement | null
+  browserUseAvailable?: boolean
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
   goalModeBusy?: boolean
@@ -654,6 +657,7 @@ const emit = defineEmits<{
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
+  openBrowserUse: []
   disarmGoal: []
   cancelReplan: []
   voiceInput: []

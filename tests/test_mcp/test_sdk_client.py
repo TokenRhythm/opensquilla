@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 
 import anyio
 import pytest
+from mcp.types import AudioContent, CallToolResult, ImageContent, TextContent
 from structlog.testing import capture_logs
 
 from opensquilla.mcp.sdk_client import SDKMCPClient
@@ -26,9 +27,9 @@ class Adapter(SDKMCPClient):
 
 def sdk_result(
     text: str | None = "done", *, structured: Any = None, is_error: bool = False,
-) -> SimpleNamespace:
-    return SimpleNamespace(
-        content=[] if text is None else [SimpleNamespace(type="text", text=text)],
+) -> CallToolResult:
+    return CallToolResult(
+        content=[] if text is None else [TextContent(type="text", text=text)],
         structured_content=structured,
         is_error=is_error,
     )
@@ -304,13 +305,14 @@ async def test_tool_result_projection(result: Any, expected: str, error: bool) -
         await client.close()
     assert actual.content == expected
     assert actual.is_error is error
+    assert actual.structured_content == result.structured_content
     if result.structured_content is not None and result.content == []:
         assert json.loads(actual.content) == result.structured_content
 
 
-async def test_nontext_only_result_is_not_an_empty_success() -> None:
+async def test_unsupported_nontext_only_result_is_not_an_empty_success() -> None:
     result = sdk_result(None)
-    result.content = [SimpleNamespace(type="image")]
+    result.content = [AudioContent(type="audio", data="AA==", mime_type="audio/wav")]
     client = Adapter(lambda: connected(sdk_client(result)))
     await client.connect()
     try:
@@ -318,15 +320,29 @@ async def test_nontext_only_result_is_not_an_empty_success() -> None:
     finally:
         await client.close()
     assert actual.is_error
-    assert "unsupported content types: image" in actual.content
+    assert "unsupported content types: audio" in actual.content
+
+
+async def test_image_only_result_preserves_media_without_binary_text_fallback() -> None:
+    result = sdk_result(None)
+    result.content = [ImageContent(type="image", data="AA==", mime_type="image/png")]
+    client = Adapter(lambda: connected(sdk_client(result)))
+    await client.connect()
+    try:
+        actual = await client.call_tool("screenshot", {})
+    finally:
+        await client.close()
+    assert not actual.is_error
+    assert actual.content == ""
+    assert actual.content_blocks == [{"type": "image", "data": "AA==", "mimeType": "image/png"}]
 
 
 async def test_multiple_text_blocks_preserve_order_and_empty_blocks() -> None:
     result = sdk_result(None, structured={"ignored": True})
     result.content = [
-        SimpleNamespace(type="text", text="first"),
-        SimpleNamespace(type="text", text=""),
-        SimpleNamespace(type="text", text="last"),
+        TextContent(type="text", text="first"),
+        TextContent(type="text", text=""),
+        TextContent(type="text", text="last"),
     ]
     client = Adapter(lambda: connected(sdk_client(result)))
     await client.connect()

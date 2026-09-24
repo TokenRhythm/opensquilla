@@ -18,7 +18,7 @@ const OTHER_LOCALES = ['zh-Hans', 'ja', 'fr', 'de', 'es']
 // English, so we enforce only KEY PARITY there and check leakage for zh-Hans.
 const LEAKAGE_LOCALES = new Set(['zh-Hans'])
 // Product terminology that deliberately remains in English in Simplified Chinese.
-const ZH_HANS_ENGLISH_TERMS = new Set(['chat.routerFx.ensembleTokens'])
+const ZH_HANS_ENGLISH_TERMS = new Set(['chat.routerFx.ensembleTokens', 'chat.composer.browserUse'])
 
 function load(name) {
   return JSON.parse(readFileSync(resolve(localesDir, `${name}.json`), 'utf8'))
