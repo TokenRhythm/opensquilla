@@ -241,6 +241,8 @@ async def test_models_configured_scope_adds_ready_profile_defaults_without_disco
         "configured", "models.list", {"scope": "configured"}, ctx,
     )
     assert configured.error is None
+    # Keep the exact response shape accepted by previously shipped clients.
+    assert set(configured.payload) == {"models", "errors"}
     assert [(m["provider"], m["id"]) for m in configured.payload["models"]] == [
         ("ollama", "test-model-good"), ("openai", "same-model"),
         ("anthropic", "same-model"),
@@ -250,6 +252,31 @@ async def test_models_configured_scope_adds_ready_profile_defaults_without_disco
     }
     assert [e["provider"] for e in configured.payload["errors"]] == ["deepseek"]
     assert "synthetic" not in str(configured.payload)
+
+
+@pytest.mark.asyncio
+async def test_models_cache_only_is_network_free_and_exposes_cache_miss(monkeypatch):
+    from opensquilla.provider.selector import ProviderConfig
+
+    async def unexpected(**_kwargs):
+        pytest.fail("cache-only must not query an upstream provider")
+
+    monkeypatch.setattr("opensquilla.onboarding.probe.discover_provider_models", unexpected)
+    selector = _DetailedModelSelector()
+    selector.current_config = ProviderConfig(
+        provider="custom", model="example-model", base_url="http://127.0.0.1:9999/v1",
+    )
+    cfg = GatewayConfig()
+    cfg.llm.provider = "custom"
+    cfg.llm.model = "example-model"
+    cfg.llm.base_url = "http://127.0.0.1:9999/v1"
+    result = await get_dispatcher().dispatch(
+        "cache", "models.list", {"scope": "configured", "cacheOnly": True},
+        RpcContext(conn_id="test", config=cfg, provider_selector=selector),
+    )
+    assert result.error is None
+    assert result.payload["catalog"]["cacheHit"] is False
+    assert result.payload["catalog"]["stale"] is True
 
 
 @pytest.mark.asyncio

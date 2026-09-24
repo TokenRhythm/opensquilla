@@ -68,7 +68,9 @@ try {
     resolve({ code, signal })
   }))
   const setup = await app.evaluate(async ({ BrowserWindow, ipcMain }, { origin, preload }) => {
-    const owner = new BrowserWindow({ show: true, width: 1000, height: 800,
+    // Initialize retained views before presenting the owner. Electron can have
+    // finished the document while isLoading() still awaits did-stop-loading.
+    const owner = new BrowserWindow({ show: false, width: 1000, height: 800,
       webPreferences: { sandbox: true, contextIsolation: true, nodeIntegration: false, preload } })
     await owner.loadURL('data:text/html,<title>Browser test host</title>')
     const manager = new globalThis.__opensquillaNativeWorkbenchSurfaceManager({ getWindow: () => owner, emit() {} })
@@ -92,6 +94,7 @@ try {
       return await manager.navigateSurface(request)
     })
     const targets = []
+    const initialClassifications = []
     for (const [surfaceId, sessionKey, path] of [
       ['first', 'session-a', '/'], ['same-url', 'session-a', '/'], ['other-session', 'session-b', '/'],
       ['working', 'session-a', '/working'],
@@ -99,14 +102,18 @@ try {
       const result = await manager.createSurface({ version: 4, surfaceId, kind: 'artifact-preview',
         payload: { launchUrl: origin + path, expectedOrigin: origin, scopeId: sessionKey, mode: 'full' } })
       if (!result.ok) throw new Error(result.message)
+      initialClassifications.push(manager.surfaces.get(surfaceId).revisionKind)
       manager.setSurfaceRect({ surfaceId, x: 100, y: 80, width: 700, height: 600, visible: true })
       targets.push(manager.getBrowserTarget(surfaceId))
     }
+    owner.show()
     manager.activateSurface('first')
     const browser = new globalThis.__opensquillaDesktopBrowserServer((request, signal) => manager.executeBrowser(request, signal))
     globalThis.browserFixture.server = browser
-    return { targets, environment: await browser.start() }
+    return { targets, initialClassifications, environment: await browser.start() }
   }, { origin, preload: fileURLToPath(new URL('../dist/preload.cjs', import.meta.url)) })
+  assert.deepEqual(setup.initialClassifications, ['immutable', 'immutable', 'immutable', 'working'],
+    'hidden previews must classify at creation, without relying on later visibility or Agent access')
   // Optional real idle measurement, also usable against an unchanged baseline.
   const idleSampleMs = Number(process.env.OPENSQUILLA_PREVIEW_IDLE_SAMPLE_MS || 0)
   if (idleSampleMs > 0) {

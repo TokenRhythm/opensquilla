@@ -74,6 +74,15 @@ describe('Platform configuration adapters', () => {
     expect(source.request).toHaveBeenLastCalledWith('models.list', undefined, expect.any(Object))
     await providers.list({ scope: 'configured' })
     expect(source.request).toHaveBeenLastCalledWith('models.list', { scope: 'configured' }, expect.any(Object))
+    await providers.list({ scope: 'configured', cacheOnly: true })
+    expect(source.request).toHaveBeenLastCalledWith('models.list', { scope: 'configured', cacheOnly: true }, expect.any(Object))
+  })
+
+  it('retains additive model catalog freshness at the adapter boundary', async () => {
+    const catalog = { cacheHit: true, stale: false, lastSyncedAt: '2026-01-01T00:00:00Z' }
+    const source = { request: vi.fn().mockResolvedValue({ models: [], errors: [], catalog }) }
+    const providers = createV4ProviderConfiguration(source, { subscribe: () => ({ close() {} }) })
+    expect(await providers.list({ cacheOnly: true })).toEqual({ models: [], errors: [], catalog })
   })
 
   it('maps config operations to AppSettings domain values', async () => {

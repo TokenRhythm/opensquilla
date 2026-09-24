@@ -546,6 +546,25 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("test_file", "function_name"),
+    [
+        (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
+        ),
+        (
+            "tests/test_engine/test_tool_concurrency.py",
+            "test_image_analysis_calls_have_dedicated_inflight_cap",
+        ),
+    ],
+)
+def test_bounded_latency_contracts_are_marked_ci_serial(
+    test_file: str, function_name: str,
+) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(Path(test_file), function_name)
+
+
 def test_real_skill_install_cancellation_is_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_engine/test_skill_install_turn.py"),

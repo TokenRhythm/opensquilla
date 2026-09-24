@@ -152,6 +152,9 @@ def test_sessions_spawn_policy_keys_by_parent_session() -> None:
     assert policy.key == ("sessions_spawn", "agent:main:parent-a")
 
 
+# This test also measures wall-clock batching latency; run it outside the
+# parallel CI worker pool without relaxing either the cap or timing assertion.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
     """Vision requests should not fan out at the generic safe-tool limit."""

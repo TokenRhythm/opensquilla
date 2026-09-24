@@ -140,7 +140,7 @@ describe('Native cascading model routing menu', () => {
     expect(query('.routing-show-all').textContent).toBe('View all models')
   })
   it.each([360, 390, 768, 1366])(
-    'keeps the expansion action outside the scrollable model list at %ipx',
+    'keeps expansion in the scrolling area but outside the listbox at %ipx',
     async (width) => {
       vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(width)
       await mount({
@@ -154,10 +154,11 @@ describe('Native cascading model routing menu', () => {
       const listbox = query('[role="listbox"]')
       const showAll = query<HTMLButtonElement>('.routing-show-all')
       expect(listArea.contains(listbox)).toBe(true)
-      expect(listArea.children).toHaveLength(1)
+      expect(listArea.children).toHaveLength(2)
       expect(listArea.firstElementChild).toBe(listbox)
-      expect(listArea.contains(showAll)).toBe(false)
-      expect(showAll.parentElement).toBe(listArea.parentElement)
+      expect(listArea.lastElementChild).toBe(showAll)
+      expect(listArea.contains(showAll)).toBe(true)
+      expect(showAll.closest('[role="listbox"]')).toBeNull()
       expect(showAll.tabIndex).toBe(0)
     },
   )
@@ -212,14 +213,23 @@ describe('Native cascading model routing menu', () => {
     await key(input, 'Enter')
     expect(selected).toHaveBeenCalledWith({ model: 'm-11', provider: 'provider-b' })
   })
-  it('does not add provider headings or loading noise to a usable single-provider list', async () => {
+  it('keeps a refreshing single-provider list usable with one quiet status message', async () => {
     await mount({
       availableModels: [{ id: 'a1', name: 'Alpha', provider: 'provider-a' }],
       modelsLoading: true,
-      modelProviderErrors: [{ provider: 'provider-a', kind: 'network', detail: 'offline' }],
     })
     expect(query('.routing-provider-heading')).toBeNull()
+    expect(query('.routing-catalog-label[role="status"]')?.textContent).toBe('Refreshing models…')
     expect(query('.routing-issue')).toBeNull()
+    expect(query('[role="option"][aria-disabled="true"]')).toBeNull()
+  })
+  it('discloses a failed refresh without disabling cached provider models', async () => {
+    await mount({
+      availableModels: [{ id: 'a1', name: 'Alpha', provider: 'provider-a' }],
+      modelProviderErrors: [{ provider: 'provider-a', kind: 'network', detail: 'offline' }],
+    })
+    expect(query('.routing-issue')?.textContent).toContain('Refresh failed. Showing the previous list.')
+    expect(query('.routing-model-scope')).toBeNull()
     expect(query('[role="option"][aria-disabled="true"]')).toBeNull()
   })
   it('keeps keyboard focus on the same model when discovery inserts an earlier row', async () => {

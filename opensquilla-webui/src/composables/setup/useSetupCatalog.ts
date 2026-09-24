@@ -5,6 +5,8 @@ import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabiliti
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
 import {
   hasEffectiveProvider,
+  catalogNeedsRefresh,
+  updateDiscoveredCatalog,
   normalizeCatalogSyncStatus,
   normalizeDiscoveredModels,
   normalizeProbeTimings,
@@ -542,8 +544,10 @@ const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 watch(() => providerForm.connection.value.models, () => {
   if (providerForm.connection.value.modelSource === 'live') modelCapacity.invalidate()
 })
-watch(tierModelCatalogs, catalogs => {
-  if (Object.values(catalogs).some(catalog => catalog.source === 'live')) modelCapacity.invalidate()
+watch(tierModelCatalogs, (catalogs, previous) => {
+  if (Object.entries(catalogs).some(([provider, catalog]) => (
+    catalog.source === 'live' && catalog.models !== previous[provider]?.models
+  ))) modelCapacity.invalidate()
 })
 const tierModelDiscoveries = new Map<string, Promise<void>>()
 let tierModelDiscoveryEpoch = 0
@@ -707,40 +711,35 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
   if (existing) return existing
 
   const epoch = tierModelDiscoveryEpoch
+  const publish = (next: DiscoveredModelCatalog) => {
+    tierModelCatalogs.value = { ...tierModelCatalogs.value, [provider]: next }
+  }
+  const current = () => tierModelCatalogs.value[provider] || { models: [], source: 'none' as const }
+  publish({ ...current(), discovering: true, discoverError: '', discoverFailureKind: '' })
   const request = (async () => {
     try {
       // Deliberately provider-only. Never forward the selected provider's
       // unsaved apiKey/baseUrl/proxy into another provider's request.
-      let res
-      if (provider === normalizeProviderId(config.value.llm?.provider)) {
-        // The current provider lives in [llm], not llm_profiles. This branch
-        // matters when Model Service is currently editing a different saved
-        // profile: the fixed-model picker must still discover the active
-        // provider through its primary deployment.
-        res = await setupWorkflow.provider.discoverPrimaryModels({ providerId: provider })
-      } else {
-        // The Adapter owns the legacy provider-discovery fallback so this
-        // consumer never branches on RPC method availability.
-        res = await setupWorkflow.profile.discoverProfileModels({ providerId: provider })
+      const load = (cacheOnly = false) => {
+        const params = { providerId: provider, ...(cacheOnly ? { cacheOnly: true } : {}) }
+        return provider === normalizeProviderId(config.value.llm?.provider)
+          ? setupWorkflow.provider.discoverPrimaryModels(params)
+          : setupWorkflow.profile.discoverProfileModels(params)
       }
+      const snapshot = await load(true)
       if (epoch !== tierModelDiscoveryEpoch) return
-      const source = res?.ok && res.source === 'live' ? 'live' : 'none'
-      tierModelCatalogs.value = {
-        ...tierModelCatalogs.value,
-        [provider]: source === 'live'
-          ? {
-              models: normalizeDiscoveredModels(res.models),
-              source,
-              catalog: normalizeCatalogSyncStatus(res.catalog),
-            }
-          : { models: [], source: 'none' },
+      if (normalizeCatalogSyncStatus(snapshot.catalog)?.cacheHit !== false) {
+        publish(updateDiscoveredCatalog(current(), snapshot))
       }
-    } catch {
+      if (!catalogNeedsRefresh(snapshot)) return
+      const res = await load()
       if (epoch !== tierModelDiscoveryEpoch) return
-      tierModelCatalogs.value = {
-        ...tierModelCatalogs.value,
-        [provider]: { models: [], source: 'none' },
-      }
+      publish(updateDiscoveredCatalog(current(), res))
+    } catch (error) {
+      if (epoch !== tierModelDiscoveryEpoch) return
+      publish({ ...current(), discoverError: error instanceof Error ? error.message : String(error) })
+    } finally {
+      if (epoch === tierModelDiscoveryEpoch) publish({ ...current(), discovering: false })
     }
   })()
   const tracked = request.finally(() => {
@@ -2043,6 +2042,7 @@ const routerPanel = routerForm.createPanel({
     const provider = normalizeProviderId(providerForm.selectedProvider.value)
     if (provider) {
       catalogs[provider] = {
+        ...providerForm.connection.value,
         models: providerForm.connection.value.models,
         source: providerForm.connection.value.modelSource,
       }
@@ -2082,6 +2082,7 @@ const fixedModelCatalog = computed<DiscoveredModelCatalog>(() => {
   if (!provider) return emptyFixedModelCatalog
   if (provider === normalizeProviderId(providerForm.selectedProvider.value)) {
     return {
+      ...providerForm.connection.value,
       models: providerForm.connection.value.models,
       source: providerForm.connection.value.modelSource,
     }
