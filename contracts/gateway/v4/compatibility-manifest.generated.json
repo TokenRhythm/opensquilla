@@ -738,7 +738,7 @@
       "lifecycle": "stable",
       "name": "models.list",
       "schema": "platform/models-list.schema.json",
-      "schemaSha256": "b99bc09fcc2d71eca1a7d45f45dd9597223438f769bcca219252f5230b797633"
+      "schemaSha256": "962da89934c7a6e546aa98ef1280c27247de586653cd8f7dd20e3f624727c715"
     },
     {
       "lifecycle": "stable",
@@ -846,7 +846,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.draft.models.discover",
       "schema": "platform/onboarding-llm-profile-draft-models-discover.schema.json",
-      "schemaSha256": "0869b6a20272818ddefcb910b8ce8d5603b1ed4afd67f550ee3ebca5bbfac525"
+      "schemaSha256": "6903543a19d22d159328dc27344b35071f78e0b11f10eca0be305c05115417af"
     },
     {
       "lifecycle": "stable",
@@ -858,7 +858,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.models.discover",
       "schema": "platform/onboarding-llm-profile-models-discover.schema.json",
-      "schemaSha256": "e81aa53627c0a49d62e6f85d7b4ac3184dbad93335e8ced9f227157918c5fefb"
+      "schemaSha256": "fe9dfccfe89f8684897f5c6d1f29e722b752f5d80f12d7715a72a5aa4a37f74f"
     },
     {
       "lifecycle": "stable",
@@ -894,7 +894,7 @@
       "lifecycle": "stable",
       "name": "onboarding.models.discover",
       "schema": "platform/onboarding-models-discover.schema.json",
-      "schemaSha256": "6118c8f27d888f5f6481d14e6f29faab3da1f1760d86b6ce22fbe9ce86555c0d"
+      "schemaSha256": "50a5dd53b131d04b45062858a2b8f0d16ff01516000463f57de2e668d012aca7"
     },
     {
       "lifecycle": "stable",
@@ -1536,7 +1536,7 @@
     "generatorSha256": "b34f4830fc0f8e5af6b9301da83eb99a93d1168a4b75578c13545c6a4b03a41c",
     "methodCount": 226,
     "schemaCount": 236,
-    "schemaTreeSha256": "c6f88179a90dbb0ca80807545a64e8aa9632831c391a0e60add79b4facba2034",
+    "schemaTreeSha256": "f94fa4f9725cd98a04058eda44d3b9eeacee10fa27a78af9f9ac4586529b243d",
     "toolchains": {
       "legacyTypes": {
         "python": {

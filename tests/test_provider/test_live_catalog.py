@@ -166,19 +166,23 @@ def test_tokenrhythm_invalid_effective_price_falls_back_to_standard(invalid: obj
     )
 
 
-def test_parse_tokenrhythm_models_skips_offline_and_malformed_rows() -> None:
+def test_parse_tokenrhythm_models_preserves_statuses_and_skips_non_chat_or_malformed() -> None:
     payload = {
         "code": 0,
         "data": [
             _tokenrhythm_row(),
             _tokenrhythm_row(id="glm-5", status="offline"),
+            _tokenrhythm_row(id="synthetic-offer", status="special_offer"),
+            _tokenrhythm_row(id="synthetic-image", type="image"),
             _tokenrhythm_row(id=""),
             "not-a-model-row",
             {"name": "row with no id"},
         ],
     }
 
-    assert set(parse_tokenrhythm_models(payload)) == {"deepseek-v4-pro"}
+    assert set(parse_tokenrhythm_models(payload)) == {
+        "deepseek-v4-pro", "glm-5", "synthetic-offer",
+    }
     assert parse_tokenrhythm_models({"code": 0, "data": "junk"}) == {}
     assert parse_tokenrhythm_models({}) == {}
 

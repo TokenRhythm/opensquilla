@@ -1310,28 +1310,25 @@ def merge_tokenrhythm_catalog(
     published: Mapping[str, TokenRhythmPublishedModel],
     declared: Mapping[str, TokenRhythmDeclaredModel],
 ) -> dict[str, TokenRhythmCatalogModel]:
-    """Merge metadata for authenticated ids only; public rows grant no access."""
+    """Merge chat metadata for authenticated ids only; public rows grant no access.
+
+    Status is descriptive provider metadata, including promotional values such
+    as ``special_offer``. Preserve it for display without overriding membership
+    in the authenticated catalog.
+    """
     published_by_id = {model_id.lower(): value for model_id, value in published.items()}
     result: dict[str, TokenRhythmCatalogModel] = {}
     for model_id, declared_model in declared.items():
         published_model = published_by_id.get(model_id.lower())
-        declared_status = (declared_model.status or "").lower()
         if (
             declared_model.model_type is not None
             and declared_model.model_type.lower() != "chat"
-        ) or declared_status not in ("", "online", "testing"):
+        ):
             continue
-        published_status = (
-            (published_model.status or "").lower()
-            if published_model is not None
-            else ""
-        )
-        if published_model is not None and (
-            (
-                published_model.model_type is not None
-                and published_model.model_type.lower() != "chat"
-            )
-            or published_status not in ("", "online", "testing")
+        if (
+            published_model is not None
+            and published_model.model_type is not None
+            and published_model.model_type.lower() != "chat"
         ):
             continue
         result[model_id] = TokenRhythmCatalogModel(
@@ -1371,11 +1368,9 @@ def _price_per_mtok(pricing: TokenRhythmPricing, raw: str | None) -> float | Non
 def tokenrhythm_published_catalog_entries(
     published: Mapping[str, TokenRhythmPublishedModel],
 ) -> TokenRhythmCatalogEntries:
+    """Project chat metadata regardless of status; this table grants no access."""
     entries: dict[str, dict[str, Any]] = {}
     for model_id, model in published.items():
-        status = (model.status or "").lower()
-        if status not in ("", "online", "testing"):
-            continue
         if model.model_type is not None and model.model_type.lower() != "chat":
             continue
         fields: dict[str, Any] = {}

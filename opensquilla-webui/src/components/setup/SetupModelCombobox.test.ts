@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createApp, nextTick } from 'vue'
+import { createApp, h, nextTick, reactive } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
 import SetupModelCombobox from './SetupModelCombobox.vue'
@@ -96,18 +96,19 @@ const mountedApps: ReturnType<typeof createApp>[] = []
 async function mountCombobox(props: Record<string, unknown> = {}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
-  const app = createApp(SetupModelCombobox, {
+  const state = reactive({
     field: FIELD,
     value: '',
     models: MODELS,
     modelSource: 'live',
     ...props,
   })
+  const app = createApp({ render: () => h(SetupModelCombobox, state) })
   app.use(i18n)
   app.mount(el)
   mountedApps.push(app)
   await nextTick()
-  return { el }
+  return { el, state }
 }
 
 async function openList(el: HTMLElement) {
@@ -360,6 +361,34 @@ describe('SetupModelCombobox', () => {
     )).toEqual(['Catalog context 262k', 'Catalog max output 16k'])
   })
 
+  it.each(['published', 'declared'] as const)(
+    'translates known %s statuses and keeps unknown-status models selectable', async source => {
+      const onUpdate = vi.fn()
+      const models = ['special_offer', 'testing', 'offline', 'future-status'].map((status, index) => ({
+        ...MODELS[0],
+        id: `test-vendor/status-${index}`,
+        metadata: source === 'published'
+          ? { ...PUBLISHED_METADATA, published: { ...PUBLISHED_METADATA.published!, status } }
+          : { ...AUTH_ONLY_METADATA, declared: { ...AUTH_ONLY_METADATA.declared!, status } },
+      }))
+      const { el } = await mountCombobox({ models, onUpdate })
+      await openList(el)
+      const statusLabels = () => optionRows().map(row => (
+        row.querySelector('.setup-model-combobox__badge--status')?.textContent?.trim()
+      ))
+
+      expect(statusLabels()).toEqual(['Special offer', 'Testing', 'Offline', 'future-status'])
+      i18n.global.setLocaleMessage('zh-Hans', zhHans)
+      i18n.global.locale.value = 'zh-Hans'
+      await nextTick()
+      expect(statusLabels()).toEqual(['特惠', '测试中', '离线', 'future-status'])
+
+      optionRows()[3].click()
+      await nextTick()
+      expect(onUpdate).toHaveBeenCalledWith('test-vendor/status-3')
+    },
+  )
+
   it('keeps the model count in the catalog header instead of the input chrome', async () => {
     const { el } = await mountCombobox()
     const trigger = el.querySelector<HTMLButtonElement>('[data-testid="setup-model-options-toggle"]')
@@ -371,11 +400,11 @@ describe('SetupModelCombobox', () => {
     await openList(el)
 
     const readout = document.querySelector('.setup-model-combobox__readout')?.textContent
-    expect(readout).toContain('Available · 2')
-    expect(readout).toContain('Live')
+    expect(readout).toContain('Models · 2')
+    expect(readout).not.toContain('Live')
   })
 
-  it('describes a live catalog as real-time in Simplified Chinese', async () => {
+  it('does not describe a cached provider catalog as real-time in Simplified Chinese', async () => {
     i18n.global.setLocaleMessage('zh-Hans', zhHans)
     i18n.global.locale.value = 'zh-Hans'
     const { el } = await mountCombobox()
@@ -383,7 +412,8 @@ describe('SetupModelCombobox', () => {
     await openList(el)
 
     const readout = document.querySelector('.setup-model-combobox__readout')?.textContent
-    expect(readout).toContain('实时')
+    expect(readout).toContain('模型 · 2')
+    expect(readout).not.toContain('实时')
     expect(readout).not.toContain('已生效')
   })
 
@@ -631,6 +661,68 @@ describe('SetupModelCombobox', () => {
     await nextTick()
 
     expect(onUpdate).toHaveBeenCalledWith('test-vendor/alpha')
+  })
+
+  it('keeps keyboard selection on the same model after a background reorder', async () => {
+    const onUpdate = vi.fn()
+    const { el, state } = await mountCombobox({ onUpdate })
+    const input = await openList(el)
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
+    await nextTick()
+    state.models = [MODELS[1], MODELS[0]]
+    await nextTick()
+    expect(optionRows()[1].classList.contains('is-active')).toBe(true)
+    expect(input.getAttribute('aria-activedescendant')).toBe(optionRows()[1].id)
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    expect(onUpdate).toHaveBeenCalledExactlyOnceWith(MODELS[0].id)
+  })
+
+  it('clears a removed keyboard target without changing the saved model', async () => {
+    const onUpdate = vi.fn()
+    const { el, state } = await mountCombobox({ value: MODELS[0].id, onUpdate })
+    const input = await openList(el)
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }))
+    await nextTick()
+    state.models = [MODELS[1]]
+    await nextTick()
+    expect(input.getAttribute('aria-activedescendant')).toBeNull()
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }))
+    expect(onUpdate).not.toHaveBeenCalled()
+    expect(input.value).toBe(MODELS[0].id)
+    expect(popup()).not.toBeNull()
+  })
+
+  it('keeps cached models selectable with a single accessible refresh message', async () => {
+    const { el } = await mountCombobox({
+      catalogState: { models: MODELS, source: 'live', discovering: true },
+    })
+    const input = await openList(el)
+    expect(input.disabled).toBe(false)
+    expect(optionRows()).toHaveLength(2)
+    expect(document.querySelectorAll('[role="status"]')).toHaveLength(1)
+    expect(popup()?.querySelector('[role="status"]')?.textContent).toBe('Refreshing models…')
+    expect(input.getAttribute('aria-describedby')).toContain('setup-provider-model-sync')
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }))
+    await nextTick()
+    expect(el.querySelector('[role="status"]')?.textContent).toBe('Refreshing models…')
+  })
+
+  it('anchors the visible row when new models arrive above the scrolled viewport', async () => {
+    const { el, state } = await mountCombobox()
+    await openList(el)
+    const list = listbox()!
+    list.scrollTop = 20
+    list.getBoundingClientRect = () => ({ top: 100 }) as DOMRect
+    for (const row of optionRows()) {
+      row.getBoundingClientRect = () => {
+        const top = 80 + Array.from(list.children).indexOf(row) * 30
+        return { top, bottom: top + 30 } as DOMRect
+      }
+    }
+    state.models = [{ ...MODELS[0], id: 'example/new-model' }, ...MODELS]
+    await nextTick()
+    await nextTick()
+    expect(list.scrollTop).toBe(50)
   })
 
   it('announces the keyboard-active option through aria-activedescendant', async () => {

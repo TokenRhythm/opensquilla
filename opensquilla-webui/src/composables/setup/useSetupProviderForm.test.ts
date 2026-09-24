@@ -35,6 +35,45 @@ afterEach(() => {
 })
 
 describe('buildProviderPayload', () => {
+  it('publishes stale cache before refresh, retains it on failure, and replaces on empty or rejection', async () => {
+    const row = { id: 'test/model', name: 'Test model' }
+    let finish!: (value: unknown) => void
+    callMock.mockResolvedValueOnce({ ok: true, source: 'live', models: [row],
+      catalog: { cacheHit: true, stale: true, lastSyncedAt: null } })
+      .mockImplementationOnce(() => new Promise(resolve => { finish = resolve }))
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('tokenrhythm')
+    const loading = f.discoverModels()
+    await vi.waitFor(() => expect(callMock).toHaveBeenCalledTimes(2))
+    expect(callMock.mock.calls[0][1]).toMatchObject({ cacheOnly: true })
+    expect(f.connection.value.models.map(m => m.id)).toEqual(['test/model'])
+    expect(f.connection.value.discovering).toBe(true)
+    finish({ ok: false, failureKind: 'transport_transient', detail: 'timeout' })
+    await loading
+    expect(f.connection.value.models.map(m => m.id)).toEqual(['test/model'])
+    expect(f.connection.value.discoverError).toBe('timeout')
+    callMock.mockResolvedValueOnce({ ok: true, source: 'live', models: [] })
+    await f.discoverModels({ forceRefresh: true })
+    expect(f.connection.value.models).toEqual([])
+    callMock.mockResolvedValueOnce({ ok: true, source: 'live', models: [row] })
+    await f.discoverModels({ forceRefresh: true })
+    callMock.mockResolvedValueOnce({ ok: false, failureKind: 'unknown',
+      catalog: { cacheHit: false, stale: true, lastSyncedAt: null, accessRejected: true } })
+    await f.discoverModels({ forceRefresh: true })
+    expect(f.connection.value.models).toEqual([])
+    expect(f.connection.value.catalog?.accessRejected).toBe(true)
+  })
+
+  it('does not refresh a fresh snapshot or restart discovery for a cached empty list', async () => {
+    callMock.mockResolvedValue({ ok: true, source: 'none', models: [],
+      catalog: { cacheHit: true, stale: false, lastSyncedAt: null } })
+    const f = useSetupProviderForm(setupWorkflow)
+    f.selectProvider('tokenrhythm')
+    await f.discoverModels()
+    expect(callMock).toHaveBeenCalledTimes(1)
+    expect(f.connection.value.catalog?.cacheHit).toBe(true)
+    expect(f.connection.value.discovering).toBe(false)
+  })
   it('camel-cases keys and drops empty values', () => {
     expect(buildProviderPayload('openrouter', { api_key: 'k', api_key_env: '', model: 'm/x' }))
       .toEqual({ providerId: 'openrouter', apiKey: 'k', model: 'm/x' })
