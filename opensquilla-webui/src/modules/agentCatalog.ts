@@ -6,15 +6,11 @@ export interface AgentCatalogRequestOptions {
 }
 
 export type AgentCatalogErrorKind =
-  | 'already-exists'
-  | 'not-found'
-  | 'immutable'
   | 'forbidden'
-  | 'conflict'
   | 'unavailable'
   | 'invalid'
 
-/** Agent-management failure projected by its Gateway Adapter. */
+/** Agent-catalog read failure projected by its Gateway Adapter. */
 export class AgentCatalogError extends Error {
   constructor(
     readonly kind: AgentCatalogErrorKind,
@@ -26,35 +22,9 @@ export class AgentCatalogError extends Error {
   }
 }
 
-export interface CreateAgentCommand {
-  readonly id?: string
-  readonly name?: string
-  readonly description?: string
-  readonly model?: string
-  readonly workspace?: string
-  readonly agentDir?: string
-  readonly enabled?: boolean
-  readonly systemPrompt?: string
-  readonly tools?: readonly string[]
-}
-
-export interface UpdateAgentCommand {
-  readonly id: string
-  readonly name?: string
-  readonly description?: string
-  readonly model?: string
-  readonly workspace?: string
-  readonly agentDir?: string
-  readonly enabled?: boolean
-  readonly systemPrompt?: string
-  readonly tools?: readonly string[]
-}
-
+/** Read-only runtime profiles for session metadata. */
 export interface AgentCatalog {
   list(options?: AgentCatalogRequestOptions): Promise<readonly Agent[]>
-  create(command: CreateAgentCommand, options?: AgentCatalogRequestOptions): Promise<Agent>
-  update(command: UpdateAgentCommand, options?: AgentCatalogRequestOptions): Promise<Agent>
-  remove(agentId: string, options?: AgentCatalogRequestOptions): Promise<void>
 }
 
 export const AGENT_CATALOG_KEY: InjectionKey<AgentCatalog> = Symbol('AgentCatalog')

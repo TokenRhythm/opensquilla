@@ -136,28 +136,7 @@
     },
     {
       "kind": "method",
-      "wireName": "agents.create",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "agents.delete",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "agents.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "agents.update",
       "roles": [
         "result"
       ]

@@ -120,7 +120,6 @@
             :config-path="displayConfigPath"
             @copy-config-path="copyDisplayPath"
             @update-auto-capture="setMemoryAutoCapture"
-            @open-agent-configuration="openAgentConfiguration"
             @open-data-maintenance="openDataMaintenance"
           />
 
@@ -475,7 +474,6 @@ let returnTo: string | null = null
 let invokerEl: HTMLElement | null = null
 let mq: MediaQueryList | null = null
 let closing = false
-let transferringFocus = false
 
 const routeParam = computed(() => route.params.section)
 // `/setup` → `/settings/auto` asks for the first not-ready section once
@@ -664,26 +662,6 @@ function closeOverlay(restoreFocus = true) {
   visible.value = false
 }
 
-// This is an intentional modal-to-page transition, not a Settings close/back
-// action. Suppress the old invoker restoration while routing, then focus the
-// destination heading so keyboard and screen-reader users perceive the change.
-async function openAgentConfiguration() {
-  if (transferringFocus) return
-  transferringFocus = true
-  try {
-    const failure = await router.push('/agents')
-    if (failure) {
-      transferringFocus = false
-      return
-    }
-    await nextTick()
-    document.getElementById('agents-page-title')?.focus()
-  } catch (error) {
-    transferringFocus = false
-    throw error
-  }
-}
-
 // Unlike a cold/deep-linked maintenance route (where the modal close button
 // deliberately keeps initial focus), an explicit activation inside Advanced
 // is an in-dialog view transition. Move context to the newly mounted heading
@@ -858,7 +836,7 @@ onUnmounted(() => {
   // A route-driven unmount that did not go through closeOverlay (e.g. the user
   // pressed browser Back) still owes focus restoration: the real invoker, or
   // the sidebar Settings button for a cold deep link, never a detached node.
-  if (!closing && !transferringFocus) (usableInvoker() ?? sidebarSettingsButton())?.focus()
+  if (!closing) (usableInvoker() ?? sidebarSettingsButton())?.focus()
   invokerEl = null
 })
 </script>

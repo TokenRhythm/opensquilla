@@ -54,6 +54,8 @@ describe('SettingsAdvancedPanel data maintenance entry', () => {
     await nextTick()
     expect(updateAutoCapture).toHaveBeenCalledWith(false)
 
+    expect(el.textContent).not.toContain('Agent configuration')
+
     const rows = el.querySelectorAll('.control-row')
     const maintenance = el.querySelector<HTMLElement>('[data-testid="advanced-data-maintenance"]')!
     expect(rows.item(rows.length - 1)).toBe(maintenance)
