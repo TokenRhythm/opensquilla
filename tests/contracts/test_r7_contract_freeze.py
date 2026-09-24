@@ -175,10 +175,13 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 217
+    assert len(specs) == 214
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 207,
+        "method": 204,
         "event": 10,
+    }
+    assert {spec.wire_name for spec in specs if spec.wire_name.startswith("agents.")} == {
+        "agents.list",
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}
     assert "models.routing.changed" in {spec.wire_name for spec in specs}

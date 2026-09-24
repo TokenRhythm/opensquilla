@@ -25,7 +25,10 @@ test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
   assert.ok(result.targets.includes('method:skills.install.status:result'))
-  assert.equal(result.targets.length, 218)
+  assert.equal(result.targets.length, 215)
+  assert.deepEqual(result.targets.filter(target => target.startsWith('method:agents.')), [
+    'method:agents.list:result',
+  ])
   assert.deepEqual(result.targets.filter(target => (
     target.startsWith('method:turns.receipt.get:')
   )), ['method:turns.receipt.get:params', 'method:turns.receipt.get:result'])
