@@ -444,14 +444,6 @@
       "reconnecting": "Reconectando con Gateway",
       "disconnected": "Desconectado"
     },
-    "bgm": {
-      "label": "Música de fondo",
-      "play": "Reproducir música de fondo",
-      "pause": "Pausar música de fondo",
-      "volume": "Volumen",
-      "chooseLocalFile": "Elegir archivo local…",
-      "noTracks": "Sin pistas — añade archivos a music/ o elige un archivo local"
-    },
     "brandHome": "Inicio de OpenSquilla",
     "controlNav": "Navegación de control",
     "primaryNav": "Principal",
@@ -489,8 +481,6 @@
       "visualEffectsDesc": "Anima las decisiones de enrutamiento de modelos y las transiciones de respuestas.",
       "composerFxLabel": "Compositor flotante",
       "composerFxDesc": "Flota el campo de entrada sobre la conversación y lo colapsa a una sola línea al desplazarse hacia arriba.",
-      "bgmLabel": "Música de fondo",
-      "bgmDesc": "Muestra el control de música de fondo en la barra superior. Desactivado por defecto; también se puede alternar desde la paleta de comandos.",
       "sidebarWidthLabel": "Ancho de la barra lateral",
       "sidebarWidthDesc": "Elige el ancho de la barra lateral en el escritorio. Los diseños compacto y de cajón usan un ancho fijo.",
       "sidebarWidthCompact": "Compacto",
@@ -4570,9 +4560,7 @@
       "groupMessages": "Mensajes",
       "actionNewChat": "Nueva tarea",
       "actionOpenSettings": "Abrir Ajustes",
-      "actionToggleTheme": "Cambiar tema",
-      "actionBgmEnable": "Activar música de fondo",
-      "actionBgmDisable": "Desactivar música de fondo"
+      "actionToggleTheme": "Cambiar tema"
     },
     "toast": {
       "dismiss": "Descartar notificación"

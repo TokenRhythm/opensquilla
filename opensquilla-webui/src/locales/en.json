@@ -445,14 +445,6 @@
       "reconnecting": "Reconnecting to Gateway",
       "disconnected": "Disconnected"
     },
-    "bgm": {
-      "label": "Background music",
-      "play": "Play background music",
-      "pause": "Pause background music",
-      "volume": "Volume",
-      "chooseLocalFile": "Choose local file…",
-      "noTracks": "No tracks bundled — add files to music/ or pick a local file"
-    },
     "brandHome": "OpenSquilla home",
     "controlNav": "Control navigation",
     "primaryNav": "Primary",
@@ -490,8 +482,6 @@
       "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
       "composerFxLabel": "Floating composer",
       "composerFxDesc": "Float the input over the transcript and collapse it to a single line while scrolling up.",
-      "bgmLabel": "Background music",
-      "bgmDesc": "Show the background-music control in the top bar. Off by default; also toggleable from the command palette.",
       "sidebarWidthLabel": "Sidebar width",
       "sidebarWidthDesc": "Choose the desktop sidebar width. Compact and drawer layouts use a fixed width.",
       "sidebarWidthCompact": "Compact",
@@ -4655,9 +4645,7 @@
       "groupMessages": "Messages",
       "actionNewChat": "New task",
       "actionOpenSettings": "Open Settings",
-      "actionToggleTheme": "Toggle theme",
-      "actionBgmEnable": "Enable background music",
-      "actionBgmDisable": "Disable background music"
+      "actionToggleTheme": "Toggle theme"
     },
     "toast": {
       "dismiss": "Dismiss notification"

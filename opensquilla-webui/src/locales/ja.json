@@ -444,14 +444,6 @@
       "reconnecting": "Gateway に再接続中",
       "disconnected": "切断済み"
     },
-    "bgm": {
-      "label": "BGM",
-      "play": "BGMを再生",
-      "pause": "BGMを一時停止",
-      "volume": "音量",
-      "chooseLocalFile": "ローカルファイルを選択…",
-      "noTracks": "曲がありません — music/ にファイルを追加するかローカルファイルを選択してください"
-    },
     "brandHome": "OpenSquilla ホーム",
     "controlNav": "ナビゲーションの操作",
     "primaryNav": "メイン",
@@ -489,8 +481,6 @@
       "visualEffectsDesc": "会話内のモデルルーティング判断と回答の切り替えをアニメーション表示します。",
       "composerFxLabel": "フローティング入力欄",
       "composerFxDesc": "入力欄を会話の上に浮かせ、上にスクロールすると1行に折りたたみます。",
-      "bgmLabel": "BGM",
-      "bgmDesc": "トップバーにBGMコントロールを表示します。既定ではオフで、コマンドパレットからも切り替えられます。",
       "sidebarWidthLabel": "サイドバーの幅",
       "sidebarWidthDesc": "デスクトップのサイドバー幅を選びます。コンパクト表示とドロワー表示では固定幅を使用します。",
       "sidebarWidthCompact": "コンパクト",
@@ -4570,9 +4560,7 @@
       "groupMessages": "メッセージ",
       "actionNewChat": "新規タスク",
       "actionOpenSettings": "設定を開く",
-      "actionToggleTheme": "テーマを切り替え",
-      "actionBgmEnable": "BGMを有効にする",
-      "actionBgmDisable": "BGMを無効にする"
+      "actionToggleTheme": "テーマを切り替え"
     },
     "toast": {
       "dismiss": "通知を閉じる"

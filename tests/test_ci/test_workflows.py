@@ -1063,7 +1063,7 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     )
     assert "generated Web UI dist must not be committed" in text
     assert "Build verified frontend artifact" in text
-    assert "> public/.DS_Store" in text
+    assert "> public-assets/.DS_Store" in text
     assert "Finder metadata survived WebUI artifact normalization" in text
     assert "npm run verify:release-dist" in text
     assert "Verify sdist-to-wheel frontend artifact round trip" in text
@@ -1073,7 +1073,7 @@ def test_ci_rejects_tracked_frontend_dist_and_builds_a_verified_artifact() -> No
     assert "ignored Finder metadata leaked into the sdist" in text
     assert 'uv build --wheel --out-dir "${wheel_dir}" "${sdists[0]}"' in text
     assert "python scripts/verify_webui_artifact.py" in text
-    assert "--forbid-personal-bgm" in text
+    assert "--forbid-personal-bgm" not in text
     assert '--wheel "${wheels[0]}"' in text
     assert "Upload verified frontend artifact" in text
     assert "name: opensquilla-webui-dist" in text
@@ -2446,6 +2446,10 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "plan-presentation.spec.ts",
         "task-progress.spec.ts",
         "provider-error-experience.spec.ts",
+        "retired-bgm-upgrade.spec.ts",
+        "header-responsive.spec.ts",
+        "topbar-global-controls.spec.ts",
+        "topbar-visual.spec.ts",
         "router-physical-model.spec.ts",
         "queue-steer.spec.ts",
         "session-created-card.spec.ts",
@@ -2629,6 +2633,9 @@ def test_windows_high_risk_job_cannot_wash_test_failures_green() -> None:
 
 def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -> None:
     job = _workflow("ci.yml")["jobs"]["macos-recovery"]
+    setup_node = next(
+        step for step in job["steps"] if step.get("name") == "Set up Node.js"
+    )
     test_step = next(
         step
         for step in job["steps"]
@@ -2644,9 +2651,21 @@ def test_macos_recovery_runs_native_contracts_and_cannot_wash_failures_green() -
     assert job["name"] == "macOS profile recovery and native no-replace (3.12)"
     assert job["runs-on"] == "macos-latest"
     assert job["timeout-minutes"] == 30
+    assert setup_node["uses"] == "actions/setup-node@v4"
+    assert setup_node["with"] == {
+        "node-version-file": "opensquilla-webui/.node-version"
+    }
+    assert "if" not in setup_node
+    assert job["steps"].index(setup_node) < job["steps"].index(test_step)
     assert "tests/test_recovery" in test_step["run"]
     assert "tests/test_migration/test_opensquilla_home_migration.py" in test_step["run"]
     assert "tests/test_desktop/test_electron_startup_contract.py" in test_step["run"]
+    for path in (
+        "tests/test_scripts/test_verify_webui_artifact.py",
+        "tests/test_scripts/test_stage_webui_artifact.py",
+        "tests/test_packaging/test_webui_build_contract.py",
+    ):
+        assert path in test_step["run"]
     assert "set -euo pipefail" in test_step["run"]
     assert "pytest_args=(" in test_step["run"]
     assert 'uv run pytest "${pytest_args[@]}"' in test_step["run"]
@@ -3020,7 +3039,75 @@ def test_container_release_smoke_serves_control_ui_entry_assets() -> None:
     assert 'path.endswith(".css")' in script
     assert 'docker exec "${container_id}" curl --fail --silent --show-error' in script
     build = next(step for step in steps if step.get("name") == "Build multi-arch image")
-    assert build["with"]["build-args"] == "OPENSQUILLA_FORBID_PERSONAL_BGM=1\n"
+    assert "build-args" not in build["with"]
+
+
+@pytest.mark.parametrize(
+    "verifier,event,tag,expects_legacy_flag",
+    [
+        ("legacy", "workflow_dispatch", "v0.5.0", True),
+        ("current", "workflow_dispatch", "v0.5.5", False),
+        ("absent", "workflow_dispatch", "v0.4.0", False),
+        ("current", "push", "v0.5.5", False),
+        ("current", "workflow_dispatch", "", False),
+    ],
+)
+def test_release_wheel_verification_uses_checked_out_contract(
+    tmp_path: Path, verifier: str, event: str, tag: str, expects_legacy_flag: bool,
+) -> None:
+    from zipfile import ZipFile
+
+    steps = _workflow("wheelhouse-release.yml")["jobs"]["build-release-assets"]["steps"]
+    script = next(
+        step["run"] for step in steps
+        if step.get("name") == "Verify wheel contains the exact Web UI artifact"
+    )
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    staged = tmp_path / "src/opensquilla/gateway/static/dist"
+    staged.mkdir(parents=True)
+    (staged / "index.html").write_text("synthetic entry", encoding="utf-8")
+    wheel = dist / "opensquilla-0.5.5-py3-none-any.whl"
+    with ZipFile(wheel, "w") as archive:
+        archive.write(staged / "index.html", "opensquilla/gateway/static/dist/index.html")
+    if verifier != "absent":
+        tool = tmp_path / "scripts/verify_webui_artifact.py"
+        tool.parent.mkdir()
+        help_text = "--dist --wheel" + (" --forbid-personal-bgm" if verifier == "legacy" else "")
+        tool.write_text(
+            "import json, sys\nfrom pathlib import Path\n"
+            "if '--help' in sys.argv:\n"
+            f"    print({help_text!r})\n"
+            "    Path('help-called').touch()\n"
+            "else:\n"
+            "    Path('verify-args.json').write_text(json.dumps(sys.argv[1:]))\n",
+            encoding="utf-8",
+        )
+    result = subprocess.run(
+        [_bash_executable(), "-euo", "pipefail", "-c", script],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", ""),
+            "GITHUB_EVENT_NAME": event,
+            "RELEASE_TAG": tag,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    if verifier == "absent":
+        assert "Verified legacy wheel Web UI" in result.stdout
+    else:
+        args = json.loads((tmp_path / "verify-args.json").read_text(encoding="utf-8"))
+        expected = ["--forbid-personal-bgm"] if expects_legacy_flag else []
+        expected += [
+            "--dist", "src/opensquilla/gateway/static/dist",
+            "--wheel", "dist/opensquilla-0.5.5-py3-none-any.whl",
+        ]
+        assert args == expected
+        assert (tmp_path / "help-called").exists() == (event == "workflow_dispatch" and bool(tag))
 
 
 @pytest.mark.parametrize("event,tag", [("push", "v0.5.5"), ("workflow_dispatch", "edge")])

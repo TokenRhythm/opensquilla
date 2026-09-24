@@ -38,7 +38,10 @@
     "tests/test_gateway/test_session_model_routing_rpc.py",
     "tests/test_tools/test_execution_status.py",
     "tests/test_tools/test_shell_native_argv.py",
-    "tests/test_provider_ensemble.py"
+    "tests/test_provider_ensemble.py",
+    "tests/test_scripts/test_verify_webui_artifact.py",
+    "tests/test_scripts/test_stage_webui_artifact.py",
+    "tests/test_packaging/test_webui_build_contract.py"
   ],
   "baseline_suites": [
     "dependency-audit",
@@ -402,7 +405,10 @@
         "tests/test_gateway/test_session_model_routing_rpc.py",
         "tests/test_tools/test_execution_status.py",
         "tests/test_tools/test_shell_native_argv.py",
-        "tests/test_provider_ensemble.py"
+        "tests/test_provider_ensemble.py",
+        "tests/test_scripts/test_verify_webui_artifact.py",
+        "tests/test_scripts/test_stage_webui_artifact.py",
+        "tests/test_packaging/test_webui_build_contract.py"
       ]
     },
     "release-packaging": {

@@ -64,11 +64,11 @@ That fail-closed rule also applies to direct `pip install .`,
 from a local checkout; VCS URL users should clone the repository and run the
 source installer, or install the official release wheel.
 
-Standard source archives (`sdist`) also reject ignored personal BGM files so a
-shareable archive cannot accidentally leak private or copyrighted audio. A
-direct locally built wheel or local Docker image can still contain an explicitly
-customized library; official release artifacts always require the tracked
-playlist to remain empty.
+Background music is no longer part of the console. Existing browser preferences
+are left untouched and ignored. Personal files in an old `public/music/`
+directory stay on disk but are excluded from builds, source archives, and
+container build contexts. All Web UI artifacts reject residual music assets.
+Chat audio playback, recording, and transcription remain available.
 
 ## Main Areas
 

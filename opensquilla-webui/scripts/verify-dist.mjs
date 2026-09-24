@@ -30,7 +30,7 @@ const sourceInputRoots = [
   'tsconfig.json',
   'tsconfig.app.json',
   'tsconfig.node.json',
-  'public',
+  'public-assets',
   'scripts',
   'src',
 ]
@@ -56,7 +56,6 @@ const normalizedTextSuffixes = new Set([
 const ignoredSourceFileNames = new Set(['.DS_Store'])
 const forbiddenArtifactFileNames = new Set(['.ds_store', '.npmrc'])
 const forbiddenArtifactSuffixes = new Set(['.key', '.pem'])
-const officialMusicFiles = new Set(['music/README.md', 'music/playlist.json'])
 
 function sha256(path) {
   return createHash('sha256').update(readFileSync(path)).digest('hex')
@@ -93,7 +92,19 @@ function listFiles(root) {
   return files
 }
 
+function isRetiredMediaPath(path) {
+  // Match the root as Windows extraction would; keep this mirrored in the Python verifier.
+  const root = path.replaceAll('\\', '/').split('/').find((part) => part && part !== '.') || ''
+  return root.replace(/[ .]+$/, '').toLowerCase() === 'music'
+}
+
 function recordsFor(root) {
+  const retiredMedia = readdirSync(root).filter(isRetiredMediaPath)
+  if (retiredMedia.length > 0) {
+    throw new Error(
+      `Web UI artifact contains forbidden metadata or sensitive files: ${retiredMedia.join(', ')}`,
+    )
+  }
   return listFiles(root)
     .map((path) => ({
       path: toPosixPath(relative(root, path)),
@@ -110,6 +121,7 @@ function isForbiddenArtifactPath(path) {
   const dot = lowered.lastIndexOf('.')
   const suffix = dot >= 0 ? lowered.slice(dot) : ''
   return (
+    isRetiredMediaPath(path) ||
     forbiddenArtifactFileNames.has(lowered) ||
     lowered === '.env' ||
     lowered.startsWith('.env.') ||
@@ -207,7 +219,7 @@ export function writeManifest(distDir = defaultDistDir, { sourceRoot = webuiRoot
 
 export function verifyDist(
   distDir = defaultDistDir,
-  { forbidPersonalBgm = false, sourceRoot = webuiRoot } = {},
+  { sourceRoot = webuiRoot } = {},
 ) {
   const root = resolve(distDir)
   const indexPath = resolve(root, 'index.html')
@@ -254,39 +266,6 @@ export function verifyDist(
       'Web UI artifact does not match its manifest. Rebuild it with `npm run build`.',
     )
   }
-  if (forbidPersonalBgm) {
-    const personalBgm = actualRecords
-      .map((record) => record.path)
-      .filter((path) => path.startsWith('music/') && !officialMusicFiles.has(path))
-    if (personalBgm.length > 0) {
-      throw new Error(
-        `Personal BGM content is forbidden in official Web UI artifacts: ${personalBgm.join(', ')}`,
-      )
-    }
-    const playlistPath = resolve(root, 'music/playlist.json')
-    if (existsSync(playlistPath)) {
-      let playlist
-      try {
-        playlist = JSON.parse(readFileSync(playlistPath, 'utf8'))
-      } catch (error) {
-        throw new Error(
-          `Official music/playlist.json is invalid: ${error instanceof Error ? error.message : error}`,
-        )
-      }
-      if (
-        playlist === null ||
-        typeof playlist !== 'object' ||
-        Array.isArray(playlist) ||
-        !Array.isArray(playlist.tracks) ||
-        playlist.tracks.length !== 0
-      ) {
-        throw new Error(
-          'Official music/playlist.json must keep its tracks list empty; use playlist.local.json only for private builds.',
-        )
-      }
-    }
-  }
-
   for (const entry of ['index.html', 'desktop.html']) {
     const entryHtml = readFileSync(resolve(root, entry), 'utf8')
     const references = referencedEntryAssets(entryHtml)
@@ -321,20 +300,18 @@ export function verifyDist(
 function main(argv) {
   const args = []
   let write = false
-  let forbidPersonalBgm = false
   for (const arg of argv) {
     if (arg === '--write') write = true
-    else if (arg === '--forbid-personal-bgm') forbidPersonalBgm = true
     else args.push(arg)
   }
   if (args.length > 1) {
     throw new Error(
-      'usage: node verify-dist.mjs [--write] [--forbid-personal-bgm] [dist-directory]',
+      'usage: node verify-dist.mjs [--write] [dist-directory]',
     )
   }
   const distDir = args[0] ? resolve(args[0]) : defaultDistDir
   if (write) writeManifest(distDir)
-  const manifest = verifyDist(distDir, { forbidPersonalBgm })
+  const manifest = verifyDist(distDir)
   console.log(
     `Web UI artifact verified: ${manifest.files.length} files in ${distDir}`,
   )

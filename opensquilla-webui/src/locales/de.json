@@ -444,14 +444,6 @@
       "reconnecting": "Verbindung zum Gateway wird wiederhergestellt",
       "disconnected": "Getrennt"
     },
-    "bgm": {
-      "label": "Hintergrundmusik",
-      "play": "Hintergrundmusik abspielen",
-      "pause": "Hintergrundmusik pausieren",
-      "volume": "Lautstärke",
-      "chooseLocalFile": "Lokale Datei auswählen…",
-      "noTracks": "Keine Titel — Dateien in music/ ablegen oder lokale Datei wählen"
-    },
     "brandHome": "OpenSquilla Startseite",
     "controlNav": "Navigation steuern",
     "primaryNav": "Primär",
@@ -489,8 +481,6 @@
       "visualEffectsDesc": "Animiert Modell-Routing-Entscheidungen und Antwortübergänge in Unterhaltungen.",
       "composerFxLabel": "Schwebende Eingabeleiste",
       "composerFxDesc": "Eingabe über dem Verlauf schweben lassen und beim Hochscrollen zu einer Zeile einklappen.",
-      "bgmLabel": "Hintergrundmusik",
-      "bgmDesc": "Zeigt das Hintergrundmusik-Element in der oberen Leiste. Standardmäßig aus; auch über die Befehlspalette umschaltbar.",
       "sidebarWidthLabel": "Seitenleistenbreite",
       "sidebarWidthDesc": "Wähle die Breite der Seitenleiste auf dem Desktop. Kompakte und Schubladenlayouts verwenden eine feste Breite.",
       "sidebarWidthCompact": "Kompakt",
@@ -4570,9 +4560,7 @@
       "groupMessages": "Nachrichten",
       "actionNewChat": "Neue Aufgabe",
       "actionOpenSettings": "Einstellungen öffnen",
-      "actionToggleTheme": "Design umschalten",
-      "actionBgmEnable": "Hintergrundmusik aktivieren",
-      "actionBgmDisable": "Hintergrundmusik deaktivieren"
+      "actionToggleTheme": "Design umschalten"
     },
     "toast": {
       "dismiss": "Benachrichtigung schließen"

@@ -1998,7 +1998,7 @@ pre {
   }
 
   .topbar--chat .topbar-right .lang-menu-current,
-  .topbar--chat .topbar-right > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
+  .topbar--chat .topbar-right > .theme-menu-wrap:not(.lang-menu-wrap) {
     display: none;
   }
 
@@ -2010,7 +2010,7 @@ pre {
 
   .topbar--chat .topbar-right--attention > .conn-pill,
   .topbar--chat .topbar-right--attention .lang-menu-wrap,
-  .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.bgm-menu-wrap):not(.lang-menu-wrap) {
+  .topbar--chat .topbar-right--attention > .theme-menu-wrap:not(.lang-menu-wrap) {
     display: none;
   }
 

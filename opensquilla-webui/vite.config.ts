@@ -13,6 +13,7 @@ const gatewayTarget = process.env.OPENSQUILLA_GATEWAY_URL || 'http://127.0.0.1:1
 export default defineConfig({
   plugins: [vue()],
   base: './',
+  publicDir: resolve(__dirname, 'public-assets'),
   // vue-i18n build feature flags — silences the bundler warnings and drops the
   // legacy API + prod devtools from the bundle (Composition mode only).
   define: {

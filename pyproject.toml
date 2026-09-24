@@ -179,10 +179,9 @@ exclude = [
 [tool.hatch.build.targets.sdist]
 # Published sdists remain self-contained: downstream wheel builds do not need
 # Node.js because release CI embeds the already-verified WebUI artifact here.
-# Standard sdists deliberately reject ignored personal BGM so an ordinary
-# source-archive build cannot leak private or copyrighted audio. Developers who
-# need a private customized artifact can build a direct local wheel instead.
+# Retired local media is not a build input and never belongs in source archives.
 artifacts = ["src/opensquilla/gateway/static/dist/**"]
+exclude = ["opensquilla-webui/public/music", "opensquilla-webui/public/music/**"]
 
 [tool.hatch.build.targets.sdist.force-include]
 "desktop/electron/runtime/runtime-pack-catalog.json" = "desktop/electron/runtime/runtime-pack-catalog.json"

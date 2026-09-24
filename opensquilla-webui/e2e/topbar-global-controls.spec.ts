@@ -13,8 +13,12 @@ test.afterEach(({ page }) => {
 
 test.describe('Chat topbar global controls', () => {
   test('non-chat language and theme popovers are mutually exclusive', async ({ page }) => {
-    await page.addInitScript(() => localStorage.setItem('opensquilla-locale', 'en'))
-    await page.goto('/control/chat')
+    await openTopbarSession(page, {
+      sessionKey: `${TOPBAR_SESSION_KEY}-non-chat`,
+      locale: 'en',
+    })
+    await page.goto('/control/changelog')
+    await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(0)
 
     const language = page.getByTestId('language-switcher-trigger')
     const theme = page.getByRole('button', { name: 'Theme', exact: true })
@@ -51,13 +55,12 @@ test.describe('Chat topbar global controls', () => {
     await expectTopbarGeometry(page)
   })
 
-  test('compact keeps approval and active audio reachable exactly once', async ({ page }) => {
+  test('compact keeps connection and approval reachable exactly once', async ({ page }) => {
     await page.setViewportSize({ width: 768, height: 900 })
     await openTopbarSession(page, {
       sessionKey: `${TOPBAR_SESSION_KEY}-compact-pressure`,
       locale: 'zh-Hans',
       approvalCount: 2,
-      bgm: { enabled: true, playing: true },
     })
 
     const system = page.getByTestId('chat-system-status')
@@ -65,9 +68,6 @@ test.describe('Chat topbar global controls', () => {
     const sessionTrigger = page.getByTestId('chat-session-actions-trigger')
     await expect(system).toHaveAttribute('data-layout', 'compact')
     await expect(page.getByTestId('connection-status')).toHaveCount(1)
-    await expect(page.getByTestId('bgm-toggle')).toHaveCount(1)
-    await expect(page.getByTestId('bgm-toggle')).toHaveAccessibleName('暂停背景音乐')
-    await expect(page.getByTestId('bgm-menu-trigger')).toHaveCount(0)
 
     await sessionTrigger.click()
     await expect(page.getByTestId('chat-session-actions-menu')).toBeVisible()
@@ -82,13 +82,12 @@ test.describe('Chat topbar global controls', () => {
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
 
-  test('tight combines connection, approval, and update without hiding pause', async ({ page }) => {
+  test('tight combines connection, approval, and update', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 })
     await openTopbarSession(page, {
       sessionKey: `${TOPBAR_SESSION_KEY}-tight-pressure`,
       locale: 'de',
       approvalCount: 3,
-      bgm: { enabled: true, playing: true },
       update: {
         status: 'available',
         latestVersion: '2.0.0',
@@ -100,7 +99,6 @@ test.describe('Chat topbar global controls', () => {
     await expect(system).toHaveAttribute('data-layout', 'tight')
     await expect(page.getByTestId('connection-status')).toHaveCount(0)
     await expect(page.getByTestId('desktop-update-indicator')).toHaveCount(0)
-    await expect(page.getByTestId('bgm-toggle')).toHaveCount(1)
     await trigger.click()
     await expect(page.getByTestId('chat-system-connection')).toHaveCount(1)
     await expect(page.getByTestId('chat-system-approval')).toHaveCount(1)
@@ -108,7 +106,7 @@ test.describe('Chat topbar global controls', () => {
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
 
     await page.getByTestId('chat-system-update').click()
-    await expect(page).toHaveURL(/\/settings\/runtime$/)
+    await expect(page).toHaveURL(/\/settings\/gateway#runtime$/)
   })
 
   test('Desktop update lifecycle preserves wide layout and focused control', async ({ page }) => {
@@ -149,12 +147,11 @@ test.describe('Chat topbar global controls', () => {
     }
   })
 
-  test('disconnection remains dominant while update and active audio stay reachable', async ({ page }) => {
+  test('disconnection remains dominant while update stays reachable', async ({ page }) => {
     await page.setViewportSize({ width: 480, height: 800 })
     const harness = await openTopbarSession(page, {
       sessionKey: `${TOPBAR_SESSION_KEY}-disconnected`,
       locale: 'en',
-      bgm: { enabled: true, playing: true },
       update: {
         status: 'available',
         latestVersion: '2.0.0',
@@ -165,7 +162,6 @@ test.describe('Chat topbar global controls', () => {
     const system = page.getByTestId('chat-system-status')
     await expect(system).toHaveAttribute('data-severity', 'danger', { timeout: 10_000 })
     await expect(page.getByTestId('connection-status')).toHaveClass(/disconnected/)
-    await expect(page.getByTestId('bgm-toggle')).toHaveCount(1)
     await page.getByTestId('chat-system-status-trigger').click()
     await expect(page.getByTestId('chat-system-update')).toHaveCount(1)
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
@@ -185,7 +181,7 @@ test.describe('Chat topbar global controls', () => {
     const update = page.getByTestId('desktop-update-indicator')
     const language = page.getByTestId('language-switcher-trigger')
     const theme = page.locator(
-      '.topbar-right > .theme-menu-wrap:not(.lang-menu-wrap):not(.bgm-menu-wrap) > button',
+      '.topbar-right > .theme-menu-wrap:not(.lang-menu-wrap) > button',
     )
     await update.click()
     await expect(page.locator('[data-chat-topbar-popover="desktop-update"]')).toHaveCount(1)
@@ -198,23 +194,6 @@ test.describe('Chat topbar global controls', () => {
     await page.keyboard.press('Escape')
     await expect(page.locator('[data-chat-topbar-popover]')).toHaveCount(0)
     await expect(theme).toBeFocused()
-  })
-
-  test('wide BGM picker yields ownership to the language menu', async ({ page }) => {
-    await page.setViewportSize({ width: 1440, height: 1000 })
-    await openTopbarSession(page, {
-      sessionKey: `${TOPBAR_SESSION_KEY}-popover-bgm`,
-      locale: 'en',
-      bgm: { enabled: true, playing: false },
-    })
-
-    const bgm = page.getByTestId('bgm-menu-trigger')
-    const language = page.getByTestId('language-switcher-trigger')
-    await bgm.click()
-    await expect(page.locator('[data-chat-topbar-popover="bgm"]')).toHaveCount(1)
-    await language.click()
-    await expect(page.locator('[data-chat-topbar-popover="bgm"]')).toHaveCount(0)
-    await expect(page.locator('[data-chat-topbar-popover="language"]')).toHaveCount(1)
   })
 
   test('200% zoom-equivalent metrics keep every essential control reachable', async ({ page, context }) => {
@@ -231,7 +210,6 @@ test.describe('Chat topbar global controls', () => {
       sessionKey: `${TOPBAR_SESSION_KEY}-zoom-200`,
       locale: 'de',
       approvalCount: 1,
-      bgm: { enabled: true, playing: true },
       update: { status: 'available', latestVersion: '2.0.0' },
     })
 
@@ -240,7 +218,6 @@ test.describe('Chat topbar global controls', () => {
       scale: window.devicePixelRatio,
     }))).toEqual({ width: 720, scale: 2 })
     await expect(page.getByTestId('chat-system-status-trigger')).toBeVisible()
-    await expect(page.getByTestId('bgm-toggle')).toBeVisible()
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
 
@@ -277,14 +254,14 @@ const THEME_PAIRWISE_CASES: Array<{
   theme: string
   width: number
   locale: 'zh-Hans' | 'de'
-  state: Pick<TopbarScenario, 'approvalCount' | 'bgm' | 'update'>
+  state: Pick<TopbarScenario, 'approvalCount' | 'update'>
 }> = [
   { theme: 'ember', width: 400, locale: 'zh-Hans', state: { approvalCount: 1 } },
   {
     theme: 'miami',
     width: 480,
     locale: 'de',
-    state: { bgm: { enabled: true, playing: true } },
+    state: {},
   },
   {
     theme: 'vapor',
@@ -297,7 +274,7 @@ const THEME_PAIRWISE_CASES: Array<{
     theme: 'terminal',
     width: 1440,
     locale: 'zh-Hans',
-    state: { approvalCount: 2, bgm: { enabled: true, playing: false } },
+    state: { approvalCount: 2 },
   },
 ]
 

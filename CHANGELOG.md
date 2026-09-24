@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- The Web UI and Desktop background-music player and its settings are removed.
+  Existing music preferences are ignored, and personal music files stay on disk
+  without entering new builds. Chat audio playback and voice input are unchanged.
+
 ## [0.5.5] - 2026-09-23
 
 ### Added
