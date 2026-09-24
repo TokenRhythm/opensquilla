@@ -36,7 +36,7 @@ async function openLogs(page: Page) {
   })
   await page.addInitScript(() => localStorage.setItem('opensquilla.logs.runTrace', '1'))
   await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
-    path: fileURLToPath(new URL('../public/opensquilla-mark.png', import.meta.url)), contentType: 'image/png',
+    path: fileURLToPath(new URL('../public-assets/opensquilla-mark.png', import.meta.url)), contentType: 'image/png',
   }))
   await page.goto('/control/logs')
   await expect(page.locator('.conn-pill.connected')).toBeVisible()

@@ -444,14 +444,6 @@
       "reconnecting": "正在重新连接 Gateway",
       "disconnected": "已断开"
     },
-    "bgm": {
-      "label": "背景音乐",
-      "play": "播放背景音乐",
-      "pause": "暂停背景音乐",
-      "volume": "音量",
-      "chooseLocalFile": "选择本地文件…",
-      "noTracks": "暂无内置曲目 — 请将音频放入 music/ 目录或选择本地文件"
-    },
     "brandHome": "OpenSquilla 主页",
     "controlNav": "控制台导航",
     "primaryNav": "主导航",
@@ -489,8 +481,6 @@
       "visualEffectsDesc": "在对话中显示模型路由决策和回答切换动画。",
       "composerFxLabel": "悬浮输入栏",
       "composerFxDesc": "输入栏悬浮于对话之上，向上滚动时收起为单行。",
-      "bgmLabel": "背景音乐",
-      "bgmDesc": "在顶栏显示背景音乐控件。默认关闭；也可通过命令面板切换。",
       "sidebarWidthLabel": "侧边栏宽度",
       "sidebarWidthDesc": "选择桌面端侧边栏宽度。紧凑和抽屉布局使用固定宽度。",
       "sidebarWidthCompact": "紧凑",
@@ -4857,9 +4847,7 @@
       "groupMessages": "消息",
       "actionNewChat": "新建任务",
       "actionOpenSettings": "打开设置",
-      "actionToggleTheme": "切换主题",
-      "actionBgmEnable": "开启背景音乐",
-      "actionBgmDisable": "关闭背景音乐"
+      "actionToggleTheme": "切换主题"
     },
     "toast": {
       "dismiss": "关闭通知"

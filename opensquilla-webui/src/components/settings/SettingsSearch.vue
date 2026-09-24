@@ -20,7 +20,7 @@ const labels: Partial<Record<SettingsRailSectionId, string[]>> = {
   modelStrategy: ['setup.modelStrategy.singleModelLabel', 'setup.modelStrategy.routerTitle', 'setup.modelStrategy.ensembleTitle'],
   capabilities: ['setup.search.title', 'setup.memory.title', 'setup.image.title', 'setup.audio.title'],
   general: ['settings.appearance.languageLabel', 'setup.behavior.autoTitlesLabel'],
-  interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel', 'settings.appearance.bgmLabel'],
+  interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel'],
   securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel'],
   memory: ['settings.memoryOverview.title'],
   advanced: ['settings.memoryOverview.autoCaptureLabel', 'setup.advanced.configFileLabel', 'setup.advanced.dataMaintenanceLabel', 'setup.advanced.agentConfigLabel'],

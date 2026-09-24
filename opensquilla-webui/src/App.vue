@@ -256,12 +256,6 @@
           <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
           <DesktopUpdateIndicator />
         </template>
-        <!-- Opt-in (Settings → Appearance or the command palette); off by
-             default so the topbar stays music-free until asked for. -->
-        <BgmControl
-          v-if="bgmEnabled"
-          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
-        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -484,10 +478,8 @@ import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
-import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
-import { useBgm } from './composables/useBgm'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
@@ -713,9 +705,6 @@ watch(
     editingProjectId.value = ''
   },
 )
-// Feature-gated topbar music control; the singleton `enabled` ref is written by
-// Settings → Appearance and the command palette.
-const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
@@ -880,7 +869,6 @@ const systemHeaderPressureCount = computed(() => (
   Number(effectiveConnectionState.value !== 'connected')
   + Number(appStore.approvalCount > 0)
   + Number(desktopUpdate.visible.value)
-  + Number(bgmEnabled.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,

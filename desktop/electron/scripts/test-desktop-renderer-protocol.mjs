@@ -36,6 +36,17 @@ assert.deepEqual(
   routeDesktopRendererRequest('opensquilla-app://desktop/chat/new'),
   { kind: 'spa', relativePath: 'desktop.html' },
 )
+// Removed background-music URLs use the ordinary unknown-route SPA fallback.
+for (const path of ['/music/playlist.json', '/music/playlist.local.json', '/music/private.mp3']) {
+  assert.deepEqual(
+    routeDesktopRendererRequest(`opensquilla-app://desktop${path}`),
+    { kind: 'spa', relativePath: 'desktop.html' },
+  )
+}
+assert.deepEqual(
+  routeDesktopRendererRequest('opensquilla-app://desktop/opensquilla-mark.png'),
+  { kind: 'file', relativePath: 'opensquilla-mark.png' },
+)
 assert.deepEqual(
   routeDesktopRendererRequest('opensquilla-app://desktop/assets/%00secret'),
   { kind: 'reject' },

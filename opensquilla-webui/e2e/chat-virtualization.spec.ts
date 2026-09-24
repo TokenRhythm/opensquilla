@@ -33,7 +33,7 @@ async function gateway(page: Page, total: number) {
   })
   // Vite preview has no gateway static proxy. Serve the same checked-in brand asset.
   await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
-    path: fileURLToPath(new URL('../public/opensquilla-mark.png', import.meta.url)),
+    path: fileURLToPath(new URL('../public-assets/opensquilla-mark.png', import.meta.url)),
     contentType: 'image/png',
   }))
   for (const endpoint of ['approvals', 'system/update', 'elevated-mode']) {
@@ -498,7 +498,7 @@ test('live-to-canonical handoff preserves the reading token inside a long answer
     localStorage.setItem('opensquilla.chat.virtualizeHistory', 'true')
   })
   await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
-    path: fileURLToPath(new URL('../public/opensquilla-mark.png', import.meta.url)),
+    path: fileURLToPath(new URL('../public-assets/opensquilla-mark.png', import.meta.url)),
     contentType: 'image/png',
   }))
   for (const endpoint of ['approvals', 'system/update', 'elevated-mode']) {

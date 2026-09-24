@@ -394,9 +394,9 @@ jobs:
         working-directory: opensquilla-webui
         shell: bash
         run: |
-          # Vite copies public/ verbatim. Prove the canonical normalization
+          # Vite copies public-assets/ verbatim. Prove the canonical normalization
           # strips harmless Finder metadata before the manifest is written.
-          printf 'CI-only Finder metadata\n' > public/.DS_Store
+          printf 'CI-only Finder metadata\n' > public-assets/.DS_Store
           npm run build:artifact
           if [[ -e dist/.DS_Store || -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
@@ -559,7 +559,6 @@ jobs:
             exit 1
           fi
           python scripts/verify_webui_artifact.py \
-            --forbid-personal-bgm \
             --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
 
@@ -872,6 +871,10 @@ jobs:
           idle-chat-recovery.spec.ts
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
+          retired-bgm-upgrade.spec.ts
+          header-responsive.spec.ts
+          topbar-global-controls.spec.ts
+          topbar-visual.spec.ts
           router-physical-model.spec.ts
           user-message-newlines.spec.ts
           session-created-card.spec.ts
@@ -1702,6 +1705,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -1761,6 +1769,9 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_scripts/test_verify_webui_artifact.py
+            tests/test_scripts/test_stage_webui_artifact.py
+            tests/test_packaging/test_webui_build_contract.py
             -vv
             --tb=short
             -o faulthandler_timeout=60
@@ -1939,8 +1950,7 @@ jobs:
           set -euo pipefail
           git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
           mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
-          docker build --file Dockerfile --tag "${mcp_image}" \
-            --build-arg OPENSQUILLA_FORBID_PERSONAL_BGM=1 . \
+          docker build --file Dockerfile --tag "${mcp_image}" . \
             2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
           docker image inspect --format '{{json .Size}}' "${mcp_image}" \
             | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"

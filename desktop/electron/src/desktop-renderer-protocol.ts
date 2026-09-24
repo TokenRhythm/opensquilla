@@ -100,7 +100,6 @@ export function routeDesktopRendererRequest(
   }
   if (
     pathname.startsWith('/assets/')
-    || pathname.startsWith('/music/')
     || pathname === '/opensquilla-mark.png'
     || pathname === '/desktop.html'
     || pathname === '/webui-artifact-manifest.json'

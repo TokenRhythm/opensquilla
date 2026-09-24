@@ -56,11 +56,13 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
         "stale source bundle\n",
     )
 
-    # Nested dotfiles and private BGM remain supported inputs. The former is
-    # harmless build metadata; the latter is deliberately allowed for local
-    # images and rejected separately for official images.
+    # Required build metadata and active public assets survive. Retired music
+    # is excluded even when an upgraded checkout still contains personal files.
     _write(context / "opensquilla-webui/.node-version", "22.12.0\n")
     _write(context / "opensquilla-webui/public/music/local.mp3", "local music\n")
+    _write(context / "opensquilla-webui/public/music/album/track.aac", "local music\n")
+    _write(context / "opensquilla-webui/public/music/playlist.local.json", "{broken")
+    _write(context / "opensquilla-webui/public-assets/opensquilla-mark.png", "image\n")
     _write(context / "src/opensquilla/__init__.py")
     _write(context / "scripts/verify_webui_artifact.py")
     _write(context / "scripts/freeze_migration_registry.py")
@@ -86,7 +88,8 @@ def test_dockerignore_filters_real_build_context(tmp_path: Path) -> None:
 
     copied = output / "context"
     assert (copied / "opensquilla-webui/.node-version").is_file()
-    assert (copied / "opensquilla-webui/public/music/local.mp3").is_file()
+    assert not (copied / "opensquilla-webui/public/music").exists()
+    assert (copied / "opensquilla-webui/public-assets/opensquilla-mark.png").is_file()
     assert (copied / "src/opensquilla/__init__.py").is_file()
     assert (copied / "scripts/verify_webui_artifact.py").is_file()
     assert (copied / "scripts/freeze_migration_registry.py").is_file()
