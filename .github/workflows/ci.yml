@@ -1257,6 +1257,7 @@ jobs:
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
@@ -1266,6 +1267,7 @@ jobs:
           elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_plan_rpc.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
               tests/test_gateway/test_task_runtime_wait_slots.py
@@ -1539,6 +1541,7 @@ jobs:
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
@@ -1548,6 +1551,7 @@ jobs:
           elif [[ "${family}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_plan_rpc.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
               tests/test_gateway/test_task_runtime_wait_slots.py

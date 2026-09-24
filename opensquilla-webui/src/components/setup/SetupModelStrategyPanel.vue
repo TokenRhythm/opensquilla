@@ -84,6 +84,7 @@ interface SinglePanelContract {
   model: string
   models: DiscoveredModelCatalog['models']
   modelSource: DiscoveredModelCatalog['source']
+  catalogState?: DiscoveredModelCatalog
 }
 
 interface ModelStrategyPanelContract {
@@ -1298,6 +1299,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="replacementModel"
                 :models="replacementModelCatalog.models"
                 :model-source="replacementModelCatalog.source"
+                :catalog-state="replacementModelCatalog"
                 @update="replacementModel = $event"
               />
               <p
@@ -1356,6 +1358,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="newCandidateModel"
                 :models="candidateModelCatalog.models"
                 :model-source="candidateModelCatalog.source"
+                :catalog-state="candidateModelCatalog"
                 @update="newCandidateModel = $event"
               />
               <div class="setup-model-strategy__editor-actions">
@@ -1526,6 +1529,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="aggregatorModel"
                 :models="aggregatorModelCatalog.models"
                 :model-source="aggregatorModelCatalog.source"
+                :catalog-state="aggregatorModelCatalog"
                 @update="aggregatorModel = $event"
               />
               <div class="setup-model-strategy__editor-actions">
@@ -1774,6 +1778,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             :value="panel.single.model"
             :models="panel.single.models"
             :model-source="panel.single.modelSource"
+            :catalog-state="panel.single.catalogState"
             @update="emit('updateFixedModel', $event)"
           >
             <template #actions><SetupModelCapacity :provider="panel.single.providerId" :model="panel.single.model" :disabled="routingModeBusy" /></template>
@@ -2164,8 +2169,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__fixed-model-row.control-row--stack {
   align-items: center;
   flex-direction: row;
-  gap: var(--sp-4);
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
   padding: var(--sp-2) 0;
+}
+
+.setup-model-strategy__fixed-model-row :deep(.setup-model-combobox__sync) {
+  flex-basis: 100%;
+  text-align: right;
 }
 
 .setup-model-strategy__fixed-model-row :deep(.control-row__label-block) {
@@ -2630,6 +2641,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
   .setup-model-strategy__fixed-model-row :deep(.control-row__control) {
     width: 100%;
+  }
+
+  .setup-model-strategy__fixed-model-row :deep(.setup-model-combobox__sync) {
+    flex-basis: auto;
+    text-align: left;
   }
 }
 

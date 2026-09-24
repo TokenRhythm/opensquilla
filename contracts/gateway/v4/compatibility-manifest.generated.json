@@ -620,7 +620,7 @@
       "lifecycle": "stable",
       "name": "models.list",
       "schema": "platform/models-list.schema.json",
-      "schemaSha256": "b99bc09fcc2d71eca1a7d45f45dd9597223438f769bcca219252f5230b797633"
+      "schemaSha256": "962da89934c7a6e546aa98ef1280c27247de586653cd8f7dd20e3f624727c715"
     },
     {
       "lifecycle": "stable",
@@ -728,7 +728,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.draft.models.discover",
       "schema": "platform/onboarding-llm-profile-draft-models-discover.schema.json",
-      "schemaSha256": "0869b6a20272818ddefcb910b8ce8d5603b1ed4afd67f550ee3ebca5bbfac525"
+      "schemaSha256": "6903543a19d22d159328dc27344b35071f78e0b11f10eca0be305c05115417af"
     },
     {
       "lifecycle": "stable",
@@ -740,7 +740,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.models.discover",
       "schema": "platform/onboarding-llm-profile-models-discover.schema.json",
-      "schemaSha256": "e81aa53627c0a49d62e6f85d7b4ac3184dbad93335e8ced9f227157918c5fefb"
+      "schemaSha256": "fe9dfccfe89f8684897f5c6d1f29e722b752f5d80f12d7715a72a5aa4a37f74f"
     },
     {
       "lifecycle": "stable",
@@ -776,7 +776,7 @@
       "lifecycle": "stable",
       "name": "onboarding.models.discover",
       "schema": "platform/onboarding-models-discover.schema.json",
-      "schemaSha256": "6118c8f27d888f5f6481d14e6f29faab3da1f1760d86b6ce22fbe9ce86555c0d"
+      "schemaSha256": "50a5dd53b131d04b45062858a2b8f0d16ff01516000463f57de2e668d012aca7"
     },
     {
       "lifecycle": "stable",
@@ -1418,7 +1418,7 @@
     "generatorSha256": "d9019b454dec45b2003c695e89022132ba7fafee86ddb43d695801b12c8dc811",
     "methodCount": 207,
     "schemaCount": 217,
-    "schemaTreeSha256": "d3d54bfd1bf21ce07e7a9a44764e64779d4fc73f0ff0044c3215ec52ace07e46",
+    "schemaTreeSha256": "4b98b6d3a2f85875c329b75fed3f211c33146395553d1fb05e4f80aae979c7c8",
     "toolchains": {
       "legacyTypes": {
         "python": {

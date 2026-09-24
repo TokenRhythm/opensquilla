@@ -37,6 +37,63 @@ function harness(input: { catalogAvailable?: boolean; capable?: boolean; storage
 }
 
 describe('new-task model selection', () => {
+  it('uses an older gateway response once without requiring snapshot metadata', async () => {
+    const h = harness()
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledExactlyOnceWith({
+      scope: 'configured', cacheOnly: true, signal: expect.any(AbortSignal),
+    })
+    expect(h.api.models.value).toEqual([MODEL])
+    expect(h.api.loading.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it('does not refresh a fresh empty snapshot', async () => {
+    const h = harness({ list: async () => ({ models: [], errors: [],
+      catalog: { cacheHit: true, stale: false, lastSyncedAt: '2026-01-01T00:00:00Z' } }) })
+    await h.api.refresh()
+    expect(h.list).toHaveBeenCalledTimes(1)
+    expect(h.api.models.value).toEqual([])
+    expect(h.api.loading.value).toBe(false)
+    h.scope.stop()
+  })
+
+  it.each(['transport_transient', 'provider_overloaded', 'rate_limited', 'probe_timeout'])(
+    'keeps the previous provider list on %s and replaces it on successful empty', async kind => {
+      const h = harness()
+      await h.api.refresh()
+      h.api.select(PIN)
+      h.list.mockResolvedValueOnce({ models: [], errors: [{ provider: MODEL.provider, kind, detail: '' }] })
+      await h.api.refresh()
+      expect(h.api.models.value).toEqual([MODEL])
+      expect(h.api.providerErrors.value[0]?.kind).toBe(kind)
+      h.list.mockResolvedValueOnce({ models: [], errors: [] })
+      await h.api.refresh()
+      expect(h.api.models.value).toEqual([])
+      expect(h.api.selection.value).toEqual(PIN)
+      h.scope.stop()
+    },
+  )
+
+  it('renders a stale snapshot before refresh and preserves an explicit pin after rejection', async () => {
+    let finish!: (value: ModelCatalogResult) => void
+    let calls = 0
+    const h = harness({ list: async () => {
+      if (++calls === 1) return { models: [MODEL], errors: [],
+        catalog: { cacheHit: true, stale: true, lastSyncedAt: null } }
+      return new Promise(resolve => { finish = resolve })
+    } })
+    await vi.waitFor(() => expect(calls).toBe(2))
+    expect(h.list.mock.calls[0]).toEqual([expect.objectContaining({ cacheOnly: true })])
+    expect(h.api.models.value).toEqual([MODEL])
+    expect(h.api.loading.value).toBe(true)
+    h.api.select(PIN)
+    finish({ models: [], errors: [{ provider: MODEL.provider, kind: 'auth_invalid', detail: '' }] })
+    await h.api.refresh()
+    expect(h.api.models.value).toEqual([])
+    expect(h.api.selection.value).toEqual(PIN)
+    h.scope.stop()
+  })
   it('shares one catalog with existing tasks without enabling a draft pin there', async () => {
     const h = harness({ catalogAvailable: true })
     await h.api.refresh()

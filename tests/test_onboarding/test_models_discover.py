@@ -22,6 +22,24 @@ from opensquilla.provider.failures import ProviderFailureKind
 from opensquilla.provider.protocol import ProviderModelListingResponseError
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider,base_url", [
+    ("openrouter", "https://openrouter.ai/api/v1"),
+    ("custom", "http://127.0.0.1:9999/v1"),
+    ("tokenrhythm", "https://uat.tokenrhythm.studio/v1"),
+])
+async def test_cache_only_miss_never_constructs_provider(monkeypatch, provider, base_url):
+    async def forbidden(**_kwargs):
+        pytest.fail("cache-only discovery must not call an upstream provider")
+
+    monkeypatch.setattr(probe_module, "discover_provider_models", forbidden)
+    result = await discover_selectable_provider_models(
+        provider_id=provider, base_url=base_url, api_key="dummy-key", cache_only=True,
+    )
+    assert result.ok and result.models == []
+    assert result.catalog == {"cacheHit": False, "stale": True, "lastSyncedAt": None}
+
+
 def _patch_response(monkeypatch: Any, response_factory) -> list[httpx.Request]:
     """Route provider HTTP through a MockTransport, capturing requests."""
     seen: list[httpx.Request] = []
@@ -179,6 +197,7 @@ def test_tokenrhythm_selectable_discovery_uses_catalog_coordinator(
             "force": True,
             "persist_entitlement": True,
             "config": catalog_config,
+            "cache_only": False,
         }
     ]
 

@@ -3250,12 +3250,14 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
             "tests/test_live_long_task_case_driver.py",
             "tests/test_engine/turn_runner/test_stage_test_boundaries.py",
             "tests/test_engine/test_runtime_artifacts.py",
+            "tests/test_engine/test_tool_concurrency.py",
             "tests/test_engine/test_tokenjuice_tool_result_projection.py",
             "tests/test_tools/test_tool_upgrade_compatibility.py",
             "tests/test_gateway/test_goal_rpc.py",
             "tests/test_tools/test_dispatch_legacy_coverage.py",
             "tests/unit/cli/repl/test_slash_bridge.py",
             "tests/test_gateway/test_channel_turn_ingress.py",
+            "tests/test_gateway/test_plan_rpc.py",
             "tests/test_gateway/test_goal_registry_cleanup.py",
             "tests/test_gateway/test_task_runtime_terminal_cleanup.py",
             "tests/test_gateway/test_task_runtime_wait_slots.py",
@@ -3295,9 +3297,11 @@ def test_offline_environment_preflight_gates_platform_tests(job_name, test_step_
     ("core", "tests/test_cli/test_chat_cmd.py"),
     ("gateway-sqlite", "tests/test_gateway/test_goal_registry_cleanup.py"),
     ("gateway-sqlite", "tests/test_gateway/test_task_runtime_wait_slots.py"),
+    ("gateway-sqlite", "tests/test_gateway/test_plan_rpc.py"),
     ("recovery-migration", "tests/test_sandbox/test_windows_shell_process_runtime.py"),
     ("recovery-migration", "tests/test_live_long_task_case_driver.py"),
     ("desktop-installer-contracts", "tests/test_ci/test_architecture_import_contracts.py"),
+    ("desktop-installer-contracts", "tests/test_engine/test_tool_concurrency.py"),
 ])
 def test_windows_preflight_selects_regressions_for_physical_partitions(family, expected_file):
     steps = _workflow("ci.yml")["jobs"]["windows-full"]["steps"]
