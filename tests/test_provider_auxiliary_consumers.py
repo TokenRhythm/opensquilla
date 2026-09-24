@@ -6,14 +6,12 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine.types import AgentConfig
 from opensquilla.gateway.rpc_memory_import import _GatewayFusionCompletion
 from opensquilla.memory.dream.runner import _run_complete
 from opensquilla.provider import auxiliary_budget
 from opensquilla.provider.auxiliary_budget import AuxiliaryRequestTooLargeError
 from opensquilla.provider.protocol import ProviderMetadata
 from opensquilla.provider.types import ChatConfig, DoneEvent, Message, TextDeltaEvent
-from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
 from opensquilla.tools.builtin.media import _complete_from_stream
 
 
@@ -146,31 +144,6 @@ async def test_dream_chat_receives_nonzero_resolved_request_cap(
     assert provider.config.provider_request_max_chars > 0
     assert provider.config.provider_context_window_tokens == small_catalog.context_window
     assert provider.config.provider_request_max_chars_explicit_cap == 0
-
-
-@pytest.mark.asyncio
-async def test_meta_chat_binds_base_deployment_budget(
-    small_catalog: _Catalog,
-) -> None:
-    provider = _ChatProvider()
-    chat = make_llm_chat_from_provider(
-        provider=provider,
-        base_config=AgentConfig(
-            provider_id="test",
-            model_id="test-model",
-            context_window_tokens=small_catalog.context_window,
-            context_overflow_threshold=0.8,
-        ),
-        max_tokens=128,
-    )
-
-    assert await chat("system", "user") == "ok"
-
-    assert provider.config is not None
-    assert provider.config.provider_request_max_chars > 0
-    assert provider.config.provider_context_window_tokens == small_catalog.context_window
-    assert provider.config.provider_request_max_chars_explicit_cap == 0
-    assert provider.config.max_tokens == 128
 
 
 @pytest.mark.asyncio

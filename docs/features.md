@@ -37,15 +37,6 @@ the runtime can keep richer raw results out-of-band.
 
 Read: [`features/tool-compression.md`](features/tool-compression.md)
 
-### Meta-Skills
-
-Repeatable multi-step workflows can be represented as skills, inspected,
-proposed, replayed, and reused. By default, users launch them manually on
-supported chat surfaces with `/meta` and `/meta <name>`.
-
-Read: [`features/meta-skills.md`](features/meta-skills.md) and
-[`features/meta-skill-user-guide.md`](features/meta-skill-user-guide.md)
-
 ### Memory
 
 Durable memory lets OpenSquilla recall useful user preferences, project notes,
@@ -121,8 +112,7 @@ OpenSquilla includes tools for:
 - Spreadsheet, PPTX, DOCX, CSV, and PDF authoring through bundled skills.
 - Feishu/Lark docs, chat, drive, wiki, permissions, and media upload.
 - Cron and gateway administration.
-- Skill listing, viewing, creating, editing, installing dependencies, and
-  meta-skill invocation.
+- Skill listing, viewing, creating, editing, and installing dependencies.
 
 Read: [`tools-and-sandbox.md`](tools-and-sandbox.md)
 
@@ -131,25 +121,13 @@ Read: [`tools-and-sandbox.md`](tools-and-sandbox.md)
 Bundled user-facing skills include:
 
 - `deep-research`
-- `summarize`
-- `memory`
-- `cron`
-- `github`
 - `docx`
-- `pptx`
-- `xlsx`
+- `github`
+- `html-coder`
 - `pdf-toolkit`
-- `html-to-pdf`
-- `multi-search-engine`
-- `weather`
-- `tmux`
-- `sub-agent`
+- `pptx`
 - `skill-creator`
-
-Retained bundled MetaSkills include `meta-paper-write`, `meta-short-drama`, and
-`meta-skill-creator`. Experimental
-MetaSkills may exist in development trees, but they are not presented as stable
-built-in product capabilities.
+- `xlsx`
 
 Read: [`features/skills.md`](features/skills.md)
 

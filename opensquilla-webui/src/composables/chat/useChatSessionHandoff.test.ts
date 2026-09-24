@@ -7,7 +7,6 @@ import {
 } from '@/composables/chat/useChatPendingQueue'
 import type { Attachment, ChatMessage } from '@/types/chat'
 import {
-  type ChatSendOutcome,
   type UseChatSendOptions as DomainUseChatSendOptions,
 } from './useChatSend'
 import { createChatSendHarness, memoryDeliveryWal } from './chatSendTestHarness'
@@ -141,10 +140,6 @@ describe('chat send session handoff', () => {
     const trace: string[] = []
     let resolveSend!: (value: unknown) => void
     let sendCurrentInput: () => void = () => {}
-    let dispatchHiddenControl: (
-      item: import('@/types/chat').ChatPendingItem,
-      ownerSessionKey: string,
-    ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 
     const persistSession = vi.fn((key: string) => {
       trace.push(`persist:${key}`)
@@ -199,17 +194,11 @@ describe('chat send session handoff', () => {
       sendCurrentInput: () => sendCurrentInput(),
       resetInputHistory: vi.fn(),
       hasComposer: () => true,
-      dispatchHiddenControl: (item, ownerSessionKey) =>
-        dispatchHiddenControl(item, ownerSessionKey),
       pendingInputWal,
     })
     inputText.value = 'existing parent follow-up'
     await pendingQueueRuntime.enqueuePendingInput(
       inputText.value,
-      { ownerRequestId: 'older-parent-request' },
-    )
-    pendingQueueRuntime.enqueueHiddenControl(
-      { text: 'existing parent control', displayText: 'Existing parent control' },
       { ownerRequestId: 'older-parent-request' },
     )
     inputText.value = 'edited question'
@@ -323,7 +312,6 @@ describe('chat send session handoff', () => {
       isCompactInFlightForCurrentSession: () => false,
       hasPendingAttachmentWork: () => false,
       enqueuePendingInput: pendingQueueRuntime.enqueuePendingInput,
-      enqueueHiddenControl: pendingQueueRuntime.enqueueHiddenControl,
       enqueuePendingSteerAttempt: pendingQueueRuntime.enqueuePendingSteerAttempt,
       steerDelivery,
       popAllPendingIntoComposer: pendingQueueRuntime.popAllPendingIntoComposer,
@@ -334,7 +322,6 @@ describe('chat send session handoff', () => {
       scrollToBottom: vi.fn(),
     })
     sendCurrentInput = send.onSend
-    dispatchHiddenControl = send.dispatchQueuedHiddenSend
 
     const firstSend = send.onSend()
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
@@ -351,10 +338,6 @@ describe('chat send session handoff', () => {
       file_uuid: 'file-queued',
     }]
     await pendingQueueRuntime.enqueuePendingInput(inputText.value)
-    pendingQueueRuntime.enqueueHiddenControl({
-      text: 'hidden control',
-      displayText: 'Hidden control',
-    })
     resolveSend({
       sessionKey: childSessionKey,
       task_id: 'task-child',
@@ -405,16 +388,6 @@ describe('chat send session handoff', () => {
         text: 'existing parent follow-up',
         ownerSessionKey: parentSessionKey,
         ownerRequestId: 'older-parent-request',
-      },
-      {
-        text: 'existing parent control',
-        hiddenControl: true,
-        hiddenControlSessionKey: parentSessionKey,
-      },
-      {
-        text: 'hidden control',
-        hiddenControl: true,
-        hiddenControlSessionKey: parentSessionKey,
       },
     ])
   })

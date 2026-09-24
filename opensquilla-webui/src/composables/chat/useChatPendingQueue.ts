@@ -4,7 +4,6 @@ import { computed, nextTick, ref, toRaw, watch, type Ref } from 'vue'
 import type {
   Attachment,
   ChatPendingItem,
-  HiddenControlDispatchResult,
   PendingSteerPhase,
 } from '@/types/chat'
 import type { SessionSteerV2Params } from '@/types/chat'
@@ -155,15 +154,6 @@ export interface UseChatPendingQueueOptions {
   onPendingPersistenceError?: (
     reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected' | 'order_conflict',
   ) => void
-  // Drain a queued hidden-control send (e.g. meta-preflight confirmation)
-  // directly through the dedicated hidden-send path instead of the composer.
-  dispatchHiddenControl?: (
-    item: ChatPendingItem,
-    ownerSessionKey: string,
-  ) => Promise<PendingDeliveryOutcome>
-  // Returning false for an explicit discard keeps the chip queued. This lets
-  // the caller fail closed when it cannot persist the cancellation tombstone.
-  onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean
   // The WebUI drains visible queue items through the same composer-preserving
   // transport used by explicit Steer. The legacy callback remains as a
   // fallback for isolated composable consumers.
@@ -178,7 +168,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingQueue = ref<ChatPendingItem[]>([])
   const parkedQueues: ParkedPendingQueueCache = new ParkedPendingQueueCache({
     unwrapObject: toRaw,
-    isPinned: item => Boolean(item.hiddenControl || item.steerAttempt || item.deliveryState
+    isPinned: item => Boolean(item.steerAttempt || item.deliveryState
       || item.ownerRequestId || item.pendingPersistenceState === 'cancelling' || (item.pendingInputId && (
         locallyCreatingIds.has(item.pendingInputId) || stagingOperations.has(item.pendingInputId)
         || cancellationOperations.has(item.pendingInputId)
@@ -466,7 +456,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function ordinaryDurableItem(item: ChatPendingItem): boolean {
     return Boolean(
       item.pendingInputId
-      && !item.hiddenControl
       && !item.steerAttempt
       && !item.deliveryState,
     )
@@ -580,7 +569,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           }
           try {
             const queuedText = item.text.trim()
-            const literalSlashEscape = !item.hiddenControl && queuedText.startsWith('//')
+            const literalSlashEscape = queuedText.startsWith('//')
             const providerMessage = literalSlashEscape
               ? queuedText.slice(1)
               : queuedText
@@ -1098,65 +1087,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     })
   }
 
-  function enqueueRecoveredInput(text: string, owner?: PendingQueueOwner) {
-    const recovered = String(text || '').trim()
-    if (!recovered) return true
-    if (pendingQueue.value.some(item => !item.hiddenControl && item.text === recovered)) {
-      return true
-    }
-    return enqueuePendingPayload({ text: recovered }, owner)
-  }
-
-  function enqueueHiddenControl(
-    item: {
-      text: string
-      displayText: string
-      clientRequestId?: string
-      sessionKey?: string
-      clientMessageId?: string
-      visibleCommitted?: boolean
-    },
-    owner?: PendingQueueOwner,
-  ) {
-    const stableRequestId = String(item.clientRequestId || '').trim()
-    const hiddenControlSessionKey = item.sessionKey || options.sessionKey.value
-    if (
-      stableRequestId
-      && pendingQueue.value.some(candidate => (
-        candidate.hiddenControl
-        && candidate.clientRequestId === stableRequestId
-        && candidate.hiddenControlSessionKey === hiddenControlSessionKey
-      ))
-    ) return true
-    if (ordinaryPendingCount.value >= MAX_PENDING) {
-      console.warn(`Pending queue full (${MAX_PENDING})`)
-      return false
-    }
-    // A hidden-control send does NOT consume the composer draft/attachments.
-    const ownerRequestId = resolveOwnerRequestId(owner)
-    pendingQueue.value.push({
-      pendingUiId: stableRequestId || createClientRequestId(),
-      text: item.text,
-      attachments: [],
-      intent: null,
-      ownerSessionKey: options.sessionKey.value,
-      ...(ownerRequestId ? { ownerRequestId } : {}),
-      hiddenControl: true,
-      displayTextOverride: item.displayText,
-      clientRequestId: item.clientRequestId,
-      hiddenControlSessionKey,
-      ...(item.clientRequestId
-        ? { hiddenClientRequestId: item.clientRequestId }
-        : {}),
-      ...(item.clientMessageId
-        ? { hiddenClientMessageId: item.clientMessageId }
-        : {}),
-      ...(item.visibleCommitted ? { hiddenVisibleCommitted: true } : {}),
-    })
-    flushDeferredPendingDrain()
-    return true
-  }
-
   function enqueuePendingSteerAttempt(
     payload: PendingSteerPayload,
     owner?: PendingQueueOwner,
@@ -1355,7 +1285,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
     ) return false
-    if (!notifyDiscardedHiddenControl(item)) return false
     if (durableItem(item)) {
       void cancelDurableItem(item).then(cancelled => {
         if (!cancelled) return
@@ -1370,7 +1299,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   function beginPendingDelivery(
     pendingUiId: string,
-    allowHiddenControl = false,
   ): ChatPendingItem | null {
     if (isReordering.value) return null
     const index = pendingIndex(pendingUiId)
@@ -1380,7 +1308,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || !identityAllowsDelivery(item)
       || item.pendingRetainAfterCancel === true
       || item.retiredAnnotationInput
-      || (item.hiddenControl && !allowHiddenControl)
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
       || item.pendingPersistenceState === 'saving'
@@ -1445,7 +1372,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (
         item.deliveryState === 'steering'
         || item.steerAttempt?.phase === 'submitting'
-        || !notifyDiscardedHiddenControl(item)
       ) continue
       const index = pendingQueue.value.indexOf(item)
       if (index < 0) continue
@@ -1459,17 +1385,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         pendingQueue.value.splice(index, 1)
       }
     }
-  }
-
-  function notifyDiscardedHiddenControl(item?: ChatPendingItem): boolean {
-    if (!item?.hiddenControl || !item.clientRequestId) return true
-    const result = options.onHiddenControlDispatchResult?.({
-      status: 'rejected',
-      reason: 'discarded',
-      clientRequestId: item.clientRequestId,
-      sessionKey: item.hiddenControlSessionKey || '',
-    })
-    return result !== false
   }
 
   function switchPendingQueue(
@@ -1626,12 +1541,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     const carried: ChatPendingItem[] = []
     const stayingVisible: ChatPendingItem[] = []
-    const stayingHidden: ChatPendingItem[] = []
     for (const item of pendingQueue.value) {
-      if (item.hiddenControl) {
-        stayingHidden.push(item)
-        continue
-      }
       if (
         !durableCommitApplied
         && ownerRequestId
@@ -1652,11 +1562,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         stayingVisible.push(item)
       }
     }
-    if (stayingVisible.length > 0 || stayingHidden.length > 0) {
+    if (stayingVisible.length > 0) {
       parkedQueues.set(sourceSessionKey, [
         ...(parkedQueues.get(sourceSessionKey) || []),
         ...stayingVisible,
-        ...stayingHidden,
       ])
     }
     const targetItems = parkedQueues.get(targetSessionKey) || []
@@ -1745,7 +1654,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (
       !item
       || !canRestoreToComposer(item)
-      || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
       // The text editor cannot reconstruct a frozen page selection. Keep the
@@ -1786,15 +1694,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function popPendingTail() {
-    // Hidden controls and explicit/ambiguous steer deliveries must retain
+    // Explicit or ambiguous steer deliveries must retain
     // their own transport identity instead of being converted into a fresh
     // composer send.
     let tailIndex = pendingQueue.value.length - 1
     while (
       tailIndex >= 0
       && (
-        pendingQueue.value[tailIndex]?.hiddenControl
-        || pendingQueue.value[tailIndex]?.deliveryState
+        pendingQueue.value[tailIndex]?.deliveryState
         || pendingQueue.value[tailIndex]?.steerAttempt
       )
     ) tailIndex--
@@ -1825,18 +1732,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     if (!options.hasComposer() || pendingQueue.value.length === 0) return false
-    // Hidden controls and explicit/ambiguous steer deliveries stay queued;
+    // Explicit or ambiguous steer deliveries stay queued;
     // only transport-free visible drafts can safely return to the composer.
     const visible = pendingQueue.value.filter(
-      p => !p.hiddenControl
-        && !p.deliveryState
+      p => !p.deliveryState
         && !p.steerAttempt
         && canRestoreToComposer(p)
         && !hasUneditablePendingAttachments(p),
     )
     const retained = pendingQueue.value.filter(
-      p => p.hiddenControl
-        || p.deliveryState
+      p => p.deliveryState
         || p.steerAttempt
         || !canRestoreToComposer(p)
         || hasUneditablePendingAttachments(p),
@@ -1886,45 +1791,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
     if (ownerSessionKey !== options.sessionKey.value) {
       if (head) head.deliveryState = 'retryable'
-      return
-    }
-    if (head?.hiddenControl) {
-      head.deliveryState = 'steering'
-      // Hidden-control sends bypass the composer entirely, but retain their
-      // queue lease until the transport confirms acceptance.
-      nextTick(() => {
-        void (async () => {
-          let outcome: PendingDeliveryOutcome = 'retryable_failure'
-          try {
-            if (options.sessionKey.value === ownerSessionKey) {
-              outcome = await options.dispatchHiddenControl?.(
-                head,
-                ownerSessionKey,
-              ) ?? 'retryable_failure'
-            }
-          } catch {
-            outcome = 'retryable_failure'
-          } finally {
-            if (head.clientRequestId) {
-              options.onHiddenControlDispatchResult?.({
-                status: outcome === 'accepted'
-                  ? 'accepted'
-                  : outcome === 'not_sent'
-                    ? 'rejected'
-                    : 'unknown',
-                reason: outcome === 'accepted'
-                  ? 'accepted'
-                  : outcome === 'not_sent'
-                    ? 'send_rejected'
-                    : 'response_unknown',
-                clientRequestId: head.clientRequestId,
-                sessionKey: head.hiddenControlSessionKey || ownerSessionKey,
-              })
-            }
-            settlePendingDelivery(head, outcome)
-          }
-        })()
-      })
       return
     }
     if (options.dispatchPendingItem) {
@@ -2252,8 +2118,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     maxPending: MAX_PENDING,
     enqueuePendingPayload,
     enqueuePendingInput,
-    enqueueRecoveredInput,
-    enqueueHiddenControl,
     enqueuePendingSteerAttempt,
     removePendingChip,
     beginPendingDelivery,

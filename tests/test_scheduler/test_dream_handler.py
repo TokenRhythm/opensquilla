@@ -121,7 +121,7 @@ async def test_post_dream_hook_exception_does_not_poison_handler_result() -> Non
             return _R()
 
     async def hook(_agent_id: str, _dream_summary: str) -> None:
-        raise RuntimeError("auto_propose blew up")
+        raise RuntimeError("post-dream hook blew up")
 
     handler = make_memory_dream_handler(
         build_dream=lambda _aid: _StubDream(),

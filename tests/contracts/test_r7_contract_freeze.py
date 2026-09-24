@@ -99,68 +99,6 @@ EXPECTED_ACCURATE_ERROR_CODES = {
         "UNAVAILABLE",
         "INTERNAL_ERROR",
     ),
-    "meta.drafts.list": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.drafts.discard": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.run": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "META_DRAFT_DISCARDED",
-        "META_DRAFT_UNAVAILABLE",
-        "META_DRAFT_OUTBOX_FULL",
-        "META_LAUNCH_BUSY",
-        "IDEMPOTENCY_CONFLICT",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.runs.confirm_preflight": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.runs.recovery": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.runs.replay": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.setup.plan": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "INTERNAL_ERROR",
-    ),
-    "meta.setup.install": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.setup.status": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "INTERNAL_ERROR",
-    ),
     "migration.sources.list": (
         "migration.invalid_params",
         "migration.unavailable",
@@ -237,9 +175,9 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 236
+    assert len(specs) == 217
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 226,
+        "method": 207,
         "event": 10,
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}

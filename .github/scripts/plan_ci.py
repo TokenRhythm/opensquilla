@@ -33,7 +33,6 @@ _DOC_EXACT: Final = {
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
-    "META_SKILL_GUIDE.md",
     "MIGRATION.md",
     "README.md",
     "SECURITY.md",
@@ -172,11 +171,9 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
@@ -203,15 +200,12 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills/test_hub_transaction_process_gates.py",
         "tests/test_gateway/test_rpc_skills_install_visibility.py",
         "tests/test_gateway/test_rpc_skills_exact_identity.py",
-        "tests/test_gateway/test_rpc_skills_coding_gate.py",
         "tests/test_gateway/test_rpc_skills_reload.py",
         "tests/test_gateway/test_skill_catalog_adapter.py",
         "tests/test_gateway/test_skill_catalog_application.py",
         "tests/test_gateway/test_skill_management_adapter.py",
         "tests/test_gateway/test_skill_management_application.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
-        "tests/test_gateway/test_skill_proposal_review_adapter.py",
-        "tests/test_gateway/test_skill_proposal_review_application.py",
         "tests/test_tools/test_skill_view_resources.py",
         "tests/test_scripts/test_bench_skill_integrity.py",
         "tests/test_cli/test_cli_product_completeness.py",
@@ -226,27 +220,22 @@ _SKILL_HUB_SOURCE_EXACT: Final = frozenset(
         "src/opensquilla/cli/gateway_client.py",
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
-        "src/opensquilla/cli/skills_meta_cmd.py",
         "src/opensquilla/application/skill_catalog.py",
         "src/opensquilla/application/skill_management.py",
         "src/opensquilla/engine/runtime.py",
         "src/opensquilla/engine/agent.py",
         "src/opensquilla/application/skill_source.py",
-        "src/opensquilla/application/skill_proposal_review.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/adapters/skill_catalog.py",
         "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
         "src/opensquilla/gateway/adapters/skill_management.py",
         "src/opensquilla/gateway/adapters/skill_management_contract.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/config.py",
         "src/opensquilla/gateway/protocol.py",
         "src/opensquilla/gateway/rpc/__init__.py",
         "src/opensquilla/gateway/rpc/registry.py",
         "src/opensquilla/gateway/rpc_skills.py",
-        "src/opensquilla/gateway/rpc_proposals.py",
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/gateway/websocket.py",
         "src/opensquilla/tools/builtin/skill_tools.py",
@@ -260,7 +249,6 @@ _SKILL_HUB_TEST_PREFIXES: Final = (
     "tests/test_gateway/test_rpc_skills_",
     "tests/test_gateway/test_skill_catalog_",
     "tests/test_gateway/test_skill_management_",
-    "tests/test_gateway/test_skill_proposal_review_",
     "tests/test_skills/test_hub_",
     "tests/test_skills/test_loader_",
     "tests/test_skills_hub_",
@@ -350,38 +338,8 @@ _MANAGED_TOOLCHAIN_SHARED_TARGETS: Final = {
     "tests/test_skills/test_toolchain_runtime_integration.py",
     "tests/test_skills/test_toolchain_state_scope.py",
 }
-_MANAGED_TOOLCHAIN_SOURCE_TARGETS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
-    (
-        "src/opensquilla/skills/bundled/meta-paper-write/",
-        (
-            "tests/test_skills/test_meta_paper*.py",
-            "tests/test_skills/test_paper_*.py",
-        ),
-    ),
-    (
-        "src/opensquilla/skills/bundled/paper-",
-        (
-            "tests/test_skills/test_meta_paper*.py",
-            "tests/test_skills/test_paper_*.py",
-        ),
-    ),
-    (
-        "src/opensquilla/skills/bundled/meta-short-drama/",
-        ("tests/test_skills/test_meta_short_drama*.py",),
-    ),
-    (
-        "src/opensquilla/skills/bundled/subtitle-burner/",
-        ("tests/test_skills/test_subtitle_burner.py",),
-    ),
-    ("src/opensquilla/skills/bundled/video-still-animator/", ()),
-)
 _MANAGED_TOOLCHAIN_TEST_PREFIXES: Final = (
     "tests/test_skills/test_toolchain_",
-    "tests/test_skills/test_meta_paper",
-    "tests/test_skills/test_paper_",
-    "tests/test_skills/test_meta_short_drama",
-    "tests/test_skills/test_subtitle_burner",
-    "tests/test_skills/test_video_still_animator",
 )
 _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
     (
@@ -409,7 +367,7 @@ _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]]
     (("src/opensquilla/scheduler/",), ("tests/test_scheduler",)),
     (
         ("src/opensquilla/skills/",),
-        ("tests/test_meta_skill*.py", "tests/test_skills", "tests/test_skills*.py"),
+        ("tests/test_skills", "tests/test_skills*.py"),
     ),
     (
         ("src/opensquilla/cli/",),
@@ -484,11 +442,6 @@ def _managed_toolchain_targets(path: str) -> set[str] | None:
         or path.startswith(_MANAGED_TOOLCHAIN_TEST_PREFIXES)
     ):
         targets = set(_MANAGED_TOOLCHAIN_SHARED_TARGETS)
-    for prefix, domain_targets in _MANAGED_TOOLCHAIN_SOURCE_TARGETS:
-        if path.startswith(prefix):
-            targets = set(_MANAGED_TOOLCHAIN_SHARED_TARGETS)
-            targets.update(domain_targets)
-            break
     if targets is not None and path.startswith("tests/"):
         targets.add(path)
     return targets

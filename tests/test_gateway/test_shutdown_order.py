@@ -396,7 +396,7 @@ async def test_channel_drain_uses_remaining_gateway_deadline(
 
 @pytest.mark.parametrize(
     "writer_field",
-    ["meta_run_writer", "router_decision_writer", "turn_error_writer"],
+    ["router_decision_writer", "turn_error_writer"],
 )
 @pytest.mark.asyncio
 async def test_service_close_does_not_block_event_loop_on_sidecar_writer(

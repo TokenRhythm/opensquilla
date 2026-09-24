@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -59,24 +60,29 @@ _UNSUPPORTED_DIALECT_FIELDS = frozenset(
         "commandtool",
         "command-arg-mode",
         "commandargmode",
-        "entrypoint",
-        "composition",
         "requires-tools",
         "fallback-for-toolsets",
-        "meta-priority",
-        "final-text-mode",
-        "request-template",
-        "output-contract",
-        "eval-prompts",
-        "preference-keys",
-        "policy-tags",
         "visibility",
         "invocation",
-        "owner-meta-skills",
-        "owner_meta_skills",
     }
 )
 _DEGRADED_DIALECT_FIELDS = frozenset({"allowed-tools", "allowedtools"})
+RETIRED_SKILL_MESSAGE = "This legacy skill definition is retired and cannot be loaded"
+
+
+class RetiredSkillError(ValueError):
+    """A legacy executable workflow must never become an ordinary skill."""
+
+
+def is_retired_skill_manifest(frontmatter: Mapping[str, object]) -> bool:
+    """Recognize retired definitions before compilation or cached recovery."""
+    return (
+        str(frontmatter.get("kind", "skill")).strip().lower() in {"meta", "meta_sop"}
+        or str(frontmatter.get("name", "")).strip() == "code-task"
+        or str(frontmatter.get("invocation", "")).strip().lower()
+        in {"meta_only", "coding_only"}
+        or str(frontmatter.get("visibility", "")).strip().lower() == "meta"
+    )
 
 
 class SkillCompileProfile(StrEnum):
@@ -340,10 +346,6 @@ def resolve_community_skill_metadata(frontmatter: dict) -> SkillPlatformMeta | N
         os=_community_string_list(raw_meta.get("os", [])),
         requires=requires,
         install=_community_install_specs(raw_meta.get("install", [])),
-        # Community-declared risk/capabilities are advisory upstream values,
-        # not authority to activate local execution paths.
-        risk_level="",
-        capabilities=[],
     )
 
 
@@ -420,10 +422,6 @@ def resolve_skill_metadata(frontmatter: dict) -> SkillPlatformMeta | None:
                 "os",
                 "requires",
                 "install",
-                "risk",
-                "risk_level",
-                "riskLevel",
-                "capabilities",
             ):
                 if key in opensquilla_meta:
                     merged_meta[key] = opensquilla_meta[key]
@@ -473,12 +471,6 @@ def resolve_skill_metadata(frontmatter: dict) -> SkillPlatformMeta | None:
         os=_string_list(raw_meta.get("os", [])),
         requires=requires,
         install=install_specs,
-        risk_level=str(
-            raw_meta.get("risk") or raw_meta.get("risk_level") or raw_meta.get("riskLevel") or ""
-        )
-        .strip()
-        .lower(),
-        capabilities=_string_list(raw_meta.get("capabilities", [])),
     )
 
 
@@ -549,20 +541,10 @@ def _compile_community_instruction_manifest(
         homepage=homepage,
         file_path=file_path,
         base_dir=str(skill_dir.resolve()),
-        # All OpenSquilla-native execution and meta-orchestration fields are
-        # deliberately empty at this trust boundary.
+        # Community skills cannot set tool requirements or toolset fallbacks.
         requires_tools=[],
         fallback_for_toolsets=[],
         kind="skill",
-        meta_priority=0,
-        composition_raw=None,
-        final_text_mode="auto",
-        request_template={},
-        output_contract={},
-        eval_prompts=[],
-        preference_keys=[],
-        policy_tags=[],
-        entrypoint=None,
         instance_id=skill_instance_id(layer=layer, file_path=file_path),
     )
 
@@ -595,6 +577,9 @@ def compile_skill_manifest(
         frontmatter, body = parse_skill_frontmatter(text)
     if not frontmatter or "name" not in frontmatter:
         raise ValueError("SKILL.md has no usable frontmatter name")
+
+    if is_retired_skill_manifest(frontmatter):
+        raise RetiredSkillError(RETIRED_SKILL_MESSAGE)
 
     if profile is SkillCompileProfile.COMMUNITY_INSTRUCTION:
         return _compile_community_instruction_manifest(
@@ -631,40 +616,9 @@ def compile_skill_manifest(
     requires_tools = activation_meta.get("requires_tools", [])
     fallback_for_toolsets = activation_meta.get("fallback_for_toolsets", [])
 
-    kind_raw = frontmatter.get("kind", "skill")
-    kind = str(kind_raw) if isinstance(kind_raw, str) else "skill"
-    meta_priority_raw = frontmatter.get("meta_priority", 0)
-    try:
-        meta_priority = int(meta_priority_raw) if meta_priority_raw is not None else 0
-    except (TypeError, ValueError):
-        meta_priority = 0
-    composition_raw = frontmatter.get("composition")
-    if not isinstance(composition_raw, dict):
-        composition_raw = None
-
-    entrypoint_raw = frontmatter.get("entrypoint")
-    entrypoint = entrypoint_raw if isinstance(entrypoint_raw, dict) else None
-
-    final_text_mode_raw = frontmatter.get("final_text_mode", "auto")
-    final_text_mode = (
-        str(final_text_mode_raw).strip() if final_text_mode_raw else "auto"
-    ) or "auto"
-    request_template_raw = frontmatter.get("request_template")
-    request_template = dict(request_template_raw) if isinstance(request_template_raw, dict) else {}
-    output_contract_raw = frontmatter.get("output_contract")
-    output_contract = dict(output_contract_raw) if isinstance(output_contract_raw, dict) else {}
-    eval_prompts_raw = frontmatter.get("eval_prompts")
-    eval_prompts = (
-        [dict(item) for item in eval_prompts_raw if isinstance(item, dict)]
-        if isinstance(eval_prompts_raw, list)
-        else []
-    )
-    preference_keys = _string_list(frontmatter.get("preference_keys", []))
-    policy_tags = _string_list(frontmatter.get("policy_tags", []))
-
     file_path = os.path.abspath(skill_file)
-    default_visibility = "meta" if kind in {"meta", "meta_sop"} else "public"
-    default_invocation = "meta_only" if kind in {"meta", "meta_sop"} else "direct"
+    default_visibility = "public"
+    default_invocation = "direct"
     spec = SkillSpec(
         name=name,
         description=description,
@@ -685,20 +639,10 @@ def compile_skill_manifest(
         fallback_for_toolsets=(
             fallback_for_toolsets if isinstance(fallback_for_toolsets, list) else []
         ),
-        kind=kind,
-        meta_priority=meta_priority,
-        composition_raw=composition_raw,
-        final_text_mode=final_text_mode,
-        request_template=request_template,
-        output_contract=output_contract,
-        eval_prompts=eval_prompts,
-        preference_keys=preference_keys,
-        policy_tags=policy_tags,
-        entrypoint=entrypoint,
+        kind="skill",
         instance_id=skill_instance_id(layer=layer, file_path=file_path),
         visibility=SkillVisibility(str(frontmatter.get("visibility", default_visibility))),
         invocation=SkillInvocation(str(frontmatter.get("invocation", default_invocation))),
-        owner_meta_skills=_string_list(frontmatter.get("owner_meta_skills", [])),
     )
     if layer is SkillLayer.BUNDLED:
         from opensquilla.skills.catalog_policy import (
@@ -758,9 +702,6 @@ def _validate_platform_metadata_mapping(
         "skillKey",
         "primaryEnv",
         "homepage",
-        "risk",
-        "risk_level",
-        "riskLevel",
     ):
         if key in metadata and not isinstance(metadata[key], str):
             diagnostics.append(
@@ -780,7 +721,7 @@ def _validate_platform_metadata_mapping(
                 field=f"{prefix}.always",
             )
         )
-    for key in ("os", "capabilities", "requires_tools", "fallback_for_toolsets"):
+    for key in ("os", "requires_tools", "fallback_for_toolsets"):
         if key in metadata:
             _validate_string_list(
                 diagnostics,
@@ -863,7 +804,7 @@ def _validate_known_manifest_types(
                 )
             )
 
-    for field in ("description_zh", "homepage", "kind", "final_text_mode"):
+    for field in ("description_zh", "homepage", "kind"):
         if field in frontmatter and not isinstance(frontmatter[field], str):
             diagnostics.append(
                 _diagnostic(
@@ -882,22 +823,7 @@ def _validate_known_manifest_types(
             path=path,
         )
 
-    for field in ("preference_keys", "policy_tags"):
-        if field in frontmatter:
-            _validate_string_list(
-                diagnostics,
-                frontmatter[field],
-                field=field,
-                path=path,
-            )
-
-    for field in (
-        "composition",
-        "entrypoint",
-        "request_template",
-        "output_contract",
-        "provenance",
-    ):
+    for field in ("provenance",):
         if field in frontmatter and not isinstance(frontmatter[field], dict):
             diagnostics.append(
                 _diagnostic(
@@ -907,32 +833,6 @@ def _validate_known_manifest_types(
                     field=field,
                 )
             )
-
-    if "eval_prompts" in frontmatter and (
-        not isinstance(frontmatter["eval_prompts"], list)
-        or any(not isinstance(item, dict) for item in frontmatter["eval_prompts"])
-    ):
-        diagnostics.append(
-            _diagnostic(
-                "FIELD_TYPE_INVALID",
-                "eval_prompts must be a list of mappings",
-                path=path,
-                field="eval_prompts",
-            )
-        )
-
-    if "meta_priority" in frontmatter and (
-        not isinstance(frontmatter["meta_priority"], int)
-        or isinstance(frontmatter["meta_priority"], bool)
-    ):
-        diagnostics.append(
-            _diagnostic(
-                "FIELD_TYPE_INVALID",
-                "meta_priority must be an integer",
-                path=path,
-                field="meta_priority",
-            )
-        )
 
     provenance = frontmatter.get("provenance")
     if isinstance(provenance, dict):

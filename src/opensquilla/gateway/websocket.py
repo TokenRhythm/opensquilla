@@ -165,7 +165,7 @@ _PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
 _ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
 _MAX_ACTIVE_PROVIDER_PROBES = 16
 _BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
-    {"meta.drafts.list", "skills.install"}
+    {"skills.install"}
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS,
 )
@@ -2259,7 +2259,6 @@ async def handle_ws_connection(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2544,7 +2543,6 @@ async def handle_ws_connection(
             channel_manager,
             usage_tracker,
             usage_event_sink,
-            meta_run_writer,
             skill_loader,
             skill_management_state,
             cron_scheduler,
@@ -2758,7 +2756,6 @@ async def _message_loop(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2936,7 +2933,6 @@ async def _message_loop(
                 ),
                 usage_tracker=usage_tracker,
                 usage_event_sink=usage_event_sink,
-                meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 skill_management_service=skill_management_service,
                 skill_management_state=(

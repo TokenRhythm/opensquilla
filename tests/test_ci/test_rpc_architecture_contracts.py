@@ -129,9 +129,10 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Add metadata-only Skill candidates and the allow-use setting.
 # Add the owner-authorized workspace source reference reader.
 # Add session-owned managed process list, output preview and stop.
-RUNTIME_RPC_METHOD_BASELINE = 302
-RUNTIME_RPC_METHOD_DIGEST = "1f72bc664390009413bcdad04bee72f9964a70605eef4d9d2d71018ba6a654a8"
-STATIC_RPC_DECORATOR_BASELINE = 72
+# Retire 19 generated MetaSkill methods and nine legacy workflow methods.
+RUNTIME_RPC_METHOD_BASELINE = 274
+RUNTIME_RPC_METHOD_DIGEST = "48ae97da183f897ac08752040ba64550d9b535ad80f4b9558912ba39951ff9e2"
+STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -217,7 +218,6 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/observability.py",
     "src/opensquilla/application/skill_catalog.py",
     "src/opensquilla/application/skill_management.py",
-    "src/opensquilla/application/skill_proposal_review.py",
     "src/opensquilla/application/artifact_workbench.py",
 )
 
@@ -1113,8 +1113,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         for binding in bindings:
             assert binding in source, f"{filename} must bind {binding}"
 
-    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(encoding="utf-8")
-    assert "opensquilla.gateway.rpc_cron" not in proposal_source
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -1321,17 +1319,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "workspaces.pin",
             "workspaces.remove",
             "workspaces.history.delete",
-            "meta.list",
-            "meta.inspect",
-            "meta.drafts.list",
-            "meta.drafts.discard",
-            "meta.run",
-            "meta.runs.confirm_preflight",
-            "meta.runs.recovery",
-            "meta.runs.replay",
-            "meta.setup.plan",
-            "meta.setup.install",
-            "meta.setup.status",
             "migration.sources.list",
             "migration.sources.preview",
         }
@@ -1644,9 +1631,6 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.skill_management_contract import (
         SKILL_MANAGEMENT_CONTRACT_METHODS,
     )
-    from opensquilla.gateway.adapters.skill_proposal_review_contract import (
-        SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
-    )
     from opensquilla.gateway.adapters.turn_admission_contract import (
         TURN_ADMISSION_CONTRACT_METHODS,
     )
@@ -1663,7 +1647,6 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *OBSERVABILITY_CONTRACT_METHODS,
         *SKILL_CATALOG_CONTRACT_METHODS,
         *SKILL_MANAGEMENT_CONTRACT_METHODS,
-        *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
         *ARTIFACT_WORKBENCH_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)

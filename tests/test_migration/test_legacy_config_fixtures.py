@@ -121,9 +121,12 @@ def test_modern_era_configs_strip_retired_skill_filter_and_memory_flush_settings
             "flush_compaction_requires_safe_receipt", "flush_compaction_safety_mode",
             "repair_enabled", "repair_interval_seconds", "repair_max_items_per_tick",
         }
+        retired_product = {"meta_skill"}
         if era == "cli-0.4":
             retired_memory.update({"flush_triggers", "flush_pre_compaction"})
+            retired_product.add("skills.coding_mode")
         assert set(result.removed_fields) == {
+            *retired_product,
             *(f"memory.{key}" for key in retired_memory),
             "skills.filter_embedding_model",
             "skills.filter_enabled",

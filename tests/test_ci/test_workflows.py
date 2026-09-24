@@ -987,11 +987,10 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
+        "tests/test_skills/test_retired_workflows.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
@@ -1018,7 +1017,7 @@ def test_skill_hub_contract_is_integrated_into_canonical_ci() -> None:
         "tests/test_skills/test_hub_transaction_process_gates.py",
         "tests/test_gateway/test_rpc_skills_install_visibility.py",
         "tests/test_gateway/test_rpc_skills_exact_identity.py",
-        "tests/test_gateway/test_rpc_skills_coding_gate.py",
+        "tests/test_gateway/test_retired_product_config.py",
         "tests/test_gateway/test_rpc_skills_reload.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
         "tests/test_tools/test_skill_view_resources.py",
@@ -1217,9 +1216,8 @@ def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl()
         },
     }
 
-    assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate["env"]
-    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate["env"]
-    assert validate["env"]["OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E"] == "1"
+    assert "OPENSQUILLA_GATEWAY_STATE_DIR" not in validate.get("env", {})
+    assert "OPENSQUILLA_TOOLCHAIN_VALIDATION_ROOT" not in validate.get("env", {})
     setup_uv = next(step for step in validate["steps"] if step.get("name") == "Set up uv")
     assert setup_uv["with"]["enable-cache"] is True
 
@@ -1253,12 +1251,9 @@ def test_managed_toolchain_artifacts_cover_native_macos_architectures_and_musl()
     assert "--component media-ffmpeg" in media_smoke
     assert "--expect-platform-key ${{ matrix.platform_key }}" in media_smoke
     assert "--check-runtime-hot-path" not in media_smoke
-    paper_compile = next(
-        step
-        for step in validate["steps"]
-        if step.get("name") == "Compile the default four-page paper with the managed toolchain"
-    )["run"]
-    assert "test_meta_default_compact_contract_compiles_real_content_to_four_pages" in paper_compile
+    for step in validate["steps"]:
+        assert not step.get("continue-on-error")
+        assert "|| true" not in step.get("run", "")
 
     musl = workflow["jobs"]["validate-musl-paper"]
     assert musl["runs-on"] == "ubuntu-24.04"

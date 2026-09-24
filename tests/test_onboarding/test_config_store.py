@@ -168,8 +168,8 @@ def test_load_accepts_existing_operator_toggle_config(tmp_path):
     cfg = load_config(target)
 
     assert cfg.skills.disabled == []
-    assert cfg.skills.coding_mode is False
-    assert cfg.meta_skill.auto_trigger is False
+    assert "coding_mode" not in cfg.skills.model_dump()
+    assert "meta_skill" not in cfg.model_dump()
     assert cfg.naming.enabled is True
     assert cfg.naming.max_chars == 48
     assert cfg.config_path == str(target)

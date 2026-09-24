@@ -136,7 +136,6 @@ async def test_failed_startup_closes_its_connection(
         assert len(connections) == 1
         assert storage._conn is None
         assert storage._transcript_reader is None
-        assert storage._meta_launch_draft_gc_task is None
         with pytest.raises(closed_error, match=closed_message):
             await connections[0].execute("SELECT 1")
     finally:

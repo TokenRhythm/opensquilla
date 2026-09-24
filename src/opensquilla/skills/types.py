@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
 
 
 class SkillLayer(StrEnum):
@@ -23,7 +22,6 @@ class SkillVisibility(StrEnum):
     """Which catalog surface may disclose a Skill."""
 
     PUBLIC = "public"
-    META = "meta"
     INTERNAL = "internal"
     TOMBSTONE = "tombstone"
     EXPERIMENTAL = "experimental"
@@ -33,8 +31,6 @@ class SkillInvocation(StrEnum):
     """Which execution domain may load or invoke a Skill."""
 
     DIRECT = "direct"
-    META_ONLY = "meta_only"
-    CODING_ONLY = "coding_only"
     HISTORICAL_ONLY = "historical_only"
     EXPERIMENTAL_INTERNAL = "experimental_internal"
 
@@ -77,10 +73,6 @@ class SkillPlatformMeta:
     os: list[str] = field(default_factory=list)
     requires: SkillRequires | None = None
     install: list[SkillInstallSpec] = field(default_factory=list)
-    # Risk metadata consumed by unattended meta-skill auto-enable. These are
-    # advisory manifest fields, not runtime permissions.
-    risk_level: str = ""
-    capabilities: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -113,7 +105,7 @@ class SkillSpec:
     # Optional localized (Simplified Chinese) one-line description. Falls back
     # to ``description`` (English) when absent. Sourced from the SKILL.md
     # front-matter ``description_zh`` field, mirroring the ``_zh/_en``
-    # convention already used by meta-skill clarify prompts.
+    # localization convention.
     description_zh: str = ""
     homepage: str = ""
     file_path: str = ""
@@ -121,42 +113,8 @@ class SkillSpec:
     # Conditional activation metadata
     requires_tools: list[str] = field(default_factory=list)
     fallback_for_toolsets: list[str] = field(default_factory=list)
-    # Meta-Skill metadata (MVP — non-meta skills keep defaults)
+    # Kept to reject unsupported historical manifests at catalog boundaries.
     kind: str = "skill"
-    meta_priority: int = 0
-    composition_raw: dict[str, object] | None = None
-    # Optional. How MetaOrchestrator should derive ``final_text``:
-    #   "auto" (default) — LLM post-processes step_outputs into a summary
-    #   "raw"            — last non-substitute step output verbatim
-    #   "step:<step_id>" — outputs[step_id] verbatim
-    final_text_mode: str = "auto"
-    # Optional meta-skill pre-flight request scaffold. Surfaces use this
-    # to show the user what the meta-skill is about to do before the DAG
-    # begins. Non-meta skills keep the default empty mapping.
-    request_template: dict[str, Any] = field(default_factory=dict)
-    # Optional final-answer contract surfaced after successful meta-skill
-    # runs. The orchestrator renders a deterministic coverage block from
-    # this metadata; future audit loops can consume the same shape.
-    output_contract: dict[str, Any] = field(default_factory=dict)
-    # Optional quality baseline prompts for meta-skill regression checks.
-    # CI/cron can execute these prompts and judge outputs against the
-    # manifest-owned rubric without inventing a separate eval catalog.
-    eval_prompts: list[dict[str, Any]] = field(default_factory=list)
-    # Optional stable preference keys a meta-skill may read/write across
-    # sessions. Runtime memory integration remains separate; this manifest
-    # field declares intent for authoring and policy review.
-    preference_keys: list[str] = field(default_factory=list)
-    # Optional policy tags for org-level governance and audit filters.
-    policy_tags: list[str] = field(default_factory=list)
-    # Wrapped-CLI manifest: when present, the skill can be invoked
-    # deterministically by meta-skill ``skill_exec`` steps without spinning up
-    # a sub-Agent. Schema (all keys optional except ``command``):
-    #   command: str           — base executable + flags (Jinja-rendered)
-    #   args: list[str]        — extra arguments (each Jinja-rendered)
-    #   parse: "text" | "json" | "lines"  — how to interpret stdout (default text)
-    #   timeout: float         — seconds before the subprocess is killed
-    #   cwd: str               — working directory (defaults to base_dir)
-    entrypoint: dict[str, Any] | None = None
     # Stable identity of this physical skill instance. Kept last so adding the
     # field does not shift any historical positional ``SkillSpec`` arguments.
     # Multiple layers may contribute the same logical ``name``; ``instance_id``
@@ -168,9 +126,6 @@ class SkillSpec:
     # a turn pinned to an older catalog cannot combine old instructions with
     # files published by a newer install or reload.
     tree_digest: str = ""
-    # Visibility and invocation are independent: a stable Meta root is visible
-    # on the Meta surface but never body-loadable through ordinary skill_view.
+    # Visibility and invocation constrain ordinary skill discovery and reads.
     visibility: SkillVisibility = SkillVisibility.PUBLIC
     invocation: SkillInvocation = SkillInvocation.DIRECT
-    # Stable Meta roots authorized to load this internal dependency.
-    owner_meta_skills: list[str] = field(default_factory=list)

@@ -417,7 +417,7 @@ describe('explicit skill send boundaries', () => {
     return result
   }
 
-  it.each(['/compact', '/meta report -- summarize', '/plan', '!pwd'])('keeps explicit selection out of %s controls', async command => {
+  it.each(['/compact', '/plan', '!pwd'])('keeps explicit selection out of %s controls', async command => {
     const result = harness()
     result.options.inputText.value = command
     result.options.classifySlashCommand = vi.fn(async () => 'registered' as const)

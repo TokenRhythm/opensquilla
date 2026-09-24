@@ -55,7 +55,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
     targetIdentity(target.kind, target.wireName, target.role)
   )))
   for (const wireName of [
-    'meta.inspect', 'meta.list', 'telemetry.product_active.record', 'plans.setPresentation',
+    'telemetry.product_active.record', 'plans.setPresentation',
     'skills.candidates', 'skills.setEnabled',
   ]) {
     const contract = inventory.find(entry => entry.kind === 'method' && entry.wireName === wireName)
@@ -118,8 +118,8 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 914)
-  assert.equal(result.comparedRoles, baselineRoot ? 897 : selected.size)
+  assert.equal(result.roles, 838)
+  assert.equal(result.comparedRoles, baselineRoot ? 821 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')
   if (baselineRoot) assert.deepEqual(result.supplementalRoles, [
     'method:sessions.list:params',

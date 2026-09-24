@@ -1034,7 +1034,7 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
     writer_queue_enabled: bool,
 ) -> None:
     requests = (
-        ("drafts", "meta.drafts.list"),
+        ("receipt", "turns.receipt.get"),
         ("workspaces", "workspaces.list"),
         ("onboarding", "onboarding.status"),
         ("run-mode", "sandbox.run_mode.preference.get"),

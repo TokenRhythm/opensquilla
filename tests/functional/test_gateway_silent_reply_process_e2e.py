@@ -179,7 +179,6 @@ async def _serve_gateway() -> None:
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
     config.memory.ttl_sweep_interval_minutes = 0
-    config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.task_runtime.max_concurrency = 1
     config.task_runtime.max_pending_per_session = 4

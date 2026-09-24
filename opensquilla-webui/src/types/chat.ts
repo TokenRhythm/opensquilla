@@ -165,7 +165,7 @@ export interface ChatPendingItem {
   intent: string | null
   /** Slash-prefixed text that a complete command catalog classified as ordinary input. */
   confirmedPlainText?: boolean
-  /** Generic non-v2 queue/hidden-control delivery lease. V2 Steer uses `steerAttempt`. */
+  /** Generic non-v2 queue delivery lease. V2 Steer uses `steerAttempt`. */
   deliveryState?: 'steering' | 'retryable'
   /** Canonical transport identity/state for a not-yet-durable steer. */
   steerAttempt?: PendingSteerAttempt
@@ -173,22 +173,6 @@ export interface ChatPendingItem {
   ownerSessionKey?: string
   /** chat.send request whose canonical response may carry this item to a child. */
   ownerRequestId?: string
-  // Hidden control sends (e.g. meta-preflight confirmation) carry the provider
-  // text in `text`, the visible bubble in `displayTextOverride`, and skip the
-  // normal user-bubble push / composer consumption on drain.
-  hiddenControl?: boolean
-  displayTextOverride?: string
-  // Stable ingress identity for a queued hidden control. Provider-setup
-  // handoffs reuse it across remounts/tabs so Gateway idempotency can collapse
-  // duplicate resumes of the same original intent.
-  clientRequestId?: string
-  /** Session that owns a durable hidden-control intent. */
-  hiddenControlSessionKey?: string
-  /** Stable transport identity for retrying a hidden control exactly once. */
-  hiddenClientRequestId?: string
-  hiddenClientMessageId?: string
-  /** The visible confirmation bubble was already rendered optimistically. */
-  hiddenVisibleCommitted?: boolean
   /** Stable identity shared by IndexedDB WAL and the Gateway staged queue. */
   pendingInputId?: string
   pendingClientRequestId?: string
@@ -216,37 +200,6 @@ export interface ChatPendingItem {
     | 'local_only'
     | 'retryable'
     | 'cancelling'
-}
-
-export type HiddenControlDispatchStatus =
-  | 'accepted'
-  | 'queued'
-  | 'rejected'
-  | 'unknown'
-
-export type HiddenControlDispatchReason =
-  | 'accepted'
-  | 'queued'
-  | 'already_queued'
-  | 'queue_full'
-  | 'discarded'
-  | 'invalid_request'
-  | 'outbox_conflict'
-  | 'outbox_persist_failed'
-  | 'send_rejected'
-  | 'response_unknown'
-
-/**
- * Machine-owned result for a hidden control send. `accepted` is the only state
- * that proves the Gateway durably owns the request; `queued` is recoverable
- * local work and must keep its persisted source intent until a later accepted
- * result arrives.
- */
-export interface HiddenControlDispatchResult {
-  status: HiddenControlDispatchStatus
-  reason: HiddenControlDispatchReason
-  clientRequestId: string
-  sessionKey: string
 }
 
 export interface ChatRouterCell {

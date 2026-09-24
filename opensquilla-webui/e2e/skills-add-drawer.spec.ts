@@ -53,17 +53,6 @@ function catalogPayload() {
   return {
     skills: [
       {
-        name: 'meta-synthetic',
-        description: 'Synthetic meta Skill used only by the browser contract test.',
-        kind: 'meta',
-        layer: 'bundled',
-        status: 'ready',
-        lifecycle: {
-          ...lifecycle(),
-          install_state: 'untracked',
-        },
-      },
-      {
         name: 'bundled-synthetic',
         description: 'Synthetic bundled Skill used only by the browser contract test.',
         kind: 'skill',
@@ -206,9 +195,6 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
               'skills.list',
               'skills.search',
               'skills.install',
-              'exec.proposals.list',
-              'exec.proposals.auto_enabled.list',
-              'exec.proposals.settings.get',
             ],
             events: [],
           },
@@ -292,17 +278,6 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
           squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
           permissions: {},
           skills: {},
-        },
-        'exec.proposals.list': { proposals: [] },
-        'exec.proposals.auto_enabled.list': { skills: [] },
-        'exec.proposals.settings.get': {
-          settings: {
-            available: false,
-            enabled: false,
-            on_dream_complete: false,
-            auto_enable: false,
-            auto_enable_max_risk: 'low',
-          },
         },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'usage.status': { sessions: [] },

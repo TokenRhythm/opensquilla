@@ -503,18 +503,7 @@ class DashboardQueries:
                 "linkedInstallToReady": self._linked_install_to_ready(connection, window),
                 "productActivity": self._product_activity(connection, window),
                 "clientUsage": self._client_usage(connection, window),
-                "metaskillUsage": self._feature_usage(
-                    connection,
-                    window,
-                    event_name="metaskill_usage",
-                    note="首个实际执行步骤开始后计 1 次；不按技能名称拆分。",
-                ),
-                "codingModeUsage": self._feature_usage(
-                    connection,
-                    window,
-                    event_name="coding_mode_usage",
-                    note="编程 Agent 进程实际启动后计 1 次；仅开启模式不计数。",
-                ),
+
             }
 
     @staticmethod
@@ -600,86 +589,6 @@ class DashboardQueries:
             "dailyTrend": daily,
         }
 
-    def _feature_usage(
-        self,
-        connection: sqlite3.Connection,
-        window: UtcCohortWindow,
-        *,
-        event_name: str,
-        note: str,
-    ) -> dict[str, Any]:
-        """Count demonstrated feature runs and expose a zero-filled daily trend.
-
-        Feature usage events are deliberately one-per-execution and are not
-        sampled, so the dashboard reports event counts directly without
-        exposing local run identifiers.
-        """
-
-        row = connection.execute(
-            f"""
-            SELECT COUNT(*) AS usage_count,
-                   COUNT(DISTINCT {_DEVICE_ID_SQL}) AS unique_devices
-            FROM events
-            WHERE event_name = ?
-              AND event_version = 1
-              AND source = 'runtime'
-              AND notice_version = ?
-              AND analytics_user_id IS NOT NULL
-              AND occurred_at_utc >= ?
-              AND occurred_at_utc < ?
-            """,
-            (
-                event_name,
-                CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value],
-                *window.sql_params,
-            ),
-        ).fetchone()
-        daily_rows = connection.execute(
-            f"""
-            SELECT substr(occurred_at_utc, 1, 10) AS period,
-                   COUNT(*) AS uses,
-                   COUNT(DISTINCT {_DEVICE_ID_SQL}) AS unique_devices
-            FROM events
-            WHERE event_name = ?
-              AND event_version = 1
-              AND source = 'runtime'
-              AND notice_version = ?
-              AND analytics_user_id IS NOT NULL
-              AND occurred_at_utc >= ?
-              AND occurred_at_utc < ?
-            GROUP BY substr(occurred_at_utc, 1, 10)
-            ORDER BY period
-            """,
-            (
-                event_name,
-                CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value],
-                *window.sql_params,
-            ),
-        ).fetchall()
-        by_day = {str(item["period"]): int(item["uses"]) for item in daily_rows}
-        devices_by_day = {
-            str(item["period"]): int(item["unique_devices"]) for item in daily_rows
-        }
-        day_count = (window.end_exclusive.date() - window.start.date()).days
-        daily = [
-            {
-                "period": (window.start + timedelta(days=offset)).date().isoformat(),
-                "uses": by_day.get(
-                    (window.start + timedelta(days=offset)).date().isoformat(),
-                    0,
-                ),
-                "uniqueDevices": devices_by_day.get(
-                    (window.start + timedelta(days=offset)).date().isoformat(), 0
-                ),
-            }
-            for offset in range(day_count)
-        ]
-        return {
-            "totalUses": int(row["usage_count"] if row is not None else 0),
-            "uniqueDevices": int(row["unique_devices"] if row is not None else 0),
-            "dailyTrend": daily,
-            "note": note,
-        }
 
     def _client_usage(
         self,

@@ -8,8 +8,7 @@ config immediately — otherwise the linkage would flip the flags while the
 scheduler still has no (or paused) dream jobs until the next restart, which is
 exactly the silent never-trains gap the linkage exists to close.
 
-Mirrors ``auto_propose_bridge``: boot owns the wiring, this module only holds
-the lookup.
+Boot owns the wiring; this module holds the lookup.
 """
 
 from __future__ import annotations

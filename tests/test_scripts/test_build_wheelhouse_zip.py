@@ -359,7 +359,6 @@ def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> 
     assert "src/opensquilla/skills/bundled/**/skill-card.md" in excludes
     assert "src/opensquilla/skills/bundled/**/references/*.md" in excludes
     assert "src/opensquilla/skills/exp/**" in excludes
-    assert "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md" in excludes
     assert module.forbidden_release_wheel_entries(tuple(force_includes.values())) == []
 
 
