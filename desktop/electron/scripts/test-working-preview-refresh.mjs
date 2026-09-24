@@ -34,7 +34,7 @@ function fixture({ immutable = false } = {}) {
     revisionKind: 'unknown', revisionLast: null, revisionEpoch: 0, revisionInteracted: false,
     annotationPickerActive: false, annotationCandidate: null, annotationFallbackActive: false,
     annotationFocusTimer: null, annotationDocumentGeneration: 1, pendingPermissions: new Map(),
-    pendingAuthentication: null, browserDocumentReady: true,
+    pendingAuthentication: null, browserDocumentReady: true, browserNavigationStopped: false,
     view: { webContents: {
       isDestroyed: () => false, isLoading: () => false,
       reload() { reloads++; record.annotationDocumentGeneration++; record.browserDocumentReady = true },
@@ -124,7 +124,7 @@ for (const immutable of [false, true]) {
   assert.equal(f.timers.size, 0)
 }
 
-for (const interrupt of ['navigate', 'dispose']) {
+for (const interrupt of ['navigate', 'dispose', 'stop']) {
   const f = fixture({ immutable: true })
   f.record.view.webContents.isLoading = () => true
   let release
@@ -132,12 +132,27 @@ for (const interrupt of ['navigate', 'dispose']) {
   const watching = f.manager.watchWorkingPreview(f.record)
   await f.flush()
   if (interrupt === 'navigate') f.record.annotationDocumentGeneration++
-  else f.record.disposed = true
+  else if (interrupt === 'dispose') f.record.disposed = true
+  else f.record.browserNavigationStopped = true
   release(f.response())
   await watching
   assert.equal(f.heads, 1)
   assert.equal(f.record.revisionKind, 'unknown', `${interrupt}: ignore a stale initial classification`)
   assert.equal(f.reloads, 0)
+  assert.equal(f.timers.size, 0)
+}
+
+{
+  const f = fixture()
+  let release
+  const activeOperation = f.manager.queueSurfaceOperation('operation:page-one', () =>
+    new Promise(resolve => { release = resolve }))
+  await f.flush()
+  const classification = f.manager.watchWorkingPreview(f.record)
+  f.record.browserNavigationStopped = true
+  release()
+  await Promise.all([activeOperation, classification])
+  assert.equal(f.heads, 0, 'stopping a page must retire its queued initial probe')
   assert.equal(f.timers.size, 0)
 }
 
@@ -157,7 +172,7 @@ for (const protection of ['revisionInteracted', 'annotationPickerActive', 'annot
   f.manager.updateWorkingPreviewVisibility(f.record, false)
 }
 
-for (const interrupt of ['hide', 'dispose', 'replace', 'navigate', 'edit', 'annotation']) {
+for (const interrupt of ['hide', 'dispose', 'replace', 'navigate', 'stop', 'edit', 'annotation']) {
   const f = fixture()
   await f.manager.watchWorkingPreview(f.record)
   let release
@@ -169,6 +184,7 @@ for (const interrupt of ['hide', 'dispose', 'replace', 'navigate', 'edit', 'anno
   if (interrupt === 'dispose') { f.record.disposed = true; f.record.revisionWatching = false }
   if (interrupt === 'replace') f.manager.surfaces.set(f.record.id, {})
   if (interrupt === 'navigate') f.record.annotationDocumentGeneration++
+  if (interrupt === 'stop') f.record.browserNavigationStopped = true
   if (interrupt === 'edit') f.record.revisionInteracted = true
   if (interrupt === 'annotation') f.record.annotationCandidate = {}
   f.revision = '2'
