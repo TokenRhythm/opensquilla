@@ -62,8 +62,6 @@ class SettingsMutation(TypedDict):
     restartRequired: bool
     restartSections: NotRequired[list[str]]
     liveApplied: NotRequired[list[str]]
-    linked: NotRequired[list[str]]
-    linkedLive: NotRequired[bool]
     model_routing: NotRequired[SettingsObject]
 
 
@@ -115,11 +113,7 @@ _SAFE_WRITE_PATCH_PATHS = frozenset(
         "squilla_router.visual_mode",
         "squilla_router.default_tier",
         "squilla_router.confidence_threshold",
-        # Settings > Advanced "memory & self-learning" group. Boolean opt-ins
-        # only -- thresholds and schedules stay admin-scoped. Patching
-        # self_learning.enabled through the safe path still runs the dream
-        # linkage (safe delegates to the full patch handler).
-        "squilla_router.self_learning.enabled",
+        # Memory capture and Dream opt-ins; schedule details stay admin-scoped.
         "memory.auto_capture_enabled",
         "memory.dream.enabled",
         "memory.dream.auto_schedule",
@@ -281,7 +275,6 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         candidate: Config,
         *,
         patched: list[str] | None = None,
-        linked: Sequence[str] = (),
     ) -> SettingsMutation:
         runtime = self._runtime
         self._last_write_persisted = False
@@ -300,15 +293,17 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         result = _change_meta(before.payload, _config_dump(candidate))
         if patched is not None:
             result["patched"] = patched
-        if linked:
-            result["linked"] = list(linked)
-            reconciled = await runtime.reconcile_dream()
-            result["linkedLive"] = reconciled is True
-            if reconciled is not True:
+        if _dream_schedule_fingerprint(before.payload) != _dream_schedule_fingerprint(
+            _config_dump(candidate)
+        ):
+            if await runtime.reconcile_dream() is not True:
                 result["restartRequired"] = True
-                sections = result.get("restartSections")
-                if reconciled is None and sections is not None and "memory.dream" not in sections:
+                sections = result.setdefault("restartSections", [])
+                if "memory.dream" not in sections:
                     sections.append("memory.dream")
+                result["liveApplied"] = [
+                    section for section in result.get("liveApplied", []) if section != "memory"
+                ]
         await self._publish_routing(before, candidate, result)
         return result
 
@@ -367,11 +362,8 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
             )
             if not _is_public_derived_config_path(".".join(item))
         }
-        linked = _link_dream_for_self_learning_patch(before.config, payload, explicit)
-        explicit.update(linked)
-        force.update(tuple(item.split(".")) for item in linked)
         candidate = self._candidate(before, payload, explicit, redacted, force, memory_paths={path})
-        return await self._write(before, candidate, linked=linked)
+        return await self._write(before, candidate)
 
     async def patch(self, changes: Sequence[SettingChange]) -> SettingsMutation:
         return await self._mutate({}, self._normalized_changes(changes))
@@ -453,14 +445,11 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
             profile_defaults=self._runtime.profile_defaults,
             profile_ids=self._runtime.profile_ids,
         )
-        linked = _link_dream_for_self_learning_patch(before.config, payload, explicit)
-        explicit.update(linked)
-        force.update(tuple(path.split(".")) for path in linked)
         candidate = self._candidate(
             before, payload, explicit, redacted, force, memory_paths=explicit
         )
         return await self._write(
-            before, candidate, patched=list(changes) + (["(merge)"] if patch else []), linked=linked
+            before, candidate, patched=list(changes) + (["(merge)"] if patch else [])
         )
 
     async def apply(self, payload: Mapping[str, SettingsValue]) -> SettingsMutation:
@@ -541,6 +530,13 @@ class AppSettings[Config: SettingsConfig, PreparedProvider]:
         return normalized
 
 
+def _dream_schedule_fingerprint(payload: SettingsObject) -> tuple[SettingsValue, ...]:
+    memory = payload.get("memory")
+    dream = memory.get("dream") if isinstance(memory, dict) else None
+    dream = dream if isinstance(dream, dict) else {}
+    return tuple(dream.get(key) for key in ("enabled", "auto_schedule", "interval_h", "cron"))
+
+
 def _memory_fingerprint(payload: SettingsObject) -> SettingsObject:
     memory = payload.get("memory")
     if not isinstance(memory, dict):
@@ -614,64 +610,6 @@ def _strip_public_derived_config_fields(payload: dict[str, Any]) -> dict[str, An
             privacy.pop(key, None)
         payload["privacy"] = privacy
     return payload
-
-
-def _link_dream_for_self_learning_patch(
-    source_config: Any,
-    cfg_dict: dict[str, Any],
-    explicit_paths: set[str],
-) -> list[str]:
-    """Atomically enable the dream chain when self-learning is switched on.
-
-    Router self-learning's training trigger rides the post-dream hook; enabling
-    it while dream is off (the default) captures samples that never train. When
-    an edit flips ``squilla_router.self_learning.enabled`` to true, pull
-    ``memory.dream.enabled`` and ``memory.dream.auto_schedule`` up with it —
-    unless the same edit also touches those keys explicitly (the operator's
-    word wins). Deliberately one-directional: disabling self-learning never
-    touches dream, which the operator may rely on independently. Returns the
-    linked dot-paths for the response so clients can show what changed.
-    """
-
-    sl_paths = {
-        "squilla_router.self_learning.enabled",
-        "squilla_router.self_learning",
-        "squilla_router",
-    }
-    if not (explicit_paths & sl_paths):
-        return []
-
-    router = cfg_dict.get("squilla_router")
-    sl = router.get("self_learning") if isinstance(router, dict) else None
-    if not isinstance(sl, dict) or not bool(sl.get("enabled")):
-        return []
-
-    was_enabled = bool(
-        getattr(
-            getattr(getattr(source_config, "squilla_router", None), "self_learning", None),
-            "enabled",
-            False,
-        )
-    )
-    if was_enabled:  # only the off -> on transition links
-        return []
-
-    memory = cfg_dict.setdefault("memory", {})
-    if not isinstance(memory, dict):
-        return []
-    dream = memory.setdefault("dream", {})
-    if not isinstance(dream, dict):
-        return []
-
-    linked: list[str] = []
-    for key in ("enabled", "auto_schedule"):
-        path = f"memory.dream.{key}"
-        if path in explicit_paths or "memory.dream" in explicit_paths:
-            continue  # explicit operator value wins over linkage
-        if not bool(dream.get(key)):
-            dream[key] = True
-            linked.append(path)
-    return linked
 
 
 def _align_auto_router_profile_for_provider_patch(

@@ -231,10 +231,6 @@ METHOD_SCOPES: dict[str, str] = {
     # router_decisions). The table stores enum tokens and numbers only (no
     # prompt text), so the listing is a plain operator read.
     "router.decisions.list": READ_SCOPE,
-    # OpenSquilla-only — self-learning loop status (active model, sample
-    # counts, gate reason, last receipt). Derived from on-disk loop state;
-    # no prompt text, no side effects — a plain operator read.
-    "router.selflearning.status": READ_SCOPE,
     # OpenSquilla-only — onboarding catalog and status are operator-readable.
     "onboarding.status": READ_SCOPE,
     "onboarding.catalog": READ_SCOPE,
@@ -377,11 +373,6 @@ METHOD_SCOPES: dict[str, str] = {
     "sandbox.runtime.cancel": ADMIN_SCOPE,
     "sandbox.runtime.discard_download": ADMIN_SCOPE,
     "sandbox.runtime.remove": ADMIN_SCOPE,
-    # OpenSquilla-only — live feedback intake (F7). Resolves a decision id and
-    # appends a rating to the per-agent self-learning feedback sidecar. Write
-    # scope: chat surfaces submit ratings on behalf of the user; it never
-    # mutates routing state directly (consumption is offline, at training).
-    "router.feedback.submit": WRITE_SCOPE,
     "channels.logout": ADMIN_SCOPE,
     "channels.restart": ADMIN_SCOPE,  # OpenSquilla-only.
     "channels.get": ADMIN_SCOPE,  # Redacted editable config still exposes secret presence.

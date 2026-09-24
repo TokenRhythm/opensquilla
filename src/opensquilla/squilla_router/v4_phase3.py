@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 from collections.abc import Iterator
@@ -71,19 +70,14 @@ class V4Phase3Strategy:
         confidence_threshold: float = 0.5,
         require_router_runtime: bool = False,
         use_aux_head: bool | None = None,
-        emit_train_features: bool = False,
-        emit_raw_bge: bool = False,
     ) -> None:
         self.bundle_dir = Path(bundle_dir) if bundle_dir else default_bundle_dir()
         self._threshold = confidence_threshold
         self._require_router_runtime = require_router_runtime
-        self._emit_train_features = emit_train_features
-        self._emit_raw_bge = emit_raw_bge
         self._core: Any | None = None
         self._request_type: Any | None = None
         self._config: dict[str, Any] = {}
         self._model_version = "unknown"
-        self._feature_schema_version = "unknown"
         self._available = False
         self._degraded_warned = False
 
@@ -108,10 +102,6 @@ class V4Phase3Strategy:
             or {}
         )
         self._model_version = self._read_model_version()
-        self._feature_schema_version = self._compute_feature_schema_version()
-        # Hand the capture toggles to the inference core via its config dict.
-        self._config["emit_train_features"] = self._emit_train_features
-        self._config["emit_raw_bge"] = self._emit_train_features and self._emit_raw_bge
 
         with runtime_src_import_path(self.bundle_dir):
             from src.router.inference.core import InferenceCore
@@ -186,30 +176,6 @@ class V4Phase3Strategy:
                 if value:
                     return str(value)
         return "unknown"
-
-    def _compute_feature_schema_version(self) -> str:
-        """Hash the fitted feature projections so captured ``features_390`` are
-        only ever mixed with samples produced under the same basis.
-
-        Re-fitting TF-IDF/SVD/PCA changes these bytes, which invalidates older
-        captured vectors (different coordinate system); the offline trainer keys
-        on this to start a fresh dataset generation. Hashing artifact bytes is
-        more robust than trusting a hand-bumped version string.
-        """
-
-        digest = hashlib.sha256()
-        for rel in (
-            "inference_manifest.json",
-            "features/meta.json",
-            "features/config.pkl",
-            "features/tfidf.pkl",
-            "features/svd.pkl",
-            "features/bge_pca.joblib",
-        ):
-            path = self.bundle_dir / rel
-            if path.exists():
-                digest.update(path.read_bytes())
-        return digest.hexdigest()[:16] if digest.digest() else "unknown"
 
     async def classify(
         self,
@@ -378,16 +344,6 @@ class V4Phase3Strategy:
         )
         if prompt_hint:
             extra["prompt_hint"] = str(prompt_hint)
-        # Self-learning: carry the captured feature vectors under a private key.
-        # The router step pops this out of routing_extra before logging/history
-        # so the large arrays never reach decision logs or routing history.
-        features_390 = intermediates.get("features_390")
-        if features_390 is not None:
-            extra["_train_features"] = {
-                "features_390": features_390,
-                "raw_bge_1536": intermediates.get("raw_bge_1536"),
-                "feature_schema_version": self._feature_schema_version,
-            }
         return tier, confidence, self.source, extra
 
     def _prompt_hint(self, prompt_policy: str, message: str | None = None) -> str | None:

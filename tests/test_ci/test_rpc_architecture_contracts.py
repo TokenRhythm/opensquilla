@@ -130,8 +130,9 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Add the owner-authorized workspace source reference reader.
 # Add session-owned managed process list, output preview and stop.
 # Retire 19 generated MetaSkill methods and nine legacy workflow methods.
-RUNTIME_RPC_METHOD_BASELINE = 274
-RUNTIME_RPC_METHOD_DIGEST = "48ae97da183f897ac08752040ba64550d9b535ad80f4b9558912ba39951ff9e2"
+# Retire router learning status and training feedback (two generated methods).
+RUNTIME_RPC_METHOD_BASELINE = 272
+RUNTIME_RPC_METHOD_DIGEST = "d27fe3c4751790915d807df7c4895100c04ed479437c3342ceb98e8553187242"
 STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
@@ -1030,7 +1031,6 @@ def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
         "GatewayLogReaderPort",
         "GatewayReadinessDataPort",
         "GatewayReadinessEvaluationPort",
-        "GatewayRouterLearningStatusPort",
         "GatewaySkillCatalogReadPort",
         "GatewaySkillManagementPort",
     }
@@ -1101,7 +1101,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         ),
         "rpc_doctor.py": ("_GatewayReadinessRuntime(ctx)",),
         "rpc_logs.py": ("_GatewayLogReaderRuntime(ctx)",),
-        "rpc_router.py": ("_GatewayRouterLearningStatusRuntime(ctx)",),
         "rpc_skills.py": (
             "_SkillCatalogRuntime(ctx)",
             "_SkillManagementRuntime(ctx)",
@@ -1112,7 +1111,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         source = (PACKAGE_ROOT / "gateway" / filename).read_text(encoding="utf-8")
         for binding in bindings:
             assert binding in source, f"{filename} must bind {binding}"
-
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -1260,7 +1258,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "usage.query",
             "usage.cost",
             "commands.list_for_surface",
-            "router.feedback.submit",
             "sessions.promptCacheKeepalive.status",
             "sessions.promptCacheKeepalive.set",
             "chat.clarify_submit",
@@ -1287,7 +1284,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "cron.subscribe",
             "cron.unsubscribe",
             "status",
-            "router.selflearning.status",
             "doctor.status",
             "logs.status",
             "logs.tail",

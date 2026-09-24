@@ -850,20 +850,6 @@
     },
     {
       "kind": "method",
-      "wireName": "router.feedback.submit",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "router.selflearning.status",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "sandbox.capability.status",
       "roles": [
         "result"

@@ -45,9 +45,9 @@ from opensquilla.gateway.config_migration import (
     DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
     ConfigParseError,
-    backup_and_write_migrated_config,
     handle_deprecated_skill_filter_env,
     migrate_config_payload,
+    rewrite_migrated_config_best_effort,
     strip_deprecated_skill_filter_settings,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -1324,54 +1324,6 @@ class RouterBudgetConfig(BaseModel):
     include_next_turn_estimate: bool = False
 
 
-class RouterSelfLearningConfig(BaseModel):
-    """Squilla Router self-learning loop (capture + offline retrain).
-
-    Opt-in. ``enabled`` is the master switch; capture and training each have
-    their own sub-toggle so an operator can collect data without yet training.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False  # master switch; off => zero overhead on the hot path
-    capture_enabled: bool = True  # gates inference-time feature emission
-    enable_mlp: bool = False  # also store raw_bge_1536 for MLP fine-tune (phase 2)
-    store_audit_summary: bool = False  # opt-in redacted summary, audit only
-    # Trigger gating (evaluated cheaply on each post-dream hook).
-    train_min_samples: int = Field(default=200, ge=1)
-    idle_hours: float = Field(default=2.0, ge=0.0)
-    cooldown_hours: float = Field(default=72.0, ge=0.0)
-    retention_days: int = Field(default=30, ge=1)
-    # Training (LightGBM incremental) — consumed by the offline trainer/worker.
-    num_boost_round: int = Field(default=60, ge=1)
-    train_timeout_seconds: float = Field(default=900.0, gt=0.0)
-    # Promotion / rollback.
-    auto_rollback: bool = True
-    golden_eval_path: str | None = None
-    cost_tolerance_pct: float = Field(default=5.0, ge=0.0)
-    max_critical_under_routing: float = Field(default=0.30, ge=0.0, le=1.0)
-    min_golden_agreement: float = Field(default=0.5, ge=0.0, le=1.0)
-    # Online rollback monitor (M4).
-    min_monitor_samples: int = Field(default=30, ge=1)
-    complaint_regression_delta: float = Field(default=0.05, ge=0.0, le=1.0)
-    # Second rollback trigger: explicit down-vote-rate regression (F7).
-    # Feedback is far sparser than samples, hence its own minimum and a
-    # wider delta than the complaint monitor.
-    min_feedback_monitor_samples: int = Field(default=5, ge=1)
-    downvote_regression_delta: float = Field(default=0.15, ge=0.0, le=1.0)
-    # Rolling holdout (per-agent progress metric).
-    holdout_pct: float = Field(default=0.10, ge=0.0, le=0.5)
-    holdout_repeats: int = Field(default=5, ge=1)
-    holdout_min_size: int = Field(default=30, ge=1)
-    holdout_granularity: Literal["session", "alignment_group"] = "session"
-
-
-# Resolve this model's own forward refs (Literal) before it is nested below, so
-# rebuilding the parent does not leave it "not fully defined" under the
-# unregistered-module exec path used by tests. See the rebuild note below.
-RouterSelfLearningConfig.model_rebuild()
-
-
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -1446,7 +1398,6 @@ class SquillaRouterConfig(BaseSettings):
     # rollback-tolerant).
     budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
     estimated_output_savings_pct: float = 0.03
-    self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
     # Deprecated compatibility fields: active history is retained until compaction;
     # image routing no longer imposes a separate turn window.
     vision_history_lookback_turns: int = Field(default=8, ge=0)
@@ -1527,11 +1478,7 @@ class SquillaRouterConfig(BaseSettings):
         return self
 
 
-# Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
-# (``from __future__ import annotations`` makes it a string). Without this the
-# model stays "not fully defined" when this file is exec'd as an unregistered
-# module (e.g. tests load it via spec_from_file_location), since pydantic falls
-# back to ``sys.modules[__module__]`` which is absent in that scenario.
+# Resolve nested routing models for callers loading this module by file path.
 SquillaRouterConfig.model_rebuild()
 
 
@@ -2176,12 +2123,6 @@ class SubagentsGatewayConfig(BaseModel):
 
     prompt_compact: bool = False
     """When enabled, subagent bootstrap prompts keep only AGENTS.md."""
-
-
-
-
-
-
 
 
 class TlsConfig(BaseSettings):
@@ -3490,7 +3431,7 @@ class GatewayConfig(BaseSettings):
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
-            _rewrite_migrated_config_best_effort(target, migration)
+            rewrite_migrated_config_best_effort(target, migration)
         return cfg
 
     @classmethod
@@ -3531,7 +3472,7 @@ class GatewayConfig(BaseSettings):
                 cfg = cls(**migration.payload)
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
-                    _rewrite_migrated_config_best_effort(path, migration)
+                    rewrite_migrated_config_best_effort(path, migration)
                 cfg.config_path = str(path)
                 cfg._mark_env_absorbed_secrets(data)
                 cfg.set_persist_snapshot(cfg.to_toml_dict(), migration.payload)
@@ -3572,26 +3513,6 @@ class GatewayConfig(BaseSettings):
 
 # --- bind-address resolution ----------------------------------------------
 
-
-def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:
-    """Persist a migrated config, degrading to a warning when not writable.
-
-    The migrated payload already validated and the gateway can run from it;
-    a read-only config location (mounted backup, locked-down home) must not
-    turn that into a boot failure. The rewrite is retried on the next load.
-    """
-    try:
-        backup_and_write_migrated_config(path, migration.payload, migration)
-    except OSError as error:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "OpenSquilla config migration could not rewrite %s (%s); running "
-            "from the migrated payload in memory. Make the file writable to "
-            "persist the migration and silence this warning.",
-            path,
-            error,
-        )
 
 # Wildcard addresses that expose the gateway on every interface. Used by the
 # boot banner and the install-script post-install message.

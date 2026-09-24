@@ -32,7 +32,6 @@ import { WORKSPACE_FILES_KEY } from './modules/workspaceFiles'
 import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
 import { USAGE_REPORTING_KEY } from './modules/usageReporting'
 import { COMMAND_CATALOG_KEY } from './modules/commandCatalog'
-import { ROUTE_FEEDBACK_KEY } from './modules/routeFeedback'
 import { PROMPT_CACHE_LEASE_KEY } from './modules/promptCacheLease'
 import { CLARIFICATION_SUBMISSION_KEY } from './modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY } from './modules/sessionMaintenance'
@@ -148,7 +147,6 @@ app.provide(WORKSPACE_FILES_KEY, gatewayAdapters.workspaceFiles)
 app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
 app.provide(USAGE_REPORTING_KEY, gatewayAdapters.usageReporting)
 app.provide(COMMAND_CATALOG_KEY, gatewayAdapters.commandCatalog)
-app.provide(ROUTE_FEEDBACK_KEY, gatewayAdapters.routeFeedback)
 app.provide(PROMPT_CACHE_LEASE_KEY, gatewayAdapters.promptCacheLease)
 app.provide(CLARIFICATION_SUBMISSION_KEY, gatewayAdapters.clarificationSubmission)
 app.provide(SESSION_MAINTENANCE_KEY, gatewayAdapters.sessionMaintenance)

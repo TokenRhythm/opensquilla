@@ -1,14 +1,7 @@
-"""Runtime bridge for live dream-cron reconciliation.
+"""Runtime bridge for reconciling Dream jobs after their configuration changes.
 
-The ``memory_dream`` cron jobs are registered by boot from the live config;
-config RPC edits (notably the self-learning -> dream linkage) change
-``memory.dream.*`` in-place without a restart. Boot installs its idempotent
-registrar here so the RPC layer can re-reconcile the jobs against the updated
-config immediately — otherwise the linkage would flip the flags while the
-scheduler still has no (or paused) dream jobs until the next restart, which is
-exactly the silent never-trains gap the linkage exists to close.
-
-Boot owns the wiring; this module holds the lookup.
+Boot owns scheduler registration; settings updates invoke this callback after
+committing the live config so Dream remains independently configurable.
 """
 
 from __future__ import annotations

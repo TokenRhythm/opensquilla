@@ -1,6 +1,6 @@
 """Transport-neutral ancillary conversation use cases.
 
-These small interfaces replace the unrelated usage, command, feedback,
+These small interfaces replace the unrelated usage, command,
 prompt-cache, and clarification methods previously exposed through one broad
 conversation facade.  Runtime storage and services stay behind narrow Ports.
 """
@@ -9,11 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 from opensquilla.session_key import canonicalize_session_key
-
-type RouteFeedbackRating = Literal["up", "down", "neutral"]
 
 
 class UsageSessionProjection(TypedDict, total=False):
@@ -108,12 +106,6 @@ class CommandCatalogResult(TypedDict, total=False):
     commands: list[CommandProjection]
 
 
-class RouteFeedbackResult(TypedDict, total=False):
-    accepted: bool
-    reason: str | None
-    recorded: str | None
-
-
 class PromptCacheLeaseResult(TypedDict, total=False):
     enabled: bool
     ttlSeconds: int
@@ -204,29 +196,6 @@ class CommandCatalog:
         if not surface:
             raise ValueError("surface must be non-empty")
         return await self._port.list(replace(query, surface=surface))
-
-
-@dataclass(frozen=True, slots=True)
-class SubmitRouteFeedback:
-    decision_id: str
-    rating: RouteFeedbackRating
-
-
-class RouteFeedbackPort(Protocol):
-    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult: ...
-
-
-class RouteFeedback:
-    def __init__(self, port: RouteFeedbackPort) -> None:
-        self._port = port
-
-    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult:
-        decision_id = command.decision_id.strip()
-        if not decision_id:
-            raise ValueError("decision_id must be non-empty")
-        if command.rating not in {"up", "down", "neutral"}:
-            raise ValueError("rating must be up, down, or neutral")
-        return await self._port.submit(replace(command, decision_id=decision_id))
 
 
 @dataclass(frozen=True, slots=True)
@@ -343,13 +312,8 @@ __all__ = [
     "PromptCacheLeasePort",
     "PromptCachePolicy",
     "PromptCacheLeaseResult",
-    "RouteFeedback",
-    "RouteFeedbackPort",
-    "RouteFeedbackRating",
-    "RouteFeedbackResult",
     "SetPromptCacheLease",
     "SubmitClarification",
-    "SubmitRouteFeedback",
     "UsageQuery",
     "UsageQueryResult",
     "UsageReporting",

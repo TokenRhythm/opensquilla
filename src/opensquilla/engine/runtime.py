@@ -7702,12 +7702,6 @@ class TurnRunner:
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
             )
-            self._emit_router_train_sample(
-                agent_id=agent_id,
-                session_key=session_key,
-                turn_obj=turn_obj,
-                message=message,
-            )
             if (
                 pending_error_event is not None
                 and not stream_state.terminal_generation_reset
@@ -11920,52 +11914,6 @@ class TurnRunner:
         except Exception as exc:  # pragma: no cover — observability must not break turns
             log.warning("decision_log.write_failed", error=str(exc))
 
-    def _emit_router_train_sample(
-        self,
-        *,
-        agent_id: str,
-        session_key: str,
-        turn_obj: Any | None,
-        message: str,
-    ) -> None:
-        """Append one self-learning sample for this turn (best-effort).
-
-        Opt-in (``squilla_router.self_learning.{enabled,capture_enabled}``) and
-        kill-switched. Writes the float16 feature vectors the model produced plus
-        the routing decision; never raw prompt text (unless the audit sidecar is
-        explicitly enabled). Must never break turn execution.
-        """
-
-        try:
-            if turn_obj is None:
-                return
-            router_cfg = getattr(self._turn_config(), "squilla_router", None)
-            sl = getattr(router_cfg, "self_learning", None)
-            if sl is None or not getattr(sl, "enabled", False):
-                return
-            if not getattr(sl, "capture_enabled", True):
-                return
-
-            from opensquilla.squilla_router.self_learning import (
-                self_learning_disabled_by_env,
-                write_sample,
-            )
-            from opensquilla.squilla_router.self_learning.capture import build_train_sample
-
-            if self_learning_disabled_by_env():
-                return
-
-            sample = build_train_sample(
-                session_key=session_key,
-                metadata=turn_obj.metadata,
-                store_audit_summary=bool(getattr(sl, "store_audit_summary", False)),
-                message=message,
-            )
-            if sample is None:
-                return
-            write_sample(sample, agent_id)
-        except Exception as exc:  # pragma: no cover — capture must not break turns
-            log.warning("router_self_learning.capture_failed", error=str(exc))
 
     @staticmethod
     def _active_persisted_user_index(

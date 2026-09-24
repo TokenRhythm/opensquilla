@@ -416,6 +416,7 @@ def migrate_config_payload(
     )
     _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
     _strip_removed_router_compaction_fields(builder)
+    _strip_router_self_learning(builder)
     _normalize_telemetry_upload_preference(builder)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
@@ -478,6 +479,18 @@ def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
         if name in privacy:
             privacy.pop(name)
             builder.removed_fields.append(f"privacy.{name}")
+
+
+def _strip_router_self_learning(builder: _MigrationBuilder) -> None:
+    """Discard retired training settings without reading any learning artifacts."""
+    router = builder.payload.get("squilla_router")
+    if isinstance(router, dict) and "self_learning" in router:
+        router.pop("self_learning")
+        builder.removed_fields.append("squilla_router.self_learning")
+        builder.warnings.append(
+            "Router self-learning was removed; routing uses the configured base model. "
+            "Existing memory settings and training files are unchanged."
+        )
 
 
 def _strip_removed_router_compaction_fields(builder: _MigrationBuilder) -> None:
@@ -978,6 +991,22 @@ def backup_and_write_migrated_config(
         },
     )
     return backup
+
+
+def rewrite_migrated_config_best_effort(
+    path: Path, migration: ConfigMigrationResult
+) -> None:
+    """Persist an already validated migration without making writes a load prerequisite."""
+    try:
+        backup_and_write_migrated_config(path, migration.payload, migration)
+    except OSError as error:
+        logging.getLogger(__name__).warning(
+            "OpenSquilla config migration could not rewrite %s (%s); running "
+            "from the migrated payload in memory. Make the file writable to "
+            "persist the migration and silence this warning.",
+            path,
+            error,
+        )
 
 
 _CONFIG_BACKUP_KEEP = 10

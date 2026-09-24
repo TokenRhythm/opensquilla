@@ -33,11 +33,6 @@
           "_status_contract",
           "_stored_session_key"
         ],
-        "src/opensquilla/gateway/rpc_router.py": [
-          "_GatewayRouteFeedbackPort",
-          "_handle_router_feedback_submit_contract",
-          "_submit_route_feedback"
-        ],
         "src/opensquilla/gateway/rpc_sessions.py": [
           "_GatewaySessionLifecyclePorts",
           "_SessionLifecycleDeletionPort",

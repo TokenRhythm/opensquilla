@@ -42,8 +42,6 @@ import type { UsageReporting } from '@/modules/usageReporting'
 import { createV4UsageReporting } from './usageReportingV4'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import { createV4CommandCatalog } from './commandCatalogV4'
-import type { RouteFeedback } from '@/modules/routeFeedback'
-import { createV4RouteFeedback } from './routeFeedbackV4'
 import type { PromptCacheLease } from '@/modules/promptCacheLease'
 import { createV4PromptCacheLease } from './promptCacheLeaseV4'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
@@ -109,7 +107,6 @@ export interface GatewayAdapters {
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
-  readonly routeFeedback: RouteFeedback
   readonly promptCacheLease: PromptCacheLease
   readonly clarificationSubmission: ClarificationSubmission
   readonly sessionMaintenance: SessionMaintenance
@@ -191,7 +188,6 @@ export function createGatewayAdapters(
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),
-    routeFeedback: createV4RouteFeedback(transports.rpc),
     promptCacheLease: createV4PromptCacheLease(transports.rpc),
     clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
     sessionMaintenance: createV4SessionMaintenance(transports.rpc),

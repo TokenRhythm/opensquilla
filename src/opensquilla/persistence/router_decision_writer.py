@@ -489,9 +489,7 @@ class RouterDecisionWriter:
     def get_decision(self, decision_id: str) -> dict[str, Any] | None:
         """Return one sanitized decision row by id, or ``None``.
 
-        Reverse-lookup surface for feedback attribution
-        (``router.feedback.submit`` resolves ``decisionId`` to the
-        ``(session_key, turn_index, executed_kind)`` the sidecar needs).
+        Supports diagnostics that correlate a turn with its routing decision.
         Same privacy posture and best-effort error handling as
         :meth:`list_decisions`.
         """

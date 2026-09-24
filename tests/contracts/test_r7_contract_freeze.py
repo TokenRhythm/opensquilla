@@ -175,9 +175,12 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 217
+    assert not {"router.selflearning.status", "router.feedback.submit"} & {
+        spec.wire_name for spec in specs
+    }
+    assert len(specs) == 215
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 207,
+        "method": 205,
         "event": 10,
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}
