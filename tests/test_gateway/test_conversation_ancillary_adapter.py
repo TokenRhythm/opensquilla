@@ -9,7 +9,6 @@ from opensquilla.application.conversation_ancillary import (
     CommandCatalogPort,
     PromptCacheLeasePort,
     PromptCachePolicy,
-    RouteFeedbackPort,
     UsageReportingPort,
 )
 from opensquilla.gateway.adapters.conversation_ancillary import (
@@ -25,7 +24,6 @@ def _adapter() -> tuple[GatewayConversationAncillaryAdapter, dict[str, AsyncMock
             "usage_query": {"rows": []},
             "usage_cost": {"totalCostUsd": 1.5},
             "commands": {"surface": "web", "commands": []},
-            "feedback": {"accepted": True},
             "prompt_status": {"enabled": False},
             "prompt_set": {"enabled": True},
             "clarification": {"accepted": True},
@@ -40,7 +38,6 @@ def _adapter() -> tuple[GatewayConversationAncillaryAdapter, dict[str, AsyncMock
         ),
     )
     commands = cast(CommandCatalogPort, SimpleNamespace(list=calls["commands"]))
-    feedback = cast(RouteFeedbackPort, SimpleNamespace(submit=calls["feedback"]))
     prompt_cache = cast(
         PromptCacheLeasePort,
         SimpleNamespace(status=calls["prompt_status"], set_policy=calls["prompt_set"]),
@@ -53,7 +50,6 @@ def _adapter() -> tuple[GatewayConversationAncillaryAdapter, dict[str, AsyncMock
         GatewayConversationAncillaryAdapter(
             usage=usage,
             commands=commands,
-            feedback=feedback,
             prompt_cache=prompt_cache,
             clarification=clarification,
             prompt_cache_policy=PromptCachePolicy(
@@ -69,12 +65,11 @@ def _adapter() -> tuple[GatewayConversationAncillaryAdapter, dict[str, AsyncMock
     )
 
 
-async def test_adapter_projects_usage_commands_feedback_and_prompt_cache() -> None:
+async def test_adapter_projects_usage_commands_and_prompt_cache() -> None:
     adapter, calls = _adapter()
 
     await adapter.usage_status({"session_key": "agent:main:webchat:test"})
     await adapter.list_commands({"surface": " web "})
-    await adapter.submit_feedback({"decision_id": "d-1", "rating": "down"})
     await adapter.prompt_cache_set(
         {"key": "agent:main:webchat:test", "enabled": True}
     )
@@ -84,8 +79,6 @@ async def test_adapter_projects_usage_commands_feedback_and_prompt_cache() -> No
     assert dict(usage_query.filters) == {"session_key": "agent:main:webchat:test"}
     command_query = calls["commands"].await_args.args[0]
     assert command_query.surface == "web"
-    feedback = calls["feedback"].await_args.args[0]
-    assert (feedback.decision_id, feedback.rating) == ("d-1", "down")
     prompt = calls["prompt_set"].await_args.args[0]
     assert (
         prompt.session_key,

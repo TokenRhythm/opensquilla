@@ -820,11 +820,9 @@
     },
     "memoryOverview": {
       "title": "记忆",
-      "desc": "选择 OpenSquilla 记住的内容，并管理可选学习功能。",
+      "desc": "选择 OpenSquilla 记住的内容，并管理记忆整理。",
       "autoCaptureLabel": "对话记录捕获",
       "autoCaptureDesc": "在本机保存原始对话与回合记录，用于审计和恢复；不会写入长期记忆，也不会建立索引用于记忆检索。",
-      "learningSummary": "记忆与自学习（高级）",
-      "learningDesc": "可选学习功能可能消耗额外模型 Token，并可能需要重启。",
       "profileImportLabel": "画像导入",
       "profileImportDesc": "检查并导入兼容的身份与记忆数据。",
       "profileImportAction": "打开"
@@ -2018,34 +2016,11 @@
       "audioEnvVar": "用于读取音频服务商访问凭据的环境变量。",
       "remoteEmbeddingKey": "远程嵌入 API 密钥或环境变量引用。"
     },
-    "memoryLearning": {
-      "groupTitle": "记忆与自学习",
+    "memoryDream": {
       "dreamLabel": "记忆整理(dream)",
       "tokenBadge": "token 消耗",
-      "dreamDesc": "周期性调用模型整理会话记忆(每 24h)。模型路由自学习依赖它提供空闲训练时机。",
-      "selfLearningLabel": "模型路由自学习",
-      "selfLearningDesc": "从你的纠错中学习路由偏好。完全在本机进行——存储特征向量,从不存储对话原文。",
-      "depDefault": "依赖上方的记忆整理:开启本项会一并启用它;单独关闭记忆整理后,自学习仍会采集样本但不会自动训练。",
-      "depLinked": "已随本项开启记忆整理。可随时单独关闭它——自学习会继续采集,只是暂停自动训练。",
-      "depPaused": "记忆整理已关闭——样本仍在采集,但不会自动训练。重新开启记忆整理即可恢复。",
-      "restartRequired": "调度变更需要重启网关后生效。",
-      "statusModel": "路由模型",
-      "statusSamples": "纠错样本",
-      "statusLastAction": "上次动作",
-      "modelBaseline": "出厂基线",
-      "modelLearned": "学习版 v{version}",
-      "samplesTotal": "共采集 {total} 条",
-      "gatePausedDream": "训练已暂停——等待记忆整理重新开启",
-      "gateReason": {
-        "ready": "就绪——将在下次训练窗口训练",
-        "disabled": "已停用",
-        "no_data": "尚未采集到样本",
-        "agent_active": "等待空闲窗口",
-        "cooldown": "近期已训练,冷却中",
-        "insufficient_data": "未训练——纠错样本不足",
-        "insufficient_class_diversity": "未训练——纠错样本覆盖的路由档位过少"
-      },
-      "detachedNote": "模型路由基础权重已升级。基于旧权重的学习成果已归档;纠错样本不受影响,将基于新权重自动重新学习。无需任何操作。"
+      "dreamDesc": "周期性调用模型整理会话记忆。",
+      "restartRequired": "调度变更需要重启网关后生效。"
     },
     "field": {
       "keepCurrentPlaceholder": "留空即保留当前值",
@@ -3924,6 +3899,10 @@
       "setup": "设置"
     },
     "usageDetails": "用量详情",
+    "messageFeedback": {
+      "up": "有帮助（仅在当前页面记录）",
+      "down": "没有帮助（仅在当前页面记录）"
+    },
     "regenerate": "重新生成",
     "forkConversation": "从这里创建分支",
     "forkCreating": "正在创建分支…",
@@ -4552,14 +4531,6 @@
       "sessionModelBusy": "当前回复完成后可切换模型。",
       "router": "智能模型路由",
       "ensemble": "多模型融合"
-    },
-    "routeFeedback": {
-      "up": "这次路由选对了",
-      "down": "这次路由选错了",
-      "upEnsemble": "对这次融合回答满意",
-      "downEnsemble": "对这次融合回答不满意",
-      "expired": "这条消息的路由记录已过期",
-      "failed": "未能记录你的评价"
     }
   },
   "shared": {

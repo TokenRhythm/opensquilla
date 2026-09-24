@@ -5,11 +5,6 @@ import {
 } from '@/contracts/generated/v4/runtimeStatus'
 import { validateResult as validateRuntimeStatusResult } from '@/contracts/generated/v4/runtimeStatusValidators.mjs'
 import {
-  ROUTER_SELFLEARNING_STATUS_METHOD,
-  type Result as RouterSelflearningStatusResult,
-} from '@/contracts/generated/v4/routerSelflearningStatus'
-import { validateResult as validateRouterSelflearningStatusResult } from '@/contracts/generated/v4/routerSelflearningStatusValidators.mjs'
-import {
   DOCTOR_STATUS_METHOD,
   type Result as DoctorStatusResult,
 } from '@/contracts/generated/v4/doctorStatus'
@@ -32,7 +27,6 @@ import type {
   GatewayStatus,
   Observability,
   ReadinessReport,
-  SelfLearningStatus,
   UpdateNotice,
 } from '@/modules/observability'
 
@@ -102,18 +96,6 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
       )
       if (!validateRuntimeStatusResult(result)) throw invalid(STATUS_METHOD)
       return result as GatewayStatus
-    },
-    async selfLearningStatus(options) {
-      await rpc.ready({ signal: options?.signal })
-      const result = await rpc.request<RouterSelflearningStatusResult>(
-        ROUTER_SELFLEARNING_STATUS_METHOD,
-        {},
-        callOptions(options?.signal),
-      )
-      if (!validateRouterSelflearningStatusResult(result)) {
-        throw invalid(ROUTER_SELFLEARNING_STATUS_METHOD)
-      }
-      return result as SelfLearningStatus
     },
     usage(range, options = {}) {
       return usageReporting.snapshot(range, options)

@@ -11,6 +11,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The Web UI and Desktop background-music player and its settings are removed.
   Existing music preferences are ignored, and personal music files stay on disk
   without entering new builds. Chat audio playback and voice input are unchanged.
+- Removed experimental router self-learning and its feedback submission API.
+  Existing installations use their configured base router; obsolete training
+  settings are ignored and cleaned on migration, while historical training files
+  remain untouched. Dream memory consolidation retains its existing settings
+  and manages its own schedule. Matching updated clients and Gateway are required.
+  Thumbs up/down remain as page-local answer ratings, with no submission or training;
+  selections reset when the page reloads.
+
+### Fixed
+
+- CLI and onboarding config loads continue with validated in-memory migrations
+  when an automatic migration backup or rewrite cannot be written.
 
 ## [0.5.5] - 2026-09-23
 

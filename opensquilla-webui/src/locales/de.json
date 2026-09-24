@@ -738,11 +738,9 @@
     },
     "memoryOverview": {
       "title": "Speicher",
-      "desc": "Festlegen, was OpenSquilla speichert, und optionale Lernfunktionen verwalten.",
+      "desc": "Wählen Sie, was OpenSquilla sich merkt, und verwalten Sie die Gedächtniskonsolidierung.",
       "autoCaptureLabel": "Gesprächsaufzeichnung",
       "autoCaptureDesc": "Speichert Unterhaltungen und Gesprächsrunden im Rohformat lokal für Prüfzwecke und Wiederherstellung. Sie werden weder dem Langzeitspeicher hinzugefügt noch für den Abruf indexiert.",
-      "learningSummary": "Speicher und Selbstlernen (erweitert)",
-      "learningDesc": "Optionale Lernfunktionen können zusätzliche Modell-Tokens verwenden und einen Neustart erfordern.",
       "profileImportLabel": "Profilimport",
       "profileImportDesc": "Kompatible Identitäts- und Speicherdaten prüfen und importieren.",
       "profileImportAction": "Öffnen"
@@ -1936,34 +1934,11 @@
       "audioEnvVar": "Umgebungsvariable, die für den Zugriff auf den Audioanbieter gelesen wird.",
       "remoteEmbeddingKey": "Remote-Embedding-API-Schlüssel oder Umgebungsreferenz."
     },
-    "memoryLearning": {
-      "groupTitle": "Gedächtnis & Selbstlernen",
+    "memoryDream": {
       "dreamLabel": "Gedächtniskonsolidierung (dream)",
       "tokenBadge": "Token-Verbrauch",
-      "dreamDesc": "Führt regelmäßig einen Modelldurchlauf zur Konsolidierung des Sitzungsgedächtnisses aus (alle 24 h). Das Selbstlernen des Modell-Routings nutzt diese Leerlauffenster zum Trainieren.",
-      "selfLearningLabel": "Modell-Routing-Selbstlernen",
-      "selfLearningDesc": "Lernt Routing-Präferenzen aus Ihren Korrekturen. Vollständig lokal — speichert Merkmalsvektoren, niemals Gesprächstexte.",
-      "depDefault": "Hängt von der Gedächtniskonsolidierung oben ab: Das Einschalten aktiviert sie mit; wird nur die Konsolidierung abgeschaltet, läuft die Erfassung weiter, das automatische Training pausiert.",
-      "depLinked": "Die Gedächtniskonsolidierung wurde zusammen mit dieser Option aktiviert. Sie können sie separat abschalten — die Erfassung läuft weiter, nur das automatische Training pausiert.",
-      "depPaused": "Die Gedächtniskonsolidierung ist aus — Stichproben werden weiter erfasst, aber es findet kein automatisches Training statt. Zum Fortsetzen wieder aktivieren.",
-      "restartRequired": "Für die Zeitplanänderung ist ein Gateway-Neustart erforderlich.",
-      "statusModel": "Routing-Modell",
-      "statusSamples": "Korrekturen",
-      "statusLastAction": "Letzte Aktion",
-      "modelBaseline": "Werksbasislinie",
-      "modelLearned": "Gelernt v{version}",
-      "samplesTotal": "Insgesamt {total} erfasst",
-      "gatePausedDream": "Training pausiert — wartet auf die Reaktivierung der Gedächtniskonsolidierung",
-      "gateReason": {
-        "ready": "Bereit — trainiert im nächsten Zeitfenster",
-        "disabled": "Deaktiviert",
-        "no_data": "Noch keine Stichproben erfasst",
-        "agent_active": "Wartet auf ein Leerlauffenster",
-        "cooldown": "Abklingzeit nach kürzlichem Training",
-        "insufficient_data": "Noch nicht trainiert — zu wenige Korrekturen",
-        "insufficient_class_diversity": "Noch nicht trainiert — Korrekturen decken zu wenige Routing-Stufen ab"
-      },
-      "detachedNote": "Die Basisgewichte des Routings wurden aktualisiert. Auf den alten Gewichten aufgebautes Lernen wurde archiviert; Ihre Korrekturen bleiben erhalten und werden auf den neuen Gewichten automatisch neu gelernt. Keine Aktion nötig."
+      "dreamDesc": "Führt regelmäßig einen Modelldurchlauf zur Konsolidierung des Sitzungsgedächtnisses aus.",
+      "restartRequired": "Für die Zeitplanänderung ist ein Gateway-Neustart erforderlich."
     },
     "field": {
       "keepCurrentPlaceholder": "leer lassen, um den aktuellen Wert zu behalten",
@@ -3840,6 +3815,10 @@
       "setup": "Einrichten"
     },
     "usageDetails": "Nutzungsdetails",
+    "messageFeedback": {
+      "up": "Hilfreich (nur auf dieser Seite)",
+      "down": "Nicht hilfreich (nur auf dieser Seite)"
+    },
     "regenerate": "Neu generieren",
     "forkConversation": "Ab hier verzweigen",
     "forkCreating": "Verzweigung wird erstellt…",
@@ -4468,14 +4447,6 @@
       "sessionModelBusy": "Das Modell kann nach Abschluss der aktuellen Antwort geändert werden.",
       "router": "Intelligentes Modellrouting",
       "ensemble": "Modell-Ensemble"
-    },
-    "routeFeedback": {
-      "up": "Richtige Modellwahl für diesen Zug",
-      "down": "Falsche Modellwahl für diesen Zug",
-      "upEnsemble": "Mit dieser aggregierten Antwort zufrieden",
-      "downEnsemble": "Mit dieser aggregierten Antwort unzufrieden",
-      "expired": "Der Routing-Eintrag dieser Nachricht ist abgelaufen",
-      "failed": "Bewertung konnte nicht gespeichert werden"
     }
   },
   "shared": {

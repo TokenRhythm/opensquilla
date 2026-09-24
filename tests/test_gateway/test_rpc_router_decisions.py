@@ -1,7 +1,6 @@
-"""router.decisions.list / router.feedback.submit RPC handlers.
+"""Read-only router.decisions.list RPC and removed learning API regression.
 
-The list surface is a read/observe view over the V017 ``router_decisions``
-table; the feedback surface is dormant plumbing (deferred F7 follow-up).
+The list surface observes the V017 ``router_decisions`` table.
 All fixture data is synthetic.
 """
 
@@ -9,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -20,15 +18,13 @@ from opensquilla.engine.steps.router_decision_record import (
 )
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.protocol import ERROR_INVALID_REQUEST, ERROR_UNAUTHORIZED
 from opensquilla.gateway.rpc import get_dispatcher, validate_classification
 from opensquilla.gateway.rpc.registry import RpcContext
 from opensquilla.gateway.rpc_router import (
     _bounded_limit,
     _handle_router_decisions_list,
-    _submit_route_feedback,
 )
-from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE, WRITE_SCOPE
+from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE
 from opensquilla.persistence.migrator import apply_pending
 from opensquilla.persistence.router_decision_writer import (
     RouterDecisionWriter,
@@ -377,211 +373,21 @@ async def test_decisions_list_allows_read_only_dispatch(
 
 
 # ---------------------------------------------------------------------------
-# router.feedback.submit (live F7 intake)
-# ---------------------------------------------------------------------------
-
-
-async def test_feedback_submit_records_to_sidecar(
-    writer: RouterDecisionWriter, tmp_path: Path, monkeypatch
-) -> None:
-    """A rating resolves through V017 and lands in the per-agent sidecar."""
-    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    writer.record_decision(_base_record())
-    before = writer.list_decisions()
-
-    payload = await _submit_route_feedback(
-        {"decisionId": "d" * 32, "rating": "down"},
-        RpcContext(conn_id="test"),
-    )
-
-    assert payload == {"accepted": True, "recorded": "down"}
-    # The decision table itself is never mutated by feedback.
-    assert writer.list_decisions() == before
-
-    from opensquilla.squilla_router.self_learning.feedback import load_feedback_map
-
-    fb = load_feedback_map("main", home=tmp_path)
-    assert fb["d" * 32].rating == "down"
-    assert fb["d" * 32].executed_kind == "single"
-
-
-async def test_feedback_submit_uses_configured_retention_days(
-    writer: RouterDecisionWriter, tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    writer.record_decision(_base_record())
-
-    from opensquilla.squilla_router.self_learning.feedback import (
-        load_feedback_map,
-        write_feedback,
-    )
-
-    write_feedback(
-        "main",
-        decision_id="old-rating",
-        session_key="agent:main:webchat:s1",
-        turn_index=1,
-        rating="up",
-        now=datetime.now(UTC) - timedelta(days=40),
-        retention_days=60,
-    )
-    cfg = GatewayConfig(
-        squilla_router={"self_learning": {"retention_days": 60}}
-    )
-
-    payload = await _submit_route_feedback(
-        {"decisionId": "d" * 32, "rating": "down"},
-        RpcContext(conn_id="test", config=cfg),
-    )
-
-    assert payload == {"accepted": True, "recorded": "down"}
-    assert "old-rating" in load_feedback_map("main", home=tmp_path)
-
-
-async def test_feedback_submit_unknown_decision_is_soft_failure(
-    writer: RouterDecisionWriter, tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    payload = await _submit_route_feedback(
-        {"decisionId": "f" * 32, "rating": "up"},
-        RpcContext(conn_id="test"),
-    )
-    assert payload == {"accepted": False, "reason": "decision_not_found"}
-
-
-async def test_feedback_submit_last_write_wins_and_neutral_revokes(
-    writer: RouterDecisionWriter, tmp_path: Path, monkeypatch
-) -> None:
-    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    writer.record_decision(_base_record())
-    from opensquilla.squilla_router.self_learning.feedback import load_feedback_map
-
-    ctx = RpcContext(conn_id="test")
-    await _submit_route_feedback({"decisionId": "d" * 32, "rating": "down"}, ctx)
-    await _submit_route_feedback({"decisionId": "d" * 32, "rating": "up"}, ctx)
-    fb = load_feedback_map("main", home=tmp_path)
-    assert fb["d" * 32].rating == "up"  # revision wins
-
-    await _submit_route_feedback(
-        {"decisionId": "d" * 32, "rating": "neutral"}, ctx
-    )
-    assert load_feedback_map("main", home=tmp_path) == {}  # revoked
-
-
-async def test_feedback_submit_preserves_ensemble_kind(
-    writer: RouterDecisionWriter, tmp_path: Path, monkeypatch
-) -> None:
-    """executed_kind rides from V017 into the sidecar for downstream gating."""
-    monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
-    writer.record_decision(_base_record(decision_id="e" * 32, executed_kind="ensemble"))
-
-    await _submit_route_feedback(
-        {"decisionId": "e" * 32, "rating": "down"},
-        RpcContext(conn_id="test"),
-    )
-
-    from opensquilla.squilla_router.self_learning.feedback import load_feedback_map
-
-    fb = load_feedback_map("main", home=tmp_path)
-    assert fb["e" * 32].executed_kind == "ensemble"
-
-
-async def test_feedback_submit_rejects_free_text_decision_id() -> None:
-    ctx = RpcContext(conn_id="test")
-    res = await get_dispatcher().dispatch(
-        "r1",
-        "router.feedback.submit",
-        {"decisionId": "this routing was wrong today", "rating": "down"},
-        ctx,
-    )
-    assert res.error is not None
-    assert res.error.code == ERROR_INVALID_REQUEST
-
-
-async def test_feedback_submit_rejects_free_text_rating() -> None:
-    ctx = RpcContext(conn_id="test")
-    res = await get_dispatcher().dispatch(
-        "r1",
-        "router.feedback.submit",
-        {"decisionId": "d" * 32, "rating": "amazing model, keep it!"},
-        ctx,
-    )
-    assert res.error is not None
-    assert res.error.code == ERROR_INVALID_REQUEST
-
-
-async def test_feedback_submit_denies_read_only_dispatch() -> None:
-    ctx = RpcContext(conn_id="test", principal=_read_only_principal())
-    res = await get_dispatcher().dispatch(
-        "r1",
-        "router.feedback.submit",
-        {"decisionId": "d" * 32, "rating": "up"},
-        ctx,
-    )
-    assert res.error is not None
-    assert res.error.code == ERROR_UNAUTHORIZED
-
-
-def test_feedback_handler_is_dormant_static() -> None:
-    """The handler module must not touch routing, calibration, or selection.
-
-    The read-only ``router.selflearning.status`` handler may import the
-    self-learning *state readers* (gates evaluation, pointer/state/store
-    reads) — those observe the loop without feeding routing. What stays
-    forbidden is anything that could route, calibrate, or mutate loop state:
-    the routing engines themselves, and the self-learning mutation surfaces
-    (training, promotion pointer writes, sample writes).
-    """
-    source = Path("src/opensquilla/gateway/rpc_router.py").read_text(encoding="utf-8")
-    assert "RoutingHistoryStore" not in source
-    import_lines = [
-        line.strip()
-        for line in source.splitlines()
-        if line.strip().startswith(("import ", "from "))
-    ]
-    allowed_readonly = (
-        "squilla_router.self_learning.gates",
-        "squilla_router.self_learning.promotion",
-        "squilla_router.self_learning.state",
-        "squilla_router.self_learning.store",
-        # Feedback intake is this module's own job: append-only sidecar writes,
-        # still nothing that routes, calibrates, or trains.
-        "squilla_router.self_learning.feedback",
-    )
-    forbidden = ("smart_routing", "router_control", "squilla_router", "calibration", "routing")
-    for line in import_lines:
-        if any(mod in line for mod in allowed_readonly):
-            continue
-        assert not any(token in line for token in forbidden), line
-    # The status handler must stay read-only: no training/mutation imports.
-    # ("train" as a bare token would false-positive on "training"/"trainedAt",
-    # so the mutation modules are matched as import paths.)
-    for mutating in (
-        "self_learning.orchestrator",
-        "self_learning.train",
-        "write_sample",
-        "write_active_atomic",
-        "promote_candidate",
-        "rollback_active",
-        "quarantine_candidate",
-    ):
-        assert mutating not in source, mutating
-
-
-# ---------------------------------------------------------------------------
 # Scope classification / boot audit
 # ---------------------------------------------------------------------------
 
 
 def test_router_rpc_scope_contract() -> None:
     assert METHOD_SCOPES["router.decisions.list"] == READ_SCOPE
-    assert METHOD_SCOPES["router.feedback.submit"] == WRITE_SCOPE
 
 
 def test_router_rpc_methods_pass_boot_scope_audit() -> None:
     registry = get_dispatcher()
     assert "router.decisions.list" in registry.methods()
-    assert "router.feedback.submit" in registry.methods()
+    assert "router.feedback.submit" not in registry.methods()
+    assert "router.selflearning.status" not in registry.methods()
+    assert "router.feedback.submit" not in METHOD_SCOPES
+    assert "router.selflearning.status" not in METHOD_SCOPES
     # Same audit boot runs at the end of opensquilla.gateway.rpc.__init__;
     # raises ScopeDriftError on declared-vs-table drift.
     validate_classification(registry)

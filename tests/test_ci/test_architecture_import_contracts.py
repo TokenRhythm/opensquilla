@@ -134,9 +134,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("gateway", "search"),
     ("gateway", "session"),
     ("gateway", "skills"),
-    # Gateway's post-dream hook drives the opt-in router self-learning
-    # orchestrator (offline retrain; default-off, fail-open).
-    ("gateway", "squilla_router"),
     # Gateway composition owns scoped telemetry lifecycle and its authenticated
     # consent RPC boundary; telemetry does not import Gateway implementation.
     ("gateway", "telemetry"),
@@ -238,9 +235,6 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("scheduler", "session"),
     ("scheduler", "skills"),
     ("scheduler", "tools"),
-    # Self-learning's opt-in audit sidecar reuses the decision-log redactor;
-    # observability is a leaf package, so this closes no cycle.
-    ("squilla_router", "observability"),
     ("session", "artifact_session"),
     ("session", "compat"),
     ("session", "engine"),

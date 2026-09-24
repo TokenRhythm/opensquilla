@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import Icon from '@/components/Icon.vue'
-import MemoryLearningGroup from '@/components/settings/MemoryLearningGroup.vue'
+import MemoryDreamSettings from '@/components/settings/MemoryDreamSettings.vue'
 
 defineProps<{
   autoCapture: boolean
@@ -103,7 +103,7 @@ function localStorageGet(key: string): string | null {
         <span>{{ t('shared.loading') }}</span>
       </div>
 
-      <MemoryLearningGroup />
+      <MemoryDreamSettings />
     </div>
 
     <h4 class="advanced-group advanced-group--section">{{ t('setup.advanced.experimentsGroup') }}</h4>

@@ -821,11 +821,9 @@
     },
     "memoryOverview": {
       "title": "Memory",
-      "desc": "Choose what OpenSquilla remembers and manage optional learning features.",
+      "desc": "Choose what OpenSquilla remembers and manage memory consolidation.",
       "autoCaptureLabel": "Conversation capture",
       "autoCaptureDesc": "Store raw conversations and turn records locally for audit and recovery. They are not added to long-term memory or indexed for recall.",
-      "learningSummary": "Memory and self-learning (advanced)",
-      "learningDesc": "Optional learning controls can use additional model tokens and may require a restart.",
       "profileImportLabel": "Profile import",
       "profileImportDesc": "Review and import compatible identity and memory data.",
       "profileImportAction": "Open"
@@ -2019,34 +2017,11 @@
       "audioEnvVar": "Environment variable to read for audio provider access.",
       "remoteEmbeddingKey": "Remote embedding API key or env reference."
     },
-    "memoryLearning": {
-      "groupTitle": "Memory & self-learning",
+    "memoryDream": {
       "dreamLabel": "Memory consolidation (dream)",
       "tokenBadge": "token usage",
-      "dreamDesc": "Periodically runs a model pass to consolidate session memory (every 24h). Model-routing self-learning relies on it for idle training windows.",
-      "selfLearningLabel": "Model-routing self-learning",
-      "selfLearningDesc": "Learns routing preferences from your corrections. Fully on-device — stores feature vectors, never raw conversation text.",
-      "depDefault": "Depends on memory consolidation above: turning this on enables it too; turning consolidation off alone keeps sampling but pauses automatic training.",
-      "depLinked": "Memory consolidation was enabled together with this. You can switch it off independently — self-learning keeps sampling, only automatic training pauses.",
-      "depPaused": "Memory consolidation is off — samples are still collected, but no automatic training runs. Re-enable it to resume.",
-      "restartRequired": "A gateway restart is needed for the schedule change to take effect.",
-      "statusModel": "Routing model",
-      "statusSamples": "Corrections",
-      "statusLastAction": "Last action",
-      "modelBaseline": "Factory baseline",
-      "modelLearned": "Learned v{version}",
-      "samplesTotal": "{total} collected in total",
-      "gatePausedDream": "Training paused — waiting for memory consolidation to be re-enabled",
-      "gateReason": {
-        "ready": "Ready — will train at the next window",
-        "disabled": "Disabled",
-        "no_data": "No samples collected yet",
-        "agent_active": "Waiting for an idle window",
-        "cooldown": "Cooling down after a recent training run",
-        "insufficient_data": "Not trained yet — not enough corrections",
-        "insufficient_class_diversity": "Not trained yet — corrections cover too few routing tiers"
-      },
-      "detachedNote": "The base routing weights were upgraded. Learning built on the old weights was archived; your corrections are unaffected and will retrain automatically on the new weights. No action needed."
+      "dreamDesc": "Periodically runs a model pass to consolidate session memory.",
+      "restartRequired": "A gateway restart is needed for the schedule change to take effect."
     },
     "field": {
       "keepCurrentPlaceholder": "leave blank to keep current",
@@ -3925,6 +3900,10 @@
       "setup": "Set up"
     },
     "usageDetails": "Usage details",
+    "messageFeedback": {
+      "up": "Helpful (this page only)",
+      "down": "Not helpful (this page only)"
+    },
     "regenerate": "Regenerate",
     "forkConversation": "Fork from here",
     "forkCreating": "Creating branch…",
@@ -4553,14 +4532,6 @@
       "sessionModelBusy": "Finish the current response before changing its model.",
       "router": "Intelligent model routing",
       "ensemble": "Model ensemble"
-    },
-    "routeFeedback": {
-      "up": "Right model choice for this turn",
-      "down": "Wrong model choice for this turn",
-      "upEnsemble": "Satisfied with this aggregated answer",
-      "downEnsemble": "Unsatisfied with this aggregated answer",
-      "expired": "This message’s routing record has expired",
-      "failed": "Could not record your rating"
     }
   },
   "shared": {

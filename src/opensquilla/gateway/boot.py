@@ -159,8 +159,6 @@ def _start_background_install_telemetry(config: GatewayConfig) -> None:
         log.debug("gateway.install_telemetry_skipped", exc_info=True)
 
 
-
-
 def gateway_graceful_timeout() -> float:
     """Per-phase graceful drain budget in seconds, env-overridable and bounded.
 
@@ -227,8 +225,6 @@ def _desktop_router_preload_enabled() -> bool:
     if override is not None:
         return override.strip().lower() in _ENABLED_VALUES
     return not _desktop_fast_start_enabled()
-
-
 
 
 def _resolve_migrations_dir() -> Path:
@@ -329,53 +325,18 @@ def _interval_h_to_schedule(interval_h: int) -> tuple[Any, str]:
     return ScheduleKind.EVERY, str(interval_h * 3600)
 
 
-async def _list_scheduler_jobs(scheduler: Any) -> list[Any]:
+async def _list_scheduler_jobs(scheduler: Any) -> list[Any] | None:
     list_jobs = getattr(scheduler, "list_jobs", None)
     if not callable(list_jobs):
-        return []
+        return None
     try:
         result = list_jobs()
         if inspect.isawaitable(result):
             result = await result
     except Exception as exc:  # noqa: BLE001
         log.warning("boot.dream.list_jobs_failed", error=str(exc))
-        return []
-    return result if isinstance(result, list) else []
-
-
-def _warn_if_self_learning_unreachable(config: Any) -> None:
-    """Warn when self-learning is on but its training trigger can never fire.
-
-    The retrain rides the post-dream hook, so with dream disabled (or its cron
-    unscheduled) capture accumulates samples while training silently never
-    runs. Config carries no cross-section validation for this, and the CLI is
-    often the only surface an operator watches — one explicit boot line turns
-    the silent gap into a diagnosable one. Mirrored by the
-    ``router.selflearning.status`` RPC's ``trainingReachable`` field.
-    """
-
-    sl_cfg = getattr(getattr(config, "squilla_router", None), "self_learning", None)
-    if sl_cfg is None or not bool(getattr(sl_cfg, "enabled", False)):
-        return
-    if os.getenv("OPENSQUILLA_ROUTER_SELFLEARN_DISABLED") == "1":
-        return  # the whole loop is deliberately off; unreachable-trigger noise helps no one
-    dream_cfg = getattr(getattr(config, "memory", None), "dream", None)
-    dream_on = bool(getattr(dream_cfg, "enabled", False))
-    dream_scheduled = dream_on and bool(getattr(dream_cfg, "auto_schedule", False))
-    if dream_scheduled and os.getenv("OPENSQUILLA_MEMORY_DREAM_DISABLED") != "1":
-        return
-    log.warning(
-        "router_self_learning.trigger_unreachable",
-        dream_enabled=dream_on,
-        dream_auto_schedule=bool(getattr(dream_cfg, "auto_schedule", False)),
-        hint=(
-            "squilla_router.self_learning.enabled is true but the post-dream "
-            "training trigger cannot fire; capture will accumulate samples "
-            "without ever training. Set memory.dream.enabled=true and "
-            "memory.dream.auto_schedule=true (and clear "
-            "OPENSQUILLA_MEMORY_DREAM_DISABLED) to activate training."
-        ),
-    )
+        return None
+    return result if isinstance(result, list) else None
 
 
 async def _register_dream_crons(
@@ -383,7 +344,7 @@ async def _register_dream_crons(
     scheduler: Any,
     memory_config: Any,
     agent_ids: list[str],
-) -> None:
+) -> bool:
     """Register a `memory_dream` cron per agent when enabled.
 
     Respects the ``OPENSQUILLA_MEMORY_DREAM_DISABLED=1`` kill switch.
@@ -396,6 +357,8 @@ async def _register_dream_crons(
 
     dream_cfg = getattr(memory_config, "dream", None)
     existing_jobs = await _list_scheduler_jobs(scheduler)
+    if existing_jobs is None:
+        return False
     existing_by_name = {
         getattr(job, "name", ""): job
         for job in existing_jobs
@@ -410,12 +373,11 @@ async def _register_dream_crons(
         disabled_reason = "auto_schedule_disabled"
 
     if disabled_reason is not None:
-        await _pause_dream_crons(
+        return await _pause_dream_crons(
             scheduler=scheduler,
             jobs=list(existing_by_name.values()),
             reason=disabled_reason,
         )
-        return
 
     assert dream_cfg is not None
     if getattr(dream_cfg, "cron", None):
@@ -437,10 +399,14 @@ async def _register_dream_crons(
             if getattr(existing, "session_target", None) != SessionTarget.ISOLATED:
                 patch["session_target"] = SessionTarget.ISOLATED
             update_job = getattr(scheduler, "update_job", None)
-            if patch and callable(update_job):
+            if patch:
+                if not callable(update_job):
+                    return False
                 result = update_job(getattr(existing, "id"), **patch)
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
+                if result is None:
+                    return False
             # A previous disabled-config pass (or boot) may have left the row
             # paused; with dream now enabled the job must actually fire again.
             # Matters for live re-reconciliation after a config RPC edit.
@@ -448,10 +414,14 @@ async def _register_dream_crons(
                 getattr(existing, "status", None), "value", getattr(existing, "status", "")
             )
             resume_job = getattr(scheduler, "resume_job", None)
-            if status == "paused" and callable(resume_job):
+            if status == "paused":
+                if not callable(resume_job):
+                    return False
                 result = resume_job(getattr(existing, "id"))
                 if inspect.isawaitable(result):
-                    await result
+                    result = await result
+                if result is None:
+                    return False
                 log.info("boot.dream.resumed", agent_id=agent_id)
             log.info(
                 "boot.dream.already_registered",
@@ -475,10 +445,12 @@ async def _register_dream_crons(
             schedule_kind=schedule_kind.value,
             schedule_value=schedule_value,
         )
+    return True
 
 
-async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) -> None:
+async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) -> bool:
     """Pause managed Dream cron jobs so persisted rows cannot bypass config."""
+    success = True
     pause_job = getattr(scheduler, "pause_job", None)
     update_job = getattr(scheduler, "update_job", None)
     for job in jobs:
@@ -494,9 +466,13 @@ async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) ->
             elif callable(update_job):
                 result = update_job(job_id, enabled=False)
             else:
+                success = False
                 continue
             if inspect.isawaitable(result):
-                await result
+                result = await result
+            if result is None:
+                success = False
+                continue
             log.info(
                 "boot.dream.paused",
                 job_id=job_id,
@@ -504,16 +480,14 @@ async def _pause_dream_crons(*, scheduler: Any, jobs: list[Any], reason: str) ->
                 reason=reason,
             )
         except Exception as exc:  # noqa: BLE001
+            success = False
             log.warning(
                 "boot.dream.pause_failed",
                 job_id=job_id,
                 reason=reason,
                 error=str(exc),
             )
-
-
-
-
+    return success
 
 
 @dataclass
@@ -4500,44 +4474,6 @@ async def start_gateway_server(
                 workspace_strict = bool(workspace_dir)
             return str(workspace_dir), workspace_strict
 
-        async def _maybe_run_router_self_learning(agent_id: str) -> None:
-            """Opportunistic router retrain, piggybacking on the dream cadence.
-
-            Gated (off by default) and run in a worker thread so the
-            subprocess-bounded LightGBM fit never blocks the event loop. Never
-            raises onto the dream hook.
-            """
-            router_cfg = getattr(config, "squilla_router", None)
-            sl_cfg = getattr(router_cfg, "self_learning", None)
-            if sl_cfg is None or not bool(getattr(sl_cfg, "enabled", False)):
-                return
-            try:
-                import anyio
-
-                from opensquilla.squilla_router.self_learning.orchestrator import (
-                    maybe_run_update_router,
-                )
-
-                result = await anyio.to_thread.run_sync(
-                    lambda: maybe_run_update_router(agent_id, router_cfg=router_cfg)
-                )
-                log.info(
-                    "router_self_learning.post_dream",
-                    agent_id=agent_id,
-                    ran=result.ran,
-                    reason=result.reason,
-                    version=result.version,
-                )
-            except Exception as exc:  # never poison the dream hook
-                log.warning(
-                    "router_self_learning.post_dream_error",
-                    agent_id=agent_id,
-                    error=str(exc),
-                )
-
-
-        async def _post_dream_learning(agent_id: str, dream_summary: str = "") -> None:
-            await _maybe_run_router_self_learning(agent_id)
 
         agent_handler = make_agent_run_handler(
             delivery_chain=delivery_chain,
@@ -4570,7 +4506,6 @@ async def start_gateway_server(
             should_skip=lambda: (
                 "disabled" if not getattr(config.memory.dream, "enabled", False) else None
             ),
-            post_dream_hook=_post_dream_learning,
             usage_event_sink=usage_event_sink,
         )
         svc.cron_scheduler.register_handler("agent_run", agent_handler)
@@ -4586,18 +4521,16 @@ async def start_gateway_server(
             memory_config=config.memory,
             agent_ids=_configured_agent_ids(config),
         )
-        _warn_if_self_learning_unreachable(config)
 
         async def _reconcile_dream_runtime_crons() -> None:
-            # Re-run the idempotent registrar against the LIVE config object:
-            # a config RPC edit (e.g. the self-learning -> dream linkage) has
-            # already mutated it in place by the time this fires, so jobs are
-            # created/resumed/paused to match without a gateway restart.
-            await _register_dream_crons(
+            # Reconcile schedules after dream settings change in the live config.
+            reconciled = await _register_dream_crons(
                 scheduler=svc.cron_scheduler,
                 memory_config=config.memory,
                 agent_ids=_configured_agent_ids(config),
             )
+            if not reconciled:
+                raise RuntimeError("Dream schedules could not be reconciled")
 
         from opensquilla.gateway.dream_bridge import register_dream_reconciler
 

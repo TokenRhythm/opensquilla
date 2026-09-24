@@ -33,7 +33,7 @@ function seededFixture(feature: string, extra: Record<string, string> = {}): str
 describe('transport architecture hard-zero integration', () => {
   it('rejects generated wire types through data-only facades and Adapter re-exports', () => {
     const root = fixture({
-      'src/contracts/generated/v4/routerFeedbackSubmit.ts': `
+      'src/contracts/generated/v4/exampleSubmit.ts': `
         export interface Result {
           accepted: boolean
           reason?: string | null
@@ -42,23 +42,23 @@ describe('transport architecture hard-zero integration', () => {
         }
       `,
       'src/contracts/publicData.ts': `
-        import type { Result as WireResult } from './generated/v4/routerFeedbackSubmit'
-        export type RouteFeedbackResult = Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>
+        import type { Result as WireResult } from './generated/v4/exampleSubmit'
+        export type ExampleResult = Readonly<Pick<WireResult, 'accepted' | 'reason' | 'recorded'>>
       `,
       'src/adapters/gateway/leak.ts': `
-        export type { Result } from '../../contracts/generated/v4/routerFeedbackSubmit'
+        export type { Result } from '../../contracts/generated/v4/exampleSubmit'
       `,
       'src/modules/leak.ts': `
         import type { Result } from '../adapters/gateway/leak'
-        export interface LeakedFeedback { submit(): Promise<Result> }
+        export interface LeakedExample { submit(): Promise<Result> }
       `,
       'src/feature.ts': `
-        import type { Result } from './contracts/generated/v4/routerFeedbackSubmit'
+        import type { Result } from './contracts/generated/v4/exampleSubmit'
       `,
     })
     const failures = evaluateRpcArchitectureGate({ root }).failures
     expect(failures).toContain(
-      'src/contracts/publicData.ts: generated wire Contract import "./generated/v4/routerFeedbackSubmit" is allowed only in a Gateway Adapter or test.',
+      'src/contracts/publicData.ts: generated wire Contract import "./generated/v4/exampleSubmit" is allowed only in a Gateway Adapter or test.',
     )
     expect(failures.some(failure => failure.startsWith('src/modules/leak.ts:'))).toBe(true)
     expect(failures.some(failure => failure.startsWith('src/feature.ts:'))).toBe(true)

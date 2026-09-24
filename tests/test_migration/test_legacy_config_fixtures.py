@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 
-import opensquilla.gateway.config as config_module
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.config_migration import LATEST_CONFIG_VERSION, migrate_config_payload
 from opensquilla.migration.opensquilla_home import (
@@ -273,7 +272,9 @@ def test_readonly_config_location_degrades_to_warning(
     def _raise(*args: object, **kwargs: object) -> None:
         raise PermissionError("read-only filesystem")
 
-    monkeypatch.setattr(config_module, "backup_and_write_migrated_config", _raise)
+    monkeypatch.setattr(
+        "opensquilla.gateway.config_migration.backup_and_write_migrated_config", _raise
+    )
     cfg = GatewayConfig.load_from_toml(config_path)
     assert cfg is not None
     # The original file is untouched (no partial rewrite).

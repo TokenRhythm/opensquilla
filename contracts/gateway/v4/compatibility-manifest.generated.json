@@ -359,13 +359,13 @@
       "lifecycle": "stable",
       "name": "config.patch",
       "schema": "platform/config-patch.schema.json",
-      "schemaSha256": "532070ce7b287105434460e7a51ed52ad5ea0e33b97bbca25927ed989ca6f937"
+      "schemaSha256": "c004f19778473d68afb5cb8ae4c7832d87730c8fba98b6855c195a2038cc79d1"
     },
     {
       "lifecycle": "stable",
       "name": "config.patch.safe",
       "schema": "platform/config-patch-safe.schema.json",
-      "schemaSha256": "867ed7d4269947560859f6c36a36bfc6910e788fe9d6101537b282b36fa35a7f"
+      "schemaSha256": "3629f65de5f4ade64cb665699d636c38836a6bdafc34fb0a8282029ac4a4992e"
     },
     {
       "lifecycle": "stable",
@@ -864,18 +864,6 @@
       "name": "providers.status",
       "schema": "platform/providers-status.schema.json",
       "schemaSha256": "5653b7e92a76e4d62ef648a693e24649de33ea0df766d6e5df039a69c8526c00"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "router.feedback.submit",
-      "schema": "conversation/router-feedback-submit.schema.json",
-      "schemaSha256": "a6d6ea9552a8727811a4eabf452d0d06f7392b35a6322749838fd32884f692b1"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "router.selflearning.status",
-      "schema": "observability/router-selflearning-status.schema.json",
-      "schemaSha256": "bac181173600854fb2de5302d5ea41a0becfe0b340af7dfae30652e85aaf9a07"
     },
     {
       "lifecycle": "stable",
@@ -1397,10 +1385,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "c6f0be5156339f5dd50205258c6ecaea3a49b195c38fdebc4e9dc188919eaa1f",
-    "methodCount": 204,
-    "schemaCount": 214,
-    "schemaTreeSha256": "6c33f94b461964765162f58f1980bd5fee81e7dc1ffa180f7c6dba63bd855bab",
+    "generatorSha256": "79b6d5194a1793c4db8a5f0aa46bf7c9aa3c5cd5ff2c7eca961e83aed81b5d22",
+    "methodCount": 202,
+    "schemaCount": 212,
+    "schemaTreeSha256": "d42a425451c1134bfdf89329dc1bce6f9a1e62f43d422dcdba9535890466f2ec",
     "toolchains": {
       "legacyTypes": {
         "python": {

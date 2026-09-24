@@ -62,7 +62,6 @@ describe('Gateway Adapter composition', () => {
       'sandboxRuntime',
       'usageReporting',
       'commandCatalog',
-      'routeFeedback',
       'promptCacheLease',
       'clarificationSubmission',
       'sessionMaintenance',

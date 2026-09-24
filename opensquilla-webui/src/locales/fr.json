@@ -738,11 +738,9 @@
     },
     "memoryOverview": {
       "title": "Mémoire",
-      "desc": "Choisissez ce qu'OpenSquilla mémorise et gérez les fonctions d'apprentissage facultatives.",
+      "desc": "Choisissez ce dont OpenSquilla se souvient et gérez la consolidation de la mémoire.",
       "autoCaptureLabel": "Capture des conversations",
       "autoCaptureDesc": "Enregistre localement les conversations et échanges bruts à des fins d’audit et de récupération. Ils ne sont ni ajoutés à la mémoire à long terme ni indexés pour la recherche en mémoire.",
-      "learningSummary": "Mémoire et auto-apprentissage (avancé)",
-      "learningDesc": "Les fonctions d'apprentissage facultatives peuvent utiliser des jetons supplémentaires et nécessiter un redémarrage.",
       "profileImportLabel": "Importation du profil",
       "profileImportDesc": "Examinez et importez des données d'identité et de mémoire compatibles.",
       "profileImportAction": "Ouvrir"
@@ -1936,34 +1934,11 @@
       "audioEnvVar": "Variable d'environnement à lire pour l'accès au fournisseur audio.",
       "remoteEmbeddingKey": "Clé API d'embedding distant ou référence d'environnement."
     },
-    "memoryLearning": {
-      "groupTitle": "Mémoire et auto-apprentissage",
+    "memoryDream": {
       "dreamLabel": "Consolidation de la mémoire (dream)",
       "tokenBadge": "consommation de tokens",
-      "dreamDesc": "Exécute périodiquement un passage du modèle pour consolider la mémoire de session (toutes les 24 h). L’auto-apprentissage du routage s’appuie sur ces fenêtres d’inactivité pour s’entraîner.",
-      "selfLearningLabel": "Auto-apprentissage du routage de modèles",
-      "selfLearningDesc": "Apprend vos préférences de routage à partir de vos corrections. Entièrement local — stocke des vecteurs de caractéristiques, jamais le texte des conversations.",
-      "depDefault": "Dépend de la consolidation de la mémoire ci-dessus : l’activer ici l’active aussi ; désactiver la consolidation seule maintient la collecte mais suspend l’entraînement automatique.",
-      "depLinked": "La consolidation de la mémoire a été activée en même temps. Vous pouvez la désactiver séparément — la collecte continue, seul l’entraînement automatique est suspendu.",
-      "depPaused": "La consolidation de la mémoire est désactivée — les échantillons sont toujours collectés, mais aucun entraînement automatique n’a lieu. Réactivez-la pour reprendre.",
-      "restartRequired": "Un redémarrage de la passerelle est nécessaire pour appliquer le changement de planification.",
-      "statusModel": "Modèle de routage",
-      "statusSamples": "Corrections",
-      "statusLastAction": "Dernière action",
-      "modelBaseline": "Référence d’usine",
-      "modelLearned": "Version apprise v{version}",
-      "samplesTotal": "{total} collectés au total",
-      "gatePausedDream": "Entraînement suspendu — en attente de la réactivation de la consolidation de la mémoire",
-      "gateReason": {
-        "ready": "Prêt — s’entraînera à la prochaine fenêtre",
-        "disabled": "Désactivé",
-        "no_data": "Aucun échantillon collecté pour l’instant",
-        "agent_active": "En attente d’une fenêtre d’inactivité",
-        "cooldown": "En refroidissement après un entraînement récent",
-        "insufficient_data": "Pas encore entraîné — corrections insuffisantes",
-        "insufficient_class_diversity": "Pas encore entraîné — les corrections couvrent trop peu de niveaux de routage"
-      },
-      "detachedNote": "Les poids de base du routage ont été mis à niveau. L’apprentissage bâti sur les anciens poids a été archivé ; vos corrections sont conservées et seront réapprises automatiquement sur les nouveaux poids. Aucune action requise."
+      "dreamDesc": "Exécute périodiquement un passage du modèle pour consolider la mémoire de session.",
+      "restartRequired": "Un redémarrage de la passerelle est nécessaire pour appliquer le changement de planification."
     },
     "field": {
       "keepCurrentPlaceholder": "laisser vide pour conserver la valeur actuelle",
@@ -3840,6 +3815,10 @@
       "setup": "Configurer"
     },
     "usageDetails": "Détails d'utilisation",
+    "messageFeedback": {
+      "up": "Utile (sur cette page uniquement)",
+      "down": "Pas utile (sur cette page uniquement)"
+    },
     "regenerate": "Régénérer",
     "forkConversation": "Créer une branche ici",
     "forkCreating": "Création de la branche…",
@@ -4468,14 +4447,6 @@
       "sessionModelBusy": "Vous pourrez changer de modèle une fois la réponse en cours terminée.",
       "router": "Routage intelligent des modèles",
       "ensemble": "Ensemble de modèles"
-    },
-    "routeFeedback": {
-      "up": "Bon choix de modèle pour ce tour",
-      "down": "Mauvais choix de modèle pour ce tour",
-      "upEnsemble": "Satisfait de cette réponse agrégée",
-      "downEnsemble": "Insatisfait de cette réponse agrégée",
-      "expired": "L’enregistrement de routage de ce message a expiré",
-      "failed": "Impossible d’enregistrer votre évaluation"
     }
   },
   "shared": {

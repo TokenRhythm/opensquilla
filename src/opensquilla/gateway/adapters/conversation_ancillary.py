@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from opensquilla.application.conversation_ancillary import (
     ClarificationSubmission,
@@ -13,12 +13,8 @@ from opensquilla.application.conversation_ancillary import (
     PromptCacheLease,
     PromptCacheLeasePort,
     PromptCachePolicy,
-    RouteFeedback,
-    RouteFeedbackPort,
-    RouteFeedbackRating,
     SetPromptCacheLease,
     SubmitClarification,
-    SubmitRouteFeedback,
     UsageQuery,
     UsageReporting,
     UsageReportingPort,
@@ -26,21 +22,19 @@ from opensquilla.application.conversation_ancillary import (
 
 
 class GatewayConversationAncillaryAdapter:
-    """Wire projection for five independent application interfaces."""
+    """Wire projection for four independent application interfaces."""
 
     def __init__(
         self,
         *,
         usage: UsageReportingPort | None = None,
         commands: CommandCatalogPort | None = None,
-        feedback: RouteFeedbackPort | None = None,
         prompt_cache: PromptCacheLeasePort | None = None,
         clarification: ClarificationSubmissionPort | None = None,
         prompt_cache_policy: PromptCachePolicy | None = None,
     ) -> None:
         self._usage = UsageReporting(usage) if usage is not None else None
         self._commands = CommandCatalog(commands) if commands is not None else None
-        self._feedback = RouteFeedback(feedback) if feedback is not None else None
         self._clarification = (
             ClarificationSubmission(clarification)
             if clarification is not None
@@ -96,22 +90,6 @@ class GatewayConversationAncillaryAdapter:
             )
         )
 
-    async def submit_feedback(self, params: dict[str, Any] | None) -> dict[str, Any]:
-        raw = self._raw(params)
-        decision_id = raw.get("decisionId", raw.get("decision_id"))
-        rating = raw.get("rating")
-        if not isinstance(decision_id, str):
-            raise ValueError("params.decisionId must be a string")
-        if rating not in {"up", "down", "neutral"}:
-            raise ValueError("params.rating must be up, down, or neutral")
-        return dict(
-            await self._require(self._feedback, "route feedback").submit(
-                SubmitRouteFeedback(
-                    decision_id=decision_id,
-                    rating=cast(RouteFeedbackRating, rating),
-                )
-            )
-        )
 
     def _prompt(self) -> PromptCacheLease:
         if self._prompt_cache is None:

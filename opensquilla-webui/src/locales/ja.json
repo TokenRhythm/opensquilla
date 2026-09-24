@@ -738,11 +738,9 @@
     },
     "memoryOverview": {
       "title": "メモリ",
-      "desc": "OpenSquilla が記憶する内容と任意の学習機能を管理します。",
+      "desc": "OpenSquilla が記憶する内容を選び、メモリ整理を管理します。",
       "autoCaptureLabel": "会話記録の保存",
       "autoCaptureDesc": "監査と復旧のため、会話とターンの生データをローカルに保存します。長期メモリには追加されず、検索用のインデックスも作成されません。",
-      "learningSummary": "メモリと自己学習（詳細）",
-      "learningDesc": "任意の学習機能は追加のモデルトークンを使い、再起動が必要な場合があります。",
       "profileImportLabel": "プロフィールのインポート",
       "profileImportDesc": "互換性のある ID とメモリのデータを確認して取り込みます。",
       "profileImportAction": "開く"
@@ -1936,34 +1934,11 @@
       "audioEnvVar": "音声プロバイダーへのアクセスに読み取る環境変数。",
       "remoteEmbeddingKey": "リモート埋め込み API キーまたは環境変数参照。"
     },
-    "memoryLearning": {
-      "groupTitle": "メモリと自己学習",
+    "memoryDream": {
       "dreamLabel": "メモリ整理(dream)",
       "tokenBadge": "トークン消費",
-      "dreamDesc": "定期的にモデルを呼び出してセッションメモリを整理します(24 時間ごと)。モデルルーティングの自己学習はこの空き時間を訓練の契機として利用します。",
-      "selfLearningLabel": "モデルルーティング自己学習",
-      "selfLearningDesc": "あなたの修正からルーティングの傾向を学習します。すべて端末内で完結——特徴ベクトルのみを保存し、会話の原文は保存しません。",
-      "depDefault": "上のメモリ整理に依存します。これを有効にするとメモリ整理も有効になります。メモリ整理だけを無効にした場合、サンプル収集は続きますが自動訓練は停止します。",
-      "depLinked": "メモリ整理はこの項目と同時に有効化されました。個別に無効化できます——自己学習は収集を続け、自動訓練のみ停止します。",
-      "depPaused": "メモリ整理が無効です——サンプルは収集されていますが、自動訓練は行われません。再度有効にすると再開します。",
-      "restartRequired": "スケジュール変更を反映するにはゲートウェイの再起動が必要です。",
-      "statusModel": "ルーティングモデル",
-      "statusSamples": "修正サンプル",
-      "statusLastAction": "前回の動作",
-      "modelBaseline": "工場出荷ベースライン",
-      "modelLearned": "学習版 v{version}",
-      "samplesTotal": "累計 {total} 件収集",
-      "gatePausedDream": "訓練は一時停止中——メモリ整理の再有効化を待っています",
-      "gateReason": {
-        "ready": "準備完了——次の訓練ウィンドウで実行されます",
-        "disabled": "無効",
-        "no_data": "サンプルはまだありません",
-        "agent_active": "アイドル時間を待機中",
-        "cooldown": "最近訓練したためクールダウン中",
-        "insufficient_data": "未訓練——修正サンプルが不足しています",
-        "insufficient_class_diversity": "未訓練——修正サンプルのルーティング階層が偏っています"
-      },
-      "detachedNote": "ルーティングの基本重みがアップグレードされました。旧重みに基づく学習成果はアーカイブされました。修正サンプルは影響を受けず、新しい重みで自動的に再学習されます。操作は不要です。"
+      "dreamDesc": "定期的にモデルを呼び出してセッションメモリを整理します。",
+      "restartRequired": "スケジュール変更を反映するにはゲートウェイの再起動が必要です。"
     },
     "field": {
       "keepCurrentPlaceholder": "空欄のままにすると現在の値を保持します",
@@ -3840,6 +3815,10 @@
       "setup": "設定"
     },
     "usageDetails": "使用量の詳細",
+    "messageFeedback": {
+      "up": "役に立った（このページ内のみ）",
+      "down": "役に立たなかった（このページ内のみ）"
+    },
     "regenerate": "再生成",
     "forkConversation": "ここからブランチを作成",
     "forkCreating": "ブランチを作成中…",
@@ -4468,14 +4447,6 @@
       "sessionModelBusy": "現在の応答が完了してからモデルを変更できます。",
       "router": "インテリジェントモデルルーティング",
       "ensemble": "モデルアンサンブル"
-    },
-    "routeFeedback": {
-      "up": "このターンのモデル選択は適切だった",
-      "down": "このターンのモデル選択は不適切だった",
-      "upEnsemble": "この統合回答に満足",
-      "downEnsemble": "この統合回答に不満",
-      "expired": "このメッセージのルーティング記録は期限切れです",
-      "failed": "評価を記録できませんでした"
     }
   },
   "shared": {
