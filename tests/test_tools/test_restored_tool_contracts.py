@@ -19,8 +19,10 @@ def test_web_discover_stays_in_allowlists() -> None:
     assert "web_discover" in _SAFE_TOOL_NAMES
 
 
-def test_background_timeout_ceiling_covers_coding_wait() -> None:
+def test_background_timeout_ceiling_covers_process_wait() -> None:
     # background_process must not clamp below the process(wait)
     # ceiling, or long-running builds get killed before the wait contract expects.
-    assert shell._MAX_BACKGROUND_TIMEOUT >= shell._CODING_PROCESS_WAIT_TIMEOUT
+    assert shell._MAX_BACKGROUND_TIMEOUT >= shell._MAX_PROCESS_WAIT_TIMEOUT
     assert shell._MAX_BACKGROUND_TIMEOUT == 5400.0
+    assert shell._resolve_background_timeout(5400.0) == 5400.0
+    assert shell._resolve_process_wait_timeout(5400.0) == 5400.0
