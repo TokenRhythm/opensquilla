@@ -5,7 +5,6 @@ import { useAppStore, type ThemeMode } from '@/stores/app'
 import { themePickerOptions } from '@/themes/registry'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
-import { useBgm } from '@/composables/useBgm'
 import { useSidebarLayout } from '@/composables/useSidebarLayout'
 import {
   TOOL_DETAIL_DISPLAY_MODES,
@@ -59,10 +58,6 @@ const {
 function pickToolDetailDisplay(mode: ToolDetailDisplayMode) {
   setToolDetailDisplayMode(mode)
 }
-
-// Background-music feature gate (off by default). Same singleton the topbar
-// control and the command palette read, so all three surfaces stay in lockstep.
-const { enabled: bgmEnabled, setEnabled: setBgmEnabled } = useBgm()
 
 const {
   mode: sidebarLayoutMode,
@@ -428,22 +423,6 @@ onBeforeUnmount(stopCustomStepRepeat)
           <span class="sidebar-width__mode">{{ sidebarModeLabel }}</span>
           <span>{{ sidebarWidthStatus }}</span>
         </div>
-      </div>
-    </div>
-
-    <div class="control-row control-row--stack">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('settings.appearance.bgmLabel') }}</span>
-        <span class="control-row__desc">{{ t('settings.appearance.bgmDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <ControlSwitch
-          :checked="bgmEnabled"
-          :aria-label="t('settings.appearance.bgmLabel')"
-          name="appearance-bgm"
-          data-testid="settings-bgm-toggle"
-          @change="setBgmEnabled"
-        />
       </div>
     </div>
   </section>

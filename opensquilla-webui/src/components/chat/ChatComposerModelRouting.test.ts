@@ -86,6 +86,12 @@ describe('Native cascading model routing menu', () => {
     await nextTick()
     expect(query('[role="listbox"]')).toBeNull()
   })
+  it('shows concise theme-colored benefit tags for each routing mode', async () => {
+    await mount({}, false)
+    expect([...document.querySelectorAll('.routing-mode__benefit')].map((el) => el.textContent))
+      .toEqual(['Token-efficient', 'Capability-first'])
+    expect(document.querySelector('.routing-mode__label')?.textContent).toBe('Fixed model')
+  })
   it('preserves provider identity when two providers expose the same model id', async () => {
     const { selected } = await mount()
     expect(document.querySelectorAll('[role="option"]')).toHaveLength(3)
@@ -133,6 +139,29 @@ describe('Native cascading model routing menu', () => {
     expect(document.querySelectorAll('[role="option"]')).toHaveLength(25)
     expect(query('.routing-show-all').textContent).toBe('View all models')
   })
+  it.each([360, 390, 768, 1366])(
+    'keeps expansion in the scrolling area but outside the listbox at %ipx',
+    async (width) => {
+      vi.spyOn(window, 'innerWidth', 'get').mockReturnValue(width)
+      await mount({
+        availableModels: Array.from({ length: 15 }, (_, index) => ({
+          id: `m-${index}`,
+          name: `Model ${index}`,
+          provider: 'provider-a',
+        })),
+      })
+      const listArea = query('.routing-models')
+      const listbox = query('[role="listbox"]')
+      const showAll = query<HTMLButtonElement>('.routing-show-all')
+      expect(listArea.contains(listbox)).toBe(true)
+      expect(listArea.children).toHaveLength(2)
+      expect(listArea.firstElementChild).toBe(listbox)
+      expect(listArea.lastElementChild).toBe(showAll)
+      expect(listArea.contains(showAll)).toBe(true)
+      expect(showAll.closest('[role="listbox"]')).toBeNull()
+      expect(showAll.tabIndex).toBe(0)
+    },
+  )
   it.each(['m-14', 'private-model'])('keeps selected %s visible within its provider budget', async (model) => {
     const { selected } = await mount({
       availableModels: Array.from({ length: 15 }, (_, index) => ({
@@ -184,14 +213,23 @@ describe('Native cascading model routing menu', () => {
     await key(input, 'Enter')
     expect(selected).toHaveBeenCalledWith({ model: 'm-11', provider: 'provider-b' })
   })
-  it('does not add provider headings or loading noise to a usable single-provider list', async () => {
+  it('keeps a refreshing single-provider list usable with one quiet status message', async () => {
     await mount({
       availableModels: [{ id: 'a1', name: 'Alpha', provider: 'provider-a' }],
       modelsLoading: true,
-      modelProviderErrors: [{ provider: 'provider-a', kind: 'network', detail: 'offline' }],
     })
     expect(query('.routing-provider-heading')).toBeNull()
+    expect(query('.routing-catalog-label[role="status"]')?.textContent).toBe('Refreshing models…')
     expect(query('.routing-issue')).toBeNull()
+    expect(query('[role="option"][aria-disabled="true"]')).toBeNull()
+  })
+  it('discloses a failed refresh without disabling cached provider models', async () => {
+    await mount({
+      availableModels: [{ id: 'a1', name: 'Alpha', provider: 'provider-a' }],
+      modelProviderErrors: [{ provider: 'provider-a', kind: 'network', detail: 'offline' }],
+    })
+    expect(query('.routing-issue')?.textContent).toContain('Refresh failed. Showing the previous list.')
+    expect(query('.routing-model-scope')).toBeNull()
     expect(query('[role="option"][aria-disabled="true"]')).toBeNull()
   })
   it('keeps keyboard focus on the same model when discovery inserts an earlier row', async () => {

@@ -293,8 +293,17 @@ jobs:
             exit 1
           fi
           if [[ -f scripts/verify_webui_artifact.py ]]; then
-            python scripts/verify_webui_artifact.py \
-              --forbid-personal-bgm \
+            verify_command=(python scripts/verify_webui_artifact.py)
+            # Existing-tag repairs execute that tag's own verifier. Only old
+            # verifiers need the optional privacy gate; current artifacts
+            # reject retired music assets unconditionally.
+            if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && -n "${RELEASE_TAG}" ]]; then
+              verifier_help="$(python scripts/verify_webui_artifact.py --help)"
+              if [[ "${verifier_help}" == *"--forbid-personal-bgm"* ]]; then
+                verify_command+=(--forbid-personal-bgm)
+              fi
+            fi
+            "${verify_command[@]}" \
               --dist src/opensquilla/gateway/static/dist \
               --wheel "${wheels[0]}"
           else
@@ -457,14 +466,31 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          node scripts/prepare-macos-keychain.cjs
           npm run build:gateway
           npm run build
           npm run verify:prepared
-          npx electron-builder --mac --publish never
+          npx electron-builder --mac --publish never --config.forceCodeSigning=true --config.dmg.sign=true
 
       - name: Verify Electron package
         working-directory: desktop/electron
         run: npm run verify:package
+
+      - name: Verify macOS signatures and notarization
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(dist/desktop-electron/mac*/OpenSquilla.app)
+          dmgs=(dist/desktop-electron/OpenSquilla-*-mac-arm64.dmg)
+          if [[ "${#apps[@]}" -ne 1 || "${#dmgs[@]}" -ne 1 ]]; then
+            echo "Expected exactly one macOS app and signed DMG" >&2
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 "${apps[0]}"
+          spctl --assess --type execute --verbose=2 "${apps[0]}"
+          xcrun stapler validate "${apps[0]}"
+          codesign --verify --strict --verbose=2 "${dmgs[0]}"
 
       - name: Enforce slim macOS artifact size budgets
         run: >-
@@ -700,7 +726,8 @@ jobs:
         working-directory: desktop/electron
         env:
           OPENSQUILLA_REQUIRE_PACKAGED_GATEWAY_SMOKE: "1"
-        run: npm run verify:gateway-smoke
+          OPENSQUILLA_SMOKE_PROVISION_SANDBOX: "1"
+        run: npm run verify:gateway-smoke -- --provision-windows-sandbox
 
       - name: Record signed candidate identity
         shell: pwsh
@@ -889,6 +916,7 @@ jobs:
           import hashlib
           import os
           import re
+          import shutil
           from pathlib import Path
 
           def desktop_asset_version(version: str) -> str:
@@ -924,13 +952,18 @@ jobs:
               for path in assets
           ]
           assert sha256s.read_text(encoding="utf-8").splitlines() == expected
+          # Internal build evidence must stay out of release downloads.
+          public = dist / "public"
+          public.mkdir()
+          for path in [*assets, sha256s]:
+              shutil.copyfile(path, public / path.name)
           PY
 
       - name: Upload aggregate workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: opensquilla-release-assets-${{ env.RELEASE_PROFILE }}
-          path: dist/*
+          path: dist/public/*
           overwrite: true
 
       - name: Checkout publication validation tooling
@@ -1049,7 +1082,7 @@ jobs:
                   )
           PY
           assert_release_is_safe_draft
-          gh release upload "${TAG}" dist/* --clobber
+          gh release upload "${TAG}" dist/public/* --clobber
           assert_release_is_safe_draft
 
       - name: Verify GitHub Release assets

@@ -201,7 +201,6 @@ _EXEC_TOOL_TIMEOUT_PADDING = _APPROVAL_RETRY_WAIT_SECONDS + 5.0
 _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
 _MAX_BACKGROUND_TIMEOUT = 5400.0
 _DEFAULT_PROCESS_WAIT_TIMEOUT = 600.0
-_CODING_PROCESS_WAIT_TIMEOUT = 5400.0
 _MAX_PROCESS_WAIT_TIMEOUT = 5400.0
 _PROCESS_WAIT_TIMEOUT_PADDING = 5.0
 _BACKGROUND_TERMINATE_TIMEOUT = 1.0
@@ -1067,21 +1066,6 @@ def _base_shell_environment() -> dict[str, str]:
     else:
         environment = _runtime_shell_environment(dict(os.environ))
 
-    # Carry the live turn's gate and authoritative config path into a code-task
-    # CLI child. ``gateway run --config`` does not mutate the parent process
-    # environment, so rediscovery in the child can otherwise select the wrong
-    # profile. These runtime-only values are removed before the nested coding
-    # Agent starts and are never serialized into telemetry.
-    if ctx is not None:
-        environment["OPENSQUILLA_CODING_MODE_ACTIVE"] = (
-            "1" if bool(getattr(ctx, "coding_mode", False)) else "0"
-        )
-        config = getattr(ctx, "sandbox_gateway_config", None)
-        config_path = str(getattr(config, "config_path", "") or "").strip()
-        if config_path:
-            environment["OPENSQUILLA_CODING_MODE_CONFIG_PATH"] = config_path
-        else:
-            environment.pop("OPENSQUILLA_CODING_MODE_CONFIG_PATH", None)
     return environment
 
 
@@ -1565,7 +1549,6 @@ class _BgSession:
     local_urls: list[str] = field(default_factory=list)
     output_capture: BoundedOutputCapture = field(default_factory=BoundedOutputCapture)
     output_lines: list[str] = field(default_factory=list)
-    code_task_marker: dict[str, str] | None = None
     done: bool = False
     timed_out: bool = False
     killed: bool = False
@@ -5887,9 +5870,6 @@ def _resolve_background_timeout(timeout: float | int | None) -> float:
 
 
 def _process_wait_default() -> float:
-    ctx = current_tool_context.get()
-    if ctx is not None and getattr(ctx, "coding_mode", False):
-        return _CODING_PROCESS_WAIT_TIMEOUT
     return _DEFAULT_PROCESS_WAIT_TIMEOUT
 
 
@@ -6151,63 +6131,11 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
     )
     if runtime_failure is not None:
         payload["runtime_failure"] = runtime_failure
-    code_task = _code_task_status_payload(session)
-    if code_task:
-        payload["code_task"] = code_task
     return payload
 
 
-def _code_task_status_payload(session: _BgSession) -> dict[str, object] | None:
-    if "code-task" not in session.command:
-        return None
-    output = _bg_rendered_output(session)
-    marker = session.code_task_marker or _parse_code_task_marker(output)
-    if marker is None:
-        return None
-    status_path = Path(marker["status_path"]).expanduser()
-    payload: dict[str, object] = dict(marker)
-    if status_path.is_file():
-        try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            status = {}
-        if isinstance(status, dict):
-            for key in (
-                "phase",
-                "updated",
-                "pid",
-                "current_command",
-                "last_output_at",
-                "quiet_for_seconds",
-                "state",
-                "verified",
-                "error",
-                "final_failure_reason",
-                "installer_path",
-                "log_paths",
-            ):
-                if key in status:
-                    payload[key] = status[key]
-    return payload
 
 
-def _parse_code_task_marker(output: str) -> dict[str, str] | None:
-    for line in output.splitlines():
-        if "[code-task] run started:" not in line or "status=" not in line:
-            continue
-        status_tail = line.split("status=", 1)[1]
-        status_end = status_tail.find("status.json")
-        if status_end < 0:
-            continue
-        status_path = status_tail[: status_end + len("status.json")]
-        payload = {"status_path": status_path}
-        run_match = re.search(r"run_id=([^\s]+)", line)
-        if run_match:
-            payload["run_id"] = run_match.group(1)
-        if "artifact_dir=" in line and " status=" in line:
-            payload["artifact_dir"] = line.split("artifact_dir=", 1)[1].split(" status=", 1)[0]
-        return payload
-    return None
 
 
 def _local_server_urls_from_command(command: str) -> list[str]:
@@ -6313,56 +6241,70 @@ async def _start_exec_command_session(
     if session is None:
         return started
 
-    if stdin is not None:
-        encoded = stdin.encode("utf-8")
-        try:
-            if session.pty_handle is not None:
-                await write_pty(session.pty_handle, encoded)
-            else:
+    # Like process(wait), the initial observation owns completion delivery only
+    # while it can return the final result. Do not enqueue that same result as
+    # an extra model notification when it exits inside the yield window.
+    previously_consumed = session.completion_consumed
+    session.completion_consumed = True
+    delivered = False
+    try:
+        if stdin is not None:
+            encoded = stdin.encode("utf-8")
+            try:
+                if session.pty_handle is not None:
+                    await write_pty(session.pty_handle, encoded)
+                else:
+                    stream = session.process.stdin
+                    if stream is not None and not stream.is_closing():
+                        stream.write(encoded)
+                        await stream.drain()
+                        if io_mode == "closed" and not stream.is_closing():
+                            stream.close()
+            except (BrokenPipeError, ConnectionResetError, PtyBackendError):
+                pass
+        elif io_mode == "closed":
+            if session.pty_handle is None:
                 stream = session.process.stdin
                 if stream is not None and not stream.is_closing():
-                    stream.write(encoded)
-                    await stream.drain()
-                    if io_mode == "closed" and not stream.is_closing():
-                        stream.close()
-        except (BrokenPipeError, ConnectionResetError, PtyBackendError):
-            pass
-    elif io_mode == "closed":
-        if session.pty_handle is None:
-            stream = session.process.stdin
-            if stream is not None and not stream.is_closing():
-                stream.close()
+                    stream.close()
 
-    if yield_time_ms > 0 and not session.done:
-        await _wait_bg_process(session, yield_time_ms / 1000.0)
-    if _session_exited(session):
-        if session.collector_task is not None and not session.collector_task.done():
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(
-                    asyncio.shield(session.collector_task),
-                    timeout=_BACKGROUND_KILL_TIMEOUT,
+        if yield_time_ms > 0 and not session.done:
+            await _wait_bg_process(session, yield_time_ms / 1000.0)
+        if _session_exited(session):
+            if session.collector_task is not None and not session.collector_task.done():
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        asyncio.shield(session.collector_task),
+                        timeout=_BACKGROUND_KILL_TIMEOUT,
+                    )
+            if not session.done and (
+                session.collector_task is None or session.collector_task.done()
+            ):
+                await _finalize_bg_session_async(session)
+        if _session_result_ready(session):
+            completed_payload: dict[str, object] = {
+                "status": "ok",
+                "execution_id": session.session_id,
+                "session": _bg_session_payload(session),
+                "output": _bg_rendered_output(session),
+                "exited": True,
+                "io_mode_requested": session.io_mode_requested,
+                "io_mode_used": session.io_mode_used,
+                "notify_on_exit": session.notify_on_exit,
+            }
+            if session.fallback_reason:
+                completed_payload["fallback_reason"] = session.fallback_reason
+                completed_payload["warning"] = (
+                    "TTY unavailable in this environment; using a regular pipe, not a TTY."
                 )
-        if not session.done and (
-            session.collector_task is None or session.collector_task.done()
-        ):
-            await _finalize_bg_session_async(session)
-    if _session_result_ready(session):
-        completed_payload: dict[str, object] = {
-            "status": "ok",
-            "execution_id": session.session_id,
-            "session": _bg_session_payload(session),
-            "output": _bg_rendered_output(session),
-            "exited": True,
-            "io_mode_requested": session.io_mode_requested,
-            "io_mode_used": session.io_mode_used,
-            "notify_on_exit": session.notify_on_exit,
-        }
-        if session.fallback_reason:
-            completed_payload["fallback_reason"] = session.fallback_reason
-            completed_payload["warning"] = (
-                "TTY unavailable in this environment; using a regular pipe, not a TTY."
-            )
-        return json.dumps(completed_payload, ensure_ascii=False)
+            completed_result = json.dumps(completed_payload, ensure_ascii=False)
+            delivered = True
+            return completed_result
+    finally:
+        if not delivered:
+            session.completion_consumed = previously_consumed
+            if session.done and not session.completion_consumed:
+                await _emit_bg_session_completion(session)
 
     payload = json.loads(started) if started.startswith("{") else None
     if not isinstance(payload, dict):
@@ -6446,6 +6388,14 @@ async def _read_bg_output(session: _BgSession, process_exited: asyncio.Event) ->
         await session.output_capture.drain(
             _PtyReader(handle), process_exited=process_exited,
             idle_timeout=_BACKGROUND_KILL_TIMEOUT,
+            # ConPTY's socket can remain open after the owned process tree has
+            # exited.  The reader has already had the post-exit grace period to
+            # consume buffered bytes; treat the quiet socket as EOF so it does
+            # not turn a successful PTY command into an incomplete capture.
+            timeout_after_process_exit_is_eof=(
+                handle.platform == "windows"
+                and getattr(handle.raw, "_server", None) is not None
+            ),
         )
         return
     await session.output_capture.drain(
@@ -6483,8 +6433,6 @@ def _finalize_bg_session(session: _BgSession) -> None:
 
 
 async def _finalize_bg_session_async(session: _BgSession) -> None:
-    if "code-task" in session.command and session.code_task_marker is None:
-        session.code_task_marker = _parse_code_task_marker(_bg_rendered_output(session))
     await session.output_capture.finish_async()
     session.output_capture.release_preview()
     _finalize_bg_session(session)
@@ -7130,8 +7078,10 @@ async def _create_host_shell_subprocess(
     description=(
         "Execute a shell command and return stdout/stderr with exit code. Use for "
         "repository inspection, builds, tests, and command-line tools. "
+        "Ordinary commands run synchronously by default. "
         "For background work, set yield_time_ms=0 instead of shell '&'; keep the "
-        "returned execution_id, continue other work, then use process(wait/log). "
+        "returned execution_id and continue other work. Read available output with "
+        "process(log/poll), or use process(wait) when you choose to await completion. "
         "For interactive CLIs, set io_mode='pty' and answer prompts with "
         "process(action='submit', execution_id=..., data=...). Only use process "
         "with a returned execution_id, not an ID inferred from command output. For workspace "
@@ -7184,7 +7134,11 @@ async def _create_host_shell_subprocess(
         },
         "notify_on_exit": {
             "type": "boolean",
-            "description": "For managed execution, enqueue one bounded completion notice.",
+            "description": (
+                "For managed execution, opt in to a bounded completion notice while "
+                "the originating Agent task is still active. Default false. "
+                "Does not start a new Agent turn after that task ends."
+            ),
         },
         "sandbox_permissions": {
             "type": "string",
@@ -7897,7 +7851,10 @@ async def _start_host_background_process(
         },
         "notify_on_exit": {
             "type": "boolean",
-            "description": "Compatibility-only completion notification opt-in.",
+            "description": (
+                "Compatibility-only opt-in to a completion notice while the originating "
+                "Agent task remains active; never starts a new turn. Default false."
+            ),
         },
     },
     required=["command"],
@@ -8505,9 +8462,10 @@ def get_bg_session(session_id: str) -> _BgSession | None:
 @tool(
     name="process",
     description=(
-        "Manage managed command sessions created by OpenSquilla. To await a "
-        "long-running background command, call action='wait' (blocks until it "
-        "exits or the wait timeout elapses) instead of polling in a loop. "
+        "Manage command sessions created by OpenSquilla. Use log or poll to read "
+        "available output without waiting for exit. When you choose to await a "
+        "background command, call action='wait' (blocks until it exits or the wait "
+        "timeout elapses) instead of polling in a loop. "
         "A wait timeout leaves the command running. For interactive prompts, "
         "submit sends one answer plus Enter; write sends raw data without Enter. "
         "After write, submit with empty data sends only Enter. PTY sessions "
@@ -8752,42 +8710,53 @@ async def process(
         return json.dumps(payload, ensure_ascii=False)
 
     if action == "log":
+        consumed_before_log = session.completion_consumed
         if _session_result_ready(session):
             session.completion_consumed = True
-        start = max(0, int(offset or 0))
-        requested_limit = 20000 if limit is None else int(limit)
-        max_chars = max(0, min(requested_limit, 100000))
-        end = start + max_chars
-        capture = session.output_capture
-        if capture.spool is not None:
-            try:
-                sliced, total_chars = await asyncio.to_thread(capture.read_slice, start, end)
-            except (OSError, ValueError):
-                capture.incomplete_reason = "stored output unavailable; preview only"
-                output = await capture.preview_async()
+        delivered = False
+        try:
+            start = max(0, int(offset or 0))
+            requested_limit = 20000 if limit is None else int(limit)
+            max_chars = max(0, min(requested_limit, 100000))
+            end = start + max_chars
+            capture = session.output_capture
+            if capture.spool is not None:
+                try:
+                    sliced, total_chars = await asyncio.to_thread(capture.read_slice, start, end)
+                except (OSError, ValueError):
+                    capture.incomplete_reason = "stored output unavailable; preview only"
+                    output = await capture.preview_async()
+                    sliced, total_chars = output[start:end], len(output)
+            else:
+                # Embedded callers may have no result store. Keep their existing
+                # preview, without mixing capture instructions into log offsets.
+                output = capture.preview() + "".join(session.output_lines)
                 sliced, total_chars = output[start:end], len(output)
-        else:
-            # Embedded callers may have no result store. Keep their existing
-            # preview, without mixing capture instructions into log offsets.
-            output = capture.preview() + "".join(session.output_lines)
-            sliced, total_chars = output[start:end], len(output)
-        output_details = session.output_capture.describe(only_if_needed=True)
-        return json.dumps(
-            {
-                "status": "ok",
-                "action": action,
-                "session": _bg_session_payload(session),
-                "output": sliced,
-                "offset": start,
-                "limit": max_chars,
-                "total_chars": total_chars,
-                "truncated": bool(
-                    start > 0 or end < total_chars
-                    or capture.storage_error or capture.incomplete_reason
-                    or (capture.spool is None and output_details.get("preview_omitted_bytes"))
-                ),
-            }
-        )
+            output_details = session.output_capture.describe(only_if_needed=True)
+            log_result = json.dumps(
+                {
+                    "status": "ok",
+                    "action": action,
+                    "session": _bg_session_payload(session),
+                    "output": sliced,
+                    "offset": start,
+                    "limit": max_chars,
+                    "total_chars": total_chars,
+                    "truncated": bool(
+                        start > 0 or end < total_chars
+                        or capture.storage_error or capture.incomplete_reason
+                        or (capture.spool is None and output_details.get("preview_omitted_bytes"))
+                    ),
+                }
+            )
+            delivered = True
+            return log_result
+        finally:
+            if not delivered:
+                session.completion_consumed = consumed_before_log
+                if session.done and not session.completion_consumed:
+                    # A cancelled disk read returned no result to the model.
+                    await _emit_bg_session_completion(session)
 
     if action == "resize":
         if session.pty_handle is None:

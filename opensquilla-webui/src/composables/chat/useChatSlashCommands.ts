@@ -1,41 +1,22 @@
-import { computed, getCurrentScope, onScopeDispose, ref, watch, type Ref } from 'vue'
+import { getCurrentScope, onScopeDispose, ref, type Ref } from 'vue'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SkillCandidate } from '@/types/skills'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { replaceSlashQuery, shortSlashDescription, slashQueryAt, slashSearchRank, type SlashQueryRange } from '@/utils/chat/slashPalette'
 import i18n from '@/i18n'
-import {
-  MetaRunCenterError,
-  type MetaLaunchDraftPayload,
-  type MetaRunCenter,
-} from '@/modules/metaRunCenter'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import type {
   UsageReporting,
   UsageReportingRequestOptions,
 } from '@/modules/usageReporting'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
-import type { HiddenControlDispatchResult } from '@/types/chat'
-import type { MetaSetupReadiness } from '@/types/metaSetup'
-import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import {
   formatGoalDuration,
   type GoalSnapshot,
 } from '@/composables/chat/useChatGoals'
 
-export interface ArgumentChoice {
-  value: string
-  description: string
-  status?: 'ready' | 'needs_setup'
-  missingBins?: string[]
-  missingEnv?: string[]
-  missingEnvAny?: string[][]
-  missingSkills?: string[]
-  missingCapabilities?: string[]
-}
-
 export interface ChatSlashCommand {
-  kind?: 'command' | 'skill' | 'meta'
+  kind?: 'command' | 'skill'
   skill?: SkillCandidate
   name: string
   cmd: string
@@ -46,16 +27,6 @@ export interface ChatSlashCommand {
   execution?: {
     action?: string
   }
-  // Tab-completable argument candidates for this command (e.g. meta-skill names).
-  argumentChoices?: ArgumentChoice[]
-  // Set on synthetic entries that represent a chosen argument ("/meta <skill>").
-  argValue?: string
-  metaStatus?: 'ready' | 'needs_setup'
-  missingBins?: string[]
-  missingEnv?: string[]
-  missingEnvAny?: string[][]
-  missingSkills?: string[]
-  missingCapabilities?: string[]
   [key: string]: unknown
 }
 
@@ -73,17 +44,14 @@ interface SlashCommandPayload extends Record<string, unknown> {
 }
 
 const SUPPORTED_WEB_SLASH_ACTIONS = new Set([
-  '/coding',
   '/compact',
   '/goal',
   '/new',
   '/plan',
   '/reset',
   '/usage',
-  'coding.mode',
   'compact_context',
   'goal.set',
-  'meta.menu',
   'new_chat',
   'plans.setMode',
   'plans.toggleMode',
@@ -100,12 +68,9 @@ export interface UseChatSlashCommandsOptions {
   getCaret?: () => number
   setCaret?: (position: number) => void
   manageSkill?: (name: string) => void
-  hasNonTextInput?: () => boolean
   commandCatalog: CommandCatalog
   usageReporting: UsageReporting
   sessionMaintenance: SessionMaintenance
-  /** Domain seam for MetaSkill launch; wire method names stay in its adapter. */
-  metaRunCenter?: MetaRunCenter
   catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
   sessionKey: Ref<string>
@@ -119,35 +84,12 @@ export interface UseChatSlashCommandsOptions {
     options?: { tone?: string; detail?: string; dismissMs?: number; source?: string },
   ) => void
   showCompactionToast: (payload: Record<string, unknown>, meta?: Record<string, unknown>) => void
-  // Surface a short, client-side notice (e.g. the meta-skill list). No provider call.
   notify: (message: string) => void
-  // Send a turn whose provider text bypasses slash parsing (mirrors the TUI
-  // override path). Used by /meta <name> to trigger the launch after meta.run.
-  dispatchHidden: (
-    providerText: string,
-    displayText: string,
-    clientRequestId?: string,
-    targetSessionKey?: string,
-  ) => void | HiddenControlDispatchResult | Promise<void | HiddenControlDispatchResult>
-  // Recover a request removed from the composer when launch cannot proceed.
-  // The callback owns same-session queueing and cross-session persistence.
-  restoreDraft?: (launchText: string, sessionKey: string) => void
-  // Open a persistent, explicitly-confirmed setup flow. Older embeddings can
-  // omit this callback and keep the compact toast fallback.
-  requestMetaSetup?: (
-    name: string,
-    readiness: MetaSetupReadiness,
-    originatingSessionKey: string,
-    launchText: string,
-    clientRequestId?: string,
-  ) => void | 'visible' | 'deferred' | Promise<void | 'visible' | 'deferred'>
   // Send the optional text after "/plan" through the normal composer path so
   // attachments, intent, optimistic rendering, and retry restoration are kept.
   dispatchPlanPrompt: (prompt: string, composerText: string) => void
   activatePlanMode?: () => boolean | Promise<boolean>
   planModeAvailable?: () => boolean
-  codingModeEnabled: Ref<boolean>
-  setCodingModeEnabled: (enabled: boolean) => Promise<boolean>
   // Arm the goal composer: selecting /goal switches the composer into goal
   // draft mode so the user types the goal normally and sends it.
   armGoal?: () => boolean | Promise<boolean>
@@ -159,29 +101,7 @@ export interface UseChatSlashCommandsOptions {
   goalClear?: () => Promise<boolean>
 }
 
-export interface MetaCommandInvocation {
-  skillName: string
-  launchText: string
-}
-
-export type DurableMetaDraft = MetaLaunchDraftPayload
-
 export type SlashCommandClassification = 'registered' | 'unknown' | 'unavailable'
-
-export function parseMetaCommandInvocation(args: string): MetaCommandInvocation | null {
-  const trimmed = String(args || '').trim()
-  if (!trimmed) return null
-
-  const firstWhitespace = trimmed.search(/\s/)
-  const skillName = firstWhitespace === -1 ? trimmed : trimmed.slice(0, firstWhitespace)
-  const suffix = firstWhitespace === -1 ? '' : trimmed.slice(firstWhitespace).trim()
-  const requestMatch = suffix.match(/^--(?:\s+([\s\S]*))?$/)
-  const request = requestMatch ? String(requestMatch[1] || '').trim() : ''
-  return {
-    skillName,
-    launchText: request ? `/meta ${skillName} -- ${request}` : `/meta ${skillName}`,
-  }
-}
 
 function slashCommandKey(value: string): string {
   const raw = String(value || '').trim().split(/\s+/, 1)[0].toLowerCase()
@@ -201,9 +121,6 @@ function isMenuCommand(command: ChatSlashCommand): boolean {
 
 function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
   const name = cmd?.name || cmd?.cmd || ''
-  const rawChoices = Array.isArray((cmd as { argument_choices?: unknown })?.argument_choices)
-    ? (cmd as { argument_choices: Array<Record<string, unknown>> }).argument_choices
-    : []
   return {
     ...cmd,
     name,
@@ -211,22 +128,6 @@ function normalizeSlashCommand(cmd: SlashCommandPayload): ChatSlashCommand {
     label: cmd?.label || name,
     desc: cmd?.description || cmd?.desc || cmd?.usage || '',
     aliases: Array.isArray(cmd?.aliases) ? cmd.aliases : [],
-    argumentChoices: rawChoices
-      .map((c) => ({
-        value: String(c?.value ?? ''),
-        description: String(c?.description ?? ''),
-        status: c?.status === 'needs_setup' ? 'needs_setup' as const : 'ready' as const,
-        missingBins: Array.isArray(c?.missing_bins) ? c.missing_bins.map(String) : [],
-        missingEnv: Array.isArray(c?.missing_env) ? c.missing_env.map(String) : [],
-        missingEnvAny: Array.isArray(c?.missing_env_any)
-          ? c.missing_env_any.map(group => Array.isArray(group) ? group.map(String) : [])
-          : [],
-        missingSkills: Array.isArray(c?.missing_skills) ? c.missing_skills.map(String) : [],
-        missingCapabilities: Array.isArray(c?.missing_capabilities)
-          ? c.missing_capabilities.map(String)
-          : [],
-      }))
-      .filter((c) => c.value),
   }
 }
 
@@ -272,26 +173,6 @@ function isValidSlashCommandPayload(value: unknown): value is SlashCommandPayloa
     && SUPPORTED_WEB_SLASH_ACTIONS.has(rawAction)
 }
 
-function makeArgCandidate(parent: ChatSlashCommand, choice: ArgumentChoice): ChatSlashCommand {
-  const full = parent.cmd + ' ' + choice.value
-  return {
-    name: full,
-    cmd: full,
-    label: full,
-    desc: localizedMetaDescription(choice),
-    searchDescriptions: [choice.description],
-    aliases: [],
-    execution: parent.execution,
-    argValue: choice.value,
-    metaStatus: choice.status,
-    missingBins: choice.missingBins,
-    missingEnv: choice.missingEnv,
-    missingEnvAny: choice.missingEnvAny,
-    missingSkills: choice.missingSkills,
-    missingCapabilities: choice.missingCapabilities,
-  }
-}
-
 const PALETTE_COPY: Record<string, { key: string; aliases: string[] }> = {
   xlsx: { key: 'xlsx', aliases: ['Excel', 'spreadsheet', '表格'] },
   docx: { key: 'docx', aliases: ['Word', 'document', '文档'] },
@@ -299,13 +180,7 @@ const PALETTE_COPY: Record<string, { key: string; aliases: string[] }> = {
   'pdf-toolkit': { key: 'pdf', aliases: ['PDF', '文档'] },
   github: { key: 'github', aliases: ['GitHub', 'repository', '代码仓库'] },
   'html-coder': { key: 'html', aliases: ['HTML', 'webpage', '网页'] },
-  AwesomeWebpageMetaSkill: { key: 'webpage', aliases: ['website', '网站'] },
-  'meta-kid-project-planner': { key: 'kidsProject', aliases: ['children', '儿童', '创意项目'] },
-  'meta-short-drama': { key: 'shortDrama', aliases: ['video', '短剧', '视频'] },
-  'meta-skill-creator': { key: 'skillCreator', aliases: ['workflow', '工作流'] },
-  'meta-paper-write': { key: 'paperWriting', aliases: ['paper', '论文'] },
 }
-const PREFERRED_META_NAMES = ['AwesomeWebpageMetaSkill', 'meta-short-drama', 'meta-paper-write']
 
 function paletteCopy(name: string, description: string): { label: string; desc: string; aliases: string[] } {
   const copy = PALETTE_COPY[name]
@@ -314,10 +189,6 @@ function paletteCopy(name: string, description: string): { label: string; desc: 
     desc: i18n.global.t(`chat.skillPalette.items.${copy.key}.description`),
     aliases: copy.aliases,
   } : { label: name, desc: shortSlashDescription(description), aliases: [] }
-}
-
-function localizedMetaDescription(choice: ArgumentChoice): string {
-  return paletteCopy(choice.value, choice.description).desc
 }
 
 export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
@@ -332,21 +203,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
   const skillCandidates = ref<SkillCandidate[]>([])
   const skillsLoading = ref(false)
   const skillsError = ref('')
-  const metaDraft = ref<{ name: string; label?: string; text: string; originalText: string; sessionKey: string } | null>(null)
   let queryRange: SlashQueryRange | null = null
   let candidatesLoaded = false
   let candidateEpoch = 0
   const unsubscribe = options.skillCatalog?.subscribeInvalidation?.(invalidateSkillCandidates)
   if (unsubscribe && getCurrentScope()) onScopeDispose(unsubscribe)
-
-  watch(options.sessionKey, (sessionKey) => {
-    const draft = metaDraft.value
-    if (!draft || draft.sessionKey === sessionKey) return
-    if (draft.text.trim()) {
-      options.restoreDraft?.(`/meta ${draft.name} -- ${draft.text.trim()}`, draft.sessionKey)
-    }
-    metaDraft.value = null
-  })
 
   function resetSkillCandidates() {
     candidateEpoch += 1
@@ -391,10 +252,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     const commands = slashCmds.value.filter(isMenuCommand).map(command => ({
       ...withLiveDescription(command), searchDescriptions: [command.desc], kind: 'command' as const,
     }))
-    const meta = slashCmds.value.flatMap(parent => (parent.argumentChoices || []).map(choice => ({
-      ...makeArgCandidate(parent, choice), kind: 'meta' as const,
-      ...paletteCopy(choice.value, choice.description),
-    })))
     const skills: ChatSlashCommand[] = skillCandidates.value.map(skill => {
       const copy = paletteCopy(skill.name, String(i18n.global.locale.value).startsWith('zh')
         ? skill.descriptionZh || skill.description : skill.description)
@@ -403,7 +260,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         aliases: [...skill.aliases, ...copy.aliases], kind: 'skill', skill,
       }
     })
-    filteredSlashCmds.value = [...commands, ...skills, ...meta]
+    filteredSlashCmds.value = [...commands, ...skills]
       .map((command, index) => ({ command, index, rank: slashSearchRank(query,
         [command.label, command.name, command.cmd, ...command.aliases],
         [command.desc, ...(command.searchDescriptions || []), command.skill?.description || '', command.skill?.descriptionZh || '']) }))
@@ -412,187 +269,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       .map(item => item.command)
     slashIdx.value = Math.max(0, Math.min(slashIdx.value, filteredSlashCmds.value.length - 1))
     slashOpen.value = true
-  }
-
-  async function launchMetaDraft() {
-    const draft = metaDraft.value
-    if (!draft?.text.trim() || draft.sessionKey !== options.sessionKey.value) return
-    if (options.hasNonTextInput?.() || options.selectedSkills?.value.length) {
-      options.notify(i18n.global.t('chat.skillPalette.metaTextOnly'))
-      return
-    }
-    const launchText = `/meta ${draft.name} -- ${draft.text.trim()}`
-    metaDraft.value = null
-    const outcome = await runMetaInvocation({ skillName: draft.name, launchText,
-      originatingSessionKey: draft.sessionKey, clientRequestId: createClientRequestId() })
-    if (outcome !== 'failed' && outcome !== 'discarded'
-      && options.sessionKey.value === draft.sessionKey && options.inputText.value === draft.originalText) {
-      options.inputText.value = ''
-      options.autoResizeTextarea()
-    }
-  }
-  const metaSkillChoices = computed(() => {
-    const command = slashCmds.value.find(c => slashCommandKey(c.name) === '/meta')
-    const choices = command?.argumentChoices || []
-    return PREFERRED_META_NAMES
-      .map(name => choices.find(choice => choice.value === name))
-      .filter((choice): choice is ArgumentChoice => Boolean(choice))
-  })
-
-  async function runMetaInvocation(input: {
-    skillName: string
-    launchText: string
-    originatingSessionKey: string
-    clientRequestId: string
-  }): Promise<'accepted' | 'queued' | 'setup' | 'failed' | 'discarded'> {
-    const {
-      skillName,
-      launchText,
-      originatingSessionKey,
-      clientRequestId,
-    } = input
-    const retainStableRetry = async (error: string): Promise<void> => {
-      if (options.requestMetaSetup) {
-        try {
-          const disposition = await options.requestMetaSetup(
-            skillName,
-            {
-              ready: false,
-              status: 'needs_setup',
-              reasons: [error],
-              setup_actions: [],
-              manual_setup_actions: [],
-            },
-            originatingSessionKey,
-            launchText,
-            clientRequestId,
-          )
-          if (disposition === 'deferred') {
-            options.notify(i18n.global.t('chat.metaRuns.savedForRetry', { skill: skillName }))
-          }
-          return
-        } catch {
-          // The Gateway outbox still owns this identity. Fall through to an
-          // explicit notice, never to ordinary composer text with a new id.
-        }
-      }
-      options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', { error }))
-    }
-    try {
-      if (!options.metaRunCenter) throw new Error('MetaRunCenter is unavailable')
-      const result = await options.metaRunCenter.launch({
-        name: skillName,
-        sessionKey: originatingSessionKey,
-        clientRequestId,
-        launchText,
-      })
-      if (result?.ok) {
-        const dispatchResult = await options.dispatchHidden(
-          launchText,
-          launchText,
-          clientRequestId,
-          originatingSessionKey,
-        )
-        if (dispatchResult?.status === 'rejected') {
-          await retainStableRetry(dispatchResult.reason)
-          return 'failed'
-        }
-        if (dispatchResult?.status === 'unknown') {
-          // The server and browser outboxes retain the exact id and payload.
-          // Surface uncertainty without creating a second sendable draft.
-          options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
-            error: dispatchResult.reason,
-          }))
-          return 'queued'
-        }
-        return dispatchResult?.status === 'queued' ? 'queued' : 'accepted'
-      }
-      if (result?.setupRequired) {
-        const readiness = result.readiness || {}
-        if (options.requestMetaSetup) {
-          const disposition = await options.requestMetaSetup(
-            skillName,
-            readiness,
-            originatingSessionKey,
-            launchText,
-            clientRequestId,
-          )
-          if (disposition === 'deferred') {
-            options.notify(i18n.global.t('chat.metaRuns.savedForRetry', { skill: skillName }))
-          }
-          return 'setup'
-        }
-        const dependencies = [
-          ...(readiness.missing_bins || []),
-          ...(readiness.missing_env || []),
-          ...(readiness.missing_env_any || []).map(group => group.join(' / ')),
-          ...(readiness.missing_skills || []),
-          ...(readiness.missing_capabilities || []),
-        ].join(', ') || i18n.global.t('chat.metaRuns.unknownDependency')
-        options.notify(i18n.global.t('chat.metaRuns.setupRequired', {
-          skill: skillName,
-          dependencies,
-        }))
-        return 'setup'
-      }
-      const error = result?.error
-        || i18n.global.t('chat.metaRuns.couldNotRunSkill', { skill: skillName })
-      if (result?.drafted) {
-        await retainStableRetry(error)
-        return 'failed'
-      }
-      // Disabled/unknown skills are rejected before the Gateway stages a raw
-      // request, so returning those to the composer cannot create two ids.
-      options.restoreDraft?.(launchText, originatingSessionKey)
-      options.notify(
-        error,
-      )
-      return 'failed'
-    } catch (err: unknown) {
-      if (err instanceof MetaRunCenterError && err.code === 'draft-discarded') {
-        // Another tab already committed the user's cancellation. This identity
-        // is terminal: never recreate a setup card or a sendable composer copy.
-        options.notify(i18n.global.t('chat.metaRuns.couldNotRunSkillError', {
-          error: err.message,
-        }))
-        return 'discarded'
-      }
-      // A transport error can happen after the Gateway commits the draft. Keep
-      // the same request id in a retry card; restoring plain text would race
-      // server recovery and create a second logical request.
-      await retainStableRetry(err instanceof Error ? err.message : String(err))
-      return 'failed'
-    }
-  }
-
-  async function restoreDurableMetaDrafts(
-    drafts: DurableMetaDraft[],
-    isCurrent: () => boolean = () => true,
-  ): Promise<string[]> {
-    const attemptedRequestIds: string[] = []
-    for (const draft of drafts) {
-      if (!isCurrent() || draft.sessionKey !== options.sessionKey.value) {
-        return attemptedRequestIds
-      }
-      if (
-        !draft.name
-        || !draft.launchText
-        || !/^\S{1,256}$/.test(draft.clientRequestId)
-      ) continue
-      attemptedRequestIds.push(draft.clientRequestId)
-      const outcome = await runMetaInvocation({
-        skillName: draft.name,
-        launchText: draft.launchText,
-        originatingSessionKey: draft.sessionKey,
-        clientRequestId: draft.clientRequestId,
-      })
-      if (!isCurrent()) return attemptedRequestIds
-      if (outcome === 'discarded') continue
-      // A setup card or queued hidden turn owns the next user-visible slot.
-      // Remaining server drafts stay durable and will be resumed later.
-      if (outcome !== 'accepted') return attemptedRequestIds
-    }
-    return attemptedRequestIds
   }
 
   async function loadSlashCommands() {
@@ -639,17 +315,10 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   function withLiveDescription(command: ChatSlashCommand): ChatSlashCommand {
     const action = command?.execution?.action || command.cmd || command.name
-    if (action === 'coding.mode' || action === '/coding') return {
-      ...command, desc: i18n.global.t(
-        options.codingModeEnabled.value
-          ? 'chat.codingMode.commandDisable'
-          : 'chat.codingMode.commandEnable',
-      ),
-    }
     const names: Record<string, string> = {
       new_chat: 'new', '/new': 'new',
       compact_context: 'compact', 'sessions.contextCompact': 'compact', '/compact': 'compact',
-      'goal.set': 'goal', '/goal': 'goal', 'meta.menu': 'meta',
+      'goal.set': 'goal', '/goal': 'goal',
       'plans.setMode': 'plan', 'plans.toggleMode': 'plan', '/plan': 'plan',
       reset_session: 'reset', 'sessions.reset': 'reset', '/reset': 'reset',
       usage_status: 'usage', 'usage.status': 'usage', '/usage': 'usage',
@@ -693,19 +362,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       openWith(exactMatches.length > 0 ? exactMatches : matches)
       return
     }
-    // Argument completion: "/meta <partial>" -> the command's argument choices.
-    const head = '/' + val.slice(1, firstSpace).toLowerCase()
-    const partial = val.slice(firstSpace + 1).trimStart().toLowerCase()
-    const parent = slashCmds.value.find(c => slashCommandKey(c.name) === slashCommandKey(head))
-    const choices = parent?.argumentChoices || []
-    if (parent && isMenuCommand(parent) && choices.length > 0) {
-      openWith(
-        choices
-          .filter(ch => ch.value.toLowerCase().startsWith(partial))
-          .map(ch => makeArgCandidate(parent, ch)),
-      )
-      return
-    }
     closeSlashMenu()
   }
 
@@ -738,26 +394,13 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       options.setCaret?.(caret)
       return
     }
-    if (cmd.kind === 'meta') {
-      if (options.hasNonTextInput?.() || options.selectedSkills?.value.length) {
-        options.notify(i18n.global.t('chat.skillPalette.metaTextOnly'))
-        return
-      }
-      const originalText = options.inputText.value
-      metaDraft.value = { name: cmd.argValue!, label: cmd.label, originalText,
-        text: queryRange ? replaceSlashQuery(originalText, queryRange).trim() : '',
-        sessionKey: options.sessionKey.value }
-      closeSlashMenu()
-      return
-    }
     if (queryRange && queryRange.start > 0) {
       options.notify(i18n.global.t('chat.skillPalette.commandAtStart'))
       return
     }
     closeSlashMenu()
-    const needsArgument = !cmd.argValue && (cmd.argumentChoices?.length ?? 0) > 0
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
-    if (action === 'goal.set' && !cmd.argValue && !options.selectedSkills?.value.length) {
+    if (action === 'goal.set' && !options.selectedSkills?.value.length) {
       // Selecting /goal arms the goal composer: the Goal chip appears next to
       // the access-mode controls and the user types the goal normally.
       const originalInput = options.inputText.value
@@ -768,17 +411,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       })
       return
     }
-    options.inputText.value = cmd.cmd + (needsArgument ? ' ' : '')
+    options.inputText.value = cmd.cmd
     options.autoResizeTextarea()
-    if (needsArgument) handleSlashInput()
   }
 
   function activateSlashCmd(cmd: ChatSlashCommand) {
-    if (cmd.kind === 'skill' || cmd.kind === 'meta') {
-      completeSlashCmd(cmd)
-      return
-    }
-    if (cmd.argValue) {
+    if (cmd.kind === 'skill') {
       completeSlashCmd(cmd)
       return
     }
@@ -793,27 +431,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   function selectSlashCmd(cmd: ChatSlashCommand, args = '') {
     const action = cmd?.execution?.action || cmd.cmd || cmd.name
-    // Argument candidate ("/meta <skill>"): Tab-completes into the composer;
-    // the user presses Enter to run it.
-    if (cmd.argValue) {
-      completeSlashCmd(cmd)
-      return
-    }
-    // A command that takes arguments, selected with none yet: complete to
-    // "/cmd " and reopen the menu showing its argument candidates.
-    if (
-      action !== 'coding.mode'
-      && action !== '/coding'
-      && !args
-      && (cmd.argumentChoices?.length ?? 0) > 0
-    ) {
-      closeSlashMenu()
-      options.inputText.value = cmd.cmd + ' '
-      options.autoResizeTextarea()
-      handleSlashInput()
-      return
-    }
-
     if (options.selectedSkills?.value.length) {
       options.notify(i18n.global.t('chat.skillPalette.commandWithSkills'))
       return
@@ -838,44 +455,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       })
       return
     }
-    if (action === 'coding.mode' || action === '/coding') {
-      closeSlashMenu()
-      const mode = String(args || '').trim().toLowerCase()
-      options.inputText.value = ''
-      options.autoResizeTextarea()
-      if (mode === 'status') {
-        options.notify(i18n.global.t(
-          options.codingModeEnabled.value
-            ? 'chat.codingMode.enabled'
-            : 'chat.codingMode.disabled',
-        ))
-        return
-      }
-      if (mode !== 'on' && mode !== 'off') {
-        if (mode === '') {
-          const enabled = !options.codingModeEnabled.value
-          void options.setCodingModeEnabled(enabled).then((updated) => {
-            options.notify(i18n.global.t(
-              updated
-                ? (enabled ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
-                : 'chat.codingMode.updateFailed',
-            ))
-          })
-          return
-        }
-        options.notify(i18n.global.t('chat.codingMode.usage'))
-        return
-      }
-      void options.setCodingModeEnabled(mode === 'on').then((updated) => {
-        options.notify(i18n.global.t(
-          updated
-            ? (mode === 'on' ? 'chat.codingMode.enabled' : 'chat.codingMode.disabled')
-            : 'chat.codingMode.updateFailed',
-        ))
-      })
-      return
-    }
-
     if (action === 'goal.set' || action === '/goal') {
       closeSlashMenu()
       const goalText = String(args || '').trim()
@@ -953,25 +532,6 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
           })
           .catch(() => options.notify(i18n.global.t('chat.skillPalette.usageFailed')))
         break
-      case 'meta.menu': {
-        // Bare "/meta" is handled by the argument-completion branch above
-        // (it reopens the menu with the skill choices). Here we only reach the
-        // run path, with a skill name supplied (e.g. Enter on "/meta <skill>").
-        const invocation = parseMetaCommandInvocation(args)
-        if (!invocation) break
-        const { skillName, launchText } = invocation
-        const originatingSessionKey = options.sessionKey.value
-        const clientRequestId = createClientRequestId()
-        // Save the exact request server-side before readiness/setup and retain
-        // its stable identity through the eventual hidden turn.
-        void runMetaInvocation({
-          skillName,
-          launchText,
-          originatingSessionKey,
-          clientRequestId,
-        })
-        break
-      }
       case 'goal.set':
       case '/goal': {
         const goalText = String(args || '').trim()
@@ -1109,10 +669,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     skillsError,
     loadSkillCandidates,
     invalidateSkillCandidates,
-    metaDraft,
-    launchMetaDraft,
     slashIdx,
-    metaSkillChoices,
     filteredSlashCmds,
     loadSlashCommands,
     handleSlashInput,
@@ -1122,6 +679,5 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     selectSlashCmd,
     classifySlashCommand,
     executeSlashCommand,
-    restoreDurableMetaDrafts,
   }
 }

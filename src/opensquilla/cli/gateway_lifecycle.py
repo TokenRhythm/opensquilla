@@ -75,6 +75,37 @@ def _running_on_windows() -> bool:
     return os.name == "nt"
 
 
+def _gateway_runtime_cwd() -> Path:
+    """Return a stable cwd for a spawned Gateway.
+
+    A Gateway must not inherit a caller's temporary checkout cwd: the checkout
+    can be removed while the child is still serving requests.
+    """
+
+    if getattr(sys, "frozen", False):
+        try:
+            candidate = Path(sys.executable).resolve(strict=True).parent
+        except (OSError, RuntimeError, ValueError):
+            candidate = Path(sys.executable).parent
+    else:
+        try:
+            module_path = Path(__file__).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            module_path = Path(__file__)
+        candidate = next(
+            (
+                parent
+                for parent in module_path.parents
+                if (parent / "pyproject.toml").is_file()
+                and (parent / "src" / "opensquilla").is_dir()
+            ),
+            module_path.parent,
+        )
+    if not candidate.is_dir():
+        raise RuntimeError(f"runtime_root_missing: {candidate}")
+    return candidate
+
+
 # Short bound on how long to wait for a process to disappear after a *hard*
 # terminate (TerminateProcess / SIGKILL), which is near-instant — distinct from
 # the graceful ``shutdown_timeout`` budget that precedes it. Reusing the full
@@ -286,13 +317,19 @@ class GatewayLifecycleManager:
         started_at = self._now()
         try:
             process = self._spawn_gateway(argv)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
+            detail = str(exc)
+            error_code = (
+                detail.split(":", 1)[0].strip().upper()
+                if isinstance(exc, RuntimeError) and ":" in detail
+                else "SPAWN_FAILED"
+            )
             return self._result(
                 "start",
                 "start_failed",
                 ok=False,
-                code="SPAWN_FAILED",
-                message=str(exc),
+                code=error_code,
+                message=detail,
                 exit_code_value=1,
             )
 
@@ -621,6 +658,7 @@ class GatewayLifecycleManager:
         creationflags = 0
         if os.name == "nt":
             creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        runtime_cwd = _gateway_runtime_cwd()
         try:
             process = subprocess.Popen(  # noqa: S603 - argv is constructed internally.
                 argv,
@@ -629,6 +667,7 @@ class GatewayLifecycleManager:
                 stderr=subprocess.STDOUT,
                 env=env,
                 shell=False,
+                cwd=str(runtime_cwd),
                 start_new_session=os.name != "nt",
                 creationflags=creationflags,
             )

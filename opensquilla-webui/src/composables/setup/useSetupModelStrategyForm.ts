@@ -7,6 +7,8 @@ export type ModelStrategy = 'router' | 'ensemble' | 'single'
 export interface SavedRoutingSummary {
   providerId: string
   providerLabel: string
+  recommendedProviderId: string
+  recommendedProviderLabel: string
   enabled: boolean
   binding: 'follow_primary' | 'custom' | 'legacy'
   crossProviderEnabled: boolean
@@ -156,6 +158,7 @@ export function useSetupModelStrategyForm(
         model: fixedModel.value,
         models: context.fixedModelCatalog.value.models,
         modelSource: context.fixedModelCatalog.value.source,
+        catalogState: context.fixedModelCatalog.value,
       },
       cards: [
         {

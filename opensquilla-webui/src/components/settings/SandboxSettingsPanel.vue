@@ -6,15 +6,13 @@
         <p>{{ t('settings.sandbox.subtitle') }}</p>
       </div>
       <span
-        v-if="capability || capabilityLoading || capabilityCheckFailed"
+        v-if="capability?.available || capabilityLoading"
         class="sandbox-settings__status"
         :class="{ 'is-ready': capability?.available }"
       >
         {{ capabilityLoading
           ? t('shared.loading')
-          : capability?.available
-            ? t('settings.sandbox.available')
-            : t('settings.sandbox.unavailable') }}
+          : t('settings.sandbox.available') }}
       </span>
     </header>
 
@@ -53,14 +51,6 @@
             </button>
           </div>
         </section>
-        <p
-          v-if="sandboxSetupOutcomeMessage"
-          class="sandbox-setup-result"
-          data-testid="sandbox-setup-result"
-          role="status"
-        >
-          {{ sandboxSetupOutcomeMessage }}
-        </p>
 
         <nav class="sandbox-list" :aria-label="t('settings.sandbox.title')">
           <button type="button" class="sandbox-list__row" data-testid="sandbox-open-files" @click="activeView = 'files'">
@@ -411,7 +401,6 @@ const { t } = useI18n()
 const {
   loading,
   capabilityLoading,
-  capabilityCheckFailed,
   loadError,
   capability,
   canRequestSandboxSetup,
@@ -673,19 +662,14 @@ function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
   return t('settings.sandbox.runtimes.actions.download')
 }
 
-const sandboxSetupOutcomeMessage = computed(() => {
-  if (sandboxSetupOutcome.value === 'cancelled') return t('settings.sandbox.setup.cancelled')
-  if (sandboxSetupOutcome.value === 'failed') return t('settings.sandbox.setup.failed')
-  if (sandboxSetupOutcome.value === 'verification_failed') {
-    return t('settings.sandbox.setup.verificationFailed')
-  }
-  return ''
-})
-
 function selectSafeMode(): void {
   sandboxSetupStore.resetOutcome()
   sandboxSetupStore.noteRunModeSelection('safe')
-  if (capability.value?.available) {
+  const windowsNeedsExplicitSetup = (
+    capability.value?.available === true
+    && capability.value.platform === 'win32'
+  )
+  if (capability.value?.available && !windowsNeedsExplicitSetup) {
     void setDefaultRunMode('safe')
     return
   }
@@ -705,8 +689,8 @@ function cancelSandboxSetup(): void {
 async function continueSandboxSetup(): Promise<void> {
   if (sandboxSetupPending.value) return
   const ready = await sandboxSetupStore.startSafeSetup()
+  if (sandboxSetupOutcome.value !== 'in_progress') sandboxSetupConfirmOpen.value = false
   if (ready) {
-    sandboxSetupConfirmOpen.value = false
     if (sandboxSetupIntendedMode.value === 'safe') adoptSavedDefaultRunMode('safe')
   }
   await load()

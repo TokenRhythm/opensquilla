@@ -22,7 +22,6 @@ const POPOVER_IDS: readonly ChatTopbarPopoverId[] = [
   'system-status',
   'language',
   'theme',
-  'bgm',
   'desktop-update',
 ]
 
@@ -105,30 +104,30 @@ describe('topbar popover coordinator', () => {
   it('does not let a stale close clear the newly active owner', async () => {
     const { controller, openById, root } = await mountCoordinator()
     const language = root.querySelector<HTMLButtonElement>('[data-registration="language"]')!
-    const bgm = root.querySelector<HTMLButtonElement>('[data-registration="bgm"]')!
+    const theme = root.querySelector<HTMLButtonElement>('[data-registration="theme"]')!
 
     language.focus()
     language.click()
-    bgm.focus()
-    bgm.click()
+    theme.focus()
+    theme.click()
 
     expect(state(openById, 'language').value).toBe(false)
-    expect(state(openById, 'bgm').value).toBe(true)
-    expect(controller.activeId.value).toBe('bgm')
-    expect(document.activeElement).toBe(bgm)
+    expect(state(openById, 'theme').value).toBe(true)
+    expect(controller.activeId.value).toBe('theme')
+    expect(document.activeElement).toBe(theme)
 
     controller.deactivate('language')
-    expect(controller.activeId.value).toBe('bgm')
+    expect(controller.activeId.value).toBe('theme')
   })
 
   it('leaves local popovers independent when coordination is disabled', async () => {
     const { controller, openById } = await mountCoordinator(false)
     state(openById, 'language').value = true
-    state(openById, 'bgm').value = true
+    state(openById, 'theme').value = true
     await nextTick()
 
     expect(state(openById, 'language').value).toBe(true)
-    expect(state(openById, 'bgm').value).toBe(true)
+    expect(state(openById, 'theme').value).toBe(true)
     expect(controller.activeId.value).toBeNull()
   })
 

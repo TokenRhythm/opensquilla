@@ -33,8 +33,6 @@ class AdmissionPendingInputConflictError(ValueError):
     """The pending input identity or revision changed."""
 
 
-class AdmissionMetaControlConflictError(ValueError):
-    """A durable control identity belongs to a different operation."""
 
 
 class AdmissionTaskCollectionUnavailableError(RuntimeError):

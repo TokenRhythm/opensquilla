@@ -210,6 +210,8 @@ export interface ModelMetadataV1 {
 }
 
 export interface CatalogSyncStatus {
+  cacheHit?: boolean
+  accessRejected?: boolean
   lastSyncedAt: string | null
   stale: boolean
 }
@@ -231,6 +233,9 @@ export interface DiscoveredModelCatalog {
   models: DiscoveredModel[]
   source: 'live' | 'none'
   catalog?: CatalogSyncStatus | null
+  discovering?: boolean
+  discoverError?: string
+  discoverFailureKind?: string
 }
 
 export interface EffectiveMaxTokens {
@@ -257,6 +262,7 @@ export interface ConnectionState {
   models: DiscoveredModel[]
   modelSource: 'live' | 'none'
   discoverError: string
+  discoverFailureKind?: string
   discovering?: boolean
   catalog?: CatalogSyncStatus | null
 }
@@ -529,10 +535,15 @@ export function normalizeModelMetadata(value: unknown, fallbackName = ''): Model
 export function normalizeCatalogSyncStatus(value: unknown): CatalogSyncStatus | null {
   const row = asRecord(value)
   if (!row || typeof row.stale !== 'boolean') return null
+  const flags = {
+    ...(typeof row.cacheHit === 'boolean' ? { cacheHit: row.cacheHit } : {}),
+    ...(typeof row.accessRejected === 'boolean' ? { accessRejected: row.accessRejected } : {}),
+  }
   if (row.lastSyncedAt === null) {
     return {
       lastSyncedAt: null,
       stale: row.stale,
+      ...flags,
     }
   }
   if (typeof row.lastSyncedAt !== 'string') return null
@@ -564,7 +575,33 @@ export function normalizeCatalogSyncStatus(value: unknown): CatalogSyncStatus | 
   return {
     lastSyncedAt,
     stale: row.stale,
+    ...flags,
   }
+}
+
+/** Discovery is an accelerator, never permission to discard a user's model ID. */
+export function updateDiscoveredCatalog(
+  previous: DiscoveredModelCatalog,
+  result: { ok?: boolean; source?: unknown; models?: unknown; catalog?: unknown; detail?: unknown; failureKind?: unknown },
+): DiscoveredModelCatalog {
+  const catalog = normalizeCatalogSyncStatus(result.catalog)
+  const rejected = catalog?.accessRejected || result.failureKind === 'auth_invalid'
+  const rows = normalizeDiscoveredModels(result.models)
+  const replace = result.ok || rejected || rows.length > 0
+  return {
+    ...previous,
+    models: replace ? (rejected || result.source !== 'live' ? [] : rows) : previous.models,
+    source: replace ? (!rejected && result.source === 'live' ? 'live' : 'none') : previous.source,
+    catalog: catalog ?? previous.catalog,
+    discoverError: result.ok ? '' : String(result.detail || result.failureKind || 'discover failed'),
+    discoverFailureKind: result.ok ? '' : String(result.failureKind || ''),
+  }
+}
+
+export function catalogNeedsRefresh(result: { catalog?: unknown }): boolean {
+  const catalog = normalizeCatalogSyncStatus(result.catalog)
+  // Older gateways ignore cacheOnly and return a normal result already.
+  return catalog?.cacheHit !== undefined && (!catalog.cacheHit || catalog.stale)
 }
 
 export function normalizeDiscoveredModels(rows: unknown): DiscoveredModel[] {
@@ -908,7 +945,7 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
       })
     }
     const epoch = connectionEpoch
-    connection.value = { ...connection.value, discovering: true, discoverError: '' }
+    connection.value = { ...connection.value, discovering: true, discoverError: '', discoverFailureKind: '' }
     const request = (async () => {
       try {
         const payload = {
@@ -917,41 +954,35 @@ export function useSetupProviderForm(setupWorkflow: SetupWorkflow) {
             : connectionParams('', options.modelOverride)),
           ...(options.forceRefresh ? { forceRefresh: true } : {}),
         }
-        const res = options.draftProfile
-          ? await setupWorkflow.profile.discoverDraftProfileModels(payload)
+        const load = (cacheOnly = false) => options.draftProfile
+          ? setupWorkflow.profile.discoverDraftProfileModels({ ...payload, ...(cacheOnly ? { cacheOnly: true } : {}) })
           : (options.storedProfile
-              ? await setupWorkflow.profile.discoverProfileModels({
+              ? setupWorkflow.profile.discoverProfileModels({
                   providerId: providerSelected.value,
                   ...(options.forceRefresh ? { forceRefresh: true } : {}),
+                  ...(cacheOnly ? { cacheOnly: true } : {}),
                 })
-              : await setupWorkflow.provider.discoverPrimaryModels(payload))
-        if (epoch !== connectionEpoch) return
-        if (res?.ok) {
-          const modelSource = res.source === 'live' ? 'live' : 'none'
-          connection.value = {
-            ...connection.value,
-            models: modelSource === 'live' ? normalizeDiscoveredModels(res.models) : [],
-            modelSource,
-            discoverError: '',
-            catalog: normalizeCatalogSyncStatus(res.catalog),
-          }
-        } else {
-          connection.value = {
-            ...connection.value,
-            models: [],
-            modelSource: 'none',
-            discoverError: String(res?.detail || res?.failureKind || 'discover failed'),
-            catalog: null,
-          }
+              : setupWorkflow.provider.discoverPrimaryModels({ ...payload, ...(cacheOnly ? { cacheOnly: true } : {}) }))
+        const publish = (res: Awaited<ReturnType<typeof load>>) => {
+          const updated = updateDiscoveredCatalog({
+            ...connection.value, source: connection.value.modelSource,
+          }, res)
+          connection.value = { ...connection.value, ...updated, modelSource: updated.source }
         }
+        if (!options.forceRefresh) {
+          const snapshot = await load(true)
+          if (epoch !== connectionEpoch) return
+          if (normalizeCatalogSyncStatus(snapshot.catalog)?.cacheHit !== false) publish(snapshot)
+          if (!catalogNeedsRefresh(snapshot)) return
+        }
+        const res = await load()
+        if (epoch !== connectionEpoch) return
+        publish(res)
       } catch (err) {
         if (epoch !== connectionEpoch) return
         connection.value = {
           ...connection.value,
-          models: [],
-          modelSource: 'none',
           discoverError: err instanceof Error ? err.message : String(err),
-          catalog: null,
         }
       }
     })()

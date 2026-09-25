@@ -121,7 +121,7 @@ def test_discovery_does_not_grant_progress_outside_main_default(
         pytest.param({"denied_tools": {"update_plan"}}, {}, id="explicit-deny"),
         pytest.param({"allowed_tools": {"read_file"}}, {}, id="strict-allowlist"),
         pytest.param({"allowed_tools": set()}, {}, id="empty-allowlist"),
-        pytest.param({}, {"tools": {"profile": "repo_coding_scaffold_edit"}}, id="profile"),
+        pytest.param({}, {"tools": {"profile": "coding"}}, id="profile"),
         pytest.param(
             {"is_owner": False, "caller_kind": CallerKind.CHANNEL}, {}, id="channel-non-owner",
         ),

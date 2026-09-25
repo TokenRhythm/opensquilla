@@ -348,6 +348,31 @@ def recovery_choose_workspace(
     )
 
 
+@recovery_app.command("initialize-unconfigured")
+def recovery_initialize_unconfigured(
+    home: Path = typer.Option(..., "--home", help="Desktop profile root H."),
+    transaction_id: str = typer.Option(..., "--transaction-id", help="Inspection transaction id."),
+    expected_revision: int = typer.Option(..., "--expected-revision", min=0),
+    json_output: bool = typer.Option(False, "--json", help="Emit the fixed JSON protocol."),
+    lock_timeout: float = _LOCK_TIMEOUT_OPTION,
+) -> None:
+    """Create the local client config without model credentials; existing config is retained."""
+    from opensquilla.recovery.unconfigured_profile import initialize_unconfigured_profile
+
+    _run(
+        lambda: initialize_unconfigured_profile(
+            home,
+            transaction_id=transaction_id,
+            expected_revision=expected_revision,
+            payload=_settings_payload_from_stdin(),
+            lock_timeout=lock_timeout,
+        ),
+        home=home,
+        json_output=json_output,
+        profile_kind="desktop-primary",
+    )
+
+
 @recovery_app.command("apply-settings")
 def recovery_apply_settings(
     home: Path = typer.Option(..., "--home", help="Desktop profile root H."),

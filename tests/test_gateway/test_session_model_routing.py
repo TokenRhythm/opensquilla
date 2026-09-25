@@ -85,7 +85,8 @@ def test_session_router_preserves_explicit_operator_tiers_and_provider_policy(
     assert config.squilla_router.model_dump() == original
 
 
-def test_session_router_follow_primary_reuses_provider_default_policy() -> None:
+@pytest.mark.parametrize("has_explicit_ladder", [False, True])
+def test_session_router_managed_ladder_follows_primary(has_explicit_ladder: bool) -> None:
     from opensquilla.provider.preset_registry import get_preset
 
     config = GatewayConfig(
@@ -93,7 +94,10 @@ def test_session_router_follow_primary_reuses_provider_default_policy() -> None:
         squilla_router={
             "enabled": False,
             "preset_binding": "follow_primary",
-            "tiers": {"c0": {"provider": "openrouter", "model": "old-primary/model"}},
+            "cross_provider_tiers": has_explicit_ladder,
+            **({"tiers": {
+                "c0": {"provider": "openrouter", "model": "old-primary/model"},
+            }} if has_explicit_ladder else {}),
         },
     )
     original = config.squilla_router.model_dump()

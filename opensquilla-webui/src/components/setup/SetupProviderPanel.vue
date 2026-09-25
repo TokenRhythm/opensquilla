@@ -20,6 +20,7 @@ import type {
 import type { ProviderProbeMode } from '@/modules/setupWorkflow'
 import { parseContextWindowInput } from '@/composables/setup/useSettingsPromotedForm'
 import { localizedRelativeTime } from '@/utils/messageTime'
+import { modelCatalogFeedbackKey } from '@/utils/modelCatalogFeedback'
 
 const { t, locale } = useI18n()
 
@@ -744,12 +745,10 @@ const effectiveMaxTokensReadout = computed(() => {
 })
 
 const catalogSyncReadout = computed(() => {
-  if (props.panel.connection.discovering) return t('setup.provider.discoveringModels')
-  if (props.panel.connection.discoverError) {
-    return `${t('setup.provider.discoverFailed')} ${props.panel.connection.discoverError}`
-  }
+  const feedback = modelCatalogFeedbackKey(props.panel.connection, currentModelId.value)
+  if (feedback) return t(`setup.provider.${feedback}`)
   if (props.panel.connection.modelSource === 'live' && !props.panel.connection.models.length) {
-    return t('setup.provider.modelListReadout', { count: 0 })
+    return t('setup.provider.modelCatalogEmpty')
   }
   const catalog = props.panel.connection.catalog
   if (!catalog) return ''
@@ -1047,6 +1046,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           :value="panel.providerFieldValue(field)"
           :models="panel.connection.models"
           :model-source="panel.connection.modelSource"
+          :external-description-id="catalogSyncReadout ? 'setup-model-catalog-sync-inline' : undefined"
           @update="(val) => emit('updateProviderField', 'model', val)"
         />
         <SetupField
@@ -1072,6 +1072,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
       <div v-if="panel.providerSelected" class="setup-model-catalog-sync">
         <span
           v-if="catalogSyncReadout"
+          id="setup-model-catalog-sync-inline"
           class="setup-model-catalog-sync__status"
           :class="{ 'is-stale': panel.connection.catalog?.stale }"
           data-testid="setup-model-catalog-sync"
@@ -1358,6 +1359,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                       :value="panel.providerFieldValue(field)"
                       :models="panel.connection.models"
                       :model-source="panel.connection.modelSource"
+                      :external-description-id="catalogSyncReadout ? 'setup-model-catalog-sync-editor' : undefined"
                       @update="(val) => emit('updateProviderField', 'model', val)"
                     />
                     <SetupField
@@ -1371,6 +1373,7 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                   <div class="setup-model-catalog-sync">
                     <span
                       v-if="catalogSyncReadout"
+                      id="setup-model-catalog-sync-editor"
                       class="setup-model-catalog-sync__status"
                       :class="{ 'is-stale': panel.connection.catalog?.stale }"
                       data-testid="setup-model-catalog-sync"

@@ -105,7 +105,7 @@ def test_offline_skills_doctor_honors_name_based_disabled_config(
         snapshot_path=tmp_path / "snapshot.json",
     )
     config = SimpleNamespace(
-        skills=SimpleNamespace(disabled=["demo"], coding_mode=False),
+        skills=SimpleNamespace(disabled=["demo"]),
     )
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(
@@ -164,7 +164,7 @@ def test_offline_skills_doctor_human_output_shows_degraded_compatibility(
         snapshot_path=tmp_path / "snapshot.json",
     )
     config = SimpleNamespace(
-        skills=SimpleNamespace(disabled=[], coding_mode=False),
+        skills=SimpleNamespace(disabled=[]),
     )
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(

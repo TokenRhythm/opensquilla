@@ -248,19 +248,7 @@
               <span>{{ t('workspaces.chooseProject') }}</span>
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
-            <button
-              v-if="codingModeEnabled"
-              type="button"
-              class="chat-coding-mode-chip"
-              :title="t('chat.codingMode.disableLabel')"
-              :aria-label="t('chat.codingMode.disableLabel')"
-              :aria-busy="codingModeSettingsBusy ? 'true' : 'false'"
-              :disabled="codingModeSettingsBusy"
-              @click="emit('setCodingModeEnabled', false)"
-            >
-              <span>{{ t('chat.codingMode.activeLabel') }}</span>
-              <Icon name="x" :size="12" aria-hidden="true" />
-            </button>
+
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
                 class="btn btn--ghost chat-run-mode-btn"
@@ -588,8 +576,6 @@ const props = withDefaults(defineProps<{
   modelsError?: string | null
   modelProviderErrors?: readonly ProviderListError[]
   modelSelectionDisabledReason?: 'routing' | 'busy' | 'unavailable' | null
-  codingModeEnabled?: boolean
-  codingModeSettingsBusy?: boolean
   addMenuAvoidElement?: HTMLElement | null
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
@@ -621,8 +607,6 @@ const props = withDefaults(defineProps<{
   floating?: boolean
 }>(), {
   canChooseProject: true,
-  codingModeEnabled: false,
-  codingModeSettingsBusy: false,
   sessionRoutingAvailable: true,
   sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
@@ -646,11 +630,11 @@ const emit = defineEmits<{
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
+  refreshRunModeAvailability: []
   setSessionRoutingMode: [mode: ModelRoutingMode]
   selectModel: [selection: { model: string; provider: string } | null]
   refreshModels: []
   openModelSettings: []
-  setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
   disarmGoal: []
@@ -904,6 +888,7 @@ function toggleRunMode() {
   if (props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
+    emit('refreshRunModeAvailability')
     addMenuOpen.value = false
     modelRoutingOpen.value = false
     moreActionsOpen.value = false
@@ -1148,41 +1133,6 @@ defineExpose<ChatComposerExpose>({
   background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
 
-.chat-coding-mode-chip {
-  flex: 0 0 auto;
-  min-height: 30px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 7px 3px 9px;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 9%, transparent);
-  color: var(--accent);
-  font: inherit;
-  font-size: var(--fs-xs);
-  font-weight: 650;
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    border-color var(--dur-fast),
-    background var(--dur-fast),
-    color var(--dur-fast);
-}
-.chat-coding-mode-chip:hover,
-.chat-coding-mode-chip:focus-visible {
-  outline: 0;
-  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
-  background: color-mix(in srgb, var(--accent) 15%, transparent);
-  color: var(--accent-hover);
-}
-.chat-coding-mode-chip:focus-visible {
-  box-shadow: var(--focus-ring);
-}
-.chat-coding-mode-chip:disabled {
-  cursor: default;
-  opacity: var(--state-disabled-opacity);
-}
 .chat-project-choose {
   flex-shrink: 0;
   max-width: 100%;
@@ -1715,9 +1665,17 @@ button.attachment-chip__primary:focus-visible {
   align-items: center;
 }
 
+.chat-collapse-region--footer,
+.chat-input-footer {
+  min-width: 0;
+}
+
 .chat-input-footer {
   justify-content: space-between;
-  flex-wrap: wrap;
+  /* Keep the two action clusters on the same baseline whenever the
+     container can accommodate them. A wrapping flex row puts the routing
+     cluster on a second, offset line at high Windows display scaling. */
+  flex-wrap: nowrap;
   gap: 0.25rem 0.75rem;
   padding: 0.25rem 0.625rem 0.625rem;
 }
@@ -1815,8 +1773,8 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-actions--left {
-  flex: 0 1 auto;
-  flex-wrap: wrap;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
   max-width: 100%;
 }
 
@@ -1833,29 +1791,135 @@ button.attachment-chip__primary:focus-visible {
   max-width: 14rem;
 }
 
-/* Keep the two footer action groups on one row while the composer still has
-   enough room for their labels. The previous 38rem threshold stacked the
-   controls in the common new-chat width (~552px), leaving a large unused gap
-   and making the routing/send controls look detached from the first row. */
-@container chat-composer (max-width: 32rem) {
-  .chat-input-footer {
+/* The stop target needs more room than the send target in narrow composers. */
+@container chat-composer (max-width: 26rem) {
+  .chat-input-footer:has(.chat-stop-btn) .chat-run-mode-btn__label {
+    display: none;
+  }
+}
+
+/* At genuinely narrow widths the touch targets cannot share one row. Give
+   both rows the same full width so the fallback remains aligned instead of
+   leaving the routing/send cluster floating on a separate edge. */
+@container chat-composer (max-width: 26rem) {
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
     flex-direction: column;
     align-items: stretch;
     gap: 0.375rem;
   }
 
-  .chat-input-actions--right {
-    align-self: flex-end;
-    margin-left: 0;
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+    width: 100%;
+    flex: 0 0 auto;
   }
 
-  .chat-more-actions-anchor {
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+    align-self: stretch;
+    margin-left: 0;
+    justify-content: space-between;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
     margin-left: auto;
   }
 
-  .chat-more-actions-menu {
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
     right: 0;
     left: auto;
+  }
+}
+
+/* An active mode adds a chip to the first cluster. Reserve a complete row
+   before that chip can push More onto an isolated line. */
+@container chat-composer (min-width: 26rem) and (max-width: 36rem) {
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+    flex-wrap: wrap;
+    gap: 0.375rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+    flex: 1 1 100%;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+    justify-content: space-between;
+    margin-left: 0;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+    margin-left: auto;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+    right: 0;
+    left: auto;
+  }
+}
+
+/* More is the only ordinary-mode popover whose trigger sits at the left edge.
+   Re-anchor it to the footer at narrow widths so the menu stays inside the
+   composer while its labels remain readable. */
+@container chat-composer (max-width: 36rem) {
+  .chat-input-footer {
+    position: relative;
+  }
+
+  .chat-more-actions-anchor {
+    position: static;
+  }
+
+  .chat-more-actions-menu {
+    left: auto;
+    right: 0.625rem;
+    max-width: calc(100% - 1.25rem);
+    min-width: 0;
+  }
+
+  .chat-more-actions-menu button > span,
+  .chat-more-actions-menu__copy {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+@container chat-composer (max-width: 22rem) {
+  .chat-input-footer {
+    gap: 0.25rem;
+    padding-inline: 0.25rem;
+  }
+
+  .chat-input-actions--left {
+    gap: 0;
+  }
+
+  .chat-input-actions--right {
+    gap: 0;
+  }
+
+  /* At this width the labels cannot coexist with the touch targets. Keep
+     their accessible names and titles, but let the controls collapse to
+     their icons so the ordinary composer still has one stable row. */
+  .chat-run-mode-btn__label,
+  .chat-model-routing-btn__label {
+    display: none;
+  }
+
+  .chat-run-mode-btn,
+  .chat-model-routing-btn {
+    gap: 0.25rem;
+    padding-inline: 0.25rem;
   }
 }
 

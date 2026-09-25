@@ -90,7 +90,7 @@ def test_nano_usd_conversion_is_decimal_and_bounded() -> None:
 
 
 def test_session_schema_version_includes_artifact_mutations_and_routing_state() -> None:
-    assert SCHEMA_VERSION == 25
+    assert SCHEMA_VERSION == 26
 
 
 async def test_initialize_cutover_snapshots_legacy_totals_once(tmp_path: Path) -> None:
@@ -473,7 +473,7 @@ async def test_unknown_never_downgrades_finalized_and_survives_session_delete(
         await storage.close()
 
 
-async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
+async def test_session_boundaries_preserve_billing_audit(
     tmp_path: Path,
 ) -> None:
     storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
@@ -501,56 +501,14 @@ async def test_session_boundaries_clean_meta_state_but_preserve_billing_audit(
             receipts=(receipt,),
         )
 
-        async def stage(client_request_id: str) -> None:
-            launch_text = f"/meta meta-paper-write -- {client_request_id}"
-            await storage.stage_meta_launch_draft(
-                session_key=session.session_key,
-                client_request_id=client_request_id,
-                meta_skill_name="meta-paper-write",
-                launch_text=launch_text,
-            )
-            await storage.promote_meta_launch_draft(
-                session_key=session.session_key,
-                client_request_id=client_request_id,
-                meta_skill_name="meta-paper-write",
-                launch_text=launch_text,
-            )
-
         async def assert_billing_audit_survives() -> None:
             assert await storage.query_usage_events(None, None) == [finalized]
             assert await storage.query_usage_event_items(["event-1"]) == [item]
             assert await storage.query_usage_item_billing_receipts(["event-1"]) == [receipt]
 
-        await stage("before-reset")
         assert await storage.advance_reset_epoch(session.session_key) == 1
-        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
-        assert await storage.get_meta_control_intent(
-            session_key=session.session_key,
-            control_kind="manual",
-            correlation_id="request:before-reset",
-        ) is None
         await assert_billing_audit_survives()
-
-        await stage("before-delete")
         await storage.delete_session(session.session_key)
-        assert await storage.list_meta_launch_drafts(session_key=session.session_key) == []
-        assert await storage.get_meta_control_intent(
-            session_key=session.session_key,
-            control_kind="manual",
-            correlation_id="request:before-delete",
-        ) is None
-        async with storage.conn.execute(
-            """
-            SELECT client_request_id
-            FROM meta_launch_discard_tombstones
-            WHERE session_key = ?
-            """,
-            (session.session_key,),
-        ) as cur:
-            assert {str(row[0]) for row in await cur.fetchall()} == {
-                "before-reset",
-                "before-delete",
-            }
         await assert_billing_audit_survives()
     finally:
         await storage.close()

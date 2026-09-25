@@ -1710,7 +1710,7 @@ async def test_run_agent_once_can_opt_into_interactive_single_shot(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("child_marker", [None, "0", "1"])
 @pytest.mark.parametrize("stateless", [False, True])
-async def test_agent_launch_counts_user_cli_not_internal_coding_child(
+async def test_agent_launch_counts_cli_even_with_retired_child_marker(
     monkeypatch: pytest.MonkeyPatch, child_marker: str | None, stateless: bool
 ) -> None:
     from opensquilla.telemetry.contracts.common import (
@@ -1756,13 +1756,12 @@ async def test_agent_launch_counts_user_cli_not_internal_coding_child(
     )
 
     assert result.status == "ok"
-    expected_launches = [] if child_marker == "1" else [{
+    assert launches == [{
         "surface": ClientSurface.CLI,
         "entrypoint": ClientEntrypoint.AGENT,
         "execution_mode": ExecutionMode.ONE_SHOT,
     }]
-    assert launches == expected_launches
-    assert active == ([] if child_marker == "1" else [{"surface": ClientSurface.CLI}])
+    assert active == [{"surface": ClientSurface.CLI}]
     assert len(turns) == 1
     assert turns[0]["telemetry_surface"] is ClientSurface.CLI
     assert turns[0]["telemetry_execution_mode"] is ExecutionMode.ONE_SHOT

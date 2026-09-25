@@ -3,10 +3,10 @@
     ref="listRootRef"
     class="chat-message-list"
     :data-virtualized="virtualizationEnabled ? 'true' : 'false'"
-    :data-rendered-message-count="renderEntries.length"
+    :data-rendered-message-count="renderEntries.filter(entry => entry.index < messages.length).length"
   >
     <div
-      v-if="virtualizationEnabled"
+      v-if="variableLayout.topSpacer > 0"
       class="chat-message-list__spacer"
       :style="spacerStyle(variableLayout.topSpacer)"
       data-testid="chat-history-top-spacer"
@@ -14,14 +14,25 @@
     />
     <template v-for="entry in renderEntries" :key="entry.key">
       <div
-        v-if="virtualizationEnabled && entry.gapBefore > 0"
+        v-if="entry.gapBefore > 0"
         class="chat-message-list__spacer"
         :style="spacerStyle(entry.gapBefore)"
         data-testid="chat-history-gap-spacer"
         aria-hidden="true"
       />
       <div
-        :ref="element => setRowElement(element, entry.key)"
+        v-if="entry.index === messages.length"
+        :ref="setRowElement"
+        :data-index="entry.index"
+        class="chat-message-list__trailing"
+        data-testid="chat-message-trailing"
+      >
+        <slot name="trailing" />
+      </div>
+      <div
+        v-else
+        :ref="setRowElement"
+        :data-index="entry.index"
         class="chat-message-list__row"
         :class="{ 'chat-message-list__row--last': entry.index === messages.length - 1 }"
         :data-chat-message-key="entry.key"
@@ -139,7 +150,7 @@
       </div>
     </template>
     <div
-      v-if="virtualizationEnabled"
+      v-if="variableLayout.bottomSpacer > 0"
       class="chat-message-list__spacer"
       :style="spacerStyle(variableLayout.bottomSpacer)"
       data-testid="chat-history-bottom-spacer"
@@ -155,7 +166,9 @@ import {
   nextTick,
   onBeforeUnmount,
   onMounted,
+  onUpdated,
   ref,
+  useSlots,
   watch,
   type ComponentPublicInstance,
 } from 'vue'
@@ -180,18 +193,16 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { chatMessageKey } from '@/utils/chat/messageIdentity'
 import { applyProgrammaticScroll } from '@/utils/chat/scrollMutation'
+import { captureVisibleTextScrollAnchor, restoreTextScrollAnchor, type TextScrollAnchor } from '@/utils/chat/scrollAnchor'
+import { readDistanceFromEnd, remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
 import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
 } from '@/utils/chat/usageAccountingFailure'
-import {
-  buildVariableWindow,
-  CHAT_HISTORY_VIRTUALIZATION_THRESHOLD,
-  type ChatMessageListVirtualizer,
-  type VariableWindowEntry,
-} from '@/utils/chat/variableMessageWindow'
+import { defaultRangeExtractor, elementScroll, measureElement as measureVirtualElement, observeElementOffset, observeElementRect, useVirtualizer, type Rect, type ScrollToOptions, type Virtualizer } from '@tanstack/vue-virtual'
+import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 
 const props = defineProps<{
   messages: ChatRenderedMessage[]
@@ -233,6 +244,8 @@ const props = defineProps<{
   resolveWorkspacePreviewResource?: (sessionKey: string, documentId: string) => Promise<WorkbenchResource | null>
   /** Required for long-history virtualization; omitted by legacy embedders. */
   scrollContainer?: HTMLElement | null
+  /** Header outside the row range; its size contributes to scrollMargin. */
+  layoutHeader?: HTMLElement | null
   /** Session/render epoch used to invalidate deferred scroll corrections. */
   scrollEpoch?: number
   /** Preview/export paths can force a complete, canonical DOM. */
@@ -241,6 +254,10 @@ const props = defineProps<{
   forceMountMessageKeys?: ReadonlySet<string>
   /** Keep the live edge pinned while estimated row heights settle. */
   followLiveEdge?: boolean
+  /** Trailing breathing room, rendered once by this list. */
+  bottomPadding?: number
+  /** Identity of the live/status slot, stable across stream updates. */
+  trailingKey?: string
 }>()
 
 const emit = defineEmits<{
@@ -343,42 +360,34 @@ function assistantRegenerateAvailable(index: number): boolean {
 }
 
 const listRootRef = ref<HTMLElement | null>(null)
-const viewportStart = ref(0)
-const viewportSize = ref(1)
+const slots = useSlots()
+const scrollMargin = ref(0)
 const measurementVersion = ref(0)
 const virtualizationAllowed = ref(readVirtualizationPreference())
 const focusedMessageKey = ref<string | null>(null)
 const ensuredMessageKeys = ref<ReadonlySet<string>>(new Set())
-const rowElements = new Map<string, HTMLElement>()
-const measuredSizes = new Map<string, number>()
-
-let attachedContainer: HTMLElement | null = null
-let rowResizeObserver: ResizeObserver | null = null
-let viewportResizeObserver: ResizeObserver | null = null
-let viewportFrame = 0
-let pendingAnchorAdjustment = 0
-let anchorAdjustmentScheduled = false
+const layoutAnchorKey = ref<string | null>(null)
+const measuredRowElements = new WeakSet<HTMLElement>()
+let layoutObserver: ResizeObserver | null = null
+let layoutWidth = 0
+let layoutGeneration = 0
 let liveEdgePinScheduled = false
-let deferredScrollGeneration = 0
-
-function currentScrollEpoch(): number {
-  return props.scrollEpoch ?? 0
-}
-
-function resetDeferredScrollWork() {
-  deferredScrollGeneration += 1
-  pendingAnchorAdjustment = 0
-  anchorAdjustmentScheduled = false
-  liveEdgePinScheduled = false
-}
+let cancelledSeek = false
+let nativeSmoothSeek = false
+let liveEdgeSeek = false
+const layoutPending = ref(false)
+let readingTextAnchor: { key: string; anchor: TextScrollAnchor } | null = null
+let readingAnchor: VirtualizerAnchor | null = null
+let readingPosition = -1
+const activeNavigation = ref<{ key: string; options: ScrollToOptions } | null>(null)
+const scrollHandoff = ref<symbol | null>(null)
+let synchronizeScrollOffset: (() => void) | null = null
 
 function readVirtualizationPreference(): boolean {
-  if (typeof window === 'undefined') return true
   try {
-    return window.localStorage.getItem(VIRTUALIZATION_STORAGE_KEY) !== '0'
+    return typeof window === 'undefined'
+      || window.localStorage.getItem(VIRTUALIZATION_STORAGE_KEY) !== '0'
   } catch {
-    // Storage can be denied in hardened/private contexts. The feature is a
-    // rendering optimization and remains safe without persistent settings.
     return true
   }
 }
@@ -392,282 +401,431 @@ function estimatedMessageSize(message: ChatRenderedMessage): number {
     return 68 + Math.min(480, Math.ceil(textLength / 72) * 22) + MESSAGE_GAP_PX
   }
   if (message.displayRole === 'assistant') {
-    return 104
-      + Math.min(1_800, Math.ceil(textLength / 88) * 24)
-      + Math.min(640, toolCount * 48)
-      + MESSAGE_GAP_PX
+    return 104 + Math.min(1_800, Math.ceil(textLength / 88) * 24)
+      + Math.min(640, toolCount * 48) + MESSAGE_GAP_PX
   }
   return 76 + Math.min(520, Math.ceil(textLength / 84) * 22) + MESSAGE_GAP_PX
 }
 
-const windowRows = computed(() => props.messages.map((message, index) => ({
-  key: chatMessageKey(message, index),
-  estimatedSize: estimatedMessageSize(message),
-})))
-
-const virtualizationEnabled = computed(() => (
-  virtualizationAllowed.value
-  && !props.shareMode
-  && !props.virtualizationDisabled
-  && Boolean(props.scrollContainer)
-  && props.messages.length >= CHAT_HISTORY_VIRTUALIZATION_THRESHOLD
-))
-
-function messageNeedsForcedMount(message: ChatRenderedMessage, index: number): boolean {
-  void index
-  // Forced mounts are correctness leases for live/interactive state, not a
-  // permanent archive of every row that once ended unusually. Settled stop,
-  // failure, Goal and maintenance rows can remount normally when they enter
-  // the viewport; retaining them all would defeat the 30-row DOM ceiling.
-  if (message.isStreaming || message.maintenance?.state === 'running') return true
-  return Boolean(message.parts?.some(part => part.type === 'interrupt' && !part.resolution))
+function updateSizeAdjustmentPolicy(
+  instance: Virtualizer<HTMLElement, HTMLElement>,
+  repeatedObservation = false,
+) {
+  // Core only caches an initial size when it differs from the estimate. A
+  // repeated observation of the same DOM row is still a resize even when that
+  // first size happened to equal its estimate. No sizes/keys are stored here.
+  instance.shouldAdjustScrollPositionOnItemSizeChange = scrollHandoff.value ? () => false : (
+    activeNavigation.value || layoutPending.value || repeatedObservation
+  ) ? (item, _delta, current) => item.end <= (current.scrollOffset ?? 0) : undefined
 }
 
+const messageKeys = computed(() => props.messages.map(chatMessageKey))
+const hasTrailing = computed(() => Boolean(slots.trailing))
+const virtualizationEnabled = computed(() => (
+  virtualizationAllowed.value && !props.shareMode && !props.virtualizationDisabled
+  && Boolean(props.scrollContainer) && props.messages.length >= 60
+))
 const forcedIndexes = computed(() => {
   const forced = new Set<number>()
-  const externalKeys = props.forceMountMessageKeys
-  windowRows.value.forEach((row, index) => {
+  props.messages.forEach((message, index) => {
+    const key = messageKeys.value[index]
     if (
-      ensuredMessageKeys.value.has(row.key)
-      || focusedMessageKey.value === row.key
-      || externalKeys?.has(row.key)
-      || messageNeedsForcedMount(props.messages[index], index)
+      ensuredMessageKeys.value.has(key) || focusedMessageKey.value === key
+      || layoutAnchorKey.value === key
+      || props.forceMountMessageKeys?.has(key)
+      || message.isStreaming || message.maintenance?.state === 'running'
+      || message.parts?.some(part => part.type === 'interrupt' && !part.resolution)
     ) forced.add(index)
   })
-  // The settled tail can still own turn actions while the next turn streams in
-  // the parent. Keep only that one row mounted rather than expanding the whole
-  // window from a reader's historical position to the live edge.
-  if (props.isStreaming && props.messages.length > 0) forced.add(props.messages.length - 1)
+  if (props.isStreaming && props.messages.length) forced.add(props.messages.length - 1)
+  if (hasTrailing.value) forced.add(props.messages.length)
   return forced
 })
 
-const variableLayout = computed(() => {
-  // Map mutations are intentionally non-reactive; a scalar invalidation avoids
-  // proxying a growing height cache on every ResizeObserver delivery.
-  void measurementVersion.value
-  return buildVariableWindow({
-    rows: windowRows.value,
-    measuredSizes,
-    viewportStart: viewportStart.value,
-    viewportSize: viewportSize.value,
-    forceIndexes: forcedIndexes.value,
-  })
-})
+// The end anchor preserves keyed reading positions on prepend. In the pinned
+// core version a negative threshold also disables resize end-pinning. Keep
+// this policy together: followOnAppend=false alone does NOT stop resize pins.
+const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => {
+  const keys = messageKeys.value
+  const forced = forcedIndexes.value
+  const virtualized = virtualizationEnabled.value
+  const count = keys.length + Number(hasTrailing.value)
+  return {
+    count,
+    getScrollElement: () => props.scrollContainer ?? null,
+    getItemKey: (index: number) => index < keys.length
+      ? keys[index] : 'trailing:' + (props.trailingKey ?? props.sessionKey ?? ''),
+    estimateSize: (index: number) => index < props.messages.length
+      ? estimatedMessageSize(props.messages[index]) : 0,
+    overscan: 5,
+    scrollMargin: scrollMargin.value,
+    paddingEnd: props.bottomPadding ?? 0,
+    scrollPaddingStart: 16,
+    // The live tail becomes a different canonical message row on completion.
+    // During that semantic handoff the text anchor, not the old tail key, owns Y.
+    anchorTo: scrollHandoff.value ? 'start' as const : 'end' as const,
+    followOnAppend: props.followLiveEdge === true,
+    scrollEndThreshold: props.followLiveEdge ? 80 : -1,
+    rangeExtractor: (range: Parameters<typeof defaultRangeExtractor>[0]) => virtualized
+      ? [...new Set([...defaultRangeExtractor(range), ...forced])].sort((a, b) => a - b)
+      : Array.from({ length: count }, (_, index) => index),
+    scrollToFn: (offset: number, options: Parameters<typeof elementScroll>[1], instance: Virtualizer<HTMLElement, HTMLElement>) => {
+      // A cancelled index/end seek can still reconcile on the next animation
+      // frame. Allow library geometry corrections (no behavior / adjustments),
+      // but never let that old navigation take ownership back from the reader.
+      if (cancelledSeek && options.behavior !== undefined && options.adjustments === undefined) return
+      if (scrollHandoff.value && options.behavior === undefined) return
+      const container = props.scrollContainer
+      if (options.behavior !== undefined) nativeSmoothSeek = options.behavior === 'smooth'
+      if (container && options.behavior === undefined && options.adjustments === undefined
+        && offset > container.scrollHeight - container.clientHeight) {
+        // Vue's adapter applies keyed prepend anchors in its pre-render
+        // watcher. An anchor beyond the old DOM's range would be clamped and
+        // its native scroll event would replace the new keyed position.
+        // Let only this structural write wait for the larger DOM to commit.
+        const generation = layoutGeneration
+        void nextTick(() => {
+          if (generation !== layoutGeneration || container !== props.scrollContainer) return
+          applyProgrammaticScroll(container, () => elementScroll(
+            instance.scrollOffset ?? offset, options, instance,
+          ))
+        })
+        return
+      }
+      if (container) applyProgrammaticScroll(container, () => elementScroll(offset, options, instance))
+    },
+    observeElementRect: (instance: Virtualizer<HTMLElement, HTMLElement>, callback: (rect: Rect) => void) => (
+      observeElementRect(instance, rect => {
+        callback(rect)
+        if (props.followLiveEdge) queueLiveEdgePin()
+      })
+    ),
+    observeElementOffset: (instance: Virtualizer<HTMLElement, HTMLElement>, callback: (offset: number, scrolling: boolean) => void) => {
+      const container = instance.scrollElement
+      const synchronize = () => { if (container) callback(container.scrollTop, false) }
+      synchronizeScrollOffset = synchronize
+      const cleanup = observeElementOffset(instance, (offset, scrolling) => {
+        callback(offset, scrolling)
+        rememberReadingAnchor()
+        if (!scrolling) void nextTick(captureReadingText)
+      })
+      return () => {
+        if (synchronizeScrollOffset === synchronize) synchronizeScrollOffset = null
+        cleanup?.()
+      }
+    },
+    // Keep fractional RO measurements, but let TanStack reuse its measurements
+    // during Vue ref updates. Synchronously measuring every ref again can race
+    // the native scroll event after a width-restoration write.
+    measureElement: (element: HTMLElement, entry: ResizeObserverEntry | undefined, instance: Virtualizer<HTMLElement, HTMLElement>) => {
+      updateSizeAdjustmentPolicy(instance, Boolean(entry && measuredRowElements.has(element)))
+      measuredRowElements.add(element)
+      return entry?.borderBoxSize?.[0]?.blockSize ?? measureVirtualElement(element, entry, instance)
+    },
+    onChange: () => {
+      measurementVersion.value += 1
+      if (props.followLiveEdge) queueLiveEdgePin()
+    },
+  }
+}))
 
-const renderEntries = computed<VariableWindowEntry[]>(() => {
-  if (virtualizationEnabled.value) return variableLayout.value.entries
-  return windowRows.value.map((row, index) => ({ index, key: row.key, gapBefore: 0 }))
+// During an explicit seek/reflow, late code controls above the reading line
+// still need compensation after an upward move. Keep TanStack's default
+// first-measure/prepend policy for ordinary reader scrolling.
+watch([activeNavigation, layoutPending, scrollHandoff], () => {
+  updateSizeAdjustmentPolicy(virtualizer.value)
+}, { immediate: true, flush: 'sync' })
+
+const variableLayout = computed(() => {
+  // Populate the same geometry even when an export renders every row.
+  const totalSize = virtualizer.value.getTotalSize()
+  if (!virtualizationEnabled.value) return {
+    entries: [
+      ...messageKeys.value.map((key, index) => ({ key, index, gapBefore: 0 })),
+      ...(hasTrailing.value ? [{ key: 'trailing:' + (props.trailingKey ?? props.sessionKey ?? ''), index: props.messages.length, gapBefore: 0 }] : []),
+    ],
+    topSpacer: 0,
+    bottomSpacer: props.bottomPadding ?? 0,
+  }
+  const items = virtualizer.value.getVirtualItems()
+  const margin = scrollMargin.value
+  return {
+    entries: items.map((item, index) => ({
+      key: String(item.key),
+      index: item.index,
+      gapBefore: index ? Math.max(0, item.start - items[index - 1].end) : 0,
+    })),
+    topSpacer: Math.max(0, (items[0]?.start ?? margin) - margin),
+    bottomSpacer: Math.max(0, totalSize
+      - ((items[items.length - 1]?.end ?? margin) - margin)),
+  }
 })
+const renderEntries = computed(() => variableLayout.value.entries)
 
 function spacerStyle(height: number): Record<string, string> {
-  return { height: `${Math.max(0, height)}px` }
+  return { height: height + 'px' }
 }
 
-function frame(callback: () => void): number {
-  if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
-    return window.requestAnimationFrame(() => callback())
+function setRowElement(value: Element | ComponentPublicInstance | null) {
+  const element = value instanceof HTMLElement ? value : null
+  virtualizer.value.measureElement(element)
+}
+
+function messageRow(index: number): HTMLElement | null {
+  return listRootRef.value?.querySelector<HTMLElement>(
+    '[data-chat-message-index="' + index + '"]',
+  ) ?? null
+}
+
+function messageElement(index: number): HTMLElement | null {
+  const row = messageRow(index)
+  return row?.querySelector<HTMLElement>('[data-chat-turn-key]')
+    || row?.firstElementChild as HTMLElement | null || row
+}
+
+async function ensureMessageVisible(index: number): Promise<HTMLElement | null> {
+  const key = messageKeys.value[index]
+  if (!key) return null
+  const session = props.sessionKey
+  const epoch = props.scrollEpoch
+  ensuredMessageKeys.value = new Set([...ensuredMessageKeys.value, key])
+  await nextTick()
+  if (session !== props.sessionKey || epoch !== props.scrollEpoch) return null
+  return messageElement(messageKeys.value.indexOf(key))
+}
+
+function releaseEnsuredMessage(index?: number) {
+  const next = new Set(ensuredMessageKeys.value)
+  if (index === undefined) next.clear()
+  else next.delete(messageKeys.value[index])
+  ensuredMessageKeys.value = next
+  if (activeNavigation.value && !next.has(activeNavigation.value.key)) activeNavigation.value = null
+}
+
+function scrollToMessage(index: number, options: ScrollToOptions = {}) {
+  const key = messageKeys.value[index]
+  if (!key) return
+  activeNavigation.value = ensuredMessageKeys.value.has(key) ? { key, options } : null
+  scrollHandoff.value = null
+  liveEdgeSeek = false
+  cancelledSeek = false
+  virtualizer.value.scrollToIndex(index, options)
+}
+
+function scrollToEnd(options?: Pick<ScrollToOptions, 'behavior'>) {
+  activeNavigation.value = null
+  scrollHandoff.value = null
+  liveEdgeSeek = true
+  cancelledSeek = false
+  virtualizer.value.scrollToEnd(options)
+}
+
+function cancelScroll() {
+  activeNavigation.value = null
+  scrollHandoff.value = null
+  liveEdgeSeek = false
+  cancelledSeek = true
+  layoutGeneration += 1
+  layoutPending.value = false
+  layoutAnchorKey.value = null
+  readingTextAnchor = null
+  readingAnchor = null
+  readingPosition = -1
+  // Do not write the current scrollTop here: Chromium may already have applied
+  // the wheel delta before dispatching wheel. Marking that position as an app
+  // write would swallow the genuine scroll event and restart bottom following.
+  // Replacing the old index seek also releases its smooth-scroll measurement
+  // restriction. The writer guard above makes this command state-only.
+  const container = props.scrollContainer
+  if (container) virtualizer.value.scrollToOffset(container.scrollTop, { behavior: 'auto' })
+  // A nested scroller's consumed wheel still has to stop an outer smooth
+  // animation. This native no-op stops it without tagging the reader's delta.
+  if (nativeSmoothSeek && props.scrollContainer) {
+    props.scrollContainer.scrollTo({ top: props.scrollContainer.scrollTop, behavior: 'instant' })
+    nativeSmoothSeek = false
   }
-  return globalThis.setTimeout(callback, 0) as unknown as number
 }
 
-function cancelScheduledFrame(id: number) {
-  if (!id || typeof window === 'undefined') return
-  if (typeof window.cancelAnimationFrame === 'function') window.cancelAnimationFrame(id)
-  else window.clearTimeout(id)
+function beginScrollHandoff(): () => void {
+  cancelScroll()
+  const owner = Symbol('terminal-answer')
+  scrollHandoff.value = owner
+  return () => {
+    if (scrollHandoff.value !== owner) return
+    // The semantic owner may have moved the DOM directly. Publish that actual
+    // offset through the current public observer before re-enabling geometry
+    // corrections; never replay the old live-tail position.
+    synchronizeScrollOffset?.()
+    scrollHandoff.value = null
+  }
 }
 
-function listStartInContainer(): number | null {
-  const root = listRootRef.value
+function stopScrollReconciliation() {
   const container = props.scrollContainer
-  if (!root || !container) return null
-  const rootRect = root.getBoundingClientRect()
-  const containerRect = container.getBoundingClientRect()
-  return rootRect.top - containerRect.top + container.scrollTop
-}
-
-function measureViewport() {
-  viewportFrame = 0
-  const container = props.scrollContainer
-  const listStart = listStartInContainer()
-  if (!container || listStart === null) return
-  viewportStart.value = Math.max(0, container.scrollTop - listStart)
-  viewportSize.value = Math.max(1, container.clientHeight)
-}
-
-function scheduleViewportMeasure() {
-  if (viewportFrame) return
-  viewportFrame = frame(measureViewport)
-}
-
-function queueAnchorAdjustment(delta: number) {
-  const container = props.scrollContainer
-  if (!container || Math.abs(delta) < 0.5) return
-  const epoch = currentScrollEpoch()
-  const sessionKey = props.sessionKey
-  const generation = deferredScrollGeneration
-  pendingAnchorAdjustment += delta
-  if (anchorAdjustmentScheduled) return
-  anchorAdjustmentScheduled = true
-  void nextTick(() => {
-    if (deferredScrollGeneration !== generation) return
-    anchorAdjustmentScheduled = false
-    const adjustment = pendingAnchorAdjustment
-    pendingAnchorAdjustment = 0
-    if (!props.scrollContainer || props.scrollContainer !== container) return
-    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
-    applyProgrammaticScroll(container, () => {
-      container.scrollTop += adjustment
-    })
-    scheduleViewportMeasure()
-  })
+  if (container) {
+    cancelledSeek = false
+    virtualizer.value.scrollToOffset(container.scrollTop, { behavior: 'auto' })
+  }
 }
 
 function queueLiveEdgePin() {
-  const container = props.scrollContainer
-  if (!container || liveEdgePinScheduled) return
-  const epoch = currentScrollEpoch()
-  const sessionKey = props.sessionKey
-  const generation = deferredScrollGeneration
+  if (liveEdgePinScheduled) return
   liveEdgePinScheduled = true
+  const generation = layoutGeneration
   void nextTick(() => {
-    if (deferredScrollGeneration !== generation) return
     liveEdgePinScheduled = false
-    if (!props.followLiveEdge || props.scrollContainer !== container) return
-    if (props.sessionKey !== sessionKey || currentScrollEpoch() !== epoch) return
-    applyProgrammaticScroll(container, () => {
-      container.scrollTop = container.scrollHeight
-    })
-    scheduleViewportMeasure()
+    if (generation !== layoutGeneration || !props.followLiveEdge) return
+    const container = props.scrollContainer
+    if (container && container.scrollHeight <= container.clientHeight) {
+      // A fitting transcript never emits the native scroll event that would
+      // acknowledge a clamped size correction. Publish its committed offset
+      // through core's observer so an old seek can finish without RAF polling.
+      if (virtualizer.value.scrollOffset !== container.scrollTop) synchronizeScrollOffset?.()
+      return
+    }
+    scrollToEnd()
   })
 }
 
-function measuredRowHeight(target: HTMLElement): number {
-  const height = target.getBoundingClientRect().height
-  return Number.isFinite(height) && height > 0 ? height : 0
-}
-
-function onRowsResize(entries: ResizeObserverEntry[]) {
-  if (!virtualizationEnabled.value) return
+function updateLayout() {
+  const root = listRootRef.value
   const container = props.scrollContainer
-  const containerTop = container?.getBoundingClientRect().top ?? 0
-  let changed = false
-  let anchorDelta = 0
-  for (const entry of entries) {
-    const target = entry.target
-    if (!(target instanceof HTMLElement)) continue
-    const key = target.dataset.chatMessageKey
-    const index = Number(target.dataset.chatMessageIndex)
-    if (!key || !Number.isInteger(index) || index < 0 || index >= windowRows.value.length) continue
-    const height = measuredRowHeight(target)
-    if (height <= 0) continue
-    const previous = measuredSizes.get(key) ?? windowRows.value[index].estimatedSize
-    if (Math.abs(previous - height) < 0.5) continue
-    measuredSizes.set(key, height)
-    changed = true
-    const delta = height - previous
-    // Estimated offsets can disagree with the physical viewport precisely
-    // while variable heights are settling. Derive the row's pre-resize bottom
-    // from its current DOM rect and the observed delta; if that old edge was
-    // above the viewport, preserve the reader's visible anchor by the same
-    // amount. This remains correct when a growing row now overlaps the viewport.
-    const previousBottom = target.getBoundingClientRect().bottom - delta
-    if (container && previousBottom <= containerTop + 0.5) {
-      anchorDelta += delta
+  if (!root || !container) return
+  const rect = root.getBoundingClientRect()
+  const initialized = layoutWidth > 0
+  const changedWidth = initialized && Math.abs(layoutWidth - rect.width) > 0.5
+  layoutWidth = rect.width
+  const nextMargin = rect.top - container.getBoundingClientRect().top + container.scrollTop
+  if (Math.abs(scrollMargin.value - nextMargin) > 0.1) {
+    if (initialized && !changedWidth && container.scrollTop > 0) {
+      // The history/recovery header is outside the virtual rows. TanStack
+      // anchors keyed prepends, but changing scrollMargin alone is not a
+      // prepend; reuse the same layout transaction without discarding sizes.
+      preserveLayoutChange(() => { scrollMargin.value = nextMargin })
+    } else scrollMargin.value = nextMargin
+    if (props.followLiveEdge) queueLiveEdgePin()
+  }
+  if (changedWidth) remeasure()
+  else {
+    rememberReadingAnchor()
+    captureReadingText()
+  }
+}
+
+function rememberReadingAnchor() {
+  const container = props.scrollContainer
+  const root = listRootRef.value
+  if (!container || !root || props.followLiveEdge || layoutPending.value || !layoutWidth
+    || Math.abs(root.getBoundingClientRect().width - layoutWidth) > 0.5) return
+  const offset = container.scrollTop
+  const item = virtualizer.value.getVirtualItemForOffset(offset)
+  if (!item) { readingAnchor = null; return }
+  let anchor = item
+  // A small leftover tail is not the reader's primary content. Anchor the
+  // next complete row, while near-boundary and oversized-message reads keep
+  // their current row (with text anchoring inside long answers).
+  if (offset - item.start > item.size / 2 && item.size < container.clientHeight) {
+    anchor = virtualizer.value.getVirtualItems().find(candidate => (
+      candidate.index > item.index && candidate.index < props.messages.length
+      && candidate.start >= offset && candidate.end <= offset + container.clientHeight
+    )) ?? item
+  }
+  readingAnchor = { key: anchor.key, intraOffset: offset - anchor.start }
+}
+
+function captureReadingText() {
+  const container = props.scrollContainer
+  if (!container || props.followLiveEdge || layoutPending.value || virtualizer.value.isScrolling) return
+  if (readingPosition === container.scrollTop) return
+  readingPosition = container.scrollTop
+  const item = virtualizer.value.getVirtualItemForOffset(container.scrollTop)
+  // Near a row boundary, that boundary is the reading anchor. Preserving a
+  // token which merely wraps to another line would unnecessarily move it.
+  // Semantic anchoring is for a reader already inside a long message.
+  const deepInside = item && readingAnchor?.key === item.key && container.scrollTop - item.start > 64
+  const anchor = deepInside ? captureVisibleTextScrollAnchor(container, messageRow(item.index)) : null
+  readingTextAnchor = anchor && item ? { key: String(item.key), anchor } : null
+}
+
+/** Width/font changes invalidate offscreen heights, which RO cannot observe. */
+function remeasure() {
+  preserveLayoutChange()
+}
+
+function preserveLayoutChange(applyLayoutChange?: () => void) {
+  cancelledSeek = false
+  const generation = ++layoutGeneration
+  const anchorOverride = applyLayoutChange ? null : readingAnchor
+  const textAnchor = !applyLayoutChange && readingTextAnchor?.key === anchorOverride?.key
+    ? readingTextAnchor : null
+  layoutPending.value = true
+  // A leased explicit destination owns navigation until arrival/cancellation.
+  // Width reflow must refresh that seek, not turn it into a reading-position
+  // restoration somewhere along its smooth-scroll journey.
+  const navigation = activeNavigation.value
+  if (navigation) {
+    if (applyLayoutChange) applyLayoutChange()
+    else virtualizer.value.measure()
+    void nextTick(() => {
+      if (generation !== layoutGeneration) return
+      if (activeNavigation.value === navigation) {
+        const index = messageKeys.value.indexOf(navigation.key)
+        if (index >= 0) virtualizer.value.scrollToIndex(index, navigation.options)
+      }
+      layoutPending.value = false
+    })
+    return
+  }
+  void remeasureVirtualizer(virtualizer.value, {
+    shouldFollowEnd: () => props.followLiveEdge === true,
+    isCurrent: () => generation === layoutGeneration,
+    getElement: messageRow,
+    applyLayoutChange,
+    anchorOverride,
+    keepAnchorMounted: key => {
+      layoutAnchorKey.value = String(key)
+      return () => {
+        if (generation === layoutGeneration) layoutAnchorKey.value = null
+      }
+    },
+  }).then(restored => {
+    if (generation !== layoutGeneration) return
+    if (restored && !props.followLiveEdge && textAnchor) {
+      const index = messageKeys.value.indexOf(textAnchor.key)
+      if (restoreTextScrollAnchor(textAnchor.anchor, messageRow(index))) stopScrollReconciliation()
     }
-  }
-  if (!changed) return
-  measurementVersion.value += 1
-  if (props.followLiveEdge) {
-    queueLiveEdgePin()
-    return
-  }
-  queueAnchorAdjustment(anchorDelta)
+    layoutPending.value = false
+    readingPosition = -1
+    rememberReadingAnchor()
+    captureReadingText()
+  })
 }
 
-function elementFromRef(value: Element | ComponentPublicInstance | null): HTMLElement | null {
-  if (value instanceof HTMLElement) return value
-  const componentElement = value && typeof value === 'object' && '$el' in value
-    ? value.$el
-    : null
-  return componentElement instanceof HTMLElement ? componentElement : null
-}
-
-function setRowElement(value: Element | ComponentPublicInstance | null, key: string) {
-  const previous = rowElements.get(key)
-  const next = elementFromRef(value)
-  if (previous && previous !== next) rowResizeObserver?.unobserve(previous)
-  if (!next) {
-    rowElements.delete(key)
-    return
-  }
-  rowElements.set(key, next)
-  if (virtualizationEnabled.value) {
-    rowResizeObserver?.observe(next, { box: 'border-box' })
-  }
-}
-
-function onContainerFocusIn(event: FocusEvent) {
+function onFocusIn(event: FocusEvent) {
   const target = event.target
-  if (!(target instanceof Element) || !listRootRef.value?.contains(target)) return
-  const row = target.closest<HTMLElement>('[data-chat-message-key]')
-  focusedMessageKey.value = row?.dataset.chatMessageKey || null
+  focusedMessageKey.value = target instanceof Element
+    ? target.closest<HTMLElement>('[data-chat-message-key]')?.dataset.chatMessageKey ?? null
+    : null
 }
 
-function onContainerFocusOut() {
+function onFocusOut() {
   void nextTick(() => {
     const active = document.activeElement
     if (!(active instanceof Element) || !listRootRef.value?.contains(active)) {
       focusedMessageKey.value = null
-      return
     }
-    focusedMessageKey.value = active.closest<HTMLElement>('[data-chat-message-key]')
-      ?.dataset.chatMessageKey || null
   })
 }
 
-function detachContainer() {
-  attachedContainer?.removeEventListener('scroll', scheduleViewportMeasure)
-  attachedContainer?.removeEventListener('focusin', onContainerFocusIn)
-  attachedContainer?.removeEventListener('focusout', onContainerFocusOut)
-  viewportResizeObserver?.disconnect()
-  viewportResizeObserver = null
-  attachedContainer = null
-}
-
-function attachContainer(container: HTMLElement | null | undefined) {
-  if (container === attachedContainer) {
-    scheduleViewportMeasure()
-    return
-  }
-  detachContainer()
-  if (!container) return
-  attachedContainer = container
-  container.addEventListener('scroll', scheduleViewportMeasure, { passive: true })
-  container.addEventListener('focusin', onContainerFocusIn)
-  container.addEventListener('focusout', onContainerFocusOut)
-  if (typeof ResizeObserver !== 'undefined') {
-    viewportResizeObserver = new ResizeObserver(entries => {
-      scheduleViewportMeasure()
-      // A container-height change has no new stream event to trigger the
-      // ordinary bottom pin. Keep a reader already following the live edge at
-      // the true bottom; historical readers retain their existing anchor.
-      if (props.followLiveEdge && entries.some(entry => entry.target === container)) {
-        queueLiveEdgePin()
-      }
-    })
-    viewportResizeObserver.observe(container)
-    if (listRootRef.value) viewportResizeObserver.observe(listRootRef.value)
-  }
-  scheduleViewportMeasure()
-}
-
-function syncRowObservation() {
-  rowResizeObserver?.disconnect()
-  if (!virtualizationEnabled.value) return
-  // measuredRowHeight() and the virtualizer cache both use the rendered
-  // border-box. Observe the same box so padding/border changes above the
-  // viewport cannot bypass the scroll-anchor correction.
-  rowElements.forEach(element => rowResizeObserver?.observe(element, { box: 'border-box' }))
+function hasPendingLayout(): boolean {
+  const container = props.scrollContainer
+  const rect = virtualizer.value.scrollRect
+  if (!container || !rect) return layoutPending.value
+  // Native scroll clamping is delivered before ResizeObserver. Until core
+  // sees this viewport, its previous end seek must not become reader intent.
+  return layoutPending.value
+    || Math.abs(rect.width - container.offsetWidth) > 0.5
+    || Math.abs(rect.height - container.offsetHeight) > 0.5
 }
 
 function syncPreference(event: StorageEvent) {
@@ -676,105 +834,74 @@ function syncPreference(event: StorageEvent) {
   }
 }
 
-function messageElement(index: number): HTMLElement | null {
-  const row = windowRows.value[index]
-  if (!row) return null
-  const wrapper = rowElements.get(row.key)
-  if (!wrapper) return null
-  return wrapper.querySelector<HTMLElement>('[data-chat-turn-key]')
-    || (wrapper.firstElementChild as HTMLElement | null)
-    || wrapper
-}
-
-async function ensureMessageVisible(index: number): Promise<HTMLElement | null> {
-  const row = windowRows.value[index]
-  if (!row) return null
-  if (!virtualizationEnabled.value) return messageElement(index)
-  ensuredMessageKeys.value = new Set([...ensuredMessageKeys.value, row.key])
-  await nextTick()
-  return messageElement(index)
-}
-
-function releaseEnsuredMessage(index?: number) {
-  if (index === undefined) {
-    if (ensuredMessageKeys.value.size > 0) ensuredMessageKeys.value = new Set()
-    return
-  }
-  const key = windowRows.value[index]?.key
-  if (!key || !ensuredMessageKeys.value.has(key)) return
-  const next = new Set(ensuredMessageKeys.value)
-  next.delete(key)
-  ensuredMessageKeys.value = next
-}
-
-function messageOffset(index: number): number | null {
-  if (!Number.isInteger(index) || index < 0 || index >= windowRows.value.length) return null
-  const container = props.scrollContainer
-  const mounted = rowElements.get(windowRows.value[index].key)
-  if (container && mounted) {
-    return mounted.getBoundingClientRect().top
-      - container.getBoundingClientRect().top
-      + container.scrollTop
-  }
-  const listStart = listStartInContainer()
-  if (listStart === null) return null
-  return listStart + (variableLayout.value.offsets[index] ?? 0)
-}
-
 defineExpose<ChatMessageListVirtualizer>({
   ensureMessageVisible,
   releaseEnsuredMessage,
-  messageOffset,
+  messageIndexAtOffset: offset => {
+    const index = virtualizer.value.getVirtualItemForOffset(offset)?.index
+    return index === undefined || !props.messages.length ? null
+      : Math.min(index, props.messages.length - 1)
+  },
+  scrollToMessage,
+  scrollToEnd,
+  getDistanceFromEnd: () => readDistanceFromEnd(props.scrollContainer, virtualizer.value),
+  hasPendingLayout,
+  cancelScroll,
+  beginScrollHandoff,
+  geometryVersion: () => measurementVersion.value,
+  remeasure,
   isVirtualized: () => virtualizationEnabled.value,
 })
 
-watch(() => props.scrollContainer, container => {
-  void nextTick(() => attachContainer(container))
+watch([() => props.sessionKey, () => props.scrollEpoch], () => {
+  cancelScroll()
+  ensuredMessageKeys.value = new Set()
+  focusedMessageKey.value = null
+  virtualizer.value.measure()
+}, { flush: 'sync' })
+watch(messageKeys, keys => {
+  const retained = new Set(keys)
+  ensuredMessageKeys.value = new Set([...ensuredMessageKeys.value].filter(key => retained.has(key)))
+  if (readingAnchor && !retained.has(String(readingAnchor.key))) readingAnchor = null
 })
-watch(virtualizationEnabled, () => {
-  void nextTick(() => {
-    syncRowObservation()
-    scheduleViewportMeasure()
-  })
+watch(() => props.followLiveEdge, follow => {
+  // Scrollbar/middle-button navigation can pause follow without an input
+  // callback. Retire its previous end seek before a viewport resize moves
+  // that target; a newly issued message navigation still owns its own seek.
+  if (follow) {
+    cancelledSeek = false
+    queueLiveEdgePin()
+  } else if (liveEdgeSeek) cancelScroll()
+}, { flush: 'sync' })
+watch(() => props.bottomPadding, () => {
+  if (props.followLiveEdge) queueLiveEdgePin()
 })
-watch(
-  [() => props.sessionKey, () => props.scrollEpoch],
-  () => {
-    resetDeferredScrollWork()
-    measuredSizes.clear()
-    ensuredMessageKeys.value = new Set()
-    focusedMessageKey.value = null
-    measurementVersion.value += 1
-    void nextTick(scheduleViewportMeasure)
-  },
-  { flush: 'sync' },
-)
-watch(() => windowRows.value.map(row => row.key), nextKeys => {
-  const retained = new Set(nextKeys)
-  for (const key of measuredSizes.keys()) {
-    if (!retained.has(key)) measuredSizes.delete(key)
-  }
-  const nextEnsured = new Set([...ensuredMessageKeys.value].filter(key => retained.has(key)))
-  if (nextEnsured.size !== ensuredMessageKeys.value.size) ensuredMessageKeys.value = nextEnsured
-  measurementVersion.value += 1
-  void nextTick(scheduleViewportMeasure)
+watch(() => props.layoutHeader, (header, previous) => {
+  if (previous) layoutObserver?.unobserve(previous)
+  if (header) layoutObserver?.observe(header)
+  void nextTick(updateLayout)
 })
-
 onMounted(() => {
-  if (typeof ResizeObserver !== 'undefined') rowResizeObserver = new ResizeObserver(onRowsResize)
-  if (typeof window !== 'undefined') window.addEventListener('storage', syncPreference)
-  attachContainer(props.scrollContainer)
-  syncRowObservation()
+  window.addEventListener('storage', syncPreference)
+  document.fonts?.addEventListener('loadingdone', remeasure)
+  listRootRef.value?.addEventListener('focusin', onFocusIn)
+  listRootRef.value?.addEventListener('focusout', onFocusOut)
+  if (typeof ResizeObserver !== 'undefined') {
+    layoutObserver = new ResizeObserver(updateLayout)
+    if (listRootRef.value) layoutObserver.observe(listRootRef.value)
+    if (props.layoutHeader) layoutObserver.observe(props.layoutHeader)
+  }
+  updateLayout()
 })
-
+onUpdated(updateLayout)
 onBeforeUnmount(() => {
-  if (typeof window !== 'undefined') window.removeEventListener('storage', syncPreference)
-  detachContainer()
-  rowResizeObserver?.disconnect()
-  rowResizeObserver = null
-  cancelScheduledFrame(viewportFrame)
-  viewportFrame = 0
-  rowElements.clear()
+  layoutGeneration += 1
+  scrollHandoff.value = null
+  window.removeEventListener('storage', syncPreference)
+  document.fonts?.removeEventListener('loadingdone', remeasure)
+  listRootRef.value?.removeEventListener('focusin', onFocusIn)
+  listRootRef.value?.removeEventListener('focusout', onFocusOut)
+  layoutObserver?.disconnect()
 })
 
 // Legacy transcripts can only use the whole-conversation fallback at the
@@ -868,6 +995,15 @@ function goalOutcomeFor(message: ChatRenderedMessage, index: number): GoalSnapsh
   padding-bottom: 0.25rem;
 }
 
+.chat-message-list__trailing {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding-top: 0.25rem;
+  flex: 0 0 auto;
+  min-width: 0;
+}
+
 .chat-message-list__row--last {
   padding-bottom: 0;
 }
@@ -877,5 +1013,8 @@ function goalOutcomeFor(message: ChatRenderedMessage, index: number): GoalSnapsh
   width: 1px;
   min-height: 0;
   pointer-events: none;
+  /* Virtual offsets must commit atomically, including under the global
+     reduced-motion rule which otherwise gives every element a transition. */
+  transition: none !important;
 }
 </style>

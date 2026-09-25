@@ -799,13 +799,24 @@ async def test_message_count_suffix_refreshes_config_and_tools_between_turns(
 async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from opensquilla.provider.types import ExecutionIdentity
+
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "suffix")
     provider = _SuffixMessageLimitProvider([None, 100, None], first_tool=True)
+    active_model = "before-tool-model"
+    monkeypatch.setattr(
+        provider,
+        "active_deployment_config",
+        lambda: ProviderConfig(provider="tokenrhythm", model=active_model),
+        raising=False,
+    )
     history = _plain_history()
     for message in history[:24]:
         message.content += " Synthetic background describing completed work." * 10
 
     async def handle_tool(call):
+        nonlocal active_model
+        active_model = "after-tool-model"
         return ToolResult(
             tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="check complete",
         )
@@ -817,7 +828,7 @@ async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
             context_window_tokens=64_000,
             max_tokens=8192,
             max_provider_retries=0,
-            metadata={"meta_match_tool_choice": "required"},
+            execution_identity=ExecutionIdentity(model=active_model),
             model_capabilities=ModelCapabilities(supports_tools=True),
         ),
         tool_definitions=[ToolDefinition(
@@ -831,8 +842,11 @@ async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
 
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert len(provider.summary_calls) == 1
-    assert provider.ordinary_configs[0].tool_choice == "required"
-    assert provider.ordinary_configs[1].tool_choice is None
+    first_identity = provider.ordinary_configs[0].execution_identity
+    latest_identity = provider.ordinary_configs[1].execution_identity
+    assert first_identity is not None and first_identity.model == "before-tool-model"
+    assert latest_identity is not None and latest_identity.model == "after-tool-model"
+    assert provider.summary_calls[0][2].execution_identity == latest_identity
     assert provider.summary_calls[0][2].tool_choice is None
     assert any("current-check" in str(message.content) for message in provider.calls[-1])
 

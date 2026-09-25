@@ -44,137 +44,13 @@ from opensquilla.contracts.turn_execution import (
     TurnPublicationLedger,
 )
 from opensquilla.observability.decision_log import build_vision_followup_gate_reason_code
-from opensquilla.skills.meta.types import MetaPaused
 
 if TYPE_CHECKING:
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.engine.types import DoneEvent, ErrorEvent
-    from opensquilla.skills.meta.types import MetaResult
     from opensquilla.tools.types import ToolContext
 
 log = structlog.get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Paused MetaResult renderer
-# ---------------------------------------------------------------------------
-
-
-def _field_qualifier_text(field: Any) -> str:
-    """Build the inline qualifier ("[1-14]", "[budget|mid|premium]" …)."""
-    type_ = field.type
-    if type_ == "int":
-        lo, hi = field.min, field.max
-        if lo is not None and hi is not None:
-            return f"({lo}-{hi})"
-        if lo is not None:
-            return f"(>={lo})"
-        if hi is not None:
-            return f"(<={hi})"
-    elif type_ == "enum" and field.choices:
-        return "[" + "|".join(str(c) for c in field.choices) + "]"
-    elif type_ == "string" and field.max_chars is not None:
-        return f"(<={field.max_chars} chars)"
-    return ""
-
-
-def _schema_language(schema: Any, intro: str = "") -> str:
-    text = "\n".join(
-        [intro or getattr(schema, "intro", "")]
-        + [getattr(field, "prompt", "") for field in getattr(schema, "fields", ())]
-        + list(getattr(schema, "cancel_keywords", ()) or ())
-    )
-    return "zh" if any("\u4e00" <= ch <= "\u9fff" for ch in text) else "en"
-
-
-def _field_flag_text(field: Any, *, language: str = "zh") -> str:
-    """Render required / default / optional marker per spec §9.3."""
-    if field.required:
-        return "[必填]" if language == "zh" else "[required]"
-    if field.default is not None:
-        return (
-            f"（默认 {field.default}）"
-            if language == "zh"
-            else f"(default {field.default})"
-        )
-    return "[可选]" if language == "zh" else "[optional]"
-
-
-def render_paused_outcome(result: MetaResult) -> str:
-    """Render a paused MetaResult into a plain-text form description.
-
-    Matches the spec §9.3 IM-fallback layout:
-      <intro>
-      请回复以下字段：
-        1) <name> — <prompt> <qualifier?> <flag>
-        ...
-      回复格式示例：
-        <name>: <type-appropriate placeholder>
-      或回复 <cancel-kw> 终止。
-
-    Surface-specific rich rendering (Web card / CLI prompt-toolkit)
-    rides on the synthetic ToolResultEvent's ``clarify_schema`` payload,
-    not on this text. This rendering is what IM bots and any
-    text-only fallback present to the user.
-    """
-    if not result.paused or result.paused_payload is None:
-        return result.final_text or ""
-    payload = result.paused_payload
-    if not isinstance(payload, MetaPaused):
-        return result.final_text or ""
-    schema = payload.schema
-    language = str(getattr(payload, "language", "") or "").lower()
-    if language not in {"en", "zh"}:
-        language = _schema_language(schema, payload.intro)
-    lines: list[str] = []
-    if payload.intro or schema.intro:
-        lines.append(payload.intro or schema.intro)
-        lines.append("")
-    lines.append("请回复以下字段：" if language == "zh" else "Please reply with these fields:")
-    for index, field in enumerate(schema.fields, start=1):
-        flag = _field_flag_text(field, language=language)
-        prompt = field.prompt or field.name
-        qualifier = _field_qualifier_text(field)
-        bits = [field.name, "—", prompt]
-        if qualifier:
-            bits.append(qualifier)
-        bits.append(flag)
-        lines.append(f"  {index}) {' '.join(bits)}")
-
-    sample_fields = [f for f in schema.fields if f.required] or list(schema.fields)
-    if sample_fields:
-        lines.append("")
-        lines.append("回复格式示例：" if language == "zh" else "Reply format example:")
-        for field in sample_fields[:3]:
-            placeholder = _field_sample_value(field)
-            lines.append(f"  {field.name}: {placeholder}")
-
-    if schema.cancel_keywords:
-        kws = " / ".join(schema.cancel_keywords)
-        lines.append("")
-        if language == "zh":
-            lines.append(f"或回复 {kws} 取消。")
-        else:
-            lines.append(f"Or reply {kws} to cancel.")
-    return "\n".join(lines)
-
-
-def _field_sample_value(field: Any) -> str:
-    """Produce a placeholder reply value for the format-example block."""
-    type_ = field.type
-    if type_ == "enum" and field.choices:
-        return str(field.choices[0])
-    if type_ == "int":
-        if field.min is not None:
-            return str(field.min)
-        if field.max is not None:
-            return str(field.max)
-        return "1"
-    if type_ == "bool":
-        return "true"
-    if field.default is not None:
-        return str(field.default)
-    return "<value>"
 
 
 # ---------------------------------------------------------------------------
@@ -277,8 +153,7 @@ def _turn_usage_payload(
         # Additive: quality label of the estimate behind cost_usd
         # ("cache_aware" | "cache_blind" | "free" | None).
         "estimate_basis": getattr(done_event, "estimate_basis", None),
-        # Additive: V017 decision-record id so chat clients can attribute
-        # feedback (router.feedback.submit) to this exact routing decision.
+        # V017 decision-record id for correlating turn and routing diagnostics.
         # None when no decision was staged (router off / bypass / no writer).
         "decision_id": getattr(done_event, "decision_id", None),
         "route_plan": getattr(done_event, "route_plan", None),

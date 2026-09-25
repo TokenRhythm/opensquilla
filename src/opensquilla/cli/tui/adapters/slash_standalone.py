@@ -791,10 +791,6 @@ async def handle_standalone_slash_command(
         console.print("[yellow]/models requires gateway mode.[/yellow]")
         return True
 
-    if _slash_parts(cmd, "/meta"):
-        console.print("[yellow]/meta requires gateway mode.[/yellow]")
-        return True
-
     if parts := _slash_parts(cmd, "/model"):
         if len(parts) == 1:
             console.print(f"[dim]model pin[/dim] [bold]{context.model or 'auto'}[/bold]")

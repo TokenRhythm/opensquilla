@@ -15,7 +15,7 @@ STAGER = REPO_ROOT / "opensquilla-webui" / "scripts" / "stage-dist.mjs"
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
-def test_normalizer_excludes_only_music_maintainer_readme_before_manifest_and_stage(
+def test_normalizer_and_stager_leave_retired_source_media_untouched(
     tmp_path: Path,
 ) -> None:
     webui = tmp_path / "opensquilla-webui"
@@ -25,16 +25,16 @@ def test_normalizer_excludes_only_music_maintainer_readme_before_manifest_and_st
     for script in ("normalize-dist.mjs", "verify-dist.mjs", "stage-dist.mjs"):
         shutil.copyfile(STAGER.parent / script, scripts / script)
     (webui / "public/music").mkdir(parents=True)
-    source_readme = webui / "public/music/README.md"
-    source_readme.write_text("Music maintainer guide\n", encoding="utf-8")
-    (dist / "music").mkdir(parents=True)
-    shutil.copyfile(source_readme, dist / "music/README.md")
-    playlist = b'{"tracks": []}\n'
-    (dist / "music/playlist.json").write_bytes(playlist)
-    (dist / "assets").mkdir()
+    retired_file = webui / "public/music/playlist.local.json"
+    retired_file.write_bytes(b"invalid legacy JSON")
+    (webui / "public-assets").mkdir()
+    (webui / "public-assets/opensquilla-mark.png").write_bytes(b"synthetic brand image")
+    (dist / "assets").mkdir(parents=True)
+    shutil.copyfile(webui / "public-assets/opensquilla-mark.png", dist / "opensquilla-mark.png")
+    (dist / ".DS_Store").write_bytes(b"Finder metadata")
     (dist / "assets/app.js").write_text("export {};\n", encoding="utf-8")
     (dist / "assets/app.css").write_text("body{}\n", encoding="utf-8")
-    # Identically named files outside the exact music path remain untouched.
+    # Ordinary asset documentation remains untouched.
     (dist / "assets/README.md").write_text("Unrelated asset documentation\n", encoding="utf-8")
     entrypoint = (
         '<script type="module" src="assets/app.js"></script>'
@@ -52,17 +52,18 @@ def test_normalizer_excludes_only_music_maintainer_readme_before_manifest_and_st
         )
         assert completed.returncode == 0, completed.stderr
 
-    assert source_readme.read_text(encoding="utf-8") == "Music maintainer guide\n"
+    assert retired_file.read_bytes() == b"invalid legacy JSON"
     staged = tmp_path / "src/opensquilla/gateway/static/dist"
     for artifact in (dist, staged):
-        assert not (artifact / "music/README.md").exists()
-        assert (artifact / "music/playlist.json").read_bytes() == playlist
+        assert not (artifact / "music").exists()
+        assert not (artifact / ".DS_Store").exists()
+        assert (artifact / "opensquilla-mark.png").read_bytes() == b"synthetic brand image"
         assert (artifact / "assets/README.md").read_text(encoding="utf-8") == (
             "Unrelated asset documentation\n"
         )
         manifest_path = artifact / "webui-artifact-manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        assert "music/README.md" not in {entry["path"] for entry in manifest["files"]}
+        assert not any(entry["path"].startswith("music/") for entry in manifest["files"])
     assert (staged / "webui-artifact-manifest.json").read_bytes() == (
         dist / "webui-artifact-manifest.json"
     ).read_bytes()
@@ -166,6 +167,9 @@ def test_stage_dist_copies_verified_source_owned_artifact(tmp_path: Path) -> Non
     # stale asset left by an earlier Vite build.
     stale_asset = staged / "assets/removed-by-next-build.js"
     stale_asset.write_text("stale\n", encoding="utf-8")
+    stale_media = staged / "music/old.mp3"
+    stale_media.parent.mkdir()
+    stale_media.write_bytes(b"synthetic retired media")
     restage = subprocess.run(
         [
             "node",
@@ -184,6 +188,26 @@ def test_stage_dist_copies_verified_source_owned_artifact(tmp_path: Path) -> Non
     )
     assert restage.returncode == 0, restage.stderr
     assert not stale_asset.exists()
+    assert not stale_media.exists()
+
+    # A valid manifest cannot authorize a retired private-media path for staging.
+    injected_media = source / "music/private.aac"
+    injected_media.parent.mkdir()
+    injected_media.write_bytes(b"synthetic private content")
+    _write_manifest(webui, source)
+    rejected = subprocess.run(
+        [
+            "node", str(STAGER), "--source", str(source), "--destination", str(staged),
+            "--webui-root", str(webui),
+        ],
+        check=False, capture_output=True, text=True, timeout=30,
+    )
+    assert rejected.returncode != 0
+    assert "forbidden metadata or sensitive files" in rejected.stderr
+    assert not (staged / "music").exists()
+    injected_media.unlink()
+    injected_media.parent.rmdir()
+    _write_manifest(webui, source)
 
     (staged / "assets/app.js").write_text("export { changed };\n", encoding="utf-8")
     stale = subprocess.run(

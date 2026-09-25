@@ -1,4 +1,5 @@
 import type { WorkspaceFile } from '@/modules/workspaceFiles'
+import { getIconSvg } from '@/utils/icons'
 
 /** A complete path is a candidate, never proof that the file exists or is accessible. */
 export function workspaceFilePath(value: string, encoded = false): string | null {
@@ -13,12 +14,12 @@ export function workspaceFilePath(value: string, encoded = false): string | null
   return path
 }
 
-type Decoration = { button: HTMLButtonElement; original: Element }
+type Decoration = { container: HTMLElement; original: Element }
 const decorated = new WeakMap<HTMLElement, Decoration[]>()
 
 export function clearWorkspaceFileLinks(root: HTMLElement): void {
-  for (const { button, original } of decorated.get(root) ?? []) {
-    if (root.contains(button)) button.replaceWith(original)
+  for (const { container, original } of decorated.get(root) ?? []) {
+    if (root.contains(container)) container.replaceWith(original)
   }
   decorated.delete(root)
 }
@@ -42,6 +43,8 @@ export function decorateWorkspaceFileLinks(
   files: readonly WorkspaceFile[],
   onOpen: (file: WorkspaceFile) => void,
   labelFor: (file: WorkspaceFile) => string,
+  onMenu?: (event: MouseEvent | KeyboardEvent, file: WorkspaceFile) => void,
+  menuLabelFor?: (file: WorkspaceFile) => string,
 ): void {
   clearWorkspaceFileLinks(root)
   const items: Decoration[] = []
@@ -49,21 +52,44 @@ export function decorateWorkspaceFileLinks(
   for (const { element, path } of candidates(root)) {
     const file = byPath.get(path)
     if (!file) continue
+    const container = document.createElement('span')
+    container.className = 'workspace-file-entry'
     const button = document.createElement('button')
     button.type = 'button'
     button.className = 'workspace-file-link'
     button.setAttribute('role', 'link')
     button.title = labelFor(file)
     button.setAttribute('aria-label', button.title)
-    if (element.tagName === 'CODE') button.appendChild(element.cloneNode(true))
-    else button.textContent = element.textContent
+    if (element.tagName === 'CODE') {
+      button.appendChild(element.cloneNode(true))
+    } else button.textContent = element.textContent
     button.addEventListener('click', event => {
       event.preventDefault()
       event.stopPropagation()
       onOpen(file)
     })
-    element.replaceWith(button)
-    items.push({ button, original: element })
+    container.appendChild(button)
+    if (onMenu) {
+      const actionButton = document.createElement('button')
+      actionButton.type = 'button'
+      actionButton.className = 'workspace-file-action-trigger'
+      actionButton.innerHTML = getIconSvg('moreHorizontal', 14)
+      actionButton.title = menuLabelFor?.(file) || labelFor(file)
+      actionButton.setAttribute('aria-label', actionButton.title)
+      actionButton.setAttribute('aria-haspopup', 'menu')
+      actionButton.addEventListener('click', event => onMenu(event, file))
+      actionButton.addEventListener('contextmenu', event => onMenu(event, file))
+      actionButton.addEventListener('keydown', event => {
+        if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) onMenu(event, file)
+      })
+      container.appendChild(actionButton)
+      button.addEventListener('contextmenu', event => onMenu(event, file))
+      button.addEventListener('keydown', event => {
+        if (event.key === 'ContextMenu' || (event.shiftKey && event.key === 'F10')) onMenu(event, file)
+      })
+    }
+    element.replaceWith(container)
+    items.push({ container, original: element })
   }
   decorated.set(root, items)
 }

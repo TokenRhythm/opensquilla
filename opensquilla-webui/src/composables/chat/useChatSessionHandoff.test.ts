@@ -7,10 +7,9 @@ import {
 } from '@/composables/chat/useChatPendingQueue'
 import type { Attachment, ChatMessage } from '@/types/chat'
 import {
-  useChatSend,
-  type ChatSendOutcome,
   type UseChatSendOptions as DomainUseChatSendOptions,
 } from './useChatSend'
+import { createChatSendHarness, memoryDeliveryWal } from './chatSendTestHarness'
 import { createV4TurnCommandsFromRpcClient } from '@/adapters/gateway/turnCommandsV4'
 import { useChatSessionRuntime } from './useChatSessionRuntime'
 import { useChatSteerDelivery } from './useChatSteerDelivery'
@@ -81,7 +80,7 @@ describe('chat send session handoff', () => {
       const pendingSessionIntent = ref<string | null>(null)
       const isStreaming = ref(false)
       const sendCurrentInput = vi.fn()
-      const pendingInputWal = memoryPendingWal()
+      const pendingInputWal = { ...memoryDeliveryWal(), ...memoryPendingWal() }
       const pendingQueue = useChatPendingQueue({
         sessionKey,
         ownerContext,
@@ -141,10 +140,6 @@ describe('chat send session handoff', () => {
     const trace: string[] = []
     let resolveSend!: (value: unknown) => void
     let sendCurrentInput: () => void = () => {}
-    let dispatchHiddenControl: (
-      item: import('@/types/chat').ChatPendingItem,
-      ownerSessionKey: string,
-    ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 
     const persistSession = vi.fn((key: string) => {
       trace.push(`persist:${key}`)
@@ -186,7 +181,7 @@ describe('chat send session handoff', () => {
       trace.push(`reset:${sessionKey.value}`)
       isStreaming.value = false
     })
-    const pendingInputWal = memoryPendingWal()
+    const pendingInputWal = { ...memoryDeliveryWal(), ...memoryPendingWal() }
     const pendingQueueRuntime = useChatPendingQueue({
       sessionKey,
       ownerContext: pendingQueueOwnerContext,
@@ -199,17 +194,11 @@ describe('chat send session handoff', () => {
       sendCurrentInput: () => sendCurrentInput(),
       resetInputHistory: vi.fn(),
       hasComposer: () => true,
-      dispatchHiddenControl: (item, ownerSessionKey) =>
-        dispatchHiddenControl(item, ownerSessionKey),
       pendingInputWal,
     })
     inputText.value = 'existing parent follow-up'
     await pendingQueueRuntime.enqueuePendingInput(
       inputText.value,
-      { ownerRequestId: 'older-parent-request' },
-    )
-    pendingQueueRuntime.enqueueHiddenControl(
-      { text: 'existing parent control', displayText: 'Existing parent control' },
       { ownerRequestId: 'older-parent-request' },
     )
     inputText.value = 'edited question'
@@ -291,7 +280,7 @@ describe('chat send session handoff', () => {
       checkpointForUserMessage: stream.checkpointForUserMessage,
       scheduleHistorySync,
     })
-    const send = useChatSend({
+    const { api: send } = createChatSendHarness({
       turnCommands,
       inputText,
       messages,
@@ -323,7 +312,6 @@ describe('chat send session handoff', () => {
       isCompactInFlightForCurrentSession: () => false,
       hasPendingAttachmentWork: () => false,
       enqueuePendingInput: pendingQueueRuntime.enqueuePendingInput,
-      enqueueHiddenControl: pendingQueueRuntime.enqueueHiddenControl,
       enqueuePendingSteerAttempt: pendingQueueRuntime.enqueuePendingSteerAttempt,
       steerDelivery,
       popAllPendingIntoComposer: pendingQueueRuntime.popAllPendingIntoComposer,
@@ -334,12 +322,11 @@ describe('chat send session handoff', () => {
       scrollToBottom: vi.fn(),
     })
     sendCurrentInput = send.onSend
-    dispatchHiddenControl = send.dispatchQueuedHiddenSend
 
     const firstSend = send.onSend()
     await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledWith(
       'chat.send',
-      expect.objectContaining({ sessionKey: parentSessionKey }),
+      expect.objectContaining({ sessionKey: parentSessionKey }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }),
     ))
 
     inputText.value = 'queued follow-up'
@@ -351,10 +338,6 @@ describe('chat send session handoff', () => {
       file_uuid: 'file-queued',
     }]
     await pendingQueueRuntime.enqueuePendingInput(inputText.value)
-    pendingQueueRuntime.enqueueHiddenControl({
-      text: 'hidden control',
-      displayText: 'Hidden control',
-    })
     resolveSend({
       sessionKey: childSessionKey,
       task_id: 'task-child',
@@ -364,7 +347,7 @@ describe('chat send session handoff', () => {
     expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       sessionKey: parentSessionKey,
       forkBeforeMessageId: 'msg-B',
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     expect(trace).toEqual([
       `unsubscribe:${parentSessionKey}`,
       `persist:${childSessionKey}`,
@@ -405,16 +388,6 @@ describe('chat send session handoff', () => {
         text: 'existing parent follow-up',
         ownerSessionKey: parentSessionKey,
         ownerRequestId: 'older-parent-request',
-      },
-      {
-        text: 'existing parent control',
-        hiddenControl: true,
-        hiddenControlSessionKey: parentSessionKey,
-      },
-      {
-        text: 'hidden control',
-        hiddenControl: true,
-        hiddenControlSessionKey: parentSessionKey,
       },
     ])
   })

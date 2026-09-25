@@ -459,14 +459,21 @@ try {
     for (const client of routedClients) blackholedClients.add(client)
     const wakeStarted = Date.now()
     await page.evaluate(() => localStorage.removeItem('opensquilla.chat.sessionNavigationDiag'))
-    await desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') })
+    await desktopApp.evaluate(({ powerMonitor }) => {
+      powerMonitor.emit('resume')
+      // A healthy replacement can recover before the periodic signal below.
+      // Inject the duplicate while the first incident is still being probed.
+      powerMonitor.emit('resume')
+    })
     const duplicateWake = setInterval(() => {
       void desktopApp.evaluate(({ powerMonitor }) => { powerMonitor.emit('resume') }).catch(() => {})
     }, 3_000)
     try {
+      // Diagnostics are stored newest-first; correlate the first incident in
+      // chronological order even if another native wake arrives after recovery.
       const readDiagnostics = () => page.evaluate(() => JSON.parse(
         localStorage.getItem('opensquilla.chat.sessionNavigationDiag') || '[]',
-      ).filter(entry => entry.source === 'rpc.transport'))
+      ).filter(entry => entry.source === 'rpc.transport').reverse())
       await waitFor(async () => (await readDiagnostics()).some(entry => entry.phase === 'probe_timeout'),
         'wake suspect diagnostic', 20_000)
       await waitFor(async () => await page.locator('[data-testid="connection-status"].connecting, [data-testid="chat-system-status-trigger"].connecting').count() > 0,

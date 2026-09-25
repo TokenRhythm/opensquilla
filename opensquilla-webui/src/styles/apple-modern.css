@@ -459,19 +459,6 @@ body > .settings-overlay .settings-modal .settings-rail__item:not(:disabled):act
   position: relative;
 }
 
-.sidebar-group-enter-active,
-.sidebar-group-leave-active {
-  transition:
-    grid-template-rows var(--dur-base) var(--ease-out),
-    opacity var(--dur-base) var(--ease-out);
-}
-
-.sidebar-group-enter-from,
-.sidebar-group-leave-to {
-  grid-template-rows: 0fr;
-  opacity: 0;
-}
-
 .sidebar-foot {
   border-top: 0;
   padding: 10px 2px 0;

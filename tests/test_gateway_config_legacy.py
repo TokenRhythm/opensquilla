@@ -89,18 +89,11 @@ def test_prompt_mode_defaults_to_auto() -> None:
     assert cfg.prompt.mode == "auto"
 
 
-def test_prompt_mode_accepts_headless_source_edit() -> None:
-    cfg = GatewayConfig.model_validate({"prompt": {"mode": "headless_source_edit"}})
+@pytest.mark.parametrize("mode", ["headless_source_edit", "headless_repo_coding_scaffold"])
+def test_retired_prompt_modes_load_as_auto(mode: str) -> None:
+    cfg = GatewayConfig.model_validate({"prompt": {"mode": mode}})
 
-    assert cfg.prompt.mode == "headless_source_edit"
-
-
-def test_prompt_mode_accepts_headless_repo_coding_scaffold() -> None:
-    cfg = GatewayConfig.model_validate(
-        {"prompt": {"mode": "headless_repo_coding_scaffold"}}
-    )
-
-    assert cfg.prompt.mode == "headless_repo_coding_scaffold"
+    assert cfg.prompt.mode == "auto"
 
 
 def test_removed_router_compaction_switches_are_migrated_away() -> None:
@@ -573,112 +566,38 @@ def test_no_legacy_fallback_env_var() -> None:
     assert "OPENSQUILLA_LEGACY_FALLBACK" not in source
 
 
-class TestMetaSkillConfig:
-    """C4: GatewayConfig must accept [meta_skill.persistence] section."""
+def test_example_toml_parses_clean() -> None:
+    """Copying opensquilla.toml.example to ~/.opensquilla/config.toml must work."""
+    import tomllib
+    from pathlib import Path
 
-    def test_default_meta_skill_config(self) -> None:
-        from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.config import GatewayConfig
 
-        cfg = GatewayConfig()
-        assert cfg.meta_skill.enabled is True
-        assert cfg.meta_skill.persistence.enabled is True
-        assert cfg.meta_skill.persistence.orphan_cleanup_age_seconds == 3600
+    example_path = Path(__file__).resolve().parents[1] / "opensquilla.toml.example"
+    with example_path.open("rb") as f:
+        data = tomllib.load(f)
 
-    def test_meta_skill_can_be_disabled_globally(self) -> None:
-        from opensquilla.gateway.config import GatewayConfig
-
-        cfg = GatewayConfig(
-            meta_skill={"enabled": False},
-        )
-        assert cfg.meta_skill.enabled is False
-
-    def test_meta_skill_persistence_disabled(self) -> None:
-        from opensquilla.gateway.config import GatewayConfig
-
-        cfg = GatewayConfig(
-            meta_skill={"persistence": {"enabled": False}},
-        )
-        assert cfg.meta_skill.persistence.enabled is False
-
-    def test_meta_skill_env_override(self, monkeypatch) -> None:
-        from opensquilla.gateway.config import MetaSkillConfig
-
-        monkeypatch.setenv("OPENSQUILLA_META_SKILL_ENABLED", "false")
-        cfg = MetaSkillConfig()
-        assert cfg.enabled is False
-
-    def test_meta_skill_persistence_env_override(self, monkeypatch) -> None:
-        from opensquilla.gateway.config import MetaSkillPersistenceConfig
-
-        monkeypatch.setenv("OPENSQUILLA_META_SKILL_PERSISTENCE_ENABLED", "false")
-        cfg = MetaSkillPersistenceConfig()
-        assert cfg.enabled is False
-
-    def test_example_toml_parses_clean(self) -> None:
-        """Copying opensquilla.toml.example to ~/.opensquilla/config.toml must work."""
-        import tomllib
-        from pathlib import Path
-
-        from opensquilla.gateway.config import GatewayConfig
-
-        example_path = Path(__file__).resolve().parents[1] / "opensquilla.toml.example"
-        with example_path.open("rb") as f:
-            data = tomllib.load(f)
-
-        # No exceptions during validation
-        GatewayConfig(**data)
+    # No exceptions during validation
+    GatewayConfig(**data)
 
 
-def test_gateway_config_accepts_repo_coding_source_edit_tool_profile() -> None:
-    cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_source_edit"}}
-    )
+@pytest.mark.parametrize("profile", [
+    "repo_coding_source_edit",
+    "repo_coding_source_edit_strict",
+    "repo_coding_source_edit_v2",
+    "repo_coding_source_edit_balanced",
+    "repo_coding_source_edit_patch_fallback",
+    "repo_coding_scaffold_edit",
+    "repo_coding_scaffold_patch",
+])
+def test_retired_repo_coding_profiles_keep_ordinary_coding_tools(profile: str) -> None:
+    from opensquilla.tools.policy_config import profile_allowlist
 
-    assert cfg.tools.profile == "repo_coding_source_edit"
+    cfg = GatewayConfig.model_validate({"tools": {"profile": profile}})
+    basic_tools = frozenset({"read_file", "write_file", "edit_file", "exec_command", "process"})
 
-
-def test_gateway_config_accepts_repo_coding_source_edit_strict_tool_profile() -> None:
-    cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_source_edit_strict"}}
-    )
-
-    assert cfg.tools.profile == "repo_coding_source_edit_strict"
-
-
-def test_gateway_config_accepts_repo_coding_source_edit_v2_tool_profile() -> None:
-    cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_source_edit_v2"}}
-    )
-
-    assert cfg.tools.profile == "repo_coding_source_edit_v2"
-
-
-def test_gateway_config_accepts_repo_coding_source_edit_balanced_tool_profile() -> None:
-    cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_source_edit_balanced"}}
-    )
-
-    assert cfg.tools.profile == "repo_coding_source_edit_balanced"
-
-
-def test_gateway_config_accepts_repo_coding_source_edit_patch_fallback_tool_profile() -> None:
-    cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_source_edit_patch_fallback"}}
-    )
-
-    assert cfg.tools.profile == "repo_coding_source_edit_patch_fallback"
-
-
-def test_gateway_config_accepts_repo_coding_scaffold_tool_profiles() -> None:
-    edit_cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_scaffold_edit"}}
-    )
-    patch_cfg = GatewayConfig.model_validate(
-        {"tools": {"profile": "repo_coding_scaffold_patch"}}
-    )
-
-    assert edit_cfg.tools.profile == "repo_coding_scaffold_edit"
-    assert patch_cfg.tools.profile == "repo_coding_scaffold_patch"
+    assert cfg.tools.profile == "coding"
+    assert profile_allowlist(cfg.tools.profile, basic_tools) == basic_tools
 
 
 def test_gateway_config_accepts_llm_sampling_controls() -> None:

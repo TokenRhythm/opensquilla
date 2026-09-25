@@ -96,6 +96,7 @@ class DiscoverPrimaryModels:
     base_url: str = ""
     proxy: str = ""
     force_refresh: bool = False
+    cache_only: bool = False
 
 
 class ProviderProbePort(Protocol):

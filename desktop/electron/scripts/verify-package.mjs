@@ -282,10 +282,8 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   if (executeCommands) {
     if (!binary) return
     verifyGatewayCommand(binary, label, ['--help'])
-    verifyGatewayCommand(binary, label, ['code-task', '--help'])
-    verifyGatewayCommand(binary, label, ['code-task', 'stage-task-file'], { input: 'desktop package smoke\n' })
-    verifyGatewayCommand(binary, label, ['code-task', 'smoke-imports'], { timeout: 120000 })
-    verifyGatewayCommand(binary, label, ['code-task', 'smoke-router'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-imports'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-router'], { timeout: 120000 })
   }
 
   if (platform === 'darwin') {
@@ -390,7 +388,7 @@ function verifyMainProcess(source, label) {
     /parent\s*:\s*parentWindow\s*\?\?\s*undefined/,
   )
   const modalOptionIndex = onboardingSource.search(
-    /modal\s*:\s*Boolean\(parentWindow\)/,
+    /modal\s*:\s*false/,
   )
   const onboardingWindowAssignmentIndex = onboardingSource.search(
     /onboardingWindow\s*=\s*window\b/,
@@ -408,7 +406,7 @@ function verifyMainProcess(source, label) {
     || modalOptionIndex < parentOptionIndex
     || onboardingWindowAssignmentIndex < modalOptionIndex
   ) {
-    fail(`${label} main process does not make first-run onboarding an owned modal child window`)
+    fail(`${label} main process does not make first-run onboarding an owned non-modal child window`)
   }
 
   const focusIndex = source.indexOf('function focusMainWindow')

@@ -1,6 +1,6 @@
 """Transport-neutral ancillary conversation use cases.
 
-These small interfaces replace the unrelated usage, command, feedback,
+These small interfaces replace the unrelated usage, command,
 prompt-cache, and clarification methods previously exposed through one broad
 conversation facade.  Runtime storage and services stay behind narrow Ports.
 """
@@ -9,11 +9,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Literal, Protocol, TypedDict
+from typing import Any, Protocol, TypedDict
 
 from opensquilla.session_key import canonicalize_session_key
-
-type RouteFeedbackRating = Literal["up", "down", "neutral"]
 
 
 class UsageSessionProjection(TypedDict, total=False):
@@ -106,12 +104,6 @@ class CommandProjection(TypedDict, total=False):
 class CommandCatalogResult(TypedDict, total=False):
     surface: str
     commands: list[CommandProjection]
-
-
-class RouteFeedbackResult(TypedDict, total=False):
-    accepted: bool
-    reason: str | None
-    recorded: str | None
 
 
 class PromptCacheLeaseResult(TypedDict, total=False):
@@ -207,29 +199,6 @@ class CommandCatalog:
 
 
 @dataclass(frozen=True, slots=True)
-class SubmitRouteFeedback:
-    decision_id: str
-    rating: RouteFeedbackRating
-
-
-class RouteFeedbackPort(Protocol):
-    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult: ...
-
-
-class RouteFeedback:
-    def __init__(self, port: RouteFeedbackPort) -> None:
-        self._port = port
-
-    async def submit(self, command: SubmitRouteFeedback) -> RouteFeedbackResult:
-        decision_id = command.decision_id.strip()
-        if not decision_id:
-            raise ValueError("decision_id must be non-empty")
-        if command.rating not in {"up", "down", "neutral"}:
-            raise ValueError("rating must be up, down, or neutral")
-        return await self._port.submit(replace(command, decision_id=decision_id))
-
-
-@dataclass(frozen=True, slots=True)
 class PromptCachePolicy:
     default_ttl_seconds: int
     minimum_ttl_seconds: int
@@ -303,8 +272,7 @@ class PromptCacheLease:
 class SubmitClarification:
     session_key: str
     fields: Mapping[str, Any]
-    request_id: str | None = None
-    run_id: str | None = None
+    request_id: str
 
 
 class ClarificationSubmissionPort(Protocol):
@@ -321,12 +289,11 @@ class ClarificationSubmission:
             raise ValueError("session_key must be non-empty")
         if not command.fields:
             raise ValueError("fields must be non-empty")
-        request_id = command.request_id.strip() if command.request_id is not None else None
+        request_id = command.request_id.strip()
         if request_id == "":
             raise ValueError("request_id must be non-empty")
-        run_id = command.run_id.strip() if command.run_id is not None else None
         return await self._port.submit(
-            replace(command, session_key=key, request_id=request_id, run_id=run_id)
+            replace(command, session_key=key, request_id=request_id)
         )
 
 
@@ -345,13 +312,8 @@ __all__ = [
     "PromptCacheLeasePort",
     "PromptCachePolicy",
     "PromptCacheLeaseResult",
-    "RouteFeedback",
-    "RouteFeedbackPort",
-    "RouteFeedbackRating",
-    "RouteFeedbackResult",
     "SetPromptCacheLease",
     "SubmitClarification",
-    "SubmitRouteFeedback",
     "UsageQuery",
     "UsageQueryResult",
     "UsageReporting",

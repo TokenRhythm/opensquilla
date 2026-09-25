@@ -34,7 +34,11 @@ class RouterProviderConflictError(LlmProfileActivationError):
 
 
 class PrimaryProviderChangedError(ValueError):
-    """The caller's expected primary no longer matches the saved primary."""
+    """The caller's expected provider no longer matches the saved routing target."""
+
+    def __init__(self, message: str, *, reason: str = "primary_changed") -> None:
+        self.reason = reason
+        super().__init__(message)
 
 
 def reconcile_recommended_router(
@@ -52,7 +56,11 @@ def reconcile_recommended_router(
     payload = config.squilla_router.model_dump(mode="python")
     payload.pop("tiers", None)
     payload["preset_binding"] = "follow_primary"
-    if preset.persistable and payload["enabled"]:
+    if (
+        preset.persistable
+        and payload["enabled"]
+        and provider_id == str(config.llm.provider).strip().lower()
+    ):
         payload["tier_profile"] = provider_id
     else:
         payload["tier_profile"] = None

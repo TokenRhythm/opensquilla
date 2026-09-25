@@ -274,6 +274,16 @@ class ClawHubSource(SkillSource):
     def trust_level(self) -> str:
         return "community"
 
+    @property
+    def requires_immutable_resolution(self) -> bool:
+        return True
+
+    @property
+    def source_name(self) -> str:
+        """Human-readable name used in shared archive-fetch diagnostics."""
+
+        return "ClawHub"
+
     def _headers(self) -> dict[str, str]:
         headers: dict[str, str] = {"Accept": "application/json"}
         if self._token:
@@ -736,7 +746,10 @@ class ClawHubSource(SkillSource):
         if resolution.artifact_kind != "archive" or not resolution.artifact_url:
             raise SkillSourceFetchError.diagnostic(
                 "SOURCE_HANDOFF_UNSUPPORTED",
-                "ClawHub resolution does not contain a supported immutable artifact hand-off.",
+                (
+                    f"{self.source_name} resolution does not contain a supported "
+                    "immutable artifact hand-off."
+                ),
                 phase=DiagnosticPhase.FETCH,
             )
 
@@ -750,7 +763,7 @@ class ClawHubSource(SkillSource):
                     raise SkillSourceFetchError.diagnostic(
                         "ARTIFACT_TRANSPORT_INSECURE",
                         (
-                            "ClawHub redirected to a plaintext artifact URL without a "
+                            f"{self.source_name} redirected to a plaintext artifact URL without a "
                             "verifiable SHA-256 digest."
                         ),
                         phase=DiagnosticPhase.SECURITY,
@@ -783,7 +796,7 @@ class ClawHubSource(SkillSource):
                                 raise_for_source_http_status(
                                     response,
                                     phase=DiagnosticPhase.FETCH,
-                                    source_name="ClawHub",
+                                    source_name=self.source_name,
                                 )
                                 size = 0
                                 with archive_path.open("wb") as output:
@@ -810,7 +823,7 @@ class ClawHubSource(SkillSource):
                             raise_for_source_http_status(
                                 response,
                                 phase=DiagnosticPhase.FETCH,
-                                source_name="ClawHub",
+                                source_name=self.source_name,
                             )
                             if exceeds_limit(
                                 len(response.content), DEFAULT_ARCHIVE_LIMITS.max_archive_bytes
@@ -829,7 +842,7 @@ class ClawHubSource(SkillSource):
             raise
         except Exception as exc:
             log.warning(
-                "clawhub.fetch_failed",
+                f"{self.source_id}.fetch_failed",
                 identifier=resolution.canonical_identifier,
                 error=str(exc),
             )
@@ -849,11 +862,11 @@ class ClawHubSource(SkillSource):
                 raise source_transport_error(
                     exc,
                     phase=DiagnosticPhase.FETCH,
-                    source_name="ClawHub",
+                    source_name=self.source_name,
                 ) from exc
             raise SkillSourceFetchError.diagnostic(
                 code,
-                str(exc) or "ClawHub artifact fetch failed.",
+                str(exc) or f"{self.source_name} artifact fetch failed.",
                 phase=phase,
                 hint="Check source availability and the immutable install reference.",
             ) from exc
@@ -863,7 +876,7 @@ class ClawHubSource(SkillSource):
             )
         except ArchiveNormalizationError as exc:
             log.warning(
-                "clawhub.fetch_invalid_archive",
+                f"{self.source_id}.fetch_invalid_archive",
                 identifier=resolution.canonical_identifier,
                 error=str(exc),
             )
@@ -874,10 +887,13 @@ class ClawHubSource(SkillSource):
             digest,
             f"sha256:{digest}",
         }:
-            log.warning("clawhub.fetch_digest_mismatch", identifier=resolution.canonical_identifier)
+            log.warning(
+                f"{self.source_id}.fetch_digest_mismatch",
+                identifier=resolution.canonical_identifier,
+            )
             raise SkillSourceFetchError.diagnostic(
                 "ARTIFACT_DIGEST_MISMATCH",
-                "The downloaded ClawHub archive digest does not match its resolution.",
+                f"The downloaded {self.source_name} archive digest does not match its resolution.",
                 phase=DiagnosticPhase.SECURITY,
             )
         diagnostics = resolution.diagnostics

@@ -29,6 +29,94 @@ def nsis_regression():
     return module
 
 
+@pytest.mark.parametrize("relative,method,field", [
+    (".", "is_dir", None),
+    ("old-install", "is_dir", "oldInstallObserved"),
+    ("old-uninstaller.exe", "is_file", "oldUninstallerObserved"),
+])
+def test_nsis_directory_sampling_recovers_from_windows_access_race(
+    nsis_regression, tmp_path, monkeypatch, relative, method, field,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    (directory / "old-install").mkdir(parents=True)
+    (directory / "old-uninstaller.exe").write_bytes(b"synthetic")
+    target = directory / relative
+    original = getattr(Path, method)
+    attempts = 0
+
+    def sample(path):
+        nonlocal attempts
+        if path == target:
+            attempts += 1
+            if attempts <= 2:
+                error = PermissionError(13, "synthetic access denied", str(path))
+                error.winerror = 5
+                raise error
+        return original(path)
+
+    monkeypatch.setattr(Path, method, sample)
+    observed, errors = {}, []
+    for seconds in (1.0, 2.0):
+        nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, seconds)
+        if field is None:
+            assert observed == {}
+        else:
+            assert observed[str(directory)][field] is False
+    assert len(errors) == 1
+    assert errors[0] == {
+        "path": str(target), "sample": method, "errno": 13, "winerror": 5,
+        "firstObservedSeconds": 1.0, "lastObservedSeconds": 2.0, "observations": 2,
+    }
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 3.0)
+    assert observed[str(directory)]["oldInstallObserved"] is True
+    assert observed[str(directory)]["oldUninstallerObserved"] is True
+
+
+def test_nsis_directory_sampling_preserves_real_evidence_after_access_race(
+    nsis_regression, tmp_path, monkeypatch,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    (directory / "old-install").mkdir(parents=True)
+    observed, errors = {}, []
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 1.0)
+    original = Path.is_dir
+
+    def denied(path):
+        if path == directory / "old-install":
+            error = PermissionError(13, "synthetic access denied", str(path))
+            error.winerror = 5
+            raise error
+        return original(path)
+
+    monkeypatch.setattr(Path, "is_dir", denied)
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 2.0)
+    assert observed[str(directory)]["oldInstallObserved"] is True
+    assert observed[str(directory)]["oldUninstallerObserved"] is False
+    assert errors[0]["winerror"] == 5
+
+
+@pytest.mark.parametrize("error_type,winerror", [
+    (PermissionError, None), (PermissionError, 32), (OSError, 5),
+])
+def test_nsis_directory_sampling_does_not_suppress_other_errors(
+    nsis_regression, tmp_path, monkeypatch, error_type, winerror,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    error = error_type("synthetic unexpected filesystem error")
+    if winerror is not None:
+        error.winerror = winerror
+
+    def failed(_path):
+        raise error
+
+    monkeypatch.setattr(Path, "is_dir", failed)
+    observed, errors = {}, []
+    with pytest.raises(error_type) as raised:
+        nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 1.0)
+    assert raised.value is error
+    assert observed == {} and errors == []
+
+
 @pytest.fixture
 def fresh_nsis_arguments(tmp_path):
     node = tmp_path / "synthetic-node.exe"

@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -176,8 +176,10 @@ def _failing_dispatch_channel(*, supports_slash_commands: bool) -> SimpleNamespa
         policy=ChannelAccessPolicy(),
         supports_slash_commands=supports_slash_commands,
         send=AsyncMock(side_effect=_http_error(503)),
-        _delivery_store=MagicMock(
-            claim_inbound=MagicMock(return_value=IngressClaim("evt-1", "tok-1"))
+        _delivery_store=SimpleNamespace(
+            claim_inbound=AsyncMock(return_value=IngressClaim("evt-1", "tok-1")),
+            complete_inbound=AsyncMock(),
+            fail_inbound=AsyncMock(),
         ),
         _delivery_channel_name="slack-main",
     )
@@ -190,7 +192,7 @@ def _failing_dispatch_channel(*, supports_slash_commands: bool) -> SimpleNamespa
             return IncomingMessage(
                 sender_id="user-1",
                 channel_id="chat-1",
-                content="/meta" if supports_slash_commands else "hello",
+                content="/skills" if supports_slash_commands else "hello",
                 metadata={"is_group": False, "message_id": "m-1"},
             )
         raise asyncio.CancelledError
@@ -211,9 +213,9 @@ async def test_command_reply_send_failure_does_not_escape_dispatch_loop() -> Non
     """A failed slash-command reply must not burn dispatch restart budget."""
     channel = _failing_dispatch_channel(supports_slash_commands=True)
     command_reply = OutgoingMessage(
-        content="meta output",
+        content="skill output",
         reply_to="chat-1",
-        metadata={"command": "/meta", "method": "meta.get"},
+        metadata={"command": "/skills", "method": "skills.list"},
     )
 
     with (
@@ -242,7 +244,7 @@ async def test_command_reply_send_failure_does_not_escape_dispatch_loop() -> Non
 
     # Bounded retries plus one delivery-failure notice, all inside the loop.
     assert channel.send.await_count == _REPLY_SEND_ATTEMPTS + 1
-    channel._delivery_store.complete_inbound.assert_called_once()
+    channel._delivery_store.complete_inbound.assert_awaited_once()
     assert (
         channel._delivery_store.complete_inbound.call_args.args[1]
         == "command_dispatched"
@@ -283,7 +285,7 @@ async def test_busy_notice_send_failure_does_not_escape_dispatch_loop() -> None:
             )
 
     assert channel.send.await_count == 1
-    channel._delivery_store.complete_inbound.assert_called_once()
+    channel._delivery_store.complete_inbound.assert_awaited_once()
     assert (
         channel._delivery_store.complete_inbound.call_args.args[1]
         == "capacity_rejected"

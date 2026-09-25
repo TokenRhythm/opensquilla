@@ -89,45 +89,10 @@ def test_collect_invoked_skills_dedups_repeated_calls() -> None:
     assert invoked == ["pdf-toolkit", "summarize", "memory"]
 
 
-def test_collect_invoked_skills_captures_meta_invoke() -> None:
-    """N7: meta_invoke tool calls record the meta-skill name in skills_invoked
-    so aggregate_meta_usage can count them."""
-    from opensquilla.engine.runtime import collect_invoked_skills
-    invoked = collect_invoked_skills([
-        {"name": "skill_view", "input": {"name": "pdf-toolkit"}},
-        {"name": "meta_invoke", "input": {"name": "meta-pdf-intelligence"}},
-        {"name": "meta_invoke", "input": {"name": "meta-travel-planner"}},
-        {"name": "other_tool", "input": {}},
-    ])
-    assert invoked == ["pdf-toolkit", "meta-pdf-intelligence", "meta-travel-planner"]
 
 
-def test_collect_invoked_skills_deduplicates_meta_invoke() -> None:
-    """N7: a meta-skill invoked multiple times in one turn appears once."""
-    from opensquilla.engine.runtime import collect_invoked_skills
-    invoked = collect_invoked_skills([
-        {"name": "meta_invoke", "input": {"name": "meta-pdf-intelligence"}},
-        {"name": "skill_view", "input": {"name": "pdf-toolkit"}},
-        {"name": "meta_invoke", "input": {"name": "meta-pdf-intelligence"}},  # dup
-    ])
-    assert invoked == ["meta-pdf-intelligence", "pdf-toolkit"]
 
 
-def test_collect_invoked_skills_extra_first_prepended_and_deduped() -> None:
-    """N16: extra_first list prepends meta-skill name from hard-takeover
-    branch, deduped against any subsequent skill_view/meta_invoke segments."""
-    from opensquilla.engine.runtime import collect_invoked_skills
-    invoked = collect_invoked_skills(
-        [
-            {"name": "skill_view", "input": {"name": "pdf-toolkit"}},
-            {"name": "skill_view", "input": {"name": "summarize"}},
-            # A subsequent meta_invoke of the same hard-takeover meta-skill
-            # should NOT duplicate the entry
-            {"name": "meta_invoke", "input": {"name": "meta-pdf-intelligence"}},
-        ],
-        extra_first=["meta-pdf-intelligence"],
-    )
-    assert invoked == ["meta-pdf-intelligence", "pdf-toolkit", "summarize"]
 
 
 def test_collect_invoked_skills_extra_first_none_is_noop() -> None:

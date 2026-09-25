@@ -64,22 +64,22 @@ That fail-closed rule also applies to direct `pip install .`,
 from a local checkout; VCS URL users should clone the repository and run the
 source installer, or install the official release wheel.
 
-Standard source archives (`sdist`) also reject ignored personal BGM files so a
-shareable archive cannot accidentally leak private or copyrighted audio. A
-direct locally built wheel or local Docker image can still contain an explicitly
-customized library; official release artifacts always require the tracked
-playlist to remain empty.
+Background music is no longer part of the console. Existing browser preferences
+are left untouched and ignored. Personal files in an old `public/music/`
+directory stay on disk but are excluded from builds, source archives, and
+container build contexts. All Web UI artifacts reject residual music assets.
+Chat audio playback, recording, and transcription remain available.
 
 ## Main Areas
 
 | Area | Use it for |
 | --- | --- |
-| Chat | Run and resume chat sessions, inspect tool activity, launch `/meta` workflows, publish artifacts, and use manual compact controls. |
+| Chat | Run and resume chat sessions, inspect tool activity, publish artifacts, and use manual compact controls. |
 | Conversations | Switch active sessions from the sidebar and keep long-running work visible. |
 | Overview / Health | See readiness, provider state, memory state, sandbox posture, and recovery hints. |
 | Settings | Configure providers, router, search, channels, permissions, and other setup sections from a modal flow. |
 | Channels | Inspect configured channel adapter status and jump to guided setup for configuration changes. |
-| Skills | Browse skill readiness and MetaSkill availability. |
+| Skills | Browse available skills and their readiness. |
 | Sessions | Inspect the durable sessions ledger and operational state. |
 | Agents | Manage durable agent entries. |
 | Usage | Inspect token and estimated-cost rollups. |
@@ -101,7 +101,6 @@ The chat UI supports:
 - a conversation sidebar for switching sessions;
 - durable `/goal` objectives with structured progress, usage, pause/resume,
   edit, clear, guardrail, and Plan-mode waiting states;
-- `/meta` listing and run launch on gateway-backed chat sessions;
 - pending message queue behavior while compaction or runtime work is in flight;
 - manual `/compact`;
 - per-turn usage and savings metadata when available;
@@ -121,14 +120,6 @@ Use `/goal <objective>` to start a multi-turn Goal. Its ribbon remains visible
 while working or waiting, and mutation results, hydration, and the Goal event
 stream keep it synchronized after reconnects. See [`goal-mode.md`](goal-mode.md)
 for the lifecycle, execution-lease, guardrail, and Plan-mode contracts.
-
-Coding mode can be enabled from chat when you want code modifications routed
-through `opensquilla code-task`. With Coding mode on, code changes use the
-guarded host workflow described in [`cli.md`](cli.md#coding-mode-and-code-task)
-instead of ordinary in-session editing. Enter `/coding` to toggle the mode.
-While it is enabled, the composer shows a `Coding ON` status control that can
-also turn the mode off. The explicit `/coding on`, `/coding off`, and
-`/coding status` forms remain available for compatibility.
 
 ## Manual Compaction
 

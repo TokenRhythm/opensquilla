@@ -28,8 +28,6 @@ async function mountComposer(overrides: Record<string, unknown> = {}) {
     sessionRoutingMode: 'off',
     sessionRoutingBusy: false,
     routerVisualEffectsEnabled: true,
-    codingModeEnabled: false,
-    codingModeSettingsBusy: false,
     voiceBusy: false,
     voiceRecording: false,
     voiceReady: true,
@@ -96,6 +94,44 @@ describe('ChatComposer popovers', () => {
     trigger.click()
     await nextTick()
     expect(el.querySelector('[role="radio"][aria-checked="true"]')?.textContent).toContain(label)
+    app.unmount()
+  })
+
+  it('requests availability when opening the run-mode menu without selecting a mode', async () => {
+    const refresh = vi.fn(), select = vi.fn()
+    const { app, el } = await mountComposer({
+      runMode: 'full',
+      allowedRunModes: ['full'],
+      onRefreshRunModeAvailability: refresh,
+      onSetRunMode: select,
+    })
+    const trigger = el.querySelector<HTMLButtonElement>('.chat-run-mode-btn')!
+    trigger.click()
+    await nextTick()
+    expect(refresh).toHaveBeenCalledOnce()
+    expect(el.querySelector<HTMLButtonElement>('[role="radio"]')?.disabled).toBe(true)
+    expect(select).not.toHaveBeenCalled()
+
+    trigger.click()
+    await nextTick()
+    expect(refresh).toHaveBeenCalledOnce()
+    trigger.click()
+    await nextTick()
+    expect(refresh).toHaveBeenCalledTimes(2)
+    expect(select).not.toHaveBeenCalled()
+    app.unmount()
+  })
+
+  it('does not request run-mode availability while the task locks the menu', async () => {
+    const refresh = vi.fn()
+    const { app, el } = await mountComposer({
+      runModeLocked: true,
+      onRefreshRunModeAvailability: refresh,
+    })
+    el.querySelector<HTMLButtonElement>('.chat-run-mode-btn')!.click()
+    await nextTick()
+    expect(refresh).not.toHaveBeenCalled()
+    expect(el.querySelector('.composer-run-mode')).toBeNull()
     app.unmount()
   })
 
@@ -226,38 +262,6 @@ describe('ChatComposer popovers', () => {
     app.unmount()
   })
 
-  it('shows an accessible Coding ON chip that requests disabling the global mode', async () => {
-    const setCodingModeEnabled = vi.fn()
-    const { app, el } = await mountComposer({
-      codingModeEnabled: true,
-      onSetCodingModeEnabled: setCodingModeEnabled,
-    })
-
-    const chip = el.querySelector<HTMLButtonElement>('.chat-coding-mode-chip')
-    expect(chip?.textContent).toContain('Coding ON')
-    expect(chip?.getAttribute('aria-label')).toBe('Disable Coding mode')
-    chip?.click()
-    await nextTick()
-    expect(setCodingModeEnabled).toHaveBeenCalledWith(false)
-
-    app.unmount()
-  })
-
-  it('hides the Coding mode chip while off and disables it during a pending update', async () => {
-    const { app, el } = await mountComposer()
-    expect(el.querySelector('.chat-coding-mode-chip')).toBeNull()
-    app.unmount()
-
-    const busy = await mountComposer({
-      codingModeEnabled: true,
-      codingModeSettingsBusy: true,
-    })
-    const chip = busy.el.querySelector<HTMLButtonElement>('.chat-coding-mode-chip')
-    expect(chip?.disabled).toBe(true)
-    expect(chip?.getAttribute('aria-busy')).toBe('true')
-    busy.app.unmount()
-  })
-
   it('preserves the original single stop control while streaming', async () => {
     const { app, el } = await mountComposer({
       isStreaming: true,
@@ -360,8 +364,6 @@ describe('ChatComposer popovers', () => {
       sessionRoutingMode: 'off',
       sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
-      codingModeEnabled: false,
-      codingModeSettingsBusy: false,
       voiceBusy: false,
       voiceRecording: false,
       voiceReady: true,
@@ -444,8 +446,6 @@ describe('ChatComposer popovers', () => {
       sessionRoutingMode: 'off',
       sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
-      codingModeEnabled: false,
-      codingModeSettingsBusy: false,
       voiceBusy: false,
       voiceRecording: false,
       voiceReady: true,

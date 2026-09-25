@@ -1,0 +1,1597 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://opensquilla.dev/contracts/gateway/v4/conversation/turns-receipt-get.schema.json",
+  "title": "OpenSquilla turns.receipt.get Contract",
+  "description": "Read an existing durable acceptance without admitting, replaying, consuming queued input, or claiming non-acceptance on a missing receipt. Original material or a previously known SHA-256 fingerprint must identify the request.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "request": {
+      "$ref": "#/$defs/TurnsReceiptGetRequestFrame"
+    },
+    "response": {
+      "$ref": "#/$defs/TurnsReceiptGetResponseFrame"
+    }
+  },
+  "x-opensquilla-wire": {
+    "protocol": "opensquilla-websocket-json",
+    "version": 4,
+    "compatibility": "exact-json-tree"
+  },
+  "x-opensquilla-codegen": {
+    "python": {
+      "tool": "datamodel-code-generator",
+      "version": "0.81.0",
+      "target": "pydantic_v2.BaseModel"
+    },
+    "typescript": {
+      "tool": "json-schema-to-typescript",
+      "version": "16.0.0"
+    },
+    "runtimeValidation": {
+      "tool": "ajv",
+      "version": "8.20.0",
+      "mode": "standalone-adapter-only"
+    }
+  },
+  "x-opensquilla-method": {
+    "name": "turns.receipt.get",
+    "kind": "query",
+    "scope": "operator.read",
+    "guestAllowed": false,
+    "idempotency": "read-only",
+    "timeout": {
+      "policy": "caller"
+    },
+    "capability": {
+      "kind": "method-availability",
+      "name": "turns.receipt.get"
+    },
+    "request": "#/$defs/TurnsReceiptGetRequestFrame",
+    "params": "#/$defs/TurnsReceiptGetParams",
+    "response": "#/$defs/TurnsReceiptGetResponseFrame",
+    "result": "#/$defs/TurnsReceiptGetResult",
+    "errors": [
+      {
+        "code": "INVALID_REQUEST"
+      },
+      {
+        "code": "UNAUTHORIZED"
+      },
+      {
+        "code": "IDEMPOTENCY_CONFLICT"
+      },
+      {
+        "code": "UNAVAILABLE"
+      },
+      {
+        "code": "STORAGE_BUSY"
+      },
+      {
+        "code": "INTERNAL_ERROR"
+      }
+    ]
+  },
+  "$defs": {
+    "ChatSendOriginalChatSendSource": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "elevated": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "noMemoryCapture": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "no_memory_capture": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "ChatSendOriginalChatSendAttachment": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "mime": {
+          "type": "string"
+        },
+        "mime_type": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "filename": {
+          "type": "string"
+        },
+        "data": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "file_uuid": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
+      }
+    },
+    "ChatSendOriginalPageContext": {
+      "description": "Page references and user annotations only. Gateway normalization enforces UTF-8 byte limits and a 65536-byte serialized context limit; JSON Schema length bounds count characters. Page text and locator hints are untrusted context, not source identity or edit authority.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pagePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "\\S",
+          "description": "Logical HTML page within the referenced document. The Gateway validates the current collection and source path; this hint does not grant access."
+        },
+        "targetRef": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S",
+          "description": "Opaque page reference. The Gateway trims whitespace and enforces a 512-byte UTF-8 limit."
+        },
+        "resourceId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S",
+          "description": "Opaque page reference. The Gateway trims whitespace and enforces a 512-byte UTF-8 limit."
+        },
+        "annotations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/ChatSendOriginalPageAnnotation"
+          }
+        }
+      }
+    },
+    "ChatSendOriginalPageAnnotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "\\S",
+          "description": "User annotation; must contain non-whitespace text and fit 16384 UTF-8 bytes."
+        },
+        "selectionText": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16384,
+          "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        },
+        "locatorHint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16384,
+          "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        }
+      }
+    },
+    "ChatSendOriginalSelectedSkillRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "instanceId",
+        "digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "instanceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "ChatSendOriginalWorkspaceFileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "relativePath",
+        "name",
+        "mime"
+      ],
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "relativePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "mime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "ChatSendOriginalRequest": {
+      "title": "chat.send original request identity and frozen material",
+      "description": "Stable chat ingress fields. The Gateway continues to accept snake/camel aliases and additive implementation-specific fields.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "message": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "session_key": {
+          "type": "string"
+        },
+        "key": {
+          "type": "string"
+        },
+        "clientRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatSendOriginalChatSendSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "intent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collaborationMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collaboration_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "initialRoutingMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "initial_routing_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "initialModel": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "initial_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "initialProvider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "initial_provider": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "description": "Optional direct-routing model deployment pin, accepted only with explicit new_chat intent."
+        },
+        "forkBeforeMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "fork_before_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "displayText": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "display_text": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "$ref": "#/$defs/ChatSendOriginalChatSendAttachment"
+          }
+        },
+        "pageContext": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChatSendOriginalPageContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selectedSkills": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/ChatSendOriginalSelectedSkillRef"
+          }
+        },
+        "workspaceFiles": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/ChatSendOriginalWorkspaceFileReference"
+          }
+        }
+      }
+    },
+    "ChatSendReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "originalRequest"
+      ],
+      "properties": {
+        "operation": {
+          "const": "chat.send"
+        },
+        "originalRequest": {
+          "$ref": "#/$defs/ChatSendOriginalRequest"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "SessionsSendOriginalPageContext": {
+      "description": "Page references and user annotations only. Gateway normalization enforces UTF-8 byte limits and a 65536-byte serialized context limit; JSON Schema length bounds count characters. Page text and locator hints are untrusted context, not source identity or edit authority.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pagePath": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "\\S",
+          "description": "Logical HTML page within the referenced document. The Gateway validates the current collection and source path; this hint does not grant access."
+        },
+        "targetRef": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S",
+          "description": "Opaque page reference. The Gateway trims whitespace and enforces a 512-byte UTF-8 limit."
+        },
+        "resourceId": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "\\S",
+          "description": "Opaque page reference. The Gateway trims whitespace and enforces a 512-byte UTF-8 limit."
+        },
+        "annotations": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/SessionsSendOriginalPageAnnotation"
+          }
+        }
+      }
+    },
+    "SessionsSendOriginalPageAnnotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "text"
+      ],
+      "properties": {
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16384,
+          "pattern": "\\S",
+          "description": "User annotation; must contain non-whitespace text and fit 16384 UTF-8 bytes."
+        },
+        "selectionText": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16384,
+          "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        },
+        "locatorHint": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 16384,
+          "description": "The Gateway enforces a 16384-byte UTF-8 limit."
+        }
+      }
+    },
+    "SessionsSendOriginalSelectedSkillRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "instanceId",
+        "digest"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "instanceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "SessionsSendOriginalWorkspaceFileReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspaceId",
+        "relativePath",
+        "name",
+        "mime"
+      ],
+      "properties": {
+        "workspaceId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "relativePath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "mime": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "SessionsSendOriginalRequest": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {}
+        },
+        "_source": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "pageContext": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionsSendOriginalPageContext"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "selectedSkills": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/SessionsSendOriginalSelectedSkillRef"
+          }
+        },
+        "workspaceFiles": {
+          "type": "array",
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/SessionsSendOriginalWorkspaceFileReference"
+          }
+        }
+      },
+      "title": "sessions.send original request identity and frozen material"
+    },
+    "SessionsSendReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "originalRequest"
+      ],
+      "properties": {
+        "operation": {
+          "const": "sessions.send"
+        },
+        "originalRequest": {
+          "$ref": "#/$defs/SessionsSendOriginalRequest"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "SessionsSteerV2OriginalSteerSource": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "elevated": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SessionsSteerV2OriginalRequest": {
+      "title": "sessions.steer.v2 original request identity and frozen material",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "expected_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pendingInputId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending_input_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "expected_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "surface_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surfaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "_source": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionsSteerV2OriginalSteerSource"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attachments": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {}
+        },
+        "intent": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "workspace_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collaborationMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "collaboration_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "run_mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "SessionsSteerV2ReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "originalRequest"
+      ],
+      "properties": {
+        "operation": {
+          "const": "sessions.steer.v2"
+        },
+        "originalRequest": {
+          "$ref": "#/$defs/SessionsSteerV2OriginalRequest"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "PendingInputsDispatchOriginalRequest": {
+      "title": "sessions.pending_inputs.dispatch original request identity and frozen material",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pendingInputId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending_input_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "_source": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        },
+        "surface_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surfaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "PendingInputsDispatchReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "originalRequest"
+      ],
+      "properties": {
+        "operation": {
+          "const": "sessions.pending_inputs.dispatch"
+        },
+        "originalRequest": {
+          "$ref": "#/$defs/PendingInputsDispatchOriginalRequest"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "PendingInputsSteerOriginalRequest": {
+      "title": "sessions.pending_inputs.steer original request identity and frozen material",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionKey": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pendingInputId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "pending_input_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientRequestId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "clientMessageId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "requestFingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "request_fingerprint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedRevision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "expected_revision": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "expected_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "expectedTurnId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "message": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surface_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surfaceId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "_source": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": true
+        }
+      }
+    },
+    "PendingInputsSteerReceiptQuery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operation",
+        "originalRequest"
+      ],
+      "properties": {
+        "operation": {
+          "const": "sessions.pending_inputs.steer"
+        },
+        "originalRequest": {
+          "$ref": "#/$defs/PendingInputsSteerOriginalRequest"
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "TurnsReceiptGetParams": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/ChatSendReceiptQuery"
+        },
+        {
+          "$ref": "#/$defs/SessionsSendReceiptQuery"
+        },
+        {
+          "$ref": "#/$defs/SessionsSteerV2ReceiptQuery"
+        },
+        {
+          "$ref": "#/$defs/PendingInputsDispatchReceiptQuery"
+        },
+        {
+          "$ref": "#/$defs/PendingInputsSteerReceiptQuery"
+        }
+      ]
+    },
+    "TurnReceiptSteer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "accepted",
+        "replayed",
+        "key",
+        "session_key",
+        "session_id",
+        "task_id",
+        "turn_id",
+        "client_request_id",
+        "client_message_id",
+        "user_message_id",
+        "surface_id",
+        "disposition",
+        "revision",
+        "fallback_safe"
+      ],
+      "properties": {
+        "key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_key": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "user_message_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "surface_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "disposition": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "promoted_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "promoted_from_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model_call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "failure_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recovery": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "const": "accepted"
+        },
+        "accepted": {
+          "const": true
+        },
+        "replayed": {
+          "const": true
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "fallback_safe": {
+          "const": false
+        },
+        "applied_iteration": {
+          "type": "integer"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
+      }
+    },
+    "TurnReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestSessionKey",
+        "sessionKey",
+        "sessionId",
+        "clientRequestId",
+        "messageId",
+        "sessionEpoch",
+        "taskId",
+        "taskStatus"
+      ],
+      "properties": {
+        "requestSessionKey": {
+          "type": "string"
+        },
+        "sessionKey": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "clientRequestId": {
+          "type": "string"
+        },
+        "messageId": {
+          "type": "string"
+        },
+        "sessionEpoch": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "taskId": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "taskStatus": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "steer": {
+          "$ref": "#/$defs/TurnReceiptSteer"
+        }
+      }
+    },
+    "TurnsReceiptGetFound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "accepted",
+        "requestFingerprint",
+        "receipt"
+      ],
+      "properties": {
+        "status": {
+          "const": "found"
+        },
+        "accepted": {
+          "const": true
+        },
+        "requestFingerprint": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "receipt": {
+          "$ref": "#/$defs/TurnReceipt"
+        }
+      }
+    },
+    "TurnsReceiptGetNotFound": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "accepted"
+      ],
+      "properties": {
+        "status": {
+          "const": "not_found"
+        },
+        "accepted": {
+          "type": "null"
+        }
+      }
+    },
+    "TurnsReceiptGetResult": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TurnsReceiptGetFound"
+        },
+        {
+          "$ref": "#/$defs/TurnsReceiptGetNotFound"
+        }
+      ]
+    },
+    "TurnsReceiptGetRequestFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "method",
+        "params"
+      ],
+      "properties": {
+        "type": {
+          "const": "req"
+        },
+        "id": {
+          "type": "string"
+        },
+        "method": {
+          "const": "turns.receipt.get"
+        },
+        "params": {
+          "$ref": "#/$defs/TurnsReceiptGetParams"
+        }
+      }
+    },
+    "RpcError": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "code",
+        "message"
+      ],
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "details": {},
+        "retryable": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "retry_after_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "accepted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "TurnsReceiptGetOkResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "payload"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": true
+        },
+        "payload": {
+          "$ref": "#/$defs/TurnsReceiptGetResult"
+        },
+        "error": {
+          "type": "null"
+        }
+      }
+    },
+    "TurnsReceiptGetErrorResponseFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "ok",
+        "error"
+      ],
+      "properties": {
+        "type": {
+          "const": "res"
+        },
+        "id": {
+          "type": "string"
+        },
+        "ok": {
+          "const": false
+        },
+        "payload": {
+          "type": "null"
+        },
+        "error": {
+          "$ref": "#/$defs/RpcError"
+        }
+      }
+    },
+    "TurnsReceiptGetResponseFrame": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/TurnsReceiptGetOkResponseFrame"
+        },
+        {
+          "$ref": "#/$defs/TurnsReceiptGetErrorResponseFrame"
+        }
+      ]
+    }
+  }
+}

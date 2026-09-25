@@ -368,18 +368,12 @@ async def test_legacy_goal_receipt_replay_omits_retired_policy_without_rewriting
         assert (await cur.fetchone())[0] == 1
 
 
-async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
+async def test_receipt_replay_preserves_goal_context_and_candidate(
     storage: SessionStorage,
 ) -> None:
     set_command = _command("set")
     accepted = await _set_goal(storage, command=set_command)
     assert accepted.goal is not None and accepted.goal_context is not None
-    await storage.stage_meta_launch_draft(
-        session_key=SESSION_KEY,
-        client_request_id=set_command.client_request_id,
-        meta_skill_name="meta-test",
-        launch_text="/meta meta-test -- synthetic stale context draft",
-    )
 
     context_replay = await storage.replay_turn_ingress_receipt(
         source_scope=SOURCE_SCOPE,
@@ -390,7 +384,6 @@ async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
     assert context_replay is not None
     assert context_replay.goal_context == accepted.goal_context
     assert context_replay.goal_candidate is None
-    assert await storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
     candidate = GoalClaimCandidate(
         session_id=SESSION_ID,
@@ -424,12 +417,6 @@ async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
     )
     assert followup.goal_context is None
     assert followup.goal_candidate == candidate
-    await storage.stage_meta_launch_draft(
-        session_key=SESSION_KEY,
-        client_request_id=followup_request_id,
-        meta_skill_name="meta-test",
-        launch_text="/meta meta-test -- synthetic stale candidate draft",
-    )
 
     candidate_replay = await storage.replay_turn_ingress_receipt(
         source_scope="gateway:sessions.send",
@@ -440,91 +427,8 @@ async def test_meta_receipt_replay_preserves_goal_context_and_candidate(
     assert candidate_replay is not None
     assert candidate_replay.goal_context is None
     assert candidate_replay.goal_candidate == candidate
-    assert await storage.list_meta_launch_drafts(session_key=SESSION_KEY) == []
 
 
-async def test_goal_and_meta_control_admission_fails_before_any_turn_write(
-    storage: SessionStorage,
-) -> None:
-    request_id = "mixed-goal-meta-control"
-    intent, _ = await storage.stage_meta_control_intent(
-        session_key=SESSION_KEY,
-        control_kind="manual",
-        correlation_id=f"request:{request_id}",
-        meta_skill_name="meta-test",
-    )
-    control = {
-        "version": 1,
-        "intent_id": intent.intent_id,
-        "kind": "manual",
-        "name": "meta-test",
-        "correlation_id": intent.correlation_id,
-    }
-    await storage.stage_meta_launch_draft(
-        session_key=SESSION_KEY,
-        client_request_id=request_id,
-        meta_skill_name="meta-test",
-        launch_text="/meta meta-test -- must remain staged",
-    )
-    candidate = GoalClaimCandidate(
-        session_id=SESSION_ID,
-        epoch=0,
-        goal_id="synthetic-goal",
-    )
-
-    with pytest.raises(
-        ValueError,
-        match="Goal turns cannot consume a MetaSkill control intent",
-    ):
-        await storage.accept_turn(
-            TranscriptEntry(
-                session_id=SESSION_ID,
-                session_key=SESSION_KEY,
-                message_id="mixed-goal-meta-message",
-                role="user",
-                content="/meta meta-test -- must remain staged",
-                created_at=300,
-                turn_context={"meta_control": control},
-            ),
-            expected_epoch=0,
-            updated_at=300,
-            task_record=AgentTaskRecord(
-                task_id="mixed-goal-meta-task",
-                session_key=SESSION_KEY,
-                status=AgentTaskStatus.QUEUED,
-                created_at=300,
-                updated_at=300,
-                details={"metadata": {"meta_control": control}},
-            ),
-            source_scope="gateway:sessions.send",
-            request_session_key=SESSION_KEY,
-            client_request_id=request_id,
-            request_fingerprint=hashlib.sha256(b"mixed-goal-meta").hexdigest(),
-            meta_control_intent_id=intent.intent_id,
-            goal_mutation=ClaimGoalMutation(candidate=candidate),
-        )
-
-    assert await storage.get_transcript(SESSION_ID) == []
-    assert await storage.get_agent_task("mixed-goal-meta-task") is None
-    assert await storage.get_turn_ingress_receipt(
-        source_scope="gateway:sessions.send",
-        request_session_key=SESSION_KEY,
-        client_request_id=request_id,
-    ) is None
-    assert await storage.get_goal(SESSION_KEY) is None
-    drafts = await storage.list_meta_launch_drafts(session_key=SESSION_KEY)
-    assert [draft.client_request_id for draft in drafts] == [request_id]
-    preserved_intent = await storage.get_meta_control_intent(
-        session_key=SESSION_KEY,
-        control_kind="manual",
-        correlation_id=intent.correlation_id,
-    )
-    assert preserved_intent is not None
-    assert preserved_intent.status == "staged"
-    assert preserved_intent.accepted_task_id is None
-    session = await storage.get_session(SESSION_KEY)
-    assert session is not None and session.updated_at == 100
-    assert storage.conn.in_transaction is False
 
 
 async def test_goal_set_conflict_rolls_back_every_turn_artifact(

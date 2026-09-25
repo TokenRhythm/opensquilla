@@ -322,6 +322,30 @@ def test_release_wheel_allows_router_provenance_markdown() -> None:
     assert skill_card in violations
 
 
+def test_release_wheel_allows_only_canonical_distribution_license_notices() -> None:
+    module = load_script()
+    notice = "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md"
+    forbidden = [
+        "THIRD_PARTY_NOTICES.md",
+        "opensquilla/skills/bundled/example/THIRD_PARTY_NOTICES.md",
+        "opensquilla-0.5.4.dist-info/licenses/private-notes.md",
+        "opensquilla-0.5.4.dist-info/licenses/nested/THIRD_PARTY_NOTICES.md",
+        "other-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md",
+        "docs/opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md",
+    ]
+    assert module.forbidden_release_wheel_entries([notice, *forbidden]) == forbidden
+
+
+def test_release_wheel_notice_still_undergoes_sensitive_text_scanning(tmp_path: Path) -> None:
+    module = load_script()
+    wheel = tmp_path / "notice-probe.whl"
+    notice = "opensquilla-0.5.4.dist-info/licenses/THIRD_PARTY_NOTICES.md"
+    marker = module.FORBIDDEN_RELEASE_TEXT_MARKERS[0]
+    with ZipFile(wheel, "w") as archive:
+        archive.writestr(notice, marker)
+    assert module.forbidden_release_text_hits(wheel) == [f"{notice}: {marker}"]
+
+
 def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> None:
     module = load_script()
     pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
@@ -335,7 +359,6 @@ def test_pyproject_release_wheel_config_excludes_forbidden_skill_resources() -> 
     assert "src/opensquilla/skills/bundled/**/skill-card.md" in excludes
     assert "src/opensquilla/skills/bundled/**/references/*.md" in excludes
     assert "src/opensquilla/skills/exp/**" in excludes
-    assert "src/opensquilla/skills/meta/META_SKILL_AUTHORING.md" in excludes
     assert module.forbidden_release_wheel_entries(tuple(force_includes.values())) == []
 
 
@@ -975,7 +998,7 @@ def test_release_workflow_publishes_wheel_and_electron_assets_without_portable()
     assert "OpenSquilla-{desktop_version}-mac-arm64.dmg" in workflow
     assert "OpenSquilla-{desktop_version}-win-x64.exe" in workflow
     assert "opensquilla-latest-py3-none-any.whl" not in workflow
-    assert "gh release upload \"${TAG}\" dist/* --clobber" in workflow
+    assert 'gh release upload "${TAG}" dist/public/* --clobber' in workflow
     assert "dist/*.zip dist/*.zip.sha256 dist/SHA256SUMS" not in workflow
     assert "Git LFS pointer leaked into wheel" in workflow
     assert "Verify GitHub Release assets" in workflow

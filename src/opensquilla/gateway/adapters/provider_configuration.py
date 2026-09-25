@@ -167,13 +167,15 @@ def model_list_error_to_projection(error: Any) -> dict[str, Any]:
 class GatewayModelCatalogPort:
     def __init__(
         self, provider_selector: Any, config: Any, *, include_configured_defaults: bool = False,
+        cache_only: bool = False,
     ) -> None:
         self._provider_selector = provider_selector
         self._config = config
         self._include_configured_defaults = include_configured_defaults
+        self._cache_only = cache_only
 
     async def load_model_catalog(self) -> ModelCatalogResult:
-        if not self._include_configured_defaults:
+        if not self._include_configured_defaults and not self._cache_only:
             return await self._load_active_catalog()
         # Settings and chat share the same selectable-discovery policy. Only
         # durable deployments are resolved here; draft credentials never enter
@@ -190,12 +192,16 @@ class GatewayModelCatalogPort:
 
         models: list[dict[str, Any]] = []
         errors: list[dict[str, Any]] = []
+        catalog_states: list[dict[str, object]] = []
         inherited = getattr(self._provider_selector, "current_config", None)
         active_provider = str(getattr(inherited, "provider", "")).strip().lower()
         candidates: dict[str, str] = {}
         if active_provider:
             candidates[active_provider] = str(getattr(inherited, "model", "") or "")
-        for key, profile in (getattr(self._config, "llm_profiles", None) or {}).items():
+        profiles = (getattr(self._config, "llm_profiles", None) or {}) if (
+            self._include_configured_defaults
+        ) else {}
+        for key, profile in profiles.items():
             provider = str(key).strip().lower()
             if provider in candidates:
                 continue
@@ -226,6 +232,7 @@ class GatewayModelCatalogPort:
                     base_url=deployment.base_url, proxy=deployment.proxy,
                     allow_default_api_key_env=False, persist_catalog=True,
                     catalog_config=self._config,
+                    cache_only=self._cache_only,
                 )
             except Exception:
                 discovered = ProviderModelsDiscoverResult(
@@ -249,6 +256,9 @@ class GatewayModelCatalogPort:
                     "detail": resolution.reason,
                 })
                 continue
+            catalog_states.append(discovered.catalog or {
+                "cacheHit": False, "stale": True, "lastSyncedAt": None,
+            })
             if discovered.source == "live" or not discovered.ok:
                 # A credential-scoped listing is authoritative. In particular,
                 # auth failures cannot resurrect a preset model.
@@ -304,7 +314,20 @@ class GatewayModelCatalogPort:
                     "source": entry.source, "reasoningFormat": entry.reasoning_format,
                     "metadata": {"catalogScope": "configured_default"},
                 })
-        return cast(ModelCatalogResult, {"models": models, "errors": errors})
+        # Older clients validate the ordinary result with additionalProperties=false.
+        # Only snapshot callers opt in to the new freshness envelope.
+        if not self._cache_only:
+            return cast(ModelCatalogResult, {"models": models, "errors": errors})
+        synced = [str(state["lastSyncedAt"]) for state in catalog_states
+                  if state.get("lastSyncedAt")]
+        return cast(ModelCatalogResult, {
+            "models": models, "errors": errors,
+            "catalog": {
+                "cacheHit": all(state.get("cacheHit") is True for state in catalog_states),
+                "stale": any(state.get("stale") is not False for state in catalog_states),
+                "lastSyncedAt": min(synced) if synced else None,
+            },
+        })
 
     async def _load_active_catalog(self) -> ModelCatalogResult:
         from opensquilla.provider.model_capacity import (
@@ -418,14 +441,22 @@ class GatewayModelRoutingPolicyPort:
             PrimaryProviderChangedError,
             reconcile_recommended_router,
             validate_router_candidate,
+            validate_router_reactivation,
         )
-
-        if provider_id.strip().lower() != str(config.llm.provider).strip().lower():
+        primary = str(config.llm.provider).strip().lower()
+        # Both the summary and recommendation action follow the saved primary.
+        # A foreign/custom ladder must be replaceable with its recommendation;
+        # the expected primary also rejects a stale client after a switch.
+        if provider_id.strip().lower() != primary:
             raise PrimaryProviderChangedError(
-                "The saved primary provider changed; reload before resetting Router"
+                "The primary provider changed; reload before resetting Router",
             )
         candidate = config.model_copy(deep=True)
-        reconcile_recommended_router(candidate, str(config.llm.provider))
+        reconcile_recommended_router(candidate, primary)
+        # A first sparse save must retain the chosen primary even when it
+        # equals the default; otherwise a provider-less reload may infer the
+        # legacy provider from the direct model and retarget this ladder.
+        candidate.mark_force_persist("llm.provider")
         patched = [
             "squilla_router.tiers",
             "squilla_router.tier_profile",
@@ -436,6 +467,8 @@ class GatewayModelRoutingPolicyPort:
         if activate_router:
             patched.extend(apply_model_routing_mode(candidate, "router", activation_config=config))
             validate_router_candidate(candidate)
+        else:
+            validate_router_reactivation(config, candidate)
         return PreparedModelRouting(candidate, tuple(patched))
 
 

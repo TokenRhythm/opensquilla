@@ -1561,8 +1561,9 @@ async def test_post_exit_output_idle_timer_restarts_after_each_chunk(
 
 
 @pytest.mark.parametrize("native_pipe", [False, True])
+@pytest.mark.parametrize("timeout_after_process_exit_is_eof", [False, True])
 async def test_quiet_output_is_limited_only_after_process_exit(
-    tmp_path: Path, native_pipe: bool,
+    tmp_path: Path, native_pipe: bool, timeout_after_process_exit_is_eof: bool,
 ) -> None:
     read_fd = write_fd = None
     stream_reader = asyncio.StreamReader()
@@ -1574,7 +1575,12 @@ async def test_quiet_output_is_limited_only_after_process_exit(
     capture = BoundedOutputCapture()
     capture.spool = _spool(ToolResultStore(tmp_path))
     exited = asyncio.Event()
-    task = asyncio.create_task(capture.drain(reader, process_exited=exited, idle_timeout=0.03))
+    task = asyncio.create_task(capture.drain(
+        reader,
+        process_exited=exited,
+        idle_timeout=0.03,
+        timeout_after_process_exit_is_eof=timeout_after_process_exit_is_eof,
+    ))
     try:
         await asyncio.sleep(0.1)
         assert not task.done()
@@ -1582,8 +1588,11 @@ async def test_quiet_output_is_limited_only_after_process_exit(
         # Keep the pipe open without more output, like an inherited daemon handle.
         await asyncio.wait_for(task, timeout=1)
         await capture.finish_async()
-        assert capture.describe()["retained_output_complete"] is False
-        assert capture.incomplete_reason == "output pipe remained open after process exit"
+        assert capture.describe()["retained_output_complete"] is timeout_after_process_exit_is_eof
+        if timeout_after_process_exit_is_eof:
+            assert capture.incomplete_reason is None
+        else:
+            assert capture.incomplete_reason == "output pipe remained open after process exit"
         assert capture.spool.lease.closed
     finally:
         if not task.done():

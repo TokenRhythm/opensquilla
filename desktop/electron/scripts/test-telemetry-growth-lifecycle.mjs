@@ -7,6 +7,8 @@ import ts from '@typescript/typescript6'
 
 import { normalizeRouterPresetBinding, resolveDesktopRouterUpdate } from '../dist/desktop-router-config.js'
 import * as primaryProviderChange from '../dist/desktop-primary-provider-change.js'
+import { DesktopRoutingConfigurationError } from '../dist/desktop-router-profiles.js'
+import { renderUnconfiguredDesktopConfig } from '../dist/desktop-unconfigured-profile.js'
 import { OnboardingSaveTelemetry } from '../dist/onboarding-save-telemetry.js'
 import { DesktopTelemetryRuntimeGate, clearEarlyTelemetryScope } from '../dist/telemetry/early-spool.js'
 import { CONSENT_MIRROR_SCHEMA_VERSION, writeConsentMirror } from '../dist/telemetry/consent-mirror.js'
@@ -72,6 +74,8 @@ function harness(directory, {
   const defaults = { requiresApiKey: false, model: 'synthetic-model', baseUrl: '', apiKeyEnv: '' }
   const context = vm.createContext({
     Date: TestDate, join, Math, JSON, Buffer, OnboardingSaveTelemetry,
+    DesktopRoutingConfigurationError, renderUnconfiguredDesktopConfig,
+    process: { platform: platform === 'macos' ? 'darwin' : platform === 'windows' ? 'win32' : 'linux' },
     normalizeRouterPresetBinding, resolveDesktopRouterUpdate,
     require(specifier) {
       assert.equal(specifier, './desktop-primary-provider-change.js')
@@ -82,6 +86,8 @@ function harness(directory, {
     desktopProcessStartedAt: TestDate.now(), desktopLocale: 'en', onboardingSaveTelemetryAttempt: 0,
     app: { isPackaged: false }, desktopLog() {}, refreshDesktopReliabilityForegroundState() {},
     activeDesktopProfile: () => profile, credentialPath: () => profile.credentialPath,
+    desktopProfileKey: () => profile.home,
+    gatewayProcess: null, gatewayState: { owned: false },
     readFile: async (path) => readFileSync(path, 'utf8'),
     readOptionalDesktopText: async (path) => existsSync(path) ? readFileSync(path, 'utf8') : null,
     desktopTelemetryDirectory: () => telemetryDirectory,

@@ -38,7 +38,8 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
     && status.value.state !== 'ready')
   const isWindows = computed(() => status.value?.platform.toLowerCase().startsWith('win') === true)
   const canSetup = computed(() =>
-    isWindows.value && status.value?.state === 'not_setup')
+    isWindows.value
+    && ['not_setup', 'failed', 'ready'].includes(status.value?.state ?? ''))
 
   function clearPoll() {
     if (pollTimer) clearTimeout(pollTimer)
@@ -62,7 +63,7 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   async function refresh() {
     if (!active.value) return
     const generation = ++requestGeneration
-    loading.value = status.value === null
+    loading.value = true
     clearPoll()
     try {
       const payload = (await options.sandbox.readiness()).status
@@ -96,6 +97,8 @@ export function useSandboxSetupRecovery(options: UseSandboxSetupRecoveryOptions)
   async function ensureSetup(): Promise<boolean> {
     if (!canSetup.value || ensuring.value) return false
     const generation = ++requestGeneration
+    // Setup owns this generation; an older read can no longer clear its flag.
+    loading.value = false
     ensuring.value = true
     error.value = ''
     clearPoll()

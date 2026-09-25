@@ -561,7 +561,8 @@ button.chat-system-status__connection:focus-visible,
   color: var(--accent-foreground);
   font-size: 0.5625rem;
   font-weight: 700;
-  left: calc(100% - 9px);
+  /* Wider counts grow inward when the trigger sits at the viewport edge. */
+  inset-inline-end: -2px;
   line-height: 14px;
   min-width: 18px;
   padding: 0 3px;

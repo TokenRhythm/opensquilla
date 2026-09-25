@@ -176,7 +176,7 @@ arguments are never submitted by completion before the argument is present.
 
 Slash controls and queries execute on the command plane: they do not become
 user Prompt cards and do not enter the Turn queue. Commands such as `/file`,
-`/image`, `/path`, and `/meta <name>` intentionally create a Turn because their
+`/image`, and `/path` intentionally create a Turn because their
 purpose is to send model input.
 
 Commands available in both gateway and standalone chat include:
@@ -217,8 +217,6 @@ Gateway-backed chat also supports session and operations commands:
 | `/resume [id]` | Open the picker, or resume a specific session. |
 | `/delete <id>` | Delete a session. |
 | `/usage` | Show aggregate usage. |
-| `/meta` | List MetaSkills. |
-| `/meta <name>` | Run a MetaSkill in the current session. |
 | `/file <path> [prompt]` | Upload a local file and send it with a prompt. |
 | `/permissions ...` | Inspect or change interactive permission mode. |
 | `/approvals ...` | Inspect or reset approval state. |
@@ -227,7 +225,7 @@ Gateway-backed chat also supports session and operations commands:
 from the default palette. Use `/model` for session-model selection and
 `/approvals` for the current approval state.
 
-Standalone chat supports the core commands above, but `/models`, `/meta`, and
+Standalone chat supports the core commands above, but `/models` and
 gateway-wide usage or approval commands require gateway mode.
 
 ## Files and Images
@@ -283,8 +281,6 @@ running maintainer integration tests for terminal rendering.
   sessions.
 - [`approvals-and-permissions.md`](approvals-and-permissions.md) for permission
   profiles and approval workflows.
-- [`features/meta-skill-user-guide.md`](features/meta-skill-user-guide.md) for
-  `/meta` workflows.
 - [`features/tui-product-contract.md`](features/tui-product-contract.md) for
   ownership, shared-session, fallback, and legacy-freeze rules.
 

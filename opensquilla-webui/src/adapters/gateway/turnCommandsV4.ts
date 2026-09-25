@@ -39,12 +39,24 @@ import {
   validateSessionsSteerV2Result,
 } from '@/contracts/generated/v4/sessionsSteerV2Validators.mjs'
 import {
+  TURNS_RECEIPT_GET_METHOD,
+  type TurnReceiptSteer,
+  type TurnsReceiptGetParams,
+  type TurnsReceiptGetResult,
+} from '@/contracts/generated/v4/turnsReceiptGet'
+import {
+  validateTurnsReceiptGetParams,
+  validateTurnsReceiptGetResult,
+} from '@/contracts/generated/v4/turnsReceiptGetValidators.mjs'
+import {
   type TurnSendRequest,
   type TurnCancelRequest,
   type TurnCancelResponse,
   type TurnCommandCapability,
   type TurnCommands,
   type TurnCommandRequestOptions,
+  type TurnReceiptRequest,
+  type TurnReceiptResult,
   TurnCommandError,
   type TurnSendParams,
   type TurnSendResponse,
@@ -252,7 +264,7 @@ function projectCancelResult(raw: ChatAbortResult): TurnCancelResponse {
   return metadata ? { ...result, metadata } : result
 }
 
-function projectSteerResult(raw: SessionsSteerV2Result | SessionsPendingInputsSteerResult): TurnSteerResponse {
+function projectSteerResult(raw: SessionsSteerV2Result | SessionsPendingInputsSteerResult | TurnReceiptSteer): TurnSteerResponse {
   const object = asObject(raw)
   const disposition = optionalDisposition(object.disposition)
   const result: TurnSteerResponse = {
@@ -479,7 +491,13 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
 }
 
 function requestOptions(options?: TurnCommandRequestOptions): RpcCallOptions | undefined {
-  return options?.signal ? { signal: options.signal } : undefined
+  if (!options?.signal && options?.expectedGeneration === undefined) return undefined
+  return {
+    ...(options.signal ? { signal: options.signal } : {}),
+    ...(options.expectedGeneration !== undefined
+      ? { expectedGeneration: options.expectedGeneration }
+      : {}),
+  }
 }
 
 function forward<T>(
@@ -540,6 +558,62 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
   )
 
   return {
+    supportsReceiptLookup: () => hasRpcMethod(TURNS_RECEIPT_GET_METHOD),
+
+    lookupReceipt: async (
+      query: TurnReceiptRequest,
+      options?: TurnCommandRequestOptions,
+    ): Promise<TurnReceiptResult> => {
+      if (!hasRpcMethod(TURNS_RECEIPT_GET_METHOD)) return { status: 'unsupported' }
+      const originalRequest = query.kind === 'steer'
+        ? toWireSteerParams(query.request)
+        : query.request.kind === 'pending-input'
+          ? { ...query.request.params }
+          : toWireSendParams(query.request.params)
+      const operation = query.kind === 'steer'
+        ? query.request.pendingInputId ? SESSIONS_PENDING_INPUTS_STEER_METHOD : SESSIONS_STEER_V2_METHOD
+        : query.request.kind === 'pending-input' ? SESSIONS_PENDING_INPUTS_DISPATCH_METHOD : CHAT_SEND_METHOD
+      const params = response<TurnsReceiptGetParams>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetParams, { operation, originalRequest })
+      let raw: unknown
+      try {
+        raw = await transport.request(TURNS_RECEIPT_GET_METHOD, params as unknown as Record<string, unknown>, {
+          ...requestOptions(options), recoveryClass: 'safe-read',
+        })
+      } catch (error) {
+        const failure = readTransportFailure(error)
+        if (failure.code === 'METHOD_NOT_FOUND' || failure.code === 'UNSUPPORTED') return { status: 'unsupported' }
+        throw mapTurnCommandError(error)
+      }
+      const result = response<TurnsReceiptGetResult>(TURNS_RECEIPT_GET_METHOD, validateTurnsReceiptGetResult, raw)
+      if (result.status === 'not_found') return { status: 'not-found' }
+      const { receipt } = result
+      // A valid shape is not enough to bind a late response to this logical
+      // delivery. Fail closed before it can supply a target to a pending Stop.
+      if (receipt.clientRequestId !== firstDefined(originalRequest, 'clientRequestId', 'client_request_id')
+        || receipt.requestSessionKey !== firstDefined(originalRequest, 'sessionKey', 'session_key', 'key')) {
+        throw new TurnCommandContractError(TURNS_RECEIPT_GET_METHOD)
+      }
+      if (query.kind === 'steer') {
+        if (!receipt.steer || receipt.steer.client_request_id !== receipt.clientRequestId) {
+          throw new TurnCommandContractError(TURNS_RECEIPT_GET_METHOD)
+        }
+        return { status: 'found', response: projectSteerResult(receipt.steer) }
+      }
+      return {
+        status: 'found',
+        response: {
+          ok: true, sessionKey: receipt.sessionKey, messageId: receipt.messageId,
+          userMessageId: receipt.messageId, replayed: true,
+          ...(receipt.taskId ? { taskId: receipt.taskId } : {}),
+          ...(receipt.taskStatus ? { taskStatus: receipt.taskStatus } : {}),
+          metadata: {
+            requestFingerprint: result.requestFingerprint,
+            sessionId: receipt.sessionId, sessionEpoch: receipt.sessionEpoch,
+          },
+        },
+      }
+    },
+
     send: async (
       request: TurnSendRequest,
       options?: TurnCommandRequestOptions,

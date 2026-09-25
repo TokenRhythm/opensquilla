@@ -394,9 +394,9 @@ jobs:
         working-directory: opensquilla-webui
         shell: bash
         run: |
-          # Vite copies public/ verbatim. Prove the canonical normalization
+          # Vite copies public-assets/ verbatim. Prove the canonical normalization
           # strips harmless Finder metadata before the manifest is written.
-          printf 'CI-only Finder metadata\n' > public/.DS_Store
+          printf 'CI-only Finder metadata\n' > public-assets/.DS_Store
           npm run build:artifact
           if [[ -e dist/.DS_Store || -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
@@ -559,7 +559,6 @@ jobs:
             exit 1
           fi
           python scripts/verify_webui_artifact.py \
-            --forbid-personal-bgm \
             --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
 
@@ -866,11 +865,16 @@ jobs:
           auth-connection-recovery.spec.ts
           chat-send-lifecycle.spec.ts
           chat-send-lifecycle.real.spec.ts
+          cross-window-sync.real.spec.ts
           composer-paste.spec.ts
           history-hydration.spec.ts
           idle-chat-recovery.spec.ts
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
+          retired-bgm-upgrade.spec.ts
+          header-responsive.spec.ts
+          topbar-global-controls.spec.ts
+          topbar-visual.spec.ts
           router-physical-model.spec.ts
           user-message-newlines.spec.ts
           session-created-card.spec.ts
@@ -885,6 +889,25 @@ jobs:
           share.spec.ts
           --project=chromium
           --workers=2
+
+      # Keep absolute performance gates isolated from other renderer processes.
+      - name: Run production-dist long-list virtualization contracts
+        working-directory: opensquilla-webui
+        run: >-
+          npm run test:e2e --
+          chat-virtualization.spec.ts
+          conversation-minimap.spec.ts
+          floating-composer.spec.ts
+          virtualized-logs.spec.ts
+          long-task-resilience.spec.ts
+          native-gateway.spec.ts
+          sidebar-drag.spec.ts
+          sidebar-hover-geometry.spec.ts
+          sidebar-virtualization.spec.ts
+          --project=chromium
+          --workers=1
+          --retries=0
+          --output=test-results/virtualization
 
       - name: Upload chat recovery traces
         id: chat-traces
@@ -993,6 +1016,7 @@ jobs:
       - name: Run desktop unit tests
         working-directory: desktop/electron
         run: |
+          node scripts/test-macos-keychain-patch.cjs
           node scripts/test-installer-progress-contract.mjs
           node --test scripts/test-gateway-integrity.mjs
           node scripts/test-secret-storage-policy.mjs
@@ -1021,13 +1045,16 @@ jobs:
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node scripts/test-working-preview-refresh.mjs
           node scripts/test-resource-file-actions.mjs
           node --test scripts/fixtures/workspace-inline-preview/provider.test.mjs
           npm run test:live-html-harness
           node scripts/test-onboarding-flow-coordinator.mjs
           node scripts/test-onboarding-save-telemetry.mjs
+          node scripts/test-desktop-unconfigured-profile.mjs
           node scripts/test-router-tier-normalization.mjs
           node scripts/test-desktop-router-config.mjs
+          node scripts/test-onboarding-routing.mjs
           node scripts/test-ci-case-telemetry.mjs
           node scripts/test-telemetry-consent.mjs
           node scripts/test-telemetry-early-spool.mjs
@@ -1230,6 +1257,7 @@ jobs:
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
@@ -1239,6 +1267,7 @@ jobs:
           elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_plan_rpc.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
               tests/test_gateway/test_task_runtime_wait_slots.py
@@ -1512,6 +1541,7 @@ jobs:
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
@@ -1521,6 +1551,7 @@ jobs:
           elif [[ "${family}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_plan_rpc.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
               tests/test_gateway/test_task_runtime_wait_slots.py
@@ -1678,6 +1709,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -1737,6 +1773,9 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_scripts/test_verify_webui_artifact.py
+            tests/test_scripts/test_stage_webui_artifact.py
+            tests/test_packaging/test_webui_build_contract.py
             -vv
             --tb=short
             -o faulthandler_timeout=60
@@ -1915,8 +1954,7 @@ jobs:
           set -euo pipefail
           git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
           mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
-          docker build --file Dockerfile --tag "${mcp_image}" \
-            --build-arg OPENSQUILLA_FORBID_PERSONAL_BGM=1 . \
+          docker build --file Dockerfile --tag "${mcp_image}" . \
             2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
           docker image inspect --format '{{json .Size}}' "${mcp_image}" \
             | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"
@@ -2089,7 +2127,7 @@ jobs:
       - name: Verify compiled Desktop Router against Gateway provider mutations
         env:
           OPENSQUILLA_REQUIRE_DESKTOP_ROUTER_BRIDGE: '1'
-        run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py
+        run: uv run --no-sync pytest -q tests/test_desktop/test_router_provider_bridge.py tests/test_desktop/test_router_catalog_generation.py
 
       - name: Run compiled Desktop recovery flows
         working-directory: desktop/electron
@@ -2361,12 +2399,14 @@ jobs:
               if [[ "${RUNNER_OS}" == "macOS" ]]; then
                 entries+=(
                   'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                  'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
                 )
               fi
               ;;
             profiles)
               entries=(
                 'onboarding-flow:scripts/test-onboarding-flow.mjs'
+                'onboarding-first-chat:scripts/test-onboarding-first-chat.mjs'
                 'profile-consolidation-flow:scripts/test-profile-consolidation-flow.mjs'
                 'primary-repair-accessibility:scripts/test-primary-repair-accessibility.mjs'
                 'profile-import-flow:scripts/test-profile-import-flow.mjs'
@@ -2559,11 +2599,10 @@ jobs:
             tests/test_skills_bundled_baseline.py \
             tests/test_skills_hot_reload.py \
             tests/test_skill_catalog_projection.py \
-            tests/test_gateway/test_meta_catalog_compatibility.py \
+            tests/test_skills/test_retired_workflows.py \
             tests/test_gateway/test_rpc_commands.py \
             tests/test_migration/test_legacy_config_fixtures.py \
             tests/test_skills/test_catalog_upgrade_retirement.py \
-            tests/test_skills/test_sop_compiler.py \
             tests/unit/cli/tui/test_opentui_completion_catalog.py \
             tests/test_skills_loader_namespaces.py \
             tests/test_skills_tree.py \
@@ -2590,7 +2629,7 @@ jobs:
             tests/test_skills/test_hub_transaction_process_gates.py \
             tests/test_gateway/test_rpc_skills_install_visibility.py \
             tests/test_gateway/test_rpc_skills_exact_identity.py \
-            tests/test_gateway/test_rpc_skills_coding_gate.py \
+            tests/test_gateway/test_retired_product_config.py \
             tests/test_gateway/test_rpc_skills_reload.py \
             tests/test_gateway/test_skill_management_service_injection.py \
             tests/test_tools/test_skill_view_resources.py \

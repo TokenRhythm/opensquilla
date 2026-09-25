@@ -20,8 +20,6 @@ import { createV4GoalContinuity } from './goalContinuityV4'
 import type { GoalContinuity } from '@/modules/goalContinuity'
 import type { PlanCenter } from '@/modules/planCenter'
 import { createV4PlanCenter } from './planCenterV4'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
-import { createV4MetaRunCenter } from './metaRunCenterV4'
 import type { AppSettings } from '@/modules/appSettings'
 import { createV4AppSettings } from './appSettingsV4'
 import type { ProductActivity } from '@/modules/productActivity'
@@ -44,8 +42,6 @@ import type { UsageReporting } from '@/modules/usageReporting'
 import { createV4UsageReporting } from './usageReportingV4'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import { createV4CommandCatalog } from './commandCatalogV4'
-import type { RouteFeedback } from '@/modules/routeFeedback'
-import { createV4RouteFeedback } from './routeFeedbackV4'
 import type { PromptCacheLease } from '@/modules/promptCacheLease'
 import { createV4PromptCacheLease } from './promptCacheLeaseV4'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
@@ -100,7 +96,6 @@ export interface GatewayAdapters {
   readonly goalCenter: GoalCenter
   readonly goalContinuity: GoalContinuity
   readonly planCenter: PlanCenter
-  readonly metaRunCenter: MetaRunCenter
   readonly appSettings: AppSettings
   readonly productActivity: ProductActivity
   readonly providerConfiguration: ProviderConfiguration
@@ -112,7 +107,6 @@ export interface GatewayAdapters {
   readonly sandboxRuntime: SandboxRuntime
   readonly usageReporting: UsageReporting
   readonly commandCatalog: CommandCatalog
-  readonly routeFeedback: RouteFeedback
   readonly promptCacheLease: PromptCacheLease
   readonly clarificationSubmission: ClarificationSubmission
   readonly sessionMaintenance: SessionMaintenance
@@ -183,7 +177,6 @@ export function createGatewayAdapters(
     goalCenter: createV4GoalCenter(transports.rpc),
     goalContinuity: createV4GoalContinuity(transports.rpc, transports.events),
     planCenter: createV4PlanCenter(transports.rpc, transports.events),
-    metaRunCenter: createV4MetaRunCenter(transports.rpc, transports.events),
     appSettings: createV4AppSettings(transports.rpc),
     productActivity: createV4ProductActivity(transports.rpc),
     providerConfiguration: createV4ProviderConfiguration(transports.rpc, transports.events),
@@ -195,7 +188,6 @@ export function createGatewayAdapters(
     sandboxRuntime: createV4SandboxRuntime(transports.rpc, transports.events),
     usageReporting: createV4UsageReporting(transports.rpc),
     commandCatalog: createV4CommandCatalog(transports.rpc),
-    routeFeedback: createV4RouteFeedback(transports.rpc),
     promptCacheLease: createV4PromptCacheLease(transports.rpc),
     clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
     sessionMaintenance: createV4SessionMaintenance(transports.rpc),

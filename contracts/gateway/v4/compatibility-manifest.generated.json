@@ -29,7 +29,7 @@
       "delivery": "live-only-best-effort",
       "family": "conversation.events",
       "schema": "conversation/conversation-events.schema.json",
-      "schemaSha256": "b3a87ab466284956737c835208e9044eb4d6eef949f05229e5d9778a428dbae0",
+      "schemaSha256": "952ace8aac4aeba3655438191a3d7c9baed037e24455117b369e0591ec600643",
       "schemaVersion": 1,
       "wireNames": [
         "chat.done",
@@ -47,10 +47,6 @@
         "session.event.goal",
         "session.event.goal_run",
         "session.event.input_disposition",
-        "session.event.meta_preflight",
-        "session.event.meta_run_announced",
-        "session.event.meta_run_completed",
-        "session.event.meta_step_state",
         "session.event.plan_revision",
         "session.event.plan_run",
         "session.event.progress",
@@ -163,27 +159,9 @@
   "methods": [
     {
       "lifecycle": "stable",
-      "name": "agents.create",
-      "schema": "agents/agents-create.schema.json",
-      "schemaSha256": "00a3ddd11a187c963b82702a4e6506f989fec343369b6272809e0d7739d4a7f0"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "agents.delete",
-      "schema": "agents/agents-delete.schema.json",
-      "schemaSha256": "cd155b2f497c7763df07c07754e6112c9fe26609cff6068f84bc264afb75c5e2"
-    },
-    {
-      "lifecycle": "stable",
       "name": "agents.list",
       "schema": "agents/agents-list.schema.json",
       "schemaSha256": "2dbdaecd6441c17039027bdcb3696fcc51823908bf6b854023a9c3b9dcabf587"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "agents.update",
-      "schema": "agents/agents-update.schema.json",
-      "schemaSha256": "532e008da6b121b1392b14a67b5b4ce4d5b02b8c23800814a0620c641befe325"
     },
     {
       "lifecycle": "stable",
@@ -345,7 +323,7 @@
       "lifecycle": "stable",
       "name": "chat.clarify_submit",
       "schema": "conversation/chat-clarify-submit.schema.json",
-      "schemaSha256": "a7bd6288b9488a00a8cba7d18e40f7d141d42ef0630f1fb28306ef5d6d8a55a5"
+      "schemaSha256": "b6768677e3a23bf0d8b257c8727a59a1461f408a5e65958294ac6aca74cc0526"
     },
     {
       "lifecycle": "stable",
@@ -357,7 +335,7 @@
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "d6baded0b633c50e3981a45810fa085bd202ecb93ff3e2d7f4d715abd60483ad"
+      "schemaSha256": "82a949807303afc9ff05b162102fb656a993c031752a6221c956ffddbcae5912"
     },
     {
       "lifecycle": "stable",
@@ -381,13 +359,13 @@
       "lifecycle": "stable",
       "name": "config.patch",
       "schema": "platform/config-patch.schema.json",
-      "schemaSha256": "532070ce7b287105434460e7a51ed52ad5ea0e33b97bbca25927ed989ca6f937"
+      "schemaSha256": "c004f19778473d68afb5cb8ae4c7832d87730c8fba98b6855c195a2038cc79d1"
     },
     {
       "lifecycle": "stable",
       "name": "config.patch.safe",
       "schema": "platform/config-patch-safe.schema.json",
-      "schemaSha256": "867ed7d4269947560859f6c36a36bfc6910e788fe9d6101537b282b36fa35a7f"
+      "schemaSha256": "3629f65de5f4ade64cb665699d636c38836a6bdafc34fb0a8282029ac4a4992e"
     },
     {
       "lifecycle": "stable",
@@ -493,54 +471,6 @@
       "name": "exec.approval.status",
       "schema": "approvals/approval-status.schema.json",
       "schemaSha256": "951d02cc9cb10329793513cdb100163dcd33b75e2c9053be2042899aff4fba8f"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.accept",
-      "schema": "skills/exec-proposals-accept.schema.json",
-      "schemaSha256": "8e7c077f3532b6107a12d7cc37380cff2e14016ec9e845b53ac568563c74e49b"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.auto_enabled.disable",
-      "schema": "skills/exec-proposals-auto-enabled-disable.schema.json",
-      "schemaSha256": "a92f1db60d1160b5edf587d0392cc54066864b5297ae98fe76f7d05701014b9c"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.auto_enabled.list",
-      "schema": "skills/exec-proposals-auto-enabled-list.schema.json",
-      "schemaSha256": "fa822209dfb6bbc4c4d7c14469c90956b408ea57c3d87d321ce286330c28342f"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.list",
-      "schema": "skills/exec-proposals-list.schema.json",
-      "schemaSha256": "27340136ac7037c1c7f9aff1f9c7f7e3a956db55232e1357d363e107b794b3b8"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.reject",
-      "schema": "skills/exec-proposals-reject.schema.json",
-      "schemaSha256": "d2e1163ece594960f9742e6cf7b25ba6ab52e078ffc07abdb0b660cbe07792b1"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.settings.get",
-      "schema": "skills/exec-proposals-settings-get.schema.json",
-      "schemaSha256": "367c6bd5a579b3a1a71a346d4cd17195f357d998496b7236c999ad72f2673d7d"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.settings.set",
-      "schema": "skills/exec-proposals-settings-set.schema.json",
-      "schemaSha256": "63f6c8a79bf32f89bdb3d887e22268bb96579353d564d71e9f732560af0c7dfc"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "exec.proposals.show",
-      "schema": "skills/exec-proposals-show.schema.json",
-      "schemaSha256": "8bc34e38f006b0b4ead50f1ba9267f2104c5d219476641f99d4d8c674ce36530"
     },
     {
       "lifecycle": "stable",
@@ -652,72 +582,6 @@
     },
     {
       "lifecycle": "stable",
-      "name": "meta.drafts.discard",
-      "schema": "meta/meta-drafts-discard.schema.json",
-      "schemaSha256": "5646ccb10ed47583e673e4ec01aeac178dcf350371c73994b8cdf46725a8274a"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.drafts.list",
-      "schema": "meta/meta-drafts-list.schema.json",
-      "schemaSha256": "f7a03aaed101fdc1ef3fe5a0b3d9ccebb3a6c73507838ea6328860fc136fea85"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.inspect",
-      "schema": "meta/meta-inspect.schema.json",
-      "schemaSha256": "6858b766224961052ff196305e87a2a983eedabe71f0be0b0f42467b12dd935c"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.list",
-      "schema": "meta/meta-list.schema.json",
-      "schemaSha256": "33f121a211ff335d98b987bad13b95ac77875d51cbea290ae5fce046923a0126"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.run",
-      "schema": "meta/meta-run.schema.json",
-      "schemaSha256": "36229e4b3fa5028ecdc277762b5211ade3978f894b58bfa4c5bd284ff652dff7"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.runs.confirm_preflight",
-      "schema": "meta/meta-runs-confirm-preflight.schema.json",
-      "schemaSha256": "1b77fd227fda410c2a24e59d0bd57e65ea300cdd9ca8c2ac96632b83d1a375bd"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.runs.recovery",
-      "schema": "meta/meta-runs-recovery.schema.json",
-      "schemaSha256": "f54cb356d1c688311c10d94e902724224336a76182155db48697f915cd083909"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.runs.replay",
-      "schema": "meta/meta-runs-replay.schema.json",
-      "schemaSha256": "228af3b6b404949e9a2790396bcf6b928c583cec60d5eaf8855b01e1447eb8de"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.setup.install",
-      "schema": "meta/meta-setup-install.schema.json",
-      "schemaSha256": "d993a0422c64445f2252a6c62775f15843a40e4b4d1565a8f4caa25ae79a5589"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.setup.plan",
-      "schema": "meta/meta-setup-plan.schema.json",
-      "schemaSha256": "031d1a71477b61a12c7e765d4135b624de12197324faaa2979b3e96146b0353c"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "meta.setup.status",
-      "schema": "meta/meta-setup-status.schema.json",
-      "schemaSha256": "3be8678f5a4f35c5a6e8b04b362c1c63048f65a2f5a7c978df7ae37a46522064"
-    },
-    {
-      "lifecycle": "stable",
       "name": "migration.sources.list",
       "schema": "platform/migration-sources-list.schema.json",
       "schemaSha256": "2181b4a3b2bfd548425c11870849822a87d5526d3f7b1e8a7d431b925861e73a"
@@ -738,7 +602,7 @@
       "lifecycle": "stable",
       "name": "models.list",
       "schema": "platform/models-list.schema.json",
-      "schemaSha256": "b99bc09fcc2d71eca1a7d45f45dd9597223438f769bcca219252f5230b797633"
+      "schemaSha256": "962da89934c7a6e546aa98ef1280c27247de586653cd8f7dd20e3f624727c715"
     },
     {
       "lifecycle": "stable",
@@ -846,7 +710,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.draft.models.discover",
       "schema": "platform/onboarding-llm-profile-draft-models-discover.schema.json",
-      "schemaSha256": "0869b6a20272818ddefcb910b8ce8d5603b1ed4afd67f550ee3ebca5bbfac525"
+      "schemaSha256": "6903543a19d22d159328dc27344b35071f78e0b11f10eca0be305c05115417af"
     },
     {
       "lifecycle": "stable",
@@ -858,7 +722,7 @@
       "lifecycle": "stable",
       "name": "onboarding.llmProfile.models.discover",
       "schema": "platform/onboarding-llm-profile-models-discover.schema.json",
-      "schemaSha256": "e81aa53627c0a49d62e6f85d7b4ac3184dbad93335e8ced9f227157918c5fefb"
+      "schemaSha256": "fe9dfccfe89f8684897f5c6d1f29e722b752f5d80f12d7715a72a5aa4a37f74f"
     },
     {
       "lifecycle": "stable",
@@ -894,7 +758,7 @@
       "lifecycle": "stable",
       "name": "onboarding.models.discover",
       "schema": "platform/onboarding-models-discover.schema.json",
-      "schemaSha256": "6118c8f27d888f5f6481d14e6f29faab3da1f1760d86b6ce22fbe9ce86555c0d"
+      "schemaSha256": "50a5dd53b131d04b45062858a2b8f0d16ff01516000463f57de2e668d012aca7"
     },
     {
       "lifecycle": "stable",
@@ -1000,18 +864,6 @@
       "name": "providers.status",
       "schema": "platform/providers-status.schema.json",
       "schemaSha256": "5653b7e92a76e4d62ef648a693e24649de33ea0df766d6e5df039a69c8526c00"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "router.feedback.submit",
-      "schema": "conversation/router-feedback-submit.schema.json",
-      "schemaSha256": "a6d6ea9552a8727811a4eabf452d0d06f7392b35a6322749838fd32884f692b1"
-    },
-    {
-      "lifecycle": "stable",
-      "name": "router.selflearning.status",
-      "schema": "observability/router-selflearning-status.schema.json",
-      "schemaSha256": "bac181173600854fb2de5302d5ea41a0becfe0b340af7dfae30652e85aaf9a07"
     },
     {
       "lifecycle": "stable",
@@ -1347,7 +1199,7 @@
       "lifecycle": "stable",
       "name": "skills.candidates",
       "schema": "skills/skills-candidates.schema.json",
-      "schemaSha256": "14b069490a5c69c6d0eae3b2cf1d336f3f1b510eb5d9e1a8c408278bc55e4caa"
+      "schemaSha256": "642b803193646a6d4d8a8a7cffdf88efba3c2d2ef635b37036e09b477f60c87f"
     },
     {
       "lifecycle": "stable",
@@ -1441,6 +1293,12 @@
     },
     {
       "lifecycle": "stable",
+      "name": "turns.receipt.get",
+      "schema": "conversation/turns-receipt-get.schema.json",
+      "schemaSha256": "77cc0ff556b4dac77c096a1f6d2bc37128dd2f867085cb7a19b99f900b9e6029"
+    },
+    {
+      "lifecycle": "stable",
       "name": "usage.cost",
       "schema": "conversation/usage-cost.schema.json",
       "schemaSha256": "c4cb8527211ff633205ffa7c53a2c712756516e1bfa9881c43a4860cc02c7b2d"
@@ -1527,10 +1385,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "7fdd4c3268ddbef30899a9b5ed5eb8d6ec401a3100294ffa27caaaec4371da58",
-    "methodCount": 225,
-    "schemaCount": 235,
-    "schemaTreeSha256": "0d85b1692d3c76d162f9d8b9322db294d340890ecd8be2e45ac1ff178f2ffbd9",
+    "generatorSha256": "79b6d5194a1793c4db8a5f0aa46bf7c9aa3c5cd5ff2c7eca961e83aed81b5d22",
+    "methodCount": 202,
+    "schemaCount": 212,
+    "schemaTreeSha256": "d42a425451c1134bfdf89329dc1bce6f9a1e62f43d422dcdba9535890466f2ec",
     "toolchains": {
       "legacyTypes": {
         "python": {

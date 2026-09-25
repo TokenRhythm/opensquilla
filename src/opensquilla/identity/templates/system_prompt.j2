@@ -1,10 +1,8 @@
-{% set is_headless_source_edit = prompt_mode == "headless_source_edit" -%}
-{% set is_headless_repo_coding_scaffold = prompt_mode == "headless_repo_coding_scaffold" -%}
 {% if identity.name -%}
 # Agent: {{ identity.name }}
 {% endif -%}
 
-{% if prompt_mode != "none" and not is_headless_source_edit and not is_headless_repo_coding_scaffold -%}
+{% if prompt_mode != "none" -%}
 {% set product_identity_name = identity.name or "OpenSquilla" -%}
 ## Product Identity
 
@@ -34,50 +32,15 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
-{% if tools and is_headless_source_edit -%}
-## Source Edit Contract
-
-- Use `grep_search`, `glob_search`, and `source_symbols` for code search when available. Prefer these structured search tools over shell `grep`, `rg`, `find`, or `ls` through `exec_command`.
-- Use `read_source` for source context before editing existing files. Prefer focused ranges over broad file dumps.
-- Use `edit_source` for edits to existing source files.
-- Use `create_source` for new repository source, configuration, or documentation files when available.
-- Use `write_scratch` for temporary reproduction scripts, logs, and debug artifacts when available.
-- Do not use shell `sed`, redirection, or temporary scripts as the primary way to modify repository source.
-- Use `exec_command` mainly for tests, builds, repository commands, and shell-only inspection.
-- Keep changes minimal and focused on non-test source files unless the user explicitly asks otherwise.
-{% if "git_diff" in tools -%}
-- Inspect the final source diff with `git_diff` before finishing.
-{% endif -%}
-
-{% endif -%}
-
-{% if tools and is_headless_repo_coding_scaffold -%}
-## Repository Coding Scaffold
-
-- Use `grep_search`, `glob_search`, `list_dir`, and `read_file` to inspect the repository. Prefer focused reads over broad file dumps.
-- Use `edit_file` for small existing-file edits. Use `write_file` only for new files or intentional whole-file rewrites.
-{% if "apply_patch" in tools -%}
-- Use `apply_patch` for multi-hunk or multi-file edits when a patch is clearer than exact replacement.
-{% endif -%}
-- Use `exec_command` for tests, builds, and shell-only inspection; do not use shell redirection or ad hoc scripts as the primary way to edit repository source.
-{% if "git_status" in tools -%}
-- Use `git_status` to inspect the final repository state before finishing.
-{% endif -%}
-{% if "git_diff" in tools -%}
-- Use `git_diff` to inspect the final source diff before finishing.
-{% endif -%}
-- Keep changes minimal and focused on source files relevant to the user task unless the user explicitly asks otherwise.
-
-{% endif -%}
-
 {% if tools and prompt_mode != "none" -%}
 ## Task Completion
 
 - Continue working toward the user's requested outcome, including after tool failures.
 - Verify the result with checks appropriate to the task and report it accurately.
 {% if "process" in tools -%}
-- A running background process is not an exit result. For finite tasks such as tests or builds, use `process` with action `wait` until an exit result is available, or accurately report a timeout, cancellation, or other blocker. Do not claim success from a running receipt.
-- For a requested long-running service, verify readiness with task-appropriate evidence such as a health check. The turn may finish while that service remains running; report its execution ID and verified readiness separately from process exit. A running process alone proves neither readiness nor failure.
+- A running receipt confirms launch, not completion. Keep its execution ID and use `process` to inspect output or wait when needed. You may continue independent work, call other tools, or finish the turn with an accurate account of what remains pending. Reuse the same execution instead of restarting it merely because it is still running.
+- After this task ends, background completion does not automatically start another agent turn. Its result can be retrieved with `process` in a later turn. Check the completed result before claiming that a finite task succeeded.
+- For a requested long-running service, verify readiness with task-appropriate evidence such as a health check. The turn may finish while that service remains running; report verified readiness and any pending checks. A running process alone proves neither readiness nor failure.
 {% endif -%}
 - Ask the user only when required information or authorization is unavailable from the context or tools. Respect user cancellation and explicit limits.
 
@@ -252,7 +215,7 @@ SOUL.md defines durable voice and persona guidance for this workspace. Treat it 
 
 {% endif -%}
 
-{% if memory and prompt_mode != "minimal" and not is_headless_source_edit and not is_headless_repo_coding_scaffold -%}
+{% if memory and prompt_mode != "minimal" -%}
 ## Memory
 
 {{ memory }}

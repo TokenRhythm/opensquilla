@@ -28,16 +28,28 @@ function object(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+// Only the fixed field names in this module enter this cache, never keys or
+// values from the wire. High-frequency deltas reuse their schema spellings.
+const camelFields = new Map<string, string>()
 function camel(key: string): string {
-  return key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
+  let name = camelFields.get(key)
+  if (name === undefined) {
+    name = key.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())
+    camelFields.set(key, name)
+  }
+  return name
 }
 
 function alias(source: Record<string, unknown>, key: string, ...alternatives: string[]): unknown {
-  for (const name of [key, camel(key), ...alternatives]) {
+  const canonical = source[key]
+  if (canonical != null) return canonical
+  const legacy = source[camel(key)]
+  if (legacy != null) return legacy
+  for (const name of alternatives) {
     const value = source[name]
     if (value !== undefined && value !== null) return value
   }
-  return source[key] ?? source[camel(key)]
+  return canonical ?? legacy
 }
 
 function eventTaskIdentity(source: Record<string, unknown>): string | undefined {

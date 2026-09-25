@@ -198,7 +198,7 @@ def test_gateway_server_close_releases_pid_lock_when_shutdown_step_fails() -> No
             released.append("released")
 
     class FailingChannelManager:
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             raise RuntimeError("channel stop failed")
 
     server = boot.GatewayServer(
@@ -546,7 +546,7 @@ def test_start_gateway_server_starts_legacy_telemetry_after_readiness(
             assert "daily_usage" not in call_order
             return {}
 
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             return None
 
     class FakeStorage:
@@ -1734,7 +1734,7 @@ async def test_start_gateway_server_schedules_router_preload_after_channels(
         def start_errors(self) -> dict[str, dict[str, str]]:
             return {}
 
-        async def stop_all(self) -> None:
+        async def stop_all(self, *, timeout: float | None = None) -> None:
             return None
 
     class FakeServer:
@@ -1948,7 +1948,6 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
                 "static_message",
                 "system_event",
                 "memory_dream",
-                "auto_propose",
             }
             self.started = True
 
@@ -2019,215 +2018,6 @@ async def test_start_gateway_server_wires_cron_failure_dispatcher(
         await server.close()
 
 
-@pytest.mark.asyncio
-async def test_start_gateway_server_wires_meta_skill_auto_propose_routes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Boot must connect the three auto-propose surfaces, not just define them.
-
-    The cron handler factory, runtime bridge, and dream post-hook each have
-    isolated unit coverage. This guards the production integration point where
-    the previous implementation left those pieces unreachable.
-    """
-    from opensquilla.gateway import boot
-    from opensquilla.gateway.auto_propose_bridge import get_runtime, reset_runtime_for_test
-    from opensquilla.scheduler import auto_propose_handler as auto_handler_mod
-    from opensquilla.scheduler import dream_handler as dream_handler_mod
-    from opensquilla.skills.creator import proposer as proposer_mod
-    from opensquilla.skills.creator import runtime_e2e as runtime_e2e_mod
-
-    reset_runtime_for_test()
-    captured: dict[str, Any] = {}
-    runtime_contexts: list[dict[str, Any]] = []
-    installed_runtime_contexts: list[dict[str, Any]] = []
-    installed_smoke_contexts: list[dict[str, Any]] = []
-    reset_tokens: list[str] = []
-    smoke_reset_tokens: list[str] = []
-
-    class FakeProviderSelector:
-        def __init__(self) -> None:
-            self.model = "primary-model"
-
-        def clone(self) -> FakeProviderSelector:
-            captured["provider_selector_cloned"] = True
-            return self
-
-        def override_model(self, model: str) -> None:
-            captured["provider_override_model"] = model
-            self.model = model
-
-        def resolve(self) -> Any:
-            return SimpleNamespace(model=self.model)
-
-    class FakeTurnRunner:
-        def __init__(self, **_kw: Any) -> None: ...
-
-        def set_session_lock_provider(self, _provider: Any) -> None: ...
-
-    class FakeCronScheduler:
-        def __init__(self) -> None:
-            self.registered: dict[str, Any] = {}
-            self.added: list[dict[str, Any]] = []
-            self.paused: list[str] = []
-            self.started = False
-
-        def register_handler(self, key: str, fn: Any) -> None:
-            self.registered[key] = fn
-
-        async def list_jobs(self) -> list:
-            return []
-
-        async def add_job(self, **kwargs: Any) -> Any:
-            self.added.append(kwargs)
-            return SimpleNamespace(id=kwargs.get("name", "job"))
-
-        async def pause_job(self, job_id: str) -> None:
-            self.paused.append(job_id)
-
-        async def start(self) -> None:
-            assert "agent_run" in self.registered
-            assert "auto_propose" in self.registered
-            self.started = True
-
-    cron_sched = FakeCronScheduler()
-
-    async def fake_build_services(**kwargs: Any) -> Any:
-        async def close() -> None:
-            return None
-
-        return SimpleNamespace(
-            provider_selector=FakeProviderSelector(),
-            tool_registry=ToolRegistry(),
-            session_manager=None,
-            skill_loader=object(),
-            usage_tracker=object(),
-            config=kwargs["config"],
-            memory_sync_managers={},
-            model_catalog=None,
-            memory_retrievers={},
-            turn_capture_services={},
-            cron_scheduler=cron_sched,
-            task_runtime=None,
-            agent_registry=None,
-            memory_managers={},
-            memory_stores={},
-            _turn_runner_ref=[],
-            close=close,
-        )
-
-    def fake_make_auto_propose_handler(**kwargs: Any) -> Any:
-        captured["auto_handler_kwargs"] = kwargs
-
-        async def _handler(_job: Any) -> Any:
-            return SimpleNamespace(summary="auto_propose fake", delivery_status="delivered")
-
-        return _handler
-
-    def fake_make_memory_dream_handler(*args: Any, **kwargs: Any) -> Any:
-        captured["dream_handler_kwargs"] = kwargs
-        return "dream-handler"
-
-    def fake_make_runtime_e2e_context(**kwargs: Any) -> dict[str, Any]:
-        runtime_contexts.append(kwargs)
-        return {"runner": object(), "judge": object(), "baseline_model": kwargs["baseline_model"]}
-
-    def fake_set_runtime_e2e_context(ctx: dict[str, Any]) -> str:
-        installed_runtime_contexts.append(ctx)
-        return "runtime-token"
-
-    def fake_reset_runtime_e2e_context(token: str) -> None:
-        reset_tokens.append(token)
-
-    def fake_set_smoke_fixture_context(ctx: dict[str, Any]) -> str:
-        installed_smoke_contexts.append(ctx)
-        return "smoke-token"
-
-    def fake_reset_smoke_fixture_context(token: str) -> None:
-        smoke_reset_tokens.append(token)
-
-    monkeypatch.setattr("opensquilla.engine.runtime.TurnRunner", FakeTurnRunner)
-    monkeypatch.setattr(boot, "build_services", fake_build_services)
-    monkeypatch.setattr(boot, "_setup_file_logging", lambda config: None)
-    monkeypatch.setattr(
-        auto_handler_mod,
-        "make_auto_propose_handler",
-        fake_make_auto_propose_handler,
-    )
-    monkeypatch.setattr(
-        dream_handler_mod,
-        "make_memory_dream_handler",
-        fake_make_memory_dream_handler,
-    )
-    monkeypatch.setattr(runtime_e2e_mod, "make_runtime_e2e_context", fake_make_runtime_e2e_context)
-    monkeypatch.setattr(proposer_mod, "set_runtime_e2e_context", fake_set_runtime_e2e_context)
-    monkeypatch.setattr(proposer_mod, "reset_runtime_e2e_context", fake_reset_runtime_e2e_context)
-    monkeypatch.setattr(proposer_mod, "set_smoke_fixture_context", fake_set_smoke_fixture_context)
-    monkeypatch.setattr(
-        proposer_mod, "reset_smoke_fixture_context", fake_reset_smoke_fixture_context
-    )
-    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.acquire", lambda self: None)
-    monkeypatch.setattr("opensquilla.gateway.pidlock.GatewayPidLock.release", lambda self: None)
-
-    config = GatewayConfig(
-        state_dir=str(tmp_path / "state"),
-        workspace_dir=str(tmp_path / "workspace"),
-        control_ui={"enabled": False},
-        channels={"channels": []},
-        memory={"dream": {"enabled": True}},
-        meta_skill={
-            "auto_propose": {
-                "enabled": True,
-                "on_dream_complete": True,
-                "auto_enable": True,
-            },
-        },
-        squilla_router={
-            "tiers": {
-                "c3": {
-                    "model": "frontier-t3-model",
-                    "thinking_level": "high",
-                },
-            },
-        },
-    )
-
-    server = await boot.start_gateway_server(config=config, run=False)
-    try:
-        assert "auto_propose" in cron_sched.registered
-        assert captured["auto_handler_kwargs"]["config"] is config.meta_skill.auto_propose
-        assert any(job["handler_key"] == "auto_propose" for job in cron_sched.added)
-        assert callable(captured["dream_handler_kwargs"].get("post_dream_hook"))
-        orch = captured["auto_handler_kwargs"]["build_orchestrator"]("main")
-        assert captured["provider_selector_cloned"] is True
-        assert captured["provider_override_model"] == "frontier-t3-model"
-        assert runtime_contexts
-        assert runtime_contexts[-1]["skill_loader"] is server._services.skill_loader
-        base_config = runtime_contexts[-1]["base_config"]
-        assert base_config.model_id == "frontier-t3-model"
-        assert base_config.metadata["routed_tier"] == "c3"
-        assert base_config.metadata["thinking_level"] == "high"
-        assert runtime_contexts[-1]["baseline_model"] == "frontier-t3-model"
-        with pytest.raises(RuntimeError):
-            await orch._tool_invoker("meta_skill_runtime_e2e_run", {"skill_md": "x"})
-        assert installed_runtime_contexts[-1] is not None
-        assert installed_smoke_contexts[-1]["llm_chat"] is not None
-        assert reset_tokens[-1] == "runtime-token"
-        assert smoke_reset_tokens[-1] == "smoke-token"
-        rt = get_runtime()
-        assert rt is not None
-        assert rt.config is config.meta_skill.auto_propose
-        assert rt.home == tmp_path
-    finally:
-        await server.close()
-        reset_runtime_for_test()
-
-
-@pytest.mark.asyncio
-async def test_build_services_registers_session_search_tool(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
     def fail_background_sandbox_setup(coro: Any) -> None:
         close = getattr(coro, "close", None)
         if callable(close):

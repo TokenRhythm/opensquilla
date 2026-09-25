@@ -45,9 +45,9 @@ from opensquilla.gateway.config_migration import (
     DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
     ConfigParseError,
-    backup_and_write_migrated_config,
     handle_deprecated_skill_filter_env,
     migrate_config_payload,
+    rewrite_migrated_config_best_effort,
     strip_deprecated_skill_filter_settings,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -55,7 +55,12 @@ from opensquilla.provider.credentials import (
     credential_provider_hint,
     endpoint_provider_hint,
 )
-from opensquilla.provider.preset_registry import get_preset, legacy_profile_ids
+from opensquilla.provider.preset_registry import (
+    PREVIOUS_RECOMMENDED_TEXT_MODELS,
+    get_preset,
+    legacy_profile_ids,
+    router_ladder_provider,
+)
 from opensquilla.router_tiers import (
     CUSTOM_B5_MAX_PROPOSERS,
     CUSTOM_B5_MAX_TOTAL_CALLS,
@@ -386,11 +391,6 @@ class SkillsConfig(BaseSettings):
     # Names of skills the operator has turned off (e.g. via the control-UI
     # plugin toggle). A disabled skill is gated out of the agent's view.
     disabled: list[str] = Field(default_factory=list)
-    # Coding mode (control-UI toggle). When ON, the agent operates in a
-    # locked coding mode: the code-task plugin is available and a directive
-    # steers every turn through it. When OFF, code-task is unreachable through
-    # every skill API. Default OFF — coding mode is opt-in.
-    coding_mode: bool = False
     max_skills_prompt_chars: int = 8000
     # "system" = full system prompt (default)
     # "user_context" = ephemeral user-role context, after history and before current user
@@ -401,7 +401,9 @@ class SkillsConfig(BaseSettings):
     @classmethod
     def _ignore_retired_filter_settings(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            return strip_deprecated_skill_filter_settings(data)
+            return strip_deprecated_skill_filter_settings(
+                {key: value for key, value in data.items() if key != "coding_mode"}
+            )
         return data
 
 
@@ -415,13 +417,6 @@ class ToolsConfig(BaseModel):
             "memory_only",
             "coding",
             "messaging",
-            "repo_coding_source_edit",
-            "repo_coding_source_edit_strict",
-            "repo_coding_source_edit_v2",
-            "repo_coding_source_edit_balanced",
-            "repo_coding_source_edit_patch_fallback",
-            "repo_coding_scaffold_edit",
-            "repo_coding_scaffold_patch",
         ]
         | None
     ) = None
@@ -434,6 +429,21 @@ class ToolsConfig(BaseModel):
     file_edit_requires_fresh_read: bool | None = None
     file_edit_flexible_recovery: bool | None = None
     trusted_fake_ip_cidrs: list[str] = Field(default_factory=list)
+
+    @field_validator("profile", mode="before")
+    @classmethod
+    def _retire_repo_coding_profiles(cls, value: object) -> object:
+        if value in (
+            "repo_coding_source_edit",
+            "repo_coding_source_edit_strict",
+            "repo_coding_source_edit_v2",
+            "repo_coding_source_edit_balanced",
+            "repo_coding_source_edit_patch_fallback",
+            "repo_coding_scaffold_edit",
+            "repo_coding_scaffold_patch",
+        ):
+            return "coding"
+        return value
 
     @field_validator("trusted_fake_ip_cidrs")
     @classmethod
@@ -1075,8 +1085,6 @@ class PromptConfig(BaseModel):
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     ] = "auto"
     platform_hint_enabled: bool = True
     # Deprecated, unused compatibility slot; preserve construction and saved configs.
@@ -1085,6 +1093,13 @@ class PromptConfig(BaseModel):
     finalize_evidence_gate: bool = False
     # Deprecated, unused. Accepted so existing configuration still loads.
     legacy_prompt_style: bool = False
+
+    @field_validator("mode", mode="before")
+    @classmethod
+    def retire_headless_modes(cls, value: object) -> object:
+        if value in ("headless_source_edit", "headless_repo_coding_scaffold"):
+            return "auto"
+        return value
 
 
 MemoryEmbeddingProvider = Literal[
@@ -1309,54 +1324,6 @@ class RouterBudgetConfig(BaseModel):
     include_next_turn_estimate: bool = False
 
 
-class RouterSelfLearningConfig(BaseModel):
-    """Squilla Router self-learning loop (capture + offline retrain).
-
-    Opt-in. ``enabled`` is the master switch; capture and training each have
-    their own sub-toggle so an operator can collect data without yet training.
-    """
-
-    model_config = ConfigDict(extra="forbid")
-
-    enabled: bool = False  # master switch; off => zero overhead on the hot path
-    capture_enabled: bool = True  # gates inference-time feature emission
-    enable_mlp: bool = False  # also store raw_bge_1536 for MLP fine-tune (phase 2)
-    store_audit_summary: bool = False  # opt-in redacted summary, audit only
-    # Trigger gating (evaluated cheaply on each post-dream hook).
-    train_min_samples: int = Field(default=200, ge=1)
-    idle_hours: float = Field(default=2.0, ge=0.0)
-    cooldown_hours: float = Field(default=72.0, ge=0.0)
-    retention_days: int = Field(default=30, ge=1)
-    # Training (LightGBM incremental) — consumed by the offline trainer/worker.
-    num_boost_round: int = Field(default=60, ge=1)
-    train_timeout_seconds: float = Field(default=900.0, gt=0.0)
-    # Promotion / rollback.
-    auto_rollback: bool = True
-    golden_eval_path: str | None = None
-    cost_tolerance_pct: float = Field(default=5.0, ge=0.0)
-    max_critical_under_routing: float = Field(default=0.30, ge=0.0, le=1.0)
-    min_golden_agreement: float = Field(default=0.5, ge=0.0, le=1.0)
-    # Online rollback monitor (M4).
-    min_monitor_samples: int = Field(default=30, ge=1)
-    complaint_regression_delta: float = Field(default=0.05, ge=0.0, le=1.0)
-    # Second rollback trigger: explicit down-vote-rate regression (F7).
-    # Feedback is far sparser than samples, hence its own minimum and a
-    # wider delta than the complaint monitor.
-    min_feedback_monitor_samples: int = Field(default=5, ge=1)
-    downvote_regression_delta: float = Field(default=0.15, ge=0.0, le=1.0)
-    # Rolling holdout (per-agent progress metric).
-    holdout_pct: float = Field(default=0.10, ge=0.0, le=0.5)
-    holdout_repeats: int = Field(default=5, ge=1)
-    holdout_min_size: int = Field(default=30, ge=1)
-    holdout_granularity: Literal["session", "alignment_group"] = "session"
-
-
-# Resolve this model's own forward refs (Literal) before it is nested below, so
-# rebuilding the parent does not leave it "not fully defined" under the
-# unregistered-module exec path used by tests. See the rebuild note below.
-RouterSelfLearningConfig.model_rebuild()
-
-
 class SquillaRouterConfig(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="OPENSQUILLA_SQUILLA_ROUTER_",
@@ -1370,13 +1337,14 @@ class SquillaRouterConfig(BaseSettings):
     tier_profile: str | None = None
     # Explicit ownership for the router ladder.  ``follow_primary`` means
     # OpenSquilla owns the ladder and may replace it with the active
-    # provider's preset when the primary provider changes.  ``custom`` means
-    # the operator owns the ladder and provider switches must preserve it.
-    # ``None`` is deliberately retained for pre-field configs: treating an
-    # unclassified historical ladder as custom is the only non-destructive
-    # upgrade behavior.  A later explicit Router save records one of the two
-    # concrete values.  Additive and downgrade-safe because this settings
-    # section ignores unknown fields in older gateways.
+    # provider's preset when the primary provider changes. ``custom`` keeps
+    # operator edits on load; explicitly selecting a curated primary provider
+    # can replace the ladder with that provider's recommendations.
+    # ``None`` is retained for pre-field configs. The versioned disk migration
+    # refreshes old OpenRouter/TokenRhythm ladders once; custom ladders saved
+    # afterward remain operator-owned. A later explicit Router save
+    # records one of the two concrete values. Additive and downgrade-safe:
+    # this settings section ignores unknown fields in older gateways.
     preset_binding: Literal["follow_primary", "custom"] | None = None
     visual_mode: str = "real_candidates"
     # Preview: execute router tiers whose provider differs from llm.provider,
@@ -1430,7 +1398,6 @@ class SquillaRouterConfig(BaseSettings):
     # rollback-tolerant).
     budget: RouterBudgetConfig = Field(default_factory=RouterBudgetConfig)
     estimated_output_savings_pct: float = 0.03
-    self_learning: RouterSelfLearningConfig = Field(default_factory=RouterSelfLearningConfig)
     # Deprecated compatibility fields: active history is retained until compaction;
     # image routing no longer imposes a separate turn window.
     vision_history_lookback_turns: int = Field(default=8, ge=0)
@@ -1511,11 +1478,7 @@ class SquillaRouterConfig(BaseSettings):
         return self
 
 
-# Eagerly resolve the ``self_learning: RouterSelfLearningConfig`` forward ref
-# (``from __future__ import annotations`` makes it a string). Without this the
-# model stays "not fully defined" when this file is exec'd as an unregistered
-# module (e.g. tests load it via spec_from_file_location), since pydantic falls
-# back to ``sys.modules[__module__]`` which is absent in that scenario.
+# Resolve nested routing models for callers loading this module by file path.
 SquillaRouterConfig.model_rebuild()
 
 
@@ -2162,95 +2125,6 @@ class SubagentsGatewayConfig(BaseModel):
     """When enabled, subagent bootstrap prompts keep only AGENTS.md."""
 
 
-class MetaSkillPersistenceConfig(BaseSettings):
-    """Persistence/audit ledger for meta-skill executions (G4)."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_PERSISTENCE_",
-        extra="forbid",
-    )
-    enabled: bool = True
-    orphan_cleanup_age_seconds: int = 3600
-    # Per-DAG memory persist: when False the orchestrator skips any step
-    # whose ``skill`` is "memory" (the conventional last-step pattern that
-    # archives DAG output to memory/*.md). Defaults to True to preserve
-    # existing behaviour. Toggle off for exploratory runs where polluting
-    # the long-term memory store is undesirable.
-    memory_persist_enabled: bool = True
-
-
-class MetaSkillAutoProposeConfig(BaseSettings):
-    """Unattended synthesis: drive meta-skill-creator from co-occurrence
-    patterns observed in ``~/.opensquilla/logs/decisions-*.jsonl``.
-
-    Two independent triggers feed the same library function
-    (``skills.creator.auto_propose``):
-      * ``enabled`` schedules a recurring cron job
-      * ``on_dream_complete`` piggybacks on memory-consolidation dreams
-
-    Both default off. Operators flip them on after reviewing
-    meta-skill-creator's gated output once.
-    """
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_AUTO_PROPOSE_",
-        extra="forbid",
-    )
-
-    enabled: bool = False
-    """Path 1: schedule the auto-propose cron job. When false no
-    handler is registered at all (zero-impact code path)."""
-
-    cron: str = "0 5 * * *"
-    """Cron expression (5-field, local time) for the scheduled job."""
-
-    window_days: int = Field(default=30, ge=1, le=365)
-    """How many days of decision-log history to aggregate."""
-
-    min_freq: int = Field(default=3, ge=1)
-    """Drop co-occurrence chains observed fewer than this many times."""
-
-    top_k: int = Field(default=5, ge=1, le=50)
-    """At most this many distinct patterns considered per fire."""
-
-    on_dream_complete: bool = False
-    """Path 2: also run after a successful memory-consolidation dream.
-    Independent of ``enabled`` — either, both, or neither may be on."""
-
-    auto_enable: bool = False
-    """When true, eligible low-risk proposals are promoted to MANAGED
-    automatically after the creator gates pass. Defaults off."""
-
-    auto_enable_max_risk: Literal["low", "medium", "high"] = "low"
-    """Highest deterministic risk class that unattended promotion may accept."""
-
-    agent_ids: list[str] = Field(default_factory=list)
-    """Restrict to these agent IDs; empty = all configured agents."""
-
-
-class MetaSkillConfig(BaseSettings):
-    """Top-level meta-skill subsystem configuration."""
-
-    model_config = SettingsConfigDict(
-        env_prefix="OPENSQUILLA_META_SKILL_",
-        env_nested_delimiter="__",
-        extra="forbid",
-    )
-    enabled: bool = True
-    auto_trigger: bool = False
-    """When False (default), meta-skills are manual-only: no prompt guidance, no
-    keyword/semantic auto-trigger, ``meta_invoke`` is not exposed for automatic
-    invocation, and meta-skills are hidden from ``<available_skills>``. They run
-    only via the explicit ``/meta`` command. Set True to restore automatic
-    activation."""
-    persistence: MetaSkillPersistenceConfig = Field(
-        default_factory=MetaSkillPersistenceConfig,
-    )
-    auto_propose: MetaSkillAutoProposeConfig = Field(
-        default_factory=MetaSkillAutoProposeConfig,
-    )
-
-
 class TlsConfig(BaseSettings):
     """Optional TLS termination at the gateway itself.
 
@@ -2535,13 +2409,19 @@ class GatewayConfig(BaseSettings):
     agents: list[AgentEntryConfig] = Field(default_factory=list)
     agents_defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     subagents: SubagentsGatewayConfig = Field(default_factory=SubagentsGatewayConfig)
-    meta_skill: MetaSkillConfig = Field(default_factory=MetaSkillConfig)
 
     # Component enable flags
     control_ui: ControlUiConfig = Field(default_factory=ControlUiConfig)
     privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     diagnostics_enabled: bool = False
     channel_admin_senders: dict[str, list[str]] = Field(default_factory=dict)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_retired_product_features(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            return {key: value for key, value in data.items() if key != "meta_skill"}
+        return data
 
     @property
     def effective_run_mode(self) -> str:
@@ -2761,59 +2641,117 @@ class GatewayConfig(BaseSettings):
     def initialize_router_profile_defaults(self) -> GatewayConfig:
         """Resolve implicit Router defaults after loading or enabling routing."""
         router = self.squilla_router
-        if not router or not getattr(router, "enabled", False):
+        if not router:
             return self
+        fields_set = set(router.model_fields_set)
+        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        follows_primary_preset = router.preset_binding == "follow_primary"
+        has_explicit_ladder = "tiers" in fields_set or bool(router.tier_profile)
+        ladder_provider = router_ladder_provider(router.tiers, provider)
+        if (
+            has_explicit_ladder
+            and ladder_provider is not None
+            and ladder_provider in PREVIOUS_RECOMMENDED_TEXT_MODELS
+        ):
+            if (
+                ladder_provider != provider
+                and not router.cross_provider_tiers
+                and not all(name in router.tiers for name in TEXT_TIERS)
+            ):
+                # A partial foreign ladder may contain only a dormant C3
+                # fusion draft. Filling missing rows would introduce direct
+                # foreign routes without cross-provider execution enabled.
+                return self
+            previous_models = tuple(
+                TierConfig.from_value(router.tiers.get(name)).model for name in TEXT_TIERS
+            )
+            is_previous_default = self.config_version < 2 and (
+                previous_models in PREVIOUS_RECOMMENDED_TEXT_MODELS[ladder_provider]
+            )
+            if follows_primary_preset or is_previous_default:
+                recommended_provider = (
+                    provider if provider in PREVIOUS_RECOMMENDED_TEXT_MODELS else ladder_provider
+                )
+                preset = get_preset(recommended_provider)
+                if preset is not None:
+                    defaults = preset.tier_defaults()
+                    tiers = dict(router.tiers)
+                    for name in TEXT_TIERS:
+                        previous = tiers.get(name)
+                        tier = dict(defaults[name])
+                        if not follows_primary_preset and isinstance(previous, dict):
+                            # Keep explicit reasoning and extra per-tier options.
+                            # Models, capabilities and the old C3 fusion default
+                            # belong to the shipped ladder being upgraded.
+                            tier.update(previous)
+                            for key in (
+                                "provider", "model", "description", "supports_image",
+                                "ensemble_enabled", "ensemble_selection_mode",
+                                "ensembleEnabled", "ensembleSelectionMode",
+                            ):
+                                tier.pop(key, None)
+                                if key in defaults[name]:
+                                    tier[key] = defaults[name][key]
+                        tiers[name] = tier
+                    if "image_model" not in tiers and "image_model" in defaults:
+                        tiers["image_model"] = defaults["image_model"]
+                    payload = router.model_dump(mode="python")
+                    payload["tiers"] = tiers
+                    if recommended_provider != ladder_provider:
+                        payload["tier_profile"] = None
+                    self.squilla_router = SquillaRouterConfig(**payload)
+                    object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
+                return self
         # An explicit custom binding is an operator ownership boundary.  Do
         # not turn a sparse custom ladder into a provider preset at load time.
         if getattr(router, "preset_binding", None) == "custom":
             return self
         if getattr(router, "tier_profile", None):
             return self
-        provider = str(getattr(self.llm, "provider", "") or "").strip().lower()
+        if not router.enabled and not follows_primary_preset:
+            return self
+        # Mixed or other-provider ladders have no single curated primary
+        # preset to apply here; retain their existing routing configuration.
+        if has_explicit_ladder and follows_primary_preset and ladder_provider != provider:
+            return self
         # Boot auto-default: persistable packaged profiles write the compact
         # tier_profile form; curated-inline presets (e.g. tokenrhythm) apply
         # their ladder as inline tiers because their ids must never persist
-        # as a tier_profile (downgrade contract). Synthesized presets are
-        # applied by onboarding/provider saves only, never at boot.
+        # as a tier_profile (downgrade contract). Sparse explicitly managed
+        # ladders may also initialize synthesized presets; historical configs
+        # without this ownership flag retain their prior boot behavior.
         if provider == "openrouter":
-            if getattr(router, "preset_binding", None) == "follow_primary" and all(
-                isinstance(tier, dict)
-                and str(tier.get("provider") or provider).strip().lower() == provider
-                for tier in router.tiers.values()
-            ):
-                # Desktop persists recommended ladders inline. Refresh only
-                # explicitly managed tiers so upgrades agree with the preset
-                # catalog shown in Settings; historical/custom ladders stay
-                # operator-owned. A foreign-provider ladder may accompany a
-                # legacy-inferred primary; provider reconciliation owns it.
-                # Preserve the inline shape and provenance.
-                fields_set = set(router.model_fields_set)
-                payload = router.model_dump(mode="python")
-                payload["tiers"] = _default_tiers()
-                self.squilla_router = SquillaRouterConfig(**payload)
-                object.__setattr__(self.squilla_router, "__pydantic_fields_set__", fields_set)
             return self
-        curated_inline_preset = None
+        initializing_managed_defaults = follows_primary_preset and not has_explicit_ladder
+        inline_preset = None
         if provider not in ROUTER_TIER_PROFILE_IDS:
             preset = get_preset(provider)
-            if preset is None or preset.synthesized or preset.persistable:
+            if (
+                preset is None
+                or preset.persistable
+                or (preset.synthesized and not initializing_managed_defaults)
+            ):
                 return self
-            curated_inline_preset = preset
-        fields_set = set(getattr(router, "model_fields_set", set()))
+            inline_preset = preset
         has_custom_tiers = (
             "tiers" in fields_set and getattr(router, "tiers", {}) != _default_tiers()
         )
-        follows_primary_preset = getattr(router, "preset_binding", None) == "follow_primary"
-        if "tier_profile" in fields_set or (has_custom_tiers and not follows_primary_preset):
+        if "tier_profile" in fields_set and not initializing_managed_defaults:
+            return self
+        if has_custom_tiers and not follows_primary_preset:
             return self
         payload = router.model_dump(mode="python")
-        if curated_inline_preset is None:
+        if inline_preset is None:
             payload["tier_profile"] = provider
             payload.pop("tiers", None)
             self.squilla_router = SquillaRouterConfig(**payload)
             return self
         payload["tier_profile"] = None
-        payload["tiers"] = curated_inline_preset.tier_defaults()
+        payload["tiers"] = inline_preset.tier_defaults()
+        if inline_preset.synthesized:
+            for tier in payload["tiers"].values():
+                if not str(tier.get("model") or "").strip():
+                    tier["model"] = str(self.llm.model or "").strip()
         self.squilla_router = SquillaRouterConfig(**payload)
         # The rebuild marks every field explicitly set; restore the original
         # provenance so the seeded ladder stays in-memory only (the load-time
@@ -2862,8 +2800,7 @@ class GatewayConfig(BaseSettings):
     # Agent runtime timeout (whole turn lifecycle). ``None`` means use the
     # long built-in runtime default; ``0`` disables the runtime budget.
     agent_runtime_timeout_seconds: float | None = None
-    # Optional safety cap for ordinary interactive Web chat turns. Coding and
-    # meta turns retain the regular agent runtime budget. Disabled by default;
+    # Optional safety cap for interactive Web chat turns. Disabled by default;
     # an explicit TurnRunner timeout still has priority when the cap is enabled.
     web_chat_runtime_timeout_seconds: float = Field(default=0.0, ge=0.0)
     # Deprecated, unused: provider inactivity and tool deadlines are separate.
@@ -3494,7 +3431,7 @@ class GatewayConfig(BaseSettings):
         cfg._mark_env_absorbed_secrets(data)
         cls._apply_profile_path_overrides(cfg, target)
         if migration.changed:
-            _rewrite_migrated_config_best_effort(target, migration)
+            rewrite_migrated_config_best_effort(target, migration)
         return cfg
 
     @classmethod
@@ -3535,7 +3472,7 @@ class GatewayConfig(BaseSettings):
                 cfg = cls(**migration.payload)
                 cls._apply_profile_path_overrides(cfg, path)
                 if migration.changed and not read_only:
-                    _rewrite_migrated_config_best_effort(path, migration)
+                    rewrite_migrated_config_best_effort(path, migration)
                 cfg.config_path = str(path)
                 cfg._mark_env_absorbed_secrets(data)
                 cfg.set_persist_snapshot(cfg.to_toml_dict(), migration.payload)
@@ -3576,26 +3513,6 @@ class GatewayConfig(BaseSettings):
 
 # --- bind-address resolution ----------------------------------------------
 
-
-def _rewrite_migrated_config_best_effort(path: Path, migration: Any) -> None:
-    """Persist a migrated config, degrading to a warning when not writable.
-
-    The migrated payload already validated and the gateway can run from it;
-    a read-only config location (mounted backup, locked-down home) must not
-    turn that into a boot failure. The rewrite is retried on the next load.
-    """
-    try:
-        backup_and_write_migrated_config(path, migration.payload, migration)
-    except OSError as error:
-        import logging
-
-        logging.getLogger(__name__).warning(
-            "OpenSquilla config migration could not rewrite %s (%s); running "
-            "from the migrated payload in memory. Make the file writable to "
-            "persist the migration and silence this warning.",
-            path,
-            error,
-        )
 
 # Wildcard addresses that expose the gateway on every interface. Used by the
 # boot banner and the install-script post-install message.

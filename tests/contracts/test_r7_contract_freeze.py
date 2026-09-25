@@ -13,6 +13,7 @@ from opensquilla.contracts.generated.v4.gateway_contract_registry import (
 from scripts.contracts.generate_gateway_contracts import discover_contracts
 
 EXPECTED_METHOD_METADATA = {
+    "turns.receipt.get": ("operator.read", "query", "read-only"),
     "models.capacity.resolve": ("operator.read", "query", "read-only"),
     "memory.import.info": ("operator.read", "query", "read-only"),
     "memory.import.start": ("operator.admin", "command", "idempotent"),
@@ -98,68 +99,6 @@ EXPECTED_ACCURATE_ERROR_CODES = {
         "UNAVAILABLE",
         "INTERNAL_ERROR",
     ),
-    "meta.drafts.list": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.drafts.discard": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.run": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "META_DRAFT_DISCARDED",
-        "META_DRAFT_UNAVAILABLE",
-        "META_DRAFT_OUTBOX_FULL",
-        "META_LAUNCH_BUSY",
-        "IDEMPOTENCY_CONFLICT",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.runs.confirm_preflight": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.runs.recovery": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.runs.replay": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.setup.plan": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "INTERNAL_ERROR",
-    ),
-    "meta.setup.install": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "UNAVAILABLE",
-        "INTERNAL_ERROR",
-    ),
-    "meta.setup.status": (
-        "INVALID_REQUEST",
-        "UNAUTHORIZED",
-        "NOT_FOUND",
-        "INTERNAL_ERROR",
-    ),
     "migration.sources.list": (
         "migration.invalid_params",
         "migration.unavailable",
@@ -236,10 +175,16 @@ def _specs_by_wire_name():
 def test_contract_inventory_freezes_all_webui_reachable_wire_names() -> None:
     specs = discover_contracts()
 
-    assert len(specs) == 235
+    assert not {"router.selflearning.status", "router.feedback.submit"} & {
+        spec.wire_name for spec in specs
+    }
+    assert len(specs) == 212
     assert Counter(spec.contract_type for spec in specs) == {
-        "method": 225,
+        "method": 202,
         "event": 10,
+    }
+    assert {spec.wire_name for spec in specs if spec.wire_name.startswith("agents.")} == {
+        "agents.list",
     }
     assert EXPECTED_METHOD_METADATA.keys() <= {spec.wire_name for spec in specs}
     assert "models.routing.changed" in {spec.wire_name for spec in specs}

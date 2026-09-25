@@ -343,6 +343,6 @@ class GatewayAppSettingsPort:
         try:
             await reconciler()
         except Exception as exc:
-            log.warning("config.dream_link_reconcile_failed", error=str(exc))
+            log.warning("config.dream_reconcile_failed", error=str(exc))
             return False
         return True

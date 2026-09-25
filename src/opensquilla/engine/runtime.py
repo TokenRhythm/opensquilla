@@ -373,7 +373,6 @@ from opensquilla.tools.types import (
 
 if TYPE_CHECKING:
     from opensquilla.engine.routing.health import ProviderHealthLedger
-    from opensquilla.persistence.meta_run_writer import MetaRunWriter
 
 # Stable user-facing envelope for LLM timeouts.
 _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
@@ -385,9 +384,6 @@ _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
 _DEFAULT_AGENT_RUNTIME_TIMEOUT_SECONDS: float = 48 * 60 * 60
 _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS: float = 120.0
 _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
-_WEB_CHAT_META_EXEMPT_KEYS: Final[frozenset[str]] = frozenset(
-    {"meta_match", "meta_launch", "meta_resume", "meta_replay", "meta_replay_error"}
-)
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
@@ -601,7 +597,7 @@ def collect_invoked_skills(
             if segment.get("status") != "loaded":
                 continue
             skill_name = segment.get("name")
-        elif tool_name in {"skill_view", "meta_invoke"}:
+        elif tool_name == "skill_view":
             skill_name = (segment.get("input") or {}).get("name")
             if tool_name == "skill_view" and skill_name in receipt_names:
                 continue
@@ -4624,10 +4620,10 @@ def _resolve_identity_prompt_mode(config: object) -> str:
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     }
     env_prompt_mode = os.environ.get("OPENSQUILLA_PROMPT_MODE", "").strip()
+    if env_prompt_mode in {"headless_source_edit", "headless_repo_coding_scaffold"}:
+        env_prompt_mode = ""
     if env_prompt_mode:
         if env_prompt_mode not in allowed_modes:
             raise ValueError(
@@ -4720,7 +4716,6 @@ class TurnRunner:
         diagnostics_state: Any | None = None,
         turn_hooks: Sequence[TurnHook] | None = None,
         compaction_hooks: Sequence[CompactionHook] | None = None,
-        meta_run_writer: MetaRunWriter | None = None,
         turn_error_writer: Any | None = None,
         provider_call_observer: Callable[..., None] | None = None,
         usage_event_sink: UsageEventSink | None = None,
@@ -4752,7 +4747,6 @@ class TurnRunner:
         self._memory_retrievers = memory_retrievers
         self._turn_capture_services = turn_capture_services
         self._diagnostics_state = diagnostics_state
-        self._meta_run_writer = meta_run_writer
         self._turn_error_writer = turn_error_writer
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
@@ -7708,12 +7702,6 @@ class TurnRunner:
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
             )
-            self._emit_router_train_sample(
-                agent_id=agent_id,
-                session_key=session_key,
-                turn_obj=turn_obj,
-                message=message,
-            )
             if (
                 pending_error_event is not None
                 and not stream_state.terminal_generation_reset
@@ -8620,12 +8608,6 @@ class TurnRunner:
         if input_mode != "user":
             return None
 
-        metadata = turn_metadata or {}
-        if tool_context.coding_mode or bool(metadata.get("coding_mode")):
-            return None
-        if any(metadata.get(key) is not None for key in _WEB_CHAT_META_EXEMPT_KEYS):
-            return None
-
         base_timeout = self._resolve_agent_runtime_timeout(session_key)
         if base_timeout == 0:
             return 0.0
@@ -8923,10 +8905,6 @@ class TurnRunner:
         """Build tool definitions and handler from registry, filtered by ToolContext."""
         if self._tool_registry is None:
             return [], None
-        from opensquilla.skills.meta.enabled import (
-            is_meta_auto_trigger_enabled,
-            is_meta_skill_enabled,
-        )
         from opensquilla.tools.dispatch import build_tool_handler
         from opensquilla.tools.policy import apply_tool_policy_from_config
         from opensquilla.tools.registry import filter_by_profile, resolve_profile
@@ -8939,13 +8917,6 @@ class TurnRunner:
                 loaded_skills = list(self._skill_loader.load_all())
             except Exception:
                 loaded_skills = []
-        meta_skill_enabled = is_meta_skill_enabled(self._config)
-        meta_auto_trigger = is_meta_auto_trigger_enabled(self._config)
-        has_invokable_meta_skill = any(
-            getattr(skill, "kind", "skill") == "meta"
-            and not getattr(skill, "disable_model_invocation", False)
-            for skill in loaded_skills
-        )
         plan_mode = ctx is not None and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
         attached_plan_run = bool(
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
@@ -8958,7 +8929,7 @@ class TurnRunner:
             if isinstance(ctx.skill_install_turn, SkillInstallTurn):
                 skill_tools.update(ctx.skill_install_turn.surface_tools())
             if project_public_catalog(
-                loaded_skills, coding_mode=ctx.coding_mode, include_stable_meta=False,
+                loaded_skills,
             ):
                 skill_tools.update({"skill_list", "skill_view"})
             if ctx.selected_skills:
@@ -8978,12 +8949,6 @@ class TurnRunner:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
                 ctx.surfaced_tools.add("retrieve_tool_result")
-            if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
-                if ctx.surfaced_tools is None:
-                    ctx.surfaced_tools = set()
-                ctx.surfaced_tools.add("meta_invoke")
-            else:
-                ctx.denied_tools.add("meta_invoke")
             if plan_mode:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
@@ -8991,7 +8956,7 @@ class TurnRunner:
                 if ctx.interaction_mode is InteractionMode.INTERACTIVE:
                     plan_control_tools.add("request_user_input")
                 ctx.surfaced_tools.update(plan_control_tools)
-                ctx.denied_tools.update({"submit", "meta_invoke"})
+                ctx.denied_tools.add("submit")
             elif (
                 ctx.subagent_depth == 0 and ctx.collaboration_mode == "default"
                 and ctx.caller_kind in {CallerKind.AGENT, CallerKind.WEB, CallerKind.CLI,
@@ -9016,7 +8981,6 @@ class TurnRunner:
                     )
                 ctx.surfaced_tools.update(controls)
         if metadata is not None:
-            metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
                 metadata["skill_catalog_generation"] = int(getattr(skill_catalog, "generation", 0))
 
@@ -9043,15 +9007,6 @@ class TurnRunner:
             # ceiling below may still remove it.
             if ctx.allowed_tools is not None and "tool_search" not in ctx.denied_tools:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {"tool_search"}
-            # Surfacing lifts the default-access deny gate but deliberately does
-            # not relax a profile allowlist. Explicit denies still win in the
-            # registry visibility check.
-            from opensquilla.tools.policy_config import coding_mode_denied_tools
-
-            skills_cfg = getattr(self._config, "skills", None)
-            coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
-            ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
-            ctx.coding_mode = coding_mode
             if ctx is not caller_ctx:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
@@ -9060,7 +9015,6 @@ class TurnRunner:
                 caller_ctx.denied_tools.clear()
                 caller_ctx.denied_tools.update(ctx.denied_tools)
                 caller_ctx.workspace_write_deny_globs[:] = ctx.workspace_write_deny_globs
-                caller_ctx.coding_mode = ctx.coding_mode
             log.debug(
                 "tool_policy.policy_pre",
                 allowed_tool_count=len(self._tool_registry.to_tool_definitions(ctx)),
@@ -9115,7 +9069,7 @@ class TurnRunner:
             skill.name
             for skill in loaded_skills
             if not getattr(skill, "disable_model_invocation", False)
-            and (meta_skill_enabled or getattr(skill, "kind", "skill") != "meta")
+            and getattr(skill, "kind", "skill") == "skill"
         }
         tool_handler = build_tool_handler(
             self._tool_registry,
@@ -9788,44 +9742,6 @@ class TurnRunner:
             return content[:max_chars] + "\n..."
         return content
 
-    def _make_meta_llm_chat(
-        self,
-        provider: Any,
-        session_key: str,
-        usage_execution_context: UsageExecutionContext | None = None,
-        provider_request_correlation: ProviderRequestCorrelation | None = None,
-    ) -> Any:
-        """Construct the (system_prompt, user_message) -> str callable that
-        meta_resolution's awaiting branch invokes for ``nl_extract: true``.
-
-        Returns None when the provider isn't available — the awaiting
-        branch silently falls back to the deterministic parser's errors,
-        which is exactly the behavior we want for non-LLM unit tests.
-        """
-        if provider is None:
-            return None
-        # Lazy import keeps the runtime cold-start independent of meta.
-        from opensquilla.engine.types import AgentConfig
-        from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
-
-        # ``make_llm_chat_from_provider`` only reads ``model_id`` /
-        # ``metadata`` off base_config (via getattr). ``self._config`` is
-        # the GatewayConfig (different shape — no .model_id), so build a
-        # minimal AgentConfig() rather than passing the wrong type.
-        meta_correlation = derive_provider_request_correlation(
-            provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.meta",
-        )
-        return make_llm_chat_from_provider(
-            provider=provider,
-            base_config=AgentConfig(),
-            usage_tracker=getattr(self, "_usage_tracker", None),
-            session_key=session_key,
-            usage_event_sink=self._usage_event_sink,
-            usage_execution_context=usage_execution_context,
-            provider_request_correlation=meta_correlation,
-        )
 
     def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
@@ -9889,12 +9805,9 @@ class TurnRunner:
         from opensquilla.engine.steps import (
             apply_prompt_cache,
             apply_squilla_router,
-            enforce_coding_mode,
             finalize_squilla_router_capacity,
             inject_platform_hint,
             inject_subagent_grounding,
-            meta_command_launch,
-            meta_resolution,
             observe_reasoning_hint,
             resolve_model,
             resolve_skill_catalog,
@@ -9973,52 +9886,13 @@ class TurnRunner:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
-        from opensquilla.skills.meta.readiness import (
-            META_READINESS_ENV_ALIASES_METADATA_KEY,
-            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
-            configured_meta_readiness_env_aliases,
-            configured_meta_skill_runtime_env,
-        )
-
         turn_config = self._turn_config()
         initial_metadata: dict[str, Any] = {
-            # Agent-side skill_view coercion, meta execution, and child
-            # orchestrators must resolve against the same generation used for
-            # prompt/tool selection. The pinned loader view preserves configured
-            # roots while keeping every catalog read free of filesystem probes.
             "skill_loader": agent_skill_loader,
-            "meta_run_writer": getattr(self, "_meta_run_writer", None),
-            # A content-free callback for the authoritative MetaSkill run
-            # boundary. It is copied to sub-Agent configs by the orchestrator
-            # and never enters persisted run inputs or telemetry payloads.
-            "metaskill_usage_recorder": getattr(
-                getattr(self, "growth_event_sink", None),
-                "observe_metaskill_usage",
-                None,
-            ),
-            # PR9+: meta_resolution's awaiting branch calls this first when
-            # the SKILL.md has ``nl_extract: true``. None keeps clarify reply
-            # parsing on the deterministic compatibility path.
-            "meta_llm_chat": self._make_meta_llm_chat(
-                provider,
-                session_key,
-                usage_execution_context,
-                provider_request_correlation,
-            ),
             "router_control_hold_store": self._router_control_hold_store,
             "router_control_routing_revision": getattr(
                 tool_context, "router_control_routing_revision", None
             ),
-            # Surface the resolved per-agent workspace so the meta_invoke
-            # handler in Agent._run_one_streaming (agent.py ~L4724) can
-            # find it without falling through to default_workspace_dir().
-            # Prefer tool_context.workspace_dir (already resolved with
-            # the gateway config in rpc_sessions / channel_dispatch /
-            # scheduler); fall back to resolving from agent_id on the
-            # tool_context, then to an empty string. When this key was
-            # absent the meta_invoke handler dropped to
-            # default_workspace_dir() and exec_command sandbox blocked
-            # paths under ``/root/`` instead of the gateway workspace.
             "bootstrap_workspace_dir": (
                 getattr(tool_context, "workspace_dir", None)
                 or (
@@ -10029,31 +9903,6 @@ class TurnRunner:
                     )
                     if tool_context is not None
                     else ""
-                )
-            ),
-            # Opaque callable only: credential bytes never enter metadata,
-            # transcripts, persisted inputs, or manifest-rendered arguments.
-            # The Agent must supply the current parent spec and the exact plan
-            # it is about to execute; the callable fails closed for any
-            # workspace/project parent or paid-step contract drift.
-            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY: (
-                lambda parent_spec, plan: configured_meta_skill_runtime_env(
-                    turn_config,
-                    parent_spec=parent_spec,
-                    plan=plan,
-                    session_key=session_key,
-                    skill_resolver=agent_skill_loader,
-                )
-            ),
-            # Names only, likewise parent+plan scoped. A global alias would
-            # make an untrusted MetaSkill appear executable even though no
-            # capability lease could safely be injected into its child.
-            META_READINESS_ENV_ALIASES_METADATA_KEY: (
-                lambda parent_spec, plan: configured_meta_readiness_env_aliases(
-                    turn_config,
-                    parent_spec=parent_spec,
-                    plan=plan,
-                    skill_resolver=agent_skill_loader,
                 )
             ),
         }
@@ -10277,10 +10126,6 @@ class TurnRunner:
         from opensquilla.engine.steps.selected_skills import load_selected_skills
 
         turn = await load_selected_skills(turn, tool_context)
-        planning_turn = (
-            tool_context is not None
-            and str(getattr(tool_context, "collaboration_mode", "default")) == "plan"
-        )
         pipeline_steps: list[TurnStep] = [resolve_model]
         pipeline_steps.extend(
             [
@@ -10288,8 +10133,6 @@ class TurnRunner:
                 observe_reasoning_hint,
             ]
         )
-        if not planning_turn:
-            pipeline_steps.extend([meta_resolution, enforce_coding_mode])
         pipeline_steps.extend(
             [
                 resolve_skill_catalog,
@@ -10298,8 +10141,6 @@ class TurnRunner:
                 apply_prompt_cache,
             ]
         )
-        if not planning_turn:
-            pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
         if router_history_replay_request is not None:
             history_capacity = await self._router_history_capacity_for_request(
@@ -12073,52 +11914,6 @@ class TurnRunner:
         except Exception as exc:  # pragma: no cover — observability must not break turns
             log.warning("decision_log.write_failed", error=str(exc))
 
-    def _emit_router_train_sample(
-        self,
-        *,
-        agent_id: str,
-        session_key: str,
-        turn_obj: Any | None,
-        message: str,
-    ) -> None:
-        """Append one self-learning sample for this turn (best-effort).
-
-        Opt-in (``squilla_router.self_learning.{enabled,capture_enabled}``) and
-        kill-switched. Writes the float16 feature vectors the model produced plus
-        the routing decision; never raw prompt text (unless the audit sidecar is
-        explicitly enabled). Must never break turn execution.
-        """
-
-        try:
-            if turn_obj is None:
-                return
-            router_cfg = getattr(self._turn_config(), "squilla_router", None)
-            sl = getattr(router_cfg, "self_learning", None)
-            if sl is None or not getattr(sl, "enabled", False):
-                return
-            if not getattr(sl, "capture_enabled", True):
-                return
-
-            from opensquilla.squilla_router.self_learning import (
-                self_learning_disabled_by_env,
-                write_sample,
-            )
-            from opensquilla.squilla_router.self_learning.capture import build_train_sample
-
-            if self_learning_disabled_by_env():
-                return
-
-            sample = build_train_sample(
-                session_key=session_key,
-                metadata=turn_obj.metadata,
-                store_audit_summary=bool(getattr(sl, "store_audit_summary", False)),
-                message=message,
-            )
-            if sample is None:
-                return
-            write_sample(sample, agent_id)
-        except Exception as exc:  # pragma: no cover — capture must not break turns
-            log.warning("router_self_learning.capture_failed", error=str(exc))
 
     @staticmethod
     def _active_persisted_user_index(

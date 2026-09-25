@@ -246,7 +246,8 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert "reorder steps" in approved
         assert "unless they exceed the user's authorization" in approved
         assert "progress is descriptive" in approved
-        assert "Verify and report the actual result" in approved
+        assert "inspect the final artifact or resulting state" in approved
+        assert "does not waive those requirements" in approved
         proposal = prompt_context["Approved Plan Proposal"]
         assert proposal.startswith("<untrusted source='plan_revision'>")
         payload = json.loads(unescape(proposal.split(">", 1)[1].rsplit("</untrusted>", 1)[0]))
@@ -290,6 +291,9 @@ async def test_implement_binds_exact_run_injects_full_plan_and_rejects_duplicate
         assert paused.active_task_id is None
 
 
+# Keep the real SQLite/artifact lifecycle and its bounded waits intact, but
+# isolate it from other CI workers competing for disk and executor time.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interruption", ["paused", "cancelled"])
 async def test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn(

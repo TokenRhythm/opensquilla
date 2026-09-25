@@ -13,6 +13,7 @@ assert.equal(isDesktopRendererUrl('opensquilla-app://desktop.evil/chat/new'), fa
 assert.equal(isDesktopRendererUrl('https://desktop/chat/new'), false)
 assert.equal(isDesktopRendererDocumentUrl(DESKTOP_RENDERER_URL), true)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/settings/runtime'), true)
+assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/agents'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/api/system/status'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/assets/app.js'), false)
 
@@ -34,6 +35,22 @@ assert.deepEqual(
 )
 assert.deepEqual(
   routeDesktopRendererRequest('opensquilla-app://desktop/chat/new'),
+  { kind: 'spa', relativePath: 'desktop.html' },
+)
+// Removed background-music URLs use the ordinary unknown-route SPA fallback.
+for (const path of ['/music/playlist.json', '/music/playlist.local.json', '/music/private.mp3']) {
+  assert.deepEqual(
+    routeDesktopRendererRequest(`opensquilla-app://desktop${path}`),
+    { kind: 'spa', relativePath: 'desktop.html' },
+  )
+}
+assert.deepEqual(
+  routeDesktopRendererRequest('opensquilla-app://desktop/opensquilla-mark.png'),
+  { kind: 'file', relativePath: 'opensquilla-mark.png' },
+)
+// Retired routes can show the SPA's Not Found page without gaining document trust.
+assert.deepEqual(
+  routeDesktopRendererRequest('opensquilla-app://desktop/agents'),
   { kind: 'spa', relativePath: 'desktop.html' },
 )
 assert.deepEqual(

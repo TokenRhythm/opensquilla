@@ -733,7 +733,7 @@ def test_usage_status_prefers_persisted_row_over_same_session_tracker_row() -> N
 
 
 def test_usage_status_overlays_tracker_when_persisted_row_is_still_empty() -> None:
-    """Cover the done-event/read-after-write race seen in live meta runs."""
+    """Cover the done-event/read-after-write race before usage is persisted."""
 
     db_session = SimpleNamespace(
         session_key="agent:webchat:stale",

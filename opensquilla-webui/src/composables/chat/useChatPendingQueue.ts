@@ -1,10 +1,9 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
-import { computed, nextTick, ref, watch, type Ref } from 'vue'
+import { computed, nextTick, ref, toRaw, watch, type Ref } from 'vue'
 import type {
   Attachment,
   ChatPendingItem,
-  HiddenControlDispatchResult,
   PendingSteerPhase,
 } from '@/types/chat'
 import type { SessionSteerV2Params } from '@/types/chat'
@@ -27,6 +26,7 @@ import {
   type PendingInputServerItem,
 } from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
+import { ParkedPendingQueueCache } from '@/utils/chat/parkedPendingQueueCache'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
@@ -154,15 +154,6 @@ export interface UseChatPendingQueueOptions {
   onPendingPersistenceError?: (
     reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected' | 'order_conflict',
   ) => void
-  // Drain a queued hidden-control send (e.g. meta-preflight confirmation)
-  // directly through the dedicated hidden-send path instead of the composer.
-  dispatchHiddenControl?: (
-    item: ChatPendingItem,
-    ownerSessionKey: string,
-  ) => Promise<PendingDeliveryOutcome>
-  // Returning false for an explicit discard keeps the chip queued. This lets
-  // the caller fail closed when it cannot persist the cancellation tombstone.
-  onHiddenControlDispatchResult?: (result: HiddenControlDispatchResult) => void | boolean
   // The WebUI drains visible queue items through the same composer-preserving
   // transport used by explicit Steer. The legacy callback remains as a
   // fallback for isolated composable consumers.
@@ -175,7 +166,18 @@ export interface UseChatPendingQueueOptions {
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
-  const parkedQueues = new Map<string, ChatPendingItem[]>()
+  const parkedQueues: ParkedPendingQueueCache = new ParkedPendingQueueCache({
+    unwrapObject: toRaw,
+    isPinned: item => Boolean(item.steerAttempt || item.deliveryState
+      || item.ownerRequestId || item.pendingPersistenceState === 'cancelling' || (item.pendingInputId && (
+        locallyCreatingIds.has(item.pendingInputId) || stagingOperations.has(item.pendingInputId)
+        || cancellationOperations.has(item.pendingInputId)
+      )) || pendingQueue.value.some(active => toRaw(active) === toRaw(item))),
+    isUrlRetained: url => [options.pendingAttachments.value,
+      ...pendingQueue.value.map(item => item.attachments),
+      ...[...parkedQueues.values()].flat().map(item => item.attachments),
+    ].some(attachments => attachments.some(attachment => attachment.dataUrl === url)),
+  })
   let pendingDrainTimer: ReturnType<typeof setTimeout> | null = null
   let deferredDrainRequested = false
   const isReordering = ref(false)
@@ -329,7 +331,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       // when they met an older Gateway. No legacy state can therefore prove
       // that an enqueue never committed; only a newly persisted false bit can.
       : true
-    return {
+    const item = {
       pendingUiId: record.pendingInputId,
       text: record.text,
       ...((record.retiredAnnotationInput || record.promptAnnotationIds?.length)
@@ -339,7 +341,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ...(normalizeAnnotationDraftIds(record.draftIds).length
         ? { draftIds: normalizeAnnotationDraftIds(record.draftIds) }
         : {}),
-      attachments: record.attachments.map(snapshotAttachment),
+      attachments: record.attachments.map(attachment => parkedQueues.restoreAttachment(snapshotAttachment(attachment))),
       intent: record.intent,
       ...(record.confirmedPlainText ? { confirmedPlainText: true } : {}),
       ownerSessionKey: record.sessionKey,
@@ -363,6 +365,8 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       pendingWalRevision: record.walRevision ?? 1,
       pendingCreatedAt: record.createdAt,
     } as ChatPendingItem
+    parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
+    return item
   }
 
   function removedIdentity(sessionKey: string, pendingInputId: string): string {
@@ -436,11 +440,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const writeRevision = (previousWalRevision ?? 0) + 1
     if (!publishStateAfterCommit) trackedItem.pendingPersistenceState = state
     trackedItem.pendingWalRevision = writeRevision
+    const cacheSnapshot = parkedQueues.snapshotForCommit({ ...trackedItem, pendingPersistenceState: state })
     try {
       await options.pendingInputWal.put(walRecordForItem(trackedItem, state))
       if (publishStateAfterCommit && trackedItem.pendingWalRevision === writeRevision) {
         trackedItem.pendingPersistenceState = state
       }
+      parkedQueues.rememberCommitted(trackedItem, cacheSnapshot)
     } catch (error) {
       trackedItem.pendingWalRevision = previousWalRevision
       throw error
@@ -450,7 +456,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function ordinaryDurableItem(item: ChatPendingItem): boolean {
     return Boolean(
       item.pendingInputId
-      && !item.hiddenControl
       && !item.steerAttempt
       && !item.deliveryState,
     )
@@ -564,7 +569,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           }
           try {
             const queuedText = item.text.trim()
-            const literalSlashEscape = !item.hiddenControl && queuedText.startsWith('//')
+            const literalSlashEscape = queuedText.startsWith('//')
             const providerMessage = literalSlashEscape
               ? queuedText.slice(1)
               : queuedText
@@ -679,6 +684,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       }
     })().finally(() => {
       stagingOperations.delete(pendingInputId)
+      parkedQueues.trim()
     })
     stagingOperations.set(pendingInputId, operation)
     return operation
@@ -1018,6 +1024,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         return false
       } finally {
         locallyCreatingIds.delete(item.pendingInputId!)
+        parkedQueues.trim()
       }
       broadcastChange(item.ownerSessionKey || options.sessionKey.value)
       void ensureServerStaged(item)
@@ -1078,65 +1085,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (saved) clearMatchingComposer()
       return saved
     })
-  }
-
-  function enqueueRecoveredInput(text: string, owner?: PendingQueueOwner) {
-    const recovered = String(text || '').trim()
-    if (!recovered) return true
-    if (pendingQueue.value.some(item => !item.hiddenControl && item.text === recovered)) {
-      return true
-    }
-    return enqueuePendingPayload({ text: recovered }, owner)
-  }
-
-  function enqueueHiddenControl(
-    item: {
-      text: string
-      displayText: string
-      clientRequestId?: string
-      sessionKey?: string
-      clientMessageId?: string
-      visibleCommitted?: boolean
-    },
-    owner?: PendingQueueOwner,
-  ) {
-    const stableRequestId = String(item.clientRequestId || '').trim()
-    const hiddenControlSessionKey = item.sessionKey || options.sessionKey.value
-    if (
-      stableRequestId
-      && pendingQueue.value.some(candidate => (
-        candidate.hiddenControl
-        && candidate.clientRequestId === stableRequestId
-        && candidate.hiddenControlSessionKey === hiddenControlSessionKey
-      ))
-    ) return true
-    if (ordinaryPendingCount.value >= MAX_PENDING) {
-      console.warn(`Pending queue full (${MAX_PENDING})`)
-      return false
-    }
-    // A hidden-control send does NOT consume the composer draft/attachments.
-    const ownerRequestId = resolveOwnerRequestId(owner)
-    pendingQueue.value.push({
-      pendingUiId: stableRequestId || createClientRequestId(),
-      text: item.text,
-      attachments: [],
-      intent: null,
-      ownerSessionKey: options.sessionKey.value,
-      ...(ownerRequestId ? { ownerRequestId } : {}),
-      hiddenControl: true,
-      displayTextOverride: item.displayText,
-      clientRequestId: item.clientRequestId,
-      hiddenControlSessionKey,
-      ...(item.clientRequestId
-        ? { hiddenClientRequestId: item.clientRequestId }
-        : {}),
-      ...(item.clientMessageId
-        ? { hiddenClientMessageId: item.clientMessageId }
-        : {}),
-      ...(item.visibleCommitted ? { hiddenVisibleCommitted: true } : {}),
-    })
-    flushDeferredPendingDrain()
-    return true
   }
 
   function enqueuePendingSteerAttempt(
@@ -1318,6 +1266,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return true
     }).finally(() => {
       cancellationOperations.delete(pendingInputId)
+      parkedQueues.trim()
     })
     cancellationOperations.set(pendingInputId, operation)
     return operation
@@ -1336,7 +1285,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
     ) return false
-    if (!notifyDiscardedHiddenControl(item)) return false
     if (durableItem(item)) {
       void cancelDurableItem(item).then(cancelled => {
         if (!cancelled) return
@@ -1351,7 +1299,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   function beginPendingDelivery(
     pendingUiId: string,
-    allowHiddenControl = false,
   ): ChatPendingItem | null {
     if (isReordering.value) return null
     const index = pendingIndex(pendingUiId)
@@ -1361,7 +1308,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       || !identityAllowsDelivery(item)
       || item.pendingRetainAfterCancel === true
       || item.retiredAnnotationInput
-      || (item.hiddenControl && !allowHiddenControl)
       || item.deliveryState === 'steering'
       || item.steerAttempt?.phase === 'submitting'
       || item.pendingPersistenceState === 'saving'
@@ -1401,11 +1347,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         // The accepted server receipt is authoritative. A failed local delete
         // is reconciled against the now-missing server row on next hydrate.
       })
+      parkedQueues.trim()
       flushDeferredPendingDrain()
       return
     }
     if (outcome === 'deferred' && !item.steerAttempt) {
       item.deliveryState = undefined
+      parkedQueues.trim()
       deferredDrainRequested = true
       flushDeferredPendingDrain()
       return
@@ -1413,6 +1361,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (!item.steerAttempt) {
       item.deliveryState = outcome === 'retryable_failure' ? 'retryable' : undefined
     }
+    parkedQueues.trim()
     flushDeferredPendingDrain()
   }
 
@@ -1423,7 +1372,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (
         item.deliveryState === 'steering'
         || item.steerAttempt?.phase === 'submitting'
-        || !notifyDiscardedHiddenControl(item)
       ) continue
       const index = pendingQueue.value.indexOf(item)
       if (index < 0) continue
@@ -1439,17 +1387,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     }
   }
 
-  function notifyDiscardedHiddenControl(item?: ChatPendingItem): boolean {
-    if (!item?.hiddenControl || !item.clientRequestId) return true
-    const result = options.onHiddenControlDispatchResult?.({
-      status: 'rejected',
-      reason: 'discarded',
-      clientRequestId: item.clientRequestId,
-      sessionKey: item.hiddenControlSessionKey || '',
-    })
-    return result !== false
-  }
-
   function switchPendingQueue(
     targetSessionKey: string,
     shouldCommit: () => boolean = () => true,
@@ -1457,11 +1394,11 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   ): void | Promise<void> {
     if (reorderCommitPromise) {
       return reorderCommitPromise.then(() => {
-        if (!shouldCommit()) return
+        if (disposed || !shouldCommit()) return
         return switchPendingQueue(targetSessionKey, shouldCommit, handoffSignal)
       })
     }
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     const sourceSessionKey = options.sessionKey.value
@@ -1478,6 +1415,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const restored = parkedQueues.get(targetSessionKey) || []
     parkedQueues.delete(targetSessionKey)
     pendingQueue.value = restored
+    parkedQueues.trim()
     nextTick(() => void hydratePendingQueue(targetSessionKey))
   }
 
@@ -1498,12 +1436,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       if (!committed) return [item]
       Object.assign(item, committed)
       item.ownerRequestId = undefined
+      parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
       committedById.delete(committed.pendingInputId!)
       migrated.push(item)
       return []
     })
     pendingQueue.value = updateOwned(pendingQueue.value)
-    for (const [sessionKey, items] of parkedQueues) {
+    // Updating the LRU cache reinserts keys; a live Map iterator would revisit them.
+    for (const [sessionKey, items] of [...parkedQueues]) {
       const retained = updateOwned(items)
       if (retained.length > 0) parkedQueues.set(sessionKey, retained)
       else parkedQueues.delete(sessionKey)
@@ -1522,13 +1462,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldApply: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ): Promise<boolean> {
-    if (!options.pendingInputWal?.acceptHandoff) return false
+    if (disposed || !options.pendingInputWal?.acceptHandoff) return false
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
-      if (!shouldApply()) return false
+      if (disposed || !shouldApply()) return false
       if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
     }
-    if (!shouldApply()) return false
+    if (disposed || !shouldApply()) return false
     const commit = await options.pendingInputWal.acceptHandoff(
       ownerRequestId,
       targetSessionKey,
@@ -1536,7 +1476,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       handoffSignal,
     )
     if (!commit) return false
-    if (shouldApply()) {
+    // A WAL transaction already in progress may finish after page cleanup.
+    // Its committed rows belong to the next queue owner; do not reconstruct
+    // attachments or install them into this disposed page's cache.
+    if (!disposed && shouldApply()) {
       applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
     }
     return true
@@ -1547,9 +1490,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     targetSessionKey: string,
     ownerRequestId: string,
   ): Promise<void> {
-    if (!sourceSessionKey || !targetSessionKey || !ownerRequestId) return
+    if (disposed || !sourceSessionKey || !targetSessionKey || !ownerRequestId) return
     const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
-    if (!committed) return
+    if (!committed || disposed) return
     if (options.sessionKey.value === targetSessionKey) {
       const restored = parkedQueues.get(targetSessionKey) || []
       parkedQueues.delete(targetSessionKey)
@@ -1580,9 +1523,10 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     shouldCommit: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ) {
+    if (disposed) return
     if (reorderCommitPromise) await reorderCommitPromise
     else cancelPendingReorder()
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
     const durableCommitApplied = await acceptDurableHandoff(
       targetSessionKey,
@@ -1590,19 +1534,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       shouldCommit,
       handoffSignal,
     )
-    if (!shouldCommit()) return
+    if (disposed || !shouldCommit()) return
     // The source queue still owns its terminal drain signal until the durable
     // handoff has committed and this epoch is current. Clearing it before the
     // await would strand A if IndexedDB failed or A→B was superseded by A.
     clearPendingDrainAfterTerminalTimer()
     const carried: ChatPendingItem[] = []
     const stayingVisible: ChatPendingItem[] = []
-    const stayingHidden: ChatPendingItem[] = []
     for (const item of pendingQueue.value) {
-      if (item.hiddenControl) {
-        stayingHidden.push(item)
-        continue
-      }
       if (
         !durableCommitApplied
         && ownerRequestId
@@ -1623,16 +1562,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
         stayingVisible.push(item)
       }
     }
-    if (stayingVisible.length > 0 || stayingHidden.length > 0) {
+    if (stayingVisible.length > 0) {
       parkedQueues.set(sourceSessionKey, [
         ...(parkedQueues.get(sourceSessionKey) || []),
         ...stayingVisible,
-        ...stayingHidden,
       ])
     }
     const targetItems = parkedQueues.get(targetSessionKey) || []
     parkedQueues.delete(targetSessionKey)
     pendingQueue.value = [...targetItems, ...carried]
+    parkedQueues.trim()
     sortOrdinaryPendingItems()
     for (const item of pendingQueue.value) {
       if (item.ownerSessionKey === targetSessionKey) void ensureServerStaged(item)
@@ -1715,7 +1654,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (
       !item
       || !canRestoreToComposer(item)
-      || item.hiddenControl
       || item.deliveryState
       || item.steerAttempt
       // The text editor cannot reconstruct a frozen page selection. Keep the
@@ -1756,15 +1694,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function popPendingTail() {
-    // Hidden controls and explicit/ambiguous steer deliveries must retain
+    // Explicit or ambiguous steer deliveries must retain
     // their own transport identity instead of being converted into a fresh
     // composer send.
     let tailIndex = pendingQueue.value.length - 1
     while (
       tailIndex >= 0
       && (
-        pendingQueue.value[tailIndex]?.hiddenControl
-        || pendingQueue.value[tailIndex]?.deliveryState
+        pendingQueue.value[tailIndex]?.deliveryState
         || pendingQueue.value[tailIndex]?.steerAttempt
       )
     ) tailIndex--
@@ -1795,18 +1732,16 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     cancelPendingReorder()
     clearPendingDrainAfterTerminalTimer()
     if (!options.hasComposer() || pendingQueue.value.length === 0) return false
-    // Hidden controls and explicit/ambiguous steer deliveries stay queued;
+    // Explicit or ambiguous steer deliveries stay queued;
     // only transport-free visible drafts can safely return to the composer.
     const visible = pendingQueue.value.filter(
-      p => !p.hiddenControl
-        && !p.deliveryState
+      p => !p.deliveryState
         && !p.steerAttempt
         && canRestoreToComposer(p)
         && !hasUneditablePendingAttachments(p),
     )
     const retained = pendingQueue.value.filter(
-      p => p.hiddenControl
-        || p.deliveryState
+      p => p.deliveryState
         || p.steerAttempt
         || !canRestoreToComposer(p)
         || hasUneditablePendingAttachments(p),
@@ -1856,45 +1791,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
     if (ownerSessionKey !== options.sessionKey.value) {
       if (head) head.deliveryState = 'retryable'
-      return
-    }
-    if (head?.hiddenControl) {
-      head.deliveryState = 'steering'
-      // Hidden-control sends bypass the composer entirely, but retain their
-      // queue lease until the transport confirms acceptance.
-      nextTick(() => {
-        void (async () => {
-          let outcome: PendingDeliveryOutcome = 'retryable_failure'
-          try {
-            if (options.sessionKey.value === ownerSessionKey) {
-              outcome = await options.dispatchHiddenControl?.(
-                head,
-                ownerSessionKey,
-              ) ?? 'retryable_failure'
-            }
-          } catch {
-            outcome = 'retryable_failure'
-          } finally {
-            if (head.clientRequestId) {
-              options.onHiddenControlDispatchResult?.({
-                status: outcome === 'accepted'
-                  ? 'accepted'
-                  : outcome === 'not_sent'
-                    ? 'rejected'
-                    : 'unknown',
-                reason: outcome === 'accepted'
-                  ? 'accepted'
-                  : outcome === 'not_sent'
-                    ? 'send_rejected'
-                    : 'response_unknown',
-                clientRequestId: head.clientRequestId,
-                sessionKey: head.hiddenControlSessionKey || ownerSessionKey,
-              })
-            }
-            settlePendingDelivery(head, outcome)
-          }
-        })()
-      })
       return
     }
     if (options.dispatchPendingItem) {
@@ -2052,6 +1948,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       item.pendingServerRevision = Number(serverItem.revision)
       item.pendingWalRevision = (item.pendingWalRevision ?? 0) + 1
     }
+    const cacheCommits = pendingQueue.value.map(item => ({
+      item, snapshot: parkedQueues.snapshotForCommit(item),
+    }))
     if (!options.pendingInputWal?.putMany) {
       for (const item of pendingQueue.value) {
         await options.pendingInputWal?.put(walRecordForItem(item, 'staged'))
@@ -2060,6 +1959,9 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       await options.pendingInputWal.putMany(
         pendingQueue.value.map(item => walRecordForItem(item, 'staged')),
       )
+    }
+    if (options.pendingInputWal) {
+      for (const commit of cacheCommits) parkedQueues.rememberCommitted(commit.item, commit.snapshot)
     }
   }
 
@@ -2139,6 +2041,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
           const record = byId.get(item.pendingInputId!)!
           item.pendingPosition = record.position
           item.pendingWalRevision = record.walRevision
+          parkedQueues.rememberCommitted(item, parkedQueues.snapshotForCommit(item))
         }
         broadcastChange(options.sessionKey.value)
       } catch {
@@ -2200,13 +2103,14 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     disposed = true
     hydrateGeneration += 1
     clearPendingDrainAfterTerminalTimer()
-    parkedQueues.clear()
+    parkedQueues.dispose()
     broadcast?.close()
     options.pendingInputWal?.close()
   }
 
   return {
     pendingQueue,
+    getParkedQueueUsage: () => parkedQueues.usage(),
     canQueueMore,
     canReorder,
     busySendMode,
@@ -2214,8 +2118,6 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     maxPending: MAX_PENDING,
     enqueuePendingPayload,
     enqueuePendingInput,
-    enqueueRecoveredInput,
-    enqueueHiddenControl,
     enqueuePendingSteerAttempt,
     removePendingChip,
     beginPendingDelivery,

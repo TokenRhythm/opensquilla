@@ -70,8 +70,7 @@ def test_docker_build_validates_generated_webui_before_python_packaging() -> Non
     )
     assert "--mount=type=cache,target=/root/.npm,sharing=locked npm ci" in dockerfile
     assert "RUN npm run build:artifact" in dockerfile
-    assert "ARG OPENSQUILLA_FORBID_PERSONAL_BGM=0" in dockerfile
-    assert "npm run verify:release-dist" in dockerfile
+    assert "OPENSQUILLA_FORBID_PERSONAL_BGM" not in dockerfile
     assert "COPY hatch_build.py ./" in dockerfile
     assert "COPY scripts/verify_webui_artifact.py ./scripts/verify_webui_artifact.py" in dockerfile
     assert "COPY opensquilla-webui/ ./opensquilla-webui/" in dockerfile
@@ -81,6 +80,7 @@ def test_docker_build_validates_generated_webui_before_python_packaging() -> Non
     )
     assert "rm -rf hatch_build.py scripts opensquilla-webui" in dockerfile
     assert "!scripts/verify_webui_artifact.py" in _load_dockerignore_rules()
+    assert "opensquilla-webui/public/music" in _load_dockerignore_rules()
 
 
 def test_dockerignore_prevents_stale_webui_and_nested_secrets_from_entering_context() -> None:

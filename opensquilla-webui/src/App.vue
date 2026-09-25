@@ -256,12 +256,6 @@
           <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
           <DesktopUpdateIndicator />
         </template>
-        <!-- Opt-in (Settings → Appearance or the command palette); off by
-             default so the topbar stays music-free until asked for. -->
-        <BgmControl
-          v-if="bgmEnabled"
-          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
-        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -355,6 +349,9 @@
       />
       <ArtifactImageLightbox />
     </div>
+    <!-- Keep recovery actions in normal flow, clear of the floating console
+         topbar. The main shell already reserves the mobile tab-bar inset. -->
+    <DeliveryRecoveryNotice @open-session="switchToSession" />
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
@@ -452,6 +449,7 @@ import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
+import { useReadinessConnectionSync } from './composables/setup/useReadinessConnectionSync'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
@@ -460,6 +458,7 @@ import {
   arrangeSidebarSections,
   useSessions,
   type SessionItem,
+  type SessionListLoadResult,
   type SidebarSection,
   type SidebarSectionRow,
 } from './composables/useSessions'
@@ -474,14 +473,13 @@ import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
+import DeliveryRecoveryNotice from './components/DeliveryRecoveryNotice.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
-import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
-import { useBgm } from './composables/useBgm'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
@@ -544,6 +542,7 @@ const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
+useReadinessConnectionSync(gatewayAccess)
 const productActivity = inject(PRODUCT_ACTIVITY_KEY)
 if (productActivity) useProductActivity(gatewayAccess, productActivity)
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
@@ -706,9 +705,6 @@ watch(
     editingProjectId.value = ''
   },
 )
-// Feature-gated topbar music control; the singleton `enabled` ref is written by
-// Settings → Appearance and the command palette.
-const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
@@ -873,7 +869,6 @@ const systemHeaderPressureCount = computed(() => (
   Number(effectiveConnectionState.value !== 'connected')
   + Number(appStore.approvalCount > 0)
   + Number(desktopUpdate.visible.value)
-  + Number(bgmEnabled.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
@@ -1286,8 +1281,6 @@ watch(sidebarDynamicMaximum, () => {
 })
 
 // Primary new-chat path: ordinary tasks always start against the default Agent.
-// Explicit custom-Agent launches still receive their Agent-scoped session key
-// from advanced Agent administration.
 function openDefaultDraft() {
   freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })
@@ -1703,8 +1696,9 @@ function scheduleSessionRefresh() {
   automaticAppRpc.schedule()
 }
 
-async function performSidebarLoad(): Promise<void> {
-  const requests: Promise<unknown>[] = [loadSessions()]
+async function performSidebarLoad(): Promise<SessionListLoadResult> {
+  const sessionRead = loadSessions()
+  const requests: Promise<unknown>[] = [sessionRead]
   if (
     gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
@@ -1714,6 +1708,7 @@ async function performSidebarLoad(): Promise<void> {
     )
   }
   await Promise.allSettled(requests)
+  return sessionRead
 }
 
 const automaticAppRpc = createAppAutomaticRpc({
@@ -1728,6 +1723,11 @@ const automaticAppRpc = createAppAutomaticRpc({
 
 function loadSidebarData(): Promise<void> {
   return automaticAppRpc.load()
+}
+
+function handleAppForeground() {
+  markCurrentSessionReadIfVisible()
+  if (document.visibilityState === 'visible') automaticAppRpc.foreground()
 }
 
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
@@ -1961,8 +1961,8 @@ onMounted(() => {
   })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.addEventListener('focus', markCurrentSessionReadIfVisible)
-  document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.addEventListener('focus', handleAppForeground)
+  document.addEventListener('visibilitychange', handleAppForeground)
   void automaticAppRpc.mount()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
@@ -1975,8 +1975,8 @@ onUnmounted(() => {
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.removeEventListener('focus', markCurrentSessionReadIfVisible)
-  document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.removeEventListener('focus', handleAppForeground)
+  document.removeEventListener('visibilitychange', handleAppForeground)
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()

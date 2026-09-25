@@ -10,7 +10,7 @@ users should launch OpenSquilla from the Start menu or taskbar.
 To install the command-line interface separately from OpenSquilla Desktop:
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl"
 ```
 
 Run:
@@ -32,7 +32,6 @@ opensquilla <command> --help
 | `opensquilla gateway` | Run and manage the gateway server. |
 | `opensquilla chat` | Start interactive terminal chat. |
 | `opensquilla agent` | Run a single automation-friendly agent turn. |
-| `opensquilla code-task` | Run a guarded coding task through Coding mode's host workflow. |
 | `opensquilla sessions` | List, inspect, resume, abort, delete, or export sessions. |
 | `opensquilla skills` | List, search, view, install, update, publish, and inspect skills. |
 | `opensquilla memory` | Inspect and maintain memory. |
@@ -85,11 +84,6 @@ Use `--ui plain` to select the rescue renderer explicitly. Read [`tui.md`](tui.m
 terminal chat usage and [`features/tui-frontend.md`](features/tui-frontend.md)
 for backend architecture, plugin slots, Router HUD, and replay benchmark
 workflow.
-
-Web chat and the CLI gateway TUI support `/meta` for manual MetaSkill launch:
-`/meta` lists available workflows and `/meta <name>` runs one. Channel surfaces
-can list MetaSkills with `/meta`, but they do not launch MetaSkill runs
-directly. Standalone CLI chat requires gateway mode for `/meta`.
 
 One-shot automation:
 
@@ -176,38 +170,6 @@ workspace, scratch, transcript, and usage paths when those outputs must be
 isolated. On Windows, pass both environment variables in each child process
 rather than relying on POSIX inline assignment syntax.
 
-## Coding Mode and Code-Task
-
-Coding mode routes code modification work through the `code-task` workflow. It
-is designed for trusted repositories: `code-task` runs an OpenSquilla agent on
-the host, may install dependencies, and is not an OS sandbox.
-
-```sh
-opensquilla code-task solve --repo /path/to/repo --task-file task.md --yes
-opensquilla code-task solve --repo https://github.com/org/project.git --issue 123
-opensquilla code-task solve --verification-mode scratch --task "Create a small CLI parser" --yes
-opensquilla code-task solve --repo /path/to/app --task-file task.md --verification-mode build --yes
-```
-
-Use exactly one task source: `--issue`, `--task`, or `--task-file`.
-Non-interactive callers must pass `--yes` to acknowledge the trusted-host
-boundary. Work happens in an isolated run directory under the OpenSquilla state
-tree; the source repo is updated only after the workflow collects and verifies a
-productive change.
-
-The bundled trusted-repository policy runs the child agent in Full Host Access:
-read-side file tools, write-side file tools, patches, and shell commands all use
-the same sandbox-off posture. A custom CodeTask agent configuration that selects
-Standard-Sandbox or Managed Execution keeps strict reads and workspace/scratch
-write containment. In every posture, the disposable clone remains the intended
-working directory and the verified-change workflow controls when the source repo
-is updated.
-
-`--verification-mode red-green` is the default for existing repositories.
-`--verification-mode build` is for app or artifact delivery checks.
-`--verification-mode scratch` creates an empty throwaway repo and must not be
-combined with `--repo`.
-
 ## Configuration Commands
 
 Provider and router:
@@ -259,46 +221,29 @@ More detail:
 - [`search.md`](search.md)
 - [`channels.md`](channels.md)
 
-## Skills and Meta-Skills
+## Skills
 
 ```sh
 opensquilla skills list
 opensquilla skills search pdf
 opensquilla skills search pdf --json --include-diagnostics
 opensquilla skills view pdf-toolkit
-opensquilla skills install <install-reference> --source <clawhub|github>
-opensquilla skills install <install-reference> --source <clawhub|github> \
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github>
+opensquilla skills install <install-reference> --source <clawhub|skillhub|github> \
   --force --risk-confirmation <token>
 opensquilla skills update --install-id <install-id>
 opensquilla skills update --all
 opensquilla skills uninstall <skill-name>
 opensquilla skills uninstall --install-id <install-id>
 opensquilla skills doctor [<skill-name-or-install-id>] --json
-opensquilla skills inspect meta-skill-creator
-opensquilla skills meta proposals list
-opensquilla skills meta runs list
-opensquilla skills meta runs show <run-id>
-opensquilla skills meta runs steps <run-id>
-opensquilla skills meta runs replay <run-id> --dry-run
 ```
 
 `skills search --json` keeps the legacy top-level array for existing clients.
 Add `--include-diagnostics` when a stable results-and-source-diagnostics envelope is needed.
 
-Use `skills inspect` when you want to see the compiled step plan for a
-meta-skill before invoking it.
-
-MetaSkills are manual-only by default. In web chat and the CLI gateway TUI,
-run `/meta` to list workflows and `/meta <name>` to launch one. Natural-language
-auto-triggering is disabled unless `meta_skill.auto_trigger = true` is set in
-configuration for compatibility with older behavior.
-
 Read:
 
 - [`features/skills.md`](features/skills.md)
-- [`features/meta-skills.md`](features/meta-skills.md)
-- [`features/meta-skill-user-guide.md`](features/meta-skill-user-guide.md)
-- [`authoring/meta-skills.md`](authoring/meta-skills.md)
 
 ## Sessions and History
 

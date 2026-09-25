@@ -192,7 +192,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_channel_dispatch_chunking.py",
     "tests/test_gateway/test_channel_reply_delivery_guard.py",
     "tests/test_gateway/test_channel_session_and_busy_policy.py",
-    "tests/test_gateway/test_capability_runtime.py",
     "tests/test_gateway/test_contract_method_adapter.py",
     "tests/test_gateway/test_session_read_adapter.py",
     "tests/test_gateway/test_session_read_contract_registration.py",
@@ -203,8 +202,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_gateway/test_conversation_runtime_adapter.py",
     "tests/test_gateway/test_goal_plan_contract_adapters.py",
     "tests/test_scripts/test_stage_webui_artifact.py",
-    "tests/test_gateway/test_meta_setup_launch_e2e.py",
-    "tests/test_gateway/test_rpc_meta_setup.py",
     "tests/test_artifact_validation.py",
     "tests/test_ci/test_dockerignore_context.py",
     "tests/test_ci/test_migration_v022.py",
@@ -253,9 +250,6 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_observability/test_usage_telemetry.py",
     "tests/test_migrations/test_v023_router_deployment_telemetry.py",
     "tests/test_migrations/test_v024_usage_native_billing_receipts.py",
-    "tests/test_migrations/test_v030_meta_control_intents.py",
-    "tests/test_migrations/test_v031_meta_launch_drafts.py",
-    "tests/test_migrations/test_v032_meta_launch_discard_tombstones.py",
     "tests/test_live_mixed_provider_gateway.py",
     "tests/test_live_long_task_case_driver.py",
     "tests/test_live_long_task_release_gate.py",
@@ -287,24 +281,11 @@ RECENTLY_ADDED_ACTIVE_TESTS = {
     "tests/test_scheduler/test_job_lifecycle.py",
     "tests/test_session/test_storage_session_list_pagination.py",
     "tests/test_session/test_storage_transactions.py",
-    "tests/test_session/test_meta_launch_drafts.py",
     "tests/test_session/test_pending_chat_inputs.py",
     "tests/test_session/test_turn_acceptance_storage.py",
     "tests/test_session/test_assistant_message_identity.py",
     "tests/test_skills/test_hub_deps_subprocess.py",
     "tests/test_skills/test_managed_toolchains.py",
-    "tests/test_skills/test_meta_readiness.py",
-    "tests/test_skills/test_meta_short_drama_delivery_audit.py",
-    "tests/test_skills/test_paper_citation_integrity_gate.py",
-    "tests/test_skills/test_paper_delivery_summary.py",
-    "tests/test_skills/test_paper_latex_sanitizer.py",
-    "tests/test_skills/test_paper_length_gate.py",
-    "tests/test_skills/test_paper_quality_gate.py",
-    "tests/test_skills/test_paper_refbib_metadata.py",
-    "tests/test_skills/test_paper_source_readiness_gate.py",
-    "tests/test_skills/test_short_drama_review_normalizer.py",
-    "tests/test_skills/test_subtitle_burner.py",
-    "tests/test_skills/test_title_card_image.py",
     "tests/test_skills/test_toolchain_runtime_integration.py",
     "tests/test_skills/test_toolchain_state_scope.py",
     "tests/test_tools/test_shell_managed_toolchains.py",
@@ -371,7 +352,7 @@ def test_every_pytest_file_belongs_to_exactly_one_windows_shard() -> None:
     assert set().union(*by_shard.values()) == discovered
     assert sum(len(paths) for paths in by_shard.values()) == len(discovered)
     assert all(len(matching_specialized_shards(path)) <= 1 for path in discovered)
-    assert "tests/fixtures/meta_skill_inputs/code_review_dirty_repo/tests/test_app.py" not in (
+    assert "tests/fixtures/synthetic_project/tests/test_app.py" not in (
         discovered
     )
     assert set(validated_files_for_shard(Path.cwd(), "core")) == by_shard["core"]
@@ -563,6 +544,25 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         Path("tests/test_skills/test_hub_transaction_process_gates.py"),
         "test_unleased_build_services_does_not_sweep_another_process_reservation",
     )
+
+
+@pytest.mark.parametrize(
+    ("test_file", "function_name"),
+    [
+        (
+            "tests/test_gateway/test_plan_rpc.py",
+            "test_interrupted_plan_can_deliver_existing_artifact_in_a_new_turn",
+        ),
+        (
+            "tests/test_engine/test_tool_concurrency.py",
+            "test_image_analysis_calls_have_dedicated_inflight_cap",
+        ),
+    ],
+)
+def test_bounded_latency_contracts_are_marked_ci_serial(
+    test_file: str, function_name: str,
+) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(Path(test_file), function_name)
 
 
 def test_real_skill_install_cancellation_is_marked_ci_serial() -> None:
@@ -939,15 +939,16 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     report = assignment_governance_summary(Path.cwd())
 
     expected_moved_paths = {
+        "tests/test_gateway/test_rpc_sessions.py",
+        "tests/test_recovery/test_session_merge.py",
+        "tests/test_engine/test_placeholder_escalation_and_wrapup.py",
         "tests/test_gateway/test_goal_rpc.py",
-        "tests/test_gateway/test_rpc_meta_runs.py",
         "tests/test_gateway/test_rpc_router_decisions.py",
         "tests/test_live_long_task_case_driver.py",
         "tests/test_live_multi_provider_matrix.py",
         "tests/test_observability/test_bundle.py",
         "tests/test_persistence/test_router_decision_writer.py",
         "tests/test_sandbox/test_windows_default_capability.py",
-        "tests/test_skills/test_meta_resume.py",
     }
     moved_paths = {
         path for path, shard in assignments.items() if baseline[path] != shard
@@ -956,7 +957,7 @@ def test_windows_assignment_snapshot_governs_reviewed_rebalancing() -> None:
     assert moved_paths == expected_moved_paths
     assert set(assignments) == set(historical_test_weights())
     assert {str(override["path"]) for override in overrides} == expected_moved_paths
-    assert sum(override.get("affinity_exception") is True for override in overrides) == 5
+    assert sum(override.get("affinity_exception") is True for override in overrides) == 6
     assert guardrails == {
         "max_moved_files": 10,
         "max_moved_fraction": 0.02,
@@ -1136,17 +1137,15 @@ def test_affinity_overflow_moves_only_environment_independent_tests() -> None:
     # These reviewed files need no shard-specific setup. Releasing them keeps
     # environment-dependent tests pinned while restoring an even critical path.
     assert moved == {
+        "tests/test_gateway/test_rpc_sessions.py": "core",
+        "tests/test_recovery/test_session_merge.py": "core",
         "tests/contracts/test_gateway_contract_parallel.py": "core",
         "tests/test_ci/test_migrations_packaged.py": "core",
         "tests/test_gateway/test_goal_rpc.py": "desktop-installer-contracts",
-        "tests/test_gateway/test_rpc_meta_runs.py": "desktop-installer-contracts",
         "tests/test_gateway/test_rpc_router_decisions.py": (
             "desktop-installer-contracts"
         ),
         "tests/test_observability/test_bundle.py": "desktop-installer-contracts",
-        "tests/test_persistence/test_meta_run_writer.py": (
-            "desktop-installer-contracts"
-        ),
         "tests/test_persistence/test_router_decision_writer.py": "core",
     }
     assert shard_for_test("tests/test_recovery/test_atomic_and_locking.py") == (

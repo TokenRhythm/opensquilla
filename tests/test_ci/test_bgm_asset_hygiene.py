@@ -9,15 +9,15 @@ MUSIC_ROOTS = (
     "opensquilla-webui/dist/music",
     "src/opensquilla/gateway/static/dist/music",
 )
-AUDIO_EXTENSIONS = ("mp3", "m4a", "ogg", "flac", "wav")
+PRIVATE_FILES = ("track.mp3", "track.aac", "playlist.local.json", "notes.txt")
 
 
-def test_personal_bgm_audio_is_ignored_at_every_supported_depth() -> None:
-    candidates = [
-        f"{root}/{relative}.{extension}"
+def test_retired_personal_media_is_ignored_at_every_depth() -> None:
+    candidates = list(MUSIC_ROOTS) + [
+        f"{root}/{relative}{filename}"
         for root in MUSIC_ROOTS
-        for relative in ("track", "album/track", "album/live/track")
-        for extension in AUDIO_EXTENSIONS
+        for relative in ("", "album/", "album/live/")
+        for filename in PRIVATE_FILES
     ]
     not_ignored = [
         path
@@ -30,4 +30,4 @@ def test_personal_bgm_audio_is_ignored_at_every_supported_depth() -> None:
         != 0
     ]
 
-    assert not not_ignored, "personal BGM audio could be committed:\n" + "\n".join(not_ignored)
+    assert not not_ignored, "retired personal media could be committed:\n" + "\n".join(not_ignored)

@@ -55,28 +55,30 @@ def _health(scope: str, fingerprint: str) -> dict[str, object]:
     }
 
 
-def test_protocol_approved_predecessor_diff_is_only_optional_device_field(
+def test_protocol_retirement_does_not_expand_approved_legacy_compatibility(
     protocol_preflight: ModuleType,
 ) -> None:
     raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
     current = protocol_preflight.manifest_fingerprint(raw)
-    manifest = json.loads(raw)
-    assert manifest.pop("device_identity") == {
-        "field": "device_id",
-        "format": "sha256-lowercase-hex",
-        "optional": True,
-        "scope": "application-events",
-        "deduplication_unit": "device",
-    }
-    assert manifest["manifest_version"] == 2
-    manifest["manifest_version"] = 1
-    previous = protocol_preflight.manifest_fingerprint(json.dumps(manifest).encode())
-    assert protocol_preflight.COMPATIBLE_PAIRS == {(current, previous)}
+    # This released pair approved only the optional device-field addition.
+    # Removing event types creates a distinct protocol requiring an exact
+    # collector match; it must not inherit that historical approval.
+    legacy_server = "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
+    legacy_client = "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
+    assert protocol_preflight.COMPATIBLE_PAIRS == {(legacy_server, legacy_client)}
+    assert current not in {legacy_server, legacy_client}
     for scope in ("growth", "reliability"):
         protocol_preflight.validate_health(_health(scope, current), scope, current)
-        protocol_preflight.validate_health(_health(scope, current), scope, previous)
+        protocol_preflight.validate_health(
+            _health(scope, legacy_server), scope, legacy_client,
+        )
         with pytest.raises(ValueError, match="does not support"):
-            protocol_preflight.validate_health(_health(scope, previous), scope, current)
+            protocol_preflight.validate_health(_health(scope, legacy_client), scope, legacy_server)
+        for legacy in (legacy_server, legacy_client):
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, legacy), scope, current)
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, current), scope, legacy)
 
 
 def test_protocol_source_reads_fixed_commit_not_mutated_checkout_or_tag(
@@ -760,6 +762,40 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     assert "-BaselineVersion $env:BASELINE_VERSION" in verify["run"]
     assert "-InstallMode $env:INSTALL_MODE" in verify["run"]
     assert "secrets." not in json.dumps(audit)
+
+
+def test_macos_release_backports_keychain_fix_before_loading_builder_and_requires_signing() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
+    step = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+                if step.get("name") == "Build signed macOS installer")
+    preparation = "node scripts/prepare-macos-keychain.cjs"
+    build = (
+        "npx electron-builder --mac --publish never "
+        "--config.forceCodeSigning=true --config.dmg.sign=true"
+    )
+    assert step["run"].index(preparation) < step["run"].index("npm run build:gateway")
+    assert step["run"].index(preparation) < step["run"].index(build)
+    assert step["env"]["CSC_LINK"] == "${{ secrets.MAC_CSC_LINK }}"
+    assert step["env"]["APPLE_ID"] == "${{ secrets.APPLE_ID }}"
+    assert step["env"]["APPLE_APP_SPECIFIC_PASSWORD"] == (
+        "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}"
+    )
+    assert step["env"]["APPLE_TEAM_ID"] == "${{ secrets.APPLE_TEAM_ID }}"
+    assert "continue-on-error" not in step
+    verify = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+                  if step.get("name") == "Verify macOS signatures and notarization")
+    assert 'codesign --verify --deep --strict --verbose=2 "${apps[0]}"' in verify["run"]
+    assert 'spctl --assess --type execute --verbose=2 "${apps[0]}"' in verify["run"]
+    assert 'xcrun stapler validate "${apps[0]}"' in verify["run"]
+    assert 'codesign --verify --strict --verbose=2 "${dmgs[0]}"' in verify["run"]
+    assert "set -euo pipefail" in verify["run"]
+    assert "continue-on-error" not in verify
+    assert "if" not in verify
+    ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    unit = next(step for step in ci["jobs"]["desktop-check"]["steps"]
+                if step.get("name") == "Run desktop unit tests")
+    assert "node scripts/test-macos-keychain-patch.cjs" in unit["run"]
+    assert "continue-on-error" not in unit
 
 
 def test_windows_only_input_skips_unrelated_jobs_and_keeps_signed_windows_audits() -> None:

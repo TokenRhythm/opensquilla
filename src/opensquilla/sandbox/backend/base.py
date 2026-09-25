@@ -6,8 +6,8 @@ cancellation. Backends must surface setup failures by raising
 :class:`~opensquilla.sandbox.types.SandboxBackendError`; they must never fall
 back to unsandboxed host execution on failure.
 
-``probe`` / ``available`` is separated from ``run`` so callers can pre-flight
-backend readiness (e.g. during gateway boot) without spawning a process.
+Startup selects installed backends without executing test commands. Actual
+operations enforce their policy and report failures without a host fallback.
 """
 
 from __future__ import annotations

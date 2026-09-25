@@ -106,26 +106,26 @@ const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
 
 describe('useChatComposerShortcuts', () => {
   describe('Slash completion safety', () => {
-    const coding = {
-      name: '/coding',
-      cmd: '/coding',
-      label: '/coding',
-      desc: 'Toggle Coding mode',
+    const compact = {
+      name: '/compact',
+      cmd: '/compact',
+      label: '/compact',
+      desc: 'Toggle context compaction',
       aliases: [],
-      execution: { action: 'coding.mode' },
+      execution: { action: 'compact_context' },
     }
 
     it('uses Tab only to complete the active candidate', () => {
       const { api, spies } = harness({
         inputText: '/co',
         slashOpen: true,
-        filteredSlashCmds: [coding],
+        filteredSlashCmds: [compact],
       })
       const e = keydown({ key: 'Tab', target: field('/co', 'end') })
 
       api.onTextareaKeydown(e)
 
-      expect(spies.completeSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.completeSlashCmd).toHaveBeenCalledWith(compact)
       expect(spies.activateSlashCmd).not.toHaveBeenCalled()
       expect(e.preventDefault).toHaveBeenCalled()
     })
@@ -134,13 +134,13 @@ describe('useChatComposerShortcuts', () => {
       const { api, spies } = harness({
         inputText: '/co',
         slashOpen: true,
-        filteredSlashCmds: [coding],
+        filteredSlashCmds: [compact],
       })
       const e = keydown({ key: 'Enter', target: field('/co', 'end') })
 
       api.onTextareaKeydown(e)
 
-      expect(spies.activateSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.activateSlashCmd).toHaveBeenCalledWith(compact)
       expect(spies.completeSlashCmd).not.toHaveBeenCalled()
       expect(spies.sendCurrentInput).not.toHaveBeenCalled()
       expect(e.preventDefault).toHaveBeenCalled()
@@ -390,7 +390,7 @@ describe('Escape and message edits', () => {
       inputText: '/co',
       slashOpen: true,
       filteredSlashCmds: [
-        { name: '/coding', cmd: '/coding', label: '/coding', desc: '' },
+        { name: '/compact', cmd: '/compact', label: '/compact', desc: '' },
       ] as unknown as ChatSlashCommand[],
       cancelMessageEdit: () => true,
     })

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from opensquilla.persistence.migrator import apply_pending
+from tests.helpers.historical_migrations import apply_pre_retirement_migrations as apply_pending
 
 MIGRATIONS_DIR = Path(__file__).resolve().parents[2] / "migrations"
 

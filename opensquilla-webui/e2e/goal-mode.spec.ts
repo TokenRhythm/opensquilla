@@ -1501,7 +1501,9 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     // The pure NO_REPLY turn (call 3) is accounted for by the Goal ledger but
     // creates no ghost bubble. Every visible turn exposes its own settled usage
     // through the shared completion receipt, never through the legacy footer.
-    await expect(page.locator('.chat-message-surface .msg-ai')).toHaveCount(3)
+    // The measured live tail shares this surface; count canonical rows only,
+    // excluding the still-running call 5's existing activity indicator.
+    await expect(page.locator('.chat-message-surface [data-chat-message-index] .msg-ai')).toHaveCount(3)
     await assertVisibleTurnReceipt(initialReply, 12, 4)
     await assertVisibleTurnReceipt(mixedBody, 11, 5)
     await assertVisibleTurnReceipt(formattedBody, 10, 4)
@@ -1603,7 +1605,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
     await expect(page.locator('.msg-ai').filter({ hasText: initialReply })).toHaveCount(1)
     await expect(page.locator('.msg-ai').filter({ hasText: mixedBody })).toHaveCount(1)
     await expect(page.locator('.msg-ai').filter({ hasText: formattedBody })).toHaveCount(1)
-    await expect(page.locator('.chat-message-surface .msg-ai')).toHaveCount(3)
+    await expect(page.locator('.chat-message-surface [data-chat-message-index] .msg-ai')).toHaveCount(3)
     await assertVisibleTurnReceipt(initialReply, 12, 4)
     await assertVisibleTurnReceipt(mixedBody, 11, 5)
     await assertVisibleTurnReceipt(formattedBody, 10, 4)

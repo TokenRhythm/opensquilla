@@ -532,6 +532,34 @@ class ChannelDeliveryStore:
             raise RuntimeError("pairing status was not persisted")
         return self._pairing_from_row(row)
 
+    def approve_pairing_once(
+        self, *, channel_name: str, pairing_id: str
+    ) -> tuple[ChannelPairing, bool]:
+        """Read old status and approve in one owned operation; notify only once."""
+        with self._lock, self._conn:
+            self._conn.execute("BEGIN IMMEDIATE")
+            row = self._conn.execute(
+                "SELECT * FROM channel_pairings WHERE channel_name = ? AND pairing_id = ?",
+                (channel_name, pairing_id),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                raise KeyError(f"Pairing not found: {pairing_id}")
+            changed = row["status"] != "approved"
+            if changed:
+                self._conn.execute(
+                    "UPDATE channel_pairings SET status = 'approved', "
+                    "approved_at = ?, revoked_at = NULL "
+                    "WHERE channel_name = ? AND pairing_id = ?",
+                    (time.time(), channel_name, pairing_id),
+                )
+                row = self._conn.execute(
+                    "SELECT * FROM channel_pairings WHERE channel_name = ? AND pairing_id = ?",
+                    (channel_name, pairing_id),
+                ).fetchone()
+            self._conn.commit()
+        return self._pairing_from_row(row), changed
+
     def accept_inbound(self, channel_name: str, message: IncomingMessage) -> bool:
         """Commit an inbound event before a provider-facing ACK is returned.
 
@@ -722,6 +750,11 @@ class ChannelDeliveryStore:
             self._conn.commit()
 
     def fail_inbound(self, claim: IngressClaim | None, error: BaseException) -> None:
+        self.fail_inbound_snapshot(claim, type(error).__name__, _safe_error_text(error))
+
+    def fail_inbound_snapshot(
+        self, claim: IngressClaim | None, error_type: str, error_text: str
+    ) -> None:
         if claim is None or not claim.event_key:
             return
         with self._lock:
@@ -730,7 +763,7 @@ class ChannelDeliveryStore:
                 "claim_token = NULL, claim_started_at = NULL, updated_at = ? "
                 "WHERE event_key = ? AND claim_token = ?",
                 (
-                    f"{type(error).__name__}: {_safe_error_text(error)}"[:2000],
+                    f"{error_type}: {error_text}"[:2000],
                     time.time(),
                     claim.event_key,
                     claim.claim_token,
@@ -872,6 +905,12 @@ class ChannelDeliveryStore:
         )
         if result is None:
             state = "sent_unconfirmed"
+        return self.complete_send_receipt(send_id, normalized, state, safe_reason=safe_reason)
+
+    def complete_send_receipt(
+        self, send_id: str, normalized: ChannelSendResult, state: str,
+        *, safe_reason: str | None = None,
+    ) -> ChannelSendResult:
         with self._lock:
             self._conn.execute(
                 "UPDATE channel_outbox SET state = ?, capability = ?, "
@@ -900,6 +939,23 @@ class ChannelDeliveryStore:
         *,
         safe_error_message: str | None = None,
     ) -> None:
+        self.fail_send_snapshot(
+            send_id,
+            type(error).__name__,
+            _safe_error_text(error),
+            classify_channel_send_error(error),
+            safe_error_message=safe_error_message,
+        )
+
+    def fail_send_snapshot(
+        self,
+        send_id: str,
+        error_type: str,
+        error_text: str,
+        error_class: str,
+        *,
+        safe_error_message: str | None = None,
+    ) -> None:
         # error_class carries the taxonomy value every consumer branches on
         # (doctor's auth_invalid alert, the console's operator cause lines);
         # the concrete exception type stays in error_message so nothing is
@@ -907,12 +963,13 @@ class ChannelDeliveryStore:
         with self._lock:
             self._conn.execute(
                 "UPDATE channel_outbox SET state = 'unknown', error_class = ?, "
-                "error_message = ?, updated_at = ? WHERE send_id = ?",
+                "error_message = ?, updated_at = ? WHERE send_id = ? "
+                "AND state NOT IN ('sent', 'sent_unconfirmed')",
                 (
-                    classify_channel_send_error(error),
+                    error_class,
                     safe_error_message
                     if safe_error_message is not None
-                    else f"{type(error).__name__}: {_safe_error_text(error)}"[:2000],
+                    else f"{error_type}: {error_text}"[:2000],
                     time.time(),
                     send_id,
                 ),
@@ -1095,19 +1152,20 @@ class ChannelDeliveryStore:
             self._conn.close()
 
 
-def delivery_store_for_config(config: Any) -> ChannelDeliveryStore:
+def delivery_store_for_config(config: Any) -> Any:
     configured = str(getattr(config, "state_dir", "") or "").strip()
     root = Path(configured).expanduser() if configured else state_dir()
-    return ChannelDeliveryStore(root / "channel_delivery.sqlite")
+    from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore
+
+    return AsyncChannelDeliveryStore(root / "channel_delivery.sqlite")
 
 
-def durable_enqueue(channel: Any, message: IncomingMessage, queue: Any) -> bool:
-    """Commit then enqueue using a store injected by :class:`ChannelManager`."""
+async def durable_enqueue(channel: Any, message: IncomingMessage, queue: Any) -> bool:
+    """Commit and hand off on the loop, even if a submitted caller is cancelled."""
     store = getattr(channel, "_delivery_store", None)
     channel_name = str(getattr(channel, "_delivery_channel_name", "") or "")
-    if isinstance(store, ChannelDeliveryStore) and channel_name:
-        if not store.accept_inbound(channel_name, message):
-            return False
+    if store is not None and channel_name:
+        return cast(bool, await store.enqueue(channel_name, message, queue))
     queue.put_nowait(message)
     return True
 
@@ -1119,19 +1177,19 @@ async def deliver_with_outbox(channel: Any, message: OutgoingMessage) -> Any:
     raw_send = getattr(channel, "_delivery_raw_send", None)
     if not callable(raw_send):
         raw_send = channel.send
-    if not isinstance(store, ChannelDeliveryStore) or not channel_name:
+    if store is None or not channel_name:
         return await raw_send(message)
     delivery_id = str(message.metadata.get("delivery_id") or uuid.uuid4().hex)
     metadata = dict(message.metadata or {})
     metadata["delivery_id"] = delivery_id
     durable_message = message.model_copy(update={"metadata": metadata})
-    send_id = store.begin_send(channel_name, durable_message)
+    send_id = await store.begin_send(channel_name, durable_message)
     try:
         result = await raw_send(durable_message)
     except BaseException as exc:
-        store.fail_send(send_id, exc)
+        await store.fail_send(send_id, exc)
         raise
-    store.complete_send(
+    await store.complete_send(
         send_id,
         result,
         target_id=str(durable_message.reply_to or ""),
@@ -1338,13 +1396,13 @@ async def deliver_operation_with_outbox(
             operation_kwargs["request"] = request
         elif args and args[0] is not None:
             operation_args = (request, *args[1:])
-    if not isinstance(store, ChannelDeliveryStore) or not channel_name:
+    if store is None or not channel_name:
         return await raw_operation(*operation_args, **operation_kwargs)
-    send_id, inserted = store.begin_send_once(channel_name, intent, capability=operation)
+    send_id, inserted = await store.begin_send_once(channel_name, intent, capability=operation)
     if contextual_artifact_operation and not inserted and request is not None:
-        if not store.claim_failed_artifact_retry(send_id, channel_name, intent):
+        if not await store.claim_failed_artifact_retry(send_id, channel_name, intent):
             return _replay_artifact_delivery(
-                store.send_record(send_id),
+                await store.send_record(send_id),
                 request=request,
                 send_id=send_id,
                 channel_name=channel_name,
@@ -1354,15 +1412,15 @@ async def deliver_operation_with_outbox(
         result = await raw_operation(*operation_args, **operation_kwargs)
     except BaseException as exc:
         if contextual_artifact_operation:
-            store.fail_send(
+            await store.fail_send(
                 send_id,
                 exc,
                 safe_error_message=_redact_operation_error(exc),
             )
         else:
-            store.fail_send(send_id, exc)
+            await store.fail_send(send_id, exc)
         raise
-    store.complete_send(
+    await store.complete_send(
         send_id,
         result,
         capability=operation,

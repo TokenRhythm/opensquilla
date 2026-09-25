@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # New releases are sourced from the transferred canonical repository. The
+  # OSS bucket and object layout remain independent of the GitHub owner.
+  CANONICAL_GITHUB_REPOSITORY: TokenRhythm/opensquilla
   OSSUTIL_VERSION: "2.3.0"
   OSSUTIL_ZIP: ossutil-2.3.0-linux-amd64.zip
   OSSUTIL_SHA256: 3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a
@@ -62,6 +65,16 @@ jobs:
             exit 1
           fi
           printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify canonical GitHub repository
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REPOSITORY}" != "${CANONICAL_GITHUB_REPOSITORY}" ]]; then
+            echo "Refusing to mirror from non-canonical GitHub repository: ${GITHUB_REPOSITORY}" >&2
+            echo "Expected: ${CANONICAL_GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
 
       - name: Validate OSS configuration
         shell: bash
@@ -115,7 +128,7 @@ jobs:
           set -euo pipefail
           mkdir -p release-assets
           gh release download "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${CANONICAL_GITHUB_REPOSITORY}" \
             --dir release-assets \
             --clobber
           asset_count="$(find release-assets -maxdepth 1 -type f | wc -l | tr -d ' ')"
@@ -134,11 +147,11 @@ jobs:
           set -euo pipefail
           mkdir -p channel-assets
           gh release view "${TAG}" \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${CANONICAL_GITHUB_REPOSITORY}" \
             --json tagName,isDraft,isPrerelease,publishedAt,url \
             > channel-assets/release.json
           gh release list \
-            --repo "${GITHUB_REPOSITORY}" \
+            --repo "${CANONICAL_GITHUB_REPOSITORY}" \
             --limit 1000 \
             --json tagName,isDraft,isPrerelease,publishedAt \
             > channel-assets/releases.json
@@ -224,6 +237,7 @@ jobs:
               exit 1
             fi
             cp -- "${matches[0]}" "${root}/${alias}"
+            printf '%s\n' "${matches[0]##*/}" > "channel-assets/${alias}.source"
           }
           make_alias "OpenSquilla-*-mac-arm64.dmg" "OpenSquilla-mac-arm64.dmg"
           make_alias "OpenSquilla-*-win-x64.exe" "OpenSquilla-win-x64.exe"
@@ -256,6 +270,11 @@ jobs:
             local -a options=(
               cp
               --force
+              --parallel 64
+              --part-size 262144
+              --bigfile-threshold 8388608
+              --read-timeout 30
+              --retry-times 3
               --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}"
             )
             if [[ -n "${cache_control}" ]]; then
@@ -264,7 +283,25 @@ jobs:
             if [[ -n "${content_type}" ]]; then
               options+=(--content-type "${content_type}")
             fi
-            ossutil "${options[@]}" "${source}" "${destination}/${name}"
+            ossutil "${options[@]}" "${source}" "${destination}/${name}" || return 1
+            if [[ "${source}" == oss://* && ( -n "${cache_control}" || -n "${content_type}" ) ]]; then
+              # ossutil 2.3 copies source cache headers during a server-side
+              # copy. Apply the moving-object policy with its metadata API.
+              local -a property_options=(set-props --force --metadata-directive update
+                --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}")
+              [[ -z "${cache_control}" ]] || property_options+=(--cache-control "${cache_control}")
+              [[ -z "${content_type}" ]] || property_options+=(--content-type "${content_type}")
+              ossutil "${property_options[@]}" "${destination}/${name}" || return 1
+            fi
+          }
+          upload_installer_alias() {
+            local name="$1"
+            local versioned_name
+            versioned_name="$(cat "channel-assets/${name}.source")" || return 1
+            # Every versioned object was verified before promotion began.
+            # Reuse it inside OSS instead of uploading the same bytes again.
+            upload_asset "${dest_prefix}/${versioned_name}" "${name}" \
+              "${latest_prefix}" "${moving_cache_control}"
           }
           download_object() {
             local object="$1"
@@ -348,7 +385,8 @@ jobs:
             local name="$2"
             local cache_control="${3:-}"
             local content_type="${4:-}"
-            local source_path
+            local source_path source_size staging_key staging_object exists_status
+            local -a staging_options=()
             local -a options=(
               api
               put-object
@@ -361,18 +399,47 @@ jobs:
               echo "Unable to resolve local release asset: ${source}" >&2
               return 1
             fi
-            options+=(--body "file://${source_path}")
-            if [[ -n "${cache_control}" ]]; then
+            source_size="$(wc -c < "${source_path}")" || return 1
+            if (( source_size >= 8388608 )); then
+              staging_key="${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/${name}"
+              staging_object="oss://${ALIYUN_OSS_BUCKET}/${staging_key}"
+              echo "Uploading multipart staging object: ${name} (${source_size} bytes)"
+              [[ -z "${cache_control}" ]] || staging_options+=(--cache-control "${cache_control}")
+              [[ -z "${content_type}" ]] || staging_options+=(--content-type "${content_type}")
+              ossutil cp \
+                --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+                --parallel 64 --part-size 262144 --bigfile-threshold 8388608 \
+                --read-timeout 30 --retry-times 3 \
+                "${staging_options[@]}" "${source_path}" "${staging_object}" || return 1
+              verify_immutable_asset "${source}" "staging/${name}" "${staging_object}" || return 1
+              # Recheck after the potentially long transfer, including for
+              # versioned buckets where the server condition is advisory.
+              if object_exists "${dest_prefix}/${name}"; then
+                verify_immutable_asset "${source}" "${name}" "${dest_prefix}/${name}"
+                return "$?"
+              else
+                exists_status="$?"
+                (( exists_status == 1 )) || return "${exists_status}"
+              fi
+              options[1]=copy-object
+              # copy-object in ossutil 2.3 has no --cache-control flag.
+              # Inherit the cache and content metadata set on the staged upload.
+              options+=(--copy-source "/${ALIYUN_OSS_BUCKET}/${staging_key}" --metadata-directive COPY)
+            else
+              options+=(--body "file://${source_path}")
+            fi
+            if (( source_size < 8388608 )) && [[ -n "${cache_control}" ]]; then
               options+=(--cache-control "${cache_control}")
             fi
-            if [[ -n "${content_type}" ]]; then
+            if (( source_size < 8388608 )) && [[ -n "${content_type}" ]]; then
               options+=(--content-type "${content_type}")
             fi
             # The server-side forbid-overwrite condition closes the gap between
             # the preceding existence check and this write. If the request lost
             # a race, or its response was lost after committing, the caller
             # verifies the now-existing object before deciding whether to fail.
-            ossutil "${options[@]}"
+            echo "Committing immutable OSS release object: ${name}"
+            ossutil "${options[@]}" || return 1
           }
           upload_immutable_asset() {
             local source="$1"
@@ -643,10 +710,10 @@ jobs:
               fi
             done
             for name in "${latest_aliases[@]}"; do
-              upload_asset \
-                "release-assets/${name}" "${name}" \
-                "${latest_prefix}" "${moving_cache_control}"
+              # Record before copying: metadata update failure must also
+              # restore an alias whose bytes were already replaced.
               promoted_aliases+=("${name}")
+              upload_installer_alias "${name}"
             done
           fi
 
@@ -684,3 +751,20 @@ jobs:
               echo "::warning::Promotion succeeded, but temporary OSS backups could not be removed."
             fi
           fi
+
+      - name: Remove this attempt's temporary multipart staging
+        if: always()
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ -n "${ALIYUN_OSS_PREFIX_NORMALIZED:-}" ]] || exit 0
+          command -v ossutil >/dev/null || exit 0
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ && "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
+          staging_prefix="oss://${ALIYUN_OSS_BUCKET}/${ALIYUN_OSS_PREFIX_NORMALIZED}/.upload-staging/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/"
+          ossutil rm --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+            --force --recursive --all-versions "$staging_prefix" \
+            || echo "::warning::Temporary staging versions could not be removed: $staging_prefix"
+          ossutil rm --addressing-style "${OSS_ADDRESSING_STYLE_NORMALIZED}" \
+            --force --recursive --multipart "$staging_prefix" \
+            || echo "::warning::Temporary multipart uploads could not be removed: $staging_prefix"

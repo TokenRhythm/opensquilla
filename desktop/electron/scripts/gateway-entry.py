@@ -10,6 +10,7 @@ _DESKTOP_DOCUMENT_PROBE_ARG = "--_desktop-document-probe"
 _DESKTOP_MCP_PROBE_ARG = "--_desktop-mcp-probe"
 _DESKTOP_PTY_PROBE_ARG = "--_desktop-pty-probe"
 _DESKTOP_PTY_PROBE_TIMEOUT_SECONDS = 10.0
+_DESKTOP_PTY_POST_EXIT_GRACE_SECONDS = 1.0
 _SANDBOX_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _INTERNAL_CHILD_ARG = "--internal-child"
 
@@ -137,30 +138,61 @@ def _run_desktop_pty_probe() -> int:
 
     async def collect() -> tuple[str, int | None]:
         handle = None
+        exited = None
+        reading = None
         try:
             handle = spawn_pty(command, cwd=os.getcwd(), env=dict(os.environ))
             async with asyncio.timeout(_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS):
                 chunks: list[bytes] = []
+                exited = asyncio.create_task(wait_pty(handle))
                 while True:
-                    try:
-                        chunk = await read_pty(handle)
-                    except EOFError:
-                        break
+                    reading = asyncio.create_task(read_pty(handle))
+                    done, _ = await asyncio.wait(
+                        {reading, exited}, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if exited in done and reading not in done:
+                        # ConPTY can keep its socket open after the child has
+                        # exited.  Give the reader a bounded grace period to
+                        # receive buffered tail bytes, then treat quietness as
+                        # EOF for this probe.
+                        try:
+                            chunk = await asyncio.wait_for(
+                                reading, timeout=_DESKTOP_PTY_POST_EXIT_GRACE_SECONDS,
+                            )
+                        except TimeoutError:
+                            reading.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await reading
+                            break
+                    else:
+                        try:
+                            chunk = reading.result()
+                        except EOFError:
+                            break
                     if not chunk:
                         break
                     chunks.append(chunk)
-                return b"".join(chunks).decode("utf-8", errors="replace"), await wait_pty(handle)
+                return b"".join(chunks).decode("utf-8", errors="replace"), await exited
         except PtyBackendError as exc:
             handle = exc.handle or handle
             raise
         finally:
+            if reading is not None and not reading.done():
+                reading.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reading
+            if exited is not None and not exited.done():
+                exited.cancel()
+                with suppress(asyncio.CancelledError):
+                    await exited
             if handle is not None:
                 # Stop the PTY child before asyncio shuts down its blocking
                 # reader thread, including a failed spawn that returned a handle.
                 with suppress(Exception):
                     await terminate_pty(handle)
-                with suppress(Exception):
-                    await asyncio.wait_for(wait_pty(handle), timeout=5.0)
+                if exited is None or exited.cancelled() or not exited.done():
+                    with suppress(Exception):
+                        await asyncio.wait_for(wait_pty(handle), timeout=5.0)
 
     try:
         output, returncode = asyncio.run(collect())

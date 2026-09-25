@@ -4,7 +4,7 @@ import { useI18n } from 'vue-i18n'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
 import Icon from '@/components/Icon.vue'
-import MemoryLearningGroup from '@/components/settings/MemoryLearningGroup.vue'
+import MemoryDreamSettings from '@/components/settings/MemoryDreamSettings.vue'
 
 defineProps<{
   autoCapture: boolean
@@ -15,7 +15,6 @@ defineProps<{
 const { t } = useI18n()
 const emit = defineEmits<{
   'update-auto-capture': [enabled: boolean]
-  'open-agent-configuration': []
   'open-data-maintenance': []
   'copy-config-path': []
 }>()
@@ -73,9 +72,6 @@ function localStorageGet(key: string): string | null {
   try { return localStorage.getItem(key) } catch { return null }
 }
 
-const agentConfigAriaLabel = computed(() =>
-  `${t('setup.advanced.agentConfigAction')}: ${t('setup.advanced.agentConfigLabel')}`,
-)
 </script>
 
 <template>
@@ -107,7 +103,7 @@ const agentConfigAriaLabel = computed(() =>
         <span>{{ t('shared.loading') }}</span>
       </div>
 
-      <MemoryLearningGroup />
+      <MemoryDreamSettings />
     </div>
 
     <h4 class="advanced-group advanced-group--section">{{ t('setup.advanced.experimentsGroup') }}</h4>
@@ -177,23 +173,6 @@ const agentConfigAriaLabel = computed(() =>
           :aria-label="t('settings.dialog.copyConfigPath')" :title="t('settings.dialog.copyConfigPath')"
           @click="emit('copy-config-path')"
         ><Icon name="copy" :size="14" /></button>
-      </div>
-    </div>
-
-    <div class="control-row">
-      <div class="control-row__label-block">
-        <span class="control-row__label">{{ t('setup.advanced.agentConfigLabel') }}</span>
-        <span class="control-row__desc">{{ t('setup.advanced.agentConfigDesc') }}</span>
-      </div>
-      <div class="control-row__control">
-        <button
-          type="button"
-          class="btn btn--ghost"
-          :aria-label="agentConfigAriaLabel"
-          @click="emit('open-agent-configuration')"
-        >
-          {{ t('setup.advanced.agentConfigAction') }}
-        </button>
       </div>
     </div>
 

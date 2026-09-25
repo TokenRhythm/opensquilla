@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.env import load_env
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.paths import native_io_path
@@ -106,7 +107,7 @@ def test_long_home_config_migration_rewrites_and_backs_up(
         assert loaded.llm_ensemble.aggregator_timeout_seconds == 3600.0
         assert loaded.config_path == os.fspath(config_path)
         assert not loaded.config_path.startswith("\\\\?\\")
-        assert "config_version = 1" in rewritten
+        assert f"config_version = {LATEST_CONFIG_VERSION}" in rewritten
         assert "proposer_timeout_seconds = 3600.0" in rewritten
         assert len(backups) == 1
         assert "proposer_timeout_seconds = 300.0" in backups[0].read_text(

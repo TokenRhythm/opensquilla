@@ -183,22 +183,8 @@ class ProductActive(GrowthEventBase):
     surface: ClientSurface
 
 
-class MetaSkillUsage(GrowthEventBase):
-    """One MetaSkill run whose first executable step has started."""
-
-    event_name: Literal["metaskill_usage"]
-    source: Literal[EventSource.RUNTIME]
-    notice_version: Literal["growth-v2"]
-    outcome: None
 
 
-class CodingModeUsage(GrowthEventBase):
-    """One Coding Mode run whose coding agent process has started."""
-
-    event_name: Literal["coding_mode_usage"]
-    source: Literal[EventSource.RUNTIME]
-    notice_version: Literal["growth-v2"]
-    outcome: None
 
 
 GrowthEvent = Annotated[
@@ -214,9 +200,7 @@ GrowthEvent = Annotated[
     | FirstTurnStarted
     | FirstTurnSucceeded
     | ClientLaunch
-    | ProductActive
-    | MetaSkillUsage
-    | CodingModeUsage,
+    | ProductActive,
     Field(discriminator="event_name"),
 ]
 
@@ -226,7 +210,6 @@ GROWTH_EVENT_ADAPTER: TypeAdapter[GrowthEvent] = TypeAdapter(GrowthEvent)
 __all__ = [
     "AcquisitionEventBase",
     "ClientLaunch",
-    "CodingModeUsage",
     "DownloadClick",
     "DownloadServed",
     "FirstAppReady",
@@ -239,7 +222,6 @@ __all__ = [
     "InstallResult",
     "InstallStarted",
     "LandingView",
-    "MetaSkillUsage",
     "OnboardingCompleted",
     "ProductActive",
     "RegistrationErrorCode",

@@ -8,7 +8,10 @@ is also a user-visible install contract.
 from __future__ import annotations
 
 import json
+import shutil
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -121,6 +124,40 @@ def test_readme_points_at_user_facing_file(project_table: dict) -> None:
     )
 
 
+def test_wheel_preserves_release_license_notices(isolated_core_wheel: Path) -> None:
+    with zipfile.ZipFile(isolated_core_wheel) as archive:
+        metadata_path = next(
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        dist_info = metadata_path.rsplit("/", 1)[0]
+        metadata = archive.read(metadata_path).decode("utf-8")
+        for filename in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+            assert archive.read(f"{dist_info}/licenses/{filename}") == (
+                PYPROJECT.parent / filename
+            ).read_bytes()
+            assert f"License-File: {filename}" in metadata.splitlines()
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
+def test_sdist_preserves_release_license_notices(tmp_path: Path) -> None:
+    from scripts.build_test_core_wheel import build_isolated_core_wheel
+
+    # CI's shared wheel fixture intentionally carries only a wheel. Build the
+    # source distribution explicitly instead of relying on its local fallback.
+    wheel = build_isolated_core_wheel(PYPROJECT.parent, tmp_path)
+    sdists = list(wheel.parent.glob("opensquilla-*.tar.gz"))
+    assert len(sdists) == 1
+    with tarfile.open(sdists[0], "r:gz") as archive:
+        for filename in ("LICENSE", "THIRD_PARTY_NOTICES.md"):
+            name = next(
+                name for name in archive.getnames()
+                if name.count("/") == 1 and name.endswith(f"/{filename}")
+            )
+            member = archive.extractfile(name)
+            assert member is not None
+            assert member.read() == (PYPROJECT.parent / filename).read_bytes()
+
+
 def test_html_coder_reference_files_are_packaged() -> None:
     """html-coder's SKILL.md links to local references that must survive wheels."""
 
@@ -166,6 +203,7 @@ def test_standard_distributions_require_verified_generated_webui() -> None:
     assert "opensquilla-webui/public/music/**" not in hatch["targets"]["sdist"][
         "artifacts"
     ]
+    assert "opensquilla-webui/public/music/**" in hatch["targets"]["sdist"]["exclude"]
     assert (PYPROJECT.parent / "hatch_build.py").is_file()
     assert (PYPROJECT.parent / "scripts" / "verify_webui_artifact.py").is_file()
     assert (PYPROJECT.parent / "opensquilla-webui" / "scripts" / "stage-dist.mjs").is_file()
@@ -181,6 +219,7 @@ def test_webui_build_owns_dist_and_stages_the_package_copy() -> None:
         )
     )
     assert "outDir: resolve(__dirname, 'dist')" in vite
+    assert "publicDir: resolve(__dirname, 'public-assets')" in vite
     assert "scripts/stage-dist.mjs" in package["scripts"]["build:artifact"]
 
 

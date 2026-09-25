@@ -46,35 +46,6 @@ def test_dream_factory_uses_public_turn_runner_lock_surface() -> None:
 
 
 @pytest.mark.asyncio
-async def test_post_dream_hook_invoked_on_successful_run() -> None:
-    """When build_dream succeeds the hook fires with the same agent_id."""
-
-    class _StubDream:
-        def __init__(self, agent_id: str) -> None:
-            self.agent_id = agent_id
-
-        async def run(self) -> object:
-            class _R:
-                files_processed = 0
-                evidence_status = "ok"
-                apply_status = "ok"
-            return _R()
-
-    captured: list[tuple[str, str]] = []
-
-    async def hook(agent_id: str, dream_summary: str) -> None:
-        captured.append((agent_id, dream_summary))
-
-    handler = make_memory_dream_handler(
-        build_dream=lambda aid: _StubDream(aid),
-        post_dream_hook=hook,
-    )
-    result = await handler(CronJob(id="dream-x", payload={"agent_id": "agent-x"}))
-    assert result.summary.startswith("dream agent=agent-x")
-    assert captured == [("agent-x", result.summary)]
-
-
-@pytest.mark.asyncio
 async def test_memory_dream_handler_binds_synthetic_usage_scope() -> None:
     from opensquilla.engine.usage_accounting import current_usage_accounting_scope
 
@@ -104,55 +75,6 @@ async def test_memory_dream_handler_binds_synthetic_usage_scope() -> None:
     assert observed[0].agent_id == "worker"
     assert observed[0].run_kind == "memory_dream"
     assert observed[0].session_id
-
-
-@pytest.mark.asyncio
-async def test_post_dream_hook_exception_does_not_poison_handler_result() -> None:
-    """Hook failure logs an exception but the dream's HandlerResult
-    must still reflect the successful dream — observability cannot
-    convert a working dream into a failed one."""
-
-    class _StubDream:
-        async def run(self) -> object:
-            class _R:
-                files_processed = 1
-                evidence_status = "ok"
-                apply_status = "ok"
-            return _R()
-
-    async def hook(_agent_id: str, _dream_summary: str) -> None:
-        raise RuntimeError("auto_propose blew up")
-
-    handler = make_memory_dream_handler(
-        build_dream=lambda _aid: _StubDream(),
-        post_dream_hook=hook,
-    )
-    result = await handler(CronJob(id="dream-y", payload={"agent_id": "main"}))
-    assert result.summary.startswith("dream agent=main")
-    assert "blew up" not in result.summary
-
-
-@pytest.mark.asyncio
-async def test_post_dream_hook_not_called_when_dream_skipped() -> None:
-    """Predicate-skip path short-circuits before the hook would fire."""
-
-    fired = False
-
-    async def hook(_agent_id: str, _dream_summary: str) -> None:
-        nonlocal fired
-        fired = True
-
-    def build(_aid: str) -> object:
-        raise AssertionError("dream should not be built when skipped")
-
-    handler = make_memory_dream_handler(
-        build_dream=build,
-        should_skip=lambda: "disabled",
-        post_dream_hook=hook,
-    )
-    result = await handler(CronJob(id="dream-z", payload={"agent_id": "main"}))
-    assert result.delivery_status == "skipped"
-    assert fired is False
 
 
 @pytest.mark.asyncio

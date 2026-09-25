@@ -149,6 +149,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "sandbox.run_mode.preference.get",
         "sessions.list",
         "sessions.messages.hydrate",
+        "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     }
@@ -164,7 +165,7 @@ _PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
 _ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
 _MAX_ACTIVE_PROVIDER_PROBES = 16
 _BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
-    {"meta.drafts.list", "skills.install"}
+    {"skills.install"}
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS,
 )
@@ -2258,7 +2259,6 @@ async def handle_ws_connection(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2446,10 +2446,16 @@ async def handle_ws_connection(
         conn._enable_flow()
 
     # Step 6: Send HelloOk
+    from opensquilla.gateway.turn_receipts import (
+        TURN_RECEIPT_CAPABILITY,
+        TURN_RECEIPT_METHOD,
+        can_read_turn_receipts,
+    )
+
     hello = HelloOk(
         protocol=negotiated,
         server=ServerInfo(version=__version__, conn_id=conn_id),
-        features=_build_features(dispatcher),
+        features=_build_features(dispatcher, principal=conn.principal),
         snapshot=SnapshotInfo(
             uptime_ms=int(time.time() * 1000),
             config_path=config.config_path,
@@ -2457,6 +2463,12 @@ async def handle_ws_connection(
             auth_mode=config.auth.mode,
         ),
         policy=PolicyInfo(
+            turn_receipt_lookup=(
+                TURN_RECEIPT_CAPABILITY
+                if can_read_turn_receipts(conn.principal)
+                and TURN_RECEIPT_METHOD in dispatcher.list_methods()
+                else None
+            ),
             transport_probe_nonce=PROBE_CAPABILITY in conn.client_caps,
             transport_flow=(
                 {
@@ -2531,7 +2543,6 @@ async def handle_ws_connection(
             channel_manager,
             usage_tracker,
             usage_event_sink,
-            meta_run_writer,
             skill_loader,
             skill_management_state,
             cron_scheduler,
@@ -2745,7 +2756,6 @@ async def _message_loop(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2923,7 +2933,6 @@ async def _message_loop(
                 ),
                 usage_tracker=usage_tracker,
                 usage_event_sink=usage_event_sink,
-                meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 skill_management_service=skill_management_service,
                 skill_management_state=(
@@ -3133,11 +3142,14 @@ async def _dispatch_and_send(
     await conn.send_res(response)
 
 
-def _build_features(dispatcher: RpcDispatcher) -> Any:
+def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = None) -> Any:
     from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
+    from opensquilla.gateway.turn_receipts import TURN_RECEIPT_METHOD, can_read_turn_receipts
 
     methods = dispatcher.list_methods()
+    if principal is not None and not can_read_turn_receipts(principal):
+        methods = [method for method in methods if method != TURN_RECEIPT_METHOD]
     events = [
         "connect.challenge",
         "agent",

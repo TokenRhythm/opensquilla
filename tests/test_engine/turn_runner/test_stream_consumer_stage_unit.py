@@ -1117,7 +1117,7 @@ def test_tool_result_handler_updates_tool_use_name_after_runtime_coercion() -> N
     state.turn_segments.append(
         {
             "type": "tool_use",
-            "tool_use_id": "meta-1",
+            "tool_use_id": "skill-1",
             "name": "skill_view",
             "input": "",
         }
@@ -1125,17 +1125,17 @@ def test_tool_result_handler_updates_tool_use_name_after_runtime_coercion() -> N
 
     _ToolResultHandler().handle(
         ToolResultEvent(
-            tool_use_id="meta-1",
-            tool_name="meta_invoke",
-            result="meta-skill 'meta-travel-planner' completed.",
-            arguments={"name": "meta-travel-planner"},
+            tool_use_id="skill-1",
+            tool_name="skill_view",
+            result="Skill instructions loaded.",
+            arguments={"name": "git-diff"},
         ),
         state,
     )
 
-    assert state.turn_segments[0]["name"] == "meta_invoke"
-    assert state.turn_segments[0]["input"] == {"name": "meta-travel-planner"}
-    assert state.turn_segments[1]["name"] == "meta_invoke"
+    assert state.turn_segments[0]["name"] == "skill_view"
+    assert state.turn_segments[0]["input"] == {"name": "git-diff"}
+    assert state.turn_segments[1]["name"] == "skill_view"
 
 
 def test_tool_result_handler_replaces_intermediate_approval_result() -> None:
@@ -3000,48 +3000,19 @@ async def test_outer_stage_persists_literal_text_before_native_tool_segment() ->
     ]
 
 
-@pytest.mark.asyncio
-async def test_outer_stage_surfaces_completed_meta_when_done_text_is_empty() -> None:
-    agent_run = _RecordingAgentRun(
-        events=[
-            ToolResultEvent(
-                tool_use_id="meta-1",
-                tool_name="meta_invoke",
-                result="meta-skill 'AwesomeWebpageMetaSkill' completed.",
-                is_error=False,
-                arguments={"name": "AwesomeWebpageMetaSkill"},
-            ),
-            DoneEvent(text=""),
-        ]
-    )
-    stage, _ = _make_stage(agent_run=agent_run)
-    inp = _make_input()
-
-    yielded = await _drain(stage, inp)
-
-    kinds = [type(e).__name__ for e in yielded]
-    assert kinds == ["ToolResultEvent", "TextDeltaEvent", "DoneEvent"]
-    fallback = yielded[1]
-    assert isinstance(fallback, TextDeltaEvent)
-    assert "AwesomeWebpageMetaSkill" in fallback.text
-    assert "没有生成可展示的最终回答" in fallback.text
-    done = yielded[2]
-    assert isinstance(done, DoneEvent)
-    assert done.text == "".join(inp.state.final_text_parts)
-    assert done.text == fallback.text
 
 
 @pytest.mark.asyncio
-async def test_outer_stage_preserves_meta_text_when_done_text_is_empty() -> None:
+async def test_outer_stage_preserves_answer_text_when_done_text_is_empty() -> None:
     agent_run = _RecordingAgentRun(
         events=[
-            TextDeltaEvent(text="Final meta answer"),
+            TextDeltaEvent(text="Final answer"),
             ToolResultEvent(
-                tool_use_id="meta-1",
-                tool_name="meta_invoke",
-                result="meta-skill 'meta-kid-project-planner' completed.",
+                tool_use_id="skill-1",
+                tool_name="skill_view",
+                result="Skill instructions loaded.",
                 is_error=False,
-                arguments={"name": "meta-kid-project-planner"},
+                arguments={"name": "git-diff"},
             ),
             DoneEvent(text=""),
         ]
@@ -3055,8 +3026,8 @@ async def test_outer_stage_preserves_meta_text_when_done_text_is_empty() -> None
     assert kinds == ["TextDeltaEvent", "ToolResultEvent", "DoneEvent"]
     done = yielded[2]
     assert isinstance(done, DoneEvent)
-    assert done.text == "Final meta answer"
-    assert inp.state.final_text_parts == ["Final meta answer"]
+    assert done.text == "Final answer"
+    assert inp.state.final_text_parts == ["Final answer"]
 
 
 @pytest.mark.asyncio

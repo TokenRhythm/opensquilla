@@ -276,21 +276,26 @@ def establish_windows_network_setup(path: Path) -> WindowsNetworkSetup:
     )
 
 
-def run_elevated_setup_helper(path: Path) -> None:
+def run_elevated_setup_helper(path: Path, *, already_elevated: bool = False) -> None:
     try:
         setup_helper_report_path(path).unlink()
     except FileNotFoundError:
         pass
     payload = _encode_setup_helper_payload(path, user_sid=_current_windows_user_sid())
     helper_args = ["--elevated-helper", payload]
-    if not getattr(sys, "frozen", False):
-        helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
-    parameters = subprocess.list2cmdline(helper_args)
-    exit_code = _shell_execute_runas_and_wait(
-        executable=sys.executable,
-        parameters=parameters,
-        directory=str(_setup_helper_import_root()),
-    )
+    if already_elevated:
+        # Use the same validated, locked setup and ACL repair for an admin
+        # caller, without requesting another UAC elevation.
+        exit_code = elevated_setup_helper_main(helper_args)
+    else:
+        if not getattr(sys, "frozen", False):
+            helper_args = ["-m", "opensquilla.sandbox.backend.windows_default_setup", *helper_args]
+        parameters = subprocess.list2cmdline(helper_args)
+        exit_code = _shell_execute_runas_and_wait(
+            executable=sys.executable,
+            parameters=parameters,
+            directory=str(_setup_helper_import_root()),
+        )
     if exit_code != 0:
         detail = _setup_helper_report_detail(path)
         message = f"windows_setup_helper_failed: exit={exit_code}"
@@ -931,10 +936,17 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
         "$user = Get-LocalUser -Name $name; "
         "$user.SID.Value"
     )
-    env = {**os.environ, "OPENSQUILLA_SANDBOX_PASSWORD": password}
+    powershell = _trusted_windows_powershell_path()
+    env = {
+        **os.environ,
+        "OPENSQUILLA_SANDBOX_PASSWORD": password,
+        # Keep PowerShell 7 compatibility modules out of inbox Windows
+        # PowerShell resolution; they can shadow Microsoft.PowerShell.Security.
+        "PSModulePath": str(Path(powershell).parent / "Modules"),
+    }
     completed = subprocess.run(
         [
-            "powershell",
+            powershell,
             "-NoProfile",
             "-ExecutionPolicy",
             "Bypass",
@@ -957,6 +969,20 @@ def ensure_offline_sandbox_user(state_root: Path) -> dict[str, str]:
         "username": OFFLINE_USERNAME,
         "protectedPassword": protect_password(password),
     }
+
+
+def _trusted_windows_powershell_path() -> str:
+    """Use inbox Windows PowerShell for LocalAccounts and ADSI setup.
+
+    PowerShell 7 can resolve these commands through compatibility modules but
+    hosted runners may not be able to load those modules. The inbox binary is
+    present on supported Windows hosts and owns the LocalAccounts module.
+    """
+
+    system_root = os.environ.get("SystemRoot") or os.environ.get("SYSTEMROOT") or ""
+    if system_root and "\x00" not in system_root:
+        return str(Path(system_root) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe")
+    return r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
 
 
 def lock_persistent_sandbox_dirs(

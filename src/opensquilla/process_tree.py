@@ -336,6 +336,7 @@ def _prepare_private_directory(path: Path) -> None:
                 directory=True,
                 expected_device=int(metadata.st_dev),
                 expected_inode=int(metadata.st_ino),
+                skip_if_private_directory=True,
             )
             current = os.lstat(path)
             if (

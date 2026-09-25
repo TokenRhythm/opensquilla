@@ -207,8 +207,8 @@ function createHarness(options: {
       rawApi.restoreLiveTurnSnapshot(snapshot),
     handlers: {
       ...rawApi.handlers,
-      onWireEventFixture: (eventName: string, payload: unknown) => {
-        receive(eventName, payload)
+      onWireEventFixture: (eventName: string, payload: unknown, meta?: { replayed?: boolean }) => {
+        receive(eventName, payload, meta)
       },
     },
   }
@@ -244,6 +244,84 @@ function createHarness(options: {
     stop: () => { detach(); scope.stop(); compaction?.cleanup(); streamRuntime?.cleanup() },
   }
 }
+
+describe('cross-window primary input hydration', () => {
+  const key = 'agent:main:test'
+  const primaryInput = {
+    key, task_id: 'task-peer', turn_id: 'task-peer',
+    user_message_id: 'user-peer', client_message_id: 'client-peer',
+    intent: 'send', disposition: 'applied', revision: 1,
+  }
+
+  it.each(['task.queued', 'task.running', 'session.event.input_disposition'])(
+    'hydrates a peer input on %s without ending its live response', event => {
+      const h = createHarness()
+      try {
+        h.api.handlers.onWireEventFixture(event, primaryInput)
+        expect(h.scheduleHistorySync).toHaveBeenCalledWith(true, 'user-peer')
+        expect(h.stream.endStreaming).not.toHaveBeenCalled()
+        expect(h.stream.resetLiveTurnState).not.toHaveBeenCalled()
+      } finally { h.stop() }
+    },
+  )
+
+  it.each([
+    { messageId: 'user-peer' },
+    { clientId: 'client-peer' },
+  ])('keeps the originating window optimistic input without another read: %o', identity => {
+    const h = createHarness({ messages: [{ role: 'user', text: 'local input', ts: 0, ...identity }] })
+    try {
+      for (const event of ['task.queued', 'task.running', 'session.event.input_disposition']) {
+        h.api.handlers.onWireEventFixture(event, primaryInput)
+      }
+      expect(h.scheduleHistorySync).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('rejects foreign sessions and retired epochs before scheduling primary hydration', () => {
+    const h = createHarness()
+    h.currentEpoch.value = 2
+    try {
+      for (const event of ['task.queued', 'task.running', 'session.event.input_disposition']) {
+        h.api.handlers.onWireEventFixture(event, { ...primaryInput, key: 'agent:main:other' })
+        h.api.handlers.onWireEventFixture(event, { ...primaryInput, epoch: 1 })
+      }
+      expect(h.scheduleHistorySync).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('hydrates a queued successor without replacing the running task owner', () => {
+    const ownership = useChatTaskOwnership()
+    ownership.noteRunning({ task_id: 'task-running', status: 'running' })
+    const h = createHarness({ taskOwnership: ownership })
+    h.activeStreamTaskId.value = 'task-running'
+    try {
+      h.api.handlers.onWireEventFixture('task.queued', primaryInput)
+      expect(h.scheduleHistorySync).toHaveBeenCalledWith(true, 'user-peer')
+      expect(h.activeStreamTaskId.value).toBe('task-running')
+      expect(ownership.runningTaskId.value).toBe('task-running')
+      expect(h.applySessionRunState).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('does not invent a history target for lifecycle events without a durable message id', () => {
+    const h = createHarness()
+    try {
+      for (const event of ['task.queued', 'task.running', 'session.event.input_disposition']) {
+        h.api.handlers.onWireEventFixture(event, { ...primaryInput, user_message_id: undefined })
+      }
+      expect(h.scheduleHistorySync).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+
+  it('leaves replayed primary inputs to bootstrap history rather than requiring an old user row', () => {
+    const h = createHarness()
+    try {
+      h.api.handlers.onWireEventFixture('session.event.input_disposition', primaryInput, { replayed: true })
+      expect(h.scheduleHistorySync).not.toHaveBeenCalled()
+    } finally { h.stop() }
+  })
+})
 
 describe('Skill load event delivery', () => {
   const receipt = {

@@ -55,7 +55,7 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
     targetIdentity(target.kind, target.wireName, target.role)
   )))
   for (const wireName of [
-    'meta.inspect', 'meta.list', 'telemetry.product_active.record', 'plans.setPresentation',
+    'telemetry.product_active.record', 'plans.setPresentation',
     'skills.candidates', 'skills.setEnabled',
   ]) {
     const contract = inventory.find(entry => entry.kind === 'method' && entry.wireName === wireName)
@@ -67,6 +67,14 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       `method:${wireName}:result`,
     ], `${wireName}: production must expose only the result validator`)
   }
+  const receipt = inventory.find(entry => entry.kind === 'method' && entry.wireName === 'turns.receipt.get')
+  assert.ok(receipt, 'turns.receipt.get: complete Contract is required')
+  assert.deepEqual(receipt.targets.map(target => target.role).sort(), [
+    'params', 'request', 'response', 'result',
+  ], 'turns.receipt.get: all verification roles are required')
+  assert.deepEqual([...selected].filter(identity => identity.startsWith('method:turns.receipt.get:')), [
+    'method:turns.receipt.get:params', 'method:turns.receipt.get:result',
+  ], 'turns.receipt.get: production must expose exactly params and result validators')
   const fixtures = fixtureValues(repositoryRoot)
   const result = {
     contracts: inventory.length, roles: 0, comparedRoles: 0, comparedInputs: 0,
@@ -110,8 +118,9 @@ export async function verifyProfiles({ baselineRoot, verificationRoot } = {}) {
       result.roles++
     }
   }
-  assert.equal(result.roles, 910)
-  assert.equal(result.comparedRoles, baselineRoot ? 897 : selected.size)
+  assert.equal(result.roles, 818)
+  // A complete baseline omits only the frozen sessions.list params validator.
+  assert.equal(result.comparedRoles, baselineRoot ? result.roles - 1 : selected.size)
   assert.deepEqual(result.rolesWithoutPositiveSeed, [], 'each role requires a positive seed')
   if (baselineRoot) assert.deepEqual(result.supplementalRoles, [
     'method:sessions.list:params',

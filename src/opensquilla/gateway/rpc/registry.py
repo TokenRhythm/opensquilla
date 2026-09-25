@@ -185,7 +185,6 @@ class RpcContext:
     channel_manager: Any = None  # ChannelManager | None (injected at boot)
     usage_tracker: Any = None  # UsageTracker instance (injected at boot)
     usage_event_sink: Any = None  # Durable per-provider-call accounting sink.
-    meta_run_writer: Any = None  # MetaRunWriter instance (injected at boot)
     skill_loader: Any = None  # SkillLoader instance (injected at boot)
     skill_management_service: Any = None  # Shared Community Skill mutation service
     skill_management_state: dict[str, Any] = field(default_factory=dict)
@@ -488,7 +487,7 @@ class RpcRegistry:
                 )
             if isinstance(exc, PrimaryProviderChangedError):
                 return make_error_res(
-                    req_id, "CONFLICT", str(exc), details={"reason": "primary_changed"}
+                    req_id, "CONFLICT", str(exc), details={"reason": exc.reason}
                 )
             if _is_artifact_product_method(method):
                 return _safe_artifact_dispatch_failure(

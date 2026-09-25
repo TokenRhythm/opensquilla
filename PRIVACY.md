@@ -99,8 +99,7 @@ Complete exception messages and stacks remain local.
 ### Product and growth analytics
 
 While unified reporting is enabled, OpenSquilla may record client launches,
-actual MetaSkill and Coding Mode executions, and
-one-time funnel milestones for acquisition, onboarding completion, first app
+product activity, and one-time funnel milestones for acquisition, onboarding completion, first app
 readiness, registration, first turn start, and first successful response.
 Product activity is recorded at most once per device, local profile, surface, and
 UTC day. The server calculates daily active devices and rolling 30-day monthly

@@ -304,31 +304,6 @@ async function assertUnifiedTelemetryNotice(page) {
   assert.equal(await page.locator('[data-i18n="onboarding.telemetry.notice"]').count(), 1)
 }
 
-async function captureOnboarding(app, path) {
-  const base64 = await app.evaluate(async ({ BrowserWindow }) => {
-    const window = BrowserWindow.getAllWindows().find((candidate) => (
-      candidate.webContents.getURL().startsWith('data:text/html')
-    ))
-    if (!window) throw new Error('Onboarding window not found for screenshot')
-    window.show()
-    window.focus()
-    await window.webContents.executeJavaScript(`
-      new Promise((resolve) => {
-        const root = document.documentElement;
-        root.style.display = 'none';
-        void root.offsetHeight;
-        root.style.display = '';
-        requestAnimationFrame(() => requestAnimationFrame(resolve));
-      })
-    `)
-    window.webContents.invalidate()
-    await new Promise((resolve) => setTimeout(resolve, 120))
-    const image = await window.capturePage()
-    return image.toPNG().toString('base64')
-  })
-  await writeFile(path, Buffer.from(base64, 'base64'))
-}
-
 async function controlPage(app) {
   return await waitFor(async () => {
     for (const page of app.windows()) {
@@ -369,6 +344,17 @@ with sqlite3.connect(Path(sys.argv[1]) / "state" / "sessions.db") as connection:
     row = connection.execute("SELECT body FROM synthetic_import_chat WHERE id = ?", ("session-1",)).fetchone()
     print(row[0] if row else "")
 `, [home])
+}
+
+function snapshotSyntheticChatTable(home) {
+  return JSON.parse(runPython(`
+import json, sqlite3, sys
+from pathlib import Path
+with sqlite3.connect(Path(sys.argv[1]) / "state" / "sessions.db") as connection:
+    schema = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", ("synthetic_import_chat",)).fetchone()
+    rows = connection.execute("SELECT id, body FROM synthetic_import_chat ORDER BY id").fetchall()
+    print(json.dumps({"schema": schema[0] if schema else None, "rows": rows}))
+`, [home]))
 }
 
 const root = await realpath(await mkdtemp(join(tmpdir(), 'opensquilla-profile-import-e2e-')))
@@ -486,18 +472,21 @@ try {
   seedProfile(source, SOURCE_IDENTITY, SOURCE_CHAT)
   seedProfile(target, TARGET_IDENTITY, 'synthetic previous Desktop chat')
   const targetWorkspaceBefore = await snapshotTree(join(target, 'workspace'))
-  const targetSessionsBefore = await readFile(join(target, 'state', 'sessions.db'))
+  const targetSessionsBefore = snapshotSyntheticChatTable(target)
   const targetConfigBefore = await readFile(join(target, 'config.toml'))
   app = await launchDesktop(userData, importHome, 18922)
   activeAppUserData = userData
-  page = await onboardingPage(app)
-  await page.locator('[data-screen="1"].active').waitFor({ state: 'visible' })
-  assert.equal(await page.locator('[data-screen="0"]').count(), 0)
-  assert.equal(await page.locator('[data-screen="5"]').count(), 0)
+  page = await controlPage(app)
+  for (const candidate of app.windows()) {
+    if (!candidate.isClosed()) {
+      assert.equal(await candidate.locator('#setup-form').count(), 0,
+        'an existing usable config must start the client without credential onboarding')
+    }
+  }
+  await assert.rejects(lstat(join(userData, 'desktop-credential.json')), { code: 'ENOENT' },
+    'starting a config-only profile must not manufacture a Desktop credential')
   if (importScreenshotDir) {
-    await page.locator('#onboardingLocale').selectOption('zh-Hans')
-    await page.waitForTimeout(220)
-    await captureOnboarding(app, join(importScreenshotDir, '04-existing-profile-no-import.png'))
+    await page.screenshot({ path: join(importScreenshotDir, '04-existing-profile-no-import.png') })
   }
   assert.equal(await readFile(join(target, 'workspace', 'IDENTITY.md'), 'utf8'), TARGET_IDENTITY)
   assert.equal(await readFile(join(target, 'workspace', 'USER.md'), 'utf8'), '# Synthetic user\n')
@@ -505,8 +494,14 @@ try {
   assert.equal(await readFile(join(target, 'workspace', 'MEMORY.md'), 'utf8'), '# Synthetic memory\n')
   assert.equal(readSyntheticChat(target), 'synthetic previous Desktop chat')
   assert.deepEqual(await readFile(join(target, 'config.toml')), targetConfigBefore)
-  assert.deepEqual(await readFile(join(target, 'state', 'sessions.db')), targetSessionsBefore)
-  assert.deepEqual(await snapshotTree(join(target, 'workspace')), targetWorkspaceBefore)
+  // Gateway boot legitimately adds its schema to the fixture DB and missing
+  // workspace templates. Preserve every original table row/schema and every
+  // original workspace entry's bytes/mode while permitting those additions.
+  assert.deepEqual(snapshotSyntheticChatTable(target), targetSessionsBefore)
+  const targetWorkspaceAfter = await snapshotTree(join(target, 'workspace'))
+  for (const [path, entry] of Object.entries(targetWorkspaceBefore)) {
+    assert.deepEqual(targetWorkspaceAfter[path], entry, `startup changed existing workspace entry ${path}`)
+  }
   assert.equal((await readdir(userData)).some((name) => name.startsWith('opensquilla.backup.')), false)
   await closeActiveApp('existing-profile-electron-shutdown')
 
@@ -592,17 +587,20 @@ try {
   )
   await requiredKeyOnboarding.locator('#apiKey').fill('synthetic-new-imported-key')
   await assertUnifiedTelemetryNotice(requiredKeyOnboarding)
-  await requiredKeyOnboarding.locator('#finish').click()
+  await requiredKeyOnboarding.locator('#probe').click()
 
   const rejectedProbeError = await waitFor(async () => {
-    const error = (await requiredKeyOnboarding.locator('#error').innerText()).trim()
-    const ready = await requiredKeyOnboarding.locator('#setup-form').getAttribute('aria-busy')
-      === 'false'
-    return error && ready && !await requiredKeyOnboarding.locator('#finish').isDisabled()
+    const error = (await requiredKeyOnboarding.locator('#apiKeyError').innerText()).trim()
+    return error && !await requiredKeyOnboarding.locator('#probe').isDisabled()
       ? error
       : null
-  }, 'rejected imported credential probe')
-  assert.match(rejectedProbeError, /401|authentication|credential|API key/i)
+  }, 'rejected optional imported credential probe')
+  assert.equal(rejectedProbeError, 'The key was rejected. Check it and paste it again.')
+  assert.equal(await requiredKeyOnboarding.locator('#probeStatus').innerText(), rejectedProbeError)
+  assert.equal(await requiredKeyOnboarding.locator('#apiKey').getAttribute('aria-invalid'), 'true')
+  assert.equal(await requiredKeyOnboarding.locator('#finish').isDisabled(), false)
+  assert.equal(await requiredKeyOnboarding.locator('#skip').isDisabled(), false)
+  assert.notEqual(await requiredKeyOnboarding.locator('#setup-form').getAttribute('aria-busy'), 'true')
   assert.equal(rejectedProbeError.includes('synthetic-new-imported-key'), false)
   assert.deepEqual(
     await readFile(join(settingsUserData, 'desktop-credential.json')).catch(() => null),
@@ -617,7 +615,9 @@ try {
   assert.deepEqual(await readFile(join(settingsTarget, 'config.toml')), importedConfigBeforeCredential)
   assert.deepEqual(await readFile(join(settingsTarget, '.env')), importedEnvBytes)
 
-  fakeProvider.setMode('success')
+  const requestsBeforeSave = fakeProvider.requests.length
+  assert.equal(requestsBeforeSave, 1, 'only the explicitly requested probe may call the provider')
+  // Keep the provider rejecting the key: local adoption must still complete.
   await requiredKeyOnboarding.locator('#finish').click()
 
   const adopted = await waitFor(async () => {
@@ -636,7 +636,10 @@ try {
     Buffer.from(adopted.encryptedApiKey, 'base64').toString('utf8'),
     'synthetic-new-imported-key',
   )
-  assert.equal(fakeProvider.requests.length, 2)
+  await waitFor(() => requiredKeyOnboarding.isClosed(), 'saved import onboarding to close')
+  await controlPage(app)
+  assert.equal(fakeProvider.requests.length, requestsBeforeSave,
+    'saving an imported credential must not re-probe after an optional 401')
   assert.equal(fakeProvider.requests[0].method, 'POST')
   assert.equal(fakeProvider.requests[0].url, '/v1/chat/completions')
   assert.equal(
@@ -644,13 +647,6 @@ try {
     'Bearer synthetic-new-imported-key',
   )
   assert.equal(JSON.parse(fakeProvider.requests[0].body).model, 'gpt-5.4-mini')
-  assert.equal(fakeProvider.requests[1].method, 'POST')
-  assert.equal(fakeProvider.requests[1].url, '/v1/chat/completions')
-  assert.equal(
-    fakeProvider.requests[1].authorization,
-    'Bearer synthetic-new-imported-key',
-  )
-  assert.equal(JSON.parse(fakeProvider.requests[1].body).model, 'gpt-5.4-mini')
   const adoptedConfig = await readFile(join(settingsTarget, 'config.toml'), 'utf8')
   assert.equal(
     adoptedConfig,

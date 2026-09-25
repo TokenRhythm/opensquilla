@@ -141,9 +141,6 @@ function createHarness(options: {
   }
 }
 
-function patchCalls(rpc: ReturnType<typeof createHarness>['rpc']) {
-  return rpc.call.mock.calls.filter(([method]) => method === 'config.patch.safe')
-}
 
 function routingCalls(rpc: ReturnType<typeof createHarness>['rpc']) {
   return rpc.call.mock.calls.filter(([method]) => method === 'models.routing.set')
@@ -275,178 +272,6 @@ describe('useChatFeatureToggles default model display', () => {
     expect(chatViewSource).toMatch(/Promise\.allSettled\(\[\s*newTaskModel\.refresh\(\), loadFeatureToggles\(\), chatSessionModel\.refresh\(\),\s*chatSessionRouting\.load\(\)/)
     expect(chatViewSource).toContain('connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch)')
     expect(chatViewSource).toContain('connectionAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated)')
-  })
-})
-
-describe('useChatFeatureToggles coding mode', () => {
-  it('reads enabled coding mode from backend config', async () => {
-    const readCallOptions: RpcCallOptions = {
-      timeoutMs: 2_000,
-      timeoutAction: 'reconnect',
-      abortAction: 'reconnect',
-    }
-    const { api, rpc } = createHarness({
-      configGetResults: [{ skills: { coding_mode: true } }],
-      readCallOptions,
-    })
-
-    await api.loadFeatureToggles()
-
-    expect(api.codingModeEnabled.value).toBe(true)
-    expect(rpc.call).toHaveBeenCalledWith(
-      'config.get',
-      undefined,
-      readCallOptions,
-    )
-  })
-
-  it.each([
-    {},
-    { skills: {} },
-  ])('defaults missing coding mode to off for %j', async (config) => {
-    const { api } = createHarness({
-      configGetResults: [config],
-    })
-
-    await api.loadFeatureToggles()
-
-    expect(api.codingModeEnabled.value).toBe(false)
-  })
-
-  it('writes coding mode on with the safe backend patch path', async () => {
-    const { api, rpc } = createHarness({
-      configGetResults: [{ skills: { coding_mode: true } }],
-    })
-
-    await api.setCodingModeEnabled(true)
-
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: { 'skills.coding_mode': true },
-    })
-  })
-
-  it('writes coding mode off with the safe backend patch path', async () => {
-    const { api, rpc } = createHarness({
-      configGetResults: [{ skills: { coding_mode: false } }],
-    })
-
-    await api.setCodingModeEnabled(false)
-
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: { 'skills.coding_mode': false },
-    })
-  })
-
-  it('strictly reloads backend config after a successful write', async () => {
-    const { api, rpc } = createHarness({
-      configGetResults: [{ skills: { coding_mode: true } }],
-    })
-
-    await api.setCodingModeEnabled(true)
-
-    const calls = rpc.call.mock.calls
-    const patchIndex = calls.findIndex(([method]) => method === 'config.patch.safe')
-    const getIndex = calls.findIndex(([method], index) => index > patchIndex && method === 'config.get')
-    expect(patchIndex).toBeGreaterThanOrEqual(0)
-    expect(getIndex).toBeGreaterThan(patchIndex)
-    expect(api.codingModeEnabled.value).toBe(true)
-  })
-
-  it('applies the strict post-patch config through the shared feature mapping', async () => {
-    const { api, setGlobalElevatedMode } = createHarness({
-      configGetResults: [{
-        skills: { coding_mode: true },
-        squilla_router: { enabled: true, rollout_phase: 'full' },
-        permissions: { default_mode: 'bypass' },
-      }],
-    })
-
-    await api.setCodingModeEnabled(true)
-
-    expect(api.codingModeEnabled.value).toBe(true)
-    expect(api.routerEnabled.value).toBe(true)
-    expect(setGlobalElevatedMode).toHaveBeenCalledWith('bypass')
-  })
-
-  it('keeps coding mode backend-confirmed while a write is pending', async () => {
-    const pendingPatch = deferred<void>()
-    const { api } = createHarness({
-      patchResults: [pendingPatch.promise],
-      configGetResults: [{ skills: { coding_mode: true } }],
-    })
-
-    const write = api.setCodingModeEnabled(true)
-    await Promise.resolve()
-
-    expect(api.codingModeSettingsBusy.value).toBe(true)
-    expect(api.codingModeEnabled.value).toBe(false)
-
-    pendingPatch.resolve(undefined)
-    await write
-    expect(api.codingModeEnabled.value).toBe(true)
-  })
-
-  it('rolls back when the backend patch fails', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const { api } = createHarness({
-      patchResults: [new Error('patch failed')],
-    })
-
-    await api.setCodingModeEnabled(true)
-
-    expect(api.codingModeEnabled.value).toBe(false)
-    expect(warn).toHaveBeenCalledWith('Failed to update Coding mode:', 'patch failed')
-  })
-
-  it('rolls back when post-patch config reload fails', async () => {
-    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
-    const { api } = createHarness({
-      configGetResults: [new Error('reload failed')],
-    })
-
-    await api.setCodingModeEnabled(true)
-
-    expect(api.codingModeEnabled.value).toBe(false)
-    expect(warn).toHaveBeenCalledWith('Failed to update Coding mode:', 'reload failed')
-  })
-
-  it('uses the post-patch backend value as authoritative', async () => {
-    const { api } = createHarness({
-      configGetResults: [{ skills: { coding_mode: false } }],
-    })
-
-    await api.setCodingModeEnabled(true)
-
-    expect(api.codingModeEnabled.value).toBe(false)
-  })
-
-  it('prevents overlapping coding mode writes while busy', async () => {
-    const pendingPatch = deferred<void>()
-    const { api, rpc } = createHarness({
-      patchResults: [pendingPatch.promise],
-      configGetResults: [{ skills: { coding_mode: true } }],
-    })
-
-    const firstWrite = api.setCodingModeEnabled(true)
-    await api.setCodingModeEnabled(false)
-    await Promise.resolve()
-
-    expect(patchCalls(rpc)).toHaveLength(1)
-    expect(rpc.call).toHaveBeenCalledWith('config.patch.safe', {
-      patches: { 'skills.coding_mode': true },
-    })
-
-    pendingPatch.resolve(undefined)
-    await firstWrite
-  })
-
-  it('does not persist coding mode through browser storage APIs', () => {
-    const setterStart = source.indexOf('async function setCodingModeEnabled')
-    const setterEnd = source.indexOf('function bindFeatureRefresh', setterStart)
-    const setterSource = source.slice(setterStart, setterEnd)
-
-    expect(setterSource).toContain('skills.coding_mode')
-    expect(setterSource).not.toMatch(/localStorage|sessionStorage/)
   })
 })
 
@@ -718,7 +543,6 @@ describe('useChatFeatureToggles model routing mode', () => {
       configGetResults: [
         firstConfig.promise,
         {
-          skills: { coding_mode: false },
           squilla_router: { enabled: true, rollout_phase: 'full' },
         },
       ],
@@ -735,12 +559,10 @@ describe('useChatFeatureToggles model routing mode', () => {
 
     await api.loadFeatureToggles()
     firstConfig.resolve({
-      skills: { coding_mode: true },
       llm_ensemble: { enabled: true },
     })
     await firstLoad
 
-    expect(api.codingModeEnabled.value).toBe(false)
     expect(api.modelRoutingMode.value).toBe('squilla_router')
     expect(api.modelRoutingCapabilitiesByMode.value).toEqual(EFFECTIVE_CAPABILITIES_BY_MODE)
   })
@@ -947,7 +769,6 @@ describe('useChatFeatureToggles model routing mode', () => {
     const setterSource = source.slice(setterStart, setterEnd)
 
     expect(setterSource).toContain('options.modelRouting.setRouting')
-    expect(source).toContain('options.appSettings.patchSafe')
     expect(setterSource).not.toMatch(/localStorage|sessionStorage/)
   })
 })

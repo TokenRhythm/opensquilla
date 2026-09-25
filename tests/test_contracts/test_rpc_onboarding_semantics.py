@@ -34,6 +34,7 @@ import tomllib
 import pytest
 
 import opensquilla.gateway.rpc_onboarding  # noqa: F401  ensures registration
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 
@@ -279,6 +280,7 @@ async def test_provider_configure_rejects_non_boolean_preserve_api_key(
 
 async def test_provider_resave_keeps_operator_authored_router_ladder(config_file):
     config_file.write_text(
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
         "[llm]\n"
         'provider = "openrouter"\n'
         'model = "custom/model-x"\n'
@@ -315,6 +317,7 @@ async def test_provider_resave_keeps_operator_authored_router_ladder(config_file
 
 async def test_router_disable_keeps_effective_ladder_inline(config_file):
     config_file.write_text(
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
         "[llm]\n"
         'provider = "openrouter"\n'
         'model = "custom/model-x"\n'

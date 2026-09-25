@@ -3,18 +3,35 @@
   "targets": [
     {
       "kind": "method",
+      "wireName": "turns.receipt.get",
+      "roles": [
+        "params",
+        "result"
+      ]
+    },
+    {
+      "kind": "method",
       "wireName": "sessions.processes.list",
-      "roles": ["params", "result"]
+      "roles": [
+        "params",
+        "result"
+      ]
     },
     {
       "kind": "method",
       "wireName": "sessions.processes.log",
-      "roles": ["params", "result"]
+      "roles": [
+        "params",
+        "result"
+      ]
     },
     {
       "kind": "method",
       "wireName": "sessions.processes.stop",
-      "roles": ["params", "result"]
+      "roles": [
+        "params",
+        "result"
+      ]
     },
     {
       "kind": "method",
@@ -119,28 +136,7 @@
     },
     {
       "kind": "method",
-      "wireName": "agents.create",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "agents.delete",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "agents.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "agents.update",
       "roles": [
         "result"
       ]
@@ -487,62 +483,6 @@
     },
     {
       "kind": "method",
-      "wireName": "exec.proposals.accept",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.auto_enabled.disable",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.auto_enabled.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.reject",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.settings.get",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.settings.set",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "exec.proposals.show",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "goals.capabilities",
       "roles": [
         "result"
@@ -610,83 +550,6 @@
     {
       "kind": "method",
       "wireName": "logs.tail",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.drafts.discard",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.drafts.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.inspect",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.list",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.run",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.runs.confirm_preflight",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.runs.recovery",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.runs.replay",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.setup.install",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.setup.plan",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "meta.setup.status",
       "roles": [
         "result"
       ]
@@ -961,20 +824,6 @@
       "wireName": "providers.status",
       "roles": [
         "params",
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "router.feedback.submit",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "router.selflearning.status",
-      "roles": [
         "result"
       ]
     },
