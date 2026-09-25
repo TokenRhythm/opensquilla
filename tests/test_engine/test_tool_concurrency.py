@@ -33,7 +33,6 @@ from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 # ---------------------------------------------------------------------------
 
 _TOOL_SLEEP_S = 0.2
-_SCHEDULER_TOLERANCE_S = 0.05
 
 
 def _tool_def(name: str) -> ToolDefinition:
@@ -152,8 +151,6 @@ def test_sessions_spawn_policy_keys_by_parent_session() -> None:
     assert policy.key == ("sessions_spawn", "agent:main:parent-a")
 
 
-# This test also measures wall-clock batching latency; run it outside the
-# parallel CI worker pool without relaxing either the cap or timing assertion.
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
@@ -161,13 +158,24 @@ async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
     tool_calls = [("image", {"path": f"slide-{i}.png"}) for i in range(6)]
     in_flight = 0
     max_in_flight = 0
+    started: list[str] = []
+    completed: list[str] = []
+    batch_started = [asyncio.Event() for _ in range(3)]
+    release_batch = [asyncio.Event() for _ in range(3)]
 
     async def _handler(tc: ToolCall) -> ToolResult:
         nonlocal in_flight, max_in_flight
         in_flight += 1
         max_in_flight = max(max_in_flight, in_flight)
-        await asyncio.sleep(_TOOL_SLEEP_S)
-        in_flight -= 1
+        batch = len(started) // 2
+        started.append(tc.tool_use_id)
+        try:
+            if len(started) % 2 == 0:
+                batch_started[batch].set()
+            await release_batch[batch].wait()
+            completed.append(tc.tool_use_id)
+        finally:
+            in_flight -= 1
         return ToolResult(
             tool_use_id=tc.tool_use_id,
             tool_name=tc.tool_name,
@@ -182,12 +190,33 @@ async def test_image_analysis_calls_have_dedicated_inflight_cap() -> None:
         tool_handler=_handler,
     )
 
-    t0 = time.monotonic()
-    await _collect(agent)
-    elapsed = time.monotonic() - t0
+    turn = asyncio.create_task(_collect(agent))
+    try:
+        # Bound a broken dispatcher without making scheduler speed part of
+        # the concurrency contract. Each pair must start before it is released.
+        async with asyncio.timeout(5):
+            for batch in range(3):
+                await batch_started[batch].wait()
+                # Give other runnable calls a chance to expose a missing cap.
+                await asyncio.sleep(0)
+                assert len(started) == (batch + 1) * 2
+                assert len(completed) == batch * 2
+                assert in_flight == 2
+                release_batch[batch].set()
+            await turn
+    finally:
+        for release in release_batch:
+            release.set()
+        if not turn.done():
+            turn.cancel()
+        await asyncio.gather(turn, return_exceptions=True)
 
     assert max_in_flight == 2
-    assert 3 * _TOOL_SLEEP_S - _SCHEDULER_TOLERANCE_S <= elapsed < 4 * _TOOL_SLEEP_S
+    assert in_flight == 0
+    expected_ids = [f"tool-{i}" for i in range(len(tool_calls))]
+    assert sorted(started) == expected_ids
+    assert sorted(completed) == expected_ids
+    assert len(provider.calls) == 2
 
 
 @pytest.mark.asyncio

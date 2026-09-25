@@ -8973,11 +8973,9 @@ class TurnRunner:
                     # Normal allow/deny/profile policy still applies below.
                     ctx.surfaced_tools.discard("update_plan")
                     ctx.explicitly_allowed_tools.add("update_plan")
-                if attached_plan_run:
-                    controls.add("plan_run_checkpoint")
                 if ctx.goal_service is not None or is_goal_owned_main_default_turn(ctx):
                     controls.update(
-                        {"get_goal", "create_goal", "update_goal", "update_goal_progress"}
+                        {"get_goal", "create_goal", "update_goal"}
                     )
                 ctx.surfaced_tools.update(controls)
         if metadata is not None:
@@ -9215,7 +9213,7 @@ class TurnRunner:
             "messages and saved progress can help locate work, but inspect the relevant "
             "current state before relying on them.\n\n"
             "Optional progress view:\n"
-            "- update_plan is optional; update_goal_progress is its legacy adapter. "
+            "- update_plan is optional. "
             "Use it only when a concise current-state "
             "view helps with meaningful multi-step work, and replace the view when reality "
             "changes. It must not define fixed phases or turn boundaries, schedule future "

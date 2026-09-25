@@ -112,9 +112,8 @@ A deferred reason can explain that automatic work is waiting for user ingress,
 other session work, or Plan mode.
 
 During complex work, the main agent uses the ordinary `update_plan` progress
-tool. `update_goal_progress` remains a compatibility adapter to the same task
-progress record; the Goal checklist is a projection, not a second authority.
-The agent may replace that checklist with
+tool. The Goal checklist is a projection of the task progress record, not a
+second authority. The agent may replace that checklist with
 up to 20 structured steps when a concise status view is useful. A step is at
 most 200 characters; the optional explanation is at most 1000 characters; at
 most one step may be `in_progress`. The checklist is a dynamic projection of the

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,7 +17,7 @@ from opensquilla.provider import ToolUseEndEvent as ProviderToolUseEnd
 from opensquilla.provider import ToolUseStartEvent as ProviderToolUseStart
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
-from opensquilla.tools.registry import ToolRegistry, ToolSpec
+from opensquilla.tools.registry import ToolRegistry, ToolSpec, get_default_registry
 from opensquilla.tools.types import CallerKind, ToolContext
 
 
@@ -64,16 +63,21 @@ class _PlanStorage:
         assert run_id == self.run.run_id
         return self.run
 
-    def complete(self) -> None:
-        # The final checkpoint enters delivery-ready state. TaskRuntime owns
-        # the later running -> completed transition after the turn succeeds.
-        self.run.status = "running"
+    async def update_progress(
+        self, steps: list[dict[str, str]], explanation: str | None,
+    ) -> dict[str, Any]:
+        assert steps == [{"step": "Implement", "status": "completed"}]
+        assert explanation is None
+        # Descriptive progress cannot complete the task or its attached run.
         self.run.state_revision += 1
         self.run.current_step_id = None
-        self.run.step_states[0]["status"] = "completed"
+        self.run.step_states = [
+            {"step_id": "progress-1", "title": "Implement", "status": "completed"},
+        ]
+        return {"steps": steps, "revision": self.run.state_revision}
 
 
-class _ReconcilesCheckpointProvider:
+class _ProgressProvider:
     provider_name = "test"
 
     def __init__(self) -> None:
@@ -102,13 +106,13 @@ class _ReconcilesCheckpointProvider:
             return
         if call_number == 2:
             yield ProviderToolUseStart(
-                tool_use_id="checkpoint-1",
-                tool_name="plan_run_checkpoint",
+                tool_use_id="progress-1",
+                tool_name="update_plan",
             )
             yield ProviderToolUseEnd(
-                tool_use_id="checkpoint-1",
-                tool_name="plan_run_checkpoint",
-                arguments={"step_id": "step-1", "step_status": "completed"},
+                tool_use_id="progress-1",
+                tool_name="update_plan",
+                arguments={"steps": [{"step": "Implement", "status": "completed"}]},
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
@@ -119,23 +123,23 @@ class _ReconcilesCheckpointProvider:
         return []
 
 
-class _IgnoresReconciliationProvider(_ReconcilesCheckpointProvider):
+class _IgnoresReconciliationProvider(_ProgressProvider):
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         yield ProviderText(text=f"Premature completion {call_number}.")
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
-class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
+class _ProgressThenMutateProvider(_ProgressProvider):
     mutation_tool = "write_file"
-    mutation_arguments = {"path": "after-completion.txt", "content": "must not run"}
+    mutation_arguments = {"path": "after-completion.txt", "content": "repair after verification"}
 
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
             for tool_use_id, tool_name, arguments in (
                 (
-                    "checkpoint-1",
-                    "plan_run_checkpoint",
-                    {"step_id": "step-1", "step_status": "completed"},
+                    "progress-1",
+                    "update_plan",
+                    {"steps": [{"step": "Implement", "status": "completed"}]},
                 ),
                 (
                     "write-1",
@@ -158,7 +162,7 @@ class _CheckpointThenMutateProvider(_ReconcilesCheckpointProvider):
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
-class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
+class _ProgressThenPublishProvider(_ProgressProvider):
     delivery_tool = "publish_artifact"
     delivery_path = "report.txt"
 
@@ -166,9 +170,9 @@ class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
         if call_number == 1:
             for tool_use_id, tool_name, arguments in (
                 (
-                    "checkpoint-1",
-                    "plan_run_checkpoint",
-                    {"step_id": "step-1", "step_status": "completed"},
+                    "progress-1",
+                    "update_plan",
+                    {"steps": [{"step": "Implement", "status": "completed"}]},
                 ),
                 (
                     "publish-1",
@@ -191,17 +195,17 @@ class _CheckpointThenPublishProvider(_ReconcilesCheckpointProvider):
         yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
-class _CheckpointThenPreviewProvider(_CheckpointThenPublishProvider):
+class _ProgressThenPreviewProvider(_ProgressThenPublishProvider):
     delivery_tool = "open_workspace_preview"
     delivery_path = "site/index.html"
 
 
-class _CheckpointThenStartServerProvider(_CheckpointThenMutateProvider):
+class _ProgressThenStartServerProvider(_ProgressThenMutateProvider):
     mutation_tool = "exec_command"
     mutation_arguments = {"command": "python -m http.server"}
 
 
-class _SubmitThenCheckpointProvider(_ReconcilesCheckpointProvider):
+class _SubmitThenProgressProvider(_ProgressProvider):
     async def _stream(self, call_number: int) -> AsyncIterator[Any]:
         if call_number == 1:
             yield ProviderToolUseStart(tool_use_id="submit-1", tool_name="submit")
@@ -214,13 +218,13 @@ class _SubmitThenCheckpointProvider(_ReconcilesCheckpointProvider):
             return
         if call_number == 2:
             yield ProviderToolUseStart(
-                tool_use_id="checkpoint-1",
-                tool_name="plan_run_checkpoint",
+                tool_use_id="progress-1",
+                tool_name="update_plan",
             )
             yield ProviderToolUseEnd(
-                tool_use_id="checkpoint-1",
-                tool_name="plan_run_checkpoint",
-                arguments={"step_id": "step-1", "step_status": "completed"},
+                tool_use_id="progress-1",
+                tool_name="update_plan",
+                arguments={"steps": [{"step": "Implement", "status": "completed"}]},
             )
             yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
             return
@@ -240,49 +244,13 @@ def _revision() -> SimpleNamespace:
     )
 
 
-def _registry(
-    storage: _PlanStorage,
-    observed_calls: list[str] | None = None,
-) -> ToolRegistry:
+def _registry(observed_calls: list[str] | None = None) -> ToolRegistry:
+    from opensquilla.tools.builtin import plan_control as _plan_control  # noqa: F401
+
     registry = ToolRegistry()
-
-    async def checkpoint(step_id: str, step_status: str) -> str:
-        assert step_id == "step-1"
-        assert step_status == "completed"
-        storage.complete()
-        return json.dumps(
-            {
-                "status": "checkpoint_recorded",
-                "plan_run": {
-                    "runId": storage.run.run_id,
-                    "status": storage.run.status,
-                    "currentStepId": storage.run.current_step_id,
-                    "steps": [
-                        {
-                            "stepId": state["step_id"],
-                            "status": state["status"],
-                        }
-                        for state in storage.run.step_states
-                    ],
-                },
-            }
-        )
-
-    registry.register(
-        ToolSpec(
-            name="plan_run_checkpoint",
-            description="Checkpoint the current plan step",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "step_id": {"type": "string"},
-                    "step_status": {"type": "string"},
-                },
-                "required": ["step_id", "step_status"],
-            },
-        ),
-        checkpoint,
-    )
+    progress = get_default_registry().get("update_plan")
+    assert progress is not None
+    registry.register(progress.spec, progress.handler)
 
     async def write_file(path: str, content: str) -> str:
         if observed_calls is not None:
@@ -383,7 +351,7 @@ async def _run(
     await manager.create(session_key)
     runner = TurnRunner(
         provider_selector=_ProviderSelector(provider),
-        tool_registry=_registry(plan_storage, observed_calls),
+        tool_registry=_registry(observed_calls),
         session_manager=manager,
         config=GatewayConfig(
             workspace_dir=str(tmp_path),
@@ -400,6 +368,7 @@ async def _run(
         plan_storage=plan_storage,
         plan_revision=_revision(),
         plan_run=plan_storage.run,
+        update_progress=plan_storage.update_progress,
         workspace_preview_opener=_preview_opener,
     )
     try:
@@ -423,9 +392,9 @@ async def _preview_opener(*args: Any, **kwargs: Any) -> dict[str, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "provider_type", [_ReconcilesCheckpointProvider, _IgnoresReconciliationProvider],
+    "provider_type", [_ProgressProvider, _IgnoresReconciliationProvider],
 )
-async def test_plan_run_finishes_without_checkpoint_or_extra_model_call(
+async def test_plan_run_finishes_without_progress_or_extra_model_call(
     tmp_path: Path, provider_type: Any,
 ) -> None:
     plan_storage = _PlanStorage()
@@ -438,11 +407,11 @@ async def test_plan_run_finishes_without_checkpoint_or_extra_model_call(
 
 
 @pytest.mark.asyncio
-async def test_final_checkpoint_allows_later_verification_and_repair(
+async def test_completed_progress_allows_later_verification_and_repair(
     tmp_path: Path,
 ) -> None:
     plan_storage = _PlanStorage()
-    provider = _CheckpointThenMutateProvider()
+    provider = _ProgressThenMutateProvider()
     observed_calls: list[str] = []
 
     events = await _run(
@@ -452,7 +421,7 @@ async def test_final_checkpoint_allows_later_verification_and_repair(
         observed_calls=observed_calls,
     )
 
-    assert observed_calls == ["write_file:after-completion.txt:must not run"]
+    assert observed_calls == ["write_file:after-completion.txt:repair after verification"]
     assert plan_storage.run.status == "running"
     assert plan_storage.run.current_step_id is None
     assert not any(isinstance(event, ErrorEvent) for event in events)
@@ -465,11 +434,11 @@ async def test_final_checkpoint_allows_later_verification_and_repair(
 
 
 @pytest.mark.asyncio
-async def test_final_checkpoint_allows_later_artifact_delivery(
+async def test_completed_progress_allows_later_artifact_delivery(
     tmp_path: Path,
 ) -> None:
     plan_storage = _PlanStorage()
-    provider = _CheckpointThenPublishProvider()
+    provider = _ProgressThenPublishProvider()
     observed_calls: list[str] = []
 
     events = await _run(
@@ -489,9 +458,11 @@ async def test_final_checkpoint_allows_later_artifact_delivery(
 
 
 @pytest.mark.asyncio
-async def test_final_checkpoint_allows_prepared_preview_without_publication(tmp_path: Path) -> None:
+async def test_completed_progress_allows_prepared_preview_without_publication(
+    tmp_path: Path,
+) -> None:
     plan_storage = _PlanStorage()
-    provider = _CheckpointThenPreviewProvider()
+    provider = _ProgressThenPreviewProvider()
     observed_calls: list[str] = []
 
     events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
@@ -507,9 +478,9 @@ async def test_final_checkpoint_allows_prepared_preview_without_publication(tmp_
 
 
 @pytest.mark.asyncio
-async def test_final_checkpoint_preserves_ordinary_shell_tools(tmp_path: Path) -> None:
+async def test_completed_progress_preserves_ordinary_shell_tools(tmp_path: Path) -> None:
     plan_storage = _PlanStorage()
-    provider = _CheckpointThenStartServerProvider()
+    provider = _ProgressThenStartServerProvider()
     observed_calls: list[str] = []
 
     events = await _run(tmp_path, provider, plan_storage, observed_calls=observed_calls)
@@ -528,7 +499,7 @@ async def test_attached_plan_run_uses_ordinary_submit_control(
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_SUBMIT_REVIEW", "on")
     plan_storage = _PlanStorage()
-    provider = _SubmitThenCheckpointProvider()
+    provider = _SubmitThenProgressProvider()
     observed_calls: list[str] = []
 
     events = await _run(
@@ -543,7 +514,8 @@ async def test_attached_plan_run_uses_ordinary_submit_control(
     assert plan_storage.run.current_step_id is None
     assert not any(isinstance(event, ErrorEvent) for event in events)
     submit_result = "\n".join(str(message.content) for message in provider.requests[1])
-    assert "plan_run_checkpoint_required" not in submit_result
+    assert "submitted" in submit_result
+    assert provider.calls == 3
 
 
 @pytest.mark.asyncio

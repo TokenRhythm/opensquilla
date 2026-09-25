@@ -792,9 +792,9 @@ async def test_terminal_control_tool_prevents_later_batch_calls_from_dispatching
     provider = _ControlBoundaryProvider(
         [
             (
-                "checkpoint-1",
-                "plan_run_checkpoint",
-                {"step_id": "verify", "step_status": "blocked"},
+                "terminal-1",
+                "terminal_control",
+                {},
             ),
             ("write-1", "write_file", {"path": "must-not-run"}),
         ]
@@ -807,14 +807,14 @@ async def test_terminal_control_tool_prevents_later_batch_calls_from_dispatching
             tool_use_id=call.tool_use_id,
             tool_name=call.tool_name,
             content=json.dumps({"status": "blocked"}),
-            terminates_turn=call.tool_name == "plan_run_checkpoint",
+            terminates_turn=call.tool_name == "terminal_control",
         )
 
     agent = Agent(
         provider=provider,
         config=AgentConfig(max_iterations=3),
         tool_definitions=[
-            _tool_def("plan_run_checkpoint"),
+            _tool_def("terminal_control"),
             _tool_def("write_file"),
         ],
         tool_handler=_handler,
@@ -822,15 +822,15 @@ async def test_terminal_control_tool_prevents_later_batch_calls_from_dispatching
 
     events = [event async for event in agent.run_turn("implement the plan")]
 
-    assert dispatched == ["plan_run_checkpoint"]
+    assert dispatched == ["terminal_control"]
     assert len(provider.calls) == 1
     results = [event for event in events if isinstance(event, ToolResultEvent)]
-    assert [event.tool_use_id for event in results] == ["checkpoint-1", "write-1"]
+    assert [event.tool_use_id for event in results] == ["terminal-1", "write-1"]
     assert json.loads(results[1].result) == {
         "status": "not_executed",
         "reason": "prior_tool_dispatch_boundary",
-        "boundary_tool": "plan_run_checkpoint",
-        "boundary_tool_use_id": "checkpoint-1",
+        "boundary_tool": "terminal_control",
+        "boundary_tool_use_id": "terminal-1",
     }
     assert results[1].is_error is True
 

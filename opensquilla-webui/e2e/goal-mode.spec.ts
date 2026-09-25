@@ -1023,12 +1023,16 @@ test('Goal mode continues through a real Gateway, refresh, and deterministic pro
     const callsDuringContinuation = await gateway.readProviderCalls()
     expect(callsDuringContinuation[0]?.toolNames).toEqual(expect.arrayContaining([
       'update_goal',
-      'update_goal_progress',
+      'update_plan',
     ]))
     expect(callsDuringContinuation[1]?.toolNames).toEqual(expect.arrayContaining([
       'update_goal',
-      'update_goal_progress',
+      'update_plan',
     ]))
+    for (const call of callsDuringContinuation) {
+      expect(call.toolNames).not.toContain('update_goal_progress')
+      expect(call.toolNames).not.toContain('plan_run_checkpoint')
+    }
     expect(callsDuringContinuation[1]).toMatchObject({
       callNumber: 2,
       objectiveInRequestContext: true,

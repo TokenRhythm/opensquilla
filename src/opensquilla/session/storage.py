@@ -8887,34 +8887,6 @@ class SessionStorage:
             assert updated is not None
             return updated
 
-    async def update_goal_progress(
-        self,
-        context: GoalTurnContext,
-        *,
-        explanation: object | None,
-        steps: object,
-        now_ms: int | None = None,
-    ) -> GoalRecord:
-        """Compatibility adapter to the single ordinary task progress authority."""
-        goal = await self.get_goal_by_id(context.goal_id)
-        if goal is None:
-            raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
-        progress = normalize_goal_progress(explanation=explanation, steps=steps)
-        await self.update_task_progress(
-            context.task_id,
-            session_key=goal.session_key,
-            session_id=context.session_id,
-            session_epoch=context.epoch,
-            steps=progress["steps"],
-            explanation=progress["explanation"],
-            goal_context=context,
-            now_ms=now_ms,
-        )
-        updated = await self.get_goal_by_id(context.goal_id)
-        if updated is None:
-            raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
-        return updated
-
     @staticmethod
     async def _turn_usage_totals_on_conn(
         conn: Any,
@@ -9538,7 +9510,6 @@ class SessionStorage:
         session_epoch: int,
         steps: list[dict[str, Any]],
         explanation: str | None = None,
-        goal_context: GoalTurnContext | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
         """Replace descriptive progress on the live owning task, never its lifecycle."""
@@ -9546,7 +9517,7 @@ class SessionStorage:
             return await self._update_task_progress_on_conn(
                 conn, task_id, session_key=session_key, session_id=session_id,
                 session_epoch=session_epoch, steps=steps, explanation=explanation,
-                goal_context=goal_context, now_ms=now_ms,
+                now_ms=now_ms,
             )
 
     async def _update_task_progress_on_conn(
@@ -9559,32 +9530,11 @@ class SessionStorage:
         session_epoch: int,
         steps: list[dict[str, Any]],
         explanation: str | None = None,
-        goal_context: GoalTurnContext | None = None,
         now_ms: int | None = None,
     ) -> dict[str, Any]:
-        """Shared transaction body for current and compatibility progress controls."""
+        """Persist task progress and its Goal and PlanRun projections atomically."""
         progress = normalize_goal_progress(steps=steps, explanation=explanation)
         timestamp = _now_ms() if now_ms is None else now_ms
-        if goal_context is not None:
-            goal = await self._select_goal_on_conn(conn, goal_id=goal_context.goal_id)
-            if goal is None:
-                raise GoalConflictError("GOAL_NOT_FOUND", "The Goal no longer exists")
-            if (
-                goal.session_id != goal_context.session_id
-                or goal.session_epoch != goal_context.epoch
-                or goal.objective_revision != goal_context.objective_revision
-                or goal.active_task_id != task_id
-                or goal.status not in {GoalStatus.ACTIVE.value, GoalStatus.PAUSED.value}
-            ):
-                raise GoalConflictError(
-                    "STALE_GOAL", "The task no longer owns this Goal objective", current=goal
-                )
-            await self._require_persisted_goal_context_on_conn(
-                conn,
-                context=goal_context,
-                expected_session_key=session_key,
-                current=goal,
-            )
         if not await _matches_session_owner_on_conn(
             conn,
             session_key=session_key,

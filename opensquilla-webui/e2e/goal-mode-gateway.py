@@ -230,7 +230,7 @@ class DeterministicGoalProvider:
             # The browser releases this only after proving that Task 1 settled,
             # Goal state stayed active, and the automatic Task 2 reached the
             # provider with the original objective and transcript history. The
-            # first Task intentionally did not call update_goal_progress.
+            # first Task intentionally did not call update_plan.
             await self._wait_for_release(call_number, self._second_release_file)
             yield ToolUseStartEvent(
                 tool_use_id="goal-complete-2",

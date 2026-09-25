@@ -1547,6 +1547,7 @@ export class NativeWorkbenchSurfaceManager {
     const epoch = record.revisionEpoch
     const generation = record.annotationDocumentGeneration
     const current = () => this.surfaces.get(record.id) === record && !record.disposed
+      && !record.browserNavigationStopped
       && !record.crashed && !contents.isDestroyed()
       && generation === record.annotationDocumentGeneration
       && (!background || (record.revisionVisible && epoch === record.revisionEpoch))

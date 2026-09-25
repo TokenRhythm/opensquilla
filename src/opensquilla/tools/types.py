@@ -401,7 +401,6 @@ current_tool_context: contextvars.ContextVar[ToolContext | None] = contextvars.C
 SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
     {
         "submit_plan", "update_plan", "create_goal", "get_goal", "update_goal",
-        "update_goal_progress", "plan_run_checkpoint",
         "cron",
         "gateway",
         "agents_list",
