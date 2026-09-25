@@ -3114,6 +3114,93 @@ describe('useChatRenderedMessages clarify history recovery', () => {
     expect(clarify?.clarify?.presentation).toBe('plan_questionnaire_v1')
   })
 
+  it('keeps a resolved question in activity order after history restoration', () => {
+    const pending = {
+      status: 'input_required',
+      kind: 'user_input',
+      paused: true,
+      request_id: 'request-ordered',
+      run_id: 'run-ordered',
+      step: 'choose_target',
+      clarify_schema: {
+        fields: [{ name: 'target', type: 'enum', choices: ['current', 'new'] }],
+      },
+    }
+    const api = renderedMessagesFor([{
+      role: 'assistant',
+      text: 'done',
+      ts: 0,
+      messageId: 'm-ordered-question',
+      turnOutcome: { turnId: 'run-ordered', taskId: 'run-ordered', status: 'succeeded' },
+      tool_calls: [
+        {
+          type: 'tool_use',
+          tool_use_id: 'request-ordered-tool',
+          name: 'request_user_input',
+          input: { questions: [{ id: 'target', question: 'Where?', options: [{ label: 'Current' }, { label: 'New' }] }] },
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'request-ordered-tool',
+          name: 'request_user_input',
+          user_input_request: pending,
+          result: JSON.stringify({
+            status: 'answered',
+            kind: 'user_input',
+            paused: false,
+            request_id: 'request-ordered',
+            answers: { target: 'current' },
+          }),
+        },
+        {
+          type: 'tool_use',
+          tool_use_id: 'inspect-ordered-tool',
+          name: 'skill_view',
+          input: {},
+        },
+        {
+          type: 'tool_result',
+          tool_use_id: 'inspect-ordered-tool',
+          name: 'skill_view',
+          result: 'ok',
+        },
+        { type: 'text', text: 'done' },
+      ],
+      activitySnapshot: {
+        version: 2,
+        taskId: 'run-ordered',
+        turnId: 'run-ordered',
+        complete: true,
+        reasoningUtf16Length: 0,
+        entries: [
+          {
+            type: 'segment', id: 'tool:request-ordered-tool', order: 10,
+            segment_type: 'tool', tool_use_id: 'request-ordered-tool', name: 'request_user_input',
+          },
+          {
+            type: 'interrupt', id: 'clarify:request-ordered', order: 11,
+            interrupt_type: 'clarify', reference_id: 'request-ordered',
+            started_at: 10, ended_at: 11,
+          },
+          {
+            type: 'segment', id: 'tool:inspect-ordered-tool', order: 12,
+            segment_type: 'tool', tool_use_id: 'inspect-ordered-tool', name: 'skill_view',
+          },
+          {
+            type: 'segment', id: 'text:0', order: 13,
+            segment_type: 'text', text_index: 0, text_utf16_length: 4,
+          },
+        ],
+      },
+    }])
+
+    const rendered = api.renderedMessages.value[0]
+    expect(rendered.timelineItems?.map(item => item.type)).toEqual([
+      'tool-group', 'interrupt', 'tool-group', 'text',
+    ])
+    expect(rendered.timelineItems?.map(item => item.activityOrder)).toEqual([10, 11, 12, 13])
+  })
+
   it.each(['succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted'])(
     'expires only unresolved structured input owned by the %s historical turn',
     (status) => {

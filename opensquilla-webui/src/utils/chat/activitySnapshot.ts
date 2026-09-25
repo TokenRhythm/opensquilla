@@ -719,13 +719,25 @@ export function restoreActivityInterruptTimeline(
       interruptParts.set(referenceId, part)
     }
     if (!part || existingItems.has(referenceId)) continue
-    nextItems.push({
+    const restoredItem: ChatStreamTimelineItem = {
       type: 'interrupt',
       key: part.key,
       approvalId: referenceId,
       part,
       activityOrder: entry.order,
-    })
+    }
+    // Restored interrupts are discovered from the snapshot after the
+    // persisted tool timeline has been reconstructed. Insert them by their
+    // authoritative order instead of appending them: the unified activity
+    // renderer rejects a source with descending orders and would otherwise
+    // render only the compact summary for completed turns containing a
+    // resolved question or approval.
+    const insertionIndex = nextItems.findIndex(item => (
+      item.activityOrder !== undefined
+      && item.activityOrder > entry.order
+    ))
+    if (insertionIndex < 0) nextItems.push(restoredItem)
+    else nextItems.splice(insertionIndex, 0, restoredItem)
     existingItems.add(referenceId)
   }
   return { items: nextItems, parts: nextParts }
