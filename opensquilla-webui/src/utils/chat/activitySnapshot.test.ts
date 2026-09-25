@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import type { ActivitySnapshotV2, ChatMessage, ChatStreamTimelineItem } from '@/types/chat'
+import type { ChatPart } from '@/types/parts'
 import {
   activityReasoningBlocks,
   activitySnapshotMatchesMessage,
@@ -296,5 +297,63 @@ describe('activitySnapshot v2', () => {
     expect(JSON.stringify(restored)).not.toContain('C:/')
     expect(restored.parts[0]?.type === 'interrupt'
       && restored.parts[0].approval?.displayTarget).toBeUndefined()
+  })
+
+  it('inserts a resolved clarify interrupt at its activity order', () => {
+    const clarifyPart: ChatPart = {
+      type: 'interrupt',
+      interruptKind: 'clarify',
+      key: 'message-1:interrupt:request-1',
+      clarify: {
+        intro: 'Choose a target.',
+        fields: [],
+        requestId: 'request-1',
+        runId: 'run-1',
+        step: 'choose_target',
+      },
+      resolution: 'replied',
+      busy: false,
+      error: '',
+    }
+    const toolItem: ChatStreamTimelineItem = {
+      type: 'tool-group',
+      key: 'tool-group-1',
+      activityOrder: 100,
+      group: {
+        groupId: 'tool-group-1',
+        operationKey: 'skill_view',
+        label: 'Inspect',
+        iconName: 'gear',
+        calls: [],
+        secondary: '',
+        isRunning: false,
+        isError: false,
+        status: 'success',
+      },
+    }
+    const restored = restoreActivityInterruptTimeline(
+      [toolItem],
+      [clarifyPart],
+      {
+        version: 2,
+        taskId: 'run-1',
+        turnId: 'run-1',
+        complete: true,
+        reasoningUtf16Length: 0,
+        entries: [{
+          type: 'interrupt',
+          id: 'clarify:request-1',
+          order: 50,
+          interrupt_type: 'clarify',
+          reference_id: 'request-1',
+          started_at: 40,
+          ended_at: 50,
+        }],
+      },
+      'message-1',
+    )
+
+    expect(restored.items.map(item => item.type)).toEqual(['interrupt', 'tool-group'])
+    expect(restored.items.map(item => item.activityOrder)).toEqual([50, 100])
   })
 })
