@@ -1918,6 +1918,7 @@ const providerFormPanel = providerForm.createPanel({
   providerEnvKey,
   providerEnvCommand,
   llmTimeoutSeconds: promotedForm.llmTimeoutSeconds,
+  llmThinking: promotedForm.llmThinking,
   contextWindowTokens: promotedForm.contextWindowTokens,
   contextWindowGlobal,
   effectiveMaxTokens,
@@ -3202,6 +3203,11 @@ function updateLlmTimeout(value: number) {
   promotedForm.setLlmTimeoutSeconds(value)
 }
 
+function updateLlmThinking(value: string) {
+  if (providerInteractionLocked()) return
+  promotedForm.setLlmThinking(value)
+}
+
 function updateContextWindow(value: string) {
   if (providerInteractionLocked()) return
   promotedForm.setContextWindowTokens(value)
@@ -3963,7 +3969,10 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   providerSavePending.value = true
   primaryMutationPending.value = true
   // Snapshot all provider-owned patches before a conflict dialog can yield.
-  const providerPatches = promotedForm.providerPatches()
+  const providerPatches: Record<string, unknown> = {
+    ...promotedForm.providerPatches(),
+    ...(promotedForm.thinkingPatch() ?? {}),
+  }
   const contextModel = currentFormModelValue()
   const contextPatch = contextModel
     ? promotedForm.contextWindowPatch(providerForm.selectedProvider.value, contextModel) : null
@@ -4556,6 +4565,7 @@ async function copyConfigPath() {
     setEnsembleProposerMaxRetries,
     updateProviderField,
     updateLlmTimeout,
+    updateLlmThinking,
     updateContextWindow,
     probeProviderConnection,
     cancelProviderProbe: providerForm.cancelProbe,
