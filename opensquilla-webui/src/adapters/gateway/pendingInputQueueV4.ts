@@ -85,6 +85,7 @@ function projectServerAttachment(value: unknown): PendingInputServerAttachment |
     name,
     mime,
     ...(size !== undefined ? { size } : {}),
+    ...(value.origin === 'paste' ? { origin: 'paste' as const } : {}),
   }
 }
 

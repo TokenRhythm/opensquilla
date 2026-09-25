@@ -25,6 +25,7 @@ export interface PendingInputServerAttachment {
   readonly name: string
   readonly mime: string
   readonly size?: number
+  readonly origin?: 'paste'
 }
 
 export interface PendingInputEnqueueRequest {

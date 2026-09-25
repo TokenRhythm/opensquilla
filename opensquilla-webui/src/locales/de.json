@@ -3604,6 +3604,7 @@
     "projectFileLiveTarget": "Aktuelle Projektdatei: {path}",
     "importedFileWorkingTarget": "Importierte Datei; Änderungen erfolgen in einer Arbeitskopie",
     "fileLabel": "Datei",
+    "pastedTextLabel": "Eingefügter Text",
     "add": "Hinzufügen",
     "attachFiles": "Dateien anhängen",
     "attachFilesTitle": "Dateien anhängen: beliebiger Dateityp (Bilder, PDF, Office und Text werden direkt gelesen; andere Dateien landen im Agent-Arbeitsbereich)",

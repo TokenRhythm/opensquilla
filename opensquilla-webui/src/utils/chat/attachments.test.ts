@@ -3,13 +3,18 @@ import { describe, expect, it } from 'vitest'
 
 import {
   collectClipboardFiles,
+  collectClipboardText,
   hasSendableModelInputImageAttachment,
   isImageDisplayAttachment,
+  isLongPlainTextPaste,
   isModelInputImageMime,
   isSendableModelInputImageAttachment,
+  LONG_PASTE_CHARS,
   normalizeDisplayAttachment,
   normalizeDisplayAttachments,
+  pastedTextAttachmentName,
   serializeDisplayAttachment,
+  serializeChatFiles,
   shouldCaptureFilePaste,
 } from './attachments'
 import type { Attachment } from '@/types/chat'
@@ -297,6 +302,18 @@ describe('attachment send display serialization', () => {
     expect(JSON.stringify(display)).not.toContain('u-secret')
   })
 
+  it('serializes pasted-text provenance while keeping the instruction separate', () => {
+    const pasted: Attachment & { kind: 'inline'; data: string } = {
+      kind: 'inline',
+      local_id: 10,
+      name: 'pasted-text.txt',
+      mime: 'text/plain',
+      data: 'aGVsbG8=',
+      origin: 'paste',
+    }
+    expect(serializeChatFiles([pasted]).attachments[0]).toMatchObject({ origin: 'paste' })
+  })
+
   it('keeps SVG attachment markup download-only', () => {
     const attachment = normalizeDisplayAttachment({
       type: 'image/svg+xml; charset=utf-8',
@@ -327,6 +344,19 @@ describe('collectClipboardFiles', () => {
 
   it('returns nothing without clipboard data', () => {
     expect(collectClipboardFiles(null)).toEqual([])
+  })
+
+  it('extracts text/plain and promotes only long pastes', () => {
+    const text = 'a'.repeat(LONG_PASTE_CHARS)
+    const data = {
+      items: [],
+      files: [],
+      getData: (type: string) => type === 'text/plain' ? text : '<b>ignored</b>',
+    } as unknown as DataTransfer
+    expect(collectClipboardText(data)).toBe(text)
+    expect(isLongPlainTextPaste(text)).toBe(true)
+    expect(isLongPlainTextPaste('short')).toBe(false)
+    expect(pastedTextAttachmentName('  # Repair notes / draft\nsecond line')).toBe('# Repair notes _ draft.txt')
   })
 
   it('lets plain-text pastes fall through unchanged', () => {

@@ -3688,6 +3688,7 @@
     "projectFileLiveTarget": "当前项目文件：{path}",
     "importedFileWorkingTarget": "导入文件；编辑使用独立工作副本",
     "fileLabel": "文件",
+    "pastedTextLabel": "粘贴文本",
     "add": "添加",
     "attachFiles": "添加文件",
     "attachFilesTitle": "添加文件：支持任意文件类型（图片、PDF、Office 和文本会被直接读取；其他文件会进入代理工作区）",

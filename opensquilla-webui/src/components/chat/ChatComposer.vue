@@ -970,15 +970,16 @@ function attachmentIcon(att: Attachment): IconName {
 }
 
 function attachmentMeta(att: Attachment): string {
+  const pasted = att.origin === 'paste' ? t('chat.pastedTextLabel') : ''
   if (att.kind === 'failed') {
     const failed = t('chat.status.failed')
-    return att.error ? `${failed} · ${att.error}` : failed
+    return [pasted, att.error ? `${failed} · ${att.error}` : failed].filter(Boolean).join(' · ')
   }
   const label = fileTypeLabel(att, t('chat.fileLabel'))
   const size = typeof att.size === 'number'
     ? `${Math.max(1, Math.round(att.size / 1024))} KB`
     : ''
-  return [label, size].filter(Boolean).join(' · ')
+  return [pasted, label, size].filter(Boolean).join(' · ')
 }
 
 function attachmentTitle(att: Attachment): string {

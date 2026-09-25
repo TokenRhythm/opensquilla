@@ -219,6 +219,70 @@ def infer_normalized_input_from_attachments(
     )
 
 
+def infer_pasted_text_input_from_attachments(
+    message_text: str,
+    attachments: list[dict[str, Any]] | None,
+) -> NormalizedInput | None:
+    """Recognize a WebUI pasted-text attachment without replacing the prompt.
+
+    ``origin`` is only a client hint. The admission layer calls this helper for
+    owner Web requests, and materialization below re-validates the text MIME and
+    bytes before assigning the server-owned preview policy.
+    """
+
+    if not attachments:
+        return None
+    matching = [
+        attachment
+        for attachment in attachments
+        if isinstance(attachment, dict)
+        and attachment.get("origin") == "paste"
+        and _attachment_mime(attachment) == "text/plain"
+    ]
+    if not matching:
+        return None
+
+    first = matching[0]
+    raw_bytes = _decode_attachment_bytes(first)
+    material_chars = 0
+    material_tokens = 0
+    if raw_bytes is not None:
+        try:
+            decoded = raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+        material_chars = len(decoded)
+        material_tokens = estimate_text_tokens(decoded)
+    else:
+        server_chars = first.get("_material_chars")
+        server_tokens = first.get("_material_estimated_tokens")
+        if isinstance(server_chars, int) and server_chars >= 0:
+            material_chars = server_chars
+        else:
+            size = first.get("size")
+            material_chars = size if isinstance(size, int) and size >= 0 else 0
+        if isinstance(server_tokens, int) and server_tokens >= 0:
+            material_tokens = server_tokens
+
+    metadata = {
+        "source": GENERATED_TEXT_ATTACHMENT_SOURCE,
+        "original_chars": material_chars,
+        "material_estimated_tokens": material_tokens,
+        "marker_score": 0,
+        "generated_attachment_count": len(matching),
+        "guard_action": "generated_text_attachment",
+        "origin": "paste",
+    }
+    return NormalizedInput(
+        kind="large_paste",
+        message_text=message_text,
+        semantic_message=message_text,
+        material_chars=material_chars,
+        material_estimated_tokens=material_tokens,
+        metadata=metadata,
+    )
+
+
 def materialize_generated_text_attachments(
     attachments: list[dict[str, Any]],
     *,
@@ -245,17 +309,26 @@ def materialize_generated_text_attachments(
         if not isinstance(attachment, dict):
             materialized.append(attachment)
             continue
-        if is_attachment_ref(attachment):
+        is_pasted = attachment.get("origin") == "paste"
+        if is_attachment_ref(attachment) and not is_pasted:
             materialized.append(attachment)
             continue
         name = _attachment_name_value(attachment)
         name_kind = _kind_from_generated_attachment_name(name)
         generated_by = attachment.get("_generated_by")
-        if generated_by != GENERATED_TEXT_ATTACHMENT_SOURCE and name_kind is None:
+        if generated_by != GENERATED_TEXT_ATTACHMENT_SOURCE and name_kind is None and not is_pasted:
             materialized.append(attachment)
             continue
         if _attachment_mime(attachment) != "text/plain":
             materialized.append(attachment)
+            continue
+        if is_attachment_ref(attachment):
+            ref = dict(attachment)
+            ref["source"] = GENERATED_TEXT_ATTACHMENT_SOURCE
+            ref["_generated_by"] = GENERATED_TEXT_ATTACHMENT_SOURCE
+            ref["_normalization_kind"] = "large_paste"
+            ref["_provider_inline_policy"] = PREVIEW_ONLY_INLINE_POLICY
+            materialized.append(ref)
             continue
         raw_bytes = _decode_attachment_bytes(attachment)
         if raw_bytes is None:
@@ -291,6 +364,8 @@ def materialize_generated_text_attachments(
         ref["_provider_inline_policy"] = PREVIEW_ONLY_INLINE_POLICY
         ref["_material_estimated_tokens"] = estimated_tokens
         ref["_material_path"] = str(path)
+        if is_pasted:
+            ref["origin"] = "paste"
         materialized.append(ref)
     return materialized
 

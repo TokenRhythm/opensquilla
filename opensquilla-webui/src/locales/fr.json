@@ -3604,6 +3604,7 @@
     "projectFileLiveTarget": "Fichier actuel du projet : {path}",
     "importedFileWorkingTarget": "Fichier importé ; modifications dans une copie de travail",
     "fileLabel": "Fichier",
+    "pastedTextLabel": "Texte collé",
     "add": "Ajouter",
     "attachFiles": "Joindre des fichiers",
     "attachFilesTitle": "Joindre des fichiers : tout type de fichier (images, PDF, Office et texte sont lus directement ; les autres vont dans l'espace de travail de l'agent)",

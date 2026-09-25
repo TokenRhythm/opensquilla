@@ -47,6 +47,7 @@ function harness(over: {
   slashOpen?: boolean
   filteredSlashCmds?: ChatSlashCommand[]
   cancelMessageEdit?: () => boolean
+  handleLongPaste?: (text: string) => boolean
 } = {}) {
   const inputText = ref(over.inputText ?? '')
   const spies = {
@@ -71,6 +72,7 @@ function harness(over: {
     filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
     isStreaming: ref(false),
     isSafariWebKit: () => over.safari ?? false,
+    handleLongPaste: over.handleLongPaste,
     ...spies,
   })
   return { api, inputText, spies }
@@ -105,6 +107,17 @@ function inputEvent(inputType: string, target: unknown): InputEvent {
 const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
 
 describe('useChatComposerShortcuts', () => {
+  it('lets the post-insertion paste fallback consume a large paste', () => {
+    const handleLongPaste = vi.fn(() => true)
+    const { api, spies } = harness({ handleLongPaste })
+    const pasted = field('x'.repeat(20_000), 'end')
+
+    api.onTextareaInput(inputEvent('insertFromPaste', pasted))
+
+    expect(handleLongPaste).toHaveBeenCalledWith(pasted.value, expect.anything())
+    expect(spies.handleSlashInput).not.toHaveBeenCalled()
+  })
+
   describe('Slash completion safety', () => {
     const compact = {
       name: '/compact',

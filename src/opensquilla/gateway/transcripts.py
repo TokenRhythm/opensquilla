@@ -150,6 +150,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": attachment.get("size"),
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
             continue
@@ -196,6 +197,7 @@ def build_transcript_attachment_envelope(
                     "name": name,
                     "mime": media_type,
                     "size": len(payload),
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
         else:
@@ -205,6 +207,7 @@ def build_transcript_attachment_envelope(
                     "type": media_type,
                     "name": name,
                     "data": data,
+                    **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
                 }
             )
 
@@ -285,6 +288,8 @@ def rebuild_attachments_for_replay(
                 session_id=session_id,
                 source="transcript",
             )
+            if entry.get("origin") == "paste":
+                rebuilt_ref["origin"] = "paste"
             missing_markers.append(attachment_ref_marker(rebuilt_ref))
         else:
             missing_reason = entry.get("missing_reason")
@@ -304,6 +309,7 @@ def rebuild_attachments_for_replay(
                         "type": mime,
                         "data": data,
                         "name": raw_name if isinstance(raw_name, str) else "attachment",
+                        **({"origin": "paste"} if entry.get("origin") == "paste" else {}),
                     }
                 )
 
