@@ -5615,6 +5615,7 @@ async function copyGatewayLink() {
 // the header subtree. The owner token makes delayed teardown harmless.
 const chatRouteHeader = useChatRouteHeaderBridge()
 const chatRouteHeaderRegistration = chatRouteHeader.register({
+  sessionKey,
   visible: computed(() => !isNewChatLanding.value),
   title: currentChatTitle,
   copyState: sessionCopyState,
