@@ -579,6 +579,7 @@ const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
 const {
+  sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
   title: chatRouteHeaderTitle,
   copyState: chatRouteHeaderCopyState,
@@ -1069,6 +1070,55 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   }
   return items
 })
+
+// A just-materialized chat can reach the route before the next sessions.list
+// snapshot. Keep an optimistic ledger entry for it so switching to another
+// conversation does not make the new task disappear from the sidebar. When
+// ChatView has the first user message, reuse its resolved header title so the
+// sidebar shows the same text immediately. The key guard prevents a title from
+// the previous ChatView instance leaking into the new session during navigation.
+function optimisticCurrentSessionTitle(key: string, allowHeaderTitle = true): string {
+  if (!allowHeaderTitle || chatRouteHeaderSessionKey.value !== key) {
+    return t('shared.sidebar.currentTask')
+  }
+  const title = chatRouteHeaderTitle.value.trim()
+  if (!isSensibleChatTitle(title)) return t('shared.sidebar.currentTask')
+  const suffix = key.split(':').pop() || ''
+  const genericTitles = new Set([
+    t('chat.newChat'),
+    t('chat.chatWithSuffix', { suffix }),
+    t('shared.sidebar.currentTask'),
+  ])
+  return genericTitles.has(title) ? t('shared.sidebar.currentTask') : title
+}
+
+watch(
+  [currentSessionKey, chatRouteHeaderSessionKey, chatRouteHeaderTitle],
+  ([key], oldValues) => {
+    if (!key || allSessions.value.some(item => item.key === key)) return
+    const existing = localChatSessions.value[key]
+    const previousKey = oldValues?.[0] || ''
+    const previousHeaderKey = oldValues?.[1] || ''
+    const sessionChanged = Boolean(
+      (previousKey && key && previousKey !== key)
+      || (previousHeaderKey
+        && chatRouteHeaderSessionKey.value
+        && previousHeaderKey !== chatRouteHeaderSessionKey.value),
+    )
+    const title = optimisticCurrentSessionTitle(key, !sessionChanged)
+    if (existing && existing.title === title) return
+    const effectiveAgentId = normalizeAgentId(key.split(':')[1] || 'main')
+    localChatSessions.value = {
+      ...localChatSessions.value,
+      [key]: {
+        effectiveAgentId: existing?.effectiveAgentId || effectiveAgentId,
+        title,
+        updatedAt: existing?.updatedAt || Date.now(),
+      },
+    }
+  },
+  { flush: 'sync', immediate: true },
+)
 
 watch(allSessions, sessions => {
   for (const item of sessions) {
@@ -1731,6 +1781,7 @@ function handleAppForeground() {
 }
 
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
+  if (change.reason === 'deleted') removeLocalSessions(new Set([change.key]))
   scheduleSessionRefresh()
   sessionTaskAttention.handleSessionDirectoryChange(change, {
     currentSessionKey: currentSessionKey.value,
