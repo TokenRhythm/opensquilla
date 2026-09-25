@@ -1332,15 +1332,16 @@ class ArtifactStore:
             if artifact_id is None
             else _validate_artifact_id(artifact_id)
         )
+        safe_mime = _safe_mime(mime)
+        sha = hashlib.sha256(payload).hexdigest()
         safe_name = _safe_filename(name)
         if visibility == "listed":
             safe_name = self._next_listed_display_name(
                 safe_name,
+                sha256=sha,
                 session_id=session_id,
                 session_key=session_key,
             )
-        safe_mime = _safe_mime(mime)
-        sha = hashlib.sha256(payload).hexdigest()
         created_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
         thumbnail_bytes = _build_thumbnail(payload, safe_mime)
@@ -1448,14 +1449,16 @@ class ArtifactStore:
         source_by_path = {item.path: item for item in files}
         entry_source = source_by_path[manifest.entrypoint]
         payload = entry_source.data
+        safe_mime = _safe_mime(mime)
+        sha = hashlib.sha256(payload).hexdigest()
         safe_name = _safe_filename(name)
         if visibility == "listed":
             safe_name = self._next_listed_display_name(
                 safe_name,
+                sha256=sha,
                 session_id=session_id,
                 session_key=session_key,
             )
-        safe_mime = _safe_mime(mime)
         if len(payload) == 0:
             raise ArtifactBudgetError("artifact payload is empty")
         if max_bytes is not None and len(payload) > max_bytes:
@@ -1489,7 +1492,6 @@ class ArtifactStore:
         session_key = _validate_non_empty("session_key", session_key)
         artifact_id = artifact_id or self.allocate_artifact_id()
         _validate_artifact_id(artifact_id)
-        sha = hashlib.sha256(payload).hexdigest()
         entry_manifest_file = next(
             item for item in manifest.files if item.path == manifest.entrypoint
         )
@@ -1648,17 +1650,17 @@ class ArtifactStore:
         *,
         session_id: str,
         session_key: str,
-    ) -> set[str]:
-        """Collect display names of listed artifacts already in the session.
+    ) -> dict[str, set[str]]:
+        """Map display names to content digests of listed session artifacts.
 
         Best-effort by design: corrupt metadata, cross-session refs, and
-        unreadable layouts contribute no name. Internal artifacts stay
+        unreadable layouts contribute no entry. Internal artifacts stay
         invisible — collision handling only concerns user-facing deliveries.
         """
 
         session_id = _validate_non_empty("session_id", session_id)
         session_key = _validate_non_empty("session_key", session_key)
-        names: set[str] = set()
+        by_name: dict[str, set[str]] = {}
         for meta_path in self._iter_session_meta_paths_for_listing(session_id):
             try:
                 raw = json.loads(native_io_path(meta_path).read_text(encoding="utf-8"))
@@ -1674,30 +1676,34 @@ class ArtifactStore:
                 continue
             if native_io_path(layout[0] / ARTIFACT_INTERNAL_MARKER_NAME).exists():
                 continue
-            names.add(ref.name)
-        return names
+            by_name.setdefault(ref.name, set()).add(ref.sha256)
+        return by_name
 
     def _next_listed_display_name(
         self,
         name: str,
         *,
+        sha256: str,
         session_id: str,
         session_key: str,
     ) -> str:
-        """Suffix a display name so same-session regenerations stay distinct.
+        """Suffix a display name when the session already used it for new content.
 
-        Identical content never reaches here — callers answer those publishes
-        from find_existing_ref first. A same-name conflict therefore means a
-        genuinely new version of the deliverable, and publishing it under the
-        identical display name would leave the UI's file list ambiguous
-        (issue 1495): report.md becomes report-2.md, report-3.md, ...
+        Re-publishing identical material under the same name is deliberate
+        delivery dedupe (channel adapters materialize one file per digest and
+        keep its filename), so a name whose only prior uses carry the same
+        digest keeps that name. A different payload under a used name is a
+        genuinely new version (issue 1495): report.md becomes report-2.md.
+        Identical-content tool publishes never reach here anyway — callers
+        short-circuit through find_existing_ref first.
         """
 
         taken = self._listed_display_names(
             session_id=session_id,
             session_key=session_key,
         )
-        if name not in taken:
+        known = taken.get(name)
+        if known is None or known == {sha256}:
             return name
         stem, dot, suffix = name.rpartition(".")
         if dot and stem:

@@ -760,10 +760,21 @@ def test_artifact_store_versions_same_session_regenerations_with_same_name(
         mime="text/markdown",
         source="create_pdf_report",
     )
+    # Re-delivering identical material keeps the established name: channel
+    # adapters dedupe one file per digest and must not have it renamed.
+    redelivered = store.publish_bytes(
+        b"draft two",
+        session_id="session-1",
+        session_key=session_key,
+        name="report-2.md",
+        mime="text/markdown",
+        source="publish_artifact",
+    )
 
     assert first.name == "report.md"
     assert second.name == "report-2.md"
     assert third.name == "report-3.md"
+    assert redelivered.name == "report-2.md"
 
 
 def test_artifact_store_versions_names_without_extension_and_compound_stems(
