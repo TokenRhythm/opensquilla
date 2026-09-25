@@ -26,7 +26,7 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 168,
+        "result": 171,
         "params": 26,
         "payload": 9,
         "frame": 1,
