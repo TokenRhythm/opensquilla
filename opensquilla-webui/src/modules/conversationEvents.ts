@@ -4,7 +4,8 @@ import type { ConversationCronResult, ConversationEnsembleProgress, Conversation
 import type { ConversationAnswerReset, ConversationSubagentCompletion } from './conversationEventContent'
 import type { ConversationCompactionContent, ConversationTextContent, ConversationThinkingContent, ConversationToolContent } from './conversationEventContent'
 import type { ConversationArtifact, ConversationCommittedTurn, ConversationEventIdentity, ConversationInputDisposition, ConversationLifecycle, ConversationRoutingDecision, ConversationTurnCompletion, ConversationWarning } from './conversationEventContent'
-import type { SessionProcess } from './sessionProcesses'
+
+type SessionProcessStatus = 'running' | 'done' | 'killed' | 'timed_out'
 
 /** Protocol-neutral meanings emitted by the Conversation event Adapter. */
 export type ConversationSemanticEventKind =
@@ -83,7 +84,7 @@ export type ConversationEventProjection =
   | ProjectedEvent<'ensemble-progress', ConversationEnsembleProgress>
   | ProjectedEvent<'answer-generation-reset', ConversationAnswerReset>
   | ProjectedEvent<'subagent-completed', ConversationSubagentCompletion>
-  | ProjectedEvent<'process-completed', { executionId: string; status: SessionProcess['status']; returncode: number | null; sessionId: string; sessionEpoch: number }>
+  | ProjectedEvent<'process-completed', { executionId: string; status: SessionProcessStatus; returncode: number | null; sessionId: string; sessionEpoch: number }>
   | ProjectedEvent<'text-delta', ConversationTextContent>
   | ProjectedEvent<'tool-use-started' | 'tool-use-delta' | 'tool-use-ended' | 'tool-result', ConversationToolContent>
   | ProjectedEvent<'thinking-started' | 'thinking-delta' | 'thinking-ended', ConversationThinkingContent>

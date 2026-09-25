@@ -10,7 +10,6 @@ const DESKTOP_RENDERER_DOCUMENT_PATHS = new Set([
   '/',
   '/approvals',
   '/channels',
-  '/changelog',
   '/chat',
   '/chat/new',
   '/config',

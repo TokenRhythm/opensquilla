@@ -223,10 +223,6 @@ test.describe('Theme engine (P0)', () => {
   })
 })
 
-function contentBackground(page: Page) {
-  return page.evaluate(() => getComputedStyle(document.getElementById('content')!).backgroundColor)
-}
-
 test.describe('Global world theme (Terminal)', () => {
   test('selecting Terminal applies its palette globally and lazy-loads the world layer', async ({ page }) => {
     await bootWithTheme(page, 'terminal')
@@ -253,35 +249,5 @@ test.describe('Global world theme (Terminal)', () => {
         page.evaluate(() => getComputedStyle(document.documentElement, '::before').backgroundImage),
       )
       .toMatch(/gradient/i)
-  })
-})
-
-test.describe('Expressive skin (P2 — Out of Register)', () => {
-  test('applies to a skinned route, scoped to the content area only', async ({ page }) => {
-    await page.addInitScript((k) => localStorage.setItem(k, 'dark'), THEME_KEY) // force a dark shell
-    await page.goto(CONTROL + 'changelog')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
-
-    // the content area opts into the skin via meta.skin
-    await expect(page.locator('#content')).toHaveAttribute('data-skin', 'out-of-register')
-
-    // the lazy skin CSS turns the content newsprint (light)…
-    await expect.poll(async () => relativeLuminance(await contentBackground(page))).toBeGreaterThan(0.6)
-    // …while the shell stays on the dark ground — proof the skin is scoped, not global
-    expect(relativeLuminance(await bodyBackground(page))).toBeLessThan(0.3)
-  })
-
-  test('does NOT apply to operational routes', async ({ page }) => {
-    await page.goto(CONTROL + 'chat')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
-    await expect(page.locator('#content')).not.toHaveAttribute('data-skin')
-  })
-
-  test('lazily loads its serif face on the skinned route', async ({ page }) => {
-    await page.goto(CONTROL + 'changelog')
-    await page.waitForSelector('.conn-pill', { timeout: 20000 })
-    await expect
-      .poll(() => page.evaluate(() => document.fonts.check('900 40px Fraunces')))
-      .toBe(true)
   })
 })

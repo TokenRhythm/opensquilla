@@ -113,8 +113,8 @@ interface DialogA11yOptions {
 /**
  * Modal-dialog accessibility for an open/close-driven overlay: traps Tab focus
  * inside `rootRef`, closes on Escape, moves focus into the dialog on open, and
- * restores focus to the invoking element on close. Mirrors the pattern already
- * used by SettingsDialog and SessionInspectDrawer.
+ * restores focus to the invoking element on close. Mirrors the pattern used by
+ * the app's modal dialogs.
  */
 export function useDialogA11y(
   rootRef: Ref<HTMLElement | null>,

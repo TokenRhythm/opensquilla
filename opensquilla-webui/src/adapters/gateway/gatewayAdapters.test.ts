@@ -65,7 +65,6 @@ describe('Gateway Adapter composition', () => {
       'promptCacheLease',
       'clarificationSubmission',
       'sessionMaintenance',
-      'sessionProcesses',
       'observability',
       'skillCatalog',
       'agentCatalog',

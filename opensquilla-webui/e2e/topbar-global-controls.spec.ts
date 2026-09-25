@@ -17,7 +17,7 @@ test.describe('Chat topbar global controls', () => {
       sessionKey: `${TOPBAR_SESSION_KEY}-non-chat`,
       locale: 'en',
     })
-    await page.goto('/control/changelog')
+    await page.goto('/control/overview')
     await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(0)
 
     const language = page.getByTestId('language-switcher-trigger')

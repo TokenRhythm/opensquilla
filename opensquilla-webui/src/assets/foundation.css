@@ -195,17 +195,15 @@
    Roles every value theme used to copy-paste verbatim, hoisted to one place —
    a theme's tokens.css now declares only its real palette and overrides these
    solely where it genuinely diverges (light/miami's paper elevation and
-   shadows, out-of-register's hairline plates, arctic's softer highlight).
+   shadows, arctic's softer highlight).
 
    The selector lists every theme host, not just :root, on purpose: var()
    inside a custom property substitutes where the property is DECLARED, so a
    :root-only declaration would freeze the shell theme's values into nested
-   theme islands (the share-export stage's data-theme) and data-skin scopes.
-   Bundle order keeps per-theme blocks winning the (0,1,0) specificity tie:
-   foundation loads before themes/tokens, and skin.css loads last (lazily). */
+   theme islands (the share-export stage's data-theme).
+   Bundle order keeps per-theme blocks winning the (0,1,0) specificity tie. */
 :root,
-[data-theme],
-[data-skin] {
+[data-theme] {
   /* Status fills — chroma-tuned marks default to their ink. */
   --ok-fill: var(--ok);
   --warn-fill: var(--warn);

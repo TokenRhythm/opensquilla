@@ -69,9 +69,8 @@ function stepFromRenderItem(
   }
 }
 
-/** Build flat NodeStep[] from a raw history row's tool_calls, mirroring
- *  SessionInspect's toolPills id-merge (SessionInspectDrawer.vue:207-223) but
- *  producing a full NodeStep (state/input/output/isError). MUST drop internal
+/** Build flat NodeStep[] from a raw history row's tool_calls, producing a full
+ *  NodeStep (state/input/output/isError). MUST drop internal
  *  tools via isInternalToolName — toolPills does not, but RunTrace shows
  *  input/output so internals must not leak. Unnamed entries (normalizeToolName
  *  returns '') are skipped, matching the chat path. */
