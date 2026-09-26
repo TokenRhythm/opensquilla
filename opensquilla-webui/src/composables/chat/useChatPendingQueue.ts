@@ -488,6 +488,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       name: attachment.name,
       mime: attachment.mime,
       ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
+      ...(attachment.origin ? { origin: attachment.origin } : {}),
       durable_material: true,
     }
   }
@@ -499,6 +500,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       name: attachment.name,
       mime: attachment.mime,
       durable_material: true as const,
+      ...(attachment.origin ? { origin: attachment.origin } : {}),
       ...(typeof attachment.size === 'number' ? { size: attachment.size } : {}),
     }))
     return [...imported, ...(serverItem.workspaceFiles || []).map((ref, index): Attachment => ({

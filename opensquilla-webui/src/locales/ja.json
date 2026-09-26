@@ -3604,6 +3604,7 @@
     "projectFileLiveTarget": "現在のプロジェクトファイル: {path}",
     "importedFileWorkingTarget": "読み込みファイル。編集には作業用コピーを使用",
     "fileLabel": "ファイル",
+    "pastedTextLabel": "貼り付けたテキスト",
     "add": "追加",
     "attachFiles": "ファイルを添付",
     "attachFilesTitle": "ファイルを添付: 任意のファイル形式（画像、PDF、Office、テキストは直接読み取り、その他のファイルはエージェントのワークスペースへ）",

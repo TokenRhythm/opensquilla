@@ -3689,6 +3689,7 @@
     "projectFileLiveTarget": "Live project file: {path}",
     "importedFileWorkingTarget": "Imported file; edits use a working copy",
     "fileLabel": "File",
+    "pastedTextLabel": "Pasted text",
     "add": "Add",
     "attachFiles": "Attach files",
     "attachFilesTitle": "Attach files: any file type (images, PDF, Office, and text are read directly; other files go to the agent workspace)",

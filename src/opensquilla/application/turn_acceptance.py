@@ -805,6 +805,7 @@ async def _accept_turn_in_scope(
     message_text = ingested_attachments.text
     raw_attachments = ingested_attachments.attachments
     inferred_normalized_input = None
+    pasted_normalized_input = None
     if normalized_input.metadata.get("guard_action") == "none":
         inferred_normalized_input = ports.infer_normalized_input(
             message_text,
@@ -813,6 +814,13 @@ async def _accept_turn_in_scope(
         if inferred_normalized_input is not None:
             message_text = inferred_normalized_input.message_text
             semantic_message_text = inferred_normalized_input.semantic_message
+        else:
+            infer_pasted = getattr(ports, "infer_pasted_text_input", None)
+            if command.source.is_web and callable(infer_pasted):
+                pasted_normalized_input = infer_pasted(message_text, raw_attachments)
+                if pasted_normalized_input is not None:
+                    message_text = pasted_normalized_input.message_text
+                    semantic_message_text = pasted_normalized_input.semantic_message
 
     normalization_metadata = (
         normalized_input.metadata
@@ -821,6 +829,11 @@ async def _accept_turn_in_scope(
             inferred_normalized_input.metadata
             if inferred_normalized_input is not None
             and inferred_normalized_input.metadata.get("guard_action") != "none"
+            else None
+        ) or (
+            pasted_normalized_input.metadata
+            if pasted_normalized_input is not None
+            and pasted_normalized_input.metadata.get("guard_action") != "none"
             else None
         )
     )

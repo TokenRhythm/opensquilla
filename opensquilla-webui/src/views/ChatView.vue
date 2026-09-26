@@ -1101,8 +1101,11 @@ import {
 } from '@/utils/chat/toolDisplay'
 import {
   collectClipboardFiles,
+  collectClipboardText,
   hasModelInputImageAttachment,
+  isLongPlainTextPaste,
   normalizeDisplayAttachment,
+  pastedTextAttachmentName,
   isSendableAttachment,
   shouldCaptureFilePaste,
 } from '@/utils/chat/attachments'
@@ -3437,6 +3440,7 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   popPendingTail,
   enqueuePendingInput,
   sendCurrentInput: () => sendCurrentInput(),
+  handleLongPaste: handleLongPastedInput,
   cancelMessageEdit: () => cancelEdit(),
 })
 const {
@@ -6293,6 +6297,39 @@ function onChatDrop(e: DragEvent) {
   composerRef.value?.focusTextarea()
 }
 
+/**
+ * Some browser hosts expose a paste as the post-insertion input event but do
+ * not provide a usable ClipboardEvent for the document-level listener.
+ */
+function handleLongPastedInput(text: string, event?: InputEvent): boolean {
+  if (!composerRef.value?.isTextareaFocused()) return false
+  if (replanActive.value) return false
+
+  // The input event fires after the browser has inserted the paste. Prefer its
+  // data payload so a paste appended to an existing instruction becomes an
+  // attachment while the instruction remains in the composer. Hosts that do
+  // not expose `data` fall back to the full field value, which preserves the
+  // previous behavior for a paste-only composer.
+  const pastedText = typeof event?.data === 'string' && event.data.length > 0
+    ? event.data
+    : text
+  if (!isLongPlainTextPaste(pastedText)) return false
+
+  if (event?.target instanceof HTMLTextAreaElement
+    && typeof event.data === 'string'
+    && event.data.length > 0) {
+    const caret = event.target.selectionStart
+    const start = Math.max(0, caret - event.data.length)
+    inputText.value = `${text.slice(0, start)}${text.slice(caret)}`
+  } else {
+    inputText.value = ''
+  }
+  autoResizeTextarea()
+  const file = new File([pastedText], pastedTextAttachmentName(pastedText), { type: 'text/plain' })
+  void addAttachments([file], { origin: 'paste' })
+  return true
+}
+
 /* ── Textarea ──────────────────────────────────────────────────────── */
 
 function autoResizeTextarea() {
@@ -6310,7 +6347,20 @@ function onDocumentPaste(e: ClipboardEvent) {
     dialogLayerOpen: hasOpenDialogLayer(),
   })) return
   const files = collectClipboardFiles(e.clipboardData)
-  if (files.length === 0) return
+  if (files.length === 0) {
+    if (!composerRef.value?.isTextareaFocused()) return
+    const text = collectClipboardText(e.clipboardData)
+    if (!isLongPlainTextPaste(text)) return
+    if (replanActive.value) {
+      e.preventDefault()
+      pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })
+      return
+    }
+    e.preventDefault()
+    const file = new File([text], pastedTextAttachmentName(text), { type: 'text/plain' })
+    void addAttachments([file], { origin: 'paste' })
+    return
+  }
   if (replanActive.value) {
     e.preventDefault()
     pushToast(t('chat.plan.attachmentsUnavailable'), { tone: 'warn' })

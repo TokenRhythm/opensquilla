@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.paths import native_io_path
+from opensquilla.token_estimation import estimate_material_text_tokens
 
 ATTACHMENT_REF_KIND = "attachment_ref"
 TRANSCRIPT_MATERIAL_STORE = "transcript"
@@ -565,6 +566,7 @@ def promote_pending_chat_input_attachments(
                     read_attachment_ref_bytes(attachment, media_root=media_root)
                 ).decode("ascii"),
                 "_was_staged": True,
+                **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
             }
             for attachment in attachments
         ]
@@ -618,16 +620,28 @@ def promote_pending_chat_input_attachments(
         name = attachment.get("name")
         if not isinstance(name, str) or not name:
             raise ValueError("pending attachment name is required")
-        promoted.append(
-            make_attachment_ref(
-                sha256=sha,
-                name=name,
-                mime=mime,
-                size=len(payload),
-                session_id=target_session_id,
-                source="pending_chat_input",
-            )
+        promoted_ref = make_attachment_ref(
+            sha256=sha,
+            name=name,
+            mime=mime,
+            size=len(payload),
+            session_id=target_session_id,
+            source="pending_chat_input",
         )
+        if attachment.get("origin") == "paste":
+            promoted_ref["origin"] = "paste"
+            if mime == "text/plain":
+                try:
+                    decoded_text = payload.decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+                else:
+                    promoted_ref["_material_chars"] = len(decoded_text)
+                    promoted_ref["_material_estimated_tokens"] = (
+                        estimate_material_text_tokens(decoded_text)
+                    )
+                    promoted_ref["_material_path"] = str(target_path)
+        promoted.append(promoted_ref)
     return promoted
 
 

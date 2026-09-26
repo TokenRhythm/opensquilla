@@ -19,6 +19,7 @@ from opensquilla.gateway.direct_turn_runtime import run_direct_turn
 from opensquilla.gateway.input_normalization import (
     NormalizedInput,
     infer_normalized_input_from_attachments,
+    infer_pasted_text_input_from_attachments,
     materialize_generated_text_attachments,
     normalize_incoming_text,
 )
@@ -128,6 +129,7 @@ class GatewayAdmissionRuntime:
             ) from exc
 
     infer_normalized_input = staticmethod(infer_normalized_input_from_attachments)
+    infer_pasted_text_input = staticmethod(infer_pasted_text_input_from_attachments)
     materialize_normalized_attachments = staticmethod(materialize_generated_text_attachments)
     transcript_content = staticmethod(build_transcript_attachment_envelope)
 

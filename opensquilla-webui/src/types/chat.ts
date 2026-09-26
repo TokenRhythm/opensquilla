@@ -71,6 +71,8 @@ export interface ChatSendAttachmentPayload {
   name: string
   data?: string
   file_uuid?: string
+  /** Client provenance used by the Gateway to preserve pasted-text semantics. */
+  origin?: 'paste'
 }
 
 /** Exact editable document head bound to one chat send attempt. */
@@ -108,6 +110,8 @@ export interface Attachment {
   workspaceFile?: WorkspaceFileReference
   /** Server-owned bytes restored from the durable pending-input queue. */
   durable_material?: true
+  /** User pasted plain text; the Gateway owns the final preview policy. */
+  origin?: 'paste'
 }
 
 export interface DisplayAttachment {
@@ -128,6 +132,7 @@ export interface DisplayAttachment {
   sha256_ref?: string
   /** Session-scoped opaque identity for Workbench preview/import actions. */
   attachmentId?: string
+  origin?: 'paste'
 }
 
 /**
