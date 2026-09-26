@@ -85,6 +85,7 @@ _EXPECTED_CATALOG_SOURCES: dict[str, tuple[str, ...]] = {
     "minimax_global": ("minimax",),
     "mistral": ("mistral",),
     "groq": ("groq",),
+    "opper": ("opper",),
     "siliconflow": ("siliconflow",),
     "volcengine": ("volcengine",),
     "byteplus": ("byteplus",),
