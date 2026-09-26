@@ -145,7 +145,6 @@ STATIC_RPC_DECORATOR_BASELINE = 63
 # production LOC reduction after each complete domain migration.
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
-    "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
     "opensquilla-webui/src/composables/usage/useUsageData.ts",
     "opensquilla-webui/src/composables/useSessions.ts",
     "opensquilla-webui/src/main.ts",

@@ -14,6 +14,7 @@ assert.equal(isDesktopRendererUrl('https://desktop/chat/new'), false)
 assert.equal(isDesktopRendererDocumentUrl(DESKTOP_RENDERER_URL), true)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/settings/runtime'), true)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/agents'), false)
+assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/changelog'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/api/system/status'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/assets/app.js'), false)
 

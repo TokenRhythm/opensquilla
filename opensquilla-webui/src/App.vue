@@ -308,8 +308,6 @@
       <main
         class="content"
         :class="{ 'content--chat': isChatRoute }"
-        :data-skin="skinId || undefined"
-        :data-skin-variant="variants || undefined"
         id="content"
       >
         <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
@@ -502,7 +500,6 @@ import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
@@ -670,8 +667,6 @@ const {
   cancelPendingRequests,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
-// Axis-B: the active expressive skin for the routed content area (meta.skin).
-const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()

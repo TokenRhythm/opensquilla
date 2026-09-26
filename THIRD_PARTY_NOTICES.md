@@ -146,8 +146,6 @@ resolved versions are recorded by `opensquilla-webui/package.json` and
 | highlight.js (`highlight.js`) | npm dependency used by `opensquilla-webui/src/composables/chat/useChatTextRendering.ts`; generated JavaScript under `src/opensquilla/gateway/static/dist/assets/` | BSD-3-Clause. Copyright (c) 2006, Ivan Sagalaev. |
 | IBM Plex Sans and IBM Plex Mono | `opensquilla-webui/src/assets/fonts/ibm-plex-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2017 IBM Corp. with Reserved Font Name "Plex". |
 | Space Grotesk | `opensquilla-webui/src/assets/fonts/space-grotesk-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Space Grotesk Project Authors. |
-| Fraunces | `opensquilla-webui/src/themes/out-of-register/fonts/fraunces-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Fraunces Project Authors (https://github.com/undercasetype/Fraunces). |
-| Newsreader | `opensquilla-webui/src/themes/out-of-register/fonts/newsreader-*.woff2` and generated Web UI font assets | SIL Open Font License 1.1. Copyright 2020 The Newsreader Project Authors. |
 
 The Web UI lockfile is the version authority for these dependencies. The build
 pipeline regenerates the browser bundle from that lockfile; no separate

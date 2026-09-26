@@ -25,7 +25,7 @@ test('production references exactly match the reviewed target policy', () => {
   const result = evaluateProductionTargets()
   assert.deepEqual(result.failures, [])
   assert.ok(result.targets.includes('method:skills.install.status:result'))
-  assert.equal(result.targets.length, 213)
+  assert.equal(result.targets.length, 207)
   for (const method of ['router.feedback.submit', 'router.selflearning.status']) {
     assert.deepEqual(result.targets.filter(target => target.startsWith(`method:${method}:`)), [])
   }
@@ -35,11 +35,6 @@ test('production references exactly match the reviewed target policy', () => {
   assert.deepEqual(result.targets.filter(target => (
     target.startsWith('method:turns.receipt.get:')
   )), ['method:turns.receipt.get:params', 'method:turns.receipt.get:result'])
-  for (const method of ['sessions.processes.list', 'sessions.processes.log', 'sessions.processes.stop']) {
-    assert.deepEqual(result.targets.filter(target => (
-      target.startsWith(`method:${method}:`)
-    )), [`method:${method}:params`, `method:${method}:result`])
-  }
   for (const method of ['sessions.messages.resume', 'sessions.messages.snapshot.release']) {
     assert.deepEqual(result.targets.filter(target => (
       target.startsWith(`method:${method}:`)

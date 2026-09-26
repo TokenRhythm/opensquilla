@@ -104,13 +104,11 @@ def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
         "highlight.js",
         "marked",
         "Copyright (c) 2004, John Gruber",
-        "DOMPurify",
-        "IBM Plex Sans",
-        "IBM Plex Mono",
-        "Space Grotesk",
-        "Fraunces",
-        "Newsreader",
-        "SIL OPEN FONT LICENSE Version 1.1",
+            "DOMPurify",
+            "IBM Plex Sans",
+            "IBM Plex Mono",
+            "Space Grotesk",
+            "SIL OPEN FONT LICENSE Version 1.1",
         "## npm and Python dependency packaging strategy",
     ]:
         assert expected in text
@@ -139,20 +137,6 @@ def test_frontend_static_assets_are_covered_by_third_party_notices() -> None:
         ROOT / "opensquilla-webui" / "src" / "composables" / "chat" / "useChatTextRendering.ts",
         ROOT / "opensquilla-webui" / "src" / "assets" / "fonts" / "ibm-plex-sans-400.woff2",
         ROOT / "opensquilla-webui" / "src" / "assets" / "fonts" / "space-grotesk-400.woff2",
-        ROOT
-        / "opensquilla-webui"
-        / "src"
-        / "themes"
-        / "out-of-register"
-        / "fonts"
-        / "fraunces-400.woff2",
-        ROOT
-        / "opensquilla-webui"
-        / "src"
-        / "themes"
-        / "out-of-register"
-        / "fonts"
-        / "newsreader-400.woff2",
     ]:
         assert path.is_file(), path
 

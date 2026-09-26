@@ -4,7 +4,6 @@ import { readLastRoute } from './lastRoute'
 
 const ChatView = () => import('@/views/ChatView.vue')
 const CronView = () => import('@/views/CronView.vue')
-const ChangelogView = () => import('@/views/ChangelogView.vue')
 const OverviewHubView = () => import('@/views/OverviewHubView.vue')
 const LogsView = () => import('@/views/LogsView.vue')
 const SkillsChannelsHubView = () => import('@/views/SkillsChannelsHubView.vue')
@@ -45,9 +44,6 @@ export const sharedRoutes: RouteRecordRaw[] = [
   { path: '/skills',    name: 'skills',    component: SkillsChannelsHubView, meta: { title: 'Skills', group: 'Work', icon: 'skills', nav: 'primary', navOrder: 40, navLabelKey: 'nav.skillsChannels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
   { path: '/channels',  name: 'channels',  component: SkillsChannelsHubView, meta: { title: 'Channels', icon: 'channels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
   { path: '/cron',      name: 'cron',      component: CronView,      meta: { title: 'Cron', group: 'Work', icon: 'cron', nav: 'primary', navOrder: 50, platforms: ['web', 'desktop'], keepAlive: true } },
-  // Editorial surface (read, not operated): the first route to opt into an
-  // Axis-B expressive skin. Not in the primary nav — reached by URL / links.
-  { path: '/changelog', name: 'changelog', component: ChangelogView, meta: { title: 'Changelog', platforms: ['web', 'desktop'], skin: 'out-of-register' } },
   // Readiness/doctor moved inline into Overview; the old deep link stays valid.
   { path: '/health',    redirect: '/overview' },
 ]
