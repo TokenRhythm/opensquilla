@@ -3544,6 +3544,8 @@ class OpenAIProvider:
                 payload["parallel_tool_calls"] = True
             if _should_send_tool_choice(self._provider_kind, cfg, caps):
                 payload["tool_choice"] = cfg.tool_choice
+            elif self._compat.default_tool_choice is not None:
+                payload["tool_choice"] = self._compat.default_tool_choice
         if self._compat.supports_provider_routing_pin:
             pinned_provider = self._provider_routing.get(self._model)
             if pinned_provider:
