@@ -103,6 +103,7 @@ function panel(overrides: Record<string, unknown> = {}) {
     providerEnvKey: '',
     providerEnvCommand: '',
     llmTimeoutSeconds: 120,
+    llmThinking: '',
     contextWindowTokens: '',
     contextWindowGlobal: null,
     effectiveMaxTokens: null,

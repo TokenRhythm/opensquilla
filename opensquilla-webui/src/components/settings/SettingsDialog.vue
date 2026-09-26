@@ -142,6 +142,7 @@
               @provider-change="onProviderChange"
               @update-provider-field="updateProviderField"
               @update-llm-timeout="updateLlmTimeout"
+              @update-llm-thinking="updateLlmThinking"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
               @cancel-provider-probe="cancelProviderProbe"
@@ -321,6 +322,7 @@ const {
   setEnsembleProposerMaxRetries,
   updateProviderField,
   updateLlmTimeout,
+  updateLlmThinking,
   updateContextWindow,
   probeProviderConnection,
   cancelProviderProbe,
