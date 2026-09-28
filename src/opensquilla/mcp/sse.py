@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+from collections.abc import AsyncIterator
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
@@ -13,9 +15,50 @@ import structlog
 from opensquilla import __version__
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.mcp.client import MCPClient
-from opensquilla.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
+from opensquilla.mcp.results import parse_tool_response
+from opensquilla.mcp.types import (
+    MAX_MCP_MESSAGE_BYTES,
+    MCPServerConfig,
+    MCPToolDef,
+    MCPToolResult,
+)
 
 log = structlog.get_logger(__name__)
+_LINE_END = re.compile(b"[\r\n]")
+
+
+async def _bounded_lines(response: httpx.Response) -> AsyncIterator[str]:
+    """Bound bytes before decoding, including streams with no line delimiter."""
+    pending = bytearray()
+    skip_lf = False
+    first_line = True
+    async for chunk in response.aiter_bytes():
+        offset = 1 if skip_lf and chunk.startswith(b"\n") else 0
+        if not chunk:
+            continue
+        skip_lf = False
+        while offset < len(chunk):
+            match = _LINE_END.search(chunk, offset)
+            end = match.start() if match else len(chunk)
+            if len(pending) + end - offset > MAX_MCP_MESSAGE_BYTES:
+                raise ValueError(f"MCP SSE line exceeds {MAX_MCP_MESSAGE_BYTES} bytes")
+            pending.extend(chunk[offset:end])
+            if match is None:
+                break
+            line = pending.decode("utf-8")
+            pending.clear()
+            if first_line:
+                line = line.removeprefix("\ufeff")
+                first_line = False
+            yield line
+            offset = end + 1
+            if chunk[end] == 13:
+                if offset == len(chunk):
+                    skip_lf = True
+                elif chunk[offset] == 10:
+                    offset += 1
+    if pending:
+        yield pending.decode("utf-8")
 
 
 def _http_origin(url: str) -> tuple[str, str, int]:
@@ -54,6 +97,7 @@ class MCPSSEClient(MCPClient):
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._stream_ctx: Any = None
         self._closed = False
+        self._stream_error: Exception | None = None
 
     def _next_id(self) -> int:
         self._request_id += 1
@@ -72,6 +116,7 @@ class MCPSSEClient(MCPClient):
             timeout=httpx.Timeout(timeout, read=None),
         )
         self._closed = False
+        self._stream_error = None
         self._reader_task = asyncio.create_task(self._read_stream())
 
         try:
@@ -102,9 +147,13 @@ class MCPSSEClient(MCPClient):
                 response.raise_for_status()
                 event_name = "message"
                 data_lines: list[str] = []
-                async for line in response.aiter_lines():
+                event_bytes = 0
+                async for line in _bounded_lines(response):
                     if line.startswith(":"):
                         continue
+                    event_bytes += len(line.encode("utf-8")) + 1
+                    if event_bytes > MAX_MCP_MESSAGE_BYTES:
+                        raise ValueError(f"MCP SSE event exceeds {MAX_MCP_MESSAGE_BYTES} bytes")
                     if line.startswith("event:"):
                         event_name = line[6:].strip()
                     elif line.startswith("data:"):
@@ -114,9 +163,12 @@ class MCPSSEClient(MCPClient):
                             self._handle_event(event_name, "".join(data_lines))
                         event_name = "message"
                         data_lines = []
+                        event_bytes = 0
+            raise ConnectionError("MCP SSE server closed the connection")
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - surface to any waiter
+            self._stream_error = exc
             self._fail_pending(exc)
             if not self._endpoint_ready.is_set():
                 # Unblock connect()'s wait so it can fall back / error out.
@@ -170,6 +222,8 @@ class MCPSSEClient(MCPClient):
     ) -> dict[str, Any]:
         """POST a JSON-RPC request and await the response from the SSE stream."""
         assert self._client is not None
+        if self._stream_error is not None:
+            raise self._stream_error
         if self._message_url is None:
             raise ConnectionError("MCP SSE endpoint handshake did not complete")
 
@@ -218,15 +272,4 @@ class MCPSSEClient(MCPClient):
             "tools/call", {"name": name, "arguments": arguments}
         )
 
-        if "error" in response:
-            return MCPToolResult(
-                content=response["error"].get("message", "Unknown error"),
-                is_error=True,
-            )
-
-        result = response.get("result", {})
-        content_list = result.get("content", [])
-        text = "\n".join(c.get("text", "") for c in content_list if c.get("type") == "text")
-        # Honor the MCP result-level ``isError`` flag so a tool-execution
-        # failure reaches the agent as an error, not a plain result.
-        return MCPToolResult(content=text, is_error=bool(result.get("isError", False)))
+        return parse_tool_response(response)

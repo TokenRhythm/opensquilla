@@ -11,7 +11,13 @@ import structlog
 
 from opensquilla import __version__
 from opensquilla.mcp.client import MCPClient
-from opensquilla.mcp.types import MCPServerConfig, MCPToolDef, MCPToolResult
+from opensquilla.mcp.results import parse_tool_response
+from opensquilla.mcp.types import (
+    MAX_MCP_MESSAGE_BYTES,
+    MCPServerConfig,
+    MCPToolDef,
+    MCPToolResult,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -61,6 +67,7 @@ class MCPStdioClient(MCPClient):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             env=env,
+            limit=MAX_MCP_MESSAGE_BYTES,
         )
 
         # MCP initialize handshake
@@ -139,7 +146,16 @@ class MCPStdioClient(MCPClient):
         assert self._process.stdout is not None
 
         while True:
-            line = await self._process.stdout.readline()
+            try:
+                line = await self._process.stdout.readline()
+            except ValueError as exc:
+                await self.close()
+                raise ValueError(
+                    f"MCP stdio response exceeds {MAX_MCP_MESSAGE_BYTES} bytes"
+                ) from exc
+            if len(line) > MAX_MCP_MESSAGE_BYTES:
+                await self.close()
+                raise ValueError(f"MCP stdio response exceeds {MAX_MCP_MESSAGE_BYTES} bytes")
             if not line:
                 raise ConnectionError("MCP stdio server closed the connection")
             try:
@@ -183,15 +199,4 @@ class MCPStdioClient(MCPClient):
         """Call a tool on the MCP server."""
         response = await self._send_request("tools/call", {"name": name, "arguments": arguments})
 
-        if "error" in response:
-            return MCPToolResult(
-                content=response["error"].get("message", "Unknown error"),
-                is_error=True,
-            )
-
-        result = response.get("result", {})
-        content_list = result.get("content", [])
-        text = "\n".join(c.get("text", "") for c in content_list if c.get("type") == "text")
-        # The MCP result-level ``isError`` flag signals a tool-execution failure;
-        # propagate it so the agent sees the error instead of a plain result.
-        return MCPToolResult(content=text, is_error=bool(result.get("isError", False)))
+        return parse_tool_response(response)

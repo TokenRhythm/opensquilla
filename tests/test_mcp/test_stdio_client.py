@@ -65,6 +65,7 @@ class _FakeProcess:
         self.wait_calls += 1
         if self.returncode is None:
             await asyncio.sleep(3600)
+        assert self.returncode is not None
         return self.returncode
 
 
@@ -228,3 +229,49 @@ async def test_call_tool_honors_result_level_is_error_flag() -> None:
 
     assert "upstream API rejected" in result.content
     assert result.is_error is True
+
+
+async def test_public_call_receives_media_in_frame_larger_than_64k() -> None:
+    client = _content_client()
+    try:
+        await client.connect()
+        result = await client.call_tool("read", {"size": 100_000})
+    finally:
+        await client.close()
+
+    assert not result.is_error
+    assert result.content == "x" * 100_000
+    assert [block["type"] for block in result.content_blocks] == ["text", "image", "resource"]
+    assert result.content_blocks[1]["data"].startswith("iVBOR")
+    assert result.structured_content == {"size": 100_000}
+
+
+@pytest.mark.parametrize("unterminated", [False, True])
+async def test_oversized_stdio_response_fails_and_closes_connection(
+    monkeypatch: pytest.MonkeyPatch, unterminated: bool
+) -> None:
+    monkeypatch.setattr("opensquilla.mcp.stdio.MAX_MCP_MESSAGE_BYTES", 1024)
+    client = _content_client()
+    try:
+        await client.connect()
+        with pytest.raises(ValueError, match="MCP stdio response exceeds 1024 bytes"):
+            await asyncio.wait_for(
+                client.call_tool("read", {"size": 2048, "unterminated": unterminated}),
+                timeout=10,
+            )
+        assert client._process is None
+        with pytest.raises(ConnectionError, match="not connected"):
+            await client.call_tool("read", {})
+    finally:
+        await client.close()
+
+
+def _content_client() -> MCPStdioClient:
+    return MCPStdioClient(
+        MCPServerConfig(
+            name="content",
+            transport="stdio",
+            command=sys.executable,
+            args=["-I", "-B", str(Path(__file__).parent / "fixtures" / "content_server.py")],
+        )
+    )

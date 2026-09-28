@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+MAX_MCP_MESSAGE_BYTES = 16 * 1024 * 1024
+
 
 @dataclass
 class MCPServerConfig:
@@ -27,5 +29,9 @@ class MCPToolDef:
 
 @dataclass
 class MCPToolResult:
+    """Received tool content; retaining media does not imply model delivery."""
+
     content: str
     is_error: bool = False
+    content_blocks: list[dict[str, Any]] = field(default_factory=list)
+    structured_content: dict[str, Any] | None = None
