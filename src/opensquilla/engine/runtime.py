@@ -2878,12 +2878,13 @@ class TurnRunner:
     ) -> ToolContext:
         attachments_cfg = getattr(self._config, "attachments", None)
         media_root = self._attachment_media_root()
-        session_id, session_epoch, workspace_id = (
-            await self._resolve_session_identity_for_log(session_key)
+        session_id, session_epoch, workspace_id = await self._resolve_session_identity_for_log(
+            session_key
         )
+        durable_session = bool(session_id) and type(session_epoch) is int
         if not session_id:
             session_id = session_key.split(":")[-1] or session_key
-        return replace(
+        context = replace(
             tool_context,
             session_key=session_key,
             artifact_media_root=str(media_root),
@@ -2902,6 +2903,17 @@ class TurnRunner:
                 None,
             ),
         )
+
+        skills_config = getattr(self._turn_config(), "skills", None)
+        protected = getattr(skills_config, "protected_script", None)
+        if protected is not None and context.agent_id in protected.agent_ids:
+            from opensquilla.skills.host import bind_protected_skill
+            from opensquilla.skills.script_runtime import SkillScriptError
+
+            if not durable_session:
+                raise SkillScriptError("Protected Skill requires durable session storage")
+            context = await asyncio.to_thread(bind_protected_skill, context, protected)
+        return context
 
     async def _capture_turn_memory(
         self,
@@ -5005,6 +5017,9 @@ class TurnRunner:
             coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
             ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
             ctx.coding_mode = coding_mode
+            from opensquilla.skills.host import enforce_protected_tool_scope
+
+            enforce_protected_tool_scope(ctx, self._tool_registry.list_names())
             if ctx is not caller_ctx:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None

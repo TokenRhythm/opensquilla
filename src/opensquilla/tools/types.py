@@ -178,6 +178,7 @@ class ToolContext:
     plan_run: Any | None = field(default=None, repr=False)
     # Explicit host grant for immutable installed scripts, never model arguments.
     skill_script_runner: Any | None = field(default=None, repr=False)
+    protected_skill_host: bool = False
 
     # Host-owned, process-local publication authority; never a model argument.
     artifact_publication_policy: ArtifactPublicationPolicy | None = field(default=None, repr=False)

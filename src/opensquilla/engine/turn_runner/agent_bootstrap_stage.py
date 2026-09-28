@@ -928,7 +928,10 @@ class AgentBootstrapStage:
             finalize_evidence_strict=_finalize_evidence_strict_from_env(
                 AgentConfig().finalize_evidence_strict
             ),
-            submit_review_enabled=_submit_review_from_env(),
+            submit_review_enabled=(
+                _submit_review_from_env()
+                and not bool(inp.tool_context and inp.tool_context.protected_skill_host)
+            ),
             submit_review_diff_max_chars=_positive_int_from_env(
                 "OPENSQUILLA_SUBMIT_REVIEW_DIFF_MAX_CHARS",
                 AgentConfig().submit_review_diff_max_chars,

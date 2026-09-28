@@ -15,7 +15,10 @@ from opensquilla.artifact_publication import (
     ArtifactPublicationRequest,
     authorize_publication,
 )
-from opensquilla.skills.publication import SkillArtifactPublicationPolicy
+from opensquilla.skills.publication import (
+    SkillArtifactPublicationPolicy,
+    SkillManifestPublicationPolicy,
+)
 from opensquilla.skills.script_runtime import (
     SkillScriptError,
     SkillScriptGrant,
@@ -282,3 +285,167 @@ async def test_changed_installed_validator_cannot_authorize(publication) -> None
     with pytest.raises(SkillScriptError, match="changed"):
         await policy.authorize(request, candidate)
     assert not list(policy.receipt_directory.iterdir())
+
+
+@pytest.fixture
+def dynamic_publication(publication, tmp_path: Path):
+    old, request, candidate = publication
+    private = tmp_path / "private"
+    raw_receipts = tmp_path / "raw-receipts"
+    private.mkdir()
+    raw_receipts.mkdir()
+    (private / "state.json").write_text('{"status":"finalized"}')
+    (raw_receipts / "raw.json").write_text('{"source":"host"}')
+    policy = SkillManifestPublicationPolicy(
+        runner=old.runner,
+        skill_name=old.skill_name,
+        validator_script=old.validator_script,
+        allowed_artifacts=ARTIFACTS,
+        caller_binding="caller",
+        input_roots={"private": private, "receipts": raw_receipts},
+        receipt_directory=old.receipt_directory,
+    )
+    return policy, replace(request, path="reports/example-collision-suffix/report.html"), candidate
+
+
+def _dynamic_manifest(
+    policy: SkillManifestPublicationPolicy,
+    request: ArtifactPublicationRequest,
+    candidate: ArtifactPublicationCandidate,
+) -> dict[str, Any]:
+    return {
+        "schemaVersion": "skill-publication-check/1",
+        "ok": True,
+        "runId": RUN_ID,
+        "artifactDirectory": str(Path(request.path).parent),
+        "inputDigests": policy._inventory(),
+        "artifacts": {name: candidate.sha256 for name in ARTIFACTS},
+    }
+
+
+def _dynamic_result(
+    policy: SkillManifestPublicationPolicy, manifest: dict[str, Any]
+) -> SkillScriptResult:
+    return SkillScriptResult(
+        0,
+        json.dumps(manifest),
+        "",
+        "2026-09-28T10:00:00+00:00",
+        "2026-09-28T10:00:01+00:00",
+        policy.runner.grants["demo"].digest,
+    )
+
+
+async def test_dynamic_directory_and_input_inventory_are_host_bound(
+    dynamic_publication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    policy, request, candidate = dynamic_publication
+    manifest = _dynamic_manifest(policy, request, candidate)
+    run = AsyncMock(return_value=_dynamic_result(policy, manifest))
+    monkeypatch.setattr(policy.runner, "run", run)
+    authorization = await policy.authorize(request, candidate)
+    assert authorization.sha256 == candidate.sha256
+    assert run.await_args is not None
+    kwargs = run.await_args.kwargs
+    assert kwargs["readonly"] is True
+    stdin = json.loads(kwargs["stdin"])
+    assert stdin["callerBinding"] == "caller"
+    assert stdin["inputDigests"] == policy._inventory()
+    assert stdin["path"] == request.path
+
+
+@pytest.mark.parametrize("mutation", ["directory", "extra", "missing", "candidate", "run", "input"])
+async def test_dynamic_manifest_rejects_wrong_scope_and_nonexact_artifact_set(
+    dynamic_publication,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    policy, request, candidate = dynamic_publication
+    manifest = _dynamic_manifest(policy, request, candidate)
+    if mutation == "directory":
+        manifest["artifactDirectory"] = "another/report"
+    elif mutation == "extra":
+        manifest["artifacts"]["private.json"] = "0" * 64
+    elif mutation == "missing":
+        manifest["artifacts"].pop("provenance.json")
+    elif mutation == "candidate":
+        manifest["artifacts"]["report.html"] = "0" * 64
+    elif mutation == "run":
+        manifest["runId"] = "another-execution"
+    else:
+        manifest["inputDigests"]["private/state.json"] = "0" * 64
+    monkeypatch.setattr(
+        policy.runner, "run", AsyncMock(return_value=_dynamic_result(policy, manifest))
+    )
+    with pytest.raises(SkillScriptError):
+        await policy.authorize(request, candidate)
+    assert not list(policy.receipt_directory.iterdir())
+
+
+@pytest.mark.parametrize("mutation", ["add", "remove", "change"])
+async def test_dynamic_inventory_changes_during_validation_are_rejected(
+    dynamic_publication,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    policy, request, candidate = dynamic_publication
+    manifest = _dynamic_manifest(policy, request, candidate)
+
+    async def mutate(*_args: Any, **_kwargs: Any) -> SkillScriptResult:
+        root = policy.input_roots["private"]
+        if mutation == "add":
+            (root / "extra.json").write_text("new data")
+        elif mutation == "remove":
+            (root / "state.json").unlink()
+        else:
+            (root / "state.json").write_text("replaced data")
+        return _dynamic_result(policy, manifest)
+
+    monkeypatch.setattr(policy.runner, "run", mutate)
+    with pytest.raises((SkillScriptError, OSError)):
+        await policy.authorize(request, candidate)
+    assert not list(policy.receipt_directory.iterdir())
+
+
+@pytest.mark.parametrize("root_name", ["private", "receipts"])
+def test_publication_receipts_cannot_overlap_dynamic_input_roots(
+    dynamic_publication, root_name: str
+) -> None:
+    policy, _, _ = dynamic_publication
+    with pytest.raises(SkillScriptError, match="isolated"):
+        SkillManifestPublicationPolicy(
+            runner=policy.runner,
+            skill_name=policy.skill_name,
+            validator_script=policy.validator_script,
+            allowed_artifacts=ARTIFACTS,
+            caller_binding="caller",
+            input_roots=policy.input_roots,
+            receipt_directory=policy.input_roots[root_name],
+        )
+
+
+@pytest.mark.parametrize("change", ["directory", "inputs"])
+async def test_one_execution_cannot_mix_different_finalized_manifests(
+    dynamic_publication,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+) -> None:
+    policy, request, candidate = dynamic_publication
+    first_manifest = _dynamic_manifest(policy, request, candidate)
+    run = AsyncMock(return_value=_dynamic_result(policy, first_manifest))
+    monkeypatch.setattr(policy.runner, "run", run)
+    await policy.authorize(request, candidate)
+    assert len(list(policy.receipt_directory.iterdir())) == 1
+    if change == "directory":
+        second_request = replace(request, path="reports/different-research/report.html")
+    else:
+        (policy.input_roots["private"] / "state.json").write_text(
+            '{"status":"new-finalized-state"}'
+        )
+        second_request = request
+    second_manifest = _dynamic_manifest(policy, second_request, candidate)
+    run.return_value = _dynamic_result(policy, second_manifest)
+    with pytest.raises(SkillScriptError):
+        await policy.authorize(second_request, candidate)
+    assert len(list(policy.receipt_directory.iterdir())) == 1

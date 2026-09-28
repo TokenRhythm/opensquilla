@@ -216,6 +216,11 @@ class ProviderAndToolsStage:
             effective_ctx = self._tool_builder.with_runtime_write_callbacks(
                 effective_ctx, inp.agent_id
             )
+            if (
+                effective_ctx.protected_skill_host
+                and effective_ctx.skill_catalog is not None
+            ):
+                skill_catalog = effective_ctx.skill_catalog
             effective_ctx = replace(effective_ctx, skill_catalog=skill_catalog)
 
         tool_metadata: dict[str, Any] = {}

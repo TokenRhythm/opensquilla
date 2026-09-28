@@ -48,6 +48,7 @@ from opensquilla.session.compaction_lifecycle import (
     FlushTrigger,
     normalize_flush_triggers_strict,
 )
+from opensquilla.skills.host import ProtectedSkillConfig
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +228,7 @@ class SkillsConfig(BaseSettings):
     filter_semantic_top_n: int = 20
     filter_rrf_k: int = 60
     filter_embedding_model: str = "BAAI/bge-small-zh-v1.5"
+    protected_script: ProtectedSkillConfig | None = None
 
 
 class ToolsConfig(BaseModel):

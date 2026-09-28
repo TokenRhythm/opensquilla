@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 from opensquilla.skills.script_runtime import SkillScriptError, SkillScriptRunner
 from opensquilla.tools.registry import tool
@@ -20,12 +21,15 @@ from opensquilla.tools.types import SafeToolError, current_tool_context
         "skill_name": {"type": "string", "description": "Installed Skill name"},
         "script": {"type": "string", "description": "Granted relative scripts/*.py entry"},
         "arguments": {"type": "array", "items": {"type": "string"}, "maxItems": 64},
+        "input": {"type": "object", "description": "Optional JSON object sent on script stdin"},
     },
     required=["skill_name", "script", "arguments"],
     exposed_by_default=False,
     execution_timeout_seconds=130,
 )
-async def run_skill_script(skill_name: str, script: str, arguments: list[str]) -> str:
+async def run_skill_script(
+    skill_name: str, script: str, arguments: list[str], input: dict[str, Any] | None = None
+) -> str:
     ctx = current_tool_context.get()
     runner = getattr(ctx, "skill_script_runner", None)
     if (
@@ -37,16 +41,20 @@ async def run_skill_script(skill_name: str, script: str, arguments: list[str]) -
     ):
         raise SafeToolError("No matching host Skill execution grant is active")
     try:
-        result = await runner.run(skill_name, script, arguments)
-    except (SkillScriptError, OSError, TimeoutError) as error:
-        raise SafeToolError(f"Skill script execution failed: {error}") from error
-    if result.returncode:
-        raise SafeToolError(
-            f"Skill script failed with exit {result.returncode}: {result.stderr[:2000]}"
+        if input is not None and not isinstance(input, dict):
+            raise SkillScriptError("Script input must be a JSON object")
+        payload = (
+            json.dumps(input, ensure_ascii=False, allow_nan=False).encode()
+            if input is not None
+            else None
         )
+        result = await runner.run(skill_name, script, arguments, stdin=payload)
+    except (ValueError, OSError, TimeoutError, TypeError, RecursionError) as error:
+        raise SafeToolError(f"Skill script execution failed: {error}") from error
     return json.dumps(
         {
             "exitCode": result.returncode,
+            "isError": result.returncode != 0,
             "stdout": result.stdout,
             "stderr": result.stderr,
             "startedAt": result.started_at,

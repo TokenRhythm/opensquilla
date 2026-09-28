@@ -1996,6 +1996,7 @@ name = "opensquilla"
 version = "0.5.2"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "aiosqlite" },
     { name = "anyio" },
     { name = "apscheduler" },
@@ -2090,6 +2091,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.12" },
     { name = "aiosqlite", specifier = ">=0.20" },
     { name = "anyio", specifier = ">=4.0" },
     { name = "apscheduler", specifier = ">=3.10" },
