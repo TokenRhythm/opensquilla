@@ -1074,7 +1074,7 @@ export class NativeWorkbenchSurfaceManager {
     if (record.disposed || record.crashed || record.view.webContents.isDestroyed()) return
     record.browserDocumentReady = false
     record.browserNavigationError = { url, code, ...(errorCode !== undefined ? { errorCode } : {}),
-      message: `Page navigation failed (${code}). The tab is still available; change the address or retry after fixing the connection.` }
+      message: `Page navigation failed (${code}). The tab is still available, but its document is not ready.` }
     this.invalidateBrowserAnchors(record)
     // Hide only the child view, so the host can show its error and address bar.
     // Its requested rectangle and stable target remain available for recovery.

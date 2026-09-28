@@ -53,7 +53,8 @@ try {
     }
   }
   await mkdir(join(stage, 'dist'), { recursive: true })
-  for (const name of ['browser-pointer.js', 'browser-pointer-controller.js', 'browser-mouse-trajectory.js', 'browser-playwright.js', 'desktop-browser.js', 'desktop-browser-mcp.js']) {
+  for (const name of ['browser-action-contract.js', 'browser-pointer.js', 'browser-pointer-controller.js',
+    'browser-mouse-trajectory.js', 'browser-playwright.js', 'desktop-browser.js', 'desktop-browser-mcp.js']) {
     await copyFile(join(projectDir, 'dist', name), join(stage, 'dist', name))
   }
   await writeFile(join(stage, 'package.json'), JSON.stringify({ name: 'browser-package-fixture',

@@ -24,13 +24,16 @@ const server = createServer((_request, response) => {
   #source,#target{position:absolute;top:200px;width:100px;height:70px;background:#eee}
   #source{left:20px}#target{left:220px}#canvas{position:absolute;left:400px;top:200px;background:#ddd}
   #panel{position:absolute;left:20px;top:310px;width:260px;height:70px;overflow:auto}
-  #panel>div{width:1500px;height:50px}#frame{position:absolute;left:400px;top:330px;width:300px;height:100px}</style>
+  #panel>div{width:1500px;height:50px}
+  #rtl-panel{position:absolute;left:20px;top:410px;width:260px;height:70px;overflow:auto;direction:rtl}
+  #rtl-panel>div{width:1500px;height:50px}#frame{position:absolute;left:400px;top:330px;width:300px;height:100px}</style>
   <pre id="original">${original}</pre><textarea aria-label="Editable text"></textarea>
   <input type="password" aria-label="Secret" value="synthetic-secret">
   <button id="hold">Hold target</button><button id="context">Context target</button>
   <div id="source" role="button">Drag source</div><div id="target" role="button">Drag destination</div>
   <canvas id="canvas" width="240" height="90" aria-label="Canvas target"></canvas>
   <div id="panel" role="region" aria-label="Horizontal panel"><div>Horizontal content</div></div>
+  <div id="rtl-panel" role="region" aria-label="RTL horizontal panel"><div>RTL horizontal content</div></div>
   <input id="file" aria-label="Upload input" type="file">
   <iframe id="frame" srcdoc="<pre>Frame line one&#10;&#10;Frame line two</pre>"></iframe>
   <script>window.events=[];window.changes=0;document.querySelector('textarea').value='Edited  value\\n\\n尾部\\n';
@@ -131,10 +134,67 @@ try {
   assert.ok(scrolling.panel > 0)
   assert.equal(scrolling.page, 0)
   assert.equal(scrolling.result.execution.scroll.changed, true)
-  assert.ok(scrolling.result.execution.scroll.after.some(item => item.left > 0))
+  const panelScroll = scrolling.result.execution.scroll.after.find(item => item.id === 'panel')
+  assert.equal(panelScroll.scope, 'element')
+  assert.ok(panelScroll.left > 0)
+  assert.equal(panelScroll.atBoundary, false)
+  const boundary = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.act('scroll', 'Horizontal panel', { direction: 'right', amount: 5000 })
+    return await f.act('scroll', 'Horizontal panel', { direction: 'right', amount: 180 })
+  })
+  assert.equal(boundary.execution.scroll.changed, false)
+  assert.equal(boundary.execution.scroll.after.find(item => item.id === 'panel').atBoundary, true)
+  const rtl = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    const right = await f.act('scroll', 'RTL horizontal panel', { direction: 'right', amount: 180 })
+    const left = await f.act('scroll', 'RTL horizontal panel', { direction: 'left', amount: 180 })
+    const farLeft = await f.act('scroll', 'RTL horizontal panel', { direction: 'left', amount: 5000 })
+    return { right, left, farLeft }
+  })
+  const rtlState = result => result.execution.scroll.after.find(item => item.id === 'rtl-panel')
+  assert.equal(rtlState(rtl.right).textDirection, 'rtl')
+  assert.equal(rtlState(rtl.right).atBoundary, true)
+  assert.ok(rtlState(rtl.left).left < 0)
+  assert.equal(rtlState(rtl.left).atBoundary, false)
+  assert.equal(rtlState(rtl.farLeft).atBoundary, true)
+  const reparented = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.read(`(()=>{const panel=document.getElementById('panel');
+      panel.addEventListener('wheel',()=>{
+        const wrapper=document.createElement('div');
+        panel.parentElement.append(wrapper);
+        wrapper.append(panel)
+      },{once:true})})()`)
+    return await f.act('scroll', 'Horizontal panel', { direction: 'left', amount: 180 })
+  })
+  assert.equal(reparented.execution.scroll.changed, null)
+  assert.ok(reparented.execution.scroll.after.some(item => item.id === 'panel' && item.connected))
+  const anonymous = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.read(`(()=>{const panel=document.getElementById('panel');
+      panel.style.cssText='position:absolute;left:20px;top:310px;width:260px;height:70px;overflow:auto';
+      panel.firstElementChild.style.width='1500px';
+      panel.removeAttribute('id')})()`)
+    return await f.act('scroll', 'Horizontal panel', { direction: 'right', amount: 180 })
+  })
+  assert.equal(anonymous.execution.scroll.changed, null)
+  const replaced = await app.evaluate(async () => {
+    const f = globalThis.capabilityFixture
+    await f.read(`(()=>{const panel=document.querySelector('[aria-label="Horizontal panel"]');
+      panel.addEventListener('wheel',()=>panel.replaceWith(panel.cloneNode(true)),{once:true})})()`)
+    return await f.act('scroll', 'Horizontal panel', { direction: 'left', amount: 180 })
+  })
+  assert.equal(replaced.execution.scroll.changed, null)
+  assert.ok(replaced.execution.scroll.before.some(item => item.scope === 'element'))
+  assert.equal(replaced.execution.scroll.after.some(item => item.scope === 'element'), false)
 
   const coordinate = await app.evaluate(async () => {
     const f = globalThis.capabilityFixture
+    if (f.owner.isMinimized()) f.owner.restore()
+    f.owner.show()
+    f.view.setVisible(true)
+    if (!f.owner.isVisible() || !f.view.getVisible()) throw new Error('Visual test window is not visible.')
     await f.read('window.events=[]')
     const observed = await f.driver.observe(f.generation, () => {}, new AbortController().signal, 'hybrid')
     const result = await f.act('drag', null, { x: 420, y: 230, toX: 600, toY: 230,

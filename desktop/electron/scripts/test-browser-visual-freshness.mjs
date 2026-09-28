@@ -17,6 +17,7 @@ function fixture() {
   const driver = new Driver({}, () => true, pointer)
   const state = { presses: 0, captures: 0, points: [], authorized: true, pixels: 'original pixels', beforePress: undefined, failureAfterPress: false }
   const page = Object.assign(new EventEmitter(), {
+    url: () => 'https://synthetic.invalid/',
     evaluate: async () => ({ width: 200, height: 100, reducedMotion: true }),
     mouse: {
       click: async (x, y) => {

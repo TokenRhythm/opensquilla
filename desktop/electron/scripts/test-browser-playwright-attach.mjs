@@ -331,6 +331,8 @@ try {
   assert.equal(observationChecks.domImageStatus, 'omitted')
   assert.equal(observationChecks.domHasBytes, false)
   assert.equal(observationChecks.failedBatch.execution.state, 'failed')
+  assert.equal(observationChecks.failedBatch.execution.stopReason, 'action_failed')
+  assert.equal(observationChecks.failedBatch.execution.stoppedAt, 0)
   assert.equal(observationChecks.failedBatch.execution.actions[1].state, 'not_started')
   assert.equal(observationChecks.initialClicks, observationChecks.afterClicks)
   for (const dialog of observationChecks.dialogResults) {
@@ -409,7 +411,9 @@ try {
     const hiddenImage = await record.driver.screenshot(guard, signal)
     const stillHidden = !record.view.getVisible()
     const previousGeneration = record.generation
-    await record.view.webContents.loadURL(origin + '/next')
+    snapshot = await record.driver.snapshot(record.generation, guard, signal)
+    const nextPageRef = snapshot.refs.find(item => item.name === 'Next page').ref
+    const actionNavigation = await record.driver.act({ action: 'click', ref: nextPageRef }, record.generation, guard, signal)
     let staleNavigation
     try { await record.driver.act({ action: 'click', ref: oldRef }, record.generation, guard, signal) }
     catch (error) { staleNavigation = error.code }
@@ -431,7 +435,7 @@ try {
     await record.driver.act({ action: 'click', ref: afterCancel.refs.find(item => item.name === 'Increment').ref }, record.generation, guard, signal)
     const afterCancelCounts = await record.view.webContents.executeJavaScript('({clicks:window.clicks||0,delayedClicks:window.delayedClicks||0})')
     await Promise.all(records.map(item => item.driver.dispose()))
-    return { staleReplacement, staleNavigation, stillHidden, hiddenWidth: hiddenImage.width,
+    return { staleReplacement, staleNavigation, stillHidden, hiddenWidth: hiddenImage.width, actionNavigation,
       generationAdvanced: record.generation > previousGeneration, navigated: navigated.text,
       reconnected: reconnected.text, login, retained, stillAttached, cancelled, afterCancelCounts, contentsId: record.view.webContents.id }
   }, origin)
@@ -440,6 +444,8 @@ try {
   assert.equal(lifecycle.stillHidden, true)
   assert.ok(lifecycle.hiddenWidth > 0)
   assert.equal(lifecycle.generationAdvanced, true)
+  assert.equal(lifecycle.actionNavigation.execution.navigation.mainFrameNavigated, true)
+  assert.equal(lifecycle.actionNavigation.execution.navigation.url, origin + '/next')
   assert.match(lifecycle.navigated, /Next document/)
   assert.match(lifecycle.reconnected, /Next document/)
   assert.equal(lifecycle.login, 'first-login')

@@ -115,66 +115,58 @@ has ended. Handle the dialog according to the task, but do not claim a managed
 artifact exists: accepting can open the native save dialog. A file chooser that
 opens after the automated action returns can likewise require native interaction.
 
-## Required workflow
+## Working with browser state
 
-1. Call `browser_tabs` first when a page may already be open.
-2. Call `browser_open` for a new URL, or `browser_navigate` for a known
-   `targetRef`.
-3. Prefer `browser_observe` before acting. If the preceding navigation, batch,
-   dialog response, or tab switch already returned a fresh observation, use it
-   directly. Read its state and blockers as well as its text; use only its refs.
-4. Use a short `browser_batch` for actions whose targets are already known.
-   Read the returned observation before deciding the next batch. An observation
-   is not proof that every action succeeded: check action outcomes and page state.
-5. When a native dialog is pending, respond to its exact `dialogId` with
-   `browser_handle_dialog` according to the user's task. Do not keep clicking the
-   blocked document. A DOM modal is page content: observe it and use its current
-   controls. A new tab is a separate target: list tabs and switch explicitly.
-6. After a timeout, covered element, changed page, or uncertain result, obtain a
-   fresh observation and change the next step using that evidence. If repeated
-   observations show no progress, check for dialogs, overlays, new tabs, and
-   visible errors instead of repeating the same action or blind wait.
-7. Verify the requested outcome from the final page state. Report an unknown
-   outcome instead of repeating a submission blindly.
+Choose the next operation from the task and the current page evidence. Use
+`browser_tabs` when reusing a page or recovering its handle; use `browser_open`
+for a new URL or `browser_navigate` for an existing target. An observation from
+navigation, a batch, a dialog response, or a tab switch can supply current
+state and refs without another read. Otherwise, use `browser_observe` (or
+`browser_inspect` on older clients) when you need to locate a control or check
+what changed. Choose DOM refs or a supported visual action according to the
+available evidence. Batch only related actions allowed by the live tool
+contract; inspect each reported outcome before relying on later actions.
 
-For hover menus, hover the current parent, inspect the expanded menu, and use
-the fresh child reference. A detached or covered target requires another
-observation, not a loop of the same click. For a scrollable region, use its
-reference when available and verify the region's content changed: the root
-viewport scroll position alone does not describe every nested scroll container.
-Use the exact key spelling exposed by the tool (for example `ArrowRight`, not
-`Right`). Read parameter errors and correct them before trying another action.
+Re-observe when a page change, stale or covered target, or uncertain result
+makes earlier evidence unreliable. A hover menu, nested scroll region, overlay,
+dialog, or new tab may require a different target or observation. For scrolling,
+check the affected region rather than assuming the root viewport moved. Use the
+exact key spelling advertised by the tool (for example `ArrowRight`). Avoid
+repeating an ineffective action or waiting without evidence of progress.
+
+A native dialog blocks the document until its exact `dialogId` is handled
+according to the user's task. A DOM modal is page content; a new tab has its
+own target. Check action outcomes and page state separately from the user's
+requested result. Verify that result when possible, and report uncertainty
+instead of blindly repeating a submission.
 
 When a tool returns `phase="argument_validation"` and `outcome="not_started"`,
-that request was rejected before browser execution. Use its structured `issues`
-to locate the invalid field and the expected constraint, check the advertised
-contract, and correct the arguments. Do not repeat the same invalid request or
-assume the page changed because validation failed. This result does not prove
-that a separate earlier request had no effect.
+that request did not reach browser execution. Use its `issues` and the
+advertised contract to correct the arguments. This says nothing about an
+earlier request's effect.
 
 A protocol error, timeout, or lost connection without that validation result
-does not establish whether an action ran. Keep an `unknown` outcome uncertain,
-inspect the page's current state, and decide what remains before submitting
-another action. A tool returning successfully proves only the operation's
-reported effect; verify the user's requested result separately.
+does not establish whether an action ran. When the connection permits, check
+the page before deciding whether another action is needed; otherwise keep the
+outcome `unknown`.
 
-Navigation errors can return a retained `targetRef` even when the tool reports
-failure. Check that target's `pageState` and `navigationError` before opening
-another tab. A failed URL can be replaced by navigating the retained tab; an
-empty tab list alone does not prove that the browser process crashed.
+Navigation errors can retain a `targetRef`. Its `pageState` and
+`navigationError` describe what remains usable; a failed URL can be replaced
+by navigating the retained tab. An empty tab list alone does not establish a
+browser-process failure.
 
 Respect `retryable`, `outcome`, and `recoveryBudget` in tool results.
 `BROWSER_RECOVERY_EXHAUSTED` ends that recovery attempt: do not alternate tool
 names, addresses, or waits to bypass it. Read-only diagnostics and unrelated
-working pages may remain usable. After `PAGE_CHANGED`, inspect the current page
-before acting. An unknown click or submission must not be repeated without
-checking its effect. Certificate errors require connection diagnosis; waiting
-or reopening the same address does not resolve a certificate mismatch.
+working pages may remain usable. After `PAGE_CHANGED`, obtain current page
+evidence before acting. Check an unknown click or submission's effect before
+retrying it. A certificate mismatch requires connection diagnosis, not another
+wait or the same navigation.
 
-With an older client, use `browser_inspect` before each deliberate `browser_act`
-and inspect again after a page change or uncertain result. Use its screenshot
-tool for visual checks when the model supports them. If a required dialog or
-tab operation is not exposed, report that specific capability limitation.
+With an older client, obtain current refs through `browser_inspect` before
+acting and inspect again when they become unreliable. Use its screenshot tool
+for visual checks when the model supports them. If a required dialog or tab
+operation is not exposed, report that specific capability limitation.
 
 ## Visual and DOM evidence
 

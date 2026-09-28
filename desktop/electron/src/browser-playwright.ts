@@ -526,19 +526,33 @@ export class BrowserPlaywrightDriver {
     const epoch = this.documentEpoch
     const invalidation = this.invalidationEpoch
     let state = 'completed'
+    let stopReason: string | undefined
+    let stoppedAt: number | undefined
     for (const [index, action] of actions.entries()) {
       try {
         const result = await this.act({ ...request, ...action, operation: 'act' }, generation, assertCurrent, signal)
         results.push({ index, ...result })
-        if (result.execution?.state === 'blocked') { state = 'blocked'; break }
-        if (this.documentEpoch !== epoch) { state = index === actions.length - 1 ? 'completed' : 'partial'; break }
-        if (this.invalidationEpoch !== invalidation) { state = index === actions.length - 1 ? 'completed' : 'partial'; break }
+        if (result.execution?.state === 'blocked') {
+          state = 'blocked'; stopReason = 'dialog'; stoppedAt = index; break
+        }
+        if (this.documentEpoch !== epoch) {
+          state = index === actions.length - 1 ? 'completed' : 'partial'
+          if (state === 'partial') { stopReason = 'main_frame_navigation'; stoppedAt = index }
+          break
+        }
+        if (this.invalidationEpoch !== invalidation) {
+          state = index === actions.length - 1 ? 'completed' : 'partial'
+          if (state === 'partial') { stopReason = 'references_invalidated'; stoppedAt = index }
+          break
+        }
       } catch (error) {
         const failure = error instanceof DesktopBrowserError ? error : new DesktopBrowserError('ACTION_UNAVAILABLE', 'The browser action ended without a confirmed result.')
         const beforeInput = ['STALE_ELEMENT', 'STALE_OBSERVATION', 'IMAGE_NOT_DELIVERED', 'VISUAL_TARGET_HIDDEN', 'INVALID_REQUEST'].includes(failure.code)
         results.push({ ...failure.details, index, performed: false, code: failure.code, message: failure.message,
           outcome: failure.details.outcome ?? (beforeInput ? 'not_started' : 'unknown'), retryable: false })
         state = results.length > 1 ? 'partial' : signal.aborted ? 'cancelled' : 'failed'
+        stopReason = signal.aborted ? 'cancelled' : 'action_failed'
+        stoppedAt = index
         break
       }
     }
@@ -547,7 +561,8 @@ export class BrowserPlaywrightDriver {
     try { observation = await this.observe(generation, assertCurrent, signal, request.observationMode ?? 'auto') }
     catch (error) { observation = { observation: { consistency: 'unavailable', imageStatus: 'unavailable',
       error: error instanceof DesktopBrowserError ? error.code : 'OBSERVATION_UNAVAILABLE', browserState: this.browserState() } } }
-    return { execution: { state, actions: results }, ...observation }
+    return { execution: { state, actions: results,
+      ...(stopReason ? { stopReason, stoppedAt } : {}) }, ...observation }
   }
 
   async snapshot(generation: number, assertCurrent: Guard, signal: AbortSignal): Promise<{
@@ -904,6 +919,7 @@ export class BrowserPlaywrightDriver {
         this.mousePositionPage = page
       }
       const documentEpoch = this.documentEpoch
+      const pageUrl = page.url()
       const motionGuard = () => {
         if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'The browser operation ended; inspect before retrying.', 504)
         assertCurrent()
@@ -1013,6 +1029,8 @@ export class BrowserPlaywrightDriver {
             }
             const amount = request.amount ?? 600
             const position = this.pointer.currentPosition()
+            const scrollRevision = (await this.viewport()).revision
+            const anchorFrame = anchor ? await anchor.element.ownerFrame() : undefined
             const before = await this.scrollContainers(page, anchor?.element, position)
             await page.mouse.wheel(request.direction === 'left' ? -amount : request.direction === 'right' ? amount : 0,
               request.direction === 'up' ? -amount : request.direction === 'down' ? amount : 0)
@@ -1022,8 +1040,33 @@ export class BrowserPlaywrightDriver {
             await Promise.race([page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))),
               new Promise<void>(resolve => setTimeout(resolve, 200))]).catch(() => {})
             const after = await this.scrollContainers(page, anchor?.element, position).catch(() => [])
-            scroll = { before, after, changed: before.some((entry, index) => after[index]
-              && (entry.left !== after[index]!.left || entry.top !== after[index]!.top)) }
+            const currentRevision = await this.viewport().then(state => state.revision, () => undefined)
+            const identifiedContainersMatch = this.documentEpoch === documentEpoch
+              && scrollRevision === currentRevision && (!anchor || anchorFrame === page.mainFrame())
+              && (!!anchor || before.every(entry => entry.scope === 'document'))
+              && after.length === before.length && after.every((entry, index) => {
+                const previous = before[index]
+                return previous?.connected && entry.connected
+                  && previous.scope === entry.scope && previous.tagName === entry.tagName
+                  && (entry.scope === 'document' || !!entry.id && previous.id === entry.id
+                    && before.filter(candidate => candidate.id === entry.id).length === 1
+                    && after.filter(candidate => candidate.id === entry.id).length === 1)
+              })
+            scroll = { direction: request.direction, amount, before,
+              after: after.map(entry => {
+                const scrollable = request.direction === 'left' || request.direction === 'right'
+                  ? entry.width > entry.clientWidth : entry.height > entry.clientHeight
+                const horizontalEnd = entry.width - entry.clientWidth
+                const atBoundary = request.direction === 'left'
+                  ? entry.textDirection === 'rtl' ? entry.left <= -horizontalEnd + 1 : entry.left <= 0
+                  : request.direction === 'right'
+                    ? entry.textDirection === 'rtl' ? entry.left >= -1 : entry.left >= horizontalEnd - 1
+                    : request.direction === 'up' ? entry.top <= 0
+                      : entry.top >= entry.height - entry.clientHeight - 1
+                return { ...entry, ...(scrollable && entry.connected ? { atBoundary } : {}) }
+              }),
+              changed: identifiedContainersMatch ? before.some((entry, index) => after[index]
+                && (entry.left !== after[index]!.left || entry.top !== after[index]!.top)) : null }
             break
           }
           default: throw new DesktopBrowserError('INVALID_REQUEST', 'Unsupported browser action.', 400)
@@ -1037,8 +1080,13 @@ export class BrowserPlaywrightDriver {
             if (point) await this.pointer.update({ ...point, action: request.action ?? 'press' })
           } catch {}
         }
+        const currentUrl = page.url()
+        const mainFrameNavigated = this.documentEpoch !== documentEpoch
+        const navigation = mainFrameNavigated || currentUrl !== pageUrl
+          ? { fromUrl: pageUrl, url: currentUrl, mainFrameNavigated } : undefined
         return { action: request.action, performed: true,
-          ...(scroll ? { execution: { scroll } } : {}), browserState: this.browserState() }
+          ...(scroll || navigation ? { execution: { ...(scroll ? { scroll } : {}), ...(navigation ? { navigation } : {}) } } : {}),
+          browserState: this.browserState() }
       } catch (error) {
         if (commitFailure) throw commitFailure
         if (!(error instanceof DesktopBrowserError)) {
@@ -1074,7 +1122,8 @@ export class BrowserPlaywrightDriver {
   }
 
   private async scrollContainers(page: Page, element?: ElementHandle<Element>, point?: { x: number; y: number } | null): Promise<{
-    tagName: string; left: number; top: number; width: number; height: number; clientWidth: number; clientHeight: number
+    scope: 'document' | 'element'; tagName: string; id?: string; connected: boolean; textDirection: string; left: number; top: number;
+    width: number; height: number; clientWidth: number; clientHeight: number
   }[]> {
     const read = (node: Element | null) => {
       const doc = node?.ownerDocument ?? document
@@ -1083,7 +1132,10 @@ export class BrowserPlaywrightDriver {
         if (current.scrollWidth > current.clientWidth || current.scrollHeight > current.clientHeight) containers.push(current)
       }
       if (doc.scrollingElement && !containers.includes(doc.scrollingElement)) containers.push(doc.scrollingElement)
-      return containers.map(current => ({ tagName: current.localName, left: current.scrollLeft, top: current.scrollTop,
+      return containers.map(current => ({ scope: current === doc.scrollingElement ? 'document' as const : 'element' as const,
+        tagName: current.localName, ...(current.id && current.id.length <= 120 ? { id: current.id } : {}),
+        connected: current.isConnected, textDirection: getComputedStyle(current).direction,
+        left: current.scrollLeft, top: current.scrollTop,
         width: current.scrollWidth, height: current.scrollHeight, clientWidth: current.clientWidth, clientHeight: current.clientHeight }))
     }
     if (element) return await element.evaluate(read)
