@@ -221,7 +221,6 @@
     "resize": "Cambiar el ancho del área de trabajo",
     "pixels": "píxeles",
     "empty": "No hay una vista previa disponible para este elemento.",
-    "itemLimitReached": "Ya hay ocho vistas previas aisladas abiertas. Cierra una antes de abrir otra.",
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
@@ -788,6 +787,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "Nivel de razonamiento global",
+      "globalDesc": "Compartido con el proveedor principal. Un valor explícito prevalece sobre las sugerencias de enrutamiento; el predeterminado las mantiene.",
+      "tierDesc": "Solo para este nivel de enrutamiento. El valor predeterminado no fija un nivel.",
+      "proposerDesc": "Solo para este rol de candidato. El valor predeterminado no fija una anulación.",
+      "aggregatorDesc": "Solo para este rol de agregador. El valor predeterminado no fija una anulación.",
+      "presetDesc": "Definido por el preajuste. Cambia a una selección personalizada para editarlo.",
+      "sharedSettings": "Ajustes compartidos del modelo",
+      "overrideHint": "Nivel global: {level}. Prevalece sobre las sugerencias de enrutamiento de un solo modelo. Los miembros de fusión usan sus propios ajustes.",
+      "inheritedAggregatorDesc": "Solo para este rol de agregador. Al fijar un nivel, este modelo deja de seguir al modelo principal."
+    },
     "capacity": {
       "customOpenAI": "Personalizado · compatible con OpenAI",
       "customAnthropic": "Personalizado · compatible con Anthropic",
@@ -1064,6 +1074,8 @@
       "timeoutLabel": "Tiempo de espera de la solicitud (segundos)",
       "timeoutDesc": "Cuánto esperar la respuesta de un modelo antes de agotar el tiempo de espera; aumenta este valor para modelos locales lentos (Ollama, vLLM, LM Studio).",
       "timeoutGlobalDesc": "Tiempo de espera global para solicitudes normales de todos los proveedores. Las comprobaciones de conexión y las pruebas del modelo usan límites fijos independientes.",
+      "thinkingLabel": "Nivel de razonamiento",
+      "thinkingDefault": "Predeterminado (sin establecer)",
       "contextWindowLabel": "Anulación de la ventana de contexto (tokens)",
       "contextWindowDesc": "Limita el presupuesto de ensamblado del prompt para este modelo. Déjalo en blanco para usar la ventana detectada automáticamente.",
       "contextWindowIdentityLabel": "Ventana de contexto · {provider} / {model}",

@@ -202,6 +202,11 @@ async def test_cancelled_reserved_piece_uses_one_neutral_tombstone_and_staged_cr
               if frame.get("meta", {}).get("flow") == delivery]
     assert len(frames) == 1
     assert frames[0]["payload"]["global_dirty"] is False
+    assert not any(
+        isinstance(frame.get("error"), dict)
+        and frame["error"].get("code") == "SNAPSHOT_STALE"
+        for frame in connection.ws.frames
+    )
     await stage(connection, response.payload)
     assert list(connection._flow.deliveries) == [ordinary]
 

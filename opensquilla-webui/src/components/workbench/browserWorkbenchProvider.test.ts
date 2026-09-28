@@ -25,7 +25,6 @@ function nativeApi(
     getCapabilities: vi.fn(async (): Promise<NativeWorkbenchCapabilities> => ({
       protocolVersions: [1, 2],
       modes: ['full', 'offline'],
-      maxSurfaces: 8,
     })),
     createSurface: vi.fn(successfulResult),
     setSurfaceRect: vi.fn(successfulResult),
@@ -297,7 +296,6 @@ describe('browser Workbench provider', () => {
       getCapabilities: vi.fn(async (): Promise<NativeWorkbenchCapabilities> => ({
         protocolVersions: [1],
         modes: ['offline'],
-        maxSurfaces: 8,
       })),
     })
     const harness = await createHarness(api)

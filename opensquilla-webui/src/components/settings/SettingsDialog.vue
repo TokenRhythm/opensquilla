@@ -142,6 +142,7 @@
               @provider-change="onProviderChange"
               @update-provider-field="updateProviderField"
               @update-llm-timeout="updateLlmTimeout"
+              @update-llm-thinking="updateLlmThinking"
               @update-context-window="updateContextWindow"
               @probe-connection="probeProviderConnection"
               @cancel-provider-probe="cancelProviderProbe"
@@ -167,6 +168,8 @@
               @reset-recommended-router="resetRecommendedRouter"
               @update-fixed-provider="setFixedProvider"
               @update-fixed-model="setFixedModel"
+              @update-llm-thinking="updateModelStrategyThinking"
+              @update-ensemble-thinking="updateEnsembleThinking"
               @update-router-default-tier="setRouterDefaultTier"
               @update-router-visual-mode="setRouterVisualMode"
               @update-tier-field="updateTierField"
@@ -321,6 +324,9 @@ const {
   setEnsembleProposerMaxRetries,
   updateProviderField,
   updateLlmTimeout,
+  updateLlmThinking,
+  updateModelStrategyThinking,
+  updateEnsembleThinking,
   updateContextWindow,
   probeProviderConnection,
   cancelProviderProbe,

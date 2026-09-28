@@ -50,6 +50,10 @@ function resolvedAuthToken(context: ArtifactPreviewLeaseContext): string {
   return artifactHttpBrokerAuthToken(context.authToken)
 }
 
+function retryableHttpStatus(status: number): boolean {
+  return [408, 429, 500, 502, 503, 504].includes(status)
+}
+
 function transportError(error: HttpTransportError): ArtifactPreviewLeaseError {
   let code = ''
   const status = typeof error.status === 'number' ? error.status : 0
@@ -71,7 +75,13 @@ function transportError(error: HttpTransportError): ArtifactPreviewLeaseError {
     const payloadError = typeof raw.error === 'string' ? raw.error : ''
     if (detail || payloadError) message = detail || payloadError
   }
-  return new ArtifactPreviewLeaseError(message, status, code)
+  return new ArtifactPreviewLeaseError(message, status, code,
+    error.kind === 'network' || error.kind === 'timeout'
+    // Fetch can lose the body after successful headers. JSON syntax errors
+    // remain terminal; a body stream failure is reported as a TypeError.
+    || (error.kind === 'decode' && error.transportCause instanceof TypeError)
+    || (error.kind === 'http-status' && retryableHttpStatus(status)),
+  )
 }
 
 function translateTransportError(error: unknown): never {
@@ -200,6 +210,9 @@ function brokerError(
       ? Math.max(0, Math.floor(result.status))
       : 0,
     typeof result.code === 'string' ? result.code : 'PREVIEW_BROKER_UNAVAILABLE',
+    typeof result.status === 'number'
+      && retryableHttpStatus(result.status)
+      && result.code !== 'INVALID_RESPONSE',
   )
 }
 

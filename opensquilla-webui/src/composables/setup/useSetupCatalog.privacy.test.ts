@@ -7608,3 +7608,291 @@ describe('capacity save integration', () => {
     } finally { app.unmount() }
   })
 })
+
+describe('primary thinking save integration', () => {
+  it.each([['', 'high'], ['high', '']])('persists thinking-only edits from %s to %s and reloads the baseline', async (initial, next) => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: initial || null })
+      await api.loadData()
+      const originalRpc = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'config.patch') {
+          const patches = params?.patches as Record<string, unknown> | undefined
+          if (patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        }
+        return originalRpc(method, params)
+      })
+      expect(api.providerDraftDirty.value).toBe(false)
+      api.updateLlmThinking(next)
+      expect(api.providerDraftDirty.value).toBe(true)
+      rpcCall.mockClear()
+      expect(await api.saveProvider()).toBe(true)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': next || null } })
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('saves thinking and capacity in the same provider save action', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      api.modelCapacity.update(target, { contextWindow: '262144', maxOutputTokens: '65536' }, 'provider:openrouter')
+      api.updateLlmThinking('high')
+      rpcCall.mockClear()
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': 'high' } })
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patch: { models: { openrouter: { [target.model]: { context_window: 262144, max_output_tokens: 65536 } } } } })
+    } finally { app.unmount() }
+  })
+
+  it('discards thinking on cancel or provider switch without leaking into profile edits', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateLlmThinking('high')
+      api.cancelProviderEdit()
+      expect(api.providerPanel.value.llmThinking).toBe('')
+      expect(api.providerDraftDirty.value).toBe(false)
+      api.updateLlmThinking('low')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      api.updateLlmThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      expect(api.providerPanel.value.llmThinking).toBe('')
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('global thinking across settings surfaces', () => {
+  it.each(['high', ''])('saves a fixed-model thinking edit through model strategy: %s', async next => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: 'medium' })
+      await api.loadData()
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        const patches = params?.patches as Record<string, unknown> | undefined
+        if (method === 'config.patch' && patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        return original(method, params)
+      })
+      api.updateModelStrategyThinking(next)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+      rpcCall.mockClear()
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': next || null } })
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(api.modelStrategyPanel.value.llmThinking).toBe(next)
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+    } finally { app.unmount() }
+  })
+  it('retains a routing thinking draft when switching provider editors and discards it explicitly', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      await api.discardChanges()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('provider thinking draft rollback', () => {
+  it.each(['high', ''])('restores the routing draft %s when a provider edit is cancelled', async draft => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: 'medium' })
+      await api.loadData()
+      api.updateModelStrategyThinking(draft)
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe(draft)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('restores the routing draft when switching away from the edited primary', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('does not resurrect the routing draft after the provider edit is saved', async () => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        const patches = params?.patches as Record<string, unknown> | undefined
+        if (method === 'config.patch' && patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        return original(method, params)
+      })
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(true)
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('minimal')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('does not resurrect a routing draft after discarding all settings', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      await api.discardChanges()
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('partial thinking save acknowledgement', () => {
+  it('keeps the acknowledged thinking baseline if the subsequent capacity save fails', async () => {
+    const { api, app } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'config.patch' && params?.patch) throw new Error('synthetic capacity failure')
+      return { changed: true }
+    })
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'provider:openrouter')
+      expect(await api.saveProvider()).toBe(false)
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('unacknowledged provider thinking patches', () => {
+  async function rejectedPatchScenario(committed = false, readbackFails = false) {
+    const result = await primaryTransitionScenario()
+    Object.assign(result.saved.llm, { thinking: 'medium' })
+    Object.assign(result.saved, { llm_request_timeout_seconds: 300 })
+    await result.api.loadData()
+    const original = rpcCall.getMockImplementation()!
+    let rejectNextPatch = true
+    rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+      if (readbackFails && !rejectNextPatch && method === 'config.get') {
+        throw new Error('synthetic read-back failure')
+      }
+      const patches = params?.patches as Record<string, unknown> | undefined
+      if (method === 'config.patch' && patches && 'llm.thinking' in patches) {
+        const reject = rejectNextPatch
+        rejectNextPatch = false
+        if (!reject || committed) {
+          Object.assign(result.saved.llm, { thinking: patches['llm.thinking'] })
+          if ('llm_request_timeout_seconds' in patches) {
+            Object.assign(result.saved, { llm_request_timeout_seconds: patches.llm_request_timeout_seconds })
+          }
+        }
+        if (reject) throw new Error('synthetic thinking patch failure')
+      }
+      return original(method, params)
+    })
+    const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+    result.api.modelCapacity.ensure(target)
+    await vi.waitFor(() => expect(result.api.modelCapacity.rows.size).toBeGreaterThan(0))
+    result.api.updateLlmTimeout(600)
+    result.api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'provider:openrouter')
+    rpcCall.mockClear()
+    return { ...result, target }
+  }
+
+  it.each(['high', ''])('retains and retries rejected thinking %s after partial save refresh', async thinking => {
+    const { api, app, saved, target } = await rejectedPatchScenario()
+    try {
+      api.updateLlmThinking(thinking)
+      expect(await api.saveProvider()).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('onboarding.provider.configure', expect.anything())
+      expect(api.providerPanel.value.llmThinking).toBe(thinking)
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(600)
+      expect(api.providerDraftDirty.value).toBe(true)
+      expect(api.modelCapacity.values(target).contextWindow).toBe('65536')
+      rpcCall.mockClear()
+      expect(await api.saveProvider()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: {
+        llm_request_timeout_seconds: 600,
+        'llm.thinking': thinking || null,
+      } })
+      expect(saved.llm).toEqual(expect.objectContaining({ thinking: thinking || null }))
+      expect(api.providerPanel.value.llmThinking).toBe(thinking)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('restores the prior routing draft when a rejected provider edit is cancelled', async () => {
+    const { api, app } = await rejectedPatchScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      // Timeout is edited outside the provider dialog and remains a global draft.
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(600)
+      expect(api.providerDraftDirty.value).toBe(true)
+      api.updateLlmTimeout(300)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('accepts a thinking write confirmed by read-back without resurrecting the prior routing draft', async () => {
+    const { api, app } = await rejectedPatchScenario(true)
+    try {
+      api.updateModelStrategyThinking('high')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('retains rejected thinking and timeout drafts when read-back also fails', async () => {
+    const { api, app } = await rejectedPatchScenario(false, true)
+    try {
+      api.updateLlmThinking('high')
+      expect(await api.saveProvider()).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe('high')
+      expect(api.providerPanel.value.llmTimeoutSeconds).toBe(600)
+      expect(api.providerDraftDirty.value).toBe(true)
+    } finally { app.unmount() }
+  })
+})

@@ -177,3 +177,38 @@ describe('parseContextWindowInput', () => {
     expect(parseContextWindowInput('abc')).toBeNull()
   })
 })
+
+// The global thinking level persists through the provider-save dot-path
+// snapshot; clearing the select writes null so the llm.thinking key is
+// removed (same clear semantics as the context-window override).
+describe('useSettingsPromotedForm — thinking level', () => {
+  it('seeds from llm.thinking and stays pristine after load', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ llm: { provider: 'deepseek', model: 'deepseek-v4', thinking: 'medium' } })
+    expect(f.llmThinking.value).toBe('medium')
+    expect(f.thinkingDirty.value).toBe(false)
+    expect(f.thinkingPatch()).toBeNull()
+  })
+
+  it('emits a dot-path patch when the level changes', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ llm: { thinking: 'low' } })
+    f.setLlmThinking('high')
+    expect(f.thinkingDirty.value).toBe(true)
+    expect(f.thinkingPatch()).toEqual({ 'llm.thinking': 'high' })
+  })
+
+  it('clears back to unset with a null patch value', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({ llm: { thinking: 'high' } })
+    f.setLlmThinking('')
+    expect(f.thinkingPatch()).toEqual({ 'llm.thinking': null })
+  })
+
+  it('treats whitespace-only input as unset', () => {
+    const f = useSettingsPromotedForm()
+    f.initFromConfig({})
+    f.setLlmThinking('  high  ')
+    expect(f.thinkingPatch()).toEqual({ 'llm.thinking': 'high' })
+  })
+})

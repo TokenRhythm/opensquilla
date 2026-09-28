@@ -221,7 +221,6 @@
     "resize": "调整工作区宽度",
     "pixels": "像素",
     "empty": "此项目没有可用的预览。",
-    "itemLimitReached": "已打开 8 个隔离预览。请先关闭一个再继续。",
     "resources": {
       "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
       "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },
@@ -870,6 +869,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "全局思考等级",
+      "globalDesc": "与主用服务商共用。设置后优先于路由层级建议；默认不覆盖层级建议。",
+      "tierDesc": "仅用于此路由层级。默认不指定等级。",
+      "proposerDesc": "仅用于此候选角色。默认不指定该角色的覆盖值。",
+      "aggregatorDesc": "仅用于此融合角色。默认不指定该角色的覆盖值。",
+      "presetDesc": "由预设方案指定；切换自定义方案后可编辑。",
+      "sharedSettings": "模型共用设置",
+      "overrideHint": "全局思考等级为 {level}，优先于单模型路由层级建议；融合成员使用各自设置。",
+      "inheritedAggregatorDesc": "仅用于此融合角色。设置等级后将固定此模型，不再跟随主用模型。"
+    },
     "capacity": {
       "customOpenAI": "自定义 · OpenAI 兼容",
       "customAnthropic": "自定义 · Anthropic 兼容",
@@ -1146,6 +1156,8 @@
       "timeoutLabel": "请求超时（秒）",
       "timeoutDesc": "等待单次模型响应的超时时长——对于较慢的本地模型（Ollama、vLLM、LM Studio）可调高此值。",
       "timeoutGlobalDesc": "所有服务商常规模型请求共享的网关超时；连接检查与模型测试使用各自独立的固定时限。",
+      "thinkingLabel": "思考等级",
+      "thinkingDefault": "默认（未设置）",
       "contextWindowLabel": "上下文窗口覆盖（token 数）",
       "contextWindowDesc": "为该模型设置提示组装预算上限。留空则使用自动检测的窗口。",
       "contextWindowIdentityLabel": "上下文窗口 · {provider} / {model}",

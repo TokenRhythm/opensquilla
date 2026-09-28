@@ -100,9 +100,7 @@ async function open() {
       || gateway?.subscriptionEpoch !== gatewayEpoch
       || (gateway && gateway.loadConnectionEndpoint() !== referenceGatewayEndpoint)
     ) return
-    if (!store.openItem(createWorkspaceFileItem(sessionKey, snapshot.reference))) {
-      errorKey.value = 'workbench.itemLimitReached'
-    }
+    store.openItem(createWorkspaceFileItem(sessionKey, snapshot.reference))
   } catch (error) {
     if (!attempt.signal.aborted) errorKey.value = workspaceReferenceErrorKey(error)
   } finally {

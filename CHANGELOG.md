@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Workbench previews remain available after opening more than eight files or
+  pages, without requiring users to close another preview or dropping older tabs.
+- Temporary preview renewal failures preserve the current page while retrying;
+  failed lease revocations are retried in the background after closing a preview.
 - CLI and onboarding config loads continue with validated in-memory migrations
   when an automatic migration backup or rewrite cannot be written.
 

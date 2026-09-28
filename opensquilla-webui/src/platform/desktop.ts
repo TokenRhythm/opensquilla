@@ -263,7 +263,7 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
 
   async function getCapabilities(): Promise<NativeWorkbenchCapabilities> {
     if (typeof api.getWorkbenchCapabilities !== 'function') {
-      return { protocolVersions: [1], modes: ['offline'], maxSurfaces: 8 }
+      return { protocolVersions: [1], modes: ['offline'] }
     }
     try {
       const payload = await api.getWorkbenchCapabilities()
@@ -284,12 +284,12 @@ function desktopNativeWorkbenchApi(api: OpenSquillaDesktopApi): NativeWorkbenchA
       return {
         protocolVersions: versions.length > 0 ? versions : [1],
         modes: modes.length > 0 ? modes : ['offline'],
-        maxSurfaces: typeof raw.maxSurfaces === 'number' && Number.isFinite(raw.maxSurfaces)
-          ? Math.max(1, Math.floor(raw.maxSurfaces))
-          : 8,
+        ...(typeof raw.maxSurfaces === 'number' && Number.isFinite(raw.maxSurfaces)
+          ? { maxSurfaces: Math.max(1, Math.floor(raw.maxSurfaces)) }
+          : {}),
       }
     } catch {
-      return { protocolVersions: [1], modes: ['offline'], maxSurfaces: 8 }
+      return { protocolVersions: [1], modes: ['offline'] }
     }
   }
 

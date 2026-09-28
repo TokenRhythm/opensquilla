@@ -8897,6 +8897,7 @@ async function reuseHealthyGatewayState(
   if (ready) {
     gatewayState.status = 'ready'
     gatewayState.error = undefined
+    desktopStartupLog('gateway_ready', { operation: 'reused' })
     sendBootStatus('control')
     publishGatewayConnection()
     return gatewayState
@@ -8965,6 +8966,7 @@ async function resumeOwnedGatewayStartup(
   }
   gatewayState.status = 'starting'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_starting', { operation: 'resume' })
   sendBootStatus('gateway-health')
   advanceGatewayStartTelemetry('health')
   await waitForGateway(url, childExitMessage)
@@ -8999,6 +9001,7 @@ async function resumeOwnedGatewayStartup(
 
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_ready', { operation: 'resume', pid: child.pid })
   markGatewayProcessReady(child)
   sendBootStatus('control')
   publishGatewayConnection()
@@ -9166,6 +9169,7 @@ async function startGateway(): Promise<GatewayState> {
     gatewayConnectionInstanceId = randomUUID()
     gatewayState.status = 'starting'
     gatewayState.error = undefined
+    desktopStartupLog('gateway_starting', { operation: 'external', port: gatewayState.port })
     publishGatewayConnection()
     const overrideReady = await readinessCheck(gatewayState.url)
     if (!isCurrent()) throw new Error('Desktop startup was superseded during Gateway override validation.')
@@ -9176,6 +9180,7 @@ async function startGateway(): Promise<GatewayState> {
       publishGatewayConnection()
       throw new Error(`Configured gateway is not healthy: ${gatewayState.url}`)
     }
+    desktopStartupLog('gateway_ready', { operation: 'external', port: gatewayState.port })
     publishGatewayConnection()
     return gatewayState
   }
@@ -9274,6 +9279,7 @@ async function startGateway(): Promise<GatewayState> {
   gatewayState.logPath = logPath
   gatewayState.error = undefined
   gatewayConnectionInstanceId = randomUUID()
+  desktopStartupLog('gateway_starting', { operation: 'spawn', port })
   publishGatewayConnection()
 
   const childPath = desktopChildPath()
@@ -9471,6 +9477,7 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('control')
   gatewayState.status = 'ready'
   gatewayState.error = undefined
+  desktopStartupLog('gateway_ready', { operation: 'spawn', pid: child.pid })
   markGatewayProcessReady(child)
   publishGatewayConnection()
   return gatewayState
@@ -12095,6 +12102,7 @@ async function stopAndJoinAllLifecycleOwnedGateways(
   stopCurrentProcess: (child: ChildProcessWithoutNullStreams) => void = () => stopGateway(),
 ): Promise<boolean> {
   cancelGatewayUnexpectedExitRestart('Gateway stop/join requested')
+  const startedAt = Date.now()
   return await stopAndJoinLifecycleProcesses({
     currentProcess: () => (
       gatewayProcess && gatewayState.owned && !hasGatewayProcessExited(gatewayProcess)
@@ -12104,6 +12112,22 @@ async function stopAndJoinAllLifecycleOwnedGateways(
     stopCurrentProcess,
     liveProcesses: liveLifecycleOwnedGatewayProcesses,
     waitForExit: (child) => waitForGatewayProcessExit(child),
+    onStopRequested: (child) => desktopStartupLog('gateway_stop_requested', {
+      pid: child.pid,
+      operationElapsedMs: Math.max(0, Date.now() - startedAt),
+    }),
+    onChildExited: (child, exited) => desktopStartupLog(
+      exited ? 'gateway_child_exited' : 'gateway_child_exit_wait',
+      {
+        pid: child.pid,
+        exited,
+        operationElapsedMs: Math.max(0, Date.now() - startedAt),
+      },
+    ),
+    onComplete: (exited) => desktopStartupLog('gateway_stop_join_complete', {
+      exited,
+      operationElapsedMs: Math.max(0, Date.now() - startedAt),
+    }),
   })
 }
 
@@ -12168,6 +12192,21 @@ async function applyWindowsInstaller(): Promise<void> {
       setAppExitPhase('deferred', 'verifying Windows update before installation')
       setDesktopUpdateState({ status: 'applying', error: null, errorCode: null })
       createApplicationMenu()
+    },
+    stage: (event, detail) => {
+      // The shared stop/join helper emits per-child gateway_stop_requested and
+      // gateway child-exit breadcrumbs. Keep the update coordinator's
+      // update-level stages separate so one child does not produce duplicates.
+      if (
+        event === 'gateway_stop_requested'
+        || event === 'gateway_child_exited'
+        || event === 'gateway_child_exit_wait'
+      ) return
+      desktopStartupLog(event, {
+        operation: 'windows-update',
+        operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+        ...detail,
+      })
     },
     verify: async () => {
       installerPath = await revalidateReadyWindowsInstaller()
@@ -12314,13 +12353,22 @@ async function applyDownloadedUpdate(): Promise<void> {
   const pendingVersion = downloadedUpdateVersion
   if (pendingVersion === null) return
   const telemetryStartedAt = Date.now()
+  desktopStartupLog('update_started', { operation: 'auto-updater' })
   updateApplying = true
   setAppExitPhase('deferred', 'preparing downloaded update')
   // Never interrupt a reconcile/workspace/settings transaction after it has
   // been admitted. Close new writers and wait for existing operations to
   // finish naturally before the installer handoff.
   const updateWriterAdmission = desktopWriters.close('apply downloaded update')
+  desktopStartupLog('writers_admission_closed', {
+    operation: 'auto-updater',
+    operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+  })
   await waitForDesktopWriterOperations()
+  desktopStartupLog('writers_drained', {
+    operation: 'auto-updater',
+    operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+  })
   downloadedUpdateVersion = null
   createApplicationMenu()
   setDesktopUpdateState({
@@ -12368,6 +12416,10 @@ async function applyDownloadedUpdate(): Promise<void> {
     updateInstallHandoffReady = true
     setAppExitPhase('committed', 'handing off to desktop updater')
     autoUpdater.quitAndInstall(false, true)
+    desktopStartupLog('installer_handoff', {
+      operation: 'auto-updater',
+      operationElapsedMs: Math.max(0, Date.now() - telemetryStartedAt),
+    })
   } catch (err) {
     desktopReliabilityTelemetry.clearUpdateHandoff()
     desktopReliabilityTelemetry.recordUpdateResult({
@@ -15057,6 +15109,8 @@ ipcMain.handle('desktop:boot:retry', async () => {
     return { ok: true }
   }
 
+  const restartStartedAt = Date.now()
+  desktopStartupLog('runtime_restart_started')
   // Otherwise force a real runtime restart. "Restart runtime" must relaunch the
   // child even when the current gateway is healthy, so join every lifecycle-
   // owned child before openOrResumeDesktopApp may respawn. This includes a
@@ -15064,6 +15118,10 @@ ipcMain.handle('desktop:boot:retry', async () => {
   // closed: spawning while any previous writer is live would race the profile
   // lock and recreate the startup failure this recovery action is meant to fix.
   const exited = await stopAndJoinAllLifecycleOwnedGateways()
+  desktopStartupLog('runtime_restart_child_exited', {
+    exited,
+    operationElapsedMs: Math.max(0, Date.now() - restartStartedAt),
+  })
   if (!exited) {
     const message = desktopGatewayStillRunningMessage()
     gatewayState.status = 'error'
@@ -15078,6 +15136,9 @@ ipcMain.handle('desktop:boot:retry', async () => {
   clearReusableGatewayState()
   bootError = null
 
+  desktopStartupLog('runtime_restart_starting', {
+    operationElapsedMs: Math.max(0, Date.now() - restartStartedAt),
+  })
   void openOrResumeDesktopApp()
   return { ok: true }
 })

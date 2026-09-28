@@ -4845,7 +4845,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(current.revision)
       artifact.documentId = current.document.documentId
       artifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -4856,13 +4856,10 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: workbenchResourceKey(current.resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (!current && resource.resource.type === 'document') {
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: artifactPayloadFromWorkbenchResource(resource),
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -4873,9 +4870,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: workbenchResourceKey(resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (
@@ -4891,7 +4885,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(imported.revision)
       artifact.documentId = imported.document.documentId
       artifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -4902,9 +4896,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: `document:${imported.document.documentId}`,
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     const readonlyResource = current?.resource || resource
@@ -4923,7 +4914,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     )
     if (!preview) return
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       initialSection: 'preview',
       nativeHtml: false,
@@ -4932,9 +4923,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
   } catch (error) {
     const classified = classifyArtifactProductError(error)
     const translated = t(classified.messageKey)
@@ -5017,14 +5005,11 @@ async function openDeliverables() {
       const snapshot = await workbenchResourcesStore.load(sessionKey.value)
       const resources = workbenchResourcesStore.navigationResources(sessionKey.value)
       if (snapshot.available && resources.length > 0) {
-        const opened = workbenchStore.openItem(createResourceCollectionWorkbenchItem({
+        workbenchStore.openItem(createResourceCollectionWorkbenchItem({
           resources,
           sessionKey: sessionKey.value,
           title: t('workbench.resources.title'),
         }))
-        if (!opened) {
-          pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-        }
         return
       }
     } catch {
@@ -5119,7 +5104,7 @@ function openLegacyArtifactWorkbench(
   artifact: ArtifactPayload,
   initialSection: 'preview' | 'source' = 'preview',
 ): boolean {
-  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+  return workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     navigationArtifacts: sessionArtifacts.value,
@@ -5129,10 +5114,6 @@ function openLegacyArtifactWorkbench(
     ),
     sessionKey: sessionKey.value,
   }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
-  return opened
 }
 
 async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
@@ -5158,7 +5139,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
       currentArtifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: currentArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5170,9 +5151,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         resourceIdentity: workbenchResourceKey(current.resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (!current && resource.resource.type === 'document') {
@@ -5195,7 +5173,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: importedArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5207,9 +5185,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         resourceIdentity: `document:${imported.document.documentId}`,
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     const readonlyResource = current?.resource || resource
@@ -5231,7 +5206,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: false,
@@ -5240,9 +5215,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
   } catch (error) {
     // METHOD_NOT_FOUND is normalized to a null open result by the provider and
     // follows the compatibility path above. Any other failure must remain
@@ -5274,7 +5246,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
     if (previewPagePath) artifact.previewPagePath = previewPagePath
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact,
       initialSection: 'preview',
       navigationArtifacts: sessionArtifacts.value,
@@ -5283,7 +5255,6 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
       resourceIdentity: workbenchResourceKey(current.resource.resource),
       sessionKey: key,
     }))
-    if (!opened) pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   },
   onError: error => {
     const classified = classifyArtifactProductError(error)
