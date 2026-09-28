@@ -2741,7 +2741,13 @@ def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> 
         assert f"matrix.shard == '{shard}'" in probe["if"]
     run = probe["run"]
     assert "set -euo pipefail" in run
-    assert "gateway-entry.py --_desktop-pty-probe" in run
+    assert run.count("gateway-entry.py --_desktop-pty-probe") == 2
+    assert 'pty_probe_statuses=("${PIPESTATUS[@]}")' in run
+    assert '"${RUNNER_OS}" != "Windows"' in run
+    assert '"available": false, "ioMode": "error"' in run
+    assert '\"reason\": \"PTY probe timed out\"' in run
+    assert '"${#pty_probe_lines[@]}" -ne 1' in run
+    assert 'pty-capability-attempt-2.log' in run
     assert "test_unified_exec_real_pty_reports_tty_and_accepts_input" in run
     assert run.index("--_desktop-pty-probe") < run.index("uv run --no-sync pytest")
     assert "continue-on-error" not in probe
