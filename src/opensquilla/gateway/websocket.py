@@ -1771,12 +1771,15 @@ class WsConnection:
                 delivery.size += extra
                 if self._recovery_enabled and not self._flow.claim(delivery_id, "original"):
                     # ``claim`` can lose a race with a cancellation/tombstone
-                    # after the response was encoded.  Undo the extra bytes
-                    # before taking the stale-receipt recovery path.
+                    # after the response was encoded.  A delivery already
+                    # published as a tombstone (or as the original response)
+                    # is an idempotent duplicate and must remain suppressed;
+                    # it is not a new stale receipt requiring resync.  Undo
+                    # any size growth before dropping that duplicate.
                     if extra:
                         delivery.size -= extra
                         self.release_transport_bytes(extra, kind="recovery")
-                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
+                    return False
                 frame.delivery_id = delivery_id
                 frame.encoded_text = encoded
                 return True
