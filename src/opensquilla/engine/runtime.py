@@ -797,6 +797,7 @@ class _EmergencyCompactionOverride:
     history_capacity_chars: int | None = None
     protected_recent_messages: int = 0
     protected_message_id: str | None = None
+    preserve_historical_images: bool = True
     consumer_admission: Callable[[str, list[dict[str, Any]]], bool] | None = field(
         default=None, repr=False
     )
@@ -10769,6 +10770,15 @@ class TurnRunner:
             )
             if not isinstance(raw_media_type, str):
                 continue
+            data = attachment.get("data")
+            sha_ref = attachment.get("sha256_ref")
+            missing_reason = attachment.get("missing_reason")
+            data_text = data if isinstance(data, str) and data else None
+            sha_ref_text = sha_ref if isinstance(sha_ref, str) and sha_ref else None
+            has_missing_reason = isinstance(missing_reason, str) and bool(missing_reason)
+            if not (data_text is not None or sha_ref_text is not None or has_missing_reason):
+                # The historical decoder skips MIME-only and alias-only rows.
+                continue
             # Historical non-image material is never included in a provider
             # message. A corrupt or missing file changes only its bounded
             # workspace/omission marker, not whether the storage Base64 is
@@ -10779,23 +10789,17 @@ class TurnRunner:
             if media_type is None:
                 return True, False, False
             occurrence = image_occurrences.get(ordinal)
-            if occurrence is None or occurrence.material_state == "invalid":
-                return True, False, False
-            data = attachment.get("data")
-            sha_ref = attachment.get("sha256_ref")
-            if sha_ref is None:
-                sha_ref = attachment.get("sha256") or attachment.get("material_id")
-            missing_reason = attachment.get("missing_reason")
-            data_text = data if isinstance(data, str) and data else None
-            sha_ref_text = sha_ref if isinstance(sha_ref, str) and sha_ref else None
-            has_missing_reason = isinstance(missing_reason, str) and bool(missing_reason)
-            if not (data_text is not None or sha_ref_text is not None or has_missing_reason):
+            if occurrence is None:
                 return True, False, False
             if data_text is not None:
                 try:
-                    base64.b64decode(data_text, validate=True)
+                    decoded = base64.b64decode(data_text, validate=True)
+                    validate_image_bytes(decoded, media_type)
                 except (binascii.Error, ValueError):
                     return True, False, False
+                continue
+            if occurrence.material_state == "invalid" and sha_ref_text is None:
+                return True, False, False
             if data_text is None and sha_ref_text is not None:
                 # Retained images can enter the provider request as media, so
                 # prove their reference before reserving the media budget.
@@ -12038,6 +12042,7 @@ class TurnRunner:
         compaction_request_context: Any | None = None,
         compaction_budget: CompactionBudget | None = None,
         attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
+        preserve_historical_images: bool = True,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -12122,6 +12127,8 @@ class TurnRunner:
         compaction_config.request_context = compaction_request_context
         compaction_config.budget = compaction_budget
         compaction_config.attachment_path_resolver = attachment_path_resolver
+        compaction_config.attachment_media_root = self._attachment_media_root()
+        compaction_config.preserve_historical_images = preserve_historical_images
         if self.has_attempted_compaction_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
@@ -12173,12 +12180,30 @@ class TurnRunner:
         )
 
         durable_prefix_end = len(transcript) - protected_suffix_count
+        replay_session_id = expected_session_id or next(
+            (
+                str(getattr(entry, "session_id"))
+                for entry in transcript
+                if getattr(entry, "session_id", None)
+            ),
+            "",
+        )
+        replay_measure_kwargs: dict[str, Any] = {
+            "media_root": compaction_config.attachment_media_root,
+            "session_id": replay_session_id,
+            "preserve_images": preserve_historical_images,
+        }
 
         def measure_replay() -> tuple[list[int], int, int]:
             return (
-                [estimate_entry_model_replay_tokens(entry) for entry in transcript],
-                estimate_entries_model_replay_chars(transcript),
-                estimate_entries_model_replay_chars(transcript[:durable_prefix_end]),
+                [
+                    estimate_entry_model_replay_tokens(entry, **replay_measure_kwargs)
+                    for entry in transcript
+                ],
+                estimate_entries_model_replay_chars(transcript, **replay_measure_kwargs),
+                estimate_entries_model_replay_chars(
+                    transcript[:durable_prefix_end], **replay_measure_kwargs,
+                ),
             )
 
         # Long histories must not block unrelated SQLite completions on the
@@ -12247,6 +12272,7 @@ class TurnRunner:
         protected_request_chars = (
             await asyncio.to_thread(
                 estimate_entry_model_replay_chars, transcript[active_user_index],
+                **replay_measure_kwargs,
             )
             if active_user_index is not None
             else 0
@@ -12291,6 +12317,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
         if protected_suffix_count and not self._durable_compaction_accepts_config():
@@ -12308,6 +12335,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
 
@@ -12392,6 +12420,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
         except Exception as exc:
@@ -12569,6 +12598,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -12591,6 +12621,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             if emergency_applied:
                 return
@@ -12645,6 +12676,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             if emergency_applied:
                 return
@@ -12746,6 +12778,7 @@ class TurnRunner:
             turn_context=turn_context if isinstance(turn_context, dict) else None,
         )
         return {
+            "session_id": getattr(entry, "session_id", None),
             "message_id": getattr(entry, "message_id", None),
             "role": role,
             "content": silent_reply.content or "",
@@ -12761,6 +12794,7 @@ class TurnRunner:
     @staticmethod
     def _emergency_replay_entry(raw: Mapping[str, Any]) -> Any:
         return SimpleNamespace(
+            session_id=raw.get("session_id"),
             message_id=raw.get("message_id"),
             role=str(raw.get("role") or "user"),
             content=str(raw.get("content") or ""),
@@ -12795,6 +12829,7 @@ class TurnRunner:
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], bool] | None = None,
+        preserve_historical_images: bool = True,
     ) -> bool:
         """Select a local request view; never summarize or mutate session storage."""
         self._turn_compaction_failed_sessions.add(session_key)
@@ -12813,6 +12848,11 @@ class TurnRunner:
         from opensquilla.session.tokenizer import estimate_tokens
 
         raw_entries = [self._entry_for_emergency_compaction(entry) for entry in transcript]
+        replay_measure_kwargs: dict[str, Any] = {
+            "media_root": self._attachment_media_root(),
+            "session_id": expected_session_id or "",
+            "preserve_images": preserve_historical_images,
+        }
         complete_summary = await self._compaction_summary_context(
             session_key, [], expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch, emit_event=False, raw_complete=True,
@@ -12827,8 +12867,11 @@ class TurnRunner:
                 return bool(consumer_admission(summary, kept))
             # Compatibility callers supply history capacity with the fixed
             # envelope already deducted. Production uses the exact wire gate.
-            tokens = sum(estimate_entry_model_replay_tokens(e) for e in kept)
-            chars = estimate_entries_model_replay_chars(kept)
+            tokens = sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in kept
+            )
+            chars = estimate_entries_model_replay_chars(kept, **replay_measure_kwargs)
             return (
                 tokens + estimate_tokens(rendered or "") <= history_window_tokens
                 and (history_capacity_chars is None
@@ -12908,6 +12951,7 @@ class TurnRunner:
             history_window_tokens=history_window_tokens,
             history_capacity_chars=history_capacity_chars,
             protected_recent_messages=protected_count, protected_message_id=protected_message_id,
+            preserve_historical_images=preserve_historical_images,
             consumer_admission=consumer_admission,
         )
         self.mark_compacted_this_turn(session_key)
@@ -12915,8 +12959,14 @@ class TurnRunner:
             session_key, source="automatic", phase=phase, status="emergency_ephemeral",
             reason=reason, removed_count=omitted_count, kept_count=len(kept),
             omitted_count=omitted_count, archived_count=0,
-            tokens_before=sum(estimate_entry_model_replay_tokens(e) for e in raw_entries),
-            tokens_after=sum(estimate_entry_model_replay_tokens(e) for e in kept)
+            tokens_before=sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in raw_entries
+            ),
+            tokens_after=sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in kept
+            )
                          + estimate_tokens(_format_compaction_summary_context([summary]) or ""),
             **compaction_effect_payload(status="emergency_ephemeral", reason=reason),
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
@@ -13293,6 +13343,9 @@ class TurnRunner:
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
                             consumer_admission=emergency_override.consumer_admission,
+                            preserve_historical_images=(
+                                emergency_override.preserve_historical_images
+                            ),
                         )
                         emergency_override = emergency_overrides.pop(session_key, None)
                 if emergency_override is not None:

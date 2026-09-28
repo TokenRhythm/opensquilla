@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import time
 from dataclasses import dataclass, field
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from PIL import Image
 
 from opensquilla.application.session_maintenance import (
     CompactSession,
@@ -16,6 +18,7 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionResult,
     SessionCompactionSession,
 )
+from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.gateway.adapters.session_maintenance import (
     GatewaySessionMaintenanceAdapter,
     GatewaySessionMaintenancePorts,
@@ -187,13 +190,14 @@ def test_manual_plan_keeps_generation_budget_without_fabricating_active_request(
     plan = ports.build_plan(None, None, "manual-generation", time.monotonic() + 120)
 
     compaction = plan.runtime_value.config
+    assert compaction.preserve_historical_images is False
     assert compaction.request_context is None
     assert compaction.llm_plan.primary.max_generation_tokens == 8192
     assert compaction.llm_plan.primary.max_output_tokens == 1024
 
 
 def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     from opensquilla.engine.runtime import TurnRunner
     from opensquilla.provider.openai import OpenAIProvider
@@ -203,6 +207,7 @@ def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(
         "provider": "openai", "model": "synthetic-manual", "api_key": "synthetic-key",
         "context_window_tokens": 32_000, "max_tokens": 1024, "thinking": "off",
     })
+    config.attachments.media_root = str(tmp_path / "media")
     current = ProviderConfig(
         provider="openai", model="synthetic-manual", api_key="synthetic-key",
     )
@@ -241,6 +246,7 @@ def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(
     session = SessionCompactionSession(raw_session.session_id, "main", raw_session)
     plan = ports.build_plan(session, None, "manual-envelope", time.monotonic() + 120)
     shared = plan.runtime_value.config.budget
+    assert plan.runtime_value.config.preserve_historical_images is True
     fallback = build_gateway_compaction_budget(plan.runtime_value.budget)
 
     assert shared.physical_context_window_tokens == 32_000
@@ -248,6 +254,47 @@ def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(
     assert 0 < shared.history_capacity_tokens < fallback.history_capacity_tokens
     assert 0 < shared.history_capacity_chars < fallback.history_capacity_chars
     assert shared.consumer_admission("complete checkpoint", []) is True
+    payload = image_bytes("JPEG")
+    sha, _path, _written = write_transcript_material(
+        media_root=Path(config.attachments.media_root),
+        session_id=raw_session.session_id, payload=payload,
+    )
+    retained_image = {
+        "role": "user", "session_id": raw_session.session_id,
+        "message_id": "synthetic-retained-image",
+        "content": json.dumps({"text": "Inspect.", "attachments": [{
+            "type": "image/jpeg", "sha256_ref": sha, "size": len(payload),
+        }]}),
+    }
+    assert shared.consumer_admission("complete checkpoint", [retained_image]) is True
+    stream = io.BytesIO()
+    with Image.new("1", (2048, 2048), 1) as image:
+        image.save(stream, format="PNG")
+    large_image = stream.getvalue()
+    large_sha, _path, _written = write_transcript_material(
+        media_root=Path(config.attachments.media_root),
+        session_id=raw_session.session_id, payload=large_image,
+    )
+    large_retained = {
+        **retained_image,
+        "content": json.dumps({"text": "Inspect.", "attachments": [{
+            "type": "image/png", "sha256_ref": large_sha, "size": len(large_image),
+        }]}),
+    }
+    # Find an admitted checkpoint with about 2k tokens of remaining space.
+    # A 1024-token reference placeholder would fit; the actual 2048² image
+    # needs 4096 media tokens and must be rejected by the manual consumer.
+    low, high = 0, shared.physical_context_window_tokens
+    while low + 1 < high:
+        midpoint = (low + high) // 2
+        if shared.consumer_admission("x " * midpoint, []):
+            low = midpoint
+        else:
+            high = midpoint
+    assert low > 2_500
+    near_budget = "x " * (low - 2_000)
+    assert shared.consumer_admission(near_budget, []) is True
+    assert shared.consumer_admission(near_budget, [large_retained]) is False
     assert any(prompt in json.dumps(payload) for payload in projected)
     assert any("synthetic_lookup" in json.dumps(payload) for payload in projected)
     assert raw_session.model_dump() == before

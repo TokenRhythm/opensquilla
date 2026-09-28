@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import hashlib
 import inspect
 import json
@@ -13,16 +15,19 @@ from bisect import bisect_right
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 import structlog
 
 from opensquilla.artifacts import artifact_history_context
+from opensquilla.attachment_refs import make_attachment_ref, read_attachment_ref_bytes
 from opensquilla.attachment_workspace import (
     historical_attachment_capacity_marker,
     historical_image_material_capacity_marker,
 )
+from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
@@ -185,6 +190,8 @@ class CompactionConfig:
     attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = field(
         default=None, repr=False, compare=False,
     )
+    attachment_media_root: Path | None = field(default=None, repr=False, compare=False)
+    preserve_historical_images: bool = True
     request_context: CompactionRequestContext | None = field(
         default=None, repr=False, compare=False,
     )
@@ -631,10 +638,19 @@ def estimate_entry_replay_tokens(entry: Any) -> int:
     return content_tokens + extra_tokens
 
 
-def estimate_entry_model_replay_tokens(entry: Any) -> int:
+def estimate_entry_model_replay_tokens(
+    entry: Any,
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> int:
     """Estimate the full transcript payload size replayed to the model."""
 
-    media_budget = _entry_model_replay_media_budget(entry)
+    media_budget = _entry_model_replay_media_budget(
+        entry, media_root=media_root, session_id=session_id,
+        preserve_images=preserve_images,
+    )
     if media_budget is not None:
         estimated = int(media_budget["estimated_tokens"])
         if _entry_get(entry, "assistant_replay") is None:
@@ -669,7 +685,7 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
         projected_content, projection_complete = project_entry_content_for_provider(
             content,
             preserve_images=False,
-            session_id=str(_entry_get(entry, "session_id") or ""),
+            session_id=session_id or str(_entry_get(entry, "session_id") or ""),
             message_id=str(_entry_get(entry, "message_id") or ""),
         )
     if projection_complete and projected_content != content:
@@ -719,6 +735,8 @@ def project_entry_content_for_provider(
     preserve_images: bool = False,
     session_id: str = "",
     message_id: str = "",
+    media_root: Path | None = None,
+    require_media_proof: bool = False,
 ) -> tuple[Any, bool]:
     """Project one persisted user attachment envelope for provider replay.
 
@@ -766,6 +784,18 @@ def project_entry_content_for_provider(
         raw_mime = item.get("type") or item.get("mime") or item.get("media_type")
         if not isinstance(raw_mime, str):
             continue
+        # The runtime skips entries with no replayable material or explicit
+        # missing status. Legacy sha256/material_id aliases alone are not a
+        # replay source for its historical attachment decoder.
+        data = item.get("data")
+        sha_ref = item.get("sha256_ref")
+        missing_reason = item.get("missing_reason")
+        if not (
+            isinstance(data, str) and bool(data)
+            or isinstance(sha_ref, str) and bool(sha_ref)
+            or isinstance(missing_reason, str) and bool(missing_reason)
+        ):
+            continue
         occurrence = occurrences_by_ordinal.get(ordinal)
         if occurrence is None:
             return content, False
@@ -781,12 +811,32 @@ def project_entry_content_for_provider(
                 sha256_ref=occurrence.sha256_ref,
             ))
             continue
-        if occurrence.material_state != "available":
+        inline_data_valid = False
+        if preserve_images and isinstance(data, str) and data:
+            try:
+                decoded = base64.b64decode(data, validate=True)
+                validate_image_bytes(decoded, mime)
+            except (binascii.Error, ValueError):
+                return content, False
+            inline_data_valid = True
+        ref_may_replay = (
+            occurrence.sha256_ref is not None
+            and isinstance(sha_ref, str)
+            and bool(sha_ref)
+        )
+        if (
+            preserve_images
+            and occurrence.material_state != "available"
+            and not inline_data_valid
+            and not ref_may_replay
+        ):
             # A missing_reason can coexist with image data or a ref, and the
             # runtime still tries to replay those bytes. Retain the raw floor
             # until that image path can be proved separately.
-            if occurrence.material_state == "invalid" or item.get("data") or item.get(
-                "sha256_ref"
+            if (
+                occurrence.material_state == "invalid"
+                or item.get("data")
+                or (item.get("sha256_ref") and media_root is None)
             ):
                 return content, False
         material_marker = historical_image_material_capacity_marker(
@@ -809,12 +859,14 @@ def project_entry_content_for_provider(
             replay_id_marker = _pad_history_marker_tokens(
                 replay_id_marker, unknown_id_tokens,
             )
-        data = item.get("data")
         if (
             preserve_images
             and isinstance(data, str)
             and data
         ):
+            # Runtime replays inline bytes before consulting a reference. A
+            # stale hash or size can invalidate manifest metadata without
+            # changing the image that actually reaches the provider.
             image_blocks.append(ContentBlockText(text=replay_id_marker))
             image_blocks.append(
                 ContentBlockImage(
@@ -830,15 +882,33 @@ def project_entry_content_for_provider(
             preserve_images
             and occurrence.sha256_ref is not None
         ):
-            # The durable bytes are not available to this pure projection.
-            # Keep a remote/reference media block so provider proof applies its
-            # bounded fallback rather than silently dropping the image.
+            if require_media_proof and (media_root is None or not session_id):
+                return content, False
+            resolved_data: str | None = None
+            if media_root is not None and session_id:
+                if session_id in {".", ".."} or "/" in session_id or "\\" in session_id:
+                    return content, False
+                raw_size = item.get("size")
+                try:
+                    ref = make_attachment_ref(
+                        sha256=occurrence.sha256_ref,
+                        name=display_name,
+                        mime=mime,
+                        size=raw_size if isinstance(raw_size, int) else -1,
+                        session_id=session_id,
+                        source="transcript",
+                    )
+                    raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
+                    validate_image_bytes(raw_bytes, mime)
+                    resolved_data = base64.b64encode(raw_bytes).decode("ascii")
+                except (OSError, ValueError):
+                    return content, False
             image_blocks.append(ContentBlockText(text=replay_id_marker))
             image_blocks.append(
                 ContentBlockImage(
-                    source_type="url",
+                    source_type="base64" if resolved_data is not None else "url",
                     media_type=mime,
-                    data="[retained image reference]",
+                    data=resolved_data or "[retained image reference]",
                     durable_retained=True,
                 )
             )
@@ -957,7 +1027,13 @@ def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
     return payload
 
 
-def estimate_entries_model_replay_chars(entries: Sequence[Any]) -> int:
+def estimate_entries_model_replay_chars(
+    entries: Sequence[Any],
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> int:
     """Count serialized text and the shared media equivalent for replay."""
 
     if not entries:
@@ -965,13 +1041,22 @@ def estimate_entries_model_replay_chars(entries: Sequence[Any]) -> int:
     payloads = [_entry_model_replay_payload(entry) for entry in entries]
     chars = len(_json_text(payloads))
     for entry, payload in zip(entries, payloads, strict=True):
-        media_budget = _entry_model_replay_media_budget(entry)
+        media_budget = _entry_model_replay_media_budget(
+            entry, media_root=media_root, session_id=session_id,
+            preserve_images=preserve_images,
+        )
         if media_budget is not None:
             chars += int(media_budget["estimated_chars"]) - len(_json_text(payload))
     return chars
 
 
-def _entry_model_replay_media_budget(entry: Any) -> dict[str, Any] | None:
+def _entry_model_replay_media_budget(
+    entry: Any,
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> dict[str, Any] | None:
     """Project accepted media positions without discounting arbitrary tool JSON."""
 
     from opensquilla.provider.request_proof import project_provider_payload
@@ -1002,9 +1087,10 @@ def _entry_model_replay_media_budget(entry: Any) -> dict[str, Any] | None:
             return None
         projected_content, estimate_complete = project_entry_content_for_provider(
             content,
-            preserve_images=True,
-            session_id=str(_entry_get(entry, "session_id") or ""),
+            preserve_images=preserve_images,
+            session_id=session_id or str(_entry_get(entry, "session_id") or ""),
             message_id=str(_entry_get(entry, "message_id") or ""),
+            media_root=media_root,
         )
         if not estimate_complete or not isinstance(projected_content, list):
             return None
@@ -1020,19 +1106,37 @@ def _entry_model_replay_media_budget(entry: Any) -> dict[str, Any] | None:
     return proof if proof.get("media_blocks_reserved") else None
 
 
-def estimate_entry_model_replay_chars(entry: Any) -> int:
+def estimate_entry_model_replay_chars(
+    entry: Any,
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> int:
     """Count one entry using the same provider-visible projection."""
 
-    return estimate_entries_model_replay_chars([entry])
+    return estimate_entries_model_replay_chars(
+        [entry], media_root=media_root, session_id=session_id,
+        preserve_images=preserve_images,
+    )
 
 
-def _entry_tokens(entry: dict[str, Any]) -> int:
+def _entry_tokens(
+    entry: dict[str, Any],
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> int:
     # Budget/skip/cut decisions must measure what the model actually replays
     # (the full tool_calls JSON), NOT the summarized compaction-LLM input. The
     # preflight trigger (runtime.py) uses the model-replay estimator; using the
     # smaller summarized estimate here made compaction veto itself on
     # tool-heavy transcripts that genuinely overflow the window.
-    return estimate_entry_model_replay_tokens(entry)
+    return estimate_entry_model_replay_tokens(
+        entry, media_root=media_root, session_id=session_id,
+        preserve_images=preserve_images,
+    )
 
 
 def effective_protected_recent_messages(cfg: CompactionConfig) -> int:
@@ -1458,12 +1562,27 @@ def _chunk_entries(
     return chunks
 
 
-def _compaction_source_size(entries: list[dict[str, Any]]) -> tuple[int, int]:
+def _compaction_source_size(
+    entries: list[dict[str, Any]],
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> tuple[int, int]:
     """Measure a frozen source without doing tokenizer/JSON work on the event loop."""
 
     return (
-        sum(_entry_tokens(entry) for entry in entries),
-        estimate_entries_model_replay_chars(entries),
+        sum(
+            _entry_tokens(
+                entry, media_root=media_root, session_id=session_id,
+                preserve_images=preserve_images,
+            )
+            for entry in entries
+        ),
+        estimate_entries_model_replay_chars(
+            entries, media_root=media_root, session_id=session_id,
+            preserve_images=preserve_images,
+        ),
     )
 
 
@@ -2848,6 +2967,10 @@ def _find_turn_boundary_cut(
     entries: list[dict[str, Any]],
     keep_budget: int,
     keep_char_budget: int | None = None,
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
 ) -> int:
     """Return a token/character-aware cut at a complete API-round boundary."""
 
@@ -2862,8 +2985,17 @@ def _find_turn_boundary_cut(
     kept_chars = 0
     keep_start = len(entries)
     for group in reversed(groups):
-        group_tokens = sum(_entry_tokens(entry) for entry in group)
-        group_chars = estimate_entries_model_replay_chars(group)
+        group_tokens = sum(
+            _entry_tokens(
+                entry, media_root=media_root, session_id=session_id,
+                preserve_images=preserve_images,
+            )
+            for entry in group
+        )
+        group_chars = estimate_entries_model_replay_chars(
+            group, media_root=media_root, session_id=session_id,
+            preserve_images=preserve_images,
+        )
         fits_tokens = kept_tokens + group_tokens <= keep_budget
         fits_chars = bool(
             keep_char_budget is None
@@ -2892,8 +3024,16 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     cfg = request.config
     entries = request.entries
     window = request.context_window_tokens
+    replay_measure_kwargs: dict[str, Any] = {}
+    if cfg.attachment_media_root is not None or not cfg.preserve_historical_images:
+        replay_measure_kwargs = {
+            "media_root": cfg.attachment_media_root,
+            "session_id": request.session_id,
+            "preserve_images": cfg.preserve_historical_images,
+        }
     raw_entry_tokens, raw_entry_chars = await await_compaction_phase(
-        asyncio.to_thread(_compaction_source_size, entries), cfg, phase="summarizing",
+        asyncio.to_thread(_compaction_source_size, entries, **replay_measure_kwargs),
+        cfg, phase="summarizing",
     )
 
     # Extract an optional previous-summary prefix injected by the caller.
@@ -3026,7 +3166,10 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         )
         # compaction: use turn-boundary-aware cut instead of raw token split.
         cut = await await_compaction_phase(
-            asyncio.to_thread(_find_turn_boundary_cut, entries, keep_budget, keep_char_budget),
+            asyncio.to_thread(
+                _find_turn_boundary_cut, entries, keep_budget, keep_char_budget,
+                **replay_measure_kwargs,
+            ),
             cfg, phase="summarizing",
         )
         cut = _retreat_to_api_round_boundary(

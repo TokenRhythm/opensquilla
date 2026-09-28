@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 from PIL import Image
 
+from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.provider.replay_budget import project_message_replay_budget
 from opensquilla.provider.request_proof import estimate_provider_media_tokens
 from opensquilla.provider.types import ContentBlockImage, ContentBlockText, Message
@@ -120,7 +121,6 @@ def test_compaction_projects_opaque_attachment_without_base64(mime: str) -> None
     [
         {"type": "application/zip", "name": "broken.zip", "data": "invalid-base64" * 8000},
         {"type": "application/octet-stream", "name": "bad.bin", "sha256_ref": "bad-ref"},
-        {"type": "application/x-unknown", "name": "empty.bin"},
         {
             "type": "application/zip", "name": "missing.zip",
             "data": "invalid-base64" * 8000, "missing_reason": "material was pruned",
@@ -147,6 +147,20 @@ def test_invalid_opaque_attachment_has_bounded_provider_estimate(
         assert attachment["data"] not in projected
     assert estimate_entry_model_replay_tokens(entry) == estimate_tokens(projected) + 17
     assert estimate_entries_model_replay_chars([entry]) < max(len(content), 2_000)
+
+
+@pytest.mark.parametrize("attachment", [
+    {"type": "application/x-unknown", "name": "empty.bin"},
+    {"type": "image/png", "sha256": "a" * 64},
+    {"type": "image/png", "material_id": "a" * 64},
+])
+def test_historical_attachment_without_runtime_material_is_skipped(
+    attachment: dict[str, str],
+) -> None:
+    content = json.dumps({"text": "Inspect.", "attachments": [attachment]})
+    assert project_entry_content_for_provider(content, preserve_images=True) == (
+        "Inspect.", True,
+    )
 
 
 def test_unverified_opaque_ref_uses_bounded_capacity_marker() -> None:
@@ -421,6 +435,13 @@ def test_invalid_image_still_needs_media_proof() -> None:
 
     assert projected == content
     assert complete is False
+    omitted, omitted_complete = project_entry_content_for_provider(
+        content, preserve_images=False,
+    )
+    assert omitted_complete is True
+    assert isinstance(omitted, str)
+    assert "invalid-base64" not in omitted
+    assert "historical attachment omitted" in omitted
 
 
 @pytest.mark.parametrize("preserve_images", [False, True])
@@ -642,3 +663,80 @@ def test_image_reference_uses_fallback_until_request_bytes_are_available() -> No
     })}
     assert 1024 <= estimate_entry_model_replay_tokens(entry) < 1500
     assert 4096 <= estimate_entries_model_replay_chars([entry]) < 6000
+
+
+@pytest.mark.parametrize("empty_inline_data", [False, True])
+def test_retained_image_reference_uses_verified_request_media(
+    png_encodings: list[str], tmp_path: Path, empty_inline_data: bool,
+) -> None:
+    raw = base64.b64decode(png_encodings[1])
+    media_root = tmp_path / "media"
+    sha, _path, _written = write_transcript_material(
+        media_root=media_root, session_id="history-scope", payload=raw,
+    )
+    attachment: dict[str, Any] = {
+        "type": "image/png", "sha256_ref": sha, "size": len(raw),
+    }
+    if empty_inline_data:
+        attachment["data"] = ""
+    content = json.dumps({"text": "Inspect.", "attachments": [attachment]})
+    entry = {"role": "user", "content": content, "session_id": "history-scope"}
+    projected, complete = project_entry_content_for_provider(
+        content, preserve_images=True, media_root=media_root,
+        session_id="history-scope", require_media_proof=True,
+    )
+    assert complete is True
+    assert isinstance(projected, list)
+    assert any(isinstance(block, ContentBlockImage) and block.data == png_encodings[1]
+               for block in projected)
+    assert 4096 <= estimate_entry_model_replay_tokens(
+        entry, media_root=media_root, session_id="history-scope",
+    ) < 4600
+    assert estimate_entries_model_replay_chars(
+        [entry], media_root=media_root, session_id="history-scope",
+    ) >= 4096 * 4
+    # A text-only route excludes that media reserve without charging its
+    # stored reference or a maximum-size image placeholder.
+    assert estimate_entry_model_replay_tokens(entry, preserve_images=False) < 500
+    assert estimate_entries_model_replay_chars([entry], preserve_images=False) < 1000
+
+
+def test_inline_image_replay_uses_data_despite_stale_metadata(
+    png_encodings: list[str],
+) -> None:
+    content = json.dumps({"text": "Inspect.", "attachments": [{
+        "type": "image/png", "data": png_encodings[1],
+        "sha256_ref": "0" * 64, "size": 1,
+    }]})
+    entry = {"role": "user", "content": content}
+    projected, complete = project_entry_content_for_provider(
+        content, preserve_images=True,
+    )
+    assert complete is True
+    assert isinstance(projected, list)
+    assert 4096 <= estimate_entry_model_replay_tokens(entry) < 4600
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong-size", "wrong-hash", "bad-image"])
+def test_retained_image_reference_requires_verifiable_material(
+    png_encodings: list[str], tmp_path: Path, damage: str,
+) -> None:
+    raw = b"synthetic corrupt PNG bytes" if damage == "bad-image" else base64.b64decode(
+        png_encodings[1]
+    )
+    media_root = tmp_path / "media"
+    sha, path, _written = write_transcript_material(
+        media_root=media_root, session_id="history-scope", payload=raw,
+    )
+    if damage == "missing":
+        path.unlink()
+    content = json.dumps({"text": "Inspect.", "attachments": [{
+        "type": "image/png", "sha256_ref": "0" * 64 if damage == "wrong-hash" else sha,
+        "size": 1 if damage == "wrong-size" else len(raw),
+    }]})
+    projected, complete = project_entry_content_for_provider(
+        content, preserve_images=True, media_root=media_root,
+        session_id="history-scope", require_media_proof=True,
+    )
+    assert complete is False
+    assert projected == content
