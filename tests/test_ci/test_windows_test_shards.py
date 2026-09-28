@@ -557,6 +557,14 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
             "tests/test_engine/test_tool_concurrency.py",
             "test_image_analysis_calls_have_dedicated_inflight_cap",
         ),
+        (
+            "tests/test_gateway/test_manual_compaction_contract.py",
+            "test_absolute_deadline_closes_provider_and_emits_one_failed_terminal",
+        ),
+        (
+            "tests/test_skills/test_staging_io_worker.py",
+            "test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup",
+        ),
     ],
 )
 def test_bounded_latency_contracts_are_marked_ci_serial(
