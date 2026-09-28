@@ -54,6 +54,7 @@ _WINDOWS_FROZEN_READY_ATTEMPTS = 2
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
+_POSIX_ANCHOR_EMPTY_INCOMPLETE = b"U"
 _POSIX_ANCHOR_CAPTURED = b"C"
 _POSIX_ANCHOR_INCOMPLETE = b"I"
 _POSIX_ANCHOR_KILL_CAPTURED = b"D"
@@ -1059,11 +1060,15 @@ def _signal_captured_posix_processes(
         try:
             if process.pidfd is not None:
                 _linux_pidfd_send_signal(process.pidfd, sig)
-            elif _captured_posix_process_matches(
-                _posix_process_info(process.pid),
-                process,
-            ):
-                os.kill(process.pid, sig)
+            else:
+                current_info = _posix_process_info(process.pid)
+                if current_info is None:
+                    # A failed identity lookup does not authorize a bare-PID
+                    # signal, but a still-existing PID cannot prove cleanup.
+                    if not _posix_pid_definitively_gone(process.pid):
+                        complete = False
+                elif _captured_posix_process_matches(current_info, process):
+                    os.kill(process.pid, sig)
         except ProcessLookupError:
             continue
         except OSError:
@@ -1830,6 +1835,13 @@ class _PosixGroupAnchor:
                 owner = self._owner
                 if owner is not None:
                     await owner._close_empty_posix_owner()
+            elif marker == _POSIX_ANCHOR_EMPTY_INCOMPLETE:
+                # No tracked process remains, but a failed census means that
+                # the anchor cannot prove that every descendant was tracked.
+                self.cleanup_incomplete = True
+                self._term_reports.put_nowait(False)
+                self._kill_reports.put_nowait(False)
+                self.release()
             elif not self._kill_reported:
                 self.cleanup_incomplete = True
                 self._term_reports.put_nowait(False)
@@ -2914,14 +2926,19 @@ def _run_posix_group_anchor(
             )
             if empty_confirmations >= _POSIX_EMPTY_CONFIRMATIONS_REQUIRED:
                 try:
-                    output_pipe.write(_POSIX_ANCHOR_EMPTY)
+                    output_pipe.write(
+                        _POSIX_ANCHOR_EMPTY
+                        if cleanup_complete else _POSIX_ANCHOR_EMPTY_INCOMPLETE
+                    )
                     output_pipe.flush()
                 except (BrokenPipeError, OSError):
-                    return 0
+                    return 0 if cleanup_complete else 125
                 if not stdin_open:
-                    return 0
+                    return 0 if cleanup_complete else 125
                 os.set_blocking(stdin_fd, True)
                 if os.read(stdin_fd, 1) != _POSIX_ANCHOR_RELEASE:
+                    return 125
+                if not cleanup_complete:
                     return 125
                 return int(target.returncode or 0) if target is not None else 0
             pipe_command = b""

@@ -415,6 +415,69 @@ async def test_posix_capture_rejects_anchor_close_without_ack(close_marker: str)
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_marker",
+    [process_tree._POSIX_ANCHOR_PRE_EOF_INCOMPLETE, process_tree._POSIX_ANCHOR_INCOMPLETE],
+)
+async def test_posix_incomplete_empty_keeps_unproven_owner_record(
+    monkeypatch, failure_marker: bytes,
+) -> None:
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=0), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+    persisted = object()
+    owner.persisted_owner = persisted
+    deleted: list[object] = []
+    monkeypatch.setattr(process_tree, "_delete_owner_record", deleted.append)
+
+    class Input:
+        closed = False
+        commands: list[bytes] = []
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            self.commands.append(command)
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def wait() -> int:
+        anchor_process.returncode = 125
+        return 125
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    stream.feed_data(failure_marker)
+    stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY_INCOMPLETE)
+    await asyncio.wait_for(anchor._monitor_task, timeout=0.2)
+
+    assert anchor.cleanup_incomplete is True
+    assert anchor.empty is False
+    assert anchor_process.stdin.commands == [process_tree._POSIX_ANCHOR_RELEASE]
+    assert anchor_process.stdin.closed
+    assert owner.persisted_owner is persisted
+    assert owner._closed is False
+    assert deleted == []
+    term_reports = []
+    while not anchor._term_reports.empty():
+        term_reports.append(anchor._term_reports.get_nowait())
+    assert term_reports == (
+        [True, False]
+        if failure_marker == process_tree._POSIX_ANCHOR_INCOMPLETE else [False]
+    )
+    assert not await anchor._kill_reports.get()
+    assert not await owner.terminate(graceful_timeout=0.01, kill_timeout=0.01)
+    assert deleted == [persisted]
+
+
+@pytest.mark.asyncio
 async def test_posix_late_capture_ack_cannot_authorize_retried_eof(monkeypatch) -> None:
     monkeypatch.setattr(process_tree, "_CONTROL_READY_TIMEOUT_SECONDS", 0.01)
     stream = asyncio.StreamReader()
@@ -941,6 +1004,29 @@ def test_posix_captured_pid_identity_change_is_not_signalled(
     assert signalled == []
 
 
+@pytest.mark.parametrize("definitively_gone", [False, True])
+def test_posix_unverifiable_live_pid_cannot_prove_signal_cleanup(
+    monkeypatch: pytest.MonkeyPatch, definitively_gone: bool,
+) -> None:
+    captured = process_tree._CapturedPosixProcess(4242, 501, "original-start", 1)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(process_tree, "_posix_process_info", lambda _pid: None)
+
+    def kill(pid: int, sig: int) -> None:
+        signals.append((pid, sig))
+        if definitively_gone:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(process_tree.os, "kill", kill)
+
+    complete = process_tree._signal_captured_posix_processes(
+        (captured,), signal.SIGTERM,
+    )
+
+    assert complete is definitively_gone
+    assert signals == [(4242, 0)]
+
+
 @pytest.mark.parametrize("members", [(100,), (100, 101), None])
 def test_posix_no_root_capture_requires_independent_empty_group_confirmation(
     monkeypatch: pytest.MonkeyPatch, members: tuple[int, ...] | None,
@@ -1082,7 +1168,10 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
     class Output(io.BytesIO):
         def write(self, data: bytes) -> int:
             written = super().write(data)
-            if data == process_tree._POSIX_ANCHOR_EMPTY:
+            if data in {
+                process_tree._POSIX_ANCHOR_EMPTY,
+                process_tree._POSIX_ANCHOR_EMPTY_INCOMPLETE,
+            }:
                 os.write(write_fd, process_tree._POSIX_ANCHOR_RELEASE)
             return written
 
@@ -1104,10 +1193,10 @@ def test_darwin_pre_eof_requires_identity_bound_direct_target(
             result = process_tree._run_posix_group_anchor(
                 "-", input_pipe=input_pipe, output_pipe=output_pipe, target_argv=["target"],
             )
-        assert result == 0
+        assert result == (0 if target_visible else 125)
         assert capture_flags == [True]
         assert set(captured_ids[0]) == ({101, 102, 103} if target_visible else {102, 103})
-        assert output_pipe.getvalue() == (b"YVE" if target_visible else b"YFE")
+        assert output_pipe.getvalue() == (b"YVE" if target_visible else b"YFU")
     finally:
         os.close(write_fd)
 
