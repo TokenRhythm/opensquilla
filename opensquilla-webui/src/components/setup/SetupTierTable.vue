@@ -11,7 +11,6 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import SetupThinkingSelect from './SetupThinkingSelect.vue'
 import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
@@ -209,6 +208,10 @@ function effectiveTierEnsembleSelectionMode(row: SetupTierRow): string {
     return String(props.effectiveEnsembleSelectionMode || '').trim()
   }
   return ''
+}
+
+function thinkingLabel(row: SetupTierRow): string {
+  return row.thinkingLevel === 'none' ? 'off' : row.thinkingLevel || t('setup.provider.thinkingDefault')
 }
 
 function thinkingManagedByEnsemble(row: SetupTierRow): boolean {
@@ -741,7 +744,7 @@ const allowsFloatingContent = computed(() => (
           :aria-label="thinkingManagedByEnsemble(tier)
             ? t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })
             : t('setup.router.tierThinkingAria', { tier: tier.name })"
-        >{{ thinkingManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : tier.thinkingLevel || '-' }}</span>
+        >{{ thinkingManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : thinkingLabel(tier) }}</span>
       </template>
       <template v-else>
         <div class="setup-tier-table__model-cell">
@@ -763,7 +766,7 @@ const allowsFloatingContent = computed(() => (
               } : undefined"
               @update="(val) => updateModelChoice(tier, val)"
             />
-            <SetupModelCapacity v-if="!tierEnsembleActive(tier)" :provider="tier.provider" :model="tier.model" :disabled="rowFieldsDisabled(tier)" :thinking="tier.thinkingLevel" thinking-scope="tier" @update-thinking="emit('updateTierField', tier.name, 'thinkingLevel', $event)" />
+            <SetupModelCapacity v-if="!thinkingManagedByEnsemble(tier)" :provider="tier.provider" :model="tier.model" :disabled="rowFieldsDisabled(tier)" :thinking="tier.thinkingLevel" thinking-scope="tier" @update-thinking="emit('updateTierField', tier.name, 'thinkingLevel', $event)" />
             <button v-else type="button" class="btn btn--icon btn--ghost" data-testid="tier-edit-shared-ensemble"
               :title="t('setup.capacity.editSharedEnsemble')" :aria-label="t('setup.capacity.editSharedEnsemble')"
               :disabled="disabled" @click="emit('editEnsemble')"><Icon name="gear" :size="14" /></button>
@@ -844,7 +847,7 @@ const allowsFloatingContent = computed(() => (
           :aria-label="t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })"
           :title="t('setup.router.tierThinkingManagedByEnsemble')"
         >{{ t('setup.router.tierThinkingManagedByEnsemble') }}</span>
-        <SetupThinkingSelect v-else :model-value="tier.thinkingLevel" :label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @update:model-value="emit('updateTierField', tier.name, 'thinkingLevel', $event)" />
+        <span v-else class="setup-tier-table__readonly" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })">{{ thinkingLabel(tier) }}</span>
       </template>
       <span
         v-if="tier.name === 'c3' && !readonly"
