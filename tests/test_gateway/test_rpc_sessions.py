@@ -20,7 +20,7 @@ from starlette.websockets import WebSocketState
 from opensquilla.agents.registry import AgentRegistry
 from opensquilla.agents.scope import default_workspace_dir
 from opensquilla.attachment_refs import transcript_material_path
-from opensquilla.engine.types import DoneEvent, ErrorEvent
+from opensquilla.engine.types import ArtifactEvent, DoneEvent, ErrorEvent
 from opensquilla.gateway import rpc_chat, rpc_sessions
 from opensquilla.gateway.agent_tasks import get_agent_task_registry
 from opensquilla.gateway.attachment_ingest import (
@@ -1475,6 +1475,53 @@ class TestSessionsList:
 
 
 class TestSessionsSend:
+    @pytest.mark.asyncio
+    async def test_published_reference_uses_webui_artifact_event(
+        self, dispatcher, monkeypatch: pytest.MonkeyPatch
+    ):
+        session = FakeSession(session_key="agent:main:webchat:artifact-event-kind")
+        artifact: dict[str, Any] = {
+            "kind": "artifact_ref",
+            "id": "art-webui",
+            "name": "report.html",
+            "mime": "text/html",
+            "sha256": "a" * 64,
+            "size": 32,
+            "download_url": "/api/v1/artifacts/art-webui",
+            "has_thumbnail": True,
+        }
+
+        class ArtifactRunner(_RecordingTurnRunner):
+            async def run(self, message: str, session_key: str, **kwargs):
+                yield ArtifactEvent(**artifact)
+                yield DoneEvent(text="Published report.html")
+
+        emitted = _capture_compaction_emits(monkeypatch)
+        ctx = make_ctx(
+            session_manager=FakeSessionManager([session]),
+            task_runtime=None,
+            turn_runner=ArtifactRunner(),
+        )
+        response = await dispatcher.dispatch(
+            "artifact-event",
+            "sessions.send",
+            {"key": session.session_key, "message": "Publish the report"},
+            ctx,
+        )
+        assert response.ok is True
+        task = get_agent_task_registry().get(session.session_key)
+        if task is not None:
+            await task
+        artifact_events = [row for row in emitted if row[1] == "session.event.artifact"]
+        assert len(artifact_events) == 1
+        assert not any(row[1] == "session.event.artifact_ref" for row in emitted)
+        payload = artifact_events[0][2]
+        assert payload["id"] == artifact["id"]
+        assert payload["download_url"] == artifact["download_url"]
+        assert payload["thumbnail_url"] == "/api/v1/artifacts/art-webui?variant=thumb"
+        assert "has_thumbnail" not in payload
+        assert artifact["kind"] == "artifact_ref"
+
     @pytest.mark.asyncio
     async def test_send_valid(self, dispatcher, ctx_with_sessions, session):
         res = await dispatcher.dispatch(

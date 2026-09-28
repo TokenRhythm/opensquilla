@@ -787,6 +787,7 @@ async def test_turn_runner_streams_artifact_event_and_persists_history(tmp_path)
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
         assert len(artifact_events) == 1
         assert artifact_events[0].id == "art-runtime"
+        assert artifact_events[0].kind == "artifact"
         assert artifact_events[0].session_id == session.session_id
         assert artifact_events[0].session_key == ""
         assert artifact_events[0].download_url == "/api/v1/artifacts/art-runtime"
@@ -978,6 +979,7 @@ async def test_turn_runner_auto_publishes_deliverable_file_when_model_omits_publ
         artifact_events = [event for event in events if isinstance(event, ArtifactEvent)]
         assert len(artifact_events) == 1
         assert artifact_events[0].name == "manual-big-write.html"
+        assert artifact_events[0].kind == "artifact"
         assert artifact_events[0].mime == "text/html"
         assert artifact_events[0].session_id == session.session_id
         assert artifact_events[0].download_url == (

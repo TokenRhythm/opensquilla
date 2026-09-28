@@ -140,6 +140,10 @@ class ArtifactEvent:
     store: str = "artifacts"
     has_thumbnail: bool = False
 
+    def __post_init__(self) -> None:
+        # Stored ArtifactRef dictionaries use artifact_ref, not the stream event kind.
+        self.kind = "artifact"
+
 
 @dataclass
 class StateChangeEvent:
