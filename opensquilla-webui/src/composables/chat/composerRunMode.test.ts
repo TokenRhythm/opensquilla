@@ -42,14 +42,14 @@ describe('effectiveComposerRunMode', () => {
     )).toBe('safe')
   })
 
-  it('routes a repairable Safe selection into setup instead of persistence', () => {
+  it('persists Safe when readiness is ready and only routes setup states to repair', () => {
     const status = { state: 'not_setup', platform: 'win32', message: '', requiresAdmin: true } as const
 
     expect(composerRunModeSelectionAction('safe', status, true)).toBe('setup')
     expect(composerRunModeSelectionAction('safe', status, false)).toBe('ignore')
     expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
     expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, false)).toBe('persist')
-    expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, true)).toBe('setup')
+    expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, true)).toBe('persist')
   })
 
   it('ignores Safe selection until the initial setup check resolves', () => {
