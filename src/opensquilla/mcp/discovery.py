@@ -8,6 +8,7 @@ from typing import Any
 
 from opensquilla.mcp.client import MCPClient
 from opensquilla.mcp.types import MCPServerConfig, MCPToolDef
+from opensquilla.tool_boundary import ToolOutput
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import SafeToolError, ToolSpec
 
@@ -89,7 +90,7 @@ def _make_tool_handler(
         required=required,
     )
 
-    async def handler(**kwargs: Any) -> str:
+    async def handler(**kwargs: Any) -> ToolOutput:
         try:
             result = await asyncio.wait_for(
                 client.call_tool(tool_name, kwargs),
@@ -99,14 +100,12 @@ def _make_tool_handler(
             raise SafeToolError(
                 f"MCP tool '{tool_name}' timed out after {timeout_seconds}s"
             ) from None
-        # An MCP error (result-level isError, or a JSON-RPC error the client
-        # flags) must reach the tool boundary AS an error, not be laundered into
-        # a successful result. Raising SafeToolError makes dispatch record
-        # is_error=True with an error execution status while preserving the
-        # server's message for the model.
-        if result.is_error:
-            raise SafeToolError(result.content or f"MCP tool '{tool_name}' failed")
-        return result.content
+        return ToolOutput(
+            content=result.content or (f"MCP tool '{tool_name}' failed" if result.is_error else ""),
+            is_error=result.is_error,
+            content_blocks=result.content_blocks,
+            structured_content=result.structured_content,
+        )
 
     registry.register(spec, handler)
 
@@ -145,7 +144,7 @@ async def discover_and_register(
                 timeout_seconds=config.tool_timeout_seconds,
             )
             registered.append(f"mcp_{t.name}")
-    except Exception:
+    except BaseException:
         if entry is not None:
             try:
                 _active_clients.remove(entry)

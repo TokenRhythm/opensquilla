@@ -200,6 +200,13 @@ def auto_publish_omitted_workspace_artifacts(
 
     if ctx is None:
         return OmittedArtifactPublishResult()
+    if ctx.artifact_publication_policy is not None:
+        return OmittedArtifactPublishResult(
+            failure_summaries=[
+                "Protected artifacts require explicit publish_artifact host validation; "
+                "automatic publication is disabled."
+            ]
+        )
     if (
         str(getattr(ctx, "plan_run_id", "") or "").strip()
         and attached_plan_run_ready is not True

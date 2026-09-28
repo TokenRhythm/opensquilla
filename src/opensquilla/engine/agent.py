@@ -112,6 +112,7 @@ from opensquilla.engine.submit_review import (
 )
 from opensquilla.engine.thinking import drop_reasoning
 from opensquilla.engine.tokenjuice_adapter import reduce_tool_result_with_tokenjuice
+from opensquilla.engine.tool_images import ToolImageBudget, project_tool_images
 from opensquilla.engine.tool_result_store import (
     TOOL_RESULT_META_NAME,
     ToolResultRecord,
@@ -4705,6 +4706,11 @@ class Agent:
             result,
             tool_call=tool_call,
         )
+        projected_result = replace(
+            projected_result,
+            content_blocks=result.content_blocks,
+            structured_content=result.structured_content,
+        )
         self._record_provider_tool_result_projection(result, projected_result)
         return projected_result
 
@@ -5080,6 +5086,7 @@ class Agent:
 
         # Build initial message list
         turn_messages: list[Message] = list(history)
+        tool_image_budget = ToolImageBudget()
         # Count-aware recovery may summarize only content before this boundary.
         # Skills context, multimodal inputs, and the active user request all
         # belong to the protected current turn.
@@ -10726,6 +10733,33 @@ class Agent:
                 turn_messages.append(
                     Message(role="user", content=tool_result_blocks)  # type: ignore[arg-type]
                 )
+                media_capabilities = _continuation_capabilities()
+                media_supports_vision = (
+                    media_capabilities[2]
+                    if media_capabilities is not None
+                    and (
+                        self.config.model_capabilities is not None
+                        or isinstance(self.config.metadata.get("route_plan"), Mapping)
+                    )
+                    else None
+                )
+                for tool_result in executed_results:
+                    if not tool_result.content_blocks:
+                        continue
+                    media = await asyncio.to_thread(
+                        project_tool_images,
+                        tool_result,
+                        tool_image_budget,
+                        supports_vision=media_supports_vision,
+                    )
+                    turn_messages.extend(media.messages)
+                    if media.records:
+                        self._write_turn_call_log(
+                            "tool_media_projection",
+                            tool_use_id=tool_result.tool_use_id,
+                            name=tool_result.tool_name,
+                            blocks=media.records,
+                        )
                 _claim_pending_inputs_for_next_call()
                 if progress_watchdog_guidance is not None:
                     turn_messages.append(Message(role="user", content=progress_watchdog_guidance))

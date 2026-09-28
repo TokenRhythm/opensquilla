@@ -10,6 +10,13 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+from opensquilla.artifact_publication import (
+    ArtifactPublicationAuthorization,
+    ArtifactPublicationError,
+    ArtifactPublicationRequest,
+    authorize_publication,
+    read_publication_candidate,
+)
 from opensquilla.artifact_validation import (
     ArtifactValidationError,
     is_pptx_candidate,
@@ -112,7 +119,11 @@ def _missing_artifact_error(path: str, workspace: Path, target: Path) -> ToolErr
 
 
 def _should_expose_local_path(ctx: ToolContext) -> bool:
-    return bool(ctx.is_owner and ctx.caller_kind in {CallerKind.CLI, CallerKind.WEB})
+    return bool(
+        ctx.artifact_publication_policy is None
+        and ctx.is_owner
+        and ctx.caller_kind in {CallerKind.CLI, CallerKind.WEB}
+    )
 
 
 def _llm_artifact_payload(
@@ -302,6 +313,12 @@ async def publish_artifact(
         raise ToolError("artifact storage is not configured for this turn")
     if not ctx.artifact_session_id or not ctx.session_key:
         raise ToolError("artifact session scope is not configured for this turn")
+    publication_policy = ctx.artifact_publication_policy
+    if publication_policy is not None and (bundle != "none" or bundle_root is not None):
+        raise RetryableToolInputError(
+            "Protected publication requires bundle='none' without bundle_root. "
+            "Directory and automatic bundles are not authorized in this profile."
+        )
 
     workspace = Path(ctx.workspace_dir).resolve()
     reject_foreign_host_path(path, platform=os.name, workspace=workspace)
@@ -358,8 +375,30 @@ async def publish_artifact(
         configured_max_bytes,
     )
     target_payload: bytes | None = None
+    authorization: ArtifactPublicationAuthorization | None = None
+    if publication_policy is not None:
+        try:
+            candidate = await asyncio.to_thread(
+                read_publication_candidate, workspace, target, max_bytes
+            )
+            authorization = await authorize_publication(
+                publication_policy,
+                ArtifactPublicationRequest(
+                    session_id=ctx.artifact_session_id,
+                    session_key=ctx.session_key,
+                    execution_id=ctx.execution_id or "",
+                    path=target.relative_to(workspace).as_posix(),
+                    name=artifact_name,
+                    mime=artifact_mime,
+                    bundle=bundle,
+                ),
+                candidate,
+            )
+            target_payload = candidate.payload
+        except ArtifactPublicationError as exc:
+            raise RetryableToolInputError(str(exc)) from exc
     if target_is_pptx:
-        target_size = target.stat().st_size
+        target_size = len(target_payload) if target_payload is not None else target.stat().st_size
         if max_bytes is not None and target_size > max_bytes:
             budget_error = ArtifactBudgetError(
                 "artifact exceeds per-file budget "
@@ -368,7 +407,8 @@ async def publish_artifact(
             raise ToolError(str(budget_error)) from budget_error
         # Inflation plus full-deck parsing is CPU-bound; keep it off the
         # gateway event loop so concurrent sessions stay responsive.
-        target_payload = await asyncio.to_thread(target.read_bytes)
+        if target_payload is None:
+            target_payload = await asyncio.to_thread(target.read_bytes)
         try:
             await asyncio.to_thread(
                 validate_artifact_for_delivery,
@@ -385,13 +425,17 @@ async def publish_artifact(
         target_payload if target_payload is not None else target.read_bytes()
     ).hexdigest()
     try:
-        bundle_snapshot = await asyncio.to_thread(
-            collect_artifact_bundle,
-            target_candidate,
-            workspace_root=workspace,
-            mode=bundle,
-            bundle_root=bundle_root_candidate,
-            entry_mime=artifact_mime,
+        bundle_snapshot = (
+            None
+            if publication_policy is not None
+            else await asyncio.to_thread(
+                collect_artifact_bundle,
+                target_candidate,
+                workspace_root=workspace,
+                mode=bundle,
+                bundle_root=bundle_root_candidate,
+                entry_mime=artifact_mime,
+            )
         )
     except (ArtifactBudgetError, ArtifactPathError, OSError) as exc:
         raise ToolError(str(exc)) from exc
@@ -441,6 +485,8 @@ async def publish_artifact(
         }
         if published_manifest is not None:
             result["bundle"] = _bundle_result(published_manifest)
+        if authorization is not None:
+            result["publicationValidation"] = authorization.public_metadata()
         return json.dumps(result, ensure_ascii=False)
 
     existing = store.find_existing_ref(
@@ -471,6 +517,8 @@ async def publish_artifact(
         }
         if bundle_manifest is not None:
             result["bundle"] = _bundle_result(bundle_manifest)
+        if authorization is not None:
+            result["publicationValidation"] = authorization.public_metadata()
         return json.dumps(result, ensure_ascii=False)
     disk_budget_bytes = (
         ctx.artifact_disk_budget_bytes
@@ -489,7 +537,7 @@ async def publish_artifact(
                 max_bytes=max_bytes,
                 disk_budget_bytes=disk_budget_bytes,
             )
-        elif target_is_pptx:
+        elif target_payload is not None:
             assert target_payload is not None
             ref = store.publish_bytes(
                 target_payload,
@@ -534,4 +582,6 @@ async def publish_artifact(
     }
     if bundle_manifest is not None:
         result["bundle"] = _bundle_result(bundle_manifest)
+    if authorization is not None:
+        result["publicationValidation"] = authorization.public_metadata()
     return json.dumps(result, ensure_ascii=False)

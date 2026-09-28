@@ -19,9 +19,7 @@ class ToolContinuation:
     sandbox_override: str = "danger_full_access"
 
     def matches(self, *, tool_use_id: str, session_key: str | None) -> bool:
-        return self.tool_use_id == tool_use_id and self.session_key == str(
-            session_key or ""
-        )
+        return self.tool_use_id == tool_use_id and self.session_key == str(session_key or "")
 
 
 @dataclass
@@ -40,6 +38,19 @@ class ToolCall:
 
 
 @dataclass
+class ToolOutput:
+    """Handler output with raw host-visible blocks, separate from budgeted text."""
+
+    content: str
+    is_error: bool = False
+    content_blocks: list[dict[str, Any]] = field(default_factory=list)
+    structured_content: dict[str, Any] | None = None
+
+    def __str__(self) -> str:
+        return self.content
+
+
+@dataclass
 class ToolResult:
     tool_use_id: str
     tool_name: str
@@ -48,6 +59,8 @@ class ToolResult:
     artifacts: list[dict[str, Any]] = field(default_factory=list)
     execution_status: ExecutionStatus | None = None
     terminates_turn: bool = False
+    content_blocks: list[dict[str, Any]] = field(default_factory=list)
+    structured_content: dict[str, Any] | None = None
 
 
 AgentToolHandler = Callable[[ToolCall], Awaitable[ToolResult]]

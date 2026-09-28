@@ -14,6 +14,7 @@ the result is normalised through the budget tracker.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from typing import Any
 
 import structlog
@@ -32,15 +33,13 @@ from opensquilla.result_budget import (
 )
 from opensquilla.router_control import router_control_payload_terminates_turn
 from opensquilla.safety.secret_redaction import redact_secret_value
-from opensquilla.tool_boundary import ToolCall, ToolResult
+from opensquilla.tool_boundary import ToolCall, ToolOutput, ToolResult
 from opensquilla.tools.envelope import build_tool_failure_envelope, is_denial_payload
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 log = structlog.get_logger("opensquilla.tools.dispatch")
 
-_PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset(
-    {"approval_required", "approval_pending"}
-)
+_PENDING_APPROVAL_STATUSES: frozenset[str] = frozenset({"approval_required", "approval_pending"})
 
 
 _DISPATCH_TRUNCATION_RETRIEVE_HINT = (
@@ -95,11 +94,7 @@ def _store_dispatch_truncated_snapshot(
     if ctx is None or not ctx.tool_result_store_dir:
         return None
 
-    session_id = (
-        ctx.tool_result_store_session_id
-        or ctx.artifact_session_id
-        or ctx.session_key
-    )
+    session_id = ctx.tool_result_store_session_id or ctx.artifact_session_id or ctx.session_key
     session_key = ctx.session_key or session_id
     agent_id = ctx.agent_id or "main"
     if not session_id or not session_key or not agent_id:
@@ -172,6 +167,7 @@ def _extract_pending_approval(content: Any) -> dict[str, Any] | None:
         return None
     return payload if payload.get("status") in _PENDING_APPROVAL_STATUSES else None
 
+
 def _denial_reason(content: Any) -> str:
     payload: Any = content
     if isinstance(content, str):
@@ -182,6 +178,7 @@ def _denial_reason(content: Any) -> str:
     if isinstance(payload, dict) and payload.get("status") == "approval_denied":
         return "approval_denied"
     return "denied"
+
 
 def _has_live_approval_surface(ctx: ToolContext | None) -> bool:
     return (
@@ -262,9 +259,7 @@ async def finalize(
                 terminates_turn=False,
             )
 
-        envelope = redact_secret_value(
-            build_tool_failure_envelope(exception, call.tool_name)
-        )
+        envelope = redact_secret_value(build_tool_failure_envelope(exception, call.tool_name))
         log.warning(
             "dispatch.tool_failed",
             tool=call.tool_name,
@@ -298,10 +293,14 @@ async def finalize(
             terminates_turn=False,
         )
 
-    result = redact_secret_value(raw_result)
+    rich_output = raw_result if isinstance(raw_result, ToolOutput) else None
+    text_output = rich_output.content if rich_output is not None else raw_result
+    if rich_output is not None and not text_output and rich_output.structured_content is not None:
+        text_output = json.dumps(rich_output.structured_content, ensure_ascii=False)
+    result = redact_secret_value(text_output)
 
     # ---------------- Approval-on-unsupported-surface branch ----------------
-    if not _has_live_approval_surface(ctx):
+    if not _has_live_approval_surface(ctx) and not (rich_output and rich_output.is_error):
         pending = _extract_pending_approval(result)
         if pending is not None and not _uses_automatic_review(pending):
             surface = ctx.caller_kind.value if ctx else "unknown"
@@ -349,6 +348,24 @@ async def finalize(
     denial = is_denial_payload(result)
     denial_reason = _denial_reason(result) if denial else None
     execution_status = execution_status_for_tool_result(call.tool_name, result)
+    if (
+        rich_output is not None
+        and rich_output.is_error
+        and not (execution_status and derive_is_error(execution_status))
+    ):
+        if execution_status is None:
+            execution_status = {
+                "version": 1,
+                "status": "error",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "source": "tool_runtime",
+                "preservation_class": "diagnostic",
+                "reason": "tool_error",
+            }
+        else:
+            execution_status = {**execution_status, "status": "error", "reason": "tool_error"}
     if execution_status is None:
         pending = _extract_pending_approval(result)
         if pending is not None:
@@ -386,9 +403,7 @@ async def finalize(
     status_is_error = derive_is_error(execution_status) if execution_status else False
     is_error = denial or status_is_error
 
-    artifacts = (
-        list(ctx.published_artifacts[artifact_start:]) if ctx is not None else []
-    )
+    artifacts = list(ctx.published_artifacts[artifact_start:]) if ctx is not None else []
     if artifacts:
         content = result
     else:
@@ -423,6 +438,10 @@ async def finalize(
         is_error=is_error,
         artifacts=artifacts,
         execution_status=execution_status,
+        content_blocks=deepcopy(rich_output.content_blocks) if rich_output is not None else [],
+        structured_content=(
+            deepcopy(rich_output.structured_content) if rich_output is not None else None
+        ),
         terminates_turn=(
             (_registered_terminates_turn(registered) and not is_error)
             or _plan_checkpoint_terminates_turn(call.tool_name, content)

@@ -7,9 +7,13 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
+from opensquilla.tool_boundary import ToolOutput
+
+if TYPE_CHECKING:
+    from opensquilla.artifact_publication import ArtifactPublicationPolicy
 
 
 class CallerKind(StrEnum):
@@ -172,6 +176,11 @@ class ToolContext:
     # run. Runtime-only prompt input; checkpoint tools continue to read live
     # storage for compare-and-set transitions.
     plan_run: Any | None = field(default=None, repr=False)
+    # Explicit host grant for immutable installed scripts, never model arguments.
+    skill_script_runner: Any | None = field(default=None, repr=False)
+
+    # Host-owned, process-local publication authority; never a model argument.
+    artifact_publication_policy: ArtifactPublicationPolicy | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate_path_roots()
@@ -281,9 +290,9 @@ class ToolSpec:
     terminates_turn: bool = False
 
 
-# Registered tool implementation: async fn that accepts keyword args and returns str.
+# Registered implementations return text or a host-visible rich output.
 # Agent-level tool-call handlers live in opensquilla.tool_boundary.
-ToolHandler = Callable[..., Awaitable[str]]
+ToolHandler = Callable[..., Awaitable[str | ToolOutput]]
 
 
 @dataclass

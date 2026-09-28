@@ -25,6 +25,7 @@ _NAMES = [
     "sessions",
     "session_search",
     "shell",
+    "skill_scripts",
     "submit_tool",
     "tool_results",
     "web",
