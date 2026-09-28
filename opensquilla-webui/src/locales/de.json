@@ -788,6 +788,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "Globale Denkstufe",
+      "globalDesc": "Mit dem Hauptanbieter geteilt. Ein gesetzter Wert überschreibt Routing-Empfehlungen; Standard lässt sie gelten.",
+      "tierDesc": "Gilt nur für diese Routing-Stufe. Standard legt keine Denkstufe fest.",
+      "proposerDesc": "Gilt nur für diese Vorschlagsrolle. Standard setzt keine Überschreibung.",
+      "aggregatorDesc": "Gilt nur für diese Zusammenführungsrolle. Standard setzt keine Überschreibung.",
+      "presetDesc": "Durch die Vorlage festgelegt. Zum Bearbeiten eine eigene Modellauswahl verwenden.",
+      "sharedSettings": "Gemeinsame Modelleinstellungen",
+      "overrideHint": "Globale Denkstufe: {level}. Sie hat Vorrang vor Einzelmodell-Routing-Empfehlungen. Fusionsmitglieder verwenden eigene Einstellungen.",
+      "inheritedAggregatorDesc": "Gilt nur für diese Zusammenführungsrolle. Eine Denkstufe fixiert dieses Modell, statt dem Hauptmodell zu folgen."
+    },
     "capacity": {
       "customOpenAI": "Benutzerdefiniert · OpenAI-kompatibel",
       "customAnthropic": "Benutzerdefiniert · Anthropic-kompatibel",
@@ -1065,7 +1076,6 @@
       "timeoutDesc": "Wie lange auf eine einzelne Modellantwort gewartet wird, bevor ein Timeout eintritt — erhöhen Sie diesen Wert für langsame lokale Modelle (Ollama, vLLM, LM Studio).",
       "timeoutGlobalDesc": "Gateway-weites Timeout für normale Modellanfragen aller Anbieter. Verbindungsprüfungen und Modelltests verwenden separate feste Fristen.",
       "thinkingLabel": "Denkstufe",
-      "thinkingGlobalDesc": "Denkaufwand für das direkt angegebene Primärmodell. Leer lassen, damit der Router ebenenabhängig vorschlägt.",
       "thinkingDefault": "Standard (nicht gesetzt)",
       "contextWindowLabel": "Kontextfenster-Überschreibung (Tokens)",
       "contextWindowDesc": "Begrenzt das Prompt-Assembly-Budget für dieses Modell. Leer lassen, um das automatisch erkannte Fenster zu verwenden.",

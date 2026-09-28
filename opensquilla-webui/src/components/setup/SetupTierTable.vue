@@ -11,6 +11,7 @@
 import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import SetupThinkingSelect from './SetupThinkingSelect.vue'
 import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
@@ -66,7 +67,6 @@ const emit = defineEmits<{
   editEnsemble: []
 }>()
 
-const THINKING_LEVELS = ['', 'off', 'none', 'minimal', 'low', 'medium', 'high', 'xhigh']
 const ENSEMBLE_CHOICE = '__shared_ensemble__'
 const EMPTY_CATALOG: DiscoveredModelCatalog = { models: [], source: 'none' }
 const COMPACT_VIEWPORT_MAX_WIDTH = 760
@@ -763,7 +763,7 @@ const allowsFloatingContent = computed(() => (
               } : undefined"
               @update="(val) => updateModelChoice(tier, val)"
             />
-            <SetupModelCapacity v-if="!tierEnsembleActive(tier)" :provider="tier.provider" :model="tier.model" :disabled="rowFieldsDisabled(tier)" />
+            <SetupModelCapacity v-if="!tierEnsembleActive(tier)" :provider="tier.provider" :model="tier.model" :disabled="rowFieldsDisabled(tier)" :thinking="tier.thinkingLevel" thinking-scope="tier" @update-thinking="emit('updateTierField', tier.name, 'thinkingLevel', $event)" />
             <button v-else type="button" class="btn btn--icon btn--ghost" data-testid="tier-edit-shared-ensemble"
               :title="t('setup.capacity.editSharedEnsemble')" :aria-label="t('setup.capacity.editSharedEnsemble')"
               :disabled="disabled" @click="emit('editEnsemble')"><Icon name="gear" :size="14" /></button>
@@ -844,9 +844,7 @@ const allowsFloatingContent = computed(() => (
           :aria-label="t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })"
           :title="t('setup.router.tierThinkingManagedByEnsemble')"
         >{{ t('setup.router.tierThinkingManagedByEnsemble') }}</span>
-        <select v-else :value="tier.thinkingLevel" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @change="emit('updateTierField', tier.name, 'thinkingLevel', ($event.target as HTMLSelectElement).value)">
-          <option v-for="v in THINKING_LEVELS" :key="v" :value="v">{{ v || '-' }}</option>
-        </select>
+        <SetupThinkingSelect v-else :model-value="tier.thinkingLevel" :label="t('setup.router.tierThinkingAria', { tier: tier.name })" :disabled="rowFieldsDisabled(tier)" @update:model-value="emit('updateTierField', tier.name, 'thinkingLevel', $event)" />
       </template>
       <span
         v-if="tier.name === 'c3' && !readonly"

@@ -537,6 +537,7 @@ const routerForm = useSetupRouterForm()
 const ensembleForm = useSetupEnsembleForm()
 const capabilitiesForm = useSetupCapabilitiesForm()
 const promotedForm = useSettingsPromotedForm()
+const thinkingDraftScope = ref<'provider' | 'modelStrategy'>('provider')
 
 const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 // Discovery may populate the runtime catalog after the first capacity read.
@@ -869,6 +870,7 @@ async function loadData(options: {
           behavior: behaviorForm.isDirty.value,
           privacy: privacyDirty.value,
           memoryCapture: promotedForm.captureDirty.value,
+          thinking: thinkingDraftScope.value === 'modelStrategy' && promotedForm.thinkingDirty.value && !options.forceResetModelStrategy,
           router: !options.forceResetModelStrategy && !options.forceResetRouter && routerForm.isDirty.value,
           ensemble: !options.forceResetModelStrategy && ensembleForm.isDirty.value,
           fixedModel: !options.forceResetModelStrategy && (
@@ -910,7 +912,7 @@ async function loadData(options: {
         providerImageGenerationOptIn.value = true
         providerSelectionKind.value = 'primary'
         if (providerForm.selectedProvider.value) void providerForm.discoverModels()
-        promotedForm.initProviderFromConfig(config.value)
+        promotedForm.initProviderFromConfig(config.value, preserve?.thinking)
       }
       if (!preserve?.fixedModel) {
         modelStrategyForm.initFixedModel(config.value.llm?.model || '')
@@ -2100,6 +2102,7 @@ const modelStrategyPanel = modelStrategyForm.createPanel({
   ensemblePanel,
   routerTemplateState: routerForm.tierTemplateState,
   fixedModelCatalog,
+  llmThinking: computed(() => promotedForm.llmThinking.value),
 })
 
 
@@ -2369,7 +2372,7 @@ const providerDirty = computed(() => (
   ||
   providerForm.isDirty.value
   || (providerOwnsFixedModelDraft.value && modelStrategyForm.fixedModelDirty.value)
-  || (editingPrimaryProvider.value && promotedForm.thinkingDirty.value)
+  || (editingPrimaryProvider.value && thinkingDraftScope.value === 'provider' && promotedForm.thinkingDirty.value)
   || (editingPrimaryProvider.value && promotedForm.timeoutDirty.value)
   || (editingPrimaryProvider.value && promotedForm.contextWindowDirty.value)
 ))
@@ -2378,6 +2381,7 @@ const securityPrivacyDirty = computed(() => privacyDirty.value)
 const memorySettingsDirty = computed(() => promotedForm.captureDirty.value)
 const modelStrategyDirty = computed(() => (
   modelCapacity.dirty('modelStrategy')
+  || (thinkingDraftScope.value === 'modelStrategy' && promotedForm.thinkingDirty.value)
   ||
   routerForm.isDirty.value
   || ensembleForm.isDirty.value
@@ -2518,7 +2522,7 @@ function selectProvider(value: string) {
 }
 
 function applyConfiguredProviderSelection(value: string) {
-  promotedForm.resetLlmThinking()
+  if (thinkingDraftScope.value === 'provider') promotedForm.resetLlmThinking()
   const provider = normalizeProviderId(value)
   if (!provider) return
   if (provider === normalizeProviderId(currentProvider.value)) {
@@ -2893,7 +2897,7 @@ function setProviderImageGenerationOptIn(enabled: boolean) {
 
 function onProviderChange() {
   if (providerInteractionLocked()) return
-  promotedForm.resetLlmThinking()
+  if (thinkingDraftScope.value === 'provider') promotedForm.resetLlmThinking()
   const provider = normalizeProviderId(providerForm.selectedProvider.value)
   if (configuredProviderIds.value.has(provider)) {
     applyConfiguredProviderSelection(provider)
@@ -3213,7 +3217,19 @@ function updateLlmTimeout(value: number) {
 
 function updateLlmThinking(value: string) {
   if (providerInteractionLocked() || !editingPrimaryProvider.value) return
+  thinkingDraftScope.value = 'provider'
   promotedForm.setLlmThinking(value)
+}
+
+function updateModelStrategyThinking(value: string) {
+  if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return
+  thinkingDraftScope.value = 'modelStrategy'
+  promotedForm.setLlmThinking(value)
+}
+
+function updateEnsembleThinking(candidate: { provider: string; model: string; role?: string }, value: string) {
+  if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return
+  ensembleForm.setCandidateThinking(candidate, value)
 }
 
 function updateContextWindow(value: string) {
@@ -3897,7 +3913,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     pushToast(t('setup.capacity.invalid'), { tone: 'danger' })
     return false
   }
-  const thinkingPatch = editingPrimaryProvider.value ? promotedForm.thinkingPatch() : null
+  const thinkingPatch = editingPrimaryProvider.value && thinkingDraftScope.value === 'provider' ? promotedForm.thinkingPatch() : null
   // Runtime tuning must not reconfigure the primary or reset its routing policy.
   const settingsOnly = (modelCapacity.dirty(capacityScope) || thinkingPatch !== null)
     && !providerForm.isDirty.value
@@ -3995,7 +4011,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   // Snapshot all provider-owned patches before a conflict dialog can yield.
   const providerPatches: Record<string, unknown> = {
     ...promotedForm.providerPatches(),
-    ...(promotedForm.thinkingPatch() ?? {}),
+    ...(thinkingDraftScope.value === 'provider' ? promotedForm.thinkingPatch() ?? {} : {}),
   }
   const contextModel = currentFormModelValue()
   const contextPatch = contextModel
@@ -4223,6 +4239,7 @@ async function saveModelStrategy(options: SaveOptions & {
   if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return false
   const routerRoutingPayload = routerForm.routingDirty.value ? JSON.parse(JSON.stringify(routerForm.payload())) : null
   const routerVisualPatches = routerForm.visualModePatches()
+  const thinkingPatch = thinkingDraftScope.value === 'modelStrategy' ? promotedForm.thinkingPatch() : null
   const fixedModelPatches = modelStrategyForm.fixedModelPatches()
   const fixedProviderChanged = modelStrategyForm.fixedProviderDirty.value
   const fixedProviderId = normalizeProviderId(modelStrategyForm.fixedProvider.value)
@@ -4236,7 +4253,7 @@ async function saveModelStrategy(options: SaveOptions & {
     pushToast(t('setup.capacity.invalid'), { tone: 'danger' })
     return false
   }
-  if (!hasRouterWork && !hasFixedModelWork && !hasEnsembleWork && !hasCapacityWork) return true
+  if (!hasRouterWork && !hasFixedModelWork && !hasEnsembleWork && !hasCapacityWork && !thinkingPatch) return true
   if (hasFixedModelWork && !fixedModel) {
     pushToast(t('setup.toast.chooseFixedModel'), { tone: 'danger' })
     return false
@@ -4262,6 +4279,7 @@ async function saveModelStrategy(options: SaveOptions & {
   let visualSaved = false
   let ensembleSaved = false
   let fixedSaved = false
+  let thinkingSaved = false
   let primaryActivationAttempted = false
   const refreshPartialSave = async (unknownPrimaryResult = false) => {
     const savedSections: string[] = []
@@ -4272,6 +4290,7 @@ async function saveModelStrategy(options: SaveOptions & {
       [hasEnsembleWork, ensembleSaved, 'setup.modelStrategy.cards.ensemble.title'],
       [hasFixedModelWork, fixedSaved, 'setup.modelStrategy.cards.single.title'],
       [hasCapacityWork, !modelCapacity.dirty('modelStrategy'), 'setup.capacity.title'],
+      [Boolean(thinkingPatch), thinkingSaved, 'setup.thinking.globalLabel'],
     ] as const) {
       if (changed) (acknowledged ? savedSections : pendingSections).push(t(label))
     }
@@ -4369,6 +4388,14 @@ async function saveModelStrategy(options: SaveOptions & {
     }
 
     fixedSaved = hasFixedModelWork
+
+    if (thinkingPatch) {
+      await patchConfig(thinkingPatch)
+      thinkingSaved = true
+      savedAny = true
+      promotedForm.acceptLlmThinking(thinkingPatch['llm.thinking'])
+      pushToast(t('setup.toast.routerSaved'))
+    }
 
     if (hasCapacityWork) {
       await modelCapacity.save('modelStrategy', deepPatchConfig)
@@ -4592,6 +4619,8 @@ async function copyConfigPath() {
     updateProviderField,
     updateLlmTimeout,
     updateLlmThinking,
+    updateModelStrategyThinking,
+    updateEnsembleThinking,
     updateContextWindow,
     probeProviderConnection,
     cancelProviderProbe: providerForm.cancelProbe,

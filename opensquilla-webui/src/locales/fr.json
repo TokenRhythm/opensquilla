@@ -788,6 +788,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "Niveau de réflexion global",
+      "globalDesc": "Partagé avec le fournisseur principal. Une valeur explicite prime sur les suggestions du routage ; la valeur par défaut les conserve.",
+      "tierDesc": "Uniquement pour ce palier de routage. Par défaut, aucun niveau imposé.",
+      "proposerDesc": "Uniquement pour ce rôle de candidat. Par défaut, aucune surcharge.",
+      "aggregatorDesc": "Uniquement pour ce rôle de synthèse. Par défaut, aucune surcharge.",
+      "presetDesc": "Défini par le préréglage. Passez à une sélection personnalisée pour modifier.",
+      "sharedSettings": "Paramètres partagés du modèle",
+      "overrideHint": "Niveau global : {level}. Il prime sur les suggestions de routage à modèle unique. Les membres de fusion utilisent leurs propres paramètres.",
+      "inheritedAggregatorDesc": "Uniquement pour ce rôle de synthèse. Définir un niveau fixe ce modèle au lieu de suivre le modèle principal."
+    },
     "capacity": {
       "customOpenAI": "Personnalisé · compatible OpenAI",
       "customAnthropic": "Personnalisé · compatible Anthropic",
@@ -1065,7 +1076,6 @@
       "timeoutDesc": "Durée d'attente d'une réponse de modèle avant expiration — augmentez-la pour les modèles locaux lents (Ollama, vLLM, LM Studio).",
       "timeoutGlobalDesc": "Délai global de la passerelle pour les requêtes normales. Les vérifications de connexion et les tests du modèle utilisent des limites fixes distinctes.",
       "thinkingLabel": "Niveau de réflexion",
-      "thinkingGlobalDesc": "Effort de raisonnement pour le modèle principal direct. Laissez vide pour laisser le Router proposer par niveau.",
       "thinkingDefault": "Par défaut (non défini)",
       "contextWindowLabel": "Remplacement de la fenêtre de contexte (tokens)",
       "contextWindowDesc": "Plafonne le budget d'assemblage du prompt pour ce modèle. Laissez vide pour utiliser la fenêtre détectée automatiquement.",

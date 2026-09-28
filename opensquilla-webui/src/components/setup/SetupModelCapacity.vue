@@ -4,9 +4,11 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
 import { MODEL_CAPACITY_KEY, capacityKey, parseCapacity, type CapacityValues } from '@/composables/setup/useModelCapacityForm'
+import SetupThinkingSelect from './SetupThinkingSelect.vue'
 import SetupModelCapacityFields from './SetupModelCapacityFields.vue'
 
-const props = defineProps<{ provider: string; model: string; scope?: string; inline?: boolean; menu?: boolean; disabled?: boolean; initialOpen?: boolean; hideTrigger?: boolean }>()
+const props = defineProps<{ provider: string; model: string; scope?: string; inline?: boolean; menu?: boolean; disabled?: boolean; initialOpen?: boolean; hideTrigger?: boolean; thinking?: string; thinkingScope?: 'global' | 'tier' | 'proposer' | 'aggregator' | 'inheritedAggregator' | 'preset'; thinkingReadonly?: boolean }>()
+const emit = defineEmits<{ updateThinking: [value: string] }>()
 const { t } = useI18n()
 const form = inject(MODEL_CAPACITY_KEY, null)
 const id = useId()
@@ -16,6 +18,8 @@ const row = computed(() => form?.rows.get(key.value))
 const scope = computed(() => props.scope || 'modelStrategy')
 const open = ref(false)
 const root = ref<HTMLElement | null>(null)
+const localThinking = ref('')
+const thinkingLabel = computed(() => props.thinkingScope === 'global' ? t('setup.thinking.globalLabel') : t('setup.provider.thinkingLabel'))
 const local = ref<CapacityValues>({ contextWindow: '', maxOutputTokens: '' })
 const values = computed(() => props.inline ? form?.values(target.value) || local.value : local.value)
 const valid = computed(() => {
@@ -32,6 +36,7 @@ watch(key, () => { open.value = false })
 function show() {
   form?.ensure(target.value)
   local.value = form?.values(target.value) || { contextWindow: '', maxOutputTokens: '' }
+  localThinking.value = props.thinking ?? ''
   open.value = true
 }
 watch(() => props.initialOpen, value => { if (value) show() }, { immediate: true })
@@ -43,6 +48,7 @@ function change(next: CapacityValues) {
 function complete() {
   if (!valid.value || props.disabled) return
   form?.update(target.value, local.value, scope.value)
+  if (props.thinking !== undefined && !props.thinkingReadonly && localThinking.value !== props.thinking) emit('updateThinking', localThinking.value)
   open.value = false
 }
 </script>
@@ -54,7 +60,7 @@ function complete() {
         {{ t('setup.capacity.title') }}
       </summary>
       <p v-if="!form.supported.value" class="control-section__desc">{{ t('setup.capacity.upgrade') }}</p>
-      <SetupModelCapacityFields v-else-if="row" :row="row" :model-value="values" :disabled="disabled" @update:model-value="change" />
+      <SetupModelCapacityFields v-else-if="row" :row="row" :model-value="values" :disabled="disabled" :hide-identity="thinking !== undefined && !inline" @update:model-value="change" />
       <p v-else class="control-section__desc" role="status">{{ t(failed ? 'setup.capacity.loadFailed' : 'shared.loading') }}</p>
       <button v-if="failed" type="button" class="btn btn--ghost" @click="form.ensure(target)">{{ t('setup.capacity.retry') }}</button>
     </details>
@@ -72,8 +78,20 @@ function complete() {
               <button type="button" class="btn btn--icon btn--ghost" :aria-label="t('common.close')" :disabled="disabled" @click="close"><Icon name="x" :size="16" /></button>
             </header>
             <div class="model-capacity-dialog__body">
+              <p v-if="thinking !== undefined">{{ provider }} · {{ model }}</p>
+              <section v-if="thinking !== undefined" class="model-capacity-thinking">
+                <label class="control-row">
+                  <span class="control-row__label-block">
+                    <span class="control-row__label">{{ thinkingLabel }}</span>
+                    <span class="control-row__desc">{{ t(`setup.thinking.${thinkingScope || 'global'}Desc`) }}</span>
+                  </span>
+                  <span v-if="thinkingReadonly">{{ thinking || t('setup.provider.thinkingDefault') }}</span>
+                  <SetupThinkingSelect v-else v-model="localThinking" :label="thinkingLabel" :disabled="disabled" data-testid="model-thinking-level" />
+                </label>
+              </section>
+              <h5 v-if="thinking !== undefined">{{ t('setup.thinking.sharedSettings') }}</h5>
               <p v-if="!form.supported.value" class="control-section__desc">{{ t('setup.capacity.upgrade') }}</p>
-              <SetupModelCapacityFields v-else-if="row" :row="row" :model-value="values" :disabled="disabled" @update:model-value="change" />
+              <SetupModelCapacityFields v-else-if="row" :row="row" :model-value="values" :disabled="disabled" :hide-identity="thinking !== undefined && !inline" @update:model-value="change" />
               <p v-else role="status">{{ t(failed ? 'setup.capacity.loadFailed' : 'shared.loading') }}</p>
               <button v-if="failed" type="button" class="btn" @click="form.ensure(target)">{{ t('setup.capacity.retry') }}</button>
             </div>
@@ -90,6 +108,11 @@ function complete() {
 </template>
 
 <style scoped>
+.model-capacity-thinking :deep(select) { width: 160px; min-width: 160px; }
+.model-capacity-thinking .control-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: var(--sp-3); }
+@media (max-width: 480px) { .model-capacity-thinking .control-row { grid-template-columns: minmax(0, 1fr); } .model-capacity-thinking :deep(select) { width: 100%; min-width: 0; } }
+.model-capacity-thinking { padding-bottom: var(--sp-3); border-bottom: 1px solid var(--border); }
+.model-capacity-dialog__body h5 { margin: var(--sp-3) 0; font-size: var(--fs-sm); color: var(--text-muted); }
 .model-capacity-disclosure { min-width: 0; width: 100%; }
 .model-capacity-trigger { flex-shrink: 0; }
 .model-capacity-menu { display: flex; align-items: center; gap: var(--sp-2); border: 0; background: transparent; color: var(--text); padding: var(--sp-2) var(--sp-3); font: inherit; cursor: pointer; text-align: start; width: 100%; }

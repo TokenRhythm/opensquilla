@@ -109,6 +109,7 @@ export interface EnsembleCandidateView {
   source: EnsembleCandidateSource
   enabled: boolean
   role: EnsembleCandidateRole
+  thinkingLevel?: string
   credential?: EnsembleCredentialStatus
 }
 
@@ -269,7 +270,7 @@ function normalizeCandidates(value: unknown): EnsembleCandidateConfig[] {
       role,
     }
     const thinkingLevel = String(raw.thinking_level ?? raw.thinkingLevel ?? '').trim()
-    if (thinkingLevel) normalized.thinking_level = thinkingLevel
+    if (raw.thinking_level !== undefined || raw.thinkingLevel !== undefined) normalized.thinking_level = thinkingLevel
     const existingIndex = seen.get(key)
     if (existingIndex === undefined) {
       seen.set(key, out.length)
@@ -339,6 +340,7 @@ function withCredential(
   status: readonly EnsembleCredentialStatus[],
   enabled = true,
   role: EnsembleCandidateRole = 'proposer',
+  thinkingLevel = '',
 ): EnsembleCandidateView {
   const normalizedProvider = normalizeProvider(provider)
   const cleanModel = normalizeModel(model)
@@ -349,6 +351,7 @@ function withCredential(
     source,
     enabled,
     role,
+    thinkingLevel,
     credential: credentialFor(normalizedProvider, status),
   }
 }
@@ -745,6 +748,21 @@ export function useSetupEnsembleForm() {
     candidates.value = normalizeCandidates(next)
   }
 
+  function setCandidateThinking(candidate: { provider: string; model: string; role?: string }, value: string) {
+    if (!['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) return
+    const role = normalizeCandidateRole(candidate.role)
+    if (role === 'aggregator' && !candidates.value.some(entry => normalizeCandidateRole(entry.role) === role && entry.enabled !== false)) {
+      if (!value) return
+      setAggregator(candidate.provider, candidate.model)
+    }
+    candidates.value = candidates.value.map(entry => (
+      normalizeProvider(entry.provider) === normalizeProvider(candidate.provider)
+      && normalizeModel(entry.model) === normalizeModel(candidate.model)
+      && normalizeCandidateRole(entry.role) === role
+        ? { ...entry, thinking_level: value } : entry
+    ))
+  }
+
   function importTierCandidates(
     tierCandidates: readonly EnsembleTierCandidate[],
     providerRestriction?: unknown,
@@ -915,7 +933,8 @@ export function useSetupEnsembleForm() {
       source: candidate.source || 'custom',
       enabled: candidate.enabled !== false,
       role: normalizeCandidateRole(candidate.role),
-      ...(candidate.thinking_level ? { thinking_level: candidate.thinking_level } : {}),
+      // Explicit empty values clear overrides; the RPC preserves omitted fields.
+      thinking_level: candidate.thinking_level || '',
     }))
     if (minSuccessfulDirty.value) params.minSuccessfulProposers = minSuccessfulProposers.value
     if (allFailedPolicyDirty.value) params.allFailedPolicy = allFailedPolicy.value
@@ -992,6 +1011,7 @@ export function useSetupEnsembleForm() {
           credentialStatus,
           true,
           normalizeCandidateRole(candidate.role),
+          candidate.thinking_level || '',
         ))
       const legacyCandidates = legacyDefaultModelOptions(modelOptions.value)
         ? []
@@ -1013,8 +1033,8 @@ export function useSetupEnsembleForm() {
       const fixedProfile: EnsembleFixedProfileView | null = activeStaticProfile
         ? {
             providerLabel: activeStaticProfile.label,
-            proposers: activeStaticProfile.proposers.map(model => withCredential(activeStaticProfile.provider, model, 'openrouter_fixed', credentialStatus)),
-            aggregator: withCredential(activeStaticProfile.provider, activeStaticProfile.aggregator, 'openrouter_fixed', credentialStatus, true, 'aggregator'),
+            proposers: activeStaticProfile.proposers.map(model => withCredential(activeStaticProfile.provider, model, 'openrouter_fixed', credentialStatus, true, 'proposer', activeStaticProfile.thinkingLevel || '')),
+            aggregator: withCredential(activeStaticProfile.provider, activeStaticProfile.aggregator, 'openrouter_fixed', credentialStatus, true, 'aggregator', activeStaticProfile.thinkingLevel || ''),
             credential: credentialFor(activeStaticProfile.provider, credentialStatus),
           }
         : null
@@ -1129,6 +1149,7 @@ export function useSetupEnsembleForm() {
     addCandidate,
     removeCandidate,
     replaceCandidate,
+    setCandidateThinking,
     setAggregator,
     importTierCandidates,
     resetModelOptions,

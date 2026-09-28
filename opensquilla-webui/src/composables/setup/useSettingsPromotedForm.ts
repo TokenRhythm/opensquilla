@@ -85,17 +85,18 @@ export function useSettingsPromotedForm() {
     initAudioFromConfig(config)
   }
 
-  function initProviderFromConfig(config: PromotedConfigData) {
+  function initProviderFromConfig(config: PromotedConfigData, preserveThinking = false) {
     const timeout = Number(config.llm_request_timeout_seconds)
     llmTimeoutSeconds.value = Number.isFinite(timeout) && timeout >= 1 ? timeout : DEFAULT_LLM_TIMEOUT_SECONDS
-    llmThinking.value = String(config.llm?.thinking ?? '').trim()
+    if (!preserveThinking) acceptLlmThinking(config.llm?.thinking)
     // Seed the context-window field from the saved provider+model override.
     contextWindowTokens.value = contextWindowOverrideFor(
       config,
       String(config.llm?.provider || ''),
       String(config.llm?.model || ''),
     )
-    commitProviderBaselines()
+    timeoutBaseline.value = llmTimeoutSeconds.value
+    contextWindowBaseline.value = contextWindowTokens.value
   }
 
   function initMemoryCaptureFromConfig(config: PromotedConfigData) {
@@ -117,12 +118,6 @@ export function useSettingsPromotedForm() {
     audioApiKey.value = ''
 
     audioBaseline.value = audioSerialized.value
-  }
-
-  function commitProviderBaselines() {
-    timeoutBaseline.value = llmTimeoutSeconds.value
-    thinkingBaseline.value = llmThinking.value
-    contextWindowBaseline.value = contextWindowTokens.value
   }
 
   function setLlmTimeoutSeconds(value: number) {
@@ -159,6 +154,11 @@ export function useSettingsPromotedForm() {
   function providerPatches(): Record<string, unknown> {
     if (!timeoutDirty.value) return {}
     return { llm_request_timeout_seconds: llmTimeoutSeconds.value }
+  }
+
+  function acceptLlmThinking(value: unknown) {
+    llmThinking.value = String(value ?? '').trim()
+    thinkingBaseline.value = llmThinking.value
   }
 
   function setLlmThinking(value: string) {
@@ -236,6 +236,7 @@ export function useSettingsPromotedForm() {
     initAudioFromConfig,
     setLlmTimeoutSeconds,
     setLlmThinking,
+    acceptLlmThinking,
     resetLlmThinking,
     setContextWindowTokens,
     reseedContextWindow,

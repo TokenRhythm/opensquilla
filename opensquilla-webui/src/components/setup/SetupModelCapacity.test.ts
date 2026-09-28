@@ -14,13 +14,13 @@ const row = (item: ModelCapacityTarget) => ({ ...item, localRuntime: false,
 const mounted: (() => void)[] = []
 afterEach(() => { mounted.splice(0).forEach(dispose => dispose()); document.body.innerHTML = '' })
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); await nextTick() }
-async function mount(duplicate = false, inline = false, resolver?: (items: ModelCapacityTarget[]) => Promise<unknown>) {
+async function mount(duplicate = false, inline = false, resolver?: (items: ModelCapacityTarget[]) => Promise<unknown>, extra: Record<string, unknown> = {}) {
   i18n.global.locale.value = 'en'
   const form = useModelCapacityForm({ capacitySupported: true,
     resolveCapacity: resolver || vi.fn(async (items: ModelCapacityTarget[]) => ({ models: items.map(row) })),
   } as unknown as ProviderConfiguration)
   const host = document.createElement('div'); document.body.append(host)
-  const app = createApp({ render: () => h('div', [h(SetupModelCapacity, { ...target, inline }), ...(duplicate ? [h(SetupModelCapacity, target)] : [])]) })
+  const app = createApp({ render: () => h('div', [h(SetupModelCapacity, { ...target, inline, ...extra }), ...(duplicate ? [h(SetupModelCapacity, target)] : [])]) })
   app.use(i18n); app.provide(MODEL_CAPACITY_KEY, form); app.mount(host)
   mounted.push(() => app.unmount()); await flush()
   return { host, form }
@@ -135,5 +135,36 @@ describe('capacity editor', () => {
     field.value = '-1'; field.dispatchEvent(new Event('input', { bubbles: true })); await flush()
     expect(form.valid('modelStrategy')).toBe(false)
     expect(form.values(target).contextWindow).toBe('-1')
+  })
+})
+
+
+describe('thinking settings draft', () => {
+  it('cancels thinking independently and emits only on Done', async () => {
+    const onUpdateThinking = vi.fn()
+    const { host } = await mount(false, false, undefined, { thinking: 'high', thinkingScope: 'proposer', onUpdateThinking })
+    const trigger = host.querySelector<HTMLButtonElement>('.model-capacity-trigger')!
+    trigger.click(); await flush()
+    let select = document.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
+    select.value = 'off'; select.dispatchEvent(new Event('change', { bubbles: true })); await flush()
+    button('Cancel').click(); await flush()
+    expect(onUpdateThinking).not.toHaveBeenCalled()
+    trigger.click(); await flush()
+    select = document.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
+    expect(select.value).toBe('high')
+    expect(document.querySelector('.model-capacity-dialog')!.textContent).toContain('Shared model settings')
+    expect(document.querySelector('.model-capacity-dialog')!.textContent).not.toContain('setup.thinking.')
+    select.value = ''; select.dispatchEvent(new Event('change', { bubbles: true })); await flush()
+    button('Done').click(); await flush()
+    expect(onUpdateThinking).toHaveBeenCalledExactlyOnceWith('')
+  })
+  it('displays preset thinking without an editable selector', async () => {
+    const onUpdateThinking = vi.fn()
+    const { host } = await mount(false, false, undefined, { thinking: 'xhigh', thinkingScope: 'preset', thinkingReadonly: true, onUpdateThinking })
+    host.querySelector<HTMLButtonElement>('.model-capacity-trigger')!.click(); await flush()
+    expect(document.querySelector('.model-capacity-thinking')!.textContent).toContain('xhigh')
+    expect(document.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
+    button('Done').click(); await flush()
+    expect(onUpdateThinking).not.toHaveBeenCalled()
   })
 })

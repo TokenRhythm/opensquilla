@@ -138,17 +138,6 @@ const emit = defineEmits<{
 
 const addOpen = ref(false)
 
-// Fixed thinking levels accepted by llm.thinking on the gateway (gateway/config.py);
-// '' is the unset default, where squilla_router may suggest per-tier levels.
-const thinkingLevelOptions = computed(() => [
-  { value: '', label: t('setup.provider.thinkingDefault') },
-  { value: 'off', label: 'off' },
-  { value: 'minimal', label: 'minimal' },
-  { value: 'low', label: 'low' },
-  { value: 'medium', label: 'medium' },
-  { value: 'high', label: 'high' },
-  { value: 'xhigh', label: 'xhigh' },
-])
 const editorOpen = ref(false)
 const listExpanded = ref(false)
 const openProviderMenuId = ref('')
@@ -1404,28 +1393,11 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                       {{ t('setup.provider.refreshModels') }}
                     </button>
                   </div>
-                  <label v-if="panel.editingPrimary" class="control-row">
-                    <div class="control-row__label-block">
-                      <span class="control-row__label">{{ t('setup.provider.thinkingLabel') }}</span>
-                      <span class="control-row__desc">{{ t('setup.provider.thinkingGlobalDesc') }}</span>
-                    </div>
-                    <div class="control-row__control">
-                      <select
-                        class="control-input control-input--narrow"
-                        :value="panel.llmThinking"
-                        name="setup_provider_thinking"
-                        :aria-label="t('setup.provider.thinkingLabel')"
-                        data-testid="provider-thinking-level"
-                        @change="emit('updateLlmThinking', ($event.target as HTMLSelectElement).value)"
-                      >
-                        <option v-for="level in thinkingLevelOptions" :key="level.value" :value="level.value">
-                          {{ level.label }}
-                        </option>
-                      </select>
-                    </div>
-                  </label>
                   <SetupModelCapacity
-                    inline :provider="panel.providerSelected"
+                    menu :provider="panel.providerSelected"
+                    :thinking="panel.editingPrimary ? panel.llmThinking : undefined"
+                    thinking-scope="global"
+                    @update-thinking="emit('updateLlmThinking', $event)"
                     :model="String(panel.providerFieldValue({ name: 'model', label: '' }) || '')"
                     :scope="`provider:${panel.providerSelected.trim().toLowerCase()}`"
                     :disabled="providerBusy || saving"

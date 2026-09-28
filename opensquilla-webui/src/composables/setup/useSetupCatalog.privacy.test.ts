@@ -7667,3 +7667,43 @@ describe('primary thinking save integration', () => {
     } finally { app.unmount() }
   })
 })
+
+
+describe('global thinking across settings surfaces', () => {
+  it.each(['high', ''])('saves a fixed-model thinking edit through model strategy: %s', async next => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: 'medium' })
+      await api.loadData()
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        const patches = params?.patches as Record<string, unknown> | undefined
+        if (method === 'config.patch' && patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        return original(method, params)
+      })
+      api.updateModelStrategyThinking(next)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(false)
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+      rpcCall.mockClear()
+      expect(await api.saveModelStrategy()).toBe(true)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': next || null } })
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+      expect(api.modelStrategyPanel.value.llmThinking).toBe(next)
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+    } finally { app.unmount() }
+  })
+  it('retains a routing thinking draft when switching provider editors and discards it explicitly', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      await api.discardChanges()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})

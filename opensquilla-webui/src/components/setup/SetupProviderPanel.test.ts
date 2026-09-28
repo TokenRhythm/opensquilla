@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
+import { MODEL_CAPACITY_KEY, useModelCapacityForm } from '@/composables/setup/useModelCapacityForm'
+import type { ProviderConfiguration, ModelCapacityTarget } from '@/modules/providerConfiguration'
 import SetupProviderPanel from './SetupProviderPanel.vue'
 import type { ConnectionState, DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
@@ -140,12 +142,18 @@ function panel(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function mountPanel(props: Record<string, unknown> = {}, listeners: Record<string, unknown> = {}) {
+async function mountPanel(props: Record<string, unknown> = {}, listeners: Record<string, unknown> = {}, withCapacity = false) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const panelState = reactive(panel(props))
   const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
+  if (withCapacity) app.provide(MODEL_CAPACITY_KEY, useModelCapacityForm({ capacitySupported: true,
+    resolveCapacity: async (items: ModelCapacityTarget[]) => ({ models: items.map(item => ({ ...item, localRuntime: false,
+      contextWindow: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+      maxOutputTokens: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+    })) }),
+  } as unknown as ProviderConfiguration))
   app.mount(el)
   await nextTick()
   return { app, el, panelState }
@@ -2653,34 +2661,34 @@ describe('SetupProviderPanel — model strategy wayfinding', () => {
 })
 
 describe('primary thinking control', () => {
-  it('renders one visible control in the real editor and emits edits and reset', async () => {
+  it('keeps thinking edits local until the model settings dialog is completed', async () => {
     const onUpdateLlmThinking = vi.fn()
-    const { app, el, panelState } = await mountPanel({ llmThinking: 'high' }, { onUpdateLlmThinking })
+    const { app, el } = await mountPanel({ llmThinking: 'high', providerFieldValue: () => 'example-model' }, { onUpdateLlmThinking }, true)
     try {
-      const dialog = await openConfiguredEditor(el)
-      const control = dialog.querySelector<HTMLSelectElement>('[data-testid="provider-thinking-level"]')!
-      expect(control).toBeTruthy()
-      expect(control.closest('[hidden]')).toBeNull()
-      expect(document.body.querySelectorAll('[data-testid="provider-thinking-level"]')).toHaveLength(1)
+      const editor = await openConfiguredEditor(el)
+      expect(editor.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
+      editor.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
+      await Promise.resolve(); await nextTick(); await nextTick()
+      const dialog = document.querySelector('.model-capacity-dialog')!
+      const control = dialog.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
       expect(control.value).toBe('high')
       expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
-      control.value = 'low'
-      control.dispatchEvent(new Event('change', { bubbles: true }))
-      expect(onUpdateLlmThinking).toHaveBeenLastCalledWith('low')
       control.value = ''
       control.dispatchEvent(new Event('change', { bubbles: true }))
-      expect(onUpdateLlmThinking).toHaveBeenLastCalledWith('')
-      panelState.llmThinking = ''
       await nextTick()
-      expect(control.value).toBe('')
+      expect(onUpdateLlmThinking).not.toHaveBeenCalled()
+      dialog.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+      expect(onUpdateLlmThinking).toHaveBeenCalledWith('')
     } finally { app.unmount() }
   })
 
-  it('does not expose the global control in a secondary provider editor', async () => {
-    const { app, el } = await mountPanel({ editingPrimary: false, selectedStoredProfile: true })
+  it('does not expose global thinking in a secondary provider settings dialog', async () => {
+    const { app, el } = await mountPanel({ editingPrimary: false, selectedStoredProfile: true, providerFieldValue: () => 'example-model' }, {}, true)
     try {
-      const dialog = await openConfiguredEditor(el)
-      expect(dialog.querySelector('[data-testid="provider-thinking-level"]')).toBeNull()
+      const editor = await openConfiguredEditor(el)
+      editor.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
+      await nextTick()
+      expect(document.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
     } finally { app.unmount() }
   })
 })
