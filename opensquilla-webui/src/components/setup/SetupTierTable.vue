@@ -210,10 +210,6 @@ function effectiveTierEnsembleSelectionMode(row: SetupTierRow): string {
   return ''
 }
 
-function thinkingLabel(row: SetupTierRow): string {
-  return row.thinkingLevel === 'none' ? 'off' : row.thinkingLevel || t('setup.provider.thinkingDefault')
-}
-
 function thinkingManagedByEnsemble(row: SetupTierRow): boolean {
   return row.name === 'c3'
     && tierEnsembleActive(row)
@@ -364,7 +360,7 @@ function clamp(value: number, minimum: number, maximum: number): number {
 
 // At the compact breakpoint the tier table becomes a horizontal scrollport.
 // Portal the tooltip to <body> and clamp it to the viewport so scrolling to
-// the Thinking/Image columns cannot crop a left-aligned C3 explanation.
+// the model column cannot crop a left-aligned C3 explanation.
 function updateEnsembleTooltipPosition() {
   if (!openEnsembleDetailsId.value) return
 
@@ -616,7 +612,7 @@ const allowsFloatingContent = computed(() => (
     :aria-disabled="disabled ? 'true' : undefined"
   >
     <div class="setup-tier-table__row is-head" role="row">
-      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span><span>{{ t('setup.router.colThinking') }}</span>
+      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span>
     </div>
     <div
       v-for="tier in visibleRows"
@@ -739,12 +735,6 @@ const allowsFloatingContent = computed(() => (
             {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
         </div>
-        <span
-          class="setup-tier-table__readonly"
-          :aria-label="thinkingManagedByEnsemble(tier)
-            ? t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })
-            : t('setup.router.tierThinkingAria', { tier: tier.name })"
-        >{{ thinkingManagedByEnsemble(tier) ? t('setup.router.tierThinkingManagedByEnsemble') : thinkingLabel(tier) }}</span>
       </template>
       <template v-else>
         <div class="setup-tier-table__model-cell">
@@ -841,13 +831,6 @@ const allowsFloatingContent = computed(() => (
             {{ t('setup.router.tierEnsembleImageRouting') }}
           </small>
         </div>
-        <span
-          v-if="thinkingManagedByEnsemble(tier)"
-          class="setup-tier-table__readonly"
-          :aria-label="t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })"
-          :title="t('setup.router.tierThinkingManagedByEnsemble')"
-        >{{ t('setup.router.tierThinkingManagedByEnsemble') }}</span>
-        <span v-else class="setup-tier-table__readonly" :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })">{{ thinkingLabel(tier) }}</span>
       </template>
       <span
         v-if="tier.name === 'c3' && !readonly"
@@ -872,7 +855,7 @@ const allowsFloatingContent = computed(() => (
 }
 
 .setup-tier-table--without-provider .setup-tier-table__row {
-  grid-template-columns: 140px minmax(0, 1fr) 120px;
+  grid-template-columns: 140px minmax(0, 1fr);
 }
 
 .setup-tier-table__provider-cell {
@@ -1035,7 +1018,7 @@ const allowsFloatingContent = computed(() => (
     overflow-x: auto;
   }
   .setup-tier-table--without-provider .setup-tier-table__row {
-    min-width: 460px;
+    min-width: 340px;
   }
 }
 </style>
