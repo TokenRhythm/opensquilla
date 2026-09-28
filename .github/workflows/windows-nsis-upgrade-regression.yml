@@ -250,8 +250,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Path old,candidate | Out-Null
-          gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old
-          if ($LASTEXITCODE -ne 0) { throw 'Baseline download failed' }
+          $asset = 'old/OpenSquilla-${{ matrix.baseline }}-win-x64.exe'
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            Remove-Item -LiteralPath $asset -Force -ErrorAction SilentlyContinue
+            $downloadOutput = gh release download 'v${{ matrix.baseline }}' --repo TokenRhythm/opensquilla --pattern 'OpenSquilla-${{ matrix.baseline }}-win-x64.exe' --dir old 2>&1
+            $downloadExitCode = $LASTEXITCODE
+            $downloadOutput | Write-Output
+            if ($downloadExitCode -eq 0) { break }
+            $retryable = (($downloadOutput | Out-String) -match '\bHTTP (429|5\d\d)\b')
+            if (-not $retryable -or $attempt -eq 3) {
+              throw "Baseline download failed after $attempt attempt(s)"
+            }
+            Write-Warning "Transient GitHub release download failure; retrying attempt $($attempt + 1) of 3"
+            Start-Sleep -Seconds (5 * $attempt)
+          }
       - uses: ./.github/actions/download-required-artifact
         with:
           name: nsis-regression-installer

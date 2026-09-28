@@ -393,6 +393,11 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     download = next(step for step in job["steps"]
                     if step.get("name") == "Download pinned official baseline")
     assert download["if"] == "matrix.scenario != 'fresh'"
+    download_script = download["run"]
+    assert "for ($attempt = 1; $attempt -le 3; $attempt++)" in download_script
+    assert "Remove-Item -LiteralPath $asset" in download_script
+    assert "HTTP (429|5\\d\\d)" in download_script
+    assert "if (-not $retryable -or $attempt -eq 3)" in download_script
     verify = next(step["run"] for step in job["steps"]
                   if "--candidate-source-sha" in step.get("run", ""))
     baseline_branch = "if ('${{ matrix.scenario }}' -ne 'fresh')"
