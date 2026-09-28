@@ -91,6 +91,7 @@ function mainStartupHarness() {
     syncDesktopConsentMirror: async () => {},
     desktopTelemetryRuntimeGate: { close() {} },
     desktopLog() {},
+    desktopStartupLog() {},
     loadDesktopRendererIntoCurrentWindow: async () => { calls.rendered.push(snapshot()) },
     beginGatewayStartTelemetry() {},
     readinessCheck: async (url) => {

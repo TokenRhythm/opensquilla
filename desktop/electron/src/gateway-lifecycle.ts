@@ -5,6 +5,9 @@ export interface LifecycleProcessDrainOptions<T> {
   stopCurrentProcess: (process: T) => void
   liveProcesses: () => T[]
   waitForExit: (process: T) => Promise<boolean>
+  onStopRequested?: (process: T) => void
+  onChildExited?: (process: T, exited: boolean) => void
+  onComplete?: (exited: boolean) => void
   maxRounds?: number
 }
 
@@ -98,16 +101,37 @@ export function lifecycleAllowsProcessSpawn(
 export async function stopAndJoinLifecycleProcesses<T>(
   options: LifecycleProcessDrainOptions<T>,
 ): Promise<boolean> {
+  const report = (callback: (() => void) | undefined): void => {
+    try { callback?.() } catch { /* diagnostics are fail-open */ }
+  }
+  const reportChild = (callback: ((exited: boolean) => void) | undefined, exited: boolean): void => {
+    try { callback?.(exited) } catch { /* diagnostics are fail-open */ }
+  }
   const maxRounds = options.maxRounds ?? 8
   for (let round = 0; round < maxRounds; round += 1) {
     const current = options.currentProcess()
-    if (current !== null) options.stopCurrentProcess(current)
+    if (current !== null) {
+      report(() => options.onStopRequested?.(current))
+      options.stopCurrentProcess(current)
+    }
 
     const processes = [...new Set(options.liveProcesses())]
-    if (processes.length === 0) return options.currentProcess() === null
+    if (processes.length === 0) {
+      const complete = options.currentProcess() === null
+      report(() => options.onComplete?.(complete))
+      return complete
+    }
 
     const exited = await Promise.all(processes.map((process) => options.waitForExit(process)))
-    if (!exited.every(Boolean)) return false
+    processes.forEach((process, index) => reportChild(
+      done => options.onChildExited?.(process, done), exited[index],
+    ))
+    if (!exited.every(Boolean)) {
+      report(() => options.onComplete?.(false))
+      return false
+    }
   }
-  return options.currentProcess() === null && options.liveProcesses().length === 0
+  const complete = options.currentProcess() === null && options.liveProcesses().length === 0
+  report(() => options.onComplete?.(complete))
+  return complete
 }
