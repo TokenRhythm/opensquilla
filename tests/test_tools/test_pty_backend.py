@@ -243,6 +243,61 @@ async def test_pty_handle_lifecycle_preserves_utf8_and_dimensions() -> None:
     assert await pty_backend.wait_pty(handle) == 0
 
 
+@pytest.mark.asyncio
+async def test_darwin_owned_pty_eof_waits_for_descendant_capture(monkeypatch) -> None:
+    monkeypatch.setattr(pty_backend.sys, "platform", "darwin")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    events: list[str] = []
+
+    async def capture() -> bool:
+        started.set()
+        await release.wait()
+        events.append("captured")
+        return True
+
+    raw = SimpleNamespace(sendeof=lambda: events.append("eof"))
+    owned = pty_backend._OwnedPtyProcess(raw)
+    owned._opensquilla_process_tree_owner = SimpleNamespace(capture_before_eof=capture)
+    handle = pty_backend.PtyHandle(owned, "posix")
+
+    task = asyncio.create_task(pty_backend.eof_pty(handle))
+    await asyncio.wait_for(started.wait(), timeout=0.5)
+    assert events == []
+    release.set()
+    await asyncio.wait_for(task, timeout=0.5)
+    assert events == ["captured", "eof"]
+
+
+@pytest.mark.asyncio
+async def test_darwin_owned_pty_eof_rejects_failed_capture(monkeypatch) -> None:
+    monkeypatch.setattr(pty_backend.sys, "platform", "darwin")
+    raw = SimpleNamespace(sendeof=Mock())
+    owned = pty_backend._OwnedPtyProcess(raw)
+    owned._opensquilla_process_tree_owner = SimpleNamespace(
+        capture_before_eof=AsyncMock(return_value=False),
+    )
+    handle = pty_backend.PtyHandle(owned, "posix")
+
+    with pytest.raises(pty_backend.PtyBackendError, match="captured before EOF"):
+        await pty_backend.eof_pty(handle)
+    raw.sendeof.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_linux_owned_pty_eof_keeps_subreaper_path(monkeypatch) -> None:
+    monkeypatch.setattr(pty_backend.sys, "platform", "linux")
+    raw = SimpleNamespace(sendeof=Mock())
+    owned = pty_backend._OwnedPtyProcess(raw)
+    owner = SimpleNamespace(capture_before_eof=AsyncMock())
+    owned._opensquilla_process_tree_owner = owner
+
+    await pty_backend.eof_pty(pty_backend.PtyHandle(owned, "posix"))
+
+    owner.capture_before_eof.assert_not_awaited()
+    raw.sendeof.assert_called_once_with()
+
+
 @pytest.mark.pty
 @pytest.mark.asyncio
 async def test_pipe_resize_reports_capability_error() -> None:
