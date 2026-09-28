@@ -15,8 +15,6 @@ import type {
   WorkbenchScope,
 } from './types'
 
-export const WORKBENCH_PREVIEW_ITEM_LIMIT = 8
-
 function hydrateWidthPreference(): WorkbenchWidthPreference {
   if (typeof localStorage === 'undefined') return defaultWorkbenchWidthPreference()
   try {
@@ -130,48 +128,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   function openItem(item: WorkbenchItem): boolean {
-    const existing = items.value.some(candidate => candidate.id === item.id)
-    if (
-      !existing
-      && item.hostKind === 'native-webcontents'
-      && items.value.filter(candidate => candidate.hostKind === 'native-webcontents').length
-        >= WORKBENCH_PREVIEW_ITEM_LIMIT
-    ) {
-      return false
-    }
     if (!updateItem(item)) {
       items.value.push(item)
       notify({ type: 'open', item })
     }
     expanded.value = true
     activateItem(item.id)
-    evictLeastRecentArtifactPreviews(item.id)
     return true
-  }
-
-  /**
-   * Preview tabs are intentionally bounded. Eviction follows the same
-   * activation order used when closing tabs, so a newly opened document and
-   * recently inspected documents survive while stale Blob-backed previews are
-   * disposed deterministically.
-   */
-  function evictLeastRecentArtifactPreviews(protectedId: string) {
-    let previewCount = items.value.filter(
-      candidate => candidate.kind === 'artifact-preview',
-    ).length
-    while (previewCount > WORKBENCH_PREVIEW_ITEM_LIMIT) {
-      const staleId = activationOrder.find(id => {
-        if (id === protectedId) return false
-        return items.value.some(
-          candidate =>
-            candidate.id === id
-            && candidate.kind === 'artifact-preview'
-            && candidate.hostKind !== 'native-webcontents',
-        )
-      })
-      if (!staleId || !closeItem(staleId, 'evicted')) break
-      previewCount -= 1
-    }
   }
 
   /** Refresh a descriptor without stealing focus from the active panel. */

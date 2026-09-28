@@ -143,6 +143,52 @@ describe('workbench runtime registry', () => {
     expect(runtimes[1]?.resume).toHaveBeenCalledOnce()
   })
 
+  it.each([false, true])(
+    'keeps metadata updates dormant after suspend (queued: %s)',
+    async queuedSuspend => {
+      const registry = new WorkbenchPanelRegistry()
+      const runtimes: WorkbenchPanelRuntime[] = []
+      const createRuntime = vi.fn(() => {
+        const runtime = { dispose: vi.fn(), resume: vi.fn(), update: vi.fn() }
+        runtimes.push(runtime)
+        return runtime
+      })
+      registry.register({ kind: 'artifact-preview', createRuntime })
+      const manager = new WorkbenchRuntimeManager(registry)
+      const original = item('document', 'dispose-on-suspend')
+      const updated = {
+        ...original,
+        title: 'Current document',
+        payload: { navigationArtifacts: ['new-document'] },
+      }
+
+      manager.handle({ type: 'open', item: original })
+      await manager.flush()
+      manager.handle({ type: 'suspend', item: original })
+      if (!queuedSuspend) await manager.flush()
+      manager.handle({ type: 'update', item: updated })
+      await manager.flush()
+
+      expect(createRuntime).toHaveBeenCalledOnce()
+      expect(runtimes[0]?.dispose).toHaveBeenCalledWith('suspended')
+      expect(runtimes[0]?.update).not.toHaveBeenCalled()
+      expect(manager.hasRuntime(original.id)).toBe(false)
+
+      manager.handle({ type: 'resume', item: updated })
+      await manager.flush()
+
+      expect(createRuntime).toHaveBeenCalledTimes(2)
+      expect(createRuntime).toHaveBeenLastCalledWith(updated, expect.any(Object))
+      expect(runtimes[1]?.resume).toHaveBeenCalledWith(updated)
+
+      const visibleUpdate = { ...updated, title: 'Renamed document' }
+      manager.handle({ type: 'update', item: visibleUpdate })
+      await manager.flush()
+      expect(createRuntime).toHaveBeenCalledTimes(2)
+      expect(runtimes[1]?.update).toHaveBeenCalledWith(visibleUpdate)
+    },
+  )
+
   it('contains provider failures and reports the affected descriptor', async () => {
     const registry = new WorkbenchPanelRegistry()
     const failure = new Error('failed')

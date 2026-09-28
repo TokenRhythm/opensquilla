@@ -221,7 +221,6 @@
     "resize": "Cambiar el ancho del área de trabajo",
     "pixels": "píxeles",
     "empty": "No hay una vista previa disponible para este elemento.",
-    "itemLimitReached": "Ya hay ocho vistas previas aisladas abiertas. Cierra una antes de abrir otra.",
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },

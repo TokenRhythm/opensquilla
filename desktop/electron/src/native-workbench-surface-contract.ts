@@ -2,7 +2,6 @@ export const NATIVE_WORKBENCH_PROTOCOL_VERSION = 1 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V2 = 2 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V3 = 3 as const
 export const NATIVE_WORKBENCH_PROTOCOL_VERSION_V4 = 4 as const
-export const NATIVE_WORKBENCH_MAX_SURFACES = 8
 export const NATIVE_WORKBENCH_MAX_HTML_BYTES = 5 * 1024 * 1024
 export const NATIVE_WORKBENCH_ARTIFACT_SCHEME = 'opensquilla-artifact'
 
@@ -134,7 +133,6 @@ export interface NativeWorkbenchCapabilities {
   navigationActions: typeof NATIVE_WORKBENCH_NAVIGATION_ACTIONS
   permissionResponses: true
   browser: true
-  maxSurfaces: typeof NATIVE_WORKBENCH_MAX_SURFACES
 }
 
 export const NATIVE_WORKBENCH_CAPABILITIES: NativeWorkbenchCapabilities = {
@@ -156,7 +154,6 @@ export const NATIVE_WORKBENCH_CAPABILITIES: NativeWorkbenchCapabilities = {
   navigationActions: NATIVE_WORKBENCH_NAVIGATION_ACTIONS,
   permissionResponses: true,
   browser: true,
-  maxSurfaces: NATIVE_WORKBENCH_MAX_SURFACES,
 }
 
 export interface NativeWorkbenchSurfaceRectRequest {
