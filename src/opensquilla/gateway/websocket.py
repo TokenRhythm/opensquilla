@@ -72,6 +72,18 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+
+class FlowDeliveryStaleError(ValueError):
+    """A flow receipt no longer belongs to the current connection state.
+
+    This is a connection-local recovery condition.  It must not be treated as
+    transport exhaustion: the caller can restart snapshot reconciliation on the
+    same authenticated socket without weakening the memory/queue limits.
+    """
+
+    pass
+
+
 _SnapshotIdentity = tuple[str | None, int | None]
 _FlowInstallReceipt = tuple[Any, Any, Any, Any, Any]
 _InstalledFlowReceipt = tuple[Any, Any, Any, Any, Any, _SnapshotIdentity]
@@ -273,6 +285,19 @@ def _payload_field(payload: Any, key: str) -> Any:
     if isinstance(payload, dict):
         return payload.get(key)
     return None
+
+
+def _is_snapshot_delivery_payload(payload: Any) -> bool:
+    """Identify the recovery snapshot envelope before applying flow rules."""
+    if not isinstance(payload, dict):
+        return False
+    return (
+        all(isinstance(payload.get(name), str) and payload[name] for name in (
+            "key", "snapshot_id", "sync_revision",
+        ))
+        and isinstance(payload.get("data"), str)
+        and type(payload.get("segment_index")) is int
+    )
 
 
 @dataclass
@@ -1731,18 +1756,29 @@ class WsConnection:
             if wire_size > MAX_PAYLOAD_BYTES:
                 raise ValueError("Outbound frame exceeds the wire limit")
             receipt = _payload_field(frame.res_frame.payload, "delivery")
-            if isinstance(receipt, dict) and receipt.get("delivery_epoch") == self._flow.epoch:
+            if isinstance(receipt, dict) and _is_snapshot_delivery_payload(frame.res_frame.payload):
+                if receipt.get("delivery_epoch") != self._flow.epoch:
+                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
                 delivery_id = receipt.get("delivery_id")
                 if not isinstance(delivery_id, int) or isinstance(delivery_id, bool):
-                    raise ValueError("Snapshot delivery reservation is not current")
+                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
                 delivery = self._flow.deliveries.get(delivery_id)
                 if delivery is None or not delivery.recovery:
-                    raise ValueError("Snapshot delivery reservation is not current")
+                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
                 extra = max(0, size - delivery.size)
                 if extra and not self.reserve_transport_bytes(extra, kind="recovery"):
                     raise ValueError("Snapshot response exceeds the transport budget")
                 delivery.size += extra
                 if self._recovery_enabled and not self._flow.claim(delivery_id, "original"):
+                    # ``claim`` can lose a race with a cancellation/tombstone
+                    # after the response was encoded.  A delivery already
+                    # published as a tombstone (or as the original response)
+                    # is an idempotent duplicate and must remain suppressed;
+                    # it is not a new stale receipt requiring resync.  Undo
+                    # any size growth before dropping that duplicate.
+                    if extra:
+                        delivery.size -= extra
+                        self.release_transport_bytes(extra, kind="recovery")
                     return False
                 frame.delivery_id = delivery_id
                 frame.encoded_text = encoded
@@ -1904,15 +1940,50 @@ class WsConnection:
             try:
                 if not self._prepare_flow_frame(frame):
                     return
-            except Exception:
+            except Exception as exc:
                 # Admission may have reserved bytes before a later flow
                 # validation/encoding step failed.  The frame will never
                 # enter the outbox, so release that reservation here before
                 # taking either the dirty-session or force-close path.
                 self._release_outbound_budget(frame)
                 log.warning(
-                    "gateway.ws_flow_encode_or_budget_failed", conn_id=self.conn_id, exc_info=True
+                    "gateway.ws_flow_encode_or_budget_failed",
+                    conn_id=self.conn_id,
+                    exception_type=type(exc).__name__,
+                    failure_class=(
+                        "stale_delivery" if isinstance(exc, FlowDeliveryStaleError)
+                        else "flow_admission"
+                    ),
+                    exc_info=True,
                 )
+                if isinstance(exc, FlowDeliveryStaleError):
+                    # A stale snapshot response is recoverable.  Mark only its
+                    # session dirty and return a retryable RPC error so the
+                    # client performs a complete snapshot resync.  The error
+                    # frame has no delivery receipt, so it is safe to enqueue
+                    # through the ordinary control path on this same socket.
+                    key = _payload_field(
+                        frame.res_frame.payload if frame.res_frame is not None else None,
+                        "key",
+                    )
+                    if isinstance(key, str):
+                        self._mark_flow_dirty({"session_key": key})
+                    if frame.res_frame is not None:
+                        self._enqueue_frame(_OutboundFrame(
+                            kind="res",
+                            classification="control",
+                            payload=None,
+                            event_name=None,
+                            res_frame=make_error_res(
+                                frame.res_frame.id,
+                                "SNAPSHOT_STALE",
+                                "Snapshot synchronization is temporarily unavailable",
+                                retryable=True,
+                                accepted=False,
+                            ),
+                            is_control=True,
+                        ))
+                    return
                 if frame.event_name and frame.event_name.startswith("session.event."):
                     self._mark_flow_dirty(frame.payload)
                     return
