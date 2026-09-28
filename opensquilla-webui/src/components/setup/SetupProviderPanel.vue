@@ -140,7 +140,7 @@ const addOpen = ref(false)
 
 // Same vocabulary as llm.thinking accepts on the gateway (gateway/config.py);
 // '' is the unset default, where squilla_router may suggest per-tier levels.
-const THINKING_LEVEL_OPTIONS = [
+const thinkingLevelOptions = computed(() => [
   { value: '', label: t('setup.provider.thinkingDefault') },
   { value: 'off', label: 'off' },
   { value: 'minimal', label: 'minimal' },
@@ -149,7 +149,7 @@ const THINKING_LEVEL_OPTIONS = [
   { value: 'high', label: 'high' },
   { value: 'xhigh', label: 'xhigh' },
   { value: 'adaptive', label: 'adaptive' },
-]
+])
 const editorOpen = ref(false)
 const listExpanded = ref(false)
 const openProviderMenuId = ref('')
@@ -1188,26 +1188,6 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
           >
         </div>
       </label>
-      <label class="control-row">
-        <div class="control-row__label-block">
-          <span class="control-row__label">{{ t('setup.provider.thinkingLabel') }}</span>
-          <span class="control-row__desc">{{ t('setup.provider.thinkingGlobalDesc') }}</span>
-        </div>
-        <div class="control-row__control">
-          <select
-            class="control-input control-input--narrow"
-            :value="panel.llmThinking"
-            name="setup_provider_thinking"
-            :aria-label="t('setup.provider.thinkingLabel')"
-            data-testid="provider-thinking-level"
-            @change="emit('updateLlmThinking', ($event.target as HTMLSelectElement).value)"
-          >
-            <option v-for="level in THINKING_LEVEL_OPTIONS" :key="level.value" :value="level.value">
-              {{ level.label }}
-            </option>
-          </select>
-        </div>
-      </label>
     </details>
 
     <div v-if="panel.providerEnvMissing" class="setup-warning">
@@ -1425,6 +1405,26 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                       {{ t('setup.provider.refreshModels') }}
                     </button>
                   </div>
+                  <label v-if="panel.editingPrimary" class="control-row">
+                    <div class="control-row__label-block">
+                      <span class="control-row__label">{{ t('setup.provider.thinkingLabel') }}</span>
+                      <span class="control-row__desc">{{ t('setup.provider.thinkingGlobalDesc') }}</span>
+                    </div>
+                    <div class="control-row__control">
+                      <select
+                        class="control-input control-input--narrow"
+                        :value="panel.llmThinking"
+                        name="setup_provider_thinking"
+                        :aria-label="t('setup.provider.thinkingLabel')"
+                        data-testid="provider-thinking-level"
+                        @change="emit('updateLlmThinking', ($event.target as HTMLSelectElement).value)"
+                      >
+                        <option v-for="level in thinkingLevelOptions" :key="level.value" :value="level.value">
+                          {{ level.label }}
+                        </option>
+                      </select>
+                    </div>
+                  </label>
                   <SetupModelCapacity
                     inline :provider="panel.providerSelected"
                     :model="String(panel.providerFieldValue({ name: 'model', label: '' }) || '')"

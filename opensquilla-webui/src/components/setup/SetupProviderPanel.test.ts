@@ -2651,3 +2651,36 @@ describe('SetupProviderPanel — model strategy wayfinding', () => {
     app.unmount()
   })
 })
+
+describe('primary thinking control', () => {
+  it('renders one visible control in the real editor and emits edits and reset', async () => {
+    const onUpdateLlmThinking = vi.fn()
+    const { app, el, panelState } = await mountPanel({ llmThinking: 'high' }, { onUpdateLlmThinking })
+    try {
+      const dialog = await openConfiguredEditor(el)
+      const control = dialog.querySelector<HTMLSelectElement>('[data-testid="provider-thinking-level"]')!
+      expect(control).toBeTruthy()
+      expect(control.closest('[hidden]')).toBeNull()
+      expect(document.body.querySelectorAll('[data-testid="provider-thinking-level"]')).toHaveLength(1)
+      expect(control.value).toBe('high')
+      expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'])
+      control.value = 'low'
+      control.dispatchEvent(new Event('change', { bubbles: true }))
+      expect(onUpdateLlmThinking).toHaveBeenLastCalledWith('low')
+      control.value = ''
+      control.dispatchEvent(new Event('change', { bubbles: true }))
+      expect(onUpdateLlmThinking).toHaveBeenLastCalledWith('')
+      panelState.llmThinking = ''
+      await nextTick()
+      expect(control.value).toBe('')
+    } finally { app.unmount() }
+  })
+
+  it('does not expose the global control in a secondary provider editor', async () => {
+    const { app, el } = await mountPanel({ editingPrimary: false, selectedStoredProfile: true })
+    try {
+      const dialog = await openConfiguredEditor(el)
+      expect(dialog.querySelector('[data-testid="provider-thinking-level"]')).toBeNull()
+    } finally { app.unmount() }
+  })
+})

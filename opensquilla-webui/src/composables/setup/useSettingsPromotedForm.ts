@@ -165,6 +165,10 @@ export function useSettingsPromotedForm() {
     llmThinking.value = value
   }
 
+  function resetLlmThinking() {
+    llmThinking.value = thinkingBaseline.value
+  }
+
   // Dot-path patch for the global thinking level. Clearing the select ('')
   // writes null, which deletes the llm.thinking key back to the unset default
   // (the same clear semantics the context-window override uses). Rides the
@@ -232,6 +236,7 @@ export function useSettingsPromotedForm() {
     initAudioFromConfig,
     setLlmTimeoutSeconds,
     setLlmThinking,
+    resetLlmThinking,
     setContextWindowTokens,
     reseedContextWindow,
     setMemoryAutoCapture,

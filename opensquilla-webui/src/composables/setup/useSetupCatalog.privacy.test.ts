@@ -7608,3 +7608,62 @@ describe('capacity save integration', () => {
     } finally { app.unmount() }
   })
 })
+
+describe('primary thinking save integration', () => {
+  it.each([['', 'high'], ['high', '']])('persists thinking-only edits from %s to %s and reloads the baseline', async (initial, next) => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: initial || null })
+      await api.loadData()
+      const originalRpc = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        if (method === 'config.patch') {
+          const patches = params?.patches as Record<string, unknown> | undefined
+          if (patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        }
+        return originalRpc(method, params)
+      })
+      expect(api.providerDraftDirty.value).toBe(false)
+      api.updateLlmThinking(next)
+      expect(api.providerDraftDirty.value).toBe(true)
+      rpcCall.mockClear()
+      expect(await api.saveProvider()).toBe(true)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': next || null } })
+      expect(api.providerPanel.value.llmThinking).toBe(next)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('saves thinking and capacity in the same provider save action', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await Promise.resolve(); await Promise.resolve(); await nextTick()
+      api.modelCapacity.update(target, { contextWindow: '262144', maxOutputTokens: '65536' }, 'provider:openrouter')
+      api.updateLlmThinking('high')
+      rpcCall.mockClear()
+      expect(await api.saveProvider({ reload: false })).toBe(true)
+      expect(rpcCall.mock.calls.some(([method]) => /configure|activate|probe/.test(method))).toBe(false)
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patches: { 'llm.thinking': 'high' } })
+      expect(rpcCall).toHaveBeenCalledWith('config.patch', { patch: { models: { openrouter: { [target.model]: { context_window: 262144, max_output_tokens: 65536 } } } } })
+    } finally { app.unmount() }
+  })
+
+  it('discards thinking on cancel or provider switch without leaking into profile edits', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateLlmThinking('high')
+      api.cancelProviderEdit()
+      expect(api.providerPanel.value.llmThinking).toBe('')
+      expect(api.providerDraftDirty.value).toBe(false)
+      api.updateLlmThinking('low')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      api.updateLlmThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      expect(api.providerPanel.value.llmThinking).toBe('')
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+})

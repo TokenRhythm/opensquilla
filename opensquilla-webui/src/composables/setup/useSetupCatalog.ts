@@ -2369,6 +2369,7 @@ const providerDirty = computed(() => (
   ||
   providerForm.isDirty.value
   || (providerOwnsFixedModelDraft.value && modelStrategyForm.fixedModelDirty.value)
+  || (editingPrimaryProvider.value && promotedForm.thinkingDirty.value)
   || (editingPrimaryProvider.value && promotedForm.timeoutDirty.value)
   || (editingPrimaryProvider.value && promotedForm.contextWindowDirty.value)
 ))
@@ -2517,6 +2518,7 @@ function selectProvider(value: string) {
 }
 
 function applyConfiguredProviderSelection(value: string) {
+  promotedForm.resetLlmThinking()
   const provider = normalizeProviderId(value)
   if (!provider) return
   if (provider === normalizeProviderId(currentProvider.value)) {
@@ -2891,6 +2893,7 @@ function setProviderImageGenerationOptIn(enabled: boolean) {
 
 function onProviderChange() {
   if (providerInteractionLocked()) return
+  promotedForm.resetLlmThinking()
   const provider = normalizeProviderId(providerForm.selectedProvider.value)
   if (configuredProviderIds.value.has(provider)) {
     applyConfiguredProviderSelection(provider)
@@ -3209,7 +3212,7 @@ function updateLlmTimeout(value: number) {
 }
 
 function updateLlmThinking(value: string) {
-  if (providerInteractionLocked()) return
+  if (providerInteractionLocked() || !editingPrimaryProvider.value) return
   promotedForm.setLlmThinking(value)
 }
 
@@ -3894,21 +3897,29 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     pushToast(t('setup.capacity.invalid'), { tone: 'danger' })
     return false
   }
-  const capacityOnly = modelCapacity.dirty(capacityScope)
+  const thinkingPatch = editingPrimaryProvider.value ? promotedForm.thinkingPatch() : null
+  // Runtime tuning must not reconfigure the primary or reset its routing policy.
+  const settingsOnly = (modelCapacity.dirty(capacityScope) || thinkingPatch !== null)
     && !providerForm.isDirty.value
     && !(providerOwnsFixedModelDraft.value && modelStrategyForm.fixedModelDirty.value)
     && !promotedForm.timeoutDirty.value && !promotedForm.contextWindowDirty.value
     && !options.activate
-  if (capacityOnly) {
+  if (settingsOnly) {
     providerSavePending.value = true
     primaryMutationPending.value = true
     try {
+      const restart = thinkingPatch ? await patchConfig(thinkingPatch) : false
       await modelCapacity.save(capacityScope, deepPatchConfig)
       restoreProviderCapacityDrafts = null
-      pushToast(t('setup.capacity.saved'))
+      if (thinkingPatch && options.reload !== false) {
+        await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
+      }
+      pushToast(t(thinkingPatch
+        ? (restart ? 'setup.toast.providerSavedRestart' : 'setup.toast.providerSaved')
+        : 'setup.capacity.saved'))
       return true
-    } catch {
-      pushToast(t('setup.capacity.saveFailed'), { tone: 'danger' })
+    } catch (err) {
+      pushToast(thinkingPatch ? saveFailedMessage(err) : t('setup.capacity.saveFailed'), { tone: 'danger' })
       return false
     } finally {
       providerSavePending.value = false
