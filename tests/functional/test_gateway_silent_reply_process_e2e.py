@@ -42,6 +42,8 @@ _OBJECTIVE = "Exercise automatic Goal continuation."
 _SERVER_MODE_ENV = "OPENSQUILLA_SILENT_REPLY_E2E_SERVER"
 _DEFAULT_SAMPLE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SAMPLE"
 _SAMPLE_SOURCE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SOURCE"
+_GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS = 45.0
+_MIGRATIONS_READY_LOG_MARKER = '"event": "build_services.migrations_ready"'
 
 
 def _verify_source_imports(source_root: Path) -> None:
@@ -210,7 +212,8 @@ async def _wait_for_health(
     process: subprocess.Popen[bytes],
     gateway_log: Path,
 ) -> None:
-    deadline = time.monotonic() + 45.0
+    deadline = time.monotonic() + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS
+    migrations_ready = False
     last_error = ""
     async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
         while time.monotonic() < deadline:
@@ -226,6 +229,17 @@ async def _wait_for_health(
                     return
             except Exception as exc:  # noqa: BLE001 - included in timeout evidence
                 last_error = str(exc)
+            if not migrations_ready:
+                output = gateway_log.read_text(encoding="utf-8", errors="replace")
+                if _MIGRATIONS_READY_LOG_MARKER in output:
+                    migrations_ready = True
+                    # Fresh-profile migrations are a distinct startup phase.
+                    # Preserve a bounded post-migration readiness budget instead
+                    # of charging slow Windows disk I/O to later boot work.
+                    deadline = max(
+                        deadline,
+                        time.monotonic() + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS,
+                    )
             await asyncio.sleep(0.1)
     output = gateway_log.read_text(encoding="utf-8", errors="replace")
     raise AssertionError(
@@ -391,7 +405,8 @@ async def _drain_available_frames(
             return
 
 
-# Fresh-profile migrations can exhaust the health deadline under CI worker load.
+# Fresh-profile migrations and post-migration service startup have independent
+# readiness budgets; keep the real process contract out of parallel CI workers.
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_real_gateway_suppresses_goal_sentinel_everywhere(
