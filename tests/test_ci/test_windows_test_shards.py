@@ -562,6 +562,10 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
             "test_absolute_deadline_closes_provider_and_emits_one_failed_terminal",
         ),
         (
+            "tests/test_engine/test_interactive_approval_retry.py",
+            "test_pending_approval_ignores_legacy_timeout_and_waits_for_decision",
+        ),
+        (
             "tests/test_skills/test_staging_io_worker.py",
             "test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup",
         ),
