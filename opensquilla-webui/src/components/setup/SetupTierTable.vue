@@ -12,6 +12,7 @@ import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
+import SetupThinkingSelect from '@/components/setup/SetupThinkingSelect.vue'
 import SetupModelCombobox from '@/components/setup/SetupModelCombobox.vue'
 import type {
   RouterProviderRoles,
@@ -607,12 +608,17 @@ const allowsFloatingContent = computed(() => (
     :class="{
       'setup-tier-table--open': allowsFloatingContent,
       'setup-tier-table--without-provider': !showProviderColumn,
+      'setup-tier-table--readonly': readonly,
     }"
     role="table"
     :aria-disabled="disabled ? 'true' : undefined"
   >
     <div class="setup-tier-table__row is-head" role="row">
-      <span>{{ t('setup.router.colTier') }}</span><span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span><span>{{ t('setup.router.colModel') }}</span>
+      <span>{{ t('setup.router.colTier') }}</span>
+      <span v-if="showProviderColumn">{{ t('setup.router.colProvider') }}</span>
+      <span>{{ t('setup.router.colModel') }}</span>
+      <span class="setup-tier-table__thinking-head">{{ t('setup.router.colThinking') }}</span>
+      <span v-if="!readonly"><span class="setup-tier-table__sr-only">{{ t('setup.capacity.title') }}</span></span>
     </div>
     <div
       v-for="tier in visibleRows"
@@ -756,10 +762,6 @@ const allowsFloatingContent = computed(() => (
               } : undefined"
               @update="(val) => updateModelChoice(tier, val)"
             />
-            <SetupModelCapacity v-if="!thinkingManagedByEnsemble(tier)" :provider="tier.provider" :model="tier.model" :disabled="rowFieldsDisabled(tier)" :thinking="tier.thinkingLevel" thinking-scope="tier" @update-thinking="emit('updateTierField', tier.name, 'thinkingLevel', $event)" />
-            <button v-else type="button" class="btn btn--icon btn--ghost" data-testid="tier-edit-shared-ensemble"
-              :title="t('setup.capacity.editSharedEnsemble')" :aria-label="t('setup.capacity.editSharedEnsemble')"
-              :disabled="disabled" @click="emit('editEnsemble')"><Icon name="gear" :size="14" /></button>
             <span
               v-if="compactSharedTierEnsembleActive(tier)"
               class="setup-tier-table__ensemble-details"
@@ -832,6 +834,36 @@ const allowsFloatingContent = computed(() => (
           </small>
         </div>
       </template>
+      <div class="setup-tier-table__thinking-cell" :data-label="t('setup.router.colThinking')">
+        <span
+          v-if="thinkingManagedByEnsemble(tier)"
+          class="setup-tier-table__thinking-note"
+          :aria-label="t('setup.router.tierThinkingManagedByEnsembleAria', { tier: tier.name })"
+        >{{ t('setup.router.tierThinkingManagedByEnsemble') }}</span>
+        <span
+          v-else-if="readonly"
+          class="setup-tier-table__readonly"
+          :aria-label="t('setup.router.tierThinkingAria', { tier: tier.name })"
+        >{{ tier.thinkingLevel === 'none' ? 'off' : tier.thinkingLevel || t('setup.provider.thinkingDefault') }}</span>
+        <SetupThinkingSelect
+          v-else
+          :model-value="tier.thinkingLevel"
+          :label="t('setup.router.tierThinkingAria', { tier: tier.name })"
+          :disabled="rowFieldsDisabled(tier)"
+          @update:model-value="emit('updateTierField', tier.name, 'thinkingLevel', $event)"
+        />
+      </div>
+      <div v-if="!readonly" class="setup-tier-table__settings-cell">
+        <SetupModelCapacity
+          v-if="!thinkingManagedByEnsemble(tier)"
+          :provider="tier.provider"
+          :model="tier.model"
+          :disabled="rowFieldsDisabled(tier)"
+        />
+        <button v-else type="button" class="btn btn--icon btn--ghost" data-testid="tier-edit-shared-ensemble"
+          :title="t('setup.capacity.editSharedEnsemble')" :aria-label="t('setup.capacity.editSharedEnsemble')"
+          :disabled="disabled" @click="emit('editEnsemble')"><Icon name="gear" :size="14" /></button>
+      </div>
       <span
         v-if="tier.name === 'c3' && !readonly"
         class="setup-tier-table__sr-only"
@@ -855,7 +887,37 @@ const allowsFloatingContent = computed(() => (
 }
 
 .setup-tier-table--without-provider .setup-tier-table__row {
-  grid-template-columns: 140px minmax(0, 1fr);
+  grid-template-columns: 140px minmax(0, 500px) 144px 44px;
+}
+
+.setup-tier-table--readonly .setup-tier-table__row {
+  grid-template-columns: 140px minmax(0, 0.8fr) minmax(0, 1.2fr) 144px;
+}
+
+.setup-tier-table__thinking-cell {
+  min-width: 0;
+}
+
+.setup-tier-table__thinking-cell :deep(select) {
+  min-width: 0;
+  width: 100%;
+  max-width: none;
+}
+
+.setup-tier-table__thinking-cell > span {
+  display: block;
+}
+
+.setup-tier-table__thinking-note {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.setup-tier-table__settings-cell {
+  display: flex;
+  justify-content: center;
 }
 
 .setup-tier-table__provider-cell {
@@ -887,7 +949,6 @@ const allowsFloatingContent = computed(() => (
   display: grid;
   gap: 4px;
   grid-template-columns: minmax(0, 1fr) auto;
-  max-width: 500px;
   min-width: 0;
 }
 
@@ -1019,8 +1080,28 @@ const allowsFloatingContent = computed(() => (
     overflow-x: auto;
   }
   .setup-tier-table--without-provider .setup-tier-table__row {
-    grid-template-columns: 86px minmax(0, 1fr);
+    grid-template-columns: 86px minmax(0, 1fr) 44px;
     min-width: 0;
+  }
+  .setup-tier-table--without-provider .setup-tier-table__thinking-head {
+    display: none;
+  }
+  .setup-tier-table--without-provider .setup-tier-table__thinking-cell {
+    align-items: center;
+    display: grid;
+    gap: var(--sp-2);
+    grid-column: 2;
+    grid-row: 2;
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+  .setup-tier-table--without-provider .setup-tier-table__thinking-cell::before {
+    color: var(--text-dim);
+    content: attr(data-label);
+    font-size: 11px;
+  }
+  .setup-tier-table--without-provider .setup-tier-table__settings-cell {
+    grid-column: 3;
+    grid-row: 1;
   }
 }
 </style>

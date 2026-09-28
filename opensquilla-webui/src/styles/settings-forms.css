@@ -66,7 +66,7 @@
   border-bottom: 1px solid var(--hairline);
   display: grid;
   gap: var(--sp-2);
-  grid-template-columns: 140px minmax(0, 1fr) minmax(0, 1fr);
+  grid-template-columns: 140px minmax(0, 0.8fr) minmax(0, 1.2fr) 144px 44px;
   padding: var(--sp-2) var(--sp-1);
 }
 
@@ -272,7 +272,7 @@
     overflow-x: auto;
   }
   .setup-tier-table__row {
-    min-width: 460px;
+    min-width: 640px;
   }
 
   .setup-ensemble-table__row {
