@@ -755,12 +755,17 @@ export function useSetupEnsembleForm() {
       if (!value) return
       setAggregator(candidate.provider, candidate.model)
     }
-    candidates.value = candidates.value.map(entry => (
+    const next = candidates.value.map(entry => (
       normalizeProvider(entry.provider) === normalizeProvider(candidate.provider)
       && normalizeModel(entry.model) === normalizeModel(candidate.model)
       && normalizeCandidateRole(entry.role) === role
+      && (entry.thinking_level || '') !== value
         ? { ...entry, thinking_level: value } : entry
     ))
+    if (next.some((entry, index) => entry !== candidates.value[index])) {
+      ensureCustomMode()
+      candidates.value = next
+    }
   }
 
   function importTierCandidates(

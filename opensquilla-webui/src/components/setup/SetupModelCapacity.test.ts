@@ -14,9 +14,9 @@ const row = (item: ModelCapacityTarget) => ({ ...item, localRuntime: false,
 const mounted: (() => void)[] = []
 afterEach(() => { mounted.splice(0).forEach(dispose => dispose()); document.body.innerHTML = '' })
 const flush = async () => { await Promise.resolve(); await Promise.resolve(); await nextTick() }
-async function mount(duplicate = false, inline = false, resolver?: (items: ModelCapacityTarget[]) => Promise<unknown>, extra: Record<string, unknown> = {}) {
+async function mount(duplicate = false, inline = false, resolver?: (items: ModelCapacityTarget[]) => Promise<unknown>, extra: Record<string, unknown> = {}, capacitySupported = true) {
   i18n.global.locale.value = 'en'
-  const form = useModelCapacityForm({ capacitySupported: true,
+  const form = useModelCapacityForm({ capacitySupported,
     resolveCapacity: resolver || vi.fn(async (items: ModelCapacityTarget[]) => ({ models: items.map(row) })),
   } as unknown as ProviderConfiguration)
   const host = document.createElement('div'); document.body.append(host)
@@ -165,6 +165,42 @@ describe('thinking settings draft', () => {
     expect(document.querySelector('.model-capacity-thinking')!.textContent).toContain('xhigh')
     expect(document.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
     button('Done').click(); await flush()
+    expect(onUpdateThinking).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('thinking without capacity metadata', () => {
+  it.each(['failed', 'unsupported', 'pending'])('commits thinking independently when capacity is %s', async state => {
+    const onUpdateThinking = vi.fn()
+    const resolver = vi.fn(async (): Promise<unknown> => {
+      if (state === 'pending') return new Promise(() => {})
+      throw new Error('synthetic capacity failure')
+    })
+    const { host, form } = await mount(false, false, resolver, {
+      thinking: 'low', thinkingScope: 'tier', onUpdateThinking,
+    }, state !== 'unsupported')
+    host.querySelector<HTMLButtonElement>('.model-capacity-trigger')!.click()
+    await flush(); await flush()
+    expect(form.rows.size).toBe(0)
+    expect(form.pending.has(capacityKey(target))).toBe(state === 'pending')
+    const select = document.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
+    select.value = 'high'; select.dispatchEvent(new Event('change', { bubbles: true }))
+    await flush()
+    expect(button('Done').disabled).toBe(false)
+    button('Done').click(); await flush()
+    expect(onUpdateThinking).toHaveBeenCalledExactlyOnceWith('high')
+    expect(form.patch('modelStrategy')).toBeNull()
+    if (state === 'unsupported') expect(resolver).not.toHaveBeenCalled()
+  })
+
+  it('still blocks invalid capacity edits when thinking is also editable', async () => {
+    const onUpdateThinking = vi.fn()
+    const { host } = await mount(false, false, undefined, { thinking: 'low', onUpdateThinking })
+    host.querySelector<HTMLButtonElement>('.model-capacity-trigger')!.click(); await flush()
+    await input('invalid')
+    expect(button('Done').disabled).toBe(true)
+    button('Done').click()
     expect(onUpdateThinking).not.toHaveBeenCalled()
   })
 })

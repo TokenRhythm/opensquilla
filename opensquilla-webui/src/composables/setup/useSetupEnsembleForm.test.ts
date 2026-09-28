@@ -1186,3 +1186,32 @@ describe('ensemble thinking by role', () => {
     ])
   })
 })
+
+
+describe('thinking edits in a custom lineup with a stored preset', () => {
+  it.each(['proposer', 'aggregator'])('pins custom mode and saves the %s thinking level', role => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5', candidates: [
+      { provider: 'ollama', model: 'example-a', role: 'proposer' },
+      { provider: 'ollama', model: 'example-b', role: 'proposer' },
+      { provider: 'ollama', model: 'example-a', role: 'aggregator' },
+    ] })
+    const panel = makePanel(f, 'ollama')
+    expect(panel.value.scheme).toBe('custom')
+    const candidate = role === 'aggregator' ? panel.value.custom.aggregator! : panel.value.custom.proposers[0]!
+    f.setCandidateThinking(candidate, 'high')
+    expect(f.isDirty.value).toBe(true)
+    expect(f.payload().selectionMode).toBe(CUSTOM_B5_SELECTION_MODE)
+    expect(f.payload().candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ provider: 'ollama', model: 'example-a', role, thinking_level: 'high' }),
+    ]))
+  })
+
+  it('does not change the stored preset for an absent candidate', () => {
+    const f = useSetupEnsembleForm()
+    f.initFromConfig({ enabled: true, selection_mode: 'static_openrouter_b5' })
+    f.setCandidateThinking({ provider: 'ollama', model: 'absent', role: 'proposer' }, 'high')
+    expect(f.isDirty.value).toBe(false)
+    expect(f.payload()).toEqual({})
+  })
+})

@@ -538,6 +538,7 @@ const ensembleForm = useSetupEnsembleForm()
 const capabilitiesForm = useSetupCapabilitiesForm()
 const promotedForm = useSettingsPromotedForm()
 const thinkingDraftScope = ref<'provider' | 'modelStrategy'>('provider')
+let providerThinkingDraftSnapshot: string | null = null
 
 const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 // Discovery may populate the runtime catalog after the first capacity read.
@@ -2478,6 +2479,7 @@ async function discardChanges() {
   if (saveAllRequestPending || modelStrategyRoutingBusy.value) return
   if (providerInteractionLocked()) return
   restoreProviderCapacityDrafts = null
+  providerThinkingDraftSnapshot = null
   for (const draft of [...modelCapacity.drafts.values()]) modelCapacity.discard(draft.scope)
   await loadData()
 }
@@ -2521,8 +2523,19 @@ function selectProvider(value: string) {
   providerForm.selectProvider(value)
 }
 
+function resetProviderThinkingDraft() {
+  if (thinkingDraftScope.value !== 'provider') return
+  if (providerThinkingDraftSnapshot === null) {
+    promotedForm.resetLlmThinking()
+    return
+  }
+  promotedForm.setLlmThinking(providerThinkingDraftSnapshot)
+  thinkingDraftScope.value = 'modelStrategy'
+  providerThinkingDraftSnapshot = null
+}
+
 function applyConfiguredProviderSelection(value: string) {
-  if (thinkingDraftScope.value === 'provider') promotedForm.resetLlmThinking()
+  resetProviderThinkingDraft()
   const provider = normalizeProviderId(value)
   if (!provider) return
   if (provider === normalizeProviderId(currentProvider.value)) {
@@ -2585,9 +2598,11 @@ async function requestAddProvider(value: string) {
 
 function cancelProviderEdit() {
   if (providerInteractionLocked()) return
+  resetProviderThinkingDraft()
   if (restoreProviderCapacityDrafts) restoreProviderCapacityDrafts()
   else modelCapacity.discard(`provider:${normalizeProviderId(providerForm.selectedProvider.value)}`)
   restoreProviderCapacityDrafts = null
+  providerThinkingDraftSnapshot = null
   if (providerOwnsFixedModelDraft.value && providerFixedModelDraftSnapshot.value != null) {
     modelStrategyForm.setFixedProvider(providerFixedModelDraftSnapshot.value.provider)
     modelStrategyForm.setFixedModel(providerFixedModelDraftSnapshot.value.model)
@@ -2897,7 +2912,7 @@ function setProviderImageGenerationOptIn(enabled: boolean) {
 
 function onProviderChange() {
   if (providerInteractionLocked()) return
-  if (thinkingDraftScope.value === 'provider') promotedForm.resetLlmThinking()
+  resetProviderThinkingDraft()
   const provider = normalizeProviderId(providerForm.selectedProvider.value)
   if (configuredProviderIds.value.has(provider)) {
     applyConfiguredProviderSelection(provider)
@@ -3217,12 +3232,18 @@ function updateLlmTimeout(value: number) {
 
 function updateLlmThinking(value: string) {
   if (providerInteractionLocked() || !editingPrimaryProvider.value) return
+  // The provider dialog temporarily owns the shared value. Keep the routing
+  // draft so cancelling this dialog restores both its value and ownership.
+  if (thinkingDraftScope.value === 'modelStrategy') {
+    providerThinkingDraftSnapshot = promotedForm.llmThinking.value
+  }
   thinkingDraftScope.value = 'provider'
   promotedForm.setLlmThinking(value)
 }
 
 function updateModelStrategyThinking(value: string) {
   if (providerInteractionLocked() || modelStrategyRoutingBusy.value) return
+  providerThinkingDraftSnapshot = null
   thinkingDraftScope.value = 'modelStrategy'
   promotedForm.setLlmThinking(value)
 }
@@ -3925,8 +3946,13 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     primaryMutationPending.value = true
     try {
       const restart = thinkingPatch ? await patchConfig(thinkingPatch) : false
+      if (thinkingPatch) {
+        promotedForm.acceptLlmThinking(thinkingPatch['llm.thinking'])
+        providerThinkingDraftSnapshot = null
+      }
       await modelCapacity.save(capacityScope, deepPatchConfig)
       restoreProviderCapacityDrafts = null
+      providerThinkingDraftSnapshot = null
       if (thinkingPatch && options.reload !== false) {
         await loadData({ preserveDirtySectionDrafts: true, throwOnError: true })
       }
@@ -4052,6 +4078,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       primaryAcknowledged = true
       await modelCapacity.save(capacityScope, deepPatchConfig)
       restoreProviderCapacityDrafts = null
+      providerThinkingDraftSnapshot = null
       if (options.reload !== false) {
         // Saving a routing-only profile refreshes its persisted status without
         // discarding drafts in any other Settings section. Provider-owned
@@ -4083,6 +4110,10 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
     acceptPrimaryRouterAction(resolvedRouterAction)
     const restart = await patchConfig(providerPatches)
+    if ('llm.thinking' in providerPatches) {
+      promotedForm.acceptLlmThinking(providerPatches['llm.thinking'])
+      providerThinkingDraftSnapshot = null
+    }
     // The per-model context-window override rides the deep-merge patch form. Key
     // it on the CURRENT canonical model draft rather than payload.model (which
     // deliberately preserves the saved primary model until Model Routing is
@@ -4090,6 +4121,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     if (contextPatch) await deepPatchConfig(contextPatch)
     await modelCapacity.save(capacityScope, deepPatchConfig)
     restoreProviderCapacityDrafts = null
+    providerThinkingDraftSnapshot = null
     if (options.reload !== false) {
       // Replacing the primary deployment on a legacy Gateway changes the
       // identity that Router and the fixed fallback are based on. Rebuild that

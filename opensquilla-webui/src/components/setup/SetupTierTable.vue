@@ -887,6 +887,7 @@ const allowsFloatingContent = computed(() => (
   display: grid;
   gap: 4px;
   grid-template-columns: minmax(0, 1fr) auto;
+  max-width: 500px;
   min-width: 0;
 }
 
@@ -1018,7 +1019,8 @@ const allowsFloatingContent = computed(() => (
     overflow-x: auto;
   }
   .setup-tier-table--without-provider .setup-tier-table__row {
-    min-width: 340px;
+    grid-template-columns: 86px minmax(0, 1fr);
+    min-width: 0;
   }
 }
 </style>

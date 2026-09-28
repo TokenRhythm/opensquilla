@@ -27,6 +27,11 @@ const valid = computed(() => {
 })
 const pending = computed(() => form?.pending.has(key.value))
 const failed = computed(() => form?.failed.has(key.value))
+// Thinking is independent of capacity metadata. Missing metadata must not
+// block a thinking-only edit or create a capacity override from empty fields.
+const canComplete = computed(() => !props.disabled && valid.value && (
+  row.value ? !pending.value : props.thinking !== undefined && !props.thinkingReadonly
+))
 function close() { if (!props.disabled) open.value = false }
 useDialogA11y(root, open, close)
 watch([target, () => form?.supported.value, () => form?.rows.size, () => form?.generation.value], () => {
@@ -46,7 +51,7 @@ function change(next: CapacityValues) {
   else local.value = next
 }
 function complete() {
-  if (!valid.value || props.disabled) return
+  if (!canComplete.value) return
   form?.update(target.value, local.value, scope.value)
   if (props.thinking !== undefined && !props.thinkingReadonly && localThinking.value !== props.thinking) emit('updateThinking', localThinking.value)
   open.value = false
@@ -98,7 +103,7 @@ function complete() {
             <footer class="model-capacity-dialog__footer">
               <span class="control-row__desc">{{ t('setup.capacity.draftHint') }}</span>
               <button type="button" class="btn" :disabled="disabled" @click="close">{{ t('common.cancel') }}</button>
-              <button type="button" class="btn btn--primary" :disabled="disabled || !row || pending || !valid" @click="complete">{{ t('setup.capacity.done') }}</button>
+              <button type="button" class="btn btn--primary" :disabled="!canComplete" @click="complete">{{ t('setup.capacity.done') }}</button>
             </footer>
           </section>
         </div>

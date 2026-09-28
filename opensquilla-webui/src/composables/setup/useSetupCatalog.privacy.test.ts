@@ -7707,3 +7707,90 @@ describe('global thinking across settings surfaces', () => {
     } finally { app.unmount() }
   })
 })
+
+
+describe('provider thinking draft rollback', () => {
+  it.each(['high', ''])('restores the routing draft %s when a provider edit is cancelled', async draft => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      Object.assign(saved.llm, { thinking: 'medium' })
+      await api.loadData()
+      api.updateModelStrategyThinking(draft)
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe(draft)
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+      expect(api.providerDraftDirty.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('restores the routing draft when switching away from the edited primary', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      await api.requestSelectConfiguredProvider('tokenrhythm')
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('high')
+      expect(api.sectionDirty('modelStrategy')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('does not resurrect the routing draft after the provider edit is saved', async () => {
+    const { api, app, saved } = await primaryTransitionScenario()
+    try {
+      const original = rpcCall.getMockImplementation()!
+      rpcCall.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
+        const patches = params?.patches as Record<string, unknown> | undefined
+        if (method === 'config.patch' && patches && 'llm.thinking' in patches) Object.assign(saved.llm, { thinking: patches['llm.thinking'] })
+        return original(method, params)
+      })
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      expect(await api.saveProvider()).toBe(true)
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('minimal')
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('does not resurrect a routing draft after discarding all settings', async () => {
+    const { api, app } = await primaryTransitionScenario()
+    try {
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      await api.discardChanges()
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
+
+
+describe('partial thinking save acknowledgement', () => {
+  it('keeps the acknowledged thinking baseline if the subsequent capacity save fails', async () => {
+    const { api, app } = await primaryTransitionScenario(false, (method, params) => {
+      if (method === 'config.patch' && params?.patch) throw new Error('synthetic capacity failure')
+      return { changed: true }
+    })
+    try {
+      const target = { provider: 'openrouter', model: 'openai/gpt-4.1-mini' }
+      api.modelCapacity.ensure(target)
+      await vi.waitFor(() => expect(api.modelCapacity.rows.size).toBeGreaterThan(0))
+      api.updateModelStrategyThinking('high')
+      await api.requestSelectConfiguredProvider('openrouter')
+      api.updateLlmThinking('low')
+      api.modelCapacity.update(target, { contextWindow: '65536', maxOutputTokens: '' }, 'provider:openrouter')
+      expect(await api.saveProvider()).toBe(false)
+      api.cancelProviderEdit()
+      expect(api.modelStrategyPanel.value.llmThinking).toBe('low')
+      expect(api.sectionDirty('modelStrategy')).toBe(false)
+    } finally { app.unmount() }
+  })
+})
