@@ -3985,6 +3985,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     && !profileSaveSupported.value
   )
   let primaryAcknowledged = false
+  let unacknowledgedProviderPatches: Record<string, unknown> | null = null
   let refreshStarted = false
   let resolvedRouterAction: 'use_recommended' | 'disable' | undefined
   let replacedRouter = false
@@ -4109,7 +4110,9 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     resolvedRouterAction = transition.routerAction
     replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
     acceptPrimaryRouterAction(resolvedRouterAction)
+    unacknowledgedProviderPatches = providerPatches
     const restart = await patchConfig(providerPatches)
+    unacknowledgedProviderPatches = null
     if ('llm.thinking' in providerPatches) {
       promotedForm.acceptLlmThinking(providerPatches['llm.thinking'])
       providerThinkingDraftSnapshot = null
@@ -4143,6 +4146,18 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         try {
           const selected = normalizeProviderId(providerForm.selectedProvider.value)
           await reloadProviderData(true)
+          // Rebase on the saved values, then restore any unacknowledged edits.
+          // A failed response may follow a committed write; matching read-back
+          // values stay clean and must not restore an older routing draft.
+          if (unacknowledgedProviderPatches) {
+            if ('llm_request_timeout_seconds' in unacknowledgedProviderPatches) {
+              promotedForm.setLlmTimeoutSeconds(Number(unacknowledgedProviderPatches.llm_request_timeout_seconds))
+            }
+            if ('llm.thinking' in unacknowledgedProviderPatches) {
+              promotedForm.setLlmThinking(String(unacknowledgedProviderPatches['llm.thinking'] ?? ''))
+              if (!promotedForm.thinkingDirty.value) providerThinkingDraftSnapshot = null
+            }
+          }
           if (selected !== normalizeProviderId(currentProvider.value)) applyConfiguredProviderSelection(selected)
         } catch { /* Keep drafts when the read-back itself is unavailable. */ }
         pushToast(t('setup.capacity.providerPartialSaved'), { tone: 'danger' })
