@@ -250,6 +250,7 @@ from opensquilla.session.compaction import (
     compaction_prompt_layout,
     compaction_replay_summary,
     effective_protected_recent_messages,
+    project_entry_content_for_provider,
 )
 from opensquilla.session.compaction_budget import (
     CompactionBudget,
@@ -3038,10 +3039,19 @@ class Agent:
         for index, entry in enumerate(entries):
             if index in skip_indexes:
                 continue
+            role = str(entry.get("role") or "")
+            content = entry.get("content") or ""
+            if role == "user":
+                content, _projection_complete = project_entry_content_for_provider(
+                    content,
+                    preserve_images=self.config.preserve_historical_images,
+                    session_id=str(entry.get("session_id") or ""),
+                    message_id=str(entry.get("message_id") or ""),
+                )
             history.extend(
                 reconstruct_messages_from_entry(
-                    str(entry.get("role") or ""),
-                    entry.get("content") or "",
+                    role,
+                    content,
                     entry.get("tool_calls"),
                     entry.get("reasoning_content"),
                     assistant_replay=entry.get("assistant_replay"),

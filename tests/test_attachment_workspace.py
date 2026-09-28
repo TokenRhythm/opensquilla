@@ -167,6 +167,34 @@ def test_materializes_transcript_ref_inside_workspace(tmp_path: Path) -> None:
     assert materialized.name == f"{sha[:12]}-report.pdf"
 
 
+@pytest.mark.parametrize(
+    ("name", "session_id"),
+    [
+        ("archive." + "x" * 1_000, "session-a"),
+        ("archive.zip", "session." + "y" * 1_000),
+    ],
+)
+def test_long_extension_and_session_keep_materialized_path_bounded(
+    tmp_path: Path, name: str, session_id: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    payload = b"synthetic archive bytes"
+    result = AttachmentWorkspaceMaterializer(
+        media_root=tmp_path / "media", workspace_dir=workspace,
+    ).materialize_bytes(
+        payload, name=name, mime="application/zip", session_id=session_id,
+    )
+
+    assert result.available is True
+    assert result.rel_path is not None
+    parts = Path(result.rel_path).parts
+    assert parts[:2] == (".opensquilla", "attachments")
+    assert len(result.name) <= 180
+    assert len(parts[2]) <= 180
+    assert len(parts[3]) <= 12 + 1 + 180
+    assert (workspace / result.rel_path).read_bytes() == payload
+
+
 def test_existing_materialized_file_is_reused_when_hash_matches(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     payload = b"hello,world\n"

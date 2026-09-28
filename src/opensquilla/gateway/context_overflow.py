@@ -112,6 +112,8 @@ def _estimate_payload_tokens(message: str, transcript: list[Any]) -> int:
 
     total = estimate_tokens(message or "")
     for entry in transcript or []:
+        # The model-replay estimator applies the canonical provider-visible
+        # history projection, including attachment markers/media reserves.
         total += estimate_entry_model_replay_tokens(entry)
     return total
 

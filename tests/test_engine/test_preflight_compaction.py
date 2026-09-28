@@ -10,6 +10,8 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import threading
 from collections.abc import AsyncIterator
 from types import SimpleNamespace
@@ -699,6 +701,34 @@ async def test_preflight_under_threshold_does_not_compact() -> None:
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
     # Threshold = 200_000 * 0.85 = 170_000 — 100 tokens is well under
     await runner._maybe_preflight_compact("user:session", 200_000)
+
+    mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_base64", [False, True])
+async def test_preflight_opaque_attachment_uses_projected_size(
+    invalid_base64: bool,
+) -> None:
+    payload = (
+        "invalid***" + "A" * 200_000
+        if invalid_base64
+        else base64.b64encode(b"opaque zip payload" * 12_000).decode("ascii")
+    )
+    envelope = json.dumps(
+        {
+            "text": "inspect this archive",
+            "attachments": [{"type": "application/zip", "name": "bundle.zip", "data": payload}],
+        },
+        separators=(",", ":"),
+    )
+    entries = [_make_entry(envelope)]
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock()
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+    await runner._maybe_preflight_compact("user:session", 1_000)
 
     mock_sm.compact.assert_not_called()
 

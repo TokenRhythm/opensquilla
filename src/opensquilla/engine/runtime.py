@@ -19,7 +19,6 @@ import json
 import math
 import os
 import platform
-import re
 import tempfile
 import time
 import uuid
@@ -53,6 +52,7 @@ from opensquilla.attachment_refs import (
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     render_attachment_material_marker,
+    render_historical_attachment_material_marker,
     workspace_attachment_budget_from_config,
 )
 from opensquilla.bootstrap_types import BootstrapFileReport
@@ -10730,8 +10730,9 @@ class TurnRunner:
 
         Ordinary JSON is not treated as an attachment envelope and remains a
         conservative text input. The result is ``(recognized, valid,
-        estimate_complete)``. Invalid recognized envelopes remain raw text;
-        only a valid envelope may replace its persisted raw-token floor.
+        estimate_complete)``. Once the outer envelope is recognized, corrupt
+        non-image material remains a bounded replay marker; only retained
+        image media requires a material proof.
         """
 
         if not content or not content.lstrip().startswith("{"):
@@ -10744,24 +10745,46 @@ class TurnRunner:
             return False, True, True
         if not isinstance(parsed.get("text"), str):
             return True, False, False
-        attachments = parsed.get("attachments") or []
+        attachments = parsed.get("attachments")
         if not isinstance(attachments, list):
             return True, False, False
-        for attachment in attachments:
+        from opensquilla.session.attachment_manifest import (
+            extract_attachment_occurrences_from_envelope,
+        )
+
+        occurrences = extract_attachment_occurrences_from_envelope(
+            content,
+            session_id=session_id or "capacity",
+            source_message_id="capacity",
+        )
+        image_occurrences = {occurrence.ordinal: occurrence for occurrence in occurrences}
+        for ordinal, attachment in enumerate(attachments):
             if not isinstance(attachment, dict):
-                return True, False, False
-            media_type = (
+                # The replay decoder skips malformed list members entirely.
+                continue
+            raw_media_type = (
                 attachment.get("type")
                 or attachment.get("mime")
                 or attachment.get("media_type")
             )
-            if (
-                not isinstance(media_type, str)
-                or media_type not in _ALLOWED_ENGINE_MEDIA_TYPES
-            ):
+            if not isinstance(raw_media_type, str):
+                continue
+            # Historical non-image material is never included in a provider
+            # message. A corrupt or missing file changes only its bounded
+            # workspace/omission marker, not whether the storage Base64 is
+            # replayed. Only images retained by this route need material proof.
+            if not preserve_image_attachments or raw_media_type not in _IMAGE_ATTACHMENT_MIMES:
+                continue
+            media_type = _normalize_attachment_mime(raw_media_type)
+            if media_type is None:
+                return True, False, False
+            occurrence = image_occurrences.get(ordinal)
+            if occurrence is None or occurrence.material_state == "invalid":
                 return True, False, False
             data = attachment.get("data")
             sha_ref = attachment.get("sha256_ref")
+            if sha_ref is None:
+                sha_ref = attachment.get("sha256") or attachment.get("material_id")
             missing_reason = attachment.get("missing_reason")
             data_text = data if isinstance(data, str) and data else None
             sha_ref_text = sha_ref if isinstance(sha_ref, str) and sha_ref else None
@@ -10773,108 +10796,29 @@ class TurnRunner:
                     base64.b64decode(data_text, validate=True)
                 except (binascii.Error, ValueError):
                     return True, False, False
-            if not preserve_image_attachments or media_type not in _IMAGE_ATTACHMENT_MIMES:
-                continue
-            if data_text is not None:
-                continue
-            if sha_ref_text is None:
-                # A persisted missing_reason-only record intentionally replays
-                # as an unavailable marker and needs no media hydration.
-                continue
-            if media_root is None or not session_id:
-                return True, True, False
-            raw_size = attachment.get("size")
-            size = raw_size if isinstance(raw_size, int) else -1
-            label = attachment.get("name")
-            if not isinstance(label, str) or not label.strip():
-                label = "image"
-            try:
-                ref = make_attachment_ref(
-                    sha256=sha_ref_text,
-                    name=label,
-                    mime=media_type,
-                    size=size,
-                    session_id=session_id,
-                    source="transcript",
-                )
-                read_attachment_ref_bytes(ref, media_root=media_root)
-            except (OSError, ValueError):
-                return True, True, False
+            if data_text is None and sha_ref_text is not None:
+                # Retained images can enter the provider request as media, so
+                # prove their reference before reserving the media budget.
+                if media_root is None or not session_id:
+                    return True, True, False
+                raw_size = attachment.get("size")
+                size = raw_size if isinstance(raw_size, int) else -1
+                label = attachment.get("name")
+                if not isinstance(label, str) or not label.strip():
+                    label = "attachment"
+                try:
+                    ref = make_attachment_ref(
+                        sha256=sha_ref_text,
+                        name=label,
+                        mime=media_type,
+                        size=size,
+                        session_id=session_id,
+                        source="transcript",
+                    )
+                    read_attachment_ref_bytes(ref, media_root=media_root)
+                except (OSError, ValueError):
+                    return True, True, False
         return True, True, True
-
-    @staticmethod
-    def _attachment_history_residual_token_floor(
-        content: str,
-        projected_content: Any,
-        persisted_token_count: int,
-    ) -> int:
-        """Remove only replayed inline-image data from a persisted raw floor.
-
-        A transcript token_count is row-scoped, so clearing it wholesale can
-        also discount ordinary text, PDF bytes, or a legacy provider-usage
-        surplus. Replace the exact canonical ``data`` JSON values for images
-        that became typed blocks, then subtract only that measured delta.
-        Failure to locate every value keeps the original conservative floor.
-        """
-
-        raw_tokens = estimate_tokens(content)
-        raw_floor = max(0, persisted_token_count, raw_tokens)
-        if not isinstance(projected_content, list):
-            return raw_floor
-        from opensquilla.provider.types import ContentBlockImage
-
-        typed_image_count = sum(
-            isinstance(block, ContentBlockImage) and block.source_type == "base64"
-            for block in projected_content
-        )
-        if typed_image_count <= 0:
-            return raw_floor
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return raw_floor
-        if not isinstance(parsed, dict):
-            return raw_floor
-        attachments = parsed.get("attachments") or []
-        if not isinstance(attachments, list):
-            return raw_floor
-        inline_image_data = [
-            attachment["data"]
-            for attachment in attachments
-            if isinstance(attachment, dict)
-            and (
-                attachment.get("type")
-                or attachment.get("mime")
-                or attachment.get("media_type")
-            )
-            in _IMAGE_ATTACHMENT_MIMES
-            and isinstance(attachment.get("data"), str)
-            and bool(attachment.get("data"))
-        ]
-        if not inline_image_data or typed_image_count < len(inline_image_data):
-            return raw_floor
-
-        residual = content
-        for data in set(inline_image_data):
-            encoded_data = json.dumps(data, ensure_ascii=False)
-            placeholder = json.dumps(
-                f"[history_image_omitted: {len(data)} chars]",
-                ensure_ascii=False,
-            )
-            pattern = re.compile(r'("data"\s*:\s*)' + re.escape(encoded_data))
-            expected_replacements = inline_image_data.count(data)
-            if len(pattern.findall(residual)) != expected_replacements:
-                return raw_floor
-            residual, replacements = pattern.subn(
-                lambda match: match.group(1) + placeholder,
-                residual,
-            )
-            if replacements != expected_replacements:
-                return raw_floor
-
-        residual_tokens = estimate_tokens(residual)
-        image_data_delta = max(0, raw_tokens - residual_tokens)
-        return max(0, residual_tokens, persisted_token_count - image_data_delta)
 
     def _project_history_replay(
         self,
@@ -10932,6 +10876,7 @@ class TurnRunner:
 
             estimate_complete = True
             raw_token_floor_applies = True
+            persisted_token_surplus = 0
             if raw_content and role == "user":
                 preserve_image = entry_index in image_indexes
                 recognized = False
@@ -10950,8 +10895,9 @@ class TurnRunner:
                     and recognized
                     and (not valid or not estimate_complete)
                 ):
-                    # Do not partially unpack unproven attachment envelopes:
-                    # retaining their raw JSON/base64 is the conservative view.
+                    # An unproven retained image or malformed outer envelope
+                    # retains its conservative raw estimate. Opaque material
+                    # is always projected through the history decoder.
                     projected_content = raw_content
                 else:
                     projected_content = self._maybe_unpack_attachments(
@@ -10973,14 +10919,59 @@ class TurnRunner:
                         allowed_image_attachment_ids=allowed_image_attachment_ids,
                         source_message_id=getattr(entry, "message_id", None),
                     )
-                if require_capacity_proof and recognized and valid:
-                    persisted_token_count = (
-                        self._attachment_history_residual_token_floor(
-                            raw_content,
-                            projected_content,
-                            persisted_token_count,
-                        )
+                if require_capacity_proof and recognized and valid and estimate_complete:
+                    # Capacity measurement uses the same side-effect-free
+                    # projection as compaction admission. It reserves possible
+                    # materialized path text for both opaque files and images;
+                    # the ordinary history load remains the actual replay.
+                    from opensquilla.session.compaction import (
+                        project_entry_content_for_provider,
                     )
+
+                    budget_content, budget_complete = project_entry_content_for_provider(
+                        raw_content,
+                        preserve_images=preserve_image,
+                        session_id=session_id or "",
+                        message_id=str(getattr(entry, "message_id", "") or ""),
+                    )
+                    if budget_complete:
+                        if (
+                            preserve_image
+                            and self._attachment_envelope_has_image(raw_content)
+                            and isinstance(budget_content, list)
+                        ):
+                            # A retained ref must use the decoder's proven
+                            # base64 media. The pure projection cannot read
+                            # it and uses a URL placeholder, which the
+                            # capacity proof would correctly reject. Add
+                            # only its conservative text markers to the
+                            # decoded media replay, without materializing.
+                            from opensquilla.provider.types import ContentBlockText
+
+                            reserve_blocks = [
+                                block for block in budget_content[1:]
+                                if isinstance(block, ContentBlockText)
+                            ]
+                            if isinstance(projected_content, list):
+                                projected_content = [*projected_content, *reserve_blocks]
+                            elif reserve_blocks:
+                                projected_content = "\n".join([
+                                    str(projected_content),
+                                    *(block.text for block in reserve_blocks),
+                                ])
+                        else:
+                            projected_content = budget_content
+                    else:
+                        projected_content = raw_content
+                        estimate_complete = False
+                if require_capacity_proof and recognized and valid and estimate_complete:
+                    # Keep only usage that exceeds the raw storage envelope;
+                    # its Base64 estimate must not become a history floor.
+                    persisted_token_surplus = max(
+                        0, persisted_token_count - estimate_tokens(raw_content),
+                    )
+                    persisted_token_count = 0
+                    raw_token_floor_applies = False
             elif raw_content and role == "assistant":
                 projected_content = self._maybe_unpack_assistant_artifacts(raw_content)
             else:
@@ -10995,6 +10986,7 @@ class TurnRunner:
                 turn_context=(turn_context if isinstance(turn_context, dict) else None),
                 estimate_complete=estimate_complete,
                 persisted_token_count=persisted_token_count,
+                persisted_token_surplus=persisted_token_surplus,
                 raw_token_floor_applies=raw_token_floor_applies,
                 last_entry_was_user=role == "user",
             )
@@ -14257,14 +14249,12 @@ class TurnRunner:
         preserved_image = False
         occurrence_ids: dict[int, str] = {}
         attachment_identity_session_id = session_id or "history"
-        try:
-            from opensquilla.session.attachment_manifest import (
-                extract_attachment_occurrences_from_envelope,
-            )
+        from opensquilla.session import attachment_manifest
 
+        try:
             occurrence_ids = {
                 occurrence.ordinal: occurrence.attachment_id
-                for occurrence in extract_attachment_occurrences_from_envelope(
+                for occurrence in attachment_manifest.extract_attachment_occurrences_from_envelope(
                     content,
                     session_id=attachment_identity_session_id,
                     source_message_id=source_message_id or "unknown",
@@ -14309,15 +14299,17 @@ class TurnRunner:
             name = att.get("name")
             fallback = "image" if media_type.startswith("image/") else "attachment"
             label = name if isinstance(name, str) and name.strip() else fallback
+            display_name = attachment_manifest.normalize_attachment_name(
+                label, fallback=fallback,
+            )
+            display_mime = attachment_manifest.normalize_attachment_mime(media_type)
             attachment_id = occurrence_ids.get(ordinal)
             if attachment_id is None:
                 # Keep legacy IDs deterministic when an old envelope omitted
                 # them. This is metadata-only; no bytes or paths enter the
                 # marker or persisted state.
                 try:
-                    from opensquilla.session.attachment_manifest import legacy_attachment_id
-
-                    attachment_id = legacy_attachment_id(
+                    attachment_id = attachment_manifest.legacy_attachment_id(
                         session_id=attachment_identity_session_id,
                         message_id=source_message_id or "unknown",
                         index=ordinal,
@@ -14335,7 +14327,7 @@ class TurnRunner:
                 image_path = historical_materializer.materialize_image_path(att, session_id)
                 if image_path:
                     image_material_marker = TurnRunner._image_attachment_material_marker(
-                        name, media_type, image_path,
+                        display_name, display_mime, image_path,
                     )
             image_replay_allowed = (
                 allowed_image_attachment_ids is None
@@ -14396,17 +14388,17 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
-                        name=label,
-                        mime=media_type,
-                        size=size,
-                        session_id=session_id,
-                        source="transcript",
-                    )
                     try:
+                        ref = make_attachment_ref(
+                            sha256=sha_ref,
+                            name=label,
+                            mime=media_type,
+                            size=size,
+                            session_id=session_id,
+                            source="transcript",
+                        )
                         raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
-                    except (FileNotFoundError, ValueError):
+                    except (OSError, ValueError):
                         omitted.append(
                             image_marker(
                                 ImageMarkerState.UNAVAILABLE,
@@ -14459,14 +14451,22 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root is not None:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
-                        name=label,
-                        mime=media_type,
-                        size=size,
-                        session_id=session_id,
-                        source="transcript",
-                    )
+                    try:
+                        ref = make_attachment_ref(
+                            sha256=sha_ref,
+                            name=label,
+                            mime=media_type,
+                            size=size,
+                            session_id=session_id,
+                            source="transcript",
+                        )
+                    except ValueError:
+                        omitted.append(
+                            "[historical attachment unavailable: "
+                            f"{display_name} ({display_mime}): "
+                            "invalid attachment reference]"
+                        )
+                        continue
                     result = materializer.materialize(ref, session_id=session_id)
                 elif isinstance(data, str) and data:
                     try:
@@ -14474,7 +14474,8 @@ class TurnRunner:
                     except (binascii.Error, ValueError):
                         omitted.append(
                             "[historical attachment unavailable: "
-                            f"{label} ({media_type}): attachment data is not valid base64]"
+                            f"{display_name} ({display_mime}): "
+                            "attachment data is not valid base64]"
                         )
                         continue
                     result = materializer.materialize_bytes(
@@ -14484,12 +14485,7 @@ class TurnRunner:
                         session_id=session_id,
                     )
                 if result is not None:
-                    prefix = (
-                        "historical attachment available"
-                        if result.available
-                        else "historical attachment unavailable"
-                    )
-                    omitted.append(render_attachment_material_marker(result, prefix=prefix))
+                    omitted.append(render_historical_attachment_material_marker(result))
                     continue
             if media_type in _IMAGE_ATTACHMENT_MIMES:
                 if image_material_marker:
@@ -14506,11 +14502,13 @@ class TurnRunner:
                 # it, while adding the explicit state and stable ID required
                 # for a model switch after compaction.
                 omitted.append(
-                    f"[historical attachment omitted: {label} ({media_type}); "
+                    f"[historical attachment omitted: {display_name} ({display_mime}); "
                     f"{marker[1:-1]}]"
                 )
             else:
-                omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
+                omitted.append(
+                    f"[historical attachment omitted: {display_name} ({display_mime})]"
+                )
         if preserved_image:
             if omitted:
                 from opensquilla.provider.types import ContentBlockText

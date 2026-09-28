@@ -1395,16 +1395,26 @@ def _manual_consumer_messages(
         project_historical_tool_payloads,
         sanitize_session_messages,
     )
+    from opensquilla.session.compaction import project_entry_content_for_provider
     from opensquilla.session.context_view import format_compaction_summary_context
 
     history: list[Message] = []
     for entry in kept_entries:
         if not isinstance(entry, dict):
             return None
+        role = _text(entry.get("role"))
+        content = entry.get("content") or ""
+        if role == "user":
+            content, _projection_complete = project_entry_content_for_provider(
+                content,
+                preserve_images=False,
+                session_id=_text(entry.get("session_id")),
+                message_id=_text(entry.get("message_id") or entry.get("id")),
+            )
         try:
             replay_messages = reconstruct_messages_from_entry(
-                _text(entry.get("role")),
-                entry.get("content") or "",
+                role,
+                content,
                 entry.get("tool_calls"),
                 entry.get("reasoning_content"),
                 assistant_replay=entry.get("assistant_replay"),

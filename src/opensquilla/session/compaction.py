@@ -19,9 +19,14 @@ import httpx
 import structlog
 
 from opensquilla.artifacts import artifact_history_context
+from opensquilla.attachment_workspace import (
+    historical_attachment_capacity_marker,
+    historical_image_material_capacity_marker,
+)
 from opensquilla.env import trust_env as _trust_env
 from opensquilla.provider.app_attribution import provider_app_headers
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
+from opensquilla.provider.image_projection import ImageMarkerState, image_marker
 from opensquilla.provider.protocol import (
     project_provider_final_request,
     provider_connection_config,
@@ -36,6 +41,7 @@ from opensquilla.provider.tokenrhythm_correlation import (
 from opensquilla.provider.types import (
     ChatConfig,
     ContentBlockImage,
+    ContentBlockText,
     DoneEvent,
     ErrorEvent,
     Message,
@@ -657,8 +663,29 @@ def estimate_entry_model_replay_tokens(entry: Any) -> int:
         persisted_tokens = int(token_count or 0)
     except (TypeError, ValueError):
         persisted_tokens = 0
-    estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
-    content_tokens = max(persisted_tokens, estimated_content_tokens)
+    projected_content = content
+    projection_complete = True
+    if _entry_get(entry, "role") == "user":
+        projected_content, projection_complete = project_entry_content_for_provider(
+            content,
+            preserve_images=False,
+            session_id=str(_entry_get(entry, "session_id") or ""),
+            message_id=str(_entry_get(entry, "message_id") or ""),
+        )
+    if projection_complete and projected_content != content:
+        raw_tokens = _estimate_tokens(str(content)) if content else 0
+        projected_tokens = _estimate_tokens(
+            _json_text(projected_content)
+            if isinstance(projected_content, list)
+            else str(projected_content)
+        ) if projected_content else 0
+        # A persisted row count may include provider framing or legacy usage
+        # that is not explained by the storage envelope. Preserve only that
+        # surplus; never reintroduce the inline Base64 as a floor.
+        content_tokens = projected_tokens + max(0, persisted_tokens - raw_tokens)
+    else:
+        estimated_content_tokens = _estimate_tokens(str(content)) if content else 0
+        content_tokens = max(persisted_tokens, estimated_content_tokens)
 
     extra_parts: list[str] = []
     tool_calls = _entry_get(entry, "tool_calls")
@@ -686,6 +713,217 @@ def _assistant_replay_budget_payload(replay: Any) -> Any:
     }
 
 
+def project_entry_content_for_provider(
+    content: Any,
+    *,
+    preserve_images: bool = False,
+    session_id: str = "",
+    message_id: str = "",
+) -> tuple[Any, bool]:
+    """Project one persisted user attachment envelope for provider replay.
+
+    Transcript rows remain canonical storage.  This helper only constructs the
+    bounded provider-visible representation used by admission and compaction
+    accounting.  It deliberately recognizes the canonical ``text`` plus
+    ``attachments`` envelope, while leaving ordinary JSON/tool payloads raw.
+    ``False`` means the envelope shape or an image cannot be projected safely.
+    Non-image attachment bytes never enter provider history: missing or invalid
+    material is represented by a bounded marker, not its stored Base64.
+    """
+
+    if not isinstance(content, str) or not content.lstrip().startswith("{"):
+        return content, True
+    try:
+        envelope = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return content, True
+    if not isinstance(envelope, dict) or "text" not in envelope:
+        return content, True
+    text = envelope.get("text")
+    attachments = envelope.get("attachments")
+    if not isinstance(text, str) or not isinstance(attachments, list):
+        return content, False
+    base_text = _provider_visible_envelope_text(envelope)
+    if not attachments:
+        return base_text, True
+
+    occurrences = extract_attachment_occurrences_from_envelope(
+        content,
+        session_id=session_id or "compaction",
+        source_message_id=message_id or "unknown",
+    )
+    occurrences_by_ordinal = {occurrence.ordinal: occurrence for occurrence in occurrences}
+
+    from opensquilla.contracts.attachments import (
+        IMAGE_ATTACHMENT_MIMES,
+    )
+    markers: list[str] = []
+    image_blocks: list[ContentBlockImage | ContentBlockText] = []
+    for ordinal, item in enumerate(attachments):
+        if not isinstance(item, dict):
+            # Runtime skips malformed list members, including any stored data.
+            continue
+        raw_mime = item.get("type") or item.get("mime") or item.get("media_type")
+        if not isinstance(raw_mime, str):
+            continue
+        occurrence = occurrences_by_ordinal.get(ordinal)
+        if occurrence is None:
+            return content, False
+        mime = raw_mime
+        display_name = normalize_attachment_name(
+            item.get("name"), fallback="image" if mime.startswith("image/") else "attachment",
+        )
+        display_mime = normalize_attachment_mime(mime)
+        if mime not in IMAGE_ATTACHMENT_MIMES:
+            markers.append(historical_attachment_capacity_marker(
+                item,
+                session_id=session_id,
+                sha256_ref=occurrence.sha256_ref,
+            ))
+            continue
+        if occurrence.material_state != "available":
+            # A missing_reason can coexist with image data or a ref, and the
+            # runtime still tries to replay those bytes. Retain the raw floor
+            # until that image path can be proved separately.
+            if occurrence.material_state == "invalid" or item.get("data") or item.get(
+                "sha256_ref"
+            ):
+                return content, False
+        material_marker = historical_image_material_capacity_marker(
+            item,
+            session_id=session_id,
+        ) if item.get("data") or item.get("sha256_ref") else ""
+        # Runtime derives legacy IDs from the owning session. An entry with no
+        # session ID can be measured before that scope is known, so leave room
+        # for a different 24-character digest's tokenizer segmentation.
+        unknown_id_tokens = (
+            24 if not session_id and valid_attachment_id(item.get("attachment_id")) is None
+            else 0
+        )
+        attachment_id = (
+            "att_legacy_" + "X" * 24
+            if unknown_id_tokens else occurrence.attachment_id
+        )
+        replay_id_marker = f"[historical image attachment_id={attachment_id}]"
+        if unknown_id_tokens:
+            replay_id_marker = _pad_history_marker_tokens(
+                replay_id_marker, unknown_id_tokens,
+            )
+        data = item.get("data")
+        if (
+            preserve_images
+            and isinstance(data, str)
+            and data
+        ):
+            image_blocks.append(ContentBlockText(text=replay_id_marker))
+            image_blocks.append(
+                ContentBlockImage(
+                    media_type=mime,
+                    data=data,
+                    durable_retained=True,
+                )
+            )
+            if material_marker:
+                image_blocks.append(ContentBlockText(text=material_marker))
+            continue
+        if (
+            preserve_images
+            and occurrence.sha256_ref is not None
+        ):
+            # The durable bytes are not available to this pure projection.
+            # Keep a remote/reference media block so provider proof applies its
+            # bounded fallback rather than silently dropping the image.
+            image_blocks.append(ContentBlockText(text=replay_id_marker))
+            image_blocks.append(
+                ContentBlockImage(
+                    source_type="url",
+                    media_type=mime,
+                    data="[retained image reference]",
+                    durable_retained=True,
+                )
+            )
+            if material_marker:
+                image_blocks.append(ContentBlockText(text=material_marker))
+            continue
+        # Omitted images may still expose a readable workspace copy. Retain
+        # both that path and the exact status/ID marker used by runtime replay.
+        if material_marker:
+            markers.append(material_marker)
+        state = (
+            ImageMarkerState.UNAVAILABLE
+            if item.get("missing_reason") and not data and not item.get("sha256_ref")
+            else ImageMarkerState.NOT_REREAD
+        )
+        state_marker = image_marker(state, attachment_id=attachment_id)
+        omitted_marker = (
+            "[historical attachment omitted: "
+            f"{display_name} ({display_mime}); {state_marker[1:-1]}]"
+        )
+        markers.append(
+            _pad_history_marker_tokens(omitted_marker, unknown_id_tokens)
+            if unknown_id_tokens else omitted_marker
+        )
+
+    if image_blocks:
+        blocks: list[Any] = [ContentBlockText(text=base_text)]
+        blocks.extend(image_blocks)
+        blocks.extend(ContentBlockText(text=marker) for marker in markers)
+        return blocks, True
+    if markers:
+        return "\n".join([base_text, *markers]).strip(), True
+    return base_text, True
+
+
+def _pad_history_marker_tokens(marker: str, extra_tokens: int) -> str:
+    """Reserve unknown legacy-ID tokenizer variation with ASCII suffix text."""
+
+    target = _estimate_tokens(marker) + extra_tokens
+    while _estimate_tokens(marker) < target:
+        marker += " !"
+    return marker
+
+
+def _provider_visible_envelope_text(envelope: Mapping[str, Any]) -> str:
+    """Rebuild the text prefix used by historical attachment replay.
+
+    Keep this side-effect-free: the runtime may materialize attachment bytes,
+    but annotation and workspace-file markers require no filesystem access.
+    """
+
+    text = str(envelope["text"])
+    from opensquilla.prompt_annotations import (
+        PromptAnnotationSnapshotError,
+        render_historical_prompt_annotation_context,
+    )
+
+    try:
+        annotation_context = render_historical_prompt_annotation_context(
+            envelope.get("prompt_annotations")
+        )
+    except PromptAnnotationSnapshotError:
+        annotation_context = None
+    if annotation_context:
+        text = "\n\n".join(part for part in (text, annotation_context) if part)
+    if envelope.get("workspace_files"):
+        from opensquilla.workspace_files import normalize_workspace_files
+
+        try:
+            refs = normalize_workspace_files(envelope["workspace_files"])
+        except ValueError:
+            refs = []
+        markers = envelope.get("_workspace_file_markers")
+        if not isinstance(markers, list) or not all(isinstance(item, str) for item in markers):
+            markers = [
+                "[live project file reference: " + json.dumps(ref, ensure_ascii=False)
+                + "; current file only, historical contents are not retained; "
+                "availability must be checked against the current workspace "
+                "and tool permissions.]"
+                for ref in refs
+            ]
+        text = "\n".join([text, *markers])
+    return text
+
+
 def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
     """Return only fields that can affect provider-visible history replay."""
 
@@ -693,6 +931,15 @@ def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
         "role": str(_entry_get(entry, "role") or ""),
         "content": _entry_get(entry, "content") or "",
     }
+    if payload["role"] == "user":
+        projected_content, estimate_complete = project_entry_content_for_provider(
+            payload["content"],
+            preserve_images=False,
+            session_id=str(_entry_get(entry, "session_id") or ""),
+            message_id=str(_entry_get(entry, "message_id") or ""),
+        )
+        if estimate_complete:
+            payload["content"] = projected_content
     assistant_replay = _entry_get(entry, "assistant_replay")
     if assistant_replay is not None:
         replay_payload = {
@@ -727,7 +974,6 @@ def estimate_entries_model_replay_chars(entries: Sequence[Any]) -> int:
 def _entry_model_replay_media_budget(entry: Any) -> dict[str, Any] | None:
     """Project accepted media positions without discounting arbitrary tool JSON."""
 
-    from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES
     from opensquilla.provider.request_proof import project_provider_payload
 
     replay = _entry_get(entry, "assistant_replay")
@@ -754,41 +1000,20 @@ def _entry_model_replay_media_budget(entry: Any) -> dict[str, Any] | None:
             or not content.lstrip().startswith("{")
         ):
             return None
-        try:
-            envelope = json.loads(content)
-        except (ValueError, TypeError):
-            return None
-        if (
-            not isinstance(envelope, dict)
-            or not isinstance(envelope.get("text"), str)
-            or not isinstance(envelope.get("attachments"), list)
-        ):
-            return None
-        blocks = []
-        for attachment in envelope["attachments"]:
-            if not isinstance(attachment, dict):
-                continue
-            mime = normalize_attachment_mime(
-                attachment.get("type") or attachment.get("mime") or attachment.get("media_type")
-            )
-            if mime not in IMAGE_ATTACHMENT_MIMES:
-                continue
-            data = attachment.get("data")
-            if isinstance(data, str) and data:
-                source_type = "base64"
-                attachment["data"] = "[image supplied separately]"
-            elif valid_sha256(attachment.get("sha256_ref")):
-                source_type = "url"
-                data = "[retained image reference]"
-            else:
-                continue
-            blocks.append({
-                "type": "image", "source_type": source_type, "media_type": mime, "data": data,
-            })
-        if not blocks:
+        projected_content, estimate_complete = project_entry_content_for_provider(
+            content,
+            preserve_images=True,
+            session_id=str(_entry_get(entry, "session_id") or ""),
+            message_id=str(_entry_get(entry, "message_id") or ""),
+        )
+        if not estimate_complete or not isinstance(projected_content, list):
             return None
         message = _entry_model_replay_payload(entry)
-        message["content"] = [{"type": "text", "text": _json_text(envelope)}, *blocks]
+        message["content"] = [
+            block.model_dump(mode="json", exclude_none=True)
+            if hasattr(block, "model_dump") else block
+            for block in projected_content
+        ]
         payload = {"messages": [message]}
 
     proof = project_provider_payload(payload, projection_adapter="history_replay", proof_budget=0)

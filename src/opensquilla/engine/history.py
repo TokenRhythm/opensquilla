@@ -33,6 +33,11 @@ from opensquilla.silent_reply import sanitize_historical_silent_reply
 
 _RECORDED_TOOL_HISTORY_PREFIX = "[Recorded tool history]"
 
+# Bump whenever the storage-to-provider history projection changes.  The value
+# is included in compaction admission fingerprints so a budget frozen under an
+# older attachment projection cannot be reused after deployment.
+HISTORY_REPLAY_PROJECTION_VERSION = "provider-visible-history-v2"
+
 _SYNTHETIC_USER_PREFIXES = (
     GENERATED_ARTIFACT_CONTEXT_PREFIX,
     "[Available skills for this turn]",
@@ -64,6 +69,9 @@ class HistoryReplayEntryProjection:
     estimate_complete: bool = True
     persisted_token_count: int = 0
     raw_token_floor_applies: bool = True
+    # Usage proven to exceed the original storage envelope. This is added to
+    # the projected estimate instead of being used as a replacement floor.
+    persisted_token_surplus: int = 0
     # ``None`` preserves the prior state, matching ignored/system rows.  A
     # terminal notice uses ``False`` so positional current-user trimming does
     # not remove a prompt that is no longer the transcript tail.
@@ -79,6 +87,7 @@ class HistoryReplayMessageProvenance:
     estimate_complete: bool = field(default=True, repr=False)
     persisted_token_count: int = field(default=0, repr=False)
     raw_token_floor_applies: bool = field(default=True, repr=False)
+    persisted_token_surplus: int = field(default=0, repr=False)
 
 
 @dataclass(frozen=True)
@@ -150,6 +159,7 @@ def project_history_replay(
                     entry_index=entry_index,
                     estimate_complete=projected.estimate_complete,
                     persisted_token_count=max(0, projected.persisted_token_count),
+                    persisted_token_surplus=max(0, projected.persisted_token_surplus),
                     raw_token_floor_applies=projected.raw_token_floor_applies,
                 ),
             )
@@ -168,6 +178,7 @@ def project_history_replay(
                     entry_index=entry_index,
                     estimate_complete=projected.estimate_complete,
                     persisted_token_count=max(0, projected.persisted_token_count),
+                    persisted_token_surplus=max(0, projected.persisted_token_surplus),
                     raw_token_floor_applies=projected.raw_token_floor_applies,
                 )
                 for _message in reconstructed
@@ -300,6 +311,7 @@ def project_history_replay_capacity(
     entry_estimates: dict[tuple[str, int], int] = {}
     entry_media_reserves: dict[tuple[str, int], int] = {}
     entry_token_floors: dict[tuple[str, int], int] = {}
+    entry_token_surpluses: dict[tuple[str, int], int] = {}
     for message_index, (message, source) in enumerate(zip(messages, provenance, strict=True)):
         media_before = media_reserve_tokens
         projected_message = _project_value(project_message_replay_budget(message))
@@ -326,9 +338,15 @@ def project_history_replay_capacity(
                 entry_token_floors.get(source_key, 0),
                 max(0, source.persisted_token_count),
             )
+        if source.persisted_token_surplus:
+            entry_token_surpluses[source_key] = max(
+                entry_token_surpluses.get(source_key, 0),
+                max(0, source.persisted_token_surplus),
+            )
 
     adjusted_entry_tokens = sum(
         max(tokens, entry_token_floors.get(source_key, 0))
+        + entry_token_surpluses.get(source_key, 0)
         + entry_media_reserves.get(source_key, 0)
         for source_key, tokens in entry_estimates.items()
     )
