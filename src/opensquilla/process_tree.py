@@ -58,6 +58,9 @@ _POSIX_ANCHOR_CAPTURED = b"C"
 _POSIX_ANCHOR_INCOMPLETE = b"I"
 _POSIX_ANCHOR_KILL_CAPTURED = b"D"
 _POSIX_ANCHOR_KILL_INCOMPLETE = b"J"
+_POSIX_ANCHOR_PRE_EOF_CAPTURE = b"S"
+_POSIX_ANCHOR_PRE_EOF_CAPTURED = b"V"
+_POSIX_ANCHOR_PRE_EOF_INCOMPLETE = b"F"
 _POSIX_ANCHOR_RELEASE = b"R"
 _POSIX_ANCHOR_TERMINATE = b"T"
 _POSIX_ANCHOR_KILL = b"K"
@@ -899,6 +902,17 @@ def _captured_posix_process_matches(
     )
 
 
+def _posix_pid_definitively_gone(pid: int) -> bool:
+    """A failed identity lookup is safe to dismiss only after ESRCH."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        pass
+    return False
+
+
 @lru_cache(maxsize=1)
 def _linux_pidfd_libc() -> Any:
     # Some portable Python builds omit pidfd APIs despite a capable host libc.
@@ -950,9 +964,16 @@ def _capture_posix_group_descendants(
     anchor = snapshot.get(anchor_pid)
     if anchor is None or anchor.pgid != pgid or anchor.uid != os.geteuid():
         return _PosixDescendantCapture((), False)
-    roots = (anchor,) if include_anchor_children else tuple(
+    group_roots = tuple(
         info for info in snapshot.values() if info.pgid == pgid and info.pid != anchor_pid
     )
+    darwin_anchor_capture = include_anchor_children and sys.platform == "darwin"
+    if darwin_anchor_capture:
+        # Preserve group roots that were reparented before this snapshot.
+        owned_group_roots = tuple(info for info in group_roots if info.uid == anchor.uid)
+        roots = (anchor, *owned_group_roots)
+    else:
+        roots = (anchor,) if include_anchor_children else group_roots
     if not roots:
         # Natural completion can leave only the still-owned anchor before a
         # stop arrives. Confirm the empty group independently; an unavailable
@@ -963,9 +984,13 @@ def _capture_posix_group_descendants(
     for info in snapshot.values():
         children.setdefault(info.ppid, []).append(info)
     seen = {root.pid for root in roots}
+    if len(seen) > _POSIX_DESCENDANT_CAPTURE_LIMIT:
+        return _PosixDescendantCapture((), False)
     pending = [(root.pid, 0) for root in roots]
-    candidates: list[tuple[_PosixProcessInfo, int]] = []
-    complete = True
+    candidates: list[tuple[_PosixProcessInfo, int]] = (
+        [(root, 1) for root in owned_group_roots] if darwin_anchor_capture else []
+    )
+    complete = not darwin_anchor_capture or len(owned_group_roots) == len(group_roots)
     while pending:
         parent_pid, parent_depth = pending.pop(0)
         for child in children.get(parent_pid, ()):
@@ -984,7 +1009,11 @@ def _capture_posix_group_descendants(
     captured: list[_CapturedPosixProcess] = []
     for candidate, depth in sorted(candidates, key=lambda item: item[1]):
         current = _posix_process_info(candidate.pid)
-        if current is None or current.start_identity != candidate.start_identity:
+        if current is None:
+            if not _posix_pid_definitively_gone(candidate.pid):
+                complete = False
+            continue
+        if current.start_identity != candidate.start_identity:
             continue
         if current.uid != candidate.uid:
             complete = False
@@ -1059,12 +1088,53 @@ def _captured_posix_processes_alive(
         if process.pidfd is not None:
             if process.pidfd not in exited_pidfds:
                 return True
-        elif _captured_posix_process_matches(
-            _posix_process_info(process.pid),
-            process,
-        ):
-            return True
+        else:
+            current_info = _posix_process_info(process.pid)
+            if current_info is None:
+                if not _posix_pid_definitively_gone(process.pid):
+                    return True
+                continue
+            if _captured_posix_process_matches(current_info, process):
+                return True
     return False
+
+
+def _merge_live_posix_captures(
+    previous: tuple[_CapturedPosixProcess, ...],
+    current: tuple[_CapturedPosixProcess, ...],
+) -> tuple[tuple[_CapturedPosixProcess, ...], bool]:
+    """Keep still-live identities when an explicit EOF refreshes the snapshot."""
+    retained: list[_CapturedPosixProcess] = []
+    identities: set[tuple[int, int, str]] = set()
+    complete = True
+    for process in previous:
+        if process.pidfd is not None:
+            definitively_exited = not _captured_posix_processes_alive((process,))
+        else:
+            current_info = _posix_process_info(process.pid)
+            if current_info is None:
+                definitively_exited = _posix_pid_definitively_gone(process.pid)
+                if not definitively_exited:
+                    complete = False
+            else:
+                definitively_exited = not _captured_posix_process_matches(
+                    current_info, process,
+                )
+        if definitively_exited:
+            _close_captured_posix_processes((process,))
+            continue
+        retained.append(process)
+        identities.add((process.pid, process.uid, process.start_identity))
+    for process in current:
+        identity = (process.pid, process.uid, process.start_identity)
+        if identity in identities or len(retained) >= _POSIX_DESCENDANT_CAPTURE_LIMIT:
+            _close_captured_posix_processes((process,))
+            if identity not in identities:
+                complete = False
+            continue
+        retained.append(process)
+        identities.add(identity)
+    return tuple(retained), complete
 
 
 def _close_captured_posix_processes(
@@ -1686,6 +1756,7 @@ class _PosixGroupAnchor:
     _monitor_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _term_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
     _kill_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
+    _capture_reports: asyncio.Queue[bool] = field(default_factory=asyncio.Queue, repr=False)
     _kill_reported: bool = field(default=False, repr=False)
 
     @property
@@ -1742,12 +1813,20 @@ class _PosixGroupAnchor:
                 self._kill_reported = True
                 self._kill_reports.put_nowait(True)
                 continue
+            if marker == _POSIX_ANCHOR_PRE_EOF_CAPTURED:
+                self._capture_reports.put_nowait(True)
+                continue
+            if marker == _POSIX_ANCHOR_PRE_EOF_INCOMPLETE:
+                self.cleanup_incomplete = True
+                self._capture_reports.put_nowait(False)
+                continue
             if marker == _POSIX_ANCHOR_EMPTY:
                 self.empty = True
                 # Natural completion can win the race with a stop request.
                 # EMPTY is authoritative even if no signal ACK will follow.
                 self._term_reports.put_nowait(True)
                 self._kill_reports.put_nowait(True)
+                self._capture_reports.put_nowait(False)
                 owner = self._owner
                 if owner is not None:
                     await owner._close_empty_posix_owner()
@@ -1755,6 +1834,7 @@ class _PosixGroupAnchor:
                 self.cleanup_incomplete = True
                 self._term_reports.put_nowait(False)
                 self._kill_reports.put_nowait(False)
+            self._capture_reports.put_nowait(False)
             break
         with contextlib.suppress(Exception):
             await self.process.wait()
@@ -1766,6 +1846,34 @@ class _PosixGroupAnchor:
         with contextlib.suppress(BrokenPipeError, ConnectionResetError):
             stdin.write(_POSIX_ANCHOR_RELEASE)
         stdin.close()
+
+    async def request_capture_before_eof(self) -> bool:
+        """Ask the live anchor to retain its descendants without signalling them."""
+        if self.cleanup_incomplete:
+            return False
+        stdin = getattr(self.process, "stdin", None)
+        if (
+            stdin is None or stdin.is_closing() or not self.alive
+            or self._monitor_task is None or self._monitor_task.done()
+        ):
+            self.cleanup_incomplete = True
+            return False
+        while not self._capture_reports.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._capture_reports.get_nowait()
+        try:
+            stdin.write(_POSIX_ANCHOR_PRE_EOF_CAPTURE)
+            await stdin.drain()
+            return await asyncio.wait_for(
+                self._capture_reports.get(), timeout=_CONTROL_READY_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            # A late ACK must never satisfy a later EOF request.
+            self.cleanup_incomplete = True
+            raise
+        except (OSError, ValueError, TimeoutError):
+            self.cleanup_incomplete = True
+            return False
 
     async def request_signal(self, command: bytes) -> bool:
         stdin = getattr(self.process, "stdin", None)
@@ -1903,6 +2011,13 @@ class ProcessTreeOwner:
                 return False
             await asyncio.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
         return True
+
+    async def capture_before_eof(self) -> bool:
+        """Confirm an identity-bound descendant snapshot before PTY EOF."""
+        async with self._terminate_lock:
+            if not self.is_active() or self.posix_anchor is None:
+                return False
+            return await self.posix_anchor.request_capture_before_eof()
 
     async def terminate(self, *, graceful_timeout: float, kill_timeout: float) -> bool:
         """Idempotently terminate this owner, bounded by the supplied timeouts."""
@@ -2672,17 +2787,26 @@ def _run_posix_group_anchor(
     capture_attempted = False
     cleanup_complete = True
 
-    def prepare_capture() -> bytes:
+    def prepare_capture(*, refresh: bool = False) -> bytes:
         nonlocal captured, capture_attempted, cleanup_complete
-        if not capture_attempted or adopt_children:
+        if refresh or not capture_attempted or adopt_children:
             try:
                 result = _capture_posix_group_descendants(
-                    pgid, own_pid, include_anchor_children=adopt_children,
+                    pgid, own_pid,
+                    include_anchor_children=(
+                        adopt_children or (refresh and sys.platform == "darwin")
+                    ),
                 )
             except Exception:
                 result = _PosixDescendantCapture((), False)
-            _close_captured_posix_processes(captured)
-            captured = result.processes
+            if refresh and capture_attempted and not adopt_children:
+                captured, retained_complete = _merge_live_posix_captures(
+                    captured, result.processes,
+                )
+                cleanup_complete = cleanup_complete and retained_complete
+            else:
+                _close_captured_posix_processes(captured)
+                captured = result.processes
             capture_attempted = True
             cleanup_complete = cleanup_complete and result.complete
         return _POSIX_ANCHOR_CAPTURED if cleanup_complete else _POSIX_ANCHOR_INCOMPLETE
@@ -2770,6 +2894,8 @@ def _run_posix_group_anchor(
             if adopt_children and (target_exited or target_cleanup_at is not None):
                 prepare_capture()
             captured_alive = children_present or _captured_posix_processes_alive(captured)
+            if sys.platform == "darwin" and target is not None and not target_exited:
+                captured_alive = True
             if (target_exited or target_cleanup_at is not None) and (
                 members != (own_pid,) or captured_alive
             ):
@@ -2816,7 +2942,27 @@ def _run_posix_group_anchor(
                 pipe_command = os.read(stdin_fd, 1)
                 if not pipe_command:
                     stdin_open = False
-            if pipe_command == _POSIX_ANCHOR_TERMINATE:
+            if pipe_command == _POSIX_ANCHOR_PRE_EOF_CAPTURE:
+                # EOF can orphan a setsid child before a later tree snapshot.
+                # Capture while the PTY target is still alive.
+                if target is None or target.poll() is not None:
+                    marker = _POSIX_ANCHOR_INCOMPLETE
+                else:
+                    marker = prepare_capture(refresh=True)
+                    if target.poll() is not None or not any(
+                        process.pid == target.pid for process in captured
+                    ):
+                        marker = _POSIX_ANCHOR_INCOMPLETE
+                if marker != _POSIX_ANCHOR_CAPTURED:
+                    cleanup_complete = False
+                report_capture(
+                    pipe_command,
+                    _POSIX_ANCHOR_PRE_EOF_CAPTURED
+                    if marker == _POSIX_ANCHOR_CAPTURED
+                    else _POSIX_ANCHOR_PRE_EOF_INCOMPLETE,
+                )
+                poll_delay = _POLL_INTERVAL_SECONDS
+            elif pipe_command == _POSIX_ANCHOR_TERMINATE:
                 signal_owned(pipe_command)
                 if adopt_children:
                     target_cleanup_at = time.monotonic() + 0.2
