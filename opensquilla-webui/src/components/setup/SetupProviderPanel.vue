@@ -53,6 +53,7 @@ interface ProviderPanelContract {
   providerEnvKey: string
   providerEnvCommand: string
   llmTimeoutSeconds: number
+  llmThinking: string
   contextWindowTokens: string
   contextWindowGlobal: number | null
   effectiveMaxTokens: {
@@ -116,6 +117,7 @@ const emit = defineEmits<{
   providerChange: []
   updateProviderField: [name: string, value: unknown]
   updateLlmTimeout: [value: number]
+  updateLlmThinking: [value: string]
   updateContextWindow: [value: string]
   probeConnection: [mode: ProviderProbeMode]
   cancelProviderProbe: []
@@ -135,6 +137,7 @@ const emit = defineEmits<{
 }>()
 
 const addOpen = ref(false)
+
 const editorOpen = ref(false)
 const listExpanded = ref(false)
 const openProviderMenuId = ref('')
@@ -1391,7 +1394,10 @@ const tokenRhythmCredentialReplacementRequired = computed(() => (
                     </button>
                   </div>
                   <SetupModelCapacity
-                    inline :provider="panel.providerSelected"
+                    menu :provider="panel.providerSelected"
+                    :thinking="panel.editingPrimary ? panel.llmThinking : undefined"
+                    thinking-scope="global"
+                    @update-thinking="emit('updateLlmThinking', $event)"
                     :model="String(panel.providerFieldValue({ name: 'model', label: '' }) || '')"
                     :scope="`provider:${panel.providerSelected.trim().toLowerCase()}`"
                     :disabled="providerBusy || saving"

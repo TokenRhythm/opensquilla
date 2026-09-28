@@ -787,6 +787,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "グローバル思考レベル",
+      "globalDesc": "主プロバイダーと共有します。指定値はルーティング階層の推奨より優先され、既定では上書きしません。",
+      "tierDesc": "このルーティング階層のみに適用。既定ではレベルを指定しません。",
+      "proposerDesc": "この候補の役割のみに適用。既定では上書きを指定しません。",
+      "aggregatorDesc": "この統合の役割のみに適用。既定では上書きを指定しません。",
+      "presetDesc": "プリセットで指定されています。編集にはカスタム構成に切り替えてください。",
+      "sharedSettings": "モデル共通設定",
+      "overrideHint": "グローバル思考レベル：{level}。単一モデルの階層推奨より優先されます。統合メンバーは個別の設定を使います。",
+      "inheritedAggregatorDesc": "この統合の役割のみに適用。レベルを指定すると、このモデルに固定され、主モデルには追従しなくなります。"
+    },
     "capacity": {
       "customOpenAI": "カスタム · OpenAI 互換",
       "customAnthropic": "カスタム · Anthropic 互換",
@@ -1063,6 +1074,8 @@
       "timeoutLabel": "リクエストのタイムアウト（秒）",
       "timeoutDesc": "1 回のモデル応答がタイムアウトするまでの待機時間です。低速なローカルモデル（Ollama、vLLM、LM Studio）では値を大きくしてください。",
       "timeoutGlobalDesc": "すべてのプロバイダーにまたがる通常のモデルリクエスト用タイムアウトです。接続確認とモデルテストには、それぞれ固定の制限時間を使用します。",
+      "thinkingLabel": "思考レベル",
+      "thinkingDefault": "デフォルト（未設定）",
       "contextWindowLabel": "コンテキストウィンドウの上書き（token 数）",
       "contextWindowDesc": "このモデルのプロンプト組み立て予算に上限を設けます。空欄の場合は自動検出されたウィンドウを使用します。",
       "contextWindowIdentityLabel": "コンテキストウィンド · {provider} / {model}",

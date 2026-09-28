@@ -38,6 +38,7 @@ interface ModelStrategyPanelContext {
   ensemblePanel: ComputedRef<EnsemblePanel>
   routerTemplateState: ComputedRef<string>
   fixedModelCatalog: ComputedRef<DiscoveredModelCatalog>
+  llmThinking?: ComputedRef<string>
   routingSummary?: ComputedRef<SavedRoutingSummary>
 }
 
@@ -139,6 +140,7 @@ export function useSetupModelStrategyForm(
       )
       return {
       activeStrategy: activeStrategy.value,
+      llmThinking: context.llmThinking?.value || '',
       routingSummary: context.routingSummary?.value,
       hasSavedProvider: context.hasSavedProvider.value,
       profileSaveSupported: context.profileSaveSupported.value,

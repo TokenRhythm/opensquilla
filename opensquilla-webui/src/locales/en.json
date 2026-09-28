@@ -870,6 +870,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "Global thinking level",
+      "globalDesc": "Shared with the primary provider. An explicit value overrides router tier suggestions; default leaves them in effect.",
+      "tierDesc": "Applies only to this routing tier. Default leaves the level unset.",
+      "proposerDesc": "Applies only to this proposer role. Default leaves its override unset.",
+      "aggregatorDesc": "Applies only to this aggregator role. Default leaves its override unset.",
+      "presetDesc": "Defined by the preset. Switch to a custom lineup to edit.",
+      "sharedSettings": "Shared model settings",
+      "overrideHint": "Global thinking override: {level}. It takes precedence over single-model tier suggestions. Fusion members use their own settings.",
+      "inheritedAggregatorDesc": "Applies only to this aggregator role. Setting a level pins this model instead of following the primary model."
+    },
     "capacity": {
       "customOpenAI": "Custom · OpenAI-compatible",
       "customAnthropic": "Custom · Anthropic-compatible",
@@ -1146,6 +1157,8 @@
       "timeoutLabel": "Request timeout (seconds)",
       "timeoutDesc": "How long to wait for a single model response before timing out — raise this for slow local models (Ollama, vLLM, LM Studio).",
       "timeoutGlobalDesc": "Gateway-wide timeout for normal model requests across all providers. Connection checks and model tests use separate fixed limits.",
+      "thinkingLabel": "Thinking level",
+      "thinkingDefault": "Default (unset)",
       "contextWindowLabel": "Context window override (tokens)",
       "contextWindowDesc": "Cap the prompt-assembly budget for this model. Leave blank to use the auto-detected window.",
       "contextWindowIdentityLabel": "Context window · {provider} / {model}",
