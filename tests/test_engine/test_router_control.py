@@ -203,7 +203,7 @@ async def test_squilla_router_applies_hold_before_normal_classification(monkeypa
 
     out = await apply_squilla_router(ctx)
 
-    assert out.model == "anthropic/claude-opus-4.8"
+    assert out.model == "z-ai/glm-5.3"
     assert out.metadata["routing_source"] == "router_control_hold"
     assert out.metadata["router_control_hold_applied"] is True
     assert out.metadata["router_control_target_tier"] == "c3"
@@ -361,11 +361,11 @@ def test_prompt_block_contains_canonical_targets_not_aliases() -> None:
     assert "router_control" in block
     assert "tier:c3" in block
     assert (
-        '"target_id":"tier:c3","label":"claude-opus-4.8",'
+        '"target_id":"tier:c3","label":"glm-5.3",'
         '"execution_kind":"single_model"'
     ) in block
     assert "tier:t3" not in block
-    assert "model:z-ai/glm-5.2" not in block
+    assert "model:z-ai/glm-5.3" not in block
     assert "description" not in block
     assert "Use labels only to map explicit model-name requests" in block
     assert "must choose one target_id exactly" in block

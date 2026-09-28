@@ -1339,6 +1339,11 @@ def _gate_workspace_strict_read(tool_name: str, resolved: Path, original_path: s
     become an existence oracle for outside paths.
     """
 
+    ctx = current_tool_context.get()
+    if ctx is not None and ctx.sandboxed_workspace_authoring is not None:
+        from opensquilla.tools.workspace_authoring import guard_channel_workspace_path
+
+        guard_channel_workspace_path(ctx, resolved)
     blocked = _workspace_strict_read_block(tool_name, resolved, original_path)
     if blocked is not None:
         raise WorkspaceAccessError(str(blocked["message"]))
@@ -1463,6 +1468,9 @@ def _is_under_configured_scratch_dir(resolved: Path) -> bool:
 
 
 def _gate_workspace_lockdown_write(tool_name: str, resolved: Path, original_path: str) -> None:
+    from opensquilla.tools.workspace_authoring import guard_channel_workspace_path
+
+    guard_channel_workspace_path(current_tool_context.get(), resolved)
     if full_host_access_active():
         return
     roots = _workspace_lockdown_roots()
@@ -1487,6 +1495,16 @@ async def _gate_out_of_workspace_write(
     prefix_rule: list[str] | None = None,
 ) -> tuple[dict[str, object] | None, bool, tuple[BackupReceiptSummary, ...]]:
     """Return ``(block, elevated, backups)`` after exact-action gating."""
+    from opensquilla.tools.workspace_authoring import (
+        guard_channel_workspace_path,
+        restricted_channel_context,
+    )
+
+    ctx = current_tool_context.get()
+    if restricted_channel_context(ctx):
+        guard_channel_workspace_path(ctx, resolved)
+        if sandbox_permissions != "use_default" or approval_id:
+            raise WorkspaceAccessError("Channel workspace tools cannot request host execution.")
     if full_host_access_active():
         return None, False, ()
 

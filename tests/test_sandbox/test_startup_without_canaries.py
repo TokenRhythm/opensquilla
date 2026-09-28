@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from opensquilla.sandbox import integration, setup_runtime
 from opensquilla.sandbox.backend.unavailable import UnavailableBackend
@@ -118,6 +119,28 @@ def test_sandbox_settings_no_longer_exposes_auto_setup() -> None:
     assert "auto_setup" not in SandboxSettings.model_fields
 
 
+@pytest.mark.parametrize("auto_setup", [True, False, "true", "false"])
+@pytest.mark.parametrize("run_mode", ["safe", "full"])
+def test_retired_auto_setup_is_ignored_without_changing_run_mode(auto_setup, run_mode):
+    settings = SandboxSettings(auto_setup=auto_setup, run_mode=run_mode, cpu_seconds=31)
+
+    assert settings.run_mode == run_mode
+    assert settings.sandbox is (run_mode == "safe")
+    assert settings.security_grading is (run_mode == "safe")
+    assert settings.cpu_seconds == 31
+    assert "auto_setup" not in settings.model_fields_set
+    assert "auto_setup" not in settings.model_dump()
+
+
+def test_retired_auto_setup_does_not_hide_unknown_sandbox_settings():
+    with pytest.raises(ValidationError) as error:
+        SandboxSettings(auto_setup=False, unexpected_setting=True)
+
+    assert [(item["loc"], item["type"]) for item in error.value.errors()] == [
+        (("unexpected_setting",), "extra_forbidden"),
+    ]
+
+
 async def test_initialized_status_is_cached_without_rechecking_host(monkeypatch):
     result = SetupResult(SandboxSetupState.READY, "win32", "Sandbox initialized.")
     monkeypatch.setattr(setup_runtime, "_LAST_RESULT", result)
@@ -158,6 +181,74 @@ async def test_startup_failure_does_not_install_repair_or_retry(monkeypatch):
     assert await setup_runtime.current_sandbox_setup_runtime_status(SimpleNamespace()) is result
     assert await setup_runtime.initialize_sandbox_runtime(SimpleNamespace()) is result
     assert calls == ["initialize"]
+
+
+@pytest.mark.parametrize("backend_name", ["seatbelt", "windows_default", "bubblewrap"])
+@pytest.mark.parametrize("explicit_setup", [False, True])
+async def test_initialization_and_status_never_execute_backend_probes(
+    monkeypatch, backend_name, explicit_setup
+):
+
+    setup_runtime.mark_sandbox_startup_pending()
+    calls: list[str] = []
+
+    class Backend:
+        name = backend_name
+
+        async def probe_runtime(self, **kwargs):
+            pytest.fail("initialization must not execute a probe")
+
+        async def run(self, *_args, **_kwargs):
+            pytest.fail("initialization must not execute a command")
+
+        async def run_operation(self, *_args, **_kwargs):
+            pytest.fail("initialization must not execute a filesystem canary")
+
+    backend = Backend()
+
+    async def initialize():
+        calls.append("initialize")
+        return backend
+
+    monkeypatch.setattr(integration, "initialize_runtime_backend", initialize)
+    monkeypatch.setattr(integration, "get_runtime", lambda: SimpleNamespace(backend=backend))
+    async def setup(_config):
+        return SetupResult(SandboxSetupState.READY, "test", "Setup complete.")
+
+    monkeypatch.setattr(setup_runtime, "ensure_sandbox_setup", setup)
+    initialize_entry = (
+        setup_runtime.ensure_sandbox_setup_auto
+        if explicit_setup else setup_runtime.initialize_sandbox_runtime
+    )
+    result = await initialize_entry(SimpleNamespace())
+
+    assert result.state is SandboxSetupState.READY
+    assert calls == ["initialize"]
+
+    assert await initialize_entry(SimpleNamespace()) is result
+    report = await setup_runtime.current_sandbox_capability_report(
+        SimpleNamespace(), force_refresh=True
+    )
+    assert report.available is True
+    assert calls == ["initialize"]
+
+
+async def test_backend_selection_failure_keeps_safe_unavailable(monkeypatch):
+    setup_runtime.mark_sandbox_startup_pending()
+
+    async def initialize():
+        from opensquilla.sandbox.types import SandboxBackendError
+
+        raise SandboxBackendError("required backend is missing")
+
+    monkeypatch.setattr(integration, "initialize_runtime_backend", initialize)
+
+    result = await setup_runtime.initialize_sandbox_runtime(SimpleNamespace())
+
+    assert result.state is SandboxSetupState.FAILED
+    assert "required backend is missing" in (result.detail or "")
+    report = await setup_runtime.current_sandbox_capability_report(SimpleNamespace())
+    assert report.available is False
 
 
 async def test_full_access_remains_authorized_when_sandbox_startup_fails(monkeypatch):

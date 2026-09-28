@@ -28,7 +28,6 @@ from opensquilla.telemetry.contracts import (
     AppCrashDetected,
     AppStartResult,
     ClientLaunch,
-    CodingModeUsage,
     DownloadClick,
     DownloadServed,
     FileParseResult,
@@ -39,7 +38,6 @@ from opensquilla.telemetry.contracts import (
     InstallResult,
     InstallStarted,
     LandingView,
-    MetaSkillUsage,
     OnboardingCompleted,
     PerformanceSummary,
     ProductActive,
@@ -298,11 +296,7 @@ def _valid_growth_payloads() -> list[tuple[type[object], dict[str, object]]]:
         execution_mode="gateway",
     )
 
-    metaskill_usage = _growth_base("metaskill_usage")
-    metaskill_usage.update(source="runtime")
 
-    coding_mode_usage = _growth_base("coding_mode_usage")
-    coding_mode_usage.update(source="runtime")
 
     product_active = _growth_base("product_active")
     product_active.update(source="gateway", surface="desktop")
@@ -320,8 +314,6 @@ def _valid_growth_payloads() -> list[tuple[type[object], dict[str, object]]]:
         (RegistrationStarted, registration_started),
         (RegistrationResult, registration_result),
         (ClientLaunch, client_launch),
-        (MetaSkillUsage, metaskill_usage),
-        (CodingModeUsage, coding_mode_usage),
         (ProductActive, product_active),
     ]
 
@@ -835,9 +827,9 @@ def test_growth_batch_accepts_closed_growth_event() -> None:
     assert isinstance(batch.events[0], FirstAppReady)
 
 
-@pytest.mark.parametrize("event_index", [12, 13])
-def test_feature_usage_events_reject_pre_disclosure_notice(event_index: int) -> None:
-    payload = dict(_valid_growth_payloads()[event_index][1])
+def test_product_activity_rejects_pre_disclosure_notice() -> None:
+    payload = next(dict(payload) for model, payload in _valid_growth_payloads()
+                   if model is ProductActive)
     payload["notice_version"] = "growth-v1"
 
     with pytest.raises(ValidationError):
@@ -1085,7 +1077,7 @@ def test_protocol_manifest_and_fingerprint_are_stable_cross_language_golden() ->
 
     assert fingerprint == TELEMETRY_PROTOCOL_FINGERPRINT_SHA256
     assert TELEMETRY_PROTOCOL_FINGERPRINT_SHA256 == (
-        "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
+        "4e8c73d2638a97ccc73a61ed71131401ccfbff54816736d2f5ed5e854d3fb6ee"
     )
     assert manifest_events == set(EVENT_MODELS)
     assert manifest["notice_versions"] == dict(CURRENT_NOTICE_VERSION_BY_SCOPE)

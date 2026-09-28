@@ -1,12 +1,31 @@
-import type { ChatMessage } from '@/types/chat'
+import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { normalizeTurnOutcome } from '@/utils/chat/turnOutcome'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
+
+/** Error visibility depends on the turn result, never on diagnostic persistence. */
+export function hasTerminalErrorNotice(outcome: ChatTurnOutcome): boolean {
+  const status = outcome.status.toLowerCase()
+  if (['succeeded', 'completed', 'cancelled', 'canceled'].includes(status)) return false
+  return ['failed', 'timeout', 'abandoned', 'interrupted', 'partial', 'budgetlimited', 'blocked'].includes(status)
+    || ['failed', 'partial', 'budgetlimited', 'blocked', 'interrupted'].includes(outcome.kind?.toLowerCase() || '')
+}
 
 /** One terminal notice per explicit turn, shared by live and paginated history. */
 export function dedupeTerminalErrorNotices(messages: ChatMessage[]): ChatMessage[] {
   const result: ChatMessage[] = []
   const byTurn = new Map<string, number>()
-  for (const message of messages) {
+  for (const rawMessage of messages) {
+    const message = rawMessage.role === 'error' && rawMessage.terminalNotice
+      ? { ...rawMessage, text: localizedChatErrorMessage(
+          rawMessage.errorCode || rawMessage.turnOutcome?.errorClass, '',
+          rawMessage.turnOutcome?.replaySafe === true, rawMessage.turnOutcome?.failureKind,
+          rawMessage.turnOutcome?.status, {
+            reason: rawMessage.turnOutcome?.reason,
+            cancellationSource: rawMessage.turnOutcome?.cancellationSource,
+            outcomeKind: rawMessage.turnOutcome?.kind,
+          },
+        ) }
+      : rawMessage
     if (message.role !== 'error' || !message.terminalNotice || !message.turnId) {
       result.push(message)
       continue
@@ -42,14 +61,12 @@ export function dedupeTerminalErrorNotices(messages: ChatMessage[]): ChatMessage
       turnOutcome.statusSource = authority.statusSource
       if (authority.terminalMessage !== undefined) turnOutcome.terminalMessage = authority.terminalMessage
     }
-    const fallback = lifecycle && lifecycle.turnOutcome?.status !== 'failed'
-      ? lifecycle.turnOutcome?.terminalMessage || lifecycle.text
-      : preferred.text
     result[index] = {
       ...other, ...preferred, turnOutcome,
       text: localizedChatErrorMessage(
-        preferred.errorCode, fallback, turnOutcome?.replaySafe === true, turnOutcome?.failureKind,
+        preferred.errorCode || turnOutcome?.errorClass, '', turnOutcome?.replaySafe === true, turnOutcome?.failureKind,
         turnOutcome?.status,
+        { reason: turnOutcome?.reason, cancellationSource: turnOutcome?.cancellationSource, outcomeKind: turnOutcome?.kind },
       ),
     }
   }

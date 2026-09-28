@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import stat
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -133,9 +134,20 @@ def prepare_managed_workspace(profile_home: Path) -> PreparedExecutionWorkspace:
         parent.mkdir(mode=0o700, exist_ok=True)
         if parent.resolve(strict=True) != parent:
             raise ProjectWorkspaceStateError("canonical_changed")
-        identity = uuid4().hex
-        root = parent / identity
-        root.mkdir(mode=0o700)
+        # The local creation date is for browsing; the durable binding keeps its
+        # full UUID and path, independent of future date or timezone changes.
+        created_on = date.today().strftime("%Y%m%d")
+        for _ in range(16):
+            identity = uuid4().hex
+            root = parent / f"{created_on}-{identity[:12]}"
+            try:
+                root.mkdir(mode=0o700)
+                break
+            except FileExistsError:
+                # Never share an existing task root after a short-ID collision.
+                continue
+        else:
+            raise ProjectWorkspaceStateError("unavailable")
         root_stat = root.lstat()
         parent_stat = parent.lstat()
         prepared = PreparedExecutionWorkspace(

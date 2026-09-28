@@ -84,6 +84,7 @@ interface SinglePanelContract {
   model: string
   models: DiscoveredModelCatalog['models']
   modelSource: DiscoveredModelCatalog['source']
+  catalogState?: DiscoveredModelCatalog
 }
 
 interface ModelStrategyPanelContract {
@@ -99,6 +100,8 @@ interface ModelStrategyPanelContract {
   routingSummary?: {
     providerId: string
     providerLabel: string
+    recommendedProviderId: string
+    recommendedProviderLabel: string
     enabled: boolean
     binding: 'follow_primary' | 'custom' | 'legacy'
     crossProviderEnabled: boolean
@@ -145,7 +148,7 @@ const bindingLabel = computed(() => t(
 
 function requestRecommendedReset() {
   const summary = props.panel.routingSummary
-  if (!summary || summary.resetDisabledReason || summary.resetPending || props.routingModeBusy) return
+  if (!summary?.recommendedProviderId || summary.resetDisabledReason || summary.resetPending || props.routingModeBusy) return
   emit('resetRecommendedRouter')
 }
 
@@ -836,7 +839,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             {{ t('setup.modelStrategy.retainedDrafts') }}
           </p>
         </div>
-        <div class="setup-model-strategy__reset">
+        <div v-if="panel.routingSummary.recommendedProviderId" class="setup-model-strategy__reset">
           <button
             type="button"
             class="btn btn--ghost"
@@ -847,7 +850,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             @click="requestRecommendedReset"
           >
             <Icon name="refresh" :size="15" aria-hidden="true" />
-            {{ t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.providerLabel }) }}
+            {{ t(panel.routingSummary.resetPending ? 'setup.modelStrategy.resettingRecommended' : 'setup.modelStrategy.resetRecommended', { provider: panel.routingSummary.recommendedProviderLabel }) }}
           </button>
           <p :id="resetHelpId">{{ panel.routingSummary.resetDisabledReason || t(panel.routingSummary.enabled ? 'setup.modelStrategy.resetKeepsMode' : 'setup.modelStrategy.resetKeepsOff') }}</p>
         </div>
@@ -1296,6 +1299,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="replacementModel"
                 :models="replacementModelCatalog.models"
                 :model-source="replacementModelCatalog.source"
+                :catalog-state="replacementModelCatalog"
                 @update="replacementModel = $event"
               />
               <p
@@ -1354,6 +1358,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="newCandidateModel"
                 :models="candidateModelCatalog.models"
                 :model-source="candidateModelCatalog.source"
+                :catalog-state="candidateModelCatalog"
                 @update="newCandidateModel = $event"
               />
               <div class="setup-model-strategy__editor-actions">
@@ -1524,6 +1529,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="aggregatorModel"
                 :models="aggregatorModelCatalog.models"
                 :model-source="aggregatorModelCatalog.source"
+                :catalog-state="aggregatorModelCatalog"
                 @update="aggregatorModel = $event"
               />
               <div class="setup-model-strategy__editor-actions">
@@ -1772,6 +1778,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             :value="panel.single.model"
             :models="panel.single.models"
             :model-source="panel.single.modelSource"
+            :catalog-state="panel.single.catalogState"
             @update="emit('updateFixedModel', $event)"
           >
             <template #actions><SetupModelCapacity :provider="panel.single.providerId" :model="panel.single.model" :disabled="routingModeBusy" /></template>
@@ -2162,8 +2169,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__fixed-model-row.control-row--stack {
   align-items: center;
   flex-direction: row;
-  gap: var(--sp-4);
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
   padding: var(--sp-2) 0;
+}
+
+.setup-model-strategy__fixed-model-row :deep(.setup-model-combobox__sync) {
+  flex-basis: 100%;
+  text-align: right;
 }
 
 .setup-model-strategy__fixed-model-row :deep(.control-row__label-block) {
@@ -2628,6 +2641,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
   .setup-model-strategy__fixed-model-row :deep(.control-row__control) {
     width: 100%;
+  }
+
+  .setup-model-strategy__fixed-model-row :deep(.setup-model-combobox__sync) {
+    flex-basis: auto;
+    text-align: left;
   }
 }
 

@@ -197,6 +197,10 @@ async def _noop_cancel_active_turn() -> None:
     return None
 
 
+async def _noop_cancel_user_input() -> bool:
+    return False
+
+
 async def _noop_steer_active_turn(_text: str) -> bool:
     return False
 
@@ -218,6 +222,8 @@ class TuiRuntimeHooks:
     notice: Callable[[str], None] | None = None
     on_cancel_active_turn: Callable[[], Awaitable[None]] = _noop_cancel_active_turn
     on_steer_active_turn: Callable[[str], Awaitable[bool]] = _noop_steer_active_turn
+    on_answer_user_input: Callable[[str], Awaitable[bool]] = _noop_steer_active_turn
+    on_cancel_user_input: Callable[[], Awaitable[bool]] = _noop_cancel_user_input
     on_surface_ready: Callable[[], Awaitable[None]] = _noop_surface_ready
     on_user_activity: Callable[[], Awaitable[None]] = _noop_surface_ready
     expose_surface: Callable[[TuiSurface], None] | None = None

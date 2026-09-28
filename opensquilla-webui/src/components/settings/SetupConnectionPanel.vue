@@ -31,8 +31,20 @@ onMounted(() => {
 
 const statusState = computed(() => {
   if (gatewayAccess.availability === 'preparing') return 'connecting'
-  if (gatewayAccess.availability === 'available') return 'connected'
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionPhase !== undefined
+      ? gatewayAccess.connectionPhase !== 'healthy' ? 'connecting' : 'connected'
+      : gatewayAccess.connectionHealth === 'suspect' ? 'connecting' : 'connected'
+  }
   return 'disconnected'
+})
+
+const transportPhase = computed(() => {
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
+  }
+  return gatewayAccess.availability === 'preparing' ? 'checking' : 'disconnected'
 })
 
 const statusPillClass = computed(() => {
@@ -43,6 +55,9 @@ const statusPillClass = computed(() => {
 
 const statusLabel = computed(() => {
   if (requiresCredential.value) return t('setup.connection.tokenRequired')
+  if (transportPhase.value !== 'healthy' && transportPhase.value !== 'disconnected') {
+    return t(`chrome.connectionState.${transportPhase.value}`)
+  }
   if (statusState.value === 'connected') return t('setup.connection.connected')
   if (statusState.value === 'connecting') return t('setup.connection.connecting')
   return t('setup.connection.disconnected')

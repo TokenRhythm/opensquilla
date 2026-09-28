@@ -166,42 +166,11 @@ def _ensure_windows_setup_sync(config: Any) -> SetupResult:
         )
     ):
         marker_path = _windows_setup_marker_path()
-        if not _windows_process_is_admin():
-            try:
-                _run_windows_setup_helper_elevated(marker_path)
-            except OSError as exc:
-                return SetupResult(
-                    state=SandboxSetupState.FAILED,
-                    platform="win32",
-                    message="Windows default sandbox setup failed.",
-                    requires_admin=True,
-                    detail=str(exc),
-                )
-            result = _windows_default_setup_result()
-            if result.state is SandboxSetupState.READY:
-                return result
-            incomplete_detail = (
-                _windows_setup_helper_report_detail(marker_path)
-                or result.detail
-                or result.message
-            )
-            return SetupResult(
-                state=SandboxSetupState.FAILED,
-                platform="win32",
-                message="Windows default sandbox setup failed.",
-                requires_admin=True,
-                detail=f"elevated_setup_incomplete: {incomplete_detail}",
-            )
         try:
-            network = _establish_windows_network_setup(marker_path)
-            _write_windows_setup_marker(marker_path, network=network)
-            return SetupResult(
-                state=SandboxSetupState.READY,
-                platform="win32",
-                message="Windows default sandbox is ready.",
-                requires_admin=False,
-                detail="proxy_allowlist=ready",
-            )
+            if _windows_process_is_admin():
+                _run_windows_setup_helper_in_process(marker_path)
+            else:
+                _run_windows_setup_helper_elevated(marker_path)
         except OSError as exc:
             return SetupResult(
                 state=SandboxSetupState.FAILED,
@@ -210,6 +179,19 @@ def _ensure_windows_setup_sync(config: Any) -> SetupResult:
                 requires_admin=True,
                 detail=str(exc),
             )
+        result = _windows_default_setup_result()
+        if result.state is SandboxSetupState.READY:
+            return result
+        incomplete_detail = (
+            _windows_setup_helper_report_detail(marker_path) or result.detail or result.message
+        )
+        return SetupResult(
+            state=SandboxSetupState.FAILED,
+            platform="win32",
+            message="Windows default sandbox setup failed.",
+            requires_admin=True,
+            detail=f"elevated_setup_incomplete: {incomplete_detail}",
+        )
     return _windows_default_setup_result()
 
 
@@ -306,11 +288,16 @@ def _windows_process_is_admin() -> bool:
         return False
 
 
+def _run_windows_setup_helper_in_process(path: Path) -> None:
+    from opensquilla.sandbox.backend.windows_default_setup import run_elevated_setup_helper
+
+    run_elevated_setup_helper(path, already_elevated=True)
+
+
 def _establish_windows_network_setup(marker_path: Path):
+    """Compatibility seam for callers/tests that mock the native setup."""
     from opensquilla.sandbox.backend.windows_default_network import WindowsNetworkSetup
-    from opensquilla.sandbox.backend.windows_default_setup import (
-        establish_windows_network_setup,
-    )
+    from opensquilla.sandbox.backend.windows_default_setup import establish_windows_network_setup
 
     network = establish_windows_network_setup(marker_path)
     if not isinstance(network, WindowsNetworkSetup):

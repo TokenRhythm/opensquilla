@@ -7,6 +7,7 @@ interface ChatSessionModelOptions {
   isDraft: () => boolean
   available: Readonly<Ref<boolean>>
   connectionEpoch: Readonly<Ref<unknown>>
+  allowed: Readonly<Ref<boolean>>
 }
 
 /** Reads the stored session model, never the model used by its last routed turn. */
@@ -17,6 +18,7 @@ export function useChatSessionModel(options: ChatSessionModelOptions) {
   let disposed = false
 
   async function refresh(): Promise<void> {
+    if (!options.allowed.value) return
     const requestGeneration = ++generation
     controller?.abort()
     controller = null
@@ -49,9 +51,23 @@ export function useChatSessionModel(options: ChatSessionModelOptions) {
     options.available,
     options.connectionEpoch,
   ], () => {
+    generation += 1
+    controller?.abort()
+    controller = null
     modelName.value = null
-    void refresh()
-  }, { immediate: true, flush: 'sync' })
+  }, { flush: 'sync' })
+
+  // Retire the old identity synchronously, but admit optional reads only after
+  // the session bootstrap has queued its critical subscription/history frames.
+  watch([
+    options.sessionKey,
+    options.isDraft,
+    options.available,
+    options.connectionEpoch,
+    options.allowed,
+  ], () => {
+    if (options.allowed.value) void refresh()
+  }, { immediate: true, flush: 'post' })
 
   onScopeDispose(() => {
     disposed = true

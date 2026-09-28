@@ -2,12 +2,15 @@
   <Teleport to="body">
     <Transition name="panel">
       <div v-if="open" class="cron-panel-overlay">
-        <div class="cron-panel__scrim" :class="{ 'is-open': open }" @click="emit('close')" />
+        <div class="cron-panel__scrim" :class="{ 'is-open': open }" @click="!saving && emit('close')" />
         <div
           ref="drawerRef"
           class="cron-panel"
           :class="{ 'is-open': open }"
           role="dialog"
+          tabindex="-1"
+          :aria-busy="saving"
+          @keydown.tab="saving && $event.preventDefault()"
           aria-modal="true"
           :aria-label="editingJob ? t('cronSkills.panel.ariaEdit') : t('cronSkills.panel.ariaCreate')"
         >
@@ -16,14 +19,15 @@
               <span class="cron-panel__eyebrow">{{ editingJob ? t('cronSkills.panel.eyebrowEdit') : t('cronSkills.panel.eyebrowNew') }}</span>
               <h3 class="cron-panel__title">{{ editingJob ? t('cronSkills.panel.titleEdit') : t('cronSkills.panel.titleCreate') }}</h3>
             </div>
-            <button class="cron-iconbtn" :aria-label="t('common.close')" @click="emit('close')">
+            <button class="cron-iconbtn" :aria-label="t('common.close')" :disabled="saving" @click="emit('close')">
               <Icon name="x" :size="16" />
             </button>
           </div>
           <div class="cron-panel__body">
+          <fieldset class="cron-panel__fields" :disabled="saving">
             <div class="cron-field">
               <label class="cron-field__label" for="cp-name">{{ t('cronSkills.panel.name') }}</label>
-              <input id="cp-name" v-model="form.name" class="cron-field__input" type="text" :placeholder="t('cronSkills.panel.friendlyNamePlaceholder')" autocomplete="off">
+              <input id="cp-name" v-model="form.name" :aria-invalid="fieldErrors?.name ? true : undefined" :aria-describedby="fieldErrors?.name ? 'cp-name-error' : undefined" class="cron-field__input" type="text" :placeholder="t('cronSkills.panel.friendlyNamePlaceholder')" autocomplete="off"><p v-if="fieldErrors?.name" id="cp-name-error" class="cron-field__error" role="alert">{{ fieldErrors.name }}</p>
             </div>
 
             <div class="cron-field">
@@ -48,8 +52,9 @@
               </div>
               <div v-else class="cron-field__hint cron-custom-time-hint"><span>{{ t('cronSkills.panel.customTimeHint') }}</span><button type="button" class="btn btn--ghost" @click="openAdvancedSchedule">{{ t('cronSkills.panel.openAdvancedTime') }}</button></div>
             </div>
-            <div v-show="form.type === 'every'" class="cron-field"><label class="cron-field__label" for="cp-every-friendly">{{ t('cronSkills.panel.everyHowOften') }}</label><div class="cron-friendly-time-row"><input id="cp-every-friendly" v-model.number="friendlyEveryAmount" class="cron-field__input" type="number" min="1"><CronSelect v-model="friendlyEveryUnit" :options="everyUnitOptions" :aria-label="t('cronSkills.panel.timeUnit')" @change="syncFriendlyEvery" /></div></div>
-            <div v-show="form.type === 'at'" class="cron-field"><label class="cron-field__label" for="cp-at-friendly">{{ t('cronSkills.panel.dateAndTime') }}</label><input id="cp-at-friendly" v-model="friendlyAt" class="cron-field__input" type="datetime-local"></div>
+            <div v-show="form.type === 'every'" class="cron-field"><label class="cron-field__label" for="cp-every-friendly">{{ t('cronSkills.panel.everyHowOften') }}</label><div class="cron-friendly-time-row"><input id="cp-every-friendly" v-model.number="friendlyEveryAmount" :aria-invalid="fieldErrors?.every ? true : undefined" :aria-describedby="fieldErrors?.every ? 'cp-every-friendly-error' : undefined" class="cron-field__input" type="number" min="1"><CronSelect v-model="friendlyEveryUnit" :options="everyUnitOptions" :aria-label="t('cronSkills.panel.timeUnit')" @change="syncFriendlyEvery" /></div><p v-if="fieldErrors?.every" id="cp-every-friendly-error" class="cron-field__error" role="alert">{{ fieldErrors.every }}</p></div>
+            <div v-show="form.type === 'at'" class="cron-field"><label class="cron-field__label" for="cp-at-friendly">{{ t('cronSkills.panel.dateAndTime') }}</label><input id="cp-at-friendly" v-model="friendlyAt" :aria-invalid="fieldErrors?.at ? true : undefined" :aria-describedby="fieldErrors?.at ? 'cp-at-friendly-error' : undefined" class="cron-field__input" type="datetime-local"><p v-if="fieldErrors?.at" id="cp-at-friendly-error" class="cron-field__error" role="alert">{{ fieldErrors.at }}</p></div>
+            <div class="cron-field"><label class="cron-field__label" for="cp-tz">{{ t('cronSkills.panel.timezone') }}</label><input id="cp-tz" v-model="form.tz" :aria-invalid="fieldErrors?.tz ? true : undefined" :aria-describedby="fieldErrors?.tz ? 'cp-tz-error' : undefined" class="cron-field__input cron-field__input--mono" type="text" placeholder="Asia/Shanghai" autocomplete="off" spellcheck="false"><p v-if="fieldErrors?.tz" id="cp-tz-error" class="cron-field__error" role="alert">{{ fieldErrors.tz }}</p><div class="cron-field__hint">{{ t('cronSkills.panel.timezoneSimpleHint') }}</div></div>
             <div class="cron-field">
               <label class="cron-field__label" for="cp-payload-kind-simple">{{ t('cronSkills.panel.jobMode') }}</label>
               <CronSelect id="cp-payload-kind-simple" v-model="form.payloadKind" :options="jobModeOptions" :aria-label="t('cronSkills.panel.jobMode')" @change="emit('payloadKindChange')" />
@@ -66,7 +71,10 @@
                 :options="workspaceOptions"
                 :aria-label="t('cronSkills.panel.projectWorkspace')"
                 :disabled="projectWorkspacesLoading"
+                :aria-invalid="fieldErrors?.workspaceId ? true : undefined"
+                :aria-describedby="fieldErrors?.workspaceId ? 'cp-workspace-error' : undefined"
               />
+              <p v-if="fieldErrors?.workspaceId" id="cp-workspace-error" class="cron-field__error" role="alert">{{ fieldErrors.workspaceId }}</p>
               <div class="cron-field__hint">
                 {{ form.workspaceRequired ? t('cronSkills.panel.workspaceRequiredHint') : t('cronSkills.panel.workspaceOptionalHint') }}
               </div>
@@ -75,11 +83,10 @@
             <details ref="runtimeSettingsRef" class="cron-advanced cron-advanced--runtime">
               <summary class="cron-advanced__summary">{{ t('cronSkills.panel.moreRuntimeSettings') }}</summary>
               <div class="cron-advanced__body">
-                <div class="cron-field"><label class="cron-field__label" for="cp-cron">{{ t('cronSkills.panel.cronExpression') }}</label><input id="cp-cron" v-model="form.cron" class="cron-field__input cron-field__input--mono" type="text" placeholder="0 9 * * 1-5" autocomplete="off" spellcheck="false" @input="emit('cronInput')"><div class="cron-field__hint">{{ t('cronSkills.panel.advancedTimeHint') }}</div><div v-if="cronExplainHuman" class="cron-explain" :class="{ 'is-valid': cronExplainValid, 'is-invalid': cronExplainInvalid }"><div class="cron-explain__human">{{ cronExplainHuman }}</div></div></div>
-                <div class="cron-field"><label class="cron-field__label" for="cp-tz">{{ t('cronSkills.panel.timezone') }}</label><input id="cp-tz" v-model="form.tz" class="cron-field__input cron-field__input--mono" type="text" placeholder="Asia/Shanghai" autocomplete="off" spellcheck="false"><div class="cron-field__hint">{{ t('cronSkills.panel.timezoneSimpleHint') }}</div></div>
+                <div class="cron-field"><label class="cron-field__label" for="cp-cron">{{ t('cronSkills.panel.cronExpression') }}</label><input id="cp-cron" v-model="form.cron" :aria-invalid="fieldErrors?.cron ? true : undefined" :aria-describedby="fieldErrors?.cron ? 'cp-cron-error' : undefined" class="cron-field__input cron-field__input--mono" type="text" placeholder="0 9 * * 1-5" autocomplete="off" spellcheck="false" @input="emit('cronInput')"><p v-if="fieldErrors?.cron" id="cp-cron-error" class="cron-field__error" role="alert">{{ fieldErrors.cron }}</p><div class="cron-field__hint">{{ t('cronSkills.panel.advancedTimeHint') }}</div><div v-if="cronExplainHuman" class="cron-explain" :class="{ 'is-valid': cronExplainValid, 'is-invalid': cronExplainInvalid }"><div class="cron-explain__human">{{ cronExplainHuman }}</div></div></div>
                 <div class="cron-field"><label class="cron-field__label" for="cp-agent-id">{{ t('cronSkills.panel.agentId') }}</label><input id="cp-agent-id" v-model="form.agentId" class="cron-field__input" type="text" placeholder="main"></div>
                 <div v-show="form.payloadKind === 'agent_turn'" class="cron-field"><label class="cron-field__label" for="cp-session-target">{{ t('cronSkills.panel.sessionTarget') }}</label><CronSelect id="cp-session-target" v-model="form.sessionTarget" :options="sessionTargetOptions" :aria-label="t('cronSkills.panel.sessionTarget')" @change="emit('sessionTargetChange')" /><div class="cron-field__hint">{{ sessionTargetHint }}</div></div>
-                <div v-show="showTargetSessionRow" class="cron-field"><label class="cron-field__label" for="cp-target-session-key">{{ targetSessionLabel }}</label><input id="cp-target-session-key" v-model="form.targetSessionKey" class="cron-field__input" type="text" placeholder="agent:main:webchat:abc123"><div class="cron-field__hint">{{ targetSessionHint }}</div></div>                <details class="cron-advanced">
+                <div v-show="showTargetSessionRow" class="cron-field"><label class="cron-field__label" for="cp-target-session-key">{{ targetSessionLabel }}</label><input id="cp-target-session-key" v-model="form.targetSessionKey" :aria-invalid="fieldErrors?.targetSessionKey ? true : undefined" :aria-describedby="fieldErrors?.targetSessionKey ? 'cp-target-session-key-error' : undefined" class="cron-field__input" type="text" placeholder="agent:main:webchat:abc123"><p v-if="fieldErrors?.targetSessionKey" id="cp-target-session-key-error" class="cron-field__error" role="alert">{{ fieldErrors.targetSessionKey }}</p><div class="cron-field__hint">{{ targetSessionHint }}</div></div>                <details class="cron-advanced">
                 <summary class="cron-advanced__summary">{{ t('cronSkills.panel.advancedSummary') }}</summary>
                 <div class="cron-advanced__body">
                 <div class="cron-field">
@@ -110,7 +117,7 @@
 
                 <div v-show="form.deliveryMode === 'webhook'" class="cron-field">
                 <label class="cron-field__label" for="cp-delivery-webhook-url">{{ t('cronSkills.panel.webhookUrl') }}</label>
-                <input id="cp-delivery-webhook-url" v-model="form.deliveryWebhookUrl" class="cron-field__input cron-field__input--mono" type="url" placeholder="https://hooks.example/cron" autocomplete="off">
+                <input id="cp-delivery-webhook-url" v-model="form.deliveryWebhookUrl" :aria-invalid="fieldErrors?.deliveryWebhookUrl ? true : undefined" :aria-describedby="fieldErrors?.deliveryWebhookUrl ? 'cp-delivery-webhook-url-error' : undefined" class="cron-field__input cron-field__input--mono" type="url" placeholder="https://hooks.example/cron" autocomplete="off"><p v-if="fieldErrors?.deliveryWebhookUrl" id="cp-delivery-webhook-url-error" class="cron-field__error" role="alert">{{ fieldErrors.deliveryWebhookUrl }}</p>
                 </div>
                 <div v-show="form.deliveryMode === 'webhook'" class="cron-field">
                 <label class="cron-field__label" for="cp-delivery-webhook-token">{{ t('cronSkills.panel.webhookToken') }}</label>
@@ -135,7 +142,7 @@
                 </div>
                 <div v-show="form.fdMode === 'channel'" class="cron-field">
                 <label class="cron-field__label" for="cp-fd-to">{{ t('cronSkills.panel.recipient') }}</label>
-                <input id="cp-fd-to" v-model="form.fdTo" class="cron-field__input" type="text" placeholder="C-ops-alerts" autocomplete="off">
+                <input id="cp-fd-to" v-model="form.fdTo" :aria-invalid="fieldErrors?.fdTo ? true : undefined" :aria-describedby="fieldErrors?.fdTo ? 'cp-fd-to-error' : undefined" class="cron-field__input" type="text" placeholder="C-ops-alerts" autocomplete="off"><p v-if="fieldErrors?.fdTo" id="cp-fd-to-error" class="cron-field__error" role="alert">{{ fieldErrors.fdTo }}</p>
                 </div>
                 <div v-show="form.fdMode === 'channel'" class="cron-field">
                 <label class="cron-field__label" for="cp-fd-account">{{ t('cronSkills.panel.accountId') }}</label>
@@ -143,7 +150,7 @@
                 </div>
                 <div v-show="form.fdMode === 'webhook'" class="cron-field">
                 <label class="cron-field__label" for="cp-fd-webhook-url">{{ t('cronSkills.panel.webhookUrl') }}</label>
-                <input id="cp-fd-webhook-url" v-model="form.fdWebhookUrl" class="cron-field__input cron-field__input--mono" type="url" placeholder="https://hooks.example/alert" autocomplete="off">
+                <input id="cp-fd-webhook-url" v-model="form.fdWebhookUrl" :aria-invalid="fieldErrors?.fdWebhookUrl ? true : undefined" :aria-describedby="fieldErrors?.fdWebhookUrl ? 'cp-fd-webhook-url-error' : undefined" class="cron-field__input cron-field__input--mono" type="url" placeholder="https://hooks.example/alert" autocomplete="off"><p v-if="fieldErrors?.fdWebhookUrl" id="cp-fd-webhook-url-error" class="cron-field__error" role="alert">{{ fieldErrors.fdWebhookUrl }}</p>
                 </div>
                 <div v-show="form.fdMode === 'webhook'" class="cron-field">
                 <label class="cron-field__label" for="cp-fd-webhook-token">{{ t('cronSkills.panel.webhookToken') }}</label>
@@ -161,10 +168,14 @@
               <span class="cron-toggle__label">{{ t('cronSkills.panel.enabled') }}</span>
             </label>
 
+            <p v-if="saveError" class="cron-field__error" role="alert">{{ saveError }}</p>
             <div class="cron-panel__actions">
-              <button class="btn btn--primary" @click="emit('save')">{{ t('cronSkills.panel.saveSchedule') }}</button>
-              <button class="btn btn--ghost" @click="emit('close')">{{ t('common.cancel') }}</button>
+              <button class="btn btn--primary" :disabled="saving" :aria-busy="saving" @click="emit('save')">
+                {{ saving ? t('common.saving') : t('cronSkills.panel.saveSchedule') }}
+              </button>
+              <button class="btn btn--ghost" :disabled="saving" @click="emit('close')">{{ t('common.cancel') }}</button>
             </div>
+          </fieldset>
           </div>
         </div>
       </div>
@@ -191,6 +202,9 @@ const { t } = useI18n()
 
 const props = defineProps<{
   open: boolean
+  saving: boolean
+  fieldErrors?: Partial<Record<keyof CronJobFormModel, string>>
+  saveError?: string
   editingJob: CronJob | null
   cronExplainHuman: string
   cronExplainValid: boolean
@@ -326,8 +340,29 @@ const emit = defineEmits<{
 
 const drawerRef = ref<HTMLElement | null>(null)
 const openRef = toRef(props, 'open')
+watch(() => props.saving, async saving => {
+  await nextTick()
+  if (!props.open) return
+  if (saving) drawerRef.value?.focus()
+  else drawerRef.value?.querySelector<HTMLButtonElement>('.cron-panel__actions .btn--primary')?.focus()
+})
 watch(openRef, open => {
   if (open) customScheduleSelected.value = false
 })
-useDialogA11y(drawerRef, openRef, () => emit('close'))
+useDialogA11y(drawerRef, openRef, () => { if (!props.saving) emit('close') })
 </script>
+
+<style scoped>
+fieldset.cron-panel__fields {
+  padding: 0;
+  border: 0;
+  margin: 0;
+  min-width: 0;
+}
+.cron-field__error {
+  color: var(--danger);
+  font-size: 12px;
+  line-height: 1.5;
+  margin: 6px 0 0;
+}
+</style>

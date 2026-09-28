@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     )
     from opensquilla.provider.types import ProviderRequestCorrelation
     from opensquilla.session.compaction import CompactionRequestContext
+    from opensquilla.session.compaction_budget import CompactionBudget
     from opensquilla.session.compaction_deployment import CompactionExecutionPlan
 
 # ---------------------------------------------------------------------------
@@ -82,6 +83,7 @@ class PreflightCompactionPort(Protocol):
         compaction_model: str | None,
         compaction_plan: CompactionExecutionPlan | None = None,
         compaction_request_context: CompactionRequestContext | None = None,
+        compaction_budget: CompactionBudget | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -184,6 +186,7 @@ class CompactionAndHistoryStageInput:
     compaction_request_context: CompactionRequestContext | None = field(
         default=None, repr=False
     )
+    compaction_budget: CompactionBudget | None = field(default=None, repr=False)
     history_capacity_tokens: int | None = None
     history_capacity_chars: int | None = None
     bound_user_message_id: str | None = None
@@ -293,6 +296,8 @@ class CompactionAndHistoryStage:
             )
             await self._fire_before_compact(preflight_state)
             preflight_kwargs: dict[str, Any] = {}
+            if inp.compaction_budget is not None:
+                preflight_kwargs["compaction_budget"] = inp.compaction_budget
             if inp.compaction_request_context is not None:
                 preflight_kwargs["compaction_request_context"] = inp.compaction_request_context
             if inp.attachment_path_resolver is not None:

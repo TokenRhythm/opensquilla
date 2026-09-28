@@ -21,6 +21,7 @@ from opensquilla.contracts.gateway_transport import (
     ANSWER_GENERATION_RESET_CAPABILITY,
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
+    STRUCTURED_USER_INPUT_CAPABILITY,
 )
 
 _STOP = object()
@@ -155,8 +156,10 @@ def _handshake_frames(*, keepalive_ms: int = 60_000) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("structured_user_input", [False, True])
 async def test_gateway_client_connect_uses_bounded_transport_limits(
     monkeypatch: pytest.MonkeyPatch,
+    structured_user_input: bool,
 ) -> None:
     ws = _FakeWebSocket(_handshake_frames())
     observed_connect: dict[str, Any] = {}
@@ -165,7 +168,7 @@ async def test_gateway_client_connect_uses_bounded_transport_limits(
         ws,
         observed_connect=observed_connect,
     )
-    client = GatewayClient()
+    client = GatewayClient(structured_user_input=structured_user_input)
 
     await client.connect("ws://127.0.0.1:18791/ws")
     try:
@@ -175,9 +178,9 @@ async def test_gateway_client_connect_uses_bounded_transport_limits(
             "max_queue": GATEWAY_CLIENT_MAX_QUEUE,
         }
         connect_frame = json.loads(ws.sent[0])
-        assert connect_frame["params"]["caps"] == [
-            ANSWER_GENERATION_RESET_CAPABILITY
-        ]
+        assert connect_frame["params"]["caps"] == [ANSWER_GENERATION_RESET_CAPABILITY] + (
+            [STRUCTURED_USER_INPUT_CAPABILITY] if structured_user_input else []
+        )
     finally:
         await client.close()
 

@@ -63,6 +63,31 @@ RAW_CURRENT_TURN_OVERFLOW_MESSAGE = (
 )
 
 
+def _inline_template_capacity(
+    agent: Agent, provider: Any, *, window: int, output: int, char_cap: int,
+) -> tuple[int, int]:
+    """Measure the inline replay envelope, whose summary is a message prefix."""
+    messages = agent._provider_request_messages_for_count_projection(
+        [Message(role="user", content="[Context summary]\n[candidate checkpoint]"),
+         Message(role="assistant", content="Understood. Continuing from summary.")],
+        request_context_message=agent._request_context_message(agent.config.request_context_prompt),
+        request_context_insert_index=2,
+        runtime_context_message=agent._freeze_preflight_runtime_context_message(),
+        runtime_context_insert_index=2,
+    )
+    projection = provider.project_final_request(
+        messages, agent.tool_definitions,
+        agent._provider_admission_chat_config(
+            "", context_window_tokens=window, max_output_tokens=output,
+            provider_request_proof_max_chars=char_cap,
+        ),
+    )
+    return (
+        projection.proof["effective_proof_token_budget"] - projection.proof["estimated_tokens"],
+        projection.proof["effective_proof_budget"] - projection.proof["estimated_chars"],
+    )
+
+
 def test_agent_compaction_uses_frozen_physical_plan() -> None:
     target_provider = _StallingProvider()
     plan = CompactionExecutionPlan(
@@ -2413,8 +2438,9 @@ async def test_inline_compaction_uses_proven_history_capacity_in_real_core(
     ]
     current = Message(role="user", content="Continue the active task exactly")
     messages.append(current)
-    fixed_capacity = agent.preflight_history_capacity(
-        active_user_message="", active_user_in_history=False,
+    fixed_capacity = _inline_template_capacity(
+        agent, provider, window=agent.config.context_window_tokens,
+        output=8192, char_cap=agent.config.provider_request_proof_max_chars,
     )
     projection = agent._project_compaction_consumer_request(
         consumer_provider=provider,
@@ -2477,6 +2503,7 @@ async def test_soft_pressure_keeps_protected_current_turn_when_final_request_fit
             # window even when the optional tokenizer is unavailable.
             context_window_tokens=3000,
             context_overflow_threshold=0.3,
+            compaction_trigger_ratio=0.3,
         ),
     )
     protected_tokens = sum(
@@ -2484,7 +2511,7 @@ async def test_soft_pressure_keeps_protected_current_turn_when_final_request_fit
         for entry in agent._message_count_compaction_entries(messages[2:])
     )
     assert protected_tokens > (
-        agent.config.context_window_tokens * agent.config.context_overflow_threshold
+        agent.config.context_window_tokens * agent.config.compaction_trigger_ratio
     )
     assert agent._estimate_live_request_tokens(messages) < agent.config.context_window_tokens
 
@@ -2967,6 +2994,8 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
     async def _compact(request: Any) -> CompactionResult:
         compact_requests.append(request)
         assert request.forced_prefix_cut is not None
+        assert request.context_window_tokens == request.config.budget.history_capacity_tokens
+        assert request.context_window_chars == request.config.budget.history_capacity_chars
         cut = int(request.forced_prefix_cut)
         return CompactionResult(
             summary="first completed tool round",
@@ -3008,8 +3037,12 @@ async def test_live_turn_recovery_uses_stable_consumer_input_budget(
     assert not any(isinstance(event, ErrorEvent) for event in events)
     assert len(provider.calls) == 5
     assert len(compact_requests) == 2
-    assert all(request.context_window_tokens == 2_750 for request in compact_requests)
-    assert all(request.context_window_chars == 11_000 for request in compact_requests)
+    assert all(request.config.budget is not None for request in compact_requests)
+    # Completed-prefix capacity also reserves the active prompt and raw tool
+    # tail. A protected tail already above the physical cap has no room for a
+    # checkpoint; the existing local request window remains the recovery path.
+    assert all(request.context_window_tokens < 2_750 for request in compact_requests)
+    assert all(request.context_window_chars < 11_000 for request in compact_requests)
     assert all(request.forced_prefix_cut is not None for request in compact_requests)
 
 
@@ -3104,6 +3137,7 @@ async def test_inline_overflow_uses_live_context_not_cumulative_provider_usage(
         config=AgentConfig(
             context_window_tokens=20_000,
             context_overflow_threshold=0.5,
+            compaction_trigger_ratio=0.5,
             max_iterations=10,
         ),
         tool_handler=_tool,
@@ -3148,6 +3182,7 @@ async def test_successful_large_request_surface_does_not_compact_durable_history
         config=AgentConfig(
             context_window_tokens=3000,
             context_overflow_threshold=0.5,
+            compaction_trigger_ratio=0.5,
             system_prompt="live request system context " + ("s" * 2000),
         ),
         tool_definitions=[large_tool],
@@ -3471,10 +3506,8 @@ async def test_narrow_route_uses_stable_window_when_stable_consumer_also_overflo
 
     assert len(compact_requests) == 1
     assert (compact_requests[0].context_window_tokens,
-            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
-        active_user_message="", active_user_in_history=False,
-        context_window_tokens=16_000, consumer_provider=stable,
-        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+            compact_requests[0].context_window_chars) == _inline_template_capacity(
+        agent, stable, window=16_000, output=512, char_cap=40_000,
     )
     assert compact_requests[0].context_window_tokens > 8_000
     assert compact_requests[0].context_window_chars > 4_000
@@ -3540,10 +3573,8 @@ async def test_narrow_route_cannot_force_stable_compaction_to_its_request_cap(
 
     assert len(compact_requests) == 1
     assert (compact_requests[0].context_window_tokens,
-            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
-        active_user_message="", active_user_in_history=False,
-        context_window_tokens=16_000, consumer_provider=stable,
-        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+            compact_requests[0].context_window_chars) == _inline_template_capacity(
+        agent, stable, window=16_000, output=512, char_cap=40_000,
     )
     assert compact_requests[0].context_window_tokens > 8_000
     assert compact_requests[0].context_window_chars > 4_000
@@ -3614,10 +3645,8 @@ async def test_mixed_pressure_does_not_install_candidate_that_stable_consumer_re
 
     assert len(compact_requests) == 1
     assert (compact_requests[0].context_window_tokens,
-            compact_requests[0].context_window_chars) == agent.preflight_history_capacity(
-        active_user_message="", active_user_in_history=False,
-        context_window_tokens=16_000, consumer_provider=stable,
-        consumer_max_output_tokens=512, consumer_provider_request_max_chars=40_000,
+            compact_requests[0].context_window_chars) == _inline_template_capacity(
+        agent, stable, window=16_000, output=512, char_cap=40_000,
     )
     assert compact_requests[0].context_window_tokens > 8_000
     assert compact_requests[0].context_window_chars > 4_000

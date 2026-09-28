@@ -19,6 +19,7 @@ from opensquilla.contracts.gateway_transport import (
     ANSWER_GENERATION_RESET_CAPABILITY,
     GATEWAY_CLIENT_MAX_MESSAGE_BYTES,
     GATEWAY_CLIENT_MAX_QUEUE,
+    STRUCTURED_USER_INPUT_CAPABILITY,
 )
 from opensquilla.session.terminal_reply import build_terminal_reply, sanitize_agent_error
 
@@ -366,8 +367,14 @@ class GatewayEventSubscription:
 class GatewayClient:
     """WebSocket client for connecting to OpenSquilla gateway daemon."""
 
-    def __init__(self, *, request_timeout_s: float | None = 30.0) -> None:
+    def __init__(
+        self,
+        *,
+        request_timeout_s: float | None = 30.0,
+        structured_user_input: bool = False,
+    ) -> None:
         self.request_timeout_s = request_timeout_s
+        self.structured_user_input = structured_user_input
         self._ws: Any = None
         self._recv_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._pending: dict[str, asyncio.Future[dict]] = {}
@@ -469,6 +476,8 @@ class GatewayClient:
             "role": "operator",
             "scopes": ["operator.admin"],
         }
+        if self.structured_user_input:
+            params["caps"].append(STRUCTURED_USER_INPUT_CAPABILITY)
         if token:
             params["auth"] = {"token": token}
         await self._ws.send(
@@ -896,6 +905,22 @@ class GatewayClient:
 
     async def abort_session(self, key: str) -> dict[str, Any]:
         return cast(dict[str, Any], await self._call("sessions.abort", {"key": key}))
+
+    async def submit_user_input(
+        self,
+        key: str,
+        *,
+        request_id: str,
+        fields: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Answer a live question on its existing task, never admit a new turn."""
+        return cast(
+            dict[str, Any],
+            await self._call(
+                "chat.clarify_submit",
+                {"sessionKey": key, "request_id": request_id, "fields": fields},
+            ),
+        )
 
     async def steer_session(
         self,

@@ -135,9 +135,18 @@ class GatewayTurnAdmissionAdapter:
             raise ValueError("initialRoutingMode requires explicit new_chat intent")
         return cast(InitialRoutingMode, mode)
 
-    def _webchat_command(self, params: dict[str, Any], key: str) -> AdmitTurn:
-        collaboration = self._initial_collaboration_mode(params)
-        routing = self._initial_routing_mode(params)
+    @classmethod
+    def decode_webchat_command(
+        cls,
+        params: dict[str, Any],
+        key: str,
+        *,
+        principal_role: str = "operator",
+        connection_id: str = "",
+    ) -> AdmitTurn:
+        """Decode original WebChat material without constructing an admission service."""
+        collaboration = cls._initial_collaboration_mode(params)
+        routing = cls._initial_routing_mode(params)
         incoming_source = params.get("_source")
         incoming_source = incoming_source if isinstance(incoming_source, dict) else {}
         elevated = incoming_source.get("elevated")
@@ -195,7 +204,7 @@ class GatewayTurnAdmissionAdapter:
                 caller_kind="web",
                 channel_kind="webchat",
                 channel_id=f"webchat:{key}",
-                sender_id=self._principal_role,
+                sender_id=principal_role,
                 source_kind="webui",
                 source_name="WebChat",
                 elevated=elevated if isinstance(elevated, str) else None,
@@ -213,8 +222,8 @@ class GatewayTurnAdmissionAdapter:
             decode_admit_turn(
                 projected,
                 surface="webchat",
-                principal_role=self._principal_role,
-                connection_id=self._connection_id,
+                principal_role=principal_role,
+                connection_id=connection_id,
                 fingerprint_params=fingerprint,
                 allow_receipt_replay=True,
             ),
@@ -233,7 +242,10 @@ class GatewayTurnAdmissionAdapter:
             raise ValueError("params.message is required")
         key = self._key(params, surface=surface)
         command = (
-            self._webchat_command(params, key)
+            self.decode_webchat_command(
+                params, key, principal_role=self._principal_role,
+                connection_id=self._connection_id,
+            )
             if surface == "webchat"
             else decode_admit_turn(
                 {**params, "key": key},

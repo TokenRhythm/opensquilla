@@ -27,6 +27,7 @@ export type AssistantActivityClusterState =
 export type AssistantActivityLifecycleCode =
   | 'chat.activity.lifecycle.working'
   | 'chat.activity.lifecycle.answering'
+  | 'chat.activity.lifecycle.preparingToolCall'
   | 'chat.activity.lifecycle.answerPrepared'
   | 'chat.activity.lifecycle.settled'
   | 'chat.activity.lifecycle.interrupted'
@@ -123,9 +124,10 @@ export type AssistantActivityStatusCode =
   | 'chat.activity.provider.fallback'
   | 'chat.compact.compacting'
   | 'chat.compact.compacted'
-  | 'chat.compact.summarySaved'
   | 'chat.compact.temporarilyReduced'
   | 'chat.compact.withinBudget'
+  | 'chat.compact.noSafeHistory'
+  | 'chat.compact.alreadyConcise'
   | 'chat.compact.skipped'
   | 'chat.compact.cancelled'
   | 'chat.compact.failed'
@@ -276,13 +278,11 @@ const COMMAND_TOOLS = new Set([
 ])
 const ARTIFACT_TOOLS = new Set(['publish_artifact'])
 const MEMORY_TOOLS = new Set(['memory_search', 'search_memory'])
-// These tools persist execution-control state that already has a dedicated
-// Plan/Goal surface. A successful call is not user work and must not inflate
-// the generic tool count. It is also answer-transparent: a terminal summary
-// can immediately precede the control call because that call ends the turn.
-//
-// `update_plan` remains only as a history-compatibility spelling. The runtime
-// no longer registers it.
+// Progress has a dedicated Plan/Goal surface and must not inflate the generic
+// tool count. Successful progress calls are answer-transparent, so an update
+// after a terminal summary does not hide that answer.
+// Keep the retired checkpoint spelling for historical PlanRun transcripts,
+// where a successful control call could end the turn after the final summary.
 const ANSWER_TRANSPARENT_CONTROL_TOOLS = new Set([
   'plan_run_checkpoint',
   'update_plan',
@@ -863,6 +863,9 @@ function statusLabelFor(
   }
   const action = String(entry.action || '').trim()
   const normalized = action.toLowerCase()
+  if (normalized === 'preparing tool call') {
+    return codeDescriptor('chat.activity.lifecycle.preparingToolCall')
+  }
   if (normalized.startsWith('provider:')) {
     const [, phase = '', first = '0', second = '0'] = normalized.split(':')
     if (phase === 'requesting') {

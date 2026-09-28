@@ -22,9 +22,9 @@ const CHECK_INTERVAL_MS = 1_000
 // re-check can wait for the 1s ticker, so evaluations this close are skipped.
 const EVALUATE_MIN_INTERVAL_MS = 500
 
-// Events that prove the provider/agent is actually making progress. Everything
-// outside this set (run_heartbeat, state_change, transport ticks, …) is
-// liveness-only and must NOT reset the content-silence clock.
+// Events that prove the provider/agent is actually making progress. The one
+// additional progress pulse is llm_tool_arguments, handled explicitly below.
+// Periodic heartbeats and transport ticks never reset content silence.
 const CONTENT_EVENTS = new Set<ConversationSemanticEventKind>([
   'text-delta',
   'thinking-delta',
@@ -245,6 +245,12 @@ export function useChatStallWatchdog(options: UseChatStallWatchdogOptions) {
     }
 
     if (eventKind === 'run-heartbeat') {
+      // Unlike periodic heartbeats, this pulse requires new model-generated
+      // tool argument text. The tool itself is still awaiting commit.
+      if (record.phase === 'llm_tool_arguments') {
+        noteContent()
+        return
+      }
       const phase = ensemblePhase(record.phase)
       if (phase) setEnsemblePhase(phase)
       evaluate()

@@ -9,18 +9,24 @@ import {
   HttpTransportError,
 } from './privateHttpTransport'
 import {
+  assertBinaryReadActive,
+  assertBinarySize,
+  BinaryBodyTooLargeError,
+  readBinaryBlob,
+  type ReadableBinaryBody,
+} from './boundedBinaryBody'
+import {
   artifactHttpAttachmentUrl,
   bindAttachmentBinaryRequest,
   runtimeAttachmentHttpBaseOrigin,
   uploadArtifactAttachment,
 } from './privateArtifactHttpTransport'
 
-interface AttachmentBinaryResponse {
-  readonly metadata: {
+interface AttachmentBinaryResponse extends ReadableBinaryBody {
+  readonly metadata: ReadableBinaryBody['metadata'] & {
     readonly filename?: string
     readonly status: number
   }
-  blob(): Promise<Blob>
 }
 
 interface AttachmentHttpTransport {
@@ -39,6 +45,7 @@ interface AttachmentDownloadOptions {
   baseOrigin?: string
   sessionKey?: string
   signal?: AbortSignal
+  maxBytes?: number
 }
 
 type AttachmentDownloadResult =
@@ -53,9 +60,10 @@ type AttachmentDownloadResult =
   | {
       ok: false
       status: number
-      source: 'none' | 'inline' | 'staged'
+      source: 'none' | 'local-file' | 'inline' | 'staged'
       url: string
       message: string
+      errorCode?: 'too_large'
     }
 
 export function attachmentAccessUrl(raw: unknown, baseOrigin: string): string {
@@ -79,17 +87,26 @@ function isAbortError(error: unknown): boolean {
     : !!error && typeof error === 'object' && 'name' in error && error.name === 'AbortError'
 }
 
-function base64Bytes(value: string): Uint8Array | null {
+function base64Bytes(value: string, maxBytes?: number): Uint8Array | null {
   const compact = value.replace(/\s+/g, '')
   if (!compact || compact.length % 4 === 1 || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact)) return null
+  const padding = compact.endsWith('==') ? 2 : compact.endsWith('=') ? 1 : 0
+  assertBinarySize(Math.floor(compact.length * 3 / 4) - padding, maxBytes)
+  let decoded: string
   try {
-    const decoded = atob(compact)
-    const bytes = new Uint8Array(decoded.length)
-    for (let i = 0; i < decoded.length; i += 1) bytes[i] = decoded.charCodeAt(i)
-    return bytes
+    decoded = atob(compact)
   } catch {
     return null
   }
+  assertBinarySize(decoded.length, maxBytes)
+  const bytes = new Uint8Array(decoded.length)
+  for (let i = 0; i < decoded.length; i += 1) bytes[i] = decoded.charCodeAt(i)
+  return bytes
+}
+
+function attachmentTooLarge(source: 'local-file' | 'inline' | 'staged', url = ''): AttachmentDownloadResult {
+  return { ok: false, status: 0, source, url, errorCode: 'too_large',
+    message: 'Attachment exceeds the requested byte limit.' }
 }
 
 export async function fetchDisplayAttachmentBlob(
@@ -97,8 +114,14 @@ export async function fetchDisplayAttachmentBlob(
   attachment: DisplayAttachment,
   options: AttachmentDownloadOptions = {},
 ): Promise<AttachmentDownloadResult> {
+  assertBinaryReadActive(options.signal)
   const filename = safeFilename(attachment.name)
   if (attachment.localFile instanceof Blob) {
+    try { assertBinarySize(attachment.localFile.size, options.maxBytes) }
+    catch (error) {
+      if (error instanceof BinaryBodyTooLargeError) return attachmentTooLarge('local-file')
+      throw error
+    }
     return {
       ok: true,
       status: 200,
@@ -113,7 +136,12 @@ export async function fetchDisplayAttachmentBlob(
   const imageData = dataUrl && isImageAttachmentMime(dataUrl[1]) ? dataUrl[2] : undefined
   const encoded = attachment.downloadData || attachment.data || imageData
   if (encoded) {
-    const bytes = base64Bytes(encoded)
+    let bytes: Uint8Array | null
+    try { bytes = base64Bytes(encoded, options.maxBytes) }
+    catch (error) {
+      if (error instanceof BinaryBodyTooLargeError) return attachmentTooLarge('inline')
+      throw error
+    }
     if (!bytes) {
       return { ok: false, status: 0, source: 'inline', url: '', message: 'Attachment data is invalid.' }
     }
@@ -155,10 +183,11 @@ export async function fetchDisplayAttachmentBlob(
       status: response.metadata.status,
       source: 'staged',
       url,
-      blob: await response.blob(),
+      blob: await readBinaryBlob(response, options),
       filename: safeFilename(response.metadata.filename || filename),
     }
   } catch (error) {
+    if (error instanceof BinaryBodyTooLargeError) return attachmentTooLarge('staged', url)
     if (isAbortError(error)) {
       if (error instanceof HttpTransportError) {
         throw new DOMException('Aborted', 'AbortError')
@@ -205,6 +234,7 @@ function runtimeOptions(request: ArtifactAccessRequest = {}): AttachmentDownload
     baseOrigin: runtimeAttachmentHttpBaseOrigin(),
     sessionKey: request.sessionKey,
     signal: request.signal,
+    maxBytes: request.maxBytes,
   }
 }
 

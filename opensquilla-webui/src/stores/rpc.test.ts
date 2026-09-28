@@ -621,9 +621,14 @@ describe('rpc link-token bootstrap', () => {
     } as unknown as OpenSquillaDesktopApi
 
     const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
     store.init()
     await vi.waitFor(() => expect(window.opensquillaDesktop?.getGatewayConnection).toHaveBeenCalled())
     expect(connectCalls).toEqual([])
+    expect(store.state).toBe('disconnected')
+    expect(access.availability).toBe('preparing')
+    expect(access.isRuntimeStarting).toBe(true)
+    expect(access.isAvailable).toBe(false)
 
     publishRef.current?.({
       schemaVersion: 1,
@@ -641,6 +646,7 @@ describe('rpc link-token bootstrap', () => {
       token: 'desktop-instance-token',
     }])
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('desktop-instance-token')
+    expect(access.isRuntimeStarting).toBe(false)
     expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
 
     publishRef.current?.({
@@ -656,6 +662,9 @@ describe('rpc link-token bootstrap', () => {
     })
     expect(clients[0].disconnect).toHaveBeenCalledOnce()
     expect(store.error).toBe('runtime stopped')
+    expect(store.state).toBe('disconnected')
+    expect(access.availability).toBe('unavailable')
+    expect(access.isRuntimeStarting).toBe(false)
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
   })
   it('applies same-address token rotation and never revives an old token for an empty descriptor', async () => {
@@ -683,6 +692,67 @@ describe('rpc link-token bootstrap', () => {
     store.disconnect()
     publish({ ...base, revision: 5, authToken: 'token-c' })
     expect(connectCalls).toHaveLength(3)
+    store.$dispose()
+  })
+
+  it('ends runtime preparation on stop, failure, or explicit disconnect', async () => {
+    let publish!: (payload: unknown) => void
+    const starting = {
+      schemaVersion: 1, revision: 1, status: 'starting', instanceId: null,
+      profileFingerprint: 'profile-a', httpUrl: null, wsUrl: null, error: null,
+    }
+    window.opensquillaDesktop = {
+      getGatewayConnection: vi.fn(async () => starting),
+      onGatewayConnectionChanged: vi.fn(callback => { publish = callback; return () => {} }),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    expect(access.availability).toBe('preparing')
+    await vi.waitFor(() => expect(window.opensquillaDesktop?.getGatewayConnection).toHaveBeenCalled())
+    let revision = 1
+    for (const status of ['stopped', 'error']) {
+      publish({ ...starting, revision: ++revision, status })
+      expect(access.availability).toBe('unavailable')
+      expect(access.isRuntimeStarting).toBe(false)
+      publish({ ...starting, revision: ++revision })
+      expect(access.isRuntimeStarting).toBe(true)
+    }
+    store.disconnect()
+    expect(access.availability).toBe('unavailable')
+    expect(access.isRuntimeStarting).toBe(false)
+    publish({ ...starting, revision: ++revision })
+    expect(access.isRuntimeStarting).toBe(false)
+    expect(connectCalls).toHaveLength(0)
+    store.$dispose()
+  })
+
+  it('refreshes preparation when reconnecting manually during startup or after failure', async () => {
+    const payload = {
+      schemaVersion: 1, revision: 1, status: 'starting', instanceId: null,
+      profileFingerprint: 'profile-a', httpUrl: null, wsUrl: null, error: null,
+    }
+    window.opensquillaDesktop = {
+      getGatewayConnection: vi.fn(async () => ({ ...payload })),
+      onGatewayConnectionChanged: vi.fn(() => () => {}),
+    } as unknown as OpenSquillaDesktopApi
+    const store = useRpcStore()
+    const access = createV4GatewayAccess(store)
+    store.init()
+    await store.connect('ws://desktop/ws')
+    store.disconnect()
+    expect(access.isRuntimeStarting).toBe(false)
+    await store.connect('ws://desktop/ws')
+    expect(access.isRuntimeStarting).toBe(true)
+    expect(access.availability).toBe('preparing')
+    for (const status of ['stopped', 'starting', 'error']) {
+      payload.status = status
+      payload.revision++
+      await store.connect('ws://desktop/ws')
+      expect(access.isRuntimeStarting).toBe(status === 'starting')
+    }
+    expect(connectCalls).toHaveLength(0)
+    expect(access.availability).toBe('unavailable')
     store.$dispose()
   })
 

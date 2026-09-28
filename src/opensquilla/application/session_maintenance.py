@@ -161,8 +161,6 @@ class SessionCompactionNotFoundError(LookupError):
 class SessionCompactionPlanningPort(Protocol):
     def timing(self) -> SessionCompactionTiming: ...
 
-    def default_context_window_tokens(self) -> int: ...
-
     async def load_session(self, session_key: str) -> SessionCompactionSession | None: ...
 
     def is_ephemeral_session_key(self, session_key: str) -> bool: ...
@@ -170,13 +168,13 @@ class SessionCompactionPlanningPort(Protocol):
     def resolve_context_window_tokens(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
     ) -> int: ...
 
     def build_plan(
         self,
         session: SessionCompactionSession | None,
-        requested_tokens: int,
+        requested_tokens: int | None,
         compaction_id: str,
         operation_deadline: float,
     ) -> SessionCompactionPlan: ...
@@ -268,11 +266,9 @@ class SessionMaintenance:
         if command.instructions is not None and not isinstance(command.instructions, str):
             raise ValueError("instructions must be a string when provided")
         command = replace(command, session_key=key)
-        requested_tokens = (
-            command.context_window_tokens
-            if command.context_window_tokens is not None
-            else self._planning.default_context_window_tokens()
-        )
+        # ``None`` means use the exact physical consumer deployment. An
+        # explicit contextWindowTokens is only a narrower history target.
+        requested_tokens = command.context_window_tokens
         initial_session = await self._planning.load_session(key)
         initial_context_window_tokens = self._planning.resolve_context_window_tokens(
             initial_session,
@@ -302,7 +298,7 @@ class _ManualCompactionOperation:
         self,
         *,
         command: CompactSession,
-        requested_tokens: int,
+        requested_tokens: int | None,
         initial_context_window_tokens: int,
         timing: SessionCompactionTiming,
         planning: SessionCompactionPlanningPort,
@@ -489,19 +485,34 @@ class _ManualCompactionOperation:
         status = "completed" if outcome.applied else compaction_failure_status(
             outcome.skip_reason or "empty_summary"
         )
+        # A stale preimage is a safe refusal to commit. Keep the manual wire
+        # lifecycle bounded to completed/skipped/failed and retain its cause.
+        if status == "stale":
+            status = "skipped"
         reason = None if outcome.applied else (outcome.skip_reason or "empty_summary")
-        await self._publish(
-            self._event(
-                status,
-                milestone=(
-                    SessionCompactionMilestone.PERSISTED
-                    if outcome.applied
-                    else SessionCompactionMilestone.TRIGGERED
-                ),
-                reason=reason,
-                result=outcome,
-            )
+        terminal = self._event(
+            status,
+            milestone=(
+                SessionCompactionMilestone.PERSISTED
+                if outcome.applied
+                else SessionCompactionMilestone.TRIGGERED
+            ),
+            reason=reason,
+            result=outcome,
         )
+        try:
+            await self._publish(terminal)
+        except (asyncio.CancelledError, Exception) as exc:
+            # Commit already happened. Cancellation or an epoch-resolution
+            # failure while preparing the terminal must not report it failed.
+            if outcome.applied and not self._terminal_emitted:
+                await self._publish(replace(
+                    terminal,
+                    reason="post_commit_publication_interrupted",
+                    cancellation_reconciled=isinstance(exc, asyncio.CancelledError),
+                    observation_error=None if isinstance(exc, asyncio.CancelledError) else str(exc),
+                ))
+            raise
         return SessionCompactionResult(
             session_key=self._command.session_key,
             compaction_id=self._compaction_id,
@@ -554,7 +565,7 @@ class _ManualCompactionOperation:
             if self._started_emitted and not self._terminal_emitted:
                 await self._publish(
                     self._event(
-                        "cancelled",
+                        "failed",
                         reason="cancelled",
                         message="Compaction was cancelled.",
                     )
@@ -564,7 +575,7 @@ class _ManualCompactionOperation:
             if self._started_emitted and not self._terminal_emitted:
                 await self._publish(
                     self._event(
-                        "timed_out",
+                        "failed",
                         reason="compaction_deadline_exceeded",
                         message=str(exc),
                         stage=exc.phase,
@@ -611,7 +622,7 @@ class _ManualCompactionOperation:
                 if self._started_emitted and not self._terminal_emitted:
                     await self._publish(
                         self._event(
-                            "cancelled",
+                            "failed",
                             reason="cancelled",
                             message="Compaction was cancelled.",
                         )

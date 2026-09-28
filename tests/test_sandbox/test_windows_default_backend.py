@@ -80,6 +80,7 @@ def _request(tmp_path: Path) -> SandboxRequest:
     )
 
 
+
 @pytest.mark.asyncio
 async def test_windows_guest_process_is_rejected_before_support_or_acl_work(
     tmp_path: Path,
@@ -1286,7 +1287,7 @@ async def test_backend_fails_closed_when_setup_is_not_ready(
 
     monkeypatch.setattr(mod, "_support_ready", lambda: False)
 
-    with pytest.raises(SandboxBackendError, match="windows_default backend unavailable"):
+    with pytest.raises(SandboxBackendError, match="sandbox_setup_required"):
         await WindowsDefaultBackend().run(_request(tmp_path))
 
 
@@ -1583,6 +1584,71 @@ async def test_backend_raises_terminal_error_for_authenticated_helper_failure(
     monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
 
     with pytest.raises(SandboxBackendError, match="execution lease is busy"):
+        await WindowsDefaultBackend().run(_request(tmp_path))
+
+
+@pytest.mark.asyncio
+async def test_invalid_helper_cwd_is_classified_as_launch_failure_without_host_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 1
+
+        async def communicate(self):
+            marker = (
+                "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+                '{"nonce":"nonce-267","message":"OSError: [Errno 267] '
+                'CreateProcessWithLogonW failed: 目录名称无效。"}\n'
+            )
+            return b"", marker.encode()
+
+    launches = 0
+
+    async def fake_exec(*_argv, **_kwargs):
+        nonlocal launches
+        launches += 1
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-267", raising=False)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxBackendError, match=r"^helper_launch_failed:.*Errno 267"):
+        await WindowsDefaultBackend().run(_request(tmp_path))
+    assert launches == 1
+
+
+@pytest.mark.asyncio
+async def test_helper_root_error_keeps_its_stable_code(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.sandbox.backend import windows_default as mod
+    from opensquilla.sandbox.backend.windows_default import WindowsDefaultBackend
+
+    class _Proc:
+        returncode = 1
+
+        async def communicate(self):
+            marker = (
+                "OPENSQUILLA_WINDOWS_DEFAULT_HELPER_ERROR "
+                '{"nonce":"nonce-root","message":"RuntimeError: '
+                'helper_root_unavailable: deleted runtime"}\n'
+            )
+            return b"", marker.encode()
+
+    async def fake_exec(*_argv, **_kwargs):
+        return _Proc()
+
+    monkeypatch.setattr(mod, "_support_ready", lambda: True)
+    monkeypatch.setattr(mod, "_new_helper_nonce", lambda: "nonce-root", raising=False)
+    monkeypatch.setattr(mod, "create_owned_subprocess_exec", fake_exec)
+
+    with pytest.raises(SandboxBackendError, match=r"^helper_root_unavailable:"):
         await WindowsDefaultBackend().run(_request(tmp_path))
 
 

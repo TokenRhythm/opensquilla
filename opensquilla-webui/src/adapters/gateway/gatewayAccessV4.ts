@@ -2,6 +2,8 @@ import type {
   GatewayAccess,
   GatewayAvailability,
   GatewayConnectionSettings,
+  GatewayConnectionHealth,
+  GatewayConnectionPhase,
   GatewayRunModePolicy,
 } from '@/modules/gatewayAccess'
 import { SESSIONS_MESSAGES_HYDRATE_METHOD } from '@/contracts/generated/v4/sessionsMessagesHydrate'
@@ -14,6 +16,11 @@ const WS_URL_KEY = 'opensquilla.wsUrl'
 
 interface GatewayAccessSource {
   readonly state: 'disconnected' | 'connecting' | 'connected'
+  readonly health: GatewayConnectionHealth
+  readonly phase?: GatewayConnectionPhase
+  readonly isResuming?: boolean
+  readonly resumeSource?: import('@/platform/types').DesktopResumeSource | null
+  readonly runtimeStarting?: boolean
   readonly error: string | null
   readonly isLocalOwner: boolean
   readonly canManageProjectWorkspaces: boolean
@@ -140,7 +147,23 @@ function streamIdleTimeoutMs(policy: GatewayAccessSource['policy']): number | nu
 export function createV4GatewayAccess(source: GatewayAccessSource): GatewayAccess {
   return {
     get availability() {
+      if (source.runtimeStarting && source.state !== 'connected') return 'preparing'
       return availability(source.state)
+    },
+    get connectionHealth() {
+      return source.isResuming ? 'suspect' : source.health
+    },
+    get connectionPhase() {
+      return source.phase || (source.isResuming ? 'checking' : source.health)
+    },
+    get isResuming() {
+      return source.isResuming === true
+    },
+    get resumeSource() {
+      return source.resumeSource ?? null
+    },
+    get isRuntimeStarting() {
+      return source.runtimeStarting === true
     },
     get connectionError() {
       return source.error

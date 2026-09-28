@@ -26,6 +26,40 @@ trailers.
 | [@ab2ence](https://github.com/ab2ence) | macOS Seatbelt backend execution, denial escalation, and release-candidate type-check cleanup. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`fb1e6225`](https://github.com/opensquilla/opensquilla/pull/46/commits/fb1e6225e4db9cb0801ea347a89c2066e3e0601b), [`f73ac3eb`](https://github.com/opensquilla/opensquilla/pull/46/commits/f73ac3eb0044c64c79cfd18f9ec03d1bba9128ff), [`cf3b046f`](https://github.com/opensquilla/opensquilla/pull/46/commits/cf3b046f42a42efc951320b0af80e9d066dcf7d2) |
 | [@kimjune01](https://github.com/kimjune01) | Provider stream timeout cleanup fix that prevents double-closing provider streams. | [#46](https://github.com/opensquilla/opensquilla/pull/46), [`06e3126d`](https://github.com/opensquilla/opensquilla/pull/46/commits/06e3126d8ebda4ad4cf349ca7be0d0804e0c008d) |
 
+## OpenSquilla 0.5.5
+
+The 0.5.5 release records new human contributor work after the 0.5.4 stable
+release. Evidence includes original contributions retained in integration
+pull requests.
+
+| Contributor | 0.5.5 contribution | Evidence |
+| --- | --- | --- |
+| [@Elioooon](https://github.com/Elioooon) | Gateway TCP port validation. | [#1540](https://github.com/TokenRhythm/opensquilla/pull/1540) |
+| [@GuddXzy](https://github.com/GuddXzy) | Preserving skipped and failed replay states. | [#1562](https://github.com/TokenRhythm/opensquilla/pull/1562) |
+| [@Kiuyor](https://github.com/Kiuyor) | Skill marketplace filtering stability. | [#1022](https://github.com/TokenRhythm/opensquilla/pull/1022) |
+| [@Kuang-xianxin](https://github.com/Kuang-xianxin) | Protecting scheduled jobs from concurrent edits. | [#1576](https://github.com/TokenRhythm/opensquilla/pull/1576), [#1752](https://github.com/TokenRhythm/opensquilla/pull/1752) |
+| [@LHMQ878](https://github.com/LHMQ878) | Preserving literal Python code in Windows shell execution. | [#1056](https://github.com/TokenRhythm/opensquilla/pull/1056) |
+| [@Liu-RK](https://github.com/Liu-RK) | Progressive tool discovery, sandbox startup, compaction, and secret redaction. | [#1432](https://github.com/TokenRhythm/opensquilla/pull/1432), [#1450](https://github.com/TokenRhythm/opensquilla/pull/1450), [#1527](https://github.com/TokenRhythm/opensquilla/pull/1527), [#1575](https://github.com/TokenRhythm/opensquilla/pull/1575), [#1631](https://github.com/TokenRhythm/opensquilla/pull/1631), [#1671](https://github.com/TokenRhythm/opensquilla/pull/1671) |
+| [@LiuXinchen1997](https://github.com/LiuXinchen1997) | The C5 multi-model fusion configuration and evaluation. | [#1709](https://github.com/TokenRhythm/opensquilla/pull/1709) |
+| [@QinLuza](https://github.com/QinLuza) | Provider-aware automatic session naming. | [#1137](https://github.com/TokenRhythm/opensquilla/pull/1137) |
+| [@Ramnath0521](https://github.com/Ramnath0521) | Matching session channel filters to their displayed source. | [#1600](https://github.com/TokenRhythm/opensquilla/pull/1600) |
+| [@RickyYii](https://github.com/RickyYii) | CLI profile selection, configuration handling, and message-edit cancellation. | [#1410](https://github.com/TokenRhythm/opensquilla/pull/1410), [#1417](https://github.com/TokenRhythm/opensquilla/pull/1417), [#1418](https://github.com/TokenRhythm/opensquilla/pull/1418), [#1422](https://github.com/TokenRhythm/opensquilla/pull/1422) |
+| [@ShaunMX](https://github.com/ShaunMX) | Provider attribution, Router configuration, and resilient patch placement. | [#1356](https://github.com/TokenRhythm/opensquilla/pull/1356), [#1357](https://github.com/TokenRhythm/opensquilla/pull/1357), [#1442](https://github.com/TokenRhythm/opensquilla/pull/1442), [#1532](https://github.com/TokenRhythm/opensquilla/pull/1532) |
+| [@YIKUAIBANZI](https://github.com/YIKUAIBANZI) | Isolating compaction, preserving trusted proxy settings, and CLI validation. | [#1565](https://github.com/TokenRhythm/opensquilla/pull/1565), [#1679](https://github.com/TokenRhythm/opensquilla/pull/1679), [#1715](https://github.com/TokenRhythm/opensquilla/pull/1715) |
+| [@freeaccount-create](https://github.com/freeaccount-create) | Safe Router recovery when removing the active provider. | [#1411](https://github.com/TokenRhythm/opensquilla/pull/1411) |
+| [@kingxiao630](https://github.com/kingxiao630) | Completed Goal cleanup and model-capacity configuration. | [#1554](https://github.com/TokenRhythm/opensquilla/pull/1554), [#1682](https://github.com/TokenRhythm/opensquilla/pull/1682) |
+| [@lifelmy](https://github.com/lifelmy) | Rejecting expired one-shot schedules. | [#1526](https://github.com/TokenRhythm/opensquilla/pull/1526), [#1684](https://github.com/TokenRhythm/opensquilla/pull/1684) |
+| [@lihongguang-0014](https://github.com/lihongguang-0014) | Chat and image continuity, provider recovery, Skills, Desktop reliability, and safer diagnostics. | [#1427](https://github.com/TokenRhythm/opensquilla/pull/1427), [#1430](https://github.com/TokenRhythm/opensquilla/pull/1430), [#1453](https://github.com/TokenRhythm/opensquilla/pull/1453), [#1457](https://github.com/TokenRhythm/opensquilla/pull/1457), [#1517](https://github.com/TokenRhythm/opensquilla/pull/1517), [#1577](https://github.com/TokenRhythm/opensquilla/pull/1577), [#1632](https://github.com/TokenRhythm/opensquilla/pull/1632), [#1652](https://github.com/TokenRhythm/opensquilla/pull/1652), [#1711](https://github.com/TokenRhythm/opensquilla/pull/1711), [#1712](https://github.com/TokenRhythm/opensquilla/pull/1712), [#1754](https://github.com/TokenRhythm/opensquilla/pull/1754) |
+| [@lihongguang0014](https://github.com/lihongguang0014) | Safe Gateway abort handling during CLI cancellation. | [#1506](https://github.com/TokenRhythm/opensquilla/pull/1506) |
+| [@mengchao99](https://github.com/mengchao99) | Large MCP stdio response support. | [#953](https://github.com/TokenRhythm/opensquilla/pull/953) |
+| [@mikemikimike](https://github.com/mikemikimike) | Isolated Cron session protection and router-card replay recovery. | [#1547](https://github.com/TokenRhythm/opensquilla/pull/1547), [#1598](https://github.com/TokenRhythm/opensquilla/pull/1598); [`ef43e259`](https://github.com/TokenRhythm/opensquilla/commit/ef43e2595a3a4a628d4516cc08468387c46bfbeb) |
+| [@openvictory](https://github.com/openvictory) | Clearer release-note navigation and technical report discovery. | [#1458](https://github.com/TokenRhythm/opensquilla/pull/1458), [#1459](https://github.com/TokenRhythm/opensquilla/pull/1459) |
+| [@ptterjgf](https://github.com/ptterjgf) | Bounded CLI chat response waits and send recovery. | [#1692](https://github.com/TokenRhythm/opensquilla/pull/1692); [`bd9e3ad8`](https://github.com/TokenRhythm/opensquilla/commit/bd9e3ad82a848aa0713b5dd5f89d13f7e4de2ad8) |
+| [@qiaoye2024](https://github.com/qiaoye2024) | Using the final request size during Ensemble recovery. | [#793](https://github.com/TokenRhythm/opensquilla/pull/793) |
+| [@superbigcup325](https://github.com/superbigcup325) | Assistant sharing and channel-catalog localization. | [#1720](https://github.com/TokenRhythm/opensquilla/pull/1720) |
+| [@wanglei1346](https://github.com/wanglei1346) | Gateway handshake and session-directory validation. | [#1585](https://github.com/TokenRhythm/opensquilla/pull/1585) |
+| [@xiaohuzai](https://github.com/xiaohuzai) | Turn cancellation cleanup and explicitly allowed browser-extension access. | [#1548](https://github.com/TokenRhythm/opensquilla/pull/1548), [#1570](https://github.com/TokenRhythm/opensquilla/pull/1570) |
+
 ## OpenSquilla 0.5.4
 
 The 0.5.4 release records new human contributor work after the 0.5.3 stable

@@ -169,6 +169,43 @@ def _windows_sddl_is_private(
     return actual_principals == expected_principals
 
 
+def _windows_sddl_is_private_directory_for_reuse(
+    sddl: str,
+    *,
+    user_sid: str,
+    canonicalize_sid: Callable[[str], str] | None = None,
+) -> bool:
+    """Return whether a directory DACL is safe to reuse without rewriting.
+
+    The general private-DACL predicate intentionally accepts equivalent ACE
+    shapes produced by Windows (including inherited ACE flags). The startup
+    fast path needs a narrower contract: only the exact protected directory
+    shape we publish may skip the write. Object/container inheritance flags
+    must be exactly ``OICI`` or its canonicalized ``CIOI`` form, and the
+    object/inherited-object GUID fields must be empty.
+    """
+
+    if not _windows_sddl_is_private(
+        sddl,
+        user_sid=user_sid,
+        directory=True,
+        require_protected=True,
+        canonicalize_sid=canonicalize_sid,
+    ):
+        return False
+    dacl_start = sddl.find("D:")
+    first_ace = sddl.find("(", dacl_start)
+    if dacl_start < 0 or first_ace < 0:
+        return False
+    for entry in _WINDOWS_ACE_RE.findall(sddl[first_ace:]):
+        fields = entry.split(";")
+        if len(fields) != 6 or fields[1] not in {"OICI", "CIOI"}:
+            return False
+        if fields[3] or fields[4]:
+            return False
+    return True
+
+
 class _CtypesWindowsPrivateAcl:
     """Thin handle-bound Win32 ACL adapter; injectable in platform-neutral tests."""
 
@@ -555,8 +592,14 @@ def apply_windows_private_dacl(
     expected_device: int,
     expected_inode: int,
     native: Any | None = None,
+    skip_if_private_directory: bool = False,
 ) -> None:
-    """Install and verify a protected current-user-and-SYSTEM DACL."""
+    """Install and verify a protected current-user-and-SYSTEM DACL.
+
+    When ``skip_if_private_directory`` is enabled for a directory, an exact
+    private DACL may be reused after it is read through the bound handle. A
+    preflight read error falls back to the normal set-and-verify path.
+    """
 
     api = native or _CtypesWindowsPrivateAcl()
     user_sid = api.current_user_sid()
@@ -567,6 +610,21 @@ def apply_windows_private_dacl(
         expected_device=expected_device,
         expected_inode=expected_inode,
     ) as handle:
+        if skip_if_private_directory and directory:
+            try:
+                actual = api.read_dacl_sddl(handle)
+            except OSError:
+                # Preserve the original set-and-verify behavior when a
+                # preflight read is temporarily unavailable. The bound handle
+                # and identity checks above still fail closed.
+                pass
+            else:
+                if _windows_sddl_is_private_directory_for_reuse(
+                    actual,
+                    user_sid=user_sid,
+                    canonicalize_sid=getattr(api, "canonical_sid", None),
+                ):
+                    return
         api.set_protected_dacl(handle, sddl)
         actual = api.read_dacl_sddl(handle)
         if not _windows_sddl_is_private(

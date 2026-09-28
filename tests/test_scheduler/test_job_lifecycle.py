@@ -4,13 +4,18 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import pytest
 
+from opensquilla.scheduler import jobs
 from opensquilla.scheduler.engine import SchedulerEngine
+from opensquilla.scheduler.jobs import apply_reserved_result
 from opensquilla.scheduler.persistence import JobStore
 from opensquilla.scheduler.types import (
     CronJob,
+    JobExecution,
+    JobReservation,
     JobStatus,
     ManualRunStatus,
     ScheduleKind,
@@ -29,6 +34,106 @@ def _due_job() -> CronJob:
         next_run_at=datetime.now(UTC) - timedelta(seconds=1),
         status=JobStatus.PENDING,
     )
+
+
+@pytest.mark.parametrize(
+    "outcome", ["success", "missing_handler", "delete_after_run", "schedule_error"],
+)
+@pytest.mark.parametrize("edit", ["delete", "new_owner", "pause", "reschedule"])
+async def test_finalization_preserves_concurrent_job_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str, edit: str,
+) -> None:
+    db_path = str(tmp_path / "scheduler.db")
+    async with JobStore(db_path) as store, JobStore(db_path) as writer:
+        job = _due_job()
+        if outcome == "delete_after_run":
+            job.schedule_kind = ScheduleKind.AT
+            job.delete_after_run = True
+        elif outcome == "schedule_error":
+            job.cron_expr = "invalid"
+        notifications: list[str] = []
+        monkeypatch.setattr(
+            jobs, "_schedule_failure_notifier", lambda _job, error: notifications.append(error),
+        )
+        await store.save(job)
+        reservation = await store.reserve_manual_job(job.id, datetime.now(UTC))
+        assert isinstance(reservation, JobReservation)
+
+        await writer._db().execute("BEGIN IMMEDIATE")
+        write_started = asyncio.Event()
+        execute = store._db().execute
+
+        def observe_write(sql, params=()):
+            if sql.lstrip().startswith(("INSERT", "UPDATE", "DELETE")) and "scheduler_jobs" in sql:
+                write_started.set()
+            return execute(sql, params)
+
+        monkeypatch.setattr(store._db(), "execute", observe_write)
+        if outcome == "missing_handler":
+            operation = store.finalize_reserved_missing_handler(
+                job.id, reservation.token, "missing",
+            )
+        else:
+            operation = apply_reserved_result(
+                job.id, reservation.token, JobExecution(job_id=job.id, success=True), store,
+            )
+        completion = asyncio.create_task(operation)
+        try:
+            async with asyncio.timeout(5):
+                await write_started.wait()
+            changed = await writer.get(job.id)
+            assert changed is not None
+            if edit == "delete":
+                await writer.delete(job.id)
+            else:
+                changed.name = "updated by user"
+                changed.payload["task"] = "keep the new task"
+                changed.updated_at += timedelta(seconds=1)
+                if edit == "new_owner":
+                    changed.reservation_token = "replacement-owner"
+                elif edit == "pause":
+                    changed.status = JobStatus.PAUSED
+                    changed.enabled = False
+                else:
+                    changed.schedule_kind = ScheduleKind.EVERY
+                    changed.cron_expr = "3600"
+                    changed.delete_after_run = False
+                await writer.save(changed)
+
+            applied = await asyncio.wait_for(completion, timeout=5)
+            assert notifications == [], "a superseded schedule must not emit a failure notification"
+            current = await writer.get(job.id)
+            if edit == "delete":
+                assert current is None, "completion must not recreate a deleted job"
+                assert applied is False
+                return
+            assert current is not None, "completion must not delete a rescheduled job"
+            assert current.name == changed.name
+            assert current.payload == changed.payload
+            if edit == "new_owner":
+                assert applied is False
+                assert current.reservation_token == "replacement-owner"
+                assert current.run_count == 0
+                assert current.error_count == 0
+            else:
+                assert applied is True
+                assert current.reservation_token == ""
+                if edit == "pause":
+                    assert current.status == JobStatus.PAUSED
+                    assert current.enabled is False
+                    assert current.run_count == 0
+                    assert current.error_count == 0
+                elif outcome == "missing_handler":
+                    assert current.status == JobStatus.FAILED
+                    assert current.error_count == 1
+                else:
+                    assert current.status == JobStatus.PENDING
+                    assert current.run_count == 1
+                    assert current.next_run_at is not None
+                    assert current.next_run_at > datetime.now(UTC) + timedelta(minutes=59)
+        finally:
+            await writer._db().rollback()
+            await asyncio.gather(completion, return_exceptions=True)
 
 
 @pytest.mark.asyncio

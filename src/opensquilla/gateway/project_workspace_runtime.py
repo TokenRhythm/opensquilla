@@ -82,6 +82,12 @@ def apply_run_context_route_metadata(
         else []
     )
     route_envelope.metadata["sandbox_run_context"] = run_context_payload
+    # This fact comes only from resolving the durable session binding. Never
+    # serialize it with the RunContext or accept it from channel metadata.
+    route_envelope.runtime_services["execution_workspace_binding_kind"] = (
+        run_context.workspace_binding_kind
+    )
+    route_envelope.runtime_services["execution_workspace_binding_root"] = run_context.workspace
     object.__setattr__(route_envelope, "sandbox_run_context_fresh", True)
     if run_context.run_mode.value == "full" and principal_is_owner:
         route_envelope.metadata["elevated"] = "full"
@@ -104,6 +110,7 @@ async def authoritative_project_run_context(
     session: SessionNode,
     config: Any,
     default_workspace: str | None,
+    include_user_grants: bool = True,
 ) -> tuple[RunContext, ProjectWorkspaceGuard | None]:
     context = await get_run_context(
         session_manager,
@@ -111,6 +118,7 @@ async def authoritative_project_run_context(
         config=config,
         workspace=default_workspace,
         session_node=session,
+        include_user_grants=include_user_grants,
     )
     validated = await resolve_session_project_workspace(storage, session)
     if validated is None:

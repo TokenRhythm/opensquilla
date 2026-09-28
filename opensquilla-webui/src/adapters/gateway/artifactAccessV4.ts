@@ -13,6 +13,7 @@ export {
 import {
   HttpTransportError,
 } from './privateHttpTransport'
+import { assertBinaryReadActive, BinaryBodyTooLargeError, readBinaryBlob, type ReadableBinaryBody } from './boundedBinaryBody'
 import {
   artifactHttpAccessUrl,
   artifactHttpGatewayOpenUrl,
@@ -21,9 +22,8 @@ import {
   runtimeArtifactHttpBaseOrigin,
 } from './privateArtifactHttpTransport'
 
-interface ArtifactBinaryResponse {
-  readonly metadata: { readonly status: number }
-  blob(): Promise<Blob>
+interface ArtifactBinaryResponse extends ReadableBinaryBody {
+  readonly metadata: ReadableBinaryBody['metadata'] & { readonly status: number }
 }
 
 interface ArtifactAccessHttpTransport {
@@ -41,6 +41,7 @@ interface ArtifactFetchOptions {
   baseOrigin?: string
   sessionKey?: string
   signal?: AbortSignal
+  maxBytes?: number
   /** Require authenticated same-origin HTTP(S) bytes and reject redirects. */
   requireSameOrigin?: boolean
 }
@@ -59,7 +60,7 @@ interface ArtifactOpenOptions extends ArtifactFetchOptions {
 
 type ArtifactFetchResult =
   | { ok: true; status: number; url: string; blob: Blob }
-  | { ok: false; status: number; url: string; message: string }
+  | { ok: false; status: number; url: string; message: string; errorCode?: 'too_large' }
 
 type ArtifactOpenResult =
   | { ok: true; status: number; url: string; objectUrl: string }
@@ -81,6 +82,7 @@ function runtimeOptions(request: ArtifactAccessRequest = {}): ArtifactFetchOptio
     requireSameOrigin: request.requireSameOrigin,
     sessionKey: request.sessionKey,
     signal: request.signal,
+    maxBytes: request.maxBytes,
   }
 }
 
@@ -179,6 +181,7 @@ export async function fetchArtifactBlob(
   artifact: ArtifactPayload,
   options: ArtifactFetchOptions = {},
 ): Promise<ArtifactFetchResult> {
+  assertBinaryReadActive(options.signal)
   const baseOrigin = resolveBaseOrigin(options.baseOrigin)
   const request = bindArtifactBinaryRequest(http, artifact, {
     baseOrigin,
@@ -199,9 +202,12 @@ export async function fetchArtifactBlob(
       ok: true,
       status: response.metadata.status,
       url,
-      blob: await response.blob(),
+      blob: await readBinaryBlob(response, options),
     }
   } catch (error) {
+    if (error instanceof BinaryBodyTooLargeError) {
+      return { ok: false, status: 0, url, message: error.message, errorCode: 'too_large' }
+    }
     if (isAbortError(error)) {
       if (error instanceof HttpTransportError) throw new DOMException('Aborted', 'AbortError')
       throw error

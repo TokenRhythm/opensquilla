@@ -38,13 +38,12 @@ const VISUAL_SCENARIOS: VisualScenario[] = [
     },
   },
   {
-    name: 'topbar-compact-bgm-synthwave-zh',
+    name: 'topbar-compact-synthwave-zh',
     viewport: { width: 480, height: 800 },
     fixture: {
       locale: 'zh-Hans',
       theme: 'synthwave',
       deliverableCount: 99,
-      bgm: { enabled: true, playing: true },
     },
   },
   {
@@ -55,7 +54,6 @@ const VISUAL_SCENARIOS: VisualScenario[] = [
       theme: 'ember',
       deliverableCount: 120,
       approvalCount: 120,
-      bgm: { enabled: true, playing: true },
       update: {
         status: 'error',
         latestVersion: '2.0.0',
@@ -77,6 +75,17 @@ test.describe('Chat topbar visual regression', () => {
       await expectTopbarGeometry(page, {
         minimumTargetSize: scenario.viewport.width <= 768 ? 44 : undefined,
       })
+
+      if ((scenario.fixture.approvalCount ?? 0) > 99) {
+        const badge = page.getByTestId('chat-system-status-badge')
+        await expect(badge).toHaveText('99+')
+        const bounds = await badge.evaluate(element => {
+          const box = element.getBoundingClientRect()
+          return { left: box.left, right: box.right }
+        })
+        expect(bounds.left).toBeGreaterThanOrEqual(0)
+        expect(bounds.right).toBeLessThanOrEqual(scenario.viewport.width)
+      }
 
       // The topbar is the regression boundary. Clipping to the component keeps
       // session-body typography and platform scrollbar rendering out of these

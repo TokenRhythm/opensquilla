@@ -17,6 +17,7 @@ import pytest
 from typer.testing import CliRunner
 
 from opensquilla.cli.main import app
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.onboarding.config_store import load_config
 
 runner = CliRunner()
@@ -38,6 +39,7 @@ def test_onboard_provider_key_rotation_keeps_router_disabled_and_model(
 ):
     target = tmp_path / "c.toml"
     target.write_text(
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
         "[llm]\n"
         'provider = "openrouter"\n'
         'model = "custom/model-x"\n'
@@ -68,6 +70,7 @@ def test_onboard_provider_key_rotation_keeps_hand_customized_tiers(
 ):
     target = tmp_path / "c.toml"
     target.write_text(
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
         "[llm]\n"
         'provider = "openrouter"\n'
         'model = "custom/model-x"\n'

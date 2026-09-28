@@ -272,6 +272,262 @@ async def test_seq_minted_at_dequeue_is_monotonic_and_contiguous() -> None:
         await conn._stop_writer()
 
 
+@pytest.mark.asyncio
+async def test_writer_serialization_failure_releases_reserved_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A frame rejected by the writer cannot strand its transport reservation."""
+
+    before = websocket_module.get_transport_budget().used
+    fake = _FakeWebSocket()
+    conn = WsConnection(conn_id="cx-serialize-failure", ws=fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=4, enabled=True)
+
+    def fail_make_event(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("synthetic serialization failure")
+
+    monkeypatch.setattr(websocket_module, "make_event", fail_make_event)
+    frame = _OutboundFrame(
+        kind="event:session.event.text_delta",
+        classification="control",
+        payload={"chunk": "x"},
+        event_name="session.event.text_delta",
+        res_frame=None,
+        budget_bytes=64,
+        is_control=True,
+    )
+    assert conn.reserve_transport_bytes(frame.budget_bytes, kind="control")
+    conn._flow_control_bytes = frame.budget_bytes
+    conn._flow_control_frames = 1
+    assert conn._outbox is not None
+    conn._outbox.put_nowait(frame)
+
+    try:
+        await asyncio.wait_for(conn._writer_task, timeout=1.0)  # type: ignore[arg-type]
+        assert conn._transport_bytes == 0
+        assert conn._flow_control_bytes == 0
+        assert conn._flow_control_frames == 0
+        assert websocket_module.get_transport_budget().used == before
+        assert fake.close_code == 1011
+        assert fake.close_reason == "writer_serialize_failed"
+    finally:
+        await conn._stop_writer()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["empty", "cancelled", "non_text"])
+async def test_writer_item_finally_releases_budget_on_non_send_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    before = websocket_module.get_transport_budget().used
+    fake = _FakeWebSocket()
+    conn = WsConnection("cx-item-finally", fake)  # type: ignore[arg-type]
+    conn._start_writer(maxsize=4, enabled=True)
+
+    class InvalidEncoder:
+        def model_dump_json(self) -> None:
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            return None
+
+    monkeypatch.setattr(websocket_module, "make_event", lambda *args, **kwargs: InvalidEncoder())
+    frame = _OutboundFrame(
+        kind="test-finally",
+        classification="control",
+        payload={},
+        event_name=None if failure == "empty" else "test",
+        res_frame=None,
+        budget_bytes=64,
+    )
+    assert conn.reserve_transport_bytes(frame.budget_bytes)
+    assert conn._outbox is not None
+    conn._outbox.put_nowait(frame)
+    conn._outbox.put_nowait(_SENTINEL_STOP)
+    try:
+        result = await asyncio.gather(conn._writer_task, return_exceptions=True)
+        if failure == "cancelled":
+            assert isinstance(result[0], asyncio.CancelledError)
+        if failure == "non_text":
+            assert fake.close_reason == "writer_serialize_failed"
+        assert fake.sent == []
+        assert conn._transport_bytes == 0
+        assert websocket_module.get_transport_budget().used == before
+    finally:
+        await conn._stop_writer()
+
+
+@pytest.mark.asyncio
+async def test_writer_item_finally_retains_budget_until_cancel_resistant_send_unwinds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started, release = asyncio.Event(), asyncio.Event()
+
+    class ResistantSendSocket(_FakeWebSocket):
+        async def send_text(self, text: str) -> None:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    before = websocket_module.get_transport_budget().used
+    conn = WsConnection("cx-retained-send", ResistantSendSocket())  # type: ignore[arg-type]
+    conn._enable_flow()
+    conn._start_writer(maxsize=4, enabled=True)
+    task = conn._writer_task
+    assert task is not None
+    monkeypatch.setattr(websocket_module, "_WRITER_STOP_SECONDS", 0.01)
+    try:
+        await conn.send_raw_text('{"type":"pong"}')
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        reserved = conn._transport_bytes
+        assert reserved > 0
+        await conn._stop_writer()
+        conn._cleanup_transport()
+        assert not task.done()
+        assert conn._transport_bytes == reserved
+        assert websocket_module.get_transport_budget().used == before + reserved
+    finally:
+        release.set()
+        await asyncio.wait_for(task, timeout=1.0)
+    assert conn._transport_bytes == 0
+    assert websocket_module.get_transport_budget().used == before
+
+
+@pytest.mark.asyncio
+async def test_socket_close_task_capacity_aborts_handler_without_another_close_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The terminal fallback cannot bypass the cancellation-resistant task cap."""
+
+    fake = _FakeWebSocket()
+    conn = WsConnection(conn_id="cx-close-capacity", ws=fake)  # type: ignore[arg-type]
+    current = asyncio.current_task()
+    assert current is not None
+    handler = asyncio.create_task(asyncio.sleep(10), name="synthetic-connection-handler")
+    conn._handler_task = handler
+    monkeypatch.setattr(websocket_module, "_MAX_WRITER_TASKS", 1)
+    monkeypatch.setattr(websocket_module, "_SOCKET_CLOSE_TASKS", {current})
+
+    with structlog.testing.capture_logs() as logs:
+        await conn.close(code=1013, reason="writer_capacity")
+    await asyncio.gather(handler, return_exceptions=True)
+
+    assert handler.cancelled()
+    assert websocket_module._SOCKET_CLOSE_TASKS == {current}
+    assert fake.close_code is None
+    assert any(
+        entry.get("event") == "gateway.ws_close_task_capacity_exhausted"
+        for entry in logs
+    )
+
+
+@pytest.mark.asyncio
+async def test_writer_task_capacity_closes_new_connection_and_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A connection rejected by the writer cap is closed instead of stranded."""
+
+    fake = _FakeWebSocket()
+    conn = WsConnection(conn_id="cx-writer-capacity", ws=fake)  # type: ignore[arg-type]
+    blocker = asyncio.create_task(asyncio.sleep(10), name="synthetic-writer-cap")
+    websocket_module._WRITER_TASKS.add(blocker)
+    monkeypatch.setattr(websocket_module, "_MAX_WRITER_TASKS", 1)
+
+    try:
+        with structlog.testing.capture_logs() as logs:
+            conn._start_writer(maxsize=4, enabled=True)
+            await asyncio.sleep(0.05)
+
+        assert conn._closing is True
+        assert conn._writer_task is None
+        assert fake.close_code == 1013
+        assert fake.close_reason == "writer_capacity"
+        assert any(
+            entry.get("event") == "gateway.ws_writer_task_capacity_exhausted"
+            for entry in logs
+        )
+    finally:
+        websocket_module._WRITER_TASKS.discard(blocker)
+        blocker.cancel()
+        await asyncio.gather(blocker, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resistant_socket_close_is_bounded_and_tracked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    class ResistantCloseSocket(_FakeWebSocket):
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            started.set()
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    fake = ResistantCloseSocket()
+    conn = WsConnection("cx-resistant-close", fake)  # type: ignore[arg-type]
+    handler = asyncio.create_task(asyncio.sleep(10), name="synthetic-connection-handler")
+    conn._handler_task = handler
+    monkeypatch.setattr(websocket_module, "_DIRECT_CLOSE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(websocket_module, "_SOCKET_CLOSE_TASKS", set())
+    try:
+        await asyncio.wait_for(conn.close(reason="test_close_timeout"), timeout=0.5)
+        await asyncio.gather(handler, return_exceptions=True)
+        assert started.is_set()
+        assert handler.cancelled()
+        assert len(websocket_module._SOCKET_CLOSE_TASKS) == 1
+    finally:
+        release.set()
+        await asyncio.gather(*websocket_module._SOCKET_CLOSE_TASKS, return_exceptions=True)
+    assert not websocket_module._SOCKET_CLOSE_TASKS
+
+
+@pytest.mark.asyncio
+async def test_writer_send_timeout_releases_budget_with_unresponsive_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BlockedSocket(_FakeWebSocket):
+        async def close(self, code: int = 1000, reason: str = "") -> None:
+            self.close_code = code
+            self.close_reason = reason
+            await asyncio.Future()
+
+    before = websocket_module.get_transport_budget().used
+    fake = BlockedSocket()
+    fake._send_event = asyncio.Event()
+    fake._send_unblock = asyncio.Event()
+    conn = WsConnection("cx-send-close-timeouts", fake)  # type: ignore[arg-type]
+    conn._enable_flow()
+    conn._start_writer(maxsize=4, enabled=True)
+    assert websocket_module._WRITER_SEND_TIMEOUT_SECONDS == 60.0
+    monkeypatch.setattr(websocket_module, "_WRITER_SEND_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(websocket_module, "_DIRECT_CLOSE_TIMEOUT_SECONDS", 0.01)
+    try:
+        # Capture timeout evidence without charging synchronous traceback
+        # rendering to the asynchronous resource-release watchdog.
+        with structlog.testing.capture_logs() as logs:
+            await conn.send_raw_text('{"type":"pong"}')
+            assert conn._transport_bytes > 0
+            await asyncio.wait_for(conn._writer_task, timeout=0.5)  # type: ignore[arg-type]
+        assert any(entry["event"] == "gateway.ws_writer_send_failed" for entry in logs)
+        assert any(
+            entry["event"] == "gateway.ws_socket_close_timeout"
+            and entry["close_reason"] == "writer_send_failed"
+            for entry in logs
+        )
+        assert fake.close_reason == "writer_send_failed"
+        assert conn._transport_bytes == 0
+        assert websocket_module.get_transport_budget().used == before
+    finally:
+        await conn._stop_writer()
+        conn._cleanup_transport()
+
+
 # ---------------------------------------------------------------------------
 # lossy drop emits gateway.ws_writer_drop log with full field set.
 # ---------------------------------------------------------------------------

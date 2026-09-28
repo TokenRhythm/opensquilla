@@ -4,6 +4,7 @@ import {
   beginSessionHandoffDiag,
   finishSessionHandoffDiag,
   readSessionNavigationDiag,
+  recordRpcResumeDiag,
   recordRpcTransportDiag,
   recordSessionNavigationDiag,
   SESSION_NAVIGATION_DIAG_LIMIT,
@@ -70,6 +71,80 @@ describe('sessionNavigationDiag', () => {
     expect(entries).toHaveLength(200)
     expect(entries[0].recoveryMs).toBe(204)
     expect(entries[entries.length - 1].recoveryMs).toBe(5)
+  })
+
+  it('preserves the wake incident timeline and first successful RPC without payloads', () => {
+    const memory = new MemoryStorage()
+    setSessionNavigationDiagStorageForTest(memory)
+    const timeline = {
+      at: 1_020_000, topology: 'proxy/vpn', visibility: 'hidden', health: 'suspect',
+      transportPhase: 'checking', wakeIncidentSource: 'desktop-resume', wakeIncidentProbeTimeoutMs: 2_000,
+      suspectAt: 1_015_000, lastRxAt: 999_000, wakeIncidentId: 3,
+      wakeIncidentStartedAt: 1_000_000, wakeIncidentDeadlineAt: 1_020_000,
+      wakeIncidentStatus: 'reconnecting', wakeSignalCount: 7,
+    }
+    recordRpcTransportDiag({
+      ...timeline, phase: 'wake_incident_timeout', generation: 8,
+      reason: 'wake_incident_timeout',
+      url: 'ws://PRIVATE_HOST/ws', payload: { secret: 'PRIVATE_PAYLOAD' },
+      token: 'PRIVATE_TOKEN', nonce: 'PRIVATE_NONCE',
+    })
+    recordRpcTransportDiag({
+      phase: 'first_successful_rpc', generation: 10, at: 1_020_700,
+      topology: 'loopback', visibility: 'visible', health: 'healthy', roundTripMs: 25.5,
+    })
+    const entries = readSessionNavigationDiag()
+    expect(entries[1]).toMatchObject({
+      ...timeline, phase: 'wake_incident_timeout', reason: 'wake_incident_timeout',
+    })
+    expect(entries[0]).toMatchObject({
+      phase: 'first_successful_rpc', generation: 10, at: 1_020_700,
+      topology: 'loopback', visibility: 'visible', health: 'healthy', roundTripMs: 25.5,
+    })
+    expect(memory.getItem(SESSION_NAVIGATION_DIAG_STORAGE_KEY)).not.toContain('PRIVATE_')
+  })
+
+  it.each([-1, Number.NaN, Number.POSITIVE_INFINITY, 'PRIVATE_VALUE', null, {}])(
+    'rejects invalid incident timing and counter values %s', value => {
+      setSessionNavigationDiagStorageForTest(new MemoryStorage())
+      const fields = [
+        'at', 'suspectAt', 'lastRxAt', 'wakeIncidentId', 'wakeIncidentStartedAt',
+        'wakeIncidentDeadlineAt', 'wakeSignalCount', 'roundTripMs',
+      ]
+      recordRpcTransportDiag({
+        phase: 'wake_incident_start', generation: 1,
+        ...Object.fromEntries(fields.map(field => [field, value])),
+      })
+      for (const field of fields) expect(readSessionNavigationDiag()[0]).not.toHaveProperty(field)
+    },
+  )
+
+  it('allows only fixed incident enums, integer counters and transport phase names', () => {
+    const memory = new MemoryStorage()
+    setSessionNavigationDiagStorageForTest(memory)
+    recordRpcTransportDiag({
+      phase: 'wake_incident_start', generation: 1,
+      topology: 'ws://PRIVATE_HOST', visibility: 'PRIVATE_VISIBILITY', health: 'PRIVATE_HEALTH',
+      wakeIncidentStatus: 'PRIVATE_STATUS', wakeIncidentId: 1.5, wakeSignalCount: 0.5,
+    })
+    expect(recordRpcTransportDiag({ phase: 'PRIVATE_PHASE', generation: 2 })).toBeNull()
+    const entry = readSessionNavigationDiag()[0]
+    for (const field of ['topology', 'visibility', 'health', 'wakeIncidentStatus', 'wakeIncidentId', 'wakeSignalCount']) {
+      expect(entry).not.toHaveProperty(field)
+    }
+    expect(memory.getItem(SESSION_NAVIGATION_DIAG_STORAGE_KEY)).not.toContain('PRIVATE_')
+  })
+
+  it.each([
+    'wake_incident_timeout', 'socket_not_open', 'probe_socket_unavailable', 'probe_failed',
+    'probe_send_failure', 'control_unconfirmed', 'scheduler_lag', 'wake_grace',
+    'native_resume_socket_unavailable',
+    'round_trip', 'hello', 'direct_send_timeout', 'recovery_credit_timeout',
+    'writer_send_failed', 'writer_serialize_failed', 'writer_capacity', 'transport_resource_limit',
+  ])('preserves the fixed transport reason %s', reason => {
+    setSessionNavigationDiagStorageForTest(new MemoryStorage())
+    recordRpcTransportDiag({ phase: 'retire', generation: 1, reason })
+    expect(readSessionNavigationDiag()[0]?.reason).toBe(reason)
   })
 
   it('records newest entries first with opaque session correlation', () => {
@@ -196,5 +271,25 @@ describe('sessionNavigationDiag', () => {
       reason: 'generation_consistency_recovery',
       reconnectAttempt: 2,
     })
+  })
+
+  it('records the bounded Desktop resume source without accepting arbitrary payloads', () => {
+    setSessionNavigationDiagStorageForTest(new MemoryStorage())
+
+    recordRpcResumeDiag({ generation: 9, resumeSource: 'desktop-resume' })
+
+    expect(readSessionNavigationDiag()[0]).toMatchObject({
+      source: 'rpc.transport',
+      phase: 'desktop_resume',
+      generation: 9,
+      reason: 'desktop_resume',
+      resumeSource: 'desktop-resume',
+    })
+    const result = recordRpcResumeDiag({
+      generation: Number.NaN,
+      resumeSource: 'desktop-resume',
+    })
+    expect(result).toBeNull()
+    expect(JSON.stringify(readSessionNavigationDiag())).not.toContain('PRIVATE')
   })
 })

@@ -9,7 +9,6 @@ from typing import Any
 from opensquilla.application.admission_views import (
     AdmissionAcceptance,
     AdmissionCommit,
-    AdmissionMetaControl,
     AdmissionPlanRevision,
     AdmissionPlanRun,
     AdmissionProjectOrigin,
@@ -30,7 +29,6 @@ from opensquilla.session.goals import ClaimCurrentGoalMutation
 from opensquilla.session.models import (
     AgentTaskRecord,
     AgentTaskStatus,
-    MetaControlIntent,
     PlanRunRecord,
     SessionIntent,
     SessionStatus,
@@ -46,7 +44,6 @@ class GatewayAdmissionStorage:
         self.capabilities = AdmissionStorageCapabilities(
             receipts=callable(getattr(raw, "replay_turn_ingress_receipt", None))
             or callable(getattr(raw, "get_turn_ingress_receipt", None)),
-            meta_controls=callable(getattr(raw, "get_meta_control_intent", None)),
             atomic_acceptance=callable(getattr(raw, "accept_turn", None)),
         )
 
@@ -119,21 +116,6 @@ class GatewayAdmissionStorage:
             return result
         raise TypeError("Plan lookup did not return a plan run")
 
-    async def get_meta_control_intent(
-        self,
-        *,
-        session_key: str,
-        control_kind: str,
-        correlation_id: str,
-    ) -> AdmissionMetaControl | None:
-        method = getattr(self.raw, "get_meta_control_intent", None)
-        if not callable(method):
-            return None
-        with translate_admission_failure():
-            result = await method(
-                session_key=session_key, control_kind=control_kind, correlation_id=correlation_id
-            )
-        return result if isinstance(result, MetaControlIntent) else None
 
     async def get_agent_task(self, task_id: str) -> AgentTaskRecord | None:
         with translate_admission_failure():
@@ -256,7 +238,6 @@ class GatewayAdmissionStorage:
                 plan_revision=command.plan_revision,
                 plan_run=command.plan_run,
                 merge_into_task=command.merge_into_task,
-                meta_control_intent_id=command.meta_control_intent_id,
                 workspace_guard=command.workspace_guard,
                 expected_collaboration_revision=command.expected_collaboration_revision,
                 expected_active_plan_revision_id=command.expected_active_plan_revision_id,

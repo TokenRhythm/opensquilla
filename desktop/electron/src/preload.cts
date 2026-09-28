@@ -23,6 +23,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   openArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:open', payload),
   saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
   sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
+  workspaceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:workspace-file:action', payload),
   chooseAttachments: (request: unknown) => ipcRenderer.invoke('desktop:attachments:choose', request),
   selectAttachmentFile: (request: unknown, file: File) => {
     // Electron validates the actual browser File backing store. Constructed
@@ -83,6 +84,7 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   getOnboardingDefaults: () => ipcRenderer.invoke('desktop:onboarding:defaults'),
   probeOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:probe', payload),
   saveOnboarding: (payload: unknown) => ipcRenderer.invoke('desktop:onboarding:save', payload),
+  skipOnboarding: () => ipcRenderer.invoke('desktop:onboarding:skip'),
   cancelOnboarding: () => ipcRenderer.invoke('desktop:onboarding:cancel'),
   getBootState: () => ipcRenderer.invoke('desktop:boot:state'),
   openKeychainAccess: () => ipcRenderer.invoke('desktop:boot:open-keychain'),
@@ -122,8 +124,8 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
     ipcRenderer.on('gateway:connection-changed', listener)
     return () => ipcRenderer.removeListener('gateway:connection-changed', listener)
   },
-  onSystemResume: (callback: () => void) => {
-    const listener = () => callback()
+  onSystemResume: (callback: (payload: unknown) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => callback(payload)
     ipcRenderer.on('desktop:system:resume', listener)
     return () => ipcRenderer.removeListener('desktop:system:resume', listener)
   },

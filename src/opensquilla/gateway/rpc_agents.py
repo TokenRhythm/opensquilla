@@ -175,37 +175,13 @@ async def _handle_agents_list(
     return await _agent_catalog(ctx).list(params)
 
 
-async def _handle_agents_create(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
-    return await _agent_catalog(ctx).create(params)
-
-
-async def _handle_agents_update(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> dict[str, Any]:
-    return await _agent_catalog(ctx).update(params)
-
-
-async def _handle_agents_delete(
-    params: dict[str, Any] | None, ctx: RpcContext
-) -> None:
-    return await _agent_catalog(ctx).remove(params)
-
-
-for _agent_catalog_method, _agent_catalog_implementation in (
-    ("agents.list", _handle_agents_list),
-    ("agents.create", _handle_agents_create),
-    ("agents.update", _handle_agents_update),
-    ("agents.delete", _handle_agents_delete),
-):
-    register_agent_catalog_contract(
-        _d,
-        _agent_catalog_method,
-        _agent_catalog_implementation,
-        internal_error=RpcHandlerError,
-        guest_allowed_checker=is_guest_rpc_method_allowed,
-    )
+register_agent_catalog_contract(
+    _d,
+    "agents.list",
+    _handle_agents_list,
+    internal_error=RpcHandlerError,
+    guest_allowed_checker=is_guest_rpc_method_allowed,
+)
 
 
 @_d.method("agents.files.list", scope="operator.read")

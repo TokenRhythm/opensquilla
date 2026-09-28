@@ -322,6 +322,7 @@ class SchedulerOps:
         schedule_updated = structured_kind is not None and structured_value is not None
         if schedule_updated:
             kind, cron_expr = _validate_structured_schedule(structured_kind, structured_value)
+            previous_kind = job.schedule_kind
             if structured_tz is not None:
                 raw_tz = (structured_tz or "").strip()
                 validate_tz(raw_tz)
@@ -331,8 +332,14 @@ class SchedulerOps:
             job.cron_expr = cron_expr
             if kind == ScheduleKind.AT:
                 _reject_past_at(cron_expr, now)
+                next_run_at = datetime.fromisoformat(cron_expr)
+                if previous_kind == ScheduleKind.AT and job.next_run_at != next_run_at:
+                    # A new occurrence gets a fresh retry budget. Keep an active
+                    # reservation intact until its owner finishes.
+                    job.consecutive_errors = 0
+                    job.backoff_until = None
                 job.anchor_at = None
-                job.next_run_at = datetime.fromisoformat(cron_expr)
+                job.next_run_at = next_run_at
             elif kind == ScheduleKind.EVERY:
                 job.anchor_at = now
                 job.next_run_at = now + timedelta(seconds=int(cron_expr))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import json
 import re
 import shutil
 import tempfile
@@ -19,6 +20,7 @@ from opensquilla.channels.contract import (
     channel_capability_profile,
     normalize_channel_send_result,
 )
+from opensquilla.channels.delivery_store import deliver_operation_with_outbox
 from opensquilla.channels.types import ChannelArtifactDeliveryRequest, IncomingMessage
 from opensquilla.paths import media_root_from_config
 
@@ -29,19 +31,14 @@ _LOOSE_IMAGE_LINE_RE = re.compile(r"^\s*(?:image|file)\s*:\s*(?P<target>\S+)\s*$
 
 
 def artifact_delivery_key(artifact: dict[str, Any]) -> str:
-    for field in (
-        "sha256",
-        "path",
-        "channel_download_url",
-        "signed_download_url",
-        "download_url",
-        "id",
-        "name",
-    ):
-        value = artifact.get(field)
-        if value:
-            return f"{field}:{value}"
-    return ""
+    # Content hashes and names are untrusted presentation data.  Different
+    # artifacts may contain identical bytes and must retain their own identity.
+    session_id, artifact_id = artifact.get("session_id"), artifact.get("id")
+    if not isinstance(session_id, str) or not session_id:
+        return ""
+    if not isinstance(artifact_id, str) or not artifact_id:
+        return ""
+    return "artifact:" + json.dumps([session_id, artifact_id], separators=(",", ":"))
 
 
 def dedupe_artifacts_for_channel_delivery(
@@ -157,44 +154,87 @@ async def deliver_artifacts_as_channel_files(
     msg: IncomingMessage,
     artifacts: list[dict[str, Any]],
     config: Any,
+    *,
+    expected_session_id: str | None = None,
+    attempted_keys: set[str] | None = None,
+    delivered_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
-    if not can_deliver_channel_files(channel):
-        return artifacts
+    # The expected owner comes from the admitted turn/session, never from an
+    # artifact marker supplied by the model or a persisted reply.  Suppress
+    # unauthorized metadata too: returning its signed URL as a text fallback
+    # would disclose the file even when native upload was correctly denied.
+    if not isinstance(expected_session_id, str) or not expected_session_id:
+        return []
+    artifacts = [
+        artifact for artifact in artifacts
+        if artifact.get("session_id") == expected_session_id
+    ]
+    native_delivery = can_deliver_channel_files(channel)
     deliver_artifact = getattr(channel, "deliver_artifact", None)
     send_file = getattr(channel, "send_file", None)
-    if not callable(deliver_artifact) and not callable(send_file):
-        return artifacts
     if not artifacts:
         return artifacts
 
     store = ArtifactStore(media_root_from_config(config))
+
+    async def deliver_request(request: ChannelArtifactDeliveryRequest) -> Any:
+        # The shared path journals contextual requests even for adapters that
+        # only implement the legacy two-argument file API.  Bypass installed
+        # wrappers here so one artifact has exactly one outbox record.
+        if callable(deliver_artifact):
+            raw = getattr(channel, "_delivery_raw_deliver_artifact", deliver_artifact)
+            result = raw(request)
+        else:
+            raw = getattr(channel, "_delivery_raw_send_file", send_file)
+            if not callable(raw):
+                raise TypeError("channel does not implement file delivery")
+            result = raw(request.inbound.channel_id, request.file_path)
+        return await result if inspect.isawaitable(result) else result
+
     undelivered: list[dict[str, Any]] = []
-    for artifact in dedupe_artifacts_for_channel_delivery(artifacts):
+    validated_keys: set[str] = set()
+    for artifact in artifacts:
         artifact_id = artifact.get("id")
         session_id = artifact.get("session_id")
         if not isinstance(artifact_id, str) or not isinstance(session_id, str):
+            continue
+        try:
+            ref, path = store.resolve_for_download(artifact_id, session_id=expected_session_id)
+        except Exception as exc:  # noqa: BLE001 - invalid refs must not become URL fallbacks.
+            log.warning(
+                "channel_artifact_delivery.reference_rejected",
+                channel_type=type(channel).__name__,
+                error_type=type(exc).__name__,
+            )
+            continue
+        # A valid id does not authenticate adjacent model-supplied fields.
+        # Build fallback metadata from the resolved ref too, so an attacker
+        # cannot attach another session's signed URL or a sensitive fake name.
+        artifact = ref.to_dict()
+        key = artifact_delivery_key(artifact)
+        if key in validated_keys:
+            continue
+        validated_keys.add(key)
+        if not native_delivery or (not callable(deliver_artifact) and not callable(send_file)):
             undelivered.append(artifact)
             continue
         try:
-            ref, path = store.resolve_for_download(artifact_id, session_id=session_id)
             with _named_artifact_delivery_path(path, ref.name) as delivery_path:
-                if callable(deliver_artifact):
-                    request = ChannelArtifactDeliveryRequest(
-                        inbound=msg,
-                        artifact_id=ref.id,
-                        file_path=str(delivery_path),
-                        name=ref.name,
-                        mime_type=ref.mime,
-                        size=ref.size,
-                    )
-                    result = deliver_artifact(request)
-                    capability = ChannelCapabilities.ARTIFACT_DELIVERY
-                else:
-                    assert callable(send_file)
-                    result = send_file(msg.channel_id, str(delivery_path))
-                    capability = ChannelCapabilities.NATIVE_FILE_UPLOAD
-                if inspect.isawaitable(result):
-                    result = await result
+                request = ChannelArtifactDeliveryRequest(
+                    inbound=msg,
+                    artifact_id=ref.id,
+                    file_path=str(delivery_path),
+                    name=ref.name,
+                    mime_type=ref.mime,
+                    size=ref.size,
+                    session_id=session_id,
+                )
+                if attempted_keys is not None:
+                    attempted_keys.add(key)
+                result = await deliver_operation_with_outbox(
+                    channel, "deliver_artifact", deliver_request, (request,), {}
+                )
+                capability = ChannelCapabilities.ARTIFACT_DELIVERY
                 normalized = normalize_channel_send_result(
                     result,
                     capability=capability,
@@ -214,6 +254,8 @@ async def deliver_artifacts_as_channel_files(
                         retryable=normalized.retryable,
                     )
                     undelivered.append(artifact)
+                elif delivered_keys is not None:
+                    delivered_keys.add(key)
         except Exception as exc:  # noqa: BLE001 - preserve text fallback on delivery failure.
             log.warning(
                 "channel_artifact_delivery.file_delivery_failed",

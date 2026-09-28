@@ -758,6 +758,25 @@ describe('projectAssistantActivity', () => {
 })
 
 describe('projectAssistantActivityTimeline', () => {
+  it('distinguishes buffered tool preparation from answering and actual execution', () => {
+    const projection = projectAssistantActivityTimeline([], {
+      lifecycle: 'answering',
+      statusHistory: [
+        { action: 'write:1', label: 'Writing reply', at: 1000 },
+        { action: 'Preparing tool call', label: 'untrusted detail', at: 5000 },
+      ],
+      endedAt: 12000,
+    })
+    expect(projection.activityClusters).toEqual([])
+    expect(projection.statusSteps[projection.statusSteps.length - 1]).toMatchObject({
+      isCurrent: true,
+      durationSeconds: 7,
+      label: { code: 'chat.activity.lifecycle.preparingToolCall', params: {} },
+    })
+    expect(projection.statusSteps[0]?.isCurrent).toBe(false)
+    expect(JSON.stringify(projection.statusSteps)).not.toContain('untrusted detail')
+  })
+
   it('projects explicit lifecycle codes and marks only live calls as current', () => {
     const running = toolGroup([
       call('running', {
@@ -1286,7 +1305,16 @@ describe('projectAssistantActivityTimeline', () => {
     ])
   })
 
-  it('does not describe a non-benign compaction veto as within budget', () => {
+  it.each([
+    ['no_entries', 'chat.compact.noSafeHistory'],
+    ['no_compression_benefit', 'chat.compact.alreadyConcise'],
+    ['quality_gate_failed', 'chat.compact.skipped'],
+    ['no_safe_turn_boundary', 'chat.compact.noSafeHistory'],
+    ['protected_tail_exhausts_compaction_window', 'chat.compact.noSafeHistory'],
+    ['non_history_envelope_exhausts_budget', 'chat.compact.skipped'],
+    ['summary_does_not_fit', 'chat.compact.skipped'],
+    ['unknown_reason', 'chat.compact.skipped'],
+  ])('distinguishes a safe no-op from a veto for %s', (reason, expectedLabel) => {
     const projection = projectAssistantActivityTimeline([], {
       lifecycle: 'settled',
       statusHistory: [{
@@ -1297,11 +1325,11 @@ describe('projectAssistantActivityTimeline', () => {
         category: 'maintenance',
         state: 'skipped',
         source: 'automatic',
-        reason: 'no_safe_turn_boundary',
+        reason,
       }],
     })
 
-    expect(projection.statusSteps[0]?.label.code).toBe('chat.compact.skipped')
+    expect(projection.statusSteps[0]?.label.code).toBe(expectedLabel)
   })
 
   it('keeps request-scoped reductions distinct from adjacent saved summaries', () => {
@@ -1344,7 +1372,7 @@ describe('projectAssistantActivityTimeline', () => {
       state: 'completed',
       source: 'automatic',
       durability: 'durable',
-      label: { code: 'chat.compact.summarySaved' },
+      label: { code: 'chat.compact.compacted' },
     })
   })
 

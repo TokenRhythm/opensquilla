@@ -456,8 +456,6 @@ class MatrixChannel:
         :class:`IncomingMessage` onto the receive queue.
         """
         event_id = getattr(event, "event_id", None)
-        if event_id and not self._dedupe.check_and_add(event_id):
-            return
         sender = getattr(event, "sender", "unknown")
         if sender == self._bot_user_id:
             return
@@ -490,7 +488,7 @@ class MatrixChannel:
         )
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, msg, self._queue)
+        await self._dedupe.run_once(event_id, lambda: durable_enqueue(self, msg, self._queue))
         log.debug(
             "matrix.inbound_received",
             room_id=room_id,
@@ -509,8 +507,6 @@ class MatrixChannel:
         events are filtered the same way as text messages.
         """
         event_id = getattr(event, "event_id", None)
-        if event_id and not self._dedupe.check_and_add(event_id):
-            return
         sender = getattr(event, "sender", "unknown")
         if sender == self._bot_user_id:
             return
@@ -565,7 +561,7 @@ class MatrixChannel:
         )
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, msg, self._queue)
+        await self._dedupe.run_once(event_id, lambda: durable_enqueue(self, msg, self._queue))
         log.debug(
             "matrix.inbound_media_received",
             room_id=room_id,

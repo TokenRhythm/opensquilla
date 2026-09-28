@@ -20,13 +20,3 @@ export interface Agent {
   system_prompt?: string
   systemPrompt?: string
 }
-
-export interface AgentForm {
-  id: string
-  name: string
-  description: string
-  tools: string[]
-  workspace: string
-  agentDir: string
-  enabled: boolean
-}

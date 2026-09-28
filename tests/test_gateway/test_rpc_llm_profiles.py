@@ -1087,6 +1087,7 @@ async def test_profile_draft_model_discovery_uses_unsaved_deployment_without_per
         "allow_default_api_key_env": False,
         "force_refresh": True,
         "persist_catalog": False,
+        "cache_only": False,
     }
     assert draft_config is not cfg
     assert response.payload["models"] == [{"id": "gpt-draft-discovered"}]

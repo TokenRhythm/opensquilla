@@ -974,6 +974,7 @@ async def discover_selectable_provider_models(
     force_refresh: bool = False,
     persist_catalog: bool = False,
     catalog_config: object | None = None,
+    cache_only: bool = False,
 ) -> ProviderModelsDiscoverResult:
     """Return endpoint-declared custom models or verified official catalogs.
 
@@ -994,6 +995,14 @@ async def discover_selectable_provider_models(
     spec = get_provider_spec(provider_id)  # raises UnknownProviderError(ValueError)
     if not spec.runtime_supported:
         raise ValueError(f"Provider '{provider_id}' has no runtime support to discover.")
+
+    # Only TokenRhythm exposes an identity-scoped persistent snapshot here.
+    # A cache miss must never construct a provider or start upstream work.
+    if cache_only and provider_id != "tokenrhythm":
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id=provider_id,
+            catalog={"cacheHit": False, "stale": True, "lastSyncedAt": None},
+        )
 
     if provider_id in {"custom", "custom_anthropic"}:
         from opensquilla.provider.model_capacity import (
@@ -1085,6 +1094,13 @@ async def discover_selectable_provider_models(
             force=force_refresh,
             persist_entitlement=persist_catalog,
             config=catalog_config,
+            cache_only=cache_only,
+        )
+
+    if cache_only:
+        return ProviderModelsDiscoverResult(
+            ok=True, provider_id=provider_id,
+            catalog={"cacheHit": False, "stale": True, "lastSyncedAt": None},
         )
 
     # The selector-facing host gate above already rejected plain HTTP,

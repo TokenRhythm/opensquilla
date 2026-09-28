@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,22 @@ def _original_async(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitabl
     while hasattr(fn, "__wrapped__"):
         fn = fn.__wrapped__  # type: ignore[attr-defined]
     return fn
+
+
+async def _wait_for_mutation_start(
+    started: asyncio.Event, operation: asyncio.Task[str],
+) -> None:
+    ready = asyncio.create_task(started.wait())
+    try:
+        done, _ = await asyncio.wait(
+            (ready, operation), timeout=0.5, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if operation in done:
+            await operation  # Surface worker/preparation failures, not a readiness timeout.
+        assert ready in done
+    finally:
+        ready.cancel()
+        await asyncio.gather(ready, return_exceptions=True)
 
 
 @pytest.fixture
@@ -103,13 +120,20 @@ async def test_edit_file_rejects_noop_edit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("single_worker", [False, True], ids=["default", "one-worker"])
 async def test_write_file_repeated_stop_waits_for_commit_and_receipt(
     monkeypatch: pytest.MonkeyPatch,
     workspace_context: tuple[Path, ToolContext, list[dict[str, Any]]],
+    single_worker: bool,
 ) -> None:
     workspace, ctx, _events = workspace_context
     target = workspace / "src" / "stopped.py"
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    if single_worker:
+        # The loop owns and closes this pool. Readiness must not occupy the
+        # only worker needed by the mutation itself.
+        loop.set_default_executor(ThreadPoolExecutor(max_workers=1))
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
     real_write_text = Path.write_text
 
@@ -120,25 +144,30 @@ async def test_write_file_repeated_stop_waits_for_commit_and_receipt(
         **kwargs: Any,
     ) -> int:
         if path == target:
-            worker_started.set()
+            loop.call_soon_threadsafe(worker_started.set)
             assert release_worker.wait(timeout=2.0)
         return real_write_text(path, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", gated_write_text)
     write_file = _original_async(filesystem.write_file)
     task = asyncio.create_task(write_file(str(target), "settled = True\n"))
-    assert await asyncio.to_thread(worker_started.wait, 0.5)
+    try:
+        await _wait_for_mutation_start(worker_started, task)
 
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
-    assert not target.exists()
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert not target.exists()
 
-    release_worker.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=0.5)
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+    finally:
+        release_worker.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     assert target.read_text(encoding="utf-8") == "settled = True\n"
     assert len(ctx.workspace_mutation_receipts) == 1
@@ -159,7 +188,8 @@ async def test_executor_mutation_tools_settle_before_repeated_stop(
     workspace_context: tuple[Path, ToolContext, list[dict[str, Any]]],
 ) -> None:
     workspace, ctx, _events = workspace_context
-    worker_started = threading.Event()
+    loop = asyncio.get_running_loop()
+    worker_started = asyncio.Event()
     release_worker = threading.Event()
     real_run_executor_mutation = filesystem._run_executor_mutation
 
@@ -169,7 +199,7 @@ async def test_executor_mutation_tools_settle_before_repeated_stop(
         settle: Callable[[BaseException | None], None],
     ) -> Any:
         def gated_worker() -> Any:
-            worker_started.set()
+            loop.call_soon_threadsafe(worker_started.set)
             assert release_worker.wait(timeout=2.0)
             return worker()
 
@@ -209,16 +239,21 @@ async def test_executor_mutation_tools_settle_before_repeated_stop(
         )
 
     task = asyncio.create_task(operation)
-    assert await asyncio.to_thread(worker_started.wait, 0.5)
-    task.cancel()
-    await asyncio.sleep(0)
-    task.cancel()
-    await asyncio.sleep(0)
-    assert not task.done()
+    try:
+        await _wait_for_mutation_start(worker_started, task)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
 
-    release_worker.set()
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=0.5)
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+    finally:
+        release_worker.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     assert target.read_text(encoding="utf-8") == expected
     if tool_name == "write_scratch":

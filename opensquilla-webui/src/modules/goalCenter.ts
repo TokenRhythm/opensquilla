@@ -3,22 +3,13 @@ import type { InjectionKey } from 'vue'
 export type GoalStatus = string
 export type GoalUsageCoverage = 'complete' | 'partial_history' | 'partial_usage'
 
-/** Missing/future coverage never implies that budget accounting is trustworthy. */
+/** Preserve missing or future coverage as unknown. */
 export function normalizeGoalUsageCoverage(value: unknown): GoalUsageCoverage | undefined {
   return value === 'complete' || value === 'partial_history' || value === 'partial_usage'
     ? value : undefined
 }
 
-export function goalUsageSupportsBudget(value: unknown): boolean {
-  return value === 'complete' || value === 'partial_history'
-}
-
 /** Domain projection of a durable goal; wire aliases stay in the adapter. */
-export interface GoalExecutionOptions {
-  readonly tokenBudget?: number | null
-  readonly executionPolicy?: 'foreground' | 'background'
-}
-
 export interface GoalSnapshot {
   readonly goalId?: string
   readonly sessionKey?: string
@@ -45,11 +36,8 @@ export interface GoalSnapshot {
   readonly activeTimeMs?: number
   readonly windowActiveTimeMs?: number
   readonly usage?: unknown
-  readonly tokenBudget?: number | null
-  readonly budgetTokensUsed?: number
   readonly usageCoverage?: 'complete' | 'partial_history' | 'partial_usage'
   readonly usageAccountingStartedAtMs?: number | null
-  readonly executionPolicy?: 'foreground' | 'background'
   readonly pauseReason?: string | null
   readonly blockedReason?: string | null
   readonly terminalReason?: string | null
@@ -62,7 +50,7 @@ export interface GoalStatusResult {
   readonly goal: GoalSnapshot | null
 }
 
-export interface GoalSetInput extends GoalExecutionOptions {
+export interface GoalSetInput {
   readonly sessionKey: string
   readonly objective: string
   readonly clientRequestId: string
@@ -106,21 +94,6 @@ export interface GoalCapabilities {
   readonly maxTurns: number
   readonly runtimeBudgetSeconds: number
   readonly methods: readonly string[]
-  readonly tokenBudgetSupported: boolean
-  readonly backgroundExecutionSupported: boolean
-}
-
-/** Omit unsupported settings while preserving ordinary Goal commands. */
-export function supportedGoalExecutionOptions(
-  options: GoalExecutionOptions,
-  capabilities: Pick<GoalCapabilities, 'tokenBudgetSupported' | 'backgroundExecutionSupported'>,
-): GoalExecutionOptions {
-  return {
-    ...(capabilities.tokenBudgetSupported && options.tokenBudget !== undefined
-      ? { tokenBudget: options.tokenBudget } : {}),
-    ...(capabilities.backgroundExecutionSupported && options.executionPolicy !== undefined
-      ? { executionPolicy: options.executionPolicy } : {}),
-  }
 }
 
 export type GoalCenterErrorCode = 'not-found' | 'unsupported' | 'forbidden' | 'conflict' | 'unavailable' | 'invalid'
@@ -168,7 +141,7 @@ export interface GoalCenter {
   capabilities(options?: { signal?: AbortSignal }): Promise<GoalCapabilities>
   status(sessionKey: string, options?: { signal?: AbortSignal }): Promise<GoalStatusResult>
   set(input: GoalSetInput, options?: { signal?: AbortSignal }): Promise<GoalSetResult>
-  edit(input: GoalMutationInput & GoalExecutionOptions & { objective: string }, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
+  edit(input: GoalMutationInput & { objective: string }, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
   pause(input: GoalMutationInput, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
   resume(input: GoalMutationInput, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>
   clear(input: GoalMutationInput, options?: { signal?: AbortSignal }): Promise<GoalMutationResult>

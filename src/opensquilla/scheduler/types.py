@@ -229,6 +229,17 @@ class ManualRunResult:
         return self.execution.finished_at if self.execution else None
 
 
+def is_rescheduled_one_shot(job: CronJob) -> bool:
+    """Whether an active reservation's occurrence was replaced by a new AT time."""
+    return (
+        job.schedule_kind == ScheduleKind.AT
+        and bool(job.reservation_token)
+        and job.scheduled_run_at is not None
+        and job.next_run_at is not None
+        and job.next_run_at != job.scheduled_run_at
+    )
+
+
 def clear_reservation(job: CronJob) -> None:
     job.reservation_token = ""
     job.reserved_at = None

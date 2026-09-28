@@ -49,6 +49,7 @@ describe('effectiveComposerRunMode', () => {
     expect(composerRunModeSelectionAction('safe', status, false)).toBe('ignore')
     expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
     expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, false)).toBe('persist')
+    expect(composerRunModeSelectionAction('safe', { ...status, state: 'ready' }, true)).toBe('setup')
   })
 
   it('ignores Safe selection until the initial setup check resolves', () => {
@@ -56,8 +57,17 @@ describe('effectiveComposerRunMode', () => {
     expect(composerRunModeSelectionAction('full', null, false, false)).toBe('persist')
   })
 
-  it.each(['failed', 'unavailable', 'setting_up'] as const)(
-    'ignores Safe selection when setup is %s even if setup availability is stale',
+  it.each(['failed'] as const)(
+    'routes a retryable Safe selection into setup when setup is %s',
+    state => {
+      const status = { state, platform: 'win32', message: '', requiresAdmin: false }
+      expect(composerRunModeSelectionAction('safe', status, true)).toBe('setup')
+      expect(composerRunModeSelectionAction('full', status, true)).toBe('persist')
+    },
+  )
+
+  it.each(['unavailable', 'setting_up'] as const)(
+    'ignores Safe selection when setup is %s',
     state => {
       const status = { state, platform: 'win32', message: '', requiresAdmin: false }
       expect(composerRunModeSelectionAction('safe', status, true)).toBe('ignore')

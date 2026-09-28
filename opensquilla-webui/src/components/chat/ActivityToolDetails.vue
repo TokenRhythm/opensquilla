@@ -3,6 +3,17 @@
     class="activity-tool-details"
     :class="{ 'activity-tool-details--bounded': isBoundedDetail }"
   >
+    <div
+      v-if="executionIo.kind !== 'unknown'"
+      class="activity-tool-details__execution-io"
+      :class="`activity-tool-details__execution-io--${executionIo.kind}`"
+      role="status"
+    >
+      {{ executionIoLabel }}
+      <span v-if="executionIo.kind === 'fallback' && executionIo.fallbackReason" class="activity-tool-details__execution-io-reason">
+        {{ executionIo.fallbackReason }}
+      </span>
+    </div>
     <template v-if="isBoundedDetail">
       <button
         type="button"
@@ -94,6 +105,7 @@ import { computed, onBeforeUnmount, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { ChatToolCallRenderItem, ToolResultContext } from '@/types/chat'
+import { projectExecutionIoForCall } from '@/utils/chat/executionIo'
 import {
   projectActivityToolDetail,
   redactActivityDetail,
@@ -127,6 +139,14 @@ const { locale, t } = useI18n()
 const projection = computed(() =>
   projectActivityToolDetail(props.call, props.operationKey),
 )
+const executionIo = computed(() => projectExecutionIoForCall(props.call))
+const executionIoLabel = computed(() => {
+  if (executionIo.value.kind === 'pty') return t('shared.runTrace.executionIoPty')
+  if (executionIo.value.kind === 'fallback') return t('shared.runTrace.executionIoFallback')
+  if (executionIo.value.kind === 'pipe') return t('shared.runTrace.executionIoPipe')
+  if (executionIo.value.kind === 'mixed') return t('shared.runTrace.executionIoMixed')
+  return t('shared.runTrace.executionIoUnknown')
+})
 const copyState = ref<'idle' | 'copied' | 'error'>('idle')
 let copyResetId: number | null = null
 
@@ -353,6 +373,7 @@ const detailActionLabel = computed(() => {
 
 function showRawDetails() {
   const detail = projection.value
+  const executionIoValue = executionIo.value
   emit(
     'showResult',
     detail.rawContent,
@@ -363,6 +384,7 @@ function showRawDetails() {
       section: detail.rawSection,
       format: detail.detailMode === 'changes' ? 'diff' : undefined,
       executionLogHandle: props.call.executionLogHandle,
+      ...(executionIoValue.kind === 'unknown' ? {} : { executionIo: executionIoValue }),
     },
   )
 }
@@ -374,6 +396,23 @@ function showRawDetails() {
   padding: 0.0625rem 0 0.25rem;
   font-size: 0.75rem;
   line-height: 1.45;
+}
+
+.activity-tool-details__execution-io {
+  margin: 0 0 0.375rem;
+  color: var(--text-muted);
+  font-size: 0.6875rem;
+}
+
+.activity-tool-details__execution-io--fallback {
+  color: var(--warn);
+}
+
+.activity-tool-details__execution-io-reason {
+  display: block;
+  color: var(--text-dim);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .activity-tool-details--bounded {

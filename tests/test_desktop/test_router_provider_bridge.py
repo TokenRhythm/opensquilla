@@ -13,13 +13,28 @@ from pathlib import Path
 import pytest
 
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.onboarding.mutations import LlmProfileActivationError, upsert_llm_provider
+from opensquilla.onboarding.mutations import (
+    upsert_llm_provider,
+    upsert_router,
+)
+from opensquilla.onboarding.provider_specs import provider_catalog_payload
 from opensquilla.onboarding.router_policy import (
     RouterProviderConflictError,
     validate_router_candidate,
 )
+from opensquilla.provider.preset_registry import get_preset
+from opensquilla.router_tiers import (
+    TEXT_TIERS,
+    effective_ensemble_selection_mode,
+    effective_tier_ensemble_selection_modes,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
+ROUTER_PROVIDER_IDS = tuple(
+    provider["providerId"]
+    for provider in provider_catalog_payload()
+    if provider["routerSupported"]
+)
 
 
 @pytest.fixture(scope="module")
@@ -61,6 +76,98 @@ process.stdout.write(routerConfigTomlLines(router).join('\\n'));
     return serialize
 
 
+@pytest.fixture(scope="module")
+def desktop_recommended_router_tomls(desktop_router_toml) -> dict[str, str]:
+    # Reuse the compiled-bridge gate, then exercise every supported provider
+    # in one Node process through the production setup and serialization path.
+    script = """
+import { readFileSync } from 'node:fs';
+import {
+  routerConfigTomlLines, resolveDesktopRouterUpdate,
+} from './desktop/electron/dist/desktop-router-config.js';
+import { defaultRouterTiers } from './desktop/electron/dist/desktop-router-profiles.js';
+const providers = JSON.parse(readFileSync(0, 'utf8'));
+const tomls = Object.fromEntries(providers.map(provider => {
+  const router = resolveDesktopRouterUpdate({
+    payload: {}, existing: null, routerMode: 'recommended', routerDefaultTier: 'c1',
+    defaultTiers: defaultRouterTiers(provider, 'recommended'), freshConfig: true,
+  });
+  return [provider, routerConfigTomlLines(router).join('\\n')];
+}));
+process.stdout.write(JSON.stringify(tomls));
+"""
+    result = subprocess.run(
+        [shutil.which("node"), "--input-type=module", "-e", script],
+        input=json.dumps(ROUTER_PROVIDER_IDS),
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=30,
+    )
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("provider_id", ROUTER_PROVIDER_IDS)
+def test_desktop_recommended_router_matches_backend_defaults(
+    desktop_recommended_router_tomls: dict[str, str], provider_id: str,
+) -> None:
+    preset = get_preset(provider_id)
+    assert preset is not None
+    parsed = tomllib.loads(desktop_recommended_router_tomls[provider_id])
+    stored_router = parsed["squilla_router"]
+    assert stored_router["enabled"] is True
+    assert stored_router["preset_binding"] == "follow_primary"
+    assert stored_router["default_tier"] == "c1"
+    assert set(TEXT_TIERS) <= stored_router["tiers"].keys()
+
+    # Check the serialized routes before GatewayConfig can seed defaults.
+    # Capability hints remain Gateway-owned rather than Desktop overrides.
+    expected_tiers = {
+        name: {key: value for key, value in tier.items() if key != "supports_image"}
+        for name, tier in preset.tier_defaults().items()
+    }
+    assert stored_router["tiers"] == expected_tiers
+
+    llm = {"provider": provider_id, "model": preset.default_model}
+    desktop = GatewayConfig.model_validate({"llm": llm, **parsed})
+    validate_router_candidate(desktop)
+    backend = upsert_router(
+        GatewayConfig(llm=llm, squilla_router={"enabled": False}), mode="recommended",
+    ).config
+    assert desktop.squilla_router.enabled == backend.squilla_router.enabled
+    assert desktop.squilla_router.default_tier == backend.squilla_router.default_tier
+    assert desktop.squilla_router.preset_binding == backend.squilla_router.preset_binding
+    desktop_tiers = {
+        name: {key: value for key, value in tier.items() if key != "supports_image"}
+        for name, tier in desktop.squilla_router.tiers.items()
+    }
+    backend_tiers = {
+        name: {key: value for key, value in tier.items() if key != "supports_image"}
+        for name, tier in backend.squilla_router.tiers.items()
+    }
+    assert desktop_tiers == backend_tiers
+    assert effective_tier_ensemble_selection_modes(
+        desktop.squilla_router.tiers,
+        shared_selection_mode=effective_ensemble_selection_mode(desktop),
+    ) == effective_tier_ensemble_selection_modes(
+        backend.squilla_router.tiers,
+        shared_selection_mode=effective_ensemble_selection_mode(backend),
+    )
+
+
+def test_desktop_serialization_retains_c3_single_model_and_qianfan_image_route(
+    desktop_recommended_router_tomls: dict[str, str],
+) -> None:
+    tokenrhythm = tomllib.loads(desktop_recommended_router_tomls["tokenrhythm"])
+    openrouter = tomllib.loads(desktop_recommended_router_tomls["openrouter"])
+    qianfan = tomllib.loads(desktop_recommended_router_tomls["qianfan"])
+    assert tokenrhythm["squilla_router"]["tiers"]["c3"]["ensemble_enabled"] is False
+    assert "ensemble_enabled" not in openrouter["squilla_router"]["tiers"]["c3"]
+    assert qianfan["squilla_router"]["tiers"]["image_model"]["image_only"] is True
+
+
 def config_from_desktop(raw: str) -> GatewayConfig:
     # A pristine Desktop runtime may carry the OpenRouter default without a key.
     return GatewayConfig.model_validate({"llm": {"provider": "openrouter"}, **tomllib.loads(raw)})
@@ -80,7 +187,7 @@ def test_new_desktop_recommendations_follow_first_usable_primary(desktop_router_
 
 
 @pytest.mark.parametrize("binding", [None, "custom"])
-def test_identical_historical_or_custom_presets_need_explicit_resolution(
+def test_curated_primary_switch_replaces_historical_or_custom_presets(
     desktop_router_toml, binding: str | None,
 ) -> None:
     raw = desktop_router_toml(binding)
@@ -88,10 +195,12 @@ def test_identical_historical_or_custom_presets_need_explicit_resolution(
         assert "preset_binding" not in raw
     source = config_from_desktop(raw)
     before = source.model_dump()
-    with pytest.raises(LlmProfileActivationError) as caught:
-        upsert_llm_provider(source, provider_id="tokenrhythm", api_key="synthetic-bridge-key")
-    assert caught.value.reason == "router_provider_conflict"
-    assert caught.value.details["conflictProviders"] == ["openrouter"]
+    replaced = upsert_llm_provider(
+        source, provider_id="tokenrhythm", api_key="synthetic-bridge-key"
+    ).config
+    assert replaced.llm.provider == "tokenrhythm"
+    assert replaced.squilla_router.preset_binding == "follow_primary"
+    assert replaced.squilla_router.tiers["c1"]["provider"] == "tokenrhythm"
     assert source.model_dump() == before
     disabled = upsert_llm_provider(
         source, provider_id="tokenrhythm", api_key="synthetic-bridge-key", router_action="disable",

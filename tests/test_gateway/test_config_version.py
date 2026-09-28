@@ -28,6 +28,7 @@ from opensquilla.gateway.config_migration import (
 )
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.onboarding import config_store
+from opensquilla.provider.preset_registry import get_preset
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
 # ---------------------------------------------------------------------------
@@ -298,7 +299,7 @@ def test_env_config_version_never_overrides_payload_stamp(
     persist_target = tmp_path / "persisted.toml"
     config_store.persist_config(cfg, path=persist_target, backup=False)
     text = persist_target.read_text(encoding="utf-8")
-    assert "config_version = 1" in text
+    assert f"config_version = {LATEST_CONFIG_VERSION}" in text
     assert "config_version = 99" not in text
 
 
@@ -355,7 +356,7 @@ def test_migrating_load_writes_stamp_into_rewritten_file(tmp_path: Path) -> None
     assert cfg.llm_ensemble.proposer_timeout_seconds == 3600.0
     assert list(tmp_path.glob("config.toml.backup.*"))
     text = toml_path.read_text(encoding="utf-8")
-    assert "config_version = 1" in text
+    assert f"config_version = {LATEST_CONFIG_VERSION}" in text
     assert "proposer_timeout_seconds = 3600.0" in text
 
     # The stamped file must load cleanly with no further rewrite.
@@ -410,6 +411,211 @@ def test_migrate_twice_equals_migrate_once(
 
 
 # ---------------------------------------------------------------------------
+# Version-gated migration: primary-provider router recommendations
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize("binding", [None, "custom", "follow_primary"])
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("version", [None, 1])
+def test_old_router_configuration_adopts_primary_recommendations_once(
+    primary: str, binding: str | None, enabled: bool, version: int | None,
+) -> None:
+    foreign_provider = "tokenrhythm" if primary == "openrouter" else "openrouter"
+    image = {"provider": foreign_provider, "model": "synthetic-image", "supports_image": True}
+    payload = {
+        **({"config_version": version} if version is not None else {}),
+        "llm": {"provider": primary, "model": "synthetic-direct-model"},
+        "llm_ensemble": {"enabled": False},
+        "squilla_router": {
+            "enabled": enabled,
+            "cross_provider_tiers": True,
+            "default_tier": "c2",
+            "rollout_phase": "observe",
+            **({"preset_binding": binding} if binding else {}),
+            "tiers": {
+                **{
+                    name: {"provider": foreign_provider, "model": f"synthetic-old-{name}"}
+                    for name in ("c0", "c1", "c2", "c3")
+                },
+                "image_model": image,
+            },
+        },
+    }
+    original_router = payload["squilla_router"]
+
+    migrated = migrate_config_payload(payload)
+
+    preset = get_preset(primary)
+    assert preset is not None
+    expected_tiers = {**preset.tier_defaults(), "image_model": image}
+    assert migrated.changed is True
+    assert migrated.payload["squilla_router"] == {
+        **original_router, "preset_binding": "follow_primary", "tiers": expected_tiers,
+    }
+    assert migrated.payload["llm"] == payload["llm"]
+    assert migrated.payload["llm_ensemble"] == payload["llm_ensemble"]
+    cfg = GatewayConfig.model_validate(migrated.payload)
+    assert cfg.squilla_router.tiers == expected_tiers
+    assert cfg.squilla_router.enabled is enabled
+    assert cfg.config_version == LATEST_CONFIG_VERSION
+    assert migrate_config_payload(migrated.payload).changed is False
+
+    # Subsequent edits, including choosing the old arbitrary ladder again,
+    # are owned by the user and survive both migration and validation.
+    migrated.payload["squilla_router"] = {**original_router, "preset_binding": "custom"}
+    edited = migrate_config_payload(migrated.payload)
+    assert edited.changed is False
+    assert GatewayConfig.model_validate(edited.payload).squilla_router.tiers == (
+        original_router["tiers"]
+    )
+
+
+@pytest.mark.parametrize("primary", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize("loader", ["load", "load_from_toml", "onboarding"])
+def test_primary_router_upgrade_is_backed_up_and_later_edits_survive_reload(
+    tmp_path: Path, primary: str, loader: str,
+) -> None:
+    path = _write_toml(tmp_path / "config.toml", {
+        "config_version": 1,
+        "llm": {"provider": primary, "model": "synthetic-direct-model"},
+        "squilla_router": {
+            "enabled": False,
+            "preset_binding": "custom",
+            "tiers": {"c1": {"provider": "openrouter", "model": "synthetic-old-model"}},
+        },
+    })
+    original = path.read_bytes()
+    if loader == "onboarding":
+        cfg = config_store.load_config(path)
+    else:
+        cfg = getattr(GatewayConfig, loader)(path)
+    preset = get_preset(primary)
+    assert preset is not None
+    assert cfg.squilla_router.tiers == preset.tier_defaults()
+    assert cfg.squilla_router.enabled is False
+    backup, = tmp_path.glob("config.toml.backup.*")
+    assert backup.read_bytes() == original
+    saved = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert saved["config_version"] == LATEST_CONFIG_VERSION
+    assert saved["squilla_router"]["tiers"] == cfg.squilla_router.tiers
+
+    cfg.squilla_router.preset_binding = "custom"
+    cfg.squilla_router.tiers["c1"]["model"] = "synthetic-post-upgrade-model"
+    config_store.persist_config(cfg, path=path, backup=False)
+    before_reload = path.read_bytes()
+    restored = config_store.load_config(path)
+    assert restored.squilla_router.tiers == cfg.squilla_router.tiers
+    assert restored.squilla_router.preset_binding == "custom"
+    assert path.read_bytes() == before_reload
+    assert list(tmp_path.glob("config.toml.backup.*")) == [backup]
+
+
+@pytest.mark.parametrize("provider", ["openai", "groq"])
+def test_router_recommendations_upgrade_does_not_change_other_providers(provider: str) -> None:
+    payload = {
+        "config_version": 1,
+        "llm": {"provider": provider},
+        "squilla_router": {"preset_binding": "custom", "tiers": {
+            "c0": {"provider": provider, "model": "synthetic-model"},
+        }},
+    }
+    migrated = migrate_config_payload(payload)
+    assert migrated.changed is False
+    assert migrated.payload["squilla_router"] == payload["squilla_router"]
+
+
+@pytest.mark.parametrize("provider", ["openrouter", "tokenrhythm"])
+@pytest.mark.parametrize("evidence", ["endpoint", "key_env", "both"])
+def test_providerless_router_upgrade_uses_distinctive_file_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str, evidence: str,
+) -> None:
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    endpoint = (
+        "https://openrouter.ai/api/v1"
+        if provider == "openrouter" else "https://tokenrhythm.studio/v1"
+    )
+    llm = {
+        **({"base_url": endpoint} if evidence != "key_env" else {}),
+        **({"api_key_env": f"{provider.upper()}_API_KEY"} if evidence != "endpoint" else {}),
+    }
+    path = _write_toml(tmp_path / "config.toml", {
+        "config_version": 1,
+        "llm": llm,
+        "squilla_router": {
+            "preset_binding": "custom",
+            "tiers": {"c1": {"provider": "openrouter", "model": "synthetic-old-model"}},
+        },
+    })
+    before = path.read_bytes()
+
+    cfg = config_store.load_config(path)
+
+    preset = get_preset(provider)
+    assert preset is not None
+    assert cfg.llm.provider == provider
+    assert cfg.squilla_router.tiers == preset.tier_defaults()
+    assert cfg.squilla_router.preset_binding == "follow_primary"
+    saved = tomllib.loads(path.read_text(encoding="utf-8"))
+    assert saved["llm"] == llm  # Preserve provider inference on later loads.
+    assert saved["config_version"] == LATEST_CONFIG_VERSION
+    assert saved["squilla_router"]["tiers"] == preset.tier_defaults()
+    backup, = tmp_path.glob("config.toml.backup.*")
+    assert backup.read_bytes() == before
+
+
+@pytest.mark.parametrize("llm", [
+    {"base_url": "https://models.example/v1", "api_key_env": "SYNTHETIC_PROVIDER_KEY"},
+    {"base_url": "https://tokenrhythm.studio/v1", "api_key_env": "OPENROUTER_API_KEY"},
+])
+def test_providerless_router_upgrade_preserves_ambiguous_configuration(llm: dict) -> None:
+    payload = {
+        "config_version": 1,
+        "llm": llm,
+        "squilla_router": {
+            "preset_binding": "custom",
+            "tiers": {"c1": {"model": "synthetic-custom-model"}},
+        },
+    }
+    migrated = migrate_config_payload(payload)
+    assert migrated.changed is False
+    assert migrated.payload["llm"] == llm
+    assert migrated.payload["squilla_router"] == payload["squilla_router"]
+
+
+def test_providerless_router_upgrade_does_not_override_conflicting_ambient_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "synthetic-openrouter-key")
+    monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
+    payload = {
+        "config_version": 1,
+        "llm": {"base_url": "https://tokenrhythm.studio/v1"},
+        "squilla_router": {
+            "preset_binding": "custom",
+            "tiers": {"c1": {"model": "synthetic-custom-model"}},
+        },
+    }
+    migrated = migrate_config_payload(payload)
+    assert migrated.changed is False
+    assert migrated.payload["squilla_router"] == payload["squilla_router"]
+
+
+@pytest.mark.parametrize("profile", ["openrouter", "tokenrhythm"])
+def test_tokenrhythm_upgrade_clears_persisted_tier_profile(profile: str) -> None:
+    migrated = migrate_config_payload({
+        "config_version": 1,
+        "llm": {"provider": "tokenrhythm"},
+        "llm_profiles": {"openrouter": {"model": "synthetic-model"}},
+        "squilla_router": {"tier_profile": profile},
+    })
+    assert "tier_profile" not in migrated.payload["squilla_router"]
+    assert GatewayConfig.model_validate(migrated.payload).squilla_router.tier_profile is None
+
+
+# ---------------------------------------------------------------------------
 # RPC guard: config_version is read-only for clients
 # ---------------------------------------------------------------------------
 
@@ -444,7 +650,7 @@ async def test_config_patch_skips_config_version(tmp_path: Path) -> None:
     assert cfg.config_version == LATEST_CONFIG_VERSION
     assert cfg.diagnostics_enabled is True
     persisted = config_path.read_text(encoding="utf-8")
-    assert "config_version = 1" in persisted
+    assert f"config_version = {LATEST_CONFIG_VERSION}" in persisted
     assert "config_version = 99" not in persisted
 
 

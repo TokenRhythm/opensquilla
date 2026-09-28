@@ -1,5 +1,11 @@
 import { expect, test, type Locator, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eworkbench'
@@ -102,24 +108,21 @@ async function installWorkbenchGateway(
           type: 'res',
           id: frame.id,
           ok: true,
-          payload: {
-            messages: [
-              {
-                role: 'user',
-                text: 'Create previewable files.',
-                id: 'workbench-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'The files are ready.',
-                id: 'workbench-assistant',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts,
-              },
-            ],
-            has_more: false,
-          },
+          payload: chatHistoryPayload([
+            {
+              role: 'user',
+              text: 'Create previewable files.',
+              id: 'workbench-user',
+              timestamp: Math.floor(Date.now() / 1000) - 120,
+            },
+            {
+              role: 'assistant',
+              text: 'The files are ready.',
+              id: 'workbench-assistant',
+              timestamp: Math.floor(Date.now() / 1000) - 60,
+              artifacts,
+            },
+          ]),
         }))
         return
       }
@@ -133,12 +136,9 @@ async function installWorkbenchGateway(
         },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(SESSION_KEY),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(SESSION_KEY),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(SESSION_KEY),
         'usage.status': { sessions: [] },
       }
       ws.send(JSON.stringify({
@@ -351,6 +351,67 @@ async function tabUntilFocused(page: Page, target: Locator, attempts = 8) {
 }
 
 test.describe('Application Workbench', () => {
+  for (const theme of ['dark', 'light'] as const) {
+    test(`${theme} pointer resize keeps a single divider and restores keyboard focus`, async ({ page }, testInfo) => {
+      await page.setViewportSize({ width: 1440, height: 900 })
+      await page.addInitScript(value => localStorage.setItem('opensquilla-theme', value), theme)
+      await openWorkbenchSession(page)
+      await page.locator('.msg-artifact-chip', { hasText: 'demo.html' })
+        .getByRole('button', { name: 'Open demo.html' }).click()
+      const resizer = page.getByTestId('workbench-resizer')
+      await expect(resizer).toBeVisible()
+      await expect(page.locator('.artifact-preview__frame--html')).toBeVisible()
+
+      // Exercise pointer focus from the composer and then from a
+      // keyboard-focused divider, which previously kept its outline on drag.
+      await page.locator('.chat-textarea').click()
+      const initialWidth = Number(await resizer.getAttribute('aria-valuenow'))
+      const box = (await resizer.boundingBox())!
+      const dragY = box.y + box.height / 2
+      await page.mouse.move(box.x + 3, dragY)
+      await page.mouse.down()
+      await page.mouse.move(box.x - 77, dragY, { steps: 16 })
+      await expect(resizer).toHaveAttribute('aria-valuenow', String(initialWidth + 80))
+      await page.screenshot({ path: testInfo.outputPath('pointer-drag.png') })
+      await expect(resizer).toHaveCSS('outline-style', 'none')
+      expect(await resizer.evaluate(element => getComputedStyle(element, '::before').width)).toBe('2px')
+
+      await page.mouse.up()
+      await page.mouse.move(40, 40)
+      await expect(resizer).toBeFocused()
+      await expect(resizer).toHaveCSS('outline-style', 'none')
+      await page.screenshot({ path: testInfo.outputPath('pointer-released.png') })
+
+      await page.keyboard.press('ArrowLeft')
+      await expect(resizer).toHaveAttribute('aria-valuenow', String(initialWidth + 88))
+      await expect(resizer).toHaveCSS('outline-style', 'solid')
+      await expect(resizer).toHaveCSS('outline-width', '2px')
+      await page.keyboard.press('Tab')
+      await expect(resizer).not.toBeFocused()
+      await page.keyboard.press('Shift+Tab')
+      await expect(resizer).toBeFocused()
+      await expect(resizer).toHaveCSS('outline-style', 'solid')
+      await page.screenshot({ path: testInfo.outputPath('keyboard-focus.png') })
+
+      const nextBox = (await resizer.boundingBox())!
+      await page.mouse.move(nextBox.x + 3, dragY)
+      await page.mouse.down()
+      await page.mouse.move(nextBox.x + 43, dragY, { steps: 8 })
+      await expect(resizer).toHaveAttribute('aria-valuenow', String(initialWidth + 48))
+      await expect(resizer).toHaveCSS('outline-style', 'none')
+      await page.keyboard.press('Escape')
+      await page.mouse.up()
+      await expect(resizer).toHaveAttribute('aria-valuenow', String(initialWidth + 88))
+      await expect(page.locator('html')).not.toHaveClass(/is-workbench-resizing/)
+
+      await page.emulateMedia({ forcedColors: 'active' })
+      await page.keyboard.press('ArrowRight')
+      await expect(resizer).toHaveAttribute('aria-valuenow', String(initialWidth + 80))
+      await expect(resizer).toHaveCSS('outline-style', 'solid')
+      await expect(resizer).toHaveCSS('outline-width', '2px')
+    })
+  }
+
   for (const mode of ['full', 'offline'] as const) {
     test(`Desktop v2 ${mode} preview is positioned when its slot becomes ready`, async ({
       page,

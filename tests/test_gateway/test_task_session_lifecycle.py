@@ -303,6 +303,14 @@ async def test_task_timeout_terminalizes_running_session_and_broadcasts_change()
             "session_key": session.session_key,
             "terminal_reason": "timeout",
             "terminal_message": "The task timed out before it could finish.",
+            "code": "TimeoutError",
+            "turn_outcome": {
+                "kind": "interrupted",
+                "reason": "timeout",
+                "error_class": "TimeoutError",
+                "error_message": "The task timed out before it could finish.",
+                "retryable": True,
+            },
         },
     )
     assert events[-1] == (

@@ -203,6 +203,24 @@ class ScopedTelemetryRuntime:
         self._record_tasks.add(task)
         task.add_done_callback(self._record_tasks.discard)
 
+    async def recover_contract_rejection_once(
+        self,
+        event: StrictTelemetryModel,
+        *,
+        expected_consent_revision: int,
+    ) -> bool:
+        """Recover an existing Growth observation without creating a new fact."""
+
+        self._ensure_open()
+        if str(getattr(event, "consent_scope", "")) != TelemetryScope.GROWTH.value:
+            return False
+        scoped = await self._scope_runtime(TelemetryScope.GROWTH)
+        if scoped is None:
+            return False
+        return await scoped.recorder.recover_contract_rejection_once(
+            event, expected_consent_revision=expected_consent_revision,
+        )
+
     async def upload_once(self, scope: TelemetryScope | str) -> None:
         """Attempt one scope upload; all operational failures remain local."""
 

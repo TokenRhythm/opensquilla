@@ -4,6 +4,10 @@ import type { SessionReadMetadata } from '@/modules/sessionReadLifecycle'
 import type { TaskProgressSnapshot } from '@/types/taskProgress'
 import { normalizeTaskProgress } from '@/utils/chat/taskProgress'
 
+const TERMINAL_STATUSES = new Set([
+  'succeeded', 'failed', 'cancelled', 'timeout', 'abandoned', 'interrupted',
+])
+
 /** Progress belongs to a task and is descriptive; it never drives scheduling. */
 export function useChatTaskProgress(options: {
   sessionKey: Ref<string>
@@ -11,24 +15,21 @@ export function useChatTaskProgress(options: {
   activeTaskId: Readonly<Ref<string>>
 }) {
   const progressByTask = ref<Record<string, TaskProgressSnapshot>>({})
-  const lastTaskId = ref('')
-  const settled = new Set<string>()
-  const taskId = computed(() => options.activeTaskId.value || lastTaskId.value)
+  const settled = ref(new Set<string>())
+  const taskId = computed(() => (
+    settled.value.has(options.activeTaskId.value) ? '' : options.activeTaskId.value
+  ))
   const progress = computed(() => progressByTask.value[taskId.value] ?? null)
 
   function reset() {
     progressByTask.value = {}
-    lastTaskId.value = ''
-    settled.clear()
+    settled.value.clear()
   }
   watch([options.sessionKey, options.currentEpoch], reset, { flush: 'sync' })
-  watch(options.activeTaskId, value => {
-    if (value) lastTaskId.value = value
-  }, { flush: 'sync', immediate: true })
 
   function apply(task: string, value: unknown) {
     const incoming = normalizeTaskProgress(value)
-    if (!task || !incoming) return
+    if (!task || !incoming || settled.value.has(task)) return
     const previous = progressByTask.value[task]
     if (previous && previous.revision >= incoming.revision) return
     progressByTask.value = { ...progressByTask.value, [task]: incoming }
@@ -37,30 +38,33 @@ export function useChatTaskProgress(options: {
   function applySnapshot(snapshot: SessionReadMetadata) {
     if (snapshot.sessionKey !== options.sessionKey.value
       || snapshot.epoch !== options.currentEpoch.value) return
+    // Terminal evidence wins even when an older active copy appears in the
+    // same hydration response. Historical progress must not revive the dock.
     for (const task of [...snapshot.tasks, snapshot.activeTask, snapshot.lastTask]) {
       if (!task) continue
       const id = String(task.task_id || task.taskId || '')
-      apply(id, task.progress)
+      if (TERMINAL_STATUSES.has(String(task.status || '').trim().toLowerCase())) {
+        noteTaskSettled(id)
+      }
     }
-    if (!lastTaskId.value) {
-      const task = snapshot.activeTask ?? snapshot.lastTask
-      lastTaskId.value = String(task?.task_id || task?.taskId || '')
+    for (const task of [...snapshot.tasks, snapshot.activeTask]) {
+      if (!task) continue
+      const id = String(task.task_id || task.taskId || '')
+      apply(id, task.progress)
     }
   }
 
   function applyEvent(payload: ConversationEventData) {
     if (payload.key !== options.sessionKey.value || payload.epoch !== options.currentEpoch.value
-      || !payload.task_id || settled.has(payload.task_id)) return
+      || !payload.task_id) return
     apply(payload.task_id, payload.progress)
-    if (!lastTaskId.value && payload.task_id === options.activeTaskId.value) {
-      lastTaskId.value = payload.task_id
-    }
   }
 
   function noteTaskSettled(id: string, epoch?: number) {
     if (!id || (epoch !== undefined && epoch !== options.currentEpoch.value)) return
-    settled.add(id)
-    if (settled.size > 256) settled.delete(settled.values().next().value!)
+    settled.value.add(id)
+    if (settled.value.size > 256) settled.value.delete(settled.value.values().next().value!)
+    delete progressByTask.value[id]
   }
 
   return { progress, taskId, applySnapshot, applyEvent, noteTaskSettled }

@@ -36,11 +36,6 @@ class CustomBuildHook(BuildHookInterface):
             verify_dist(
                 root / STAGED_DIST_RELATIVE,
                 webui_root=root / "opensquilla-webui",
-                # Source archives are easy to redistribute accidentally. Keep
-                # standard sdists privacy-safe even when a checkout contains
-                # ignored personal music; direct local wheels may still embed
-                # an explicitly customized artifact.
-                forbid_personal_bgm=self.target_name == "sdist",
             )
             if self.target_name == "sdist":
                 verify_sdist_source_inventory(root / "opensquilla-webui")
@@ -60,12 +55,6 @@ class CustomBuildHook(BuildHookInterface):
                     else "migrations/registry.json"
                 )
         except (ImportError, OSError, RuntimeError) as exc:
-            privacy_note = (
-                " Standard sdists intentionally reject personal BGM; build a "
-                "direct local wheel if you need a private customized artifact."
-                if self.target_name == "sdist"
-                else ""
-            )
             raise RuntimeError(
                 "A verified WebUI artifact is required for standard wheel/sdist builds. "
                 "From a repository checkout, run "
@@ -74,7 +63,7 @@ class CustomBuildHook(BuildHookInterface):
                 "an official release wheel, or clone the repository and run "
                 "`bash scripts/install_source.sh` (`powershell -ExecutionPolicy "
                 "Bypass -File ./scripts/install_source.ps1` on Windows). "
-                f"Validation failed: {exc}{privacy_note}"
+                f"Validation failed: {exc}"
             ) from exc
         finally:
             sys.path.remove(str(root))

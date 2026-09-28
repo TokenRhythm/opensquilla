@@ -98,7 +98,11 @@
           {{ t('usageLogs.logs.retry') }}
         </button>
       </div>
-      <div ref="displayRef" class="lg-display" @scroll="onScroll">
+      <div
+        ref="displayRef" class="lg-display"
+        @wheel.passive="cancelLayoutRestore" @touchstart.passive="cancelLayoutRestore"
+        @pointerdown.passive="cancelLayoutRestore" @keydown="cancelLayoutRestore"
+      >
         <div
           v-if="loadState === 'loading' && allLines.length === 0"
           class="lg-display__placeholder"
@@ -131,11 +135,14 @@
         <div
           v-else
           class="lg-window"
-          :style="{ paddingTop: topPad + 'px', paddingBottom: bottomPad + 'px' }"
+          :style="{ height: virtualizer.getTotalSize() + 'px' }"
         >
           <div
-            v-for="{ item: line, index: idx } in windowedLines"
-            :key="idx"
+            v-for="{ item: line, index: idx, key, start } in windowedLines"
+            :key="String(key)"
+            :ref="el => virtualizer.measureElement(el as HTMLElement | null)"
+            :data-index="idx"
+            :style="{ transform: `translateY(${start - scrollMargin}px)` }"
             :class="['lg-line', `lg-line--${(line.level || 'info').toLowerCase()}`, idx % 2 === 1 ? 'lg-line--alt' : '', runTraceEnabled ? 'lg-line--interactive' : '']"
             :role="runTraceEnabled ? 'button' : undefined"
             :tabindex="runTraceEnabled ? 0 : undefined"
@@ -209,11 +216,11 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, inject, onMounted, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
+import { ref, computed, inject, onUnmounted, onActivated, onDeactivated, watch, nextTick } from 'vue'
+import { defaultRangeExtractor, measureElement as measureVirtualElement, observeElementOffset, observeElementRect, useVirtualizer, type Rect, type VirtualItem, type Virtualizer } from '@tanstack/vue-virtual'
 import { useI18n } from 'vue-i18n'
 import { RouterLink } from 'vue-router'
 import { OBSERVABILITY_KEY, type GatewayLogStatus } from '@/modules/observability'
-import { useFixedWindow } from '@/composables/useFixedWindow'
 import Icon from '@/components/Icon.vue'
 import ControlSwitch from '@/components/ControlSwitch.vue'
 import RunTrace from '@/components/run/RunTrace.vue'
@@ -221,12 +228,14 @@ import SupportDiagnosticsMenu from '@/components/SupportDiagnosticsMenu.vue'
 import { useRunTrace } from '@/composables/run/useRunTrace'
 import { nodeStepsFromToolCalls } from '@/components/run/runTrace'
 import type { NodeStep, RunTraceSummary } from '@/types/runTrace'
+import { remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 interface LogLine {
+  id: number
   level: string
   message: string
   ts?: string | number | null
@@ -240,11 +249,9 @@ interface LogLine {
 const LEVELS = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR'] as const
 const DEFAULT_LEVELS = new Set<string>(['DEBUG', 'INFO', 'WARN', 'ERROR'])
 
-// Desktop .lg-line height: 12px mono at 1.6 line-height plus 2px vertical
-// padding each side. At <=480px the row reflows to a taller column layout, so
-// windowing is disabled there and the plain list renders (see windowingEnabled).
+// The estimate matches a short desktop line. TanStack measures wrapped messages
+// and the narrow-screen column layout instead of assuming every line is 24px.
 const ROW_H = 24
-const WINDOW_MIN_WIDTH = '(min-width: 481px)'
 
 // ---------------------------------------------------------------------------
 // State
@@ -255,6 +262,7 @@ const injectedObservability = inject(OBSERVABILITY_KEY)
 if (!injectedObservability) throw new Error('Observability was not provided')
 const observability = injectedObservability
 const allLines = ref<LogLine[]>([])
+let lineSequence = 0
 const cursor = ref(0)
 const searchText = ref('')
 const debouncedSearch = ref('')
@@ -313,20 +321,95 @@ const filteredLines = computed(() => {
 
 const visibleCount = computed(() => filteredLines.value.length)
 
-// The stream buffer caps at 2000 lines but the viewport only ever shows ~50, so
-// mount the on-screen slice instead of the whole filtered set. Disabled on
-// narrow viewports where the row reflows to a variable-height column layout.
-const windowingEnabled = ref(true)
-let windowMedia: MediaQueryList | null = null
-const { visible: windowVisible, topPad: windowTopPad, bottomPad: windowBottomPad, onScroll, measure, scrollToEnd } =
-  useFixedWindow<LogLine>(filteredLines, ROW_H, displayRef, 12)
+const layoutAnchor = ref<VirtualItem['key'] | null>(null)
+const scrollMargin = ref(0)
+let layoutWidth = 0
+let layoutGeneration = 0
+let readingAnchor: VirtualizerAnchor | null = null
+const extractLogRange = computed(() => {
+  const anchorIndex = filteredLines.value.findIndex(line => line.id === layoutAnchor.value)
+  return (range: Parameters<typeof defaultRangeExtractor>[0]) => {
+    const indexes = defaultRangeExtractor(range)
+    return anchorIndex < 0 ? indexes : [...new Set([...indexes, anchorIndex])].sort((a, b) => a - b)
+  }
+})
+const virtualizer = useVirtualizer<HTMLElement, HTMLElement>(computed(() => ({
+  count: filteredLines.value.length,
+  getScrollElement: () => displayRef.value,
+  getItemKey: (index: number) => filteredLines.value[index].id,
+  estimateSize: () => ROW_H,
+  overscan: 12,
+  scrollMargin: scrollMargin.value,
+  anchorTo: 'end' as const,
+  scrollEndThreshold: autoFollow.value ? 80 : -1,
+  measureElement: (element: HTMLElement, entry: ResizeObserverEntry | undefined, instance: Virtualizer<HTMLElement, HTMLElement>) => (
+    entry?.borderBoxSize?.[0]?.blockSize ?? measureVirtualElement(element, entry, instance)
+  ),
+  rangeExtractor: extractLogRange.value,
+  observeElementOffset: (instance: Virtualizer<HTMLElement, HTMLElement>, callback: (offset: number, scrolling: boolean) => void) => (
+    observeElementOffset(instance, (offset, scrolling) => {
+      callback(offset, scrolling)
+      rememberReadingAnchor(instance)
+    })
+  ),
+  observeElementRect: (instance: Virtualizer<HTMLElement, HTMLElement>, callback: (rect: Rect) => void) => (
+    observeElementRect(instance, rect => {
+      const changed = layoutWidth > 0 && layoutWidth !== rect.width
+      const anchor = readingAnchor
+      // The wrapper begins after the existing display padding; keep core
+      // offsets in scroll-container coordinates without changing its styling.
+      const element = instance.scrollElement
+      scrollMargin.value = element
+        ? Number.parseFloat(instance.targetWindow?.getComputedStyle(element).paddingTop || '0') || 0 : 0
+      layoutWidth = rect.width
+      callback(rect)
+      if (changed) remeasureLogs(instance, anchor)
+    })
+  ),
+})))
+// A reflow transaction owns its absolute anchor. Parallel row compensation
+// would use the pre-reflow offset until the native scroll event catches up.
+virtualizer.value.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => (
+  layoutAnchor.value === null && item.end <= (instance.scrollOffset ?? 0)
+)
 
-const windowedLines = computed(() =>
-  windowingEnabled.value
-    ? windowVisible.value
-    : filteredLines.value.map((item, index) => ({ item, index })))
-const topPad = computed(() => (windowingEnabled.value ? windowTopPad.value : 0))
-const bottomPad = computed(() => (windowingEnabled.value ? windowBottomPad.value : 0))
+function rememberReadingAnchor(instance: Virtualizer<HTMLElement, HTMLElement>) {
+  // Row RO may precede container RO and shrink/clamp the old scroll range.
+  // Retain only the last stable reading key, never a second size/offset cache.
+  if (autoFollow.value || layoutAnchor.value !== null || !layoutWidth
+    || instance.scrollElement?.offsetWidth !== layoutWidth) return
+  const offset = instance.scrollElement.scrollTop
+  const item = instance.getVirtualItemForOffset(offset)
+  readingAnchor = item ? { key: item.key, intraOffset: offset - item.start } : null
+}
+
+function cancelLayoutRestore() {
+  layoutGeneration += 1
+  layoutAnchor.value = null
+  readingAnchor = null
+}
+
+function remeasureLogs(instance = virtualizer.value, anchorOverride?: VirtualizerAnchor | null) {
+  const generation = ++layoutGeneration
+  void remeasureVirtualizer(instance, {
+    anchorOverride,
+    shouldFollowEnd: () => autoFollow.value,
+    isCurrent: () => generation === layoutGeneration && isActive,
+    getElement: index => displayRef.value?.querySelector<HTMLElement>(`[data-index="${index}"]`) ?? null,
+    keepAnchorMounted: key => {
+      layoutAnchor.value = key
+      return () => { if (generation === layoutGeneration) layoutAnchor.value = null }
+    },
+  }).then(restored => {
+    if (generation !== layoutGeneration || !isActive) return
+    if (restored) rememberReadingAnchor(instance)
+    else readingAnchor = null
+  })
+}
+const virtualRows = computed(() => virtualizer.value.getVirtualItems())
+const windowedLines = computed(() => virtualRows.value.map(row => ({
+  item: filteredLines.value[row.index], index: row.index, key: row.key, start: row.start,
+})))
 
 const fileLogEnabled = computed(() => status.value?.gateway_file_log?.enabled ?? false)
 const filePath = computed(() => status.value?.gateway_file_log?.path || 'debug.log')
@@ -385,13 +468,6 @@ const lineSummary = computed<RunTraceSummary | undefined>(() => {
 // Lifecycle
 // ---------------------------------------------------------------------------
 
-onMounted(() => {
-  windowMedia = window.matchMedia(WINDOW_MIN_WIDTH)
-  windowingEnabled.value = windowMedia.matches
-  windowMedia.addEventListener('change', onWindowMediaChange)
-  measure()
-})
-
 // Polling lives on activate/deactivate so a kept-alive but hidden Logs view
 // neither tails nor reacts to document visibility changes. onActivated also
 // fires on first mount, so all data ownership starts here without a duplicate
@@ -411,18 +487,16 @@ onActivated(() => {
 
 onDeactivated(() => {
   isActive = false
+  cancelLayoutRestore()
   stopPolling()
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 
 onUnmounted(() => {
   isActive = false
+  cancelLayoutRestore()
   stopPolling()
   if (searchTimer) clearTimeout(searchTimer)
-  if (windowMedia) {
-    windowMedia.removeEventListener('change', onWindowMediaChange)
-    windowMedia = null
-  }
   document.removeEventListener('visibilitychange', onVisibilityChange)
   document.removeEventListener('keydown', onDetailKeydown)
 })
@@ -439,17 +513,14 @@ function stopPolling() {
   }
 }
 
-function onWindowMediaChange(e: MediaQueryListEvent) {
-  windowingEnabled.value = e.matches
-  if (e.matches) nextTick(() => measure())
-}
-
 // Auto-scroll when filtered lines change and autoFollow is on
 watch(filteredLines, () => {
   if (autoFollow.value) {
     nextTick(() => scrollToBottom())
   }
 })
+
+watch([activeLevels, debouncedSearch], cancelLayoutRestore, { flush: 'sync' })
 
 // Debounce search so typing doesn't re-scan the whole buffer per keystroke.
 watch(searchText, (val) => {
@@ -462,7 +533,16 @@ function onVisibilityChange() {
 }
 
 watch(autoFollow, (val) => {
-  if (val) scrollToBottom()
+  if (val) {
+    cancelLayoutRestore()
+    scrollToBottom()
+  } else {
+    // Retire an unfinished end-index seek before the reader takes over. A
+    // later viewport resize must not resume that old Auto-follow command.
+    const display = displayRef.value
+    if (display) virtualizer.value.scrollToOffset(display.scrollTop, { behavior: 'auto' })
+    rememberReadingAnchor(virtualizer.value)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -472,11 +552,14 @@ watch(autoFollow, (val) => {
 async function loadData() {
   if (initialLoadInFlight || !isActive) return
   initialLoadInFlight = true
+  cancelLayoutRestore()
   stopPolling()
   loadState.value = 'loading'
   try {
     cursor.value = 0
     allLines.value = []
+    await nextTick()
+    virtualizer.value.measure()
     await loadStatus()
     if (!isActive) return
     await poll()
@@ -514,9 +597,10 @@ async function poll() {
       }
       lines.forEach(entry => {
         if (typeof entry === 'string') {
-          allLines.value.push({ level: guessLevel(entry), message: entry, raw: entry })
+          allLines.value.push({ id: lineSequence++, level: guessLevel(entry), message: entry, raw: entry })
         } else {
           allLines.value.push({
+            id: lineSequence++,
             level: (entry.level || entry.lvl || 'INFO').toUpperCase(),
             message: entry.message || entry.msg || JSON.stringify(entry),
             ts: entry.timestamp || entry.ts || null,
@@ -526,6 +610,9 @@ async function poll() {
       })
       if (allLines.value.length > 2000) {
         allLines.value = allLines.value.slice(allLines.value.length - 2000)
+        // TanStack retains keyed measurements for removed rows. Clear them
+        // after its keyed trim has committed, preserving the reader's anchor.
+        void nextTick(() => { if (isActive) remeasureLogs() })
       }
     }
     loadState.value = 'ready'
@@ -653,14 +740,7 @@ function highlightParts(message: string): Array<{ text: string; match: boolean }
 }
 
 function scrollToBottom() {
-  // Route through the window so its internal scroll offset re-syncs to the new
-  // scrollHeight after an append; otherwise the mounted slice goes stale.
-  if (windowingEnabled.value) {
-    scrollToEnd()
-    return
-  }
-  const el = displayRef.value
-  if (el) el.scrollTop = el.scrollHeight
+  virtualizer.value.scrollToEnd()
 }
 
 function escRegex(s: string): string {
@@ -856,6 +936,7 @@ function escRegex(s: string): string {
   line-height: 1.6;
   max-height: 60vh;
   overflow: auto;
+  overflow-anchor: none;
   padding: var(--sp-3);
 }
 
@@ -937,10 +1018,15 @@ function escRegex(s: string): string {
   to { transform: rotate(360deg); }
 }
 
-/* Windowed body: top/bottom padding stands in for the off-screen rows so the
-   scrollbar geometry matches the full buffer. No color — padding passthrough. */
+/* TanStack owns the full height and each measured row's position. */
 .lg-window {
-  display: flow-root;
+  position: relative;
+}
+
+.lg-window,
+.lg-line {
+  /* Virtual geometry must never inherit the global reduced-motion transition. */
+  transition: none !important;
 }
 
 .lg-line {
@@ -949,6 +1035,10 @@ function escRegex(s: string): string {
   display: flex;
   gap: 10px;
   padding: 2px 6px;
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
   white-space: pre-wrap;
   word-break: break-word;
 }

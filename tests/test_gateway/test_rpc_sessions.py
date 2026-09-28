@@ -648,6 +648,13 @@ class _FakeCompactionProvider:
     def model(self) -> str:
         return self._model
 
+    def project_final_request(self, messages, tools, config, *, message_limit=None):
+        from opensquilla.provider.openai import OpenAIProvider
+
+        return OpenAIProvider(
+            api_key=self._api_key, model=self._model, base_url=self._base_url,
+        ).project_final_request(messages, tools, config, message_limit=message_limit)
+
 
 class _FakeSelectorClone:
     def __init__(self, provider: _FakeCompactionProvider) -> None:
@@ -3813,7 +3820,7 @@ class TestSessionsSend:
         assert chat_session.origin["sandbox_run_context"]["run_mode"] == "standard"
 
     @pytest.mark.asyncio
-    async def test_send_strips_hidden_preflight_payload_before_task_runtime(
+    async def test_send_preserves_message_before_task_runtime_with_web_display_text(
         self, dispatcher, session
     ):
         class RecordingTaskRuntime:
@@ -3831,28 +3838,27 @@ class TestSessionsSend:
         runtime = RecordingTaskRuntime()
         manager = FakeSessionManager([session])
         ctx = make_ctx(session_manager=manager, task_runtime=runtime)
-        hidden_message = (
-            "Original visible request\n\n"
-            "Confirmed request fields:\n"
-            "- audience: decision owner\n\n"
-            "<!-- opensquilla:meta_preflight_confirmed=1 -->\n"
-            "<!-- opensquilla:meta_preflight_run_id=01KTCQUEUE -->"
-        )
+        message = "Summarize these notes.\n\nMeeting notes: review the release checklist."
+        display_text = "Summarize these notes."
 
         res = await dispatcher.dispatch(
             "r1",
             "sessions.send",
             {
                 "key": session.session_key,
-                "message": hidden_message,
+                "message": message,
+                "displayText": display_text,
                 "_source": {"caller_kind": "web", "channel_kind": "webchat"},
             },
             ctx,
         )
 
         assert res.ok is True
-        assert runtime.enqueue_calls[0]["message"] == "Original visible request"
-        assert runtime.enqueue_calls[0]["semantic_message"] == hidden_message
+        assert runtime.enqueue_calls[0]["message"] == message
+        assert runtime.enqueue_calls[0]["semantic_message"] == message
+        persisted = json.loads(manager.created_messages[0][2])
+        assert persisted["text"] == message
+        assert persisted["display_text"] == display_text
 
     @pytest.mark.asyncio
     async def test_send_marks_direct_runner_empty_transcript_as_fresh_user_session(
@@ -4133,30 +4139,28 @@ class TestSessionsSend:
         assert cli_runner.run_calls[0]["message"] == "Describe these attachments"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("display_text", ["Summarize these notes.", ""])
     async def test_send_persists_web_display_text_without_attachments(
         self,
         dispatcher,
+        display_text,
     ):
         session = FakeSession(
-            session_key="agent:main:webchat:hidden-confirmation",
-            session_id="hidden-confirmation",
+            session_key="agent:main:webchat:text-display",
+            session_id="text-display",
         )
         manager = FakeSessionManager([session])
         runner = _RecordingTurnRunner()
         ctx = make_ctx(session_manager=manager, turn_runner=runner)
-        hidden_message = (
-            "Confirmed request fields:\n"
-            "- audience: decision owner\n\n"
-            "<!-- opensquilla:meta_preflight_confirmed=1 -->"
-        )
+        message = "Summarize these notes.\n\nMeeting notes: review the release checklist."
 
         res = await dispatcher.dispatch(
             "r1",
             "sessions.send",
             {
                 "key": session.session_key,
-                "message": hidden_message,
-                "displayText": "请帮我判断这份供应商续费材料",
+                "message": message,
+                "displayText": display_text,
                 "_source": {"caller_kind": "web", "channel_kind": "webchat"},
             },
             ctx,
@@ -4167,39 +4171,25 @@ class TestSessionsSend:
 
         assert res.ok is True
         persisted = json.loads(manager.created_messages[0][2])
-        assert persisted["text"] == hidden_message
-        assert persisted["display_text"] == "请帮我判断这份供应商续费材料"
+        assert persisted["text"] == message
+        assert persisted["display_text"] == display_text
         assert persisted["attachments"] == []
-        assert runner.run_calls[0]["message"] == ""
-        assert runner.run_calls[0]["semantic_message"] == hidden_message
+        assert runner.run_calls[0]["message"] == message
+        assert runner.run_calls[0]["semantic_message"] == message
 
     @pytest.mark.asyncio
-    async def test_send_sanitizes_legacy_web_preflight_confirmation_display_text(
-        self,
-        dispatcher,
-    ):
+    @pytest.mark.parametrize("prefix", ["Summarize these notes.\n\n", ""])
+    async def test_send_accepts_retired_markers_as_ordinary_text(self, dispatcher, prefix):
         session = FakeSession(
-            session_key="agent:main:webchat:legacy-hidden-confirmation",
-            session_id="legacy-hidden-confirmation",
+            session_key="agent:main:webchat:retired-marker-text",
+            session_id="retired-marker-text",
         )
         manager = FakeSessionManager([session])
         runner = _RecordingTurnRunner()
         ctx = make_ctx(session_manager=manager, turn_runner=runner)
-        original = (
-            "请帮我判断这份供应商续费材料：这个合同要不要签、拒绝还是谈判，并给我一份决策表。\n\n"
-            "合同摘录：\n"
-            "- 服务期：2026-07-01 到 2027-06-30\n"
-            "- 价格：每月 $4,800，较上一年上涨 38%"
-        )
-        hidden_message = (
-            "请帮我判断这份供应商续费材料：这个合同要不要签、拒绝还是谈判，并给我一份决策表。\n\n"
-            f"{original}\n\n"
-            "Confirmed request fields:\n"
-            "- audience: decision owner\n"
-            "- decision_question: 签不签合同\n\n"
-            "<!-- opensquilla:meta_preflight_confirmed=1 -->\n"
-            "<!-- opensquilla:meta_preflight_run_id=01KTC2NFJ4ZXB20PSNTJEKYPS7 -->\n"
-            "<!-- opensquilla:meta_preflight_fields=abc -->"
+        message = (
+            f"{prefix}<!-- opensquilla:meta_preflight_confirmed=1 -->\n"
+            "<!-- opensquilla:meta_preflight_run_id=retired-run -->"
         )
 
         res = await dispatcher.dispatch(
@@ -4207,7 +4197,7 @@ class TestSessionsSend:
             "sessions.send",
             {
                 "key": session.session_key,
-                "message": hidden_message,
+                "message": message,
                 "_source": {"caller_kind": "web", "channel_kind": "webchat"},
             },
             ctx,
@@ -4217,51 +4207,10 @@ class TestSessionsSend:
             await task
 
         assert res.ok is True
-        persisted = json.loads(manager.created_messages[0][2])
-        assert persisted["text"] == hidden_message
-        assert persisted["display_text"] == original
-        assert "Confirmed request fields" not in persisted["display_text"]
-        assert "opensquilla:meta_preflight_confirmed" not in persisted["display_text"]
-        assert runner.run_calls[0]["message"] == original
-        assert runner.run_calls[0]["semantic_message"] == hidden_message
-
-    @pytest.mark.asyncio
-    async def test_send_hides_marker_only_web_preflight_confirmation_display_text(
-        self,
-        dispatcher,
-    ):
-        session = FakeSession(
-            session_key="agent:main:webchat:marker-only-hidden-confirmation",
-            session_id="marker-only-hidden-confirmation",
-        )
-        manager = FakeSessionManager([session])
-        runner = _RecordingTurnRunner()
-        ctx = make_ctx(session_manager=manager, turn_runner=runner)
-        hidden_message = (
-            "<!-- opensquilla:meta_preflight_confirmed=1 -->\n"
-            "<!-- opensquilla:meta_preflight_run_id=01KTCMARKERONLY -->"
-        )
-
-        res = await dispatcher.dispatch(
-            "r1",
-            "sessions.send",
-            {
-                "key": session.session_key,
-                "message": hidden_message,
-                "_source": {"caller_kind": "web", "channel_kind": "webchat"},
-            },
-            ctx,
-        )
-        task = get_agent_task_registry().get(session.session_key)
-        if task is not None:
-            await task
-
-        assert res.ok is True
-        persisted = json.loads(manager.created_messages[0][2])
-        assert persisted["text"] == hidden_message
-        assert persisted["display_text"] == ""
-        assert runner.run_calls[0]["message"] == ""
-        assert runner.run_calls[0]["semantic_message"] == hidden_message
+        assert manager.created_messages[0] == (session.session_key, "user", message)
+        assert len(runner.run_calls) == 1
+        assert runner.run_calls[0]["message"] == message
+        assert runner.run_calls[0]["semantic_message"] == message
 
     @pytest.mark.asyncio
     async def test_web_large_paste_is_normalized_before_turn_runner(
@@ -4524,31 +4473,29 @@ class TestSessionsSend:
         assert persisted["display_text"] == ""
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("display_text", ["Summarize these notes.", ""])
     async def test_chat_send_forwards_display_text_without_attachments(
         self,
         dispatcher,
+        display_text,
     ):
         assert rpc_chat._handle_chat_send is not None
         chat_session = FakeSession(
-            session_key="agent:main:webchat:chat-hidden-confirmation",
-            session_id="chat-hidden-confirmation",
+            session_key="agent:main:webchat:chat-text-display",
+            session_id="chat-text-display",
         )
         chat_manager = FakeSessionManager([chat_session])
         chat_runner = _RecordingTurnRunner()
         chat_ctx = make_ctx(session_manager=chat_manager, turn_runner=chat_runner)
-        hidden_message = (
-            "Confirmed request fields:\n"
-            "- audience: decision owner\n\n"
-            "<!-- opensquilla:meta_preflight_confirmed=1 -->"
-        )
+        message = "Summarize these notes.\n\nMeeting notes: review the release checklist."
 
         res = await dispatcher.dispatch(
-            "r-chat-hidden-confirmation",
+            "r-chat-text-display",
             "chat.send",
             {
                 "sessionKey": chat_session.session_key,
-                "message": hidden_message,
-                "displayText": "请帮我判断这份供应商续费材料",
+                "message": message,
+                "displayText": display_text,
             },
             chat_ctx,
         )
@@ -4558,11 +4505,11 @@ class TestSessionsSend:
 
         assert res.ok is True
         persisted = json.loads(chat_manager.created_messages[0][2])
-        assert persisted["text"] == hidden_message
-        assert persisted["display_text"] == "请帮我判断这份供应商续费材料"
+        assert persisted["text"] == message
+        assert persisted["display_text"] == display_text
         assert persisted["attachments"] == []
-        assert chat_runner.run_calls[0]["message"] == ""
-        assert chat_runner.run_calls[0]["semantic_message"] == hidden_message
+        assert chat_runner.run_calls[0]["message"] == message
+        assert chat_runner.run_calls[0]["semantic_message"] == message
 
     @pytest.mark.asyncio
     async def test_chat_send_client_normalized_paste_preserves_provenance(
@@ -7676,6 +7623,7 @@ class TestSessionsContextCompact:
     async def test_context_compact_summarizes_instead_of_truncating(
         self, dispatcher, ctx_with_sessions, session
     ):
+        ctx_with_sessions.provider_selector = _FakeProviderSelector()
         res = await dispatcher.dispatch(
             "r1",
             "sessions.contextCompact",
@@ -7753,8 +7701,12 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert res.payload["context_window_tokens"] == 4096
-        assert manager.compact_calls[0][:2] == (session.session_key, 4096)
+        _, history_capacity, compaction_config = manager.compact_calls[0]
+        assert compaction_config.budget.physical_context_window_tokens == 4096
+        assert history_capacity == compaction_config.budget.history_capacity_tokens
+        assert 0 < history_capacity < 4096 - 512
+        assert res.payload["context_window_tokens"] == history_capacity
+        assert manager.compact_calls[0][0] == session.session_key
         compact_kwargs = manager.compact_kwargs[0]
         assert compact_kwargs["context_window_chars"] > 0
         assert callable(compact_kwargs["consumer_admission"])
@@ -7884,11 +7836,11 @@ class TestSessionsContextCompact:
 
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "cancelled",
+            "failed",
         ]
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
-            "cancelled",
+            "failed",
         ]
         assert manager.compact_calls == []
 
@@ -7943,7 +7895,7 @@ class TestSessionsContextCompact:
         ]
         assert [payload["status"] for payload in compaction_events] == [
             "started",
-            "cancelled",
+            "failed",
         ]
         assert {payload["compaction_id"] for payload in compaction_events} == {
             compaction_id
@@ -8031,9 +7983,9 @@ class TestSessionsContextCompact:
             ]
             assert [payload["status"] for payload in operation_events] == [
                 "started",
-                "cancelled",
+                "failed",
             ]
-            assert [payload["status"] for payload in terminal_events] == ["cancelled"]
+            assert [payload["status"] for payload in terminal_events] == ["failed"]
             assert manager.started.is_set() is False
             assert manager.compact_calls == []
 
@@ -8046,7 +7998,7 @@ class TestSessionsContextCompact:
                 and event.payload.get("status")
                 in {"completed", "skipped", "failed", "cancelled", "timed_out"}
             ]
-            assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+            assert [payload["status"] for payload in replayed_terminals] == ["failed"]
         finally:
             release_started_broadcast.set()
             manager.release.set()
@@ -8222,8 +8174,8 @@ class TestSessionsContextCompact:
             and event.payload.get("status")
             in {"completed", "skipped", "failed", "cancelled", "timed_out"}
         ]
-        assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
-        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "cancelled"
+        assert [payload["status"] for payload in replayed_terminals] == ["failed"]
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "failed"
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_failed_when_summary_is_empty(
@@ -8355,11 +8307,11 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert res.payload["status"] == "stale"
+        assert res.payload["status"] == "skipped"
         assert res.payload["reason"] == stale_reason
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "stale",
+            "skipped",
         ]
 
     @pytest.mark.asyncio
@@ -8401,7 +8353,7 @@ class TestSessionsContextCompact:
         assert res.error.code == "COMPACTION_TIMEOUT"
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "timed_out",
+            "failed",
         ]
 
     @pytest.mark.asyncio
@@ -8471,10 +8423,11 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert ctx.session_manager.compact_calls[0][:2] == (
-            session.session_key,
-            ctx.config.context_budget_tokens,
-        )
+        compact_key, history_capacity, compaction_config = ctx.session_manager.compact_calls[0]
+        assert compact_key == session.session_key
+        assert history_capacity == compaction_config.budget.history_capacity_tokens
+        # This scope-only fixture has no provider proof; capacity remains zero.
+        assert history_capacity == 0
 
     @pytest.mark.asyncio
     async def test_context_compact_passes_provider_config(self, dispatcher):

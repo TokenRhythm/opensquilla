@@ -11,11 +11,15 @@
             <th
               v-for="col in tableColumns"
               :key="col.key"
+              scope="col"
               :class="{ 'usage-th-sort': sortableCols.includes(col.key) }"
-              @click="sortableCols.includes(col.key) ? emit('sort', col.key) : undefined"
+              :aria-sort="sortableCols.includes(col.key) ? sortCol === col.key ? sortAsc ? 'ascending' : 'descending' : 'none' : undefined"
             >
-              {{ col.label }}
-              <span v-if="sortCol === col.key" class="usage-table__arrow">{{ sortAsc ? ' ▲' : ' ▼' }}</span>
+              <button v-if="sortableCols.includes(col.key)" type="button" class="usage-sort-button" @click="emit('sort', col.key)">
+                {{ col.label }}
+                <span v-if="sortCol === col.key" class="usage-table__arrow" aria-hidden="true">{{ sortAsc ? ' ▲' : ' ▼' }}</span>
+              </button>
+              <template v-else>{{ col.label }}</template>
             </th>
           </tr>
         </thead>
@@ -64,6 +68,7 @@
                   v-if="row.hasModelBreakdown"
                   class="usage-model-toggle"
                   :class="{ open: expandedSessions.has(row.rowIdentity) }"
+                  :aria-expanded="expandedSessions.has(row.rowIdentity)"
                   @click="emit('toggleModelExpand', row)"
                 >
                   <span>{{ modelDisplayLabel(row.raw) }}</span><span class="usage-model-caret">▾</span>
@@ -133,3 +138,23 @@ const emit = defineEmits<{
   toggleModelExpand: [row: SortedRow]
 }>()
 </script>
+
+<style scoped>
+.usage-sort-button {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  font: inherit;
+  min-height: 44px;
+  margin: -10px -6px;
+  padding: 10px 6px;
+}
+.usage-sort-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+</style>

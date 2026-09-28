@@ -91,6 +91,7 @@ def test_subagent_model_override_binds_child_provider_window_and_compaction_plan
             provider_id="fake",
             model_id="parent-model",
             context_window_tokens=100_000,
+            compaction_trigger_ratio=0.6,
             max_tokens=4096,
             provider_request_proof_max_chars=200_000,
         ),
@@ -107,6 +108,7 @@ def test_subagent_model_override_binds_child_provider_window_and_compaction_plan
     assert child.config.model_id == "child-model"
     assert child.config.context_window_tokens == 32_768
     assert child.config.context_window_known is True
+    assert child.config.compaction_trigger_ratio == 0.6
     assert child.config.max_tokens == catalog.resolve_max_tokens(
         "child-model",
         provider="fake",

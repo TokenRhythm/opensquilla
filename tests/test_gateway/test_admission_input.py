@@ -135,7 +135,7 @@ async def test_changed_input_conflicts_with_existing_receipt_before_projection(t
         sessions=object(),
         storage=SimpleNamespace(
             capabilities=AdmissionStorageCapabilities(
-                receipts=True, meta_controls=False, atomic_acceptance=False
+                receipts=True, atomic_acceptance=False
             ),
             replay_turn_ingress_receipt=AsyncMock(return_value=acceptance),
         ),
@@ -203,7 +203,7 @@ async def test_retired_requests_only_read_matching_durable_receipts(surface, out
     ports = SimpleNamespace(
         storage=SimpleNamespace(
             capabilities=AdmissionStorageCapabilities(
-                receipts=True, meta_controls=False, atomic_acceptance=False
+                receipts=True, atomic_acceptance=False
             ),
             replay_turn_ingress_receipt=lookup,
         ),

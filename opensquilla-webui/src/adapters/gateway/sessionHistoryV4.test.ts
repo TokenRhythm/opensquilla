@@ -223,7 +223,7 @@ describe('v4 SessionHistory Adapter', () => {
     expect(requestSpy).toHaveBeenCalledWith(
       CHAT_HISTORY_METHOD,
       expect.objectContaining({ sessionKey: 'session-1', includeCanonical: true }),
-      expect.objectContaining({ timeoutAction: 'reject' }),
+      expect.objectContaining({ timeoutAction: 'reject', recoveryClass: 'safe-read' }),
     )
     const message = page.messages[0]
     expect(message?.pageContext).toEqual({ targetRef: 'target-1', resourceId: 'document:doc-1', annotations: [{ text: 'Larger heading', selectionText: 'Welcome', locatorHint: 'h1' }] })

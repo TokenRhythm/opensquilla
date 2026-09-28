@@ -16,14 +16,11 @@ Use skills for repeatable work patterns such as:
 - GitHub and PR workflows;
 - document generation;
 - spreadsheet, slide, PDF, and DOCX work;
-- web search;
-- weather lookup;
-- terminal or tmux monitoring;
+- web page creation;
 - subagent delegation;
-- skill creation and review.
+- skill creation.
 
-If the workflow combines multiple skills or a reusable multi-step plan, use a
-meta-skill instead.
+The agent can use multiple ordinary skills in a single task.
 
 ## Discover Installed Skills
 
@@ -60,8 +57,13 @@ Install a managed skill:
 
 ```sh
 opensquilla skills install <clawhub-install-reference> --source clawhub
+opensquilla skills install <skillhub-slug>[@version] --source skillhub
 opensquilla skills install <owner/repo[@ref][:subpath]> --source github
 ```
+
+The default SkillHub endpoint is `https://api.skillhub.cn`. Set
+`SKILLHUB_BASE_URL` for a compatible mirror and `SKILLHUB_API_KEY` when the
+registry requires an API key.
 
 Update one skill or all managed skills:
 
@@ -86,8 +88,12 @@ opensquilla skills uninstall --install-id <install-id>
 ```
 
 OpenSquilla currently supports single-root, instruction-first Community Skills
-from ClawHub and GitHub. A flat package or one wrapper directory is accepted. A
-GitHub branch or tag is resolved to an immutable commit before files are fetched.
+from ClawHub, Tencent SkillHub, and GitHub. A flat package or one wrapper
+directory is accepted. Registry versions and GitHub branches or tags are
+resolved to immutable revisions before files are fetched. SkillHub provenance,
+license, signature, and content-hash metadata is retained when the registry
+publishes it. Missing registry license metadata does not block installation;
+users are responsible for complying with each downloaded Skill's license.
 An install commits content and provenance; it does not install declared runtime
 dependencies.
 
@@ -142,12 +148,6 @@ Publish a skill directory:
 opensquilla skills publish <path-to-skill>
 ```
 
-Inspect the compiled composition for a meta-skill:
-
-```sh
-opensquilla skills inspect <meta-skill-name>
-```
-
 For ordinary skill content, use:
 
 ```sh
@@ -175,11 +175,10 @@ matches their description and triggers.
 
 | Family | Examples |
 | --- | --- |
-| Research | deep research, multi-source search, summarization |
-| Documents | DOCX, PPTX, XLSX, PDF, HTML-to-PDF |
-| Operations | cron, GitHub, terminal monitoring, subagents |
-| Memory | memory-oriented helpers and history exploration |
-| Creation | skill creator, skill review, proposal helpers |
+| Research | `deep-research` |
+| Documents | `docx`, `pptx`, `xlsx`, `pdf-toolkit` |
+| Development | `github`, `html-coder` |
+| Creation | `skill-creator` |
 
 ## Troubleshooting
 
@@ -210,9 +209,6 @@ Gateway from the same upgraded installation before retrying Doctor. The CLI
 does not silently switch to an offline scan while an older Gateway still owns
 the profile.
 
-For composed workflows, read [`meta-skills.md`](meta-skills.md). For the full
-MetaSkill user guide, read [`meta-skill-user-guide.md`](meta-skill-user-guide.md).
-For authoring rules, read [`../authoring/meta-skills.md`](../authoring/meta-skills.md).
 
 ---
 

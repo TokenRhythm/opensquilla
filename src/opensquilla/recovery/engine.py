@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION
 from opensquilla.recovery.atomic import (
     PathIdentity,
     _chmod_open_file,
@@ -50,7 +51,7 @@ from opensquilla.recovery.locking import (
 )
 from opensquilla.recovery.models import RecoveryOutcome, RecoveryReport, WorkspaceCandidate
 
-SUPPORTED_CONFIG_VERSION = 1
+SUPPORTED_CONFIG_VERSION = LATEST_CONFIG_VERSION
 _IMPORT_LAYOUT_RECEIPT_FIELDS = frozenset(
     {
         "schema_version",

@@ -33,6 +33,7 @@ from opensquilla.sandbox.backend.base import Backend
 from opensquilla.sandbox.backend.filesystem_worker_policy import (
     build_filesystem_worker_policy,
 )
+from opensquilla.sandbox.backend.seatbelt_resources import DarwinResourceGuard
 from opensquilla.sandbox.managed_proxy_env import managed_proxy_env
 from opensquilla.sandbox.operation_runtime import (
     SANDBOX_FILESYSTEM_WRITE_KINDS,
@@ -87,7 +88,6 @@ _FILESYSTEM_WORKER_ENV_ALLOWLIST = (
 )
 _OUTPUT_BYTE_CAP = 1_048_576
 _TERMINATE_GRACE_S = 2.0
-
 # This mirrors Codex's macOS Seatbelt posture for workspace-write:
 # deny by default, allow ordinary macOS runtime services, allow full-disk reads,
 # and constrain writes to explicit writable roots.
@@ -550,6 +550,19 @@ def _render_seatbelt_profile(
         for root in profile_runtime_roots
         if root != Path("/")
     )
+    # Canonical read roots alone cannot traverse an interpreter prefix reached
+    # through a symlink. Permit only metadata for the declared spelling; data
+    # access remains limited to the frozen canonical target above.
+    for entry in file_system.effective_entries:
+        if (
+            entry.access in {FileSystemAccess.READ, FileSystemAccess.WRITE}
+            and entry.lexical_path != entry.path
+        ):
+            alias = _seatbelt_path(entry.lexical_path)
+            lines.append(_seatbelt_path_ancestor_rule(alias))
+            lines.append(
+                f"(allow file-read-metadata file-test-existence {_literal(alias)})"
+            )
 
     private_read_roots, private_write_roots = _private_transport_roots(
         private_transport,
@@ -1151,6 +1164,14 @@ class SeatbeltBackend(Backend):
 
             wall = request.policy.limits.wall_timeout_s
             started = time.monotonic()
+            resource_guard: DarwinResourceGuard | None = None
+            if (
+                request.action_kind == "code.exec"
+                and request.policy.description.startswith("Managed channel workspace authoring")
+                and sys.platform == "darwin"
+                and os.uname().sysname == "Darwin"
+            ):
+                resource_guard = DarwinResourceGuard(request.policy.limits)
             try:
                 proc = await create_owned_subprocess_exec(
                     *argv,
@@ -1159,6 +1180,7 @@ class SeatbeltBackend(Backend):
                     stderr=asyncio.subprocess.PIPE,
                     cwd=str(request.cwd),
                     env=env,
+                    **({"preexec_fn": resource_guard.cpu_preexec()} if resource_guard else {}),
                 )
             except FileNotFoundError as exc:
                 raise SandboxBackendError(f"seatbelt launch failed: {exc}") from exc
@@ -1166,16 +1188,59 @@ class SeatbeltBackend(Backend):
                 raise SandboxBackendError(f"seatbelt launch failed: {exc}") from exc
 
             timed_out = False
+            memory_exceeded = False
+            resource_error: str | None = None
+            memory_watch: asyncio.Task[bool] | None = None
+            communicate_task: asyncio.Task[tuple[bytes, bytes, bool, bool]] | None = None
+            if resource_guard is not None:
+                memory_watch = asyncio.create_task(resource_guard.watch(proc))
             try:
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    proc.communicate(input=request.stdin), timeout=wall
+                communicate_task = asyncio.create_task(
+                    _communicate_capped(proc, input_data=request.stdin)
                 )
+                wait_set: set[asyncio.Task[object]] = {communicate_task}
+                if memory_watch is not None:
+                    wait_set.add(memory_watch)
+                done, _pending = await asyncio.wait(
+                    wait_set,
+                    timeout=wall,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if memory_watch is not None and memory_watch in done:
+                    memory_exceeded = bool(memory_watch.result())
+                    if memory_exceeded:
+                        await _terminate_process_group(proc, drain_output=False)
+                        stdout_bytes, stderr_bytes, trunc_out, trunc_err = (
+                            await _finish_communication(communicate_task)
+                        )
+                    else:
+                        stdout_bytes, stderr_bytes, trunc_out, trunc_err = (
+                            await communicate_task
+                        )
+                elif communicate_task in done:
+                    stdout_bytes, stderr_bytes, trunc_out, trunc_err = (
+                        communicate_task.result()
+                    )
+                else:
+                    timed_out = True
+                    await _terminate_process_group(proc, drain_output=False)
+                    stdout_bytes, stderr_bytes, trunc_out, trunc_err = (
+                        await _finish_communication(communicate_task)
+                    )
             except asyncio.CancelledError:
-                await asyncio.shield(_terminate_process_group(proc))
+                await asyncio.shield(
+                    _terminate_process_group(proc, drain_output=communicate_task is None)
+                )
                 raise
-            except TimeoutError:
-                timed_out = True
-                stdout_bytes, stderr_bytes = await _terminate_process_group(proc)
+            except Exception as exc:
+                resource_error = str(exc)
+                await _terminate_process_group(proc, drain_output=False)
+                if communicate_task is not None:
+                    stdout_bytes, stderr_bytes, trunc_out, trunc_err = (
+                        await _finish_communication(communicate_task)
+                    )
+                else:
+                    stdout_bytes, stderr_bytes, trunc_out, trunc_err = b"", b"", False, False
             else:
                 owner = getattr(proc, "_opensquilla_process_tree_owner", None)
                 if owner is not None:
@@ -1183,11 +1248,28 @@ class SeatbeltBackend(Backend):
                         graceful_timeout=0.0,
                         kill_timeout=_TERMINATE_GRACE_S,
                     )
+            finally:
+                if memory_watch is not None and not memory_watch.done():
+                    memory_watch.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await memory_watch
+                if communicate_task is not None and not communicate_task.done():
+                    communicate_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await communicate_task
 
             elapsed = time.monotonic() - started
-            stdout, trunc_out = _decode_capped(stdout_bytes)
-            stderr, trunc_err = _decode_capped(stderr_bytes)
+            stdout, decoded_trunc_out = _decode_capped(stdout_bytes)
+            stderr, decoded_trunc_err = _decode_capped(stderr_bytes)
+            trunc_out = trunc_out or decoded_trunc_out
+            trunc_err = trunc_err or decoded_trunc_err
             returncode = proc.returncode if proc.returncode is not None else -1
+            if resource_error is not None:
+                # A parent may exit successfully before a surviving child
+                # triggers supervision failure. Do not report the whole
+                # execution as successful or hide the failure in backend notes.
+                returncode = returncode or -1
+                stderr = "Sandbox resource supervision failed; execution stopped.\n" + stderr
             notes: tuple[_SeatbeltNote, ...] = ()
             if not timed_out:
                 notes = _classify_denial(
@@ -1216,7 +1298,9 @@ class SeatbeltBackend(Backend):
                 truncated_stdout=trunc_out,
                 truncated_stderr=trunc_err,
                 timed_out=timed_out,
-                backend_notes=tuple(n.to_user_string() for n in notes),
+                backend_notes=tuple(n.to_user_string() for n in notes)
+                + (("resource.memory_exceeded",) if memory_exceeded else ())
+                + ((f"resource.monitor_failed: {resource_error}",) if resource_error else ()),
             )
         finally:
             if profile_path is not None:
@@ -1236,6 +1320,8 @@ def _decode_capped(raw: bytes | None) -> tuple[str, bool]:
 
 async def _terminate_process_group(
     proc: asyncio.subprocess.Process,
+    *,
+    drain_output: bool = True,
 ) -> tuple[bytes, bytes]:
     owner = capture_process_tree_owner(proc, isolated=True)
     await owner.terminate(
@@ -1245,19 +1331,94 @@ async def _terminate_process_group(
     with contextlib.suppress(ProcessLookupError):
         await proc.wait()
 
-    stdout = b""
-    stderr = b""
-    if proc.stdout is not None:
-        try:
-            stdout = await proc.stdout.read()
-        except Exception:  # noqa: BLE001
-            stdout = b""
-    if proc.stderr is not None:
-        try:
-            stderr = await proc.stderr.read()
-        except Exception:  # noqa: BLE001
-            stderr = b""
+    if not drain_output:
+        return b"", b""
+    try:
+        stdout, stderr, _trunc_out, _trunc_err = await asyncio.wait_for(
+            _communicate_capped(proc), timeout=_TERMINATE_GRACE_S,
+        )
+    except TimeoutError:
+        stdout, stderr = b"", b""
     return stdout, stderr
+
+
+async def _finish_communication(
+    task: asyncio.Task[tuple[bytes, bytes, bool, bool]],
+) -> tuple[bytes, bytes, bool, bool]:
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=_TERMINATE_GRACE_S)
+    except TimeoutError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return b"", b"", False, False
+    except asyncio.CancelledError:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        raise
+
+
+async def _read_capped_stream(
+    stream: asyncio.StreamReader | None,
+) -> tuple[bytes, bool]:
+    if stream is None:
+        return b"", False
+    retained = bytearray()
+    truncated = False
+    while True:
+        chunk = await stream.read(64 * 1024)
+        if not chunk:
+            break
+        if len(retained) < _OUTPUT_BYTE_CAP:
+            remaining = _OUTPUT_BYTE_CAP - len(retained)
+            retained.extend(chunk[:remaining])
+            truncated = truncated or len(chunk) > remaining
+        else:
+            truncated = True
+    return bytes(retained), truncated
+
+
+async def _communicate_capped(
+    proc: asyncio.subprocess.Process,
+    *,
+    input_data: bytes | None = None,
+) -> tuple[bytes, bytes, bool, bool]:
+    """Drain both pipes incrementally, retaining at most one MiB per stream."""
+
+    stdout_stream = getattr(proc, "stdout", None)
+    stderr_stream = getattr(proc, "stderr", None)
+    if stdout_stream is None and stderr_stream is None:
+        stdout, stderr = await proc.communicate(input=input_data)
+        return stdout or b"", stderr or b"", False, False
+    stdout_task = asyncio.create_task(_read_capped_stream(stdout_stream))
+    stderr_task = asyncio.create_task(_read_capped_stream(stderr_stream))
+    try:
+        # Start both readers before writing stdin. A child is allowed to fill
+        # stdout/stderr before it consumes input; waiting for stdin.drain()
+        # first would deadlock once that pipe reaches its kernel buffer limit.
+        stdin = getattr(proc, "stdin", None)
+        if input_data is not None and stdin is not None:
+            try:
+                stdin.write(input_data)
+                await stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # Match asyncio.subprocess.Process.communicate(): a child may
+                # exit before consuming stdin, and that is not a sandbox or
+                # resource-monitor failure.
+                pass
+            finally:
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                    stdin.close()
+        await proc.wait()
+        stdout_result, stderr_result = await asyncio.gather(stdout_task, stderr_task)
+        return stdout_result[0], stderr_result[0], stdout_result[1], stderr_result[1]
+    finally:
+        for task in (stdout_task, stderr_task):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
 
 # ─── Denial classifier ───────────────────────────────────────────────────

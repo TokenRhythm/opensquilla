@@ -5,6 +5,8 @@ import { useSetupCapabilitiesForm } from '@/composables/setup/useSetupCapabiliti
 import { useSetupBehaviorForm } from '@/composables/setup/useSetupBehaviorForm'
 import {
   hasEffectiveProvider,
+  catalogNeedsRefresh,
+  updateDiscoveredCatalog,
   normalizeCatalogSyncStatus,
   normalizeDiscoveredModels,
   normalizeProbeTimings,
@@ -40,7 +42,7 @@ import {
   useSetupModelStrategyForm,
   type ModelStrategy,
 } from '@/composables/setup/useSetupModelStrategyForm'
-import { invalidateReadiness } from '@/composables/setup/useReadinessSummary'
+import { invalidateReadiness } from '@/composables/setup/readinessInvalidation'
 import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composables/setup/useSettingsPromotedForm'
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
@@ -74,19 +76,6 @@ import { PROVIDER_CONFIGURATION_KEY, ProviderConfigurationError, type ProviderCo
 
 export { SETTINGS_SECTIONS } from '@/composables/setup/settingsSections'
 export type { SettingsSectionId } from '@/composables/setup/settingsSections'
-
-const READINESS_KEYS: Record<string, string> = {
-  ok: 'setup.readiness.ready',
-  optional: 'setup.readiness.optional',
-  missing: 'setup.readiness.missing',
-  degraded: 'setup.readiness.needsAction',
-  unknown: 'setup.readiness.check',
-}
-
-function readinessLabel(status: string): string {
-  const key = READINESS_KEYS[status]
-  return key ? i18n.global.t(key) : ''
-}
 
 // The gateway's image_generation section detail is a backend-built English
 // sentence (onboarding/status.py, onboarding/next_steps.py) rendered verbatim
@@ -555,8 +544,10 @@ const tierModelCatalogs = ref<DiscoveredModelsByProvider>({})
 watch(() => providerForm.connection.value.models, () => {
   if (providerForm.connection.value.modelSource === 'live') modelCapacity.invalidate()
 })
-watch(tierModelCatalogs, catalogs => {
-  if (Object.values(catalogs).some(catalog => catalog.source === 'live')) modelCapacity.invalidate()
+watch(tierModelCatalogs, (catalogs, previous) => {
+  if (Object.entries(catalogs).some(([provider, catalog]) => (
+    catalog.source === 'live' && catalog.models !== previous[provider]?.models
+  ))) modelCapacity.invalidate()
 })
 const tierModelDiscoveries = new Map<string, Promise<void>>()
 let tierModelDiscoveryEpoch = 0
@@ -720,40 +711,35 @@ function discoverTierProviderModels(providerId: string): Promise<void> {
   if (existing) return existing
 
   const epoch = tierModelDiscoveryEpoch
+  const publish = (next: DiscoveredModelCatalog) => {
+    tierModelCatalogs.value = { ...tierModelCatalogs.value, [provider]: next }
+  }
+  const current = () => tierModelCatalogs.value[provider] || { models: [], source: 'none' as const }
+  publish({ ...current(), discovering: true, discoverError: '', discoverFailureKind: '' })
   const request = (async () => {
     try {
       // Deliberately provider-only. Never forward the selected provider's
       // unsaved apiKey/baseUrl/proxy into another provider's request.
-      let res
-      if (provider === normalizeProviderId(config.value.llm?.provider)) {
-        // The current provider lives in [llm], not llm_profiles. This branch
-        // matters when Model Service is currently editing a different saved
-        // profile: the fixed-model picker must still discover the active
-        // provider through its primary deployment.
-        res = await setupWorkflow.provider.discoverPrimaryModels({ providerId: provider })
-      } else {
-        // The Adapter owns the legacy provider-discovery fallback so this
-        // consumer never branches on RPC method availability.
-        res = await setupWorkflow.profile.discoverProfileModels({ providerId: provider })
+      const load = (cacheOnly = false) => {
+        const params = { providerId: provider, ...(cacheOnly ? { cacheOnly: true } : {}) }
+        return provider === normalizeProviderId(config.value.llm?.provider)
+          ? setupWorkflow.provider.discoverPrimaryModels(params)
+          : setupWorkflow.profile.discoverProfileModels(params)
       }
+      const snapshot = await load(true)
       if (epoch !== tierModelDiscoveryEpoch) return
-      const source = res?.ok && res.source === 'live' ? 'live' : 'none'
-      tierModelCatalogs.value = {
-        ...tierModelCatalogs.value,
-        [provider]: source === 'live'
-          ? {
-              models: normalizeDiscoveredModels(res.models),
-              source,
-              catalog: normalizeCatalogSyncStatus(res.catalog),
-            }
-          : { models: [], source: 'none' },
+      if (normalizeCatalogSyncStatus(snapshot.catalog)?.cacheHit !== false) {
+        publish(updateDiscoveredCatalog(current(), snapshot))
       }
-    } catch {
+      if (!catalogNeedsRefresh(snapshot)) return
+      const res = await load()
       if (epoch !== tierModelDiscoveryEpoch) return
-      tierModelCatalogs.value = {
-        ...tierModelCatalogs.value,
-        [provider]: { models: [], source: 'none' },
-      }
+      publish(updateDiscoveredCatalog(current(), res))
+    } catch (error) {
+      if (epoch !== tierModelDiscoveryEpoch) return
+      publish({ ...current(), discoverError: error instanceof Error ? error.message : String(error) })
+    } finally {
+      if (epoch === tierModelDiscoveryEpoch) publish({ ...current(), discovering: false })
     }
   })()
   const tracked = request.finally(() => {
@@ -1233,9 +1219,8 @@ const currentRouterProfile = computed(() => {
   if (persistedProfile) return persistedProfile
   // Curated inline and synthesized presets are intentionally absent from the
   // legacy tier_profile catalog, but their provider entries still carry the
-  // managed ladder. Follow-primary must use that ladder too; otherwise a
-  // disabled sparse config would expose the settings model's materialized
-  // OpenRouter defaults when re-enabled.
+  // managed ladder used to fill missing rows in an empty or sparse config.
+  // Effective saved tiers always take precedence when the form is initialized.
   const provider = runtimeProviders.value.find(
     candidate => normalizeProviderId(candidate.providerId) === providerId,
   )
@@ -1861,9 +1846,17 @@ const routerBinding = computed<'follow_primary' | 'custom' | 'legacy'>(() => {
 })
 const ensembleEnabled = computed(() => config.value.llm_ensemble?.enabled === true)
 const resetRecommendedSupported = computed(() => providerConfiguration.resetRecommendedSupported === true)
+const recommendedRouterProvider = computed(() => {
+  // The recommendation and summary share the saved primary. Existing custom
+  // tiers and unsaved provider/tier drafts must not change the reset target.
+  const providerId = normalizeProviderId(currentProvider.value)
+  return providerId === 'openrouter' || providerId === 'tokenrhythm' ? providerId : ''
+})
 const routingSummary = computed(() => ({
   providerId: hasSavedProvider.value ? currentProvider.value : '',
   providerLabel: hasSavedProvider.value ? providerCatalogLabel(currentProvider.value) : '',
+  recommendedProviderId: recommendedRouterProvider.value,
+  recommendedProviderLabel: recommendedRouterProvider.value ? providerCatalogLabel(recommendedRouterProvider.value) : '',
   enabled: modelRouterEnabled.value,
   binding: routerBinding.value,
   crossProviderEnabled: config.value.squilla_router?.cross_provider_tiers === true,
@@ -2050,6 +2043,7 @@ const routerPanel = routerForm.createPanel({
     const provider = normalizeProviderId(providerForm.selectedProvider.value)
     if (provider) {
       catalogs[provider] = {
+        ...providerForm.connection.value,
         models: providerForm.connection.value.models,
         source: providerForm.connection.value.modelSource,
       }
@@ -2089,6 +2083,7 @@ const fixedModelCatalog = computed<DiscoveredModelCatalog>(() => {
   if (!provider) return emptyFixedModelCatalog
   if (provider === normalizeProviderId(providerForm.selectedProvider.value)) {
     return {
+      ...providerForm.connection.value,
       models: providerForm.connection.value.models,
       source: providerForm.connection.value.modelSource,
     }
@@ -2302,8 +2297,14 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
     return { label: t('setup.connection.disconnected'), tone: 'is-warn' }
   }
   if (sectionId === 'provider') {
-    if (status.value.llmConfigured === false || providerEnvMissing.value) return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
-    return detailStepStatus((status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider)
+    // Saved primary configuration owns this indicator. Optional capabilities,
+    // probes, and older detail snapshots must not override a configured LLM.
+    if (status.value.llmConfigured === true) return { label: t('setup.readiness.ready'), tone: 'is-ok' }
+    if (status.value.llmConfigured === false || status.value.llmSource === 'missing_env') return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
+    const detail = (status.value.sectionDetails || {}).llm || (status.value.sectionDetails || {}).provider
+    if (detail?.status === 'missing') return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
+    if (detail?.status === 'ok') return { label: t('setup.readiness.ready'), tone: 'is-ok' }
+    return { label: t('setup.status.review'), tone: 'is-muted' }
   }
   // General/Security/Advanced are always-valid preference toggles, not
   // readiness milestones — a neutral dot (rather than a green "Live" that
@@ -2327,20 +2328,12 @@ function sectionStatus(sectionId: string): { label: string; tone: string } {
   return { label: t('setup.status.review'), tone: 'is-muted' }
 }
 
-function detailStepStatus(detail?: SectionDetail): { label: string; tone: string } {
-  if (!detail) return { label: t('setup.status.review'), tone: 'is-muted' }
-  if (stepDetailNeedsAction(detail)) return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
-  if (detail.status === 'ok') return { label: t('setup.readiness.ready'), tone: 'is-ok' }
-  return { label: readinessLabel(detail.status || '') || t('setup.readiness.optional'), tone: 'is-muted' }
-}
-
 function aggregateStepStatus(sectionNames: string[]): { label: string; tone: string } {
   const details = status.value.sectionDetails || {}
   const entries = sectionNames.map(name => details[name]).filter(Boolean) as SectionDetail[]
-  if (entries.some(detail => stepDetailNeedsAction(detail))) {
-    return { label: t('setup.readiness.needsAction'), tone: 'is-warn' }
-  }
-  if (entries.length && entries.every(detail => detail.status === 'ok')) {
+  // Optional features keep their diagnostics inside their panels. The rail
+  // stays quiet until the user chooses to configure them.
+  if (entries.length && entries.every(detail => detail.status === 'ok' && !stepDetailNeedsAction(detail))) {
     return { label: t('setup.readiness.ready'), tone: 'is-ok' }
   }
   return { label: t('setup.readiness.optional'), tone: 'is-muted' }
@@ -2795,8 +2788,14 @@ function acceptPrimaryRouterAction(action?: string) {
   }
 }
 
-function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string) {
-  const synchronized = action === 'use_recommended' || previousBinding === 'follow_primary'
+function primarySwitchReplacesRouter(providerId: string, previousProvider: string): boolean {
+  const provider = normalizeProviderId(providerId)
+  return provider !== normalizeProviderId(previousProvider)
+    && (provider === 'openrouter' || provider === 'tokenrhythm')
+}
+
+function pushPrimaryRouterOutcome(action: string | undefined, previousBinding: string, replacedRouter = false) {
+  const synchronized = action === 'use_recommended' || previousBinding === 'follow_primary' || replacedRouter
   const message = t(action === 'disable' ? 'setup.provider.routerOutcomeDisabled'
     : synchronized ? 'setup.provider.routerOutcomeSynchronized'
       : 'setup.provider.routerOutcomePreserved')
@@ -2831,6 +2830,7 @@ async function activateProvider(value: string) {
   primaryMutationPending.value = true
   let acknowledged = false
   const previousBinding = routerBinding.value
+  const replacesRouter = primarySwitchReplacesRouter(providerId, currentProvider.value)
   try {
     providerActivation.value = {
       providerId,
@@ -2847,8 +2847,13 @@ async function activateProvider(value: string) {
       if (!transition) return
       acknowledged = true
       acceptPrimaryRouterAction(transition.routerAction)
-      await loadData({ preserveDirtySectionDrafts: true, forceResetRouter: transition.routerAction === 'use_recommended', throwOnError: true })
-      pushPrimaryRouterOutcome(transition.routerAction, previousBinding)
+      await loadData({
+        preserveDirtySectionDrafts: true,
+        forceResetRouter: transition.routerAction === 'use_recommended'
+          || (replacesRouter && transition.routerAction !== 'disable'),
+        throwOnError: true,
+      })
+      pushPrimaryRouterOutcome(transition.routerAction, previousBinding, replacesRouter)
     } catch (err) {
       if (acknowledged) pushToast(t('setup.modelStrategy.savedRefreshFailed'), { tone: 'danger' })
       else await reportPrimaryMutationFailure(err)
@@ -3356,8 +3361,8 @@ async function setModelStrategy(strategy: ModelStrategy) {
 }
 
 async function resetRecommendedRouter(): Promise<boolean> {
-  if (routingSummary.value.resetDisabledReason) return false
-  const providerId = currentProvider.value
+  if (routingSummary.value.resetDisabledReason || !recommendedRouterProvider.value) return false
+  const providerId = recommendedRouterProvider.value
   routerResetPending.value = true
   let acknowledged = false
   try {
@@ -3929,6 +3934,8 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
   let primaryAcknowledged = false
   let refreshStarted = false
   let resolvedRouterAction: 'use_recommended' | 'disable' | undefined
+  let replacedRouter = false
+  const previousProvider = currentProvider.value
   const previousBinding = routerBinding.value
   const providerOwnedFixedModelDraft = providerOwnsFixedModelDraft.value
   const providerModelDraftWasSubmitted = options.includeProviderModelDraft === true
@@ -3937,7 +3944,13 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     forceResetModelStrategy = false,
   ) => {
     refreshStarted = true
-    await loadData({ preserveDirtySectionDrafts, forceResetModelStrategy, forceResetRouter: resolvedRouterAction === 'use_recommended', throwOnError: true })
+    await loadData({
+      preserveDirtySectionDrafts,
+      forceResetModelStrategy,
+      forceResetRouter: resolvedRouterAction === 'use_recommended'
+        || (replacedRouter && resolvedRouterAction !== 'disable'),
+      throwOnError: true,
+    })
     if (providerOwnedFixedModelDraft && !replacesPrimaryOnLegacyGateway) {
       providerOwnsFixedModelDraft.value = false
       providerFixedModelDraftSnapshot.value = null
@@ -4004,6 +4017,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         }, command => setupWorkflow.profile.upsertAndActivateProfile(command), providerCatalogLabel)
         if (!transition) return false
         resolvedRouterAction = transition.routerAction
+        replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
         acceptPrimaryRouterAction(resolvedRouterAction)
       } else {
         await setupWorkflow.profile.upsertProfile(payload)
@@ -4022,7 +4036,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
         applyConfiguredProviderSelection(selectedProviderId)
       }
       if (activateProfile) {
-        pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding)
+        pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter)
       } else {
         pushToast(t('setup.toast.providerProfileSaved', {
           provider: providerCatalogLabel(selectedProviderId),
@@ -4039,6 +4053,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
     if (!transition) return false
     primaryAcknowledged = true
     resolvedRouterAction = transition.routerAction
+    replacedRouter = primarySwitchReplacesRouter(selectedProviderId, previousProvider)
     acceptPrimaryRouterAction(resolvedRouterAction)
     const restart = await patchConfig(providerPatches)
     // The per-model context-window override rides the deep-merge patch form. Key
@@ -4058,7 +4073,7 @@ async function saveProvider(options: SaveOptions = {}): Promise<boolean> {
       pushToast(t('setup.toast.envNotVisibleGateway', { envKey: providerEnvKey.value }), { tone: 'danger' })
       return true
     }
-    pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding)
+    pushPrimaryRouterOutcome(resolvedRouterAction, previousBinding, replacedRouter)
     if (!resolvedRouterAction) {
       pushToast(restart ? t('setup.toast.providerSavedRestart') : t('setup.toast.providerSaved'))
     }

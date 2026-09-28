@@ -396,6 +396,7 @@ def _collect_non_stream(
     provider_kind: str = "profile_test",
     model: str = "profile-test",
     expected_calls: int = 2,
+    usage: dict[str, Any] | None = None,
 ) -> list[Any]:
     calls = 0
 
@@ -443,7 +444,7 @@ def _collect_non_stream(
                         "finish_reason": finish_reason,
                     }
                 ],
-                "usage": {},
+                "usage": usage or {},
             },
         )
 
@@ -584,6 +585,8 @@ def test_text_tool_profile_is_provider_and_model_scoped(
         ("deepseek", "deepseek-v4-flash-0731"),
         ("tokenrhythm", "tokenrhythm/deepseek-v4-pro"),
         ("openrouter", "deepseek/deepseek-v4-flash"),
+        ("openrouter", "deepseek/deepseek-v4-flash-0731"),
+        ("openrouter", "deepseek/deepseek-v4-pro-0813"),
     ],
 )
 def test_dsml_executes_only_for_exact_packaged_provider_model_pairs(
@@ -1268,6 +1271,9 @@ def test_only_complete_allowlisted_qwen_schema_failures_claim_protocol(
     if rejected:
         assert _text(events) == ""
         _assert_rejected_tool_lifecycle(events, expected_names=expected_names)
+        error = next(event for event in events if isinstance(event, ErrorEvent))
+        assert error.tool_argument_rejection is not None
+        assert error.tool_argument_rejection.calls[0].reason == "schema_invalid"
     else:
         assert _text(events) == literal
         assert _tool_starts(events) == []
@@ -1323,6 +1329,10 @@ def test_complete_allowlisted_schema_failures_emit_start_then_error(
 
     assert _text(events) == ""
     _assert_rejected_tool_lifecycle(events, expected_names=[tool_name])
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is not None
+    assert error.tool_argument_rejection.calls[0].tool_name == tool_name
+    assert error.tool_argument_rejection.calls[0].reason == "schema_invalid"
 
 
 @pytest.mark.parametrize(
@@ -2158,6 +2168,260 @@ def test_invalid_native_arguments_fail_closed_in_stream_and_non_stream(
         assert "_raw" not in error.message
 
 
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize("usage", [
+    {},
+    {"prompt_tokens": 23},
+    {"completion_tokens": 11},
+    {"prompt_tokens": 0},
+    {"prompt_tokens": 23, "completion_tokens": 11},
+    {"prompt_tokens": 0, "completion_tokens": 0},
+])
+def test_argument_rejection_preserves_visible_output_and_known_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    stream: bool,
+    usage: dict[str, Any],
+) -> None:
+    raw_arguments = '{"query":"private payload",}'
+    call = {
+        "id": "call_bad",
+        "type": "function",
+        "function": {"name": "search", "arguments": raw_arguments},
+    }
+    if stream:
+        events = _collect_stream(
+            monkeypatch,
+            provider_kind="openai",
+            model="gpt-test",
+            text_chunks=[],
+            tools=[_SEARCH_TOOL],
+            raw_body=_raw_sse([
+                {"choices": [{"delta": {"content": "I will search."}}]},
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, **call}]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+                {"choices": [], "usage": usage},
+            ]),
+        )
+    else:
+        events = _collect_non_stream(
+            monkeypatch,
+            text="I will search.",
+            finish_reason="tool_calls",
+            compat=_plain_profile(),
+            raw_tool_calls=[call],
+            usage=usage,
+        )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    rejection = error.tool_argument_rejection
+    assert rejection is not None
+    assert [(call.tool_call_id, call.tool_name, call.reason) for call in rejection.calls] == [
+        ("call_bad", "search", "invalid_json")
+    ]
+    assert rejection.terminal_reason == "tool_calls"
+    assert "private payload" not in repr(error)
+    assert _text(events) == "I will search."
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+    if usage:
+        assert len(error.model_usage_breakdown) == 1
+        assert error.model_usage_breakdown[0]["input_tokens"] == usage.get("prompt_tokens", 0)
+        assert error.model_usage_breakdown[0]["output_tokens"] == usage.get("completion_tokens", 0)
+        assert error.usage_missing_count == int(
+            not {"prompt_tokens", "completion_tokens"} <= usage.keys()
+        )
+    else:
+        assert error.model_usage_breakdown == []
+        assert error.usage_missing_count == 1
+
+
+def test_argument_rejection_usage_split_trailers_preserve_complete_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch, provider_kind="openai", model="gpt-test", text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=_raw_sse([
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_bad",
+                "function": {"name": "search", "arguments": "{bad-json"},
+            }]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 23}},
+            {"choices": [], "usage": {"completion_tokens": 11}},
+        ]),
+    )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is not None
+    assert error.model_usage_breakdown[0]["input_tokens"] == 23
+    assert error.model_usage_breakdown[0]["output_tokens"] == 11
+    assert error.usage_missing_count == 0
+
+
+def test_native_argument_rejection_preserves_confirmed_billing_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch,
+        provider_kind="tokenrhythm",
+        model="kimi-k2.7-code",
+        base_url="https://tokenrhythm.studio",
+        text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=_raw_sse([
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_bad",
+                "function": {"name": "search", "arguments": "{bad-json"},
+            }]}}]},
+            {
+                "choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                "usage": {"prompt_tokens": 23, "completion_tokens": 11},
+                "cost_cny": 0.0071,
+                "billing_pending": False,
+            },
+        ]),
+    )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is not None
+    row = error.model_usage_breakdown[0]
+    assert row["cost_source"] == "provider_billed"
+    assert row["billing_receipt"].status == "confirmed"
+    assert row["billing_receipt"].currency == "CNY"
+    assert row["billing_receipt"].amount_nanos == 7_100_000
+    assert error.usage_missing_count == 0
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+@pytest.mark.parametrize(
+    "case", ["missing_id", "unknown_name", "missing_name", "wire_arguments", "wire_type"]
+)
+def test_argument_rejection_does_not_recover_ambiguous_native_protocol(
+    monkeypatch: pytest.MonkeyPatch, stream: bool, case: str,
+) -> None:
+    call: dict[str, Any] = {
+        "id": "call_bad",
+        "type": "function",
+        "function": {"name": "search", "arguments": "{bad-json"},
+    }
+    if case == "missing_id":
+        del call["id"]
+    elif case == "unknown_name":
+        call["function"]["name"] = "unknown"
+    elif case == "missing_name":
+        del call["function"]["name"]
+    elif case == "wire_arguments":
+        call["function"]["arguments"] = {"query": "not a wire string"}
+    elif case == "wire_type":
+        call["type"] = "unknown"
+    if stream:
+        events = _collect_stream(
+            monkeypatch,
+            provider_kind="openai",
+            model="gpt-test",
+            text_chunks=[],
+            tools=[_SEARCH_TOOL],
+            raw_body=_raw_sse([
+                {"choices": [{"delta": {"tool_calls": [{"index": 0, **call}]}}]},
+                {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            ]),
+        )
+    else:
+        events = _collect_non_stream(
+            monkeypatch, text="", finish_reason="tool_calls",
+            compat=_plain_profile(), raw_tool_calls=[call],
+        )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is None
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.parametrize("function", [[], 0, False, ""])
+def test_argument_rejection_does_not_recover_falsey_function_fragment(
+    monkeypatch: pytest.MonkeyPatch, function: Any,
+) -> None:
+    events = _collect_stream(
+        monkeypatch, provider_kind="openai", model="gpt-test", text_chunks=[],
+        tools=[_SEARCH_TOOL],
+        raw_body=_raw_sse([
+            {"choices": [{"delta": {"tool_calls": [{
+                "index": 0, "id": "call_bad",
+                "function": {"name": "search", "arguments": "{bad-json"},
+            }]}}]},
+            {"choices": [{"delta": {"tool_calls": [{"index": 0, "function": function}]}}]},
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+        ]),
+    )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is None
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.parametrize("finish_reason", [None, "length", "content_filter"])
+@pytest.mark.parametrize("include_done", [True, False])
+def test_argument_rejection_requires_successful_choice_terminal(
+    monkeypatch: pytest.MonkeyPatch, finish_reason: str | None, include_done: bool,
+) -> None:
+    chunks: list[dict[str, Any]] = [{"choices": [{"delta": {"tool_calls": [{
+        "index": 0, "id": "call_bad",
+        "function": {"name": "search", "arguments": "{bad-json"},
+    }]}}]}]
+    if finish_reason:
+        chunks.append({"choices": [{"delta": {}, "finish_reason": finish_reason}]})
+    events = _collect_stream(
+        monkeypatch, provider_kind="openai", model="gpt-test", text_chunks=[],
+        tools=[_SEARCH_TOOL], raw_body=_raw_sse(chunks, include_done=include_done),
+    )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is None
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+def test_text_schema_rejection_reuses_emitted_identity(
+    monkeypatch: pytest.MonkeyPatch, stream: bool,
+) -> None:
+    literal = 'search{"query":7}'
+    if stream:
+        events = _collect_stream(
+            monkeypatch, provider_kind="profile_test", model="profile-test",
+            text_chunks=list(literal), tools=[_SEARCH_TOOL], compat=_plain_profile(),
+        )
+    else:
+        events = _collect_non_stream(
+            monkeypatch, text=literal, finish_reason="stop", compat=_plain_profile(),
+        )
+    start = next(event for event in events if isinstance(event, ToolUseStartEvent))
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    rejection = error.tool_argument_rejection
+    assert rejection is not None
+    assert len(rejection.calls) == 1
+    assert rejection.calls[0].tool_call_id == start.tool_use_id
+    assert rejection.calls[0].tool_name == "search"
+    assert rejection.calls[0].reason == "schema_invalid"
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
+def test_collapsed_text_batch_does_not_guess_invalid_call_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = _collect_stream(
+        monkeypatch, provider_kind="dashscope", model="qwen3.6-flash",
+        text_chunks=[
+            _QWEN_CALL + '\n<tool_call>{"name":"search","arguments":{"query":7}}</tool_call>'
+        ],
+        tools=[_SEARCH_TOOL],
+    )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is None
+    assert _tool_ends(events) == []
+    assert not any(isinstance(event, DoneEvent) for event in events)
+
+
 def test_non_stream_native_batch_is_atomic_when_later_call_is_invalid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2181,6 +2445,13 @@ def test_non_stream_native_batch_is_atomic_when_later_call_is_invalid(
         if isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
     )
     assert all(events.index(start) < events.index(error) for start in starts)
+    assert error.tool_argument_rejection is not None
+    assert [call.reason for call in error.tool_argument_rejection.calls] == [
+        "batch_not_executed", "invalid_json",
+    ]
+    assert [call.tool_call_id for call in error.tool_argument_rejection.calls] == [
+        start.tool_use_id for start in starts
+    ]
 
 
 def test_stream_native_batch_keeps_diagnostics_but_no_end_when_later_call_is_invalid(
@@ -2234,6 +2505,14 @@ def test_stream_native_batch_keeps_diagnostics_but_no_end_when_later_call_is_inv
         isinstance(event, ErrorEvent) and event.code == "incomplete_tool_call"
         for event in events
     )
+    error = next(event for event in events if isinstance(event, ErrorEvent))
+    assert error.tool_argument_rejection is not None
+    assert [call.reason for call in error.tool_argument_rejection.calls] == [
+        "batch_not_executed", "invalid_json",
+    ]
+    assert [call.tool_call_id for call in error.tool_argument_rejection.calls] == [
+        "call_valid", "call_invalid",
+    ]
 
 
 def test_native_start_waits_for_late_nonempty_name_without_text_candidate(

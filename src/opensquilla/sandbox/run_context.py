@@ -74,6 +74,12 @@ class RunContext:
     temporary_grants: tuple[TemporaryGrant, ...] = ()
     run_mode_source: str | None = None
     source: str = "default"
+    # Trusted execution-workspace binding kind.  This is populated from the
+    # session-owned execution_workspace binding at the gateway boundary; it is
+    # deliberately separate from ``workspace`` because a path alone is not an
+    # isolation guarantee.  ``configured`` and absent bindings must never
+    # authorize channel workspace authoring.
+    workspace_binding_kind: str | None = None
 
     def to_origin_payload(self) -> dict[str, Any]:
         return {
@@ -503,6 +509,7 @@ def _with_user_grants(context: RunContext) -> RunContext:
         temporary_grants=context.temporary_grants,
         run_mode_source=context.run_mode_source,
         source=context.source,
+        workspace_binding_kind=context.workspace_binding_kind,
     )
 
 
@@ -548,6 +555,7 @@ async def get_run_context(
     include_user_grants: bool = True,
     session_node: Any | None = None,
 ) -> RunContext:
+    binding_kind = None
     node = (
         session_node
         if session_node is not None
@@ -558,7 +566,25 @@ async def get_run_context(
         if binding is not None and not getattr(node, "workspace_id", None):
             from opensquilla.execution_workspaces import validate_execution_workspace
 
-            workspace = validate_execution_workspace(binding)["root"]
+            validated_binding = validate_execution_workspace(binding)
+            workspace = validated_binding["root"]
+            binding_kind = validated_binding.get("kind")
+            if binding_kind == "managed" and (
+                getattr(node, "parent_session_key", None)
+                or getattr(node, "spawned_by", None)
+                or getattr(node, "forked_from_parent", False)
+            ):
+                # Branch/spawn preserves the parent's binding for trusted
+                # owner workflows. That shared directory is not a unique
+                # execution workspace for ordinary channel authoring.
+                binding_kind = None
+        elif getattr(node, "workspace_id", None):
+            # Project workspaces are durable configured roots.  They are valid
+            # for trusted owner workflows, but are never a managed channel
+            # authoring workspace.
+            binding_kind = "configured"
+        else:
+            binding_kind = None
         origin = _origin_dict(node)
         saved = _context_from_payload(
             _without_materialized_user_grants(origin.get(RUN_CONTEXT_ORIGIN_KEY)),
@@ -566,13 +592,20 @@ async def get_run_context(
         )
         if saved is not None:
             if binding is not None and not getattr(node, "workspace_id", None):
-                saved = replace(saved, workspace=workspace)
+                saved = replace(
+                    saved,
+                    workspace=workspace,
+                    workspace_binding_kind=binding_kind,
+                )
+            else:
+                saved = replace(saved, workspace_binding_kind=binding_kind)
             return _with_user_grants(saved) if include_user_grants else saved
     configured_mode, _source = await resolve_default_run_mode(session_manager, config)
     context = RunContext(
         run_mode=configured_mode,
         workspace=_workspace_from_payload(workspace),
         source="default",
+        workspace_binding_kind=binding_kind,
     )
     return _with_user_grants(context) if include_user_grants else context
 

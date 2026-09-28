@@ -10,7 +10,7 @@ import {
 } from '@/contracts/generated/v4/sessionsSubscribe'
 import { SESSIONS_UNSUBSCRIBE_METHOD } from '@/contracts/generated/v4/sessionsUnsubscribe'
 
-type Handler = (payload: unknown) => void
+type Handler = (...payload: unknown[]) => void
 
 function makeHarness(initialGeneration = 1) {
   let generation = initialGeneration
@@ -46,8 +46,8 @@ function makeHarness(initialGeneration = 1) {
     rpc,
     events,
     calls,
-    emit(event: string, payload: unknown) {
-      handlers.get(event)?.forEach(handler => handler(payload))
+    emit(event: string, ...payload: unknown[]) {
+      handlers.get(event)?.forEach(handler => handler(...payload))
     },
     setGeneration(value: number) { generation = value },
     listenerCount(event: string) { return handlers.get(event)?.size || 0 },
@@ -150,7 +150,7 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
     expect(harness.calls[0].method).toBe(SESSIONS_SUBSCRIBE_METHOD)
     expect(harness.calls[0].params).toEqual({})
     expect(harness.calls[0].options).toMatchObject({ expectedGeneration: 1, abortAction: 'reject' })
-    expect(harness.events.subscribe).toHaveBeenCalledTimes(2)
+    expect(harness.events.subscribe).toHaveBeenCalledTimes(3)
     expect(Math.max(...harness.events.subscribe.mock.invocationCallOrder))
       .toBeLessThan(Math.min(...harness.rpc.request.mock.invocationCallOrder))
 
@@ -166,6 +166,54 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
     secondSubscription.close()
     await flushAsyncWork()
     expect(harness.calls.filter(call => call.method === SESSIONS_UNSUBSCRIBE_METHOD)).toHaveLength(1)
+  })
+
+  it.each([
+    'task.succeeded', 'task.failed', 'task.cancelled', 'task.abandoned', 'task.timeout',
+    'session.event.done', 'session.event.error', 'chat.done',
+  ])('uses %s as an identity-only fallback when directory invalidation is missing', async name => {
+    const harness = makeHarness()
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events)
+    const listener = vi.fn()
+    changes.subscribe(listener)
+    await changes.resume()
+    harness.emit('*', name, {
+      schema_version: 1,
+      session_key: 'agent:main:task',
+      task_id: 'finished-predecessor',
+      status: 'cancelled',
+    })
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ key: 'agent:main:task', reason: 'updated' })
+    expect(harness.calls).toHaveLength(1)
+    changes.dispose()
+    expect(harness.listenerCount('*')).toBe(0)
+  })
+
+  it('invalidates again when a durable commit follows an earlier turn completion', () => {
+    const harness = makeHarness()
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events)
+    const listener = vi.fn()
+    changes.subscribe(listener)
+    harness.emit('*', 'session.event.turn_committed', {
+      schema_version: 1, session_key: 'agent:main:task',
+      task_id: 'finished-task', turn_id: 'finished-task', stream_seq: 12,
+      status: 'succeeded', terminal_reason: 'completed', finished_at: 123,
+    })
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ key: 'agent:main:task', reason: 'updated' })
+    changes.dispose()
+  })
+
+  it('ignores nonterminal, unscoped, and invalid-version fallback events', () => {
+    const harness = makeHarness()
+    const warn = vi.fn()
+    const changes = createV4SessionDirectoryChanges(harness.rpc, harness.events, { warn })
+    const listener = vi.fn()
+    changes.subscribe(listener)
+    harness.emit('*', 'session.event.text_delta', { key: 'agent:main:task', text: 'hello' })
+    harness.emit('*', 'task.cancelled', { task_id: 'task-without-session' })
+    harness.emit('*', 'task.cancelled', { schema_version: 2, key: 'agent:main:task' })
+    expect(listener).not.toHaveBeenCalled()
+    changes.dispose()
   })
 
   it('rebinds once after a new generation and fences unsubscribe', async () => {

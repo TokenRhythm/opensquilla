@@ -550,6 +550,34 @@ async def test_task_owned_context_exhaustion_skips_compaction_and_keeps_owner() 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("physical_window", [None, 1_000_000])
+async def test_ownerless_context_exhaustion_never_uses_legacy_soft_budget(
+    physical_window: int | None,
+) -> None:
+    manager = _RecordingSessionManager()
+    runner = TurnRunner(
+        provider_selector=None,
+        session_manager=manager,
+        config=SimpleNamespace(
+            context_budget_tokens=100_000,
+            context_window_tokens=physical_window,
+        ),
+    )
+
+    await runner._persist_turn_error(
+        "agent:main:webchat:test",
+        ErrorEvent(
+            message="The accepted turn no longer fits in the current context.",
+            code="current_turn_context_exhausted",
+        ),
+    )
+
+    assert manager.compact_calls == []
+    assert len(manager.append_calls) == 1
+    assert str(manager.append_calls[0]["content"]).startswith("Error:")
+
+
+@pytest.mark.asyncio
 async def test_stale_finalizer_append_does_not_fall_back_to_unfenced_error_row() -> None:
     manager = _StaleAssistantSessionManager()
     runner = TurnRunner(

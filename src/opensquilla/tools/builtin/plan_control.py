@@ -11,7 +11,6 @@ from opensquilla.session.plans import (
     MAX_PLAN_MARKDOWN_CHARS,
     MAX_PLAN_STEP_DETAILS_CHARS,
     MAX_PLAN_STEP_ID_CHARS,
-    MAX_PLAN_STEP_REASON_CHARS,
     MAX_PLAN_STEP_TITLE_CHARS,
     MAX_PLAN_STEPS,
     MAX_PLAN_TITLE_CHARS,
@@ -73,8 +72,9 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
 @tool(
     name="submit_plan",
     description=(
-        "Submit the complete structured plan for the current Plan turn. "
-        "This creates a new immutable revision and ends the turn."
+        "Submit the complete structured plan for user review in the current Plan turn. "
+        "This creates a new immutable revision and ends the planning turn; "
+        "it does not authorize or start implementation."
     ),
     params={
         "title": {
@@ -86,8 +86,10 @@ def _normalized_steps(steps: Any) -> list[dict[str, Any]]:
         "markdown": {
             "type": "string",
             "description": (
-                "Complete human-readable plan. Do not use Markdown task-list "
-                "checkboxes as execution state."
+                "Complete human-readable plan, including the requested deliverables "
+                "and acceptance requirements. Methods and step order may adapt during "
+                "implementation without dropping those requirements. Do not use "
+                "Markdown task-list checkboxes as execution state."
             ),
             "minLength": 1,
             "maxLength": MAX_PLAN_MARKDOWN_CHARS,
@@ -341,9 +343,18 @@ async def request_user_input(questions: list[dict[str, Any]]) -> str:
 @tool(
     name="update_plan",
     description=(
-        "Replace the optional progress list for this task. Add, remove, reorder or "
-        "reopen steps as the work changes. Progress describes actual work and does "
-        "not control tool permissions, execution order or task completion."
+        "Replace the optional progress list for this task. Use a concise progress "
+        "view for substantive multi-step work, including approved-plan implementation. "
+        "Start the list before substantive implementation, with current work in progress; "
+        "do not defer all reporting until the end. Skip simple questions and single-step "
+        "tasks. Once used, keep it aligned "
+        "with actual work at meaningful milestones and before the final response "
+        "when an update is needed. Batch related changes instead of updating after "
+        "every tool call, and do not resend an unchanged list. Add, remove, reorder "
+        "or reopen steps as the work changes; do not mark unperformed or unverified "
+        "work complete. This does not enter Plan mode or create a Goal. "
+        "Progress describes actual work and does not control tool permissions, "
+        "execution order or task completion."
     ),
     params={
         "steps": {
@@ -373,65 +384,3 @@ async def update_plan(steps: list[dict[str, Any]], explanation: str | None = Non
         raise SafeToolError("Progress requires a running main Default task")
     progress = await ctx.update_progress(steps, explanation)
     return json.dumps({"status": "accepted", "progress": progress}, ensure_ascii=False)
-
-
-@tool(
-    name="plan_run_checkpoint",
-    description=(
-        "Compatibility progress update for a previously proposed step. "
-        "Prefer update_plan for a complete, adjustable progress list. "
-        "This does not stop the task or constrain subsequent tools."
-    ),
-    params={
-        "step_id": {"type": "string", "maxLength": MAX_PLAN_STEP_ID_CHARS},
-        "step_status": {"type": "string", "enum": ["completed", "blocked", "skipped"]},
-        "reason": {"type": "string", "maxLength": MAX_PLAN_STEP_REASON_CHARS},
-    },
-    required=["step_id", "step_status"],
-    default_access="deny",
-)
-async def plan_run_checkpoint(
-    step_id: str, step_status: str, next_step_id: str | None = None,
-    reason: str | None = None,
-) -> str:
-    """Translate an old checkpoint into the shared task progress update."""
-    ctx = current_tool_context.get()
-    if ctx is None or not ctx.plan_run_id or ctx.plan_storage is None:
-        raise SafeToolError("Checkpoint requires a current plan implementation")
-    if step_status not in {"completed", "blocked", "skipped"}:
-        raise RetryableToolInputError("Invalid checkpoint status")
-    from opensquilla.session.plans import PlanValidationError, checkpoint_plan_progress
-
-    proposed = list(getattr(ctx.plan_revision, "steps", []) or [])
-    task = await ctx.plan_storage.get_agent_task(ctx.task_id)
-    metadata = ((task.details or {}).get("metadata") or {}) if task else {}
-    run = await ctx.plan_storage.get_plan_run(ctx.plan_run_id)
-    if (
-        run is None or run.status != "running" or run.active_task_id != ctx.task_id
-        or metadata.get("plan_run_id") != ctx.plan_run_id
-    ):
-        raise SafeToolError("Checkpoint requires the current task's attached plan run")
-    prior = metadata.get("progress") or {}
-    steps = prior.get("steps")
-    if steps is None:
-        source = getattr(run, "step_states", None) or proposed
-        steps = [
-            {"step": item["title"], "status": (
-                item["status"] if item.get("status") in {"completed", "in_progress"}
-                else "pending"
-            )}
-            for item in source
-        ]
-    try:
-        steps = checkpoint_plan_progress(
-            proposed, steps, step_id=step_id, step_status=step_status,
-            next_step_id=next_step_id, reason=reason,
-        )
-    except PlanValidationError as exc:
-        raise RetryableToolInputError(str(exc)) from exc
-    response = json.loads(await update_plan(steps, reason))
-    from opensquilla.session.plans import plan_run_snapshot
-
-    run = await ctx.plan_storage.get_plan_run(ctx.plan_run_id)
-    response.update(status="checkpoint_recorded", plan_run=plan_run_snapshot(run))
-    return json.dumps(response, ensure_ascii=False)

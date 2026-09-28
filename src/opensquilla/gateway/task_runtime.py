@@ -22,7 +22,6 @@ import asyncio
 import builtins
 import contextlib
 import inspect
-import json
 import time
 import uuid
 from collections import deque
@@ -44,7 +43,6 @@ import structlog
 from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
 from opensquilla.engine.agent_injection import PendingInputClaim, PendingInputProvider
 from opensquilla.engine.outcome import completed_outcome, outcome_from_error
-from opensquilla.engine.steps.inject_time_prefix import TIME_PREFIX_RE
 from opensquilla.gateway.routing import RouteEnvelope, SourceKind
 from opensquilla.gateway.session_lifecycle import (
     SessionTaskSnapshot,
@@ -976,6 +974,8 @@ def _cleanup_guest_profile(task: _RuntimeTask) -> None:
 @dataclass(frozen=True)
 class _SteeredInput:
     text: str
+    # Internal notices may be consumed by this turn without creating another.
+    allow_followup: bool = True
     semantic_message: str | None = None
     persisted_user_message_id: str | None = None
     client_request_id: str | None = None
@@ -1263,26 +1263,6 @@ def _ordered_message_ids(
     return ordered
 
 
-def _recover_meta_control_message(content: object) -> str | None:
-    """Recover provider text from an accepted text-only control transcript."""
-
-    if not isinstance(content, str) or not content:
-        return None
-    try:
-        parsed = json.loads(content)
-    except (json.JSONDecodeError, ValueError):
-        # Plain user entries receive the standard timestamp prefix after the
-        # provider-facing text is captured. Remove only that exact prefix.
-        return TIME_PREFIX_RE.sub("", content, count=1)
-    if not isinstance(parsed, dict):
-        return TIME_PREFIX_RE.sub("", content, count=1)
-    text = parsed.get("text")
-    attachments = parsed.get("attachments")
-    # MetaSkill launch and replay controls are text-only. Anything else is a
-    # corrupted or mismatched recovery row and must fail closed.
-    if not isinstance(text, str) or attachments != []:
-        return None
-    return text
 
 
 class PendingOverflowPolicy(StrEnum):
@@ -1473,6 +1453,10 @@ class TaskRuntime:
         self._reserved_overflow_victims: set[str] = set()
         self._last_envelope_by_session: dict[str, RouteEnvelope] = {}
         self._last_envelope_task_id_by_session: dict[str, str] = {}
+        # Process completion deduplication is intentionally in-memory. Notices
+        # are owner-routed control input; durable process recovery is out of
+        # scope for the managed execution API.
+        self._process_completion_seen: dict[tuple[str, str], None] = {}
         self._state_lock = asyncio.Lock()
         # Admission is per session so durable RPC ingress crosses reserve,
         # commit, and activation in order. This prevents resets from overtaking
@@ -1518,153 +1502,6 @@ class TaskRuntime:
         self._agent_in_flight: dict[str, int] = {}
         self._fair_cond: asyncio.Condition | None = None
 
-    async def recover_durable_meta_controls(self, *, limit: int = 64) -> int:
-        """Reactivate accepted MetaSkill controls that never started.
-
-        Session storage marks persisted QUEUED controls with a dedicated
-        restart reason before this runtime is constructed.  RUNNING controls
-        are intentionally excluded: once the durable running boundary was
-        crossed, provider side effects may already have happened and automatic
-        replay would not be safe.
-
-        The original task id, transcript row, and server-bound ``meta_control``
-        payload are reused.  No transcript row or ingress receipt is inserted
-        during recovery.
-        """
-
-        claim = getattr(self._storage, "claim_recoverable_meta_control_tasks", None)
-        if not callable(claim):
-            return 0
-        batch_limit = max(1, min(int(limit), 256))
-        recovered = 0
-        while True:
-            claimed = await claim(limit=batch_limit)
-            if not claimed:
-                break
-            batch_failed = False
-            for item in claimed:
-                task = item.task
-                entry = item.entry
-                reservation: TaskReservation | None = None
-                try:
-                    details = task.details if isinstance(task.details, dict) else {}
-                    metadata = details.get("metadata")
-                    if not isinstance(metadata, dict) or not isinstance(
-                        metadata.get("meta_control"), dict
-                    ):
-                        raise ValueError("missing durable MetaSkill control metadata")
-                    persisted_message = details.get("meta_control_message")
-                    message = (
-                        persisted_message
-                        if isinstance(persisted_message, str)
-                        else _recover_meta_control_message(entry.content)
-                    )
-                    if message is None:
-                        raise ValueError("invalid durable MetaSkill control transcript")
-                    persisted_semantic = details.get("meta_control_semantic_message")
-                    semantic_message = (
-                        persisted_semantic
-                        if isinstance(persisted_semantic, str)
-                        else message
-                    )
-                    source_name = details.get("source_name")
-                    input_provenance = details.get("input_provenance")
-                    persisted_ids = details.get("persisted_user_message_ids")
-                    if not isinstance(persisted_ids, list):
-                        persisted_ids = []
-                    persisted_ids = [
-                        value for value in persisted_ids if isinstance(value, str)
-                    ]
-                    if entry.message_id not in persisted_ids:
-                        persisted_ids.insert(0, entry.message_id)
-                    owner = _durable_task_session_owner(
-                        details,
-                        fallback_session_id=entry.session_id,
-                    )
-                    if owner is None or owner[0] != entry.session_id:
-                        raise ValueError("invalid durable MetaSkill session owner")
-                    envelope = RouteEnvelope(
-                        source_kind=SourceKind(task.source_kind),
-                        source_name=(
-                            source_name
-                            if isinstance(source_name, str) and source_name
-                            else "recovered_meta_control"
-                        ),
-                        agent_id=task.agent_id,
-                        session_key=task.session_key,
-                        session_id=owner[0],
-                        input_provenance=(
-                            dict(input_provenance)
-                            if isinstance(input_provenance, dict)
-                            else {}
-                        ),
-                        metadata=dict(metadata),
-                        session_epoch=owner[1],
-                    )
-                    from opensquilla.engine.start_turn import reserve_turn_via_runtime
-
-                    async with self.collect_admission(envelope.session_key):
-                        if not await self._recovered_route_owner_is_current(envelope):
-                            raise ValueError("durable MetaSkill session owner is stale")
-                        reservation = await reserve_turn_via_runtime(
-                            self,
-                            envelope,
-                            message,
-                            attachments=[],
-                            mode="followup",
-                            run_kind=task.run_kind,
-                            no_memory_capture=bool(
-                                details.get("no_memory_capture", False)
-                            ),
-                            semantic_message=semantic_message,
-                            persisted_user_message_id=entry.message_id,
-                            fresh_user_session=bool(
-                                details.get("fresh_user_session", False)
-                            ),
-                            turn_id=task.task_id,
-                            bypass_pending_limit=True,
-                        )
-                        await self._restore_durable_accepted_model_routing(
-                            reservation,
-                            task,
-                        )
-                        await self.activate(
-                            reservation,
-                            persisted_user_message_id=entry.message_id,
-                            persisted_user_message_ids=persisted_ids,
-                            fresh_user_session=bool(
-                                details.get("fresh_user_session", False)
-                            ),
-                        )
-                    recovered += 1
-                except Exception as exc:  # noqa: BLE001 - preserve accepted work.
-                    batch_failed = True
-                    if reservation is not None and not reservation.activated:
-                        with contextlib.suppress(Exception):
-                            await self.abort_reservation(reservation)
-                    with contextlib.suppress(Exception):
-                        await self._storage.update_agent_task(
-                            task.task_id,
-                            status=AgentTaskStatus.ABANDONED,
-                            finished_at=int(time.time() * 1000),
-                            terminal_reason="meta_control_restart_before_start",
-                            error_class=type(exc).__name__,
-                            error_message=(
-                                "Gateway could not reactivate the accepted MetaSkill control"
-                            ),
-                        )
-                    log.error(
-                        "task_runtime.meta_control_recovery_failed",
-                        task_id=task.task_id,
-                        session_key=task.session_key,
-                        error_class=type(exc).__name__,
-                        exc_info=True,
-                    )
-            # A failed row was returned to the same claim pool. Stop this boot
-            # pass to avoid a tight retry loop; a later restart can retry it.
-            if batch_failed or len(claimed) < batch_limit:
-                break
-        return recovered
 
     async def enqueue(
         self,
@@ -2382,15 +2219,6 @@ class TaskRuntime:
                 "fresh_user_session": fresh_user_session,
             },
         )
-        if isinstance(envelope.metadata.get("meta_control"), dict):
-            # Controls are text-only and already present in the transcript.
-            # Persist their exact provider/semantic projections so restart
-            # recovery is independent of display envelopes and time stamping.
-            assert record.details is not None
-            record.details["meta_control_message"] = message
-            record.details["meta_control_semantic_message"] = (
-                semantic_message if isinstance(semantic_message, str) else message
-            )
         record.details = {
             **(record.details or {}),
             **_task_identity_payload(
@@ -3785,6 +3613,68 @@ class TaskRuntime:
             update_envelope_cache=False,
         )
 
+    async def _deliver_process_completion(
+        self, task: _RuntimeTask, payload: dict[str, Any],
+    ) -> None:
+        """Deliver once to the originating active turn, without starting another."""
+        from opensquilla.tools.builtin.shell import is_background_process_completion_consumed
+
+        envelope = task.envelope
+        execution_id = str(payload["execution_id"])
+        key = (envelope.session_key, execution_id)
+
+        def consumed() -> bool:
+            return payload.get("completion_consumed") is True or (
+                is_background_process_completion_consumed(
+                    execution_id, session_key=envelope.session_key, task_id=task.task_id,
+                )
+            )
+
+        def accepted() -> None:
+            self._process_completion_seen[key] = None
+            if len(self._process_completion_seen) > 4096:
+                self._process_completion_seen.pop(next(iter(self._process_completion_seen)))
+
+        async with self.collect_admission(envelope.session_key):
+            if (
+                self._closing
+                or task.cancel_requested
+                or task.terminal_closing
+                or task.status is not AgentTaskStatus.RUNNING
+                or key in self._process_completion_seen
+            ):
+                return
+            if consumed():
+                return
+            if not await self._recovered_route_owner_is_current(envelope):
+                return
+            status = str(payload.get("status") or "done")
+            notice = (
+                "[Managed process completed]\n"
+                f"execution_id={execution_id} status={status} "
+                f"returncode={payload.get('returncode')}"
+            )
+            tail = str(payload.get("output_tail") or payload.get("output") or "")[-2000:]
+            if tail:
+                notice += f"\noutput_tail:\n{tail}"
+            async with self._state_lock:
+                running = self._running_by_session.get(envelope.session_key)
+                if (
+                    self._closing
+                    or running is not task
+                    or task.status is not AgentTaskStatus.RUNNING
+                    or task.terminal_closing
+                    or task.cancel_requested
+                    or consumed()
+                ):
+                    return
+                # No await between the terminal guard and append: terminal
+                # settlement claims this same lock before draining steers.
+                task.pending_input_provider.append(
+                    _SteeredInput(text=notice, allow_followup=False),
+                )
+                accepted()
+
     async def wait(self, task_id: str, timeout: float | None = None) -> AgentTaskRecord:
         runtime_task = self._tasks.get(task_id)
         if runtime_task is None:
@@ -4551,9 +4441,6 @@ class TaskRuntime:
                     client_request_id = metadata.get("client_request_id")
                     if isinstance(client_request_id, str) and client_request_id:
                         turn_context["client_request_id"] = client_request_id
-                    meta_control = metadata.get("meta_control")
-                    if isinstance(meta_control, dict):
-                        turn_context["meta_control"] = dict(meta_control)
                     if (
                         metadata.get("collaboration_mode") == "plan"
                         or int(metadata.get("collaboration_revision", 0) or 0) > 0
@@ -4858,19 +4745,65 @@ class TaskRuntime:
                 log.warning("task_runtime.progress_projection_failed", task_id=task.task_id)
             return cast(dict[str, Any], progress)
 
+        async def emit_process_event(event: dict[str, Any]) -> None:
+            payload = dict(event)
+            execution_id = str(payload.get("execution_id") or payload.get("session_id") or "")
+            # The shell's legacy session_id aliases execution_id. Gateway
+            # projections must carry the actual admitted session generation.
+            payload.update(
+                session_key=task.envelope.session_key,
+                session_id=task.envelope.session_id,
+                session_epoch=task.envelope.session_epoch,
+                epoch=task.envelope.session_epoch,
+                task_id=task.task_id,
+                execution_id=execution_id,
+            )
+            try:
+                await self._emit(
+                    task.envelope.session_key,
+                    "session.event.process_completed",
+                    payload,
+                )
+            except Exception:
+                log.warning("task_runtime.process_completion_projection_failed", exc_info=True)
+            if payload.get("notify_on_exit") is not True or not execution_id:
+                return
+            # The shell finalizer calls once. Retry transient admission failures
+            # here, without keeping a separate producer or durable queue alive.
+            for attempt in range(3):
+                try:
+                    await self._deliver_process_completion(task, payload)
+                    return
+                except Exception:
+                    log.warning(
+                        "task_runtime.process_completion_delivery_failed",
+                        session_key=task.envelope.session_key,
+                        execution_id=execution_id,
+                        attempt=attempt + 1,
+                        exc_info=True,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(0.05 * (2 ** attempt))
+
         runtime_services = {
             **task.envelope.runtime_services,
             "update_progress": update_progress,
             "plan_storage": self._storage,
             "goal_service": self._goal_service,
             "plan_event_emitter": self._emit,
+            "process_event_emitter": emit_process_event,
             "suspend_compute_slot": lambda: self._suspend_compute_slot(task),
         }
-        # WebChat has a request-id response RPC and reconnect hydration. Other
-        # interactive surfaces retain the terminating compatibility protocol
-        # until they expose the same reply transport; injecting a waiter there
-        # would strand the turn behind its own session execution lock.
-        if task.envelope.source_kind is SourceKind.WEB:
+        # WebChat and the gateway CLI resolve request IDs outside the session
+        # execution lane and hydrate pending questions on reconnect. Keep the
+        # task alive while waiting, so Goal cannot mistake a question for an
+        # idle turn and start a continuation before the user answers.
+        # Other surfaces retain the terminating compatibility protocol until
+        # they expose that reply transport.
+        if task.envelope.source_kind is SourceKind.WEB or (
+            task.envelope.source_kind is SourceKind.CLI
+            and metadata.get("structured_user_input") is True
+        ):
             runtime_services["user_input_provider"] = self._user_input_broker
         attached_run_id = str(metadata.get("plan_run_id") or "").strip()
         if attached_run_id and not str(
@@ -5620,6 +5553,9 @@ class TaskRuntime:
     ) -> _SteerPromotionResult | None:
         """Turn a too-late steer into one durable follow-up task."""
 
+        # Unread process notices expire with their originating turn. Output
+        # remains queryable through process; user steering still promotes.
+        items = [item for item in items if item.allow_followup]
         if not items:
             return None
         last = items[-1]
@@ -6682,22 +6618,27 @@ class TaskRuntime:
                 payload["terminal_message"] = append_error_ref(
                     build_terminal_reply(terminal_payload), safe_error_id(error_id)
                 )
-                if failure_kind or safe_error_id(error_id):
-                    details = terminal_update.get("details")
-                    turn_outcome = (
-                        details.get("turn_outcome") if isinstance(details, dict) else None
-                    )
-                    if not isinstance(turn_outcome, dict):
-                        turn_outcome = outcome_from_error(
-                            code=terminal_reason if terminal_reason != "error" else error_class,
-                            message=error_message,
-                            error_class=error_class,
-                            failure_kind=failure_kind,
-                        ).to_dict()
-                        if safe_error_id(error_id):
-                            turn_outcome["error_id"] = error_id
-                    payload["code"] = error_class
-                    payload["turn_outcome"] = dict(turn_outcome)
+                # Classification is a runtime fact, independent of best-effort
+                # diagnostic persistence. Keep it when no error reference exists.
+                details = terminal_update.get("details")
+                turn_outcome = (
+                    details.get("turn_outcome") if isinstance(details, dict) else None
+                )
+                if not isinstance(turn_outcome, dict):
+                    turn_outcome = outcome_from_error(
+                        code=terminal_reason if terminal_reason != "error" else error_class,
+                        error_class=error_class,
+                        failure_kind=failure_kind,
+                    ).to_dict()
+                    if safe_error_id(error_id):
+                        turn_outcome["error_id"] = error_id
+                payload["code"] = error_class or terminal_reason
+                payload["turn_outcome"] = {
+                    **turn_outcome,
+                    # Do not publish internal exception prose with the newly
+                    # unconditional classification. The durable record retains it.
+                    "error_message": build_terminal_reply(terminal_payload),
+                }
             if status != AgentTaskStatus.SUCCEEDED and is_usage_accounting_barrier(error_class):
                 details = terminal_update.get("details")
                 details = details if isinstance(details, dict) else {}
@@ -6925,9 +6866,6 @@ class TaskRuntime:
         client_request_id = metadata.get("client_request_id")
         if isinstance(client_request_id, str) and client_request_id:
             context["client_request_id"] = client_request_id
-        meta_control = metadata.get("meta_control")
-        if isinstance(meta_control, dict):
-            context["meta_control"] = dict(meta_control)
         for context_field in ("target_turn_id", "promoted_from_turn_id"):
             value = metadata.get(context_field)
             if isinstance(value, str) and value:
@@ -7476,23 +7414,34 @@ class TaskRuntime:
     async def _persist_terminal_update(
         self, task_id: str, session_key: str, update: dict[str, Any],
     ) -> None:
+        details = update.get("details") or {}
         if not callable(getattr(type(self._storage), "settle_agent_task", None)):
             await self._storage.update_agent_task(task_id, **update)
-            return
-        details = update.get("details") or {}
-        remove_keys = ["cancellation_requested"]
-        if "applied_steer_evidence" not in details:
-            remove_keys.append("applied_steer_evidence")
-        await self._storage.settle_agent_task(
-            task_id,
-            session_key=session_key,
-            details_patch={
-                key: value for key, value in details.items() if key in _TERMINAL_DETAIL_KEYS
-            },
-            remove_detail_keys=remove_keys,
-            plan_result=(details.get("metadata") or {}).get("plan_result"),
-            **{key: value for key, value in update.items() if key != "details"},
+        else:
+            remove_keys = ["cancellation_requested"]
+            if "applied_steer_evidence" not in details:
+                remove_keys.append("applied_steer_evidence")
+            await self._storage.settle_agent_task(
+                task_id,
+                session_key=session_key,
+                details_patch={
+                    key: value for key, value in details.items() if key in _TERMINAL_DETAIL_KEYS
+                },
+                remove_detail_keys=remove_keys,
+                plan_result=(details.get("metadata") or {}).get("plan_result"),
+                **{key: value for key, value in update.items() if key != "details"},
+            )
+        # Successful terminal persistence may still lack complete presentation
+        # evidence. Never reclaim its only remaining trace on that basis.
+        snapshot = terminal_activity_snapshot(
+            details.get("activity_snapshot"), task_id=task_id, turn_id=task_id,
         )
+        if snapshot is not None and snapshot.get("complete") is True:
+            from opensquilla.gateway.session_streams import get_session_streams
+
+            get_session_streams().mark_terminal_persisted(
+                session_key, task_id, reconstructible=True,
+            )
 
     def _remember_compensated_terminal(self, task_id: str) -> None:
         record = self._terminal_fallback_records.pop(task_id, None)

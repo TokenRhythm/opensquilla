@@ -36,6 +36,18 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
     : null
 }
 
+function responseProperty(
+  source: Record<string, unknown>,
+  names: readonly string[],
+): { present: boolean; value: unknown } {
+  for (const name of names) {
+    if (Object.prototype.hasOwnProperty.call(source, name)) {
+      return { present: true, value: source[name] }
+    }
+  }
+  return { present: false, value: undefined }
+}
+
 function collaborationRevisionFrom(value: unknown): number | undefined {
   const source = objectRecord(value)
   if (!source) return undefined
@@ -179,6 +191,15 @@ export function useChatPlans(options: UseChatPlansOptions) {
   const planPresentations = ref<Record<string, PlanPresentationSnapshot>>({})
   const presentationPending = ref<string | null>(null)
   const activePlanRun = ref<PlanRunSnapshot | null>(null)
+  // A terminal run can be cleared by an authoritative ``activePlanRun: null``
+  // snapshot while replayed events from the same subscription are still in
+  // flight. Keep the terminal watermark outside the visible state so a late
+  // running update cannot resurrect the old execution.
+  const terminalPlanRuns = new Map<string, PlanRunSnapshot>()
+  // An explicit null activePlanRun is an authoritative empty snapshot. Keep
+  // that fence until a mutation/bootstrap supplies a new active run; replayed
+  // historical running events must not recreate the old execution.
+  let emptyActiveRunRevisionId: string | null = null
   const settledTaskIds = ref<ReadonlySet<string>>(new Set())
   const visiblePlanRun = computed<PlanRunSnapshot | null>(() => {
     const run = activePlanRun.value
@@ -217,6 +238,8 @@ export function useChatPlans(options: UseChatPlansOptions) {
     planPresentations.value = {}
     presentationPending.value = null
     activePlanRun.value = null
+    terminalPlanRuns.clear()
+    emptyActiveRunRevisionId = null
     settledTaskIds.value = new Set()
     modeBusy.value = false
     pendingAction.value = null
@@ -288,7 +311,11 @@ export function useChatPlans(options: UseChatPlansOptions) {
       collaborationRevisionFrom(envelope),
       collaboration.value.revision,
     )) return false
+    const previousRevisionId = currentPlan.value?.revisionId
     currentPlan.value = { ...plan, current: true }
+    if (previousRevisionId !== plan.revisionId) {
+      emptyActiveRunRevisionId = null
+    }
     if (
       activePlanRun.value
       && activePlanRun.value.planRevisionId !== plan.revisionId
@@ -300,13 +327,22 @@ export function useChatPlans(options: UseChatPlansOptions) {
 
   function applyPlanRun(value: unknown): boolean {
     const run = normalizePlanRunSnapshot(value)
+    const terminal = run ? terminalPlanRuns.get(run.runId) ?? null : null
+    const current = activePlanRun.value ?? terminal
     if (
       !run
       || !currentPlan.value
       || run.planRevisionId !== currentPlan.value.revisionId
-      || !shouldAdoptPlanRun(run, activePlanRun.value)
+      || (
+        emptyActiveRunRevisionId === currentPlan.value.revisionId
+        && !TERMINAL_RUN_STATUSES.has(run.status)
+      )
+      || !shouldAdoptPlanRun(run, current)
     ) return false
     activePlanRun.value = run
+    if (TERMINAL_RUN_STATUSES.has(run.status)) {
+      terminalPlanRuns.set(run.runId, run)
+    }
     return true
   }
 
@@ -319,13 +355,11 @@ export function useChatPlans(options: UseChatPlansOptions) {
     if (source.collaboration !== undefined) {
       applyCollaboration(source)
     }
-    const rawPlan = source.currentPlan
-      ?? source.current_plan
-      ?? source.planRevision
-      ?? source.plan_revision
-      ?? source.plan
-      ?? source.snapshot
-    if (rawPlan !== undefined) {
+    const planProperty = responseProperty(source, [
+      'currentPlan', 'current_plan', 'planRevision', 'plan_revision', 'plan', 'snapshot',
+    ])
+    if (planProperty.present) {
+      const rawPlan = planProperty.value
       if (rawPlan !== null) {
         if (!staleEnvelope) {
           applyPlanRevision(rawPlan, source)
@@ -333,20 +367,26 @@ export function useChatPlans(options: UseChatPlansOptions) {
       } else if (!staleEnvelope) {
         currentPlan.value = null
         activePlanRun.value = null
+        emptyActiveRunRevisionId = null
       }
     }
-    const rawRun = source.activePlanRun
-      ?? source.active_plan_run
-      ?? source.planRun
-      ?? source.plan_run
-      ?? source.run
-    if (rawRun !== undefined) {
+    const runProperty = responseProperty(source, [
+      'activePlanRun', 'active_plan_run', 'planRun', 'plan_run', 'run',
+    ])
+    if (runProperty.present) {
+      const rawRun = runProperty.value
       if (rawRun !== null) {
         if (!staleEnvelope) {
+          emptyActiveRunRevisionId = null
           applyPlanRun(rawRun)
         }
       } else if (!staleEnvelope) {
-        activePlanRun.value = null
+        emptyActiveRunRevisionId = currentPlan.value?.revisionId ?? null
+        // Preserve a terminal snapshot long enough for the run-order gate to
+        // reject replayed running events that arrive after the empty snapshot.
+        if (!activePlanRun.value || !TERMINAL_RUN_STATUSES.has(activePlanRun.value.status)) {
+          activePlanRun.value = null
+        }
       }
     }
   }

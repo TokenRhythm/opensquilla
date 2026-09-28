@@ -235,7 +235,7 @@ def test_notify_compaction_does_not_record_non_durable_or_manual_activity(
             applied=True,
             durability="request_scoped",
         )
-        cache_break_monitor.notify_compaction(
+        manual = cache_break_monitor.notify_compaction(
             "agent:main:activity-filter",
             status="completed",
             source="manual",
@@ -245,6 +245,39 @@ def test_notify_compaction_does_not_record_non_durable_or_manual_activity(
         )
 
         assert current_turn_context() == {"turn_id": "turn-compaction-filter"}
+        assert manual is not None
+        assert "turn_id" not in manual
+        assert "task_id" not in manual
+
+
+@pytest.mark.asyncio
+async def test_background_manual_owner_exit_closes_same_operation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _isolate_compaction_lifecycle(monkeypatch)
+    key, compaction_id = "agent:main:manual-backstop", "manual-backstop"
+    gate = asyncio.Event()
+    task = asyncio.create_task(gate.wait())
+    events: list[dict] = []
+    remove = cache_break_monitor.add_compaction_listener(
+        lambda _key, payload: events.append(payload),
+    )
+    try:
+        cache_break_monitor.register_active_compaction(key, compaction_id, task)
+        cache_break_monitor.notify_compaction(
+            key, source="manual", status="started", compaction_id=compaction_id,
+            track_current_task=False,
+        )
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+    finally:
+        remove()
+
+    assert [event["status"] for event in events] == ["started", "failed"]
+    assert {event["compaction_id"] for event in events} == {compaction_id}
+    assert events[-1]["reason"] == "owner_task_cancelled"
+    assert cache_break_monitor.active_compaction_ids(key) == ()
 
 
 def test_notify_compaction_resets_cache_only_after_completed_status(

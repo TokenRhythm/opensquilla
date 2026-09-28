@@ -9,6 +9,7 @@ from opensquilla.session.context_view import (
     build_compaction_context_items,
     build_compaction_context_records,
     build_provider_compaction_context,
+    compaction_replay_is_complete,
     format_compaction_summary_context,
 )
 from opensquilla.session.models import SessionContextState, SessionSummary
@@ -42,7 +43,7 @@ def test_compaction_summary_formatter_omits_oversized_structured_section_atomica
         )
     )
 
-    rendered = format_compaction_summary_context([summary])
+    rendered = format_compaction_summary_context([summary], max_chars=16_000)
 
     assert rendered is not None
     assert len(rendered) <= 16_000
@@ -66,11 +67,11 @@ def test_compaction_summary_formatter_prioritizes_recent_complete_summary() -> N
         )
     )
 
-    rendered = format_compaction_summary_context([older, newer])
+    rendered = format_compaction_summary_context([older, newer], max_chars=16_000)
 
     assert rendered is not None
     assert len(rendered) <= 16_000
-    assert rendered == format_compaction_summary_context([older, newer])
+    assert rendered == format_compaction_summary_context([older, newer], max_chars=16_000)
     assert "[Summary 2]" in rendered
     assert "Use the newest checkpoint." in rendered
     assert "The newest checkpoint remains complete." in rendered
@@ -84,7 +85,7 @@ def test_compaction_summary_formatter_preserves_oversized_legacy_summary_edges()
         + "\nRECENT_STATUS_START continue the pending operation next. RECENT_STATUS_END"
     )
 
-    rendered = format_compaction_summary_context([summary])
+    rendered = format_compaction_summary_context([summary], max_chars=16_000)
 
     assert rendered is not None
     assert len(rendered) <= 16_000
@@ -92,6 +93,24 @@ def test_compaction_summary_formatter_preserves_oversized_legacy_summary_edges()
     assert "RECENT_STATUS_START" in rendered
     assert "RECENT_STATUS_END" in rendered
     assert "Legacy compaction summary text omitted in the middle" in rendered
+
+
+def test_default_replay_preserves_long_checkpoints_and_prose_section_headers() -> None:
+    status = (
+        "Completed work.\n\nGoal:\nBuild the requested app.\n\n"
+        "Current Status:\nAll reviewed behavior must remain available. "
+        + "Implementation details and pending decisions. " * 600
+    )
+    summary = render_structured_summary(StructuredCompactionSummary(current_status=status))
+    rendered = format_compaction_summary_context([summary, "Second checkpoint", summary])
+
+    assert len(summary) > 16_000
+    assert rendered == (
+        f"[Compacted Session Summaries]\n[Summary 1]\n{summary.strip()}\n\n"
+        "[Summary 2]\nSecond checkpoint"
+    )
+    assert compaction_replay_is_complete([summary, "Second checkpoint", summary], rendered)
+    assert not compaction_replay_is_complete([summary, "Second checkpoint"], rendered[:-1])
 
 
 def test_provider_compaction_context_dropped_for_non_anthropic_provider() -> None:

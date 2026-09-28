@@ -8,6 +8,7 @@ from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from typing import Any
 
+from opensquilla.cli.chat.commands import is_exit_command
 from opensquilla.cli.tui.adapters.slash_policy import SlashCategory, classify
 from opensquilla.cli.tui.backend.contracts import (
     TuiInputKind,
@@ -164,6 +165,8 @@ def classify_chat_input(
     surface: Surface = Surface.CLI_GATEWAY,
 ) -> TuiInputKind:
     """Classify chat input without leaking slash policy into the runtime."""
+    if is_exit_command(user_input):
+        return TuiInputKind.EXIT
     parts = user_input.lstrip().lower().split(maxsplit=1)
     if (
         parts[0:1] == ["/routing"]

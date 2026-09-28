@@ -1,5 +1,11 @@
 import { test, expect, type Page } from '@playwright/test'
 import { helloOkResponse } from './support/gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './support/session-read-fixtures'
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eartifactcard'
@@ -16,8 +22,8 @@ const WEBM_TINY = Buffer.from(
   'base64',
 )
 
-// Seed a finished assistant turn carrying one image, one previewable document,
-// and one download-only data file, rewriting chat.history in flight.
+// Seed a finished assistant turn carrying one image, one PDF, and one CSV,
+// rewriting chat.history in flight.
 async function seedHistory(
   page: Page,
   options: { artifacts?: Array<Record<string, unknown>>; includeHtml?: boolean } = {},
@@ -38,8 +44,22 @@ async function seedHistory(
       }
       if (frame.type !== 'req') return
       const method = String(frame.method || '')
+      const params = frame.params as Record<string, unknown> | undefined
       if (method === 'connect') {
-        ws.send(helloOkResponse())
+        const auth = params?.auth as Record<string, unknown> | undefined
+        // Match the local owner handshake: only a supplied token is verified.
+        ws.send(helloOkResponse({
+          auth: {
+            principal: {
+              isOwner: true,
+              authenticated: typeof auth?.token === 'string' && auth.token.length > 0,
+              authState: 'authenticated',
+              role: 'operator',
+              scopes: ['operator.read', 'operator.write'],
+              capabilities: ['chat.read', 'chat.write'],
+            },
+          },
+        }))
         return
       }
       if (method === 'chat.history') {
@@ -68,27 +88,25 @@ async function seedHistory(
           type: 'res',
           id: frame.id,
           ok: true,
-          payload: {
-            messages: [
-              {
-                role: 'user',
-                text: 'Produce a few deliverables.',
-                id: 'msg-artcard-user',
-                timestamp: Math.floor(Date.now() / 1000) - 120,
-              },
-              {
-                role: 'assistant',
-                text: 'Here you go.',
-                id: 'msg-artcard-assistant',
-                timestamp: Math.floor(Date.now() / 1000) - 60,
-                artifacts,
-              },
-            ],
-            has_more: false,
-          },
+          payload: chatHistoryPayload([
+            {
+              role: 'user',
+              text: 'Produce a few deliverables.',
+              id: 'msg-artcard-user',
+              timestamp: Math.floor(Date.now() / 1000) - 120,
+            },
+            {
+              role: 'assistant',
+              text: 'Here you go.',
+              id: 'msg-artcard-assistant',
+              timestamp: Math.floor(Date.now() / 1000) - 60,
+              artifacts,
+            },
+          ]),
         }))
         return
       }
+      const key = String(params?.key || params?.sessionKey || SESSION_KEY)
       const payloads: Record<string, unknown> = {
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
@@ -99,12 +117,9 @@ async function seedHistory(
         },
         'onboarding.status': { audioConfigured: false },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
-        'sessions.messages.subscribe': {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-        },
+        'sessions.messages.subscribe': sessionMessagesSubscribePayload(key),
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
         'usage.status': { sessions: [] },
       }
       ws.send(JSON.stringify({
@@ -244,24 +259,77 @@ test.describe('Artifact deliverable cards', () => {
     expect(popupCount).toBe(0)
   })
 
-  test('download-only file card has a Download control and no Open', async ({ page }) => {
+  test('CSV file card exposes Office Open and a separate Download control', async ({ page }) => {
     await openSeeded(page)
 
     const csvCard = page.locator('.msg-artifact-chip', { hasText: 'pricing.csv' })
     await expect(csvCard).toBeVisible()
     await expect(csvCard.locator('.msg-artifact-kind')).toHaveText('CSV')
 
-    // No Open affordance for non-previewable data.
-    await expect(csvCard.getByRole('button', { name: 'Open pricing.csv' })).toHaveCount(0)
+    await expect(csvCard.getByRole('button', { name: 'Open pricing.csv' })).toBeVisible()
     await expect(csvCard.getByRole('button', { name: 'Download pricing.csv' })).toBeVisible()
   })
 
+  test('download-only file card has a Download control and no Open', async ({ page }) => {
+    await seedHistory(page, {
+      artifacts: [{ id: 'art-card-json', name: 'pricing.json', mime: 'application/json', size: 12288 }],
+    })
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+
+    const dataCard = page.locator('.msg-artifact-chip', { hasText: 'pricing.json' })
+    await expect(dataCard).toBeVisible()
+    await expect(dataCard.locator('.msg-artifact-kind')).toHaveText('JSON')
+    await expect(dataCard.getByRole('button', { name: 'Open pricing.json' })).toHaveCount(0)
+    await expect(dataCard.getByRole('button', { name: 'Download pricing.json' })).toBeVisible()
+  })
+
   test('html file card opens the offline Workbench preview and downloads separately', async ({ page }) => {
+    const previewPath = '/api/v1/artifact-preview/art-card-html-token/interactive.html'
+    const html = '<html><body>Offline HTML preview</body></html>'
+    let leaseCount = 0
+    let previewCount = 0
     let nativeOpenCount = 0
-    let htmlDownloadCount = 0
+    let htmlContentRequestCount = 0
+    let browserDownloadCount = 0
+    page.on('download', () => { browserDownloadCount += 1 })
+    await page.addInitScript(() => {
+      localStorage.setItem('opensquilla.workbench.preview.v1', JSON.stringify({
+        version: 1, mode: 'offline', noticeShown: true,
+      }))
+    })
+    await page.route(`**${previewPath}`, route => {
+      previewCount += 1
+      return route.fulfill({ status: 200, contentType: 'text/html', body: html })
+    })
+    await page.route('**/api/v1/artifact-preview-leases/art-card-html-lease', route =>
+      route.fulfill({ status: 204 }))
     await page.route('**/api/v1/artifacts/**', async route => {
       const request = route.request()
       const url = new URL(request.url())
+      if (url.pathname === '/api/v1/artifacts/art-card-html/preview-leases') {
+        leaseCount += 1
+        expect(request.method()).toBe('POST')
+        expect(request.headers()['x-opensquilla-session-key']).toBe(SESSION_KEY)
+        expect(request.postDataJSON()).toEqual({ version: 1, mode: 'offline', client: 'web' })
+        await route.fulfill({
+          status: 201,
+          json: {
+            version: 1,
+            lease_id: 'art-card-html-lease',
+            effective_mode: 'offline',
+            launch_url: previewPath,
+            entrypoint: 'interactive.html',
+            expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+            preview_origin: null,
+            idle_timeout_seconds: 3600,
+            source: {
+              kind: 'single_file', collection_status: 'not_applicable', file_count: 1,
+              total_bytes: Buffer.byteLength(html), warning_codes: [],
+            },
+          },
+        })
+        return
+      }
       if (url.pathname === '/api/v1/artifacts/art-card-html/open') {
         nativeOpenCount += 1
         expect(request.method()).toBe('POST')
@@ -274,11 +342,11 @@ test.describe('Artifact deliverable cards', () => {
         return
       }
       if (url.pathname === '/api/v1/artifacts/art-card-html') {
-        htmlDownloadCount += 1
+        htmlContentRequestCount += 1
         await route.fulfill({
           status: 200,
           contentType: 'text/html',
-          body: '<html><body>download only</body></html>',
+          body: html,
         })
         return
       }
@@ -298,6 +366,11 @@ test.describe('Artifact deliverable cards', () => {
     const preview = workbench.locator('.artifact-preview__frame--html')
     await expect(preview).toBeVisible()
     await expect(preview).toHaveAttribute('sandbox', 'allow-scripts')
+    await expect(preview).toHaveAttribute('src', new URL(previewPath, page.url()).toString())
+    await expect(preview.contentFrame().getByText('Offline HTML preview')).toBeVisible()
+    // The initial preview resource can read the artifact before its lease is
+    // installed. Reading those bytes must not trigger a browser download.
+    expect(browserDownloadCount).toBe(0)
 
     const downloadPromise = page.waitForEvent('download')
     await htmlCard.getByRole('button', { name: 'Download interactive.html' }).click()
@@ -305,7 +378,10 @@ test.describe('Artifact deliverable cards', () => {
 
     expect(download.suggestedFilename()).toBe('interactive.html')
     expect(nativeOpenCount).toBe(0)
-    expect(htmlDownloadCount).toBe(2)
+    expect(leaseCount).toBe(1)
+    expect(previewCount).toBe(1)
+    expect(htmlContentRequestCount).toBe(2)
+    expect(browserDownloadCount).toBe(1)
   })
 
   test('audio performs zero initial requests and fetches authenticated bytes only after Play', async ({ page }) => {
@@ -396,7 +472,7 @@ test.describe('Artifact deliverable cards', () => {
     await page.waitForTimeout(200)
     expect(requests).toHaveLength(0)
 
-    await page.getByRole('button', { name: 'Play video sample.webm' }).click()
+    await page.getByRole('button', { name: 'Load video preview for sample.webm' }).click()
     const player = page.locator('.msg-video-card__player')
     await expect(player).toBeVisible({ timeout: 10000 })
     await expect(player).toHaveAttribute('controls', '')

@@ -24,6 +24,8 @@ const i18n = createI18n({
         workedForMinutes: 'Worked for {minutes}m {seconds}s',
         activity: {
           liveStep: 'step {n}',
+          phaseElapsed: 'Current step {duration}',
+          stale: 'Still working — no recent signal',
         },
       },
     },
@@ -172,8 +174,8 @@ describe('ActivityDisclosure lifecycle transitions', () => {
       .toBe('false')
   })
 
-  it('forces a terminal transition closed and allows reopening afterwards', async () => {
-    const state = reactive({ lifecycle: 'working' as 'working' | 'settled' })
+  it.each([false, true])('keeps explicitly opened details at completion (canonical identity changes: %s)', async reconcileIdentity => {
+    const state = reactive({ lifecycle: 'working' as 'working' | 'settled', stateKey: 'message-live' })
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp({
@@ -182,7 +184,7 @@ describe('ActivityDisclosure lifecycle transitions', () => {
         defaultOpen: state.lifecycle === 'working',
         stepCount: 1,
         failureCount: 0,
-        stateKey: 'message-manual-expansion',
+        stateKey: state.stateKey,
         continuityKey: 'turn-manual-expansion',
       }, { default: () => 'Activity details' }),
     })
@@ -200,15 +202,59 @@ describe('ActivityDisclosure lifecycle transitions', () => {
     expect(liveSummary?.getAttribute('aria-expanded')).toBe('true')
 
     state.lifecycle = 'settled'
+    if (reconcileIdentity) state.stateKey = 'message-canonical'
     await nextTick()
 
     const settledSummary = host.querySelector<HTMLButtonElement>('.assistant-activity__summary')
     expect(settledSummary?.getAttribute('aria-expanded'))
-      .toBe('false')
+      .toBe('true')
     settledSummary?.click()
     await nextTick()
     expect(settledSummary?.getAttribute('aria-expanded'))
-      .toBe('true')
+      .toBe('false')
+  })
+
+  it.each([false, true])('preserves the manual %s choice through live remount and completion, but not a new turn', async expanded => {
+    const state = reactive({
+      lifecycle: 'working' as 'working' | 'settled',
+      defaultOpen: true,
+      stepCount: 1,
+      failureCount: 0,
+      stateKey: 'message-live-remount',
+      continuityKey: 'turn-remount',
+    })
+    const firstHost = mountDisclosure(state)
+    await nextTick()
+    const firstSummary = firstHost.querySelector<HTMLButtonElement>('button')!
+    firstSummary.click()
+    await nextTick()
+    if (expanded) {
+      firstSummary.click()
+      await nextTick()
+    }
+    mountedApps.pop()?.unmount()
+
+    state.stateKey = 'message-canonical-remount'
+    const host = mountDisclosure(state)
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe(String(expanded))
+
+    state.lifecycle = 'settled'
+    state.defaultOpen = false
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe(String(expanded))
+    expect(host.querySelector('.assistant-activity__body')?.getAttribute('aria-hidden')).toBe(String(!expanded))
+
+    state.stateKey = 'message-next-turn'
+    state.continuityKey = 'turn-next'
+    state.lifecycle = 'working'
+    state.defaultOpen = true
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('true')
+    state.lifecycle = 'settled'
+    state.defaultOpen = false
+    await nextTick()
+    expect(host.querySelector('button')?.getAttribute('aria-expanded')).toBe('false')
   })
 
   it('preserves a terminal manual reopen across same-turn canonical identity reconcile', async () => {
@@ -435,6 +481,34 @@ describe('ActivityDisclosure live header', () => {
     expect(host.querySelector('.assistant-activity__sep')).toBeNull()
     expect(host.querySelector('.assistant-activity__live-failure')).toBeNull()
   })
+
+  it('keeps the current phase timer separate from the total and live announcement', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 2,
+      failureCount: 0,
+      phaseLabel: 'Running commands',
+      elapsedLabel: '42s',
+      phaseElapsedLabel: '12s',
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+
+    const announcement = host.querySelector('[role="status"]')
+    const timer = host.querySelector('.assistant-activity__phase-elapsed')
+    expect(host.querySelector('.assistant-activity__live-elapsed')?.textContent?.trim()).toBe('· 42s')
+    expect(timer?.textContent).toBe('Current step 12s')
+    expect(timer?.getAttribute('aria-hidden')).toBe('true')
+    expect(timer?.closest('[aria-live]')).toBeNull()
+    expect(announcement?.textContent?.trim()).toBe('Running commands')
+
+    props.elapsedLabel = '43s'
+    props.phaseElapsedLabel = '13s'
+    await nextTick()
+    expect(timer?.textContent).toBe('Current step 13s')
+    expect(announcement?.textContent?.trim()).toBe('Running commands')
+    expect(host.querySelectorAll('[aria-live]')).toHaveLength(1)
+  })
 })
 
 describe('ActivityDisclosure stale state', () => {
@@ -450,9 +524,9 @@ describe('ActivityDisclosure stale state', () => {
     const dot = host.querySelector('.assistant-activity__live-dot')
     const label = host.querySelector('.assistant-activity__live-label')
 
-    // The stale copy itself is owned upstream (the stream module passes it in
-    // as phaseLabel); this component only carries the visual half.
     expect(label?.textContent?.trim()).toBe('Working')
+    expect(host.querySelector('.assistant-activity__stale-note')?.textContent?.trim())
+      .toBe('Still working — no recent signal')
     expect(dot?.classList.contains('is-active')).toBe(false)
     expect(dot?.classList.contains('is-stale')).toBe(true)
     expect(label?.classList.contains('is-stale')).toBe(true)
@@ -476,6 +550,36 @@ describe('ActivityDisclosure stale state', () => {
 
     expect(host.querySelector('.assistant-activity__live-label')?.textContent?.trim())
       .toBe('Running commands')
+    expect(host.querySelector('[role="status"]')?.textContent)
+      .toContain('Still working — no recent signal')
+    expect(host.querySelector('.assistant-activity__stale-note')?.getAttribute('aria-hidden'))
+      .toBe('true')
+  })
+
+  it('removes the stale explanation and resumes the running indicator on progress', async () => {
+    const props = reactive({
+      lifecycle: 'working' as const,
+      stepCount: 1,
+      failureCount: 0,
+      phaseLabel: 'Running commands',
+      phaseElapsedLabel: '24s',
+      stale: true,
+      defaultOpen: true,
+    })
+    const host = mountDisclosure(props)
+    await nextTick()
+    expect(host.querySelector('.assistant-activity__stale-note')).not.toBeNull()
+
+    props.stale = false
+    props.phaseLabel = 'Waiting for model'
+    props.phaseElapsedLabel = '0s'
+    await nextTick()
+
+    expect(host.querySelector('.assistant-activity__stale-note')).toBeNull()
+    expect(host.querySelector('[role="status"]')?.textContent?.trim()).toBe('Waiting for model')
+    expect(host.querySelector('.assistant-activity__live-dot')?.classList.contains('is-active')).toBe(true)
+    expect(host.querySelector('.assistant-activity__phase-elapsed')?.textContent).toBe('Current step 0s')
+    expect(host.querySelector('.assistant-activity__live-head')?.getAttribute('aria-expanded')).toBe('true')
   })
 
   it('shows the working copy with the pulsing dot when live and not stale', async () => {

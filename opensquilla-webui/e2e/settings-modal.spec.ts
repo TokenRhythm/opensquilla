@@ -653,12 +653,6 @@ test.describe('Settings modal', () => {
     // the Gateway-backed conversation-capture row above still does.
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
 
-    // Long-lived Agent management is available only from this advanced escape
-    // hatch; routing through Vue preserves the /control base path.
-    await dialog(page).getByRole('button', { name: 'Open: Agent configuration (advanced)' }).click()
-    await expect(page).toHaveURL(/\/agents$/)
-    await expect(dialog(page)).toHaveCount(0)
-    await expect(page.locator('.agents-view, .agents-page, .ag-stage').first()).toBeVisible()
-    await expect(page.getByRole('heading', { name: 'Agents', level: 1 })).toBeFocused()
+    await expect(dialog(page).getByRole('button', { name: 'Open: Agent configuration (advanced)' })).toHaveCount(0)
   })
 })

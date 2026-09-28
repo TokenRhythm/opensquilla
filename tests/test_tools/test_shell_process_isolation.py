@@ -134,41 +134,6 @@ def test_background_process_result_surfaces_local_http_server_url() -> None:
     assert "include the local URL" in result
 
 
-def test_bg_session_payload_surfaces_codetask_status_with_spaced_path(tmp_path) -> None:
-    run_dir = tmp_path / "Application Support" / "code-task" / "run-1"
-    run_dir.mkdir(parents=True)
-    status_path = run_dir / "status.json"
-    status_path.write_text(
-        json.dumps(
-            {
-                "run_id": "run-1",
-                "phase": "agent_running",
-                "updated": "2026-06-29T00:00:00Z",
-                "log_paths": {"stdout": str(run_dir / "agent_stdout.log")},
-            }
-        ),
-        encoding="utf-8",
-    )
-    session = _session(
-        "code",
-        "agent:main:one",
-        command="opensquilla-gateway code-task solve --task-file /tmp/x --yes",
-    )
-    session.output_lines.append(
-        "[code-task] run started: run_id=run-1 "
-        f"artifact_dir={run_dir} status={status_path} "
-        "(work happens in the run dir)\n"
-    )
-
-    payload = shell._bg_session_payload(session)
-
-    code_task = payload["code_task"]
-    assert isinstance(code_task, dict)
-    assert code_task["run_id"] == "run-1"
-    assert code_task["artifact_dir"] == str(run_dir)
-    assert code_task["status_path"] == str(status_path)
-    assert code_task["phase"] == "agent_running"
-    assert code_task["log_paths"] == {"stdout": str(run_dir / "agent_stdout.log")}
 
 
 def test_verified_channel_admin_can_manage_background_sessions_across_sessions() -> None:
@@ -206,6 +171,44 @@ def test_unverified_channel_owner_cannot_manage_other_background_sessions() -> N
         assert shell.get_bg_session(other.session_id) is None
     finally:
         current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("verified_admin", [False, True])
+async def test_channel_process_dispatch_requires_verified_admin(verified_admin: bool) -> None:
+    from opensquilla.tool_boundary import ToolCall
+    from opensquilla.tools.dispatch import build_tool_handler
+    from opensquilla.tools.registry import get_default_registry
+
+    own = _session("own", "agent:main:feishu:direct:owner", done=True)
+    other = _session("other", "agent:main:feishu:direct:other", done=True)
+    shell._bg_sessions.update({own.session_id: own, other.session_id: other})
+    ctx = ToolContext(
+        is_owner=True,
+        channel_admin_verified=verified_admin,
+        caller_kind=CallerKind.CHANNEL,
+        session_key=own.session_key,
+        allowed_tools={"process"},
+    )
+    registry = get_default_registry()
+    visible = {tool.name for tool in registry.to_tool_definitions(ctx)}
+    assert ("process" in visible) is verified_admin
+    handler = build_tool_handler(registry, ctx)
+    for target in (own, other):
+        result = await handler(ToolCall(
+            tool_use_id=f"channel-process-{target.session_id}",
+            tool_name="process",
+            arguments={"action": "poll", "execution_id": target.session_id},
+        ))
+        assert result.is_error is not verified_admin
+        payload = json.loads(result.content)
+        if verified_admin:
+            # The authenticated channel-admin contract intentionally permits
+            # managing other sessions; a generic owner flag does not.
+            assert payload["session"]["execution_id"] == target.session_id
+        else:
+            assert payload["error_class"] == "UnsupportedSurface"
+            assert not target.completion_consumed
 
 
 @pytest.mark.skipif(os.name != "posix", reason="process group behavior is POSIX-specific")
@@ -510,6 +513,212 @@ async def test_exec_command_writes_optional_stdin() -> None:
     exit_line, stdout = result.split("\n", 1)
     assert exit_line == "exit_code=0", result
     assert stdout.splitlines() == ["STDIN:payload"]
+
+
+@pytest.mark.asyncio
+async def test_exec_command_yield_returns_handle_and_process_waits_for_same_run() -> None:
+    """The unified start path must spawn once and expose its result to process."""
+
+    token = current_tool_context.set(
+        _ctx("agent:main:unified-exec", task_id="task-unified-exec")
+    )
+    try:
+        command = _python_shell_command(
+            "import time; print('started', flush=True); time.sleep(0.2); print('done')"
+        )
+        started = await shell.exec_command(command, timeout=5.0, yield_time_ms=0)
+        payload = json.loads(started)
+        execution_id = payload["execution_id"]
+        assert payload["session"]["status"] == "running"
+
+        waited = json.loads(
+            await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
+        )
+        assert waited["execution_id"] == execution_id
+        assert waited["exited"] is True
+        assert waited["session"]["status"] == "done"
+        assert waited["session"]["returncode"] == 0
+        assert "started" in waited["output"]
+        assert "done" in waited["output"]
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_unified_exec_pipe_accepts_process_submit_and_eof() -> None:
+    token = current_tool_context.set(
+        _ctx("agent:main:unified-pipe", task_id="task-unified-pipe")
+    )
+    try:
+        command = _python_shell_command(
+            "import sys; print('READY', flush=True); print('INPUT:' + sys.stdin.read())"
+        )
+        started = json.loads(
+            await shell.exec_command(
+                command,
+                timeout=5.0,
+                io_mode="pipe",
+            )
+        )
+        execution_id = started["execution_id"]
+        written = json.loads(
+            await shell.process(
+                action="submit",
+                execution_id=execution_id,
+                data="payload",
+            )
+        )
+        assert written["status"] == "submitted"
+        eof = json.loads(await shell.process(action="eof", execution_id=execution_id))
+        assert eof["status"] == "eof"
+        waited = json.loads(
+            await shell.process(action="wait", execution_id=execution_id, timeout=5.0)
+        )
+        assert waited["session"]["returncode"] == 0
+        assert "INPUT:payload" in waited["output"]
+    finally:
+        current_tool_context.reset(token)
+
+
+@pytest.mark.platform_pty
+@pytest.mark.asyncio
+async def test_unified_exec_real_pty_reports_tty_and_accepts_input() -> None:
+    """Exercise the platform backend through the same exec/process API as an agent."""
+
+    pytest.importorskip("winpty" if os.name == "nt" else "ptyprocess")
+    token = current_tool_context.set(
+        _ctx("agent:main:unified-pty", task_id="task-unified-pty")
+    )
+    try:
+        command = _python_shell_command(
+            "import os, sys; "
+            "print(f'TTY:{sys.stdin.isatty()}:{sys.stdout.isatty()}', flush=True); "
+            "value = sys.stdin.readline().strip(); print('INPUT:' + value, flush=True); "
+            "size = os.get_terminal_size(1); print(f'SIZE:{size.columns}:{size.lines}')"
+        )
+        started = json.loads(
+            await shell.exec_command(
+                command,
+                timeout=10.0,
+                io_mode="pty",
+            )
+        )
+        assert started["io_mode_requested"] == "pty"
+        assert started["io_mode_used"] == "pty", started
+        execution_id = started["execution_id"]
+        resized = json.loads(await shell.process(
+            "resize", execution_id=execution_id, cols=77, rows=19,
+        ))
+        assert resized["status"] == "resized"
+        written = json.loads(await shell.process(
+            "write", execution_id=execution_id, data="pty-",
+        ))
+        assert written["status"] == "written"
+        submitted = json.loads(
+            await shell.process(
+                action="submit",
+                execution_id=execution_id,
+                data="payload",
+            )
+        )
+        assert submitted["status"] == "submitted"
+        waited = json.loads(
+            await shell.process(action="wait", execution_id=execution_id, timeout=10.0)
+        )
+    finally:
+        current_tool_context.reset(token)
+
+    assert waited["session"]["returncode"] == 0
+    assert "TTY:True:True" in waited["output"]
+    assert "INPUT:pty-payload" in waited["output"]
+    assert "SIZE:77:19" in waited["output"]
+
+
+@pytest.mark.asyncio
+async def test_unified_exec_emits_process_completion_event() -> None:
+    events: list[dict[str, object]] = []
+    async_events: list[dict[str, object]] = []
+
+    async def emit(event: dict[str, object]) -> None:
+        async_events.append(event)
+
+    context = ToolContext(
+        is_owner=True,
+        caller_kind=CallerKind.CLI,
+        session_key="agent:main:completion-event",
+        task_id="task-completion-event",
+        on_runtime_event=events.append,
+        process_event_emitter=emit,
+    )
+    token = current_tool_context.set(context)
+    try:
+        started = json.loads(
+            await shell.exec_command(
+                _python_shell_command("print('complete')"),
+                yield_time_ms=0,
+            )
+        )
+        execution_id = started["execution_id"]
+        waited = json.loads(await shell.process("wait", execution_id=execution_id, timeout=10))
+    finally:
+        current_tool_context.reset(token)
+
+    assert waited["session"]["status"] == "done"
+    completion = [event for event in events if event.get("name") == "process.completed"]
+    assert len(completion) == 1
+    assert completion[0]["execution_id"] == execution_id
+    assert completion[0]["returncode"] == 0
+    assert len(async_events) == 1
+    assert async_events[0]["name"] == "process.completed"
+
+
+@pytest.mark.asyncio
+async def test_process_wait_any_and_all_cover_multiple_unified_executions() -> None:
+    token = current_tool_context.set(
+        _ctx("agent:main:wait-modes", task_id="task-wait-modes")
+    )
+    try:
+        first = json.loads(
+            await shell.exec_command(
+                _python_shell_command("import time; time.sleep(0.1); print('first')"),
+                yield_time_ms=0,
+                timeout=5.0,
+            )
+        )
+        second = json.loads(
+            await shell.exec_command(
+                _python_shell_command("import time; time.sleep(0.8); print('second')"),
+                yield_time_ms=0,
+                timeout=5.0,
+            )
+        )
+        execution_ids = [first["execution_id"], second["execution_id"]]
+        any_result = json.loads(
+            await shell.process(
+                "wait",
+                execution_ids=execution_ids,
+                wait_mode="any",
+                timeout=5.0,
+            )
+        )
+        assert any_result["wait_mode"] == "any"
+        assert any_result["exited"] is True
+        assert any_result["completed_execution_ids"]
+
+        all_result = json.loads(
+            await shell.process(
+                "wait",
+                execution_ids=execution_ids,
+                wait_mode="all",
+                timeout=5.0,
+            )
+        )
+        assert all_result["wait_mode"] == "all"
+        assert all_result["exited"] is True
+        assert set(all_result["completed_execution_ids"]) == set(execution_ids)
+        assert all(item["status"] == "done" for item in all_result["sessions"])
+    finally:
+        current_tool_context.reset(token)
 
 
 @pytest.mark.asyncio
@@ -854,18 +1063,6 @@ def test_process_tool_declares_wait_timeout_metadata() -> None:
     assert spec.execution_timeout_argument == "timeout"
 
 
-def test_process_wait_uses_coding_mode_default_timeout() -> None:
-    ctx = ToolContext(coding_mode=True)
-
-    assert ctx.coding_mode is True
-    token = current_tool_context.set(ctx)
-    try:
-        assert (
-            shell._resolve_process_wait_timeout(None)
-            == shell._CODING_PROCESS_WAIT_TIMEOUT
-        )
-    finally:
-        current_tool_context.reset(token)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="uses POSIX sleep/true")

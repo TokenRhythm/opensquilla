@@ -96,6 +96,7 @@
             <Icon name="download" :size="14" />
             <span>{{ t('chat.download') }}</span>
           </button>
+          <ImageCopyActions :source="active" :session-key="controller.request.value?.sessionKey" labelled />
         </footer>
       </div>
     </div>
@@ -106,6 +107,7 @@
 import { computed, inject, nextTick, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ImageCopyActions from '@/components/ImageCopyActions.vue'
 import { useArtifactImageLightbox, type ImageLightboxItem } from '@/composables/chat/useArtifactImageLightbox'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useDocumentEvent } from '@/composables/useDocumentEvent'

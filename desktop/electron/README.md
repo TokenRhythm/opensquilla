@@ -39,9 +39,40 @@ Playwright stays on the 1.60 line while Electron 42 is supported: the hidden
 browser reload viewport check fails with Playwright 1.63 on Electron 42. Upgrade
 that pair only after the existing native viewport and rendering checks pass.
 
-On first run, the shell opens a setup window for provider, model, base URL, and
-API key. The key is encrypted with Electron `safeStorage` when available, and a
-desktop-specific gateway config is written under Electron `userData`.
+On first run, the shell starts the client and Gateway with an explicitly
+unconfigured model profile, then offers a non-modal setup window. **Set up later**
+and the window close button leave the client running; later launches go straight
+to the client. The chat composer offers a shortcut to provider settings while
+the Gateway reports that the model is not configured.
+
+Saving setup validates local fields without requiring a network connection or
+a successful provider test. **Test connection (optional)** reports connectivity
+separately and does not prevent saving or leaving setup. Credentials use Electron
+`safeStorage` when available, and the profile lives under Electron `userData`.
+Only TokenRhythm and OpenRouter supply a first-run model preset; other providers
+require an explicit model choice. The local Gateway restarts after setup is saved
+to apply the new configuration.
+
+`npm run test:onboarding-flow` exercises the native invitation, optional probe
+failures, dismissal, and restart. `npm run test:onboarding-first-chat` exercises
+an empty first run through Settings to a real Gateway chat against a local model
+fixture. Both use isolated profiles and synthetic credentials. Set
+`OPENSQUILLA_DESKTOP_FIRST_CHAT_OUTPUT_DIR` to retain first-chat screenshots and
+its JSON report.
+
+Router support and default tiers come from the backend provider catalog and
+preset registry. After changing them, regenerate the checked-in offline catalog
+from the repository root:
+
+```bash
+uv run python scripts/generate_desktop_router_catalog.py --write
+uv run python scripts/generate_desktop_router_catalog.py --check
+```
+
+The Desktop build reads `src/generated/desktop-router-catalog.ts` without running
+Python. CI checks that it matches the backend and that the compiled Desktop
+serializer produces the same Gateway routes. Conflicting routing selections are
+rejected; saved routing conflicts expose the boot page's **Reset setup** action.
 
 The shell looks for the checkout root automatically. To point it at a different
 checkout:

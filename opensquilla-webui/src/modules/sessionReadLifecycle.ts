@@ -273,6 +273,8 @@ export interface SessionReadPort {
 
 export interface SessionReadRuntimeOwner {
   readonly cursor: ConversationRuntime
+  /** Read the active, installed projection, including accepted live events. */
+  readonly getInstalledCursor?: () => ConversationCursor
   readonly subscriptions: ConversationSubscriptionLifecycle<SessionReadPortLease>
   readonly prepareReadRetirement?: (key: string) => (released?: boolean) => void
 }
@@ -358,6 +360,7 @@ export interface CreateSessionReadLifecycleOptions {
   readonly port: SessionReadPort
   /** Externally owned, shared conversation consistency policy. */
   readonly runtime: ConversationRuntime
+  readonly getInstalledCursor?: () => ConversationCursor
   /** Externally owned subscription identity/cancellation owner. */
   readonly subscriptions: ConversationSubscriptionLifecycle<SessionReadPortLease>
   readonly prepareReadRetirement?: (key: string) => (released?: boolean) => void
@@ -443,9 +446,15 @@ export function createSessionReadLifecycle(
     const sessionKey = normalizedSessionKey(request.sessionKey)
     const retireReleasedRead = options.prepareReadRetirement?.(sessionKey)
     const prior = active
-    const seed = prior?.sessionKey === sessionKey
-      ? prior.cursor
-      : options.runtime.createCursor(sessionKey)
+    // The initial snapshot cursor is not the live consumer's cursor. Resume
+    // from what the owner actually installed, including intentional resets;
+    // max(snapshot, live) would discard a new generation's lower sequence.
+    const installed = options.getInstalledCursor?.()
+    const seed = installed?.sessionKey === sessionKey
+      ? installed
+      : prior?.sessionKey === sessionKey
+        ? prior.cursor
+        : options.runtime.createCursor(sessionKey)
     const releasePrior = prior
       ? prior.close('superseded').catch(() => {})
       : Promise.resolve()
@@ -716,6 +725,7 @@ export function createSessionReadLifecycleFactory(
       return createSessionReadLifecycle({
         port,
         runtime: owner.cursor,
+        getInstalledCursor: owner.getInstalledCursor,
         subscriptions: owner.subscriptions,
         prepareReadRetirement: owner.prepareReadRetirement,
       })

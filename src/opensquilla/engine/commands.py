@@ -347,16 +347,6 @@ _COMMANDS: tuple[CommandDef, ...] = (
         presentation=CommandPresentation.NOTICE,
         order=70,
     ),
-    CommandDef(
-        name="/coding",
-        usage="/coding [on|off|status]",
-        description="Turn Coding mode on or off.",
-        execution={_W: _local("coding.mode")},
-        category=CommandCategory.CONTROL,
-        busy_policy=CommandBusyPolicy.IMMEDIATE,
-        presentation=CommandPresentation.NOTICE,
-        order=75,
-    ),
     # ---- TUI + Channel ----------------------------------------------------
     CommandDef(
         name="/help",
@@ -705,20 +695,6 @@ _COMMANDS: tuple[CommandDef, ...] = (
             ArgumentChoice("safe", "Use Safe mode for this channel session."),
             ArgumentChoice("full", "Use Full Host Access; channel admin only."),
         ),
-    ),
-    CommandDef(
-        name="/meta",
-        usage="/meta [skill-name] [request]",
-        description="List meta-skills, or run one with /meta <skill-name> [request].",
-        execution={
-            _W: _local("meta.menu"),
-            _T: _local("meta.menu"),
-            _C: _rpc("meta.list", _empty),
-        },
-        category=CommandCategory.TURN,
-        busy_policy=CommandBusyPolicy.NEXT_TURN,
-        presentation=CommandPresentation.TURN,
-        order=230,
     ),
     CommandDef(
         name="/skills",

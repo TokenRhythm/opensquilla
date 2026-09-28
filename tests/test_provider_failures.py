@@ -20,10 +20,35 @@ def test_http_error_body_text_prefixes_top_level_code() -> None:
     with the localized message so classification substrings can match."""
     body = '{"code": "MODEL_NOT_AVAILABLE", "message": "模型不可用：xyz", "traceId": "trace_0"}'
     assert _http_error_body_text(body.encode()) == "MODEL_NOT_AVAILABLE: 模型不可用：xyz"
-    # OpenAI envelopes keep their message untouched.
-    assert _http_error_body_text(b'{"error": {"message": "boom", "code": "x"}}') == "boom"
+    # OpenAI envelopes retain their machine cause alongside the message.
+    assert _http_error_body_text(b'{"error": {"message": "boom", "code": "x"}}') == "x: boom"
     # A top-level message without a code stays bare.
     assert _http_error_body_text(b'{"message": "plain"}') == "plain"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected"),
+    [
+        (429, b'{"error":{"code":"insufficient_quota","message":"Quota exhausted"}}',
+         ProviderFailureKind.INSUFFICIENT_CREDITS),
+        (429, b'{"error":{"type":"insufficient_quota","message":"Quota exhausted"}}',
+         ProviderFailureKind.INSUFFICIENT_CREDITS),
+        (403, b'{"error":{"code":"invalid_api_key","message":"Access denied"}}',
+         ProviderFailureKind.AUTH_INVALID),
+        (404, b'{"error":{"code":"model_not_found","message":"Resource unavailable"}}',
+         ProviderFailureKind.MODEL_NOT_FOUND),
+        (403, b'{"error":{"code":"permission_denied","message":"Access denied"}}',
+         ProviderFailureKind.UNKNOWN),
+        (404, b'{"error":{"type":"not_found_error","message":"Resource unavailable"}}',
+         ProviderFailureKind.UNKNOWN),
+    ],
+)
+def test_nested_http_error_machine_cause_survives_generic_message(
+    status_code: int, body: bytes, expected: ProviderFailureKind,
+) -> None:
+    assert classify_provider_error(
+        "openai", status_code, message=_http_error_body_text(body),
+    ) is expected
 
 
 def test_provider_request_budget_exhausted_is_context_overflow() -> None:

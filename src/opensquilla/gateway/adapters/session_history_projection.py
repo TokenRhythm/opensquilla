@@ -427,8 +427,14 @@ async def _chat_history_turn_outcomes(
         if (
             status != "succeeded"
             and isinstance(outcome, dict)
-            and (outcome.get("failure_kind") or safe_error_id(outcome.get("error_id")))
+            and (
+                error_class
+                or outcome.get("failure_kind")
+                or safe_error_id(outcome.get("error_id"))
+            )
         ):
+            if error_class:
+                projected["code"] = error_class
             projected["terminal_message"] = append_error_ref(
                 build_terminal_reply({
                     "status": status,

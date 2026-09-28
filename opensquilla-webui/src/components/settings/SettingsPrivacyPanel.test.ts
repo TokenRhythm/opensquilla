@@ -41,7 +41,7 @@ describe('SettingsPrivacyPanel', () => {
     expect(networkReporting.checked).toBe(true)
     expect(el.querySelectorAll('input[type="checkbox"]')).toHaveLength(1)
     expect(el.textContent).toContain('Diagnostics and usage reporting')
-    expect(el.textContent).toContain('actual MetaSkill and Coding Mode run counts')
+    expect(el.textContent).toContain('anonymous diagnostics and usage statistics')
     expect(el.textContent).not.toContain('No choice has been saved yet')
 
     networkReporting.checked = false

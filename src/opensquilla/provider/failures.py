@@ -185,9 +185,29 @@ def _is_gateway_transient(signal: FailureSignal) -> bool:
     return bool(_GATEWAY_TRANSIENT_RE.search(signal.text))
 
 
+def _is_anthropic_missing_model(signal: FailureSignal) -> bool:
+    """Anthropic's missing-resource type needs an explicit model target.
+
+    A 404 or ``not_found_error`` can also refer to a route, file, or other
+    resource. Only the provider's ``model: <id>`` shape justifies model
+    fallback when the message does not otherwise say the model is missing.
+    """
+    return (
+        signal.status_code == 404 or "not_found_error" in signal.text
+    ) and bool(
+        re.search(
+            r'(?:^\s*|^HTTP\s+404:\s*|"message"\s*:\s*")model\s*:\s*[^"\s]',
+            signal.message,
+            re.IGNORECASE,
+        )
+    )
+
+
 _MODEL_UNAVAILABLE_SUBSTRINGS = (
     "no endpoints found",
     "model not found",
+    "model_not_found",
+    "model does not exist",
     "model is not available",
     "model not available",
     "not available in your region",
@@ -276,15 +296,16 @@ _SHARED_PRE_MATCHERS: tuple[FailureMatcher, ...] = (
 
 FAILURE_TABLES: dict[str, tuple[FailureMatcher, ...]] = {
     "openai_compat": (
-        FailureMatcher(ProviderFailureKind.MODEL_NOT_FOUND, status_codes=frozenset({404})),
         FailureMatcher(
             ProviderFailureKind.MODEL_NOT_FOUND,
             message_substrings=_MODEL_UNAVAILABLE_SUBSTRINGS,
         ),
-        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401, 403})),
+        # A bare 403 says only that access was refused; a bare 404 can be
+        # a missing API route. Neither proves a credential or model problem.
+        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401})),
         FailureMatcher(
             ProviderFailureKind.AUTH_INVALID,
-            message_substrings=("invalid api key", "unauthorized"),
+            message_substrings=("invalid api key", "invalid_api_key", "unauthorized"),
         ),
         FailureMatcher(ProviderFailureKind.INSUFFICIENT_CREDITS, status_codes=frozenset({402})),
         FailureMatcher(
@@ -310,12 +331,15 @@ FAILURE_TABLES: dict[str, tuple[FailureMatcher, ...]] = {
         FailureMatcher(ProviderFailureKind.BAD_REQUEST, message_substrings=("invalid_request",)),
     ),
     "anthropic": (
-        FailureMatcher(ProviderFailureKind.MODEL_NOT_FOUND, status_codes=frozenset({404})),
         FailureMatcher(
             ProviderFailureKind.MODEL_NOT_FOUND,
-            message_substrings=("not_found_error", *_MODEL_UNAVAILABLE_SUBSTRINGS),
+            predicate=_is_anthropic_missing_model,
         ),
-        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401, 403})),
+        FailureMatcher(
+            ProviderFailureKind.MODEL_NOT_FOUND,
+            message_substrings=_MODEL_UNAVAILABLE_SUBSTRINGS,
+        ),
+        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401})),
         FailureMatcher(
             ProviderFailureKind.AUTH_INVALID,
             message_substrings=("authentication_error",),
@@ -352,9 +376,9 @@ FAILURE_TABLES: dict[str, tuple[FailureMatcher, ...]] = {
             ProviderFailureKind.MODEL_NOT_FOUND,
             message_substrings_all=("pull", "model"),
         ),
-        # Ollama Cloud / secured remote hosts return standard auth statuses;
+        # Ollama Cloud / secured remote hosts return standard auth failures;
         # without these rows a 401 fell through to UNKNOWN.
-        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401, 403})),
+        FailureMatcher(ProviderFailureKind.AUTH_INVALID, status_codes=frozenset({401})),
         FailureMatcher(ProviderFailureKind.AUTH_INVALID, message_substrings=("unauthorized",)),
         FailureMatcher(
             ProviderFailureKind.TRANSPORT_TRANSIENT,

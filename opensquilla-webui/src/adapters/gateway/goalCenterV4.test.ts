@@ -15,13 +15,18 @@ function transport(response: unknown, supported = true) {
 }
 
 describe('createV4GoalCenter', () => {
-  it('preserves explicit no-budget and background options and projects total budget accounting', async () => {
-    const source = transport({ accepted: true, goal: { status: 'active', tokenBudget: null, budgetTokensUsed: 321, usageCoverage: 'complete', executionPolicy: 'background' } })
+  it('omits removed execution controls from mutations and legacy snapshots', async () => {
+    const source = transport({ accepted: true, goal: { status: 'active', tokenBudget: 5000, budgetTokensUsed: 321, usageCoverage: 'complete', executionPolicy: 'background' } })
     const center = createV4GoalCenter(source)
-    const result = await center.edit({ sessionKey: 'agent:demo', expectedGoalId: 'g1', expectedStateRevision: 2, clientRequestId: 'budget-edit', objective: 'ship', tokenBudget: null, executionPolicy: 'background' })
-    expect(source.requests[0]?.params).toMatchObject({ tokenBudget: null, executionPolicy: 'background' })
-    expect(result.goal).toMatchObject({ tokenBudget: null, budgetTokensUsed: 321, usageCoverage: 'complete', executionPolicy: 'background' })
-    await center.edit({ sessionKey: 'agent:demo', expectedGoalId: 'g1', expectedStateRevision: 3, clientRequestId: 'objective-only', objective: 'ship again' })
+    const input = { sessionKey: 'agent:demo', expectedGoalId: 'g1', expectedStateRevision: 2, clientRequestId: 'objective-edit', objective: 'ship', tokenBudget: 5000, executionPolicy: 'background' }
+    const result = await center.edit(input)
+    expect(source.requests[0]?.params).not.toHaveProperty('tokenBudget')
+    expect(source.requests[0]?.params).not.toHaveProperty('executionPolicy')
+    expect(result.goal).toMatchObject({ status: 'active', usageCoverage: 'complete' })
+    expect(result.goal).not.toHaveProperty('tokenBudget')
+    expect(result.goal).not.toHaveProperty('budgetTokensUsed')
+    expect(result.goal).not.toHaveProperty('executionPolicy')
+    await center.set({ ...input, clientRequestId: '550e8400-e29b-41d4-a716-446655440000', clientMessageId: '550e8400-e29b-41d4-a716-446655440001' })
     expect(source.requests[1]?.params).not.toHaveProperty('tokenBudget')
     expect(source.requests[1]?.params).not.toHaveProperty('executionPolicy')
   })
@@ -52,23 +57,10 @@ describe('createV4GoalCenter', () => {
       maxTurns: 50,
       runtimeBudgetSeconds: 3600,
       methods: ['goals.status'],
-      tokenBudgetSupported: false,
-      backgroundExecutionSupported: false,
     })
     expect(source.requests[0]).toEqual({
       method: 'goals.capabilities',
       params: undefined,
-    })
-  })
-
-  it('projects explicit current-server budget and background capabilities', async () => {
-    const center = createV4GoalCenter(transport({
-      supported: true, executionEnabled: true, maxTurns: 50, runtimeBudgetSeconds: 3600,
-      methods: ['goals.set', 'goals.edit'],
-      tokenBudgetSupported: true, backgroundExecutionSupported: true,
-    }))
-    await expect(center.capabilities()).resolves.toMatchObject({
-      tokenBudgetSupported: true, backgroundExecutionSupported: true,
     })
   })
 

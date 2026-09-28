@@ -107,7 +107,7 @@ def test_messaging_group_does_not_revive_removed_agent_send_wrapper() -> None:
     assert "send_message" not in result.allowed_tools
 
 
-def test_channel_media_group_expands_safe_file_authoring_tools() -> None:
+def test_channel_media_group_does_not_restore_retired_file_tools() -> None:
     cfg = {
         "channels": {
             "feishu": {
@@ -140,13 +140,7 @@ def test_channel_media_group_expands_safe_file_authoring_tools() -> None:
         config=cfg,
     )
 
-    assert result.allowed_tools == {
-        "session_status",
-        "create_csv",
-        "create_xlsx",
-        "create_pptx",
-        "create_pdf_report",
-    }
+    assert result.allowed_tools == {"session_status"}
 
 
 def test_channel_perm_group_is_empty_until_explicit_tools_exist() -> None:
@@ -220,5 +214,5 @@ def test_channel_sender_policy_can_enable_drive_for_one_sender() -> None:
         config=cfg,
     )
 
-    assert allowed.allowed_tools == {"session_status", "create_pptx"}
+    assert allowed.allowed_tools == {"session_status"}
     assert other.allowed_tools == {"session_status"}

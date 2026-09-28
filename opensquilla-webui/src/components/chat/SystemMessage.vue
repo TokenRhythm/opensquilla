@@ -1,36 +1,27 @@
 <template>
-  <!-- Terminal errors are plain conversation text, not a separate panel. -->
-  <div v-if="message.displayRole === 'error'" class="msg-error" role="alert">
-    <p v-if="errorText" class="msg-error__text">{{ errorText }}</p>
-    <p v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</p>
-    <div v-if="diagnosticId || showModelCapacity || showResume || showRetry || timeIso" class="msg-error__actions">
-      <RouterLink v-if="showModelCapacity" class="msg-error__action msg-error__capacity"
-        :to="{ path: '/settings/modelStrategy', query: message.modelCapacity ? {
-          capacityProvider: message.modelCapacity.provider, capacityModel: message.modelCapacity.model,
-        } : {} }">{{ t('setup.capacity.title') }}</RouterLink>
+  <!-- Keep the reason and its one safe action in the conversation flow. -->
+  <div v-if="message.displayRole === 'error'" class="msg-error" :role="errorRole">
+    <span v-if="errorText" class="msg-error__text">{{ errorText }}</span>
+    <span v-if="hasPartialAnswer" class="msg-error__note">{{ t('chat.partialFailureNote') }}</span>
+    <span v-if="settingsTarget || showResume || showRetry" class="msg-error__actions">
+      <RouterLink v-if="settingsTarget" class="msg-error__action"
+        :class="{ 'msg-error__capacity': isCapacityError }"
+        :to="settingsTarget">{{ actionLabel }}</RouterLink>
       <button
-        v-if="diagnosticId"
-        type="button"
-        class="msg-error__action msg-error__copy"
-        @click="copyDiagnosticId"
-      >{{ copied ? t('chat.copiedDiagnosticId') : t('chat.copyDiagnosticId') }}: {{ diagnosticId }}</button>
-      <button
-        v-if="showResume"
+        v-else-if="showResume"
         type="button"
         class="msg-error__action msg-error__resume"
         :disabled="resolving"
         @click="onResume"
-      >{{ t('chat.sandboxPausedResume') }}</button>
+      >{{ t('chat.errorAction.resumeSandbox') }}</button>
       <button
-        v-if="showRetry"
+        v-else-if="showRetry"
         type="button"
         class="msg-error__action msg-error__resume"
         :disabled="retryResolving"
         @click="onRetry"
-      >{{ t('chat.retry') }}</button>
-      <time v-if="timeIso" class="msg-error__time" :datetime="timeIso" :title="timeFull">{{ timeAbs }}</time>
-    </div>
-    <span v-if="diagnosticId && copyFailed" class="msg-error__note" role="status">{{ t('chat.copyDiagnosticFailed') }}</span>
+      >{{ t('chat.errorAction.retryUsageReplay') }}</button>
+    </span>
   </div>
 
   <!-- All other system roles: centered pill (unchanged). -->
@@ -52,13 +43,12 @@
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
 import { useI18n } from 'vue-i18n'
 import type { ChatRenderedMessage } from '@/types/chat'
 import { absoluteTime, fullTime, isoTime } from '@/utils/messageTime'
-import { copyTextWithFallback } from '@/utils/browser'
-import { diagnosticErrorId } from '@/utils/chat/providerFailure'
+import { chatErrorPresentation } from '@/utils/chat/chatErrorPresentation'
 import { localizedChatErrorMessage } from '@/utils/chat/errors'
 import {
   hasStrictUsageBarrierReplayProof,
@@ -72,6 +62,7 @@ const props = defineProps<{
   subagentSummary: (text: string) => string
   subagentBody: (text: string) => string
   retryAvailable?: boolean
+  resumeAvailable?: boolean
   hasPartialAnswer?: boolean
 }>()
 
@@ -80,37 +71,65 @@ const props = defineProps<{
 // to the sandbox.resume RPC. Resume is idempotent, but we disable the button
 // after one click to avoid duplicate confirmations.
 const emit = defineEmits<{
-  resume: []
+  resume: [message: ChatRenderedMessage]
   retry: [message: ChatRenderedMessage, settle: (accepted: boolean) => void]
 }>()
 const resolving = ref(false)
 const retryResolving = ref(false)
-const showModelCapacity = computed(() => ['provider_request_too_large', 'provider_request_budget_exhausted'].includes(props.message.errorCode || ''))
-const copied = ref(false)
-const copyFailed = ref(false)
-const diagnosticId = computed(() => props.message.turnId && props.message.turnId === props.message.turnOutcome?.turnId
-  ? diagnosticErrorId(props.message.turnOutcome?.errorId)
-  : undefined)
+watch(
+  () => [props.resumeAvailable, props.message.turnId, props.message.turnOutcome?.turnId] as const,
+  ([available]) => {
+    if (available) resolving.value = false
+  },
+)
+const errorCode = computed(() => props.message.errorCode || props.message.turnOutcome?.errorClass)
+const presentation = computed(() => chatErrorPresentation({
+  code: errorCode.value,
+  failureKind: props.message.turnOutcome?.failureKind,
+  terminalStatus: props.message.turnOutcome?.status,
+  reason: props.message.turnOutcome?.reason,
+  cancellationSource: props.message.turnOutcome?.cancellationSource,
+  outcomeKind: props.message.turnOutcome?.kind,
+  replaySafe: hasStrictUsageBarrierReplayProof(props.message),
+}))
 const errorText = computed(() => localizedChatErrorMessage(
-  props.message.errorCode, props.message.text,
-  props.message.turnOutcome?.replaySafe === true, props.message.turnOutcome?.failureKind,
+  errorCode.value,
+  '',
+  hasStrictUsageBarrierReplayProof(props.message),
+  props.message.turnOutcome?.failureKind,
   props.message.turnOutcome?.status,
+  {
+    reason: props.message.turnOutcome?.reason,
+    cancellationSource: props.message.turnOutcome?.cancellationSource,
+    outcomeKind: props.message.turnOutcome?.kind,
+  },
 ))
-
-async function copyDiagnosticId() {
-  if (!diagnosticId.value) return
-  try {
-    await copyTextWithFallback(diagnosticId.value)
-    copied.value = true
-    copyFailed.value = false
-  } catch {
-    copyFailed.value = true
-  }
-}
+const errorRole = computed(() => [
+  'chat.errorMessage.stopped', 'chat.errorMessage.interrupted',
+  'chat.errorMessage.approvalRequired', 'chat.errorMessage.needsConfirmation',
+  'chat.errorMessage.runLimit',
+].includes(presentation.value.messageKey) ? 'status' : 'alert')
+const isCapacityError = computed(() => presentation.value.messageKey === 'chat.errorMessage.contextLimit')
+const settingsTarget = computed(() => {
+  const action = presentation.value.action
+  if (action === 'open-provider-settings') return { path: '/settings/provider' }
+  if (action !== 'open-model-settings' && action !== 'choose-model') return undefined
+  const capacity = isCapacityError.value ? props.message.modelCapacity : undefined
+  return capacity
+    ? { path: '/settings/modelStrategy', query: { capacityProvider: capacity.provider, capacityModel: capacity.model } }
+    : { path: '/settings/modelStrategy' }
+})
+const actionLabel = computed(() => {
+  const action = presentation.value.action
+  if (action === 'open-provider-settings') return t('chat.errorAction.openProviderSettings')
+  if (action === 'choose-model') return t('chat.errorAction.chooseModel')
+  return t('chat.errorAction.openModelSettings')
+})
 const showResume = computed(
   () =>
     props.message.displayRole === 'error' &&
-    props.message.errorCode === 'sandbox_threshold_exceeded',
+    presentation.value.action === 'resume-sandbox' &&
+    props.resumeAvailable === true,
 )
 const isUsageBarrier = computed(
   () => props.message.displayRole === 'error'
@@ -119,18 +138,19 @@ const isUsageBarrier = computed(
 const showRetry = computed(
   () =>
     isUsageBarrier.value
+    && presentation.value.action === 'retry-usage-replay'
     && hasStrictUsageBarrierReplayProof(props.message)
     && props.retryAvailable === true,
 )
 
 function onResume() {
-  if (resolving.value) return
+  if (resolving.value || !showResume.value) return
   resolving.value = true
-  emit('resume')
+  emit('resume', props.message)
 }
 
 function onRetry() {
-  if (retryResolving.value) return
+  if (retryResolving.value || !showRetry.value) return
   emit('retry', props.message, (accepted) => {
     retryResolving.value = accepted
   })
@@ -189,29 +209,22 @@ const timeFull = computed(() => fullTime(props.message.ts))
 
 .msg-error {
   padding: 0.375rem 1.5rem;
-  font-size: 0.875rem;
+  font-size: 0.8125rem;
   color: var(--text-muted);
   line-height: 1.5;
+  text-align: center;
+  overflow-wrap: anywhere;
 }
 
 .msg-error__text,
 .msg-error__note {
   margin: 0;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 .msg-error__note,
 .msg-error__actions {
-  font-size: 0.8125rem;
-  color: var(--text-dim);
-}
-
-.msg-error__actions {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 0.25rem 0.75rem;
+  margin-inline-start: 0.5rem;
 }
 
 .msg-error__action {
@@ -220,7 +233,7 @@ const timeFull = computed(() => fullTime(props.message.ts))
   background: none;
   color: inherit;
   font: inherit;
-  text-align: start;
+  text-align: inherit;
   text-decoration: underline;
   text-underline-offset: 0.15em;
   user-select: text;
@@ -230,29 +243,6 @@ const timeFull = computed(() => fullTime(props.message.ts))
 .msg-error__action:disabled {
   opacity: 0.55;
   cursor: default;
-}
-
-.msg-error__time {
-  font-size: var(--fs-xs);
-  font-variant-numeric: tabular-nums;
-  opacity: 0;
-  transition: opacity var(--dur-fast);
-}
-
-.msg-error:hover .msg-error__time {
-  opacity: 1;
-}
-
-@media (hover: none) {
-  .msg-error__time {
-    opacity: 1;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .msg-error__time {
-    transition: none;
-  }
 }
 
 .chat-subagent-disclosure {

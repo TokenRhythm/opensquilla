@@ -18,6 +18,11 @@ from opensquilla.telemetry.contracts.common import StrictTelemetryModel
 from opensquilla.telemetry.coordination import (
     scope_consent_coordinator_for,
 )
+from opensquilla.telemetry.identity import (
+    TelemetryIdentityKind,
+    identity_state_path,
+    read_identity,
+)
 from opensquilla.telemetry.outbox import EnqueueResult, OutboxPriority, TelemetryOutbox
 
 
@@ -57,6 +62,34 @@ class TelemetryRecorder:
         """Return whether this recorder shares the live config's coordinator."""
 
         return self._config is config
+
+    async def recover_contract_rejection_once(
+        self,
+        event: StrictTelemetryModel,
+        *,
+        expected_consent_revision: int,
+    ) -> bool:
+        """Restore a retained Growth event under the same current authorization."""
+
+        if self.scope is not TelemetryScope.GROWTH or str(
+            getattr(event, "consent_scope", "")
+        ) != self.scope.value:
+            return False
+        notice = getattr(event, "notice_version", None)
+        if notice != CURRENT_NOTICE_VERSION_BY_SCOPE[self.scope.value]:
+            return False
+        async with self._coordinator.authorized(
+            self.scope, checkpoint=ConsentCheckpoint.ENQUEUE, notice_version=notice,
+        ) as permit:
+            if permit is None or permit.revision != expected_consent_revision:
+                return False
+            identity = read_identity(
+                identity_state_path(TelemetryIdentityKind.ANALYTICS_USER, config=self._config),
+                expected_kind=TelemetryIdentityKind.ANALYTICS_USER,
+            )
+            if identity is None or identity.value != str(getattr(event, "analytics_user_id", "")):
+                return False
+            return await self._outbox.recover_contract_rejection_once(event)
 
     async def record(
         self,

@@ -89,6 +89,18 @@ def capability_report_from_setup(
         SandboxSetupState.FAILED: "setup_failed",
         SandboxSetupState.UNAVAILABLE: "backend_unavailable",
     }[setup.state]
+    if setup.state is SandboxSetupState.FAILED:
+        detail = (setup.detail or "").strip()
+        known_codes = {
+            "helper_root_unavailable",
+            "runtime_root_missing",
+            "helper_launch_failed",
+            "helper_probe_timeout",
+            "sandbox_setup_required",
+        }
+        prefix = detail.split(":", 1)[0].strip()
+        if prefix in known_codes:
+            code = prefix
     return CapabilityReport(
         available=setup.state is SandboxSetupState.READY,
         backend=str(backend),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,12 +14,17 @@ from opensquilla.application.session_maintenance import (
     CompactSession,
     SessionCompactionDeadlineError,
     SessionCompactionResult,
+    SessionCompactionSession,
 )
 from opensquilla.gateway.adapters.session_maintenance import (
     GatewaySessionMaintenanceAdapter,
     GatewaySessionMaintenancePorts,
 )
-from opensquilla.gateway.compaction_target import GatewayCompactionTarget, GatewayConsumerBudget
+from opensquilla.gateway.compaction_target import (
+    GatewayCompactionTarget,
+    GatewayConsumerBudget,
+    build_gateway_compaction_budget,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
 from opensquilla.project_workspaces import project_path_key
@@ -178,12 +184,103 @@ def test_manual_plan_keeps_generation_budget_without_fabricating_active_request(
         provider_selector=SimpleNamespace(current_config=current),
     ))
 
-    plan = ports.build_plan(None, 0, "manual-generation", time.monotonic() + 120)
+    plan = ports.build_plan(None, None, "manual-generation", time.monotonic() + 120)
 
     compaction = plan.runtime_value.config
     assert compaction.request_context is None
     assert compaction.llm_plan.primary.max_generation_tokens == 8192
     assert compaction.llm_plan.primary.max_output_tokens == 1024
+
+
+def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.engine.runtime import TurnRunner
+    from opensquilla.provider.openai import OpenAIProvider
+    from opensquilla.provider.types import ToolDefinition
+
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-manual", "api_key": "synthetic-key",
+        "context_window_tokens": 32_000, "max_tokens": 1024, "thinking": "off",
+    })
+    current = ProviderConfig(
+        provider="openai", model="synthetic-manual", api_key="synthetic-key",
+    )
+    runner = TurnRunner(provider_selector=None, config=config)
+    prompt = "Synthetic session instructions. " * 200
+    tool = ToolDefinition(
+        name="synthetic_lookup", description="Synthetic lookup tool.",
+        input_schema={"type": "object", "properties": {"query": {"type": "string"}}},
+    )
+    monkeypatch.setattr(runner, "_build_tools", lambda **_: ([tool], None))
+    monkeypatch.setattr(runner, "_assemble_prompt", lambda *_, **__: prompt)
+    monkeypatch.setattr(runner, "_extra_context_for_tool_context", lambda _: None)
+
+    def unexpected_turn(*args, **kwargs):
+        raise AssertionError("manual envelope preparation must not start a turn or call a model")
+
+    monkeypatch.setattr(runner, "run", unexpected_turn)
+    monkeypatch.setattr(OpenAIProvider, "chat", unexpected_turn)
+    projected = []
+    project = OpenAIProvider.project_final_request
+
+    def capture_projection(self, *args, **kwargs):
+        result = project(self, *args, **kwargs)
+        projected.append(result.payload)
+        return result
+
+    monkeypatch.setattr(OpenAIProvider, "project_final_request", capture_projection)
+    raw_session = SessionNode(
+        session_key="agent:main:webchat:manual-envelope", session_id="session-envelope",
+    )
+    before = raw_session.model_dump()
+    ports = GatewaySessionMaintenancePorts(RpcContext(
+        conn_id="manual-envelope", config=config, session_manager=SimpleNamespace(storage=None),
+        provider_selector=SimpleNamespace(current_config=current), turn_runner=runner,
+    ))
+    session = SessionCompactionSession(raw_session.session_id, "main", raw_session)
+    plan = ports.build_plan(session, None, "manual-envelope", time.monotonic() + 120)
+    shared = plan.runtime_value.config.budget
+    fallback = build_gateway_compaction_budget(plan.runtime_value.budget)
+
+    assert shared.physical_context_window_tokens == 32_000
+    assert plan.context_window_tokens == shared.history_capacity_tokens
+    assert 0 < shared.history_capacity_tokens < fallback.history_capacity_tokens
+    assert 0 < shared.history_capacity_chars < fallback.history_capacity_chars
+    assert shared.consumer_admission("complete checkpoint", []) is True
+    assert any(prompt in json.dumps(payload) for payload in projected)
+    assert any("synthetic_lookup" in json.dumps(payload) for payload in projected)
+    assert raw_session.model_dump() == before
+
+
+def test_manual_budget_uses_session_deployment_without_a_legacy_default_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = GatewayConfig(context_budget_tokens=100_000)
+    raw_session = SimpleNamespace(session_key="agent:main:webchat:large-context")
+    session = SessionCompactionSession("session-large", "main", raw_session)
+    ports = GatewaySessionMaintenancePorts(RpcContext(
+        conn_id="manual-budget", config=config, session_manager=SimpleNamespace(storage=None),
+    ))
+    resolved_sessions = []
+
+    def resolve(_ctx, candidate):
+        resolved_sessions.append(candidate)
+        return GatewayConsumerBudget(
+            context_window_tokens=1_000_000,
+            physical_context_window_tokens=1_000_000,
+            provider_request_max_chars=3_000_000,
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.gateway.adapters.session_maintenance.resolve_gateway_consumer_budget",
+        resolve,
+    )
+
+    assert ports.resolve_context_window_tokens(session, None) == 1_000_000
+    assert ports.resolve_context_window_tokens(session, 40_000) == 40_000
+    assert ports.resolve_context_window_tokens(session, 2_000_000) == 1_000_000
+    assert resolved_sessions == [raw_session, raw_session, raw_session]
 
 
 @pytest.mark.parametrize("workspace_kind", ["agent", "project", "untrusted", "disabled"])

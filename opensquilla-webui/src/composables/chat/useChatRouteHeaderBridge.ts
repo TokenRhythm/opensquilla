@@ -18,6 +18,7 @@ export type ChatRouteHeaderAction =
   | 'copy-gateway-link'
 
 export interface ChatRouteHeaderModel {
+  sessionKey: Readonly<Ref<string>>
   visible: Readonly<Ref<boolean>>
   title: Readonly<Ref<string>>
   copyState: Readonly<Ref<string | null>>
@@ -51,6 +52,7 @@ export interface ChatRouteHeaderRegistration {
 
 export interface ChatRouteHeaderBridge {
   model: {
+    sessionKey: ComputedRef<string>
     visible: ComputedRef<boolean>
     title: ComputedRef<string>
     copyState: ComputedRef<string | null>
@@ -127,6 +129,7 @@ export function provideChatRouteHeaderBridge(): ChatRouteHeaderBridge {
 
   const bridge: ChatRouteHeaderBridge = {
     model: {
+      sessionKey: computed(() => ownerValue('sessionKey', '')),
       visible: computed(() => ownerValue('visible', false)),
       title: computed(() => ownerValue('title', '')),
       copyState: computed(() => ownerValue('copyState', null)),

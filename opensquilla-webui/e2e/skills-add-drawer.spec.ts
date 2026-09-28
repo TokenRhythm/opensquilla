@@ -53,17 +53,6 @@ function catalogPayload() {
   return {
     skills: [
       {
-        name: 'meta-synthetic',
-        description: 'Synthetic meta Skill used only by the browser contract test.',
-        kind: 'meta',
-        layer: 'bundled',
-        status: 'ready',
-        lifecycle: {
-          ...lifecycle(),
-          install_state: 'untracked',
-        },
-      },
-      {
         name: 'bundled-synthetic',
         description: 'Synthetic bundled Skill used only by the browser contract test.',
         kind: 'skill',
@@ -206,9 +195,6 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
               'skills.list',
               'skills.search',
               'skills.install',
-              'exec.proposals.list',
-              'exec.proposals.auto_enabled.list',
-              'exec.proposals.settings.get',
             ],
             events: [],
           },
@@ -247,11 +233,17 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
             version: '1.0.0',
             source: 'clawhub',
             trust_level: 'community',
+            identifier: isFailureFixture
+              ? 'synthetic-publisher/synthetic-failure@1.0.0'
+              : isUnknownFixture
+                ? 'synthetic-publisher/synthetic-unknown@1.0.0'
+                : 'synthetic-publisher/synthetic-search-result@1.0.0',
             installReference: isFailureFixture
               ? 'synthetic-publisher/synthetic-failure@1.0.0'
               : isUnknownFixture
                 ? 'synthetic-publisher/synthetic-unknown@1.0.0'
                 : 'synthetic-publisher/synthetic-search-result@1.0.0',
+            installed: false,
           }],
         }))
         return
@@ -286,17 +278,6 @@ async function installSkillGateway(page: Page): Promise<SkillGatewayCapture> {
           squilla_router: { enabled: false, rollout_phase: 'observe', tiers: {} },
           permissions: {},
           skills: {},
-        },
-        'exec.proposals.list': { proposals: [] },
-        'exec.proposals.auto_enabled.list': { skills: [] },
-        'exec.proposals.settings.get': {
-          settings: {
-            available: false,
-            enabled: false,
-            on_dream_complete: false,
-            auto_enable: false,
-            auto_enable_max_risk: 'low',
-          },
         },
         'sessions.list': { sessions: [], count: 0, ts: 1_800_000_000, has_more: false },
         'usage.status': { sessions: [] },
@@ -430,7 +411,7 @@ test.describe('Add Skill drawer', () => {
     await expect(searchResult.getByRole('button')).not.toHaveAttribute('aria-busy', 'true')
     await expect(dialog.locator('.sk-spinner:visible')).toHaveCount(1)
 
-    await expect(searchResult.getByRole('button')).toContainText('Installed')
+    await expect(searchResult.getByRole('button')).toContainText('View details')
     await expect(activity.locator('.sk-add-activity-toggle'))
       .toHaveAttribute('aria-expanded', 'false', { timeout: 5_000 })
     await expect(activity.locator('.sk-add-queue-item')).toBeHidden()
@@ -460,10 +441,10 @@ test.describe('Add Skill drawer', () => {
     const unknownResult = dialog.locator('.sk-add-result')
     await expect(unknownResult).toContainText('Installation result unknown')
     await expect(unknownResult).not.toContainText('Synthetic install response was interrupted.')
-    await expect(unknownResult.getByRole('button')).toHaveText('View details')
+    await expect(unknownResult.getByRole('button')).toHaveText('View installation details')
     await dialog.locator('.sk-add-activity-toggle').click()
     await expect(unknownItem).toBeHidden()
-    await unknownResult.getByRole('button', { name: 'View details', exact: true }).click()
+    await unknownResult.getByRole('button', { name: 'View installation details', exact: true }).click()
     await expect(unknownItem).toBeVisible()
     await expect(dialog.locator('.sk-add-activity-toggle')).toHaveAttribute('aria-expanded', 'true')
   })
@@ -494,7 +475,7 @@ test.describe('Add Skill drawer', () => {
     await expect(failedResult).toContainText('Failed')
     await expect(failedResult).not.toContainText('Synthetic compatibility failure')
     await expect(failedResult).not.toContainText('Not installed')
-    await expect(failedResult.getByRole('button')).toHaveText('View details')
+    await expect(failedResult.getByRole('button')).toHaveText('View installation details')
     await expect(dialog.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(1)
 
     await githubTab.click()

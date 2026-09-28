@@ -1,8 +1,8 @@
 """Acceptance-time model-routing resolution for session-scoped turns.
 
-The persisted session value is deliberately resolved only for ordinary user
-turns.  Background work must retain the global deployment strategy even when
-it happens to target a user session for delivery or transcript context.
+The persisted session value is resolved for ordinary user turns and their Goal
+continuations. Independent background work retains the global deployment
+strategy even when it targets a user session for delivery or transcript context.
 """
 
 from __future__ import annotations
@@ -22,12 +22,14 @@ from opensquilla.gateway.session_services import get_session_storage
 
 # This is intentionally an allow-list rather than a deny-list.  New system
 # run kinds must opt in deliberately, which keeps cron, retries, maintenance,
-# and subagents on the global policy by default.
+# and subagents on the global policy by default. Goal continuations keep working
+# on the user's session objective and must preserve that session's routing mode.
 _SESSION_SCOPED_RUN_KINDS = frozenset(
     {
         "session_turn",
         "web_turn",
         "channel_turn",
+        "goal",
     }
 )
 _VALID_MODES = frozenset({"direct", "router", "ensemble"})
@@ -43,7 +45,7 @@ class SessionModelRoutingResolution:
 
 
 def uses_session_model_routing(run_kind: str | None) -> bool:
-    """Whether this run kind is an ordinary user session turn."""
+    """Whether this run kind follows the user's session-routing policy."""
 
     return str(run_kind or "default") in _SESSION_SCOPED_RUN_KINDS
 

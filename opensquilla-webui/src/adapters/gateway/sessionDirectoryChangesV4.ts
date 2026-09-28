@@ -13,6 +13,10 @@ import {
   type SessionsChangedEventPayload,
 } from '@/contracts/generated/v4/sessionsChanged'
 import { validateSessionsChangedEventPayload } from '@/contracts/generated/v4/sessionsChangedValidators.mjs'
+import {
+  conversationSemanticEventKind,
+  decodeConversationEvent,
+} from './conversationEventsV4'
 import type {
   SessionDirectoryChange,
   SessionDirectoryChangeReason,
@@ -30,6 +34,10 @@ const SESSION_DIRECTORY_CHANGE_CALL_OPTIONS: RpcCallOptions = {
   abortAction: 'reject',
 }
 const PRIVATE_STATE_EVENT = '_state'
+const TERMINAL_INVALIDATION_KINDS = new Set([
+  'task-succeeded', 'task-failed', 'task-cancelled', 'task-abandoned', 'task-timed-out',
+  'turn-completed', 'turn-failed', 'turn-committed',
+])
 
 interface SessionDirectoryChangesRpcTransport {
   request<T = unknown>(
@@ -213,8 +221,8 @@ function isExpectedUnavailable(error: unknown): boolean {
 }
 
 /**
- * Own the session-directory subscription as a logical lease. There is one raw
- * event listener and at most one server subscribe per physical connection
+ * Own the session-directory subscription as a logical lease. There is at most
+ * one server subscribe per physical connection
  * generation, regardless of how many UI consumers subscribe locally.
  */
 export function createV4SessionDirectoryChanges(
@@ -235,6 +243,19 @@ export function createV4SessionDirectoryChanges(
   let releaseWork: Promise<void> | null = null
   let releaseRequested = false
 
+  function publish(change: SessionDirectoryChange) {
+    if (disposed) return
+    for (const listener of [...listeners]) {
+      try {
+        listener(change)
+      } catch (error) {
+        // One view must not prevent the rest of the application from
+        // observing an invalidation.
+        warn('Session directory listener failed', error)
+      }
+    }
+  }
+
   const eventSubscription = events.subscribe(
     SESSIONS_CHANGED_EVENT,
     payload => {
@@ -243,17 +264,23 @@ export function createV4SessionDirectoryChanges(
         warn('Dropped malformed sessions.changed event')
         return
       }
-      for (const listener of [...listeners]) {
-        try {
-          listener(change)
-        } catch (error) {
-          // One view must not prevent the rest of the application from
-          // observing an invalidation.
-          warn('Session directory listener failed', error)
-        }
-      }
+      publish(change)
     },
   )
+  const terminalSubscription = events.subscribe('*', (name, payload) => {
+    if (disposed || typeof name !== 'string' || !name.trim() || !listeners.size) return
+    if (!TERMINAL_INVALIDATION_KINDS.has(conversationSemanticEventKind(name))) return
+    try {
+      const event = decodeConversationEvent(name, payload)
+      if (!event.sessionKey) return
+      // The conversation lane may arrive even when sessions.changed is lost.
+      // A finished predecessor says nothing about a queued successor: only
+      // invalidate the directory and let its authoritative snapshot decide.
+      publish({ key: event.sessionKey, reason: 'updated' })
+    } catch (error) {
+      warn('Dropped malformed terminal directory invalidation', error)
+    }
+  })
   const stateSubscription = events.subscribe(
     PRIVATE_STATE_EVENT,
     state => {
@@ -395,6 +422,7 @@ export function createV4SessionDirectoryChanges(
     resumeRequested = false
     releaseRequested = true
     eventSubscription.close()
+    terminalSubscription.close()
     stateSubscription.close()
     listeners.clear()
     if (!bindWork) void releaseLease()

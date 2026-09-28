@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from opensquilla.cli import codetask_cmd
+from opensquilla.cli import uninstall_cmd
 from opensquilla.cli.main import app
 from opensquilla.uninstall import actions as actions_module
 from opensquilla.uninstall import inventory as inventory_module
@@ -150,7 +150,7 @@ def test_desktop_profile_routes_data_deletion_to_complete_desktop_cleanup(
 
 def test_purge_all_requires_confirmation_phrase(monkeypatch, tmp_path: Path) -> None:
     _patch_discover(monkeypatch, tmp_path / "home")
-    monkeypatch.setattr(codetask_cmd, "_stdin_is_tty", lambda: True)  # allow interactive path
+    monkeypatch.setattr(uninstall_cmd, "_stdin_is_tty", lambda: True)  # allow interactive path
 
     def _boom(*_a, **_k):
         raise AssertionError("execute must not run on a mismatched phrase")
@@ -196,7 +196,7 @@ def test_yes_purge_all_with_phrase_executes(monkeypatch, tmp_path: Path) -> None
 
 def test_purge_all_proceeds_on_correct_phrase(monkeypatch, tmp_path: Path) -> None:
     _patch_discover(monkeypatch, tmp_path / "home")
-    monkeypatch.setattr(codetask_cmd, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(uninstall_cmd, "_stdin_is_tty", lambda: True)
     captured = {}
 
     def _fake_execute(plan, inventory, **_kwargs):

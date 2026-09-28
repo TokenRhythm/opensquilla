@@ -56,13 +56,13 @@ def test_squilla_router_defaults_match_runtime_router_config() -> None:
     assert cfg.require_router_runtime is True
     assert cfg.vision_followup_gate_tier == "c0"
 
-    assert cfg.tiers["c0"]["model"] == "deepseek/deepseek-v4-flash"
+    assert cfg.tiers["c0"]["model"] == "qwen/qwen3.7-flash"
     assert cfg.tiers["c0"]["thinking_level"] == "high"
-    assert cfg.tiers["c1"]["model"] == "deepseek/deepseek-v4-pro"
+    assert cfg.tiers["c1"]["model"] == "deepseek/deepseek-v4-flash-0731"
     assert cfg.tiers["c1"]["thinking_level"] == "high"
-    assert cfg.tiers["c2"]["model"] == "z-ai/glm-5.2"
+    assert cfg.tiers["c2"]["model"] == "deepseek/deepseek-v4-pro-0813"
     assert cfg.tiers["c2"]["thinking_level"] == "high"
-    assert cfg.tiers["c3"]["model"] == "anthropic/claude-opus-4.8"
+    assert cfg.tiers["c3"]["model"] == "z-ai/glm-5.3"
     assert cfg.tiers["c3"]["thinking_level"] == "high"
     assert cfg.tiers["image_model"]["model"] == "moonshotai/kimi-k2.6"
     assert cfg.tiers["image_model"]["supports_image"] is True
@@ -197,10 +197,10 @@ def test_direct_legacy_openrouter_router_defaults_are_migrated(provider_id: str)
 
 
 TOKENRHYTHM_EXPECTED_TIER_MODELS = {
-    "c0": "deepseek-v4-flash-0731",
-    "c1": "deepseek-v4-pro-0813",
-    "c2": "kimi-k2.7-code",
-    "c3": "glm-5.2",
+    "c0": "qwen3.7-flash",
+    "c1": "deepseek-flash",
+    "c2": "deepseek-v4-pro-0813",
+    "c3": "glm-5.3",
 }
 
 
@@ -216,7 +216,7 @@ def test_unset_tier_profile_seeds_tokenrhythm_curated_inline_tiers() -> None:
         assert cfg.squilla_router.tiers[tier]["provider"] == "tokenrhythm"
         assert cfg.squilla_router.tiers[tier]["model"] == model
     assert cfg.squilla_router.tiers["c0"]["supports_image"] is False
-    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is False
     assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
     assert cfg.squilla_router.tiers["image_model"]["model"] == "kimi-k2.6"
 
@@ -242,7 +242,7 @@ def test_tokenrhythm_follow_primary_binding_refreshes_managed_inline_tiers() -> 
     for tier, model in TOKENRHYTHM_EXPECTED_TIER_MODELS.items():
         assert cfg.squilla_router.tiers[tier]["model"] == model
         assert "thinking_level" not in cfg.squilla_router.tiers[tier]
-    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert cfg.squilla_router.tiers["c3"]["ensemble_enabled"] is False
     assert "ensemble_selection_mode" not in cfg.squilla_router.tiers["c3"]
 
 
@@ -465,13 +465,13 @@ def test_example_toml_enables_runtime_router_defaults() -> None:
     for name in ("c0", "c1", "c2", "c3", "image_model"):
         assert tiers[name]["provider"] == "tokenrhythm"
         assert "thinking_level" not in tiers[name]
-    assert tiers["c0"]["model"] == "deepseek-v4-flash-0731"
+    assert tiers["c0"]["model"] == "qwen3.7-flash"
     assert tiers["c0"]["supports_image"] is False
-    assert tiers["c1"]["model"] == "deepseek-v4-pro-0813"
-    assert tiers["c2"]["model"] == "kimi-k2.7-code"
+    assert tiers["c1"]["model"] == "deepseek-flash"
+    assert tiers["c2"]["model"] == "deepseek-v4-pro-0813"
     assert tiers["c2"]["supports_image"] is False
-    assert tiers["c3"]["model"] == "glm-5.2"
-    assert tiers["c3"]["ensemble_enabled"] is True
+    assert tiers["c3"]["model"] == "glm-5.3"
+    assert tiers["c3"]["ensemble_enabled"] is False
     assert "ensemble_selection_mode" not in tiers["c3"]
     assert tiers["image_model"]["model"] == "kimi-k2.6"
     assert tiers["image_model"]["supports_image"] is True
@@ -492,12 +492,12 @@ def test_runtime_router_config_does_not_ship_unused_cost_fields() -> None:
     text = runtime_config.read_text(encoding="utf-8")
     data = yaml.safe_load(text)
 
-    assert data["tier_registry"]["S"] == ["deepseek/deepseek-v4-flash"]
-    assert data["tier_registry"]["M"] == ["deepseek/deepseek-v4-pro"]
-    assert data["tier_registry"]["L"] == ["z-ai/glm-5.2"]
-    assert data["tier_registry"]["XL"] == ["anthropic/claude-opus-4.8"]
-    assert data["tier_explanations"]["L"]["model"] == "z-ai/glm-5.2"
-    assert data["tier_explanations"]["XL"]["model"] == "anthropic/claude-opus-4.8"
+    assert data["tier_registry"]["S"] == ["qwen/qwen3.7-flash"]
+    assert data["tier_registry"]["M"] == ["deepseek/deepseek-v4-flash-0731"]
+    assert data["tier_registry"]["L"] == ["deepseek/deepseek-v4-pro-0813"]
+    assert data["tier_registry"]["XL"] == ["z-ai/glm-5.3"]
+    assert data["tier_explanations"]["L"]["model"] == "deepseek/deepseek-v4-pro-0813"
+    assert data["tier_explanations"]["XL"]["model"] == "z-ai/glm-5.3"
     assert "cost_ratios:" not in text
     assert "cost_matrix:" not in text
     assert "under_routing_multiplier" not in text

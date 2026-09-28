@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -336,6 +336,7 @@ def _prepare_private_directory(path: Path) -> None:
                 directory=True,
                 expected_device=int(metadata.st_dev),
                 expected_inode=int(metadata.st_ino),
+                skip_if_private_directory=True,
             )
             current = os.lstat(path)
             if (
@@ -402,12 +403,29 @@ def _prepare_private_file_once(path: Path) -> None:
         metadata = os.lstat(path)
     try:
         if os.name == "nt":
-            apply_windows_private_dacl(
-                path,
-                directory=False,
-                expected_device=int(metadata.st_dev),
-                expected_inode=int(metadata.st_ino),
-            )
+            try:
+                apply_windows_private_dacl(
+                    path,
+                    directory=False,
+                    expected_device=int(metadata.st_dev),
+                    expected_inode=int(metadata.st_ino),
+                )
+            except OSError as exc:
+                # Another first writer may replace its newly created file
+                # before the ACL handle is bound. Only a fresh regular file
+                # with a different identity qualifies for the existing retry;
+                # same-object ACL errors and unsafe replacements remain fatal.
+                current = os.lstat(path)
+                if (
+                    stat.S_ISREG(current.st_mode)
+                    and bool(metadata.st_ino)
+                    and (int(current.st_dev), int(current.st_ino))
+                    != (int(metadata.st_dev), int(metadata.st_ino))
+                ):
+                    raise _OwnerRegistryFileChangedError(
+                        "task process owner registry changed during privacy hardening"
+                    ) from exc
+                raise
             current = os.lstat(path)
             if (
                 stat.S_ISLNK(current.st_mode)
@@ -881,9 +899,48 @@ def _captured_posix_process_matches(
     )
 
 
+@lru_cache(maxsize=1)
+def _linux_pidfd_libc() -> Any:
+    # Some portable Python builds omit pidfd APIs despite a capable host libc.
+    library = ctypes.CDLL(None, use_errno=True)
+    try:
+        library.pidfd_open.argtypes = [ctypes.c_int, ctypes.c_uint]
+        library.pidfd_open.restype = ctypes.c_int
+        library.pidfd_send_signal.argtypes = [
+            ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint,
+        ]
+        library.pidfd_send_signal.restype = ctypes.c_int
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "native pidfd APIs are unavailable") from exc
+    return library
+
+
+def _linux_pidfd_open(pid: int) -> int:
+    opener = getattr(os, "pidfd_open", None)
+    if callable(opener):
+        return int(opener(pid, 0))
+    descriptor = int(_linux_pidfd_libc().pidfd_open(pid, 0))
+    if descriptor < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+    return descriptor
+
+
+def _linux_pidfd_send_signal(descriptor: int, sig: int) -> None:
+    sender = getattr(signal, "pidfd_send_signal", None)
+    if callable(sender):
+        sender(descriptor, sig, None, 0)
+        return
+    if _linux_pidfd_libc().pidfd_send_signal(descriptor, sig, None, 0) < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def _capture_posix_group_descendants(
     pgid: int,
     anchor_pid: int,
+    *,
+    include_anchor_children: bool = False,
 ) -> _PosixDescendantCapture:
     if not (sys.platform.startswith("linux") or sys.platform == "darwin"):
         return _PosixDescendantCapture((), True)
@@ -893,11 +950,15 @@ def _capture_posix_group_descendants(
     anchor = snapshot.get(anchor_pid)
     if anchor is None or anchor.pgid != pgid or anchor.uid != os.geteuid():
         return _PosixDescendantCapture((), False)
-    roots = tuple(
+    roots = (anchor,) if include_anchor_children else tuple(
         info for info in snapshot.values() if info.pgid == pgid and info.pid != anchor_pid
     )
     if not roots:
-        return _PosixDescendantCapture((), False)
+        # Natural completion can leave only the still-owned anchor before a
+        # stop arrives. Confirm the empty group independently; an unavailable
+        # snapshot or a surviving member must still fail closed. The anchor
+        # retains its consecutive-empty checks before releasing ownership.
+        return _PosixDescendantCapture((), _posix_group_members(pgid) == (anchor_pid,))
     children: dict[int, list[_PosixProcessInfo]] = {}
     for info in snapshot.values():
         children.setdefault(info.ppid, []).append(info)
@@ -918,10 +979,8 @@ def _capture_posix_group_descendants(
                 continue
             depth = parent_depth + 1
             pending.append((child.pid, depth))
-            if child.pgid != pgid:
+            if include_anchor_children or child.pgid != pgid:
                 candidates.append((child, depth))
-    pidfd_open = getattr(os, "pidfd_open", None)
-    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
     captured: list[_CapturedPosixProcess] = []
     for candidate, depth in sorted(candidates, key=lambda item: item[1]):
         current = _posix_process_info(candidate.pid)
@@ -932,28 +991,24 @@ def _capture_posix_group_descendants(
             continue
         pidfd: int | None = None
         if sys.platform.startswith("linux"):
-            if not callable(pidfd_open) or not callable(pidfd_send_signal):
+            try:
+                pidfd = _linux_pidfd_open(candidate.pid)
+            except OSError as exc:
+                if exc.errno == errno.ESRCH:
+                    continue
                 complete = False
                 continue
-            else:
-                try:
-                    pidfd = int(pidfd_open(candidate.pid, 0))
-                except OSError as exc:
-                    if exc.errno == errno.ESRCH:
-                        continue
-                    complete = False
-                    continue
-                if pidfd is not None and not _captured_posix_process_matches(
-                    _posix_process_info(candidate.pid),
-                    _CapturedPosixProcess(
-                        pid=candidate.pid,
-                        uid=candidate.uid,
-                        start_identity=candidate.start_identity,
-                        depth=depth,
-                    ),
-                ):
-                    os.close(pidfd)
-                    continue
+            if not _captured_posix_process_matches(
+                _posix_process_info(candidate.pid),
+                _CapturedPosixProcess(
+                    pid=candidate.pid,
+                    uid=candidate.uid,
+                    start_identity=candidate.start_identity,
+                    depth=depth,
+                ),
+            ):
+                os.close(pidfd)
+                continue
         captured.append(
             _CapturedPosixProcess(
                 pid=candidate.pid,
@@ -970,12 +1025,11 @@ def _signal_captured_posix_processes(
     captured: tuple[_CapturedPosixProcess, ...],
     sig: int,
 ) -> bool:
-    pidfd_send_signal = getattr(signal, "pidfd_send_signal", None)
     complete = True
     for process in captured:
         try:
-            if process.pidfd is not None and callable(pidfd_send_signal):
-                pidfd_send_signal(process.pidfd, sig, None, 0)
+            if process.pidfd is not None:
+                _linux_pidfd_send_signal(process.pidfd, sig)
             elif _captured_posix_process_matches(
                 _posix_process_info(process.pid),
                 process,
@@ -1690,6 +1744,10 @@ class _PosixGroupAnchor:
                 continue
             if marker == _POSIX_ANCHOR_EMPTY:
                 self.empty = True
+                # Natural completion can win the race with a stop request.
+                # EMPTY is authoritative even if no signal ACK will follow.
+                self._term_reports.put_nowait(True)
+                self._kill_reports.put_nowait(True)
                 owner = self._owner
                 if owner is not None:
                     await owner._close_empty_posix_owner()
@@ -1714,6 +1772,7 @@ class _PosixGroupAnchor:
         if command not in {_POSIX_ANCHOR_TERMINATE, _POSIX_ANCHOR_KILL}:
             raise ValueError("invalid POSIX anchor signal command")
         if stdin is None or stdin.is_closing() or not self.alive:
+            await self.settle(_CONTROL_READY_TIMEOUT_SECONDS)
             if not self.empty and not self._kill_reported:
                 self.cleanup_incomplete = True
             return False
@@ -1729,7 +1788,11 @@ class _PosixGroupAnchor:
             stdin.write(command)
             await stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
-            self.cleanup_incomplete = True
+            # Drain the status pipe before classifying a closed control pipe:
+            # the anchor may already have reported an empty process group.
+            await self.settle(_CONTROL_READY_TIMEOUT_SECONDS)
+            if not self.empty and not self._kill_reported:
+                self.cleanup_incomplete = True
             return False
         if self._monitor_task is not None:
             try:
@@ -2284,7 +2347,12 @@ async def create_owned_subprocess_shell(command: str, **kwargs: Any) -> Any:
     )
 
 
-def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
+def create_owned_popen(
+    argv: list[str] | tuple[str, ...],
+    *,
+    process_factory: Callable[..., Any] | None = None,
+    **kwargs: Any,
+) -> Any:
     """Synchronous Windows controlled-helper launcher for blocking pipe I/O."""
 
     if os.name != "nt":
@@ -2314,8 +2382,14 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
     process: Any | None = None
     persisted_owner: _PersistedOwnerRef | None = None
     try:
-        process = subprocess.Popen(helper_argv, **child_kwargs)
-        job.assign_pid(int(process.pid))
+        if process_factory is None:
+            process = subprocess.Popen(helper_argv, **child_kwargs)
+            job.assign_pid(int(process.pid))
+        else:
+            # Native PTY wrappers can fail while constructing their reader,
+            # after the process starts but before returning a Python handle.
+            # The factory assigns the still-gated helper before that boundary.
+            process = process_factory(helper_argv, owner_job=job, **child_kwargs)
         _wait_for_windows_helper_ready(gate)
         if task_scope is not None:
             persisted_owner = _insert_owner_record(
@@ -2353,6 +2427,139 @@ def create_owned_popen(argv: list[str] | tuple[str, ...], **kwargs: Any) -> Any:
         ) from exc
     finally:
         gate.close()
+
+
+class _PtyControlPipe:
+    """Keep the existing anchor protocol separate from terminal input/output."""
+
+    def __init__(self, fd: int, mode: str) -> None:
+        self.file = os.fdopen(fd, mode, buffering=0)
+
+    async def read(self, size: int) -> bytes:
+        # The anchor waits for our RELEASE before exiting. A blocking worker
+        # here can starve the terminal reader/waiter that must reach that point.
+        loop = asyncio.get_running_loop()
+        descriptor = self.file.fileno()
+        ready: asyncio.Future[bytes] = loop.create_future()
+
+        def read_ready() -> None:
+            if ready.done():
+                return
+            try:
+                ready.set_result(os.read(descriptor, size))
+            except OSError as exc:
+                ready.set_exception(exc)
+
+        loop.add_reader(descriptor, read_ready)
+        try:
+            return await ready
+        finally:
+            loop.remove_reader(descriptor)
+
+    async def readexactly(self, size: int) -> bytes:
+        value = await self.read(size)
+        if len(value) != size:
+            raise asyncio.IncompleteReadError(value, size)
+        return value
+
+    def write(self, value: bytes) -> None:
+        self.file.write(value)
+
+    async def drain(self) -> None:
+        self.file.flush()
+
+    def is_closing(self) -> bool:
+        return self.file.closed
+
+    def close(self) -> None:
+        self.file.close()
+
+
+@dataclass
+class _PtyAnchorProcess:
+    process: Any
+    stdin: _PtyControlPipe
+    stdout: _PtyControlPipe
+
+    @property
+    def returncode(self) -> int | None:
+        value = self.process.returncode
+        return int(value) if value is not None else None
+
+    async def wait(self) -> int:
+        try:
+            return int(await asyncio.to_thread(self.process.wait))
+        finally:
+            self.stdin.close()
+            self.stdout.close()
+
+
+def create_owned_posix_pty(
+    argv: list[str], process_factory: Callable[..., Any], **kwargs: Any,
+) -> Any:
+    """Run the existing group anchor as PTY leader, with private control pipes."""
+
+    loop = asyncio.get_running_loop()
+    owner_id = uuid.uuid4().hex
+    scope = _current_task_process_scope()
+    database_path = _owner_database_path(scope.state_dir) if scope is not None else None
+    control_path = (
+        _owner_control_path(database_path, owner_id) if database_path is not None else None
+    )
+    if control_path is not None:
+        _prepare_private_directory(control_path.parent)
+    control_read, control_write = os.pipe()
+    status_read, status_write = os.pipe()
+    process = None
+    persisted_owner = None
+    try:
+        # ptyprocess preserves pass_fds when closing descriptors, but unlike
+        # subprocess.Popen it does not clear their close-on-exec flag.
+        os.set_inheritable(control_read, True)
+        os.set_inheritable(status_write, True)
+        process = process_factory(
+            list(_process_tree_child_argv(
+                "--posix-group-anchor", owner_id, str(control_path) if control_path else "-",
+                str(control_read), str(status_write), "--", *argv,
+            )),
+            pass_fds=(control_read, status_write), **kwargs,
+        )
+        os.close(control_read)
+        control_read = -1
+        os.close(status_write)
+        status_write = -1
+        readable, _, _ = select.select([status_read], [], [], _CONTROL_READY_TIMEOUT_SECONDS)
+        if not readable or os.read(status_read, 1) != _POSIX_ANCHOR_READY:
+            raise ProcessTreeOwnershipError("PTY group anchor did not become ready")
+        if scope is not None:
+            persisted_owner = _insert_owner_record(
+                scope, owner_id=owner_id, platform=_platform_kind(),
+                controller_pid=int(process.pid),
+            )
+        control = _PtyAnchorProcess(
+            process, _PtyControlPipe(control_write, "wb"), _PtyControlPipe(status_read, "rb"),
+        )
+        control_write = status_read = -1
+        anchor = _PosixGroupAnchor(process=control, pgid=int(process.pid))
+        owner = ProcessTreeOwner(
+            process=process, pid=int(process.pid), pgid=int(process.pid),
+            posix_anchor=anchor, persisted_owner=persisted_owner,
+        )
+        anchor.bind(owner)
+        _attach_owner(process, owner)
+        anchor._monitor_task = loop.create_task(anchor._watch_empty(control.stdout))
+        control.stdin.write(_POSIX_ANCHOR_ARM)
+        return process
+    except BaseException:
+        if process is not None:
+            process.terminate()
+        if persisted_owner is not None:
+            _delete_owner_record(persisted_owner)
+        raise
+    finally:
+        for fd in (control_read, control_write, status_read, status_write):
+            if fd >= 0:
+                os.close(fd)
 
 
 def _posix_group_members(pgid: int) -> tuple[int, ...] | None:
@@ -2432,7 +2639,27 @@ def _advance_posix_empty_confirmation(
     return 0
 
 
-def _run_posix_group_anchor(control_path_raw: str) -> int:
+def _run_posix_group_anchor(
+    control_path_raw: str,
+    *,
+    input_pipe: Any = None,
+    output_pipe: Any = None,
+    target_argv: list[str] | None = None,
+) -> int:
+    input_pipe = input_pipe or sys.stdin.buffer
+    output_pipe = output_pipe or sys.stdout.buffer
+    target: subprocess.Popen[bytes] | None = None
+    target_cleanup_at: float | None = None
+    adopt_children = target_argv is not None and sys.platform.startswith("linux")
+    if adopt_children:
+        # Keep setsid/double-fork children attributable after the PTY shell exits.
+        # This changes only the private PTY anchor, never the Gateway or pipe owners.
+        library = ctypes.CDLL(None, use_errno=True)
+        prctl = library.prctl
+        prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
+        prctl.restype = ctypes.c_int
+        if prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            return 125
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(sig, signal.SIG_IGN)
     own_pid = os.getpid()
@@ -2447,11 +2674,14 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
 
     def prepare_capture() -> bytes:
         nonlocal captured, capture_attempted, cleanup_complete
-        if not capture_attempted:
+        if not capture_attempted or adopt_children:
             try:
-                result = _capture_posix_group_descendants(pgid, own_pid)
+                result = _capture_posix_group_descendants(
+                    pgid, own_pid, include_anchor_children=adopt_children,
+                )
             except Exception:
                 result = _PosixDescendantCapture((), False)
+            _close_captured_posix_processes(captured)
             captured = result.processes
             capture_attempted = True
             cleanup_complete = cleanup_complete and result.complete
@@ -2466,8 +2696,8 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
                 else _POSIX_ANCHOR_KILL_INCOMPLETE
             )
         try:
-            sys.stdout.buffer.write(pipe_marker)
-            sys.stdout.buffer.flush()
+            output_pipe.write(pipe_marker)
+            output_pipe.flush()
         except (BrokenPipeError, OSError):
             pass
 
@@ -2505,21 +2735,51 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
             with contextlib.suppress(OSError):
                 os.chmod(control_path, 0o600)
             server.listen(2)
-        sys.stdout.buffer.write(_POSIX_ANCHOR_READY)
-        sys.stdout.buffer.flush()
-        if sys.stdin.buffer.read(1) != _POSIX_ANCHOR_ARM:
+        output_pipe.write(_POSIX_ANCHOR_READY)
+        output_pipe.flush()
+        if input_pipe.read(1) != _POSIX_ANCHOR_ARM:
             return 125
-        stdin_fd = sys.stdin.fileno()
+        if target_argv is not None:
+            def restore_signals() -> None:
+                for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+                    signal.signal(sig, signal.SIG_DFL)
+            target = subprocess.Popen(target_argv, preexec_fn=restore_signals)
+        stdin_fd = input_pipe.fileno()
         os.set_blocking(stdin_fd, False)
         stdin_open = True
         poll_delay = _POLL_INTERVAL_SECONDS
         poll_cap = 0.25 if os.path.isdir("/proc") else 1.0
         empty_confirmations = 0
         while True:
+            children_present = False
+            if adopt_children:
+                # Reap adopted descendants as well as the direct shell. Reaping
+                # the shell here must preserve its exit status for the caller.
+                while True:
+                    try:
+                        reaped_pid, reaped_status = os.waitpid(-1, os.WNOHANG)
+                    except ChildProcessError:
+                        break
+                    if reaped_pid == 0:
+                        children_present = True
+                        break
+                    if target is not None and reaped_pid == target.pid:
+                        target.returncode = os.waitstatus_to_exitcode(reaped_status)
+            target_exited = target is not None and target.poll() is not None
             members = _posix_group_members(pgid)
-            captured_alive = members == (own_pid,) and _captured_posix_processes_alive(
-                captured
-            )
+            if adopt_children and (target_exited or target_cleanup_at is not None):
+                prepare_capture()
+            captured_alive = children_present or _captured_posix_processes_alive(captured)
+            if (target_exited or target_cleanup_at is not None) and (
+                members != (own_pid,) or captured_alive
+            ):
+                if target_cleanup_at is None:
+                    signal_owned(_POSIX_ANCHOR_TERMINATE)
+                    target_cleanup_at = time.monotonic() + 0.2
+                elif time.monotonic() >= target_cleanup_at:
+                    signal_owned(_POSIX_ANCHOR_KILL)
+            if adopt_children and not cleanup_complete:
+                captured_alive = True
             empty_confirmations = _advance_posix_empty_confirmation(
                 empty_confirmations,
                 members,
@@ -2528,14 +2788,16 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
             )
             if empty_confirmations >= _POSIX_EMPTY_CONFIRMATIONS_REQUIRED:
                 try:
-                    sys.stdout.buffer.write(_POSIX_ANCHOR_EMPTY)
-                    sys.stdout.buffer.flush()
+                    output_pipe.write(_POSIX_ANCHOR_EMPTY)
+                    output_pipe.flush()
                 except (BrokenPipeError, OSError):
                     return 0
                 if not stdin_open:
                     return 0
                 os.set_blocking(stdin_fd, True)
-                return 0 if os.read(stdin_fd, 1) == _POSIX_ANCHOR_RELEASE else 125
+                if os.read(stdin_fd, 1) != _POSIX_ANCHOR_RELEASE:
+                    return 125
+                return int(target.returncode or 0) if target is not None else 0
             pipe_command = b""
             readers: list[Any] = [stdin_fd] if stdin_open else []
             if server is not None:
@@ -2556,9 +2818,17 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
                     stdin_open = False
             if pipe_command == _POSIX_ANCHOR_TERMINATE:
                 signal_owned(pipe_command)
+                if adopt_children:
+                    target_cleanup_at = time.monotonic() + 0.2
                 poll_delay = _POLL_INTERVAL_SECONDS
             elif pipe_command == _POSIX_ANCHOR_KILL:
                 signal_owned(pipe_command)
+                if adopt_children:
+                    # The anchor must survive to adopt/reap children that raced
+                    # the snapshot. SIGKILL is delivered through captured pidfds.
+                    target_cleanup_at = time.monotonic()
+                    poll_delay = _POLL_INTERVAL_SECONDS
+                    continue
                 try:
                     os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
                 except OSError:
@@ -2584,6 +2854,8 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
                         continue
                     if command == _POSIX_ANCHOR_TERMINATE:
                         marker = signal_owned(command)
+                        if adopt_children:
+                            target_cleanup_at = time.monotonic() + 0.2
                         with contextlib.suppress(OSError):
                             connection.sendall(marker)
                         poll_delay = _POLL_INTERVAL_SECONDS
@@ -2591,6 +2863,10 @@ def _run_posix_group_anchor(control_path_raw: str) -> int:
                         marker = signal_owned(command)
                         with contextlib.suppress(OSError):
                             connection.sendall(marker)
+                        if adopt_children:
+                            target_cleanup_at = time.monotonic()
+                            poll_delay = _POLL_INTERVAL_SECONDS
+                            continue
                         try:
                             os.killpg(pgid, getattr(signal, "SIGKILL", signal.SIGTERM))
                         except OSError:
@@ -2956,11 +3232,20 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args = list(sys.argv[1:] if argv is None else argv)
     if (
-        len(args) == 3
+        len(args) >= 3
         and args[0] == "--posix-group-anchor"
         and _OWNER_ID_RE.fullmatch(args[1]) is not None
     ):
-        return _run_posix_group_anchor(args[2])
+        if len(args) == 3:
+            return _run_posix_group_anchor(args[2])
+        if len(args) >= 7 and args[5] == "--":
+            with os.fdopen(int(args[3]), "rb", buffering=0) as input_pipe, os.fdopen(
+                int(args[4]), "wb", buffering=0,
+            ) as output_pipe:
+                return _run_posix_group_anchor(
+                    args[2], input_pipe=input_pipe, output_pipe=output_pipe, target_argv=args[6:],
+                )
+        return 2
     if len(args) >= 5 and args[0] == "--posix-owned-launch" and args[3] == "--":
         try:
             gate_fd = int(args[1])

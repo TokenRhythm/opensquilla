@@ -117,6 +117,7 @@ def test_openrouter_c5_models_have_offline_budgets_and_capabilities() -> None:
     ("model", "window", "output"),
     [
         ("deepseek/deepseek-v4-flash", 1_024_000, 384_000),
+        ("deepseek/deepseek-v4-flash-0731", 1_048_576, 943_718),
         ("deepseek/deepseek-v4-pro", 1_048_576, 393_216),
         ("z-ai/glm-5.2", 1_048_576, 131_072),
         ("z-ai/glm-5.1", 200_000, 128_000),
@@ -130,9 +131,92 @@ def test_openrouter_public_physical_limits_are_available_offline(
     entry = catalog.resolve_entry(model, provider="openrouter")
     assert (entry.context_window, entry.max_output_tokens) == (window, output)
     assert catalog.resolve_context_window_with_source(model, "openrouter") == (window, "catalog")
-    assert catalog.resolve_max_tokens(model, provider="openrouter") == output
+    assert catalog.resolve_max_tokens_with_source(
+        model, provider="openrouter", capacity_only=True
+    ) == (output, "catalog")
     assert entry.supports_tools is True
     assert entry.supports_reasoning is True
+
+
+@pytest.mark.parametrize(
+    ("provider", "expected_limits"),
+    [
+        ("openrouter", [(1_000_000, 65_536), (1_048_576, 943_718),
+                        (1_024_000, 384_000), (1_048_576, 131_072)]),
+        ("tokenrhythm", [(1_000_000, 65_536), (1_000_000, 384_000),
+                         (1_000_000, 384_000), (1_048_576, 131_072)]),
+    ],
+)
+def test_recommended_router_tiers_have_known_offline_capacity_and_vision(
+    provider: str, expected_limits: list[tuple[int, int]],
+) -> None:
+    """Cold boots preserve physical facts and safe execution limits."""
+    from opensquilla.provider.preset_registry import get_preset
+
+    catalog = ModelCatalog()
+    preset = get_preset(provider)
+    assert preset is not None
+    for tier, (window, output) in zip(("c0", "c1", "c2", "c3"), expected_limits, strict=True):
+        model = preset.tiers[tier]["model"]
+        limits = catalog.resolve_deployment_limits(model, provider=provider)
+        expected_request_output = (
+            window // 2
+            if provider == "openrouter" and output >= (window * 9) // 10
+            else output
+        )
+        assert (limits.context_window, limits.max_output_tokens) == (
+            window,
+            expected_request_output,
+        )
+        assert limits.context_window_known is True
+        assert limits.max_output_tokens_known is True
+        assert catalog.resolve_context_window_with_source(model, provider) == (window, "catalog")
+        assert catalog.resolve_max_tokens_with_source(model, provider=provider) == (
+            expected_request_output, "catalog"
+        )
+        assert catalog.resolve_max_tokens_with_source(
+            model, provider=provider, capacity_only=True
+        ) == (
+            output, "catalog"
+        )
+        assert catalog.resolve_vision_support(model, provider_name=provider) == (
+            "supported"
+            if tier == "c0" or (provider == "tokenrhythm" and tier == "c1")
+            else "unsupported"
+        )
+        capabilities = catalog.get_capabilities(model, provider_name=provider)
+        assert capabilities.supports_tools is True
+        assert capabilities.supports_reasoning is (provider == "openrouter")
+        assert capabilities.reasoning_format == (
+            "openrouter" if provider == "openrouter" else "none"
+        )
+
+
+def test_openrouter_ninety_percent_completion_reserves_half_window() -> None:
+    catalog = ModelCatalog()
+    catalog._populate_from_data(
+        [
+            {
+                "id": "provider/large-output-model",
+                "context_length": 1_048_576,
+                "top_provider": {"max_completion_tokens": 943_718},
+            }
+        ]
+    )
+
+    assert catalog.resolve_max_tokens_with_source(
+        "provider/large-output-model",
+        provider="openrouter",
+        capacity_only=True,
+    ) == (943_718, "catalog")
+    assert catalog.resolve_max_tokens(
+        "provider/large-output-model", provider="openrouter"
+    ) == 524_288
+    assert catalog.resolve_max_tokens(
+        "provider/large-output-model",
+        user_override=700_000,
+        provider="openrouter",
+    ) == 700_000
 
 
 @pytest.mark.parametrize("top_window", [None, -1, 100_000, 250_000])

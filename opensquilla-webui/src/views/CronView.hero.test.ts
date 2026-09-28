@@ -17,6 +17,7 @@ const testState = vi.hoisted(() => ({
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: vi.fn() }),
+  onBeforeRouteLeave: vi.fn(),
 }))
 
 vi.mock('@/composables/cron/useCronJobs', async () => {
@@ -67,6 +68,9 @@ vi.mock('@/composables/cron/useCronForm', async () => {
   return { useCronForm: () => ({
     form: { cron: '' },
     panelOpen: ref(false),
+    saving: ref(false),
+    fieldErrors: ref({}),
+    saveError: ref(''),
     editingJob: ref(null),
     cronExplainHuman: ref(''),
     cronExplainValid: ref(false),
@@ -193,12 +197,41 @@ describe('CronView automation hero states', () => {
 
     expect(launch?.classList.contains('automation-launch--compact')).toBe(true)
     expect(launch?.querySelector('.automation-launch__clock')).not.toBeNull()
-    expect(launch?.textContent).toContain('Automations are running')
+    expect(launch?.textContent).toContain('Active schedules')
     expect(launch?.textContent).toContain('1 of 2 jobs enabled')
     expect(launch?.textContent).toContain('18 min')
     expect(launch?.textContent).toContain('1 / 2')
     expect(launch?.querySelector('.automation-launch__button')).toBeNull()
     expect(host.querySelector('[data-testid="cron-job-list"]')).not.toBeNull()
+  })
+
+  it('shows a paused status when all schedules are disabled', () => {
+    testState.hasLoaded = true
+    testState.jobs = [{ id: 'paused', name: 'Paused reminder', enabled: false }]
+    const host = mountCronView()
+    expect(host.querySelector('.automation-launch__status-copy')?.textContent).toContain('paused')
+    expect(host.querySelector('.automation-launch__status-dot.is-paused')).not.toBeNull()
+  })
+
+  it('moves focus into the overview and closes it with Escape', async () => {
+    testState.hasLoaded = true
+    const host = mountCronView()
+    const trigger = Array.from(host.querySelectorAll<HTMLButtonElement>('.cron-toolbar__actions button')).find(button => button.textContent?.includes('Run overview'))!
+    expect(trigger).toBeDefined()
+
+    trigger.focus()
+    trigger.click()
+    await nextTick()
+    await nextTick()
+
+    const dialog = host.querySelector<HTMLElement>('[aria-labelledby="automation-overview-title"]')
+    expect(dialog).not.toBeNull()
+    expect(dialog?.contains(document.activeElement)).toBe(true)
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    await nextTick()
+    await vi.waitFor(() => expect(host.querySelector('[aria-labelledby="automation-overview-title"]')).toBeNull())
+    expect(document.activeElement).toBe(trigger)
   })
 
   it('prioritizes the load error over both automation states', () => {

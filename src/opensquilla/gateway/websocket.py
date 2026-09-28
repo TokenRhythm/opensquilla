@@ -60,6 +60,7 @@ from opensquilla.gateway.transport_flow import (
     FLOW_WINDOW_BYTES,
     FLOW_WINDOW_FRAMES,
     PROBE_CAPABILITY,
+    RECOVERY_CREDIT_SECONDS,
     BudgetKind,
     FlowWindow,
     get_transport_budget,
@@ -102,6 +103,7 @@ _MAX_DETACHED_READS_PER_CONNECTION = 4
 _DETACHED_READ_STOP_TIMEOUT_SECONDS = 2.0
 _DIRECT_SEND_TIMEOUT_SECONDS = 2.0
 _DIRECT_CLOSE_TIMEOUT_SECONDS = 1.0
+_WRITER_SEND_TIMEOUT_SECONDS = 60.0
 _MAX_ORDINARY_REQUESTS = 8
 _ORDINARY_DRAIN_SECONDS = 0.25
 _CONTROL_RPC_METHODS = frozenset({"transport.flow.update"})
@@ -147,6 +149,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "sandbox.run_mode.preference.get",
         "sessions.list",
         "sessions.messages.hydrate",
+        "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     }
@@ -162,7 +165,7 @@ _PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
 _ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
 _MAX_ACTIVE_PROVIDER_PROBES = 16
 _BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
-    {"meta.drafts.list", "skills.install"}
+    {"skills.install"}
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS,
 )
@@ -249,6 +252,8 @@ class _OutboundFrame:
     delivery_id: int | None = None
     is_control: bool = False
     budget_kind: BudgetKind = None
+    is_probe: bool = False
+    enqueued_at: float = field(default_factory=time.monotonic, repr=False)
 
 
 @dataclass(eq=False, slots=True)
@@ -296,6 +301,10 @@ class WsConnection:
     _writer_queue_maxsize: int = field(default=512, init=False, repr=False)
     _outbox: asyncio.Queue[Any] | None = field(default=None, init=False, repr=False)
     _writer_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _last_inbound_at: float | None = field(default=None, init=False, repr=False)
+    _last_outbound_at: float | None = field(default=None, init=False, repr=False)
+    _probe_wait_started_at: float | None = field(default=None, init=False, repr=False)
+    _handler_task: asyncio.Task[Any] | None = field(default=None, init=False, repr=False)
     _detached_read_tasks: set[asyncio.Task[None]] = field(
         default_factory=set,
         init=False,
@@ -408,7 +417,11 @@ class WsConnection:
             self.snapshot_registry().get(key, sync_revision, snapshot_id)
             if self._recovery_enabled else None
         )
-        deadline = min(time.monotonic() + 30.0, transfer.deadline) if transfer else None
+        deadline = (
+            min(time.monotonic() + RECOVERY_CREDIT_SECONDS, transfer.deadline)
+            if transfer
+            else None
+        )
         delivery_id = self._flow.admit(
             encoded_response_bytes, recovery=True, key=key, owner=transfer,
             segment_index=segment_index, deadline=deadline,
@@ -704,12 +717,65 @@ class WsConnection:
         else:
             self._transport_cleanup.append(callback)
 
-    def transport_diagnostics(self) -> dict[str, int | bool]:
+    def _mark_inbound(self) -> None:
+        self._last_inbound_at = time.monotonic()
+
+    def _mark_probe_waiting(self) -> None:
+        if self._probe_wait_started_at is None:
+            self._probe_wait_started_at = time.monotonic()
+
+    def _mark_outbound(self, *, probe: bool = False) -> None:
+        self._last_outbound_at = time.monotonic()
+        if probe:
+            self._probe_wait_started_at = None
+
+    def transport_diagnostics(self) -> dict[str, int | bool | str | None]:
         """Aggregate counters only: never include keys, payloads or credentials."""
         flow = self._flow
+        now = time.monotonic()
+        oldest_age_ms = 0
+        if self._outbox is not None:
+            queued = [
+                item for item in self._outbox._queue  # type: ignore[attr-defined]
+                if isinstance(item, _OutboundFrame)
+            ]
+            if queued:
+                oldest_age_ms = max(0, int((now - min(item.enqueued_at for item in queued)) * 1000))
+        last_inbound_age_ms = (
+            max(0, int((now - self._last_inbound_at) * 1000))
+            if self._last_inbound_at is not None
+            else None
+        )
+        last_outbound_age_ms = (
+            max(0, int((now - self._last_outbound_at) * 1000))
+            if self._last_outbound_at is not None
+            else None
+        )
+        probe_wait_age_ms = (
+            max(0, int((now - self._probe_wait_started_at) * 1000))
+            if self._probe_wait_started_at is not None
+            else None
+        )
+        queue_depth = self._outbox.qsize() if self._outbox is not None else 0
+        if probe_wait_age_ms is not None:
+            starvation_reason = "probe_wait"
+        elif queue_depth and (self._writer_task is None or self._writer_task.done()):
+            starvation_reason = "writer_task_missing"
+        elif queue_depth:
+            starvation_reason = "queue_backlog"
+        else:
+            starvation_reason = "none"
         return {
-            "queue_depth": self._outbox.qsize() if self._outbox is not None else 0,
+            "queue_depth": queue_depth,
             "queue_capacity": self._writer_queue_maxsize if self._queue_enabled else 0,
+            "queue_oldest_age_ms": oldest_age_ms,
+            "last_inbound_age_ms": last_inbound_age_ms,
+            "last_outbound_age_ms": last_outbound_age_ms,
+            "probe_wait_age_ms": probe_wait_age_ms,
+            "writer_starvation_reason": starvation_reason,
+            "writer_task_count": len(_WRITER_TASKS),
+            "writer_task_limit": _MAX_WRITER_TASKS,
+            "close_task_count": len(_SOCKET_CLOSE_TASKS),
             "transport_reserved_bytes": self._transport_bytes,
             "global_transport_reserved_bytes": get_transport_budget().used,
             "ordinary_pending_requests": (
@@ -1158,7 +1224,7 @@ class WsConnection:
                     pending_count=len(pending),
                 )
 
-    async def _send_direct_text(self, text: str) -> None:
+    async def _send_direct_text(self, text: str, *, probe: bool = False) -> None:
         """Bound legacy direct sends so a wedged socket cannot stall an RPC."""
 
         if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
@@ -1183,6 +1249,7 @@ class WsConnection:
             except BaseException:
                 self._closing = True
                 raise
+            self._mark_outbound(probe=probe)
             return
 
         send_task.cancel()
@@ -1194,22 +1261,11 @@ class WsConnection:
             timeout_seconds=_DIRECT_SEND_TIMEOUT_SECONDS,
         )
 
-        close_task = asyncio.create_task(
-            self.ws.close(code=1011, reason="direct_send_timeout"),
-            name=f"ws-direct-close-{self.conn_id}",
-        )
-        done, _ = await asyncio.wait(
-            {close_task},
-            timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS,
-        )
-        if close_task in done:
-            try:
-                await close_task
-            except Exception:
-                pass
-        else:
-            close_task.cancel()
-            close_task.add_done_callback(self._consume_task_result)
+        # The same bounded coordinator owns queued and direct close paths.
+        # A legacy RPC worker can time out while its reader is still waiting:
+        # abort that handler if close stalls, and keep resistant close tasks
+        # inside the global cap instead of stranding an untracked task.
+        await self.close(code=1011, reason="direct_send_timeout")
         raise TimeoutError("WebSocket direct send timed out")
 
     # ------------------------------------------------------------------
@@ -1299,7 +1355,7 @@ class WsConnection:
                 )
                 await self._send_direct_text(encoded.model_dump_json())
 
-    async def send_raw_text(self, text: str) -> None:
+    async def send_raw_text(self, text: str, *, probe: bool = False) -> None:
         """Send a protocol-level raw frame through the connection writer."""
 
         if self._closing:
@@ -1313,16 +1369,30 @@ class WsConnection:
                     event_name=None,
                     res_frame=None,
                     raw_text=text,
+                    is_probe=probe,
                 )
             )
             return
         async with self._send_lock:
             if not self._closing and self.ws.client_state == WebSocketState.CONNECTED:
-                await self._send_direct_text(text)
+                await self._send_direct_text(text, probe=probe)
 
     async def close(self, code: int = WS_CLOSE_SERVICE_RESTART, reason: str = "") -> None:
         self._closing = True
         if len(_SOCKET_CLOSE_TASKS) >= _MAX_WRITER_TASKS:
+            # A cancellation-resistant close already occupies every slot.
+            # Do not create an untracked task (or await close inline forever).
+            # End the owning ASGI handler: Uvicorn closes the transport when
+            # that handler returns, including its cancellation path.
+            log.error(
+                "gateway.ws_close_task_capacity_exhausted",
+                conn_id=self.conn_id,
+                close_code=code,
+                close_reason=reason,
+                active_close_tasks=len(_SOCKET_CLOSE_TASKS),
+                task_capacity=_MAX_WRITER_TASKS,
+            )
+            self._abort_connection_handler(reason="close_capacity")
             return
         task = asyncio.create_task(
             self.ws.close(code=code, reason=reason) if reason else self.ws.close(code=code),
@@ -1331,9 +1401,38 @@ class WsConnection:
         _SOCKET_CLOSE_TASKS.add(task)
         task.add_done_callback(_SOCKET_CLOSE_TASKS.discard)
         task.add_done_callback(self._consume_task_result)
-        done, _ = await asyncio.wait({task}, timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=_DIRECT_CLOSE_TIMEOUT_SECONDS)
+        except BaseException:
+            task.cancel()
+            raise
         if not done:
             task.cancel()
+            log.warning(
+                "gateway.ws_socket_close_timeout",
+                conn_id=self.conn_id,
+                close_code=code,
+                close_reason=reason,
+                timeout_seconds=_DIRECT_CLOSE_TIMEOUT_SECONDS,
+            )
+            self._abort_connection_handler(reason="socket_close_timeout")
+
+    def _abort_connection_handler(self, *, reason: str) -> None:
+        handler = self._handler_task
+        abortable = handler is not None and not handler.done() and not handler.cancelling()
+        log.error(
+            "gateway.ws_connection_handler_fallback",
+            conn_id=self.conn_id,
+            reason=reason,
+            handler_cancelled=abortable,
+        )
+        if abortable and handler is not None:
+            if handler is asyncio.current_task():
+                # Inject cancellation before the handler enters its finally.
+                # Queuing self-cancellation would instead interrupt the first
+                # awaited teardown step and skip registry/budget cleanup.
+                raise asyncio.CancelledError
+            handler.cancel()
 
     def _track_detached_request(
         self,
@@ -1430,6 +1529,13 @@ class WsConnection:
             return
         if len(_WRITER_TASKS) >= _MAX_WRITER_TASKS:
             self._closing = True
+            log.error(
+                "gateway.ws_writer_task_capacity_exhausted",
+                conn_id=self.conn_id,
+                active_writer_tasks=len(_WRITER_TASKS),
+                task_capacity=_MAX_WRITER_TASKS,
+                close_reason="writer_capacity",
+            )
             task = asyncio.create_task(self.close(code=1013, reason="writer_capacity"))
             task.add_done_callback(self._consume_task_result)
             return
@@ -1680,92 +1786,99 @@ class WsConnection:
                     return
                 if not isinstance(item, _OutboundFrame):
                     continue
-                if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
-                    # This frame is no longer in the queue drained during
-                    # teardown. Its non-ledger reservation belongs to us.
-                    self._release_outbound_budget(item)
-                    return
+                text: str | None = None
                 try:
-                    if item.encoded_text is not None:
-                        text = item.encoded_text
-                        if (
-                            self._flow_dirty_notice_pending is item
-                            and self._flow is not None
-                        ):
-                            self._freeze_pending_dirty_notice()
-                            assert item.encoded_text is not None
+                    if self._closing or self.ws.client_state != WebSocketState.CONNECTED:
+                        return
+                    try:
+                        if item.encoded_text is not None:
                             text = item.encoded_text
-                        if item.event_name is not None:
-                            text = text[:-1] + f',"seq":{self.next_seq()}' + "}"
-                    elif item.event_name is not None:
-                        text = make_event(
-                            item.event_name,
-                            encode_payload_for_protocol(
-                                item.payload,
-                                protocol=self.protocol,
-                            ),
-                            seq=self.next_seq(),
-                            meta=item.meta,
-                        ).model_dump_json()
-                    elif item.res_frame is not None:
-                        text = item.res_frame.model_copy(
-                            update={
-                                "payload": encode_payload_for_protocol(
-                                    item.res_frame.payload,
+                            if (
+                                self._flow_dirty_notice_pending is item
+                                and self._flow is not None
+                            ):
+                                self._freeze_pending_dirty_notice()
+                                assert item.encoded_text is not None
+                                text = item.encoded_text
+                            if item.event_name is not None:
+                                text = text[:-1] + f',"seq":{self.next_seq()}' + "}"
+                        elif item.event_name is not None:
+                            text = make_event(
+                                item.event_name,
+                                encode_payload_for_protocol(
+                                    item.payload,
                                     protocol=self.protocol,
-                                )
-                            }
-                        ).model_dump_json()
-                    elif item.raw_text is not None:
-                        text = item.raw_text
-                    else:
-                        continue
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    # A frame that cannot be serialized (e.g. a lone surrogate
-                    # in a payload) must not silently kill this task: the
-                    # socket would stay open, requests would keep executing,
-                    # and no response would ever leave. Close instead so the
-                    # reader loop tears the connection down normally.
-                    log.warning(
-                        "gateway.ws_frame_serialize_failed",
-                        conn_id=self.conn_id,
-                        exc_info=True,
-                    )
-                    self._closing = True
+                                ),
+                                seq=self.next_seq(),
+                                meta=item.meta,
+                            ).model_dump_json()
+                        elif item.res_frame is not None:
+                            text = item.res_frame.model_copy(
+                                update={
+                                    "payload": encode_payload_for_protocol(
+                                        item.res_frame.payload,
+                                        protocol=self.protocol,
+                                    )
+                                }
+                            ).model_dump_json()
+                        elif item.raw_text is not None:
+                            text = item.raw_text
+                        else:
+                            continue
+                        if not isinstance(text, str):
+                            raise TypeError("Writer serialization did not produce text")
+                    except Exception:
+                        # Reject a malformed frame without leaving a live
+                        # connection whose only writer has stopped.
+                        if self._flow_dirty_notice_pending is item:
+                            self._flow_dirty_notice_pending = None
+                        log.warning(
+                            "gateway.ws_frame_serialize_failed",
+                            conn_id=self.conn_id,
+                            queue_depth=self._outbox.qsize(),
+                            transport_reserved_bytes=self._transport_bytes,
+                            close_reason="writer_serialize_failed",
+                            exc_info=True,
+                        )
+                        self._closing = True
+                        try:
+                            await self.close(code=1011, reason="writer_serialize_failed")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
                     try:
-                        await self.ws.close(code=1011)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return
-                try:
-                    if self._flow is not None and item.delivery_id is not None:
-                        self._flow.mark_sending(item.delivery_id)
-                    async with asyncio.timeout(60.0):
-                        await self.ws.send_text(text)
-                    if self._flow is not None and item.delivery_id is not None:
-                        self._flow.mark_sent(item.delivery_id)
-                except WebSocketDisconnect:
-                    self._closing = True
-                    return
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    log.debug(
-                        "gateway.ws_writer_send_failed",
-                        conn_id=self.conn_id,
-                        exc_info=True,
-                    )
-                    self._closing = True
-                    try:
-                        await self.ws.close(code=1011, reason="writer_send_failed")
-                    except Exception:  # noqa: BLE001
-                        pass
-                    return
+                        if self._flow is not None and item.delivery_id is not None:
+                            self._flow.mark_sending(item.delivery_id)
+                        async with asyncio.timeout(_WRITER_SEND_TIMEOUT_SECONDS):
+                            await self.ws.send_text(text)
+                        self._mark_outbound(probe=item.is_probe)
+                        if self._flow is not None and item.delivery_id is not None:
+                            self._flow.mark_sent(item.delivery_id)
+                    except WebSocketDisconnect:
+                        self._closing = True
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.debug(
+                            "gateway.ws_writer_send_failed",
+                            conn_id=self.conn_id,
+                            exc_info=True,
+                        )
+                        self._closing = True
+                        try:
+                            await self.close(code=1011, reason="writer_send_failed")
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return
+                    finally:
+                        if self._flow is not None and item.delivery_id is not None:
+                            self._flow.mark_send_finished(item.delivery_id)
                 finally:
-                    if self._flow is not None and item.delivery_id is not None:
-                        self._flow.mark_send_finished(item.delivery_id)
+                    # Once dequeued, every terminal path owns this reservation:
+                    # rejection, serialization failure, cancellation, and send.
+                    # A cancellation-resistant physical send retains it until
+                    # that await actually unwinds and reaches this finally.
                     self._release_outbound_budget(item)
                     # The next queue wait may last for the connection's entire
                     # lifetime. Do not retain an uncharged completed frame.
@@ -1792,6 +1905,11 @@ class WsConnection:
                 if not self._prepare_flow_frame(frame):
                     return
             except Exception:
+                # Admission may have reserved bytes before a later flow
+                # validation/encoding step failed.  The frame will never
+                # enter the outbox, so release that reservation here before
+                # taking either the dirty-session or force-close path.
+                self._release_outbound_budget(frame)
                 log.warning(
                     "gateway.ws_flow_encode_or_budget_failed", conn_id=self.conn_id, exc_info=True
                 )
@@ -2141,7 +2259,6 @@ async def handle_ws_connection(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2170,6 +2287,7 @@ async def handle_ws_connection(
 
     conn_id = str(uuid.uuid4())
     conn = WsConnection(conn_id=conn_id, ws=ws)
+    conn._handler_task = asyncio.current_task()
     registry = get_registry()
 
     await ws.accept()
@@ -2186,6 +2304,7 @@ async def handle_ws_connection(
     try:
         preauth_timeout = PREAUTH_TIMEOUT_MS / 1000
         raw = await asyncio.wait_for(ws.receive_text(), timeout=preauth_timeout)
+        conn._mark_inbound()
     except TimeoutError:
         log.warning("ws.preauth_timeout", conn_id=conn_id)
         await conn.close()
@@ -2327,10 +2446,16 @@ async def handle_ws_connection(
         conn._enable_flow()
 
     # Step 6: Send HelloOk
+    from opensquilla.gateway.turn_receipts import (
+        TURN_RECEIPT_CAPABILITY,
+        TURN_RECEIPT_METHOD,
+        can_read_turn_receipts,
+    )
+
     hello = HelloOk(
         protocol=negotiated,
         server=ServerInfo(version=__version__, conn_id=conn_id),
-        features=_build_features(dispatcher),
+        features=_build_features(dispatcher, principal=conn.principal),
         snapshot=SnapshotInfo(
             uptime_ms=int(time.time() * 1000),
             config_path=config.config_path,
@@ -2338,6 +2463,12 @@ async def handle_ws_connection(
             auth_mode=config.auth.mode,
         ),
         policy=PolicyInfo(
+            turn_receipt_lookup=(
+                TURN_RECEIPT_CAPABILITY
+                if can_read_turn_receipts(conn.principal)
+                and TURN_RECEIPT_METHOD in dispatcher.list_methods()
+                else None
+            ),
             transport_probe_nonce=PROBE_CAPABILITY in conn.client_caps,
             transport_flow=(
                 {
@@ -2412,7 +2543,6 @@ async def handle_ws_connection(
             channel_manager,
             usage_tracker,
             usage_event_sink,
-            meta_run_writer,
             skill_loader,
             skill_management_state,
             cron_scheduler,
@@ -2437,6 +2567,7 @@ async def handle_ws_connection(
     finally:
         # Stop admission before draining. A running mutation may finish under
         # supervision; queued work must never begin after the client has left.
+        conn._handler_task = None
         conn._closing = True
         get_recovery_scheduler().cancel_connection(conn.conn_id)
         await conn._stop_ordinary_requests()
@@ -2625,7 +2756,6 @@ async def _message_loop(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2651,6 +2781,7 @@ async def _message_loop(
                 raw = await asyncio.wait_for(ws.receive_text(), timeout=keepalive_timeout)
             else:
                 raw = await ws.receive_text()
+            conn._mark_inbound()
         except WebSocketDisconnect:
             return
         except RuntimeError:
@@ -2754,7 +2885,8 @@ async def _message_loop(
             pong: dict[str, Any] = {"type": "pong"}
             if nonce is not None and PROBE_CAPABILITY in conn.client_caps:
                 pong["nonce"] = nonce
-            await conn.send_raw_text(json.dumps(pong, separators=(",", ":")))
+            conn._mark_probe_waiting()
+            await conn.send_raw_text(json.dumps(pong, separators=(",", ":")), probe=True)
             continue
 
         if frame_type == "pong":
@@ -2801,7 +2933,6 @@ async def _message_loop(
                 ),
                 usage_tracker=usage_tracker,
                 usage_event_sink=usage_event_sink,
-                meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 skill_management_service=skill_management_service,
                 skill_management_state=(
@@ -3011,11 +3142,14 @@ async def _dispatch_and_send(
     await conn.send_res(response)
 
 
-def _build_features(dispatcher: RpcDispatcher) -> Any:
+def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = None) -> Any:
     from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
+    from opensquilla.gateway.turn_receipts import TURN_RECEIPT_METHOD, can_read_turn_receipts
 
     methods = dispatcher.list_methods()
+    if principal is not None and not can_read_turn_receipts(principal):
+        methods = [method for method in methods if method != TURN_RECEIPT_METHOD]
     events = [
         "connect.challenge",
         "agent",

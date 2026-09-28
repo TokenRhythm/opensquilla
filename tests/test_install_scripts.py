@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -12,7 +13,7 @@ RELEASE_PS1 = ROOT / "install.ps1"
 RELEASE_SH = ROOT / "install.sh"
 SOURCE_PS1 = ROOT / "scripts" / "install_source.ps1"
 SOURCE_SH = ROOT / "scripts" / "install_source.sh"
-CURRENT_RELEASE_TAG = "v0.5.4"
+CURRENT_RELEASE_TAG = "v0.5.5"
 
 
 def test_source_install_scripts_force_refresh_local_uv_tool_package() -> None:
@@ -145,6 +146,26 @@ def test_install_scripts_support_optional_extras() -> None:
         assert "msteams" not in script
 
 
+def test_recommended_profile_bundles_platform_pty_and_core_does_not() -> None:
+    project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    extras = project["optional-dependencies"]
+    recommended = extras["recommended"]
+    pty = extras["pty"]
+
+    assert any(
+        value.startswith("ptyprocess>=0.7,<1;") and "sys_platform != 'win32'" in value
+        for value in recommended
+    )
+    assert any(
+        value.startswith("pywinpty>=2.0,<3;") and "sys_platform == 'win32'" in value
+        for value in recommended
+    )
+    assert not any(
+        value.startswith(("ptyprocess", "pywinpty")) for value in project["dependencies"]
+    )
+    assert set(pty).issubset(set(recommended))
+
+
 def test_windows_installer_bootstraps_vc_redist_for_router_runtime() -> None:
     scripts = [
         RELEASE_PS1.read_text(encoding="utf-8"),
@@ -170,9 +191,9 @@ def test_source_install_pins_python_312_and_refuses_below() -> None:
     # the pip fallback refuses to install on python < 3.12 (no silent broken install)
     assert "sys.version_info >= (3, 12)" in sh
     assert "astral.sh/uv/install.sh" in sh
-    # Windows pip fallback also gated; self-check targets code-task, not just --version
+    # Windows pip fallback also gated; self-check targets agent startup, not just --version
     assert "sys.version_info >= (3, 12)" in ps1
-    assert "code-task --help" in sh
+    assert "agent --help" in sh
 
 
 def test_source_installers_build_webui_and_keep_dry_run_non_mutating() -> None:

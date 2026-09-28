@@ -6,6 +6,7 @@ import type {
   PlatformFilesApi,
   DesktopMainWindowCloseBehavior,
   DesktopGatewayConnection,
+  DesktopResumeEvent,
   DesktopPreferences,
   DesktopRetryStartupResult,
   DesktopUpdateState,
@@ -52,7 +53,7 @@ declare global {
     onUpdateState?: (callback: (payload: unknown) => void) => () => void
     getGatewayStatus: () => Promise<DesktopSettings['gateway']>
     getGatewayConnection?: () => Promise<DesktopGatewayConnection>
-    onSystemResume?: (callback: () => void) => () => void
+    onSystemResume?: (callback: (event: DesktopResumeEvent) => void) => () => void
     onGatewayConnectionChanged?: (
       callback: (payload: DesktopGatewayConnection) => void,
     ) => () => void
@@ -102,6 +103,7 @@ declare global {
     cancelAttachmentSelections?: PlatformFilesApi['cancelAttachmentSelections']
     saveArtifact?: PlatformFilesApi['saveArtifact']
     sourceFileAction?: PlatformFilesApi['sourceFileAction']
+    workspaceFileAction?: PlatformFilesApi['workspaceFileAction']
     chooseProjectDirectory: (
       request?: ProjectDirectoryPickerRequest,
     ) => Promise<{ path: string } | null>

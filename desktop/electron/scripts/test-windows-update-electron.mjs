@@ -44,7 +44,7 @@ const names = [
   'restoreDownloadedUpdateRetryState', 'classifyDesktopUpdateError', 'classifyDesktopUpdateTelemetryError', 'desktopUpdateErrorMessage',
   'applyWindowsInstaller', 'applyDownloadedUpdate', 'handleMainWindowClose', 'trustedMainWindowControlIpc',
   'desktopUpdateCheckAllowed', 'runDesktopUpdateCheck', 'checkForUpdates', 'showUpdateError',
-  'desktopUpdatePlatform', 'resolveDesktopUpdate',
+  'desktopUpdatePlatform', 'resolveDesktopUpdate', 'desktopGatewayConnectionSuspendedForExit',
 ]
 for (const name of names) assert.ok(functions.has(name), `production ${name} must exist`)
 const statements = []

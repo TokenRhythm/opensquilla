@@ -11,33 +11,33 @@
 id = "tokenrhythm"
 provider = "tokenrhythm"
 label = "TokenRhythm"
-description = "Curated TokenRhythm router ladder (DeepSeek V4 Flash 0731, DeepSeek V4 Pro 0813, Kimi K2.7 Code, then shared B5 fusion), applied as inline tiers."
+description = "Curated TokenRhythm router ladder (Qwen3.7 Flash, DeepSeek Flash, DeepSeek V4 Pro 0813, then GLM 5.3), applied as inline tiers."
 default_model = "deepseek-v4-pro-0813"
 
 [tiers.c0]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash-0731"
-description = "Fast DeepSeek V4 Flash 0731 route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+model = "qwen3.7-flash"
+description = "Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
 supports_image = false
 
 [tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro-0813"
-description = "Default DeepSeek V4 Pro 0813 route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-flash"
+description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [tiers.c2]
 provider = "tokenrhythm"
-model = "kimi-k2.7-code"
-description = "Stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "deepseek-v4-pro-0813"
+description = "Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [tiers.c3]
 provider = "tokenrhythm"
-model = "glm-5.2"
-description = "Highest tier: shared multi-model fusion using the current plan, with the configured direct/fallback model as its single-model fallback"
+model = "glm-5.3"
+description = "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 supports_image = false
-ensemble_enabled = true
+ensemble_enabled = false
 
 [tiers.image_model]
 provider = "tokenrhythm"

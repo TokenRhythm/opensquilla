@@ -180,8 +180,70 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
             and shell_payload.get("retryable") is False
         ):
             return runtime_execution_status("error", reason="runtime_unavailable")
+        if (
+            isinstance(shell_payload, dict)
+            and shell_payload.get("status") == "capability_error"
+            and shell_payload.get("reason") == "pty_started_but_handle_initialization_failed"
+        ):
+            return runtime_execution_status(
+                "error", reason="pty_started_but_handle_initialization_failed",
+            )
 
     if tool_name == "exec_command":
+        # The unified execution form returns a JSON receipt while the child is
+        # still alive.  Treat that receipt exactly like the legacy process
+        # running state so turn finalization does not claim completion early.
+        if isinstance(shell_payload, dict) and isinstance(shell_payload.get("session"), dict):
+            session = shell_payload["session"]
+            session_status = session.get("status")
+            returncode = _as_exit_code(session.get("returncode"))
+            timed_out = _as_bool(session.get("timed_out"))
+            killed = _as_bool(session.get("killed"))
+            if session_status == "running":
+                return {
+                    "version": 1,
+                    "status": "unknown",
+                    "exit_code": None,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "background_running",
+                    "source": "adapter",
+                    "preservation_class": "ephemeral",
+                }
+            if timed_out or session_status == "timed_out":
+                return {
+                    "version": 1,
+                    "status": "timeout",
+                    "exit_code": returncode,
+                    "timed_out": True,
+                    "truncated": False,
+                    "reason": "tool_timeout",
+                    "source": "adapter",
+                    "preservation_class": "diagnostic",
+                }
+            if killed or session_status == "killed":
+                return {
+                    "version": 1,
+                    "status": "cancelled",
+                    "exit_code": returncode,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "killed",
+                    "source": "adapter",
+                    "preservation_class": "diagnostic",
+                }
+            if returncode is not None:
+                failed = returncode != 0
+                return {
+                    "version": 1,
+                    "status": "error" if failed else "success",
+                    "exit_code": returncode,
+                    "timed_out": False,
+                    "truncated": False,
+                    "reason": "nonzero_exit" if failed else None,
+                    "source": "adapter",
+                    "preservation_class": "diagnostic" if failed else "normal",
+                }
         if content.startswith("[timeout after "):
             return {
                 "version": 1,
@@ -190,6 +252,17 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
                 "timed_out": True,
                 "truncated": False,
                 "reason": "tool_timeout",
+                "source": "adapter",
+                "preservation_class": "diagnostic",
+            }
+        if content.startswith("[error] "):
+            return {
+                "version": 1,
+                "status": "error",
+                "exit_code": None,
+                "timed_out": False,
+                "truncated": False,
+                "reason": "runtime_error",
                 "source": "adapter",
                 "preservation_class": "diagnostic",
             }
@@ -272,68 +345,90 @@ def execution_status_for_tool_result(tool_name: str, content: Any) -> ExecutionS
         if not isinstance(payload, dict):
             return None
         session = payload.get("session")
-        if not isinstance(session, dict):
+        if isinstance(session, dict):
+            return execution_status_for_process_session(session)
+        sessions = payload.get("sessions")
+        if payload.get("action") != "wait" or not isinstance(sessions, list) or not sessions:
             return None
-        session_status = session.get("status")
-        returncode = _as_exit_code(session.get("returncode"))
-        timed_out = _as_bool(session.get("timed_out"))
-        killed = _as_bool(session.get("killed"))
-        if session_status == "running":
-            return {
-                "version": 1,
-                "status": "unknown",
-                "exit_code": None,
-                "timed_out": False,
-                "truncated": False,
-                "reason": "background_running",
-                "source": "adapter",
-                "preservation_class": "ephemeral",
-            }
-        if timed_out or session_status == "timed_out":
-            return {
-                "version": 1,
-                "status": "timeout",
-                "exit_code": returncode,
-                "timed_out": True,
-                "truncated": False,
-                "reason": "tool_timeout",
-                "source": "adapter",
-                "preservation_class": "diagnostic",
-            }
-        if killed or session_status == "killed":
-            return {
-                "version": 1,
-                "status": "cancelled",
-                "exit_code": returncode,
-                "timed_out": False,
-                "truncated": False,
-                "reason": "killed",
-                "source": "adapter",
-                "preservation_class": "diagnostic",
-            }
-        if returncode is None:
+        statuses = [execution_status_for_process_session(item) for item in sessions]
+        # A failed execution must not be hidden by a successful sibling or a
+        # still-running child. The original payload retains every outcome.
+        for item in statuses:
+            if item is not None and derive_is_error(item):
+                return item
+        for item in statuses:
+            if item is not None and item["reason"] == "background_running":
+                return item
+        if any(item is None for item in statuses):
             return None
-        failed = returncode != 0
-        runtime_failure = session.get("runtime_failure")
-        runtime_unavailable = (
-            failed
-            and isinstance(runtime_failure, dict)
-            and runtime_failure.get("code") == "RUNTIME_UNAVAILABLE"
-        )
+        return statuses[0]
+
+    return None
+
+
+def execution_status_for_process_session(session: Any) -> ExecutionStatus | None:
+    """Map one managed execution without interpreting aggregate wait completion."""
+
+    if not isinstance(session, dict):
+        return None
+    session_status = session.get("status")
+    returncode = _as_exit_code(session.get("returncode"))
+    timed_out = _as_bool(session.get("timed_out"))
+    killed = _as_bool(session.get("killed"))
+    if session_status == "running":
         return {
             "version": 1,
-            "status": "error" if failed else "success",
+            "status": "unknown",
+            "exit_code": None,
+            "timed_out": False,
+            "truncated": False,
+            "reason": "background_running",
+            "source": "adapter",
+            "preservation_class": "ephemeral",
+        }
+    if timed_out or session_status == "timed_out":
+        return {
+            "version": 1,
+            "status": "timeout",
+            "exit_code": returncode,
+            "timed_out": True,
+            "truncated": False,
+            "reason": "tool_timeout",
+            "source": "adapter",
+            "preservation_class": "diagnostic",
+        }
+    if killed or session_status == "killed":
+        return {
+            "version": 1,
+            "status": "cancelled",
             "exit_code": returncode,
             "timed_out": False,
             "truncated": False,
-            "reason": (
-                "runtime_unavailable" if runtime_unavailable else "nonzero_exit" if failed else None
-            ),
+            "reason": "killed",
             "source": "adapter",
-            "preservation_class": "diagnostic" if failed else "normal",
+            "preservation_class": "diagnostic",
         }
-
-    return None
+    if returncode is None:
+        return None
+    failed = returncode != 0
+    runtime_failure = session.get("runtime_failure")
+    runtime_unavailable = (
+        failed
+        and isinstance(runtime_failure, dict)
+        and runtime_failure.get("code") == "RUNTIME_UNAVAILABLE"
+    )
+    return {
+        "version": 1,
+        "status": "error" if failed else "success",
+        "exit_code": returncode,
+        "timed_out": False,
+        "truncated": False,
+        "reason": (
+            "runtime_unavailable" if runtime_unavailable else "nonzero_exit" if failed else None
+        ),
+        "source": "adapter",
+        "preservation_class": "diagnostic" if failed else "normal",
+    }
 
 
 def mark_execution_status_truncated(status: Any) -> ExecutionStatus:

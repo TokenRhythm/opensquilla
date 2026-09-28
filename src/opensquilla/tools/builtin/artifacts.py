@@ -141,7 +141,7 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
             "Do not call publish_artifact again for this unchanged file. Follow the "
             "Active Goal instructions: re-evaluate the entire objective and continue "
             "any remaining work with the ordinary tools available for this turn. "
-            "update_goal_progress remains optional; use it only when a concise current-state "
+            "update_plan remains optional; use it only when a concise current-state "
             "view helps, and replace that view when reality changes rather than treating it "
             "as fixed phases or turn boundaries. Call "
             "update_goal only when the entire objective is complete or genuinely blocked. "
@@ -154,7 +154,7 @@ def _publish_note(ctx: ToolContext, *, already_published: bool = False) -> str:
         prefix = (
             "This file is already registered for the current surface in this turn. "
             if already_published
-            else "The user already sees a clickable download button rendered by the UI. "
+            else "This file is registered for the current surface. "
         )
         return (
             prefix
@@ -222,7 +222,7 @@ def _record_publication_source(
         "For exactly one file, including self-contained HTML, set bundle='none' and omit "
         "bundle_root. bundle_root is valid only with bundle='directory'. "
         "The active surface handles download chips or native channel delivery; do not include "
-        "any URL in your reply — just confirm the file is ready."
+        "invented artifact URL in your reply. Reference the returned file path when available."
     ),
     params={
         "path": {

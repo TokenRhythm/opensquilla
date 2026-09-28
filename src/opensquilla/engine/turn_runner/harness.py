@@ -1082,6 +1082,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         compaction_model: str | None,
         compaction_plan: Any | None = None,
         compaction_request_context: Any | None = None,
+        compaction_budget: Any | None = None,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -1097,6 +1098,10 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
+        if compaction_budget is not None and _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact, "compaction_budget"
+        ):
+            correlation_kwargs["compaction_budget"] = compaction_budget
         if compaction_request_context is not None and _accepts_keyword_arg(
             self._runner._maybe_preflight_compact, "compaction_request_context"
         ):

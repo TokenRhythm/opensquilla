@@ -18,9 +18,8 @@ from pathlib import Path
 
 import pytest
 
-import opensquilla.gateway.config as config_module
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.config_migration import migrate_config_payload
+from opensquilla.gateway.config_migration import LATEST_CONFIG_VERSION, migrate_config_payload
 from opensquilla.migration.opensquilla_home import (
     OpenSquillaHomeMigrator,
     OpenSquillaMigrationOptions,
@@ -121,9 +120,12 @@ def test_modern_era_configs_strip_retired_skill_filter_and_memory_flush_settings
             "flush_compaction_requires_safe_receipt", "flush_compaction_safety_mode",
             "repair_enabled", "repair_interval_seconds", "repair_max_items_per_tick",
         }
+        retired_product = {"meta_skill"}
         if era == "cli-0.4":
             retired_memory.update({"flush_triggers", "flush_pre_compaction"})
+            retired_product.add("skills.coding_mode")
         assert set(result.removed_fields) == {
+            *retired_product,
             *(f"memory.{key}" for key in retired_memory),
             "skills.filter_embedding_model",
             "skills.filter_enabled",
@@ -221,6 +223,7 @@ def test_mismatched_tier_profile_is_cleared_not_fatal() -> None:
 def test_matching_tier_profile_is_untouched() -> None:
     result = migrate_config_payload(
         {
+            "config_version": LATEST_CONFIG_VERSION,
             "llm": {"provider": "openrouter", "model": "dummy/model"},
             "squilla_router": {"tier_profile": "openrouter"},
         }
@@ -269,7 +272,9 @@ def test_readonly_config_location_degrades_to_warning(
     def _raise(*args: object, **kwargs: object) -> None:
         raise PermissionError("read-only filesystem")
 
-    monkeypatch.setattr(config_module, "backup_and_write_migrated_config", _raise)
+    monkeypatch.setattr(
+        "opensquilla.gateway.config_migration.backup_and_write_migrated_config", _raise
+    )
     cfg = GatewayConfig.load_from_toml(config_path)
     assert cfg is not None
     # The original file is untouched (no partial rewrite).

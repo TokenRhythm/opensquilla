@@ -28,7 +28,7 @@ def test_onboarding_uses_one_flow_scoped_source_of_truth() -> None:
     assert "extends CoordinatedOnboardingFlow" in flow_type
     for field in (
         "window: BrowserWindow | null",
-        "resolve: ((credential: DesktopConnection) => void) | null",
+        "resolve: ((credential: DesktopConnection | null) => void) | null",
         "reject: ((error: Error) => void) | null",
     ):
         assert field in flow_type
@@ -96,14 +96,6 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     telemetry_start = save.index("const telemetry = new OnboardingSaveTelemetry(")
     recovery_stage = save.index("'primary_recovery_inspect'")
     recovery = save.index("() => refreshPrimaryRecoveryAfterImportAttempt()")
-    provider_lookup = save.index(
-        "PROVIDER_BY_ID.get(normalizeProvider(payload.provider))"
-    )
-    provider_probe = save.index("await probeOnboardingProvider(payload)")
-    probe_failure = save.index("throw new Error(probe.message")
-    restore_after_probe = save.index(
-        "if (flow.state === 'saving') flow.state = 'editing'", probe_failure
-    )
     admission = save.index("beginDesktopWriterOperation('complete desktop onboarding')")
     writer_admitted = save.index("telemetry.markWriterAdmitted()")
     marker_stage = save.index("'pending_setup_read'")
@@ -124,8 +116,8 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     complete = save.index("if (!completeOnboardingFlow(flow, credential))")
     telemetry_finish = save.index("telemetry.finish()")
 
-    assert telemetry_start < recovery_stage < recovery < provider_lookup < provider_probe
-    assert provider_probe < probe_failure < restore_after_probe < admission < writer_admitted
+    assert telemetry_start < recovery_stage < recovery < admission < writer_admitted
+    assert "probeOnboardingProvider" not in save
     assert writer_admitted < marker_stage < marker < settings_stage
     assert settings_stage < refresh_keychain < imported < settings_persisted
     assert refresh_keychain < ordinary < settings_persisted
@@ -134,9 +126,63 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     assert "app.isPackaged" in save
     assert "(event, detail) => desktopLog(event, detail)" in save
     assert "return telemetry.recordReturned(" in save
-    assert "if (provider?.requiresApiKey)" in save
     assert "if (flow.state === 'saving') flow.state = 'editing'" in save
     assert "throw error" in save
+
+
+def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() -> None:
+    source = _main_source()
+    startup = _section(
+        source,
+        "async function startGateway(): Promise<GatewayState>",
+        "async function startGatewayWithPortRecovery",
+    )
+    run = _section(source, "async function runOnboarding", "async function pathExists")
+
+    assert "await prepareDesktopStartupConnection()" in startup
+    assert "await runOnboarding()" not in startup
+    assert "void runOnboarding()" in source
+    assert "Promise<DesktopConnection | null>" in run
+    assert "modal: true" not in run
+
+
+def test_onboarding_skip_is_trusted_and_does_not_quit_the_client() -> None:
+    source = _main_source()
+    skip = _section(
+        source,
+        "ipcMain.handle('desktop:onboarding:skip'",
+        "ipcMain.handle('desktop:onboarding:cancel'",
+    )
+    preload = (ROOT / "desktop/electron/src/preload.cts").read_text(encoding="utf-8")
+
+    assert "trustedOnboardingIpc(event, flow)" in skip
+    assert "app.quit()" not in skip
+    assert "skipOnboarding" in preload
+    assert "desktop:onboarding:skip" in preload
+
+
+def test_profile_import_retires_the_previous_onboarding_draft_after_admission() -> None:
+    source = _main_source()
+    migration = _section(
+        source,
+        "ipcMain.handle('desktop:migration:run'",
+        "ipcMain.handle('desktop:migration:last-result'",
+    )
+    admission = migration.index("desktopWriters.tryBeginExclusive('complete profile import')")
+    refused = migration.index("if (!exclusive)", admission)
+    dismissal = migration.index(
+        "if (onboardingFlows.active) dismissOnboardingFlow(onboardingFlows.active)",
+        refused,
+    )
+    drain = migration.index("await waitForDesktopWriterOperations(1)")
+    publish = migration.index("await beginMigrationReconciliationIntent(candidate)")
+
+    # The non-modal window can coexist with Data Transfer. Retire its draft
+    # before import changes the credential authority, but preserve it when the
+    # import was refused or cancelled before obtaining exclusive admission.
+    assert admission < refused < dismissal < drain < publish
+    assert "dismissOnboardingFlow" not in migration[:admission]
+    assert migration.index("return {", refused) < dismissal
 
 
 def test_onboarding_save_and_cancel_have_closed_flow_and_typed_failure_contracts() -> None:

@@ -136,6 +136,9 @@ class DoneEvent:
     # recovery decisions need the input size of the terminal physical request.
     # None means input_tokens already describes the current request.
     terminal_request_input_tokens: int | None = None
+    # Composite envelopes may repeat prior physical receipts across tool
+    # continuations. A stable scope lets the outer Agent count each row once.
+    cumulative_usage_id: str = ""
 
     @property
     def upstream_cost_usd(self) -> float:
@@ -197,6 +200,27 @@ class ProviderMessageLimitProof:
     base_host: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class RejectedToolArguments:
+    """One unexecuted call in a completely received, rejected tool batch."""
+
+    tool_call_id: str
+    tool_name: str
+    reason: Literal["invalid_json", "schema_invalid", "batch_not_executed"]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolArgumentRejection:
+    """Adapter proof of a clean terminal and an entirely unexecuted batch.
+
+    This is never evidence of an interrupted stream, ambiguous call identity,
+    or an executed tool failure. Raw arguments are deliberately excluded.
+    """
+
+    calls: tuple[RejectedToolArguments, ...]
+    terminal_reason: str
+
+
 @dataclass
 class ErrorEvent:
     """Stream error.
@@ -223,6 +247,11 @@ class ErrorEvent:
     # Preserve request accounting when an ensemble's terminal call fails.
     ensemble_trace: dict[str, Any] | None = None
 
+    # Complete generation with invalid arguments: the coordinator may ask the
+    # model to correct it without replaying the preceding visible response.
+    tool_argument_rejection: ToolArgumentRejection | None = None
+    cumulative_usage_id: str = ""
+
 
 @dataclass(frozen=True, slots=True)
 class ProviderGenerationResetEvent:
@@ -246,6 +275,7 @@ class ProviderGenerationResetEvent:
     model_usage_breakdown: list[dict[str, Any]] = field(default_factory=list)
     usage_missing_count: int = 0
     ensemble_trace: dict[str, Any] | None = None
+    cumulative_usage_id: str = ""
 
 
 @dataclass

@@ -1212,6 +1212,7 @@ async def test_doctor_reports_tier_managed_c3_ensemble_fallback_when_keyless(
         },
         llm_ensemble={"enabled": False},
     )
+    config.squilla_router.tiers["c3"]["ensemble_enabled"] = True
     response = await get_dispatcher().dispatch(
         "req-1",
         "doctor.status",

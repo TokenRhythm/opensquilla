@@ -326,6 +326,114 @@ async def test_posix_anchor_owns_signalling_and_closes_with_its_lifecycle(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("exit_during_drain", [False, True])
+async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation(
+    exit_during_drain: bool,
+) -> None:
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            if command == process_tree._POSIX_ANCHOR_TERMINATE:
+                # The group became empty before the stop command arrived.
+                # Its authoritative EMPTY report replaces a signal ACK.
+                owner.process.returncode = 7
+                stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+
+        async def drain(self) -> None:
+            if exit_during_drain:
+                anchor_process.returncode = 0
+                raise BrokenPipeError
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert await asyncio.wait_for(
+            owner.terminate(graceful_timeout=0.1, kill_timeout=0.1), timeout=0.5,
+        )
+        assert anchor.empty is True
+        assert anchor.cleanup_incomplete is False
+        assert owner.is_active() is False
+        assert await owner.terminate(graceful_timeout=0.0, kill_timeout=0.0)
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_posix_stop_after_leader_exit_signals_before_settling(monkeypatch) -> None:
+    commands: list[bytes] = []
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=7), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, command: bytes) -> None:
+            commands.append(command)
+            if command == process_tree._POSIX_ANCHOR_TERMINATE:
+                stream.feed_data(process_tree._POSIX_ANCHOR_CAPTURED)
+                stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            pass
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    original_settle = anchor.settle
+
+    async def settle_after_signal(timeout: float) -> None:
+        # The leader may exit while descendants remain. Stop must signal them
+        # before spending any of its grace budget waiting for the anchor.
+        assert process_tree._POSIX_ANCHOR_TERMINATE in commands
+        await original_settle(timeout)
+
+    monkeypatch.setattr(anchor, "settle", settle_after_signal)
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert await owner.terminate(graceful_timeout=0.1, kill_timeout=0.1)
+        assert commands == [
+            process_tree._POSIX_ANCHOR_TERMINATE, process_tree._POSIX_ANCHOR_RELEASE,
+        ]
+        assert owner.is_active() is False
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_posix_incomplete_cleanup_remains_failed_after_anchor_exit() -> None:
     anchor = process_tree._PosixGroupAnchor(
         process=SimpleNamespace(returncode=0),
@@ -605,6 +713,23 @@ def test_posix_captured_pid_identity_change_is_not_signalled(
     assert signalled == []
 
 
+@pytest.mark.parametrize("members", [(100,), (100, 101), None])
+def test_posix_no_root_capture_requires_independent_empty_group_confirmation(
+    monkeypatch: pytest.MonkeyPatch, members: tuple[int, ...] | None,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    monkeypatch.setattr(process_tree.sys, "platform", "linux")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: {100: anchor})
+    monkeypatch.setattr(process_tree, "_posix_group_members", lambda _pgid: members)
+
+    capture = process_tree._capture_posix_group_descendants(100, 100)
+
+    assert capture.processes == ()
+    assert capture.complete is (members == (100,))
+
+
 def test_linux_descendant_capture_does_not_fall_back_to_numeric_pid(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -641,6 +766,99 @@ def test_linux_descendant_capture_does_not_fall_back_to_numeric_pid(
 
     assert capture.complete is False
     assert capture.processes == ()
+
+
+def test_linux_adopted_children_use_pidfds_without_python_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    adopted = process_tree._PosixProcessInfo(102, 100, 102, uid, "adopted")
+    unrelated = process_tree._PosixProcessInfo(103, 1, 103, uid, "unrelated")
+    snapshot = {100: anchor, 102: adopted, 103: unrelated}
+    calls = []
+    library = SimpleNamespace(
+        pidfd_open=lambda pid, flags: calls.append(("open", pid, flags)) or 42,
+        pidfd_send_signal=lambda fd, sig, info, flags: (
+            calls.append(("signal", fd, sig, info, flags)) or 0
+        ),
+    )
+    monkeypatch.setattr(process_tree.sys, "platform", "linux")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.delattr(process_tree.os, "pidfd_open", raising=False)
+    monkeypatch.delattr(process_tree.signal, "pidfd_send_signal", raising=False)
+    monkeypatch.setattr(process_tree, "_linux_pidfd_libc", lambda: library)
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
+    monkeypatch.setattr(process_tree, "_posix_process_info", snapshot.get)
+    monkeypatch.setattr(
+        process_tree.os, "kill",
+        lambda *_args: pytest.fail("native pidfd support must not use numeric PID signalling"),
+    )
+
+    capture = process_tree._capture_posix_group_descendants(
+        100, 100, include_anchor_children=True,
+    )
+    assert capture.complete
+    assert [(item.pid, item.pidfd) for item in capture.processes] == [(102, 42)]
+    assert process_tree._signal_captured_posix_processes(capture.processes, signal.SIGTERM)
+    assert calls == [("open", 102, 0), ("signal", 42, signal.SIGTERM, None, 0)]
+
+
+@pytest.mark.asyncio
+async def test_pty_control_pipe_reads_ready_bytes_without_executor(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    pipe = process_tree._PtyControlPipe(read_fd, "rb")
+    loop = asyncio.get_running_loop()
+    registered = {}
+
+    def add_reader(descriptor, callback):
+        registered[descriptor] = callback
+        loop.call_soon(callback)
+
+    monkeypatch.setattr(loop, "add_reader", add_reader)
+    monkeypatch.setattr(loop, "remove_reader", lambda descriptor: registered.pop(descriptor))
+    monkeypatch.setattr(
+        loop, "run_in_executor",
+        lambda *_args: pytest.fail("ownership control must not consume a shared worker"),
+    )
+    try:
+        os.write(write_fd, b"E")
+        assert await asyncio.wait_for(pipe.read(1), 1) == b"E"
+        assert not registered
+        os.close(write_fd)
+        write_fd = -1
+        assert await asyncio.wait_for(pipe.read(1), 1) == b""
+        assert not registered
+    finally:
+        pipe.close()
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_pty_control_pipe_unregisters_reader(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    pipe = process_tree._PtyControlPipe(read_fd, "rb")
+    loop = asyncio.get_running_loop()
+    registered = {}
+    monkeypatch.setattr(
+        loop, "add_reader", lambda descriptor, callback: registered.update({descriptor: callback}),
+    )
+    monkeypatch.setattr(loop, "remove_reader", lambda descriptor: registered.pop(descriptor))
+    reading = asyncio.create_task(pipe.read(1))
+    try:
+        await asyncio.sleep(0)
+        callback = registered[read_fd]
+        reading.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reading
+        assert not registered
+        os.write(write_fd, b"E")
+        callback()  # A readiness callback queued before cancellation must not consume data.
+        assert os.read(read_fd, 1) == b"E"
+    finally:
+        pipe.close()
+        os.close(write_fd)
 
 
 def test_other_posix_descendant_capture_preserves_group_only_behavior(
@@ -1991,6 +2209,97 @@ def test_windows_registry_retries_disappearing_main_file(
     assert attempts == 3
 
 
+@pytest.mark.parametrize("preexisting", [False, True])
+@pytest.mark.parametrize("persistent", [False, True])
+def test_windows_registry_retries_main_file_identity_change_before_acl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+    persistent: bool,
+) -> None:
+    database_path = tmp_path / "synthetic-registry.sqlite3"
+    if preexisting:
+        database_path.write_bytes(b"original")
+    attempts = 0
+    delays: list[float] = []
+
+    def replace_before_bind(
+        path,
+        *,
+        directory: bool,
+        expected_device: int,
+        expected_inode: int,
+        **_kwargs: object,
+    ) -> None:
+        nonlocal attempts
+        if directory:
+            return
+        attempts += 1
+        metadata = os.lstat(path)
+        assert (metadata.st_dev, metadata.st_ino) == (expected_device, expected_inode)
+        if attempts > 1 and not persistent:
+            return
+        # Keep the old file alive so the replacement cannot reuse its identity.
+        path.rename(path.with_name(f"previous-{attempts}.sqlite3"))
+        path.write_bytes(b"replacement")
+        current = os.lstat(path)
+        assert (current.st_dev, current.st_ino) != (expected_device, expected_inode)
+        raise OSError("synthetic bound path changed")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_before_bind)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    if persistent:
+        with pytest.raises(
+            process_tree.ProcessTreeOwnershipError,
+            match="registry changed during privacy hardening",
+        ):
+            process_tree._prepare_private_file(database_path)
+        assert attempts == len(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS) + 1
+        assert delays == list(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS)
+    else:
+        process_tree._prepare_private_file(database_path)
+        assert attempts == 2
+        assert delays == list(process_tree._WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS[:1])
+    assert database_path.read_bytes() == b"replacement"
+    assert (tmp_path / "previous-1.sqlite3").read_bytes() == (
+        b"original" if preexisting else b""
+    )
+
+
+def test_windows_registry_rejects_nonregular_replacement_before_acl(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "synthetic-registry.sqlite3"
+    previous = tmp_path / "previous.sqlite3"
+    database_path.write_bytes(b"original")
+    attempts = 0
+    delays: list[float] = []
+
+    def replace_before_bind(path, *, directory: bool, **_kwargs: object) -> None:
+        nonlocal attempts
+        if directory:
+            return
+        attempts += 1
+        path.rename(previous)
+        path.mkdir()
+        raise OSError("synthetic unsafe replacement")
+
+    monkeypatch.setattr(process_tree.os, "name", "nt")
+    monkeypatch.setattr(process_tree, "apply_windows_private_dacl", replace_before_bind)
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
+
+    with pytest.raises(OSError, match="synthetic unsafe replacement"):
+        process_tree._prepare_private_file(database_path)
+
+    assert attempts == 1
+    assert delays == []
+    assert database_path.is_dir()
+    assert previous.read_bytes() == b"original"
+
+
 def test_windows_registry_main_file_identity_churn_remains_fail_closed(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2024,6 +2333,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     state_dir = tmp_path / "synthetic-runtime-state"
     state_dir.mkdir()
     directory_attempts = 0
+    directory_fast_path_flags: list[object] = []
 
     def apply_acl(
         *_args: object,
@@ -2034,6 +2344,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
         if not directory:
             return
         directory_attempts += 1
+        directory_fast_path_flags.append(_kwargs.get("skip_if_private_directory"))
         if directory_attempts < 3:
             error = PermissionError("synthetic sharing violation")
             error.winerror = 32
@@ -2047,6 +2358,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     process_tree._prepare_private_file(database_path)
 
     assert directory_attempts == 3
+    assert directory_fast_path_flags == [True, True, True]
     assert database_path.is_file()
 
 
@@ -2223,6 +2535,8 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
     database_path = state_dir / process_tree._OWNER_DATABASE_FILENAME
     if preexisting:
         database_path.write_bytes(b"synthetic-existing-registry")
+    attempts = 0
+    delays: list[float] = []
     monkeypatch.setattr(process_tree.os, "name", "nt")
 
     def fail_file_acl(
@@ -2230,7 +2544,9 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
         directory: bool,
         **_kwargs: object,
     ) -> None:
+        nonlocal attempts
         if not directory:
+            attempts += 1
             raise OSError("synthetic ACL failure")
 
     monkeypatch.setattr(
@@ -2238,10 +2554,13 @@ def test_windows_owner_registry_file_acl_failure_is_fail_closed(
         "apply_windows_private_dacl",
         fail_file_acl,
     )
+    monkeypatch.setattr(process_tree.time, "sleep", delays.append)
 
     with pytest.raises(OSError, match="synthetic ACL failure"):
-        process_tree._prepare_private_file_once(database_path)
+        process_tree._prepare_private_file(database_path)
 
+    assert attempts == 1
+    assert delays == []
     if preexisting:
         assert database_path.read_bytes() == b"synthetic-existing-registry"
     else:

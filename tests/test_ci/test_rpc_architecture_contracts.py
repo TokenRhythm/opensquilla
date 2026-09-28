@@ -37,6 +37,8 @@ GENERATED_WIRE_IMPORT_ALLOWLIST = frozenset(
         "src/opensquilla/gateway/adapters/session_read_contract.py",
         # Additive connection-local snapshot and consumption control Contracts.
         "src/opensquilla/gateway/adapters/connection_recovery_contract.py",
+        # Read-only acceptance recovery validates frozen material without copying bodies.
+        "src/opensquilla/gateway/adapters/turn_receipt_contract.py",
         # SandboxRuntime handlers stay legacy-compatible while generated
         # descriptors own registration metadata and success validation.
         "src/opensquilla/gateway/adapters/sandbox_runtime_contract.py",
@@ -126,9 +128,13 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire the five legacy memory raw-fallback and repair methods.
 # Add metadata-only Skill candidates and the allow-use setting.
 # Add the owner-authorized workspace source reference reader.
-RUNTIME_RPC_METHOD_BASELINE = 298
-RUNTIME_RPC_METHOD_DIGEST = "bec25ad65b2122367c833922e3b7057c56f27f7bcef08d0b9fcbcf0cef295363"
-STATIC_RPC_DECORATOR_BASELINE = 72
+# Add session-owned managed process list, output preview and stop.
+# Retire 19 generated MetaSkill methods and nine legacy workflow methods.
+# Retire router learning status and training feedback (two generated methods).
+# Retire the three advanced agent administration methods.
+RUNTIME_RPC_METHOD_BASELINE = 269
+RUNTIME_RPC_METHOD_DIGEST = "0a318497edc7647e3feedc807972b62622e74403386b1aaf1c166278b58c31d9"
+STATIC_RPC_DECORATOR_BASELINE = 63
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was
@@ -139,7 +145,6 @@ STATIC_RPC_DECORATOR_BASELINE = 72
 # production LOC reduction after each complete domain migration.
 AUTHORED_RUNTIME_FILES = (
     "opensquilla-webui/src/App.vue",
-    "opensquilla-webui/src/components/sessions/SessionInspectDrawer.vue",
     "opensquilla-webui/src/composables/usage/useUsageData.ts",
     "opensquilla-webui/src/composables/useSessions.ts",
     "opensquilla-webui/src/main.ts",
@@ -214,7 +219,6 @@ R3_APPLICATION_MODULE_FILES = (
     "src/opensquilla/application/observability.py",
     "src/opensquilla/application/skill_catalog.py",
     "src/opensquilla/application/skill_management.py",
-    "src/opensquilla/application/skill_proposal_review.py",
     "src/opensquilla/application/artifact_workbench.py",
 )
 
@@ -1027,7 +1031,6 @@ def test_r5_gateway_adapters_depend_on_typed_ports_not_rpc_callbacks() -> None:
         "GatewayLogReaderPort",
         "GatewayReadinessDataPort",
         "GatewayReadinessEvaluationPort",
-        "GatewayRouterLearningStatusPort",
         "GatewaySkillCatalogReadPort",
         "GatewaySkillManagementPort",
     }
@@ -1098,7 +1101,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         ),
         "rpc_doctor.py": ("_GatewayReadinessRuntime(ctx)",),
         "rpc_logs.py": ("_GatewayLogReaderRuntime(ctx)",),
-        "rpc_router.py": ("_GatewayRouterLearningStatusRuntime(ctx)",),
         "rpc_skills.py": (
             "_SkillCatalogRuntime(ctx)",
             "_SkillManagementRuntime(ctx)",
@@ -1109,9 +1111,6 @@ def test_r5_rpc_factories_bind_concrete_typed_runtime_ports() -> None:
         source = (PACKAGE_ROOT / "gateway" / filename).read_text(encoding="utf-8")
         for binding in bindings:
             assert binding in source, f"{filename} must bind {binding}"
-
-    proposal_source = (PACKAGE_ROOT / "gateway" / "rpc_proposals.py").read_text(encoding="utf-8")
-    assert "opensquilla.gateway.rpc_cron" not in proposal_source
 
 
 def test_rpc_context_does_not_grow_past_pinned_main() -> None:
@@ -1259,14 +1258,10 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "usage.query",
             "usage.cost",
             "commands.list_for_surface",
-            "router.feedback.submit",
             "sessions.promptCacheKeepalive.status",
             "sessions.promptCacheKeepalive.set",
             "chat.clarify_submit",
             "agents.list",
-            "agents.create",
-            "agents.update",
-            "agents.delete",
             "channels.status",
             "channels.get",
             "channels.probe",
@@ -1286,7 +1281,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "cron.subscribe",
             "cron.unsubscribe",
             "status",
-            "router.selflearning.status",
             "doctor.status",
             "logs.status",
             "logs.tail",
@@ -1318,17 +1312,6 @@ def test_static_rpc_decorator_sites_are_exact_and_contract_methods_are_adapter_r
             "workspaces.pin",
             "workspaces.remove",
             "workspaces.history.delete",
-            "meta.list",
-            "meta.inspect",
-            "meta.drafts.list",
-            "meta.drafts.discard",
-            "meta.run",
-            "meta.runs.confirm_preflight",
-            "meta.runs.recovery",
-            "meta.runs.replay",
-            "meta.setup.plan",
-            "meta.setup.install",
-            "meta.setup.status",
             "migration.sources.list",
             "migration.sources.preview",
         }
@@ -1424,6 +1407,18 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     assert len(methods) == len(set(methods))
     digest = hashlib.sha256(("\n".join(sorted(methods)) + "\n").encode()).hexdigest()
     assert digest == RUNTIME_RPC_METHOD_DIGEST
+
+    for method, scope in (
+        ("sessions.processes.list", "operator.read"),
+        ("sessions.processes.log", "operator.read"),
+        ("sessions.processes.stop", "operator.write"),
+        ("turns.receipt.get", "operator.read"),
+    ):
+        process_entry = registry.get_entry(method)
+        assert process_entry is not None
+        assert process_entry.required_scope == scope
+        assert process_entry.generated_contract_name == method
+        assert process_entry.handler.__module__ == "opensquilla.gateway.adapters.contract_method"
 
     source_entry = registry.get_entry("workspaces.references.read")
     assert source_entry is not None
@@ -1629,9 +1624,6 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
     from opensquilla.gateway.adapters.skill_management_contract import (
         SKILL_MANAGEMENT_CONTRACT_METHODS,
     )
-    from opensquilla.gateway.adapters.skill_proposal_review_contract import (
-        SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
-    )
     from opensquilla.gateway.adapters.turn_admission_contract import (
         TURN_ADMISSION_CONTRACT_METHODS,
     )
@@ -1648,7 +1640,6 @@ def test_runtime_rpc_surface_is_exact_and_contract_methods_use_generic_adapter()
         *OBSERVABILITY_CONTRACT_METHODS,
         *SKILL_CATALOG_CONTRACT_METHODS,
         *SKILL_MANAGEMENT_CONTRACT_METHODS,
-        *SKILL_PROPOSAL_REVIEW_CONTRACT_METHODS,
         *ARTIFACT_WORKBENCH_CONTRACT_METHODS,
     ):
         entry = registry.get_entry(method)

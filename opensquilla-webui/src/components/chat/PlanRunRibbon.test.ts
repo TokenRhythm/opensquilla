@@ -7,7 +7,7 @@ import { useChatPlans } from '@/composables/chat/useChatPlans'
 import type { PlanRunSnapshot, PlanRunStatus } from '@/types/plans'
 import executionTodoMarkerSource from './ExecutionTodoMarker.vue?raw'
 import PlanRunRibbon from './PlanRunRibbon.vue'
-import planRunRibbonSource from './PlanRunRibbon.vue?raw'
+import planRunRibbonSource from './ExecutionProgressRibbon.vue?raw'
 import chatViewSource from '@/views/ChatView.vue?raw'
 
 const mountedApps: ReturnType<typeof createApp>[] = []
@@ -35,7 +35,7 @@ const i18n = createI18n({
             running: 'Running',
             paused: 'Paused',
             blocked: 'Blocked',
-            completed: 'Completed',
+            completed: 'Execution ended',
             cancelled: 'Cancelled',
             superseded: 'Replaced by a newer plan',
           },
@@ -499,6 +499,31 @@ describe('PlanRunRibbon', () => {
     )
   })
 
+  it.each([
+    { reported: 'no list', statuses: [], count: '' },
+    { reported: 'no completed steps', statuses: ['pending', 'pending', 'pending', 'pending'], count: '0/4' },
+    { reported: 'partial progress', statuses: ['completed', 'in_progress', 'pending', 'pending'], count: '1/4' },
+    { reported: 'all steps completed', statuses: ['completed', 'completed', 'completed', 'completed'], count: '4/4' },
+  ] as const)('ends the turn neutrally with $reported, without changing step facts', async ({ statuses, count }) => {
+    const snapshot = run({
+      status: 'completed',
+      currentStepId: undefined,
+      steps: statuses.map((status, index) => ({
+        stepId: `step-${index}`, title: `Work ${index}`, status,
+      })),
+    })
+    const originalSteps = structuredClone(snapshot.steps)
+    const host = mountRibbon(snapshot)
+    await nextTick()
+
+    expect(host.querySelector('.plan-run__title')?.textContent).toBe('Execution ended')
+    expect(host.querySelector('.plan-run__static-status')?.textContent.trim() ?? '').toBe(count)
+    expect(host.querySelector('.execution-todo-marker--completed')).toBeNull()
+    expect(host.querySelector('.execution-todo-marker--pending')).not.toBeNull()
+    expect(host.querySelector('.plan-run__steps')).toBeNull()
+    expect(snapshot.steps).toEqual(originalSteps)
+  })
+
   it('counts completed and skipped todos in the completed summary', async () => {
     const host = mountRibbon(run({
       status: 'completed',
@@ -512,7 +537,8 @@ describe('PlanRunRibbon', () => {
     await nextTick()
 
     expect(host.querySelector('.plan-run__static-status')?.textContent.trim()).toBe('3/3')
-    expect(host.querySelector('.execution-todo-marker--completed')).not.toBeNull()
+    expect(host.querySelector('.execution-todo-marker--completed')).toBeNull()
+    expect(host.querySelector('.execution-todo-marker--pending')).not.toBeNull()
   })
 
   it('keeps terminal presentation when a stale running event arrives afterward', async () => {
@@ -593,7 +619,7 @@ describe('PlanRunRibbon', () => {
 
     expect(host.querySelector('.plan-run--completed')).not.toBeNull()
     expect(host.querySelector('.plan-run__summary')).toBeNull()
-    expect(host.textContent).toContain('Completed')
+    expect(host.textContent).toContain('Execution ended')
     expect(host.textContent).not.toMatch(/Step \d+\/\d+/)
   })
 
@@ -673,17 +699,15 @@ describe('PlanRunRibbon', () => {
     expect(host.querySelector('.plan-run__summary')?.hasAttribute('aria-expanded')).toBe(false)
   })
 
-  it.each<PlanRunStatus>(['queued', 'running'])('exposes cancellation for a %s plan before opening progress', async status => {
+  it.each<PlanRunStatus>(['queued', 'running'])('leaves active %s plan stopping to the composer', async status => {
     const cancel = vi.fn()
     const host = mountRibbon(run({ status }), false, { onCancel: cancel })
     await nextTick()
-    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
-    expect(button?.textContent.trim()).toBe('Cancel')
+    expect(host.querySelector('.plan-run__cancel')).toBeNull()
     expect(host.querySelector('.plan-run__popover')).toBeNull()
-    button?.click()
-    expect(cancel).toHaveBeenCalledOnce()
+    expect(cancel).not.toHaveBeenCalled()
     await tapSummary(host.querySelector<HTMLButtonElement>('.plan-run__summary'))
-    expect(host.querySelectorAll('.plan-run__end')).toHaveLength(1)
+    expect(host.querySelectorAll('.plan-run__end')).toHaveLength(0)
   })
 
   it.each<PlanRunStatus>(['paused', 'blocked'])('keeps End plan reachable for %s runs without optional progress', async status => {
@@ -697,14 +721,11 @@ describe('PlanRunRibbon', () => {
     expect(host.querySelector('.plan-run__popover')).toBeNull()
   })
 
-  it('disables the visible cancellation while pending, including a queued plan without steps', async () => {
+  it('does not add a second stop action while a queued plan is pending', async () => {
     const cancel = vi.fn()
     const host = mountRibbon(run({ status: 'queued', steps: [] }), false, { onCancel: cancel, cancelBusy: true })
     await nextTick()
-    const button = host.querySelector<HTMLButtonElement>('.plan-run__cancel')
-    expect(button?.disabled).toBe(true)
-    expect(button?.textContent.trim()).toBe('Cancelling…')
-    button?.click()
+    expect(host.querySelector('.plan-run__cancel')).toBeNull()
     expect(cancel).not.toHaveBeenCalled()
   })
 

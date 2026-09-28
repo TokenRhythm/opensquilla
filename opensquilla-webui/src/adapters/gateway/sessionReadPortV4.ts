@@ -148,6 +148,7 @@ function callOptions(
   timeoutMs: number,
   expectedGeneration: number,
   onSent?: (generation: number) => void,
+  recoveryClass: RpcCallOptions['recoveryClass'] = 'mutation',
 ): RpcCallOptions {
   return {
     signal,
@@ -156,6 +157,7 @@ function callOptions(
     abortAction: 'reject',
     cancelOnAbort: true,
     expectedGeneration,
+    recoveryClass,
     ...(onSent ? { onSent } : {}),
   }
 }
@@ -182,6 +184,30 @@ function isMissingMethod(error: unknown): boolean {
 
 function subscriptionError(error: unknown): unknown {
   return mapSessionReadError(error)
+}
+
+function snapshotInstallationHooks(
+  staged: StagedSessionSnapshot | null,
+): Pick<SessionReadPortLive, 'confirmInstalled' | 'assertInstalledCurrent'> {
+  if (!staged) return {}
+  // Keep each consumer bound to its exact snapshot. A later reconciliation
+  // must not redirect an older confirmation to the replacement transfer.
+  return {
+    async confirmInstalled() {
+      try {
+        await staged.confirmInstalled()
+      } catch (error) {
+        throw mapSessionReadError(error)
+      }
+    },
+    assertInstalledCurrent() {
+      try {
+        staged.assertInstalledCurrent()
+      } catch (error) {
+        throw mapSessionReadError(error)
+      }
+    },
+  }
 }
 
 function invalidContract(method: string): SessionReadContractError {
@@ -394,7 +420,7 @@ async function hydrate(
     raw = await rpc.request(
       SESSIONS_MESSAGES_HYDRATE_METHOD,
       params,
-      callOptions(signal, READ_TIMEOUT_MS, expectedGeneration),
+      callOptions(signal, READ_TIMEOUT_MS, expectedGeneration, undefined, 'safe-read'),
     )
   } catch (error) {
     throw mapSessionReadError(error)
@@ -425,7 +451,7 @@ async function optionalSnapshot(
       callOptions(signal, SNAPSHOT_TIMEOUT_MS, expectedGeneration, generation => {
         sentGeneration = generation
         latch.sent(generation)
-      }),
+      }, 'safe-read'),
     )
     return requireResult<SessionsMessagesSnapshotResult>(
       SESSIONS_MESSAGES_SNAPSHOT_METHOD,
@@ -641,8 +667,7 @@ export function createV4SessionReadPort(
           activeTaskId: snapshot?.task_id ?? activeTaskId(subscription),
           initialMetadata: projectMetadata(subscription),
           snapshot: snapshot ? projectSnapshot(snapshot) : null,
-          confirmInstalled: stagedSnapshot?.confirmInstalled,
-          assertInstalledCurrent: stagedSnapshot?.assertInstalledCurrent,
+          ...snapshotInstallationHooks(stagedSnapshot),
           cursor: Object.freeze({
             sessionKey: request.sessionKey,
             sessionEpoch: subscription.epoch,
@@ -729,8 +754,7 @@ export function createV4SessionReadPort(
               activeTaskId: snapshot?.task_id ?? textValue(metadata.activeTask?.task_id, metadata.activeTask?.taskId),
               initialMetadata: metadata,
               snapshot: snapshot ? projectSnapshot(snapshot) : null,
-              confirmInstalled: stagedSnapshot?.confirmInstalled,
-          assertInstalledCurrent: stagedSnapshot?.assertInstalledCurrent,
+              ...snapshotInstallationHooks(stagedSnapshot),
               cursor: Object.freeze({
                 sessionKey: request.sessionKey,
                 sessionEpoch: metadata.epoch,
@@ -785,16 +809,19 @@ export function createV4SessionReadPort(
         function retryMetadata(): Promise<SessionReadMetadata> {
           if (closed || request.signal.aborted) return Promise.reject(abortError())
           if (retry) return retry
-          const current = Promise.all([
-            criticalRequestsQueued,
-            subscribePromise,
-          ]).then(([, subscription]) => hydrate(
-            rpc,
-            request.sessionKey,
-            request.signal,
-            expectedGeneration,
-            subscription,
-          ))
+          const current = (async () => {
+            await criticalRequestsQueued
+            // Reconciliation may have recovered an initially lost ACK. Its
+            // metadata retry must not replay the original rejected promise.
+            const subscription = acknowledgedSubscription ?? await subscribePromise
+            return hydrate(
+              rpc,
+              request.sessionKey,
+              request.signal,
+              expectedGeneration,
+              subscription,
+            )
+          })()
           const observed = current.finally(() => {
             if (retry === observed) retry = null
           })

@@ -141,10 +141,10 @@ describe('useSessions pagination', () => {
     await sessions.loadSessions()
     await sessions.loadMoreSessions()
     await sessions.loadMoreSessions()
-    await sessions.loadSessions()
+    expect(await sessions.loadSessions()).toBe('failed')
 
     expect(sessions.sessionsList.value).toHaveLength(401)
-    expect(sessions.sessionListError.value).toBe(false)
+    expect(sessions.sessionListError.value).toBe(true)
     expect(sessions.hasMore.value).toBe(false)
     errorLog.mockRestore()
   })
@@ -167,7 +167,7 @@ describe('useSessions pagination', () => {
 
       expect(sessions.sessionsList.value).toBe(complete)
       expect(sessions.sessionsList.value.map(item => item.key)).toEqual(rows(0, 4).map(item => item.key))
-      expect(sessions.sessionListError.value).toBe(false)
+      expect(sessions.sessionListError.value).toBe(true)
       expect(sessions.isLoading.value).toBe(false)
       expect(sessions.hasMore.value).toBe(false)
       expect(errorLog).toHaveBeenCalledWith(
@@ -249,14 +249,31 @@ describe('useSessions pagination', () => {
 
     const staleRefresh = sessions.loadSessions()
     const currentRefresh = sessions.loadSessions()
-    await currentRefresh
+    expect(await currentRefresh).toBe('applied')
     connection.resolve()
-    await staleRefresh
+    expect(await staleRefresh).toBe('superseded')
 
     expect(call).toHaveBeenCalledTimes(1)
     expect(sessions.sessionsList.value.map(({ key, title }) => ({ key, title }))).toEqual([
       { key: 'agent:main:webchat:current', title: 'Current' },
     ])
+  })
+
+  it('never lets an older terminal snapshot clear a newer running task', async () => {
+    const oldRead = deferred<SessionPageFixture>()
+    const { call, sessions } = setup([
+      oldRead.promise,
+      { sessions: [{ key: 'agent:main:webchat:one', title: 'Successor task', runStatus: 'running' }] },
+    ])
+    const previous = sessions.loadSessions()
+    await vi.waitFor(() => expect(call).toHaveBeenCalledOnce())
+    expect(await sessions.loadSessions()).toBe('applied')
+    oldRead.resolve({
+      sessions: [{ key: 'agent:main:webchat:one', title: 'Completed predecessor', runStatus: 'done' }],
+    })
+    expect(await previous).toBe('superseded')
+    expect(sessions.sessionsList.value[0]).toMatchObject({ title: 'Successor task', runStatus: 'running' })
+    expect(sessions.sessionListError.value).toBe(false)
   })
 
   it('does not dispatch load-more after a refresh wins during connection wait', async () => {

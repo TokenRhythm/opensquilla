@@ -3115,6 +3115,75 @@ async def test_compact_with_result_missing_protected_boundary_fails_closed(
     assert current.compaction_count == 0
 
 
+def test_compaction_singleflight_distinguishes_manual_force_from_automatic_skip():
+    kwargs = {
+        "preimage": (),
+        "previous_summary": "",
+        "context_window_tokens": 100_000,
+        "context_window_chars": None,
+        "custom_instructions": None,
+        "config": CompactionConfig(),
+    }
+    automatic = session_manager_module._frozen_compaction_prefix_hash(**kwargs)
+    manual = session_manager_module._frozen_compaction_prefix_hash(**kwargs, force=True)
+    assert automatic != manual
+    assert automatic == session_manager_module._frozen_compaction_prefix_hash(**kwargs, force=False)
+
+
+@pytest.mark.asyncio
+async def test_manual_compaction_trigger_reaches_shared_compactor(manager, monkeypatch):
+    node = await manager.create("agent:test:manual-force")
+    await manager.append_message(node.session_key, "user", "Current request")
+    observed = []
+
+    async def capture(request):
+        observed.append(request.force)
+        return CompactionResult(
+            summary="", kept_entries=request.entries, removed_count=0, chunks_processed=0,
+        )
+
+    monkeypatch.setattr(session_manager_module, "compact_context", capture)
+    await manager.compact_with_result(node.session_key, 100_000, trigger_reason="manual")
+    await manager.compact_with_result(
+        node.session_key, 100_000, trigger_reason="preflight_compaction",
+    )
+    assert observed == [True, False]
+
+
+@pytest.mark.asyncio
+async def test_compaction_uses_shared_budget_without_inventing_capacity(manager, monkeypatch):
+    from opensquilla.session.compaction_budget import CompactionBudget
+
+    node = await manager.create("agent:test:shared-budget")
+    await manager.append_message(node.session_key, "user", "Current request")
+    def admission(summary, kept):
+        return False
+    config = CompactionConfig(budget=CompactionBudget(
+        physical_context_window_tokens=100_000, generation_reserve_tokens=8_000,
+        history_capacity_tokens=0, history_capacity_chars=0,
+        auto_trigger_tokens=0, auto_trigger_chars=0,
+        retained_tail_tokens=0, retained_tail_messages=2,
+        summary_output_tokens=4096, provider_request_max_chars=360_000,
+        consumer_admission_fingerprint="shared-proof", consumer_admission=admission,
+    ))
+    seen = []
+
+    async def capture(request):
+        seen.append(request)
+        return CompactionResult(
+            summary="", kept_entries=request.entries, removed_count=0, chunks_processed=0,
+        )
+
+    monkeypatch.setattr(session_manager_module, "compact_context", capture)
+    await manager.compact_with_result(node.session_key, 100_000, config, trigger_reason="manual")
+    assert len(seen) == 1
+    assert seen[0].context_window_tokens == 0
+    assert seen[0].context_window_chars == 0
+    assert seen[0].consumer_admission is admission
+    assert seen[0].config.budget is config.budget
+    assert seen[0].force is True
+
+
 def test_compaction_singleflight_target_fingerprint_is_credential_aware():
     first = CompactionConfig(provider="provider-a", model="model-a", api_key="secret-a")
     same_deployment_and_credentials = CompactionConfig(
@@ -5324,8 +5393,8 @@ async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summ
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("invalid", ["missing_fact", "oversized", "malformed", "empty", "header"])
-async def test_precomputed_compaction_revalidates_claimed_pass_without_removing_rows(
+@pytest.mark.parametrize("invalid", ["missing_fact", "long_valid", "malformed", "empty", "header"])
+async def test_precomputed_compaction_revalidates_artifact_before_removing_rows(
     manager, invalid,
 ):
     node = await manager.create("agent:main:untrusted-candidate")
@@ -5338,7 +5407,7 @@ async def test_precomputed_compaction_revalidates_claimed_pass_without_removing_
     before = await manager.get_transcript(node.session_key)
     source = await manager.capture_compaction_source(node.session_key)
     payload = StructuredCompactionSummary(
-        current_status="x" * 16_553 if invalid == "oversized" else "Earlier work complete.",
+        current_status="x" * 16_553 if invalid == "long_valid" else "Earlier work complete.",
         source_coverage={"status": "pass", "checked_obligations": 0},
     ).model_dump(mode="json")
     if invalid == "malformed":
@@ -5355,6 +5424,20 @@ async def test_precomputed_compaction_revalidates_claimed_pass_without_removing_
         source_context_fingerprint=source.context_fingerprint,
     )
 
+    if invalid == "long_valid":
+        assert installed is True
+        assert await manager.get_transcript(node.session_key) == before[-1:]
+        assert await manager.get_canonical_transcript(node.session_key) == before
+        records = build_compaction_context_records(
+            context_states=await manager.get_context_states(node.session_key),
+            summaries=await manager.get_summaries(node.session_key),
+        )
+        texts = [record.text for record in records]
+        replay = format_compaction_summary_context(texts)
+        assert payload["current_status"] in replay
+        assert compaction_replay_is_complete(texts, replay)
+        assert (await manager.get_session(node.session_key)).compaction_count == 1
+        return
     assert installed is False
     assert await manager.get_transcript(node.session_key) == before
     assert await manager.get_canonical_transcript(node.session_key) == before
@@ -5432,12 +5515,12 @@ async def test_precomputed_summary_replacement_checks_source_context_and_commit_
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("exceeds_total_replay_budget", [False, True])
+@pytest.mark.parametrize("exceeds_legacy_replay_limit", [False, True])
 async def test_precomputed_append_validates_all_final_checkpoints(
-    manager, exceeds_total_replay_budget,
+    manager, exceeds_legacy_replay_limit,
 ):
     node = await manager.create("agent:main:checkpoint-append-budget")
-    repeats = 650 if exceeds_total_replay_budget else 20
+    repeats = 650 if exceeds_legacy_replay_limit else 20
     old_summary = await manager._storage.save_summary(SessionSummary(
         session_id=node.session_id, session_key=node.session_key,
         summary_text="old checkpoint " * repeats,
@@ -5459,18 +5542,21 @@ async def test_precomputed_append_validates_all_final_checkpoints(
         source_preimage=source.preimage, source_context_fingerprint=source.context_fingerprint,
     )
 
-    assert installed is not exceeds_total_replay_budget
+    assert installed
     summaries = await manager.get_summaries(node.session_key)
     assert summaries[0] == old_summary
     records = build_compaction_context_records(
         context_states=await manager.get_context_states(node.session_key), summaries=summaries,
     )
     texts = [record.text for record in records]
-    assert compaction_replay_is_complete(texts, format_compaction_summary_context(texts))
-    assert len(summaries) == (1 if exceeds_total_replay_budget else 2)
-    assert await manager.get_transcript(node.session_key) == (
-        original if exceeds_total_replay_budget else original[2:]
-    )
+    replay = format_compaction_summary_context(texts)
+    assert compaction_replay_is_complete(texts, replay)
+    assert old_summary.summary_text.strip() in replay
+    assert candidate.current_status.strip() in replay
+    assert len(texts) == 2
+    assert (len(replay) > 16_000) is exceeds_legacy_replay_limit
+    assert len(summaries) == 2
+    assert await manager.get_transcript(node.session_key) == original[2:]
     assert await manager.get_canonical_transcript(node.session_key) == original
     assert (await manager.get_session(node.session_key)).compaction_count == int(installed)
 
@@ -5522,7 +5608,7 @@ async def test_precomputed_summary_only_replacement_preserves_coverage_boundary(
     [
         ("empty", "empty_summary"),
         ("missing_fact", "coverage_blocked"),
-        ("oversized", "summary_replay_incomplete"),
+        ("overcapacity", "consumer_admission_failed"),
         ("boundary", "invalid_source_boundary"),
         ("overrun", "invalid_source_boundary"),
         ("tail", "invalid_source_boundary"),
@@ -5546,7 +5632,7 @@ async def test_manager_final_candidate_gate_preserves_original_context(
         removed = 4 if invalid == "overrun" else 2
         summary = (
             "" if invalid == "empty"
-            else "x" * 16_553 if invalid == "oversized"
+            else "x" * 16_553 if invalid == "overcapacity"
             else "Earlier work complete."
         )
         return CompactionResult(
@@ -5556,15 +5642,19 @@ async def test_manager_final_candidate_gate_preserves_original_context(
             chunks_processed=1, summary_source="llm", coverage_status="pass",
         )
 
-    def admission(*_):
+    def admission(summary, kept):
         if invalid == "consumer_stale":
             raise ConsumerAdmissionStaleError("consumer changed")
+        if invalid == "overcapacity":
+            return len(summary) + sum(len(entry["content"]) for entry in kept) <= 16_000
         return False
 
     monkeypatch.setattr(session_manager_module, "compact_context", candidate)
     result = await manager.compact_with_result(
         node.session_key, context_window_tokens=100_000,
-        consumer_admission=admission if invalid.startswith("consumer_") else None,
+        consumer_admission=(
+            admission if invalid.startswith("consumer_") or invalid == "overcapacity" else None
+        ),
     )
 
     assert result.skip_reason == expected_reason

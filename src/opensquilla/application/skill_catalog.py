@@ -27,6 +27,12 @@ class SkillSearchProjection(TypedDict):
     identifier: str
     installReference: str
     installed: bool
+    license: NotRequired[str]
+    homepage: NotRequired[str]
+    upstream_url: NotRequired[str]
+    origin_source: NotRequired[str]
+    signature_status: NotRequired[str]
+    content_hash: NotRequired[str]
 
 
 class SkillSearchDiagnostic(TypedDict, total=False):

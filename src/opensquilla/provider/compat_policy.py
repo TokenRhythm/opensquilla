@@ -88,7 +88,9 @@ _TOKENRHYTHM_V4_LOW_EFFORT_MODEL_IDS = frozenset(
 )
 _OPENROUTER_DSML_MODEL_IDS = (
     "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-v4-flash-0731",
     "deepseek/deepseek-v4-pro",
+    "deepseek/deepseek-v4-pro-0813",
 )
 
 
@@ -519,10 +521,6 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "gemini": OpenAICompatPolicy(
         display_name="Gemini",
         official_host="generativelanguage.googleapis.com",
-        tool_schema_string_item_fallback_tools=frozenset({"create_csv"}),
-        tool_schema_string_item_fallback_api_root=(
-            "https://generativelanguage.googleapis.com/v1beta/openai"
-        ),
     ),
     "dashscope": OpenAICompatPolicy(
         display_name="DashScope",

@@ -648,6 +648,18 @@ def _error_failure_kind(error: BaseException | None) -> str:
     return ProviderFailureKind.UNKNOWN.value
 
 
+def _is_declared_access_rejection(error: BaseException | None) -> bool:
+    """A denied entitlement fetch cannot validate a previously cached grant.
+
+    A 403 does not prove invalid credentials, so keep its generic failure
+    classification separate from this authenticated catalog access policy.
+    """
+    return (
+        isinstance(error, httpx.HTTPStatusError)
+        and error.response.status_code in {401, 403}
+    )
+
+
 def _first_capability(
     declared: TokenRhythmDeclaredModel,
     published: TokenRhythmPublishedModel | None,
@@ -1765,10 +1777,9 @@ class TokenRhythmCatalogCoordinator:
                 elif outcome.declared_error is not None:
                     if (
                         persist_entitlement
-                        and _error_failure_kind(outcome.declared_error)
-                        == ProviderFailureKind.AUTH_INVALID.value
+                        and _is_declared_access_rejection(outcome.declared_error)
                     ):
-                        # A known rejected credential is not a transient outage.
+                        # A denied entitlement fetch is not a transient outage.
                         # Revoke only this saved authority; draft probes must not
                         # erase the active account's durable entitlement.
                         self._entitlements.pop(request.authority_identity, None)
@@ -2038,7 +2049,11 @@ class TokenRhythmCatalogCoordinator:
         force: bool,
         persist_entitlement: bool,
         activate: bool,
+        cache_only: bool = False,
     ) -> _CatalogView:
+        if cache_only:
+            async with self._lock:
+                return self._view_locked(request, now=float(self._clock()))
         return await self.refresh(
             request,
             force=force,
@@ -2199,6 +2214,7 @@ async def discover_tokenrhythm_models(
     force: bool = False,
     persist_entitlement: bool = False,
     config: object | None = None,
+    cache_only: bool = False,
 ) -> ProviderModelsDiscoverResult:
     """Admin discovery entry point returning the additive onboarding contract."""
 
@@ -2227,6 +2243,7 @@ async def discover_tokenrhythm_models(
             force=force,
             persist_entitlement=persist_entitlement,
             activate=activate,
+            cache_only=cache_only,
         )
     except Exception as error:  # noqa: BLE001 - discovery returns typed failure
         return ProviderModelsDiscoverResult(
@@ -2236,29 +2253,37 @@ async def discover_tokenrhythm_models(
             detail="TokenRhythm model catalog refresh failed.",
             catalog={"lastSyncedAt": None, "stale": True},
         )
+    catalog_status = {
+        **view.catalog,
+        "cacheHit": view.declared_available,
+        "accessRejected": bool(
+            view.declared_error is not None
+            and _is_declared_access_rejection(view.declared_error)
+        ),
+    }
     infos = _model_infos(
         view.published,
         view.declared,
         catalog=coordinator._catalog,
         request=request,
     )
-    if view.declared_error is not None and (
-        not view.declared_available
-        or _error_failure_kind(view.declared_error) == ProviderFailureKind.AUTH_INVALID.value
-    ):
+    if view.declared_error is not None:
+        retained = infos if not catalog_status["accessRejected"] else []
         return ProviderModelsDiscoverResult(
             ok=False,
             provider_id=provider_id,
             failure_kind=_error_failure_kind(view.declared_error),
             detail="TokenRhythm authenticated model catalog is unavailable.",
-            catalog=view.catalog,
+            source="live" if retained else "none",
+            models=_discovery_rows(retained),
+            catalog=catalog_status,
         )
     return ProviderModelsDiscoverResult(
         ok=True,
         provider_id=provider_id,
         source="live" if infos else "none",
         models=_discovery_rows(infos),
-        catalog=view.catalog,
+        catalog=catalog_status,
     )
 
 

@@ -9,6 +9,8 @@
       aria-haspopup="listbox"
       :aria-expanded="open"
       :aria-label="ariaLabel"
+      :aria-invalid="ariaInvalid"
+      :aria-describedby="ariaDescribedby"
       :disabled="disabled"
       @click="toggle"
       @keydown="onTriggerKeydown"
@@ -54,6 +56,8 @@ const props = withDefaults(defineProps<{
   modelValue: string
   options: CronSelectOption[]
   ariaLabel?: string
+  ariaInvalid?: boolean
+  ariaDescribedby?: string
   disabled?: boolean
   embedded?: boolean
 }>(), {

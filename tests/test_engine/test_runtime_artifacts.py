@@ -229,11 +229,11 @@ class _GoalPostPublishLoopProvider:
         if call_number == 2:
             yield ProviderToolUseStart(
                 tool_use_id="progress-2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
             )
             yield ProviderToolUseEnd(
                 tool_use_id="progress-2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
                 arguments={
                     "steps": [
                         {
@@ -512,19 +512,6 @@ class _RetryPublishProvider(_FailedPublishProvider):
         yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
 
 
-class _FailedCreatePptxProvider(_FailedPublishProvider):
-    async def _stream(self, call_number: int) -> AsyncIterator[Any]:
-        if call_number == 1:
-            yield ProviderToolUseStart(tool_use_id="create-1", tool_name="create_pptx")
-            yield ProviderToolUseEnd(
-                tool_use_id="create-1",
-                tool_name="create_pptx",
-                arguments={"name": "report.pptx", "slides": [{"title": "Report"}]},
-            )
-            yield ProviderDone(stop_reason="tool_use", input_tokens=1, output_tokens=1)
-            return
-        yield ProviderText(text="Report file is ready for download.")
-        yield ProviderDone(stop_reason="stop", input_tokens=1, output_tokens=1)
 
 
 class _OmittedPublishProvider:
@@ -1042,28 +1029,6 @@ def _retry_publish_registry() -> ToolRegistry:
     return registry
 
 
-def _failed_create_pptx_registry() -> ToolRegistry:
-    registry = ToolRegistry()
-
-    async def create_pptx(slides: list[dict[str, Any]], name: str | None = None) -> str:
-        raise RetryableToolInputError("The PPTX was not attached; regenerate it.")
-
-    registry.register(
-        ToolSpec(
-            name="create_pptx",
-            description="Create a presentation",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "name": {"type": "string"},
-                    "slides": {"type": "array", "items": {"type": "object"}},
-                },
-                "required": ["slides"],
-            },
-        ),
-        create_pptx,
-    )
-    return registry
 
 
 def _publish_then_forbidden_tool_registry() -> tuple[ToolRegistry, list[str]]:
@@ -1153,9 +1118,9 @@ def _goal_publish_loop_registry(
         )
         return json.dumps({"status": "published", "artifact": {"name": path}})
 
-    async def update_goal_progress(steps: list[dict[str, Any]]) -> str:
+    async def update_plan(steps: list[dict[str, Any]]) -> str:
         control_calls.append(f"progress:{steps[0]['status']}")
-        return json.dumps({"status": "accepted"})
+        return json.dumps({"status": "accepted", "progress": {"revision": 1, "steps": steps}})
 
     async def update_goal(status: str, reason: str | None = None) -> str:
         control_calls.append(f"goal:{status}")
@@ -1181,8 +1146,8 @@ def _goal_publish_loop_registry(
     )
     registry.register(
         ToolSpec(
-            name="update_goal_progress",
-            description="Update Goal progress",
+            name="update_plan",
+            description="Update task progress",
             parameters={
                 "type": "object",
                 "properties": {"steps": {"type": "array"}},
@@ -1190,7 +1155,7 @@ def _goal_publish_loop_registry(
             },
             default_access="deny",
         ),
-        update_goal_progress,
+        update_plan,
     )
     registry.register(
         ToolSpec(
@@ -1542,7 +1507,7 @@ async def test_goal_publish_continues_normal_loop_through_terminal_and_final_sum
         "publish_artifact",
         "qa_check",
         "update_goal",
-        "update_goal_progress",
+        "update_plan",
     }
     assert all(set(tool_names) == expected_tools for tool_names in provider.tool_names_seen)
     assert isinstance(provider.requests[3][-1].content, list)
@@ -1570,7 +1535,7 @@ async def test_goal_publish_continues_normal_loop_through_terminal_and_final_sum
         event.tool_name
         for event in events
         if isinstance(event, ToolUseStartEvent)
-    ] == ["publish_artifact", "update_goal_progress", "update_goal"]
+    ] == ["publish_artifact", "update_plan", "update_goal"]
     done = next(event for event in events if isinstance(event, DoneEvent))
     assert done.text == "The Goal is complete."
 
@@ -1590,7 +1555,7 @@ async def test_goal_terminal_keeps_tools_available_for_final_checks(
 
     assert provider.calls == 5
     assert all(
-        set(names) == {"publish_artifact", "qa_check", "update_goal", "update_goal_progress"}
+        set(names) == {"publish_artifact", "qa_check", "update_goal", "update_plan"}
         for names in provider.tool_names_seen
     )
     assert control_calls == ["progress:completed", f"goal:{terminal_status}"]
@@ -1745,7 +1710,7 @@ async def test_goal_publish_then_plain_final_succeeds_without_artificial_error(
         "publish_artifact",
         "qa_check",
         "update_goal",
-        "update_goal_progress",
+        "update_plan",
     }
     assert control_calls == []
     assert qa_calls == []
@@ -3289,45 +3254,6 @@ async def test_turn_runner_clears_delivery_failure_after_same_target_retry_succe
         await storage.close()
 
 
-@pytest.mark.asyncio
-async def test_turn_runner_marks_failed_create_pptx_delivery_in_final_text(tmp_path) -> None:
-    storage = SessionStorage(":memory:")
-    await storage.connect()
-    manager = SessionManager(storage)
-    session_key = "agent:main:webchat:create-pptx-failed"
-    await manager.create(session_key)
-    runner = TurnRunner(
-        provider_selector=_ProviderSelector(_FailedCreatePptxProvider()),
-        tool_registry=_failed_create_pptx_registry(),
-        session_manager=manager,
-        config=GatewayConfig(
-            attachments=AttachmentsConfig(media_root=str(tmp_path / "media")),
-            squilla_router=SquillaRouterConfig(enabled=False),
-        ),
-    )
-    tool_context = ToolContext(
-        is_owner=True,
-        caller_kind=CallerKind.WEB,
-        workspace_dir=str(tmp_path),
-    )
-
-    try:
-        events = [
-            event
-            async for event in runner.run(
-                "make report",
-                session_key,
-                tool_context=tool_context,
-                history_has_persisted_user=False,
-                no_memory_capture=True,
-            )
-        ]
-        done = next(event for event in events if isinstance(event, DoneEvent))
-        assert [event for event in events if isinstance(event, ArtifactEvent)] == []
-        assert "File delivery failed:" in done.text
-        assert "correct or regenerate it" in done.text
-    finally:
-        await storage.close()
 
 
 class _GoalArtifactTopologySelector:
@@ -3615,7 +3541,7 @@ async def test_goal_post_publish_selector_keeps_the_active_fallback_leg(
     _assert_goal_artifact_published_once(events)
     assert all(
         set(tool_names)
-        == {"publish_artifact", "qa_check", "update_goal", "update_goal_progress"}
+        == {"publish_artifact", "qa_check", "update_goal", "update_plan"}
         for tool_names in fallback.tool_names_seen
     )
 

@@ -254,6 +254,7 @@ function tileController(artifact: ArtifactPayload): ArtifactPreviewController {
 }
 
 function registerTileThumb(artifact: ArtifactPayload, el: unknown) {
+  if (!isVisual(artifact)) return
   const target = el && typeof el === 'object' && '$el' in el
     ? (el as { $el: unknown }).$el
     : el

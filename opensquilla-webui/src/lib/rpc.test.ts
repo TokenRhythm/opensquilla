@@ -1,5 +1,6 @@
 // @vitest-environment happy-dom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { markRaw, ref } from 'vue'
 import {
   isHelloOkFrame,
   RpcAbortError,
@@ -1386,6 +1387,53 @@ describe('RpcClient', () => {
     expect(MockWebSocket.instances).toHaveLength(1)
   })
 
+  it('does not treat initial browser lifecycle signals as a wake incident', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', (detail: unknown) => {
+      diagnostics.push(detail as Record<string, unknown>)
+    })
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+
+    window.dispatchEvent(new Event('online'))
+    window.dispatchEvent(new Event('pageshow'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    document.dispatchEvent(new Event('resume'))
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    expect(client.phase).toBe('healthy')
+    expect(socket.sent.filter(frame => frame.includes('"type":"ping"'))).toHaveLength(0)
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_start',
+    }))
+
+    establishConnection(socket)
+    expect(client.state).toBe('connected')
+    client.disconnect()
+  })
+
+  it('ignores a non-persisted pageshow after Hello', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    const pageshow = new Event('pageshow')
+    Object.defineProperty(pageshow, 'persisted', { value: false })
+
+    window.dispatchEvent(pageshow)
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    expect(client.phase).toBe('healthy')
+    expect(socket.sent.filter(frame => frame.includes('"type":"ping"'))).toHaveLength(0)
+    expect(diagnostics).not.toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_start',
+    }))
+    client.disconnect()
+  })
+
   it('only resets backoff after a stable Hello, not a flapping Hello', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
@@ -1562,7 +1610,7 @@ describe('RpcClient', () => {
     client.disconnect()
   })
 
-  it('tolerates a short wake pause, then recovers a persistent half-open socket', async () => {
+  it('retires a persistent half-open socket at the bounded wake incident deadline', async () => {
     const client = new RpcClient()
     client.connect('ws://rpc.test')
     const socket = MockWebSocket.instances[0]
@@ -1574,13 +1622,581 @@ describe('RpcClient', () => {
     await vi.advanceTimersByTimeAsync(10_000)
     expect(client.health).toBe('suspect')
     socket.receive({ type: 'event', event: 'tick' })
-    await vi.advanceTimersByTimeAsync(20_000)
+    expect(client.phase).toBe('healthy')
+    await vi.advanceTimersByTimeAsync(4_999)
     expect(socket.readyState).toBe(MockWebSocket.OPEN)
-    await vi.advanceTimersByTimeAsync(10_000)
-    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
-    await vi.advanceTimersByTimeAsync(500)
-    expect(MockWebSocket.instances).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(1)
     client.disconnect()
+  })
+
+  it('does not extend the wake incident deadline on repeated signals', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+
+    window.dispatchEvent(new Event('pageshow'))
+    await vi.advanceTimersByTimeAsync(5_000)
+    window.dispatchEvent(new Event('online'))
+    document.dispatchEvent(new Event('resume'))
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    client.disconnect()
+  })
+
+  it('keeps a healthy connection alive when repeated wake signals arrive before the first probe', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+
+    window.dispatchEvent(new Event('pageshow'))
+    await vi.advanceTimersByTimeAsync(3_000)
+    window.dispatchEvent(new Event('online'))
+    await vi.advanceTimersByTimeAsync(3_000)
+    document.dispatchEvent(new Event('resume'))
+    await vi.advanceTimersByTimeAsync(2_000)
+
+    const probe = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(probe).toMatchObject({ type: 'ping', nonce: expect.any(String) })
+    socket.receive({ type: 'pong', nonce: probe.nonce })
+    await vi.advanceTimersByTimeAsync(12_000)
+
+    expect(client.health).toBe('healthy')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('recovers a closing socket when the close event is missing', async () => {
+    const client = new RpcClient()
+    const transport: unknown[] = []
+    client.on('_transport', detail => transport.push(detail))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket)
+    socket.readyState = MockWebSocket.CLOSING
+    socket.onclose = null
+
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(transport).toContainEqual(expect.objectContaining({
+      phase: 'probe_socket_unavailable',
+      reason: 'socket_not_open',
+    }))
+    expect(client.state).toBe('disconnected')
+    client.disconnect()
+  })
+
+  it('does not treat a pre-wake RPC response as wake recovery evidence', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    const request = client.call('sessions.list')
+    const requestId = JSON.parse(socket.sent[socket.sent.length - 1]).id
+
+    window.dispatchEvent(new Event('pageshow'))
+    await vi.advanceTimersByTimeAsync(5_000)
+    socket.receive({ type: 'res', id: requestId, ok: true, payload: { sessions: [] } })
+    await expect(request).resolves.toEqual({ sessions: [] })
+    await vi.advanceTimersByTimeAsync(10_000)
+
+    expect(client.health).toBe('suspect')
+    client.disconnect()
+  })
+
+  it('does not write business requests while the current connection is suspect', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    window.dispatchEvent(new Event('pageshow'))
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(client.health).toBe('suspect')
+    const sentBefore = socket.sent.length
+    await expect(client.call('chat.send', { text: 'blocked' })).rejects.toMatchObject({
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: false,
+    })
+    expect(socket.sent).toHaveLength(sentBefore)
+    client.disconnect()
+  })
+
+  it('does not restore a periodic suspect connection merely because a wake signal arrives', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    await vi.advanceTimersByTimeAsync(40_000)
+    expect(client.health).toBe('suspect')
+    client.notifyResume()
+    expect(client.health).toBe('suspect')
+    const sentBefore = socket.sent.length
+    await expect(client.call('chat.send', { text: 'still blocked' })).rejects.toMatchObject({
+      code: 'RPC_TRANSPORT_ERROR', accepted: false,
+    })
+    expect(socket.sent).toHaveLength(sentBefore)
+    await vi.advanceTimersByTimeAsync(100)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(ping.type).toBe('ping')
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    expect(client.health).toBe('healthy')
+    const request = client.call('sessions.list')
+    const id = JSON.parse(socket.sent[socket.sent.length - 1]).id
+    socket.receive({ type: 'res', id, ok: true, payload: {} })
+    await expect(request).resolves.toEqual({})
+    client.disconnect()
+  })
+
+  it.each([false, true])('keeps a new wake incident started by a synchronous recovery observer (reactive=%s)', async reactive => {
+    const instance = new RpcClient()
+    const client = reactive ? ref(instance).value as RpcClient : instance
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => {
+      const entry = detail as Record<string, unknown>
+      diagnostics.push(entry)
+      if (entry.phase === 'wake_incident_recovered') client.notifyResume()
+    })
+    client.connect('ws://rpc.test')
+    const socket = markRaw(MockWebSocket.instances[0])
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    const incidents = diagnostics.filter(item => item.phase === 'wake_incident_start')
+    expect(incidents).toHaveLength(2)
+    expect(incidents[1].wakeIncidentId).not.toBe(incidents[0].wakeIncidentId)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_recovered',
+      wakeIncidentId: incidents[0].wakeIncidentId,
+      wakeIncidentStatus: 'recovered',
+    }))
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_timeout', wakeIncidentId: incidents[1].wakeIncidentId,
+    }))
+    client.disconnect()
+  })
+
+  it.each([false, true])('does not retire an incident recovered inside a synchronous timeout observer (reactive=%s)', async reactive => {
+    const instance = new RpcClient()
+    const client = reactive ? ref(instance).value as RpcClient : instance
+    client.connect('ws://rpc.test')
+    const socket = markRaw(MockWebSocket.instances[0])
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.on('_transport', detail => {
+      if ((detail as { phase: string }).phase !== 'wake_incident_timeout') return
+      const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+      expect(ping.type).toBe('ping')
+      socket.receive({ type: 'pong', nonce: ping.nonce })
+    })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(21_000)
+    expect(client.health).toBe('healthy')
+    expect(client.state).toBe('connected')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('retires a Vue ref-owned wake incident at its first deadline and makes the replacement usable', async () => {
+    const client = ref(new RpcClient()).value as RpcClient
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    // Native WebSocket objects are not Vue-reactive; preserve that property in
+    // the plain class mock while allowing the client's incident to be proxied.
+    const socket = markRaw(MockWebSocket.instances[0])
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    const started = diagnostics.find(item => item.phase === 'wake_incident_start')!
+    const duplicates = setInterval(() => client.notifyResume(), 3_000)
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(client.health).toBe('suspect')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(1)
+    clearInterval(duplicates)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_timeout',
+      wakeIncidentId: started.wakeIncidentId,
+      wakeIncidentDeadlineAt: started.wakeIncidentDeadlineAt,
+      wakeSignalCount: 7,
+    }))
+    await vi.advanceTimersByTimeAsync(500)
+    const replacement = markRaw(MockWebSocket.instances[1])
+    establishConnection(replacement, { transport_probe_nonce: true })
+    const request = client.call('sessions.list')
+    const id = JSON.parse(replacement.sent[replacement.sent.length - 1]).id
+    replacement.receive({ type: 'res', id, ok: true, payload: { sessions: [] } })
+    await expect(request).resolves.toEqual({ sessions: [] })
+    expect(client.health).toBe('healthy')
+    expect(diagnostics.filter(item => item.phase === 'first_successful_rpc')).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('preserves Vue ref-owned recovery during the deadline status callback after scheduler lag', async () => {
+    const client = ref(new RpcClient()).value as RpcClient
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = markRaw(MockWebSocket.instances[0])
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.on('_status', detail => {
+      if ((detail as { health: string }).health !== 'suspect') return
+      const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+      expect(ping.type).toBe('ping')
+      socket.receive({ type: 'pong', nonce: ping.nonce })
+    })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    vi.setSystemTime(Date.now() + 6_000)
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(client.health).toBe('healthy')
+    expect(diagnostics.some(item => item.phase === 'wake_incident_recovered')).toBe(true)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(diagnostics).toContainEqual(expect.objectContaining({ phase: 'wake_incident_recovered' }))
+    expect(diagnostics.some(item => item.phase === 'wake_incident_timeout')).toBe(false)
+    expect(client.health).toBe('healthy')
+    expect(client.state).toBe('connected')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    client.disconnect()
+  })
+
+  it('publishes healthy before a synchronous connected listener sends its first replacement RPC', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    establishConnection(MockWebSocket.instances[0], { transport_probe_nonce: true })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(20_500)
+    expect(client.health).toBe('suspect')
+    const replacement = MockWebSocket.instances[1]
+    let firstCall: Promise<unknown> | undefined
+    const observedHealth: string[] = []
+    client.on('_state', state => {
+      if (state !== 'connected') return
+      observedHealth.push(client.health)
+      firstCall = client.call('sessions.list').catch(error => error)
+    })
+    establishConnection(replacement, { transport_probe_nonce: true })
+    expect(observedHealth).toEqual(['healthy'])
+    const request = JSON.parse(replacement.sent[replacement.sent.length - 1])
+    expect(request.method).toBe('sessions.list')
+    replacement.receive({ type: 'res', id: request.id, ok: true, payload: { sessions: [] } })
+    await expect(firstCall).resolves.toEqual({ sessions: [] })
+    client.disconnect()
+  })
+
+  it('keeps a connection that returns the current wake pong after 13 seconds', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    await vi.advanceTimersByTimeAsync(8_000)
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_recovered', recoveryMs: 13_000,
+    }))
+    await vi.advanceTimersByTimeAsync(8_000)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(client.health).toBe('healthy')
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('uses the native resume source for an immediate two-second probe', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+
+    client.notifyResume('desktop-resume')
+    expect(client.phase).toBe('checking')
+    await vi.advanceTimersByTimeAsync(100)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(ping).toMatchObject({ type: 'ping', nonce: expect.any(String) })
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_start',
+      wakeIncidentSource: 'desktop-resume',
+      wakeIncidentProbeTimeoutMs: 2_000,
+    }))
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(client.phase).toBe('reconnecting')
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    client.disconnect()
+  })
+
+  it.each(['connecting', 'no-socket'] as const)(
+    'uses the native resume replacement path for %s sockets', async path => {
+      const client = new RpcClient()
+      const diagnostics: Array<Record<string, unknown>> = []
+      client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+      client.connect('ws://rpc.test')
+      const firstSocket = MockWebSocket.instances[0]
+      establishConnection(firstSocket, { transport_probe_nonce: true })
+      firstSocket.close()
+
+      if (path === 'connecting') {
+        MockWebSocket.initialReadyState = MockWebSocket.CONNECTING
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(MockWebSocket.instances[1].readyState).toBe(MockWebSocket.CONNECTING)
+      }
+
+      client.notifyResume('desktop-resume')
+      await vi.advanceTimersByTimeAsync(100)
+
+      if (path === 'connecting') {
+        expect(MockWebSocket.instances[1].readyState).toBe(MockWebSocket.CLOSED)
+      }
+      if (path === 'connecting') {
+        expect(diagnostics).toContainEqual(expect.objectContaining({
+          phase: 'retire',
+          reason: 'native_resume_socket_unavailable',
+        }))
+        await vi.advanceTimersByTimeAsync(1_000)
+        expect(MockWebSocket.instances).toHaveLength(3)
+      } else {
+        expect(MockWebSocket.instances).toHaveLength(2)
+        expect(diagnostics.filter(item => item.phase === 'connect_start')).toHaveLength(2)
+      }
+      client.disconnect()
+    },
+  )
+
+  it('publishes a soft suspect state after five seconds without closing the socket', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+
+    expect(client.phase).toBe('suspect')
+    expect(client.health).toBe('suspect')
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'soft_suspect',
+      transportPhase: 'suspect',
+    }))
+    client.disconnect()
+  })
+
+  it('bounds recovery reads to eight five-second requests and fails mutations closed', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+
+    const sentBefore = socket.sent.length
+    await expect(client.call('chat.send', { text: 'blocked' })).rejects.toMatchObject({
+      code: 'RPC_TRANSPORT_ERROR',
+      accepted: false,
+    })
+    expect(socket.sent).toHaveLength(sentBefore)
+
+    const reads = Array.from({ length: 8 }, (_, index) =>
+      client.call('sessions.list', { index }, { recoveryClass: 'read' }))
+    await expect(
+      client.call('sessions.list', { index: 8 }, { recoveryClass: 'read' }),
+    ).rejects.toMatchObject({ code: 'RPC_TRANSPORT_ERROR', accepted: false })
+
+    const requestFrames = socket.sent
+      .map(frame => JSON.parse(frame) as { type?: string; id?: string; method?: string })
+      .filter(frame => frame.type === 'req' && frame.id && frame.method === 'sessions.list')
+    expect(requestFrames).toHaveLength(0)
+    await vi.advanceTimersByTimeAsync(100)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(ping).toMatchObject({ type: 'ping', nonce: expect.any(String) })
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    await vi.advanceTimersByTimeAsync(0)
+    const recoveredRequestFrames = socket.sent
+      .map(frame => JSON.parse(frame) as { type?: string; id?: string; method?: string })
+      .filter(frame => frame.type === 'req' && frame.id && frame.method === 'sessions.list')
+    expect(recoveredRequestFrames).toHaveLength(8)
+    for (const frame of recoveredRequestFrames) {
+      socket.receive({ type: 'res', id: frame.id, ok: true, payload: { sessions: [] } })
+    }
+    await expect(Promise.all(reads)).resolves.toHaveLength(8)
+    client.disconnect()
+  })
+
+  it.each([3_000, 14_000, 40_000])('keeps the first incident deadline with wake signals every %i ms', async intervalMs => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    const started = diagnostics.find(item => item.phase === 'wake_incident_start')!
+    const interval = setInterval(() => client.notifyResume(), intervalMs)
+    await vi.advanceTimersByTimeAsync(19_999)
+    expect(socket.sent.some(frame => JSON.parse(frame).type === 'ping')).toBe(true)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(1)
+    clearInterval(interval)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics.filter(item => item.phase === 'wake_incident_start')).toHaveLength(1)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_timeout',
+      wakeIncidentId: started.wakeIncidentId,
+      wakeIncidentDeadlineAt: started.wakeIncidentDeadlineAt,
+    }))
+    client.disconnect()
+  })
+
+  it('does not let repeated pre-probe wake signals starve a healthy connection of its probe', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(3_000)
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(2_000)
+    const ping = JSON.parse(socket.sent[socket.sent.length - 1])
+    expect(ping.type).toBe('ping')
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    await vi.advanceTimersByTimeAsync(16_000)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    expect(client.health).toBe('healthy')
+    expect(MockWebSocket.instances).toHaveLength(1)
+    client.disconnect()
+  })
+
+  it('keeps the active incident deadline when the scheduler reports a late timer', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    const started = diagnostics.find(item => item.phase === 'wake_incident_start')!
+    await vi.advanceTimersByTimeAsync(5_000)
+    vi.setSystemTime(Date.now() + 6_000)
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(socket.readyState).toBe(MockWebSocket.OPEN)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    expect(diagnostics.some(item => item.phase === 'scheduler_lag')).toBe(true)
+    expect(diagnostics.filter(item => item.phase === 'wake_incident_start')).toHaveLength(1)
+    expect(diagnostics).toContainEqual(expect.objectContaining({
+      phase: 'wake_incident_timeout',
+      wakeIncidentDeadlineAt: started.wakeIncidentDeadlineAt,
+    }))
+    client.disconnect()
+  })
+
+  it.each(['abort', 'timeout'] as const)('does not recover a wake incident with a response after request %s', async termination => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    client.notifyResume()
+    const controller = new AbortController()
+    const request = client.call('sessions.list', {}, {
+      recoveryClass: 'read',
+      signal: controller.signal,
+      ...(termination === 'timeout' ? { timeoutMs: 1 } : {}),
+    }).catch(error => error)
+    const id = JSON.parse(socket.sent[socket.sent.length - 1]).id
+    if (termination === 'abort') controller.abort()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(await request).toBeInstanceOf(termination === 'abort' ? RpcAbortError : RpcTimeoutError)
+    expect(client.health).toBe('suspect')
+    socket.receive({ type: 'res', id, ok: true, payload: { sessions: [] } })
+    expect(client.health).toBe('suspect')
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    client.disconnect()
+  })
+
+  it('does not let an old generation pong or nonce recover the replacement wake incident', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    const first = MockWebSocket.instances[0]
+    establishConnection(first, { transport_probe_nonce: true })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    const oldPing = JSON.parse(first.sent[first.sent.length - 1])
+    first.close()
+    await vi.advanceTimersByTimeAsync(500)
+    const replacement = MockWebSocket.instances[1]
+    establishConnection(replacement, { transport_probe_nonce: true })
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    const currentPing = JSON.parse(replacement.sent[replacement.sent.length - 1])
+    expect(currentPing.nonce).not.toBe(oldPing.nonce)
+    first.receive({ type: 'pong', nonce: oldPing.nonce })
+    replacement.receive({ type: 'pong', nonce: oldPing.nonce })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(client.health).toBe('suspect')
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(replacement.readyState).toBe(MockWebSocket.CLOSED)
+    client.disconnect()
+  })
+
+  it('resolves a pre-wake request response without treating it as post-wake liveness', async () => {
+    const client = new RpcClient()
+    const diagnostics: Array<Record<string, unknown>> = []
+    client.on('_transport', detail => diagnostics.push(detail as Record<string, unknown>))
+    client.connect('ws://rpc.test')
+    const socket = MockWebSocket.instances[0]
+    establishConnection(socket, { transport_probe_nonce: true })
+    const request = client.call('sessions.list')
+    const id = JSON.parse(socket.sent[socket.sent.length - 1]).id
+    client.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    socket.receive({ type: 'res', id, ok: true, payload: { sessions: [] } })
+    await expect(request).resolves.toEqual({ sessions: [] })
+    expect(diagnostics.some(item => item.phase === 'wake_incident_recovered')).toBe(false)
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(client.health).toBe('suspect')
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
+    client.disconnect()
+  })
+
+  it('cleans incident timers when a synchronous incident diagnostic listener disconnects', async () => {
+    const client = new RpcClient()
+    client.connect('ws://rpc.test')
+    establishConnection(MockWebSocket.instances[0], { transport_probe_nonce: true })
+    const phases: string[] = []
+    client.on('_transport', detail => {
+      const phase = (detail as { phase: string }).phase
+      phases.push(phase)
+      if (phase === 'wake_incident_start') client.disconnect()
+    })
+    client.notifyResume()
+    expect(client.state).toBe('disconnected')
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(phases).not.toContain('wake_incident_timeout')
+    expect(MockWebSocket.instances).toHaveLength(1)
   })
 
   it('does not accept a wrong nonce or duplicate Hello as control recovery', async () => {
@@ -1917,5 +2533,24 @@ describe('RpcClient', () => {
     expect(completed).toBe(false)
     finish('applied')
     await expect(result).resolves.toBe('applied')
+  })
+
+  it('keeps the current generation across thirty native resume probe cycles', async () => {
+    for (let cycle = 0; cycle < 30; cycle += 1) {
+      const client = new RpcClient()
+      client.connect(`ws://rpc.test/${cycle}`)
+      const socket = MockWebSocket.instances[MockWebSocket.instances.length - 1]!
+      establishConnection(socket, { transport_probe_nonce: true })
+      const generation = client.connectionGeneration
+      client.notifyResume('desktop-resume')
+      await vi.advanceTimersByTimeAsync(100)
+      const ping = JSON.parse(socket.sent[socket.sent.length - 1]!) as { type: string; nonce?: string }
+      expect(ping).toMatchObject({ type: 'ping', nonce: expect.any(String) })
+      socket.receive({ type: 'pong', nonce: ping.nonce })
+      expect(client.phase).toBe('healthy')
+      expect(client.connectionGeneration).toBe(generation)
+      expect(socket.sent.filter((frame: string) => JSON.parse(frame).method === 'chat.send')).toHaveLength(0)
+      client.disconnect()
+    }
   })
 })

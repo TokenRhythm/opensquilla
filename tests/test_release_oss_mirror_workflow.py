@@ -111,11 +111,36 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
                 shutil.copyfile(native_path(source_url.removeprefix("file://")), destination)
                 raise SystemExit(0)
 
+            if args[:2] == ["api", "copy-object"]:
+                destination = remote_root / option("--bucket") / option("--key")
+                source = remote_root / option("--copy-source").lstrip("/")
+                assert option("--forbid-overwrite") == "true"
+                assert option("--metadata-directive") == "COPY"
+                assert "--cache-control" not in args
+                versioning = os.environ.get("FAKE_OSS_VERSIONING_STATUS", "")
+                if destination.exists() and versioning not in ("Enabled", "Suspended"):
+                    raise SystemExit(9)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(source, destination)
+                raise SystemExit(0)
+
             if args[0] == "cp":
                 source = mapped(args[-2])
                 destination = mapped(args[-1])
+                if ".upload-staging/" in args[-1]:
+                    assert option("--cache-control") == "public,max-age=31536000,immutable"
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, destination)
+                if ".upload-staging/" in args[-1] and os.environ.get("FAKE_OSS_CORRUPT_STAGE"):
+                    destination.write_bytes(b"corrupted-staging-object")
+                raise SystemExit(0)
+
+            if args[0] == "set-props":
+                assert mapped(args[-1]).is_file()
+                assert option("--metadata-directive") == "update"
+                assert option("--cache-control") == "no-cache,max-age=0,must-revalidate"
+                if os.environ.get("FAKE_OSS_FAIL_SET_PROPS"):
+                    raise SystemExit(17)
                 raise SystemExit(0)
 
             if args[0] == "ls":
@@ -144,8 +169,12 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
         newline="\n",
     )
     fake = fake_bin / "ossutil"
+    # The workflow runs on Linux. Preserve OSS /bucket/key arguments when
+    # Git Bash launches the native Python fake on Windows; local POSIX paths
+    # are handled explicitly by native_path() above.
     fake.write_text(
-        '#!/usr/bin/env bash\nexec "$FAKE_OSS_PYTHON" "$FAKE_OSS_SCRIPT" "$@"\n',
+        '#!/usr/bin/env bash\nexport MSYS2_ARG_CONV_EXCL="*"\n'
+        'exec "$FAKE_OSS_PYTHON" "$FAKE_OSS_SCRIPT" "$@"\n',
         encoding="utf-8",
         newline="\n",
     )
@@ -214,6 +243,10 @@ def test_aliyun_oss_release_mirror_workflow_contract() -> None:
     assert "MANUAL_RELEASE_TAG: ${{ inputs.tag }}" in workflow
     assert 'tag="${MANUAL_RELEASE_TAG}"' in workflow
     assert 'tag="${{ inputs.tag }}"' not in workflow
+    assert "CANONICAL_GITHUB_REPOSITORY: TokenRhythm/opensquilla" in workflow
+    assert "Verify canonical GitHub repository" in workflow
+    assert '"${GITHUB_REPOSITORY}" != "${CANONICAL_GITHUB_REPOSITORY}"' in workflow
+    assert '--repo "${CANONICAL_GITHUB_REPOSITORY}"' in workflow
     assert "gh release download" in workflow
     assert "gh release view" in workflow
     assert "gh release list" in workflow
@@ -428,3 +461,126 @@ def test_version_scoped_oss_objects_are_write_once_and_race_safe(tmp_path: Path)
     assert tampered.returncode != 0
     assert "Refusing to replace immutable OSS release object" in tampered.stderr
     assert (remote_release / "racy.bin").read_bytes() == b"concurrent-writer"
+
+
+def test_large_assets_are_verified_before_server_side_commit(tmp_path: Path, monkeypatch) -> None:
+    fake_bin, remote_root, call_log = _install_fake_ossutil(tmp_path)
+    release_assets = tmp_path / "release-assets"
+    channel_assets = tmp_path / "channel-assets"
+    release_assets.mkdir()
+    channel_assets.mkdir()
+    payload = release_assets / "large.bin"
+    payload.write_bytes(b"synthetic-release-data" * 400_000)
+    (release_assets / "SHA256SUMS").write_text(
+        "synthetic checksums\n", encoding="utf-8", newline="\n"
+    )
+    (release_assets / "CHECKSUMMED_ASSETS").write_text(
+        "large.bin\n", encoding="utf-8", newline="\n"
+    )
+    (channel_assets / "TARGETS").write_text("", encoding="utf-8", newline="\n")
+
+    monkeypatch.setenv("FAKE_OSS_CORRUPT_STAGE", "1")
+    corrupt = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=1)
+    assert corrupt.returncode != 0
+    final = remote_root / "release-bucket/releases/v0.5.0rc4/large.bin"
+    assert not final.exists()
+    assert not any(
+        json.loads(line)[:2] == ["api", "copy-object"] for line in call_log.read_text().splitlines()
+    )
+
+    monkeypatch.delenv("FAKE_OSS_CORRUPT_STAGE")
+    call_log.write_text("", encoding="utf-8", newline="\n")
+    passed = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=2)
+    assert passed.returncode == 0, passed.stderr
+    assert final.read_bytes() == payload.read_bytes()
+    calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+    copy_index = next(i for i, call in enumerate(calls) if call[:2] == ["api", "copy-object"])
+    assert any(call[0] == "cp" and ".upload-staging/" in call[-2] for call in calls[:copy_index])
+    assert not any(call[:2] == ["api", "put-object"] and "large.bin" in call for call in calls)
+
+    call_log.write_text("", encoding="utf-8", newline="\n")
+    repeated = _run_upload_step(tmp_path, fake_bin, remote_root, call_log, attempt=4)
+    assert repeated.returncode == 0, repeated.stderr
+    repeat_calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+    assert not any(call[:2] == ["api", "copy-object"] for call in repeat_calls)
+    assert not any(call[0] == "cp" and ".upload-staging/" in call[-1] for call in repeat_calls)
+
+    # A different writer appearing during the transfer must survive untouched.
+    final.unlink()
+    raced = _run_upload_step(
+        tmp_path,
+        fake_bin,
+        remote_root,
+        call_log,
+        attempt=3,
+        race_object="oss://release-bucket/releases/v0.5.0rc4/large.bin",
+        versioning_status="Enabled",
+    )
+    assert raced.returncode != 0
+    assert final.read_bytes() == b"concurrent-writer"
+
+
+def test_installer_alias_uses_verified_oss_object_without_local_reupload(tmp_path: Path) -> None:
+    fake_bin, remote_root, call_log = _install_fake_ossutil(tmp_path)
+    channel_assets = tmp_path / "channel-assets"
+    channel_assets.mkdir()
+    alias = "OpenSquilla-mac-arm64.dmg"
+    original = "OpenSquilla-0.5.0-rc4-mac-arm64.dmg"
+    (channel_assets / f"{alias}.source").write_text(original + "\n", encoding="utf-8", newline="\n")
+    source = remote_root / "release-bucket/releases/v0.5.0rc4" / original
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b"verified-installer-bytes")
+    # There is intentionally no local installer: promotion must use an OSS copy.
+    env = os.environ.copy()
+    env.update(
+        {
+            "ALIYUN_OSS_BUCKET": "release-bucket",
+            "ALIYUN_OSS_PREFIX_NORMALIZED": "releases",
+            "FAKE_OSS_LOG": str(call_log),
+            "FAKE_OSS_PYTHON": Path(sys.executable).as_posix(),
+            "FAKE_OSS_ROOT": str(remote_root),
+            "FAKE_OSS_SCRIPT": (fake_bin / "ossutil.py").as_posix(),
+            "OSS_ADDRESSING_STYLE_NORMALIZED": "virtual",
+            "TAG": "v0.5.0rc4",
+            "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+        }
+    )
+    script = _upload_step_script().split("          download_object()".strip(), 1)[0]
+    script += (
+        '\nlatest_prefix="oss://release-bucket/releases/latest"\n'
+        'moving_cache_control="no-cache,max-age=0,must-revalidate"\n'
+        f'upload_installer_alias "{alias}"\n'
+    )
+    script_path = tmp_path / "promote-alias.sh"
+    script_path.write_text(script, encoding="utf-8", newline="\n")
+    result = subprocess.run(
+        [_bash_executable(), script_path.as_posix()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (
+        remote_root / "release-bucket/releases/latest" / alias
+    ).read_bytes() == source.read_bytes()
+    calls = [json.loads(line) for line in call_log.read_text().splitlines()]
+    assert len(calls) == 2
+    assert calls[0][-2] == f"oss://release-bucket/releases/v0.5.0rc4/{original}"
+    assert calls[0][calls[0].index("--cache-control") + 1] == "no-cache,max-age=0,must-revalidate"
+
+    assert calls[1][0] == "set-props"
+    assert calls[1][calls[1].index("--metadata-directive") + 1] == "update"
+    assert calls[1][calls[1].index("--cache-control") + 1] == "no-cache,max-age=0,must-revalidate"
+
+    env["FAKE_OSS_FAIL_SET_PROPS"] = "1"
+    failed = subprocess.run(
+        [_bash_executable(), script_path.as_posix()],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert failed.returncode != 0

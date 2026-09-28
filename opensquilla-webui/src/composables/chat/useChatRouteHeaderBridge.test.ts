@@ -39,6 +39,7 @@ function owner(title: string): {
 } {
   return {
     model: {
+      sessionKey: ref('agent:main:webchat:test'),
       visible: ref(true),
       title: ref(title),
       copyState: ref(null),

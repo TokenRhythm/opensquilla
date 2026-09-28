@@ -28,8 +28,6 @@ describe('ChatComposer project draft', () => {
       sessionRoutingMode: 'off',
       sessionRoutingBusy: false,
       routerVisualEffectsEnabled: true,
-      codingModeEnabled: false,
-      codingModeSettingsBusy: false,
       voiceBusy: false,
       voiceRecording: false,
       voiceReady: true,

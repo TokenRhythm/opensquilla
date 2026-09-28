@@ -16,6 +16,9 @@ function memoryStorage(): Storage {
 function source() {
   return {
     state: 'disconnected' as 'disconnected' | 'connecting' | 'connected',
+    health: 'healthy' as 'healthy' | 'suspect',
+    isResuming: false,
+    resumeSource: null as 'desktop-resume' | null,
     error: null as string | null,
     isLocalOwner: false,
     canManageProjectWorkspaces: false,
@@ -61,6 +64,7 @@ describe('createV4GatewayAccess', () => {
     const access = createV4GatewayAccess(raw)
 
     expect(access.availability).toBe('available')
+    expect(access.connectionHealth).toBe('healthy')
     expect(access.isAuthenticated).toBe(true)
     expect(access.canChooseProject).toBe(true)
     expect(access.runModePolicy).toEqual({
@@ -86,6 +90,29 @@ describe('createV4GatewayAccess', () => {
 
     expect(raw.connect).toHaveBeenCalledWith('ws://next.example/ws', 'secret')
     expect(raw.disconnect).toHaveBeenCalledOnce()
+  })
+
+  it('projects suspect transport health separately from authenticated availability', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.health = 'suspect'
+    const access = createV4GatewayAccess(raw)
+
+    expect(access.availability).toBe('available')
+    expect(access.isAvailable).toBe(true)
+    expect(access.connectionHealth).toBe('suspect')
+  })
+
+  it('projects a native resume as suspect until the transport confirms liveness', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.isResuming = true
+    raw.resumeSource = 'desktop-resume'
+    const access = createV4GatewayAccess(raw)
+
+    expect(access.isResuming).toBe(true)
+    expect(access.resumeSource).toBe('desktop-resume')
+    expect(access.connectionHealth).toBe('suspect')
   })
 
   it('fails closed for malformed auth and stream policy projections', () => {

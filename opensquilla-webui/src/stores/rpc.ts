@@ -7,10 +7,12 @@ import {
   type RpcEventHandler,
   type RpcLifecycle,
   type RpcConsumptionHandler,
+  type RpcResumeSource,
+  type RpcTransportPhase,
 } from '@/lib/rpc'
-import type { DesktopGatewayConnection } from '@/platform/types'
+import type { DesktopGatewayConnection, DesktopResumeEvent, DesktopResumeSource } from '@/platform/types'
 import { getPlatform } from '@/platform'
-import { recordRpcTransportDiag } from '@/utils/chat/sessionNavigationDiag'
+import { recordRpcResumeDiag, recordRpcTransportDiag } from '@/utils/chat/sessionNavigationDiag'
 
 const WS_URL_KEY = 'opensquilla.wsUrl'
 const WS_TOKEN_KEY = 'opensquilla.wsToken'
@@ -100,6 +102,7 @@ async function deliverySalt(): Promise<string | null> {
 export const useRpcStore = defineStore('rpc', () => {
   const client = ref<RpcClient | null>(null)
   const state = ref<'disconnected' | 'connecting' | 'connected'>('disconnected')
+  const runtimeStarting = ref(false)
   const policy = ref<Record<string, unknown> | null>(null)
   const auth = ref<Record<string, unknown> | null>(null)
   const methods = ref<string[]>([])
@@ -108,6 +111,9 @@ export const useRpcStore = defineStore('rpc', () => {
   const error = ref<string | null>(null)
   const lifecycle = ref<RpcLifecycle>('stopped')
   const health = ref<'healthy' | 'suspect'>('healthy')
+  const phase = ref<RpcTransportPhase>('healthy')
+  const isResuming = ref(false)
+  const resumeSource = ref<DesktopResumeSource | null>(null)
   // RpcClient is stored as a class instance and several callbacks retain the
   // raw object, so its private generation mutations are not Vue-reactive.
   // Mirror the value explicitly at every transport/state boundary.
@@ -175,6 +181,7 @@ export const useRpcStore = defineStore('rpc', () => {
     }).catch(() => {
       if (revision !== descriptorRequestRevision || !connectionDesired) return
       error.value = 'Gateway connection information is temporarily unavailable'
+      runtimeStarting.value = false
       if (request.retry && descriptorTimer === null) {
         const cap = Math.min(15_000, 500 * 2 ** Math.min(descriptorAttempt++, 10))
         descriptorTimer = setTimeout(() => {
@@ -272,6 +279,7 @@ export const useRpcStore = defineStore('rpc', () => {
     }
 
     desktopConnectionRevision = payload.revision
+    runtimeStarting.value = payload.status === 'starting' && (!manual || state.value !== 'connected')
     const nextUrl = typeof payload.wsUrl === 'string' ? payload.wsUrl.trim() : ''
     const nextInstance = typeof payload.instanceId === 'string' ? payload.instanceId : ''
     if (payload.status !== 'ready' || !nextUrl || !nextInstance) {
@@ -338,9 +346,19 @@ export const useRpcStore = defineStore('rpc', () => {
     const rpc = new RpcClient()
     client.value = rpc
 
-    rpc.on('_status', (status: { lifecycle: RpcLifecycle; health: 'healthy' | 'suspect'; reason: string | null }) => {
+    rpc.on('_status', (status: {
+      lifecycle: RpcLifecycle
+      health: 'healthy' | 'suspect'
+      phase?: RpcTransportPhase
+      reason: string | null
+    }) => {
       lifecycle.value = status.lifecycle
       health.value = status.health
+      phase.value = status.phase || (status.health === 'suspect' ? 'suspect' : 'healthy')
+      if (status.health === 'healthy' && phase.value === 'healthy') {
+        isResuming.value = false
+        resumeSource.value = null
+      }
       if (status.lifecycle === 'blocked') error.value = status.reason
       if (status.lifecycle === 'blocked' || status.lifecycle === 'stopped') {
         deliveryProof = null
@@ -396,6 +414,7 @@ export const useRpcStore = defineStore('rpc', () => {
       typeof gatewayPlatform.getConnection === 'function'
       && typeof gatewayPlatform.onConnection === 'function'
     ) {
+      runtimeStarting.value = true
       connectionSubscriptions.push(gatewayPlatform.onConnection(payload => applyDesktopConnection(payload)))
       refreshDesktopConnection()
       return
@@ -461,17 +480,30 @@ export const useRpcStore = defineStore('rpc', () => {
 
   function disconnect() {
     connectionDesired = false
+    runtimeStarting.value = false
     beginDeliveryIntent(null)
     cancelDescriptorRecovery()
     client.value?.disconnect()
+    isResuming.value = false
+    resumeSource.value = null
     desktopConnectionKey = ''
     state.value = 'disconnected'
     clearConnectionIdentity()
   }
 
-  function notifyResume(): void {
+  function notifyResume(event: DesktopResumeEvent = { source: 'desktop-resume' }): void {
     if (!connectionDesired) return
-    client.value?.notifyResume()
+    const canonicalSource: DesktopResumeSource = event.source === 'power-monitor'
+      ? 'desktop-resume'
+      : event.source
+    isResuming.value = true
+    resumeSource.value = canonicalSource
+    recordRpcResumeDiag({
+      generation: client.value?.connectionGeneration ?? connectionGeneration.value,
+      resumeSource: 'desktop-resume',
+    })
+    const source: RpcResumeSource = canonicalSource
+    client.value?.notifyResume(source)
     refreshDesktopConnection()
   }
 
@@ -550,6 +582,7 @@ export const useRpcStore = defineStore('rpc', () => {
   return {
     client,
     state,
+    runtimeStarting,
     policy,
     auth,
     methods,
@@ -557,6 +590,9 @@ export const useRpcStore = defineStore('rpc', () => {
     error,
     lifecycle,
     health,
+    phase,
+    isResuming,
+    resumeSource,
     connectionGeneration,
     deliveryContext,
     isConnected,

@@ -1,0 +1,91 @@
+name: Windows Candidate Probes
+
+on:
+  workflow_call:
+    inputs:
+      artifact_name:
+        required: true
+        type: string
+      source_sha:
+        required: true
+        type: string
+      source_run_id:
+        default: ''
+        type: string
+      installer_sha256:
+        default: ''
+        type: string
+      require_signature:
+        default: false
+        type: boolean
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  candidate-probe:
+    name: Candidate ${{ matrix.probe }}
+    runs-on: windows-2022
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        probe: [startup-compat, ownership, migration, session]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22.12.0'
+          cache: npm
+          cache-dependency-path: desktop/electron/package-lock.json
+      - name: Prepare verification harness
+        working-directory: desktop/electron
+        run: |
+          npm ci
+          if ($LASTEXITCODE -ne 0) { throw 'Verification dependencies failed.' }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw 'Verification harness build failed.' }
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: candidate
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.source_run_id || github.run_id }}
+      - name: Verify independent installed candidate probe
+        env:
+          EXPECTED_SOURCE: ${{ inputs.source_sha }}
+          PRODUCER_RUN: ${{ inputs.source_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_INSTALLER_HASH: ${{ inputs.installer_sha256 }}
+          SIGNED_CANDIDATE: ${{ inputs.require_signature }}
+          CANDIDATE_PROBE: ${{ matrix.probe }}
+        run: |
+          $installers = @(Get-ChildItem candidate -Filter 'OpenSquilla-*-win-x64.exe' -File)
+          if ($installers.Count -ne 1) { throw 'Expected one candidate installer.' }
+          .github/scripts/verify-windows-candidate-probe.ps1 `
+            -CandidateInstaller $installers[0].FullName `
+            -CandidateManifest candidate/audit-candidate.json `
+            -SourceSha $env:EXPECTED_SOURCE -Probe $env:CANDIDATE_PROBE `
+            -SourceRunId $env:PRODUCER_RUN `
+            -InstallerSha256 $env:EXPECTED_INSTALLER_HASH `
+            -RequireSignature:($env:SIGNED_CANDIDATE -eq 'true')
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: candidate-${{ matrix.probe }}-${{ inputs.require_signature && 'signed' || 'unsigned' }}
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/candidate-${{ matrix.probe }}/evidence/
+            candidate/audit-candidate.json
+          if-no-files-found: error
+          retention-days: 14

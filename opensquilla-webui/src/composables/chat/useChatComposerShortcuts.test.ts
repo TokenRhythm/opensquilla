@@ -47,6 +47,7 @@ function harness(over: {
   slashOpen?: boolean
   filteredSlashCmds?: ChatSlashCommand[]
   cancelMessageEdit?: () => boolean
+  handleLongPaste?: (text: string) => boolean
 } = {}) {
   const inputText = ref(over.inputText ?? '')
   const spies = {
@@ -71,6 +72,7 @@ function harness(over: {
     filteredSlashCmds: ref(over.filteredSlashCmds ?? []),
     isStreaming: ref(false),
     isSafariWebKit: () => over.safari ?? false,
+    handleLongPaste: over.handleLongPaste,
     ...spies,
   })
   return { api, inputText, spies }
@@ -105,27 +107,38 @@ function inputEvent(inputType: string, target: unknown): InputEvent {
 const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
 
 describe('useChatComposerShortcuts', () => {
+  it('lets the post-insertion paste fallback consume a large paste', () => {
+    const handleLongPaste = vi.fn(() => true)
+    const { api, spies } = harness({ handleLongPaste })
+    const pasted = field('x'.repeat(20_000), 'end')
+
+    api.onTextareaInput(inputEvent('insertFromPaste', pasted))
+
+    expect(handleLongPaste).toHaveBeenCalledWith(pasted.value, expect.anything())
+    expect(spies.handleSlashInput).not.toHaveBeenCalled()
+  })
+
   describe('Slash completion safety', () => {
-    const coding = {
-      name: '/coding',
-      cmd: '/coding',
-      label: '/coding',
-      desc: 'Toggle Coding mode',
+    const compact = {
+      name: '/compact',
+      cmd: '/compact',
+      label: '/compact',
+      desc: 'Toggle context compaction',
       aliases: [],
-      execution: { action: 'coding.mode' },
+      execution: { action: 'compact_context' },
     }
 
     it('uses Tab only to complete the active candidate', () => {
       const { api, spies } = harness({
         inputText: '/co',
         slashOpen: true,
-        filteredSlashCmds: [coding],
+        filteredSlashCmds: [compact],
       })
       const e = keydown({ key: 'Tab', target: field('/co', 'end') })
 
       api.onTextareaKeydown(e)
 
-      expect(spies.completeSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.completeSlashCmd).toHaveBeenCalledWith(compact)
       expect(spies.activateSlashCmd).not.toHaveBeenCalled()
       expect(e.preventDefault).toHaveBeenCalled()
     })
@@ -134,13 +147,13 @@ describe('useChatComposerShortcuts', () => {
       const { api, spies } = harness({
         inputText: '/co',
         slashOpen: true,
-        filteredSlashCmds: [coding],
+        filteredSlashCmds: [compact],
       })
       const e = keydown({ key: 'Enter', target: field('/co', 'end') })
 
       api.onTextareaKeydown(e)
 
-      expect(spies.activateSlashCmd).toHaveBeenCalledWith(coding)
+      expect(spies.activateSlashCmd).toHaveBeenCalledWith(compact)
       expect(spies.completeSlashCmd).not.toHaveBeenCalled()
       expect(spies.sendCurrentInput).not.toHaveBeenCalled()
       expect(e.preventDefault).toHaveBeenCalled()
@@ -390,7 +403,7 @@ describe('Escape and message edits', () => {
       inputText: '/co',
       slashOpen: true,
       filteredSlashCmds: [
-        { name: '/coding', cmd: '/coding', label: '/coding', desc: '' },
+        { name: '/compact', cmd: '/compact', label: '/compact', desc: '' },
       ] as unknown as ChatSlashCommand[],
       cancelMessageEdit: () => true,
     })

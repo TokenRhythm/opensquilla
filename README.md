@@ -45,7 +45,7 @@ TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, DeepSeek, Gemini,
 Qwen/DashScope, and 20+ other LLM providers with no change to your code or config
 schema.
 
-OpenSquilla 0.5.4 is the current stable release.
+OpenSquilla 0.5.5 is the current stable release.
 
 For task-oriented product documentation, start with the
 [OpenSquilla Product Guide](README.product.md) or the
@@ -67,9 +67,9 @@ contain that console, so their users do **not** need Node.js or npm.
 Release install commands use published GitHub release assets. Python wheel installs use versioned wheel filenames because installers validate the version
 embedded in the wheel filename.
 
-For 0.5.4 desktop use, prefer the packaged desktop installers from
-the GitHub Release: `OpenSquilla-0.5.4-mac-arm64.dmg` on macOS and
-`OpenSquilla-0.5.4-win-x64.exe` on Windows.
+For 0.5.5 desktop use, prefer the packaged desktop installers from
+the GitHub Release: `OpenSquilla-0.5.5-mac-arm64.dmg` on macOS and
+`OpenSquilla-0.5.5-win-x64.exe` on Windows.
 
 | Path | Audience | When to use |
 | --- | --- | --- |
@@ -115,11 +115,11 @@ Install links: [Git](https://git-scm.com/downloads) ·
 
 ### Desktop installers
 
-The 0.5.4 desktop installers package the Vue control console and
+The 0.5.5 desktop installers package the Vue control console and
 gateway runtime in an Electron shell.
 
-- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/OpenSquilla-0.5.5-mac-arm64.dmg>
+- Windows x64: <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/OpenSquilla-0.5.5-win-x64.exe>
 
 For faster Mainland China downloads, use the OSS direct-download aliases:
 - macOS Apple Silicon: <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -145,9 +145,9 @@ profile data during a normal uninstall.
 Code signing policy: [`docs/code-signing-policy.md`](docs/code-signing-policy.md).
 
 > [!NOTE]
-> The published v0.5.4 Windows installer remains unsigned. The current Release
-> Assets workflow Authenticode signs new Windows installers as Beijing
-> TokenRhythm Technologies Co., Ltd. SmartScreen reputation can still take time
+> The 0.5.5 Windows installer is Authenticode signed as Beijing TokenRhythm
+> Technologies Co., Ltd. The published v0.5.4 Windows installer remains unsigned.
+> SmartScreen reputation can still take time
 > to build for a new publisher or application. If enterprise policy blocks the
 > Desktop app, use [Quick terminal install](#quick-terminal-install) instead.
 
@@ -178,7 +178,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Install OpenSquilla** — the same command on every platform.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl"
 ```
 
 This installs the OpenSquilla wheel from the release URL, then lets
@@ -202,7 +202,7 @@ opensquilla gateway run
 > a new terminal, or re-run the PATH line from step 1.
 
 For a fully pinned install, use the versioned wheel URL:
-`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl`.
 
 ### Install from source
 
@@ -397,8 +397,8 @@ in Privacy settings, without separate onboarding choices or consent popups:
 - **Reliability diagnostics** records bounded operation results for app and
   Gateway startup, crashes, turns, tools, file parsing, updates, and session
   performance.
-- **Product and growth analytics** records client launches, actual MetaSkill
-  and Coding Mode executions, and one-time acquisition, onboarding,
+- **Product and growth analytics** records client launches, product activity,
+  and one-time acquisition, onboarding,
   app-readiness, registration, and first-successful-turn milestones. Existing
   installations do not become new-user cohorts just by enabling reporting.
 
@@ -653,8 +653,8 @@ to allow inbound TCP on that port. Do not expose the gateway with
 **Docker**
 
 Prebuilt multi-arch images (`amd64`/`arm64`) are published to
-`ghcr.io/tokenrhythm/opensquilla` on release tags. 0.5.4 is published as
-both `v0.5.4` and the moving `latest` tag —
+`ghcr.io/tokenrhythm/opensquilla` on release tags. 0.5.5 is published as
+both `v0.5.5` and the moving `latest` tag —
 [`docs/docker.md`](docs/docker.md) is the full container guide
 (home servers and NAS, LAN exposure with token auth, upgrades):
 
@@ -705,9 +705,6 @@ Per-version highlights live in [`CHANGELOG.md`](CHANGELOG.md) and
 | **Durable sessions, subagents, and scheduling** | SQLite-backed session, transcript, and replay storage with per-agent workspaces. Agents spawn depth-bounded subagents, and a `SchedulerEngine` with an in-tree cron parser runs recurring jobs via `opensquilla cron`. |
 | **Operator controls** | Human-in-the-loop approvals can pause sensitive tool calls for a decision; per-turn and per-session token and cost rollups (`opensquilla cost`) and diagnostics are available from the CLI and Web UI. |
 
-MetaSkill docs: [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md),
-and [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md).
 
 ---
 

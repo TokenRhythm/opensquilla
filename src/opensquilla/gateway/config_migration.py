@@ -18,13 +18,12 @@ from typing import Any
 import tomli_w
 from pydantic import TypeAdapter
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION as LATEST_CONFIG_VERSION
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
-# Schema version stamped into every migrated payload. Bump this together with
-# a new ``_MIGRATIONS`` entry whenever a one-time value migration is added.
-# ``GatewayConfig.config_version`` (gateway/config.py) defaults to this value.
-LATEST_CONFIG_VERSION = 1
+# The shared version also gates lightweight profile recovery. Bump it together
+# with a new ``_MIGRATIONS`` entry whenever a one-time value migration is added.
 
 
 class ConfigParseError(ValueError):
@@ -408,6 +407,7 @@ def migrate_config_payload(
     """
     builder = _MigrationBuilder(payload=copy.deepcopy(data))
 
+    _strip_retired_product_features(builder)
     _strip_removed_sandbox_fields(builder)
     _normalize_memory_fields(builder, emit_diagnostics=emit_diagnostics)
     _normalize_agent_token_saving_fields(
@@ -416,6 +416,7 @@ def migrate_config_payload(
     )
     _normalize_skill_filter_fields(builder, emit_diagnostics=emit_diagnostics)
     _strip_removed_router_compaction_fields(builder)
+    _strip_router_self_learning(builder)
     _normalize_telemetry_upload_preference(builder)
     _clamp_search_max_results(builder)
     _park_unknown_channel_entries(builder, emit_diagnostics=emit_diagnostics)
@@ -435,6 +436,22 @@ def migrate_config_payload(
     builder.payload["config_version"] = LATEST_CONFIG_VERSION
 
     return builder.result()
+
+
+def _strip_retired_product_features(builder: _MigrationBuilder) -> None:
+    """Discard obsolete mode settings without inspecting or logging their values."""
+    if "meta_skill" in builder.payload:
+        builder.payload.pop("meta_skill")
+        builder.removed_fields.append("meta_skill")
+    skills = builder.payload.get("skills")
+    if isinstance(skills, dict) and "coding_mode" in skills:
+        skills.pop("coding_mode")
+        builder.removed_fields.append("skills.coding_mode")
+    if {"meta_skill", "skills.coding_mode"}.intersection(builder.removed_fields):
+        builder.warnings.append(
+            "MetaSkill and Coding Mode were removed; ordinary agents, coding tools "
+            "and skills use the normal tool and skill permissions."
+        )
 
 
 def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
@@ -462,6 +479,18 @@ def _normalize_telemetry_upload_preference(builder: _MigrationBuilder) -> None:
         if name in privacy:
             privacy.pop(name)
             builder.removed_fields.append(f"privacy.{name}")
+
+
+def _strip_router_self_learning(builder: _MigrationBuilder) -> None:
+    """Discard retired training settings without reading any learning artifacts."""
+    router = builder.payload.get("squilla_router")
+    if isinstance(router, dict) and "self_learning" in router:
+        router.pop("self_learning")
+        builder.removed_fields.append("squilla_router.self_learning")
+        builder.warnings.append(
+            "Router self-learning was removed; routing uses the configured base model. "
+            "Existing memory settings and training files are unchanged."
+        )
 
 
 def _strip_removed_router_compaction_fields(builder: _MigrationBuilder) -> None:
@@ -828,11 +857,85 @@ def _migrate_v1_llm_ensemble_legacy_timeouts(builder: _MigrationBuilder) -> None
             )
 
 
+def _migrate_v2_primary_router_recommendations(builder: _MigrationBuilder) -> None:
+    """Replace pre-refresh text routing once with the primary's recommendations.
+
+    Earlier clients could save a recommended ladder as custom, or leave the
+    other curated provider's ladder behind after changing the primary. The
+    version stamp distinguishes that upgrade from subsequent deliberate edits.
+    """
+    llm = builder.payload.get("llm")
+    router = builder.payload.get("squilla_router")
+    if not isinstance(llm, dict) or not isinstance(router, dict):
+        return
+    provider = str(llm.get("provider") or "").strip().lower()
+    if "provider" not in llm:
+        from opensquilla.provider.credentials import (
+            credential_provider_hint,
+            endpoint_provider_hint,
+        )
+
+        # Older files can leave the primary implicit. Use the same distinctive
+        # evidence as the config resolver without persisting an inferred
+        # llm.provider or guessing from arbitrary models/custom endpoints.
+        hints = {
+            credential_provider_hint(llm.get("api_key")),
+            credential_provider_hint(api_key_env=llm.get("api_key_env")),
+            endpoint_provider_hint(llm.get("base_url")),
+        } - {""}
+        if str(router.get("tier_profile") or "").strip().lower() == "openrouter":
+            hints.add("openrouter")
+        if len(hints) == 1:
+            provider = next(iter(hints))
+            if not {"api_key", "api_key_env"} & llm.keys():
+                # The runtime also considers ambient keys in this case. A
+                # conflicting environment cannot authorize a permanent reset.
+                ambient = {
+                    candidate for candidate, name in (
+                        ("openrouter", "OPENROUTER_API_KEY"),
+                        ("tokenrhythm", "TOKENRHYTHM_API_KEY"),
+                    ) if os.environ.get(name, "").strip()
+                }
+                if ambient - {provider}:
+                    return
+    if provider not in {"openrouter", "tokenrhythm"}:
+        return
+    existing_tiers = router.get("tiers")
+    if existing_tiers is not None and not isinstance(existing_tiers, dict):
+        return  # Keep malformed payloads subject to normal config validation.
+
+    from opensquilla.provider.preset_registry import get_preset
+    from opensquilla.router_tiers import TEXT_TIERS, normalize_text_tier
+
+    preset = get_preset(provider)
+    if preset is None:
+        return
+    defaults = preset.tier_defaults()
+    tiers = dict(existing_tiers or {})
+    for name in TEXT_TIERS:
+        # Keep historical table spellings so lossless cross-install import
+        # can update their leaf assignments without leaving empty alias tables.
+        # SquillaRouterConfig canonicalizes these keys after migration.
+        saved_names = [key for key in tiers if normalize_text_tier(key) == name]
+        for saved_name in saved_names or [name]:
+            tiers[saved_name] = dict(defaults[name])
+    if "image_model" not in tiers and "image_model" in defaults:
+        tiers["image_model"] = defaults["image_model"]
+    router["tiers"] = tiers
+    router["preset_binding"] = "follow_primary"
+    if not preset.persistable or router.get("tier_profile") != provider:
+        router.pop("tier_profile", None)
+    builder.changes.append(
+        f"squilla_router: upgraded text tiers to {provider} recommendations following the primary"
+    )
+
+
 # One-time value migrations, walked in ascending version order. An entry with
 # version N runs only when the payload's config_version stamp is below N.
 # Keep versions strictly increasing and cap them at LATEST_CONFIG_VERSION.
 _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
     (1, _migrate_v1_llm_ensemble_legacy_timeouts),
+    (2, _migrate_v2_primary_router_recommendations),
 ]
 
 
@@ -888,6 +991,22 @@ def backup_and_write_migrated_config(
         },
     )
     return backup
+
+
+def rewrite_migrated_config_best_effort(
+    path: Path, migration: ConfigMigrationResult
+) -> None:
+    """Persist an already validated migration without making writes a load prerequisite."""
+    try:
+        backup_and_write_migrated_config(path, migration.payload, migration)
+    except OSError as error:
+        logging.getLogger(__name__).warning(
+            "OpenSquilla config migration could not rewrite %s (%s); running "
+            "from the migrated payload in memory. Make the file writable to "
+            "persist the migration and silence this warning.",
+            path,
+            error,
+        )
 
 
 _CONFIG_BACKUP_KEEP = 10

@@ -93,7 +93,12 @@ test('execution logs are fetched by page independently of the model result previ
   await expect(visible).toContainText(MIDDLE)
   expect(Array.from(await visible.textContent() || '').length).toBe(12000)
   await modal.getByRole('button', { name: 'Copy this page', exact: true }).click()
-  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(await visible.textContent())
+  const visibleText = await visible.textContent() || ''
+  // Windows' native clipboard represents line breaks as CRLF. Keep the
+  // returned bytes exact; only the expected platform representation changes.
+  const windowsClipboard = await page.evaluate(() => navigator.platform.startsWith('Win'))
+  const expectedClipboard = windowsClipboard ? visibleText.replace(/\r?\n/g, '\r\n') : visibleText
+  expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(expectedClipboard)
   await modal.getByRole('button', { name: 'Next', exact: true }).click()
   await expect(visible).not.toContainText(MIDDLE)
   await expect(modal.getByRole('button', { name: 'Next', exact: true })).toBeDisabled()
@@ -101,4 +106,70 @@ test('execution logs are fetched by page independently of the model result previ
   await modal.getByRole('button', { name: 'Tool result', exact: true }).click()
   await expect(visible).toContainText(PREVIEW)
   await expect(visible).not.toContainText(MIDDLE)
+})
+
+test('shows PTY fallback in the collapsed activity row', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'reduce' })
+  const pageErrors: string[] = []
+  page.on('pageerror', error => pageErrors.push(error.message))
+  const sessionKey = 'agent:main:webchat:e2e-execution-io'
+  const fallbackResult = JSON.stringify({
+    status: 'ok',
+    execution_id: 'fallback-e2e',
+    io_mode_requested: 'pty',
+    io_mode_used: 'pipe',
+    fallback_reason: 'PTY backend unavailable',
+    output: 'pipe output',
+  })
+
+  await page.addInitScript(() => window.localStorage.setItem('opensquilla-locale', 'en'))
+  await page.routeWebSocket(/\/ws$/, ws => {
+    ws.onMessage(message => {
+      const frame = JSON.parse(String(message))
+      if (frame.type !== 'req') return
+      const reply = (payload: unknown) => ws.send(JSON.stringify({ type: 'res', id: frame.id, ok: true, payload }))
+      switch (frame.method) {
+        case 'connect': ws.send(helloOkResponse()); return
+        case 'chat.history':
+          reply(chatHistoryPayload([{
+            role: 'assistant', id: 'assistant-execution-io', text: 'The command used a safe fallback.', timestamp: 1000,
+            tool_calls: [{
+              tool_use_id: 'fallback-call', name: 'exec_command', groupId: 'execution-io-group',
+              input: { command: 'printf pipe output', io_mode: 'pty' }, result: fallbackResult,
+              is_error: false, execution_status: { status: 'success' },
+            }],
+            timeline: [{ type: 'tool-group', groupId: 'execution-io-group' }],
+          }]))
+          return
+        case 'sessions.messages.subscribe': reply(sessionMessagesSubscribePayload(sessionKey)); return
+        case 'sessions.messages.snapshot': reply(sessionMessagesSnapshotPayload(sessionKey)); return
+        case 'sessions.messages.hydrate': reply(sessionMessagesHydratePayload(sessionKey)); return
+        default: reply({})
+      }
+    })
+    ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
+  })
+
+  await page.goto(`/control/chat?session=${encodeURIComponent(sessionKey)}`)
+  const activity = page.getByTestId('assistant-activity')
+  await expect(activity).toBeVisible()
+  await activity.locator('.assistant-activity__summary').click()
+  const row = activity.locator('.tool-row').first()
+  await expect(row).toBeVisible()
+  await expect(row).toContainText('TTY unavailable; using a regular pipe')
+  await expect(row).not.toContainText('Real terminal (TTY)')
+  await expect(row).toHaveAttribute('aria-expanded', 'false')
+  await row.screenshot({ path: 'output/playwright/execution-io-fallback-row.png' })
+  await row.click()
+  await expect(activity.locator('.activity-tool-details__execution-io'))
+    .toContainText('TTY unavailable; using a regular pipe')
+  await activity.locator('.activity-tool-details__view, .activity-tool-details__hit-target, .activity-tool-details__fallback').first().click()
+  const modal = page.locator('.tool-sheet')
+  await expect(modal).toBeVisible()
+  await expect(modal.locator('.tool-sheet__execution-io'))
+    .toContainText('TTY unavailable; using a regular pipe')
+  await expect(modal.locator('.tool-sheet__execution-io-reason'))
+    .toContainText('PTY backend unavailable')
+  await page.screenshot({ path: 'output/playwright/execution-io-fallback.png', fullPage: true })
+  expect(pageErrors).toEqual([])
 })

@@ -22,7 +22,6 @@ from opensquilla.session.models import SessionContextState, SessionSummary
 
 _ANTHROPIC_COMPACTION_STATE_KIND = "anthropic_compaction_block"
 _COMPACTION_SUMMARY_CONTEXT_HEADER = "[Compacted Session Summaries]"
-_COMPACTION_SUMMARY_CONTEXT_MAX_CHARS = 16_000
 _STRUCTURED_COMPACTION_SUMMARY_HEADER = "[Structured Compaction Summary]"
 _STRUCTURED_SUMMARY_SECTION_ORDER = (
     "Goal",
@@ -266,9 +265,7 @@ def _render_summary_context_blocks(
     return f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n" + "\n\n".join(body)
 
 
-def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | None:
-    """Render portable checkpoints exactly as the request-context path does."""
-
+def _deduplicated_summary_texts(summary_texts: Sequence[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
     for raw in summary_texts:
@@ -277,6 +274,19 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
             continue
         seen.add(text)
         deduped.append(text)
+    return deduped
+
+
+def format_compaction_summary_context(
+    summary_texts: Sequence[str], *, max_chars: int | None = None,
+) -> str | None:
+    """Render complete checkpoints for authoritative request admission.
+
+    Only explicitly bounded legacy/display callers may pack or omit content.
+    Physical request admission owns the model's actual capacity limit.
+    """
+
+    deduped = _deduplicated_summary_texts(summary_texts)
     if not deduped:
         return None
 
@@ -288,8 +298,10 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
         f"{_COMPACTION_SUMMARY_CONTEXT_HEADER}\n"
         + "\n\n".join(blocks)
     )
-    if len(rendered) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
+    if max_chars is None or len(rendered) <= max_chars:
         return rendered
+    if max_chars <= 0:
+        return None
 
     # Budget from newest to oldest, but retain the original chronological
     # rendering order. Structured summaries keep complete sections; opaque
@@ -304,7 +316,7 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
             [*selected, (summary_number, full_block)],
             omitted_earlier=index,
         )
-        if len(full_candidate) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
+        if len(full_candidate) <= max_chars:
             selected.append((summary_number, full_block))
             continue
 
@@ -313,9 +325,7 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
             [*selected, (summary_number, block_prefix)],
             omitted_earlier=index,
         )
-        section_budget = (
-            _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS - len(prefix_candidate)
-        )
+        section_budget = max_chars - len(prefix_candidate)
         packed = _pack_structured_summary_sections(
             deduped[index],
             max_chars=section_budget,
@@ -336,7 +346,7 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
                 [*selected, (summary_number, packed_block)],
                 omitted_earlier=index,
             )
-            if len(packed_candidate) <= _COMPACTION_SUMMARY_CONTEXT_MAX_CHARS:
+            if len(packed_candidate) <= max_chars:
                 selected.append((summary_number, packed_block))
                 continue
 
@@ -345,10 +355,11 @@ def format_compaction_summary_context(summary_texts: Sequence[str]) -> str | Non
     else:
         omitted_earlier = 0
 
-    return _render_summary_context_blocks(
+    bounded = _render_summary_context_blocks(
         selected,
         omitted_earlier=omitted_earlier,
     )
+    return bounded if len(bounded) <= max_chars else None
 
 
 def compaction_summary_replay_is_complete(summary_text: str) -> bool:
@@ -366,20 +377,20 @@ def compaction_summary_replay_is_complete(summary_text: str) -> bool:
 
 
 def compaction_replay_is_complete(summary_texts: Sequence[str], rendered: str | None) -> bool:
-    """Check whether an existing checkpoint set is intact and unambiguous."""
+    """Require the entire ordered checkpoint set in its exact replay wrapper.
 
-    texts = [text.strip() for text in summary_texts if text.strip()]
+    Checkpoint bodies are opaque text: a quoted section title or older summary
+    marker inside model prose must not be mistaken for renderer-owned syntax.
+    """
+
+    texts = _deduplicated_summary_texts(summary_texts)
     if not texts or not rendered:
         return False
-    for text in texts:
-        if text not in rendered:
-            return False
-        if text.startswith(_STRUCTURED_COMPACTION_SUMMARY_HEADER) and (
-            _split_structured_summary_sections(text) is None
-            or text.count(_STRUCTURED_COMPACTION_SUMMARY_HEADER) != 1
-        ):
-            return False
-    return True
+    expected = _render_summary_context_blocks(
+        [(index, f"[Summary {index}]\n{text}") for index, text in enumerate(texts, start=1)],
+        omitted_earlier=0,
+    )
+    return rendered == expected
 
 
 def compaction_context_fingerprint(

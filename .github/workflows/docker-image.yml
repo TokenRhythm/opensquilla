@@ -150,11 +150,6 @@ jobs:
           push: ${{ github.event_name == 'push' || inputs.publish == true }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          # Official/tag and edge builds must never publish a checkout's
-          # ignored personal BGM. Local `docker build` keeps the opt-in custom
-          # music behavior because the Dockerfile argument defaults to 0.
-          build-args: |
-            OPENSQUILLA_FORBID_PERSONAL_BGM=1
           # Keep the pushed artifact a plain two-entry manifest list; the
           # default provenance attestation adds an unknown/unknown entry that
           # confuses registry UIs and `docker pull` inspection.

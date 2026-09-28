@@ -185,16 +185,14 @@ base_url = "https://tokenrhythm.studio/v1"
 "z-ai/glm-5.1" = "z-ai"
 "z-ai/glm-5.2" = "z-ai"
 
-# LLM ensemble routing. The recommended TokenRhythm router lets C3 reuse this
-# shared plan through squilla_router.tiers.c3.ensemble_enabled below. Keep this
-# global switch off when C0-C2 should remain single-model routes. Enabling it
-# applies the same plan to every request; C3 never stores a second plan.
-# C3 fusion itself does not handle images. The dedicated image_model route stays
-# enabled and is preferred; another non-C3 tier with supports_image=true is used
-# only when the dedicated image route is unavailable.
-# The static_tokenrhythm_b5 profile is the TokenRhythm mirror of B5
-# (deepseek-v4-pro, glm-5.2, kimi-k2.7-code, qwen3.7-max + glm-5.2
-# aggregator). It needs a TokenRhythm credential: the [llm] api_key when
+# LLM ensemble routing is an optional feature. The recommended TokenRhythm
+# router uses four single-model tiers; enable the shared plan explicitly when
+# C3 should use fusion. Keep this global switch off for single-model routing.
+# C3 fusion itself does not handle images. Image requests use a configured
+# C0-C3 tier with catalog-proven vision support (Qwen3.7 Flash in this preset).
+# image_model is retained below for legacy configuration compatibility.
+# The static_tokenrhythm_b5 profile remains available as an opt-in legacy
+# fusion plan. It needs a TokenRhythm credential: the [llm] api_key when
 # TokenRhythm is active, or TOKENRHYTHM_API_KEY in the environment. Without
 # one, or whenever fusion cannot complete, requests use the fixed/direct
 # provider and model configured under [llm].
@@ -420,28 +418,28 @@ estimated_output_savings_pct = 0.03
 # on C1), and explicit turn settings remain available for compatible models.
 [squilla_router.tiers.c0]
 provider = "tokenrhythm"
-model = "deepseek-v4-flash-0731"
-description = "Fast DeepSeek V4 Flash 0731 route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
+model = "qwen3.7-flash"
+description = "Fast Qwen3.7 Flash route for trivial chat, short rewrites, extraction, low-risk simple Q&A, and lightweight coding"
 supports_image = false
 
 [squilla_router.tiers.c1]
 provider = "tokenrhythm"
-model = "deepseek-v4-pro-0813"
-description = "Default DeepSeek V4 Pro 0813 route for normal agent work, coding assistance, debugging, and moderate analysis"
+model = "deepseek-flash"
+description = "Default DeepSeek Flash route for normal agent work, coding assistance, debugging, and moderate analysis"
 supports_image = false
 
 [squilla_router.tiers.c2]
 provider = "tokenrhythm"
-model = "kimi-k2.7-code"
-description = "Stronger Kimi K2.7 Code route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
+model = "deepseek-v4-pro-0813"
+description = "Stronger DeepSeek V4 Pro 0813 route for multi-step coding, structured reasoning, larger context synthesis, and harder analysis"
 supports_image = false
 
 [squilla_router.tiers.c3]
 provider = "tokenrhythm"
-model = "glm-5.2"
-description = "Highest tier: shared static TokenRhythm B5 fusion; this provider/model is retained for single-model C3 mode"
+model = "glm-5.3"
+description = "Highest-tier GLM 5.3 route for difficult planning, deep review, complex debugging, and high-stakes synthesis"
 supports_image = false
-ensemble_enabled = true
+ensemble_enabled = false
 
 [squilla_router.tiers.image_model]
 provider = "tokenrhythm"
@@ -557,51 +555,3 @@ default_mode = "bypass"                 # off | on | bypass | full
 # signing_secret = ""         # required for Slack webhook mode
 # slack_channel_id = "C12345"
 # reply_in_thread = false
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Meta-Skill subsystem
-# ─────────────────────────────────────────────────────────────────────────────
-
-[meta_skill]
-# Master gate. When false the meta-skill subsystem is fully off: meta-skills are
-# not injected into prompts, meta_invoke is not surfaced, and the /meta command
-# refuses (both list and run). Default: true.
-# enabled = true
-
-# Automatic activation. When false (the default), meta-skills are MANUAL-ONLY:
-# no system-prompt guidance, no keyword/semantic auto-trigger, meta_invoke is not
-# offered for automatic invocation, and meta-skills are hidden from automatic
-# skill listings.
-# They run only via the explicit `/meta <name>` command. Set true to restore the
-# previous automatic behavior. Default: false.
-# auto_trigger = false
-
-[meta_skill.persistence]
-# Whether to write meta-skill execution traces to SQLite (G4 traceable audit).
-# Disabling drops the writer to no-op; the CLI `skills meta runs ...` will
-# report no rows. Default: true.
-# enabled = true
-
-# How long (seconds) a 'running' row may live before boot cleanup marks it
-# 'failed' as an orphan from a crashed prior process. Only applies to rows
-# whose owner_pid differs from the current process pid. Default: 3600 (1h).
-# orphan_cleanup_age_seconds = 3600
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Meta-Skill auto-propose: unattended synthesis from co-occurrence patterns
-#
-# Two independent triggers feed the same library function
-# (skills.creator.auto_propose):
-#   * `enabled`           — schedule a recurring cron job (Path 1)
-#   * `on_dream_complete` — piggyback on memory-consolidation dreams (Path 2)
-# Both default OFF. Operators turn them on after reviewing how
-# meta-skill-creator's gated output looks once.
-# ─────────────────────────────────────────────────────────────────────────────
-[meta_skill.auto_propose]
-# enabled = false                  # Path 1 cron toggle
-# cron = "0 5 * * *"               # 5-field local-time cron; daily 05:00
-# window_days = 30                 # log-history window for co-occurrence
-# min_freq = 3                     # drop chains observed fewer than N times
-# top_k = 5                        # consider at most N patterns per fire
-# on_dream_complete = false        # Path 2 dream-hook toggle (independent)
-# agent_ids = ["main"]             # empty/omitted = all configured agents

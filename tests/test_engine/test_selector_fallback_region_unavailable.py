@@ -43,8 +43,20 @@ class FakeProvider:
 
 
 @pytest.mark.asyncio
-async def test_runtime_falls_back_from_region_unavailable_router_model(
+@pytest.mark.parametrize(
+    ("code", "message", "expected_fallback"),
+    [
+        ("403", "HTTP 403: This model is not available in your region.", True),
+        ("404", "HTTP 404: model not found", True),
+        ("403", "HTTP 403: forbidden", False),
+        ("404", "HTTP 404: not found", False),
+    ],
+)
+async def test_runtime_only_falls_back_with_explicit_model_failure(
     monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    message: str,
+    expected_fallback: bool,
 ) -> None:
     calls: list[str] = []
 
@@ -53,12 +65,7 @@ async def test_runtime_falls_back_from_region_unavailable_router_model(
             return FakeProvider(
                 cfg.provider,
                 cfg.model,
-                [
-                    ErrorEvent(
-                        message="HTTP 403: This model is not available in your region.",
-                        code="403",
-                    )
-                ],
+                [ErrorEvent(message=message, code=code)],
                 calls,
             )
         return FakeProvider(
@@ -93,6 +100,14 @@ async def test_runtime_falls_back_from_region_unavailable_router_model(
     provider = _SelectorFallbackProvider(selector.resolve(), selector)
 
     events = [event async for event in provider.chat([{"role": "user", "content": "hi"}])]
+
+    if not expected_fallback:
+        # No retry or fallback request may follow an unclassified denial.
+        assert calls == [HIGH_TIER_MODEL]
+        assert len(events) == 1
+        assert isinstance(events[0], ErrorEvent)
+        assert events[0].code == code
+        return
 
     assert calls == [HIGH_TIER_MODEL, MID_TIER_MODEL]
     assert [getattr(event, "kind", "") for event in events] == [

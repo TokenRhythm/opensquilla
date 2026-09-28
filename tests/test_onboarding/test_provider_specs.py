@@ -90,7 +90,7 @@ EXPECTED_EXPERIMENTAL = {
 EXPECTED_SUPPORTED = EXPECTED_VERIFIED | EXPECTED_EXPERIMENTAL
 
 
-def test_tokenrhythm_preset_wire_exposes_the_shared_c3_binding():
+def test_tokenrhythm_preset_wire_exposes_single_model_c3_default():
     row = next(
         item
         for item in provider_catalog_payload()
@@ -98,8 +98,8 @@ def test_tokenrhythm_preset_wire_exposes_the_shared_c3_binding():
     )
 
     c3 = row["presets"][0]["tiers"]["c3"]
-    assert c3["ensembleEnabled"] is True
-    assert "configured direct/fallback model" in c3["description"]
+    assert c3["ensembleEnabled"] is False
+    assert c3["model"] == "glm-5.3"
 
 
 def test_tier_payload_preserves_a_legacy_ensemble_selection_mode():

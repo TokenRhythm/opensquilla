@@ -32,6 +32,31 @@ afterEach(() => {
 })
 
 describe('SidebarConversations pagination', () => {
+  it('shows refresh retry beside retained rows after a directory refresh failure', async () => {
+    i18n.global.locale.value = 'en'
+    const refresh = vi.fn()
+    const root = document.createElement('div')
+    document.body.appendChild(root)
+    const app = createApp(defineComponent(() => () => h(SidebarConversations, {
+      sections: [{ family: 'chats', label: 'Tasks', rows: [taskRow('Existing conversation', 'main')] }],
+      error: true,
+      loading: false,
+      currentKey: '',
+      contractDebugEnabled: false,
+      searchHint: 'Ctrl+K',
+      onRefresh: refresh,
+    })))
+    app.use(i18n)
+    app.mount(root)
+    mounted.push(app)
+    await nextTick()
+
+    expect(root.querySelector('.sidebar-history-list')).not.toBeNull()
+    expect(root.textContent).toContain('Existing conversation')
+    root.querySelector<HTMLButtonElement>('.sidebar-history-retry')?.click()
+    expect(refresh).toHaveBeenCalledOnce()
+  })
+
   it('keeps loading when the current page has no displayable rows', async () => {
     i18n.global.locale.value = 'en'
     const loadMore = vi.fn()

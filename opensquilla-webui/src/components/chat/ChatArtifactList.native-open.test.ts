@@ -94,6 +94,18 @@ beforeEach(() => {
 })
 
 describe('ChatArtifactList native HTML open', () => {
+  it('offers image copy for SVG delivered with a text MIME without changing its file presentation', async () => {
+    const { app, el } = await mountList({
+      http: httpTransportTestDouble(), isOwner: false,
+      artifact: { id: 'text-svg', name: 'drawing.svg', mime: 'text/plain' },
+    })
+    expect(el.querySelector('.msg-media-card')).toBeNull()
+    expect(el.querySelector('.msg-artifact-chip [data-testid="copy-image"]')).not.toBeNull()
+    // The existing resource menu owns source copying; do not add a second menu.
+    expect(el.querySelector('[data-testid="image-copy-more"]')).toBeNull()
+    app.unmount()
+  })
+
   it('posts HTML artifacts to the gateway native-open endpoint for owner Web sessions', async () => {
     const requestBinary = vi.fn(async () => httpBinaryResponse('{"ok":true}', { status: 202 }))
     const http = httpTransportTestDouble({ requestBinary })

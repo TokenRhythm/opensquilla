@@ -41,7 +41,12 @@
               <span class="settings-rail__label">{{ t('settings.rail.' + s.id) }}</span>
               <span v-if="sectionDirty(s.id)" class="settings-rail__dirty" aria-hidden="true"></span>
               <span v-if="s.id === 'gateway'" class="settings-rail__dot" :class="sectionStatus(s.id).tone" aria-hidden="true"></span>
-              <span v-else-if="!s.client && sectionStatus(s.id).tone === 'is-warn'" class="settings-rail__warn" aria-hidden="true">!</span>
+              <span
+                v-else-if="s.id === 'provider' && loaded && sectionStatus(s.id).tone === 'is-warn'"
+                class="settings-rail__dot is-danger"
+                :title="sectionStatus(s.id).label"
+                aria-hidden="true"
+              ></span>
             </button>
           </template>
         </nav>
@@ -49,6 +54,7 @@
         <div class="settings-main">
           <header class="settings-modal__head">
             <h2 id="settings-modal-title" class="settings-modal__title">{{ t('settings.dialog.title') }}</h2>
+            <SettingsSearch :is-desktop="isDesktop" :disabled="settingsInteractionLocked" @select="selectSearchResult" />
             <button
               ref="closeBtn"
               type="button"
@@ -114,7 +120,6 @@
             :config-path="displayConfigPath"
             @copy-config-path="copyDisplayPath"
             @update-auto-capture="setMemoryAutoCapture"
-            @open-agent-configuration="openAgentConfiguration"
             @open-data-maintenance="openDataMaintenance"
           />
 
@@ -234,6 +239,7 @@ import SetupModelCapacity from '@/components/setup/SetupModelCapacity.vue'
 import SetupModelStrategyPanel from '@/components/setup/SetupModelStrategyPanel.vue'
 import SetupCapabilitiesPanel from '@/components/setup/SetupCapabilitiesPanel.vue'
 import SettingsAppearancePanel from '@/components/settings/SettingsAppearancePanel.vue'
+import SettingsSearch from '@/components/settings/SettingsSearch.vue'
 import SettingsKeyboardPanel from '@/components/settings/SettingsKeyboardPanel.vue'
 import SettingsAdvancedPanel from '@/components/settings/SettingsAdvancedPanel.vue'
 import SettingsMemoryPanel from '@/components/settings/SettingsMemoryPanel.vue'
@@ -470,7 +476,6 @@ let returnTo: string | null = null
 let invokerEl: HTMLElement | null = null
 let mq: MediaQueryList | null = null
 let closing = false
-let transferringFocus = false
 
 const routeParam = computed(() => route.params.section)
 // `/setup` → `/settings/auto` asks for the first not-ready section once
@@ -495,6 +500,40 @@ function selectSection(id: string) {
   if (route.params.section !== id) {
     void router.replace({ path: `/settings/${id}` })
   }
+}
+
+const SEARCH_TARGET_IDS: Record<string, string> = {
+  'setup.connection.wsUrlLabel': 'conn-ws-url',
+  'setup.connection.tokenLabel': 'conn-ws-token',
+  'setup.runtime.title': 'settings-gateway-runtime',
+  'settings.search.permissions': 'settings-security-sandbox',
+  'settings.sandbox.title': 'settings-security-sandbox',
+  'settings.sandbox.mode.title': 'settings-security-sandbox',
+}
+
+async function selectSearchResult(id: string, labelKey: string) {
+  selectSection(id)
+  await nextTick()
+  const panel = panelRef.value
+  if (!panel || section.value !== id || settingsInteractionLocked.value) return
+
+  const targetId = SEARCH_TARGET_IDS[labelKey]
+  const label = labelKey ? t(labelKey) : ''
+  const explicitTarget = targetId ? panel.querySelector<HTMLElement>(`#${targetId}`) : null
+  const matched = label
+    ? Array.from(panel.querySelectorAll<HTMLElement>('label, .control-row__label, .capability-card__title, h3, h4'))
+      .find(element => element.textContent?.trim() === label)
+    : undefined
+  const row = matched?.closest<HTMLElement>('.control-row, .capability-card')
+  // A section-only result must not focus an unrelated action at the top of
+  // that section. Exact setting rows can focus their own native control.
+  const target = explicitTarget
+    ?? row?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)')
+    ?? matched
+    ?? panel
+  target.scrollIntoView?.({ block: 'nearest', behavior: 'auto' })
+  if (!target.matches('input, select, button, [tabindex]')) target.tabIndex = -1
+  target.focus({ preventScroll: true })
 }
 
 // Resolve aliases and nested destinations. Old URLs are canonicalized with a
@@ -623,26 +662,6 @@ function closeOverlay(restoreFocus = true) {
   // Flip visibility to play the modal's leave transition; onLeaveComplete then
   // navigates away (which unmounts the route component).
   visible.value = false
-}
-
-// This is an intentional modal-to-page transition, not a Settings close/back
-// action. Suppress the old invoker restoration while routing, then focus the
-// destination heading so keyboard and screen-reader users perceive the change.
-async function openAgentConfiguration() {
-  if (transferringFocus) return
-  transferringFocus = true
-  try {
-    const failure = await router.push('/agents')
-    if (failure) {
-      transferringFocus = false
-      return
-    }
-    await nextTick()
-    document.getElementById('agents-page-title')?.focus()
-  } catch (error) {
-    transferringFocus = false
-    throw error
-  }
 }
 
 // Unlike a cold/deep-linked maintenance route (where the modal close button
@@ -819,7 +838,7 @@ onUnmounted(() => {
   // A route-driven unmount that did not go through closeOverlay (e.g. the user
   // pressed browser Back) still owes focus restoration: the real invoker, or
   // the sidebar Settings button for a cold deep link, never a detached node.
-  if (!closing && !transferringFocus) (usableInvoker() ?? sidebarSettingsButton())?.focus()
+  if (!closing) (usableInvoker() ?? sidebarSettingsButton())?.focus()
   invokerEl = null
 })
 </script>
@@ -880,6 +899,7 @@ onUnmounted(() => {
 .settings-modal__head {
   align-items: center;
   display: flex;
+  flex-wrap: wrap;
   flex-shrink: 0;
   gap: var(--sp-3);
   padding: var(--sp-4) var(--sp-4) 0;
@@ -983,24 +1003,9 @@ onUnmounted(() => {
 }
 
 .settings-rail__dot.is-ok { background: var(--ok); }
+.settings-rail__dot.is-danger { background: var(--danger); }
 .settings-rail__dot.is-warn { background: var(--warn-fill); }
 .settings-rail__dot.is-muted { background: var(--text-dim); opacity: 0.5; }
-
-.settings-rail__warn {
-  align-items: center;
-  background: var(--warn-fill);
-  clip-path: polygon(50% 0, 100% 100%, 0 100%);
-  color: var(--bg);
-  display: inline-flex;
-  flex-shrink: 0;
-  font-size: 7px;
-  font-weight: 700;
-  height: 11px;
-  justify-content: center;
-  line-height: 1;
-  padding-top: 3px;
-  width: 12px;
-}
 
 .settings-rail__dirty {
   background: var(--accent);

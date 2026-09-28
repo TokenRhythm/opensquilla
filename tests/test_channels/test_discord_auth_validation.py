@@ -38,22 +38,13 @@ async def test_discord_gateway_url_fetch_uses_bot_token_auth_header() -> None:
 
 
 @pytest.mark.anyio
-async def test_discord_identify_payload_uses_bot_token_and_intents() -> None:
-    sent: list[dict] = []
+async def test_discord_sdk_receives_configured_gateway_intents() -> None:
     channel = DiscordChannel(DiscordChannelConfig(token="bot-token", intents=513))
-
-    async def fake_ws_send(payload: dict) -> None:
-        sent.append(payload)
-
-    channel._ws_send = fake_ws_send  # type: ignore[method-assign]
-
-    await channel._identify()
-
-    assert len(sent) == 1
-    assert sent[0]["op"] == 2
-    assert sent[0]["d"]["token"] == "bot-token"
-    assert sent[0]["d"]["intents"] == 513
-    assert {"os", "browser", "device"} <= set(sent[0]["d"]["properties"])
+    client = channel._create_gateway_client()
+    try:
+        assert client.intents.value == 513
+    finally:
+        await client.close()
 
 
 def test_discord_gateway_spec_does_not_accept_interactions_public_key_as_auth() -> None:

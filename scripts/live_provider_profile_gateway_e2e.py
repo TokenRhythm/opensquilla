@@ -39,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION  # noqa: E402
 from opensquilla.context_budget import CHARS_PER_TOKEN, ContextBudgetGovernor  # noqa: E402
 from opensquilla.engine.capacity_admission import (  # noqa: E402
     MAX_THINKING_BUDGET_TOKENS,
@@ -429,6 +430,7 @@ def _write_config(
         f"""
 host = "127.0.0.1"
 debug = false
+config_version = {LATEST_CONFIG_VERSION}
 llm_request_timeout_seconds = {llm_request_timeout_seconds}
 agent_runtime_timeout_seconds = {agent_runtime_timeout_seconds}
 agent_max_iterations = {agent_max_iterations}

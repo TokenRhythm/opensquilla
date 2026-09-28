@@ -246,7 +246,7 @@ async def test_default_tools_rpc_hides_git_tools_when_runtime_is_unavailable(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["tools.catalog", "tools.effective"])
-async def test_default_channel_tools_rpc_exposes_structured_file_authoring(method: str) -> None:
+async def test_default_channel_tools_rpc_excludes_retired_file_authoring(method: str) -> None:
     import opensquilla.tools.builtin  # noqa: F401
     from opensquilla.tools.registry import get_default_registry
 
@@ -260,7 +260,7 @@ async def test_default_channel_tools_rpc_exposes_structured_file_authoring(metho
     assert result.error is None, result.error
     names = _tool_names(result.payload)
 
-    assert {"create_csv", "create_xlsx", "create_pdf_report", "create_pptx"} <= names
+    assert {"create_csv", "create_xlsx", "create_pdf_report", "create_pptx"}.isdisjoint(names)
     assert "write_file" not in names
     assert "execute_code" not in names
     assert "apply_patch" not in names

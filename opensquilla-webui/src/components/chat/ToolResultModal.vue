@@ -53,6 +53,18 @@
         </div>
       </header>
 
+      <div
+        v-if="executionIoLabel"
+        class="tool-sheet__execution-io"
+        :class="`tool-sheet__execution-io--${executionIoKind}`"
+        role="status"
+      >
+        {{ executionIoLabel }}
+        <span v-if="executionIoFallbackReason" class="tool-sheet__execution-io-reason">
+          {{ executionIoFallbackReason }}
+        </span>
+      </div>
+
       <div v-if="logMode" class="tool-sheet__log-navigation">
         <form class="tool-sheet__log-controls" @submit.prevent="loadExecutionLog(Number(logOffsetInput))">
           <label>
@@ -116,6 +128,22 @@ const props = defineProps<{
   context?: ToolResultContext
   sessionKey?: string
 }>()
+
+// The modal receives the structured projection from the trace. Its `content`
+// prop may be the legacy INPUT/RESULT display string, so it is intentionally
+// never parsed as execution metadata here.
+const executionIo = computed(() => props.context?.executionIo || { kind: 'unknown' as const, entries: [] })
+const executionIoKind = computed(() => executionIo.value.kind)
+const executionIoLabel = computed(() => {
+  if (executionIo.value.kind === 'pty') return t('shared.runTrace.executionIoPty')
+  if (executionIo.value.kind === 'fallback') return t('shared.runTrace.executionIoFallback')
+  if (executionIo.value.kind === 'pipe') return t('shared.runTrace.executionIoPipe')
+  if (executionIo.value.kind === 'mixed') return t('shared.runTrace.executionIoMixed')
+  return ''
+})
+const executionIoFallbackReason = computed(() => executionIo.value.kind === 'fallback'
+  ? executionIo.value.fallbackReason || ''
+  : '')
 
 const emit = defineEmits<{
   close: []
@@ -511,6 +539,24 @@ onBeforeUnmount(() => {
   gap: 2px var(--sp-2);
   margin-top: 2px;
   min-width: 0;
+}
+
+.tool-sheet__execution-io {
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  padding: var(--sp-2) var(--sp-4);
+}
+
+.tool-sheet__execution-io--fallback {
+  color: var(--warn);
+}
+
+.tool-sheet__execution-io-reason {
+  color: var(--text-dim);
+  display: block;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .tool-sheet__path {

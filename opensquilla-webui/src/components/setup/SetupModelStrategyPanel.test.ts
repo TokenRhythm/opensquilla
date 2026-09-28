@@ -1938,11 +1938,31 @@ describe('SetupModelStrategyPanel', () => {
 
 const summary = {
   providerId: 'tokenrhythm', providerLabel: 'TokenRhythm', enabled: false,
+  recommendedProviderId: 'tokenrhythm', recommendedProviderLabel: 'TokenRhythm',
   binding: 'custom', crossProviderEnabled: false, hasForeignTierProviders: true,
   hasUnsavedChanges: false, resetPending: false, resetDisabledReason: '',
 }
 
 describe('saved routing summary and recommended recovery', () => {
+  it.each(['OpenRouter', 'TokenRhythm'])('labels the reset and summary for the saved %s primary', async providerLabel => {
+    const providerId = providerLabel.toLowerCase()
+    const { app, el } = await mountPanel({
+      routingSummary: { ...summary, providerId, providerLabel, recommendedProviderId: providerId, recommendedProviderLabel: providerLabel },
+    })
+    expect(el.querySelector('[data-testid="routing-saved-summary"]')?.textContent).toContain(providerLabel)
+    expect(el.querySelector('[data-testid="router-reset-recommended"]')?.textContent).toContain(providerLabel)
+    app.unmount()
+  })
+
+  it('hides reset when the saved primary has no supported recommendation target', async () => {
+    const { app, el } = await mountPanel({
+      routingSummary: { ...summary, recommendedProviderId: '', recommendedProviderLabel: '' },
+    })
+    expect(el.querySelector('[data-testid="router-reset-recommended"]')).toBeNull()
+    expect(el.querySelector('[data-testid="routing-saved-summary"]')).toBeTruthy()
+    app.unmount()
+  })
+
   it('separates the saved primary, Router switch and custom ownership below mode cards', async () => {
     const onResetRecommendedRouter = vi.fn()
     const { app, el } = await mountPanel({ routingSummary: summary }, { onResetRecommendedRouter })
@@ -1963,7 +1983,7 @@ describe('saved routing summary and recommended recovery', () => {
   })
 
   it.each([
-    ['follow_primary', 'Recommended · follows primary'],
+    ['follow_primary', 'Recommended · follows primary provider'],
     ['legacy', 'Existing tiers · follow behavior unspecified'],
   ])('shows %s ownership independently of the enabled state', async (binding, label) => {
     const { app, el } = await mountPanel({ routingSummary: { ...summary, binding, enabled: true, hasUnsavedChanges: true, crossProviderEnabled: true } })

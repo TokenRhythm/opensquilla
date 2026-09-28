@@ -136,17 +136,30 @@ def create_collector_app(settings: CollectorSettings) -> Starlette:
             status_code=200,
         )
 
+    def reject(status_code: int, reason: str) -> JSONResponse:
+        # Only fixed rejection categories enter the journal. Never attach the
+        # request or an exception: either may contain private wire values.
+        _LOGGER.log(
+            logging.ERROR if status_code >= 500 else logging.WARNING,
+            "collector_rejected scope=%s status=%s reason=%s protocol=%s",
+            settings.scope.value,
+            status_code,
+            reason,
+            settings.protocol_fingerprint,
+        )
+        return _error_response(status_code, reason)
+
     async def ingest(request: Request) -> Response:
         if not _is_json_content_type(request):
-            return _error_response(415, "unsupported_media_type")
+            return reject(415, "unsupported_media_type")
         declared_error = _declared_body_error(
             request,
             max_body_bytes=settings.max_body_bytes,
         )
         if declared_error == "body_too_large":
-            return _error_response(413, "body_too_large")
+            return reject(413, "body_too_large")
         if declared_error is not None:
-            return _error_response(400, declared_error)
+            return reject(400, declared_error)
 
         try:
             body = await _read_bounded_body(
@@ -154,9 +167,9 @@ def create_collector_app(settings: CollectorSettings) -> Starlette:
                 max_body_bytes=settings.max_body_bytes,
             )
         except _BodyTooLargeError:
-            return _error_response(413, "body_too_large")
+            return reject(413, "body_too_large")
         except _ClientDisconnectedError:
-            return _error_response(400, "client_disconnected")
+            return reject(400, "client_disconnected")
 
         try:
             authenticated_producer = producer_authenticator.authenticate(
@@ -166,7 +179,7 @@ def create_collector_app(settings: CollectorSettings) -> Starlette:
                 path=request.url.path,
             )
         except ProducerCredentialError:
-            return _error_response(401, "producer_unauthorized")
+            return reject(401, "producer_unauthorized")
 
         try:
             batch: TelemetryBatch
@@ -182,38 +195,28 @@ def create_collector_app(settings: CollectorSettings) -> Starlette:
                 )
         except TelemetryWireError as exc:
             if exc.code is TelemetryWireErrorCode.BODY_TOO_LARGE:
-                return _error_response(413, "body_too_large")
-            return _error_response(422, "schema_invalid")
+                return reject(413, "body_too_large")
+            return reject(422, "schema_invalid")
 
         if settings.scope is ConsentScope.GROWTH:
             event_sources = frozenset(event.source for event in batch.events)
             if authenticated_producer is None:
                 if not event_sources <= CLIENT_OWNED_GROWTH_SOURCES:
-                    return _error_response(401, "producer_unauthorized")
+                    return reject(401, "producer_unauthorized")
             elif event_sources != {authenticated_producer}:
-                return _error_response(403, "producer_source_mismatch")
+                return reject(403, "producer_source_mismatch")
             elif authenticated_producer not in SERVER_OWNED_GROWTH_SOURCES:
-                return _error_response(403, "producer_source_mismatch")
+                return reject(403, "producer_source_mismatch")
 
         storage: TelemetryIngestStorage = app.state.telemetry_storage
         try:
             receipt = await storage.ingest(batch)
         except (BatchConflictError, EventConflictError):
-            return _error_response(409, "identifier_conflict")
+            return reject(409, "identifier_conflict")
         except StorageScopeError:
-            _LOGGER.error(
-                "telemetry_collector_scope_invariant_failed",
-                extra={"telemetry_scope": settings.scope.value},
-            )
-            return _error_response(500, "internal_error")
+            return reject(500, "internal_error")
         except Exception:
-            # Deliberately omit exception text and traceback: lower layers may
-            # contain identifiers, filesystem paths, or rejected wire values.
-            _LOGGER.error(
-                "telemetry_collector_ingest_failed",
-                extra={"telemetry_scope": settings.scope.value},
-            )
-            return _error_response(500, "internal_error")
+            return reject(500, "internal_error")
 
         return _json_response(
             {

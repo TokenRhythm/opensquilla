@@ -21,13 +21,18 @@ from dataclasses import dataclass
 from typing import Any
 
 from opensquilla.execution_status import normalize_execution_status
-from opensquilla.safety.permission_matrix import CHANNEL_WEBUI, Principal, is_tool_allowed
+from opensquilla.safety.permission_matrix import Principal, is_tool_allowed
 from opensquilla.tool_boundary import ToolCall, ToolResult
 from opensquilla.tools.envelope import build_tool_failure_envelope
 from opensquilla.tools.policy.types import DispatchInput, PolicyDecision
 from opensquilla.tools.policy_helpers import private_memory_read_tool_denied
 from opensquilla.tools.types import CallerKind, ToolContext
 from opensquilla.tools.visibility import guest_safe_tool_allowed
+from opensquilla.tools.workspace_authoring import (
+    WORKSPACE_AUTHORING_TOOLS,
+    restricted_channel_context,
+    workspace_authoring_attested,
+)
 
 
 def _denial_envelope(
@@ -271,6 +276,7 @@ class ProfilePolicy:
             d.tool_call.tool_name,
             resolve_profile(ctx),
             explicitly_allowed=ctx.allowed_tools,
+            context=ctx,
         ):
             envelope = _denial_envelope(
                 d.tool_call,
@@ -302,6 +308,24 @@ class PermissionMatrixPolicy:
 
     def evaluate(self, d: DispatchInput) -> PolicyDecision:
         ctx = d.ctx
+        if (
+            restricted_channel_context(ctx)
+            and d.tool_call.tool_name in WORKSPACE_AUTHORING_TOOLS
+            and (
+                d.tool_call.arguments.get("sandbox_permissions", "use_default")
+                != "use_default"
+                or d.tool_call.arguments.get("approval_id")
+            )
+        ):
+            return PolicyDecision(
+                allowed=False,
+                envelope=_denial_envelope(
+                    d.tool_call,
+                    exc=PermissionError("channel authoring cannot elevate"),
+                    error_class_override="PolicyDenied",
+                    user_message_override="Channel workspace tools cannot request host execution.",
+                ),
+            )
         if ctx and ctx.caller_kind is CallerKind.CHANNEL:
             # Only the authenticated channel ingress boundary can set
             # ``channel_admin_verified``. A generic ``is_owner`` context is
@@ -311,12 +335,13 @@ class PermissionMatrixPolicy:
                 role="operator" if ctx.channel_admin_verified else "user",
                 channel_id=ctx.channel_id or ctx.session_key,
             )
-            channel_kind = (
-                CHANNEL_WEBUI
-                if (ctx.source_kind or "").strip().lower() == CHANNEL_WEBUI
-                else (ctx.channel_kind or "dm")
+            channel_kind = "group" if ctx.channel_kind == "group" else "dm"
+            decision = is_tool_allowed(
+                d.tool_call.tool_name,
+                channel_kind,
+                principal,
+                workspace_authoring_attested=workspace_authoring_attested(ctx),
             )
-            decision = is_tool_allowed(d.tool_call.tool_name, channel_kind, principal)
             if not decision.allowed:
                 envelope = _denial_envelope(
                     d.tool_call,

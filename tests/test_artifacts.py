@@ -680,7 +680,7 @@ def test_artifact_store_finds_existing_session_deliverable_by_name_and_sha(
         session_key="agent:main:webchat:session-1",
         name="brief.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        source="create_pptx",
+        source="publish_artifact",
     )
 
     found = store.find_existing_ref(
@@ -714,7 +714,7 @@ def test_artifact_store_skips_existing_deliverable_with_bad_material(
         session_key="agent:main:webchat:session-1",
         name="brief.pptx",
         mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        source="create_pptx",
+        source="publish_artifact",
     )
     store.path_for(ref).write_bytes(b"corrupt")
 
@@ -995,6 +995,8 @@ async def test_publish_artifact_tool_allows_workspace_file_only(tmp_path: Path) 
     assert payload["artifact"]["local_path"] == str(output.resolve())
     assert "note" in payload
     assert "local_path" in payload["note"]
+    assert "registered for the current surface" in payload["note"]
+    assert "already sees" not in payload["note"]
     assert "Do not run more tools" not in payload["note"]
     assert "Send the final response now" not in payload["note"]
     assert "unchanged file does not need to be published again" in payload["note"]

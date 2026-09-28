@@ -16,13 +16,6 @@ vi.mock('vue-router', () => ({
   useRouter: () => ({ push: routerPush }),
 }))
 
-vi.mock('@/composables/useBgm', () => ({
-  useBgm: () => ({
-    enabled: { value: false },
-    setEnabled: vi.fn(),
-  }),
-}))
-
 function emptySearch(): SessionSearchResult {
   return { sessions: [], messages: [] }
 }

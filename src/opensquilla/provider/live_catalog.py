@@ -65,10 +65,10 @@ def parse_tokenrhythm_models(payload: Mapping[str, Any]) -> dict[str, dict[str, 
     ``context_window`` (``contextWindow``), ``max_output_tokens``
     (``maxOutputTokens``), ``display_name``, ``supports_tools`` /
     ``supports_vision`` (the listing's capability booleans are
-    authoritative both ways), and CNY→USD converted costs. Public ``testing``
-    rows are retained as metadata (only the authenticated listing grants
-    entitlement); offline, non-chat, and malformed rows do not enter the
-    runtime compatibility table.
+    authoritative both ways), and CNY→USD converted costs. Public chat rows
+    are retained as metadata regardless of their descriptive status (only the
+    authenticated listing grants entitlement); non-chat and malformed rows
+    do not enter the runtime compatibility table.
     """
     published = parse_tokenrhythm_published(payload)
     return tokenrhythm_published_catalog_entries(published)

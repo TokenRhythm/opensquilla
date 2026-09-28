@@ -184,8 +184,7 @@ describe('ordinary usage is not ensemble evidence', () => {
     expect(details).toContain('fast')
     expect(details).toContain('$0.001')
     expect(details).toContain('↑10 ↓5')
-    expect(el.querySelector('.msg-action--vote')?.getAttribute('title')).toBe(i18n.global.t('chat.routeFeedback.up'))
-    expect(el.querySelector('.msg-action--vote')?.getAttribute('title')).not.toBe(i18n.global.t('chat.routeFeedback.upEnsemble'))
+    expect(el.querySelector('.msg-action--vote')).toBeNull()
   })
 
   it.each([false, true])('does not invent a strip in fixed mode (history=%s)', async restored => {

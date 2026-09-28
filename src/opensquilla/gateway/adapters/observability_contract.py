@@ -17,7 +17,6 @@ from opensquilla.gateway.adapters.contract_method import (
 
 OBSERVABILITY_CONTRACT_METHODS: Final = (
     "status",
-    "router.selflearning.status",
     "doctor.status",
     "logs.status",
     "logs.tail",

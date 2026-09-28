@@ -8,6 +8,9 @@ _DESKTOP_TOOL_SEARCH_PROBE_ARG = "--_desktop-tool-search-probe"
 _DESKTOP_TOOL_SEARCH_PROBE_OK = "opensquilla-desktop-tool-search-ok"
 _DESKTOP_DOCUMENT_PROBE_ARG = "--_desktop-document-probe"
 _DESKTOP_MCP_PROBE_ARG = "--_desktop-mcp-probe"
+_DESKTOP_PTY_PROBE_ARG = "--_desktop-pty-probe"
+_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS = 10.0
+_DESKTOP_PTY_POST_EXIT_GRACE_SECONDS = 1.0
 _SANDBOX_FILESYSTEM_WORKER_ARG = "--_sandbox-filesystem-worker"
 _INTERNAL_CHILD_ARG = "--internal-child"
 
@@ -106,6 +109,120 @@ def _run_desktop_document_probe(filename: str) -> int:
     return 0
 
 
+def _run_desktop_pty_probe() -> int:
+    """Verify that the frozen gateway contains a working platform PTY backend."""
+    import asyncio
+    import json
+    from contextlib import suppress
+
+    from opensquilla.tools.pty_backend import (
+        PtyBackendError,
+        read_pty,
+        spawn_pty,
+        terminate_pty,
+        wait_pty,
+    )
+
+    if os.name == "nt":
+        command = (
+            "if (-not [Console]::IsInputRedirected -and "
+            "-not [Console]::IsOutputRedirected) { "
+            "Write-Output 'opensquilla-pty-ok' } else { "
+            "Write-Output 'opensquilla-pty-miss' }"
+        )
+    else:
+        command = (
+            "if [ -t 0 ] && [ -t 1 ]; then printf 'opensquilla-pty-ok\\n'; "
+            "else printf 'opensquilla-pty-miss\\n'; fi"
+        )
+
+    async def collect() -> tuple[str, int | None]:
+        handle = None
+        exited = None
+        reading = None
+        try:
+            handle = spawn_pty(command, cwd=os.getcwd(), env=dict(os.environ))
+            async with asyncio.timeout(_DESKTOP_PTY_PROBE_TIMEOUT_SECONDS):
+                chunks: list[bytes] = []
+                exited = asyncio.create_task(wait_pty(handle))
+                while True:
+                    reading = asyncio.create_task(read_pty(handle))
+                    done, _ = await asyncio.wait(
+                        {reading, exited}, return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if exited in done and reading not in done:
+                        # ConPTY can keep its socket open after the child has
+                        # exited.  Give the reader a bounded grace period to
+                        # receive buffered tail bytes, then treat quietness as
+                        # EOF for this probe.
+                        try:
+                            chunk = await asyncio.wait_for(
+                                reading, timeout=_DESKTOP_PTY_POST_EXIT_GRACE_SECONDS,
+                            )
+                        except TimeoutError:
+                            reading.cancel()
+                            with suppress(asyncio.CancelledError):
+                                await reading
+                            break
+                    else:
+                        try:
+                            chunk = reading.result()
+                        except EOFError:
+                            break
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                return b"".join(chunks).decode("utf-8", errors="replace"), await exited
+        except PtyBackendError as exc:
+            handle = exc.handle or handle
+            raise
+        finally:
+            if reading is not None and not reading.done():
+                reading.cancel()
+                with suppress(asyncio.CancelledError):
+                    await reading
+            if exited is not None and not exited.done():
+                exited.cancel()
+                with suppress(asyncio.CancelledError):
+                    await exited
+            if handle is not None:
+                # Stop the PTY child before asyncio shuts down its blocking
+                # reader thread, including a failed spawn that returned a handle.
+                with suppress(Exception):
+                    await terminate_pty(handle)
+                if exited is None or exited.cancelled() or not exited.done():
+                    with suppress(Exception):
+                        await asyncio.wait_for(wait_pty(handle), timeout=5.0)
+
+    try:
+        output, returncode = asyncio.run(collect())
+        is_tty = "opensquilla-pty-ok" in output
+        result = {
+            "probe": "opensquilla-desktop-pty",
+            "available": is_tty and returncode == 0,
+            "ioMode": "pty" if is_tty else "pipe",
+            "returncode": returncode,
+        }
+        print(json.dumps(result))
+        return 0 if result["available"] else 1
+    except PtyBackendError as exc:
+        print(json.dumps({
+            "probe": "opensquilla-desktop-pty",
+            "available": False,
+            "ioMode": "unavailable",
+            "reason": str(exc),
+        }))
+        return 1
+    except Exception as exc:
+        print(json.dumps({
+            "probe": "opensquilla-desktop-pty",
+            "available": False,
+            "ioMode": "error",
+            "reason": "PTY probe timed out" if isinstance(exc, TimeoutError) else str(exc),
+        }))
+        return 1
+
+
 def _run_desktop_mcp_probe(gateway_url: str) -> int:
     """Use real MCP stdio and the production server bridge to the local Gateway."""
     import asyncio
@@ -189,6 +306,9 @@ if __name__ == "__main__":
 
     if len(sys.argv) == 3 and sys.argv[1] == _DESKTOP_DOCUMENT_PROBE_ARG:
         raise SystemExit(_run_desktop_document_probe(sys.argv[2]))
+
+    if sys.argv[1:] == [_DESKTOP_PTY_PROBE_ARG]:
+        raise SystemExit(_run_desktop_pty_probe())
 
     if len(sys.argv) == 3 and sys.argv[1] == _DESKTOP_MCP_PROBE_ARG:
         raise SystemExit(_run_desktop_mcp_probe(sys.argv[2]))

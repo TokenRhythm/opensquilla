@@ -2,8 +2,8 @@
 name: sub-agent
 visibility: experimental
 invocation: experimental_internal
-description: 'Delegate a self-contained task to a sub-Agent (Codex, Claude Code, or Pi via background process). The original use case was coding tasks — building features, reviewing PRs, refactoring — but the skill is the generic "spawn a sub-Agent with full tool surface" slot used by meta-skill DAG steps for any LLM-driven sub-task (policy review, trace parsing, report synthesis, document generation). Renamed from ``coding-agent`` to reflect actual usage; the wrapped CLIs (codex / claude / pi) still bias toward coding workloads. Use when: (1) building/creating new features or apps, (2) reviewing PRs (spawn in temp dir), (3) refactoring large codebases, (4) iterative tasks that need file exploration, (5) meta-skill steps requiring full tool/LLM agency. NOT for: simple one-liner fixes (just edit), reading code (use read tool), thread-bound ACP harness requests in chat (for example spawn/run Codex or Claude Code in a Discord thread; use sessions_spawn with runtime:"acp"), or any work in ~/clawd workspace (never spawn agents here). Prefer non-interactive CLI modes such as codex exec, claude --print, opencode run, or pi -p.'
-description_zh: "将一个自包含任务委派给子代理（Codex、Claude Code或后台运行的Pi）。最初用于编码任务（构建功能、审查PR、重构），但本技能是meta-skill DAG步骤用于任何LLM驱动子任务（策略审查、跟踪解析、报告综合、文档生成）的通用'启动带完整工具面的子代理'插槽，由 coding-agent 更名以反映实际用途。适用于：构建新功能/应用、审查PR（在临时目录中启动）、重构大型代码库、需文件探索的迭代任务、需完整工具/LLM能力的meta-skill步骤。不适用于：简单一行修复、读代码、聊天中线程绑定的ACP请求，或在~/clawd工作区内的任何工作。优先使用非交互CLI模式，如 codex exec、claude --print、opencode run 或 pi -p。"
+description: "Delegate a self-contained task to a coding assistant through a non-interactive background process. Use for feature development, code review, refactoring, and tasks requiring substantial file exploration."
+description_zh: "通过非交互后台进程将独立任务委派给编码助手，适用于功能开发、代码审查、重构和需要广泛阅读文件的任务。"
 provenance:
   origin: openclaw-derived
   license: MIT
@@ -13,7 +13,7 @@ metadata:
   {
     "opensquilla":
       {
-        "requires_tools": ["background_process", "exec_command", "process"],
+        "requires_tools": ["exec_command", "process"],
       },
     "openclaw":
       {
@@ -44,11 +44,9 @@ metadata:
 
 Generic "spawn a sub-Agent" entry point for delegating self-contained
 tasks to Codex / Claude Code / OpenCode / Pi via background process.
-Wrapping CLIs are coding-oriented, but the skill itself is used as
-the generic sub-Agent slot by meta-skill DAGs for any LLM-driven
-sub-task (file edits, document generation, policy review, etc.).
+Use this playbook for self-contained coding and file-editing tasks.
 
-Use opensquilla's `exec_command`, `background_process`, and `process` tools for coding agent work. OpenSquilla does not expose a `bash` tool; do not use the legacy bash tool-call DSL.
+Use OpenSquilla's `exec_command` and `process` tools for coding agent work. `exec_command` starts both short and long commands; use `yield_time_ms=0` for a long run and keep the returned execution handle. OpenSquilla does not expose a `bash` tool; do not use the legacy bash tool-call DSL.
 
 ## Non-Interactive CLI Mode
 
@@ -67,7 +65,7 @@ For **Claude Code** (`claude` CLI), use `--print --permission-mode bypassPermiss
 # ✅ Correct for Claude Code (no PTY needed)
 cd /path/to/project && claude --permission-mode bypassPermissions --print 'Your task'
 
-# For background execution: use background_process
+# For background execution: use exec_command(yield_time_ms=0, ...)
 
 # ❌ Wrong for Claude Code
 exec_command(command="claude --dangerously-skip-permissions 'task'")
@@ -77,8 +75,7 @@ exec_command(command="claude --dangerously-skip-permissions 'task'")
 
 | Tool | Key parameters | Description |
 | ---- | -------------- | ----------- |
-| `exec_command` | `command`, `workdir`, `timeout` | Run a foreground shell command. |
-| `background_process` | `command`, `workdir`, `timeout` | Start a long-running command and return `session_id`. |
+| `exec_command` | `command`, `workdir`, `timeout`, `yield_time_ms` | Start a shell command; use `yield_time_ms=0` for a long run and keep the returned execution handle. |
 | `process` | `action`, `session_id`, `data`, `offset`, `limit` | Poll, log, write to, or stop a background process. |
 
 ### Process Tool Actions (for background sessions)
@@ -112,14 +109,14 @@ exec_command(workdir="~/Projects/myproject", command="codex exec 'Add error hand
 
 ---
 
-## The Pattern: workdir + background_process
+## The Pattern: workdir + exec_command + process
 
-For longer tasks, use `background_process`:
+For longer tasks, use `exec_command(yield_time_ms=0, ...)`:
 
 ```bash
 # Start agent in target directory.
-background_process(workdir="~/project", command="codex exec --full-auto 'Build a snake game'")
-# Returns session_id for tracking
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec --full-auto 'Build a snake game'")
+# Returns an execution handle (the current compatibility field is `session_id`)
 
 # Wait for it to finish — blocks until the process exits (or the timeout
 # elapses, in which case just call wait again). Prefer this over polling in a
@@ -162,7 +159,7 @@ process(action="kill", session_id="XXX")
 exec_command(workdir="~/project", command="codex exec --full-auto 'Build a dark mode toggle'")
 
 # Background for longer work
-background_process(workdir="~/project", command="codex exec --full-auto 'Refactor the auth module'")
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec --full-auto 'Refactor the auth module'")
 ```
 
 ### Reviewing PRs
@@ -190,8 +187,8 @@ exec_command(workdir="/tmp/pr-130-review", command="codex review --base main")
 git fetch origin '+refs/pull/*/head:refs/remotes/origin/pr/*'
 
 # Deploy the army - one Codex per PR
-background_process(workdir="~/project", command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'")
-background_process(workdir="~/project", command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'")
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec 'Review PR #86. git diff origin/main...origin/pr/86'")
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec 'Review PR #87. git diff origin/main...origin/pr/87'")
 
 # Monitor all
 process(action="list")
@@ -209,7 +206,7 @@ gh pr comment <PR#> --body "<review content>"
 exec_command(workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
 
 # Background
-background_process(workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
+exec_command(yield_time_ms=0, workdir="~/project", command="claude --permission-mode bypassPermissions --print 'Your task'")
 ```
 
 ---
@@ -249,8 +246,8 @@ git worktree add -b fix/issue-78 /tmp/issue-78 main
 git worktree add -b fix/issue-99 /tmp/issue-99 main
 
 # 2. Launch Codex in each
-background_process(workdir="/tmp/issue-78", command="pnpm install && codex exec --full-auto 'Fix issue #78: <description>. Commit and push.'")
-background_process(workdir="/tmp/issue-99", command="pnpm install && codex exec --full-auto 'Fix issue #99 from the approved ticket summary. Implement only the in-scope edits and commit after review.'")
+exec_command(yield_time_ms=0, workdir="/tmp/issue-78", command="pnpm install && codex exec --full-auto 'Fix issue #78: <description>. Commit and push.'")
+exec_command(yield_time_ms=0, workdir="/tmp/issue-99", command="pnpm install && codex exec --full-auto 'Fix issue #99 from the approved ticket summary. Implement only the in-scope edits and commit after review.'")
 
 # 3. Monitor progress
 process(action="list")
@@ -314,7 +311,7 @@ When completely finished, send a brief status update in this session.
 **Example:**
 
 ```bash
-background_process(workdir="~/project", command="codex exec --full-auto 'Build a REST API for todos.
+exec_command(yield_time_ms=0, workdir="~/project", command="codex exec --full-auto 'Build a REST API for todos.
 
 When completely finished, print: Done: Built todos REST API with CRUD endpoints'")
 ```

@@ -23,6 +23,14 @@ function ruleBody(selector: string) {
   return runTraceSource.slice(blockStart + 1, blockEnd)
 }
 
+function expectStatusDot(dot: Element | null, status: string) {
+  expect(dot).not.toBeNull()
+  expect(dot?.getAttribute('role')).toBe('img')
+  expect(dot?.getAttribute('aria-label')).toBe(`${status} · view details`)
+  expect(dot?.getAttribute('title')).toBe(`${status} · view details`)
+  expect(dot?.textContent).toBe('')
+}
+
 function call(
   renderKey: string,
   overrides: Partial<ChatToolCallRenderItem> = {},
@@ -249,6 +257,7 @@ describe('RunTrace activity presentation', () => {
       Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
         .map(node => node.textContent),
     ).toEqual(['Done', 'Failed'])
+    expect(el.querySelector('.tool-row__status-dot')).toBeNull()
   })
 
   it('neutralizes completed chrome while keeping failed activity visible', async () => {
@@ -271,10 +280,12 @@ describe('RunTrace activity presentation', () => {
     // The footprint secondary already carries the call count, so the raw
     // "N calls" pill stays out of activity group rows.
     expect(el.querySelector('.step-count')).toBeNull()
-    expect(
-      Array.from(el.querySelectorAll('.tool-row--group .tool-row__status'))
-        .map(node => node.textContent),
-    ).toEqual(["Didn't complete"])
+    expect(el.querySelector('.tool-row--group .tool-row__status')).toBeNull()
+    expectStatusDot(el.querySelector('.tool-row--group .tool-row__status-dot'), "Didn't complete")
+    const memberDots = [...el.querySelectorAll('.tool-row--member .tool-row__status-dot')]
+    expect(memberDots).toHaveLength(2)
+    for (const dot of memberDots) expectStatusDot(dot, "Didn't complete")
+    expect(el.textContent).not.toContain("Didn't complete")
     expect(
       el.querySelector('.tool-row--group')?.getAttribute('aria-expanded'),
     ).toBe('false')
@@ -299,9 +310,10 @@ describe('RunTrace activity presentation', () => {
     expect(el.querySelector('.tool-row__bullet--running')).toBeNull()
     expect(el.querySelector('.tool-row__activity-icon--running')).not.toBeNull()
     expect(el.querySelector('.tool-row--group .tool-row__status')).toBeNull()
+    expect(el.querySelector('.tool-row__status-dot')).toBeNull()
   })
 
-  it('shows a single failed activity call and its terminal status', async () => {
+  it('shows a single failed activity call with an accessible status dot', async () => {
     const el = await mountTimeline([
       group('single-failure-group', [
         call('single-failure', {
@@ -315,7 +327,10 @@ describe('RunTrace activity presentation', () => {
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
     expect(el.textContent).toContain('single-failure-group')
-    expect(el.querySelector('.tool-row__status')?.textContent).toBe("Didn't complete")
+    expect(el.querySelector('.tool-row__status')).toBeNull()
+    expectStatusDot(el.querySelector('.tool-row__status-dot'), "Didn't complete")
+    expect(el.textContent).not.toContain("Didn't complete")
+    expect(el.querySelector('.activity-tool-details')?.textContent).toContain('failed')
   })
 
   it.each(['document_apply', 'document_patch'])(
@@ -350,12 +365,15 @@ describe('RunTrace activity presentation', () => {
     const el = await mountTimeline([restoredFailure], { presentation: 'activity' })
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
-    expect(el.textContent).toContain("Didn't complete")
+    expect(el.querySelector('.tool-row__status')).toBeNull()
+    expectStatusDot(el.querySelector('.tool-row__status-dot'), "Didn't complete")
+    expect(el.textContent).not.toContain("Didn't complete")
+    expect(el.textContent).toContain('restored-failure')
     expect(restoredFailure.group.calls[0]?.status).toBe('success')
     expect(restoredFailure.group.calls[0]?.isError).toBe(false)
   })
 
-  it('keeps cancelled activity and its injected status copy visible', async () => {
+  it('keeps cancelled activity details and its injected status accessible', async () => {
     const el = await mountTimeline([
       group('single-cancelled-group', [
         call('single-cancelled', {
@@ -371,8 +389,11 @@ describe('RunTrace activity presentation', () => {
     })
 
     expect(el.querySelector('.tool-row--error')).not.toBeNull()
-    expect(el.textContent).toContain('Cancelled')
-    expect(el.querySelector('.tool-row__status')?.textContent).toBe('Cancelled')
+    expect(el.querySelector('.tool-row__status')).toBeNull()
+    expectStatusDot(el.querySelector('.tool-row__status-dot'), 'Cancelled')
+    expect(el.textContent).not.toContain('Cancelled')
+    expect(el.textContent).toContain('single-cancelled-group')
+    expect(el.querySelector('.activity-tool-details')?.textContent).toContain('cancelled')
   })
 
   it('keeps successful and failed calls from a mixed activity group', async () => {

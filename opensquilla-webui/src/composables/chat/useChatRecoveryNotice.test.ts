@@ -5,6 +5,31 @@ import { useChatRecoveryNotice } from './useChatRecoveryNotice'
 
 afterEach(() => vi.useRealTimers())
 describe('quiet automatic recovery notice', () => {
+  it('leaves slow runtime startup to the desktop notice but still shows terminal failures', async () => {
+    vi.useFakeTimers()
+    const scope = effectScope()
+    const state = ref<ChatSessionRecoveryState | null>('live-connecting')
+    const runtimeStarting = ref(true)
+    const visible = scope.run(() => useChatRecoveryNotice(state, runtimeStarting))!
+    await vi.advanceTimersByTimeAsync(15_000)
+    state.value = 'live-degraded'
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(visible.value).toBe(false)
+
+    runtimeStarting.value = false
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(visible.value).toBe(true)
+    runtimeStarting.value = true
+    await nextTick()
+    expect(visible.value).toBe(false)
+    state.value = null
+    runtimeStarting.value = false
+    await vi.advanceTimersByTimeAsync(2_000)
+    expect(visible.value).toBe(false)
+    scope.stop()
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
   it('does not flash for a short failure, then keeps one timer through retry phase changes', async () => {
     vi.useFakeTimers()
     const scope = effectScope()

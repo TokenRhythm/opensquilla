@@ -7,6 +7,8 @@ import type { ArtifactPayload } from '@/types/artifacts'
 import { usePlatform } from '@/platform'
 import { useDialogLayer } from '@/composables/useDialogA11y'
 import { useToasts } from '@/composables/useToasts'
+import { useImageClipboard, isSvgClipboardCandidate } from '@/composables/useImageClipboard'
+import { ImageClipboardError } from '@/utils/imageClipboard'
 import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
 import { artifactWorkbenchPreviewKind } from '@/utils/workbench/artifactPreview'
 import { isPreviewPagePath } from '@/utils/workbench/previewPagePath'
@@ -45,6 +47,40 @@ const html = computed(() => !!selected.value && artifactWorkbenchPreviewKind({
   ...selected.value,
   ...(metadata.value ? { name: metadata.value.name, mime: metadata.value.mime } : {}),
 }) === 'html')
+const clipboardArtifact = computed(() => selected.value ? {
+  ...selected.value,
+  ...(metadata.value ? { name: metadata.value.name, mime: metadata.value.mime } : {}),
+} : null)
+const svg = computed(() => !!clipboardArtifact.value && isSvgClipboardCandidate(clipboardArtifact.value))
+const imageClipboard = useImageClipboard({
+  source: () => clipboardArtifact.value ? { kind: 'artifact', artifact: clipboardArtifact.value } : null,
+  sessionKey: () => props.sessionKey || session,
+  loadBlob: async (signal, maxBytes) => {
+    const artifact = selected.value
+    if (!artifact || !workbench) throw new ImageClipboardError('failed')
+    if (source.value) {
+      if (!workbench.content.fetchWorkingFile) throw new ImageClipboardError('failed')
+      let blob: Blob
+      try {
+        blob = await workbench.content.fetchWorkingFile({ ...currentRequest(artifact, signal), maxBytes })
+      } catch (error) {
+        if (error && typeof error === 'object' && 'code' in error && error.code === 'too_large') {
+          throw new ImageClipboardError('tooLarge')
+        }
+        throw error
+      }
+      if (blob.size > maxBytes) throw new ImageClipboardError('tooLarge')
+      return blob
+    }
+    const result = await workbench.content.fetchArtifact(artifact, { sessionKey: session, signal, maxBytes })
+    if (!result.ok) throw new ImageClipboardError(result.errorCode === 'too_large' ? 'tooLarge' : 'failed')
+    return result.blob
+  },
+})
+function copySvgSource() {
+  close()
+  void imageClipboard.copy('svg-source')
+}
 const revealLabel = computed(() => t(isMacPlatform() ? 'resourceActions.revealFinder'
   : typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent)
     ? 'resourceActions.revealExplorer' : 'resourceActions.reveal'))
@@ -58,6 +94,7 @@ function close() {
 function cancel() {
   generation++
   pending?.abort()
+  imageClipboard.cancel()
   close()
 }
 watch(signature, cancel)
@@ -241,7 +278,9 @@ defineExpose({ show })
             {{ t(platform.files.saveArtifact ? 'resourceActions.saveAs' : 'chat.download') }}
           </button>
           <button v-if="source && !html" role="menuitem" type="button" @click="perform('path')">{{ t(localInstance ? 'resourceActions.copyPath' : 'resourceActions.copyGatewayPath') }}</button>
-          <button v-if="!html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
+          <button v-if="svg" role="menuitem" type="button" :disabled="imageClipboard.busy.value"
+            @click="copySvgSource">{{ t('imageClipboard.copySource') }}</button>
+          <button v-else-if="!html" role="menuitem" type="button" @click="perform('contents')">{{ t('resourceActions.copyContents') }}</button>
         </template>
         <small v-if="source && !readable" role="status">{{ t(loading ? 'common.loading' : 'resourceActions.unavailable') }}</small>
       </div>

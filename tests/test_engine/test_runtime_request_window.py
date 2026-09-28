@@ -137,12 +137,12 @@ async def test_load_recomputes_window_after_append_and_preserves_new_messages(hi
     assert key not in runner._emergency_compaction_overrides
 
 
-@pytest.mark.parametrize("valid", [True, False])
-async def test_window_uses_only_complete_previous_checkpoint_once(history, valid):
+@pytest.mark.parametrize("quoted_headers", [False, True])
+async def test_window_preserves_complete_previous_checkpoint_once(history, quoted_headers):
     storage, manager, key, session = history
     entries = await populate(manager, key)
     text = "SYNTHETIC_CHECKPOINT_FACT: retain violet setting"
-    if not valid:
+    if quoted_headers:
         text = (
             "[Structured Compaction Summary]\n\nCurrent Status:\n"
             "[Structured Compaction Summary]\n\nCurrent Status:\n" + text
@@ -159,7 +159,10 @@ async def test_window_uses_only_complete_previous_checkpoint_once(history, valid
     agent = history_agent()
     context = await runner._load_history(agent, key, trim_last_user=False)
     assert context and "Temporary history window" in context
-    assert context.count("SYNTHETIC_CHECKPOINT_FACT") == int(valid)
+    # Legacy checkpoint prose can quote section markers. Preserve its complete
+    # body once; only the renderer-owned wrapper determines replay integrity.
+    assert text in context
+    assert context.count("SYNTHETIC_CHECKPOINT_FACT") == 1
     assert context.count("[Compacted Session Summaries]") == 1
     assert await fingerprint(manager, key) == before
     summaries = await storage.get_all_summaries(session.session_id)

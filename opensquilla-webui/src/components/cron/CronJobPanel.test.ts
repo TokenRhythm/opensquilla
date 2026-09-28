@@ -2,7 +2,7 @@
 
 import { createApp, h, nextTick, reactive, ref } from 'vue'
 import { createI18n } from 'vue-i18n'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import CronJobPanel from './CronJobPanel.vue'
 import type { CronJobFormModel } from '@/types/cron'
 
@@ -49,12 +49,16 @@ function formModel(): CronJobFormModel {
 
 function mountPanel() {
   const open = ref(true)
+  const saving = ref(false)
+  const close = vi.fn()
   const form = reactive(formModel())
   const host = document.createElement('div')
   document.body.appendChild(host)
   const app = createApp({
     setup: () => () => h(CronJobPanel, {
       open: open.value,
+      saving: saving.value,
+      onClose: close,
       editingJob: null,
       form,
       'onUpdate:form': (next: CronJobFormModel) => Object.assign(form, next),
@@ -81,10 +85,28 @@ function mountPanel() {
   }))
   app.mount(host)
   apps.push(app)
-  return { form, open }
+  return { form, open, saving, close }
 }
 
 describe('CronJobPanel friendly schedule contracts', () => {
+  it('keeps focus in the dialog and ignores Escape while saving', async () => {
+    const { saving, close } = mountPanel()
+    saving.value = true
+    await nextTick()
+    await nextTick()
+    const dialog = document.querySelector<HTMLElement>('.cron-panel')!
+    expect(document.activeElement).toBe(dialog)
+    const tab = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+    dialog.dispatchEvent(tab)
+    expect(tab.defaultPrevented).toBe(true)
+    dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true }))
+    expect(close).not.toHaveBeenCalled()
+    saving.value = false
+    await nextTick()
+    await nextTick()
+    expect(document.activeElement).toBe(dialog.querySelector('.cron-panel__actions .btn--primary'))
+  })
+
   it('writes a backend-valid offset timestamp from datetime-local input', async () => {
     const { form } = mountPanel()
     form.type = 'at'

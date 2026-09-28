@@ -93,7 +93,7 @@ async def run_native_chat_runtime(
             config=TuiRuntimeConfig(
                 task_name=surface_task_name(surface),
                 queue_max_size=queue_max_size,
-                concurrent_input_during_turn=False,
+                concurrent_input_during_turn=callable(scope.get("answer_user_input")),
                 classify_input=lambda user_input: classify_chat_input(
                     user_input,
                     surface=surface,
@@ -115,6 +115,12 @@ async def run_native_chat_runtime(
                     else TuiRuntimeHooks().on_surface_ready
                 ),
                 on_user_activity=on_user_activity or TuiRuntimeHooks().on_user_activity,
+                on_answer_user_input=scope.get(
+                    "answer_user_input", TuiRuntimeHooks().on_answer_user_input,
+                ),
+                on_cancel_user_input=scope.get(
+                    "cancel_user_input", TuiRuntimeHooks().on_cancel_user_input,
+                ),
                 expose_surface=context.expose_surface,
                 clear_exposed_surface=context.clear_output,
             ),

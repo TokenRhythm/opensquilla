@@ -79,8 +79,6 @@
       "required": ["supported", "executionEnabled", "maxTurns", "runtimeBudgetSeconds", "methods"],
       "properties": {
         "supported": {"type": "boolean"},
-        "tokenBudgetSupported": {"type": "boolean", "description": "Whether Goal token budgets are supported. Clients must treat an absent field as unsupported."},
-        "backgroundExecutionSupported": {"type": "boolean", "description": "Whether explicitly authorized background Goal execution is supported. Clients must treat an absent field as unsupported."},
         "executionEnabled": {"type": "boolean"},
         "maxTurns": {"type": "integer", "minimum": 0},
         "runtimeBudgetSeconds": {"type": "integer", "minimum": 0},

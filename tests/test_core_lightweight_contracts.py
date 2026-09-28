@@ -87,7 +87,7 @@ def test_deprecated_protocol_strip_preserves_protocol_like_html() -> None:
 def test_deprecated_protocol_strip_preserves_dsml_text() -> None:
     text = (
         "Let me create the printable daily record sheet as well:\n\n"
-        '<｜DSML｜tool_calls><｜DSML｜invoke name="create_xlsx">'
+        '<｜DSML｜tool_calls><｜DSML｜invoke name="generic_table">'
         '<｜DSML｜parameter name="name" string="true">'
         "bean-sprout-daily-record-sheet.xlsx"
         "</｜DSML｜parameter>"
@@ -129,7 +129,7 @@ def test_deprecated_streaming_guard_passes_split_dsml_without_buffering() -> Non
 
     first = "Let me make the sheet.\n\n<｜DS"
     second = (
-        'ML｜tool_calls><｜DSML｜invoke name="create_xlsx">'
+        'ML｜tool_calls><｜DSML｜invoke name="generic_table">'
         '<｜DSML｜parameter name="sheets">[]</｜DSML｜parameter>'
     )
     assert guard.push(first) == first

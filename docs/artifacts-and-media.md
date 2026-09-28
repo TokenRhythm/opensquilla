@@ -30,6 +30,21 @@ Create a one-page HTML dashboard from this data and publish it as an artifact.
 Generate a PDF briefing with sources and publish the final file.
 ```
 
+The Agent creates CSV, XLSX, PPTX, and PDF files with ordinary workspace tools,
+`execute_code`, and document skills, then calls `publish_artifact`. Generation
+and publication use the same path regardless of the requested file format.
+
+In ordinary channel sessions, generation requires a Gateway-attested managed
+workspace and sandbox; unavailable isolation does not enable host execution.
+See [ordinary channel sessions](tools-and-sandbox.md#ordinary-channel-sessions).
+
+Channel delivery verifies the artifact against the admitted session and pins
+it to the original inbound account, conversation, and thread. The outbox assigns
+a stable delivery identity. Replaying a completed send reuses its receipt;
+an uncertain provider response is retained as `unknown` rather than blindly
+uploading and sending again. Cross-session artifacts are rejected, including
+their fallback download links. Platform file limits still apply.
+
 ### HTML projects and webpage preview
 
 `publish_artifact` can preserve a generated HTML project instead of publishing

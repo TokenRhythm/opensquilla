@@ -60,8 +60,8 @@ export default defineConfig({
           ? { launchOptions: { executablePath: chromiumExecutablePath } }
           : {}),
       },
-      // The append-only live-turn proof runs in the dedicated project below.
-      testIgnore: /fold-live-turn\.spec\.ts/,
+      // Live-turn and OS clipboard proofs have isolated projects/configs.
+      testIgnore: /(?:fold-live-turn|image-copy)\.spec\.ts/,
     },
     {
       // Drive the real live-stream path through the sole turn projection.

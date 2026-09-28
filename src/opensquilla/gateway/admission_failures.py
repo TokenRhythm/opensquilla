@@ -7,7 +7,6 @@ from contextlib import contextmanager
 
 from opensquilla.application.admission_failures import (
     AdmissionIngressConflictError,
-    AdmissionMetaControlConflictError,
     AdmissionPendingInputConflictError,
     AdmissionPlanConflictError,
     AdmissionPlanSessionBusyError,
@@ -17,7 +16,6 @@ from opensquilla.application.admission_failures import (
 )
 from opensquilla.session.plans import PlanConflictError, PlanRunConflictError
 from opensquilla.session.storage import (
-    MetaControlIntentConflictError,
     PendingChatInputConflictError,
     PlanImplementationSessionBusyError,
     StaleEpochError,
@@ -47,8 +45,6 @@ def admission_failure(error: Exception) -> Exception | None:
         return AdmissionIngressConflictError(str(error))
     if isinstance(error, PendingChatInputConflictError):
         return AdmissionPendingInputConflictError(str(error))
-    if isinstance(error, MetaControlIntentConflictError):
-        return AdmissionMetaControlConflictError(str(error))
     if isinstance(error, TaskCollectionUnavailableError):
         return AdmissionTaskCollectionUnavailableError(str(error))
     if isinstance(error, (PlanConflictError, PlanRunConflictError)):

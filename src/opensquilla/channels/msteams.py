@@ -322,7 +322,7 @@ class MSTeamsChannel:
             self._bot_id = activity.recipient.id
 
         msg = self._activity_to_incoming(activity)
-        self.enqueue(msg)
+        await self.enqueue(msg)
         log.info(
             "msteams.inbound_received",
             conversation_id=msg.metadata.get("conversation_id"),
@@ -410,7 +410,7 @@ class MSTeamsChannel:
     # Inbound queue
     # ------------------------------------------------------------------
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    async def enqueue(self, message: IncomingMessage) -> None:
         activity_id = str(message.metadata.get("activity_id") or "")
         if activity_id and not self._dedupe.check_and_add(activity_id):
             return

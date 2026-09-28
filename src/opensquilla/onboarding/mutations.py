@@ -680,11 +680,11 @@ def _apply_primary_provider_router_policy(
 ) -> None:
     """Apply the single Router contract for every primary-provider switch.
 
-    Managed ladders follow the target provider while retaining Router enabled
-    state and all orthogonal settings.  Explicit custom and unclassified
-    legacy ladders are byte-preserved unless the caller selects one of the
-    conflict-resolution actions.  Ensemble state is intentionally outside
-    this helper and is never touched.
+    Switching to OpenRouter or TokenRhythm installs that provider's current
+    recommended ladder. Other providers preserve custom and legacy ladders,
+    while managed ladders follow the target provider. Explicit conflict
+    actions take precedence. Router enabled state, orthogonal settings, and
+    Ensemble state remain unchanged unless an explicit action changes them.
     """
 
     action = _normalize_router_conflict_action(router_action)
@@ -711,6 +711,10 @@ def _apply_primary_provider_router_policy(
             target_provider,
             preset=explicit_preset,
         )
+        return
+
+    if primary_changed and target in {"openrouter", "tokenrhythm"}:
+        _reconcile_router_profile_for_provider(candidate, target_provider)
         return
 
     if binding == "follow_primary" or (
@@ -767,11 +771,11 @@ def upsert_llm_provider(
     providers or endpoint origins.
 
     Router ownership is explicit and shared with profile activation:
-    ``follow_primary`` reconciles to this provider while preserving Router
-    enabled state and orthogonal settings; ``custom`` and legacy/unclassified
-    ladders are preserved.  A cross-provider custom ladder that cannot execute
-    with cross-provider routing off is rejected unless ``router_action``
-    resolves it explicitly.
+    Switching to OpenRouter or TokenRhythm installs its recommended ladder;
+    ``follow_primary`` likewise reconciles to any target provider. Router
+    enabled state and orthogonal settings are preserved. Other providers keep
+    custom/legacy ladders, rejecting an unexecutable cross-provider ladder
+    unless ``router_action`` resolves it explicitly.
 
     ``image_generation_intent`` is an additive client contract. Its default
     is ``preserve`` for old clients; ``enable_provider_default`` may add the
@@ -2832,10 +2836,11 @@ def activate_llm_profile(
     """Atomically promote a stored profile and demote the current primary.
 
     The mutation is pure: callers must persist the returned candidate before
-    applying it to the running gateway.  Managed Router presets follow the new
-    primary; custom/legacy Router state and all Ensemble fields remain intact
-    unless ``router_action`` explicitly resolves a provider conflict. Image
-    defaults likewise require an explicit ``image_generation_intent``.
+    applying it to the running gateway. Switching to OpenRouter or TokenRhythm
+    installs its recommended Router ladder. Other providers preserve custom
+    ladders and synchronize managed presets. Router mode and all Ensemble
+    fields remain intact unless ``router_action`` explicitly changes them.
+    Image defaults require an explicit ``image_generation_intent``.
     """
     from opensquilla.provider.deployment import resolve_provider_deployment
 

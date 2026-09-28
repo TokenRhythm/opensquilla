@@ -129,6 +129,12 @@ class ChannelArtifactDeliveryRequest:
     name: str
     mime_type: str
     size: int
+    # Durable outbox identity for provider-side idempotency.  The field is
+    # optional at the protocol boundary so third-party adapters and older
+    # callers remain source compatible; the channel outbox stamps it before a
+    # contextual delivery reaches a managed adapter.
+    delivery_id: str | None = None
+    session_id: str = ""
 
 
 class OutgoingMessage(BaseModel):

@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from types import SimpleNamespace
+from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
-import websockets.exceptions
 
 from opensquilla.channels.discord import (
     GATEWAY_INTENTS,
@@ -33,229 +35,249 @@ def test_discord_intent_defaults_are_consistent_across_config_surfaces() -> None
     assert GATEWAY_INTENTS & (1 << 13)  # DIRECT_MESSAGE_REACTIONS
 
 
+def _ready_frame() -> str:
+    return json.dumps({
+        "op": 0, "t": "READY", "s": 7,
+        "d": {"session_id": "session-1", "user": {"id": "bot-1", "username": "bot"},
+              "guilds": []},
+    })
+
+
 @pytest.mark.anyio
-async def test_first_gateway_heartbeat_uses_negotiated_jitter(
+async def test_sdk_ready_bridge_preserves_order_and_authenticated_messages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    channel = DiscordChannel(DiscordChannelConfig(token="token"))
-    channel._connected = True
-    channel._state.heartbeat_interval_ms = 40_000
-    delays: list[float] = []
+    import discord
 
-    async def fake_sleep(delay: float) -> None:
-        delays.append(delay)
-        channel._connected = False
+    received: list[tuple[str, bool, int]] = []
+    closed = asyncio.Event()
 
-    monkeypatch.setattr("opensquilla.channels.discord.random.random", lambda: 0.25)
-    monkeypatch.setattr("opensquilla.channels.discord.asyncio.sleep", fake_sleep)
+    async def start(client: Any, token: str, *, reconnect: bool) -> None:
+        received.append((token, reconnect, client.intents.value))
+        client.dispatch("socket_raw_receive", _ready_frame())
+        for kind, data in [
+            ("THREAD_CREATE", {"id": "thread-1", "type": 11, "parent_id": "parent-1"}),
+            ("MESSAGE_CREATE", {"id": "message-1", "channel_id": "thread-1",
+                                "author": {"id": "user-1"}, "content": "hello"}),
+        ]:
+            client.dispatch("socket_raw_receive", json.dumps({"op": 0, "t": kind, "d": data}))
+        await asyncio.Event().wait()
 
-    await channel._heartbeat_loop()
+    async def close(_client: Any) -> None:
+        closed.set()
 
-    assert delays == [10.0]
+    monkeypatch.setattr(discord.Client, "start", start)
+    monkeypatch.setattr(discord.Client, "close", close)
+    channel = DiscordChannel(DiscordChannelConfig(token="token", application_id="app-1"))
+    try:
+        await channel.start()
+        assert channel.is_connected()
+        assert channel.bot_user_id == "bot-1"
+        message = await asyncio.wait_for(channel.receive(), timeout=1)
+        assert message.metadata["native_thread_id"] == "thread-1"
+        assert message.metadata["native_parent_channel_id"] == "parent-1"
+        assert message.provenance.authenticated
+        assert message.provenance.account_id == "app-1"
+        assert received == [("token", True, GATEWAY_INTENTS)]
+        assert (await channel.health_check()).extra["gateway_sdk"] == "discord.py"
+        # SDK owns reconnection; the adapter only reflects its lifecycle.
+        channel._gateway_client.dispatch("disconnect")
+        await asyncio.sleep(0)
+        assert not channel.is_connected()
+        channel._gateway_client.dispatch(
+            "socket_raw_receive", json.dumps({"op": 0, "t": "RESUMED", "d": {}})
+        )
+        await asyncio.sleep(0)
+        assert channel.is_connected()
+    finally:
+        await channel.stop()
+    assert closed.is_set()
+    assert not channel.is_connected()
+    assert channel._gateway_task is None
+    assert channel._dispatch_task is None
 
 
 @pytest.mark.anyio
-async def test_start_schedules_heartbeat_after_hello_and_requires_ready() -> None:
-    channel = DiscordChannel(
-        DiscordChannelConfig(token="token", reconnect_max_retries=0)
-    )
-    frames = [
-        {"op": 10, "d": {"heartbeat_interval": 40_000}},
-        {
-            "op": 0,
-            "t": "READY",
-            "s": 7,
-            "d": {
-                "session_id": "session-1",
-                "resume_gateway_url": "wss://resume.example.test",
-                "user": {"id": "bot-1", "username": "bot"},
-                "guilds": [],
-            },
-        },
-    ]
-    sent: list[dict] = []
+async def test_sdk_login_failure_is_reported_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import discord
 
-    async def fake_connect(_url: str) -> object:
-        return object()
+    async def start(_client: Any, _token: str, *, reconnect: bool) -> None:
+        raise discord.LoginFailure("synthetic invalid token")
 
-    async def fake_recv() -> dict:
-        return frames.pop(0)
+    close = AsyncMock()
+    monkeypatch.setattr(discord.Client, "start", start)
+    monkeypatch.setattr(discord.Client, "close", close)
+    channel = DiscordChannel(DiscordChannelConfig(token="token"))
+    with pytest.raises(discord.LoginFailure):
+        await channel.start()
+    assert close.await_count >= 1
+    assert channel._gateway_client is None
+    assert not channel.is_connected()
 
-    async def fake_send(payload: dict) -> None:
-        sent.append(payload)
-        if payload.get("op") == 2:
-            assert channel._heartbeat_task is not None
-            assert not channel._connected
 
-    channel._connect_ws = fake_connect  # type: ignore[method-assign]
-    channel._ws_recv = fake_recv  # type: ignore[method-assign]
-    channel._ws_send = fake_send  # type: ignore[method-assign]
+@pytest.mark.anyio
+async def test_cancel_before_ready_closes_sdk_and_workers(monkeypatch: pytest.MonkeyPatch) -> None:
+    import discord
+
+    started = asyncio.Event()
+
+    async def start(_client: Any, _token: str, *, reconnect: bool) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    close = AsyncMock()
+    monkeypatch.setattr(discord.Client, "start", start)
+    monkeypatch.setattr(discord.Client, "close", close)
+    channel = DiscordChannel(DiscordChannelConfig(token="token"))
+    startup = asyncio.create_task(channel.start())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    assert not channel.is_connected()
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+    assert close.await_count >= 1
+    assert channel._gateway_task is None
+    assert channel._dispatch_task is None
+
+
+@pytest.mark.anyio
+async def test_sdk_terminal_failure_marks_health_disconnected_and_closes_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import discord
+
+    fail = asyncio.Event()
+
+    async def start(client: Any, _token: str, *, reconnect: bool) -> None:
+        client.dispatch("socket_raw_receive", _ready_frame())
+        await fail.wait()
+        raise RuntimeError("synthetic terminal error")
+
+    close = AsyncMock()
+    monkeypatch.setattr(discord.Client, "start", start)
+    monkeypatch.setattr(discord.Client, "close", close)
+    channel = DiscordChannel(DiscordChannelConfig(token="token"))
     try:
         await channel.start()
-
-        assert channel._connected is True
-        assert channel.bot_user_id == "bot-1"
-        assert channel._state.sequence == 7
-        assert sent[0]["op"] == 2
+        fail.set()
+        task = channel._gateway_task
+        assert task is not None
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert not (await channel.health_check()).connected
+        assert close.await_count >= 1
     finally:
         await channel.stop()
 
 
 @pytest.mark.anyio
-async def test_start_retries_early_gateway_reconnect_before_marking_connected() -> None:
-    channel = DiscordChannel(
-        DiscordChannelConfig(
-            token="token",
-            reconnect_max_retries=1,
-            reconnect_base_delay_s=0,
+async def test_sdk_custom_endpoints_are_instance_scoped() -> None:
+    channel = DiscordChannel(DiscordChannelConfig(token="token"))
+    client = channel._create_gateway_client()
+    request = AsyncMock(return_value={"ok": True})
+    connect = AsyncMock(return_value=object())
+    client.http.request = request
+    client.http.ws_connect = connect
+    channel.config.api_base = "https://api.example.test/v10"
+    channel.config.gateway_url = "wss://gateway.example.test/socket"
+    channel._configure_sdk_endpoints(client)
+    route = SimpleNamespace(BASE="https://discord.com/api/v10",
+                            url="https://discord.com/api/v10/users/@me")
+    try:
+        await client.http.request(route)
+        assert request.call_args.args[0].url == "https://api.example.test/v10/users/@me"
+        assert route.url == "https://discord.com/api/v10/users/@me"
+        await client.http.ws_connect("wss://gateway.discord.gg/?v=10&compress=zlib-stream")
+        assert connect.call_args.args[0] == (
+            "wss://gateway.example.test/socket?v=10&compress=zlib-stream"
         )
-    )
-    frames = [
-        {"op": 10, "d": {"heartbeat_interval": 40_000}},
-        {"op": 7, "d": None},
-        {"op": 10, "d": {"heartbeat_interval": 40_000}},
-        {
-            "op": 0,
-            "t": "READY",
-            "s": 8,
-            "d": {
-                "session_id": "session-2",
-                "user": {"id": "bot-2", "username": "bot"},
-                "guilds": [],
-            },
-        },
-    ]
-    connections: list[str] = []
+        await client.http.ws_connect("wss://resume.example.test/?v=10")
+        assert connect.call_args.args[0] == "wss://resume.example.test/?v=10"
+    finally:
+        await client.close()
 
-    async def fake_connect(url: str) -> object:
-        connections.append(url)
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ("enabled", "bypass", "rest_proxy", "gateway_proxy", "resume_proxy"),
+    [
+        (False, "", False, False, False),
+        (True, "", True, True, True),
+        (True, "gateway.discord.gg", True, False, True),
+        (True, "discord.com,resume.example.test", False, True, False),
+        (True, "*", False, False, False),
+    ],
+)
+async def test_sdk_proxy_policy_applies_per_rest_gateway_and_resume_url(
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+    bypass: str,
+    rest_proxy: bool,
+    gateway_proxy: bool,
+    resume_proxy: bool,
+) -> None:
+    from contextlib import asynccontextmanager
+
+    import aiohttp
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "WS_PROXY", "WSS_PROXY", "NO_PROXY"):
+        monkeypatch.delenv(name, raising=False)
+        monkeypatch.delenv(name.lower(), raising=False)
+    proxy = "http://proxy.example.test:8080"
+    monkeypatch.setenv("HTTPS_PROXY", proxy)
+    monkeypatch.setenv("NO_PROXY", bypass)
+    monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "1" if enabled else "0")
+    calls: list[tuple[str, str | None]] = []
+
+    @asynccontextmanager
+    async def request(_session: Any, _method: str, url: str, **kwargs: Any) -> Any:
+        calls.append((url, kwargs.get("proxy")))
+        yield SimpleNamespace(
+            status=200,
+            headers={"content-type": "application/json"},
+            text=AsyncMock(return_value='{"id":"bot-1"}'),
+        )
+
+    async def connect(_session: Any, url: str, **kwargs: Any) -> Any:
+        calls.append((url, kwargs.get("proxy")))
         return object()
 
-    async def fake_recv() -> dict:
-        return frames.pop(0)
-
-    async def fake_gateway_url() -> str:
-        return "wss://gateway-retry.example.test"
-
-    async def fake_send(_payload: dict) -> None:
-        return None
-
-    channel._connect_ws = fake_connect  # type: ignore[method-assign]
-    channel._ws_recv = fake_recv  # type: ignore[method-assign]
-    channel._ws_send = fake_send  # type: ignore[method-assign]
-    channel._fetch_gateway_url = fake_gateway_url  # type: ignore[method-assign]
+    monkeypatch.setattr(aiohttp.ClientSession, "request", request)
+    monkeypatch.setattr(aiohttp.ClientSession, "ws_connect", connect)
+    channel = DiscordChannel(DiscordChannelConfig(token="synthetic-token"))
+    client = channel._create_gateway_client()
     try:
-        await channel.start()
-
-        assert channel._connected is True
-        assert connections == [
-            channel.config.gateway_url,
-            "wss://gateway-retry.example.test",
+        # Exercise the actual SDK login/session construction and REST method;
+        # replace only the final aiohttp transport, so no network is used.
+        await client.http.static_login("synthetic-token")
+        await client.http.ws_connect("wss://gateway.discord.gg/?v=10")
+        await client.http.ws_connect("wss://resume.example.test/?v=10")
+        assert calls == [
+            ("https://discord.com/api/v10/users/@me", proxy if rest_proxy else None),
+            ("wss://gateway.discord.gg/?v=10", proxy if gateway_proxy else None),
+            ("wss://resume.example.test/?v=10", proxy if resume_proxy else None),
         ]
     finally:
-        await channel.stop()
+        await client.close()
 
 
 @pytest.mark.anyio
-async def test_early_invalid_session_clears_resume_state(
+async def test_sdk_proxy_bridge_fails_explicitly_for_missing_sdk_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    channel = DiscordChannel(DiscordChannelConfig(token="token"))
-    channel._state.session_id = "stale-session"
-    channel._state.sequence = 9
-
-    async def fake_recv() -> dict:
-        return {"op": 9, "d": False}
-
-    async def fake_sleep(_delay: float) -> None:
-        return None
-
-    channel._ws_recv = fake_recv  # type: ignore[method-assign]
-    monkeypatch.setattr("opensquilla.channels.discord.asyncio.sleep", fake_sleep)
-
-    with pytest.raises(RuntimeError, match="invalidated"):
-        await channel._await_ready_dispatch()
-
-    assert channel._state.session_id is None
-    assert channel._state.sequence is None
-
-
-@pytest.mark.anyio
-async def test_dispatch_loop_keeps_reading_after_reconnect() -> None:
-    channel = DiscordChannel(DiscordChannelConfig(token="token"))
-    channel._connected = True
-    frames = [
-        {"op": 7, "d": None},
-        {"op": 0, "t": "RESUMED", "s": 9, "d": {}},
-    ]
-    reconnects = 0
-    reads = 0
-
-    async def fake_recv() -> dict:
-        nonlocal reads
-        frame = frames[reads]
-        reads += 1
-        if reads == len(frames):
-            channel._connected = False
-        return frame
-
-    async def fake_reconnect() -> None:
-        nonlocal reconnects
-        reconnects += 1
-
-    channel._ws_recv = fake_recv  # type: ignore[method-assign]
-    channel._reconnect = fake_reconnect  # type: ignore[method-assign]
-
-    await channel._dispatch_loop()
-
-    assert reads == 2
-    assert reconnects == 1
-    assert channel._state.sequence == 9
-
-
-@pytest.mark.anyio
-async def test_ws_recv_reports_closed_connection_when_socket_is_torn_down() -> None:
-    """A reconnect-in-flight nulls the socket; readers must see ConnectionClosed."""
-    channel = DiscordChannel(DiscordChannelConfig(token="token"))
-    assert channel._ws is None
-
-    with pytest.raises(websockets.exceptions.ConnectionClosed):
-        await channel._ws_recv()
-
-
-@pytest.mark.anyio
-async def test_dispatch_loop_waits_for_in_flight_reconnect_and_resumes_reading() -> None:
-    """A heartbeat-timeout reconnect must not kill the dispatch loop.
-
-    While the heartbeat task's reconnect is in flight the socket is ``None``;
-    the dispatch loop must wait for that reconnect to finish and then resume
-    reading from the fresh socket instead of dying on ``None.recv()``.
-    """
-    channel = DiscordChannel(DiscordChannelConfig(token="token"))
-    channel._connected = True
-    channel._ws = None  # the heartbeat task's reconnect tore the socket down
-
-    await channel._reconnect_lock.acquire()  # reconnect still in flight
-    channel._reconnecting = True
-
-    dispatch = asyncio.create_task(channel._dispatch_loop())
-    for _ in range(5):
-        await asyncio.sleep(0)
-    # Pre-fix the loop died here with an unobserved AttributeError.
-    assert not dispatch.done()
-
-    class _FreshSocket:
-        async def recv(self) -> str:
-            channel._connected = False
-            return json.dumps({"op": 0, "t": "RESUMED", "s": 5, "d": {}})
-
-    channel._ws = _FreshSocket()
-    channel._reconnecting = False
-    channel._reconnect_lock.release()
-
-    await asyncio.wait_for(dispatch, timeout=2)
-
-    assert channel._state.sequence == 5
+    monkeypatch.setenv("OPENSQUILLA_TRUST_ENV", "1")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.example.test:8080")
+    monkeypatch.setenv("NO_PROXY", "")
+    monkeypatch.delenv("no_proxy", raising=False)
+    channel = DiscordChannel(DiscordChannelConfig(token="synthetic-token"))
+    client = channel._create_gateway_client()
+    try:
+        with pytest.raises(RuntimeError, match="SDK session is unavailable"):
+            await client.http.ws_connect("wss://gateway.discord.gg/?v=10")
+    finally:
+        await client.close()
 
 
 @pytest.mark.anyio

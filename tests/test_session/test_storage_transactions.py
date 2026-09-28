@@ -136,7 +136,6 @@ async def test_failed_startup_closes_its_connection(
         assert len(connections) == 1
         assert storage._conn is None
         assert storage._transcript_reader is None
-        assert storage._meta_launch_draft_gc_task is None
         with pytest.raises(closed_error, match=closed_message):
             await connections[0].execute("SELECT 1")
     finally:
@@ -962,8 +961,23 @@ async def test_existing_database_reopens_with_reader_and_passes_quick_check(
 
 
 @pytest.mark.asyncio
-async def test_close_takes_writer_lock_before_transcript_reader_lock(tmp_path) -> None:
-    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+async def test_close_takes_writer_lock_before_transcript_reader_lock() -> None:
+    # Exercise the real locks without timing SQLite worker or filesystem shutdown.
+    # Real connection handle release is covered by the integration tests above.
+    storage = SessionStorage()
+    closed: list[str] = []
+
+    class RecordingConnection:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        async def close(self) -> None:
+            assert storage._operation_lock.locked()
+            assert storage._transcript_reader_lock.locked()
+            closed.append(self.name)
+
+    storage._transcript_reader = RecordingConnection("reader")
+    storage._conn = RecordingConnection("writer")
     close: asyncio.Task[None] | None = None
     await storage._transcript_reader_lock.acquire()
     try:
@@ -974,10 +988,12 @@ async def test_close_takes_writer_lock_before_transcript_reader_lock(tmp_path) -
             await asyncio.sleep(0)
         assert storage._operation_lock.locked()
         assert close.done() is False
+        assert closed == []
     finally:
         storage._transcript_reader_lock.release()
     assert close is not None
     await asyncio.wait_for(close, timeout=1.0)
+    assert closed == ["reader", "writer"]
     assert storage._transcript_reader is None
     assert storage._conn is None
 

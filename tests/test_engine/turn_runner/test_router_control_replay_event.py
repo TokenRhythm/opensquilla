@@ -133,7 +133,7 @@ async def test_router_control_replay_event_replays_turn_once(monkeypatch) -> Non
     assert replay_events[0].target_tier == "c3"
     # Initial turn routes to c1 (the strategy returns c1); the router_control
     # hold replays it at c3. Models follow the default tier profile.
-    assert provider.calls == ["deepseek/deepseek-v4-pro", "anthropic/claude-opus-4.8"]
+    assert provider.calls == ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3"]
     assert done_events[-1].text == "new final"
     assert text.endswith("new final")
 
@@ -318,15 +318,15 @@ async def test_router_control_replay_persists_distinct_usage_executions(
     # Guard the premise: the replay really ran, at two different models.
     assert len([e for e in events if isinstance(e, RouterControlReplayEvent)]) == 1
     assert not any(isinstance(e, ErrorEvent) for e in events)
-    assert provider.calls == ["deepseek/deepseek-v4-pro", "anthropic/claude-opus-4.8"]
+    assert provider.calls == ["deepseek/deepseek-v4-flash-0731", "z-ai/glm-5.3"]
 
     # Both provider legs are real spend and must survive the ledger's identity
     # guards as separate finalized rows under one logical turn.
     assert len(rows) == 2
     assert {row.status for row in rows} == {"finalized"}
     rows_by_model = {row.model: row for row in rows}
-    first = rows_by_model["deepseek/deepseek-v4-pro"]
-    second = rows_by_model["anthropic/claude-opus-4.8"]
+    first = rows_by_model["deepseek/deepseek-v4-flash-0731"]
+    second = rows_by_model["z-ai/glm-5.3"]
     assert first.turn_id is not None
     assert second.turn_id == first.turn_id
     assert first.execution_id == first.turn_id

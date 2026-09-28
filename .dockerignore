@@ -58,6 +58,9 @@ install.ps1
 *.key
 **/*.key
 
+# Retired personal media must never enter the build context.
+opensquilla-webui/public/music
+
 # --- Build artefacts --------------------------------------------------------
 dist
 opensquilla-webui/dist

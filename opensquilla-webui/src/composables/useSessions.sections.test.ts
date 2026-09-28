@@ -169,6 +169,7 @@ describe('arrangeSidebarSections — subagent nesting', () => {
       { title: 'Subagent task', depth: 1 },
     ])
     expect(rows[1].sessionKind).toBe('task')
+    expect(rows[1].parentKey).toBe(parentKey)
   })
 
   it('indents an orphan subagent (parent absent) at depth 1', () => {
@@ -213,6 +214,7 @@ describe('arrangeSidebarSections — subagent nesting', () => {
       { title: `${parentTitle} (2)`, depth: 0 },
       { title: parentTitle, depth: 0 },
     ])
+    expect(sectionFor(sections, 'chats').rows.every(row => row.parentKey === undefined)).toBe(true)
   })
 })
 

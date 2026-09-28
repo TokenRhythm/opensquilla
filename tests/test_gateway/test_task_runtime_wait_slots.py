@@ -37,12 +37,13 @@ class _Storage:
             setattr(self.records[task_id], name, value)
 
 
-def _envelope(name: str) -> RouteEnvelope:
+def _envelope(name: str, source_kind: SourceKind = SourceKind.WEB) -> RouteEnvelope:
     return RouteEnvelope(
-        source_kind=SourceKind.WEB,
+        source_kind=source_kind,
         source_name="wait-slot-test",
         agent_id="main",
         session_key=f"agent:main:webchat:{name}",
+        metadata={"structured_user_input": source_kind is SourceKind.CLI},
     )
 
 
@@ -64,7 +65,82 @@ async def _drain_until(predicate: Any) -> None:
 
 
 @pytest.mark.asyncio
-async def test_answer_reacquires_capacity_without_restarting_or_unlocking_session() -> None:
+async def test_cli_without_reply_transport_retains_terminating_question_protocol() -> None:
+    """Noninteractive/older clients must not be stranded behind a live waiter."""
+    from opensquilla.engine import Agent, AgentConfig, ToolResult
+    from opensquilla.provider import (
+        DoneEvent,
+        ToolDefinition,
+        ToolInputSchema,
+        ToolUseEndEvent,
+        ToolUseStartEvent,
+    )
+    from opensquilla.tools.builtin.plan_control import request_user_input
+    from opensquilla.tools.policy.finalize import _user_input_terminates_turn
+    from opensquilla.tools.types import current_tool_context
+
+    class Provider:
+        provider_name = "fake"
+        calls = 0
+
+        async def list_models(self) -> list[Any]:
+            return []
+
+        async def chat(self, *_args: Any, **_kwargs: Any) -> AsyncIterator[Any]:
+            self.calls += 1
+            assert self.calls == 1
+            yield ToolUseStartEvent(tool_use_id="question", tool_name="request_user_input")
+            yield ToolUseEndEvent(
+                tool_use_id="question", tool_name="request_user_input",
+                arguments={"questions": [{"id": "scope", "question": "Which scope?"}]},
+            )
+            yield DoneEvent(stop_reason="tool_use", input_tokens=1, output_tokens=1)
+
+    provider = Provider()
+
+    async def handler(run: Any) -> None:
+        context = run.envelope.tool_context(is_owner=True)
+
+        async def tool_handler(call: Any) -> ToolResult:
+            token = current_tool_context.set(context)
+            try:
+                content = await request_user_input(**call.arguments)
+            finally:
+                current_tool_context.reset(token)
+            return ToolResult(
+                tool_use_id=call.tool_use_id, tool_name=call.tool_name, content=content,
+                terminates_turn=_user_input_terminates_turn(call.tool_name, content),
+            )
+
+        agent = Agent(
+            provider=provider, config=AgentConfig(max_iterations=3),
+            tool_definitions=[ToolDefinition(
+                name="request_user_input", description="Ask a question",
+                input_schema=ToolInputSchema(properties={}, required=[]),
+            )],
+            tool_handler=tool_handler, tool_context=context,
+            session_key=run.envelope.session_key,
+        )
+        async for _event in agent.run_turn("prepare a plan"):
+            pass
+
+    runtime = TaskRuntime(storage=_Storage(), turn_handler=handler)
+    try:
+        envelope = _envelope("legacy", SourceKind.CLI)
+        envelope.metadata.clear()
+        task = await runtime.enqueue(envelope, "question")
+        assert (await runtime.wait(task.task_id, timeout=2)).status == AgentTaskStatus.SUCCEEDED
+        assert provider.calls == 1
+        assert runtime.pending_user_inputs(task.session_key) == []
+    finally:
+        await runtime.shutdown(timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source_kind", [SourceKind.WEB, SourceKind.CLI])
+async def test_answer_reacquires_capacity_without_restarting_or_unlocking_session(
+    source_kind: SourceKind,
+) -> None:
     storage = _Storage()
     waiting = asyncio.Event()
     other_started = asyncio.Event()
@@ -92,7 +168,7 @@ async def test_answer_reacquires_capacity_without_restarting_or_unlocking_sessio
 
     runtime = TaskRuntime(storage=storage, turn_handler=handler, max_concurrency=1)
     try:
-        first = await runtime.enqueue(_envelope("one"), "question")
+        first = await runtime.enqueue(_envelope("one", source_kind), "question")
         await asyncio.wait_for(waiting.wait(), 2)
         started_at = storage.records[first.task_id].started_at
         assert runtime._global_in_flight == 0
@@ -130,7 +206,10 @@ async def test_answer_reacquires_capacity_without_restarting_or_unlocking_sessio
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("when", ["waiting", "answered", "reacquiring", "resumed"])
-async def test_cancel_during_input_or_capacity_wait_never_leaks_or_resumes(when: str) -> None:
+@pytest.mark.parametrize("source_kind", [SourceKind.WEB, SourceKind.CLI])
+async def test_cancel_during_input_or_capacity_wait_never_leaks_or_resumes(
+    when: str, source_kind: SourceKind,
+) -> None:
     storage = _Storage()
     waiting = asyncio.Event()
     other_started = asyncio.Event()
@@ -154,7 +233,7 @@ async def test_cancel_during_input_or_capacity_wait_never_leaks_or_resumes(when:
 
     runtime = TaskRuntime(storage=storage, turn_handler=handler, max_concurrency=1)
     try:
-        first = await runtime.enqueue(_envelope("one"), "question")
+        first = await runtime.enqueue(_envelope("one", source_kind), "question")
         await asyncio.wait_for(waiting.wait(), 2)
         other = await runtime.enqueue(_envelope("two"), "other")
         await asyncio.wait_for(other_started.wait(), 2)
@@ -352,6 +431,8 @@ async def test_approval_terminal_denial_needs_no_slot_but_execution_always_reacq
         approval_module, "_DEFAULT_APPROVAL_QUEUE_PATH", tmp_path / "approval.sqlite",
     )
     reset_approval_queue()
+    # Prepare the real SQLite queue before timing the compute-slot handoff.
+    queue = get_approval_queue()
     published, other_started, finish_other, reacquiring = (asyncio.Event() for _ in range(4))
     events: list[Any] = []
     approval: dict[str, str] = {}
@@ -378,7 +459,7 @@ async def test_approval_terminal_denial_needs_no_slot_but_execution_always_reacq
             tool_calls.append(call.tool_use_id)
             if len(tool_calls) > 1:
                 return ToolResult(call.tool_use_id, call.tool_name, "executed")
-            approval["id"] = get_approval_queue().request("exec", {
+            approval["id"] = queue.request("exec", {
                 "toolName": call.tool_name, "command": call.arguments["command"],
                 "args": dict(call.arguments),
                 "reviewer": "auto_review" if decision == "rule_denied" else "user",
@@ -415,9 +496,9 @@ async def test_approval_terminal_denial_needs_no_slot_but_execution_always_reacq
         other = await runtime.enqueue(_envelope("other"), "other")
         await asyncio.wait_for(other_started.wait(), 2)
         if decision == "expired":
-            get_approval_queue().expire_pending(approval["id"])
+            queue.expire_pending(approval["id"])
         else:
-            get_approval_queue().resolve(approval["id"], decision == "approved")
+            queue.resolve(approval["id"], decision == "approved")
         if decision == "denied":
             await runtime.wait(first.task_id, timeout=2)
             assert not reacquiring.is_set()

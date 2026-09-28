@@ -10,8 +10,9 @@ import os
 import re
 import shutil
 import subprocess
+from email.message import Message
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError, URLError
 
 import pytest
@@ -26,6 +27,258 @@ POLICY = {
     "publisherSubjectContains": "Test Publisher",
     "timestampUrl": "http://timestamp.example.invalid",
 }
+
+
+@pytest.fixture
+def protocol_preflight(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
+    script = ROOT / ".github/scripts/release_protocol_preflight.py"
+    spec = importlib.util.spec_from_file_location("release_protocol_preflight", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def no_network(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("Protocol preflight tests must not contact a real collector")
+
+    monkeypatch.setattr(module, "build_opener", no_network)
+    # Keep the retry guard local: subprocess also uses the shared time module.
+    monkeypatch.setattr(module, "time", SimpleNamespace(sleep=no_network))
+    return module
+
+
+def _health(scope: str, fingerprint: str) -> dict[str, object]:
+    return {
+        "ok": True,
+        "scope": scope,
+        "schema_version": 1,
+        "protocol_fingerprint": fingerprint,
+    }
+
+
+def test_protocol_retirement_does_not_expand_approved_legacy_compatibility(
+    protocol_preflight: ModuleType,
+) -> None:
+    raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
+    current = protocol_preflight.manifest_fingerprint(raw)
+    # This released pair approved only the optional device-field addition.
+    # Removing event types creates a distinct protocol requiring an exact
+    # collector match; it must not inherit that historical approval.
+    legacy_server = "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
+    legacy_client = "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
+    assert protocol_preflight.COMPATIBLE_PAIRS == {(legacy_server, legacy_client)}
+    assert current not in {legacy_server, legacy_client}
+    for scope in ("growth", "reliability"):
+        protocol_preflight.validate_health(_health(scope, current), scope, current)
+        protocol_preflight.validate_health(
+            _health(scope, legacy_server), scope, legacy_client,
+        )
+        with pytest.raises(ValueError, match="does not support"):
+            protocol_preflight.validate_health(_health(scope, legacy_client), scope, legacy_server)
+        for legacy in (legacy_server, legacy_client):
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, legacy), scope, current)
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, current), scope, legacy)
+
+
+def test_protocol_source_reads_fixed_commit_not_mutated_checkout_or_tag(
+    protocol_preflight: ModuleType, local_source: Path,
+) -> None:
+    raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
+    path = local_source / protocol_preflight.MANIFEST_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    sha = _commit(local_source)
+    _git(local_source, "tag", "v0.5.5")
+    path.write_text("{}")
+    newer = _commit(local_source)
+    _git(local_source, "tag", "-f", "v0.5.5", newer)
+    assert protocol_preflight.source_fingerprint(local_source, sha) == (
+        protocol_preflight.manifest_fingerprint(raw)
+    )
+    with pytest.raises(ValueError, match="Unsupported release protocol"):
+        protocol_preflight.source_fingerprint(local_source, newer)
+    with pytest.raises(ValueError, match="full commit SHA"):
+        protocol_preflight.source_fingerprint(local_source, "v0.5.5")
+
+
+def test_protocol_legacy_tag_without_clients_does_not_need_collector(
+    protocol_preflight: ModuleType, local_source: Path,
+) -> None:
+    sha = _git(local_source, "rev-parse", "HEAD")
+    assert protocol_preflight.source_fingerprint(local_source, sha) is None
+
+
+@pytest.mark.parametrize("client_path", [
+    "src/opensquilla/telemetry", "desktop/electron/src/telemetry",
+])
+def test_protocol_existing_client_cannot_bypass_gate_with_missing_manifest(
+    protocol_preflight: ModuleType, local_source: Path, client_path: str,
+) -> None:
+    path = local_source / client_path / "client.txt"
+    path.parent.mkdir(parents=True)
+    path.write_text("synthetic client")
+    sha = _commit(local_source)
+    with pytest.raises(ValueError, match="manifest is missing"):
+        protocol_preflight.source_fingerprint(local_source, sha)
+
+
+@pytest.mark.parametrize("replacement", [
+    {"ok": False}, {"ok": 1}, {"scope": "reliability"},
+    {"schema_version": True}, {"schema_version": 2},
+    {"protocol_fingerprint": "A" * 64}, {"protocol_fingerprint": "b" * 64},
+    {"extra": "unexpected"},
+])
+def test_protocol_health_rejects_wrong_service_version_or_identity(
+    protocol_preflight: ModuleType, replacement: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        protocol_preflight.validate_health({**_health("growth", "a" * 64), **replacement},
+                                          "growth", "a" * 64)
+
+
+@pytest.mark.parametrize("raw", [
+    b"[]", b"null", b"{broken", b'{"manifest_version":1,"manifest_version":2}',
+    b'{"manifest_version":true,"batch_version":1,"events":[{}]}',
+    b'{"manifest_version":2,"batch_version":1,"events":[NaN]}', b"\xff",
+])
+def test_protocol_manifest_rejects_malformed_input(
+    protocol_preflight: ModuleType, raw: bytes,
+) -> None:
+    with pytest.raises(ValueError):
+        protocol_preflight.manifest_fingerprint(raw)
+
+
+@pytest.mark.parametrize(("status", "content_type", "final_url", "raw", "valid"), [
+    (200, "application/json; charset=utf-8", None, b'{"ok":true}', True),
+    (202, "application/json", None, b'{"ok":true}', False),
+    (200, "text/html", None, b'{"ok":true}', False),
+    (200, "application/json", "https://other.example.invalid/", b'{"ok":true}', False),
+    (200, "application/json", None, b'{"ok":false,"ok":true}', False),
+    (200, "application/json", None, b"x" * 4097, False),
+])
+def test_protocol_https_response_is_bounded_and_not_redirected(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
+    status: int, content_type: str, final_url: str | None, raw: bytes, valid: bool,
+) -> None:
+    url = protocol_preflight.HEALTH_URLS["growth"]
+    response = io.BytesIO(raw)
+    response.status = status  # type: ignore[attr-defined]
+    response.headers = Message()  # type: ignore[attr-defined]
+    response.headers["Content-Type"] = content_type  # type: ignore[attr-defined]
+    response.geturl = lambda: final_url or url  # type: ignore[attr-defined]
+
+    class Opener:
+        def open(self, request: object, timeout: int) -> io.BytesIO:
+            assert request.full_url == url  # type: ignore[attr-defined]
+            assert request.get_method() == "GET"  # type: ignore[attr-defined]
+            assert request.get_header("Cache-control") == "no-cache"  # type: ignore[attr-defined]
+            assert timeout == 10
+            return response
+
+    def opener(handler: object) -> Opener:
+        with pytest.raises(ValueError, match="redirects are forbidden"):
+            handler.redirect_request(None, None, 302, None, None, url)  # type: ignore[attr-defined]
+        return Opener()
+
+    monkeypatch.setattr(protocol_preflight, "build_opener", opener)
+    if valid:
+        assert protocol_preflight.read_health(url) == {"ok": True}
+    else:
+        with pytest.raises(ValueError):
+            protocol_preflight.read_health(url)
+    assert response.closed
+
+
+@pytest.mark.parametrize("error", [
+    URLError("synthetic network failure"), TimeoutError(),
+    HTTPError("https://example.invalid", 503, "unavailable", {}, None),
+    HTTPError("https://example.invalid", 429, "rate limited", {}, None),
+])
+def test_protocol_transient_failure_retries_then_checks_both_scopes(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, error: Exception,
+) -> None:
+    calls: list[str] = []
+    delays: list[int] = []
+
+    def read(url: str) -> object:
+        calls.append(url)
+        if len(calls) <= 2:
+            raise error
+        scope = "growth" if "/growth/" in url else "reliability"
+        return _health(scope, "a" * 64)
+
+    monkeypatch.setattr(protocol_preflight, "read_health", read)
+    monkeypatch.setattr(protocol_preflight.time, "sleep", delays.append)
+    protocol_preflight.check_collectors("a" * 64)
+    assert calls == [protocol_preflight.HEALTH_URLS["reliability"]] * 3 + [
+        protocol_preflight.HEALTH_URLS["growth"]
+    ]
+    assert delays == [1, 2]
+
+
+@pytest.mark.parametrize(("status", "attempts"), [(301, 1), (401, 1), (404, 1), (503, 3)])
+def test_protocol_http_failure_never_allows_publication(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, status: int, attempts: int,
+) -> None:
+    calls: list[str] = []
+    monkeypatch.setattr(protocol_preflight.time, "sleep", lambda _delay: None)
+
+    def read(url: str) -> object:
+        calls.append(url)
+        raise HTTPError(url, status, "synthetic error", {}, None)
+
+    monkeypatch.setattr(protocol_preflight, "read_health", read)
+    with pytest.raises(ValueError):
+        protocol_preflight.check_collectors("a" * 64)
+    assert len(calls) == attempts
+
+
+def test_protocol_second_scope_mismatch_blocks_after_first_scope_succeeds(
+    protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def read(url: str) -> object:
+        if url == protocol_preflight.HEALTH_URLS["reliability"]:
+            return _health("reliability", "a" * 64)
+        return _health("growth", "b" * 64)
+
+    monkeypatch.setattr(protocol_preflight, "read_health", read)
+    with pytest.raises(ValueError, match="growth: collector protocol"):
+        protocol_preflight.check_collectors("a" * 64)
+
+
+def test_protocol_release_workflow_gates_fixed_source_before_build_and_publication() -> None:
+    jobs = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())["jobs"]
+    condition = "${{ github.event_name == 'push' || github.event.inputs.tag != '' }}"
+    preflight = jobs["release-preflight"]["steps"]
+    gate = next(step for step in preflight if step.get("name") ==
+                "Check production collector compatibility")
+    assert gate["env"]["RELEASE_SOURCE_SHA"] == "${{ steps.source.outputs.source_sha }}"
+    assert gate["run"] == (
+        'python .github/scripts/release_protocol_preflight.py --source-sha "$RELEASE_SOURCE_SHA"'
+    )
+    assert preflight.index(gate) > next(i for i, step in enumerate(preflight)
+                                        if step.get("id") == "source")
+    publication = jobs["publish-release"]["steps"]
+    index = next(i for i, step in enumerate(publication)
+                 if step.get("name") == "Upload to GitHub Release")
+    final_gate = publication[index - 1]
+    assert final_gate["env"]["RELEASE_SOURCE_SHA"] == (
+        "${{ needs.build-release-assets.outputs.source_sha }}"
+    )
+    assert final_gate["run"] == (
+        'python .release-validation/.github/scripts/release_protocol_preflight.py '
+        '--source-sha "$RELEASE_SOURCE_SHA"'
+    )
+    tooling = publication[index - 2]
+    assert tooling["uses"] == "actions/checkout@v4"
+    assert tooling["with"]["ref"] == "${{ github.workflow_sha }}"
+    assert tooling["with"]["path"] == ".release-validation"
+    for step in (gate, final_gate):
+        assert step["if"] == condition
+        assert step["timeout-minutes"] == 3
+        assert not step.get("continue-on-error", False)
+        assert "secrets." not in json.dumps(step)
 
 
 @pytest.fixture
@@ -390,13 +643,32 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
 
     checkouts = 0
     for job_name, job in jobs.items():
+        if "uses" in job:
+            # A reusable verifier consumes the bound candidate SHA rather than
+            # exposing checkout steps in the caller. Keep its provenance chain
+            # subject to the same declared-needs and preflight validation.
+            assert job_name == "internal-windows-candidate-probes"
+            assert job["uses"] == "./.github/workflows/windows-candidate-probes.yml"
+            assert "steps" not in job
+            match = expression.fullmatch(job["with"]["source_sha"])
+            assert match, f"{job_name} consumes a mutable or unvalidated source"
+            needs = job["needs"]
+            assert match[1] in ([needs] if isinstance(needs, str) else needs)
+            assert_provenance(match[1], {job_name})
+            assert job["with"]["require_signature"] is True
+            continue
         for step in job["steps"]:
             if not step.get("uses", "").startswith("actions/checkout@"):
                 continue
             ref = step["with"]["ref"]
             assert step["with"]["persist-credentials"] is False
-            if job_name == "release-preflight":
+            if job_name == "release-preflight" or (
+                job_name == "publish-release"
+                and step.get("name") == "Checkout publication validation tooling"
+            ):
                 assert ref == "${{ github.workflow_sha }}"
+                if job_name == "publish-release":
+                    assert step["with"]["path"] == ".release-validation"
                 continue
             match = expression.fullmatch(ref)
             assert match, f"{job_name} checks out a mutable or unvalidated source"
@@ -444,7 +716,12 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     audit = jobs["audit-internal-windows-artifact"]
     assert (
         audit["if"]
-        == "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}"
+        == "${{ always() && github.event_name == 'workflow_dispatch' "
+        "&& github.event.inputs.tag == '' "
+        "&& needs.build-desktop-windows.outputs.candidate_artifact_id != '' }}"
+    )
+    assert jobs["build-desktop-windows"]["outputs"]["candidate_artifact_id"] == (
+        "${{ steps.internal-candidate.outputs.artifact-id }}"
     )
     assert "build-desktop-windows" in audit["needs"]
     assert "publish-release" not in audit["needs"]
@@ -460,7 +737,7 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
         for step in audit["steps"]
         if step.get("uses", "").startswith("actions/download-artifact@")
     )
-    assert download["with"]["name"] == "opensquilla-electron-windows"
+    assert download["with"]["name"] == "windows-signed-candidate-diagnostics"
     verify = next(
         step
         for step in audit["steps"]
@@ -468,10 +745,57 @@ def test_empty_tag_runs_independent_windows_artifact_audit_matrix() -> None:
     )
     assert verify["env"]["BASELINE_VERSION"] == "${{ matrix.baseline-version }}"
     assert verify["env"]["INSTALL_MODE"] == "${{ matrix.install-mode }}"
+    assert verify["env"]["CANDIDATE_SOURCE_SHA"] == (
+        "${{ needs.build-control-ui.outputs.source_sha }}"
+    )
+    assert "windows_candidate_identity.py" in verify["run"]
+    assert (
+        "--manifest release-audit/audit-candidate.json --source-sha $env:CANDIDATE_SOURCE_SHA"
+    ) in verify["run"]
+    assert (
+        "if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }"
+    ) in verify["run"]
+    assert verify["run"].index("windows_candidate_identity.py") < verify["run"].index(
+        "verify-windows-signatures.ps1"
+    )
     assert "verify-windows-signatures.ps1 -InstallerPath" in verify["run"]
     assert "-BaselineVersion $env:BASELINE_VERSION" in verify["run"]
     assert "-InstallMode $env:INSTALL_MODE" in verify["run"]
     assert "secrets." not in json.dumps(audit)
+
+
+def test_macos_release_backports_keychain_fix_before_loading_builder_and_requires_signing() -> None:
+    workflow = yaml.safe_load((ROOT / ".github/workflows/wheelhouse-release.yml").read_text())
+    step = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+                if step.get("name") == "Build signed macOS installer")
+    preparation = "node scripts/prepare-macos-keychain.cjs"
+    build = (
+        "npx electron-builder --mac --publish never "
+        "--config.forceCodeSigning=true --config.dmg.sign=true"
+    )
+    assert step["run"].index(preparation) < step["run"].index("npm run build:gateway")
+    assert step["run"].index(preparation) < step["run"].index(build)
+    assert step["env"]["CSC_LINK"] == "${{ secrets.MAC_CSC_LINK }}"
+    assert step["env"]["APPLE_ID"] == "${{ secrets.APPLE_ID }}"
+    assert step["env"]["APPLE_APP_SPECIFIC_PASSWORD"] == (
+        "${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}"
+    )
+    assert step["env"]["APPLE_TEAM_ID"] == "${{ secrets.APPLE_TEAM_ID }}"
+    assert "continue-on-error" not in step
+    verify = next(step for step in workflow["jobs"]["build-desktop-macos"]["steps"]
+                  if step.get("name") == "Verify macOS signatures and notarization")
+    assert 'codesign --verify --deep --strict --verbose=2 "${apps[0]}"' in verify["run"]
+    assert 'spctl --assess --type execute --verbose=2 "${apps[0]}"' in verify["run"]
+    assert 'xcrun stapler validate "${apps[0]}"' in verify["run"]
+    assert 'codesign --verify --strict --verbose=2 "${dmgs[0]}"' in verify["run"]
+    assert "set -euo pipefail" in verify["run"]
+    assert "continue-on-error" not in verify
+    assert "if" not in verify
+    ci = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
+    unit = next(step for step in ci["jobs"]["desktop-check"]["steps"]
+                if step.get("name") == "Run desktop unit tests")
+    assert "node scripts/test-macos-keychain-patch.cjs" in unit["run"]
+    assert "continue-on-error" not in unit
 
 
 def test_windows_only_input_skips_unrelated_jobs_and_keeps_signed_windows_audits() -> None:
@@ -527,13 +851,20 @@ def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication(
     steps = jobs["build-desktop-windows"]["steps"]
     by_name = {step.get("name"): step for step in steps}
     diagnostic = by_name["Retain internal signed candidate for diagnosis"]
-    assert diagnostic["if"] == jobs["audit-internal-windows-artifact"]["if"]
+    # Upload after signature verification succeeds; downstream audits must
+    # still run after a later build-job gate fails, but only with this artifact.
+    assert diagnostic["if"] == (
+        "${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag == '' }}"
+    )
+    assert diagnostic["id"] == "internal-candidate"
+    assert diagnostic["with"]["name"] == "windows-signed-candidate-diagnostics"
     assert (
         steps.index(by_name["Verify Windows Authenticode signatures and timestamps"])
         < steps.index(diagnostic)
         < steps.index(by_name["Gate packaged first-send renderer"])
     )
     assert diagnostic["with"]["path"].splitlines() == [
+        "dist/desktop-electron/audit-candidate.json",
         "dist/desktop-electron/*.exe",
         "dist/desktop-electron/*.blockmap",
         "dist/desktop-electron/latest.yml",
@@ -549,10 +880,17 @@ def test_internal_diagnostics_preserve_signed_bytes_without_feeding_publication(
     assert steps.index(by_name["Remove DigiCert client authentication material"]) < steps.index(
         failure_log
     )
-    for job in jobs.values():
+    for name, job in jobs.items():
         for step in job.get("steps", []):
             if step.get("uses", "").startswith("actions/download-artifact@"):
-                assert "windows-signed-candidate-diagnostics" not in json.dumps(step)
+                if name == "audit-internal-windows-artifact":
+                    assert step["with"]["name"] == "windows-signed-candidate-diagnostics"
+                else:
+                    assert "windows-signed-candidate-diagnostics" not in json.dumps(step)
+    reusable = jobs["internal-windows-candidate-probes"]
+    assert reusable["with"]["artifact_name"] == diagnostic["with"]["name"]
+    assert reusable["with"]["require_signature"] is True
+    assert reusable["if"] == jobs["audit-internal-windows-artifact"]["if"]
 
 
 def test_reused_windows_audits_require_signatures_without_signing_credentials() -> None:

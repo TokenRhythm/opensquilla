@@ -191,6 +191,7 @@ async function createAnnotationDraftHarness(
     surfaceInstanceId: 'surface-instance-current',
   }))
   const destroySurface = vi.fn(async (): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
+  const uploadAttachment = vi.fn(async () => ({ fileUuid: 'test-file' }))
   const pushToast = vi.fn()
   const lease = {
     version: 1 as const,
@@ -260,6 +261,7 @@ async function createAnnotationDraftHarness(
     sessionKey: 'session-a',
   })
   const definition = createArtifactWorkbenchDefinitions({
+    artifactContent: { ...testArtifactContent, uploadAttachment },
     artifactDocuments: {
       load: vi.fn(async () => undefined),
       snapshot: vi.fn(() => ({
@@ -365,11 +367,39 @@ async function createAnnotationDraftHarness(
     setAnnotationMode,
     setSurfaceRect,
     showOverlay,
+    uploadAttachment,
     updateAnnotation,
   }
 }
 
 describe('artifact Workbench provider', () => {
+  it.each([
+    { editor: 'native', result: { ok: true } as NativeWorkbenchSurfaceResult },
+    { editor: 'trusted browser fallback', result: { ok: false } as NativeWorkbenchSurfaceResult },
+  ])('opens the $editor annotation editor without capturing or uploading an image', async ({ editor, result }) => {
+    const harness = await createAnnotationDraftHarness(result)
+
+    expect(harness.nativeApi.captureWorkbenchScreenshot).not.toHaveBeenCalled()
+    expect(harness.uploadAttachment).not.toHaveBeenCalled()
+    expect(harness.createAnnotation).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      documentId: 'document-1',
+      resourceId: 'document:document-1',
+      selection: expect.objectContaining({
+        targetRef: 'target-focused', selectionText: 'Button', locatorHint: 'button',
+      }),
+    }))
+    expect(harness.showOverlay).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      selectionId: 'selection-focused', annotationId: harness.annotationId,
+    }))
+    if (editor === 'trusted browser fallback') {
+      expect(harness.renderState.annotationFallback).toEqual({
+        annotationId: harness.annotationId, body: '', reason: 'overlay-unavailable',
+      })
+    } else {
+      expect(harness.renderState.annotationFallback).toBeUndefined()
+    }
+  })
+
   describe('explicit preview reopen', () => {
     async function setup(nativeHtml: boolean, options: Partial<Parameters<typeof createArtifactPreviewWorkbenchItem>[0]> = {}) {
       const renderState: Record<string, unknown> = {}
@@ -653,11 +683,8 @@ describe('artifact Workbench provider', () => {
     expect(harness.updateAnnotation).toHaveBeenCalledOnce()
   })
 
-  it('keeps the local body, screenshot, and fallback when lifecycle flush fails', async () => {
+  it('keeps the local body and fallback when lifecycle flush fails', async () => {
     vi.useFakeTimers()
-    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:focused-annotation-preview')
-    const revokeScreenshotUrl = vi.spyOn(URL, 'revokeObjectURL')
-      .mockImplementation(() => undefined)
     const harness = await createAnnotationDraftHarness({
       ok: false,
       code: 'PREVIEW_RENDERER_FAILED',
@@ -685,9 +712,7 @@ describe('artifact Workbench provider', () => {
       annotationId: harness.annotationId,
       body: 'Retry this saved-locally body.',
       reason: 'surface-reloaded',
-      screenshotUrl: 'blob:focused-annotation-preview',
     })
-    expect(revokeScreenshotUrl).not.toHaveBeenCalled()
     expect(harness.pushToast).toHaveBeenCalledWith(
       'workbench.artifactAnnotation.updateFailed',
       { tone: 'danger' },
@@ -885,6 +910,46 @@ describe('artifact Workbench provider', () => {
     }
   })
 
+  it('explains a rejected selection safely and keeps the picker ready for another selection', async () => {
+    const harness = await createAnnotationDraftHarness({ ok: true }, true)
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-submit',
+      detail: { annotationId: harness.annotationId, body: 'Finish the first annotation.' },
+    }, harness.item)
+    harness.pushToast.mockClear()
+    const modeCallsBeforeRejection = harness.setAnnotationMode.mock.calls.length
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'blocked-action',
+      detail: {
+        action: 'annotation-picker',
+        reason: 'synthetic CDP failure containing a private page detail',
+      },
+    }, harness.item)
+
+    expect(harness.pushToast).toHaveBeenCalledExactlyOnceWith(
+      'workbench.artifactAnnotation.createFailed',
+      { tone: 'warn', dedupeKey: `workbench:annotation-picker:${harness.item.id}` },
+    )
+    expect(JSON.stringify(harness.pushToast.mock.calls)).not.toContain('synthetic CDP failure')
+    expect(harness.setAnnotationMode).toHaveBeenCalledTimes(modeCallsBeforeRejection)
+    expect(harness.renderState.annotationMode).toBe(true)
+
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'annotation-selected',
+      detail: {
+        selection: {
+          selectionId: 'selection-after-rejection', tagName: 'button',
+          elementPath: '[["","button",2]]', targetRef: 'target-focused',
+          rect: { x: 40, y: 2, width: 30, height: 20 },
+        },
+      },
+    }, harness.item)
+    expect(harness.createAnnotation).toHaveBeenCalledTimes(2)
+    expect(harness.showOverlay).toHaveBeenCalledTimes(2)
+    expect(harness.pushToast).toHaveBeenCalledOnce()
+  })
+
   it('recovers once when rejected-target automatic rearm reports a stable failure', async () => {
     const harness = await createAnnotationDraftHarness({ ok: true }, true)
     await harness.runtime.handleNativeSurfaceEvent?.({
@@ -943,6 +1008,11 @@ describe('artifact Workbench provider', () => {
         body: 'Finish the editor before the terminal recovery failure.',
       },
     }, harness.item)
+    harness.pushToast.mockClear()
+    await harness.runtime.handleNativeSurfaceEvent?.({
+      version: 3, surfaceId: harness.item.id, type: 'blocked-action',
+      detail: { action: 'annotation-picker', reason: 'synthetic selection failure' },
+    }, harness.item)
     harness.setAnnotationMode.mockResolvedValue({
       ok: false,
       code: 'ANNOTATION_UNAVAILABLE',
@@ -963,8 +1033,13 @@ describe('artifact Workbench provider', () => {
     expect(harness.renderState.annotationMode).toBe(false)
     expect(harness.pushToast).toHaveBeenCalledWith(
       'workbench.artifactAnnotation.unavailable',
-      { tone: 'danger' },
+      { tone: 'danger', dedupeKey: `workbench:annotation-picker:${harness.item.id}` },
     )
+    expect(harness.pushToast.mock.calls.filter(([message]) => (
+      message === 'workbench.artifactAnnotation.createFailed'
+    ))).toHaveLength(1)
+    expect(new Set(harness.pushToast.mock.calls.map(([, options]) => options.dedupeKey)))
+      .toEqual(new Set([`workbench:annotation-picker:${harness.item.id}`]))
   })
 
   it('ignores a rejected-target rearm failure from a replaced surface instance', async () => {
@@ -3159,7 +3234,7 @@ describe('artifact Workbench provider', () => {
     expect(renderState.annotationMode).toBe(false)
     expect(pushToast).toHaveBeenCalledWith(
       'workbench.artifactAnnotation.unavailable',
-      { tone: 'danger' },
+      { tone: 'danger', dedupeKey: `workbench:annotation-picker:${item.id}` },
     )
     await runtime.dispose?.('closed')
   })
@@ -3293,27 +3368,10 @@ describe('artifact Workbench provider', () => {
       ok: false,
       message: 'overlay-unavailable',
     }))
-    let deferNextScreenshot = false
-    let resolveDeferredScreenshot: (() => void) | null = null
-    const finishDeferredScreenshot = () => {
-      const resolve: unknown = resolveDeferredScreenshot
-      if (typeof resolve !== 'function') throw new Error('deferred screenshot is not pending')
-      resolve()
-      resolveDeferredScreenshot = null
-    }
-    const screenshot = vi.fn(async () => {
-      if (deferNextScreenshot) {
-        deferNextScreenshot = false
-        await new Promise<void>((resolve) => {
-          resolveDeferredScreenshot = resolve
-        })
-      }
-      return { targetRef: 'target-1', mimeType: 'image/png' as const, dataBase64: 'iVBORw==', width: 320, height: 180 }
-    })
-    const createScreenshotUrl = vi.spyOn(URL, 'createObjectURL')
-      .mockReturnValue('blob:frozen-annotation-preview')
-    const revokeScreenshotUrl = vi.spyOn(URL, 'revokeObjectURL')
-      .mockImplementation(() => undefined)
+    const screenshot = vi.fn(async () => ({
+      targetRef: 'target-1', mimeType: 'image/png' as const,
+      dataBase64: 'iVBORw==', width: 320, height: 180,
+    }))
     const closeOverlay = vi.fn(async (
       _request: Parameters<NonNullable<NativeWorkbenchApi['closeArtifactAnnotationOverlay']>>[0],
     ): Promise<NativeWorkbenchSurfaceResult> => ({ ok: true }))
@@ -3511,11 +3569,7 @@ describe('artifact Workbench provider', () => {
     // before the create RPC can resolve it.
     expect(setMode).toHaveBeenCalledTimes(1)
     expect(setMode).not.toHaveBeenCalledWith(expect.objectContaining({ enabled: false }))
-    expect(screenshot).toHaveBeenCalledWith({ surfaceId: item.id, targetRef: 'target-1' })
-    expect(screenshot.mock.invocationCallOrder[0]).toBeLessThan(
-      showOverlay.mock.invocationCallOrder[0]!,
-    )
-    expect(createScreenshotUrl).toHaveBeenCalledOnce()
+    expect(screenshot).not.toHaveBeenCalled()
     const annotationId = String(showOverlay.mock.calls[0]?.[0].annotationId || '')
     expect(beginOverlayEdit).toHaveBeenCalledWith(annotationId, 'session-a')
     expect(beginOverlayEdit.mock.invocationCallOrder[0])
@@ -3533,7 +3587,6 @@ describe('artifact Workbench provider', () => {
     expect(renderState.annotationFallback).toMatchObject({
       body: '',
       reason: 'overlay-crashed',
-      screenshotUrl: 'blob:frozen-annotation-preview',
     })
     expect(definition.getProps?.(item, {
       active: true,
@@ -3543,7 +3596,7 @@ describe('artifact Workbench provider', () => {
     })).toMatchObject({ annotationFallback: expect.any(Object) })
 
     // A normal close is blocked when the latest trusted-editor body cannot be
-    // saved. The draft owner, frozen screenshot, and user text stay available
+    // saved. The draft owner and user text stay available
     // for a later retry.
     await runtime.handleNativeSurfaceEvent?.({
       version: 3,
@@ -3556,9 +3609,7 @@ describe('artifact Workbench provider', () => {
     expect(renderState.annotationFallback).toMatchObject({
       annotationId,
       body: 'Keep this local body.',
-      screenshotUrl: 'blob:frozen-annotation-preview',
     })
-    expect(revokeScreenshotUrl).not.toHaveBeenCalled()
 
     // A required Preview/head rebuild may continue, but it transfers the
     // unsaved body to the Web fallback instead of clearing it. The replacement
@@ -3577,10 +3628,8 @@ describe('artifact Workbench provider', () => {
       annotationId,
       body: 'Keep this body through refresh.',
       reason: 'update-pending',
-      screenshotUrl: 'blob:frozen-annotation-preview',
     })
     expect(renderState.annotationMode).toBe(true)
-    expect(revokeScreenshotUrl).not.toHaveBeenCalled()
     expect(nativeApi.setSurfaceRect).toHaveBeenLastCalledWith(
       expect.objectContaining({ surfaceId: item.id, visible: false }),
     )
@@ -3905,7 +3954,7 @@ describe('artifact Workbench provider', () => {
     })
     expect(pushToast).toHaveBeenCalledWith(
       'workbench.artifactAnnotation.unavailable',
-      { tone: 'danger' },
+      { tone: 'danger', dedupeKey: `workbench:annotation-picker:${item.id}` },
     )
     expect(pushToast.mock.calls.flat().join(' ')).not.toContain('native stop rejected')
     const setModeCountBeforeStopRetry = setMode.mock.calls.length
@@ -3916,28 +3965,6 @@ describe('artifact Workbench provider', () => {
       surfaceId: item.id,
       enabled: false,
     })
-    expect(renderState.annotationMode).toBe(false)
-
-    // The second fence, after screenshot capture, closes the same race window:
-    // a refresh cannot let the completed screenshot continue into an overlay.
-    await runtime.performAction?.('toggle-annotation-mode', item)
-    deferNextScreenshot = true
-    resolveDeferredScreenshot = null
-    const screenshotCreateIndex = createAnnotation.mock.calls.length
-    const pendingScreenshot = runtime.handleNativeSurfaceEvent?.(
-      lateSelection('selection-late-screenshot', '2'),
-      item,
-    )
-    await vi.waitFor(() => expect(resolveDeferredScreenshot).toBeTypeOf('function'))
-    const screenshotAnnotationId = String(
-      createAnnotation.mock.calls[screenshotCreateIndex]?.[0].annotationId || '',
-    )
-    await runtime.performAction?.('refresh', item)
-    finishDeferredScreenshot()
-    await pendingScreenshot
-    expect(discardAnnotation).toHaveBeenCalledWith(screenshotAnnotationId)
-    expect(showOverlay).toHaveBeenCalledTimes(2)
-    expect(renderState.annotationFallback).toBeNull()
     expect(renderState.annotationMode).toBe(false)
 
     // Reselect keeps the original draft until the new trusted fallback has
@@ -3979,19 +4006,19 @@ describe('artifact Workbench provider', () => {
       type: 'artifact-prompt-annotation-reselect',
       payload: { annotationId: 'annotation-stale-preserved', body: 'Preserve me.' },
     }, item)
-    deferNextScreenshot = true
-    resolveDeferredScreenshot = null
+    deferNextCreate = true
+    resolveDeferredCreate = null
     const uncommittedCreateIndex = createAnnotation.mock.calls.length
     const pendingUncommitted = runtime.handleNativeSurfaceEvent?.(
       lateSelection('selection-uncommitted-replacement', '4'),
       item,
     )
-    await vi.waitFor(() => expect(resolveDeferredScreenshot).toBeTypeOf('function'))
+    await vi.waitFor(() => expect(resolveDeferredCreate).toBeTypeOf('function'))
     const uncommittedAnnotationId = String(
       createAnnotation.mock.calls[uncommittedCreateIndex]?.[0].annotationId || '',
     )
     await runtime.performAction?.('refresh', item)
-    finishDeferredScreenshot()
+    finishDeferredCreate()
     await pendingUncommitted
     expect(discardAnnotation).toHaveBeenCalledWith(uncommittedAnnotationId)
     expect(discardAnnotation).not.toHaveBeenCalledWith('annotation-stale-preserved')
@@ -4157,9 +4184,6 @@ describe('artifact Workbench provider', () => {
     expect(renderState.annotationMode).toBe(false)
 
     await runtime.dispose?.('closed')
-    expect(revokeScreenshotUrl).toHaveBeenCalledWith('blob:frozen-annotation-preview')
-    createScreenshotUrl.mockRestore()
-    revokeScreenshotUrl.mockRestore()
   })
 
 })

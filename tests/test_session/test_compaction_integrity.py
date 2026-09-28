@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
@@ -272,7 +273,11 @@ async def test_proportional_tail_scales_with_capacity_without_fixed_cap(window, 
     kept_tokens = sum(estimate_entry_model_replay_tokens(entry) for entry in result.kept_entries)
     assert kept_tokens <= window // 5
     if character_limit is None:
-        assert kept_tokens == window // 5
+        # The shared policy retains one fifth of available history, capped by
+        # consumer capacity, so manual compaction of a short transcript has a
+        # useful prefix without sacrificing the same recent tail as automatic.
+        history_tokens = sum(estimate_entry_model_replay_tokens(entry) for entry in entries)
+        assert kept_tokens == min(window, history_tokens) // 5
         assert kept_tokens > 20_000
     else:
         assert estimate_entries_model_replay_chars(result.kept_entries) <= character_limit // 5
@@ -337,17 +342,41 @@ def test_pressure_diagnostic_does_not_reject_a_valid_smaller_checkpoint(
     assert report["pressure_released"] is released
 
 
-def test_final_wrapper_cannot_silently_omit_structured_paths():
+@pytest.mark.parametrize("bounded", [False, True])
+def test_final_wrapper_preserves_all_paths_or_rejects_explicit_bounded_replay(bounded):
     paths = ["synthetic/" + str(i) + "x" * 460 + ".txt" for i in range(40)]
     summary = StructuredCompactionSummary(files_and_artifacts=[{"path": path} for path in paths])
     text = render_structured_summary(summary)
     obligations = [CompactionObligation(kind="file_path", value=path) for path in paths]
-    coverage, reason = validate_compaction_artifact(text, obligations)
+    def replay(summary):
+        return format_compaction_summary_context([summary], max_chars=16_000 if bounded else None)
+
+    coverage, reason = validate_compaction_artifact(
+        text, obligations, summary_replay_renderer=replay,
+    )
     assert coverage.status == "pass"
-    assert reason == "summary_replay_incomplete"
-    rendered = format_compaction_summary_context([text])
-    assert rendered and len(rendered) <= 16000
-    assert not compaction_replay_is_complete([text], rendered)
+    assert reason == ("summary_replay_incomplete" if bounded else None)
+    rendered = replay(text)
+    assert rendered
+    if bounded:
+        assert len(rendered) <= 16000
+        assert not compaction_replay_is_complete([text], rendered)
+    else:
+        assert len(rendered) > 16000
+        assert all(path in rendered for path in paths)
+        assert compaction_replay_is_complete([text], rendered)
+
+
+def test_model_prose_heading_does_not_make_complete_checkpoint_invalid():
+    summary, _ = build_structured_summary_from_text(
+        "Completed work.\n\nGoal:\nBuild the requested app.", [],
+    )
+    text = render_structured_summary(summary)
+    assert len(text) < 200
+    coverage, reason = validate_compaction_artifact(text, [])
+    assert coverage.status == "unknown"
+    assert reason is None
+    assert compaction_replay_is_complete([text], format_compaction_summary_context([text]))
 
 
 def test_actual_renderer_must_replay_the_whole_artifact():
@@ -400,9 +429,11 @@ async def test_rejected_candidate_does_not_report_pressure_released(rejection):
     assert result.quality_report["pressure_released"] is False
 
 
-async def test_nonshrinking_candidate_does_not_report_pressure_released():
+@pytest.mark.parametrize("manual", [False, True])
+@pytest.mark.parametrize("rejection", [None, "consumer", "replay"])
+async def test_nonshrinking_candidate_does_not_report_pressure_released(manual, rejection):
     entries = [
-        {"role": "user", "content": "Brief old request"},
+        {"role": "user", "content": "Preserve the source file src/main.py."},
         {"role": "assistant", "content": "Brief old answer"},
         {"role": "user", "content": "Continue"},
         {"role": "assistant", "content": "Current reply"},
@@ -411,12 +442,33 @@ async def test_nonshrinking_candidate_does_not_report_pressure_released():
         session_id="nonshrinking-pressure", entries=entries, context_window_tokens=4000,
         config=synthetic_compaction_config(summary="Completed ordinary background. " * 20),
         forced_prefix_cut=2,
+        force=manual,
+        reason="manual" if manual else "automatic",
+        consumer_admission=lambda _summary, _kept: rejection != "consumer",
+        summary_replay_renderer=(lambda text: text[:5]) if rejection == "replay" else None,
     ))
 
     assert result.removed_count == 0
     assert result.kept_entries == entries
-    assert result.skip_reason == "quality_gate_failed"
+    assert result.skip_reason == {
+        None: "no_compression_benefit",
+        "consumer": "consumer_admission_failed",
+        "replay": "summary_replay_incomplete",
+    }[rejection]
+    assert compaction_failure_status(result.skip_reason) == (
+        "skipped" if rejection is None else "failed"
+    )
+    assert result.tokens_after == result.tokens_before
+    assert result.summary == ""
     assert result.quality_report["pressure_released"] is False
+    if rejection is None:
+        assert result.coverage_status == "pass"
+        assert result.quality_report["compression_ratio"] > 1
+        assert result.quality_report["protected_tail_preserved"] is True
+        assert result.quality_report["fits_context_window"] is True
+        assert result.quality_report["fits_character_window"] is True
+        assert result.quality_report["consumer_admission_fits"] is True
+        assert result.quality_report["passes_structural_gate"] is False
 
 
 @pytest.mark.parametrize("reasoning_control", [True, False])

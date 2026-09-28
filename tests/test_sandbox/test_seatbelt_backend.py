@@ -14,11 +14,14 @@ import pytest
 from opensquilla.sandbox.backend import seatbelt as seatbelt_mod
 from opensquilla.sandbox.backend import select_backend
 from opensquilla.sandbox.backend.seatbelt import (
+    _OUTPUT_BYTE_CAP,
     SeatbeltBackend,
     _classify_denial,
+    _communicate_capped,
     build_seatbelt_argv,
     render_seatbelt_profile,
 )
+from opensquilla.sandbox.backend.seatbelt_resources import DarwinResourceGuard
 from opensquilla.sandbox.config import SandboxSettings
 from opensquilla.sandbox.operation_runtime import SandboxOperation, SandboxOperationResult
 from opensquilla.sandbox.permissions import (
@@ -116,6 +119,277 @@ def _access_rule(profile: str, action: str, root: Path) -> str:
     ]
     assert rules, f"missing {action} rule for {root}"
     return rules[0]
+
+
+@pytest.mark.asyncio
+async def test_code_execution_output_is_drained_with_a_fixed_retention_cap() -> None:
+    class Stream:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        async def read(self, size: int) -> bytes:
+            if not self.payload:
+                return b""
+            chunk, self.payload = self.payload[:size], self.payload[size:]
+            return chunk
+
+    class Process:
+        stdout = Stream(b"x" * (_OUTPUT_BYTE_CAP + 8192))
+        stderr = Stream(b"e" * (_OUTPUT_BYTE_CAP + 1))
+        stdin = None
+
+        async def wait(self) -> None:
+            return None
+
+    stdout, stderr, truncated_stdout, truncated_stderr = await _communicate_capped(Process())
+
+    assert len(stdout) == _OUTPUT_BYTE_CAP
+    assert len(stderr) == _OUTPUT_BYTE_CAP
+    assert truncated_stdout is True
+    assert truncated_stderr is True
+
+
+@pytest.mark.asyncio
+async def test_capped_communication_drains_output_before_blocking_stdin() -> None:
+    output_started = asyncio.Event()
+
+    class Stream:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+            self.read_calls = 0
+
+        async def read(self, size: int) -> bytes:
+            self.read_calls += 1
+            output_started.set()
+            if not self.payload:
+                return b""
+            chunk, self.payload = self.payload[:size], self.payload[size:]
+            return chunk
+
+    class Stdin:
+        def __init__(self) -> None:
+            self.written = b""
+            self.closed = False
+
+        def write(self, payload: bytes) -> None:
+            self.written += payload
+
+        async def drain(self) -> None:
+            # This models a full input pipe that can make progress only after
+            # the child has been allowed to drain its output pipe.
+            await output_started.wait()
+
+        def close(self) -> None:
+            self.closed = True
+
+    class Process:
+        stdout = Stream(b"output")
+        stderr = Stream(b"")
+        stdin = Stdin()
+
+        async def wait(self) -> None:
+            assert self.stdin.closed
+
+    process = Process()
+    stdout, stderr, truncated_stdout, truncated_stderr = await asyncio.wait_for(
+        _communicate_capped(process, input_data=b"input"), timeout=1,
+    )
+
+    assert stdout == b"output"
+    assert stderr == b""
+    assert truncated_stdout is False
+    assert truncated_stderr is False
+    assert process.stdin.written == b"input"
+    assert process.stdout.read_calls > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "error"),
+    [("write", BrokenPipeError), ("drain", ConnectionResetError)],
+)
+async def test_capped_communication_ignores_early_child_stdin_close(phase, error) -> None:
+    class Stream:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        async def read(self, size: int) -> bytes:
+            chunk, self.payload = self.payload[:size], self.payload[size:]
+            return chunk
+
+    class Stdin:
+        def write(self, payload: bytes) -> None:
+            if phase == "write":
+                raise error
+
+        async def drain(self) -> None:
+            if phase == "drain":
+                raise error
+
+        def close(self) -> None:
+            pass
+
+    class Process:
+        stdout = Stream(b"child finished")
+        stderr = Stream(b"")
+        stdin = Stdin()
+
+        async def wait(self) -> None:
+            return None
+
+    stdout, stderr, truncated_stdout, truncated_stderr = await _communicate_capped(
+        Process(), input_data=b"input"
+    )
+
+    assert stdout == b"child finished"
+    assert stderr == b""
+    assert truncated_stdout is False
+    assert truncated_stderr is False
+
+
+def test_resource_guard_accounts_for_target_and_excludes_posix_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = SimpleNamespace(pid=200, pgid=100, ppid=100, start_identity="target")
+    anchor = SimpleNamespace(pid=100, pgid=100, ppid=1, start_identity="anchor")
+    descendant = SimpleNamespace(pid=300, pgid=100, ppid=200, start_identity="descendant")
+    snapshot = {item.pid: item for item in (anchor, target, descendant)}
+    owner = SimpleNamespace(pid=target.pid, pgid=anchor.pgid, is_active=lambda: True)
+    guard = object.__new__(DarwinResourceGuard)
+    guard.library = object()
+    guard.limits = ResourceLimits(cpu_seconds=1, memory_mb=3, pids=4)
+    guard.known = {}
+    resident_sizes = {target.pid: 2 * 1024 * 1024, descendant.pid: 512 * 1024}
+    monkeypatch.setattr(
+        "opensquilla.process_tree._darwin_process_snapshot", lambda: snapshot
+    )
+    monkeypatch.setattr(
+        "opensquilla.process_tree._darwin_process_info",
+        lambda pid, _library: snapshot[pid],
+    )
+    monkeypatch.setattr(
+        guard,
+        "_read_task",
+        lambda pid: SimpleNamespace(resident_size=resident_sizes.get(pid, 100 * 1024 * 1024)),
+    )
+
+    guard._check(owner)
+
+    assert set(guard.known) == {target.pid, descendant.pid}
+
+
+@pytest.mark.asyncio
+async def test_run_preserves_configured_wall_timeout(monkeypatch, tmp_path):
+    captured = []
+    original_wait = asyncio.wait
+
+    async def wait_with_timeout(tasks, *, timeout, return_when):
+        captured.append(timeout)
+        return await original_wait(tasks, timeout=timeout, return_when=return_when)
+
+    class Process:
+        returncode = 0
+
+        async def communicate(self, input=None):
+            return b"ok", b""
+
+    async def spawn(*args, **kwargs):
+        return Process()
+
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/sandbox-exec")
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", spawn)
+    monkeypatch.setattr(seatbelt_mod.asyncio, "wait", wait_with_timeout)
+    request = _request(_policy(tmp_path), tmp_path)
+    result = await SeatbeltBackend().run(request)
+    assert result.returncode == 0
+    assert captured == [request.policy.limits.wall_timeout_s]
+
+
+@pytest.mark.asyncio
+async def test_run_cancel_during_timeout_output_cleanup_propagates(monkeypatch, tmp_path):
+    cleanup_started = asyncio.Event()
+    original_finish = seatbelt_mod._finish_communication
+
+    class Process:
+        returncode = -15
+
+        async def communicate(self, input=None):
+            await asyncio.Event().wait()
+
+    async def spawn(*args, **kwargs):
+        return Process()
+
+    async def terminate(*args, **kwargs):
+        return b"", b""
+
+    async def finish(task):
+        cleanup_started.set()
+        return await original_finish(task)
+
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/sandbox-exec")
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", spawn)
+    monkeypatch.setattr(seatbelt_mod, "_terminate_process_group", terminate)
+    monkeypatch.setattr(seatbelt_mod, "_finish_communication", finish)
+    running = asyncio.create_task(SeatbeltBackend().run(_request(_policy(tmp_path), tmp_path)))
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), timeout=2)
+        running.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running
+    finally:
+        running.cancel()
+        await asyncio.gather(running, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_resource_monitor_failure_cannot_report_success(monkeypatch, tmp_path):
+    terminated = asyncio.Event()
+    communicating = asyncio.Event()
+
+    class Process:
+        # A successful parent may exit while descendants still own the pipes.
+        returncode = 0
+
+        async def communicate(self, input=None):
+            communicating.set()
+            await terminated.wait()
+            return b"parent finished", b""
+
+    class FailingGuard:
+        def __init__(self, limits):
+            pass
+
+        def cpu_preexec(self):
+            return lambda: None
+
+        async def watch(self, process):
+            await communicating.wait()
+            raise SandboxBackendError("Seatbelt resource monitor cannot inspect a task")
+
+    async def spawn(*args, **kwargs):
+        return Process()
+
+    async def terminate(*args, **kwargs):
+        terminated.set()
+        return b"", b""
+
+    monkeypatch.setattr(seatbelt_mod.sys, "platform", "darwin")
+    monkeypatch.setattr(seatbelt_mod.os, "uname", lambda: SimpleNamespace(sysname="Darwin"))
+    monkeypatch.setattr(seatbelt_mod, "DarwinResourceGuard", FailingGuard)
+    monkeypatch.setattr(seatbelt_mod, "_sandbox_exec_binary", lambda binary=None: "/sandbox-exec")
+    monkeypatch.setattr(seatbelt_mod, "create_owned_subprocess_exec", spawn)
+    monkeypatch.setattr(seatbelt_mod, "_terminate_process_group", terminate)
+    request = replace(
+        _request(_policy(tmp_path), tmp_path),
+        action_kind="code.exec",
+        policy=replace(_policy(tmp_path), description="Managed channel workspace authoring"),
+    )
+    result = await SeatbeltBackend().run(request)
+    assert result.returncode != 0
+    assert "resource supervision failed" in result.stderr
+    assert result.stdout == "parent finished"
 
 
 def _directory_symlink(link: Path, target: Path) -> None:
@@ -361,6 +635,29 @@ def test_profile_expands_logical_and_canonical_carveout_variants(
     for variant in (logical, target):
         assert f'(require-not (literal "{variant}"))' in workspace_write
         assert f'(require-not (subpath "{variant}"))' in workspace_write
+
+
+def test_closed_profile_allows_runtime_alias_metadata_without_alias_data_grant(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = tmp_path / "runtime-versioned"
+    alias = tmp_path / "runtime-current"
+    workspace.mkdir()
+    target.mkdir()
+    _directory_symlink(alias, target)
+    profile = FileSystemPermissionProfile.workspace(
+        workspace=workspace,
+        readable_roots=(alias,),
+        host_root_readonly=False,
+        tmp_writable=False,
+        tmpdir_env_writable=False,
+    )
+    policy = replace(_policy(workspace), file_system=profile)
+    rendered = render_seatbelt_profile(_request(policy, workspace))
+    assert f'(allow file-read-metadata file-test-existence (literal "{alias}"))' in rendered
+    assert f'(allow file-read* (require-all (literal "{alias}"))' not in rendered
+    assert f'(allow file-read* (require-all (literal "{target}"))' in rendered
 
 
 @pytest.mark.parametrize(
@@ -1323,7 +1620,11 @@ async def test_run_caller_cancel_terminates_process_group(
         assert "start_new_session" not in kwargs
         return FakeProcess()
 
-    async def fake_terminate(proc: FakeProcess) -> tuple[bytes, bytes]:
+    async def fake_terminate(
+        proc: FakeProcess,
+        *,
+        drain_output: bool = True,
+    ) -> tuple[bytes, bytes]:
         terminated.append(proc.pid)
         return b"", b""
 

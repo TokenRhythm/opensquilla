@@ -24,6 +24,7 @@ export interface SessionNavigationDiagEntry {
   handoffEpoch?: number
   targetKeyHash?: string
   phase?: string
+  transportPhase?: 'healthy' | 'checking' | 'suspect' | 'reconnecting'
   closeCode?: number
   wasClean?: boolean
   reconnectAttempt?: number
@@ -31,6 +32,21 @@ export interface SessionNavigationDiagEntry {
   recoveryMs?: number
   loopLagMs?: number
   maxLoopLagMs?: number
+  at?: number
+  topology?: 'loopback' | 'remote' | 'proxy/vpn' | 'unknown'
+  visibility?: 'visible' | 'hidden' | 'unknown'
+  health?: 'healthy' | 'suspect'
+  suspectAt?: number
+  lastRxAt?: number
+  wakeIncidentId?: number
+  wakeIncidentStartedAt?: number
+  wakeIncidentDeadlineAt?: number
+  wakeIncidentStatus?: 'probing' | 'suspect' | 'reconnecting' | 'recovered'
+  wakeIncidentSource?: 'desktop-resume' | 'pageshow' | 'online' | 'manual'
+  wakeIncidentProbeTimeoutMs?: number
+  wakeSignalCount?: number
+  roundTripMs?: number
+  resumeSource?: 'desktop-resume'
 }
 
 export type SessionNavigationDiagData = Omit<SessionNavigationDiagEntry, 't' | 'iso' | 'source'>
@@ -81,10 +97,86 @@ const SAFE_DIAGNOSTIC_REASONS = new Set([
   'wake_probe_send_failure',
   'wake_socket_stale',
   'wake_probe_timeout',
+  'wake_incident_timeout',
+  'socket_not_open',
+  'probe_socket_unavailable',
+  'probe_send_failure',
+  'probe_failed',
+  'control_unconfirmed',
+  'wake_probe_unconfirmed',
+  'native_resume_probe_timeout',
+  'native_resume_socket_unavailable',
+  'desktop_resume',
+  'scheduler_lag',
+  'wake_grace',
+  'hello',
+  'round_trip',
+  'direct_send_timeout',
+  'recovery_credit_timeout',
+  'writer_send_failed',
+  'writer_serialize_failed',
+  'writer_capacity',
+  'transport_resource_limit',
   'transport_recovery',
   'peer_close_reason_redacted',
   'reason_redacted',
 ])
+const SAFE_TRANSPORT_PHASES = new Set([
+  'connect_start', 'hello', 'challenge', 'first_successful_rpc', 'close',
+  'watchdog_timeout', 'handshake_invalid', 'wake_incident_timeout',
+  'wake_incident_start', 'wake_incident_recovered', 'retire',
+  'probe_socket_unavailable', 'probe_deferred', 'probe_timeout',
+  'scheduler_lag', 'reconnect_scheduled',
+  'desktop_resume',
+  'soft_suspect', 'soft_suspect_deferred',
+])
+const TRANSPORT_TIMING_FIELDS = [
+  'at', 'suspectAt', 'lastRxAt', 'wakeIncidentStartedAt',
+  'wakeIncidentDeadlineAt', 'roundTripMs',
+] as const
+
+function safeTransportMetrics(value: Record<string, unknown>): SessionNavigationDiagData {
+  const metrics: SessionNavigationDiagData = {}
+  for (const field of TRANSPORT_TIMING_FIELDS) {
+    const candidate = value[field]
+    if (typeof candidate === 'number' && Number.isFinite(candidate) && candidate >= 0) {
+      metrics[field] = candidate
+    }
+  }
+  for (const field of ['wakeIncidentId', 'wakeSignalCount'] as const) {
+    const candidate = value[field]
+    if (typeof candidate === 'number' && Number.isSafeInteger(candidate) && candidate >= 0) {
+      metrics[field] = candidate
+    }
+  }
+  if (value.topology === 'loopback' || value.topology === 'remote'
+    || value.topology === 'proxy/vpn' || value.topology === 'unknown') {
+    metrics.topology = value.topology
+  }
+  if (value.visibility === 'visible' || value.visibility === 'hidden' || value.visibility === 'unknown') {
+    metrics.visibility = value.visibility
+  }
+  if (value.health === 'healthy' || value.health === 'suspect') metrics.health = value.health
+  if (value.transportPhase === 'healthy' || value.transportPhase === 'checking'
+    || value.transportPhase === 'suspect' || value.transportPhase === 'reconnecting') {
+    metrics.transportPhase = value.transportPhase
+  }
+  if (value.wakeIncidentStatus === 'probing' || value.wakeIncidentStatus === 'suspect'
+    || value.wakeIncidentStatus === 'reconnecting' || value.wakeIncidentStatus === 'recovered') {
+    metrics.wakeIncidentStatus = value.wakeIncidentStatus
+  }
+  if (value.resumeSource === 'desktop-resume') metrics.resumeSource = value.resumeSource
+  if (value.wakeIncidentSource === 'desktop-resume' || value.wakeIncidentSource === 'pageshow'
+    || value.wakeIncidentSource === 'online' || value.wakeIncidentSource === 'manual') {
+    metrics.wakeIncidentSource = value.wakeIncidentSource
+  }
+  if (typeof value.wakeIncidentProbeTimeoutMs === 'number'
+    && Number.isFinite(value.wakeIncidentProbeTimeoutMs)
+    && value.wakeIncidentProbeTimeoutMs >= 0) {
+    metrics.wakeIncidentProbeTimeoutMs = value.wakeIncidentProbeTimeoutMs
+  }
+  return metrics
+}
 
 function createRendererInstance(): string {
   const randomUuid = globalThis.crypto?.randomUUID?.()
@@ -162,13 +254,14 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
   const generation = typeof value.generation === 'number' && Number.isFinite(value.generation)
     ? value.generation
     : undefined
-  if (!phase || generation === undefined) return null
+  if (!SAFE_TRANSPORT_PHASES.has(phase) || generation === undefined) return null
   const handoff = activeHandoff
   const reason = safeTransportReason(value.reason, phase)
   return recordSessionNavigationDiag('rpc.transport', {
     rendererInstance: sessionNavigationRendererInstance(),
     generation,
     phase,
+    ...safeTransportMetrics(value),
     ...(typeof value.connId === 'string' && value.connId
       ? { connId: value.connId.slice(0, 128) }
       : {}),
@@ -195,6 +288,20 @@ export function recordRpcTransportDiag(detail: unknown): SessionNavigationDiagEn
     ...(handoff
       ? { handoffEpoch: handoff.epoch, targetKeyHash: handoff.targetKeyHash }
       : {}),
+  })
+}
+
+/** Record the native wake observation without persisting renderer payloads. */
+export function recordRpcResumeDiag(detail: {
+  generation: number
+  resumeSource: 'desktop-resume'
+}): SessionNavigationDiagEntry | null {
+  if (!Number.isFinite(detail.generation)) return null
+  return recordRpcTransportDiag({
+    phase: 'desktop_resume',
+    generation: detail.generation,
+    reason: 'desktop_resume',
+    resumeSource: detail.resumeSource,
   })
 }
 

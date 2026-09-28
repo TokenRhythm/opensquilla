@@ -14,13 +14,6 @@ from opensquilla.contracts.tool_presentation import ToolPresentationCategory
 from opensquilla.contracts.turn_execution import SurfaceCapabilities
 from opensquilla.sandbox.operation_runtime import SandboxToolDescriptor
 
-# Set only by the trusted Meta scheduler around its internal skill_view
-# preface. It is intentionally separate from model-supplied tool arguments.
-current_meta_skill_owner: contextvars.ContextVar[str] = contextvars.ContextVar(
-    "current_meta_skill_owner",
-    default="",
-)
-
 # A fresh dictionary per dispatch keeps output references out of tool text and
 # isolates parallel calls. Reader workers can update the shared per-call value.
 current_execution_log: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
@@ -119,7 +112,6 @@ class ToolContext:
     scratch_file_writes: list[dict[str, Any]] = field(default_factory=list)
     allowed_tools: set[str] | None = None
     denied_tools: set[str] = field(default_factory=set)
-    coding_mode: bool = False  # operator coding-mode toggle (affects tool defaults)
     on_memory_source_write: Callable[[str, str], None] | None = None
     on_bootstrap_source_write: Callable[[str, str], None] | None = None
     on_runtime_event: Callable[[dict[str, Any]], None] | None = None
@@ -323,12 +315,25 @@ class ToolContext:
     persist_attachment_working_files: Callable[[], Awaitable[None]] | None = field(
         default=None, repr=False,
     )
-
     # Explicit config additions are tracked separately from an unrestricted
     # allowlist so opting into one default-deny tool does not restrict the
     # normal catalog or authorize every other default-deny tool. Append to
     # preserve the positional compatibility of the existing context fields.
     explicitly_allowed_tools: set[str] = field(default_factory=set)
+
+    # Runtime-attested execution facts. These are populated only by the
+    # trusted gateway route builder; model arguments and channel metadata can
+    # never grant them. They keep tool projection and dispatch on one frozen
+    # per-turn authority snapshot.
+    sandboxed_workspace_authoring: Any | None = field(default=None, repr=False)
+
+    # Async completion sink owned by the current TaskRuntime. Shell process
+    # sessions use it to publish one structured completion event without
+    # introducing a second event bus. Keep it after every historical field so
+    # positional ToolContext callers retain their existing argument order.
+    process_event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = field(
+        default=None, repr=False
+    )
 
 
 def is_goal_owned_main_default_turn(ctx: ToolContext | None) -> bool:
@@ -396,7 +401,6 @@ current_tool_context: contextvars.ContextVar[ToolContext | None] = contextvars.C
 SUBAGENT_TOOL_DENY: frozenset[str] = frozenset(
     {
         "submit_plan", "update_plan", "create_goal", "get_goal", "update_goal",
-        "update_goal_progress", "plan_run_checkpoint",
         "cron",
         "gateway",
         "agents_list",
@@ -435,6 +439,7 @@ CRON_AGENT_DENY: frozenset[str] = frozenset(
         "subagents",
         "message",
         "exec_command",
+        "process",
         "background_process",
         "write_file",
         "edit_file",

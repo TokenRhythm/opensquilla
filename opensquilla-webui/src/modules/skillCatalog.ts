@@ -1,8 +1,5 @@
 import type { InjectionKey } from 'vue'
 import type {
-  AutoEnabledSkill,
-  Proposal,
-  ProposalsSettings,
   RegistryResult,
   Skill,
   SkillCandidate,
@@ -56,30 +53,6 @@ export interface SkillReloadResult {
   readonly removed?: readonly string[]
   readonly modified?: readonly string[]
   readonly errors?: readonly SkillReloadError[]
-}
-
-export interface SkillProposalSnapshot {
-  readonly proposals: readonly Proposal[]
-  readonly autoEnabledSkills: readonly AutoEnabledSkill[]
-  readonly settings: ProposalsSettings | null
-}
-
-export interface SkillProposalDetail extends Partial<Proposal> {
-  readonly status?: string
-  readonly reason?: string
-}
-
-export interface SkillProposalAction {
-  readonly status?: string
-  readonly reason?: string
-  readonly settings?: ProposalsSettings
-}
-
-export interface ProposalSettingsUpdate {
-  readonly enabled?: boolean
-  readonly on_dream_complete?: boolean
-  readonly auto_enable?: boolean
-  readonly auto_enable_max_risk?: 'low' | 'medium' | 'high'
 }
 
 export interface SkillInstallStatus {
@@ -145,17 +118,6 @@ export interface SkillCatalog {
     readonly installId?: string
     readonly signal?: AbortSignal
   }): Promise<SkillInstallResult>
-  proposals(options?: { readonly signal?: AbortSignal }): Promise<SkillProposalSnapshot>
-  updateProposalSettings(changes: ProposalSettingsUpdate, options?: {
-    readonly signal?: AbortSignal
-  }): Promise<SkillProposalAction>
-  proposal(proposalId: string, options?: { readonly signal?: AbortSignal }): Promise<SkillProposalDetail>
-  acceptProposal(proposalId: string, options?: {
-    readonly force?: boolean
-    readonly signal?: AbortSignal
-  }): Promise<SkillProposalAction>
-  rejectProposal(proposalId: string, options?: { readonly signal?: AbortSignal }): Promise<SkillProposalAction>
-  disableAutoEnabledSkill(name: string, options?: { readonly signal?: AbortSignal }): Promise<SkillProposalAction>
 }
 
 export const SKILL_CATALOG_KEY: InjectionKey<SkillCatalog> = Symbol('SkillCatalog')

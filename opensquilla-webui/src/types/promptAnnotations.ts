@@ -29,7 +29,6 @@ export interface PromptAnnotation {
   resourceId?: string
   pagePath?: string
   locatorHint?: string
-  screenshotAttachment?: import('./chat').Attachment
   status: PromptAnnotationStatus
   freshness?: PromptAnnotationFreshness
   staleReason?: string | null

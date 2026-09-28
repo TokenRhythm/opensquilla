@@ -87,7 +87,7 @@ export type ProviderProbeMode = 'reachability' | 'model'
 export interface ProbePrimaryProvider extends ConfigurePrimaryProvider {
   mode?: ProviderProbeMode
 }
-export interface DiscoverPrimaryModels extends Omit<ConfigurePrimaryProvider, 'model' | 'presetId' | 'routerAction' | 'imageGenerationIntent'> { forceRefresh?: boolean | null }
+export interface DiscoverPrimaryModels extends Omit<ConfigurePrimaryProvider, 'model' | 'presetId' | 'routerAction' | 'imageGenerationIntent'> { forceRefresh?: boolean | null; cacheOnly?: boolean }
 
 export interface UpsertProfile {
   providerId: string
@@ -126,6 +126,7 @@ export interface ProfileProbe {
   baseUrl?: string | null
   proxy?: string | null
   forceRefresh?: boolean | null
+  cacheOnly?: boolean
   mode?: ProviderProbeMode
 }
 

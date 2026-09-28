@@ -2,7 +2,7 @@ import { onMounted, onUnmounted, watch } from 'vue'
 import type { GatewayAccess } from '@/modules/gatewayAccess'
 import { ProductActivityError, type ProductActivity } from '@/modules/productActivity'
 import { getPlatform } from '@/platform'
-import { onReadinessInvalidated } from './setup/useReadinessSummary'
+import { onReadinessInvalidated } from './setup/readinessInvalidation'
 
 const RETRY_INTERVAL_MS = 60_000
 

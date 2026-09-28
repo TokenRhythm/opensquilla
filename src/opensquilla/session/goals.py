@@ -524,29 +524,6 @@ def normalize_goal_progress(
     return progress
 
 
-def validate_goal_budget(value: object) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 2**63 - 1:
-        raise GoalValidationError(
-            "token_budget must be a positive integer", code="INVALID_GOAL_BUDGET"
-        )
-    return value
-
-
-def goal_budget_pause_reason(goal: GoalRecord) -> str | None:
-    """Use one budget decision for edits, resume, and ordinary turn admission."""
-    if goal.token_budget is None:
-        return None
-    # Historical gaps precede this budget's accounting boundary. Missing
-    # receipts within that boundary still prevent a trustworthy decision.
-    if goal.usage_coverage not in {"complete", "partial_history"}:
-        return "usage_unknown"
-    if goal.budget_tokens_used >= goal.token_budget:
-        return "token_budget"
-    return None
-
-
 def new_goal(
     *,
     goal_id: str,
@@ -557,8 +534,6 @@ def new_goal(
     task_id: str | None = None,
     source_user_message_id: str | None = None,
     created_at_ms: int | None = None,
-    token_budget: int | None = None,
-    background: bool = False,
 ) -> GoalRecord:
     """Build a fresh current Goal with monotonic revisions initialized."""
 
@@ -592,9 +567,7 @@ def new_goal(
         session_epoch=session_epoch,
         goal_id=goal_id,
         objective=normalized,
-        token_budget=validate_goal_budget(token_budget),
         usage_accounting_started_at_ms=timestamp,
-        background=background,
         status=GoalStatus.ACTIVE.value,
         state_revision=1,
         objective_revision=1,
@@ -670,15 +643,12 @@ def goal_snapshot(
             "cacheWriteTokens": goal.cache_write_tokens,
             "totalTokens": goal.total_tokens,
         },
-        "tokenBudget": goal.token_budget,
-        "budgetTokensUsed": goal.budget_tokens_used,
         "usageAccountingStartedAtMs": goal.usage_accounting_started_at_ms,
         "usageCoverage": (
             "partial_history"
             if not goal.usage_accounting_version and goal.usage_coverage == "complete"
             else goal.usage_coverage
         ),
-        "executionPolicy": "background" if goal.background else "foreground",
         "pauseReason": goal.pause_reason,
         # ``blocked_reason`` is also the bounded, internal hand-off slot for
         # the blocker that preceded a Resume.  It is current public state only

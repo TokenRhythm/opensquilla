@@ -30,7 +30,7 @@ Python, no Git, no build tools.
 
 Prebuilt multi-arch images are published to
 [`ghcr.io/tokenrhythm/opensquilla`](https://github.com/TokenRhythm/opensquilla/pkgs/container/opensquilla)
-for each release tag. The immutable `v0.5.4` tag identifies the 0.5.4 stable release, while
+for each release tag. The immutable `v0.5.5` tag identifies the 0.5.5 stable release, while
 `latest` follows the most recently pushed release tag, including previews and
 backports. If a backport moves `latest`, the newest release workflow is rerun to
 restore the intended ordering. If the release you want predates image
@@ -45,8 +45,8 @@ Create a directory for the deployment and write this `compose.yaml`:
 ```yaml
 services:
   gateway:
-    # Pin v0.5.4 for reproducibility; latest follows the most recent tag push.
-    image: ghcr.io/tokenrhythm/opensquilla:v0.5.4
+    # Pin v0.5.5 for reproducibility; latest follows the most recent tag push.
+    image: ghcr.io/tokenrhythm/opensquilla:v0.5.5
     environment:
       # In-container bind. Keep it 0.0.0.0 — what the network can reach is
       # decided by `ports` below, not by this value.

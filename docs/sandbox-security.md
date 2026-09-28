@@ -100,10 +100,12 @@ selector simply disables Safe mode without an extra banner, badge, or error
 color. Desktop startup shows one native safety notice unless the user chooses
 “Don't remind me again.”
 
-An authenticated host task whose saved preference is Safe can soft-land to Full
-access for that turn. The task records both the desired and effective modes;
-the stored preference remains Safe. A sandbox failure after execution starts
-stops the task and never replays it automatically with host permissions.
+When a task requests Safe mode while the sandbox is unavailable, the gateway
+rejects it before execution, including for authenticated host users. It does
+not automatically switch the task to Full access. Users with the `host.execute`
+capability can explicitly select Full access, which remains available even when
+the sandbox is unavailable. A sandbox failure after execution starts stops the
+task and never replays it automatically with host permissions.
 
 ---
 

@@ -17,7 +17,7 @@
           type="button"
           class="msg-media-card__img"
           :aria-label="t('chat.openTitle', { title: artifactFileTitle(artifact) })"
-          @click="openPreview(artifact)"
+          @click="openPreview(artifact, $event)"
         >
           <img
             :src="thumbUrlFor(artifact)"
@@ -86,6 +86,7 @@
           <span class="msg-media-card__name">{{ artifactFileTitle(artifact) }}</span>
           <span class="msg-media-card__meta">{{ artifactFileSubtitle(artifact) }}</span>
           <span class="msg-media-card__spacer" />
+          <ImageCopyActions v-if="!shareMode" :source="{ kind: 'artifact', artifact }" :session-key="sessionKey" />
           <button
             type="button"
             class="msg-media-card__download"
@@ -131,6 +132,7 @@
         :artifact="artifact"
         :category="artifactCategory(artifact)"
         :session-key="sessionKey"
+        :share-mode="shareMode"
         :icon-name="artifactIconName(artifact)"
         :title="artifactFileTitle(artifact)"
         :kind-pill="artifactKindPill(artifact)"
@@ -149,6 +151,7 @@
 import { computed, inject, onUnmounted, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
+import ImageCopyActions from '@/components/ImageCopyActions.vue'
 import ArtifactChip from '@/components/chat/ArtifactChip.vue'
 import AudioArtifactCard from '@/components/chat/AudioArtifactCard.vue'
 import VideoArtifactCard from '@/components/chat/VideoArtifactCard.vue'
@@ -179,6 +182,7 @@ const props = defineProps<{
   artifacts: ArtifactPayload[]
   navigationArtifacts?: ArtifactPayload[]
   sessionKey?: string
+  shareMode?: boolean
   /** Route previewable document artifacts into the app-level Workbench. */
   preferWorkbench?: boolean
 }>()
@@ -271,7 +275,10 @@ function retryPreview(artifact: ArtifactPayload) {
 
 // App owns image preview so images opened from a message and from the
 // Workbench collection share one Lightbox.
-function openPreview(artifact: ArtifactPayload) {
+function openPreview(artifact: ArtifactPayload, event: MouseEvent) {
+  // WebKit does not focus buttons on pointer clicks; the lightbox records
+  // the active element so it can return focus here when dismissed.
+  if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true })
   emit('open', artifact)
 }
 

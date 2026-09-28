@@ -752,6 +752,7 @@ const allowsFloatingContent = computed(() => (
               :value="modelChoiceValue(tier)"
               :models="catalogFor(tier).models"
               :model-source="catalogFor(tier).source"
+              :catalog-state="catalogFor(tier)"
               :disabled="rowFieldsDisabled(tier)"
               :commit-on-select="tier.name === 'c3'"
               :external-description-id="ensembleDescriptionId(tier)"

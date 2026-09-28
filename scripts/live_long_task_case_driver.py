@@ -46,6 +46,7 @@ if str(REPO_ROOT) not in sys.path:
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
+from opensquilla.config_version import LATEST_CONFIG_VERSION  # noqa: E402
 from opensquilla.gateway_client import GatewayRPCClient  # noqa: E402
 from opensquilla.provider.registry import get_provider_spec  # noqa: E402
 from scripts.live_harness_security import (  # noqa: E402
@@ -464,6 +465,7 @@ def render_gateway_config(
     lines = [
         'host = "127.0.0.1"',
         "debug = false",
+        f"config_version = {LATEST_CONFIG_VERSION}",
         "log_file_enabled = false",
         f"workspace_dir = {_toml_string(workspace_dir)}",
         "llm_request_timeout_seconds = 900",
@@ -558,7 +560,7 @@ class GatewayProcess:
             self.turn_log_dir,
         ):
             directory.mkdir(mode=0o700)
-        self.port = _free_port()
+        self.port = 0
         self.proc: subprocess.Popen[bytes] | None = None
         self._stdout: Any = None
         self._stderr: Any = None
@@ -611,6 +613,11 @@ class GatewayProcess:
     def start(self) -> None:
         if self.proc is not None and self.proc.poll() is None:
             raise RuntimeError("Gateway is already running")
+        if not self.port:
+            # Fault proxies bind between construction and the first start.
+            # Select afterward so they cannot take our released ephemeral
+            # port; retain it on restart for existing browser/RPC clients.
+            self.port = _free_port()
         self._stdout = (self.root / "gateway.stdout.log").open("ab")
         self._stderr = (self.root / "gateway.stderr.log").open("ab")
         # Restarts append to the raw logs so cleanup can scan every attempt.

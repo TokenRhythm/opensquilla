@@ -75,7 +75,6 @@
       </router-link>
     </div>
 
-    <SidebarSetupBanner />
 
     <!-- Recent conversations -->
     <SidebarConversations
@@ -257,12 +256,6 @@
           <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
           <DesktopUpdateIndicator />
         </template>
-        <!-- Opt-in (Settings → Appearance or the command palette); off by
-             default so the topbar stays music-free until asked for. -->
-        <BgmControl
-          v-if="bgmEnabled"
-          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
-        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -315,8 +308,6 @@
       <main
         class="content"
         :class="{ 'content--chat': isChatRoute }"
-        :data-skin="skinId || undefined"
-        :data-skin-variant="variants || undefined"
         id="content"
       >
         <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
@@ -356,6 +347,9 @@
       />
       <ArtifactImageLightbox />
     </div>
+    <!-- Keep recovery actions in normal flow, clear of the floating console
+         topbar. The main shell already reserves the mobile tab-bar inset. -->
+    <DeliveryRecoveryNotice @open-session="switchToSession" />
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
@@ -453,6 +447,7 @@ import { useAppStore, type ThemeMode, type PendingApproval } from './stores/app'
 import { GATEWAY_ACCESS_KEY } from './modules/gatewayAccess'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { useProductActivity } from './composables/useProductActivity'
+import { useReadinessConnectionSync } from './composables/setup/useReadinessConnectionSync'
 import { SESSION_DIRECTORY_KEY } from './modules/sessionDirectory'
 import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges'
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
@@ -461,6 +456,7 @@ import {
   arrangeSidebarSections,
   useSessions,
   type SessionItem,
+  type SessionListLoadResult,
   type SidebarSection,
   type SidebarSectionRow,
 } from './composables/useSessions'
@@ -475,15 +471,13 @@ import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
+import DeliveryRecoveryNotice from './components/DeliveryRecoveryNotice.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
-import SidebarSetupBanner from './components/SidebarSetupBanner.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
-import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
-import { useBgm } from './composables/useBgm'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
@@ -506,7 +500,6 @@ import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
@@ -546,6 +539,7 @@ const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
 const gatewayAccess = injectedGatewayAccess
+useReadinessConnectionSync(gatewayAccess)
 const productActivity = inject(PRODUCT_ACTIVITY_KEY)
 if (productActivity) useProductActivity(gatewayAccess, productActivity)
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
@@ -582,6 +576,7 @@ const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
 const {
+  sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
   title: chatRouteHeaderTitle,
   copyState: chatRouteHeaderCopyState,
@@ -633,9 +628,18 @@ const APP_SESSION_SYNC_SOURCE = 'app-sidebar'
 // Localized connection-state label for the topbar pill and its tooltip. The
 // Semantic availability is projected into the existing presentation keys;
 // CSS uppercases the result (a no-op for CJK scripts).
-const connectionState = computed(() => gatewayAccess.availability === 'available'
-  ? 'connected'
-  : gatewayAccess.availability === 'preparing' ? 'connecting' : 'disconnected')
+const gatewayConnectionPhase = computed(() => {
+  if (gatewayAccess.availability === 'available') {
+    return gatewayAccess.connectionPhase
+      || (gatewayAccess.isResuming || gatewayAccess.connectionHealth === 'suspect' ? 'suspect' : 'healthy')
+  }
+  return gatewayAccess.availability === 'preparing' ? 'checking' : 'disconnected'
+})
+const connectionState = computed(() => {
+  if (gatewayConnectionPhase.value === 'healthy') return 'connected'
+  if (gatewayConnectionPhase.value === 'disconnected') return 'disconnected'
+  return 'connecting'
+})
 const effectiveConnectionState = computed(() => effectiveChatConnectionState(
   connectionState.value,
   appStore.chatLivePhase,
@@ -643,7 +647,9 @@ const effectiveConnectionState = computed(() => effectiveChatConnectionState(
 ))
 const connectionStateLabel = computed(() => getPlatform().id === 'web' && gatewayAccess.requiresCredential
   ? t('setup.connection.tokenRequired')
-  : t(`chrome.connectionState.${effectiveConnectionState.value}`))
+  : gatewayConnectionPhase.value === 'healthy' || gatewayConnectionPhase.value === 'disconnected'
+  ? t(`chrome.connectionState.${effectiveConnectionState.value}`)
+  : t(`chrome.connectionState.${gatewayConnectionPhase.value}`))
 // afterEach only fires on navigation, so a same-route language switch needs an
 // explicit re-localize of the tab title.
 watch(() => appStore.locale, () => {
@@ -661,8 +667,6 @@ const {
   cancelPendingRequests,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
-// Axis-B: the active expressive skin for the routed content area (meta.skin).
-const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
@@ -697,9 +701,6 @@ watch(
     editingProjectId.value = ''
   },
 )
-// Feature-gated topbar music control; the singleton `enabled` ref is written by
-// Settings → Appearance and the command palette.
-const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
@@ -864,7 +865,6 @@ const systemHeaderPressureCount = computed(() => (
   Number(effectiveConnectionState.value !== 'connected')
   + Number(appStore.approvalCount > 0)
   + Number(desktopUpdate.visible.value)
-  + Number(bgmEnabled.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
@@ -1065,6 +1065,55 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   }
   return items
 })
+
+// A just-materialized chat can reach the route before the next sessions.list
+// snapshot. Keep an optimistic ledger entry for it so switching to another
+// conversation does not make the new task disappear from the sidebar. When
+// ChatView has the first user message, reuse its resolved header title so the
+// sidebar shows the same text immediately. The key guard prevents a title from
+// the previous ChatView instance leaking into the new session during navigation.
+function optimisticCurrentSessionTitle(key: string, allowHeaderTitle = true): string {
+  if (!allowHeaderTitle || chatRouteHeaderSessionKey.value !== key) {
+    return t('shared.sidebar.currentTask')
+  }
+  const title = chatRouteHeaderTitle.value.trim()
+  if (!isSensibleChatTitle(title)) return t('shared.sidebar.currentTask')
+  const suffix = key.split(':').pop() || ''
+  const genericTitles = new Set([
+    t('chat.newChat'),
+    t('chat.chatWithSuffix', { suffix }),
+    t('shared.sidebar.currentTask'),
+  ])
+  return genericTitles.has(title) ? t('shared.sidebar.currentTask') : title
+}
+
+watch(
+  [currentSessionKey, chatRouteHeaderSessionKey, chatRouteHeaderTitle],
+  ([key], oldValues) => {
+    if (!key || allSessions.value.some(item => item.key === key)) return
+    const existing = localChatSessions.value[key]
+    const previousKey = oldValues?.[0] || ''
+    const previousHeaderKey = oldValues?.[1] || ''
+    const sessionChanged = Boolean(
+      (previousKey && key && previousKey !== key)
+      || (previousHeaderKey
+        && chatRouteHeaderSessionKey.value
+        && previousHeaderKey !== chatRouteHeaderSessionKey.value),
+    )
+    const title = optimisticCurrentSessionTitle(key, !sessionChanged)
+    if (existing && existing.title === title) return
+    const effectiveAgentId = normalizeAgentId(key.split(':')[1] || 'main')
+    localChatSessions.value = {
+      ...localChatSessions.value,
+      [key]: {
+        effectiveAgentId: existing?.effectiveAgentId || effectiveAgentId,
+        title,
+        updatedAt: existing?.updatedAt || Date.now(),
+      },
+    }
+  },
+  { flush: 'sync', immediate: true },
+)
 
 watch(allSessions, sessions => {
   for (const item of sessions) {
@@ -1277,8 +1326,6 @@ watch(sidebarDynamicMaximum, () => {
 })
 
 // Primary new-chat path: ordinary tasks always start against the default Agent.
-// Explicit custom-Agent launches still receive their Agent-scoped session key
-// from advanced Agent administration.
 function openDefaultDraft() {
   freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })
@@ -1536,14 +1583,15 @@ function onPaletteSelectSession(key: string) {
   switchToSession(key, 'command_palette.select_session')
 }
 
-function switchToSession(key: string, source = 'app.switchToSession') {
+async function switchToSession(key: string, source = 'app.switchToSession') {
   if (!key) return
   sessionTaskAttention.markRead(key)
   recordSessionNavigationDiag(source, {
     from: currentSessionKey.value,
     to: key,
   })
-  router.push({ path: '/chat', query: { session: key } })
+  await router.push({ path: '/chat', query: { session: key } })
+  if ($route.path === '/chat' && $route.query.session === key) closeSidebarDrawer()
 }
 
 // Optimistic rename: show the new title immediately, then persist through the
@@ -1693,8 +1741,9 @@ function scheduleSessionRefresh() {
   automaticAppRpc.schedule()
 }
 
-async function performSidebarLoad(): Promise<void> {
-  const requests: Promise<unknown>[] = [loadSessions()]
+async function performSidebarLoad(): Promise<SessionListLoadResult> {
+  const sessionRead = loadSessions()
+  const requests: Promise<unknown>[] = [sessionRead]
   if (
     gatewayAccess.canManageProjectWorkspaces
     && optionalSessionRpcAllowed.value
@@ -1704,6 +1753,7 @@ async function performSidebarLoad(): Promise<void> {
     )
   }
   await Promise.allSettled(requests)
+  return sessionRead
 }
 
 const automaticAppRpc = createAppAutomaticRpc({
@@ -1720,7 +1770,13 @@ function loadSidebarData(): Promise<void> {
   return automaticAppRpc.load()
 }
 
+function handleAppForeground() {
+  markCurrentSessionReadIfVisible()
+  if (document.visibilityState === 'visible') automaticAppRpc.foreground()
+}
+
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
+  if (change.reason === 'deleted') removeLocalSessions(new Set([change.key]))
   scheduleSessionRefresh()
   sessionTaskAttention.handleSessionDirectoryChange(change, {
     currentSessionKey: currentSessionKey.value,
@@ -1951,8 +2007,8 @@ onMounted(() => {
   })
   window.visualViewport?.addEventListener('resize', syncMobileKeyboard)
   window.addEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.addEventListener('focus', markCurrentSessionReadIfVisible)
-  document.addEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.addEventListener('focus', handleAppForeground)
+  document.addEventListener('visibilitychange', handleAppForeground)
   void automaticAppRpc.mount()
   // Keep the approval badge/count live app-wide, not just on the Approvals page.
   subscribeApprovals()
@@ -1965,8 +2021,8 @@ onUnmounted(() => {
   appAutomaticRpcMounted = false
   automaticAppRpc.dispose()
   window.removeEventListener(LOCAL_SESSIONS_DELETED_EVENT, handleLocalSessionsDeleted)
-  window.removeEventListener('focus', markCurrentSessionReadIfVisible)
-  document.removeEventListener('visibilitychange', markCurrentSessionReadIfVisible)
+  window.removeEventListener('focus', handleAppForeground)
+  document.removeEventListener('visibilitychange', handleAppForeground)
   sessionDirectoryChangesSubscription.close()
   sessionDirectoryChanges.dispose()
   unsubscribeApprovals()

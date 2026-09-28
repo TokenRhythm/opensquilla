@@ -39,6 +39,10 @@ log = structlog.get_logger(__name__)
 
 DEFAULT_MAX_TOKENS = 16384
 SAFE_OPENROUTER_DEFAULT_MAX_TOKENS = 8192
+# A published OpenRouter completion ceiling at 90% or more of the shared
+# context window is a physical capability, not a safe automatic reservation.
+OPENROUTER_NEAR_CONTEXT_RATIO_NUMERATOR = 9
+OPENROUTER_NEAR_CONTEXT_RATIO_DENOMINATOR = 10
 DEFAULT_CONTEXT_WINDOW = 200_000
 
 
@@ -1479,7 +1483,8 @@ class ModelCatalog:
         here (single implementation), so value and attribution can never
         drift apart. The clamp below may lower the number without changing
         the attribution: the source names the layer that supplied the
-        pre-clamp candidate.
+        pre-clamp candidate. ``capacity_only`` returns that physical candidate
+        without applying execution-time output reservation clamps.
         """
         provider_id = (provider or "").strip().lower()
         context_window = self.resolve_context_window(model_id, provider_id)
@@ -1586,6 +1591,21 @@ class ModelCatalog:
                 and effective >= context_window - DEFAULT_MAX_TOKENS
             ):
                 effective = min(effective, SAFE_OPENROUTER_DEFAULT_MAX_TOKENS)
+            elif (
+                provider_id == "openrouter"
+                and not using_user_override
+                and context_window > DEFAULT_MAX_TOKENS
+                and effective
+                >= (
+                    context_window * OPENROUTER_NEAR_CONTEXT_RATIO_NUMERATOR
+                    // OPENROUTER_NEAR_CONTEXT_RATIO_DENOMINATOR
+                )
+            ):
+                # OpenRouter may publish a real max_completion_tokens value
+                # that occupies almost the entire shared context window. Keep
+                # that physical capability available through capacity_only,
+                # while reserving half the window for normal execution.
+                effective = min(effective, max(1, context_window // 2))
 
         return effective, source
 

@@ -8,6 +8,7 @@ import copy
 import json
 import random
 import time
+import uuid
 from collections.abc import (
     AsyncGenerator,
     AsyncIterator,
@@ -640,6 +641,11 @@ def _generation_reset(
         model_usage_breakdown=list(model_usage_breakdown or ()),
         usage_missing_count=max(0, int(usage_missing_count or 0)),
         ensemble_trace=(dict(ensemble_trace) if ensemble_trace is not None else None),
+        cumulative_usage_id=(
+            str(ensemble_trace.get("usage_scope_id") or "")
+            if ensemble_trace is not None and (model_usage_breakdown or usage_missing_count)
+            else ""
+        ),
     )
 
 
@@ -1457,6 +1463,31 @@ def _done_usage_row(
     if event.billing_receipt is not None:
         row["billing_receipt"] = event.billing_receipt
     return row
+
+
+def _rejected_tool_usage_rows(
+    event: ErrorEvent,
+    *,
+    role: str,
+    profile: str,
+    provider: str,
+    model: str,
+) -> tuple[list[dict[str, Any]], int]:
+    """Attribute the rejected physical generation without losing its receipt."""
+    rows = [dict(row) for row in event.model_usage_breakdown]
+    missing_count = event.usage_missing_count
+    if not rows:
+        rows = [{"usage_receipt_missing": True, "usage_reported": False}]
+        missing_count = max(1, missing_count)
+    for row in rows:
+        row.update(role=role, profile=profile, label=role, attempt_ok=False)
+        row["provider"] = row.get("provider") or provider
+        row["model"] = row.get("model") or model
+        row.setdefault("sample_index", 0)
+        row.setdefault("request_started", True)
+        row.setdefault("usage_reported", True)
+        row.setdefault("usage_receipt_missing", False)
+    return rows, missing_count
 
 
 class EnsembleProvider:
@@ -3645,6 +3676,7 @@ class EnsembleProvider:
         selected = list(selected_candidates or [])
         trace = {
             "mode": "b5_fusion",
+            "usage_scope_id": uuid.uuid4().hex,
             "profile": self.profile_name,
             "selection_strategy": self.selection_plan.get(
                 "strategy", ROUTER_DYNAMIC_SELECTION_MODE
@@ -3739,6 +3771,7 @@ class EnsembleProvider:
         trace: dict[str, Any],
         aggregator_role: str = "aggregator",
     ) -> AsyncIterator[StreamEvent]:
+        trace.setdefault("usage_scope_id", uuid.uuid4().hex)
         final_text_parts: list[str] = []
         aggregator_started = time.monotonic()
         retry_rows: list[dict[str, Any]] = []
@@ -3886,8 +3919,9 @@ class EnsembleProvider:
                 candidate_bundle=candidate_bundle,
                 candidate_bundle_messages=candidate_bundle_messages,
                 trace=trace,
-                prior_final_rows=failure_rows,
-                prior_final_missing_count=missing_count,
+                prior_final_rows=[*prior_rows, *failure_rows],
+                prior_final_missing_count=prior_missing_count + missing_count,
+                prior_rows_include_proposers=True,
                 replace_generation_from_role=(
                     StickyExecutionRole.PRIMARY_AGGREGATOR
                 ),
@@ -3929,6 +3963,7 @@ class EnsembleProvider:
                 cost_source=_rollup_cost_source(rows),
                 model_usage_breakdown=rows,
                 ensemble_trace=trace,
+                cumulative_usage_id=trace["usage_scope_id"],
                 usage_missing_count=prior_missing_count + retry_missing_count,
                 billing_receipt=None,
             )
@@ -4131,6 +4166,63 @@ class EnsembleProvider:
                                 api_key=self.aggregator.provider_config.api_key,
                             ),
                         )
+                        if safe_event.tool_argument_rejection is not None:
+                            rejected_rows, rejected_missing = _rejected_tool_usage_rows(
+                                safe_event,
+                                role=aggregator_role,
+                                profile=self.profile_name,
+                                provider=self.aggregator.provider_config.provider,
+                                model=self.aggregator.provider_config.model,
+                            )
+                            rows = [*prior_rows, *retry_rows, *rejected_rows]
+                            missing_count = (
+                                prior_missing_count + retry_missing_count + rejected_missing
+                            )
+                            trace["final_request"].update({
+                                "status": "error",
+                                "output": _trace_content(
+                                    "".join(attempt_text_parts), max_chars=TRACE_CONTENT_MAX_CHARS,
+                                ),
+                                "error": {"code": safe_event.code, "message": safe_event.message},
+                            })
+                            # Correct the completed batch with this same answer
+                            # provider. Re-running proposers or taking the fixed
+                            # leg would discard the model's correction context.
+                            self._primary_takeover_active = True
+                            self._primary_provider = provider
+                            self._primary_candidate_bundle = self._immutable_candidates(
+                                candidate_bundle
+                            )
+                            self._primary_base_messages = tuple(original_messages)
+                            self._primary_all_candidates = self._immutable_candidates(
+                                all_candidates
+                            )
+                            self._primary_trace = copy.deepcopy(trace)
+                            self._primary_prior_rows = tuple(rows)
+                            self._primary_prior_missing_count = missing_count
+                            self._record_continuation_snapshot(
+                                execution_context,
+                                successful_drafts=all_candidates,
+                                candidate_bundle=candidate_bundle,
+                                all_candidates=all_candidates,
+                                base_messages=original_messages,
+                                prior_rows=rows,
+                                missing_cost_entries=missing_count,
+                                trace=trace,
+                            )
+                            yield aggregator_progress(
+                                "aggregator_finish",
+                                usage=rejected_rows[-1],
+                                error=safe_event.message,
+                            )
+                            yield replace(
+                                safe_event,
+                                model_usage_breakdown=rows,
+                                usage_missing_count=missing_count,
+                                ensemble_trace=trace,
+                                cumulative_usage_id=trace["usage_scope_id"],
+                            )
+                            return
                         self._report_member_credential_failure(
                             self.aggregator,
                             message=safe_event.message,
@@ -4340,6 +4432,12 @@ class EnsembleProvider:
                 code="ensemble_primary_sticky_unavailable",
                 candidates=all_candidates,
                 candidate_bundle=bundle,
+                trace=copy.deepcopy(self._primary_trace)
+                if self._primary_trace is not None
+                else None,
+                prior_final_rows=self._primary_prior_rows,
+                prior_final_missing_count=self._primary_prior_missing_count,
+                prior_rows_include_proposers=True,
                 replace_generation_from_role=(
                     StickyExecutionRole.PRIMARY_AGGREGATOR
                 ),
@@ -4386,6 +4484,7 @@ class EnsembleProvider:
                 else None,
                 prior_final_rows=self._primary_prior_rows,
                 prior_final_missing_count=self._primary_prior_missing_count,
+                prior_rows_include_proposers=True,
                 replace_generation_from_role=(
                     StickyExecutionRole.PRIMARY_AGGREGATOR
                 ),
@@ -4411,6 +4510,9 @@ class EnsembleProvider:
             final_request_timeout_seconds=self.aggregator_timeout_seconds,
         )
         if self._primary_trace is not None:
+            trace["usage_scope_id"] = self._primary_trace.get(
+                "usage_scope_id", trace["usage_scope_id"]
+            )
             trace["prior_primary_trace"] = copy.deepcopy(self._primary_trace)
             trace["llm_request_count"] = int(
                 self._primary_trace.get("llm_request_count") or 0
@@ -4460,6 +4562,7 @@ class EnsembleProvider:
     ) -> AsyncIterator[StreamEvent]:
         """Run one fixed logical call with one transient retry at most."""
 
+        trace.setdefault("usage_scope_id", uuid.uuid4().hex)
         fixed_rows: list[dict[str, Any]] = []
         fixed_attempt = 0
         fixed_request_started = False
@@ -4552,6 +4655,7 @@ class EnsembleProvider:
                     + primary_missing_count
                     + missing_count
                 ),
+                cumulative_usage_id=trace["usage_scope_id"],
             )
 
         while True:
@@ -4676,13 +4780,16 @@ class EnsembleProvider:
                             )
                         fixed_rows.append(row)
                         rows = [*proposer_rows, *primary_rows, *fixed_rows]
+                        missing_count = (
+                            proposer_missing_count
+                            + primary_missing_count
+                            + sum(
+                                1 for item in fixed_rows if item.get("usage_receipt_missing")
+                            )
+                        )
                         if self._fixed_takeover_active:
                             self._fixed_prior_rows = tuple(rows)
-                            self._fixed_prior_missing_count = sum(
-                                1
-                                for item in rows
-                                if item.get("usage_receipt_missing")
-                            )
+                            self._fixed_prior_missing_count = missing_count
                             if attempt_had_tool:
                                 self._record_continuation_snapshot(
                                     execution_context,
@@ -4711,11 +4818,8 @@ class EnsembleProvider:
                             cost_source=_rollup_cost_source(rows),
                             model_usage_breakdown=rows,
                             ensemble_trace=trace,
-                            usage_missing_count=sum(
-                                1
-                                for item in rows
-                                if item.get("usage_receipt_missing")
-                            ),
+                            cumulative_usage_id=trace["usage_scope_id"],
+                            usage_missing_count=missing_count,
                             billing_receipt=None,
                         )
                         return
@@ -4732,6 +4836,50 @@ class EnsembleProvider:
                                 api_key=self._fallback_api_key,
                             ),
                         )
+                        if safe_event.tool_argument_rejection is not None:
+                            rejected_rows, rejected_missing = _rejected_tool_usage_rows(
+                                safe_event,
+                                role=fixed_role,
+                                profile=self.profile_name,
+                                provider=physical_provider,
+                                model=physical_model,
+                            )
+                            rows = [*proposer_rows, *primary_rows, *fixed_rows, *rejected_rows]
+                            missing_count = (
+                                proposer_missing_count + primary_missing_count
+                                + sum(1 for row in fixed_rows if row.get("usage_receipt_missing"))
+                                + rejected_missing
+                            )
+                            trace["final_request"].update({
+                                "status": "error",
+                                "output": _trace_content(
+                                    "".join(text_parts), max_chars=TRACE_CONTENT_MAX_CHARS,
+                                ),
+                                "error": {"code": safe_event.code, "message": safe_event.message},
+                            })
+                            if self._fixed_takeover_active:
+                                self._fixed_prior_rows = tuple(rows)
+                                self._fixed_prior_missing_count = missing_count
+                                self._record_continuation_snapshot(
+                                    execution_context,
+                                    successful_drafts=self._fixed_all_candidates,
+                                    candidate_bundle=self._fixed_candidate_bundle,
+                                    all_candidates=self._fixed_all_candidates,
+                                    base_messages=self._fixed_base_messages,
+                                    prior_rows=rows,
+                                    missing_cost_entries=missing_count,
+                                    trace=trace,
+                                )
+                            # This is an unexecuted batch for Agent to correct,
+                            # not a fixed-provider failure that resets the answer.
+                            yield replace(
+                                safe_event,
+                                model_usage_breakdown=rows,
+                                usage_missing_count=missing_count,
+                                ensemble_trace=trace,
+                                cumulative_usage_id=trace["usage_scope_id"],
+                            )
+                            return
                         can_retry = (
                             fixed_attempt < 2
                             and self._member_error_is_retryable(
@@ -4906,13 +5054,21 @@ class EnsembleProvider:
         trace: dict[str, Any] | None = None,
         prior_final_rows: Sequence[dict[str, Any]] = (),
         prior_final_missing_count: int = 0,
+        prior_rows_include_proposers: bool = False,
         replace_generation_from_role: StickyExecutionRole | None = None,
         replace_generation_reason: str = "",
     ) -> AsyncIterator[StreamEvent]:
-        proposer_rows = _candidate_usage_rows(candidates, profile=self.profile_name)
-        proposer_missing_count = _candidate_missing_usage_count(candidates)
+        proposer_rows = (
+            [] if prior_rows_include_proposers
+            else _candidate_usage_rows(candidates, profile=self.profile_name)
+        )
+        proposer_missing_count = (
+            0 if prior_rows_include_proposers else _candidate_missing_usage_count(candidates)
+        )
         primary_rows = list(prior_final_rows)
         primary_missing_count = max(0, int(prior_final_missing_count or 0))
+        usage_scope_id = str(trace.get("usage_scope_id") or "") if trace is not None else ""
+        usage_scope_id = usage_scope_id or uuid.uuid4().hex
 
         def proposer_error(event: ErrorEvent) -> ErrorEvent:
             return replace(
@@ -4921,6 +5077,7 @@ class EnsembleProvider:
                 usage_missing_count=(
                     proposer_missing_count + primary_missing_count
                 ),
+                cumulative_usage_id=usage_scope_id,
             )
 
         request_budget_error = _uniform_request_budget_error(candidates)

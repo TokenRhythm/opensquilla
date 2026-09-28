@@ -396,6 +396,48 @@ describe('SessionReadLifecycle', () => {
     await second.close()
   })
 
+  it.each([
+    ['stream-1', 10],
+    ['restarted-stream', 1],
+    [null, 0],
+  ] as const)('resumes the installed live cursor, including generation/epoch resets (%s/%s)', async (streamGeneration, streamSeq) => {
+    const adapter = new InMemorySessionReadPortAdapter([fixture('alpha')])
+    const runtime = createConversationRuntime()
+    let installed = runtime.createCursor('alpha')
+    const lifecycle = createSessionReadLifecycleFactory(adapter).create({
+      cursor: runtime,
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+      getInstalledCursor: () => installed,
+    })
+    const first = lifecycle.open({ sessionKey: 'alpha' })
+    await first.live
+    // The accepted projection can advance beyond the initial snapshot, or
+    // deliberately reset after a gateway restart / session epoch change.
+    installed = runtime.createCursor('alpha', { streamGeneration, streamSeq })
+    const second = lifecycle.open({ sessionKey: 'alpha' })
+    await second.live
+    expect(adapter.openRecords[1]?.resumeFrom).toEqual({ streamGeneration, streamSeq })
+    await second.close()
+  })
+
+  it('never resumes another session from the installed cursor', async () => {
+    const adapter = new InMemorySessionReadPortAdapter([fixture('alpha'), fixture('beta')])
+    const runtime = createConversationRuntime()
+    const lifecycle = createSessionReadLifecycleFactory(adapter).create({
+      cursor: runtime,
+      subscriptions: createConversationSubscriptionLifecycle<SessionReadPortLease>(),
+      getInstalledCursor: () => runtime.createCursor('alpha', {
+        streamGeneration: 'alpha-stream', streamSeq: 51,
+      }),
+    })
+    const first = lifecycle.open({ sessionKey: 'alpha' })
+    await first.live
+    const second = lifecycle.open({ sessionKey: 'beta' })
+    await second.live
+    expect(adapter.openRecords[1]?.resumeFrom).toEqual({ streamGeneration: null, streamSeq: 0 })
+    await second.close()
+  })
+
   it('finishes the prior generation-pinned release before opening a replacement', async () => {
     const order: string[] = []
     let resolveRelease!: () => void

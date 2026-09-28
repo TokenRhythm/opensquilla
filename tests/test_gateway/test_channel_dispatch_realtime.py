@@ -13,7 +13,7 @@ import pytest
 import structlog
 
 from opensquilla.artifacts import ArtifactStore
-from opensquilla.channels.contract import ChannelCapabilityProfile
+from opensquilla.channels.contract import ChannelCapabilityProfile, ChannelSendResult
 from opensquilla.channels.stream_policy import resolve_channel_stream_policy
 from opensquilla.channels.types import (
     Attachment,
@@ -49,6 +49,7 @@ from opensquilla.gateway.channel_dispatch import (
     _preserve_route_channel_metadata,
     _route_envelope_reply_message,
     _run_turn_batch_path,
+    _run_turn_streaming_path,
     _run_turn_with_streaming,
     _RuntimeChannelStreamRelay,
 )
@@ -1244,21 +1245,12 @@ async def test_direct_channel_batch_turn_keeps_text_fallback_without_card_suppor
 
 
 @pytest.mark.asyncio
-async def test_direct_channel_batch_turn_sends_artifact_fallback() -> None:
-    artifact = {
-        "id": "art-channel",
-        "kind": "artifact_ref",
-        "name": "report.txt",
-        "mime": "text/plain",
-        "size": 4,
-        "sha256": "f" * 64,
-        "session_id": "session-1",
-        "session_key": "agent:main:channel-test",
-        "source": "publish_artifact",
-        "created_at": "2026-05-06T12:00:00Z",
-        "download_url": "/api/v1/artifacts/art-channel?sessionKey=agent%3Amain%3Achannel-test",
-        "store": "artifacts",
-    }
+async def test_direct_channel_batch_turn_sends_artifact_fallback(tmp_path) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"text", session_id="session-1", session_key="agent:main:channel-test",
+        name="report.txt", mime="text/plain", source="publish_artifact",
+    )
+    artifact = ref.to_dict()
 
     class FakeTurnRunner:
         async def run(self, message: str, session_key: str, **kwargs):
@@ -1268,6 +1260,7 @@ async def test_direct_channel_batch_turn_sends_artifact_fallback() -> None:
     channel = _FakeChannel()
     bridge = _FakeEventBridge()
     config = SimpleNamespace(
+        attachments=SimpleNamespace(media_root=str(tmp_path)),
         agent_stream_heartbeat_interval_seconds=0.0,
         agent_stream_idle_timeout_seconds=1.0,
     )
@@ -1281,6 +1274,7 @@ async def test_direct_channel_batch_turn_sends_artifact_fallback() -> None:
         bridge,
         None,
         config,
+        expected_session_id="session-1",
     )
 
     assert channel.sent[-1].content == (
@@ -1294,7 +1288,7 @@ async def test_direct_channel_batch_turn_sends_artifact_fallback() -> None:
         "session.event.artifact",
         event_artifact,
     )
-    assert event_artifact["download_url"] == "/api/v1/artifacts/art-channel"
+    assert event_artifact["download_url"] == f"/api/v1/artifacts/{ref.id}"
     assert "session_key" not in event_artifact
     assert "sessionKey" not in json.dumps(event_artifact)
 
@@ -1344,10 +1338,12 @@ async def test_direct_channel_batch_turn_sends_artifact_with_adapter_file_upload
         bridge,
         None,
         config,
+        expected_session_id="session-1",
     )
 
     assert channel.sent[-1].content == "done"
     assert channel.files == [("c1", "report.pptx")]
+
 
 
 @pytest.mark.asyncio
@@ -1395,10 +1391,12 @@ async def test_direct_channel_batch_turn_sends_artifact_with_original_filename(
         _FakeEventBridge(),
         None,
         config,
+        expected_session_id="session-1",
     )
 
     assert channel.sent[-1].content == "done"
     assert channel.files == [("c1", "思考快与慢_信息图.png")]
+
 
 
 @pytest.mark.asyncio
@@ -1447,10 +1445,12 @@ async def test_direct_channel_batch_turn_removes_delivered_markdown_image_refere
         _FakeEventBridge(),
         None,
         config,
+        expected_session_id="session-1",
     )
 
     assert channel.sent[-1].content == "新版改进：\n\n点击附件保存原图。"
     assert "![Thinking" not in channel.sent[-1].content
+
 
 
 @pytest.mark.asyncio
@@ -1500,11 +1500,13 @@ async def test_direct_channel_batch_turn_removes_artifact_markers_from_channel_t
         _FakeEventBridge(),
         None,
         config,
+        expected_session_id="session-1",
     )
 
     assert channel.sent[-1].content == "ready"
     assert marker not in channel.sent[-1].content
     assert channel.files == [("c1", "chart.png")]
+
 
 
 @pytest.mark.asyncio
@@ -1715,7 +1717,7 @@ def test_channel_artifact_fallback_uses_only_channel_safe_absolute_links() -> No
 
 
 @pytest.mark.asyncio
-async def test_runtime_channel_stream_relay_emits_artifact_fallback() -> None:
+async def test_runtime_channel_stream_relay_emits_artifact_fallback(tmp_path) -> None:
     class StreamingChannel:
         def __init__(self) -> None:
             self.chunks: list[str] = []
@@ -1728,19 +1730,19 @@ async def test_runtime_channel_stream_relay_emits_artifact_fallback() -> None:
         async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
             return None
 
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"text", session_id="session-1", session_key="agent:main:channel-test",
+        name="stream.txt", mime="text/plain", source="publish_artifact",
+    )
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
     channel = StreamingChannel()
-    relay = _RuntimeChannelStreamRelay.maybe_start(channel, _message(), FakeTaskRuntime())
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel, _message(), FakeTaskRuntime(), config=config, expected_session_id="session-1",
+    )
 
     assert relay is not None
 
-    await relay.emit(
-        {
-            "kind": "artifact",
-            "id": "art-stream",
-            "name": "stream.txt",
-            "download_url": "/api/v1/artifacts/art-stream?sessionKey=secret",
-        }
-    )
+    await relay.emit(ArtifactEvent(**ref.to_dict()))
     await relay.close()
 
     assert channel.chunks == [
@@ -1750,7 +1752,7 @@ async def test_runtime_channel_stream_relay_emits_artifact_fallback() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runtime_channel_stream_relay_appends_artifact_fallback_to_text() -> None:
+async def test_runtime_channel_stream_relay_appends_artifact_fallback_to_text(tmp_path) -> None:
     class StreamingChannel:
         def __init__(self) -> None:
             self.chunks: list[str] = []
@@ -1763,20 +1765,20 @@ async def test_runtime_channel_stream_relay_appends_artifact_fallback_to_text() 
         async def enqueue(self, envelope, message: str, *, stream_event_sink=None):
             return None
 
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"text", session_id="session-1", session_key="agent:main:channel-test",
+        name="stream.txt", mime="text/plain", source="publish_artifact",
+    )
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
     channel = StreamingChannel()
-    relay = _RuntimeChannelStreamRelay.maybe_start(channel, _message(), FakeTaskRuntime())
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel, _message(), FakeTaskRuntime(), config=config, expected_session_id="session-1",
+    )
 
     assert relay is not None
 
     await relay.emit(TextDeltaEvent(text="done"))
-    await relay.emit(
-        {
-            "kind": "artifact",
-            "id": "art-stream",
-            "name": "stream.txt",
-            "download_url": "/api/v1/artifacts/art-stream?sessionKey=secret",
-        }
-    )
+    await relay.emit(ArtifactEvent(**ref.to_dict()))
     await relay.close()
 
     assert channel.chunks == [
@@ -1932,6 +1934,7 @@ async def test_runtime_channel_stream_relay_sends_artifact_with_adapter_upload(
         _message(),
         FakeTaskRuntime(),
         config,
+        expected_session_id="session-1",
     )
 
     assert relay is not None
@@ -1943,6 +1946,7 @@ async def test_runtime_channel_stream_relay_sends_artifact_with_adapter_upload(
     assert channel.chunks == ["done"]
     assert channel.files == [("c1", "report.pptx")]
     assert channel.sent == []
+
 
 
 @pytest.mark.asyncio
@@ -1998,7 +2002,9 @@ async def test_stream_failure_does_not_replay_attempted_artifact_at_terminal_rep
     runtime = FakeTaskRuntime()
     config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
     inbound = _message()
-    relay = _RuntimeChannelStreamRelay.maybe_start(channel, inbound, runtime, config)
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel, inbound, runtime, config, expected_session_id="session-1",
+    )
     assert relay is not None
     await relay.emit(TextDeltaEvent(text="Report ready."))
     await relay.emit(ArtifactEvent(**ref.to_dict()))
@@ -2009,7 +2015,7 @@ async def test_stream_failure_does_not_replay_attempted_artifact_at_terminal_rep
         session_manager=FakeSessionManager(),
         session_key="agent:main:channel-test",
         task_id="task-1",
-        route_envelope=SimpleNamespace(reply_target=None),
+        route_envelope=SimpleNamespace(reply_target=None, session_id="session-1"),
         inbound=inbound,
         transcript_watermark=1,
         config=config,
@@ -2025,6 +2031,7 @@ async def test_stream_failure_does_not_replay_attempted_artifact_at_terminal_rep
     assert fallback_messages == [
         "Generated file: report.pdf -> available in the OpenSquilla task"
     ]
+
 
 
 @pytest.mark.asyncio
@@ -2063,12 +2070,17 @@ async def test_channel_file_delivery_dedupes_same_artifact_material(tmp_path) ->
     undelivered = await _deliver_artifacts_as_channel_files(
         channel,
         _message(),
-        [first.to_dict(), second.to_dict()],
+        [first.to_dict(), second.to_dict(), first.to_dict(), second.to_dict()],
         config,
+        expected_session_id="session-1",
     )
 
     assert undelivered == []
-    assert channel.files == [("c1", "image.png")]
+    # Equal bytes do not make two independently published refs the same
+    # artifact. Repeated occurrences of each ref are still delivered once.
+    assert first.id != second.id
+    assert channel.files == [("c1", "image.png"), ("c1", "image.png")]
+
 
 
 @pytest.mark.asyncio
@@ -2124,6 +2136,7 @@ async def test_runtime_channel_stream_relay_does_not_redeliver_transcript_artifa
         _message(),
         runtime,
         config,
+        expected_session_id="session-1",
     )
 
     assert relay is not None
@@ -2135,7 +2148,7 @@ async def test_runtime_channel_stream_relay_does_not_redeliver_transcript_artifa
         session_manager=FakeSessionManager(),
         session_key="agent:main:discord:direct:u1",
         task_id="task-1",
-        route_envelope=SimpleNamespace(reply_target=None),
+        route_envelope=SimpleNamespace(reply_target=None, session_id="session-1"),
         inbound=_message(),
         transcript_watermark=1,
         config=config,
@@ -2144,6 +2157,7 @@ async def test_runtime_channel_stream_relay_does_not_redeliver_transcript_artifa
 
     assert channel.files == [("c1", "chart.png")]
     assert channel.sent == []
+
 
 
 @pytest.mark.asyncio
@@ -3294,7 +3308,7 @@ async def test_runtime_reply_delivers_transcript_artifact_with_adapter_upload(tm
         session_manager=FakeSessionManager(),
         session_key="agent:main:feishu:direct:u1",
         task_id="task-1",
-        route_envelope=SimpleNamespace(reply_target=None),
+        route_envelope=SimpleNamespace(reply_target=None, session_id="session-1"),
         inbound=_message(),
         transcript_watermark=1,
         config=config,
@@ -3302,6 +3316,7 @@ async def test_runtime_reply_delivers_transcript_artifact_with_adapter_upload(tm
 
     assert channel.sent[-1].content == "做好了，点击上方按钮下载。"
     assert channel.files == [("c1", "思考快与慢_信息图.png")]
+
 
 
 @pytest.mark.asyncio
@@ -3354,7 +3369,7 @@ async def test_runtime_reply_delivers_file_artifact_with_adapter_upload(tmp_path
         session_manager=FakeSessionManager(),
         session_key="agent:main:feishu:direct:u1",
         task_id="task-1",
-        route_envelope=SimpleNamespace(reply_target=None),
+        route_envelope=SimpleNamespace(reply_target=None, session_id="session-1"),
         inbound=_message(),
         transcript_watermark=1,
         config=config,
@@ -3362,6 +3377,7 @@ async def test_runtime_reply_delivers_file_artifact_with_adapter_upload(tmp_path
 
     assert channel.sent[-1].content == "报告已生成。"
     assert channel.files == [("c1", "report.pdf")]
+
 
 
 # ── Stream relay coalescing + per-event fallback ────────────────────────────
@@ -3670,3 +3686,268 @@ async def test_runtime_channel_stream_relay_handles_late_failure_gracefully() ->
     # Successfully-yielded chunks must NOT be duplicated.
     assert "alpha" not in fallback
     assert "beta" not in fallback
+
+
+class _ArtifactBoundaryChannel(_FakeChannel):
+    def __init__(self, *, native: bool) -> None:
+        super().__init__()
+        self.capability_profile = ChannelCapabilityProfile(
+            channel_type="artifact-boundary-test", artifact_delivery=native,
+        )
+        self.chunks: list[str] = []
+        self.requests: list[Any] = []
+
+    async def send_streaming(self, chunks, **kwargs):
+        async for chunk in chunks:
+            self.chunks.append(chunk)
+
+    async def deliver_artifact(self, request):
+        self.requests.append(request)
+        assert Path(request.file_path).read_bytes() == b"test material"
+        return ChannelSendResult.sent(capability="artifact_delivery")
+
+    def build_reply_message(self, content, inbound):
+        return OutgoingMessage(content=content, reply_to=inbound.channel_id)
+
+
+async def _drive_artifact_boundary_path(
+    channel, artifact, config, *, mode, inbound, expected_session_id, task_session_id,
+):
+    class Runner:
+        async def run(self, message, session_key, **kwargs):
+            yield {**artifact, "kind": "artifact"}
+            yield TextDeltaEvent(text="safe response")
+            yield DoneEvent()
+
+    class Runtime:
+        async def enqueue(self, envelope, message, *, stream_event_sink=None):
+            return None
+
+        async def wait(self, task_id):
+            return SimpleNamespace(status="succeeded", details={
+                "session_id": task_session_id,
+                "terminal_assistant_message_content": json.dumps({
+                    "text": "safe response", "artifacts": [artifact],
+                }),
+            })
+
+    if mode in {"batch", "stream"}:
+        entrypoint = _run_turn_batch_path if mode == "batch" else _run_turn_streaming_path
+        await entrypoint(
+            channel, Runner(), inbound, "agent:main:channel-test", _tool_ctx(), None,
+            None, config, expected_session_id=expected_session_id,
+        )
+    elif mode == "relay":
+        relay = _RuntimeChannelStreamRelay.maybe_start(
+            channel, inbound, Runtime(), config, expected_session_id=expected_session_id,
+        )
+        assert relay is not None
+        await relay.emit({**artifact, "kind": "artifact"})
+        await relay.emit(TextDeltaEvent(text="safe response"))
+        await relay.close()
+        return relay
+    else:
+        await _deliver_runtime_channel_reply(
+            channel=channel, task_runtime=Runtime(), session_manager=SimpleNamespace(),
+            session_key="agent:main:channel-test", task_id="task-1",
+            route_envelope=SimpleNamespace(reply_target=None, session_id=expected_session_id),
+            inbound=inbound, transcript_watermark=0, config=config,
+        )
+    return None
+
+
+@pytest.mark.parametrize("mode", ["batch", "stream", "relay", "runtime"])
+@pytest.mark.parametrize("native", [False, True])
+@pytest.mark.parametrize("attack", ["foreign", "spoofed", "missing_authority"])
+async def test_channel_artifact_paths_reject_cross_session_refs_and_signed_links(
+    tmp_path: Path, mode: str, native: bool, attack: str,
+) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"test material", session_id="session-a", session_key="foreign-session",
+        name="private-report.txt", mime="text/plain", source="test",
+    )
+    artifact = ref.to_dict()
+    artifact["signed_download_url"] = "https://example.test/private-link?sig=test-signature"
+    artifact["channel_id"] = "foreign-room"
+    artifact["native_thread_id"] = "foreign-thread"
+    if attack == "spoofed":
+        artifact["session_id"] = "session-b"
+    expected = None if attack == "missing_authority" else "session-b"
+    inbound = IncomingMessage(
+        sender_id="requesting-user", channel_id="original-room", content="create report",
+        metadata={"native_thread_id": "original-thread", "session_id": "session-a"},
+        provenance=IngressProvenance(provider="test", account_id="original-account"),
+    )
+    original = inbound.model_dump()
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
+    channel = _ArtifactBoundaryChannel(native=native)
+    relay = await _drive_artifact_boundary_path(
+        channel, artifact, config, mode=mode, inbound=inbound,
+        expected_session_id=expected, task_session_id=expected,
+    )
+    assert channel.requests == []
+    visible = "".join(channel.chunks) + "".join(message.content for message in channel.sent)
+    assert visible == "safe response"
+    assert inbound.model_dump() == original
+    if relay is not None:
+        assert relay.delivered_artifact_keys == set()
+        assert relay.attempted_artifact_keys == set()
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_runtime_artifact_session_mismatch_between_task_and_route_fails_closed(
+    tmp_path: Path, native: bool,
+) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"test material", session_id="session-a", session_key="session-key",
+        name="private-report.txt", mime="text/plain", source="test",
+    )
+    channel = _ArtifactBoundaryChannel(native=native)
+    await _drive_artifact_boundary_path(
+        channel, ref.to_dict(),
+        SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path))),
+        mode="runtime", inbound=_message(), expected_session_id="session-b",
+        task_session_id="session-a",
+    )
+    assert channel.requests == []
+    assert [message.content for message in channel.sent] == ["safe response"]
+
+
+@pytest.mark.parametrize("mode", ["batch", "stream", "relay", "runtime"])
+async def test_authorized_artifacts_keep_original_inbound_session_and_route(
+    tmp_path: Path, mode: str,
+) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"test material", session_id="session-b", session_key="session-key",
+        name="report.txt", mime="text/plain", source="test",
+    )
+    artifact = {**ref.to_dict(), "channel_id": "foreign-room", "native_thread_id": "foreign"}
+    inbound = IncomingMessage(
+        sender_id="requesting-user", channel_id="original-room", content="create report",
+        metadata={"native_thread_id": "original-thread"},
+        provenance=IngressProvenance(provider="test", account_id="original-account"),
+    )
+    original = inbound.model_dump()
+    channel = _ArtifactBoundaryChannel(native=True)
+    await _drive_artifact_boundary_path(
+        channel, artifact, SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path))),
+        mode=mode, inbound=inbound, expected_session_id="session-b", task_session_id="session-b",
+    )
+    assert len(channel.requests) == 1
+    request = channel.requests[0]
+    assert request.inbound.model_dump() == original
+    assert request.session_id == "session-b"
+    assert request.artifact_id == ref.id
+
+
+async def test_invalid_same_hash_artifact_does_not_suppress_authorized_file(tmp_path: Path) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"test material", session_id="session-b", session_key="session-key",
+        name="report.txt", mime="text/plain", source="test",
+    )
+    forged = {**ref.to_dict(), "id": "0" * 32}
+    channel = _ArtifactBoundaryChannel(native=True)
+    await _deliver_artifacts_as_channel_files(
+        channel, _message(), [forged, ref.to_dict(), ref.to_dict()],
+        SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path))),
+        expected_session_id="session-b",
+    )
+    assert [request.artifact_id for request in channel.requests] == [ref.id]
+
+
+async def test_non_native_fallback_rejects_foreign_signed_url_before_render(tmp_path: Path) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"test material", session_id="session-a", session_key="foreign-session",
+        name="private-report.txt", mime="text/plain", source="test",
+    )
+    artifact = {**ref.to_dict(), "signed_download_url": "https://example.test/private?sig=test"}
+    channel = _ArtifactBoundaryChannel(native=False)
+    undelivered = await _deliver_artifacts_as_channel_files(
+        channel, _message(), [artifact],
+        SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path))),
+        expected_session_id="session-b",
+    )
+    assert _artifact_fallback_lines(undelivered) == []
+
+
+async def test_rejected_stream_artifact_does_not_suppress_valid_runtime_final(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(tmp_path)
+    foreign = store.publish_bytes(
+        b"test material", session_id="session-a", session_key="foreign-session",
+        name="report.txt", mime="text/plain", source="test",
+    )
+    allowed = store.publish_bytes(
+        b"test material", session_id="session-b", session_key="accepted-session",
+        name="report.txt", mime="text/plain", source="test",
+    )
+    assert foreign.sha256 == allowed.sha256
+
+    class Runtime:
+        async def enqueue(self, envelope, message, *, stream_event_sink=None):
+            return None
+
+        async def wait(self, task_id):
+            return SimpleNamespace(status="succeeded", details={
+                "session_id": "session-b",
+                "terminal_assistant_message_content": json.dumps({
+                    "text": "safe response", "artifacts": [allowed.to_dict()],
+                }),
+            })
+
+    channel = _ArtifactBoundaryChannel(native=True)
+    config = SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path)))
+    inbound = _message()
+    runtime = Runtime()
+    relay = _RuntimeChannelStreamRelay.maybe_start(
+        channel, inbound, runtime, config, expected_session_id="session-b",
+    )
+    assert relay is not None
+    await relay.emit(ArtifactEvent(**foreign.to_dict()))
+    await relay.emit(TextDeltaEvent(text="safe response"))
+    for _ in range(2):
+        await _deliver_runtime_channel_reply(
+            channel=channel, task_runtime=runtime, session_manager=SimpleNamespace(),
+            session_key="accepted-session", task_id="task-1",
+            route_envelope=SimpleNamespace(reply_target=None, session_id="session-b"),
+            inbound=inbound, transcript_watermark=0, config=config, stream_relay=relay,
+        )
+    assert [request.artifact_id for request in channel.requests] == [allowed.id]
+    assert channel.chunks == ["safe response"]
+    assert channel.sent == []
+
+
+@pytest.mark.parametrize("native", [False, True])
+async def test_valid_artifact_cannot_smuggle_unverified_url_or_name_in_fallback(
+    tmp_path: Path, native: bool,
+) -> None:
+    ref = ArtifactStore(tmp_path).publish_bytes(
+        b"test material", session_id="session-b", session_key="accepted-session",
+        name="report.txt", mime="text/plain", source="test",
+    )
+
+    class UnsupportedFileChannel(_ArtifactBoundaryChannel):
+        async def deliver_artifact(self, request):
+            self.requests.append(request)
+            return ChannelSendResult.unsupported(capability="artifact_delivery")
+
+    channel = UnsupportedFileChannel(native=native)
+    untrusted = {
+        **ref.to_dict(),
+        "name": "unverified-private-name.txt",
+        "signed_download_url": "https://example.test/foreign-private?sig=test",
+        "channel_download_url": "https://example.test/foreign-channel?sig=test",
+    }
+    undelivered = await _deliver_artifacts_as_channel_files(
+        channel, _message(), [untrusted],
+        SimpleNamespace(attachments=SimpleNamespace(media_root=str(tmp_path))),
+        expected_session_id="session-b",
+    )
+    assert undelivered == [ref.to_dict()]
+    assert _artifact_fallback_lines(undelivered) == [
+        "Generated file: report.txt -> available in the OpenSquilla task"
+    ]
+    if native:
+        assert len(channel.requests) == 1
+        assert channel.requests[0].name == "report.txt"

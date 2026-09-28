@@ -92,24 +92,26 @@
           "additionalProperties": true
         },
         "requestId": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string",
+          "minLength": 1
         },
         "request_id": {
-          "type": [
-            "string",
-            "null"
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "requestId"
           ]
         },
-        "run_id": {
-          "type": [
-            "string",
-            "null"
+        {
+          "required": [
+            "request_id"
           ]
         }
-      }
+      ]
     },
     "Request": {
       "type": "object",

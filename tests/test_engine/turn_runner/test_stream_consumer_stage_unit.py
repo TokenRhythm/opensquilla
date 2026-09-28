@@ -938,7 +938,6 @@ def test_tool_result_handler_keeps_small_write_file_arguments() -> None:
     ("tool_name", "arguments"),
     [
         ("publish_artifact", {"path": "deck.pptx"}),
-        ("create_pptx", {"name": "deck.pptx", "slides": [{"title": "Deck"}]}),
     ],
 )
 def test_tool_result_handler_clears_delivery_failure_after_same_target_succeeds(
@@ -1046,128 +1045,10 @@ def test_tool_result_handler_matches_publish_target_across_workspace_path_forms(
     assert state.artifact_delivery_failures_by_target == {}
 
 
-def test_tool_result_handler_uses_create_pptx_effective_basename_and_suffix() -> None:
-    state = _make_state()
-    handler = _ToolResultHandler()
-
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="failed",
-            tool_name="create_pptx",
-            result='{"status":"error","user_message":"regenerate"}',
-            is_error=True,
-            arguments={"name": "reports/deck"},
-        ),
-        state,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="succeeded",
-            tool_name="create_pptx",
-            result='{"status":"published"}',
-            arguments={"name": "deck.pptx"},
-        ),
-        state,
-    )
-
-    assert state.artifact_delivery_failures == []
-    assert state.artifact_delivery_failures_by_target == {}
 
 
-def test_publish_success_clears_create_name_failure_but_not_other_path_failure(
-    tmp_path,
-) -> None:
-    workspace = tmp_path / "workspace"
-    ctx = SimpleNamespace(workspace_dir=str(workspace))
-    state = _make_state()
-    handler = _ToolResultHandler()
-
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="create-failed",
-            tool_name="create_pptx",
-            result='{"status":"error","user_message":"create failed"}',
-            is_error=True,
-            arguments={"name": "deck.pptx"},
-        ),
-        state,
-        tool_context=ctx,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="root-publish-failed",
-            tool_name="publish_artifact",
-            result='{"status":"error","user_message":"root path failed"}',
-            is_error=True,
-            arguments={"path": "deck.pptx"},
-        ),
-        state,
-        tool_context=ctx,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="nested-publish-succeeded",
-            tool_name="publish_artifact",
-            result='{"status":"published","artifact":{"name":"deck.pptx"}}',
-            arguments={"path": "reports/deck.pptx"},
-        ),
-        state,
-        tool_context=ctx,
-    )
-
-    assert state.artifact_delivery_failures == ["root path failed"]
-    assert len(state.artifact_delivery_failures_by_target) == 1
-    assert next(iter(state.artifact_delivery_failures_by_target)).startswith("path:")
 
 
-@pytest.mark.parametrize(
-    ("failed_path_factory", "cleared"),
-    [
-        (lambda workspace: "deck.pptx", True),
-        (lambda workspace: str(workspace / "deck.pptx"), True),
-        (lambda workspace: "/workspace/deck.pptx", True),
-        (lambda workspace: "reports/deck.pptx", False),
-    ],
-)
-def test_create_pptx_success_only_clears_matching_root_publish_failure(
-    tmp_path,
-    failed_path_factory,
-    cleared: bool,
-) -> None:
-    workspace = tmp_path / "workspace"
-    ctx = SimpleNamespace(workspace_dir=str(workspace))
-    state = _make_state()
-    handler = _ToolResultHandler()
-    failed_path = failed_path_factory(workspace)
-
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="publish-failed",
-            tool_name="publish_artifact",
-            result='{"status":"error","user_message":"regenerate"}',
-            is_error=True,
-            arguments={"path": failed_path},
-        ),
-        state,
-        tool_context=ctx,
-    )
-    handler.handle(
-        ToolResultEvent(
-            tool_use_id="create-succeeded",
-            tool_name="create_pptx",
-            result='{"status":"published","artifact":{"name":"deck.pptx"}}',
-            arguments={"name": "deck.pptx", "slides": [{"title": "Deck"}]},
-        ),
-        state,
-        tool_context=ctx,
-    )
-
-    if cleared:
-        assert state.artifact_delivery_failures == []
-        assert state.artifact_delivery_failures_by_target == {}
-    else:
-        assert state.artifact_delivery_failures == ["regenerate"]
-        assert len(state.artifact_delivery_failures_by_target) == 1
 
 
 @pytest.mark.parametrize(
@@ -1211,13 +1092,13 @@ def test_explicit_publish_name_is_the_single_logical_failure_identity(
     handler.handle(
         ToolResultEvent(
             tool_use_id="create-succeeded",
-            tool_name="create_pptx",
+            tool_name="publish_artifact",
             result=(
                 '{"status":"published","artifact":{"name":"'
                 + created_name
                 + '"}}'
             ),
-            arguments={"name": created_name, "slides": [{"title": "Deck"}]},
+            arguments={"path": created_name},
         ),
         state,
         tool_context=ctx,
@@ -1236,7 +1117,7 @@ def test_tool_result_handler_updates_tool_use_name_after_runtime_coercion() -> N
     state.turn_segments.append(
         {
             "type": "tool_use",
-            "tool_use_id": "meta-1",
+            "tool_use_id": "skill-1",
             "name": "skill_view",
             "input": "",
         }
@@ -1244,17 +1125,17 @@ def test_tool_result_handler_updates_tool_use_name_after_runtime_coercion() -> N
 
     _ToolResultHandler().handle(
         ToolResultEvent(
-            tool_use_id="meta-1",
-            tool_name="meta_invoke",
-            result="meta-skill 'meta-travel-planner' completed.",
-            arguments={"name": "meta-travel-planner"},
+            tool_use_id="skill-1",
+            tool_name="skill_view",
+            result="Skill instructions loaded.",
+            arguments={"name": "git-diff"},
         ),
         state,
     )
 
-    assert state.turn_segments[0]["name"] == "meta_invoke"
-    assert state.turn_segments[0]["input"] == {"name": "meta-travel-planner"}
-    assert state.turn_segments[1]["name"] == "meta_invoke"
+    assert state.turn_segments[0]["name"] == "skill_view"
+    assert state.turn_segments[0]["input"] == {"name": "git-diff"}
+    assert state.turn_segments[1]["name"] == "skill_view"
 
 
 def test_tool_result_handler_replaces_intermediate_approval_result() -> None:
@@ -2453,7 +2334,7 @@ async def test_system_event_runtime_notice_overrides_suppressed_model_delivery()
         "DoneEvent",
     ]
     notice = yielded[0].text
-    assert "could not confirm" in notice
+    assert "A running process was reported" in notice
     done = yielded[1]
     assert isinstance(done, DoneEvent)
     assert done.text == notice
@@ -3119,48 +3000,19 @@ async def test_outer_stage_persists_literal_text_before_native_tool_segment() ->
     ]
 
 
-@pytest.mark.asyncio
-async def test_outer_stage_surfaces_completed_meta_when_done_text_is_empty() -> None:
-    agent_run = _RecordingAgentRun(
-        events=[
-            ToolResultEvent(
-                tool_use_id="meta-1",
-                tool_name="meta_invoke",
-                result="meta-skill 'AwesomeWebpageMetaSkill' completed.",
-                is_error=False,
-                arguments={"name": "AwesomeWebpageMetaSkill"},
-            ),
-            DoneEvent(text=""),
-        ]
-    )
-    stage, _ = _make_stage(agent_run=agent_run)
-    inp = _make_input()
-
-    yielded = await _drain(stage, inp)
-
-    kinds = [type(e).__name__ for e in yielded]
-    assert kinds == ["ToolResultEvent", "TextDeltaEvent", "DoneEvent"]
-    fallback = yielded[1]
-    assert isinstance(fallback, TextDeltaEvent)
-    assert "AwesomeWebpageMetaSkill" in fallback.text
-    assert "没有生成可展示的最终回答" in fallback.text
-    done = yielded[2]
-    assert isinstance(done, DoneEvent)
-    assert done.text == "".join(inp.state.final_text_parts)
-    assert done.text == fallback.text
 
 
 @pytest.mark.asyncio
-async def test_outer_stage_preserves_meta_text_when_done_text_is_empty() -> None:
+async def test_outer_stage_preserves_answer_text_when_done_text_is_empty() -> None:
     agent_run = _RecordingAgentRun(
         events=[
-            TextDeltaEvent(text="Final meta answer"),
+            TextDeltaEvent(text="Final answer"),
             ToolResultEvent(
-                tool_use_id="meta-1",
-                tool_name="meta_invoke",
-                result="meta-skill 'meta-kid-project-planner' completed.",
+                tool_use_id="skill-1",
+                tool_name="skill_view",
+                result="Skill instructions loaded.",
                 is_error=False,
-                arguments={"name": "meta-kid-project-planner"},
+                arguments={"name": "git-diff"},
             ),
             DoneEvent(text=""),
         ]
@@ -3174,8 +3026,8 @@ async def test_outer_stage_preserves_meta_text_when_done_text_is_empty() -> None
     assert kinds == ["TextDeltaEvent", "ToolResultEvent", "DoneEvent"]
     done = yielded[2]
     assert isinstance(done, DoneEvent)
-    assert done.text == "Final meta answer"
-    assert inp.state.final_text_parts == ["Final meta answer"]
+    assert done.text == "Final answer"
+    assert inp.state.final_text_parts == ["Final answer"]
 
 
 @pytest.mark.asyncio

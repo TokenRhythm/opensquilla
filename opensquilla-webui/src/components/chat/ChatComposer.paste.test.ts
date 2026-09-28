@@ -43,8 +43,6 @@ const BASE_PROPS = {
   sessionRoutingMode: 'llm_ensemble',
   sessionRoutingBusy: false,
   routerVisualEffectsEnabled: true,
-  codingModeEnabled: false,
-  codingModeSettingsBusy: false,
   voiceBusy: false,
   voiceRecording: false,
   voiceReady: true,
@@ -91,8 +89,6 @@ const ComposerWrapper = defineComponent({
       :session-routing-mode="'llm_ensemble'"
       :session-routing-busy="false"
       :router-visual-effects-enabled="true"
-      :coding-mode-enabled="false"
-      :coding-mode-settings-busy="false"
       :voice-busy="false"
       :voice-recording="false"
       :voice-ready="true"

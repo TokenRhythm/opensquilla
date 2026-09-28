@@ -19,6 +19,7 @@ from opensquilla.provider import (
     ProviderGenerationResetEvent,
     TextDeltaEvent,
 )
+from opensquilla.provider.preset_registry import get_preset
 from opensquilla.provider.selector import (
     ModelSelector,
     ProviderConfig,
@@ -130,6 +131,15 @@ class _ReplayAwareSelector(_FakeSelector):
     def disable_provider_state_replay(self) -> None:
         self.disable_calls += 1
         self._cfg = replace(self._cfg, replay_provider_state=False)
+
+
+def _tokenrhythm_shared_c3_router() -> dict[str, Any]:
+    """Keep shared-plan tests opted in independently of preset defaults."""
+    preset = get_preset("tokenrhythm")
+    assert preset is not None
+    tiers = preset.tier_defaults()
+    tiers["c3"]["ensemble_enabled"] = True
+    return {"preset_binding": "custom", "tiers": tiers}
 
 
 def _static_b5_config(**ensemble_overrides: Any) -> GatewayConfig:
@@ -271,9 +281,9 @@ async def test_static_tokenrhythm_b5_wraps_when_active_provider_is_keyed(
 @pytest.mark.parametrize(
     ("routed_tier", "expected_model", "expect_ensemble"),
     [
-        ("c0", "deepseek-v4-flash-0731", False),
-        ("c1", "deepseek-v4-pro-0813", False),
-        ("c2", "kimi-k2.7-code", False),
+        ("c0", "qwen3.7-flash", False),
+        ("c1", "deepseek-flash", False),
+        ("c2", "deepseek-v4-pro-0813", False),
         # Shared C3 triggers the global plan without replacing the configured
         # direct/fallback selector head.
         ("c3", "deepseek-v4-flash-0731", True),
@@ -286,6 +296,7 @@ async def test_tokenrhythm_router_uses_ensemble_only_for_c3(
     expect_ensemble: bool,
 ) -> None:
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": "deepseek-v4-flash-0731",
@@ -328,7 +339,7 @@ async def test_tokenrhythm_router_uses_ensemble_only_for_c3(
         assert provider.profile_name == "static_tokenrhythm_b5"
         assert provider.fallback_model == "deepseek-v4-flash-0731"
         assert turn.model == "deepseek-v4-flash-0731"
-        assert turn.metadata["routed_model_before_ensemble"] == "glm-5.2"
+        assert turn.metadata["routed_model_before_ensemble"] == "glm-5.3"
         assert turn.metadata["ensemble_activation_source"] == "router_tier"
         assert turn.metadata["ensemble_tier_binding"] == "shared"
         assert turn.metadata["ensemble_selection_mode"] == "static_tokenrhythm_b5"
@@ -399,6 +410,7 @@ async def test_attachment_capacity_bypass_keeps_routed_model_without_building_en
     fixed_model = "deepseek-v4-flash-0731"
     routed_model = "glm-5.2"
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": fixed_model,
@@ -470,6 +482,7 @@ async def test_shared_c3_rejects_an_empty_fixed_fallback_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": "",
@@ -953,6 +966,7 @@ async def test_shared_c3_all_failed_policy_keeps_the_global_fallback_contract(
     fixed_model = "deepseek-v4-flash-0731"
     calls: list[str] = []
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": fixed_model,
@@ -1066,6 +1080,7 @@ async def test_shared_c3_outer_selector_does_not_retry_the_global_fixed_model(
     secondary_model = "qwen3.7-flash"
     calls: list[str] = []
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": fixed_model,
@@ -1169,6 +1184,7 @@ async def test_shared_c3_follows_an_explicit_change_to_the_global_plan(
 ) -> None:
     monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-synthetic")
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": "deepseek-v4-flash-0731",
@@ -1300,6 +1316,7 @@ async def test_shared_c3_unsupported_plan_skips_to_the_global_fixed_model(
 ) -> None:
     fixed_model = "deepseek-v4-flash-0731"
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": fixed_model,
@@ -1928,6 +1945,7 @@ async def test_tokenrhythm_c3_uses_fixed_model_without_ensemble_credential(
 ) -> None:
     monkeypatch.delenv("TOKENRHYTHM_API_KEY", raising=False)
     cfg = GatewayConfig(
+        squilla_router=_tokenrhythm_shared_c3_router(),
         llm={
             "provider": "tokenrhythm",
             "model": "deepseek-v4-flash-0731",
@@ -1977,7 +1995,7 @@ async def test_tokenrhythm_c3_uses_fixed_model_without_ensemble_credential(
     assert calls == []
     assert selector.current_config.model == "deepseek-v4-flash-0731"
     assert turn.model == "deepseek-v4-flash-0731"
-    assert turn.metadata["routed_model_before_ensemble"] == "glm-5.2"
+    assert turn.metadata["routed_model_before_ensemble"] == "glm-5.3"
     assert turn.metadata["ensemble_wrap_skipped_reason"] == (
         "static_tokenrhythm_b5_no_credential"
     )

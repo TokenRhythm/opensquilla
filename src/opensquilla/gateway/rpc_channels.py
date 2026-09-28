@@ -142,7 +142,7 @@ async def read_channel_status(params: dict | None, ctx: RpcContext) -> dict[str,
     )
 
 
-def _resolve_pairing_target(target: PairingTarget, ctx: RpcContext) -> tuple[str, str]:
+async def _resolve_pairing_target(target: PairingTarget, ctx: RpcContext) -> tuple[str, str]:
     """Resolve the target pairing from ``pairingId`` or the 8-char ``pairingCode``.
 
     The code is what a sender's pairing notice shows and what the operator
@@ -158,7 +158,7 @@ def _resolve_pairing_target(target: PairingTarget, ctx: RpcContext) -> tuple[str
         raise ValueError("pairingId or pairingCode required")
     matches = [
         record
-        for record in _pairing_store(ctx).list_pairings(channel_name=channel_name)
+        for record in await _pairing_store(ctx).list_pairings(channel_name=channel_name)
         if str(getattr(record, "pairing_id", "")).startswith(pairing_code)
     ]
     if not matches:
@@ -173,13 +173,6 @@ def _channel_entry(ctx: RpcContext, channel_name: str) -> dict[str, Any] | None:
         if str(entry.get("name") or "") == channel_name:
             return entry
     return None
-
-
-def _pairing_status_of(store: Any, channel_name: str, pairing_id: str) -> str:
-    for record in store.list_pairings(channel_name=channel_name):
-        if str(getattr(record, "pairing_id", "")) == pairing_id:
-            return str(getattr(record, "status", ""))
-    return ""
 
 
 async def _send_pairing_approved_notice(ctx: RpcContext, record: Any) -> None:
@@ -224,15 +217,14 @@ async def _approve_pairing(
     command: ApprovePairing,
     ctx: RpcContext,
 ) -> PairingMutationResult:
-    channel_name, pairing_id = _resolve_pairing_target(command.target, ctx)
+    channel_name, pairing_id = await _resolve_pairing_target(command.target, ctx)
     store = _pairing_store(ctx)
     # Re-approving an already-approved pairing must not re-notify the sender.
-    was_approved = _pairing_status_of(store, channel_name, pairing_id) == "approved"
-    record = store.set_pairing_status(
+    record, status_changed = await store.approve_pairing_once(
         channel_name=channel_name,
         pairing_id=pairing_id,
-        status="approved",
     )
+    was_approved = not status_changed
     payload: dict[str, Any] = {"pairing": _pairing_payload(record)}
     if command.as_admin:
         # Deliberate, narrow scope expansion: an operator.pairing caller may
@@ -376,8 +368,8 @@ async def _revoke_pairing(
     target: PairingTarget,
     ctx: RpcContext,
 ) -> PairingMutationResult:
-    channel_name, pairing_id = _resolve_pairing_target(target, ctx)
-    record = _pairing_store(ctx).set_pairing_status(
+    channel_name, pairing_id = await _resolve_pairing_target(target, ctx)
+    record = await _pairing_store(ctx).set_pairing_status(
         channel_name=channel_name,
         pairing_id=pairing_id,
         status="revoked",
@@ -537,7 +529,7 @@ class _ChannelPairingRuntime(ChannelPairingPort):
         self._ctx = ctx
 
     async def list(self, query: PairingQuery) -> list[PairingProjection]:
-        records = _pairing_store(self._ctx).list_pairings(
+        records = await _pairing_store(self._ctx).list_pairings(
             channel_name=query.channel_name,
             status=query.status,
             limit=query.limit,

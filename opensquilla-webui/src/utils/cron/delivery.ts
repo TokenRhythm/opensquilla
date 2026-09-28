@@ -17,10 +17,15 @@ export interface NormalizedCronDeliveryFields {
   fdWebhookToken: string
 }
 
-export interface CronDeliveryBuildResult {
-  delivery?: DeliveryConfig | null
-  error?: string
+interface CronDeliveryValidationError {
+  error: string
+  errorField: keyof CronDeliveryFormValues
+  delivery?: never
 }
+
+export type CronDeliveryBuildResult =
+  | { delivery: DeliveryConfig | null; error?: never }
+  | CronDeliveryValidationError
 
 export function normalizeDeliveryFields(job: CronJob | null): NormalizedCronDeliveryFields {
   const d = job?.delivery || {}
@@ -50,7 +55,7 @@ export function buildDeliveryFromValues(values: CronDeliveryFormValues): CronDel
   if (!mode && !fdMode) return { delivery: null }
 
   const failure = buildFailureDestinationFromValues(values)
-  if (failure.error) return failure
+  if (failure.error !== undefined) return failure
   const fd = failure.delivery
 
   if (mode === 'none') {
@@ -60,7 +65,10 @@ export function buildDeliveryFromValues(values: CronDeliveryFormValues): CronDel
   }
   if (mode === 'webhook') {
     const url = values.deliveryWebhookUrl.trim()
-    if (!url) return { error: i18n.global.t('cronSkills.delivery.errWebhookUrlRequired') }
+    if (!url) return {
+      error: i18n.global.t('cronSkills.delivery.errWebhookUrlRequired'),
+      errorField: 'deliveryWebhookUrl',
+    }
     const out: DeliveryConfig = { mode: 'webhook', webhookUrl: url }
     const token = values.deliveryWebhookToken.trim()
     if (token) out.webhookToken = token
@@ -83,11 +91,16 @@ export function buildDeliveryFromValues(values: CronDeliveryFormValues): CronDel
   return { delivery: fd ? { failureDestination: fd } : null }
 }
 
-function buildFailureDestinationFromValues(values: CronDeliveryFormValues): { delivery?: FailureDestination | null; error?: string } {
+function buildFailureDestinationFromValues(values: CronDeliveryFormValues):
+  | { delivery: FailureDestination | null; error?: never }
+  | CronDeliveryValidationError {
   if (!values.fdMode) return { delivery: null }
   if (values.fdMode === 'webhook') {
     const url = values.fdWebhookUrl.trim()
-    if (!url) return { error: i18n.global.t('cronSkills.delivery.errFdWebhookUrlRequired') }
+    if (!url) return {
+      error: i18n.global.t('cronSkills.delivery.errFdWebhookUrlRequired'),
+      errorField: 'fdWebhookUrl',
+    }
     const out: FailureDestination = { mode: 'webhook', webhookUrl: url }
     const token = values.fdWebhookToken.trim()
     if (token) out.webhookToken = token
@@ -96,7 +109,10 @@ function buildFailureDestinationFromValues(values: CronDeliveryFormValues): { de
   const channel = values.fdChannel.trim()
   const to = values.fdTo.trim()
   const account = values.fdAccount.trim()
-  if (!channel && !to) return { error: i18n.global.t('cronSkills.delivery.errFdChannelNeedsTarget') }
+  if (!channel && !to) return {
+    error: i18n.global.t('cronSkills.delivery.errFdChannelNeedsTarget'),
+    errorField: 'fdTo',
+  }
   const out: FailureDestination = { mode: 'channel' }
   if (channel) out.channelName = channel.toLowerCase()
   if (to) out.to = to

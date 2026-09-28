@@ -24,6 +24,14 @@ function threadWheelHandlerSource(): string {
 }
 
 describe('ChatView scroll ownership wiring', () => {
+  it('uses the same projected message indexes for the list and minimap', () => {
+    const list = chatViewSource.slice(chatViewSource.indexOf('<ChatMessageList'), chatViewSource.indexOf('</ChatMessageList>'))
+    const minimap = chatViewSource.slice(chatViewSource.indexOf('<ConversationMinimap'), chatViewSource.indexOf('@navigate-end="onHistoryNavigateEnd"'))
+    expect(list).toContain(':messages="forkTransition?.previewMessages || visibleRenderedMessages"')
+    expect(minimap).toContain(':messages="visibleRenderedMessages"')
+    expect(minimap).toContain(':virtualizer="messageListRef"')
+  })
+
   it('invalidates deferred work and pins a switched session only once', () => {
     expect(chatViewSource).toContain('const scrollEpoch = ref(0)')
     expect(chatViewSource).toContain('watch(sessionKey, beginSessionScrollEpoch, { flush: \'sync\' })')
@@ -36,16 +44,36 @@ describe('ChatView scroll ownership wiring', () => {
   it('cancels pending layout pins for explicit reader input', () => {
     expect(chatViewSource).toContain('@touchcancel.passive="onThreadTouchEnd"')
     expect(chatViewSource).toContain('@pointercancel="onThreadPointerEnd"')
-    expect(threadWheelHandlerSource()).toContain('cancelTailLayoutPin()')
-    expect(threadScrollHandlerSource()).toContain('if (!scrollMutation?.matched) cancelTailLayoutPin()')
+    expect(threadWheelHandlerSource()).toContain('cancelVirtualScroll()')
+    expect(chatViewSource).toContain('messageListRef.value?.cancelScroll()')
+    // Native smooth scrolling emits intermediate unmarked samples. Only
+    // reader intent, not every scroll event, may cancel TanStack's seek.
+    expect(threadScrollHandlerSource()).not.toContain('cancelVirtualScroll()')
   })
 
   it('pauses follow after a source-less native scroll during session landing', () => {
     const source = threadScrollHandlerSource()
 
-    expect(source).toContain('const gap = metrics.height - metrics.top - metrics.clientHeight')
+    expect(source).toContain('const gap = threadDistanceFromEnd(el)')
     expect(source).toContain('readerMovingAway = true')
     expect(source).toContain('autoScroll.value = false')
+  })
+
+  it('keeps layout clamping separate from explicit reader navigation', () => {
+    const source = threadScrollHandlerSource()
+    expect(source).toContain('const resizingLiveEdge = autoScroll.value && intent === null')
+    expect(source).toContain('sourceLessScrollPointerId === null')
+    expect(source).toContain('messageListRef.value?.hasPendingLayout()')
+    expect(source).toContain('!programmatic && !resizingLiveEdge && !historyNavigationScrollLock.locked')
+  })
+
+  it('shares the virtualizer bottom-distance read without changing follow ownership', () => {
+    expect(chatViewSource).toContain('messageListRef.value.getDistanceFromEnd()')
+    expect(chatViewSource).toContain(': readDistanceFromEnd(container)')
+    expect(chatViewSource).not.toMatch(/scrollHeight\s*-\s*\w+\.scrollTop\s*-\s*\w+\.clientHeight/)
+    expect(chatViewSource).toContain('bottomGap <= LIVE_EDGE_EPSILON_PX')
+    expect(chatViewSource).toContain('&& !readerMovingAway')
+    expect(chatViewSource).toContain('&& !historyNavigationScrollLock.locked')
   })
 
   it('marks questionnaire edge handoff as reader input before writing scrollTop', () => {

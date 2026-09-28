@@ -1,5 +1,3 @@
-import { stageCapturedImage } from '@/composables/chat/useChatAttachments'
-import type { Attachment } from '@/types/chat'
 import type {
   Platform,
   WorkbenchPreviewMode,
@@ -86,7 +84,6 @@ export interface ArtifactWorkbenchProviderOptions {
   promptAnnotations?: {
     create(request: PromptAnnotationCreateRequest): Promise<PromptAnnotation>
     update(annotationId: string, body: string): Promise<PromptAnnotation | null>
-    setScreenshot?(annotationId: string, attachment: Attachment): void
     discard(annotationId: string): Promise<boolean>
     beginOverlayEdit?(annotationId: string, sessionKey: string): void
     completeOverlayEdit?(annotationId: string): void
@@ -119,6 +116,7 @@ export interface ArtifactWorkbenchProviderOptions {
   pushToast(message: string, options?: {
     tone?: 'info' | 'ok' | 'warn' | 'danger'
     duration?: number
+    dedupeKey?: string
   }): void
   t: Translate
 }
@@ -321,7 +319,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     attempt: number
     annotationId: string
   } | null = null
-  private annotationScreenshotUrl = ''
   private annotationReplacement: {
     annotationId: string
     body: string
@@ -397,7 +394,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     return this.nativeProtocolVersion === 1 ? 2 : this.nativeProtocolVersion
   }
 
-  /** Annotation and screenshot IPC is available only on v3+ surfaces. */
+  /** Annotation IPC is available only on v3+ surfaces. */
   private nativeArtifactProtocolVersion(): 3 | 4 {
     return this.nativeProtocolVersion === 4 ? 4 : 3
   }
@@ -989,7 +986,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
       this.options.pushToast(
         this.options.t('workbench.artifactAnnotation.unavailable'),
-        { tone: 'danger' },
+        { tone: 'danger', dedupeKey: `workbench:annotation-picker:${this.item.id}` },
       )
       return false
     }
@@ -1148,7 +1145,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           annotationId,
           body: this.annotationOverlayBody,
           reason: event.detail?.reason || '',
-          screenshotUrl: this.annotationScreenshotUrl,
         },
       })
       this.options.pushToast(
@@ -1240,6 +1236,21 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
           && !this.annotationOverlayId
           && !this.annotationSelectionPending
         ) await this.setAnnotationMode(true)
+      } else if (
+        event.detail?.action === 'annotation-picker'
+        && event.detail?.code !== 'ANNOTATION_REARM_FAILED'
+        && this.annotationMode
+        && !this.annotationOverlayId
+        && !this.annotationSelectionPending
+        && (!event.detail.surfaceInstanceId
+          || event.detail.surfaceInstanceId === this.nativeSurfaceInstanceId)
+      ) {
+        // Desktop rearms a rejected selection itself. Explain the failed pick
+        // without exposing CDP diagnostics or stacking recovery notifications.
+        this.options.pushToast(
+          this.options.t('workbench.artifactAnnotation.createFailed'),
+          { tone: 'warn', dedupeKey: `workbench:annotation-picker:${this.item.id}` },
+        )
       }
     } else if (event.type === 'capability-expired') {
       await this.replaceLeasePreview()
@@ -1297,7 +1308,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     const annotationId = this.annotationId()
     const replacement = this.annotationReplacement
     let created: PromptAnnotation | null = null
-    let screenshotUrl = ''
     let overlayRequested = false
     let takeoverCommitted = false
 
@@ -1313,7 +1323,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       if (created && this.annotationOverlayId === created.annotationId) {
         this.clearAnnotationOverlayState()
       } else {
-        this.releaseAnnotationScreenshot(screenshotUrl)
         promptAnnotations.releaseOverlayEdit?.(created?.annotationId || annotationId)
       }
     }
@@ -1334,7 +1343,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       }
     }
 
-    this.releaseAnnotationScreenshot()
     promptAnnotations.beginOverlayEdit?.(annotationId, current.sessionKey)
     try {
       const pagePath = this.lease ? previewPagePathFromUrl(
@@ -1365,16 +1373,10 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         await abandonLateContinuation()
         return
       }
-      screenshotUrl = await this.captureAnnotationScreenshot(candidate.targetRef, annotationId)
-      if (!this.annotationSelectionFenceCurrent(fence)) {
-        await abandonLateContinuation()
-        return
-      }
       promptAnnotations.setActiveDocument(current.sessionKey, current.document.documentId)
       this.annotationOverlayAttempt += 1
       this.annotationOverlayId = created.annotationId
       this.annotationOverlayBody = created.body
-      this.annotationScreenshotUrl = screenshotUrl
       const supportsLocalizedOverlay = this.annotationOverlayCopyVersion === 1
       if (!supportsLocalizedOverlay) {
         await this.hideNativeSurfaceForAnnotationFallback()
@@ -1383,7 +1385,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
             annotationId: created.annotationId,
             body: created.body,
             reason: 'localized-overlay-unavailable',
-            screenshotUrl: this.annotationScreenshotUrl,
           },
         })
         takeoverCommitted = true
@@ -1435,15 +1436,12 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
             annotationId: created.annotationId,
             body: created.body,
             reason: shown.code || 'overlay-unavailable',
-            screenshotUrl: this.annotationScreenshotUrl,
           },
         })
         this.options.pushToast(
           this.options.t('workbench.artifactAnnotation.overlayFallback'),
           { tone: 'warn', duration: 7000 },
         )
-      } else {
-        this.releaseAnnotationScreenshot()
       }
       // Only retire the old stale draft after a native editor or an explicit
       // trusted fallback has successfully taken ownership of the new draft.
@@ -1465,7 +1463,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
             annotationId: created.annotationId,
             body: created.body,
             reason: 'overlay-unavailable',
-            screenshotUrl: this.annotationScreenshotUrl,
           },
         })
         await commitReplacement()
@@ -1807,7 +1804,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.annotationOverlayId = ''
     this.annotationOverlayBody = ''
     this.options.promptAnnotations?.releaseOverlayEdit?.(annotationId)
-    this.releaseAnnotationScreenshot()
     this.context.updateRenderState({ annotationFallback: null })
     return true
   }
@@ -1846,43 +1842,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     }
   }
 
-  private async captureAnnotationScreenshot(targetRef: string, annotationId: string): Promise<string> {
-    const capture = this.context.nativeWorkbenchApi?.captureWorkbenchScreenshot
-    if (!capture || typeof URL?.createObjectURL !== 'function') return ''
-    try {
-      const result = await capture({ surfaceId: this.item.id, targetRef })
-      if (result.targetRef !== targetRef) return ''
-      const bytes = Uint8Array.from(atob(result.dataBase64), char => char.charCodeAt(0))
-      const file = new File([bytes], 'page-selection.png', { type: 'image/png' })
-      const url = URL.createObjectURL(file)
-      if (this.options.promptAnnotations?.setScreenshot) {
-        try {
-          const attachment = await stageCapturedImage(file, this.options.artifactContent)
-          this.options.promptAnnotations.setScreenshot(annotationId, attachment)
-        } catch {
-          this.options.pushToast(this.options.t('workbench.artifactAnnotation.screenshotUploadFailed'), {
-            tone: 'warn',
-          })
-        }
-      }
-      return url
-    } catch {
-      return ''
-    }
-  }
-
-  private releaseAnnotationScreenshot(url = this.annotationScreenshotUrl) {
-    if (url === this.annotationScreenshotUrl) this.annotationScreenshotUrl = ''
-    if (
-      !url
-      || typeof URL === 'undefined'
-      || typeof URL.revokeObjectURL !== 'function'
-    ) return
-    try {
-      URL.revokeObjectURL(url)
-    } catch {}
-  }
-
   private preserveAnnotationFallback(reason = 'update-pending') {
     if (!this.annotationOverlayId) return
     this.context.updateRenderState({
@@ -1890,7 +1849,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
         annotationId: this.annotationOverlayId,
         body: this.annotationOverlayBody,
         reason,
-        screenshotUrl: this.annotationScreenshotUrl,
       },
     })
   }
@@ -2494,7 +2452,7 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
       width: rect.width,
       height: rect.height,
       // A retained Web annotation editor owns the user's unpersisted body and
-      // frozen screenshot while the Preview is rebuilt. Keep the new native
+      // selected context while the Preview is rebuilt. Keep the new native
       // surface behind it until submit/cancel closes that fallback.
       visible: rect.visible && !this.context.getRenderState().annotationFallback,
     }
@@ -2663,7 +2621,6 @@ class ArtifactPreviewRuntime implements WorkbenchPanelRuntime {
     this.annotationModeOperation += 1
     this.annotationSelectionAttempt += 1
     this.annotationSelectionPending = false
-    if (!preserveAnnotationFallback) this.releaseAnnotationScreenshot()
     if (!nativeApi || !hadSurface) {
       if (this.annotationOverlayId && !preserveAnnotationFallback) {
         this.clearAnnotationOverlayState()

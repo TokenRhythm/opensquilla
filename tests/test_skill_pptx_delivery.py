@@ -19,8 +19,7 @@ def test_pptx_skill_instructs_artifact_delivery() -> None:
     assert "publish_artifact" in content
     assert "file-authoring tools" in content
     assert "If none of those file-authoring tools are available" in content
-    assert "If only `create_pptx` is available" in content
-    assert "basic text-only deck" in content
+    assert "create_pptx" not in content
     assert "Do not attempt to generate, save, or modify the `.pptx`" in content
     assert "Ignore the Path B, Path C, and Visual QA sections below" in content
     assert "Do not paste OOXML" in content

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import sqlite3
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -404,6 +406,197 @@ async def test_rejection_metadata_is_bounded_by_count_and_ttl(tmp_path: Path) ->
         clock.advance(1_000)
         assert (await outbox.stats()).rejected_events == 0
         assert await outbox.list_rejections() == ()
+    finally:
+        await outbox.close()
+
+
+def _device_activity(number: int = 1):
+    payload = _growth_event(number).model_dump(mode="json")
+    payload.update(event_name="product_active", source="gateway", surface="cli", device_id="a" * 64)
+    return TELEMETRY_EVENT_ADAPTER.validate_json(json.dumps(payload), strict=True)
+
+
+async def _reject_activity(outbox: TelemetryOutbox, event, *, status: int = 422) -> None:
+    await outbox.enqueue(event)
+    batch = await outbox.claim_batch()
+    assert batch is not None
+    await outbox.quarantine(
+        batch.lease_id, status_code=status, reason="contract" if status == 422 else "conflict",
+    )
+
+
+async def test_contract_recovery_upgrades_old_database_and_preserves_original_expiry(
+    tmp_path: Path,
+) -> None:
+    event = _device_activity()
+    occurred = int(event.occurred_at_utc.timestamp() * 1_000)
+    clock = FakeClock(occurred + 86_400_000)
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    await _reject_activity(outbox, event)
+    database_path = outbox.database_path
+    await outbox.close()
+    with sqlite3.connect(database_path) as connection:
+        # Exact pre-recovery layout, including the original rejection metadata.
+        connection.execute("DROP TABLE telemetry_contract_recoveries")
+        before = connection.execute("SELECT * FROM telemetry_rejections").fetchall()
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    try:
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT * FROM telemetry_rejections").fetchall() == before
+        assert await outbox.recover_contract_rejection_once(event)
+        batch = await outbox.claim_batch()
+        assert batch is not None and batch.events[0].payload == canonical_json_bytes(event)
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute(
+                "SELECT created_at_ms, expires_at_ms FROM telemetry_outbox"
+            ).fetchone() == (occurred, occurred + 30 * 86_400_000)
+        await outbox.acknowledge(batch.lease_id)
+        assert await outbox.list_rejections() == ()
+        assert not await outbox.recover_contract_rejection_once(event)
+        # Even a second rejection cannot turn the retained ledger into an endless retry source.
+        await _reject_activity(outbox, event)
+    finally:
+        await outbox.close()
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    try:
+        assert not await outbox.recover_contract_rejection_once(event)
+        assert (await outbox.stats()).pending_events == 0
+        await outbox.clear_scope()
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM telemetry_contract_recoveries"
+            ).fetchone() == (0,)
+    finally:
+        await outbox.close()
+
+
+@pytest.mark.parametrize(
+    "case", ["expired", "future", "no_device", "missing", "conflict", "wrong_name"],
+)
+async def test_contract_recovery_requires_recent_matching_device_rejection(tmp_path, case):
+    event = _device_activity()
+    occurred = int(event.occurred_at_utc.timestamp() * 1_000)
+    clock = FakeClock(occurred + 1000)
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    try:
+        if case != "missing":
+            await _reject_activity(outbox, event, status=409 if case == "conflict" else 422)
+        if case == "expired":
+            clock.now_ms = occurred + 30 * 86_400_000
+        elif case == "future":
+            clock.now_ms = occurred - 1
+        elif case == "no_device":
+            event = event.model_copy(update={"device_id": None})
+        elif case == "wrong_name":
+            with sqlite3.connect(outbox.database_path) as connection:
+                connection.execute("UPDATE telemetry_rejections SET event_name = 'client_launch'")
+        assert not await outbox.recover_contract_rejection_once(event)
+        assert (await outbox.stats()).pending_events == 0
+    finally:
+        await outbox.close()
+
+
+async def test_recovery_capacity_preserves_pending_and_never_evicts_attempt_markers(tmp_path):
+    event = _device_activity()
+    occurred = int(event.occurred_at_utc.timestamp() * 1000)
+    clock = FakeClock(occurred + 1000)
+    outbox = await _open(
+        tmp_path, TelemetryScope.GROWTH, clock=clock,
+        limits=OutboxLimits(max_events=1, rejection_max_events=1),
+    )
+    try:
+        await _reject_activity(outbox, event)
+        await outbox.enqueue(_device_activity(2))
+        assert not await outbox.recover_contract_rejection_once(event)
+        pending = await outbox.claim_batch()
+        assert pending is not None and pending.events[0].event_id == _uuid(2)
+        await outbox.acknowledge(pending.lease_id)
+        assert await outbox.recover_contract_rejection_once(event)
+        recovered = await outbox.claim_batch()
+        assert recovered is not None
+        await outbox.acknowledge(recovered.lease_id)
+        await _reject_activity(outbox, _device_activity(3))
+        assert not await outbox.recover_contract_rejection_once(_device_activity(3))
+        with sqlite3.connect(outbox.database_path) as connection:
+            assert connection.execute(
+                "SELECT event_id FROM telemetry_contract_recoveries"
+            ).fetchall() == [(_uuid(1),)]
+        clock.now_ms = occurred + 30 * 86_400_000
+        assert not await outbox.recover_contract_rejection_once(event)
+        await outbox.stats()
+        with sqlite3.connect(outbox.database_path) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM telemetry_contract_recoveries"
+            ).fetchone() == (0,)
+    finally:
+        await outbox.close()
+
+
+async def test_recovery_payload_and_attempt_marker_commit_together(tmp_path, monkeypatch):
+    event = _device_activity()
+    clock = FakeClock(int(event.occurred_at_utc.timestamp() * 1000) + 1000)
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    try:
+        await _reject_activity(outbox, event)
+        execute = outbox._execute
+
+        async def interrupt_marker(sql, params=()):
+            if "INSERT INTO telemetry_contract_recoveries" in sql:
+                raise asyncio.CancelledError
+            return await execute(sql, params)
+
+        monkeypatch.setattr(outbox, "_execute", interrupt_marker)
+        with pytest.raises(asyncio.CancelledError):
+            await outbox.recover_contract_rejection_once(event)
+        assert (await outbox.stats()).pending_events == 0
+        monkeypatch.setattr(outbox, "_execute", execute)
+        assert await outbox.recover_contract_rejection_once(event)
+    finally:
+        await outbox.close()
+
+
+async def test_concurrent_processes_recover_one_event_only_once(tmp_path):
+    event = _device_activity()
+    clock = FakeClock(int(event.occurred_at_utc.timestamp() * 1000) + 1000)
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    await _reject_activity(outbox, event)
+    await outbox.close()
+    script = """
+import asyncio, sys
+from pathlib import Path
+from opensquilla.telemetry.contracts import TELEMETRY_EVENT_ADAPTER
+from opensquilla.telemetry import outbox as outbox_module
+from opensquilla.telemetry.outbox import TelemetryOutbox
+assert Path(outbox_module.__file__).resolve().is_relative_to(Path(sys.argv[4]).resolve())
+async def run():
+    event = TELEMETRY_EVENT_ADAPTER.validate_json(sys.argv[2], strict=True)
+    outbox = await TelemetryOutbox.open(sys.argv[1], 'growth', clock=lambda: int(sys.argv[3]))
+    async with outbox:
+        print(int(await outbox.recover_contract_rejection_once(event)))
+asyncio.run(run())
+"""
+    processes = await asyncio.gather(*(
+        asyncio.create_subprocess_exec(
+            sys.executable, "-c", script, str(tmp_path), event.model_dump_json(), str(clock.now_ms),
+            str(Path(__file__).resolve().parents[2] / "src"),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        ) for _ in range(4)
+    ))
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*(process.communicate() for process in processes)), timeout=30,
+        )
+    finally:
+        for process in processes:
+            if process.returncode is None:
+                process.kill()
+        await asyncio.gather(*(process.wait() for process in processes))
+    for process, (_, error) in zip(processes, results, strict=True):
+        assert process.returncode == 0, error.decode()
+    assert sorted(output.strip() for output, _ in results) == [b"0", b"0", b"0", b"1"]
+    outbox = await _open(tmp_path, TelemetryScope.GROWTH, clock=clock)
+    try:
+        assert (await outbox.stats()).pending_events == 1
     finally:
         await outbox.close()
 

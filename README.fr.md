@@ -51,7 +51,7 @@ enfichable dialogue avec TokenRhythm, OpenRouter, OpenAI, Anthropic, Ollama, Dee
 Qwen/DashScope et plus de 20 autres fournisseurs de LLM, sans aucun changement dans
 votre code ni dans votre schéma de configuration.
 
-OpenSquilla 0.5.4 est la version stable actuelle.
+OpenSquilla 0.5.5 est la version stable actuelle.
 
 Pour une documentation produit orientée tâches, commencez par le
 [Guide produit OpenSquilla](README.product.md) ou par l'[index de la
@@ -76,9 +76,9 @@ GitHub publiées. Les installations de wheel Python utilisent des noms de fichie
 wheel versionnés, car les installateurs valident la version intégrée au nom de
 fichier du wheel.
 
-Pour un usage bureau en 0.5.4, préférez les installateurs de bureau empaquetés issus de la
-Release GitHub : `OpenSquilla-0.5.4-mac-arm64.dmg` sous macOS et
-`OpenSquilla-0.5.4-win-x64.exe` sous Windows.
+Pour un usage bureau en 0.5.5, préférez les installateurs de bureau empaquetés issus de la
+Release GitHub : `OpenSquilla-0.5.5-mac-arm64.dmg` sous macOS et
+`OpenSquilla-0.5.5-win-x64.exe` sous Windows.
 
 | Voie | Public | Quand l'utiliser |
 | --- | --- | --- |
@@ -127,11 +127,11 @@ Liens d'installation : [Git](https://git-scm.com/downloads) ·
 
 ### Installateurs de bureau
 
-Les installateurs de bureau 0.5.4 empaquettent la console de contrôle Vue et
+Les installateurs de bureau 0.5.5 empaquettent la console de contrôle Vue et
 l'environnement d'exécution de la passerelle dans une enveloppe Electron.
 
-- macOS Apple Silicon : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-mac-arm64.dmg>
-- Windows x64 : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/OpenSquilla-0.5.4-win-x64.exe>
+- macOS Apple Silicon : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/OpenSquilla-0.5.5-mac-arm64.dmg>
+- Windows x64 : <https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/OpenSquilla-0.5.5-win-x64.exe>
 
 Pour des téléchargements plus rapides depuis la Chine continentale, utilisez les alias de téléchargement direct OSS :
 - macOS Apple Silicon : <https://opensquilla-releases.oss-cn-beijing.aliyuncs.com/releases/latest/OpenSquilla-mac-arm64.dmg>
@@ -180,7 +180,7 @@ $env:Path = "$env:USERPROFILE\.local\bin;" + $env:Path
 **2. Installer OpenSquilla** — la même commande sur toutes les plateformes.
 
 ```sh
-uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl"
+uv tool install --python 3.12 "opensquilla[recommended] @ https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl"
 ```
 
 Cela installe le wheel OpenSquilla depuis l'URL de release, puis laisse `uv`
@@ -205,7 +205,7 @@ opensquilla gateway run
 > nouveau terminal, ou réexécutez la ligne PATH de l'étape 1.
 
 Pour une installation entièrement épinglée, utilisez l'URL de wheel versionnée :
-`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.4/opensquilla-0.5.4-py3-none-any.whl`.
+`https://github.com/TokenRhythm/opensquilla/releases/download/v0.5.5/opensquilla-0.5.5-py3-none-any.whl`.
 
 <a id="install-from-source"></a>
 
@@ -664,9 +664,6 @@ Les détails de chaque version se trouvent dans [`CHANGELOG.md`](CHANGELOG.md) e
 | **Sessions durables, sous-Agents et planification** | Stockage des sessions, des transcriptions et des relectures adossé à SQLite, avec des espaces de travail par Agent. Les Agents engendrent des sous-Agents à profondeur bornée, et un `SchedulerEngine` doté d'un analyseur cron intégré exécute des tâches récurrentes via `opensquilla cron`. |
 | **Contrôles de l'opérateur** | Les approbations avec humain dans la boucle peuvent mettre en pause les appels d'outils sensibles en attendant une décision ; les récapitulatifs de Token et de coût par tour et par session (`opensquilla cost`) ainsi que les diagnostics sont accessibles depuis la CLI et la Web UI. |
 
-Documentation MetaSkill : [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md),
-et [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md).
 
 ---
 

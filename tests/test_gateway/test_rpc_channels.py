@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
-import httpx
 import pytest
 
 import opensquilla.gateway.rpc_channels  # noqa: F401  ensures registration
@@ -244,7 +244,7 @@ async def test_channels_status_explains_admission_policy_and_denials():
         )
 
     class FakeStore:
-        def admission_reason_counts(self, name: str) -> dict:
+        async def admission_reason_counts(self, name: str) -> dict:
             assert name == "telegram-main"
             return {
                 "dm_admitted": {"count": 9, "first_at": 1700000000.0, "last_at": 1700000300.0},
@@ -418,6 +418,11 @@ async def test_channels_get_redacts_configured_secrets() -> None:
 async def test_channels_probe_merges_secrets_and_runs_real_slack_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from contextlib import AsyncExitStack
+
+    from aiohttp import ClientSession, web
+    from slack_sdk.web.async_client import AsyncWebClient
+
     from opensquilla.channels import registry as channel_registry
 
     token = "xoxb-stored-probe-secret"
@@ -434,61 +439,73 @@ async def test_channels_probe_merges_secrets_and_runs_real_slack_probe(
     )
     ctx.config = result.config
 
-    def handle_auth_test(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/auth.test"
-        assert request.headers["Authorization"] == f"Bearer {token}"
-        return httpx.Response(
-            200,
-            json={"ok": True, "user_id": "U1", "team_id": "T1"},
-        )
+    requests: list[str] = []
 
-    client = httpx.AsyncClient(
-        base_url="https://slack.test/api",
-        headers={"Authorization": f"Bearer {token}"},
-        transport=httpx.MockTransport(handle_auth_test),
-    )
+    async def handle_auth_test(request: web.Request) -> web.Response:
+        assert request.path == "/api/auth.test"
+        assert request.headers["Authorization"] == f"Bearer {token}"
+        requests.append(request.path)
+        return web.json_response({"ok": True, "user_id": "U1", "team_id": "T1"})
+
+    app = web.Application()
+    app.router.add_post("/api/auth.test", handle_auth_test)
     real_build = channel_registry.build_managed_channel
     built_adapters: list[object] = []
 
-    def build_with_mock_transport(entry):
-        assert entry.token == token
-        assert entry.signing_secret == signing_secret
-        adapter = real_build(entry)
-        assert adapter is not None
-        adapter._client = client
-        built_adapters.append(adapter)
-        return adapter
+    async with AsyncExitStack() as resources:
+        runner = web.AppRunner(app)
+        await runner.setup()
+        resources.push_async_callback(runner.cleanup)
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        api_base = f"http://127.0.0.1:{runner.addresses[0][1]}/api/"
+        session = await resources.enter_async_context(ClientSession())
+        monkeypatch.setattr(
+            "opensquilla.channels.slack.SLACK_API_BASE", api_base,
+        )
+        monkeypatch.setattr("opensquilla.channels.slack._trust_env", lambda: False)
 
-    monkeypatch.setattr(channel_registry, "build_managed_channel", build_with_mock_transport)
+        def build_with_local_transport(entry):
+            assert entry.token == token
+            assert entry.signing_secret == signing_secret
+            adapter = real_build(entry)
+            assert adapter is not None
+            client = adapter._get_client()
+            assert isinstance(client, AsyncWebClient)
+            client.session = session
+            built_adapters.append(adapter)
+            return adapter
 
-    rpc_res = await get_dispatcher().dispatch(
-        "r-probe",
-        "channels.probe",
-        {
-            "entry": {
-                "type": "slack",
-                "name": "work",
-                "token": "",
-                "signing_secret": "",
-            }
-        },
-        ctx,
-    )
+        monkeypatch.setattr(channel_registry, "build_managed_channel", build_with_local_transport)
 
-    assert rpc_res.error is None, rpc_res.error
-    assert rpc_res.payload["status"] == "verified"
-    assert rpc_res.payload["connected"] is True
-    assert isinstance(rpc_res.payload["latencyMs"], int)
-    assert rpc_res.payload["result"] == {
-        "authenticated": True,
-        "bot_user_id": "U1",
-        "team_id": "T1",
-    }
-    assert token not in repr(rpc_res.payload)
-    assert signing_secret not in repr(rpc_res.payload)
-    assert len(built_adapters) == 1
-    assert client.is_closed is True
-    assert built_adapters[0]._client is None
+        rpc_res = await get_dispatcher().dispatch(
+            "r-probe",
+            "channels.probe",
+            {
+                "entry": {
+                    "type": "slack",
+                    "name": "work",
+                    "token": "",
+                    "signing_secret": "",
+                }
+            },
+            ctx,
+        )
+
+        assert rpc_res.error is None, rpc_res.error
+        assert rpc_res.payload["status"] == "verified"
+        assert rpc_res.payload["connected"] is True
+        assert isinstance(rpc_res.payload["latencyMs"], int)
+        assert rpc_res.payload["result"] == {
+            "authenticated": True,
+            "bot_user_id": "U1",
+            "team_id": "T1",
+        }
+        assert token not in repr(rpc_res.payload)
+        assert signing_secret not in repr(rpc_res.payload)
+        assert requests == ["/api/auth.test"]
+        assert len(built_adapters) == 1
+        assert session.closed is True
+        assert built_adapters[0]._client is None
 
 
 @pytest.mark.asyncio
@@ -612,7 +629,7 @@ async def test_channels_restart_unloaded_channel_returns_typed_error():
 @pytest.mark.asyncio
 async def test_channels_status_counts_pending_pairings_per_channel():
     class _Store:
-        def list_pairings(self, *, channel_name=None, status=None):
+        async def list_pairings(self, *, channel_name=None, status=None):
             assert status == "pending"
             mk = type("P", (), {})
             out = []
@@ -680,15 +697,23 @@ class _NoticeStore:
             reply_to=reply_to,
         )
 
-    def list_pairings(self, *, channel_name=None, status=None):
+    async def list_pairings(self, *, channel_name=None, status=None):
         if status is not None and self.record.status != status:
             return []
         return [self.record]
 
-    def set_pairing_status(self, *, channel_name, pairing_id, status):
+    async def set_pairing_status(self, *, channel_name, pairing_id, status):
         self.record.status = status
         self.record.approved_at = 2.0
         return self.record
+
+    async def approve_pairing_once(self, *, channel_name, pairing_id):
+        changed = self.record.status != "approved"
+        if changed:
+            await self.set_pairing_status(
+                channel_name=channel_name, pairing_id=pairing_id, status="approved",
+            )
+        return self.record, changed
 
 
 def _notice_ctx(adapter, store, *, notice: bool = True):
@@ -717,6 +742,44 @@ def _notice_ctx(adapter, store, *, notice: bool = True):
 
     ctx.channel_manager = _Manager()
     return ctx
+
+
+@pytest.mark.asyncio
+async def test_async_store_status_and_concurrent_pairing_approval_notify_once(tmp_path):
+    from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore
+
+    store = AsyncChannelDeliveryStore(tmp_path / "channels.db")
+    adapter = _NoticeAdapter()
+    ctx = _notice_ctx(adapter, store)
+    try:
+        record = await store.request_pairing(
+            channel_name="work", provider="slack", account_id="acct", sender_id="U-1",
+            reply_to="dm-chat-1",
+        )
+        assert record is not None
+        before = await get_dispatcher().dispatch("status-before", "channels.status", {}, ctx)
+        assert before.error is None, before.error
+        assert before.payload["channels"][0]["pendingPairings"] == 1
+
+        approvals = await asyncio.gather(*(
+            get_dispatcher().dispatch(
+                f"approve-{index}", "channels.pairing.approve",
+                {"channelName": "work", "pairingId": record.pairing_id}, ctx,
+            ) for index in range(2)
+        ))
+        assert all(result.error is None for result in approvals)
+        assert all(result.payload["pairing"]["status"] == "approved" for result in approvals)
+        assert len(adapter.sent) == 1
+        assert adapter.sent[0].reply_to == "dm-chat-1"
+        assert adapter.sent[0].metadata["pairing_approved"] is True
+
+        after = await get_dispatcher().dispatch("status-after", "channels.status", {}, ctx)
+        assert after.error is None, after.error
+        assert after.payload["channels"][0]["pendingPairings"] == 0
+        persisted = await store.list_pairings(channel_name="work", status="approved")
+        assert [row.pairing_id for row in persisted] == [record.pairing_id]
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

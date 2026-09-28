@@ -13,6 +13,7 @@ import json
 import re
 import sqlite3
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -179,7 +180,7 @@ async def run_comparison(
     observer.replay_checks["comparison"] = comparison
     observer.replay_checks["compaction_events"] = events
     original_init = Agent.__init__
-    original_capacity = Agent.preflight_history_capacity
+    original_capacity = Agent.resolve_compaction_budget
     original_refresh = Agent.refresh_system_prompt
 
     def initialize(agent, *args, **kwargs):
@@ -189,12 +190,31 @@ async def run_comparison(
         original_init(agent, *args, **kwargs)
 
     def capacity(agent, **kwargs):
-        natural_tokens, natural_chars = original_capacity(agent, **kwargs)
-        used_tokens = natural_tokens if history_tokens is None else history_tokens
-        used_chars = natural_chars if history_chars is None else history_chars
+        natural = original_capacity(agent, **kwargs)
+        natural_tokens = natural.history_capacity_tokens
+        natural_chars = natural.history_capacity_chars
+        used_tokens = (natural_tokens if history_tokens is None
+                       else min(natural_tokens, max(0, history_tokens)))
+        used_chars = (natural_chars if history_chars is None
+                      else min(natural_chars, max(0, history_chars)))
         capacity_samples.append({"natural_tokens": natural_tokens, "natural_chars": natural_chars,
                                  "applied_tokens": used_tokens, "applied_chars": used_chars})
-        return used_tokens, used_chars
+        if history_tokens is None and history_chars is None:
+            return natural
+        # This benchmark can narrow the compactor's history target, while the
+        # original final-request admission still enforces physical capacity.
+        return replace(
+            natural,
+            history_capacity_tokens=used_tokens,
+            history_capacity_chars=used_chars,
+            auto_trigger_tokens=int(used_tokens * config.preflight_compact_ratio),
+            auto_trigger_chars=int(used_chars * config.preflight_compact_ratio),
+            retained_tail_tokens=used_tokens // 5,
+            consumer_admission_fingerprint=digest({
+                "consumer": natural.consumer_admission_fingerprint,
+                "history_tokens": used_tokens, "history_chars": used_chars,
+            }),
+        )
 
     def event_listener(session_key, event):
         if session_key == SESSION_KEY:
@@ -241,7 +261,7 @@ async def run_comparison(
             ))
             stack.enter_context(patch.object(Agent, "refresh_system_prompt",
                                             lambda agent, prompt: original_refresh(agent, SYSTEM)))
-            stack.enter_context(patch.object(Agent, "preflight_history_capacity", capacity))
+            stack.enter_context(patch.object(Agent, "resolve_compaction_budget", capacity))
             stack.callback(harness.add_compaction_listener(event_listener))
             user = await manager.append_message(SESSION_KEY, "user", prompt)
             turn_events = [event async for event in runner.run(

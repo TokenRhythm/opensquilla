@@ -78,10 +78,10 @@ def create_dashboard_app(
         )
 
     async def login(request: Request) -> Response:
-        origin_valid = _same_origin_or_absent(
+        origin_valid = _valid_form_origin(
             request,
             public_origin=configured_origin,
-        ) or _same_site_document_navigation(request)
+        )
         if not origin_valid:
             log.warning(
                 "statistics preview login rejected: origin_present=%s "
@@ -223,7 +223,7 @@ def create_dashboard_app(
         session = _session(request, auth)
         if session is None:
             return _json_error(401, "authentication_required")
-        if not _same_origin_or_absent(request, public_origin=configured_origin):
+        if not _valid_form_origin(request, public_origin=configured_origin):
             return _error_response(request, 403, "请求校验失败。")
         form = await _read_urlencoded_form(request, expected={"csrf_token"})
         if form is None or not auth.verify_session_csrf(
@@ -465,17 +465,17 @@ def _same_origin_or_absent(request: Request, *, public_origin: str | None) -> bo
     return hmac.compare_digest(supplied, expected)
 
 
-def _same_site_document_navigation(request: Request) -> bool:
-    """Accept the Fetch Metadata signal used by sandboxed embedded browsers.
+def _valid_form_origin(request: Request, *, public_origin: str | None) -> bool:
+    """Allow opaque embedded form navigation with same-origin Fetch Metadata.
 
-    Chromium may serialize a nonstandard Origin for a sandboxed application
-    webview even though the form navigation is same-origin.  Fetch Metadata is
-    browser-controlled and the signed form token remains mandatory, so this
-    fallback does not accept cross-site form submissions.
+    A sandboxed browser may serialize Origin as null for a same-origin form.
+    Only that opaque origin can use this fallback; an explicit different origin
+    must remain rejected. Both form handlers independently verify signed tokens.
     """
 
-    return (
-        request.method == "POST"
+    return _same_origin_or_absent(request, public_origin=public_origin) or (
+        request.headers.get("origin") == "null"
+        and request.method == "POST"
         and request.headers.get("sec-fetch-site", "").lower() == "same-origin"
         and request.headers.get("sec-fetch-mode", "").lower() == "navigate"
         and request.headers.get("sec-fetch-dest", "").lower() == "document"

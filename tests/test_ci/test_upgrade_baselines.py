@@ -29,6 +29,94 @@ def nsis_regression():
     return module
 
 
+@pytest.mark.parametrize("relative,method,field", [
+    (".", "is_dir", None),
+    ("old-install", "is_dir", "oldInstallObserved"),
+    ("old-uninstaller.exe", "is_file", "oldUninstallerObserved"),
+])
+def test_nsis_directory_sampling_recovers_from_windows_access_race(
+    nsis_regression, tmp_path, monkeypatch, relative, method, field,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    (directory / "old-install").mkdir(parents=True)
+    (directory / "old-uninstaller.exe").write_bytes(b"synthetic")
+    target = directory / relative
+    original = getattr(Path, method)
+    attempts = 0
+
+    def sample(path):
+        nonlocal attempts
+        if path == target:
+            attempts += 1
+            if attempts <= 2:
+                error = PermissionError(13, "synthetic access denied", str(path))
+                error.winerror = 5
+                raise error
+        return original(path)
+
+    monkeypatch.setattr(Path, method, sample)
+    observed, errors = {}, []
+    for seconds in (1.0, 2.0):
+        nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, seconds)
+        if field is None:
+            assert observed == {}
+        else:
+            assert observed[str(directory)][field] is False
+    assert len(errors) == 1
+    assert errors[0] == {
+        "path": str(target), "sample": method, "errno": 13, "winerror": 5,
+        "firstObservedSeconds": 1.0, "lastObservedSeconds": 2.0, "observations": 2,
+    }
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 3.0)
+    assert observed[str(directory)]["oldInstallObserved"] is True
+    assert observed[str(directory)]["oldUninstallerObserved"] is True
+
+
+def test_nsis_directory_sampling_preserves_real_evidence_after_access_race(
+    nsis_regression, tmp_path, monkeypatch,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    (directory / "old-install").mkdir(parents=True)
+    observed, errors = {}, []
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 1.0)
+    original = Path.is_dir
+
+    def denied(path):
+        if path == directory / "old-install":
+            error = PermissionError(13, "synthetic access denied", str(path))
+            error.winerror = 5
+            raise error
+        return original(path)
+
+    monkeypatch.setattr(Path, "is_dir", denied)
+    nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 2.0)
+    assert observed[str(directory)]["oldInstallObserved"] is True
+    assert observed[str(directory)]["oldUninstallerObserved"] is False
+    assert errors[0]["winerror"] == 5
+
+
+@pytest.mark.parametrize("error_type,winerror", [
+    (PermissionError, None), (PermissionError, 32), (OSError, 5),
+])
+def test_nsis_directory_sampling_does_not_suppress_other_errors(
+    nsis_regression, tmp_path, monkeypatch, error_type, winerror,
+):
+    directory = tmp_path / "nsSynthetic.tmp"
+    error = error_type("synthetic unexpected filesystem error")
+    if winerror is not None:
+        error.winerror = winerror
+
+    def failed(_path):
+        raise error
+
+    monkeypatch.setattr(Path, "is_dir", failed)
+    observed, errors = {}, []
+    with pytest.raises(error_type) as raised:
+        nsis_regression.sample_nsis_plugin_directory(directory, observed, errors, 1.0)
+    assert raised.value is error
+    assert observed == {} and errors == []
+
+
 @pytest.fixture
 def fresh_nsis_arguments(tmp_path):
     node = tmp_path / "synthetic-node.exe"
@@ -516,7 +604,11 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     if not node:
         pytest.skip("Node.js is required for the packaged recovery harness")
     scripts = ROOT / "desktop/electron/scripts"
-    for name in ("test-packaged-session-recovery.mjs", "session-recovery-transport-contract.mjs"):
+    for name in (
+        "test-packaged-session-recovery.mjs",
+        "session-recovery-transport-contract.mjs",
+        "session-recovery-rpc-evidence.mjs",
+    ):
         shutil.copyfile(scripts / name, tmp_path / name)
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
         "export function requiredOption(name) {\n"
@@ -531,6 +623,9 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     )
     (tmp_path / "packaged-first-send-cleanup.mjs").write_text(
         "import assert from 'node:assert/strict';\n"
+        "export async function captureFirstSendDiagnostic(operation) {\n"
+        "try { return await operation() }\n"
+        "catch (error) { return { diagnosticError: error.message } } }\n"
         "export async function captureElectronProcessIdentity() {\n"
         "return { wrapperPid: 111, electronPid: 222 } }\n"
         "export function electronProcessSnapshot(identity) { return { ...identity } }\n"
@@ -584,6 +679,12 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     assert "packaged_session_recovery_failed_before_cleanup" in stderr
     assert "synthetic-cleanup-ran" in stderr
     assert "Error: synthetic recovery fault" in stderr
+    assert "packaged_session_recovery_failure_evidence" in stderr
+    evidence_path = tmp_path / "profile/logs/packaged-session-recovery/failure.json"
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["ui"] == {"pageUnavailable": True}
+    assert evidence["rpc"] == {"overflow": False, "events": []}
+    assert evidence["screenshot"] == {"captured": False}
     assert not stdout
     if cleanup_fails:
         assert stderr.rindex("Error: synthetic recovery fault") > stderr.rindex(

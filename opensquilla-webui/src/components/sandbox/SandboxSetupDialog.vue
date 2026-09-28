@@ -1,7 +1,7 @@
 <template>
   <Teleport to="body">
     <div
-      v-if="open"
+      v-if="open && !quietFailure"
       class="sandbox-setup-overlay"
       data-testid="sandbox-setup-confirm"
       @click.self="cancel"
@@ -24,9 +24,6 @@
           role="status"
         >
           {{ progressMessage }}
-        </p>
-        <p v-else-if="outcomeMessage" class="sandbox-setup-result" role="status">
-          {{ outcomeMessage }}
         </p>
         <div class="sandbox-setup-dialog__actions">
           <button
@@ -108,16 +105,14 @@ const progressMessage = computed(() => {
   return `${phase} ${t('settings.sandbox.setup.elapsed', { seconds: elapsedSeconds.value })}`
 })
 
-const outcomeMessage = computed(() => {
-  if (props.outcome === 'cancelled') return t('settings.sandbox.setup.cancelled')
-  if (props.outcome === 'failed') return t('settings.sandbox.setup.failed')
-  if (props.outcome === 'verification_failed') return t('settings.sandbox.setup.verificationFailed')
-  return ''
-})
+const quietFailure = computed(() => !props.pending && (
+  props.outcome === 'cancelled'
+  || props.outcome === 'failed'
+  || props.outcome === 'verification_failed'
+))
 
 const confirmLabel = computed(() => {
   if (setupActive.value) return t('settings.sandbox.setup.configuring')
-  if (outcomeMessage.value) return t('settings.sandbox.actions.retry')
   return t('settings.sandbox.setup.continue')
 })
 

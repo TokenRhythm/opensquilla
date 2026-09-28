@@ -17,6 +17,7 @@ BENIGN_AUTOMATIC_COMPACTION_SKIP_REASONS: Final[frozenset[str]] = frozenset(
         "already_attempted_this_turn",
         "already_compacted_this_turn",
         "no_entries",
+        "no_compression_benefit",
         "stale_preimage",
         "structured_content_noop",
         "within_budget",

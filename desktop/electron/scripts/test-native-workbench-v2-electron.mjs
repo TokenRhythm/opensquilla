@@ -1502,6 +1502,103 @@ try {
         !annotationOverlay.view.getVisible()
         && annotationOverlay.binding === null
         && manager.surfaces.get('artifact:v3-bridge')?.annotationCandidate === null
+      const annotationNormalizedSelections = []
+      for (const kind of ['before', 'after', 'text', 'shadow-open', 'shadow-closed', 'element', 'svg']) {
+        const eventsBefore = events.length
+        await v3Contents.executeJavaScript(`(() => {
+          const kind = ${JSON.stringify(kind)}
+          const host = document.createElement('div')
+          host.id = 'annotation-normalization-probe'
+          host.style.cssText = 'position:fixed;left:20px;top:100px;width:220px;height:80px;z-index:2147483647;background:#eee'
+          if (kind === 'before' || kind === 'after') {
+            const style = document.createElement('style')
+            style.id = 'annotation-normalization-style'
+            style.textContent = '#annotation-normalization-probe::' + kind
+              + '{content:"";position:absolute;inset:0;background:#ccc}'
+            document.head.append(style)
+            host.textContent = 'Decorative panel'
+          } else if (kind.startsWith('shadow-')) {
+            const root = host.attachShadow({ mode: kind.slice(7) })
+            root.innerHTML = '<button style="width:100%;height:100%">Component action</button>'
+          } else if (kind === 'svg') {
+            host.innerHTML = '<svg width="220" height="80"><foreignObject id="annotation-normalization-target" width="220" height="80"><div xmlns="http://www.w3.org/1999/xhtml">SVG content</div></foreignObject></svg>'
+          } else {
+            host.textContent = 'Editable panel'
+          }
+          document.body.append(host)
+        })()`)
+        await waitFor(() => view('artifact:v3-bridge').getVisible(), `${kind} annotation preview`)
+        const armed = await manager.setArtifactAnnotationMode({
+          version: 3, surfaceId: 'artifact:v3-bridge', enabled: true,
+        })
+        if (!armed.ok) throw new Error(`${kind} annotation picker failed to start.`)
+        if (kind === 'text' || kind === 'svg') {
+          const textObject = await v3Contents.debugger.sendCommand('Runtime.evaluate', {
+            expression: kind === 'text'
+              ? "document.getElementById('annotation-normalization-probe').firstChild"
+              : "document.getElementById('annotation-normalization-target')",
+          })
+          const textNode = await v3Contents.debugger.sendCommand('DOM.describeNode', {
+            objectId: textObject.result.objectId,
+          })
+          await manager.handleAnnotationNodeSelected(
+            manager.surfaces.get('artifact:v3-bridge'), textNode.node.backendNodeId,
+          )
+          await v3Contents.debugger.sendCommand('Runtime.releaseObject', {
+            objectId: textObject.result.objectId,
+          })
+        } else {
+          v3Contents.focus()
+          for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+            await v3Contents.debugger.sendCommand('Input.dispatchMouseEvent', {
+              type, x: 130, y: 140, button: type === 'mouseMoved' ? 'none' : 'left', clickCount: 1,
+            })
+          }
+        }
+        const event = await waitFor(() => events.slice(eventsBefore).find(event =>
+          event.surfaceId === 'artifact:v3-bridge'
+          && (event.type === 'annotation-selected' || event.type === 'blocked-action')),
+        `${kind} annotation selection`)
+        if (event.type !== 'annotation-selected') {
+          throw new Error(`${kind} annotation was rejected: ${JSON.stringify(event.detail)}`)
+        }
+        const selection = event.detail.selection
+        const expectedTargetId = kind === 'svg'
+          ? 'annotation-normalization-target' : 'annotation-normalization-probe'
+        const retained = manager.surfaces.get('artifact:v3-bridge').annotationCandidate
+        const selectedTarget = await v3Contents.debugger.sendCommand('Runtime.callFunctionOn', {
+          objectId: retained.objectId,
+          functionDeclaration: `function (locatorHint, expectedTargetId) {
+            const expected = document.getElementById(expectedTargetId)
+            return {
+              matchesHost: document.querySelector(locatorHint) === expected,
+              retainedHost: this === expected,
+            }
+          }`,
+          arguments: [{ value: selection.locatorHint }, { value: expectedTargetId }],
+          returnByValue: true,
+        })
+        const shown = await manager.showArtifactAnnotationOverlay({
+          version: 3, surfaceId: 'artifact:v3-bridge', selectionId: selection.selectionId,
+          annotationId: `annotation_normalized_${kind}`, initialBody: '',
+        })
+        annotationNormalizedSelections.push({
+          kind,
+          matchesHost: selectedTarget.result.value.matchesHost,
+          retainedHost: selectedTarget.result.value.retainedHost,
+          editorVisible: shown.ok && annotationOverlay.view.getVisible(),
+          tagName: selection.tagName,
+        })
+        const closed = await closeAnnotationOverlayImmediately({
+          version: 3, surfaceId: 'artifact:v3-bridge',
+          annotationId: `annotation_normalized_${kind}`, rearm: true,
+        })
+        if (!closed.ok) throw new Error(`${kind} annotation editor failed to close.`)
+        await v3Contents.executeJavaScript(`
+          document.getElementById('annotation-normalization-probe').remove();
+          document.getElementById('annotation-normalization-style')?.remove();
+        `)
+      }
       const annotationRearmEventsBefore = events.length
       const annotationPickerRearm = annotationOverlayAcknowledgement
       const annotationRejectedSelectionDiagnosticsBefore = annotationLifecycleDiagnostics.length
@@ -1509,10 +1606,9 @@ try {
       if (!annotationRejectedSelectionRecord) {
         throw new Error('The annotation surface disappeared before rejected-selection recovery.')
       }
-      // A CSS pseudo-element can produce an inspectNodeRequested backend id
-      // which cannot be resolved to a supported Element in the isolated
-      // world. Exercise the same rejection path deterministically, then prove
-      // the next real click is still captured by the picker below.
+      // A removed node can leave an inspectNodeRequested backend id which no
+      // longer resolves. Exercise that rejection path deterministically, then
+      // prove the next real click is still captured by the picker below.
       await manager.handleAnnotationNodeSelected(
         annotationRejectedSelectionRecord,
         Number.MAX_SAFE_INTEGER,
@@ -2710,6 +2806,7 @@ try {
         annotationOverlayClosedAfterAcknowledgement,
         annotationAtomicHandoffPendingState,
         annotationPickerRearm,
+        annotationNormalizedSelections,
         annotationRejectedSelectionRecovery,
         annotationRejectedSelectionRearmFailure,
         annotationRearmOverlayResult,
@@ -3148,6 +3245,13 @@ try {
     body: 'Retain this body after a failed handoff.',
   })
   assert.equal(result.annotationAtomicFailureRetry.ok, true)
+  assert.deepEqual(result.annotationNormalizedSelections,
+    ['before', 'after', 'text', 'shadow-open', 'shadow-closed', 'element', 'svg'].map(kind => ({
+      kind, matchesHost: true, retainedHost: true, editorVisible: true,
+      tagName: kind === 'svg' ? 'foreignobject' : 'div',
+    })),
+    'generated content and component internals must open an editor anchored to their document element',
+  )
   assert.deepEqual(result.annotationRejectedSelectionRecovery, {
     blocked: true,
     rejected: true,

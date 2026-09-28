@@ -248,35 +248,25 @@
               <span>{{ t('workspaces.chooseProject') }}</span>
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
-            <button
-              v-if="codingModeEnabled"
-              type="button"
-              class="chat-coding-mode-chip"
-              :title="t('chat.codingMode.disableLabel')"
-              :aria-label="t('chat.codingMode.disableLabel')"
-              :aria-busy="codingModeSettingsBusy ? 'true' : 'false'"
-              :disabled="codingModeSettingsBusy"
-              @click="emit('setCodingModeEnabled', false)"
-            >
-              <span>{{ t('chat.codingMode.activeLabel') }}</span>
-              <Icon name="x" :size="12" aria-hidden="true" />
-            </button>
+
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
-                class="btn btn--icon btn--ghost chat-run-mode-btn"
+                class="btn btn--ghost chat-run-mode-btn"
                 :class="[`chat-run-mode-btn--${runMode}`, {
                   'is-active': runModeOpen,
                   'is-locked': runModeLocked,
                 }]"
-                :title="runModeLocked ? undefined : t('chat.composer.runMode')"
-                :aria-label="t('chat.composer.runMode')"
+                :title="runModeLocked ? undefined : runModeLabel"
+                :aria-label="`${t('chat.composer.runMode')}: ${runModeLabel}`"
+                aria-haspopup="dialog"
                 :aria-expanded="runModeOpen ? 'true' : 'false'"
                 :aria-disabled="runModeLocked ? 'true' : 'false'"
                 :aria-describedby="runModeLocked ? 'chat-run-mode-lock-tip' : undefined"
                 :disabled="runModeLocked"
                 @click="toggleRunMode"
               >
-                <Icon name="shield" :size="17" />
+                <Icon name="shield" :size="16" aria-hidden="true" />
+                <span class="chat-run-mode-btn__label">{{ runModeLabel }}</span>
               </button>
               <span
                 v-if="runModeLocked"
@@ -293,7 +283,19 @@
                 @set-run-mode="emit('setRunMode', $event)"
               />
             </div>
-            <div ref="moreActionsAnchorEl" class="chat-settings-anchor">
+            <ChatComposerGoalMode
+              :active="goalDraftArmed"
+              @disarm="emit('disarmGoal')"
+            />
+            <ChatComposerPlanMode
+              :available="planModeAvailable === true"
+              :mode="collaborationMode || 'default'"
+              :busy="planModeBusy === true"
+              :disabled="planModeDisabled === true"
+              :applies-next-turn="planModeAppliesNextTurn === true"
+              @set-mode="emit('setCollaborationMode', $event)"
+            />
+            <div ref="moreActionsAnchorEl" class="chat-settings-anchor chat-more-actions-anchor">
               <button
                 class="btn btn--icon btn--ghost chat-more-actions-btn"
                 :class="{ 'is-active': moreActionsOpen }"
@@ -363,23 +365,11 @@
               </div>
             </div>
           </div>
-          <ChatComposerGoalMode
-            :active="goalDraftArmed"
-            @disarm="emit('disarmGoal')"
-          />
-          <ChatComposerPlanMode
-            :available="planModeAvailable === true"
-            :mode="collaborationMode || 'default'"
-            :busy="planModeBusy === true"
-            :disabled="planModeDisabled === true"
-            :applies-next-turn="planModeAppliesNextTurn === true"
-            @set-mode="emit('setCollaborationMode', $event)"
-          />
           <div class="chat-input-actions chat-input-actions--right">
             <div
               v-if="modelRoutingVisible"
               ref="modelRoutingAnchorEl"
-              class="chat-settings-anchor"
+              class="chat-settings-anchor chat-model-routing-anchor"
             >
               <button
                 class="chat-model-routing-btn"
@@ -458,7 +448,9 @@
                 <button
                   v-if="canStop && !showSkillQueueSend"
                   key="stop"
-                  class="btn btn--icon btn--danger chat-send-btn"
+                  class="btn btn--icon btn--danger chat-send-btn chat-stop-btn"
+                  :disabled="stopPending"
+                  :aria-busy="stopPending || undefined"
                   :title="stopTargetsPlanRun
                     ? t('chat.planRun.stopExecutionEsc')
                     : t('chat.stopResponseEsc')"
@@ -558,6 +550,7 @@ const props = withDefaults(defineProps<{
   isStreaming: boolean
   canStop: boolean
   stopTargetsPlanRun?: boolean
+  stopPending?: boolean
   isNewLanding: boolean
   placeholder: string
   sendButtonTitle: string
@@ -583,8 +576,6 @@ const props = withDefaults(defineProps<{
   modelsError?: string | null
   modelProviderErrors?: readonly ProviderListError[]
   modelSelectionDisabledReason?: 'routing' | 'busy' | 'unavailable' | null
-  codingModeEnabled?: boolean
-  codingModeSettingsBusy?: boolean
   addMenuAvoidElement?: HTMLElement | null
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
@@ -616,8 +607,6 @@ const props = withDefaults(defineProps<{
   floating?: boolean
 }>(), {
   canChooseProject: true,
-  codingModeEnabled: false,
-  codingModeSettingsBusy: false,
   sessionRoutingAvailable: true,
   sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
@@ -641,11 +630,11 @@ const emit = defineEmits<{
   send: []
   setBusySendMode: [mode: 'queue' | 'steer']
   setRunMode: [mode: SandboxRunMode]
+  refreshRunModeAvailability: []
   setSessionRoutingMode: [mode: ModelRoutingMode]
   selectModel: [selection: { model: string; provider: string } | null]
   refreshModels: []
   openModelSettings: []
-  setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
   disarmGoal: []
@@ -666,6 +655,9 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const runModeLabel = computed(() => t(
+  props.runMode === 'full' ? 'chat.composer.runModeFull' : 'chat.composer.runModeSafe',
+))
 
 const showSkillQueueSend = computed(() => props.canStop
   && props.isStreaming
@@ -896,6 +888,7 @@ function toggleRunMode() {
   if (props.runModeLocked) return
   runModeOpen.value = !runModeOpen.value
   if (runModeOpen.value) {
+    emit('refreshRunModeAvailability')
     addMenuOpen.value = false
     modelRoutingOpen.value = false
     moreActionsOpen.value = false
@@ -977,15 +970,16 @@ function attachmentIcon(att: Attachment): IconName {
 }
 
 function attachmentMeta(att: Attachment): string {
+  const pasted = att.origin === 'paste' ? t('chat.pastedTextLabel') : ''
   if (att.kind === 'failed') {
     const failed = t('chat.status.failed')
-    return att.error ? `${failed} · ${att.error}` : failed
+    return [pasted, att.error ? `${failed} · ${att.error}` : failed].filter(Boolean).join(' · ')
   }
   const label = fileTypeLabel(att, t('chat.fileLabel'))
   const size = typeof att.size === 'number'
     ? `${Math.max(1, Math.round(att.size / 1024))} KB`
     : ''
-  return [label, size].filter(Boolean).join(' · ')
+  return [pasted, label, size].filter(Boolean).join(' · ')
 }
 
 function attachmentTitle(att: Attachment): string {
@@ -1140,41 +1134,6 @@ defineExpose<ChatComposerExpose>({
   background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
 
-.chat-coding-mode-chip {
-  flex: 0 0 auto;
-  min-height: 30px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 7px 3px 9px;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 9%, transparent);
-  color: var(--accent);
-  font: inherit;
-  font-size: var(--fs-xs);
-  font-weight: 650;
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    border-color var(--dur-fast),
-    background var(--dur-fast),
-    color var(--dur-fast);
-}
-.chat-coding-mode-chip:hover,
-.chat-coding-mode-chip:focus-visible {
-  outline: 0;
-  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
-  background: color-mix(in srgb, var(--accent) 15%, transparent);
-  color: var(--accent-hover);
-}
-.chat-coding-mode-chip:focus-visible {
-  box-shadow: var(--focus-ring);
-}
-.chat-coding-mode-chip:disabled {
-  cursor: default;
-  opacity: var(--state-disabled-opacity);
-}
 .chat-project-choose {
   flex-shrink: 0;
   max-width: 100%;
@@ -1520,6 +1479,7 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-panel {
+  container: chat-composer / inline-size;
   display: flex;
   flex-direction: column;
   min-height: 128px;
@@ -1706,9 +1666,17 @@ button.attachment-chip__primary:focus-visible {
   align-items: center;
 }
 
+.chat-collapse-region--footer,
+.chat-input-footer {
+  min-width: 0;
+}
+
 .chat-input-footer {
   justify-content: space-between;
-  flex-wrap: wrap;
+  /* Keep the two action clusters on the same baseline whenever the
+     container can accommodate them. A wrapping flex row puts the routing
+     cluster on a second, offset line at high Windows display scaling. */
+  flex-wrap: nowrap;
   gap: 0.25rem 0.75rem;
   padding: 0.25rem 0.625rem 0.625rem;
 }
@@ -1806,15 +1774,154 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-input-actions--left {
-  flex-shrink: 0;
-  flex-wrap: wrap;
+  flex: 1 1 auto;
+  flex-wrap: nowrap;
   max-width: 100%;
 }
 
 .chat-input-actions--right {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  justify-content: flex-end;
   margin-left: auto;
   max-width: 100%;
+}
+
+.chat-model-routing-anchor {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 14rem;
+}
+
+/* The stop target needs more room than the send target in narrow composers. */
+@container chat-composer (max-width: 26rem) {
+  .chat-input-footer:has(.chat-stop-btn) .chat-run-mode-btn__label {
+    display: none;
+  }
+}
+
+/* At genuinely narrow widths the touch targets cannot share one row. Give
+   both rows the same full width so the fallback remains aligned instead of
+   leaving the routing/send cluster floating on a separate edge. */
+@container chat-composer (max-width: 26rem) {
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0.375rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+    width: 100%;
+    flex: 0 0 auto;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+    align-self: stretch;
+    margin-left: 0;
+    justify-content: space-between;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+    margin-left: auto;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+    right: 0;
+    left: auto;
+  }
+}
+
+/* An active mode adds a chip to the first cluster. Reserve a complete row
+   before that chip can push More onto an isolated line. */
+@container chat-composer (min-width: 26rem) and (max-width: 36rem) {
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) {
+    flex-wrap: wrap;
+    gap: 0.375rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions {
+    flex: 1 1 100%;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--left {
+    flex-wrap: wrap;
+    row-gap: 0.25rem;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) > .chat-input-actions--right {
+    justify-content: space-between;
+    margin-left: 0;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-anchor {
+    margin-left: auto;
+  }
+
+  .chat-input-footer:has(.composer-plan-mode, .composer-goal-mode) .chat-more-actions-menu {
+    right: 0;
+    left: auto;
+  }
+}
+
+/* More is the only ordinary-mode popover whose trigger sits at the left edge.
+   Re-anchor it to the footer at narrow widths so the menu stays inside the
+   composer while its labels remain readable. */
+@container chat-composer (max-width: 36rem) {
+  .chat-input-footer {
+    position: relative;
+  }
+
+  .chat-more-actions-anchor {
+    position: static;
+  }
+
+  .chat-more-actions-menu {
+    left: auto;
+    right: 0.625rem;
+    max-width: calc(100% - 1.25rem);
+    min-width: 0;
+  }
+
+  .chat-more-actions-menu button > span,
+  .chat-more-actions-menu__copy {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+}
+
+@container chat-composer (max-width: 22rem) {
+  .chat-input-footer {
+    gap: 0.25rem;
+    padding-inline: 0.25rem;
+  }
+
+  .chat-input-actions--left {
+    gap: 0;
+  }
+
+  .chat-input-actions--right {
+    gap: 0;
+  }
+
+  /* At this width the labels cannot coexist with the touch targets. Keep
+     their accessible names and titles, but let the controls collapse to
+     their icons so the ordinary composer still has one stable row. */
+  .chat-run-mode-btn__label,
+  .chat-model-routing-btn__label {
+    display: none;
+  }
+
+  .chat-run-mode-btn,
+  .chat-model-routing-btn {
+    gap: 0.25rem;
+    padding-inline: 0.25rem;
+  }
 }
 
 .chat-input-wrap {
@@ -1889,13 +1996,14 @@ button.attachment-chip__primary:focus-visible {
   justify-content: center;
   gap: 6px;
   height: 30px;
-  max-width: min(230px, 40vw);
+  min-width: 0;
+  max-width: 100%;
   padding: 0 9px;
   width: auto;
   position: relative;
-  border: 1px solid var(--border);
+  border: 1px solid transparent;
   border-radius: var(--radius-control);
-  background: var(--bg-surface);
+  background: transparent;
   color: var(--text-muted);
   font-family: inherit;
   font-weight: 500;
@@ -1912,10 +2020,13 @@ button.attachment-chip__primary:focus-visible {
 }
 
 .chat-model-routing-btn__label {
+  flex: 0 1 auto;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: var(--fs-xs);
+  text-align: left;
 }
 
 .chat-model-routing-btn__dot {
@@ -1936,9 +2047,6 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-model-routing-btn__default {
   flex-shrink: 0;
-  padding: 1px 4px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-control);
   color: var(--text-dim);
   font-size: var(--fs-xs);
   line-height: 1.2;
@@ -1962,8 +2070,8 @@ button.attachment-chip__primary:focus-visible {
 
 .chat-model-routing-btn:hover,
 .chat-model-routing-btn.is-open {
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
-  background: color-mix(in srgb, var(--accent) 7%, var(--bg-surface));
+  border-color: var(--border);
+  background: var(--bg-hover);
   color: var(--text);
 }
 
@@ -1982,21 +2090,19 @@ button.attachment-chip__primary:focus-visible {
   --run-mode-border: transparent;
   --run-mode-marker: var(--text-dim);
   position: relative;
+  gap: 0.375rem;
+  min-height: 32px;
+  padding: 0.375rem 0.5rem;
   border-color: var(--run-mode-border);
   background: var(--run-mode-tint);
   color: var(--run-mode-tone);
 }
 
-.chat-run-mode-btn::after {
-  content: "";
-  position: absolute;
-  right: 7px;
-  bottom: 7px;
-  width: 6px;
-  height: 6px;
-  border-radius: var(--radius-full);
-  background: var(--run-mode-marker);
-  box-shadow: 0 0 0 2px var(--bg-surface);
+.chat-run-mode-btn__label {
+  color: var(--text);
+  font-size: var(--fs-xs);
+  font-weight: 500;
+  white-space: nowrap;
 }
 
 .chat-run-mode-btn--safe {
@@ -2078,6 +2184,11 @@ button.attachment-chip__primary:focus-visible {
   background: var(--bg-hover);
   color: var(--text-dim);
   border-color: var(--bg-hover);
+}
+
+.chat-stop-btn {
+  min-width: 44px;
+  min-height: 44px;
 }
 
 .chat-send-control {

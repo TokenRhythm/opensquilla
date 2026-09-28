@@ -28,21 +28,21 @@ from opensquilla.telemetry.contracts.common import (
 )
 from opensquilla.telemetry.contracts.growth import (
     ClientLaunch,
-    CodingModeUsage,
+    FirstAppReady,
     FirstTurnStarted,
     FirstTurnSucceeded,
-    MetaSkillUsage,
+    OnboardingCompleted,
     ProductActive,
 )
 from opensquilla.telemetry.coordination import scope_consent_coordinator_for
 from opensquilla.telemetry.device_identity import get_device_id
 from opensquilla.telemetry.growth.state import (
+    DESKTOP_GROWTH_MILESTONE_STATE_NAME,
     GrowthStateError,
     client_launch_state_path,
-    coding_mode_usage_state_path,
     gateway_growth_milestone_state_path,
     growth_cohort_state_path,
-    metaskill_usage_state_path,
+    growth_telemetry_directory,
     product_active_state_path,
     read_active_growth_cohort,
     read_growth_state_object,
@@ -70,18 +70,14 @@ _CLIENT_LAUNCH_MARKER_KIND = "growth_client_launches"
 PRODUCT_ACTIVE_SCHEMA_VERSION = 1
 _PRODUCT_ACTIVE_MARKER_KIND = "growth_product_active"
 _MAX_CLIENT_LAUNCH_RECORDS = 8
-METASKILL_USAGE_SCHEMA_VERSION = 1
-_METASKILL_USAGE_MARKER_KIND = "growth_metaskill_usage"
-CODING_MODE_USAGE_SCHEMA_VERSION = 1
-_CODING_MODE_USAGE_MARKER_KIND = "growth_coding_mode_usage"
 _MAX_ENQUEUED_FEATURE_USAGE_RECORDS = 24
 _FEATURE_USAGE_RUN_KEY_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _RETRY_INITIAL_SECONDS = 1.0
 _RETRY_MAX_SECONDS = 60.0
 
-FeatureUsageEvent = MetaSkillUsage | CodingModeUsage
 GrowthMilestoneEvent = (
-    FirstTurnStarted | FirstTurnSucceeded | ClientLaunch | ProductActive | FeatureUsageEvent
+    FirstTurnStarted | FirstTurnSucceeded | ClientLaunch | ProductActive
+    | OnboardingCompleted | FirstAppReady
 )
 GrowthMilestoneName = Literal["first_turn_started", "first_turn_result"]
 
@@ -148,16 +144,19 @@ class GrowthEventSink:
         self._clock = clock or (lambda: datetime.now(UTC))
         self._coordinator = scope_consent_coordinator_for(config)
         self._marker_path = gateway_growth_milestone_state_path(config=config)
+        self._desktop_marker_path = (
+            growth_telemetry_directory(config=config) / DESKTOP_GROWTH_MILESTONE_STATE_NAME
+        )
         self._client_launch_path = client_launch_state_path(config=config)
         self._product_active_path = product_active_state_path(config=config)
-        self._metaskill_usage_path = metaskill_usage_state_path(config=config)
-        self._coding_mode_usage_path = coding_mode_usage_state_path(config=config)
         self._cohort_path = growth_cohort_state_path(config=config)
         self._identity_path = identity_state_path(
             TelemetryIdentityKind.ANALYTICS_USER,
             config=config,
         )
         self._lock = asyncio.Lock()
+        self._recovery_lock = asyncio.Lock()
+        self._recovery_scanned = False
         self._tasks: set[asyncio.Task[Any]] = set()
         self._retry_requested = asyncio.Event()
         self._retry_task: asyncio.Task[None] | None = None
@@ -171,21 +170,14 @@ class GrowthEventSink:
     def product_active_path(self) -> Path:
         return self._product_active_path
 
-    @property
-    def metaskill_usage_path(self) -> Path:
-        """Path of the bounded local deduplication state for MetaSkill runs."""
 
-        return self._metaskill_usage_path
-
-    @property
-    def coding_mode_usage_path(self) -> Path:
-        """Path of the bounded local deduplication state for Coding Mode runs."""
-
-        return self._coding_mode_usage_path
 
     async def start(self) -> None:
         """Recover pending milestones and keep retrying without another turn."""
 
+        if self._closed or self._retry_task is not None:
+            return
+        await self._recover_rejected_once()
         if self._closed or self._retry_task is not None:
             return
         self._retry_task = asyncio.create_task(
@@ -222,53 +214,14 @@ class GrowthEventSink:
             return
         self._schedule(self.record_turn_succeeded(occurred_at))
 
-    def observe_metaskill_usage(self, run_id: str) -> None:
-        """Count one newly admitted MetaSkill run without collecting its content.
 
-        ``run_id`` is an internal persistence key used only to make retries and
-        duplicate callbacks idempotent. It is never included in the wire event.
-        """
-
-        if self._closed or not _valid_feature_usage_run_key(run_id):
-            return
-        occurred_at = self._safe_now()
-        if occurred_at is None:
-            return
-        # Schedule the already-admitted operation directly. ``close()`` stops
-        # accepting new observations but drains this coroutine before returning.
-        self._schedule(
-            self._record_feature_usage(
-                run_id=run_id,
-                occurred_at=occurred_at,
-                event_name="metaskill_usage",
-            )
-        )
-
-    def observe_coding_mode_usage(self, run_id: str) -> None:
-        """Count one Coding Mode run after its coding agent process starts.
-
-        ``run_id`` is used only by the local deduplication ledger and is never
-        serialized into the event payload.
-        """
-
-        if self._closed or not _valid_feature_usage_run_key(run_id):
-            return
-        occurred_at = self._safe_now()
-        if occurred_at is None:
-            return
-        self._schedule(
-            self._record_feature_usage(
-                run_id=run_id,
-                occurred_at=occurred_at,
-                event_name="coding_mode_usage",
-            )
-        )
 
     async def replay_pending(self) -> None:
         """Retry only existing payloads, preserving their IDs and timestamps."""
 
         if self._closed:
             return
+        await self._recover_rejected_once()
         await self._replay_pending_client_launches()
         try:
             state = read_gateway_growth_milestone_state(self._marker_path)
@@ -290,6 +243,74 @@ class GrowthEventSink:
                     )
         except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
             log.debug("product activity replay rejected", exc_info=True)
+
+    async def _recover_rejected_once(self) -> None:
+        """Inspect retained enqueue receipts once, including in short CLI runs."""
+
+        if self._recovery_scanned:
+            return
+        async with self._recovery_lock:
+            if self._recovery_scanned:
+                return
+            try:
+                notice = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
+                async with self._coordinator.authorized(
+                    TelemetryScope.GROWTH, checkpoint=ConsentCheckpoint.ENQUEUE,
+                    notice_version=notice,
+                ) as permit:
+                    if permit is None:
+                        return
+                    identity_value = self._usage_identity_value()
+                    self._recovery_scanned = True
+                    if identity_value is None:
+                        return
+                    records: list[GrowthMilestoneRecord] = []
+                    readers = (
+                        (self._product_active_path, read_product_active_state),
+                        (self._client_launch_path, read_client_launch_state),
+                    )
+                    for path, reader in readers:
+                        try:
+                            with ProfileOperationLock(path):
+                                records.extend(reader(path).values())
+                        except Exception:
+                            log.debug("growth recovery ledger rejected")
+                    try:
+                        if self._active_identity_value() == identity_value:
+                            with ProfileOperationLock(
+                                self._marker_path,
+                            ):
+                                state = read_gateway_growth_milestone_state(self._marker_path)
+                            records.extend(record for record in (
+                                state.first_turn_started, state.first_turn_result,
+                            ) if record is not None)
+                    except Exception:
+                        log.debug("growth recovery milestone state rejected")
+                    try:
+                        if self._active_identity_value() == identity_value:
+                            with ProfileOperationLock(
+                                self._desktop_marker_path,
+                            ):
+                                records.extend(
+                                    read_desktop_growth_milestone_state(self._desktop_marker_path)
+                                )
+                    except Exception:
+                        log.debug("desktop growth recovery state rejected")
+                    events = [record.event for record in records if (
+                        record.status is GrowthMilestoneStatus.ENQUEUED
+                        and str(record.event.analytics_user_id) == identity_value
+                        and record.event.notice_version == notice
+                        and record.event.device_id is not None
+                    )]
+                for event in events:
+                    try:
+                        await self._runtime.recover_contract_rejection_once(
+                            event, expected_consent_revision=permit.revision,
+                        )
+                    except Exception:
+                        log.debug("growth contract recovery failed")
+            except Exception:
+                log.debug("growth contract recovery state rejected")
 
     async def _replay_pending_client_launches(self) -> None:
         """Replay stored launch payloads across device-key upgrades unchanged."""
@@ -332,40 +353,7 @@ class GrowthEventSink:
     async def record_turn_succeeded(self, occurred_at: datetime) -> None:
         await self._record_milestone("first_turn_result", occurred_at)
 
-    async def record_metaskill_usage(
-        self,
-        run_id: str,
-        occurred_at: datetime,
-    ) -> bool:
-        """Persist one accepted MetaSkill usage observation.
 
-        The local record keeps a stable event ID while an upload is pending;
-        an evicted outbox item can therefore be retried without inflating the
-        server-side count.
-        """
-
-        if self._closed:
-            return False
-        return await self._record_feature_usage(
-            run_id=run_id,
-            occurred_at=occurred_at,
-            event_name="metaskill_usage",
-        )
-
-    async def record_coding_mode_usage(
-        self,
-        run_id: str,
-        occurred_at: datetime,
-    ) -> bool:
-        """Persist one actual Coding Mode execution observation."""
-
-        if self._closed:
-            return False
-        return await self._record_feature_usage(
-            run_id=run_id,
-            occurred_at=occurred_at,
-            event_name="coding_mode_usage",
-        )
 
     async def _retry_loop(self) -> None:
         while True:
@@ -451,6 +439,7 @@ class GrowthEventSink:
         *,
         replay_key: str | None = None,
     ) -> bool:
+        await self._recover_rejected_once()
         async with self._lock:
             try:
                 prepared = await self._prepare_product_active(
@@ -571,13 +560,9 @@ class GrowthEventSink:
         occurred_at = self._safe_now()
         if occurred_at is None:
             return False
+        await self._recover_rejected_once()
         async with self._lock:
             try:
-                # A prior feature observation may have been durably written to
-                # its local ledger just before a crash. A normal app restart
-                # emits client_launch even if the user starts no new turn, so
-                # use that boundary to resume the pending enqueue.
-                await self._retry_pending_feature_usage_locked()
                 prepared = await self._prepare_client_launch(
                     occurred_at=occurred_at,
                     surface=surface,
@@ -688,235 +673,12 @@ class GrowthEventSink:
                 )
                 write_client_launch_state(self._client_launch_path, records)
 
-    async def _record_feature_usage(
-        self,
-        *,
-        run_id: str,
-        occurred_at: datetime,
-        event_name: Literal["metaskill_usage", "coding_mode_usage"],
-    ) -> bool:
-        if not _valid_feature_usage_run_key(run_id):
-            return False
-        if not _valid_utc_datetime(occurred_at):
-            return False
-        async with self._lock:
-            try:
-                await self._retry_pending_feature_usage_locked(
-                    excluded=(event_name, run_id),
-                )
-                prepared = await self._prepare_feature_usage(
-                    run_id=run_id,
-                    occurred_at=occurred_at,
-                    event_name=event_name,
-                )
-                if prepared is None:
-                    return False
-                key, event, consent_revision = prepared
-                result = await self._runtime.record(
-                    event,
-                    expected_consent_revision=consent_revision,
-                )
-                if result.status not in {RecordStatus.RECORDED, RecordStatus.DUPLICATE}:
-                    return False
-                await self._acknowledge_feature_usage(key, event)
-                return True
-            except asyncio.CancelledError:
-                raise
-            except (GrowthStateError, IdentityStateError, OSError, ValueError, TypeError):
-                log.debug("feature usage state rejected", exc_info=True)
-            except Exception:
-                log.debug("feature usage persistence failed", exc_info=True)
-        return False
 
-    async def _prepare_feature_usage(
-        self,
-        *,
-        run_id: str,
-        occurred_at: datetime,
-        event_name: Literal["metaskill_usage", "coding_mode_usage"],
-    ) -> tuple[str, FeatureUsageEvent, int] | None:
-        notice_version = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
-        async with self._coordinator.authorized(
-            TelemetryScope.GROWTH,
-            checkpoint=ConsentCheckpoint.ENQUEUE,
-            notice_version=notice_version,
-        ) as permit:
-            if permit is None:
-                return None
-            identity_value = self._usage_identity_value(create=True)
-            assert identity_value is not None
-            state_path = self._feature_usage_path(event_name)
-            with ProfileOperationLock(
-                state_path,
-                timeout=_STATE_LOCK_TIMEOUT_SECONDS,
-            ):
-                records = self._read_feature_usage_state(event_name)
-                existing = records.get(run_id)
-                if existing is not None:
-                    if existing.event.event_name != event_name:
-                        raise GrowthStateError("feature usage state contains another event type")
-                    if str(existing.event.analytics_user_id) != identity_value:
-                        raise GrowthStateError(
-                            "feature usage belongs to another analytics identity"
-                        )
-                    if existing.status is GrowthMilestoneStatus.ENQUEUED:
-                        return None
-                    return run_id, existing.event, permit.revision
-                event_fields: dict[str, Any] = {
-                    "event_name": event_name,
-                    "event_version": 1,
-                    "event_id": new_event_id(),
-                    "occurred_at_utc": occurred_at,
-                    "source": EventSource.RUNTIME,
-                    "app_version": self._app_version,
-                    "platform": self._platform,
-                    "outcome": None,
-                    "error_code": None,
-                    "duration_ms": None,
-                    "consent_scope": ConsentScope.GROWTH,
-                    "notice_version": notice_version,
-                    "sample_rate": 1,
-                    "analytics_user_id": UUID(identity_value),
-                    "device_id": get_device_id(),
-                }
-                event: FeatureUsageEvent
-                if event_name == "metaskill_usage":
-                    event = MetaSkillUsage(**event_fields)
-                else:
-                    event = CodingModeUsage(**event_fields)
-                records[run_id] = GrowthMilestoneRecord(
-                    status=GrowthMilestoneStatus.PENDING,
-                    event=event,
-                )
-                self._write_feature_usage_state(event_name, records)
-                return run_id, event, permit.revision
 
-    async def _acknowledge_feature_usage(
-        self,
-        key: str,
-        event: FeatureUsageEvent,
-    ) -> None:
-        notice_version = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
-        async with self._coordinator.authorized(
-            TelemetryScope.GROWTH,
-            checkpoint=ConsentCheckpoint.ENQUEUE,
-            notice_version=notice_version,
-        ) as permit:
-            if permit is None:
-                return
-            if self._usage_identity_value() != str(event.analytics_user_id):
-                return
-            event_name = event.event_name
-            state_path = self._feature_usage_path(event_name)
-            with ProfileOperationLock(
-                state_path,
-                timeout=_STATE_LOCK_TIMEOUT_SECONDS,
-            ):
-                records = self._read_feature_usage_state(event_name)
-                existing = records.get(key)
-                if existing is None or existing.event.event_id != event.event_id:
-                    return
-                records[key] = GrowthMilestoneRecord(
-                    status=GrowthMilestoneStatus.ENQUEUED,
-                    event=event,
-                )
-                self._write_feature_usage_state(event_name, records)
 
-    async def _retry_pending_feature_usage_locked(
-        self,
-        *,
-        excluded: tuple[str, str] | None = None,
-    ) -> None:
-        """Retry durable pending usage with its original event ID.
 
-        This runs at later usage observations, so a crash or a temporarily
-        full outbox after writing the local ledger does not permanently lose a
-        demonstrated feature use.
-        """
 
-        notice_version = CURRENT_NOTICE_VERSION_BY_SCOPE[TelemetryScope.GROWTH.value]
-        async with self._coordinator.authorized(
-            TelemetryScope.GROWTH,
-            checkpoint=ConsentCheckpoint.ENQUEUE,
-            notice_version=notice_version,
-        ) as permit:
-            if permit is None:
-                return
-            identity_value = self._usage_identity_value()
-            if identity_value is None:
-                return
-            pending: list[tuple[str, str, FeatureUsageEvent]] = []
-            for event_name in ("metaskill_usage", "coding_mode_usage"):
-                state_path = self._feature_usage_path(event_name)
-                try:
-                    with ProfileOperationLock(
-                        state_path,
-                        timeout=_STATE_LOCK_TIMEOUT_SECONDS,
-                    ):
-                        records = self._read_feature_usage_state(event_name)
-                except (GrowthStateError, OSError, ValueError, TypeError):
-                    # The two feature ledgers are purpose-isolated. Corruption
-                    # in one must not suppress a valid observation in the other.
-                    log.debug(
-                        "pending feature usage ledger rejected",
-                        exc_info=True,
-                        extra={"event_name": event_name},
-                    )
-                    continue
-                for key, record in records.items():
-                    if excluded == (event_name, key):
-                        continue
-                    if not isinstance(record.event, (MetaSkillUsage, CodingModeUsage)):
-                        raise GrowthStateError(
-                            "feature usage state contains another event type"
-                        )
-                    if (
-                        record.status is GrowthMilestoneStatus.PENDING
-                        and str(record.event.analytics_user_id) == identity_value
-                    ):
-                        pending.append((event_name, key, record.event))
-        for _event_name, key, event in pending:
-            try:
-                result = await self._runtime.record(
-                    event,
-                    expected_consent_revision=permit.revision,
-                )
-                if result.status in {RecordStatus.RECORDED, RecordStatus.DUPLICATE}:
-                    await self._acknowledge_feature_usage(key, event)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.debug("pending feature usage retry failed", exc_info=True)
 
-    def _feature_usage_path(self, event_name: str) -> Path:
-        if event_name == "metaskill_usage":
-            return self._metaskill_usage_path
-        if event_name == "coding_mode_usage":
-            return self._coding_mode_usage_path
-        raise ValueError("unknown feature usage event")
-
-    def _read_feature_usage_state(
-        self,
-        event_name: str,
-    ) -> dict[str, GrowthMilestoneRecord]:
-        if event_name == "metaskill_usage":
-            return read_metaskill_usage_state(self._metaskill_usage_path)
-        if event_name == "coding_mode_usage":
-            return read_coding_mode_usage_state(self._coding_mode_usage_path)
-        raise ValueError("unknown feature usage event")
-
-    def _write_feature_usage_state(
-        self,
-        event_name: str,
-        records: dict[str, GrowthMilestoneRecord],
-    ) -> None:
-        if event_name == "metaskill_usage":
-            write_metaskill_usage_state(self._metaskill_usage_path, records)
-            return
-        if event_name == "coding_mode_usage":
-            write_coding_mode_usage_state(self._coding_mode_usage_path, records)
-            return
-        raise ValueError("unknown feature usage event")
 
     async def close(self) -> None:
         if self._closed:
@@ -960,9 +722,9 @@ class GrowthEventSink:
     ) -> None:
         if not _valid_utc_datetime(occurred_at):
             return
+        await self._recover_rejected_once()
         async with self._lock:
             try:
-                await self._retry_pending_feature_usage_locked()
                 prepared = await self._prepare_event(name, occurred_at, replay_only=replay_only)
                 if prepared is None:
                     return
@@ -1179,6 +941,39 @@ def read_gateway_growth_milestone_state(
     )
 
 
+def read_desktop_growth_milestone_state(path: str | Path) -> tuple[GrowthMilestoneRecord, ...]:
+    """Read the existing desktop receipt without changing its enqueue state."""
+
+    payload = read_growth_state_object(path)
+    if payload is None:
+        return ()
+    if (
+        set(payload) != {"schema_version", "marker_kind", "onboarding_result", "first_app_ready"}
+        or type(payload.get("schema_version")) is not int
+        or payload["schema_version"] != 1
+        or payload.get("marker_kind") != "growth_desktop_milestones"
+    ):
+        raise GrowthStateError("desktop growth milestone state is invalid")
+    records = []
+    for name, event_type in (
+        ("onboarding_result", OnboardingCompleted), ("first_app_ready", FirstAppReady),
+    ):
+        raw_record = payload[name]
+        if raw_record is None:
+            continue
+        if not isinstance(raw_record, dict) or set(raw_record) != {"status", "event"}:
+            raise GrowthStateError("desktop growth milestone record is invalid")
+        try:
+            status = GrowthMilestoneStatus(raw_record["status"])
+            event = event_type.model_validate_json(
+                json.dumps(raw_record["event"], separators=(",", ":")), strict=True,
+            )
+        except (ValueError, TypeError) as exc:
+            raise GrowthStateError("desktop growth milestone event is invalid") from exc
+        records.append(GrowthMilestoneRecord(status, event))
+    return tuple(records)
+
+
 def write_gateway_growth_milestone_state(
     path: str | Path,
     state: GatewayGrowthMilestoneState,
@@ -1296,58 +1091,12 @@ def write_product_active_state(path: str | Path, records: dict[str, GrowthMilest
     )
 
 
-def read_metaskill_usage_state(path: str | Path) -> dict[str, GrowthMilestoneRecord]:
-    """Read the bounded, local-only MetaSkill usage deduplication ledger."""
-
-    return _read_feature_usage_state(
-        path,
-        schema_version=METASKILL_USAGE_SCHEMA_VERSION,
-        marker_kind=_METASKILL_USAGE_MARKER_KIND,
-        event_type=MetaSkillUsage,
-        event_name="metaskill_usage",
-        label="metaskill",
-    )
 
 
-def write_metaskill_usage_state(
-    path: str | Path,
-    records: dict[str, GrowthMilestoneRecord],
-) -> None:
-    """Write the bounded MetaSkill usage ledger atomically."""
-
-    _write_feature_usage_state(
-        path,
-        records,
-        schema_version=METASKILL_USAGE_SCHEMA_VERSION,
-        marker_kind=_METASKILL_USAGE_MARKER_KIND,
-    )
 
 
-def read_coding_mode_usage_state(path: str | Path) -> dict[str, GrowthMilestoneRecord]:
-    """Read the bounded, local-only Coding Mode usage deduplication ledger."""
-
-    return _read_feature_usage_state(
-        path,
-        schema_version=CODING_MODE_USAGE_SCHEMA_VERSION,
-        marker_kind=_CODING_MODE_USAGE_MARKER_KIND,
-        event_type=CodingModeUsage,
-        event_name="coding_mode_usage",
-        label="coding mode",
-    )
 
 
-def write_coding_mode_usage_state(
-    path: str | Path,
-    records: dict[str, GrowthMilestoneRecord],
-) -> None:
-    """Write the bounded Coding Mode usage ledger atomically."""
-
-    _write_feature_usage_state(
-        path,
-        records,
-        schema_version=CODING_MODE_USAGE_SCHEMA_VERSION,
-        marker_kind=_CODING_MODE_USAGE_MARKER_KIND,
-    )
 
 
 def _read_feature_usage_state(
@@ -1355,8 +1104,8 @@ def _read_feature_usage_state(
     *,
     schema_version: int,
     marker_kind: str,
-    event_type: type[MetaSkillUsage] | type[CodingModeUsage] | type[ProductActive],
-    event_name: Literal["metaskill_usage", "coding_mode_usage", "product_active"],
+    event_type: type[ProductActive],
+    event_name: Literal["product_active"],
     label: str,
 ) -> dict[str, GrowthMilestoneRecord]:
     payload = read_growth_state_object(path)
@@ -1386,7 +1135,7 @@ def _read_feature_usage_state(
         status_value = raw_record.get("status")
         if (
             not isinstance(key, str)
-            or not _valid_feature_usage_run_key(key)
+            or not bool(_FEATURE_USAGE_RUN_KEY_RE.fullmatch(key))
             or not isinstance(status_value, str)
             or key in records
         ):
@@ -1507,8 +1256,6 @@ def _valid_utc_datetime(value: object) -> bool:
     )
 
 
-def _valid_feature_usage_run_key(value: object) -> bool:
-    return isinstance(value, str) and bool(_FEATURE_USAGE_RUN_KEY_RE.fullmatch(value))
 
 
 __all__ = [
@@ -1517,18 +1264,12 @@ __all__ = [
     "write_product_active_state",
     "GATEWAY_GROWTH_MILESTONE_SCHEMA_VERSION",
     "CLIENT_LAUNCH_SCHEMA_VERSION",
-    "CODING_MODE_USAGE_SCHEMA_VERSION",
-    "METASKILL_USAGE_SCHEMA_VERSION",
     "GatewayGrowthMilestoneState",
     "GrowthEventSink",
     "GrowthMilestoneRecord",
     "GrowthMilestoneStatus",
     "read_gateway_growth_milestone_state",
     "read_client_launch_state",
-    "read_coding_mode_usage_state",
-    "read_metaskill_usage_state",
     "write_gateway_growth_milestone_state",
     "write_client_launch_state",
-    "write_coding_mode_usage_state",
-    "write_metaskill_usage_state",
 ]

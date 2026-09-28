@@ -236,6 +236,35 @@ describe('ArtifactPreviewPanel', () => {
     mounted.unmount()
   })
 
+  it('shows a useful fallback when the browser disables inline PDF viewing', async () => {
+    const descriptor = Object.getOwnPropertyDescriptor(window.navigator, 'pdfViewerEnabled')
+    Object.defineProperty(window.navigator, 'pdfViewerEnabled', {
+      configurable: true,
+      value: false,
+    })
+    const http = httpTransportTestDouble({
+      requestBinary: vi.fn().mockResolvedValue(httpBinaryResponse(
+        new Uint8Array([0x25, 0x50, 0x44, 0x46]),
+        { contentType: 'application/pdf' },
+      )),
+    })
+
+    try {
+      const mounted = mountPanel({
+        artifact: artifact({ name: 'report.pdf', mime: 'application/pdf' }),
+      }, http)
+      await settlePreview()
+
+      expect(mounted.element.querySelector('.artifact-preview__frame--pdf')).toBeNull()
+      expect(mounted.element.querySelector('[role="alert"]')?.textContent)
+        .toContain(en.workbench.artifactPreview.pdfViewerUnavailable)
+      mounted.unmount()
+    } finally {
+      if (descriptor) Object.defineProperty(window.navigator, 'pdfViewerEnabled', descriptor)
+      else Reflect.deleteProperty(window.navigator, 'pdfViewerEnabled')
+    }
+  })
+
   it('bridges Escape from an opaque HTML frame back to the Workbench', async () => {
     const onWorkbenchEvent = vi.fn()
     vi.spyOn(URL, 'createObjectURL').mockReturnValue('about:blank')

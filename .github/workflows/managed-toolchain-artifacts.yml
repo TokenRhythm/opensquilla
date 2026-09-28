@@ -42,9 +42,6 @@ jobs:
             runner: windows-2022
             platform_key: windows-x64
             paper_platform_key: windows-x64
-    env:
-      OPENSQUILLA_REQUIRE_MANAGED_TOOLCHAIN_E2E: "1"
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -80,11 +77,6 @@ jobs:
           uv run --frozen python scripts/validate_managed_toolchain_artifacts.py
           --component media-ffmpeg
           --expect-platform-key ${{ matrix.platform_key }}
-
-      - name: Compile the default four-page paper with the managed toolchain
-        run: >-
-          uv run --frozen pytest -q
-          tests/test_skills/test_meta_paper_skills.py::test_meta_default_compact_contract_compiles_real_content_to_four_pages
 
   validate-musl-paper:
     name: Linux musl x64 TinyTeX real artifact

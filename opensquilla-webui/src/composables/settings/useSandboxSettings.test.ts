@@ -242,8 +242,8 @@ afterEach(() => {
 })
 
 describe('useSandboxSettings auto-save', () => {
-  it.each(['failed', 'unavailable', 'setting_up'] as const)(
-    'does not offer first-time setup for %s', async setupState => {
+  it.each(['unavailable', 'setting_up'] as const)(
+    'does not offer setup for %s', async setupState => {
       const { operations, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
       await settings.load()
       await settle()
@@ -266,6 +266,19 @@ describe('useSandboxSettings auto-save', () => {
     expect(settings.defaultRunModeBaseline.value).toBe('safe')
     scope.stop()
   })
+
+  it.each(['failed', 'ready'] as const)(
+    'offers explicit setup retry/repair for Windows %s', async setupState => {
+      const { operations, scope, settings } = await createSandboxSettings({ desktop: true, setupState })
+      await settings.load()
+      await settle()
+      expect(settings.sandboxSetupStatus.value?.state).toBe(setupState)
+      expect(settings.canRequestSandboxSetup.value).toBe(true)
+      await expect(settings.ensureSandboxSetupForSafeMode()).resolves.toBe(false)
+      expect(operations.ensureReady).toHaveBeenCalledOnce()
+      scope.stop()
+    },
+  )
 
   it('adopts a mode already persisted by the shared setup task without writing it twice', async () => {
     const { operations, scope, settings } = await createSandboxSettings()

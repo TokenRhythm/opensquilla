@@ -68,16 +68,11 @@ If `write_file`, `edit_file`, `apply_patch`, or `execute_code` is available:
   that tool is available.
 - The code examples later in this document apply.
 
-If only `create_pptx` is available:
-
-- Use it only for a basic text-only deck from slide titles, body text, and
-  bullets.
-- Do not use it for illustrated, image-heavy, chart-heavy, template-based, or
-  visually designed decks. It does not support images, icons, charts, custom
-  layouts, or visual QA.
-- If the user asked for those visual features, explain that full visual deck
-  authoring is unavailable in this session instead of calling `create_pptx` as
-  though it satisfies the request.
+In restricted channels, run the inline Python examples with `execute_code`
+and save workspace-relative files before calling `publish_artifact`. Shell,
+Node, and LibreOffice commands require the corresponding exposed tool and
+runtime. Do not use Python subprocesses to bypass an unavailable shell tool,
+and do not retry generation on the host when sandbox execution fails.
 
 If none of those file-authoring tools are available:
 
@@ -112,9 +107,9 @@ user explicitly says "start fresh" or there is no input deck.
 
 ## Path A: Read text from a `.pptx`
 
-Use the helper script. It walks slides via the python-pptx public API and
-prints text grouped by slide. This is always available because python-pptx is
-the only hard dependency.
+When shell execution is available, use the helper script. It walks slides via
+the python-pptx public API and prints text grouped by slide. With
+`execute_code`, use the inline Python example instead.
 
 ```bash
 python {baseDir}/scripts/extract_text.py /path/to/deck.pptx

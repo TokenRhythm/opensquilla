@@ -15,7 +15,7 @@ function transport(call: ReturnType<typeof vi.fn>, supports = true) {
 }
 
 describe('v4 Observability Adapter', () => {
-  it('owns Gateway and self-learning status methods', async () => {
+  it('owns Gateway status', async () => {
     const call = vi.fn(async (method: string) => {
       if (method === 'status') {
         return {
@@ -26,17 +26,6 @@ describe('v4 Observability Adapter', () => {
           active_sessions: 0,
         }
       }
-      return {
-        agentId: 'main',
-        enabled: false,
-        captureEnabled: false,
-        trainingReachable: false,
-        dream: {},
-        activeModel: {},
-        samples: null,
-        gate: null,
-        lastReceipt: null,
-      }
     })
     const adapter = createV4Observability(
       transport(call).value as Parameters<typeof createV4Observability>[0],
@@ -44,9 +33,7 @@ describe('v4 Observability Adapter', () => {
     )
 
     await expect(adapter.gatewayStatus()).resolves.toMatchObject({ status: 'running' })
-    await expect(adapter.selfLearningStatus()).resolves.toMatchObject({ agentId: 'main' })
     expect(call).toHaveBeenNthCalledWith(1, 'status', {}, expect.any(Object))
-    expect(call).toHaveBeenNthCalledWith(2, 'router.selflearning.status', {}, expect.any(Object))
   })
 
   it('rejects a successful response that violates the generated Contract', async () => {

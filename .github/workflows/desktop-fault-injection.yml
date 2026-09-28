@@ -45,6 +45,14 @@ on:
         type: boolean
         required: false
         default: true
+      windows_expected_source_sha:
+        description: Exact signed candidate source SHA required for a release audit
+        required: false
+        default: ''
+      windows_expected_installer_sha256:
+        description: Exact signed installer SHA256 required for a release audit
+        required: false
+        default: ''
 
 permissions:
   actions: read
@@ -331,6 +339,10 @@ jobs:
         shell: pwsh
         env:
           STRICT_RELEASE_AUDIT: ${{ inputs.run_windows_release_audit }}
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ inputs.windows_source_run_id }}
+          EXPECTED_SOURCE: ${{ inputs.windows_expected_source_sha }}
+          EXPECTED_INSTALLER_HASH: ${{ inputs.windows_expected_installer_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $installers = @(Get-ChildItem packaged-windows -Filter *.exe -Recurse)
@@ -340,6 +352,11 @@ jobs:
           }
           $installer = $installers[0].FullName
           if ($env:STRICT_RELEASE_AUDIT -eq 'true') {
+            if ($env:EXPECTED_INSTALLER_HASH -notmatch '^[0-9a-f]{64}$') { throw 'Expected installer hash is required.' }
+            $context = .github/scripts/windows-candidate-context.ps1 -SourceSha $env:EXPECTED_SOURCE -SourceRunId $env:SOURCE_RUN_ID
+            $identityArgs = @('--installer', $installer, '--manifest', 'packaged-windows/audit-candidate.json', '--source-sha', $env:EXPECTED_SOURCE, '--installer-sha256', $env:EXPECTED_INSTALLER_HASH, '--workflow-sha', $context.WorkflowSha, '--expected-version', $context.Version)
+            python .github/scripts/windows_candidate_identity.py @identityArgs
+            if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }
             Write-Host "Signed candidate SHA256: $((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())"
             .github/scripts/verify-windows-signatures.ps1 -InstallerPath $installer
             if ($LASTEXITCODE -ne 0) { throw 'Downloaded installer signature verification failed.' }
@@ -370,6 +387,9 @@ jobs:
           "stage=$stage" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "app=$($exe.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           if ($env:STRICT_RELEASE_AUDIT -eq 'true') {
+            $installedVersion = [Diagnostics.FileVersionInfo]::GetVersionInfo($exe.FullName).ProductVersion
+            python .github/scripts/windows_candidate_identity.py @identityArgs --root $target --installed-version $installedVersion
+            if ($LASTEXITCODE -ne 0) { throw 'Installed signed candidate bytes mismatch.' }
             .github/scripts/verify-windows-signatures.ps1 -InstalledRoot $target
             if ($LASTEXITCODE -ne 0) { throw 'Installed executable signature verification failed.' }
           }
@@ -504,10 +524,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           BASELINE_VERSION: ${{ matrix.baseline-version }}
           INSTALL_MODE: ${{ matrix.install-mode }}
+          EXPECTED_SOURCE: ${{ inputs.windows_expected_source_sha }}
+          SOURCE_RUN_ID: ${{ inputs.windows_source_run_id }}
+          EXPECTED_INSTALLER_HASH: ${{ inputs.windows_expected_installer_sha256 }}
         run: |
           $ErrorActionPreference = 'Stop'
           $candidates = @(Get-ChildItem 'release-audit/OpenSquilla-*-win-x64.exe' -File)
           if ($candidates.Count -ne 1) { throw 'Expected one signed test installer.' }
+          if ($env:EXPECTED_INSTALLER_HASH -notmatch '^[0-9a-f]{64}$') { throw 'Expected installer hash is required.' }
+          $context = .github/scripts/windows-candidate-context.ps1 -SourceSha $env:EXPECTED_SOURCE -SourceRunId $env:SOURCE_RUN_ID
+          python .github/scripts/windows_candidate_identity.py --installer $candidates[0].FullName --manifest release-audit/audit-candidate.json --source-sha $env:EXPECTED_SOURCE --installer-sha256 $env:EXPECTED_INSTALLER_HASH --workflow-sha $context.WorkflowSha --expected-version $context.Version
+          if ($LASTEXITCODE -ne 0) { throw 'Signed candidate provenance mismatch.' }
           Write-Host "Signed candidate SHA256: $((Get-FileHash -LiteralPath $candidates[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
           .github/scripts/verify-windows-signatures.ps1 -InstallerPath $candidates[0].FullName
           if ($LASTEXITCODE -ne 0) { throw 'Downloaded installer signature verification failed.' }
@@ -521,6 +548,31 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: reused-windows-upgrade-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
-          path: ${{ runner.temp }}/opensquilla-release-preservation-reused-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/*.log
+          path: ${{ runner.temp }}/opensquilla-release-preservation-reused-${{ matrix.baseline-version }}-${{ matrix.install-mode }}-${{ matrix.install-mode }}-${{ matrix.baseline-version }}/appdata/OpenSquilla/logs/**
           if-no-files-found: ignore
           retention-days: 7
+
+  windows-candidate-probes:
+    if: ${{ github.repository == 'TokenRhythm/opensquilla' && github.actor == 'Open-Squilla' && inputs.run_windows_release_audit && inputs.windows_source_run_id != '' }}
+    uses: ./.github/workflows/windows-candidate-probes.yml
+    with:
+      artifact_name: ${{ inputs.windows_artifact_name }}
+      source_run_id: ${{ inputs.windows_source_run_id }}
+      source_sha: ${{ inputs.windows_expected_source_sha }}
+      installer_sha256: ${{ inputs.windows_expected_installer_sha256 }}
+      require_signature: true
+
+  windows-release-acceptance:
+    if: ${{ always() && inputs.run_windows_release_audit && inputs.run_windows_upgrade_matrix && inputs.windows_source_run_id != '' }}
+    needs: [windows-fault-injection, windows-release-upgrade-audit, windows-candidate-probes]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all reused signed candidate gates
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          python - <<'PY'
+          import json, os
+          results = json.loads(os.environ['RESULTS'])
+          assert all(job['result'] == 'success' for job in results.values()), results
+          PY

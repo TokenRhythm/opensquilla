@@ -109,14 +109,16 @@ def test_packaged_preset_metadata_is_populated() -> None:
 
 
 def test_packaged_default_model_follows_onboarding_direct_default() -> None:
-    # default_model mirrors onboarding's default-direct-model semantics:
-    # the c1 tier model (c0 fallback) for curated profiles.
+    # OpenRouter's direct default remains independent of its router ladder.
+    # Other legacy profiles retain their c1 model (c0 fallback) as the default.
     golden = _golden()
     for preset_id in sorted(LEGACY_NINE):
         preset = get_preset(preset_id)
         assert preset is not None
         tiers = golden[preset_id]
         expected = str((tiers.get("c1") or tiers.get("c0") or {}).get("model") or "")
+        if preset_id == "openrouter":
+            expected = "deepseek/deepseek-v4-pro"
         assert preset.default_model == expected, preset_id
 
 
@@ -155,10 +157,10 @@ def test_tokenrhythm_curated_ladder() -> None:
         == "static_tokenrhythm_b5"
     )
     expected_models = {
-        "c0": "deepseek-v4-flash-0731",
-        "c1": "deepseek-v4-pro-0813",
-        "c2": "kimi-k2.7-code",
-        "c3": "glm-5.2",
+        "c0": "qwen3.7-flash",
+        "c1": "deepseek-flash",
+        "c2": "deepseek-v4-pro-0813",
+        "c3": "glm-5.3",
         "image_model": "kimi-k2.6",
     }
     tiers = preset.tier_defaults()
@@ -177,7 +179,7 @@ def test_tokenrhythm_curated_ladder() -> None:
     assert tiers["c2"]["supports_image"] is False
     assert tiers["image_model"]["supports_image"] is True
     assert tiers["image_model"]["image_only"] is True
-    assert tiers["c3"]["ensemble_enabled"] is True
+    assert tiers["c3"]["ensemble_enabled"] is False
     assert "ensemble_selection_mode" not in tiers["c3"]
 
 

@@ -15,6 +15,7 @@ interface StoredAttachment {
   workspaceFile?: WorkspaceFileReference
   fileUuid?: string; expiresAt?: number; ttlSeconds?: number
   error?: string
+  origin?: 'paste'
 }
 interface DraftRecord {
   key: string; version: 1; updatedAt: number; expiresAt: number; bytes: number
@@ -49,7 +50,8 @@ function inlineBlob(attachment: Attachment): Blob | undefined {
   return new Blob([bytes], { type: attachment.mime })
 }
 function storedAttachment(attachment: Attachment): StoredAttachment {
-  const base = { name: attachment.name, mime: attachment.mime, size: attachment.size ?? 0 }
+  const base = { name: attachment.name, mime: attachment.mime, size: attachment.size ?? 0,
+    ...(attachment.origin ? { origin: attachment.origin } : {}) }
   if (attachment.kind === 'workspace' && attachment.workspaceFile) {
     // Persist identity, never a native token or a reusable filesystem authority.
     return { ...base, workspaceFile: { ...attachment.workspaceFile } }
@@ -74,6 +76,7 @@ function restore(record: DraftRecord, now: number): Attachment[] {
     bytes += item.blob instanceof Blob ? item.blob.size : item.size
     if (bytes > ATTACHMENT_DRAFT_MAX_BYTES) throw new Error('Saved attachment draft exceeds its size limit')
     const base = { local_id: index + 1, name: item.name, mime: item.mime, size: item.size }
+    const origin = item.origin === 'paste' ? { origin: 'paste' as const } : {}
     if (item.workspaceFile) {
       const ref = item.workspaceFile
       if (typeof ref.workspaceId !== 'string' || typeof ref.relativePath !== 'string'
@@ -81,18 +84,18 @@ function restore(record: DraftRecord, now: number): Attachment[] {
         || ref.relativePath.includes('\\') || ref.relativePath.split('/').some(part => !part || part === '..' || part === '.')) {
         throw new Error('Saved project file reference is invalid; select the file again')
       }
-      return { ...base, kind: 'workspace', workspaceFile: { ...ref } }
+      return { ...base, ...origin, kind: 'workspace', workspaceFile: { ...ref } }
     }
     if (item.blob instanceof Blob && item.blob.size !== item.size) throw new Error('Saved attachment size changed')
     const file = item.blob instanceof Blob ? new File([item.blob], item.name, { type: item.mime }) : undefined
     if (item.fileUuid && typeof item.fileUuid === 'string'
       && (file || (typeof item.expiresAt === 'number' && item.expiresAt * 1000 > now))) {
-      return { ...base, kind: 'staged', file_uuid: item.fileUuid,
+      return { ...base, ...origin, kind: 'staged', file_uuid: item.fileUuid,
         expires_at: item.expiresAt ?? 0, ttl_seconds: item.ttlSeconds, file }
     }
     // Restored bytes go through the ordinary bounded upload path before send.
     // No native path/selection survives a reload, including browser File objects.
-    return { ...base, kind: 'failed', file,
+    return { ...base, ...origin, kind: 'failed', file,
       error: item.error || (file ? 'Draft restored; retry to prepare the file' : 'Select the file again to restore this attachment') }
   })
 }

@@ -271,8 +271,10 @@ conversation. Set it only when you want a default fallback channel. Enable
 
 ## Webhook Channels
 
-Slack webhook mode and WeCom require a public, provider-reachable URL. Feishu
-and Telegram may require one depending on mode.
+Slack webhook mode and WeCom corp-app webhook mode require a public,
+provider-reachable URL. WeCom AI Bot mode uses an outbound WebSocket and does
+not require a public callback URL. Feishu and Telegram may require one depending
+on mode.
 
 For public channels:
 
@@ -294,15 +296,29 @@ Do not expose an unauthenticated gateway to the public internet.
 The limitations below are intentional release boundaries, not a description of
 everything each vendor supports.
 
+SDKs handle provider connections and message/file transport. OpenSquilla still
+owns verified ingress, admission and pairing, session routing, Agent tool
+permissions, and the delivery outbox. An SDK connection or a group's admission
+does not grant the Agent host execution permissions.
+
+| Provider | Transport implementation |
+| --- | --- |
+| Slack | Official [`slack_sdk`][slack-sdk] `AsyncWebClient` and aiohttp Socket Mode client; the SDK owns socket reconnects. File delivery uses `files_upload_v2`. |
+| Discord | Community [`discord.py`][discord-sdk] client owns Gateway authentication, heartbeat, resume, and reconnect. Outbound messages and native attachments keep the existing REST path. |
+| Feishu / Lark | Current official [`lark-oapi`][feishu-sdk] integration is retained. There is no dependency on `lark-channel-sdk`. |
+| DingTalk | Official [`dingtalk-stream`][dingtalk-sdk] remains the ingress transport; native artifact delivery keeps the original inbound context. |
+| WeCom | AI Bot mode uses the community [`wecom-aibot-sdk`][wecom-sdk] Python client for connection lifecycle and media transfer. Corp-app webhook mode remains a separate adapter path. |
+| QQ | Official [`qq-botpy`][qq-sdk] handles C2C/group sessions and supported URL media. SDK adoption does not expand the platform's ordinary-file permissions. |
+
 | Provider | Current experimental boundary | Primary documentation |
 | --- | --- | --- |
-| Slack | Events API and Socket Mode messaging subset. Webhook mode fails closed without request signing. Native Slack AI streaming and complete inbound file handling are not yet exposed. | [Request verification][slack-verification], [Socket Mode][slack-socket] |
+| Slack | Events API and Socket Mode messaging, with native outbound files pinned to the original conversation/thread. Webhook mode fails closed without request signing. Native Slack AI streaming and complete inbound file handling are not yet exposed. | [Request verification][slack-verification], [Socket Mode][slack-socket] |
 | Discord | Gateway messaging/reply subset. Full sharding, component/modal workflows, and parity across all message operations remain incomplete. | [Gateway][discord-gateway], [interactions][discord-interactions] |
 | Telegram | Polling/webhook messaging and common media subset. Draft streaming, callback keyboards, and reaction workflows are not yet complete. | [Bot API][telegram-api] |
 | Feishu / Lark | Webhook or long-connection messaging, attachments, and selected cards. CardKit native streaming and complete event/action normalization remain incomplete. | [Event receipt and encryption][feishu-events] |
-| WeCom | Corp-app webhook and AI Bot websocket messaging. AI Bot live probing and websocket media upload are intentionally unsupported; inbound attachment resolution remains incomplete. Untargeted corp-app sends are rejected instead of broadcasting to `@all`. | [Callback encryption][wecom-callback], [app messages][wecom-messages] |
+| WeCom | Corp-app webhook and AI Bot WebSocket messaging and native outbound files. AI Bot credential probing remains unsupported because a second subscription can disconnect the active client; inbound attachment resolution remains incomplete. Untargeted corp-app sends are rejected instead of broadcasting to `@all`. | [Callback encryption][wecom-callback], [app messages][wecom-messages] |
 | Matrix | Client-server sync and room messaging subset. Full encrypted-media/device-trust behavior and reaction/thread parity remain incomplete. | [Client-Server API v1.19][matrix-client] |
-| QQ | C2C/group text messaging subset. Rich-media, interaction, and complete recall coverage are not yet exposed despite current platform support. | [Message sending][qq-send], [rich media][qq-media] |
+| QQ | C2C/group text and existing public-URL PNG/JPEG, MP4, and SILK media. Local-file uploads, ordinary files, interactions, and complete recall coverage are not exposed. | [Message sending][qq-send], [rich media][qq-media] |
 | DingTalk | Stream-mode message/reply, selected card streaming, and native outbound artifacts associated with the current inbound message. Inbound artifact parsing, proactive/cron attachment sends, and interactive-card action coverage remain incomplete. | [Robot replies and sends][dingtalk-messages], [card interaction][dingtalk-cards] |
 | Microsoft Teams | The legacy adapter is hidden and is not a supported public channel. It must migrate from Bot Framework to Teams SDK or Microsoft 365 Agents SDK before promotion. | [SDK comparison][teams-sdk], [Bot Framework migration][teams-migration] |
 
@@ -313,8 +329,34 @@ OpenSquilla normalizes agent execution through the same runtime path, but the
 platform transport still controls file size limits, message threading, and
 download/upload capabilities.
 
+Agents generate CSV, XLSX, PPTX, and PDF files through the available generic
+workspace tools and skills, then call `publish_artifact`.
+Restricted channel authoring requires a runtime-verified
+managed sandbox workspace; an unavailable sandbox does not fall back to host
+execution.
+
 When a channel cannot deliver a large artifact directly, use the Web UI artifact
 card or session export as the recovery path.
+
+### WeCom AI Bot outbound artifacts
+
+AI Bot mode uploads files through its SDK and replies using the original inbound
+request identifier. Local artifacts must be nonempty and no larger than 20 MiB.
+Images, video, and audio use the matching media message type; other files use a
+native file message. This support does not imply complete inbound attachment
+resolution or enable a second connection for credential probing.
+
+### QQ media and local artifacts
+
+The official C2C/group SDK accepts an existing public URL for PNG/JPEG images,
+MP4 video, and SILK audio. OpenSquilla preserves the original conversation and
+message identifier when uploading and replying with that media.
+
+Local generated artifacts, including CSV, XLSX, PPTX, PDF, and local images,
+return an explicit unsupported delivery result. OpenSquilla does not upload
+them to a public host, turn documents into images, or use the unopened ordinary
+file endpoint to bypass that boundary. The artifact remains available through
+the existing OpenSquilla download surface.
 
 ### DingTalk outbound artifacts
 
@@ -370,6 +412,12 @@ If a channel does not respond:
 
 [slack-verification]: https://docs.slack.dev/authentication/verifying-requests-from-slack/
 [slack-socket]: https://docs.slack.dev/apis/events-api/using-socket-mode/
+[slack-sdk]: https://github.com/slackapi/python-slack-sdk
+[discord-sdk]: https://github.com/Rapptz/discord.py
+[feishu-sdk]: https://github.com/larksuite/oapi-sdk-python
+[dingtalk-sdk]: https://github.com/open-dingtalk/dingtalk-stream-sdk-python
+[wecom-sdk]: https://github.com/xiaowangzhixiao/wecom-aibot-python-sdk
+[qq-sdk]: https://github.com/tencent-connect/botpy
 [discord-gateway]: https://docs.discord.com/developers/events/gateway
 [discord-interactions]: https://docs.discord.com/developers/interactions/receiving-and-responding
 [telegram-api]: https://core.telegram.org/bots/api

@@ -233,16 +233,19 @@ async function controlPage(app) {
   }
 }
 
-async function onboardingPage(app) {
-  return await waitFor(async () => {
-    for (const candidate of app.windows()) {
-      if (candidate.isClosed()) continue
-      observeRenderer(candidate)
-      await candidate.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
-      if (await candidate.locator('#setup-form').count().catch(() => 0)) return candidate
-    }
-    return null
-  }, 'normal primary onboarding')
+async function unconfiguredControlPage(app) {
+  const page = await controlPage(app)
+  // Existing config remains startup authority even without a usable credential.
+  // The live client exposes Settings; it must not replay first-run onboarding.
+  const notice = page.locator('.chat-model-setup-notice')
+  await notice.waitFor({ state: 'visible' })
+  assert.equal(await notice.getByRole('button').isVisible(), true)
+  for (const candidate of app.windows()) {
+    if (candidate.isClosed()) continue
+    await candidate.waitForLoadState('domcontentloaded', { timeout: 5_000 })
+    assert.equal(await candidate.locator('#setup-form').count(), 0, candidate.url())
+  }
+  return page
 }
 
 async function createLegacyRecovery({
@@ -581,15 +584,15 @@ try {
   await closeActiveApp('consolidated-primary-electron-shutdown')
 
   // A completed receipt is never replayed. If the user later removes the
-  // primary credential, startup must offer normal onboarding instead of
-  // resurrecting the archived historical secret.
+  // primary credential, startup must still reach the client and offer Settings
+  // without resurrecting the archived historical secret or replaying onboarding.
   await rm(primaryCredential)
   activeAppUserData = userData
   app = await electron.launch({
     args: ['--use-mock-keychain', `--user-data-dir=${userData}`, packageRoot],
     env: launchEnvironment(isolatedHome),
   })
-  await onboardingPage(app)
+  await unconfiguredControlPage(app)
   assert.equal(await pathExists(primaryCredential), false)
   assert.equal(
     JSON.parse(await readFile(consolidationReceiptPath, 'utf8')).credential_adoption_status,
@@ -610,7 +613,7 @@ try {
 
   // A recovery may be the newest valid configuration source without carrying
   // a Desktop credential. Consolidation still succeeds, consumes the legacy
-  // profile, and presents normal primary onboarding for a fresh credential.
+  // profile, and opens the client with a Settings entry for a fresh credential.
   const configOnlyUserData = join(root, 'config-only-user-data')
   const configOnlyHome = join(root, 'config-only-home')
   const configOnlyPrimaryHome = join(configOnlyUserData, 'opensquilla')
@@ -629,7 +632,7 @@ try {
     args: ['--use-mock-keychain', `--user-data-dir=${configOnlyUserData}`, packageRoot],
     env: launchEnvironment(configOnlyHome),
   })
-  await onboardingPage(app)
+  await unconfiguredControlPage(app)
   assert.equal(await pathExists(join(configOnlyUserData, 'recovery-profiles')), false)
   assert.equal(await pathExists(join(configOnlyPrimaryHome, 'config.toml')), true)
   assert.equal(await pathExists(join(configOnlyUserData, 'desktop-credential.json')), false)
@@ -729,7 +732,7 @@ try {
 
   // Corrupt historical credential bytes are archived and reported, but they
   // must not make startup permanently fail. The copied primary configuration
-  // remains usable and normal onboarding collects a new credential.
+  // remains usable and the client offers Settings for a new credential.
   const invalidUserData = join(root, 'invalid-credential-user-data')
   const invalidHome = join(root, 'invalid-credential-home')
   const invalidPrimaryHome = join(invalidUserData, 'opensquilla')
@@ -748,7 +751,7 @@ try {
     args: ['--use-mock-keychain', `--user-data-dir=${invalidUserData}`, packageRoot],
     env: launchEnvironment(invalidHome),
   })
-  await onboardingPage(app)
+  await unconfiguredControlPage(app)
   assert.equal(await pathExists(join(invalidUserData, 'recovery-profiles')), false)
   assert.equal(await pathExists(join(invalidPrimaryHome, 'config.toml')), true)
   assert.equal(await pathExists(join(invalidUserData, 'desktop-credential.json')), false)
@@ -791,9 +794,10 @@ try {
     recoveryChoiceUiPresent: false,
     pendingReceiptRecoveredAfterCrash: true,
     completedReceiptDidNotResurrectCredential: true,
-    configOnlySourceOnboarding: true,
+    completedReceiptUnconfiguredClientReady: true,
+    configOnlySourceClientReady: true,
     credentialOnlySourceGeneratedPrimary: true,
-    invalidCredentialOnboarding: true,
+    invalidCredentialClientReady: true,
     invalidCredentialStableCode: skippedCredentialEvent.stableCode,
   }, null, 2))
 } catch (error) {

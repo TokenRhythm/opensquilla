@@ -24,6 +24,13 @@ const gatewayUvArgs = [
   '--extra', 'recommended', '--extra', 'mcp', '--extra', 'msg',
   '--extra', 'matrix', '--extra', 'document-extras',
 ]
+// PTY backends are imported lazily by the managed execution path, so
+// PyInstaller cannot discover them from the Python source graph.  Collect only
+// the backend for the current build platform: ptyprocess is pure Python on
+// POSIX, while winpty includes the pywinpty ConPTY extension on Windows.
+const ptyCollectionArgs = process.platform === 'win32'
+  ? ['--collect-all', 'winpty']
+  : ['--collect-all', 'ptyprocess']
 
 function findFilesByName(root, fileName) {
   const matches = []
@@ -331,6 +338,7 @@ const args = [
   pyinstallerWorkDir,
   '--specpath',
   pyinstallerWorkDir,
+  ...ptyCollectionArgs,
   '--collect-all',
   'opensquilla',
   '--collect-all',
@@ -339,6 +347,12 @@ const args = [
   // PyInstaller's static import discovery of the anyascii._data subpackage.
   '--collect-all',
   'anyascii',
+  // Generic authoring code imports these at runtime. Retired model tools no
+  // longer provide static imports for PyInstaller to discover.
+  '--collect-all',
+  'openpyxl',
+  '--collect-all',
+  'reportlab',
   '--collect-data',
   'certifi',
   '--hidden-import',

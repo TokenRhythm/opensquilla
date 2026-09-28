@@ -27,28 +27,6 @@
   padding: 2rem 0 6rem;
 }
 
-/* Once setup is requested it becomes the primary task. Reclaim the landing
-   greeting's space so the dependency details remain comfortably readable on
-   short and mobile viewports while the composer stays available below. */
-.chat--new-landing.chat--meta-setup {
-  justify-content: flex-start;
-  gap: 0;
-  padding: var(--sp-3) 0;
-}
-
-.chat--new-landing.chat--meta-setup .chat-body {
-  display: none;
-}
-
-.chat--new-landing.chat--meta-setup > .meta-setup-card {
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.chat--new-landing.chat--meta-setup .chat-composer-dock {
-  width: 100%;
-}
-
 .chat-share-banner {
   display: flex;
   align-items: center;
@@ -214,10 +192,10 @@
 .chat-thread {
   flex: 1;
   overflow-y: auto;
-  /* ChatMessageList owns variable-row anchor correction. Native scroll
+  /* TanStack Virtual owns variable-row anchor correction. Native scroll
      anchoring would apply the same height delta a second time. */
   overflow-anchor: none;
-  padding: 0.25rem 0 1.5rem;
+  padding: 0.25rem 0 0;
   display: flex;
   flex-direction: column;
   gap: 0.25rem;
@@ -226,20 +204,6 @@
      content's left edge) does not shift when the conversation grows a
      scrollbar mid-stream. */
   scrollbar-gutter: stable;
-}
-
-/* Native anchoring preserves a non-virtualized reader's visible paragraph
-   across width reflow. Live following and virtualized history keep their
-   existing application-owned pin/correction so the two systems never stack. */
-.chat-thread--reading-history:has(.chat-message-list[data-virtualized="false"]) {
-  overflow-anchor: auto;
-}
-
-/* Vue-owned fallback for WebViews without :has(): ChatView mirrors the
-   virtualizer state on the thread element so historical reflow keeps the
-   browser's native anchor in the same cases. */
-.chat-thread--reading-history.chat-thread--nonvirtualized {
-  overflow-anchor: auto;
 }
 
 /* Floating composer (existing conversation, toggle on): reserve the dock's
@@ -254,6 +218,17 @@
 .chat-thread:focus-visible {
   box-shadow: inset 0 0 0 2px var(--border-focus);
   outline: none;
+}
+
+.chat-thread__header {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.chat-thread__header:empty {
+  display: none;
 }
 
 .chat-message-surface {
@@ -1079,13 +1054,6 @@
   .chat--new-landing {
     padding: clamp(3.25rem, 13vh, 5.5rem) 0.75rem 1.25rem;
     gap: 0.875rem;
-  }
-
-  /* The app topbar floats above new-chat content. Setup mode intentionally
-     replaced the landing padding with a compact desktop inset, so restore a
-     phone-safe top inset here and keep the card title/status fully visible. */
-  .chat--new-landing.chat--meta-setup {
-    padding: calc(3.25rem + env(safe-area-inset-top, 0px)) 0.75rem 0.75rem;
   }
 
   .chat-landing-brand,

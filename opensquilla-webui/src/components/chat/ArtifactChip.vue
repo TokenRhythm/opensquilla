@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
 import ResourceActionsMenu from '@/components/ResourceActionsMenu.vue'
+import ImageCopyActions from '@/components/ImageCopyActions.vue'
+import { isClipboardImageCandidate } from '@/composables/useImageClipboard'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import type { IconName } from '@/utils/icons'
@@ -11,6 +13,7 @@ const { t } = useI18n()
 const props = defineProps<{
   artifact: ArtifactPayload
   sessionKey?: string
+  shareMode?: boolean
   category: string
   iconName: IconName
   title: string
@@ -68,6 +71,8 @@ const bodyLabel = computed(() => {
       </span>
     </button>
     <span class="msg-artifact-actions">
+      <ImageCopyActions v-if="!shareMode && isClipboardImageCandidate(artifact)"
+        :source="{ kind: 'artifact', artifact }" :session-key="sessionKey" :source-menu="false" />
       <ResourceActionsMenu ref="fileMenu" :artifact="artifact" :session-key="sessionKey"
         :previewable="previewable" trigger @open="emit('open', $event)" />
       <!-- Previewable: an explicit "Open" verb plus an icon-only Download.

@@ -1,6 +1,5 @@
 import { createClientRequestId } from './messageIdentity'
 import { createPendingRequestStore } from './pendingRequestStore'
-import type { GoalExecutionOptions } from '@/modules/goalCenter'
 
 interface PendingGoalSet {
   clientRequestId: string
@@ -16,13 +15,9 @@ const requests = createPendingRequestStore(
   },
 )
 
-export function goalSetIdentity(
-  sessionKey: string, epoch: number, objective: string, options: GoalExecutionOptions,
-): string {
-  return JSON.stringify([
-    sessionKey, epoch, objective,
-    options.tokenBudget ?? null, options.executionPolicy ?? 'foreground',
-  ])
+export function goalSetIdentity(sessionKey: string, epoch: number, objective: string): string {
+  // Preserve persisted ordinary requests across upgrades; legacy custom settings stay distinct.
+  return JSON.stringify([sessionKey, epoch, objective, null, 'foreground'])
 }
 
 export function recoverGoalSet(identity: string): PendingGoalSet {

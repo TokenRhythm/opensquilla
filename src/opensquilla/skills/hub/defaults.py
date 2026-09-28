@@ -14,6 +14,7 @@ from opensquilla.skills.hub.installer import SkillInstaller
 from opensquilla.skills.hub.lockfile import Lockfile
 from opensquilla.skills.hub.management import SkillManagementService
 from opensquilla.skills.hub.router import SourceRouter
+from opensquilla.skills.hub.skillhub import SkillHubSource
 from opensquilla.skills.hub.source import SkillSource
 
 _default_router: SourceRouter | None = None
@@ -29,6 +30,10 @@ def get_default_skill_router() -> SourceRouter:
             ClawHubSource(
                 token=os.environ.get("CLAWHUB_TOKEN"),
                 github_source=github,
+            ),
+            SkillHubSource(
+                base_url=os.environ.get("SKILLHUB_BASE_URL", "https://api.skillhub.cn"),
+                token=os.environ.get("SKILLHUB_API_KEY"),
             ),
             github,
         ]

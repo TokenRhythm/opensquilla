@@ -3,7 +3,7 @@ export type HelloOkOverrides = {
   features?: Record<string, unknown>
   snapshot?: Record<string, unknown>
   policy?: Record<string, unknown>
-  auth?: Record<string, unknown> | null
+  auth?: { principal?: Record<string, unknown> | null; [key: string]: unknown } | null
   [key: string]: unknown
 }
 
@@ -14,7 +14,7 @@ export function helloOkFrame(overrides: HelloOkOverrides = {}) {
     features = {},
     snapshot = {},
     policy = {},
-    auth = null,
+    auth = {},
     ...extensions
   } = overrides
   return {
@@ -36,7 +36,18 @@ export function helloOkFrame(overrides: HelloOkOverrides = {}) {
       tick_interval_ms: 30_000,
       ...policy,
     },
-    auth,
+    // Real Gateway hellos carry a complete server-derived principal. Partial
+    // fixture overrides customize it; auth:null explicitly models a peer
+    // without identity proof and must not authorize durable delivery.
+    auth: auth === null ? null : {
+      ...auth,
+      principal: auth.principal === null ? null : {
+        role: 'operator', authenticated: true, isOwner: true, authState: 'authenticated',
+        scopes: ['operator.read', 'operator.write'], capabilities: ['chat.read', 'chat.write'],
+        tokenPublicId: null, guestOwnerId: null,
+        ...auth.principal,
+      },
+    },
   }
 }
 

@@ -3,6 +3,7 @@ import i18n, { loadLocaleMessages } from '@/i18n'
 import type { ChatMessage } from '@/types/chat'
 import { normalizeTurnOutcome } from './turnOutcome'
 import { localizedChatErrorMessage } from './errors'
+import { chatErrorPresentation } from './chatErrorPresentation'
 import { dedupeTerminalErrorNotices } from './terminalErrorNotices'
 import { reconcileClientTerminalNotices } from './historyMerge'
 
@@ -24,8 +25,8 @@ describe('provider terminal metadata', () => {
     const outcome = normalizeTurnOutcome({ turn_id: 't', code: '429', message: fallback })
     expect(outcome?.errorId).toBeUndefined()
     expect(outcome?.failureKind).toBeUndefined()
-    expect(localizedChatErrorMessage('429', fallback)).toBe(fallback)
-    expect(localizedChatErrorMessage('429', fallback, false, 'future_kind')).toBe(fallback)
+    expect(localizedChatErrorMessage('429', fallback)).toBe('The task did not finish. Please try again later.')
+    expect(localizedChatErrorMessage('429', fallback, false, 'future_kind')).toBe('The task did not finish. Please try again later.')
   })
 
   it('fails closed when references or turn identities conflict', () => {
@@ -42,8 +43,8 @@ describe('provider terminal metadata', () => {
       'policy_refusal', 'empty_response', 'malformed_response', 'bad_request'] as const) {
       const message = localizedChatErrorMessage('429', 'safe fallback', false, kind)
       expect(message).not.toBe('safe fallback')
-      expect(message).not.toContain('chat.providerFailure.')
-      expect(message).toBe(i18n.global.getLocaleMessage(locale).chat.providerFailure[kind])
+      expect(message).not.toContain('chat.errorMessage.')
+      expect(message).toBe(i18n.global.t(chatErrorPresentation({ failureKind: kind }).messageKey))
     }
     i18n.global.locale.value = 'en'
   })
@@ -88,16 +89,21 @@ describe('provider terminal metadata', () => {
     } }
     const rich = notice('abcdef01')
     const [merged] = dedupeTerminalErrorNotices(reversed ? [rich, terminal] : [terminal, rich])
-    expect(merged?.text).toBe('Safe timeout')
+    expect(merged?.text).toBe(i18n.global.t('chat.errorMessage.timeout'))
     expect(merged?.turnOutcome).toMatchObject({ status: 'timeout', reason: 'hard_deadline_exceeded', errorId: 'abcdef01' })
   })
 
-  it('keeps more specific terminal guidance', () => {
-    for (const code of ['timeout', 'llm_timeout', 'provider_output_truncated', 'provider_request_too_large']) {
-      expect(localizedChatErrorMessage(code, 'specific guidance', false, 'rate_limited')).toBe('specific guidance')
+  it('replaces technical terminal guidance with a concise local cause', () => {
+    for (const [code, key] of [
+      ['timeout', 'timeout'], ['llm_timeout', 'timeout'],
+      ['provider_output_truncated', 'responseIncomplete'], ['provider_request_too_large', 'contextLimit'],
+    ]) {
+      expect(localizedChatErrorMessage(code, 'specific guidance', false, 'rate_limited'))
+        .toBe(i18n.global.t(`chat.errorMessage.${key}`))
     }
     const reasoning = 'The model used its output budget for reasoning without returning a visible answer. Increase the budget.'
-    expect(localizedChatErrorMessage('empty_response', reasoning, false, 'empty_response')).toBe(reasoning)
+    expect(localizedChatErrorMessage('empty_response', reasoning, false, 'empty_response'))
+      .toBe(i18n.global.t('chat.errorMessage.responseIncomplete'))
   })
 
   it('merges notices by explicit turn, keeps partial content, and retains reference conflicts', () => {

@@ -31,20 +31,13 @@ async def test_slack_send_file_uses_external_upload_flow(tmp_path: Path) -> None
     requests: list[tuple[str, dict[str, Any]]] = []
 
     class FakeClient:
-        async def post(self, path: str, **kwargs: Any) -> _FakeResponse:
-            requests.append((path, kwargs))
-            if path == "/files.getUploadURLExternal":
-                return _FakeResponse(
-                    {"ok": True, "upload_url": "https://upload.test", "file_id": "F1"}
-                )
-            if path == "https://upload.test":
-                return _FakeResponse({"ok": True})
-            if path == "/files.completeUploadExternal":
-                return _FakeResponse({"ok": True, "files": [{"id": "F1"}]})
-            raise AssertionError(path)
+        async def files_upload_v2(self, **kwargs: Any) -> dict[str, Any]:
+            requests.append(("files_upload_v2", kwargs))
+            assert Path(kwargs["file"]).read_bytes() == b"report"
+            return {"ok": True, "files": [{"id": "F1"}]}
 
     channel = SlackChannel(token="xoxb-token", slack_channel_id="C-default")
-    channel._client = FakeClient()  # type: ignore[assignment]
+    channel._client = FakeClient()
 
     result = await channel.send_file("C-target", str(file_path), content="done")
 
@@ -52,18 +45,18 @@ async def test_slack_send_file_uses_external_upload_flow(tmp_path: Path) -> None
     assert result.capability == ChannelCapabilities.NATIVE_FILE_UPLOAD
     assert result.target_id == "C-target"
     assert result.provider_file_id == "F1"
-    assert requests[0][0] == "/files.getUploadURLExternal"
-    assert requests[1][0] == "https://upload.test"
-    assert requests[2] == (
-        "/files.completeUploadExternal",
-        {
-            "json": {
-                "files": [{"id": "F1", "title": "report.txt"}],
-                "channel_id": "C-target",
+    assert requests == [
+        (
+            "files_upload_v2",
+            {
+                "file": str(file_path),
+                "filename": "report.txt",
+                "title": "report.txt",
+                "channel": "C-target",
                 "initial_comment": "done",
-            }
-        },
-    )
+            },
+        )
+    ]
 
 
 @pytest.mark.asyncio

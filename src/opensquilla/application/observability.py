@@ -8,11 +8,6 @@ from typing import Literal, NotRequired, Protocol, TypedDict
 
 
 @dataclass(frozen=True, slots=True)
-class RouterLearningQuery:
-    agent_id: str = "main"
-
-
-@dataclass(frozen=True, slots=True)
 class LogTailQuery:
     cursor: int = 0
     limit: int = 100
@@ -58,19 +53,6 @@ class RuntimeStatusResult(TypedDict):
     provider: NotRequired[str | None]
 
 
-class RouterLearningStatusResult(TypedDict):
-    agentId: str
-    enabled: bool
-    captureEnabled: bool
-    trainingReachable: bool
-    dream: Mapping[str, object]
-    activeModel: Mapping[str, object]
-    samples: Mapping[str, object] | None
-    gate: Mapping[str, object] | None
-    lastReceipt: Mapping[str, object] | None
-    error: NotRequired[str]
-
-
 class LogStatusResult(TypedDict):
     raw_turn_call_log: Mapping[str, object]
     gateway_file_log: Mapping[str, object]
@@ -102,10 +84,6 @@ class ReadinessReport(TypedDict):
 
 class RuntimeStatusPort(Protocol):
     async def snapshot(self) -> RuntimeStatusResult: ...
-
-
-class RouterLearningStatusPort(Protocol):
-    async def snapshot(self, query: RouterLearningQuery) -> RouterLearningStatusResult: ...
 
 
 class LogReaderPort(Protocol):
@@ -155,15 +133,6 @@ class RuntimeStatus:
 
     async def read(self) -> RuntimeStatusResult:
         return await self._port.snapshot()
-
-
-class RouterLearningStatus:
-    def __init__(self, port: RouterLearningStatusPort) -> None:
-        self._port = port
-
-    async def read(self, query: RouterLearningQuery) -> RouterLearningStatusResult:
-        agent_id = str(query.agent_id or "main").strip() or "main"
-        return await self._port.snapshot(RouterLearningQuery(agent_id))
 
 
 class LogReader:
@@ -319,10 +288,6 @@ __all__ = [
     "ReadinessQuery",
     "ReadinessReport",
     "ReadinessReportPort",
-    "RouterLearningQuery",
-    "RouterLearningStatus",
-    "RouterLearningStatusPort",
-    "RouterLearningStatusResult",
     "RuntimeStatus",
     "RuntimeStatusPort",
     "RuntimeStatusResult",

@@ -21,7 +21,7 @@ describe('usage query presentation boundary', () => {
     const usage = vi.fn<Observability['usage']>().mockResolvedValue(snapshot)
     const unused = async (): Promise<never> => { throw new Error('Unexpected observation') }
     const observability: Observability = {
-      usage, gatewayStatus: unused, selfLearningStatus: unused, readiness: unused,
+      usage, gatewayStatus: unused, readiness: unused,
       logStatus: unused, tailLogs: unused, updateNotice: unused, downloadSupportBundle: unused,
     }
     const options = {

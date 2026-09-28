@@ -25,6 +25,8 @@ export interface TransportCallOptions {
   signal?: AbortSignal
   timeoutAction?: TransportTerminationAction
   abortAction?: TransportTerminationAction
+  /** Missing values fail closed as mutations while wake recovery is active. */
+  recoveryClass?: 'safe-read' | 'read' | 'mutation' | 'ephemeral'
   cancelOnAbort?: boolean
   expectedGeneration?: number
   onSent?: (socketGeneration: number) => void

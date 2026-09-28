@@ -435,18 +435,15 @@ describe('SandboxSettingsPanel', () => {
       .toBe(false)
   })
 
-  it('immediately persists an available Safe mode selection without Save or Discard', async () => {
+  it('requires explicit Windows setup even when Safe currently appears available', async () => {
     const { el, operations } = await mountPanel()
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
     await settle()
 
-    expect(operations.selectMode).toHaveBeenCalledWith('safe')
+    expect(operations.selectMode).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
     expect(el.querySelector('[data-testid="save-sandbox-section"]')).toBeNull()
-    await vi.waitFor(() => {
-      expect(el.querySelector('[data-testid="sandbox-safe-mode"]')?.classList.contains('is-selected'))
-        .toBe(true)
-    })
   })
 
   it('does not retry an unavailable live capability in the background', async () => {
@@ -527,7 +524,7 @@ describe('SandboxSettingsPanel', () => {
     expect(operations.ensureReady).not.toHaveBeenCalled()
   })
 
-  it.each(['failed', 'unavailable', 'setting_up'] as const)(
+  it.each(['unavailable', 'setting_up'] as const)(
     'disables Safe mode when sandbox status is %s without opening setup',
     async setupState => {
       const { el, operations } = await mountPanel({ setupState })
@@ -543,6 +540,18 @@ describe('SandboxSettingsPanel', () => {
         .toBe(false)
     },
   )
+
+  it('offers retry setup when sandbox status is failed', async () => {
+    const { el, operations } = await mountPanel({ setupState: 'failed' })
+    const safeButton = el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!
+
+    expect(safeButton.disabled).toBe(false)
+    safeButton.click()
+    await settle()
+
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+    expect(operations.ensureReady).not.toHaveBeenCalled()
+  })
 
   it('allows cancelling first-time setup and opening it again without installing', async () => {
     const { el, operations } = await mountPanel({ setupState: 'not_setup' })
@@ -691,8 +700,9 @@ describe('SandboxSettingsPanel', () => {
 
     expect(el.querySelector('[data-testid="sandbox-full-mode"]')?.classList.contains('is-selected'))
       .toBe(true)
-    expect(el.querySelector('[data-testid="sandbox-setup-result"]')?.textContent)
-      .not.toContain('windows_setup_helper_cancelled')
+    expect(el.querySelector('[data-testid="sandbox-setup-result"]')).toBeNull()
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
+    expect(document.body.textContent).not.toContain('windows_setup_helper_cancelled')
     expect(operations.selectMode).not.toHaveBeenCalled()
   })
 

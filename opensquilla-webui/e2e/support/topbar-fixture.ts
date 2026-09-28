@@ -1,5 +1,12 @@
+import { fileURLToPath } from 'node:url'
 import { expect, type Page, type WebSocketRoute } from '@playwright/test'
 import { helloOkResponse } from './gateway-fixture'
+import {
+  chatHistoryPayload,
+  sessionMessagesHydratePayload,
+  sessionMessagesSnapshotPayload,
+  sessionMessagesSubscribePayload,
+} from './session-read-fixtures'
 
 export const CONTROL_URL = '/control/'
 export const TOPBAR_FIXED_TIME = new Date('2024-01-15T08:00:00.000Z')
@@ -53,10 +60,6 @@ export type TopbarScenario = {
   theme?: string
   deliverableCount?: number
   approvalCount?: number
-  bgm?: {
-    enabled: boolean
-    playing: boolean
-  }
   update?: Partial<TopbarUpdateState> | null
 }
 
@@ -157,53 +160,30 @@ function historyPayload(deliverableCount: number) {
     mime: 'text/csv',
     size: 2048 + index,
   }))
-  return {
-    messages: [
-      {
-        role: 'user',
-        text: 'Review the responsive topbar contract.',
-        message_id: 'msg-topbar-user',
-        timestamp: '2024-01-15T07:58:00.000Z',
-      },
-      {
-        role: 'assistant',
-        text: 'The deterministic topbar fixture is ready.',
-        message_id: 'msg-topbar-assistant',
-        timestamp: '2024-01-15T07:59:00.000Z',
-        artifacts,
-      },
-    ],
-    has_more: false,
-    canonical_complete: true,
-  }
+  return chatHistoryPayload([
+    {
+      role: 'user',
+      text: 'Review the responsive topbar contract.',
+      message_id: 'msg-topbar-user',
+      timestamp: '2024-01-15T07:58:00.000Z',
+    },
+    {
+      role: 'assistant',
+      text: 'The deterministic topbar fixture is ready.',
+      message_id: 'msg-topbar-assistant',
+      timestamp: '2024-01-15T07:59:00.000Z',
+      artifacts,
+    },
+  ])
 }
 
 async function installPreferences(page: Page, scenario: Required<Pick<
   TopbarScenario,
-  'locale' | 'theme' | 'bgm'
+  'locale' | 'theme'
 >>) {
-  await page.addInitScript(({ locale, theme, bgm }) => {
+  await page.addInitScript(({ locale, theme }) => {
     localStorage.setItem('opensquilla-locale', locale)
     localStorage.setItem('opensquilla-theme', theme)
-    localStorage.setItem('opensquilla-bgm', JSON.stringify({
-      enabled: bgm.enabled,
-      playing: bgm.playing,
-      trackId: bgm.playing ? 'topbar-synthetic-track' : '',
-      volume: 0.35,
-    }))
-
-    if (bgm.playing) {
-      // The shipped playlist is intentionally empty. Stub only the media
-      // settlement and provide one synthetic manifest entry so "playing" is a
-      // stable UI state without making an audio or third-party network request.
-      HTMLMediaElement.prototype.play = function play() {
-        this.dispatchEvent(new Event('play'))
-        return Promise.resolve()
-      }
-      HTMLMediaElement.prototype.pause = function pause() {
-        this.dispatchEvent(new Event('pause'))
-      }
-    }
   }, scenario)
 }
 
@@ -286,8 +266,11 @@ async function installStaticRoutes(
   page: Page,
   sessionKey: string,
   approvals: ReturnType<typeof approvalSnapshot>,
-  bgmEnabled: boolean,
 ) {
+  await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
+    path: fileURLToPath(new URL('../../public-assets/opensquilla-mark.png', import.meta.url)),
+    contentType: 'image/png',
+  }))
   await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
   await page.route('**/api/elevated-mode', route => route.fulfill({
     json: { enabled: false },
@@ -295,17 +278,6 @@ async function installStaticRoutes(
   await page.route('**/api/approvals', route => route.fulfill({
     json: { pending: approvals, mode: 'prompt', allowPatterns: [], denyPatterns: [] },
   }))
-  if (bgmEnabled) {
-    const playlist = {
-      tracks: [{
-        id: 'topbar-synthetic-track',
-        title: 'Synthetic silence',
-        src: 'https://example.invalid/topbar-silence.mp3',
-      }],
-    }
-    await page.route('**/music/playlist.local.json', route => route.fulfill({ json: playlist }))
-    await page.route('**/music/playlist.json', route => route.fulfill({ json: playlist }))
-  }
 
   // Keep the route's session explicit even when a gateway with unrelated
   // operator data is behind the page. The WebSocket below is fully synthetic.
@@ -357,13 +329,7 @@ async function installMockGateway(
         return
       }
       if (method === 'sessions.messages.subscribe') {
-        ws.send(response(frame.id, {
-          subscribed: true,
-          replay_complete: true,
-          current_stream_seq: 0,
-          run_status: 'idle',
-          active_task: null,
-        }))
+        ws.send(response(frame.id, sessionMessagesSubscribePayload(sessionKey)))
         return
       }
       if (method === 'sandbox.run_mode.preference.get') {
@@ -372,6 +338,8 @@ async function installMockGateway(
       }
 
       const payloads: Record<string, unknown> = {
+        'sessions.messages.snapshot': sessionMessagesSnapshotPayload(sessionKey),
+        'sessions.messages.hydrate': sessionMessagesHydratePayload(sessionKey),
         'agents.list': { agents: [] },
         'commands.list_for_surface': { commands: [] },
         'config.get': {
@@ -436,13 +404,12 @@ export async function openTopbarSession(page: Page, options: TopbarScenario = {}
   const theme = options.theme || 'light'
   const deliverableCount = Math.max(0, Math.floor(options.deliverableCount ?? 1))
   const approvalCount = Math.max(0, Math.floor(options.approvalCount ?? 0))
-  const bgm = options.bgm || { enabled: false, playing: false }
   const approvals = approvalSnapshot(sessionKey, approvalCount)
 
   await page.clock.setFixedTime(TOPBAR_FIXED_TIME)
-  await installPreferences(page, { locale, theme, bgm })
+  await installPreferences(page, { locale, theme })
   if (options.update) await installDesktopUpdateBridge(page, options.update)
-  await installStaticRoutes(page, sessionKey, approvals, bgm.enabled)
+  await installStaticRoutes(page, sessionKey, approvals)
   const gateway = await installMockGateway(page, sessionKey, title, deliverableCount)
 
   await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(sessionKey)}`)
@@ -450,9 +417,6 @@ export async function openTopbarSession(page: Page, options: TopbarScenario = {}
   await waitForTopbarStable(page, theme)
   if (approvalCount > 0) {
     await expect(page.getByTestId('chat-system-status')).toHaveAttribute('data-severity', 'danger')
-  }
-  if (bgm.playing) {
-    await expect(page.getByTestId('bgm-toggle')).toHaveAttribute('aria-pressed', 'true')
   }
 
   return {
@@ -504,7 +468,6 @@ export async function probeTopbarGeometry(
       const box = element.getBoundingClientRect()
       return {
         element,
-        composite: element.closest('.bgm-menu-wrap'),
         label: labelFor(element, index),
         left: box.left,
         right: box.right,
@@ -525,8 +488,6 @@ export async function probeTopbarGeometry(
       for (let rightIndex = leftIndex + 1; rightIndex < controls.length; rightIndex += 1) {
         const left = controls[leftIndex]
         const right = controls[rightIndex]
-        // BGM is an intentional split button; its two controls share a border.
-        if (left.composite && left.composite === right.composite) continue
         const overlapWidth = Math.min(left.right, right.right) - Math.max(left.left, right.left)
         const overlapHeight = Math.min(left.bottom, right.bottom) - Math.max(left.top, right.top)
         if (overlapWidth > 0.5 && overlapHeight > 0.5) {
@@ -578,7 +539,7 @@ export async function probeTopbarGeometry(
       scrollWidth: document.documentElement.scrollWidth,
       topbarClientWidth: topbar?.clientWidth ?? 0,
       topbarScrollWidth: topbar?.scrollWidth ?? 0,
-      controls: controls.map(({ element: _element, composite: _composite, ...control }) => control),
+      controls: controls.map(({ element: _element, ...control }) => control),
       outsideViewport,
       overlaps,
       missedCenters,

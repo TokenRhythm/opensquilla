@@ -106,7 +106,7 @@
               class="msg-thumb-button"
               :title="attachmentPrimaryActionLabel(attachment)"
               :aria-label="attachmentPrimaryActionLabel(attachment)"
-              @click.stop="emit('previewImage', attachment)"
+              @click.stop="previewImage(attachment, $event)"
             >
               <img
                 class="msg-thumb"
@@ -115,6 +115,7 @@
               />
             </button>
             <span v-if="!shareMode" class="msg-file-resource__actions">
+              <ImageCopyActions :source="{ kind: 'attachment', attachment }" :session-key="sessionKey" />
               <button
                 type="button"
                 :title="attachmentDownloadLabel(attachment)"
@@ -141,7 +142,7 @@
               :aria-label="attachment.workspaceFile ? undefined : attachmentPrimaryActionLabel(attachment)"
               :aria-busy="attachment.workspaceFile ? undefined : downloadingAttachments.has(attachment.renderKey)"
               :disabled="attachment.workspaceFile ? undefined : downloadingAttachments.has(attachment.renderKey)"
-              @click.stop="activateAttachment(attachment)"
+              @click.stop="activateAttachment(attachment, $event)"
             >
               <span class="msg-file-chip__icon" aria-hidden="true">
                 <span v-if="downloadingAttachments.has(attachment.renderKey)" class="spinner msg-file-chip__spinner" />
@@ -155,9 +156,11 @@
               </span>
             </component>
             <span
-              v-if="!attachment.workspaceFile && (isImageDisplayAttachment(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
+              v-if="!attachment.workspaceFile && (isImageDisplayAttachment(attachment) || isClipboardImageCandidate(attachment) || workbenchAttachmentResource(attachment)) && !shareMode"
               class="msg-file-resource__actions"
             >
+              <ImageCopyActions v-if="isClipboardImageCandidate(attachment)"
+                :source="{ kind: 'attachment', attachment }" :session-key="sessionKey" />
               <button
                 v-if="isImageDisplayAttachment(attachment) || attachmentCanOpen(attachment)"
                 type="button"
@@ -238,6 +241,8 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import TurnOutcomeStatus from '@/components/chat/TurnOutcomeStatus.vue'
 import { useCopyFeedback } from '@/composables/chat/useCopyFeedback'
+import ImageCopyActions from '@/components/ImageCopyActions.vue'
+import { isClipboardImageCandidate } from '@/composables/useImageClipboard'
 import { useRelativeNow } from '@/composables/useRelativeNow'
 import type {
   ChatRenderedMessage,
@@ -262,6 +267,7 @@ const { t } = useI18n()
 
 const props = defineProps<{
   message: ChatRenderedMessage
+  sessionKey?: string
   shareMode: boolean
   shareSelected: boolean
   shareMessageId: string
@@ -469,10 +475,16 @@ function attachmentUnavailableReason(attachment: DisplayAttachment): string {
   return attachmentOpenReason(attachment)
 }
 
-function activateAttachment(attachment: DisplayAttachment) {
+function previewImage(attachment: DisplayAttachment, event: MouseEvent) {
+  // Establish the return target even when pointer clicks do not focus buttons.
+  if (event.currentTarget instanceof HTMLElement) event.currentTarget.focus({ preventScroll: true })
+  emit('previewImage', attachment)
+}
+
+function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
   if (attachment.workspaceFile) return
   if (isImageDisplayAttachment(attachment)) {
-    emit('previewImage', attachment)
+    previewImage(attachment, event)
     return
   }
   if (attachmentCanOpen(attachment)) {

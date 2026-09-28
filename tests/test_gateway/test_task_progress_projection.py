@@ -45,44 +45,65 @@ def test_task_summary_ignores_unknown_plan_result_status():
     assert "plan_result" not in result
 
 
-@pytest.mark.parametrize("tool_name", ["update_plan", "update_goal_progress"])
-async def test_public_progress_immediately_projects_naturally_created_and_edited_goal(
-    tmp_path, tool_name,
+@pytest.mark.parametrize("create_before_discovery", [False, True])
+async def test_discovered_progress_projects_ordinary_task_and_naturally_created_and_edited_goal(
+    tmp_path, create_before_discovery,
 ):
+    from opensquilla.engine.agent import Agent
+    from opensquilla.engine.runtime import TurnRunner
     from opensquilla.engine.types import ToolCall
+    from opensquilla.gateway.config import GatewayConfig
     from opensquilla.gateway.rpc_sessions import _handle_sessions_send_contract
     from opensquilla.session.models import AgentTaskStatus
-    from opensquilla.tools.dispatch import build_tool_handler
     from opensquilla.tools.registry import get_default_registry
-    from opensquilla.tools.types import CallerKind, ToolContext
     from tests.test_gateway.test_goal_rpc import SOURCE_KEY, _open_goal_rpc_stack
 
     checked = []
     observed_event_counts = []
 
     async def handler(run):
-        ctx = ToolContext(
-            caller_kind=CallerKind.WEB, run_mode="full", is_owner=True,
-            session_key=SOURCE_KEY, session_id=run.envelope.session_id,
-            session_epoch=run.envelope.session_epoch, task_id=run.task_id,
-            goal_service=stack.service,
-            update_progress=run.envelope.runtime_services["update_progress"],
-            allowed_tools={"create_goal", "update_goal", "update_plan", "update_goal_progress"},
+        ctx = run.envelope.tool_context(is_owner=True)
+        runner = TurnRunner(
+            provider_selector=None, config=GatewayConfig(),
+            tool_registry=get_default_registry(),
         )
-        dispatch = build_tool_handler(get_default_registry(), ctx)
+        definitions, dispatch = runner._build_tools(ctx)
+        assert "update_plan" not in {definition.name for definition in definitions}
+        assert "update_plan" in ctx.authorized_tool_names
+        agent = Agent(
+            provider=object(), tool_definitions=definitions, tool_handler=dispatch,
+            tool_registry=get_default_registry(), tool_context=ctx,
+        )
+        tool_call_count = 0
 
         async def invoke(name, arguments):
-            result = await dispatch(ToolCall(tool_use_id=name, tool_name=name, arguments=arguments))
+            nonlocal tool_call_count
+            tool_call_count += 1
+            result = await agent._execute_tool(ToolCall(
+                tool_use_id=f"call-{tool_call_count}", tool_name=name, arguments=arguments,
+            ))
             assert not result.is_error, result.content
             return json.loads(result.content)
 
-        await invoke("create_goal", {"objective": "Complete the synthetic task."})
+        if create_before_discovery:
+            await invoke("create_goal", {"objective": "Complete the synthetic task."})
+        found = await invoke("tool_search", {"query": "update_plan", "limit": 1})
+        assert [match["name"] for match in found["matches"]] == ["update_plan"]
+        assert "update_plan" in {definition.name for definition in agent.tool_definitions}
+        if not create_before_discovery:
+            ordinary = await invoke("update_plan", {
+                "steps": [{"step": "Inspect the task", "status": "in_progress"}],
+            })
+            assert ordinary["progress"]["revision"] == 1
+            assert await stack.storage.get_goal(SOURCE_KEY) is None
+            assert not any(name == "session.event.goal" for _, name, _ in stack.events)
+            await invoke("create_goal", {"objective": "Complete the synthetic task."})
         for index in (1, 2):
             if index == 2:
                 await invoke("update_goal", {"objective": "Complete the revised synthetic task."})
             before = len(stack.events)
             steps = [{"step": f"Verification {index}", "status": "in_progress"}]
-            result = await invoke(tool_name, {"steps": steps})
+            result = await invoke("update_plan", {"steps": steps})
             events = [payload for _, name, payload in stack.events[before:]
                       if name == "session.event.goal"]
             observed_event_counts.append(len(events))
@@ -91,8 +112,7 @@ async def test_public_progress_immediately_projects_naturally_created_and_edited
             assert projected["progress"]["steps"] == steps
             assert projected["objectiveRevision"] == index
             assert projected["activeTaskId"] == run.task_id
-            if tool_name == "update_goal_progress":
-                assert result["goal"]["progressRevision"] == projected["progressRevision"]
+            assert result["progress"]["steps"] == projected["progress"]["steps"]
             task = await stack.storage.get_agent_task(run.task_id)
             assert task.status == AgentTaskStatus.RUNNING
             assert task.details["metadata"]["progress"]["steps"] == steps
@@ -104,8 +124,8 @@ async def test_public_progress_immediately_projects_naturally_created_and_edited
              "clientRequestId": "public-goal-progress"}, stack.context,
         )
         task = await stack.runtime.wait(sent["task_id"], timeout=3)
+        assert task.status == AgentTaskStatus.SUCCEEDED, task.error_message
         assert observed_event_counts == [1, 1]
-        assert task.status == AgentTaskStatus.SUCCEEDED
         assert checked == [1, 2]
 
 

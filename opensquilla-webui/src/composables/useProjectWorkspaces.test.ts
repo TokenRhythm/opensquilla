@@ -48,6 +48,8 @@ function catalogFromRpc(rpc: ReturnType<typeof useRpcStore>): WorkspaceCatalog {
 function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
   return {
     get availability() { return rpc.isConnected ? 'available' : 'unavailable' },
+    get connectionHealth() { return rpc.health },
+    isRuntimeStarting: false,
     get connectionError() { return rpc.error },
     requiresCredential: false,
     get isAvailable() { return rpc.isConnected },

@@ -100,7 +100,7 @@ async def _teardown(mgr: ChannelManager) -> None:
     for name in list(mgr._channels):
         await mgr.stop_channel(name)
     if mgr._delivery_store is not None:
-        mgr._delivery_store.close()
+        (await mgr._delivery_store.close())
 
 
 async def test_add_starts_a_new_channel_live(manager: ChannelManager) -> None:

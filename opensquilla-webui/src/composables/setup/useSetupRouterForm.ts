@@ -437,10 +437,10 @@ export function useSetupRouterForm() {
     routerDefaultTier.value = normalizeRouterTier(router.default_tier || '') || DEFAULT_TEXT_TIER
     routerVisualMode.value = normalizeRouterVisualMode(router.visual_mode)
 
-    const hasProfileTiers = Object.keys(profileTiers || {}).length > 0
-    const tiers = binding === 'follow_primary' && hasProfileTiers
-      ? { ...profileTiers }
-      : Object.assign({}, profileTiers || {}, router.tiers || {})
+    // The Gateway supplies effective tiers, including migrated defaults and
+    // explicit overrides. A primary-provider preset may only fill absent rows;
+    // it must not disguise a saved route or customized model as a new default.
+    const tiers = Object.assign({}, profileTiers || {}, router.tiers || {})
     const next: Record<string, SetupTierValue> = {}
     Object.entries(tiers).forEach(([name, tier]) => {
       const tierName = normalizeRouterTier(name) || name

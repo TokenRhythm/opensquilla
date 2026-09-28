@@ -7,6 +7,7 @@ import { projectAssistantActivityTimeline } from '@/utils/chat/assistantActivity
 import type { ChatMessage, ChatTurnOutcome } from '@/types/chat'
 import { RpcTimeoutError } from '@/lib/rpc'
 import {
+  SessionReadFailure,
   SessionReadHistoryCursorError,
   SessionReadSessionMissingError,
   type SessionReadCompactionSummary,
@@ -266,9 +267,10 @@ function makeHistory(autoScroll = true, overrides: {
       after: (cursor: string, readOptions?: SessionReadHistoryOptions) => readHistory('after', cursor, readOptions),
     },
   } as SessionReadLease
+  let currentLease = lease
   const scrollToBottom = vi.fn()
   const api = useChatHistory({
-    sessionReadLeaseReader: { current: () => lease },
+    sessionReadLeaseReader: { current: () => currentLease },
     sessionKey,
     messages,
     threadRef: overrides.threadRef,
@@ -282,7 +284,14 @@ function makeHistory(autoScroll = true, overrides: {
     scrollToBottom,
     onTerminalTask: overrides.onTerminalTask,
   })
-  return { api, readHistory, historyFixture, scrollToBottom, messages }
+  return {
+    api,
+    readHistory,
+    historyFixture,
+    scrollToBottom,
+    messages,
+    replaceReadLease: () => { currentLease = { ...lease } },
+  }
 }
 
 function historyMessage(id: string): SessionReadMessage {
@@ -311,7 +320,7 @@ function makeLiveEdgeRecovery(overrides: {
     scrollTop: { configurable: true, value: 11_700, writable: true },
   })
   document.body.append(thread)
-  const { api, messages } = makeHistory(true, {
+  const { api, messages, scrollToBottom } = makeHistory(true, {
     autoScroll,
     scrollEpoch: overrides.scrollEpoch,
     canApplyViewportCorrection: overrides.canApplyViewportCorrection,
@@ -339,6 +348,7 @@ function makeLiveEdgeRecovery(overrides: {
   return {
     api,
     autoScroll,
+    scrollToBottom,
     thread,
     cleanup: () => {
       stopRender()
@@ -399,7 +409,7 @@ function makeReaderAnchorRecovery(overrides: {
   renderAnchor()
   document.body.append(thread)
 
-  const { api, messages } = makeHistory(false, {
+  const { api, messages, scrollToBottom } = makeHistory(false, {
     canApplyViewportCorrection: overrides.canApplyViewportCorrection,
     threadRef: ref<HTMLElement | null>(thread),
     messages: [{
@@ -428,6 +438,7 @@ function makeReaderAnchorRecovery(overrides: {
   return {
     api,
     thread,
+    scrollToBottom,
     emitPendingImageLoad: () => emitPendingImageLoad(),
     setMessageContentTop: (top: number) => { messageContentTop = top },
     cleanup: () => {
@@ -1671,7 +1682,7 @@ describe('useChatHistory canonical pagination', () => {
     ])
   })
 
-  it('prepends one page per cursor and preserves the reader scroll anchor', async () => {
+  it('prepends one page per cursor without taking over the virtualizer viewport', async () => {
     const thread = document.createElement('div')
     let height = 400
     const earlySummary = {
@@ -1691,7 +1702,7 @@ describe('useChatHistory canonical pagination', () => {
       scrollTop: { configurable: true, value: 120, writable: true },
     })
     const threadRef = ref<HTMLElement | null>(thread)
-    const { api, readHistory, historyFixture, messages } = makeHistory(false, {
+    const { api, readHistory, historyFixture, messages, scrollToBottom } = makeHistory(false, {
       threadRef,
       response: {
         messages: [historyMessage('m3'), historyMessage('m4')],
@@ -1749,7 +1760,8 @@ describe('useChatHistory canonical pagination', () => {
     expect(messages.value
       .filter(message => message.role !== 'maintenance')
       .map(message => message.messageId)).toEqual(['m1', 'm2', 'm3', 'm4'])
-    expect(thread.scrollTop).toBe(320)
+    expect(thread.scrollTop).toBe(120)
+    expect(scrollToBottom).not.toHaveBeenCalled()
     expect(readHistory).toHaveBeenCalledTimes(2)
     expect(api.historyState.value.canonicalComplete).toBe(true)
     expect(api.historyState.value.newestCursor).toBe('cursor-4')
@@ -2827,7 +2839,7 @@ describe('useChatHistory canonical pagination', () => {
   })
 })
 
-describe('useChatHistory scroll anchoring', () => {
+describe('useChatHistory scroll intent ownership', () => {
   it('does not force the thread to the latest message when the reader has scrolled up', async () => {
     const { api, scrollToBottom } = makeHistory(false)
 
@@ -2846,20 +2858,25 @@ describe('useChatHistory scroll anchoring', () => {
     expect(scrollToBottom).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps the visible durable message anchored across a recovery refresh', async () => {
+  it('leaves recovery-refresh geometry to the virtualizer without scanning message DOM', async () => {
     const harness = makeReaderAnchorRecovery()
+    const query = vi.spyOn(harness.thread, 'querySelectorAll')
+    const measure = vi.spyOn(harness.thread, 'getBoundingClientRect')
 
     try {
       await harness.api.loadHistory()
       await nextTick()
 
-      expect(harness.thread.scrollTop).toBe(1_000)
+      expect(harness.thread.scrollTop).toBe(0)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
+      expect(query).not.toHaveBeenCalled()
+      expect(measure).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
   })
 
-  it('does not restore a reader anchor during application-owned history navigation', async () => {
+  it('does not reclaim scroll ownership during application-owned history navigation', async () => {
     const navigationActive = ref(false)
     const harness = makeReaderAnchorRecovery({
       canApplyViewportCorrection: () => !navigationActive.value,
@@ -2871,12 +2888,13 @@ describe('useChatHistory scroll anchoring', () => {
       await nextTick()
 
       expect(harness.thread.scrollTop).toBe(0)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
   })
 
-  it('stops late anchor stabilization when application-owned navigation starts', async () => {
+  it('does not install late image corrections that compete with application navigation', async () => {
     const navigationActive = ref(false)
     const harness = makeReaderAnchorRecovery({
       canApplyViewportCorrection: () => !navigationActive.value,
@@ -2886,20 +2904,22 @@ describe('useChatHistory scroll anchoring', () => {
     try {
       await harness.api.loadHistory()
       await nextTick()
-      expect(harness.thread.scrollTop).toBe(1_000)
+      expect(harness.thread.scrollTop).toBe(0)
 
       navigationActive.value = true
+      harness.thread.scrollTop = 615
       harness.setMessageContentTop(1_140)
       harness.emitPendingImageLoad()
       await Promise.resolve()
 
-      expect(harness.thread.scrollTop).toBe(1_000)
+      expect(harness.thread.scrollTop).toBe(615)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
   })
 
-  it('keeps live-edge ownership when a recovery refresh resets layout scroll', async () => {
+  it('delegates live-edge restoration when a recovery refresh resets layout scroll', async () => {
     const harness = makeLiveEdgeRecovery({
       onCommit: ({ autoScroll, thread }) => {
         // Model the long-history virtualizer clamping the old viewport before
@@ -2915,7 +2935,10 @@ describe('useChatHistory scroll anchoring', () => {
       await nextTick()
 
       expect(harness.autoScroll.value).toBe(true)
-      expect(harness.thread.scrollTop).toBe(12_000)
+      expect(harness.scrollToBottom).toHaveBeenCalledTimes(1)
+      // The injected viewport owner is a spy here; history must not mutate the
+      // DOM independently of that owner. Real geometry has component/E2E tests.
+      expect(harness.thread.scrollTop).toBe(0)
     } finally {
       harness.cleanup()
     }
@@ -2939,6 +2962,7 @@ describe('useChatHistory scroll anchoring', () => {
       expect(outcome).toMatchObject({ ok: false, cancelled: true })
       expect(harness.autoScroll.value).toBe(false)
       expect(harness.thread.scrollTop).toBe(0)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
@@ -2963,6 +2987,7 @@ describe('useChatHistory scroll anchoring', () => {
       expect(outcome).toMatchObject({ ok: true })
       expect(harness.autoScroll.value).toBe(false)
       expect(harness.thread.scrollTop).toBe(6_000)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
@@ -2986,6 +3011,7 @@ describe('useChatHistory scroll anchoring', () => {
       expect(outcome).toMatchObject({ ok: true })
       expect(harness.autoScroll.value).toBe(false)
       expect(harness.thread.scrollTop).toBe(6_000)
+      expect(harness.scrollToBottom).not.toHaveBeenCalled()
     } finally {
       harness.cleanup()
     }
@@ -3387,11 +3413,11 @@ describe('useChatHistory optimistic local rows', () => {
   it.each([
     [
       'image_input_unsupported',
-      'The selected model cannot process image input. Choose an image-capable model or remove the image.',
+      'This model does not support images.',
     ],
     [
       'ensemble_multimodal_unsupported',
-      "Model ensemble does not support image input yet. Under Model routing, choose Intelligent model routing with an image-capable tier configured, or Fixed model with an image-capable model.",
+      'This mode does not support images.',
     ],
   ])('restores %s as a localized error card', async (errorClass, expectedText) => {
     const { api, messages } = makeHistory(true, {
@@ -3437,6 +3463,139 @@ describe('useChatHistory optimistic local rows', () => {
       terminalNotice: true,
       text: expectedText,
     })
+  })
+
+  it.each([
+    { errorId: undefined, durable: false },
+    { errorId: 'abcdef01', durable: false },
+    { errorId: undefined, durable: true },
+    { errorId: 'abcdef01', durable: true },
+  ])('restores no_provider without relying on diagnostic persistence: $errorId, durable=$durable', async ({ errorId, durable }) => {
+    const turnId = 'turn-no-provider'
+    const response: SessionReadHistoryPageFixture = {
+      messages: [{
+        id: 'user-no-provider', messageId: 'user-no-provider', role: 'user', text: 'hello',
+        createdAt: '2026-07-07T10:00:00Z', turnContext: { turnId },
+      }, ...(durable ? [{
+        id: 'error-no-provider', messageId: 'error-no-provider', role: 'system',
+        text: 'Error: private upstream diagnostic (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }] : [])],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'failed', errorClass: 'no_provider',
+        terminalMessage: 'No provider available (ref: abcdef01)',
+        outcome: { kind: 'failed', reason: 'no_provider', ...(errorId ? { error_id: errorId } : {}) },
+      }],
+      hasMore: false,
+    }
+    const { api, messages } = makeHistory(true, { response })
+
+    await api.loadHistory()
+    await api.loadHistory()
+
+    const errors = messages.value.filter(message => message.role === 'error')
+    expect(errors).toHaveLength(1)
+    expect(errors[0]).toMatchObject({
+      text: 'No model is available.', errorCode: 'no_provider', turnId, terminalNotice: true,
+      turnOutcome: { status: 'failed', statusSource: 'task', reason: 'no_provider' },
+    })
+    expect(errors[0]?.turnOutcome?.errorId).toBe(errorId)
+    expect(errors[0]?.text).not.toMatch(/private|upstream|abcdef01|ref:/)
+  })
+
+  it('restores an unknown failure using safe local copy and preserves its internal classification', async () => {
+    const turnId = 'turn-unknown-failure'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [{
+        id: 'unknown-error', role: 'system', text: 'Error: Authorization: Bearer private-token (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'failed', errorClass: 'future_internal_failure',
+        terminalMessage: 'Authorization: Bearer private-token (ref: abcdef01)',
+      }],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      role: 'error', text: 'The task did not finish. Please try again later.',
+      turnId, errorCode: 'future_internal_failure', terminalNotice: true,
+    })
+  })
+
+  it('does not synthesize a failed turn from recovered provider warning metadata on success', async () => {
+    const turnId = 'turn-recovered'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [{
+        id: 'recovered-answer', role: 'assistant', text: 'Completed answer',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'succeeded', errorClass: '429',
+        outcome: { kind: 'completed', failure_kind: 'rate_limited', error_id: 'abcdef01' },
+      }],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value.filter(message => message.role === 'error')).toHaveLength(0)
+    expect(messages.value.map(message => [message.role, message.text])).toEqual([['assistant', 'Completed answer']])
+  })
+
+  it('localizes a legacy terminal system receipt without an Error prefix exactly once', async () => {
+    const turnId = 'turn-legacy-truncated'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [{
+        id: 'legacy-truncated', messageId: 'legacy-truncated', role: 'system',
+        text: 'The provider stopped because the output limit was reached before the task finished. (ref: abcdef01)',
+        createdAt: '2026-07-07T10:00:01Z', turnContext: { turnId },
+      }],
+      turnOutcomes: [{
+        turnId, taskId: turnId, status: 'failed', errorClass: 'provider_output_truncated',
+        outcome: { kind: 'partial', reason: 'output_truncated', error_id: 'abcdef01' },
+      }],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(1)
+    expect(messages.value[0]).toMatchObject({
+      messageId: 'legacy-truncated', role: 'error', terminalNotice: true,
+      text: 'The model response did not finish. Please try again later.',
+      errorCode: 'provider_output_truncated', turnId,
+    })
+    expect(messages.value[0]?.text).not.toContain('abcdef01')
+  })
+
+  it('hides legacy raw Error rows without rewriting ordinary conversation text', async () => {
+    const unrelatedText = 'Ordinary text mentions an Error: example and (ref: abcdef01).'
+    const { api, messages } = makeHistory(true, { response: {
+      messages: [
+        { id: 'legacy-error', role: 'system', text: 'Error: raw secret (ref: abcdef01)', createdAt: 1_000 },
+        { id: 'system-note', role: 'system', text: unrelatedText, createdAt: 2_000 },
+        { id: 'user-example', role: 'user', text: 'Error: an example, not an error receipt', createdAt: 3_000 },
+        { id: 'assistant-example', role: 'assistant', text: 'Error: a quoted example', createdAt: 4_000 },
+        {
+          id: 'cron-note', role: 'system', text: 'Error: review incident notes', createdAt: 5_000,
+          provenance: { kind: 'cron', sourceTool: null, sourceSessionKey: null },
+        },
+      ],
+    } })
+
+    await api.loadHistory()
+
+    expect(messages.value).toHaveLength(5)
+    expect(messages.value[0]).toMatchObject({
+      role: 'error', terminalNotice: true, text: 'The task did not finish. Please try again later.',
+    })
+    expect(messages.value.slice(1).map(message => [message.role, message.text])).toEqual([
+      ['system', unrelatedText],
+      ['user', 'Error: an example, not an error receipt'],
+      ['assistant', 'Error: a quoted example'],
+      ['system', 'Error: review incident notes'],
+    ])
   })
 
   it('restores a usage barrier retry card when the transcript error row is absent', async () => {
@@ -3745,7 +3904,7 @@ describe('useChatHistory optimistic local rows', () => {
         ['assistant', 'Initial summary.'],
         ['user', 'Include the risks'],
         ['assistant', 'Risk analysis in progress.'],
-        ['error', safeMessage],
+        ['error', 'The model service is busy. Please try again later.'],
       ])
       const notice = messages.value.filter(message => message.role === 'error')
       expect(notice).toHaveLength(1)
@@ -3915,7 +4074,7 @@ describe('useChatHistory optimistic local rows', () => {
 
     expect(messages.value.map(message => [message.role, message.text])).toEqual([
       ['user', 'retry this turn'],
-      ['error', 'Activation failed; retry this message.'],
+      ['error', 'The task did not finish. Please try again later.'],
     ])
     expect(messages.value[1]).toMatchObject({
       errorCode: 'failed',
@@ -4185,6 +4344,442 @@ describe('useChatHistory accepted ensemble reconciliation', () => {
     expect(messages.value.some(message => ['ensemble', 'llm_ensemble'].includes(
       String(message.routerDecision?.accepted_routing_mode || '').toLowerCase(),
     ))).toBe(false)
+  })
+})
+
+describe('useChatHistory bounded observer recovery', () => {
+  const emptyPage: SessionReadHistoryPageFixture = {
+    messages: [],
+    canonicalAvailable: true,
+    canonicalComplete: true,
+  }
+  const inputPage = (id = 'observer-input'): SessionReadHistoryPageFixture => ({
+    ...emptyPage,
+    messages: [{
+      id,
+      messageId: id,
+      role: 'user',
+      text: 'question from another window',
+      createdAt: 1,
+      turnContext: { turnId: 'observer-turn' },
+    }],
+  })
+
+  it('continues recovery created during an ordinary read when that read fails', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      let rejectRead!: (error: Error) => void
+      historyFixture.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRead = reject }))
+      const pendingRead = api.loadHistory()
+      api.scheduleHistorySync(true, 'observer-input')
+      messages.value.push({ role: 'assistant', text: 'answer already streaming', ts: 2, turnId: 'observer-turn' })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(readHistory).toHaveBeenCalledTimes(2)
+
+      historyFixture.mockResolvedValueOnce(inputPage())
+      rejectRead(new Error('temporary history failure'))
+      await pendingRead
+      await vi.advanceTimersByTimeAsync(250)
+
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.filter(message => message.messageId === 'observer-input')).toHaveLength(1)
+      expect(messages.value.map(message => message.text)).toContain('answer already streaming')
+      expect(api.historyState.value.recoveryError).toBe(false)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retains terminal recovery until a read started after its invalidation succeeds', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      let resolveRead!: (page: SessionReadHistoryPageFixture) => void
+      historyFixture.mockImplementationOnce(() => new Promise(resolve => { resolveRead = resolve }))
+      const pendingRead = api.loadHistory()
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(50)
+      historyFixture.mockRejectedValueOnce(new Error('fresh read failed')).mockResolvedValueOnce(inputPage())
+      resolveRead(emptyPage)
+      await pendingRead
+      await vi.advanceTimersByTimeAsync(300)
+
+      expect(readHistory).toHaveBeenCalledTimes(4)
+      expect(messages.value.map(message => message.messageId)).toEqual(['observer-input'])
+      expect(api.historyState.value.recoveryError).toBe(false)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(4)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['session switch', 'lease replacement'] as const)(
+    'does not retire a successor recovery when an earlier read settles after %s',
+    async (transition) => {
+      vi.useFakeTimers()
+      const sessionKey = ref('agent:main:webchat:observer')
+      const { api, historyFixture, readHistory, messages, replaceReadLease } = makeHistory(false, {
+        sessionKey, response: emptyPage,
+      })
+      try {
+        await api.loadHistory()
+        let rejectRead!: (error: Error) => void
+        historyFixture.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRead = reject }))
+        const pendingRead = api.loadHistory({ nonReconnecting: true })
+        if (transition === 'session switch') sessionKey.value = 'agent:main:webchat:successor'
+        else replaceReadLease()
+        api.scheduleHistorySync(true, 'new-input')
+        historyFixture.mockRejectedValueOnce(new Error('temporary new history failure')).mockResolvedValueOnce(inputPage('new-input'))
+
+        rejectRead(new Error('obsolete read failed'))
+        await pendingRead
+        await vi.advanceTimersByTimeAsync(300)
+
+        expect(readHistory).toHaveBeenCalledTimes(4)
+        expect(messages.value.map(message => message.messageId)).toEqual(['new-input'])
+        expect(api.historyState.value.recoveryError).toBe(false)
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(readHistory).toHaveBeenCalledTimes(4)
+      } finally {
+        api.cleanup()
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('retires recovery created during a read if that read is aborted', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      let rejectRead!: (error: Error) => void
+      historyFixture.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRead = reject }))
+      const pendingRead = api.loadHistory({ nonReconnecting: true })
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(50)
+      rejectRead(new SessionReadFailure('aborted', 'read cancelled', false))
+      await pendingRead
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(2)
+
+      historyFixture.mockResolvedValueOnce(inputPage())
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(50)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.map(message => message.messageId)).toEqual(['observer-input'])
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('continues observer recovery after an earlier-page read fails without retrying that page', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, {
+      response: {
+        ...emptyPage,
+        hasMore: true,
+        oldestCursor: 'older-page',
+        newestCursor: 'latest-page',
+      },
+    })
+    try {
+      await api.loadHistory()
+      let rejectRead!: (error: Error) => void
+      historyFixture.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRead = reject }))
+      const pendingRead = api.loadEarlierHistory()
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(50)
+      historyFixture.mockResolvedValueOnce(inputPage())
+      rejectRead(new Error('earlier page temporarily unavailable'))
+      await pendingRead
+      expect(api.historyState.value.loadEarlierError).toBe(true)
+      await vi.advanceTimersByTimeAsync(250)
+
+      expect(readHistory.mock.calls.map(call => call[0])).toEqual(['latest', 'before', 'latest'])
+      expect(messages.value.map(message => message.messageId)).toEqual(['observer-input'])
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['latest', 'earlier'] as const)('keeps cursor replacement explicit when recovery is created during a rejected %s read', async (page) => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, {
+      response: { ...emptyPage, hasMore: true, oldestCursor: 'older-page' },
+    })
+    try {
+      await api.loadHistory()
+      let rejectRead!: (error: Error) => void
+      historyFixture.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRead = reject }))
+      const pendingRead = page === 'latest' ? api.loadHistory() : api.loadEarlierHistory()
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(50)
+      rejectRead(new SessionReadHistoryCursorError('stale', 'cursor rejected'))
+      await pendingRead
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      expect(page === 'latest'
+        ? api.historyState.value.recoveryError
+        : api.historyState.value.loadEarlierError).toBe(true)
+
+      historyFixture.mockResolvedValueOnce(inputPage())
+      await api.retryHistory()
+      expect(messages.value.map(message => message.messageId)).toEqual(['observer-input'])
+      expect(api.historyState.value.recoveryError).toBe(false)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retries a failure and an incomplete successful read while retaining the live answer and router', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      messages.value.push(
+        {
+          role: 'router', text: '', ts: 2, turnId: 'observer-turn',
+          routerDecision: { model: 'test-model', source: 'squilla_router' },
+        },
+        { role: 'assistant', text: 'answer already streaming', ts: 3, turnId: 'observer-turn' },
+      )
+      historyFixture
+        .mockRejectedValueOnce(new RpcTimeoutError('chat.history', 1_000))
+        .mockResolvedValueOnce(emptyPage)
+        .mockResolvedValueOnce(inputPage())
+
+      api.scheduleHistorySync(true, 'observer-input')
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(50)
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      expect(api.historyState.value.recoveryError).toBe(false)
+      await vi.advanceTimersByTimeAsync(250)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.some(message => message.role === 'user')).toBe(false)
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(readHistory).toHaveBeenCalledTimes(4)
+      expect(messages.value.filter(message => message.messageId === 'observer-input')).toHaveLength(1)
+      expect(messages.value).toEqual(expect.arrayContaining([
+        expect.objectContaining({ role: 'assistant', text: 'answer already streaming' }),
+        expect.objectContaining({ role: 'router', routerDecision: { model: 'test-model', source: 'squilla_router' } }),
+      ]))
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(4)
+      expect(api.historyState.value).toMatchObject({ initialLoadStatus: 'ready', recoveryError: false })
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['missing input', 'read failure'] as const)('bounds %s and exposes manual recovery without clearing the visible transcript', async (failure) => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      messages.value.push({ role: 'assistant', text: 'visible live answer', ts: 2, turnId: 'observer-turn' })
+      if (failure === 'read failure') historyFixture.mockRejectedValue(new Error('unavailable history'))
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(5)
+      expect(messages.value.map(message => message.text)).toContain('visible live answer')
+      expect(api.historyState.value).toMatchObject({ initialLoadStatus: 'ready', recoveryError: true })
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(5)
+
+      historyFixture.mockResolvedValueOnce(inputPage())
+      await api.retryHistory()
+      expect(readHistory).toHaveBeenCalledTimes(6)
+      expect(messages.value.filter(message => message.messageId === 'observer-input')).toHaveLength(1)
+      expect(messages.value.map(message => message.text)).toContain('visible live answer')
+      expect(api.historyState.value.recoveryError).toBe(false)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('also retries terminal synchronization with no expected input ID', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      historyFixture.mockRejectedValueOnce(new Error('temporary failure')).mockResolvedValueOnce(inputPage())
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(300)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value[0]?.messageId).toBe('observer-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('recovers on a fresh terminal invalidation after input hydration exhausted its retry budget', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      messages.value.push({ role: 'assistant', text: 'answer already streaming', ts: 2, turnId: 'observer-turn' })
+      historyFixture.mockRejectedValue(new Error('temporary outage'))
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(5)
+      expect(api.historyState.value.recoveryError).toBe(true)
+
+      historyFixture.mockResolvedValueOnce(inputPage())
+      api.scheduleHistorySync(true)
+      await vi.advanceTimersByTimeAsync(50)
+      expect(readHistory).toHaveBeenCalledTimes(6)
+      expect(messages.value.filter(message => message.messageId === 'observer-input')).toHaveLength(1)
+      expect(messages.value.map(message => message.text)).toContain('answer already streaming')
+      expect(api.historyState.value.recoveryError).toBe(false)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(6)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retires satisfied targets after an ordinary latest read so later inputs get a fresh budget', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      api.scheduleHistorySync(true, 'old-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(api.historyState.value.recoveryError).toBe(true)
+      historyFixture.mockResolvedValueOnce(inputPage('old-input'))
+      await api.loadHistory()
+      expect(api.historyState.value.recoveryError).toBe(false)
+      historyFixture.mockResolvedValueOnce(inputPage('new-input'))
+      api.scheduleHistorySync(true, 'new-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(7)
+      expect(api.historyState.value.recoveryError).toBe(false)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('retires an aborted attempt without retrying and admits a later notification for the same input', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      historyFixture.mockRejectedValueOnce(new SessionReadFailure('aborted', 'read cancelled', false))
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      expect(api.historyState.value.recoveryError).toBe(false)
+      historyFixture.mockResolvedValueOnce(inputPage())
+      api.scheduleHistorySync(true, 'observer-input')
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value[0]?.messageId).toBe('observer-input')
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it.each(['session switch', 'lease replacement', 'cleanup'] as const)(
+    'retires a scheduled retry after %s',
+    async (transition) => {
+      vi.useFakeTimers()
+      const sessionKey = ref('agent:main:webchat:observer')
+      const { api, historyFixture, readHistory, replaceReadLease } = makeHistory(false, {
+        sessionKey, response: emptyPage,
+      })
+      try {
+        await api.loadHistory()
+        historyFixture.mockRejectedValueOnce(new Error('temporary failure'))
+        api.scheduleHistorySync(true, 'observer-input')
+        await vi.advanceTimersByTimeAsync(50)
+        if (transition === 'session switch') sessionKey.value = 'agent:main:webchat:successor'
+        else if (transition === 'lease replacement') replaceReadLease()
+        else api.cleanup()
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(readHistory).toHaveBeenCalledTimes(2)
+        expect(api.historyState.value.recoveryError).toBe(false)
+      } finally {
+        api.cleanup()
+        vi.useRealTimers()
+      }
+    },
+  )
+
+  it('does not join an obsolete same-key read or apply its late response after the lease changes', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages, replaceReadLease } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      let resolveOld!: (page: SessionReadHistoryPageFixture) => void
+      historyFixture.mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
+      api.scheduleHistorySync(true, 'old-input')
+      await vi.advanceTimersByTimeAsync(50)
+      const oldSignal = readHistory.mock.calls[1]?.[2]?.signal
+      replaceReadLease()
+      historyFixture.mockResolvedValueOnce(inputPage('new-input'))
+      api.scheduleHistorySync(true, 'new-input')
+      await vi.advanceTimersByTimeAsync(50)
+      expect(oldSignal?.aborted).toBe(true)
+      expect(messages.value.map(message => message.messageId)).toEqual(['new-input'])
+      resolveOld(inputPage('old-input'))
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.map(message => message.messageId)).toEqual(['new-input'])
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
+  })
+
+  it('coalesces new missing inputs while a read is active and waits for all requested IDs', async () => {
+    vi.useFakeTimers()
+    const { api, historyFixture, readHistory, messages } = makeHistory(false, { response: emptyPage })
+    try {
+      await api.loadHistory()
+      let resolveRead!: (page: SessionReadHistoryPageFixture) => void
+      historyFixture.mockImplementationOnce(() => new Promise(resolve => { resolveRead = resolve }))
+      api.scheduleHistorySync(true, 'first-input')
+      await vi.advanceTimersByTimeAsync(50)
+      api.scheduleHistorySync(true, 'second-input')
+      api.scheduleHistorySync(true, 'second-input')
+      await vi.advanceTimersByTimeAsync(50)
+      expect(readHistory).toHaveBeenCalledTimes(2)
+      historyFixture.mockResolvedValueOnce({
+        ...emptyPage,
+        messages: [...inputPage('first-input').messages!, ...inputPage('second-input').messages!],
+      })
+      resolveRead(inputPage('first-input'))
+      await vi.advanceTimersByTimeAsync(250)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+      expect(messages.value.map(message => message.messageId)).toEqual(['first-input', 'second-input'])
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(readHistory).toHaveBeenCalledTimes(3)
+    } finally {
+      api.cleanup()
+      vi.useRealTimers()
+    }
   })
 })
 

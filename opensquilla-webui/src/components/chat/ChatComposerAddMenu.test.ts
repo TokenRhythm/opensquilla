@@ -22,6 +22,7 @@ const i18n = createI18n({
       chat: {
         add: 'Add',
         attachFiles: 'Attach files',
+        composer: { contentGroup: 'Content', workStyleGroup: 'Work style' },
         planMode: {
           label: 'Plan mode',
           readOnly: 'Research and discuss before implementation. Tests and builds follow normal permissions.',
@@ -129,6 +130,20 @@ describe('ChatComposerAddMenu', () => {
 
     items[0].click()
     expect(attachFiles).toHaveBeenCalledOnce()
+  })
+
+  it('separates content sources from work style choices without adding empty sections', async () => {
+    const { host } = mountMenu()
+    await nextTick()
+    const groups = [...host.querySelectorAll('[role="group"]')]
+    expect(groups.map(group => group.getAttribute('aria-label'))).toEqual(['Content', 'Work style'])
+    expect(groups[0].querySelectorAll('[role="menuitem"]')).toHaveLength(1)
+    expect(groups[1].querySelectorAll('[role="menuitem"]')).toHaveLength(2)
+
+    const unavailable = mountMenu({ planModeAvailable: false, goalModeAvailable: false }).host
+    await nextTick()
+    expect(unavailable.querySelectorAll('[role="group"]')).toHaveLength(1)
+    expect(unavailable.textContent).not.toContain('Work style')
   })
 
   it('does not use the Add menu as an exit control for active Plan mode', async () => {

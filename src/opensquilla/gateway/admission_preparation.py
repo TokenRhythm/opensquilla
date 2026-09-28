@@ -26,6 +26,7 @@ from opensquilla.gateway.project_workspace_runtime import (
 )
 from opensquilla.gateway.routing import RouteEnvelope
 from opensquilla.gateway.rpc import RpcHandlerError
+from opensquilla.gateway.user_input_broker import connection_supports_user_input
 from opensquilla.project_workspaces import ProjectWorkspaceGuard, ProjectWorkspaceStateError
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.guest_profile import GuestProfile, GuestProfileBoundaryError
@@ -236,6 +237,7 @@ async def prepare_route(
             principal_host_execute=host_execute_allowed,
             run_mode=run_context.run_mode.value,
         )
+        route_envelope.metadata["structured_user_input"] = connection_supports_user_input(conn_id)
     else:
         route_envelope = build_web_route_envelope(
             session_key=key,

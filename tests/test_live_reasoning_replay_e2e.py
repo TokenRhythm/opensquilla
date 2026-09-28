@@ -296,16 +296,28 @@ def test_logical_details_never_merge_across_encrypted_or_conflicting_identity():
 
 def test_live_cli_suppresses_provider_output_and_restores_environment(monkeypatch, capsys):
     import os
+    import sqlite3
+    from pathlib import Path
+
+    from opensquilla.application import approval_queue
+
+    # Exercise cleanup of a queue created by this invocation, regardless of
+    # whether an earlier test has already initialized the process singleton.
+    monkeypatch.setattr(approval_queue, "_queue", None)
 
     secret = "synthetic-cli-credential"
     monkeypatch.setenv("DEEPSEEK_API_KEY", secret)
     monkeypatch.setenv("UNRELATED_SECRET", "never-pass-this")
     roots = []
+    queues = []
 
     async def run(root, **kwargs):
         roots.append(root)
         assert "UNRELATED_SECRET" not in os.environ
         assert kwargs["api_key"] == secret
+        if os.name == "nt":
+            assert Path.home().is_relative_to(root)
+        queues.append(approval_queue.get_approval_queue())
         print(secret)
         print("opaque-provider-signature")
         return {"ok": True, "provider": "deepseek"}
@@ -317,6 +329,88 @@ def test_live_cli_suppresses_provider_output_and_restores_environment(monkeypatc
     assert json.loads(public)["ok"] is True
     assert os.environ["UNRELATED_SECRET"] == "never-pass-this"
     assert roots and not roots[0].exists()
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        queues[0]._conn.execute("SELECT 1")
+
+
+def test_live_cli_does_not_close_or_delete_an_existing_external_approval_queue(
+    tmp_path, monkeypatch, capsys,
+):
+    from opensquilla.application import approval_queue
+
+    database = tmp_path / "caller-owned.sqlite"
+    queue = approval_queue.ApprovalQueue(db_path=str(database))
+    approval_id = queue.request("exec", {"command": "synthetic pending command"})
+    monkeypatch.setattr(approval_queue, "_queue", queue)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-cli-credential")
+    roots = []
+
+    async def run(root, **kwargs):
+        roots.append(root)
+        assert not database.resolve().is_relative_to(root.resolve())
+        return {"ok": True, "provider": "deepseek"}
+
+    monkeypatch.setattr(harness, "run_case", run)
+    try:
+        assert harness.main(["--live"]) == 0
+        assert json.loads(capsys.readouterr().out)["ok"] is True
+        assert roots and not roots[0].exists()
+        assert approval_queue.get_approval_queue() is queue
+        assert database.is_file()
+        assert queue.get(approval_id).resolved is False
+        assert queue._conn.execute("SELECT COUNT(*) FROM approval_queue").fetchone()[0] == 1
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize("serve_fails", [False, True])
+def test_live_cli_ui_dist_is_served_despite_prior_import_and_restored_on_exit(
+    tmp_path, monkeypatch, capsys, serve_fails,
+):
+    from starlette.applications import Starlette
+
+    from opensquilla.gateway import control_ui
+    from opensquilla.gateway.config import GatewayConfig
+    from scripts import live_compaction_gateway
+
+    old_dist = tmp_path / "previous-bundle"
+    requested_dist = tmp_path / "requested-bundle"
+    for directory, name in ((old_dist, "previous"), (requested_dist, "requested")):
+        (directory / "assets").mkdir(parents=True)
+        (directory / "index.html").write_text(
+            f'<script type="module" src="/assets/{name}.js"></script>', encoding="utf-8",
+        )
+        (directory / "assets" / f"{name}.js").write_text(f"{name}_bundle", encoding="utf-8")
+    # Simulate the already-imported production controller caching the old build.
+    monkeypatch.setattr(control_ui, "_DIST_DIR", old_dist)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-cli-credential")
+    served = []
+
+    async def serve(root, **kwargs):
+        config = GatewayConfig(control_ui={"enabled": True, "base_path": "/control"})
+        app = Starlette(routes=control_ui.create_control_ui_routes(config))
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver",
+        ) as client:
+            index = await client.get("/control/")
+            asset = await client.get("/control/static/dist/assets/requested.js")
+        assert index.status_code == asset.status_code == 200
+        assert "requested.js" in index.text and "previous.js" not in index.text
+        assert asset.text == "requested_bundle"
+        served.append(True)
+        if serve_fails:
+            raise RuntimeError("controlled gateway exit")
+        return {"ok": True, "lifecycle_status": "stopped", "artifact_scan_status": "passed"}
+
+    monkeypatch.setattr(live_compaction_gateway, "serve_compaction_gateway", serve)
+    assert harness.main([
+        "--live", "--serve-gateway", "--gateway-root", str(tmp_path / "owned-state"),
+        "--ui-dist", str(requested_dist),
+    ]) == int(serve_fails)
+    capsys.readouterr()
+    assert served == [True]
+    assert control_ui._DIST_DIR == old_dist
+    assert "previous.js" in control_ui._read_vite_assets("/control")[0]
 
 
 def test_shared_relay_is_installed_after_clean_environment_and_uses_only_placeholder(

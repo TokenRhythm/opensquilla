@@ -1,6 +1,5 @@
 import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
-import type { Attachment } from '@/types/chat'
 import type {
   PromptAnnotation,
   PromptAnnotationCreateRequest,
@@ -26,7 +25,13 @@ function readDrafts(): Record<string, PromptAnnotation> {
       && typeof item.sessionKey === 'string' && typeof item.documentId === 'string'
       && typeof item.body === 'string' && promptAnnotationBodyWithinLimit(item.body)
       && item.status === 'draft',
-    )).map(item => [item.annotationId, item]))
+    )).map(item => {
+      // Older drafts can contain automatic captures whose staged uploads have expired.
+      const { screenshotAttachment: _capture, ...annotation } = item as PromptAnnotation & {
+        screenshotAttachment?: unknown
+      }
+      return [annotation.annotationId, annotation]
+    }))
   } catch {
     return {}
   }
@@ -60,9 +65,7 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
   function commit(next: Record<string, PromptAnnotation>) {
     const storage = draftStorage()
     if (!storage) throw new Error('Local annotation storage is unavailable.')
-    storage.setItem(STORAGE_KEY, JSON.stringify(Object.values(next), (key, value) => (
-      key === 'file' ? undefined : value
-    )))
+    storage.setItem(STORAGE_KEY, JSON.stringify(Object.values(next)))
     annotations.value = next
   }
   function draftsForSession(sessionKey: string) {
@@ -83,10 +86,9 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
       item.body.trim() && promptAnnotationBodyWithinLimit(item.body)
     ))
   }
-  function sendBlockedReason(sessionKey: string): 'editing' | 'empty' | 'too-long' | null {
+  function sendBlockedReason(sessionKey: string): 'editing' | 'too-long' | null {
     if (Object.values(overlayOwnerSessions.value).includes(sessionKey)) return 'editing'
     const items = activeDraftsForSession(sessionKey)
-    if (items.some(item => !item.body.trim())) return 'empty'
     return items.some(item => !promptAnnotationBodyWithinLimit(item.body)) ? 'too-long' : null
   }
   function beginOverlayEdit(annotationId: string, sessionKey: string) {
@@ -121,18 +123,6 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
     commit({ ...annotations.value, [item.annotationId]: item })
     setActiveDocument(item.sessionKey, item.documentId)
     return item
-  }
-  function setScreenshot(annotationId: string, screenshotAttachment: Attachment) {
-    const current = annotations.value[annotationId]
-    if (!current) return
-    commit({ ...annotations.value, [annotationId]: { ...current, screenshotAttachment } })
-  }
-  function attachmentsForIds(ids: readonly string[]): Attachment[] {
-    // A batch describes one page. Its latest capture accompanies all selected areas.
-    const screenshot = [...ids].reverse()
-      .map(id => annotations.value[id]?.screenshotAttachment)
-      .find((item): item is Attachment => Boolean(item))
-    return screenshot ? [screenshot] : []
   }
   async function update(annotationId: string, body: string) {
     if (!promptAnnotationBodyWithinLimit(body)) throw new Error('The annotation is too long.')
@@ -198,5 +188,5 @@ export const useArtifactPromptAnnotationsStore = defineStore('artifactPromptAnno
   return { annotations, drafts, overlayOwnerSessions, activeDocumentBySession, draftsForSession,
     setActiveDocument, activeDraftsForSession, sendableDraftsForSession, sendBlockedReason,
     beginOverlayEdit, releaseOverlayEdit, completeOverlayEdit, load, create, update, discard,
-    prepareForSend, snapshotsForIds, attachmentsForIds, setScreenshot, acknowledgeSent, clearSession, reset }
+    prepareForSend, snapshotsForIds, acknowledgeSent, clearSession, reset }
 })

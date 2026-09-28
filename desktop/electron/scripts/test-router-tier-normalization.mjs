@@ -3,10 +3,10 @@ import { strict as assert } from 'node:assert'
 import { normalizeRouterTiers } from '../dist/router-tier-normalization.js'
 
 const currentFallback = {
-  c0: { provider: 'tokenrhythm', model: 'deepseek-v4-flash-0731', supportsImage: false },
-  c1: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
-  c2: { provider: 'tokenrhythm', model: 'kimi-k2.7-code' },
-  c3: { provider: 'tokenrhythm', model: 'glm-5.2', supportsImage: true, ensembleEnabled: true },
+  c0: { provider: 'tokenrhythm', model: 'qwen3.7-flash', supportsImage: false },
+  c1: { provider: 'tokenrhythm', model: 'deepseek-flash' },
+  c2: { provider: 'tokenrhythm', model: 'deepseek-v4-pro-0813' },
+  c3: { provider: 'tokenrhythm', model: 'glm-5.3', supportsImage: true, ensembleEnabled: false },
 }
 
 const legacyCredentialTiers = {
@@ -45,7 +45,7 @@ for (const key of ['supports_image', 'supportsImage']) {
 }
 
 const fresh = normalizeRouterTiers(undefined, currentFallback)
-assert.equal(fresh.c3.ensembleEnabled, true)
+assert.equal(fresh.c3.ensembleEnabled, false)
 assert.equal(Object.hasOwn(fresh.c0, 'supportsImage'), false)
 assert.equal(Object.hasOwn(fresh.c3, 'supportsImage'), false)
 

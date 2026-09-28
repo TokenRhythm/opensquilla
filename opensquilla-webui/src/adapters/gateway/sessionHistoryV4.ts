@@ -362,6 +362,7 @@ export async function requestV4SessionHistory(
     timeoutMs: timeoutMs(request, options.policy),
     timeoutAction: options.policy.concurrentHistoryReads() ? 'reject' : 'reconnect',
     abortAction: 'reject',
+    recoveryClass: 'safe-read',
     ...(options.expectedGeneration === undefined
       ? {}
       : { expectedGeneration: options.expectedGeneration }),

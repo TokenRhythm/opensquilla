@@ -237,38 +237,39 @@ def test_ingress_event_namespace_isolated_by_provider_and_account(tmp_path: Path
         store.close()
 
 
-def test_duplicate_accepted_event_is_not_enqueued_twice_and_recovers_once(
+async def test_duplicate_accepted_event_is_not_enqueued_twice_and_recovers_once(
+    channel_store,
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "channel_delivery.sqlite"
     message = _inbound("slack")
-    first = ChannelDeliveryStore(path)
+    first = await channel_store(path)
     queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
     channel = SimpleNamespace(
         _delivery_store=first,
         _delivery_channel_name="slack-main",
     )
     try:
-        assert durable_enqueue(channel, message, queue) is True
-        assert durable_enqueue(channel, message, queue) is False
+        assert (await durable_enqueue(channel, message, queue)) is True
+        assert (await durable_enqueue(channel, message, queue)) is False
         assert queue.qsize() == 1
     finally:
-        first.close()
+        (await first.close())
 
-    restarted = ChannelDeliveryStore(path)
+    restarted = await channel_store(path)
     recovered_queue: asyncio.Queue[IncomingMessage] = asyncio.Queue()
     restarted_channel = SimpleNamespace(
         _delivery_store=restarted,
         _delivery_channel_name="slack-main",
     )
     try:
-        recovered = restarted.recover_inbound("slack-main")
+        recovered = await restarted.recover_inbound("slack-main")
         assert len(recovered) == 1
-        assert durable_enqueue(restarted_channel, recovered[0], recovered_queue) is True
-        assert durable_enqueue(restarted_channel, message, recovered_queue) is False
+        assert (await durable_enqueue(restarted_channel, recovered[0], recovered_queue)) is True
+        assert (await durable_enqueue(restarted_channel, message, recovered_queue)) is False
         assert recovered_queue.qsize() == 1
     finally:
-        restarted.close()
+        (await restarted.close())
 
 
 @pytest.mark.parametrize(
@@ -301,11 +302,12 @@ def test_duplicate_accepted_event_is_not_enqueued_twice_and_recovers_once(
 )
 @pytest.mark.asyncio
 async def test_outbox_records_explicit_provider_outcomes_without_retry(
+    channel_store,
     tmp_path: Path,
     result: ChannelSendResult | None,
     expected_state: str,
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     calls = 0
 
     class Channel:
@@ -328,14 +330,14 @@ async def test_outbox_records_explicit_provider_outcomes_without_retry(
             is result
         )
         assert calls == 1
-        assert store.diagnostics("mock-main")["outbox"][expected_state]["count"] == 1
+        assert (await store.diagnostics("mock-main"))["outbox"][expected_state]["count"] == 1
     finally:
-        store.close()
+        (await store.close())
 
 
 @pytest.mark.asyncio
-async def test_install_outbox_is_idempotent(tmp_path: Path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_install_outbox_is_idempotent(channel_store, tmp_path: Path) -> None:
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     calls = 0
 
     class Channel:
@@ -355,9 +357,9 @@ async def test_install_outbox_is_idempotent(tmp_path: Path) -> None:
 
         await channel.send(OutgoingMessage(content="hello", reply_to="chat-origin"))
         assert calls == 1
-        assert store.diagnostics("mock-main")["outbox"]["sent_unconfirmed"]["count"] == 1
+        assert (await store.diagnostics("mock-main"))["outbox"]["sent_unconfirmed"]["count"] == 1
     finally:
-        store.close()
+        (await store.close())
 
 
 @pytest.mark.asyncio
@@ -371,22 +373,15 @@ async def test_safe_probes_do_not_start_ingress_or_mutate_provider_state(
         "telegram": [],
     }
 
-    class SlackResponse:
-        def raise_for_status(self) -> None:
-            return None
-
-        def json(self) -> dict[str, Any]:
-            return {"ok": True, "user_id": "B1", "team_id": "T1"}
-
     class SlackClient:
-        async def post(self, path: str) -> SlackResponse:
-            calls["slack"].append(path)
-            return SlackResponse()
+        async def api_call(self, method: str, **_kwargs: Any) -> dict[str, Any]:
+            calls["slack"].append(method)
+            return {"ok": True, "user_id": "B1", "team_id": "T1"}
 
     slack = SlackChannel("token", "C1", signing_secret="secret")
     monkeypatch.setattr(slack, "_get_client", lambda: SlackClient())
     assert (await slack.probe_connection())["authenticated"] is True
-    assert calls["slack"] == ["/auth.test"]
+    assert calls["slack"] == ["auth.test"]
     assert slack.is_connected() is False
 
     discord = DiscordChannel(DiscordChannelConfig(token="token"))
@@ -398,7 +393,7 @@ async def test_safe_probes_do_not_start_ingress_or_mutate_provider_state(
     monkeypatch.setattr(discord, "_fetch_gateway_url", fetch_gateway)
     assert (await discord.probe_connection())["authenticated"] is True
     assert calls["discord"] == ["gateway/bot"]
-    assert discord._ws is None
+    assert discord._gateway_client is None
 
     feishu = FeishuChannel(
         FeishuChannelConfig(
@@ -453,11 +448,11 @@ async def test_missing_credentials_fail_before_transport_or_http_client_creation
     discord = DiscordChannel(DiscordChannelConfig(token=""))
     discord_transport_calls = 0
 
-    async def discord_connect(_url: str) -> None:
+    def discord_connect() -> None:
         nonlocal discord_transport_calls
         discord_transport_calls += 1
 
-    monkeypatch.setattr(discord, "_connect_ws", discord_connect)
+    monkeypatch.setattr(discord, "_create_gateway_client", discord_connect)
     with pytest.raises(ValueError, match="bot token is required"):
         await discord.start()
     assert discord_transport_calls == 0
@@ -525,14 +520,14 @@ async def test_empty_targets_fail_before_provider_client_creation(
 async def test_dead_dispatch_and_poll_workers_make_health_unhealthy() -> None:
     discord = DiscordChannel(DiscordChannelConfig(token="token"))
     discord._connected = True
-    discord._heartbeat_task = asyncio.create_task(asyncio.sleep(60))
+    discord._gateway_task = asyncio.create_task(asyncio.sleep(60))
     discord._dispatch_task = asyncio.create_task(asyncio.sleep(0))
     await discord._dispatch_task
     try:
         assert (await discord.health_check()).connected is False
     finally:
-        discord._heartbeat_task.cancel()
-        await asyncio.gather(discord._heartbeat_task, return_exceptions=True)
+        discord._gateway_task.cancel()
+        await asyncio.gather(discord._gateway_task, return_exceptions=True)
 
     telegram = TelegramChannel(
         TelegramChannelConfig(token="token", transport_name="polling")
@@ -572,8 +567,7 @@ def test_retryable_outbox_failure_is_recorded_without_implicit_retry(tmp_path: P
         )
         with sqlite3.connect(store.path) as connection:
             row = connection.execute(
-                "SELECT state, retryable, error_message FROM channel_outbox "
-                "WHERE send_id = ?",
+                "SELECT state, retryable, error_message FROM channel_outbox WHERE send_id = ?",
                 (send_id,),
             ).fetchone()
         assert row == ("failed", 1, "provider rate limit")

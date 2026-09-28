@@ -156,8 +156,8 @@ def test_runtime_name_storage_name_and_visibility_are_independent(
     assert validation.spec is not None
     assert validation.spec.name == "metro_home"
     assert validation.spec.user_invocable is False
-    assert validation.spec.entrypoint is None
-    assert validation.spec.composition_raw is None
+    assert not hasattr(validation.spec, "entrypoint")
+    assert not hasattr(validation.spec, "composition_raw")
     codes = {item["code"] for item in validation.compatibility_diagnostics}
     assert "DIALECT_FIELD_UNSUPPORTED" in codes
 
@@ -340,9 +340,7 @@ def test_community_candidate_ignores_known_metadata_type_pollution(
         ("plugin", "vendor/plugin"),
         ("mcpServers", "{}"),
         ("command-dispatch", "tool"),
-        ("entrypoint", "{command: 'python run.py'}"),
-        ("kind", "meta"),
-        ("composition", "{}"),
+        ("kind", "workflow"),
     ],
 )
 def test_community_candidate_ignores_unsupported_execution_dialect_fields(
@@ -361,8 +359,8 @@ def test_community_candidate_ignores_unsupported_execution_dialect_fields(
     assert validation.ok is True
     assert validation.spec is not None
     assert validation.spec.kind == "skill"
-    assert validation.spec.entrypoint is None
-    assert validation.spec.composition_raw is None
+    assert not hasattr(validation.spec, "entrypoint")
+    assert not hasattr(validation.spec, "composition_raw")
     assert any(
         diagnostic["code"] == "DIALECT_FIELD_UNSUPPORTED" and diagnostic["field"] == field
         for diagnostic in validation.compatibility_diagnostics
@@ -573,7 +571,7 @@ def test_instruction_projection_retains_instructions_visibility_and_safe_require
             'disable-model-invocation: "yes"\n'
             "always: true\n"
             "triggers: [automatic]\n"
-            "kind: meta\n"
+            "kind: skill\n"
             "entrypoint: {command: 'python run.py'}\n"
             "composition: {steps: []}\n"
             "meta_priority: 99\n"
@@ -614,14 +612,14 @@ def test_instruction_projection_retains_instructions_visibility_and_safe_require
     assert spec.always is False
     assert spec.triggers == []
     assert spec.kind == "skill"
-    assert spec.entrypoint is None
-    assert spec.composition_raw is None
-    assert spec.meta_priority == 0
-    assert spec.request_template == {}
-    assert spec.output_contract == {}
-    assert spec.eval_prompts == []
-    assert spec.preference_keys == []
-    assert spec.policy_tags == []
+    assert not hasattr(spec, "entrypoint")
+    assert not hasattr(spec, "composition_raw")
+    assert not hasattr(spec, "meta_priority")
+    assert not hasattr(spec, "request_template")
+    assert not hasattr(spec, "output_contract")
+    assert not hasattr(spec, "eval_prompts")
+    assert not hasattr(spec, "preference_keys")
+    assert not hasattr(spec, "policy_tags")
     assert spec.requires_tools == []
     assert spec.metadata is not None
     assert spec.metadata.always is None
@@ -654,12 +652,12 @@ def test_loader_projects_only_exact_lock_tracked_community_directories(
         managed,
         "source-slug",
         name="runtime_name",
-        extra="always: true\nkind: meta\nentrypoint: {command: unsafe}\n",
+        extra="always: true\nkind: skill\nentrypoint: {command: unsafe}\n",
     )
     _write_skill(
         managed,
         "accepted-local-meta",
-        extra="always: true\nkind: meta\nentrypoint: {command: trusted}\n",
+        extra="always: true\nkind: skill\nentrypoint: {command: trusted}\n",
     )
     lock_path = tmp_path / "skills-lock.json"
     lockfile = Lockfile()
@@ -688,11 +686,11 @@ def test_loader_projects_only_exact_lock_tracked_community_directories(
     assert projected is not None
     assert projected.always is False
     assert projected.kind == "skill"
-    assert projected.entrypoint is None
+    assert not hasattr(projected, "entrypoint")
     assert local_meta is not None
     assert local_meta.always is True
-    assert local_meta.kind == "meta"
-    assert local_meta.entrypoint == {"command": "trusted"}
+    assert local_meta.kind == "skill"
+    assert not hasattr(local_meta, "entrypoint")
 
 
 @pytest.mark.parametrize(
@@ -710,7 +708,7 @@ def test_loader_quarantines_managed_layer_when_lock_profile_is_untrusted(
     _write_skill(
         managed,
         "looks-local",
-        extra="always: true\nkind: meta\nentrypoint: {command: unsafe}\n",
+        extra="always: true\nkind: skill\nentrypoint: {command: unsafe}\n",
     )
     lock_path = tmp_path / "skills-lock.json"
     lock_path.write_text(lock_payload, encoding="utf-8")
@@ -740,7 +738,7 @@ def test_loader_serves_projected_lkg_when_lock_or_tracked_path_becomes_untrusted
         managed,
         "source-slug",
         name="runtime_name",
-        extra="kind: meta\nentrypoint: {command: first}\n",
+        extra="kind: skill\nentrypoint: {command: first}\n",
         body="Original instructions.",
     )
     lock_path = tmp_path / "skills-lock.json"
@@ -764,11 +762,11 @@ def test_loader_serves_projected_lkg_when_lock_or_tracked_path_becomes_untrusted
     baseline = loader.get_by_name("runtime_name")
     assert baseline is not None
     assert baseline.kind == "skill"
-    assert baseline.entrypoint is None
+    assert not hasattr(baseline, "entrypoint")
 
     (tracked / "SKILL.md").write_text(
         "---\nname: runtime_name\ndescription: Changed.\n"
-        "kind: meta\nentrypoint: {command: second}\n---\nChanged instructions.\n",
+        "kind: skill\nentrypoint: {command: second}\n---\nChanged instructions.\n",
         encoding="utf-8",
     )
     if invalid_lock_path:
@@ -787,7 +785,7 @@ def test_loader_serves_projected_lkg_when_lock_or_tracked_path_becomes_untrusted
     assert retained is not None
     assert retained.content == "Original instructions."
     assert retained.kind == "skill"
-    assert retained.entrypoint is None
+    assert not hasattr(retained, "entrypoint")
 
 
 def test_loader_lock_fingerprint_is_content_stable_across_identical_restore(
@@ -844,7 +842,7 @@ def test_loader_relocates_v1_profile_by_storage_key_not_stale_absolute_path(
         "source-slug",
         name="runtime_name",
         description="stale copy",
-        extra="kind: meta\nentrypoint: {command: stale}\n",
+        extra="kind: skill\nentrypoint: {command: stale}\n",
     )
     managed = tmp_path / "moved-profile" / "skills"
     _write_skill(
@@ -852,7 +850,7 @@ def test_loader_relocates_v1_profile_by_storage_key_not_stale_absolute_path(
         "source-slug",
         name="runtime_name",
         description="moved copy",
-        extra="kind: meta\nentrypoint: {command: moved}\n",
+        extra="kind: skill\nentrypoint: {command: moved}\n",
     )
     lock_path = tmp_path / "moved-profile" / "skills-lock.json"
     lockfile = Lockfile()
@@ -876,16 +874,16 @@ def test_loader_relocates_v1_profile_by_storage_key_not_stale_absolute_path(
     assert loaded is not None
     assert loaded.description == "moved copy"
     assert loaded.kind == "skill"
-    assert loaded.entrypoint is None
+    assert not hasattr(loaded, "entrypoint")
 
 
-def test_compile_profile_default_preserves_trusted_execution_semantics(
+def test_compile_profile_preserves_ordinary_activation_semantics(
     tmp_path: Path,
 ) -> None:
     skill_dir = _write_skill(
         tmp_path,
         "trusted-meta",
-        extra="always: true\nkind: meta\nentrypoint: {command: trusted}\n",
+        extra="always: true\nkind: skill\nentrypoint: {command: trusted}\n",
     )
 
     trusted = compile_skill_manifest(skill_dir, SkillLayer.MANAGED)
@@ -896,11 +894,11 @@ def test_compile_profile_default_preserves_trusted_execution_semantics(
     )
 
     assert trusted.always is True
-    assert trusted.kind == "meta"
-    assert trusted.entrypoint == {"command": "trusted"}
+    assert trusted.kind == "skill"
+    assert not hasattr(trusted, "entrypoint")
     assert community.always is False
     assert community.kind == "skill"
-    assert community.entrypoint is None
+    assert not hasattr(community, "entrypoint")
 
 
 def test_existing_loader_layers_remain_tolerant_of_legacy_uppercase_names(
@@ -966,7 +964,7 @@ def test_catalog_exposes_candidates_shadowed_instances_and_diagnostics(
     assert snapshot.get_candidate_by_instance_id(snapshot.shadowed[0].instance_id) is not None
 
 
-def test_v16_snapshot_round_trips_candidate_view_and_invalidates_v15(
+def test_v17_snapshot_round_trips_candidate_view_and_invalidates_v16(
     tmp_path: Path,
 ) -> None:
     low = tmp_path / "low"
@@ -982,7 +980,7 @@ def test_v16_snapshot_round_trips_candidate_view_and_invalidates_v15(
     )
     loader.load_all()
     data = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    assert data["version"] == 16
+    assert data["version"] == 17
     assert len(data["candidates"]) == 2
     assert len(data["shadowed"]) == 1
 
@@ -1000,7 +998,7 @@ def test_v16_snapshot_round_trips_candidate_view_and_invalidates_v15(
 
     # v15 has no catalog visibility/invocation policy fields. It must miss so
     # candidates cannot be restored into the wrong public execution domain.
-    data["version"] = 15
+    data["version"] = 16
     data.pop("candidates", None)
     data.pop("shadowed", None)
     data.pop("diagnostics", None)

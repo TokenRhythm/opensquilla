@@ -39,21 +39,27 @@ describe('local page annotation drafts', () => {
     expect(restored.annotations['draft-1'].pagePath).toBe('layouts/dashboard.html')
   })
 
-  it('persists the opaque screenshot upload without putting File bytes in local JSON', async () => {
+  it('restores legacy drafts without retaining their automatic screenshot uploads', async () => {
     const store = useArtifactPromptAnnotationsStore()
     await store.create(request)
-    store.setScreenshot('draft-1', {
-      kind: 'staged', local_id: -1, name: 'page-selection.png', mime: 'image/png',
-      file_uuid: 'capture-file', file: new File(['png'], 'page-selection.png'),
-    })
-    const persisted = localStorage.getItem('opensquilla.page-annotation-drafts.v1')!
-    expect(persisted).not.toContain('"file":')
-    expect(persisted).not.toContain('base64')
+    localStorage.setItem('opensquilla.page-annotation-drafts.v1', JSON.stringify([{
+      ...store.annotations['draft-1'],
+      screenshotAttachment: {
+        kind: 'staged', local_id: -1, name: 'page-selection.png', mime: 'image/png',
+        file_uuid: 'expired-capture-file',
+      },
+    }]))
     setActivePinia(createPinia())
     const restored = useArtifactPromptAnnotationsStore()
-    expect(restored.attachmentsForIds(['draft-1'])).toEqual([
-      expect.objectContaining({ file_uuid: 'capture-file', kind: 'staged' }),
-    ])
+    expect(restored.annotations['draft-1']).not.toHaveProperty('screenshotAttachment')
+    expect(restored.sendBlockedReason('session-1')).toBeNull()
+    expect(await restored.prepareForSend(['draft-1'])).toBe(true)
+    expect(restored.snapshotsForIds(['draft-1'])[0]).toMatchObject({
+      body: request.body, targetRef: 'target-1', locatorHint: 'h1',
+    })
+    await restored.update('draft-1', 'Another instruction')
+    expect(localStorage.getItem('opensquilla.page-annotation-drafts.v1'))
+      .not.toContain('screenshotAttachment')
   })
 
   it('clears only unchanged drafts after an accepted send', async () => {
@@ -75,6 +81,23 @@ describe('local page annotation drafts', () => {
     expect(store.sendableDraftsForSession('session-1')).toEqual([])
     store.completeOverlayEdit('draft-1')
     expect(store.sendableDraftsForSession('session-1')).toHaveLength(1)
+  })
+
+  it.each(['', ' \n\t '])('keeps an empty draft editable without blocking ready instructions', async body => {
+    const store = useArtifactPromptAnnotationsStore()
+    await store.create({ ...request, annotationId: 'empty-draft', body })
+    expect(store.sendBlockedReason('session-1')).toBeNull()
+    expect(store.sendableDraftsForSession('session-1')).toEqual([])
+    expect(await store.prepareForSend(['empty-draft'])).toBe(false)
+
+    await store.create(request)
+    expect(store.sendBlockedReason('session-1')).toBeNull()
+    expect(store.sendableDraftsForSession('session-1').map(item => item.annotationId))
+      .toEqual(['draft-1'])
+    store.acknowledgeSent(store.snapshotsForIds(['draft-1']))
+    expect(store.activeDraftsForSession('session-1')).toEqual([
+      expect.objectContaining({ annotationId: 'empty-draft', body }),
+    ])
   })
 
   it('does not lose the existing draft when durable local storage fails', async () => {

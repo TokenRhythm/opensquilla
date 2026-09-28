@@ -12,12 +12,19 @@
     ".github/scripts/prepare-electron.mjs",
     ".github/scripts/test-prepare-electron.mjs",
     ".github/scripts/verify-nsis-upgrade-regression.py",
+    ".github/scripts/verify-packaged-ownership-long-paths.py",
+    ".github/scripts/verify-packaged-startup-compatibility.py",
+    ".github/scripts/verify-packaged-v054-upgrade.py",
     ".github/scripts/verify-sandbox-package.mjs",
+    ".github/scripts/verify-windows-candidate-probe.ps1",
+    ".github/scripts/windows-candidate-context.ps1",
+    ".github/scripts/windows_candidate_identity.py",
     ".github/scripts/windows_test_assignments.json",
     ".github/scripts/windows_test_partitions.json",
     ".github/scripts/windows_test_shards.py",
     ".github/workflows/ci.yml",
     ".github/workflows/managed-toolchain-artifacts.yml",
+    ".github/workflows/windows-candidate-probes.yml",
     ".github/workflows/windows-nsis-upgrade-regression.yml"
   ]
 }

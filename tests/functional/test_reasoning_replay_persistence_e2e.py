@@ -652,9 +652,13 @@ async def test_comparison_reuses_frozen_sqlite_input_and_locks_controls(tmp_path
         assert proof["archive_preserved"] is True
         assert all(proof["answer_fact_checks"].values())
         assert proof["source_sha256"] == manifest["source_sha256"]
+        assert proof["capacity_samples"]
+        assert all(sample["applied_tokens"] <= sample["natural_tokens"]
+                   and sample["applied_chars"] <= sample["natural_chars"]
+                   for sample in proof["capacity_samples"])
         if tokens is not None:
-            assert proof["capacity_samples"]
             assert all(sample["applied_tokens"] == tokens for sample in proof["capacity_samples"])
+            assert all(sample["applied_chars"] == chars for sample in proof["capacity_samples"])
         measured.append(proof)
     for key in ("source_sha256", "prompt_sha256", "controls_sha256", "actual_system_sha256",
                 "actual_tools_sha256", "actual_model", "actual_controls_sha256"):

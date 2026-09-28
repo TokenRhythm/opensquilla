@@ -546,6 +546,52 @@ def test_gateway_lifecycle_paths_use_state_root(tmp_path, monkeypatch) -> None:
     assert gateway_lifecycle.gateway_log_path() == tmp_path / "home" / "logs" / "gateway.log"
 
 
+def test_gateway_spawn_passes_stable_runtime_cwd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    calls: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(pid=4242)
+
+    monkeypatch.setattr(gateway_lifecycle, "_gateway_runtime_cwd", lambda: runtime_root)
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fake_popen)
+    manager = Manager(port=0, health_timeout=0)
+    manager.log_path = tmp_path / "gateway.log"
+
+    manager._spawn_gateway([sys.executable, "-m", "opensquilla.cli.main", "gateway", "run"])
+
+    assert calls
+    assert calls[0][1]["cwd"] == str(runtime_root)
+
+
+def test_gateway_spawn_does_not_spawn_when_runtime_root_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spawned = False
+
+    def fail_popen(*_args, **_kwargs):
+        nonlocal spawned
+        spawned = True
+        raise AssertionError("invalid runtime root must fail before Popen")
+
+    monkeypatch.setattr(
+        gateway_lifecycle,
+        "_gateway_runtime_cwd",
+        lambda: (_ for _ in ()).throw(RuntimeError("runtime_root_missing: deleted")),
+    )
+    monkeypatch.setattr(gateway_lifecycle.subprocess, "Popen", fail_popen)
+    manager = Manager(port=0, health_timeout=0)
+    manager.log_path = tmp_path / "gateway.log"
+
+    with pytest.raises(RuntimeError, match=r"^runtime_root_missing:"):
+        manager._spawn_gateway([sys.executable, "-m", "opensquilla.cli.main", "gateway", "run"])
+    assert spawned is False
+
+
 def test_safe_desktop_gateway_start_uses_external_lifecycle_state(
     tmp_path: Path,
     monkeypatch,
@@ -1812,11 +1858,21 @@ def test_gateway_run_drains_via_http_shutdown_trigger(tmp_path, monkeypatch) -> 
     _install_fake_start(server, holder, monkeypatch)
     monkeypatch.setattr(gateway_cmd, "_gateway_bind_available", lambda *_args: True)
 
-    gateway_cmd.run_gateway(
-        port=None, bind=None, listen="", debug=False, config_path=str(config)
-    )
+    import structlog
+
+    with structlog.testing.capture_logs() as logs:
+        gateway_cmd.run_gateway(
+            port=None, bind=None, listen="", debug=False, config_path=str(config)
+        )
 
     assert holder["server"].closed == ["api_shutdown"]
+    assert {
+        "event": "gateway.shutdown_requested",
+        "reason": "api_shutdown",
+    } in [
+        {key: event[key] for key in ("event", "reason") if key in event}
+        for event in logs
+    ]
 
 
 def test_gateway_run_force_exits_after_incomplete_shutdown(tmp_path, monkeypatch) -> None:

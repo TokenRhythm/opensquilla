@@ -18,6 +18,7 @@ from opensquilla.provider.openai import (
     _stream_timeout,
     _tool_schema_accepts_arguments,
 )
+from opensquilla.provider.preset_registry import get_preset
 from opensquilla.provider.selector import build_provider
 from opensquilla.provider.tokenrhythm_correlation import (
     is_tokenrhythm_correlation_target,
@@ -37,87 +38,6 @@ from opensquilla.provider.types import (
     ToolInputSchema,
     ToolUseEndEvent,
 )
-from opensquilla.tools.policy_helpers import ToolPolicy, apply_tool_policy
-from opensquilla.tools.registry import get_default_registry
-from opensquilla.tools.types import ToolContext
-
-STRICT_SOURCE_EDIT_TOOL_NAMES = {
-    "read_source",
-    "edit_source",
-    "grep_search",
-    "glob_search",
-    "exec_command",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-SOURCE_EDIT_V2_TOOL_NAMES = {
-    "read_source",
-    "edit_source",
-    "source_symbols",
-    "grep_search",
-    "glob_search",
-    "exec_command",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-BALANCED_SOURCE_EDIT_TOOL_NAMES = {
-    "read_source",
-    "edit_source",
-    "create_source",
-    "write_scratch",
-    "source_symbols",
-    "read_file",
-    "grep_search",
-    "glob_search",
-    "list_dir",
-    "exec_command",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES = BALANCED_SOURCE_EDIT_TOOL_NAMES | {"apply_patch"}
-SCAFFOLD_EDIT_TOOL_NAMES = {
-    "exec_command",
-    "read_file",
-    "edit_file",
-    "write_file",
-    "glob_search",
-    "grep_search",
-    "list_dir",
-    "git_status",
-    "git_diff",
-    "retrieve_tool_result",
-}
-SCAFFOLD_PATCH_TOOL_NAMES = SCAFFOLD_EDIT_TOOL_NAMES | {"apply_patch"}
-STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES = {
-    "read_file",
-    "list_dir",
-    "write_file",
-    "edit_file",
-    "apply_patch",
-    "execute_code",
-    "background_process",
-    "process",
-    "git_log",
-}
-SCAFFOLD_FORBIDDEN_TOOL_NAMES = {
-    "background_process",
-    "process",
-    "execute_code",
-    "git_log",
-    "read_source",
-    "edit_source",
-    "source_symbols",
-}
-SCAFFOLD_EDIT_FORBIDDEN_DESCRIPTION_NAMES = SCAFFOLD_FORBIDDEN_TOOL_NAMES | {
-    "apply_patch",
-    "read_spreadsheet",
-}
-SCAFFOLD_PATCH_FORBIDDEN_DESCRIPTION_NAMES = SCAFFOLD_FORBIDDEN_TOOL_NAMES | {
-    "read_spreadsheet",
-}
 
 
 def _sse_body(model: str = "test-model") -> bytes:
@@ -251,13 +171,6 @@ def test_openrouter_normal_request_omits_keepalive_affinity_header(
     assert "X-Session-Id" not in captured["headers"]
 
 
-def _payload_tool_descriptions(payload: dict[str, Any]) -> str:
-    return "\n".join(
-        str(tool["function"].get("description", ""))
-        for tool in payload.get("tools", [])
-    )
-
-
 def _assert_no_dashscope_duplicate_omission(messages: list[dict[str, Any]]) -> None:
     serialized = json.dumps(messages, ensure_ascii=False)
     assert "duplicate tool interaction omitted" not in serialized
@@ -315,6 +228,29 @@ def _collect(provider: OpenAIProvider, cfg: ChatConfig) -> DoneEvent:
         return done
 
     return asyncio.run(_run())
+
+
+def test_tokenrhythm_recommended_c1_keeps_neutral_request_dialect(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    _patch_transport(monkeypatch, captured)
+    preset = get_preset("tokenrhythm")
+    assert preset is not None
+    model = preset.tier_defaults()["c1"]["model"]
+    catalog = ModelCatalog()
+    provider = OpenAIProvider(
+        api_key="test-key", model=model,
+        base_url="https://tokenrhythm.studio/v1", provider_kind="tokenrhythm",
+    )
+    _collect(provider, ChatConfig(
+        max_tokens=catalog.resolve_max_tokens(model, provider="tokenrhythm"),
+        model_capabilities=catalog.get_capabilities(model, provider_name="tokenrhythm"),
+    ))
+    payload = captured["payload"]
+    assert payload["model"] == "deepseek-flash"
+    assert payload["max_tokens"] == 384_000
+    assert "thinking" not in payload
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
 
 
 @pytest.mark.parametrize("provider_id", ["dashscope", "deepseek"])
@@ -1643,212 +1579,6 @@ def _assert_invalid_native_arguments_fail_closed(
     assert "_raw" not in error.message
 
 
-def test_strict_source_edit_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_strict"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == STRICT_SOURCE_EDIT_TOOL_NAMES
-    assert STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-
-
-def test_source_edit_v2_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_v2"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == SOURCE_EDIT_V2_TOOL_NAMES
-    assert STRICT_SOURCE_EDIT_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-
-
-def test_balanced_source_edit_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_balanced"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == BALANCED_SOURCE_EDIT_TOOL_NAMES
-    assert {"write_file", "edit_file", "apply_patch", "execute_code"}.isdisjoint(tool_names)
-
-
-def test_patch_fallback_source_edit_profile_provider_payload_adds_only_apply_patch(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_source_edit_patch_fallback"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-    cfg = ChatConfig(
-        model_capabilities=ModelCapabilities(
-            supports_tools=True,
-            reasoning_format="dashscope",
-        )
-    )
-
-    _collect_events(provider, cfg, tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == PATCH_FALLBACK_SOURCE_EDIT_TOOL_NAMES
-    assert {"write_file", "edit_file", "execute_code"}.isdisjoint(tool_names)
-
-
-def test_scaffold_edit_profile_provider_payload_exposes_exact_tool_surface(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_scaffold_edit"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-
-    _collect_events(provider, ChatConfig(), tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == SCAFFOLD_EDIT_TOOL_NAMES
-    assert SCAFFOLD_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-    assert "apply_patch" not in tool_names
-    descriptions = _payload_tool_descriptions(captured["payload"])
-    for hidden_name in SCAFFOLD_EDIT_FORBIDDEN_DESCRIPTION_NAMES:
-        assert hidden_name not in descriptions
-
-
-def test_scaffold_patch_profile_provider_payload_adds_only_apply_patch(
-    monkeypatch: Any,
-) -> None:
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="qwen3.6-flash",
-        base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
-        provider_kind="dashscope",
-    )
-    registry = get_default_registry()
-    ctx = apply_tool_policy(
-        ToolContext(is_owner=True),
-        available_tools=registry.list_names(),
-        agent_policy=ToolPolicy(profile="repo_coding_scaffold_patch"),
-    )
-    tools = registry.to_tool_definitions(ctx)
-
-    _collect_events(provider, ChatConfig(), tools=tools)
-
-    tool_names = {
-        tool["function"]["name"]
-        for tool in captured["payload"]["tools"]
-    }
-    assert tool_names == SCAFFOLD_PATCH_TOOL_NAMES
-    assert SCAFFOLD_FORBIDDEN_TOOL_NAMES.isdisjoint(tool_names)
-    descriptions = _payload_tool_descriptions(captured["payload"])
-    assert "apply_patch" in descriptions
-    for hidden_name in SCAFFOLD_PATCH_FORBIDDEN_DESCRIPTION_NAMES:
-        assert hidden_name not in descriptions
-
-
 def test_tool_input_schema_omits_additional_properties_by_default() -> None:
     tool = ToolDefinition(
         name="lookup",
@@ -1889,33 +1619,17 @@ def test_tool_input_schema_supports_explicit_additional_properties_false() -> No
     assert not _tool_schema_accepts_arguments(tool, {"q": "hi", "extra": "rejected"})
 
 
-def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
-    monkeypatch: Any,
-) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+def test_gemini_does_not_project_retired_csv_schema(monkeypatch: Any) -> None:
+    tool = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
-    original_definition = create_csv.model_copy(deep=True)
-    assert create_csv.allow_string_item_schema_projection is True
-    assert "allow_string_item_schema_projection" not in create_csv.model_dump()
-    assert (
-        "allow_string_item_schema_projection"
-        not in ToolDefinition.model_json_schema()["properties"]
-    )
-    assert create_csv.model_copy(deep=True).allow_string_item_schema_projection is True
-    assert (
-        ToolDefinition.model_validate(create_csv.model_dump())
-        .allow_string_item_schema_projection
-        is False
-    )
-    assert create_csv.input_schema.properties["rows"]["items"] == {"type": "array"}
-    assert _tool_schema_accepts_arguments(
-        create_csv,
-        {"rows": [["text", 1, True, None, {"x": 1}, ["nested"]]]},
-    )
-
+    tool._enable_string_item_schema_projection()
+    original_definition = tool.model_copy(deep=True)
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
     provider = OpenAIProvider(
@@ -1924,20 +1638,20 @@ def test_gemini_projects_only_create_csv_itemless_arrays_to_string_items(
         base_url="https://generativelanguage.googleapis.com/v1beta/openai",
         provider_kind="gemini",
     )
-    _collect_events(provider, ChatConfig(), tools=[create_csv])
+    _collect_events(provider, ChatConfig(), tools=[tool])
 
     wire_rows = captured["payload"]["tools"][0]["function"]["parameters"][
         "properties"
     ]["rows"]
-    assert wire_rows["items"] == {"type": "array", "items": {"type": "string"}}
-    assert create_csv == original_definition
+    assert wire_rows["items"] == {"type": "array"}
+    assert tool == original_definition
 
 
 @pytest.mark.parametrize(
     ("base_url", "tool_name"),
     [
-        ("https://relay.example/v1", "create_csv"),
-        ("https://openrouter.ai/api/v1", "create_csv"),
+        ("https://relay.example/v1", "generic_table"),
+        ("https://openrouter.ai/api/v1", "generic_table"),
         ("https://generativelanguage.googleapis.com/v1beta/openai", "mcp_csv"),
     ],
 )
@@ -1948,7 +1662,7 @@ def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
 ) -> None:
     tool = ToolDefinition(
         name=tool_name,
-        description="Create a CSV-like artifact.",
+        description="Process a generic table.",
         input_schema=ToolInputSchema(
             properties={"rows": {"type": "array", "items": {"type": "array"}}},
             required=["rows"],
@@ -1974,7 +1688,7 @@ def test_gemini_string_item_projection_is_endpoint_and_tool_allowlisted(
 def test_gemini_does_not_project_an_untrusted_same_named_tool(monkeypatch: Any) -> None:
     tool = ToolDefinition.model_validate(
         {
-            "name": "create_csv",
+            "name": "generic_table",
             "description": "Third-party tool with unrelated row semantics.",
             "input_schema": {
                 "properties": {
@@ -2028,10 +1742,13 @@ def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
     monkeypatch: Any,
     base_url: str,
 ) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+    create_csv = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
     captured: dict[str, Any] = {}
     _patch_transport(monkeypatch, captured)
@@ -2053,8 +1770,8 @@ def test_gemini_does_not_project_create_csv_on_nonofficial_api_roots(
 def test_string_item_projection_preserves_schema_shaped_literals() -> None:
     literal = {"type": "array"}
     tool = ToolDefinition(
-        name="create_csv",
-        description="Create a CSV file.",
+        name="generic_table",
+        description="Process a generic table.",
         input_schema=ToolInputSchema(
             properties={
                 "value": {
@@ -2081,13 +1798,14 @@ def test_string_item_projection_preserves_schema_shaped_literals() -> None:
     assert tool == original_definition
 
 
-def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
-    monkeypatch: Any,
-) -> None:
-    create_csv = next(
-        tool
-        for tool in get_default_registry().to_tool_definitions()
-        if tool.name == "create_csv"
+def test_string_item_projection_traverses_composed_schemas_without_mutating_source() -> None:
+    create_csv = ToolDefinition(
+        name="generic_table",
+        description="Synthetic generic table tool.",
+        input_schema=ToolInputSchema(
+            properties={"rows": {"type": "array", "items": {"type": "array"}}},
+            required=["rows"],
+        ),
     )
     tool = create_csv.model_copy(
         deep=True,
@@ -2111,20 +1829,11 @@ def test_gemini_projection_traverses_composed_schemas_without_mutating_source(
         },
     )
     original_definition = tool.model_copy(deep=True)
-    captured: dict[str, Any] = {}
-    _patch_transport(monkeypatch, captured)
-    provider = OpenAIProvider(
-        api_key="test",
-        model="gemini-2.5-flash",
-        base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
-        provider_kind="gemini",
+    payload = _build_openai_tool(
+        tool,
+        complete_itemless_arrays_with_string_items=True,
     )
-
-    _collect_events(provider, ChatConfig(), tools=[tool])
-
-    properties = captured["payload"]["tools"][0]["function"]["parameters"][
-        "properties"
-    ]
+    properties = payload["function"]["parameters"]["properties"]
     assert properties["all_of"]["allOf"][0]["items"] == {"type": "string"}
     assert properties["any_of"]["anyOf"][0]["items"] == {"type": "string"}
     assert properties["one_of"]["oneOf"][0]["items"] == {"type": "string"}
@@ -6021,8 +5730,8 @@ def test_openai_compat_sends_required_tool_choice_when_configured(
         provider_kind="openrouter",
     )
     tool = ToolDefinition(
-        name="meta_invoke",
-        description="Invoke a meta-skill.",
+        name="lookup_record",
+        description="Look up a named record.",
         input_schema=ToolInputSchema(properties={"name": {"type": "string"}}, required=["name"]),
     )
 
@@ -6043,11 +5752,11 @@ def test_openai_compat_sends_named_function_tool_choice_when_configured(
         provider_kind="openrouter",
     )
     tool = ToolDefinition(
-        name="meta_invoke",
-        description="Invoke a meta-skill.",
+        name="lookup_record",
+        description="Look up a named record.",
         input_schema=ToolInputSchema(properties={"name": {"type": "string"}}, required=["name"]),
     )
-    tool_choice = {"type": "function", "function": {"name": "meta_invoke"}}
+    tool_choice = {"type": "function", "function": {"name": "lookup_record"}}
 
     _collect_events(provider, ChatConfig(tool_choice=tool_choice), tools=[tool])
 

@@ -85,7 +85,8 @@ def test_session_router_preserves_explicit_operator_tiers_and_provider_policy(
     assert config.squilla_router.model_dump() == original
 
 
-def test_session_router_follow_primary_reuses_provider_default_policy() -> None:
+@pytest.mark.parametrize("has_explicit_ladder", [False, True])
+def test_session_router_managed_ladder_follows_primary(has_explicit_ladder: bool) -> None:
     from opensquilla.provider.preset_registry import get_preset
 
     config = GatewayConfig(
@@ -93,7 +94,10 @@ def test_session_router_follow_primary_reuses_provider_default_policy() -> None:
         squilla_router={
             "enabled": False,
             "preset_binding": "follow_primary",
-            "tiers": {"c0": {"provider": "openrouter", "model": "old-primary/model"}},
+            "cross_provider_tiers": has_explicit_ladder,
+            **({"tiers": {
+                "c0": {"provider": "openrouter", "model": "old-primary/model"},
+            }} if has_explicit_ladder else {}),
         },
     )
     original = config.squilla_router.model_dump()
@@ -248,8 +252,62 @@ async def test_legacy_default_resolution_is_audited_with_its_revision() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("session_mode", "global_mode"),
+    [("direct", "router"), ("router", "direct"), ("ensemble", "direct")],
+)
+async def test_goal_continuation_keeps_the_user_sessions_routing_mode(
+    session_mode: str,
+    global_mode: str,
+) -> None:
+    config = GatewayConfig(
+        squilla_router={
+            "enabled": global_mode == "router",
+            "rollout_phase": "full",
+        },
+        llm_ensemble={"enabled": False},
+    )
+    calls: list[tuple[str, str]] = []
+    session_key = "agent:main:webchat:goal-routing"
+
+    class SessionManager:
+        async def get_session_routing(
+            self,
+            key: str,
+            *,
+            fallback_mode: str,
+        ) -> dict[str, Any]:
+            calls.append((key, fallback_mode))
+            return {
+                "mode": session_mode,
+                "revision": 4,
+                "source": "session_override",
+            }
+
+    manager = SessionManager()
+    initial = await capture_accepted_model_routing_config(
+        config, manager, session_key=session_key, run_kind="session_turn"
+    )
+    continuation = await capture_accepted_model_routing_config(
+        config, manager, session_key=session_key, run_kind="goal"
+    )
+
+    assert calls == [(session_key, global_mode), (session_key, global_mode)]
+    assert model_routing_snapshot(initial)["mode"] == session_mode
+    assert model_routing_snapshot(continuation) == model_routing_snapshot(initial)
+    assert model_routing_snapshot(config)["mode"] == global_mode
+    initial_audit = accepted_model_routing_audit(initial, run_kind="session_turn")
+    continuation_audit = accepted_model_routing_audit(continuation, run_kind="goal")
+    assert initial_audit is not None
+    assert continuation_audit == {**initial_audit, "run_kind": "goal"}
+    assert continuation_audit["scope"] == "session"
+    assert continuation_audit["session_mode"] == session_mode
+    assert continuation_audit["session_revision"] == 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "run_kind",
-    ["default", "runtime_send", "cron_turn", "heartbeat", "goal"],
+    ["default", "runtime_send", "cron_turn", "heartbeat"],
 )
 async def test_noninteractive_runs_keep_global_mode_without_reading_session(
     run_kind: str,

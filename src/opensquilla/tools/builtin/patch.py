@@ -451,10 +451,23 @@ async def _gate_patch_ops(
 
     from opensquilla.sandbox.sensitive_paths import build_block_envelope, sensitive_path_marker
     from opensquilla.tools.builtin import filesystem
+    from opensquilla.tools.workspace_authoring import (
+        guard_channel_workspace_path,
+        restricted_channel_context,
+    )
     from opensquilla.tools.write_policy import (
         match_workspace_write_deny,
         workspace_write_deny_block,
     )
+
+    ctx = filesystem.current_tool_context.get()
+    if restricted_channel_context(ctx):
+        for op in ops:
+            guard_channel_workspace_path(ctx, _resolve_path(op.path, root))
+        if sandbox_permissions != "use_default" or approval_id:
+            raise filesystem.WorkspaceAccessError(
+                "Channel workspace tools cannot request host execution."
+            )
 
     elevated_full = full_host_access_active()
     workspace = filesystem._workspace_root()

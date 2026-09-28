@@ -506,10 +506,10 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
     assert res.config.squilla_router.enabled is True
     assert res.config.squilla_router.tier_profile is None
     expected = {
-        "c0": "deepseek-v4-flash-0731",
-        "c1": "deepseek-v4-pro-0813",
-        "c2": "kimi-k2.7-code",
-        "c3": "glm-5.2",
+        "c0": "qwen3.7-flash",
+        "c1": "deepseek-flash",
+        "c2": "deepseek-v4-pro-0813",
+        "c3": "glm-5.3",
         "image_model": "kimi-k2.6",
     }
     for tier, model in expected.items():
@@ -517,8 +517,8 @@ def test_tokenrhythm_provider_save_seeds_curated_inline_ladder():
         assert res.config.squilla_router.tiers[tier]["model"] == model
     persisted = res.config.to_toml_dict()["squilla_router"]
     assert "tier_profile" not in persisted
-    assert persisted["tiers"]["c3"]["model"] == "glm-5.2"
-    assert persisted["tiers"]["c3"]["ensemble_enabled"] is True
+    assert persisted["tiers"]["c3"]["model"] == "glm-5.3"
+    assert persisted["tiers"]["c3"]["ensemble_enabled"] is False
     assert persisted["tiers"]["c0"]["supports_image"] is False
     assert persisted["tiers"]["c2"]["supports_image"] is False
     assert "ensemble_selection_mode" not in persisted["tiers"]["c3"]
@@ -542,7 +542,7 @@ def test_provider_default_direct_model_does_not_follow_existing_router_tier():
 
     assert res.config.llm.model == "deepseek/deepseek-v4-pro"
     assert res.config.squilla_router.default_tier == "c2"
-    assert res.config.squilla_router.tiers["c2"]["model"] == "z-ai/glm-5.2"
+    assert res.config.squilla_router.tiers["c2"]["model"] == "deepseek/deepseek-v4-pro-0813"
 
 
 def test_upsert_channel_appends_new():
@@ -1548,24 +1548,21 @@ def test_upsert_router_recommended_writes_profile_without_expanded_tiers():
     assert res.public_payload["mode"] == "recommended"
 
 
-def test_upsert_router_materializes_the_shared_tokenrhythm_plan_without_global_enable():
+def test_upsert_router_keeps_single_model_tokenrhythm_c3_without_plan_activation():
     cfg = GatewayConfig()
 
     res = upsert_router(cfg, mode="recommended")
 
-    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is False
     assert res.config.llm_ensemble.enabled is False
-    assert res.config.llm_ensemble.selection_mode == "static_tokenrhythm_b5"
+    assert res.config.llm_ensemble.selection_mode == "static_openrouter_b5"
     assert res.config.llm_ensemble.min_successful_proposers == 1
-    assert res.config.llm_ensemble.proposer_max_retries == 1
+    assert res.config.llm_ensemble.proposer_max_retries == 0
     assert res.config.llm_ensemble.all_failed_policy == "fallback_single"
-    assert "llm_ensemble.selection_mode" in res.config.force_persist_paths()
-    assert "llm_ensemble.min_successful_proposers" in res.config.force_persist_paths()
-    assert "llm_ensemble.proposer_max_retries" in res.config.force_persist_paths()
-    assert "llm_ensemble.all_failed_policy" in res.config.force_persist_paths()
+    assert "llm_ensemble.selection_mode" not in res.config.force_persist_paths()
 
 
-def test_upsert_router_preserves_explicit_shared_ensemble_policy() -> None:
+def test_upsert_router_preserves_explicit_shared_ensemble_policy_with_single_model_c3() -> None:
     cfg = GatewayConfig(
         llm_ensemble={
             "min_successful_proposers": 4,
@@ -1576,7 +1573,7 @@ def test_upsert_router_preserves_explicit_shared_ensemble_policy() -> None:
 
     res = upsert_router(cfg, mode="recommended")
 
-    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is True
+    assert res.config.squilla_router.tiers["c3"]["ensemble_enabled"] is False
     assert res.config.llm_ensemble.min_successful_proposers == 4
     assert res.config.llm_ensemble.proposer_max_retries == 2
     assert res.config.llm_ensemble.all_failed_policy == "error"

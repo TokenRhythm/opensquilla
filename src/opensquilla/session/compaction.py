@@ -74,6 +74,7 @@ from opensquilla.session.compaction_state import (
 
 if TYPE_CHECKING:
     from opensquilla.provider.types import ProviderRequestCorrelation
+    from opensquilla.session.compaction_budget import CompactionBudget
 
 log = structlog.get_logger(__name__)
 
@@ -170,6 +171,9 @@ class CompactionConfig:
     # may disable only this redundant semantic-tail check for their isolated
     # completed prefix. Durable/session compaction always leaves it enabled.
     protect_semantic_tail: bool = True
+    # Completed-prefix recovery already owns its raw live tail outside entries.
+    # Disable only the profile's implicit retention, preserving its summary policy.
+    protect_profile_tail: bool = True
     # Runtime-owned materializer. It returns only verified workspace paths,
     # and is absent when image retention is disabled or no workspace exists.
     attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = field(
@@ -178,6 +182,7 @@ class CompactionConfig:
     request_context: CompactionRequestContext | None = field(
         default=None, repr=False, compare=False,
     )
+    budget: CompactionBudget | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -219,6 +224,10 @@ class CompactionRequest:
     # Additive runtime provenance. Kept at the end so legacy positional
     # construction retains the original public field ordering.
     context_window_source: str = "consumer_capacity"
+    # A deliberate manual request bypasses only the automatic pressure gate.
+    # Prefix boundaries, protected history and output/admission validation are
+    # identical to automatic compaction.
+    force: bool = False
 
 
 @dataclass
@@ -803,12 +812,12 @@ def _entry_tokens(entry: dict[str, Any]) -> int:
 
 def effective_protected_recent_messages(cfg: CompactionConfig) -> int:
     configured = max(0, int(getattr(cfg, "protected_recent_messages", 0) or 0))
-    if configured:
-        return configured
     profile = str(getattr(cfg, "compaction_profile", "conversation") or "conversation")
-    if profile in {"coding", "research", "support"}:
-        return 12
-    return 0
+    if cfg.protect_profile_tail and not configured and profile in {"coding", "research", "support"}:
+        configured = 12
+    if cfg.budget is not None:
+        configured = max(configured, cfg.budget.retained_tail_messages)
+    return configured
 
 
 def _apply_protected_tail(
@@ -1057,14 +1066,20 @@ def _compaction_quality_report(
     reduces_tokens = tokens_after < tokens_before
     # A valid, smaller checkpoint may still leave the consumer above its soft
     # trigger. Report that separately; it is not a second persistence gate.
-    pressure_released = bool(
-        tokens_after * cfg.safety_margin < context_window_tokens
-        and (
-            context_window_chars is None
-            or chars_after is None
-            or chars_after * cfg.safety_margin < context_window_chars
+    if cfg.budget is not None:
+        pressure_released = bool(
+            tokens_after < cfg.budget.auto_trigger_tokens
+            and (chars_after is None or chars_after < cfg.budget.auto_trigger_chars)
         )
-    )
+    else:
+        pressure_released = bool(
+            tokens_after * cfg.safety_margin < context_window_tokens
+            and (
+                context_window_chars is None
+                or chars_after is None
+                or chars_after * cfg.safety_margin < context_window_chars
+            )
+        )
     # Message-count recovery removes wire-message cardinality rather than
     # necessarily reducing token usage.  It remains safe only when the result
     # still fits the context window.  The default token-budget path retains its
@@ -2682,10 +2697,27 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
     )
     total_tokens = raw_entry_tokens + previous_summary_tokens
     total_chars = raw_entry_chars + len(previous_replay)
-    over_token_budget = total_tokens * cfg.safety_margin >= window
-    over_character_budget = bool(
-        request.context_window_chars is not None
-        and total_chars * cfg.safety_margin >= request.context_window_chars
+    if window <= 0 or (
+        request.context_window_chars is not None and request.context_window_chars <= 0
+    ):
+        return CompactionResult(
+            summary="", kept_entries=entries, removed_count=0, chunks_processed=0,
+            summary_source="skipped", tokens_before=total_tokens, tokens_after=total_tokens,
+            remaining_budget_tokens=0,
+            skip_reason="non_history_envelope_exhausts_budget",
+        )
+    over_token_budget = (
+        total_tokens >= cfg.budget.auto_trigger_tokens
+        if cfg.budget is not None
+        else total_tokens * cfg.safety_margin >= window
+    )
+    over_character_budget = (
+        total_chars >= cfg.budget.auto_trigger_chars
+        if cfg.budget is not None
+        else bool(
+            request.context_window_chars is not None
+            and total_chars * cfg.safety_margin >= request.context_window_chars
+        )
     )
 
     if not entries and not prev_summary:
@@ -2719,11 +2751,12 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             skip_reason=forced_cut_error,
         )
 
-    # If we're within budget, no token-driven compaction is needed.  A valid
-    # forced prefix cut is an independent cardinality recovery request and must
-    # still run even when the transcript already fits the token window.
+    # Explicit manual intent and a valid cardinality recovery cut bypass only
+    # the automatic pressure trigger; selection and quality gates below remain
+    # identical to automatic compaction.
     if (
         forced_cut is None
+        and not request.force
         and not over_token_budget
         and not over_character_budget
     ):
@@ -2753,9 +2786,16 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         kept = entries[cut:]
         to_compact = entries[:cut]
     else:
-        keep_budget = max(1, window // 5)
+        # Both automatic and manual compaction retain the same adaptive tail.
+        # A large model window must not turn a small manual request into a
+        # no-op; only the candidate tail target scales to raw history. Physical
+        # consumer capacity, protected history and validation stay intact.
+        retained_tail_tokens = (
+            cfg.budget.retained_tail_tokens if cfg.budget is not None else window // 5
+        )
+        keep_budget = max(1, min(retained_tail_tokens, max(1, raw_entry_tokens // 5)))
         keep_char_budget = (
-            max(1, int(request.context_window_chars) // 5)
+            max(1, min(int(request.context_window_chars), raw_entry_chars) // 5)
             if request.context_window_chars is not None
             else None
         )
@@ -3249,8 +3289,24 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         )
     quality_report["consumer_admission_fits"] = True
     if not bool(quality_report.get("passes_structural_gate", False)):
-        log.warning(
-            "compaction.quality_gate_failed",
+        # A complete, admissible replacement can still be larger than its
+        # source, especially when manually compacting an existing checkpoint.
+        # Keep the strict reduction gate, but do not report lack of benefit as
+        # an integrity failure. Any independent structural defect stays failed.
+        no_compression_benefit = bool(
+            request.trigger != "message_count"
+            and tokens_after >= total_tokens
+            and (to_compact or replace_previous_only)
+            and quality_report.get("protected_tail_preserved")
+            and quality_report.get("fits_context_window")
+            and quality_report.get("fits_character_window")
+        )
+        rejection_reason = (
+            "no_compression_benefit" if no_compression_benefit else "quality_gate_failed"
+        )
+        report_rejection = log.info if no_compression_benefit else log.warning
+        report_rejection(
+            f"compaction.{rejection_reason}",
             profile=quality_report.get("profile"),
             protected_tail_preserved=quality_report.get("protected_tail_preserved"),
             compression_ratio=quality_report.get("compression_ratio"),
@@ -3270,7 +3326,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             coverage_status=coverage.status,
             missing_obligations=coverage.missing_obligations,
             critical_carry_forward=coverage.critical_carry_forward,
-            skip_reason="quality_gate_failed",
+            skip_reason=rejection_reason,
             quality_report={**quality_report, "pressure_released": False},
         )
 
@@ -3329,6 +3385,14 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
             ),
         }
     )
+    if cfg.budget is not None:
+        for name in (
+            "physical_context_window_tokens", "generation_reserve_tokens",
+            "history_capacity_tokens", "history_capacity_chars", "auto_trigger_tokens",
+            "auto_trigger_chars", "retained_tail_tokens", "retained_tail_messages",
+            "summary_output_tokens", "provider_request_max_chars",
+        ):
+            telemetry[name] = getattr(cfg.budget, name)
     if target is not None:
         telemetry.update(
             {

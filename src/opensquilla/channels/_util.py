@@ -133,6 +133,35 @@ class EventDedupeCache:
     def __init__(self, max_size: int = 10_000) -> None:
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._max_size = max_size
+        self._pending: dict[str, asyncio.Future[bool]] = {}
+
+    async def run_once(self, event_id: str | None, operation: Any) -> Any:
+        """Reserve while admission waits; retain only completed acceptance.
+
+        A duplicate waits for the first owner. If that owner fails before
+        acceptance, the duplicate may retry instead of being silently dropped.
+        """
+        if not event_id:
+            return await operation()
+        while pending := self._pending.get(event_id):
+            if await asyncio.shield(pending):
+                return False
+        if event_id in self._seen:
+            self._seen.move_to_end(event_id)
+            return False
+        pending = asyncio.get_running_loop().create_future()
+        self._pending[event_id] = pending
+        try:
+            result = await operation()
+        except BaseException:
+            pending.set_result(False)
+            raise
+        else:
+            self.check_and_add(event_id)
+            pending.set_result(True)
+            return result
+        finally:
+            self._pending.pop(event_id, None)
 
     def check_and_add(self, event_id: str) -> bool:
         """Return True if the event_id is new (not a duplicate)."""

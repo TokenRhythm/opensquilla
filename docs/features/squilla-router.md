@@ -19,6 +19,28 @@ SquillaRouter is useful when you want:
 
 It is not required. OpenSquilla can also run in direct single-model mode.
 
+## Base Model and Memory
+
+Routing loads the packaged base model, or the explicit `squilla_router.v4_bundle_dir`
+path. Router self-learning and its feedback submission API have been removed. On upgrade,
+the obsolete `squilla_router.self_learning` settings are discarded automatically;
+credentials, model tiers, explicit model paths, and Dream settings are preserved.
+A failed automatic config backup or rewrite does not prevent loading the migrated
+settings in memory. Explicit save failures still report an error.
+
+Historical learned-model pointers, samples, and training directories are left in
+place and are no longer read. Model choices may therefore differ from a previously
+personalized model. Routing diagnostics, manual model selection, calibration, and
+immediate complaint escalation remain available.
+
+Chat thumbs up/down rate the answer independently of routing. Selections are kept
+only for the current page and reset on reload; they are not submitted or used for
+training. Clicking the selected thumb again clears it.
+
+Memory Dream runs independently. Saving its enabled state or schedule reconciles
+its scheduled jobs; if that cannot take effect live, settings report that a restart
+is required. Dream's preview and memory-writing behavior are unchanged.
+
 ## Enable Routing
 
 Recommended first-run setup:
@@ -39,32 +61,40 @@ Use the OpenRouter mixed defaults:
 opensquilla configure router --router openrouter-mix
 ```
 
-When the primary provider is TokenRhythm, the recommended preset uses this
-ladder:
+OpenRouter and TokenRhythm use the following recommended single-model tiers:
 
-| Tier | Route |
-| --- | --- |
-| C0 | `deepseek-v4-flash-0731` |
-| C1 | `deepseek-v4-pro-0813` |
-| C2 | `kimi-k2.7-code` |
-| C3 | static TokenRhythm B5 multi-model fusion |
+| Tier | OpenRouter | TokenRhythm |
+| --- | --- | --- |
+| C0 | `qwen/qwen3.7-flash` | `qwen3.7-flash` |
+| C1 | `deepseek/deepseek-v4-flash-0731` | `deepseek-flash` |
+| C2 | `deepseek/deepseek-v4-pro-0813` | `deepseek-v4-pro-0813` |
+| C3 | `z-ai/glm-5.3` | `glm-5.3` |
 
-C3 reuses the plan configured under `llm_ensemble`: four proposer models
-produce candidates and GLM 5.2 aggregates the final answer in the recommended
-TokenRhythm setup. The plan is activated only for C3; C0–C2 stay single-model
-routes. Editing the shared plan also changes what C3 uses, without a second
-tier-specific profile. If the shared plan cannot start or complete, C3 uses the
-global provider/model configured under `[llm]` — the same fixed/direct fallback
-model used by global fusion. The provider/model stored on C3 remains available
-only when C3 is switched back to single-model routing.
-
-The packaged mixed-family ladder leaves tier `thinking_level` unset. Direct
+The TokenRhythm ladder leaves tier `thinking_level` unset. Direct
 requests without an explicit thinking setting preserve the provider default;
 Router auto-thinking can still choose a per-turn level (normally `low` on C1).
 Fresh and managed (`preset_binding = "follow_primary"`) configurations receive
-this ladder; custom inline tiers remain authoritative and are not migrated.
+this ladder. The one-time configuration version 2 migration replaces old text
+tiers with the saved primary provider's recommended ladder when that primary is
+OpenRouter or TokenRhythm. This includes custom and mixed text tiers from 0.5.4.
+The migration preserves the routing mode, primary credentials, and other router
+controls, and backs up the previous configuration before writing. Custom edits
+made after this migration remain intact on subsequent loads.
+OpenRouter retains `high` as its packaged tier thinking level.
 
-For a newly configured C3 tier, the tier-local runtime-policy defaults are one
+Setting OpenRouter or TokenRhythm as primary also applies that provider's
+recommended text tiers while preserving the current usage mode. The saved
+primary summary and recommended-tier button use the same primary provider.
+The reset button replaces the current ladder with that provider's recommendation,
+including saved or unsaved custom tiers. Other primary providers do not show this
+shortcut. Restoring tiers keeps the current usage mode.
+
+C3 can optionally use the shared multi-model fusion plan configured under
+`llm_ensemble`. Enabling fusion on C3 makes it use that plan instead of its
+single-model route. If the plan falls back to a single model, it uses the global
+provider/model configured under `[llm]`.
+
+For a newly configured C3 fusion tier, the tier-local runtime-policy defaults are one
 successful proposer out of the four-member lineup, one retry after each
 proposer's initial attempt, and `all_failed_policy = "fallback_single"`. These
 defaults fill only fields that the operator has not set. Explicit

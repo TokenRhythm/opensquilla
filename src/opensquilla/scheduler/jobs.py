@@ -10,7 +10,15 @@ from zoneinfo import ZoneInfo
 
 from .parser import parse_cron
 from .persistence import JobStore
-from .types import CronJob, HandlerResult, JobExecution, JobStatus, ScheduleKind, clear_reservation
+from .types import (
+    CronJob,
+    HandlerResult,
+    JobExecution,
+    JobStatus,
+    ScheduleKind,
+    clear_reservation,
+    is_rescheduled_one_shot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,25 +271,32 @@ async def apply_reserved_result(
     store: JobStore,
 ) -> bool:
     """Apply an execution result only when the reservation token still owns the job."""
-    current = await store.get(job_id)
-    if current is None:
-        return False
-    if current.reservation_token != reservation_token:
-        return False
-    if current.status in (JobStatus.PAUSED, JobStatus.DISABLED):
-        clear_reservation(current)
-        await store.save(current)
-        return True
+    while True:
+        current = await store.get(job_id)
+        if current is None or current.reservation_token != reservation_token:
+            return False
+        expected_updated_at = current.updated_at
+        delete_job = False
+        schedule_errors: list[str] = []
+        if current.status not in (JobStatus.PAUSED, JobStatus.DISABLED):
+            delete_job = _apply_result_state(
+                current, execution, datetime.now(UTC),
+                schedule_failure_notifier=lambda _job, error: schedule_errors.append(error),
+            )
+        if await store.finalize_reserved_job(
+            current, reservation_token, expected_updated_at, delete=delete_job,
+        ):
+            # Notify only for the state that was actually committed, not for a
+            # stale schedule superseded by an edit while the write was waiting.
+            for error in schedule_errors:
+                _notify_schedule_failure(current, error)
+            return True
 
-    delete_job = _apply_result_state(current, execution, datetime.now(UTC))
-    if delete_job:
-        await store.delete(current.id)
-    else:
-        await store.save(current)
-    return True
 
-
-def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) -> bool:
+def _apply_result_state(
+    job: CronJob, execution: JobExecution, now: datetime,
+    *, schedule_failure_notifier: ScheduleFailureNotifier | None = None,
+) -> bool:
     """Post-execution state machine: update job state based on execution outcome.
 
     Handles:
@@ -291,6 +306,21 @@ def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) ->
 
     Returns True when the job should be deleted.
     """
+    if is_rescheduled_one_shot(job):
+        # Account for the old execution without consuming the replacement or
+        # applying the old occurrence's retry budget to it. Compare instants,
+        # even when the replacement is already due by the time we finish.
+        job.run_count += 1
+        if not execution.success:
+            job.error_count += 1
+        job.last_error = None if execution.success else execution.error
+        job.updated_at = now
+        job.status = JobStatus.PENDING
+        job.consecutive_errors = 0
+        job.backoff_until = None
+        clear_reservation(job)
+        return False
+
     if execution.success:
         job.consecutive_errors = 0
         job.backoff_until = None
@@ -310,7 +340,9 @@ def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) ->
                 job.next_run_at = _next_run(job, now)
                 job.status = JobStatus.PENDING
             except Exception as exc:
-                _mark_schedule_compute_failed(job, exc, now, increment_error=True)
+                _mark_schedule_compute_failed(
+                    job, exc, now, increment_error=True, notifier=schedule_failure_notifier,
+                )
             else:
                 clear_reservation(job)
 
@@ -357,7 +389,9 @@ def _apply_result_state(job: CronJob, execution: JobExecution, now: datetime) ->
                 try:
                     job.next_run_at = _next_run(job, now)
                 except Exception as exc:
-                    _mark_schedule_compute_failed(job, exc, now, increment_error=False)
+                    _mark_schedule_compute_failed(
+                        job, exc, now, increment_error=False, notifier=schedule_failure_notifier,
+                    )
                 else:
                     job.backoff_until = now + timedelta(seconds=backoff_secs)
                     job.status = JobStatus.PENDING
@@ -388,6 +422,7 @@ def _mark_schedule_compute_failed(
     now: datetime,
     *,
     increment_error: bool,
+    notifier: ScheduleFailureNotifier | None = None,
 ) -> None:
     if increment_error:
         job.error_count += 1
@@ -398,9 +433,13 @@ def _mark_schedule_compute_failed(
     job.backoff_until = None
     job.next_run_at = None
     clear_reservation(job)
+    (notifier or _notify_schedule_failure)(job, str(exc))
+
+
+def _notify_schedule_failure(job: CronJob, error: str) -> None:
     notifier = _schedule_failure_notifier
     if notifier is not None:
         try:
-            notifier(job, str(exc))
+            notifier(job, error)
         except Exception:  # noqa: BLE001 — notifier is best-effort
             logger.warning("schedule_failure_notifier_raised id=%s", job.id, exc_info=True)

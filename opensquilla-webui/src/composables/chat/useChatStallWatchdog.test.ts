@@ -101,7 +101,7 @@ describe('useChatStallWatchdog', () => {
     h.scope.stop()
   })
 
-  it('run_heartbeat and other liveness events do NOT reset the clock', async () => {
+  it('periodic run_heartbeat and other liveness events do NOT reset the clock', async () => {
     const h = harness()
     await startStreaming(h)
 
@@ -111,6 +111,20 @@ describe('useChatStallWatchdog', () => {
     h.api.noteEvent('tick', {})
 
     vi.advanceTimersByTime(THRESHOLD / 2)
+    expect(h.api.stallActive.value).toBe(true)
+    h.scope.stop()
+  })
+
+  it('counts growing tool arguments as progress without treating a tool heartbeat as progress', async () => {
+    const h = harness()
+    await startStreaming(h)
+    vi.advanceTimersByTime(THRESHOLD)
+    expect(h.api.stallActive.value).toBe(true)
+    h.api.noteEvent('session.event.run_heartbeat', { phase: 'llm_tool_arguments' })
+    expect(h.api.stallActive.value).toBe(false)
+    vi.advanceTimersByTime(THRESHOLD - 1000)
+    h.api.noteEvent('session.event.run_heartbeat', { phase: 'tool' })
+    vi.advanceTimersByTime(1000)
     expect(h.api.stallActive.value).toBe(true)
     h.scope.stop()
   })

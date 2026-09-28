@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 
-import { createApp, h, nextTick, ref } from 'vue'
+import { createApp, h, nextTick } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import i18n from '@/i18n'
 import { useSkillsCatalog } from '@/composables/skills/useSkillsCatalog'
@@ -24,23 +24,10 @@ describe('SkillGroup lifecycle compatibility', () => {
           eligible: true,
         }]))
     const skillCatalog = { list } as unknown as SkillCatalog
-    const loadProposals = vi.fn(async () => {})
-    const catalog = useSkillsCatalog(skillCatalog, {
-      proposals: ref([]),
-      autoEnabledSkills: ref([]),
-      proposalsSettings: ref({
-        available: false,
-        enabled: false,
-        on_dream_complete: false,
-        auto_enable: false,
-        auto_enable_max_risk: 'low',
-      }),
-      loadProposals,
-    })
+    const catalog = useSkillsCatalog(skillCatalog)
 
     await expect(catalog.loadData()).resolves.toBe(true)
     expect(list).toHaveBeenCalledOnce()
-    expect(loadProposals).toHaveBeenCalledOnce()
     expect(catalog.allSkills.value).toHaveLength(1)
     expect(catalog.allSkills.value[0]?.lifecycle).toBeUndefined()
 

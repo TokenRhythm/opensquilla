@@ -208,31 +208,38 @@ def _registry_with(name: str) -> ToolRegistry:
 
 
 @pytest.mark.asyncio
-async def test_permission_matrix_rejects_unverified_owner_channel_context() -> None:
+@pytest.mark.parametrize("tool_name", ["git_push", "process"])
+@pytest.mark.parametrize("channel_kind", ["dm", "group", "webui"])
+async def test_permission_matrix_rejects_unverified_owner_channel_context(
+    tool_name: str, channel_kind: str,
+) -> None:
     """A leaked ``is_owner=True`` on a CHANNEL ctx must not promote to operator.
 
-    ``git_push`` is ``ADMIN_ONLY`` in the permission matrix. A genuine
+    Both tools are ``ADMIN_ONLY`` in the permission matrix. A genuine
     operator principal would receive ``operator_override`` and be allowed,
     so any test that sees an allow here would prove the clamp had failed.
     """
-    handler = build_tool_handler(_registry_with("git_push"))
+    registry = _registry_with(tool_name)
+    handler = build_tool_handler(registry)
     ctx = ToolContext(
         is_owner=True,  # Simulated leak from a buggy upstream constructor.
         caller_kind=CallerKind.CHANNEL,
         interaction_mode=InteractionMode.UNATTENDED,
         agent_id="main",
         session_key="agent:main:hardening",
+        channel_kind=channel_kind,
         # Explicit allowlist bypasses the profile gate so the matrix gate
         # is the one we observe.
-        allowed_tools={"git_push"},
+        allowed_tools={tool_name},
     )
+    assert not registry.to_tool_definitions(ctx)
     token = current_tool_context.set(ctx)
     try:
         with structlog.testing.capture_logs() as captured:
             result = await handler(
                 ToolCall(
                     tool_use_id="tc-matrix-clamp",
-                    tool_name="git_push",
+                    tool_name=tool_name,
                     arguments={},
                 )
             )
@@ -253,9 +260,14 @@ async def test_permission_matrix_rejects_unverified_owner_channel_context() -> N
 
 
 @pytest.mark.asyncio
-async def test_permission_matrix_allows_authenticated_channel_admin_context() -> None:
+@pytest.mark.parametrize("tool_name", ["git_push", "process"])
+@pytest.mark.parametrize("channel_kind", ["dm", "group", "webui"])
+async def test_permission_matrix_allows_authenticated_channel_admin_context(
+    tool_name: str, channel_kind: str,
+) -> None:
     """The ingress-verified admin marker is sufficient for admin-only tools."""
-    handler = build_tool_handler(_registry_with("git_push"))
+    registry = _registry_with(tool_name)
+    handler = build_tool_handler(registry)
     ctx = ToolContext(
         is_owner=True,
         channel_admin_verified=True,
@@ -264,13 +276,15 @@ async def test_permission_matrix_allows_authenticated_channel_admin_context() ->
         agent_id="main",
         session_key="agent:main:hardening",
         channel_id="oc_channel",
+        channel_kind=channel_kind,
     )
+    assert {tool.name for tool in registry.to_tool_definitions(ctx)} == {tool_name}
     token = current_tool_context.set(ctx)
     try:
         result = await handler(
             ToolCall(
                 tool_use_id="tc-matrix-admin",
-                tool_name="git_push",
+                tool_name=tool_name,
                 arguments={},
             )
         )
@@ -282,18 +296,18 @@ async def test_permission_matrix_allows_authenticated_channel_admin_context() ->
 
 
 @pytest.mark.asyncio
-async def test_permission_matrix_uses_webui_source_for_owner_admin_tools() -> None:
+@pytest.mark.parametrize("tool_name", ["write_file", "process"])
+async def test_authenticated_webui_owner_uses_web_caller_kind(tool_name: str) -> None:
     """Authenticated Web UI turns should use the Web UI permission surface.
 
-    Webchat sessions carry ``channel_kind='webchat'`` for display/routing,
-    while the trusted surface is recorded as ``source_kind='webui'``. The
-    permission matrix must not collapse those turns to the DM surface or
-    admin-only workspace tools are denied even for authenticated operators.
+    Webchat sessions carry ``channel_kind='webchat'`` for display/routing.
+    Their trusted CallerKind.WEB distinguishes them from external channels;
+    source_kind metadata alone must never promote an external caller.
     """
-    handler = build_tool_handler(_registry_with("write_file"))
+    handler = build_tool_handler(_registry_with(tool_name))
     ctx = ToolContext(
         is_owner=True,
-        caller_kind=CallerKind.CHANNEL,
+        caller_kind=CallerKind.WEB,
         interaction_mode=InteractionMode.INTERACTIVE,
         agent_id="main",
         session_key="agent:main:webchat:hardening",
@@ -305,7 +319,7 @@ async def test_permission_matrix_uses_webui_source_for_owner_admin_tools() -> No
         result = await handler(
             ToolCall(
                 tool_use_id="tc-webui-write",
-                tool_name="write_file",
+                tool_name=tool_name,
                 arguments={},
             )
         )

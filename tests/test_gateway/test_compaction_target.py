@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -7,6 +8,7 @@ import pytest
 from opensquilla.gateway.compaction_target import (
     GatewayConsumerBudget,
     _manual_consumer_messages,
+    build_gateway_compaction_budget,
     build_gateway_consumer_admission,
     limit_gateway_consumer_budget,
     resolve_gateway_compaction_target,
@@ -27,6 +29,7 @@ from opensquilla.provider.types import (
     ProviderReplayState,
 )
 from opensquilla.session.compaction import build_compaction_config_from_provider
+from opensquilla.session.compaction_budget import named_auth_profile_fingerprint
 
 
 class _ReadOnlySelector:
@@ -180,6 +183,68 @@ def test_manual_consumer_budget_uses_stable_base_not_last_routed_model() -> None
     )
 
 
+def test_manual_consumer_default_ignores_legacy_soft_context_budget() -> None:
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-million-context",
+        "api_key": "synthetic-key", "context_window_tokens": 1_000_000,
+        "max_tokens": 8_192, "thinking": "off",
+    }, context_budget_tokens=100_000)
+    budget = resolve_gateway_consumer_budget(
+        _ctx(config, ProviderConfig(
+            provider="openai", model="synthetic-million-context", api_key="synthetic-key",
+        )),
+        SimpleNamespace(session_key="agent:main:webchat:physical-default"),
+    )
+
+    assert budget.context_window_tokens == 1_000_000
+    assert budget.physical_context_window_tokens == 1_000_000
+    assert budget.provider_request_max_chars > 100_000 * 4
+    shared = build_gateway_compaction_budget(budget)
+    assert 100_000 < shared.history_capacity_tokens < 1_000_000 - budget.max_output_tokens
+    assert shared.history_capacity_chars > 100_000 * 4
+    assert shared.physical_context_window_tokens == 1_000_000
+    assert shared.generation_reserve_tokens == budget.max_output_tokens
+    assert limit_gateway_consumer_budget(budget, 50_000).context_window_tokens == 50_000
+    assert limit_gateway_consumer_budget(budget, 2_000_000).context_window_tokens == 1_000_000
+
+
+@pytest.mark.parametrize("session_provider", ["openai", "anthropic"])
+def test_manual_session_budget_is_not_capped_by_unrelated_base_model(
+    monkeypatch: pytest.MonkeyPatch, session_provider: str,
+) -> None:
+    from opensquilla.provider.model_catalog import ModelCatalog
+
+    catalog = ModelCatalog()
+    catalog.set_user_overrides({
+        "openai/synthetic-small-base": {"context_window": 32_000, "max_output_tokens": 4096},
+        f"{session_provider}/synthetic-large-session": {
+            "context_window": 1_000_000, "max_output_tokens": 8192,
+        },
+    })
+    monkeypatch.setattr("opensquilla.gateway.compaction_target.shared_catalog", lambda: catalog)
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-small-base", "api_key": "base-key",
+        "thinking": "off",
+    })
+    config.llm_profiles[session_provider] = LlmProviderProfile(api_key="session-key")
+    consumer = resolve_gateway_consumer_budget(
+        _ctx(config, ProviderConfig(
+            provider="openai", model="synthetic-small-base", api_key="base-key",
+        )),
+        SimpleNamespace(
+            session_key="agent:main:webchat:session-model", provider_override=session_provider,
+            model_override="synthetic-large-session",
+        ),
+    )
+    shared = build_gateway_compaction_budget(consumer)
+
+    assert consumer.source == "session_override"
+    assert shared.physical_context_window_tokens == 1_000_000
+    assert 100_000 < shared.history_capacity_tokens < 1_000_000
+    assert shared.history_capacity_chars > 400_000
+    assert shared.consumer_admission("complete checkpoint", []) is True
+
+
 @pytest.mark.parametrize("configured_window", [0, 32_000])
 def test_gateway_preserves_unknown_window_compatibility(
     monkeypatch: pytest.MonkeyPatch, configured_window: int,
@@ -208,7 +273,8 @@ def test_gateway_preserves_unknown_window_compatibility(
     assert budget.context_window_known is (configured_window > 0)
     admission, _ = build_gateway_consumer_admission(budget)
     assert admission("synthetic checkpoint", []) is True
-    assert projected_windows == [configured_window, configured_window]
+    assert projected_windows
+    assert all(window == configured_window for window in projected_windows)
     target = resolve_gateway_compaction_target(ctx, session)
     assert target.plan is not None
     assert target.plan.primary.context_window_source == (
@@ -426,9 +492,72 @@ def test_manual_window_cap_does_not_reduce_actual_generation_reserve() -> None:
     )
     limited = limit_gateway_consumer_budget(budget, 4_096)
     assert limited.context_window_tokens == 4_096
+    assert limited.physical_context_window_tokens == 128_000
     assert limited.max_output_tokens == 16_384
+    assert limited.provider_request_max_chars == budget.provider_request_max_chars
+    assert limited.next_request_reserve_tokens == budget.next_request_reserve_tokens
+    assert limited.next_request_reserve_chars == budget.next_request_reserve_chars
+    shared = build_gateway_compaction_budget(limited)
+    assert shared.history_capacity_tokens == 4_096
+    assert shared.history_capacity_chars == 4_096 * 4
     admission, _ = build_gateway_consumer_admission(limited)
-    assert admission("synthetic checkpoint", []) is False
+    assert admission("synthetic checkpoint", []) is True
+    assert admission("checkpoint", [{
+        "role": "user", "content": "synthetic preserved history " * 4_096,
+    }]) is False
+
+
+@pytest.mark.parametrize("physical_window,admitted", [(1_000_000, True), (64_000, False)])
+def test_manual_history_target_does_not_replace_physical_context_window(
+    physical_window: int, admitted: bool,
+) -> None:
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-large-output", "api_key": "synthetic-key",
+        "context_window_tokens": physical_window, "max_tokens": 128_000, "thinking": "off",
+    }, context_budget_tokens=100_000)
+    budget = resolve_gateway_consumer_budget(
+        _ctx(config, ProviderConfig(
+            provider="openai", model="synthetic-large-output", api_key="synthetic-key",
+        )),
+        SimpleNamespace(session_key="agent:main:webchat:large-output"),
+    )
+    limited = limit_gateway_consumer_budget(budget, 100_000)
+    admission, _ = build_gateway_consumer_admission(limited)
+
+    assert limited.context_window_tokens == min(physical_window, 100_000)
+    assert limited.physical_context_window_tokens == physical_window
+    assert limited.max_output_tokens == 128_000
+    assert limited.provider_request_max_chars == budget.provider_request_max_chars
+    assert limited.next_request_reserve_tokens == budget.next_request_reserve_tokens
+    shared = build_gateway_compaction_budget(limited)
+    assert shared.history_capacity_tokens <= 100_000
+    assert shared.history_capacity_chars <= 400_000
+    assert (limited.provider_request_max_chars > 10_000) is admitted
+    assert admission("Complete checkpoint. " * 500, []) is admitted
+
+
+def test_manual_history_target_preserves_explicit_character_limit_and_physical_identity() -> None:
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-large-output", "api_key": "synthetic-key",
+        "context_window_tokens": 1_000_000, "max_tokens": 128_000, "thinking": "off",
+        "provider_request_proof_max_chars": 4_096,
+    }, context_budget_tokens=100_000)
+    budget = resolve_gateway_consumer_budget(
+        _ctx(config, ProviderConfig(
+            provider="openai", model="synthetic-large-output", api_key="synthetic-key",
+        )),
+        SimpleNamespace(session_key="agent:main:webchat:explicit-cap"),
+    )
+    limited = limit_gateway_consumer_budget(budget, 100_000)
+    admission, fingerprint = build_gateway_consumer_admission(limited)
+
+    assert limited.provider_request_max_chars == 4_096
+    assert limited.provider_request_max_chars_explicit_cap == 4_096
+    assert admission("checkpoint", []) is False
+    _, changed_fingerprint = build_gateway_consumer_admission(
+        replace(limited, physical_context_window_tokens=500_000),
+    )
+    assert changed_fingerprint != fingerprint
 
 
 @pytest.mark.parametrize("explicit_cap", [0, 12_345])
@@ -742,6 +871,64 @@ def test_named_session_auth_profile_fails_closed_when_exact_profile_is_missing()
     assert consumer.source == "auth_profile_unresolved"
     assert consumer.blocked_reason == "named_auth_profile_not_found"
     assert admission("deterministic checkpoint", []) is False
+
+
+@pytest.mark.parametrize("profile_key,session_profile", [
+    ("work", " WORK "),
+    ("OpenAI:Work", " openai:WORK "),
+])
+def test_named_profile_identity_matches_automatic_and_manual_real_budget(
+    profile_key: str, session_profile: str,
+) -> None:
+    from opensquilla.engine import Agent, AgentConfig
+
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-budget", "api_key": "base-key",
+        "context_window_tokens": 100_000, "max_tokens": 1024, "thinking": "off",
+    })
+    profile = LlmProviderProfile(api_key="named-key", base_url="https://api.openai.com/v1")
+    config.llm_profiles[profile_key] = profile
+    config.llm_profiles["openai:other"] = profile
+    ctx = _ctx(config, ProviderConfig(
+        provider="openai", model="synthetic-budget", api_key="base-key",
+    ))
+    session = SimpleNamespace(
+        session_key="agent:main:webchat:profile-parity", provider_override="openai",
+        model="synthetic-budget", auth_profile_override=session_profile,
+    )
+    consumer = resolve_gateway_consumer_budget(ctx, session)
+    assert consumer.source == "session_auth_profile"
+    assert consumer.deployment_fingerprint == named_auth_profile_fingerprint(session_profile)
+    agent = Agent(provider=consumer.provider, config=AgentConfig(
+        system_prompt="Synthetic preserved instructions.", context_window_tokens=100_000,
+        max_tokens=1024, thinking=False,
+    ))
+    manual = build_gateway_compaction_budget(consumer, consumer_agent=agent)
+    # Use the exact same request and next-request reserve to isolate identity
+    # parity; both paths execute the real final provider projection.
+    automatic = agent.resolve_compaction_budget(
+        consumer_provider=consumer.provider, active_user_message="", active_user_in_history=False,
+        bound_user_message_id=None, attachment_messages=None,
+        context_window_tokens=100_000, max_output_tokens=1024,
+        consumer_model_id=consumer.model,
+        consumer_provider_request_max_chars=consumer.provider_request_max_chars_explicit_cap,
+        consumer_deployment_fingerprint=named_auth_profile_fingerprint(
+            session.auth_profile_override,
+        ),
+        history_limit_tokens=consumer.context_window_tokens,
+        envelope_reserve_tokens=consumer.next_request_reserve_tokens,
+        envelope_reserve_chars=consumer.next_request_reserve_chars,
+    )
+    assert manual == automatic
+    assert manual.consumer_admission("Complete portable checkpoint.", []) is True
+
+    session.auth_profile_override = "openai:other"
+    other = build_gateway_compaction_budget(
+        resolve_gateway_consumer_budget(ctx, session), consumer_agent=agent,
+    )
+    assert other.history_capacity_tokens == manual.history_capacity_tokens
+    assert other.consumer_admission_fingerprint != manual.consumer_admission_fingerprint
+    assert named_auth_profile_fingerprint(None) == named_auth_profile_fingerprint("") == ""
 
 
 def test_named_session_auth_profile_binds_complete_manual_deployment() -> None:

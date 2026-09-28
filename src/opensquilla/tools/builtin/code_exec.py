@@ -51,9 +51,11 @@ from opensquilla.sandbox.types import (
     DenialResult,
     MountSpec,
     NetworkMode,
+    ResourceLimits,
     SandboxBackendError,
     SandboxPolicy,
     SandboxRequest,
+    SecurityLevel,
 )
 from opensquilla.subprocess_encoding import apply_utf8_child_env
 from opensquilla.tools.output_capture import BoundedOutputCapture
@@ -924,6 +926,12 @@ def _current_python_runtime_roots(*, workspace: Path | None = None) -> tuple[Pat
     for prefix in (Path(sys.prefix), Path(sys.base_prefix)):
         candidates.extend(_runtime_path_variants(prefix))
 
+    # venv launchers can refer through an installation alias (for example a
+    # uv minor-version symlink) while sys.base_prefix is already canonical.
+    # Keep the alias so a closed filesystem can traverse that launcher too.
+    base_executable = Path(getattr(sys, "_base_executable", "") or sys.executable)
+    candidates.extend(_runtime_path_variants(base_executable.parent.parent))
+
     for executable_path in _runtime_path_variants(Path(sys.executable)):
         candidates.append(
             executable_path.parent.parent
@@ -1118,6 +1126,121 @@ def _policy_with_bubblewrap_python_runtime(
     )
 
 
+async def _execute_channel_workspace_code(code: str, timeout: float) -> str:
+    """Run channel code with a closed filesystem, clean env and no host retry.
+
+    This uses the same backend and result shape as owner code execution, but
+    deliberately has no elevation, network approval, or unsandboxed branch.
+    Python subprocesses inherit the operating-system sandbox restrictions.
+    """
+
+    from opensquilla.tools.workspace_authoring import (
+        channel_workspace_file_system,
+        require_workspace_authoring,
+    )
+
+    ctx = current_tool_context.get()
+    proof = require_workspace_authoring(ctx)
+    python_bin = _resolve_python_bin(sandbox_enabled=True)
+    runtime_roots = list(_current_python_runtime_roots(workspace=proof.workspace))
+    if sys.platform == "darwin":
+        runtime_roots.extend(
+            Path(path) for path in (
+                "/System/Library", "/usr/lib", "/Library/Apple/System/Library",
+                "/Library/Apple/usr/lib", "/private/var/db/dyld",
+                "/usr/share/zoneinfo", "/Library/Fonts",
+            ) if Path(path).exists()
+        )
+    elif sys.platform.startswith("linux"):
+        runtime_roots.extend(
+            Path(path) for path in ("/lib", "/lib64", "/usr/lib", "/usr/share/fonts")
+            if Path(path).exists()
+        )
+    readable = tuple(dict.fromkeys(runtime_roots))
+    profile = channel_workspace_file_system(ctx, readable_roots=readable)
+    environment = {
+        "HOME": str(proof.workspace),
+        "TMPDIR": str(proof.workspace),
+        "TMP": str(proof.workspace),
+        "TEMP": str(proof.workspace),
+        "PATH": str(Path(python_bin).parent),
+        "LANG": "C.UTF-8",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    policy = SandboxPolicy(
+        level=SecurityLevel.LOCKED,
+        network=NetworkMode.NONE,
+        # The profile is the single authority for workspace and runtime roots.
+        # A parallel mount grant could reopen a runtime below an operator DENY
+        # after the Linux planner masks its ancestor. Both concrete backends
+        # derive their filesystem access directly from this filtered profile.
+        mounts=(),
+        workspace_rw=True,
+        tmp_writable=False,
+        limits=ResourceLimits(
+            wall_timeout_s=min(timeout, proof.runtime.settings.wall_seconds),
+            cpu_seconds=proof.runtime.settings.cpu_seconds,
+            memory_mb=proof.runtime.settings.memory_mb,
+        ),
+        env_allowlist=tuple(environment),
+        require_approval=False,
+        file_system=profile,
+        description="Managed channel workspace authoring; no host fallback",
+    )
+    argv = _python_execution_argv(python_bin, code)
+    if not bool(getattr(sys, "frozen", False)):
+        # Apply per-process limits before arbitrary authoring code runs. Linux
+        # also enforces these in its wrapper; this prefix covers macOS, where
+        # RLIMIT_AS is rejected by the kernel.
+        limit_prefix = (
+            "import resource as __opensquilla_resource; "
+            "__opensquilla_inherited_cpu = __opensquilla_resource.getrlimit("
+            "__opensquilla_resource.RLIMIT_CPU)[1]; "
+            f"__opensquilla_cpu = {proof.runtime.settings.cpu_seconds} "
+            "if __opensquilla_inherited_cpu == __opensquilla_resource.RLIM_INFINITY "
+            f"else min({proof.runtime.settings.cpu_seconds}, __opensquilla_inherited_cpu); "
+            "__opensquilla_resource.setrlimit(__opensquilla_resource.RLIMIT_CPU, "
+            "(__opensquilla_cpu, __opensquilla_cpu)); "
+            "\n"
+        )
+        # Compile submitted code independently: future imports and module
+        # docstrings must retain their normal module-leading semantics.
+        argv = (
+            python_bin, "-I", "-c",
+            limit_prefix + f"exec(compile({code!r}, '<string>', 'exec'))",
+        )
+    request = SandboxRequest(
+        argv=argv,
+        cwd=proof.workspace,
+        action_kind="code.exec",
+        policy=policy,
+        env=environment,
+        session_id=proof.session_key,
+        run_mode="safe",
+    )
+    before = snapshot_current_workspace_mutations()
+    started = time.monotonic_ns()
+    # Recheck after constructing the request: a backend replacement or
+    # workspace retarget must not send this proof to a different executor.
+    require_workspace_authoring(ctx)
+    try:
+        result = await proof.backend.run(request)
+    except SandboxBackendError as exc:
+        return _execution_result_json(
+            returncode=-1, stdout="", stderr=f"Sandbox execution unavailable: {exc}",
+            timed_out=False, elapsed_ms=0,
+        )
+    record_observed_workspace_mutations(
+        tool_name="execute_code", before=before,
+        metadata={"code_hash": mutation_ledger_text_hash(code)},
+    )
+    return _execution_result_json(
+        returncode=result.returncode, stdout=result.stdout, stderr=result.stderr,
+        timed_out=result.timed_out, elapsed_ms=(time.monotonic_ns() - started) // 1_000_000,
+    )
+
+
 @tool(
     name="execute_code",
     description=(
@@ -1179,6 +1302,15 @@ async def execute_code(
 ) -> str:
     if not code.strip():
         raise ToolError("Code must not be empty")
+
+    from opensquilla.tools.workspace_authoring import restricted_channel_context
+
+    if restricted_channel_context(current_tool_context.get()):
+        if sandbox_permissions != "use_default" or approval_id:
+            raise ToolError("Channel workspace code cannot request host execution.")
+        return await _execute_channel_workspace_code(
+            code, max(1.0, min(float(timeout), _MAX_TIMEOUT)),
+        )
 
     runtime = get_runtime()
     reject_windows_guest_process(runtime)

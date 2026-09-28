@@ -59,8 +59,6 @@ function composerProps(overrides: Record<string, unknown> = {}) {
     modelRoutingMode: 'off',
     modelRoutingSettingsBusy: false,
     routerVisualEffectsEnabled: true,
-    codingModeEnabled: false,
-    codingModeSettingsBusy: false,
     voiceBusy: false,
     voiceRecording: false,
     voiceReady: true,

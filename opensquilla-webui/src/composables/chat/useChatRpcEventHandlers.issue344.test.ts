@@ -460,7 +460,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
       expect(messages.value[messages.value.length - 1]).toMatchObject({
         role: 'error',
         errorCode: 'ensemble_multimodal_unsupported',
-        text: '多模型融合暂不支持图片输入。请在“模型路由”中选择已配置图片模型的“智能模型路由”，或选择“固定模型”并使用支持图片的模型。',
+        text: '当前模式不支持图片',
       })
     } finally {
       scope.stop()
@@ -636,7 +636,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     expect(stream.endStreaming).toHaveBeenCalledTimes(1)
     expect(messages.value[messages.value.length - 1]).toMatchObject({
       role: 'error',
-      text: 'The accepted task failed before the response arrived.',
+      text: 'The task did not finish. Please try again later.',
     })
     expect(options.scheduleHistorySync).toHaveBeenCalledTimes(1)
     expect(activeTaskId.value).toBe(FINISHED_STREAM_TASK_ID)
@@ -838,7 +838,7 @@ describe('issue #344 — live stream is bound to a single task', () => {
     })
     expect(newest.api.finishRecovery()).toBe(true)
     expect(newest.stream.endStreaming).toHaveBeenCalledTimes(1)
-    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('Task 8 failed.')
+    expect(newest.messages.value[newest.messages.value.length - 1]?.text).toBe('The task did not finish. Please try again later.')
     expect(newest.options.lastStreamSeq.value).toBe(9)
     oldest.scope.stop()
     newest.scope.stop()

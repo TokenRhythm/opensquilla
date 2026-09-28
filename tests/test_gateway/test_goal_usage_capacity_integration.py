@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
 
@@ -39,8 +40,6 @@ from opensquilla.tools.types import CallerKind, ToolContext
 from tests.test_session.test_goal_storage import (
     SESSION_ID,
     SESSION_KEY,
-    _command,
-    _expected,
     _set_goal,
 )
 
@@ -51,6 +50,7 @@ class _Provider:
     def __init__(self, streams: list[list[Any]]) -> None:
         self.streams = streams
         self.configs: list[ChatConfig] = []
+        self.messages: list[list[Message]] = []
 
     def chat(
         self,
@@ -58,7 +58,8 @@ class _Provider:
         tools: list[ToolDefinition] | None = None,
         config: ChatConfig | None = None,
     ) -> AsyncIterator[Any]:
-        del messages, tools
+        self.messages.append(deepcopy(messages))
+        del tools
         assert config is not None
         events = self.streams[len(self.configs)]
         self.configs.append(config)
@@ -171,13 +172,6 @@ async def test_goal_counts_subagent_and_compaction_receipts_with_model_capacity(
         assert accepted.goal is not None
         # Four provider receipts total 1,291 tokens, including 200 cache reads.
         # The 50 reasoning tokens are already included in the child's output.
-        await storage.edit_goal(
-            session_key=SESSION_KEY,
-            expected=_expected(accepted.goal),
-            objective=accepted.goal.objective,
-            command=_command("edit"),
-            settings={"tokenBudget": 1091},
-        )
         await storage.update_agent_task(
             "task-1", status=AgentTaskStatus.RUNNING, started_at=201,
         )
@@ -265,7 +259,7 @@ async def test_goal_counts_subagent_and_compaction_receipts_with_model_capacity(
         assert child_calls[0].parent_turn_id == "task-1"
 
         # A repeated delivery must not count the child, compaction, or either
-        # parent request twice after the budget has already paused the Goal.
+        # parent request twice or change the Goal execution state.
         for call, receipt in tuple(sink.receipts):
             await sink.finalize(call, receipt)
         rows = await (await storage.conn.execute(
@@ -278,9 +272,56 @@ async def test_goal_counts_subagent_and_compaction_receipts_with_model_capacity(
         goal = await storage.get_goal(SESSION_KEY)
         assert goal is not None
         assert goal.total_tokens == 1291
-        assert goal.budget_tokens_used == 1091
         assert goal.usage_coverage == "complete"
-        assert (goal.status, goal.pause_reason) == ("paused", "token_budget")
+        assert (goal.status, goal.pause_reason) == ("active", None)
     finally:
         await sink.close()
         await storage.close()
+
+
+@pytest.mark.parametrize("pause_reason", ["token_budget", "usage_unknown"])
+async def test_agent_does_not_wrap_up_work_for_retired_goal_budget(pause_reason: str) -> None:
+    class HistoricalGoalService:
+        calls = 0
+
+        async def build_prompt_context(self, _context):
+            self.calls += 1
+            return {"goalId": "legacy-goal", "pauseReason": pause_reason, "tokenBudget": 1}
+
+    service = HistoricalGoalService()
+    provider = _Provider([
+        [ToolUseStartEvent(tool_use_id="read-1", tool_name="read_synthetic"),
+         ToolUseEndEvent(tool_use_id="read-1", tool_name="read_synthetic", arguments={}),
+         ProviderDone(stop_reason="tool_use", input_tokens=10, output_tokens=2)],
+        [ProviderText(text="Synthetic work completed"),
+         ProviderDone(input_tokens=12, output_tokens=3)],
+    ])
+
+    async def handle(call) -> ToolResult:
+        return ToolResult(
+            tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="Read complete",
+        )
+
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_iterations=3, provider_id="synthetic", model_id="synthetic",
+            context_window_tokens=8192, context_window_known=True, max_tokens=1024,
+        ),
+        tool_definitions=[ToolDefinition(
+            name="read_synthetic", description="Read synthetic state",
+            input_schema=ToolInputSchema(properties={}, required=[]),
+        )],
+        tool_handler=handle,
+        tool_context=ToolContext(
+            caller_kind=CallerKind.WEB, is_owner=True, session_key=SESSION_KEY,
+            goal_service=service, goal_context={"goalId": "legacy-goal"},
+        ),
+    )
+    events = [event async for event in agent.run_turn("Complete the synthetic work")]
+    assert any(isinstance(event, EngineDoneEvent) for event in events)
+    assert len(provider.messages) == 2
+    assert service.calls == 0
+    assert all(
+        "Wrap up the current work safely" not in str(messages) for messages in provider.messages
+    )

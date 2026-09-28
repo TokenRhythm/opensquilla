@@ -4,45 +4,17 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from opensquilla.application.agent_catalog import (
-    AgentBuiltinImmutableError,
-    AgentCatalog,
-    CreateAgent,
-    UpdateAgent,
-)
+from opensquilla.application.agent_catalog import AgentCatalog
 
 
 @pytest.mark.asyncio
-async def test_agent_catalog_normalizes_create_and_explicit_patch() -> None:
+async def test_agent_catalog_reads_configured_profiles() -> None:
     registry = AsyncMock()
-    registry.create.return_value = {"id": "research-agent", "name": "Research Agent"}
-    registry.update.return_value = {"id": "research-agent", "name": "Research"}
+    registry.list.return_value = [{"id": "ops", "name": "Operations"}]
     catalog = AgentCatalog(registry)
 
-    await catalog.create(CreateAgent(name=" Research Agent ", tools=("web",)))
-    await catalog.update(UpdateAgent(agent_id="Research Agent", name="Research"))
-
-    created = registry.create.await_args.args[0]
-    assert created.agent_id == "research-agent"
-    assert created.name == "Research Agent"
-    assert created.tools == ("web",)
-    updated = registry.update.await_args.args[0]
-    assert updated.agent_id == "research-agent"
-    assert updated.changed_fields() == {"name": "Research"}
-
-
-@pytest.mark.asyncio
-async def test_agent_catalog_rejects_builtin_and_empty_patch_before_port() -> None:
-    registry = AsyncMock()
-    catalog = AgentCatalog(registry)
-
-    with pytest.raises(AgentBuiltinImmutableError):
-        await catalog.remove("main")
-    with pytest.raises(ValueError, match="No fields to update"):
-        await catalog.update(UpdateAgent(agent_id="ops"))
-
-    registry.remove.assert_not_awaited()
-    registry.update.assert_not_awaited()
+    assert await catalog.list(include_builtin=False) == [{"id": "ops", "name": "Operations"}]
+    registry.list.assert_awaited_once_with(include_builtin=False)
 
 
 @pytest.mark.asyncio

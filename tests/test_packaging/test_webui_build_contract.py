@@ -47,23 +47,14 @@ def _rewrite_manifest(probe: Path) -> None:
 def _write_verified_artifact(
     probe: Path,
     *,
-    include_personal_bgm: bool = False,
+    include_retired_media: bool = False,
 ) -> None:
-    """Create a valid artifact so target-specific policy can be exercised."""
+    """Create a manifest-bound artifact and optional forbidden media."""
 
     webui = probe / "opensquilla-webui"
     (webui / "src").mkdir(parents=True)
     (webui / ".node-version").write_text("22.12.0\n", encoding="utf-8")
     (webui / "src/App.vue").write_text("<template>probe</template>\n", encoding="utf-8")
-    if include_personal_bgm:
-        music_source = webui / "public" / "music"
-        music_source.mkdir(parents=True)
-        (music_source / "local.mp3").write_bytes(b"private audio\n")
-        (music_source / "playlist.local.json").write_text(
-            '{"tracks":[{"id":"local","title":"Local","src":"local.mp3"}]}\n',
-            encoding="utf-8",
-        )
-
     dist = probe / "src" / "opensquilla" / "gateway" / "static" / "dist"
     assets = dist / "assets"
     assets.mkdir(parents=True)
@@ -75,7 +66,7 @@ def _write_verified_artifact(
     )
     for entrypoint_name in ("index.html", "desktop.html"):
         (dist / entrypoint_name).write_text(synthetic_entrypoint, encoding="utf-8")
-    if include_personal_bgm:
+    if include_retired_media:
         music = dist / "music"
         music.mkdir()
         (music / "local.mp3").write_bytes(b"private audio\n")
@@ -130,6 +121,7 @@ artifacts = ["src/opensquilla/gateway/static/dist/**"]
 
 [tool.hatch.build.targets.sdist]
 artifacts = ["src/opensquilla/gateway/static/dist/**"]
+exclude = ["opensquilla-webui/public/music", "opensquilla-webui/public/music/**"]
 
 [tool.hatch.build.hooks.custom]
 """,
@@ -200,49 +192,42 @@ def test_no_dist_allows_pep660_editable_but_blocks_standard_distributions(
 
 
 @pytest.mark.skipif(shutil.which("uv") is None, reason="uv not on PATH")
-def test_personal_bgm_is_allowed_in_direct_local_wheel_but_forbidden_in_sdist(
-    tmp_path: Path,
-) -> None:
+@pytest.mark.parametrize("target", ["--wheel", "--sdist"])
+def test_retired_media_cannot_enter_any_distribution(tmp_path: Path, target: str) -> None:
     probe = _build_contract_probe(tmp_path)
-    _write_verified_artifact(probe, include_personal_bgm=True)
-
-    wheel = _run(
-        "uv",
-        "build",
-        "--wheel",
-        "--out-dir",
-        str(tmp_path / "wheel"),
-        cwd=probe,
-    )
-    assert wheel.returncode == 0, wheel.stderr
-
-    sdist_dir = tmp_path / "sdist"
-    sdist = _run(
-        "uv",
-        "build",
-        "--sdist",
-        "--out-dir",
-        str(sdist_dir),
-        cwd=probe,
-    )
-    assert sdist.returncode != 0
-    output = f"{sdist.stdout}\n{sdist.stderr}"
-    assert "personal BGM content is forbidden" in output
-    assert "direct local wheel" in output
-    assert not list(sdist_dir.glob("*.tar.gz"))
+    _write_verified_artifact(probe, include_retired_media=True)
+    output_dir = tmp_path / "rejected-artifacts"
+    result = _run("uv", "build", target, "--out-dir", str(output_dir), cwd=probe)
+    assert result.returncode != 0
+    assert "forbidden metadata or sensitive files" in result.stderr
+    assert "music" in result.stderr
+    assert not list(output_dir.glob("*.whl"))
+    assert not list(output_dir.glob("*.tar.gz"))
 
 
 @pytest.mark.skipif(
     shutil.which("uv") is None or shutil.which("git") is None,
     reason="uv and git are required",
 )
-def test_ignored_junk_survives_sdist_to_wheel_fingerprint_round_trip(
-    tmp_path: Path,
+@pytest.mark.parametrize("retired_kind", ["files", "symlink"])
+def test_ignored_metadata_and_retired_media_survive_sdist_to_wheel_round_trip(
+    tmp_path: Path, retired_kind: str,
 ) -> None:
     probe = _build_contract_probe(tmp_path)
     _write_verified_artifact(probe)
     junk = probe / "opensquilla-webui" / "src" / ".DS_Store"
     junk.write_bytes(b"ignored Finder metadata")
+    retired = probe / "opensquilla-webui/public/music"
+    retired.parent.mkdir(parents=True)
+    if retired_kind == "files":
+        retired.mkdir()
+        (retired / "private.aac").write_bytes(b"synthetic personal media")
+        (retired / "playlist.local.json").write_bytes(b"invalid legacy JSON")
+    else:
+        try:
+            retired.symlink_to(tmp_path / "missing-personal-library", target_is_directory=True)
+        except OSError as exc:
+            pytest.skip(f"symlinks are unavailable: {exc}")
 
     initialized = _run("git", "init", cwd=probe)
     assert initialized.returncode == 0, initialized.stderr
@@ -251,6 +236,17 @@ def test_ignored_junk_survives_sdist_to_wheel_fingerprint_round_trip(
     tracked = _run("git", "ls-files", cwd=probe)
     assert tracked.returncode == 0, tracked.stderr
     assert "opensquilla-webui/src/.DS_Store" not in tracked.stdout.splitlines()
+    assert not any("public/music" in name for name in tracked.stdout.splitlines())
+
+    local_wheel_dir = tmp_path / "direct-wheel"
+    local_wheel = _run(
+        "uv", "build", "--wheel", "--out-dir", str(local_wheel_dir), cwd=probe,
+    )
+    assert local_wheel.returncode == 0, local_wheel.stderr
+    with zipfile.ZipFile(next(local_wheel_dir.glob("*.whl"))) as archive:
+        assert not any(
+            "/music/" in name or name.endswith("/music") for name in archive.namelist()
+        )
 
     sdist_dir = tmp_path / "round-trip-sdist"
     sdist_result = _run(
@@ -266,6 +262,9 @@ def test_ignored_junk_survives_sdist_to_wheel_fingerprint_round_trip(
     assert len(sdists) == 1
     with tarfile.open(sdists[0], "r:gz") as archive:
         assert not any(Path(name).name == ".DS_Store" for name in archive.getnames())
+        assert not any(
+            "/music/" in name or name.endswith("/music") for name in archive.getnames()
+        )
         registries = [
             name for name in archive.getnames() if name.endswith("migrations/registry.json")
         ]
@@ -287,7 +286,15 @@ def test_ignored_junk_survives_sdist_to_wheel_fingerprint_round_trip(
     assert wheel_result.returncode == 0, wheel_result.stderr
     wheels = list(wheel_dir.glob("*.whl"))
     assert len(wheels) == 1
+    if retired_kind == "files":
+        assert (retired / "playlist.local.json").read_bytes() == b"invalid legacy JSON"
+        assert (retired / "private.aac").read_bytes() == b"synthetic personal media"
+    else:
+        assert retired.is_symlink()
     with zipfile.ZipFile(wheels[0]) as archive:
+        assert not any(
+            "/music/" in name or name.endswith("/music") for name in archive.namelist()
+        )
         registry_path = "opensquilla/_migrations/registry.json"
         assert archive.namelist().count(registry_path) == 1
         assert archive.read(registry_path) == source_registry
@@ -369,7 +376,7 @@ def test_untracked_frontend_input_is_local_wheel_only(tmp_path: Path) -> None:
 def test_sensitive_public_file_cannot_enter_any_distribution(tmp_path: Path) -> None:
     probe = _build_contract_probe(tmp_path)
     _write_verified_artifact(probe)
-    public_env = probe / "opensquilla-webui" / "public" / ".env"
+    public_env = probe / "opensquilla-webui" / "public-assets" / ".env"
     public_env.parent.mkdir(exist_ok=True)
     public_env.write_text("PRIVATE_TOKEN=must-not-ship\n", encoding="utf-8")
     dist_env = probe / "src/opensquilla/gateway/static/dist/.env"

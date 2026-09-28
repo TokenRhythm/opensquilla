@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { ArtifactPayload } from '@/types/artifacts'
 import {
   httpBinaryResponse,
@@ -15,11 +15,14 @@ import {
   resolveArtifactPreviewLaunch,
   revokeArtifactPreviewLeaseHttp,
   runtimeArtifactHttpBaseOrigin,
+  runtimeAttachmentHttpBaseOrigin,
   bindAttachmentBinaryRequest,
   bindArtifactBinaryRequest,
   bindArtifactOpenRequest,
   uploadArtifactAttachment,
 } from './privateArtifactHttpTransport'
+
+afterEach(() => vi.unstubAllGlobals())
 
 function artifact(overrides: Partial<ArtifactPayload> = {}): ArtifactPayload {
   return {
@@ -117,6 +120,61 @@ describe('private Artifact HTTP transport', () => {
       method: 'POST',
       form,
     })
+  })
+
+  it.each([
+    '/api/v1/attachments/page-capture?token=old&sessionKey=old&Session_ID=old&variant=download#private',
+    'opensquilla-app://desktop/api/v1/attachments/page-capture?token=old&sessionKey=old&Session_ID=old&variant=download#private',
+  ])('downloads a sanitized Desktop attachment through the scoped transport: %s', async raw => {
+    const response = httpBinaryResponse('captured image', { contentType: 'image/png' })
+    const requestBinary = vi.fn(async () => response)
+    const http = httpTransportTestDouble({ requestBinary })
+    const baseOrigin = 'opensquilla-app://desktop'
+    const url = '/api/v1/attachments/page-capture?variant=download'
+
+    expect(artifactHttpAttachmentUrl(raw, baseOrigin)).toBe(url)
+    const request = bindAttachmentBinaryRequest(http, raw, { baseOrigin })
+    expect(request?.url).toBe(url)
+    await expect(request?.execute({ sessionKey: 'session-desktop', timeoutMs: 0 }))
+      .resolves.toBe(response)
+    expect(requestBinary).toHaveBeenCalledExactlyOnceWith(url, {
+      sessionKey: 'session-desktop', signal: undefined, timeoutMs: 0,
+    })
+  })
+
+  it.each([
+    'opensquilla-app://other-host/api/v1/attachments/item',
+    'opensquilla-app://desktop:1234/api/v1/attachments/item',
+    'other-app://desktop/api/v1/attachments/item',
+    'http://desktop/api/v1/attachments/item',
+    'https://desktop/api/v1/attachments/item',
+    'https://external.example/api/v1/attachments/item',
+    'opensquilla-app://user:password@desktop/api/v1/attachments/item',
+  ])('rejects an untrusted Desktop attachment without issuing a request: %s', raw => {
+    const requestBinary = vi.fn()
+    const http = httpTransportTestDouble({ requestBinary })
+    const baseOrigin = 'opensquilla-app://desktop'
+
+    expect(artifactHttpAttachmentUrl(raw, baseOrigin)).toBe('')
+    expect(bindAttachmentBinaryRequest(http, raw, { baseOrigin })).toBeNull()
+    expect(requestBinary).not.toHaveBeenCalled()
+  })
+
+  it('uses the exact Desktop proxy for attachment URLs even when its origin is opaque', () => {
+    vi.stubGlobal('window', {
+      location: { protocol: 'opensquilla-app:', hostname: 'desktop', origin: 'null' },
+    })
+    expect(runtimeAttachmentHttpBaseOrigin()).toBe('opensquilla-app://desktop')
+    expect(artifactHttpAttachmentUrl(
+      '/api/v1/attachments/page-capture', runtimeAttachmentHttpBaseOrigin(),
+    )).toBe('/api/v1/attachments/page-capture')
+  })
+
+  it('retains the browser origin and server fallback for attachment URLs', () => {
+    vi.stubGlobal('window', { location: new URL('https://control.example/control/chat') })
+    expect(runtimeAttachmentHttpBaseOrigin()).toBe('https://control.example')
+    vi.stubGlobal('window', undefined)
+    expect(runtimeAttachmentHttpBaseOrigin()).toBe('http://localhost')
   })
 
   it('owns preview lease routes and Desktop broker credential provenance', async () => {

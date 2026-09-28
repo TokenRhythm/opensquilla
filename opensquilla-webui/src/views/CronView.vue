@@ -10,6 +10,10 @@
           <span class="cron-search-icon"><Icon name="search" :size="16" /></span>
           <input v-model="cronJobs.searchText.value" class="cron-search-input" type="search" :placeholder="t('cronSkills.view.searchPlaceholder')" autocomplete="off">
         </div>
+        <button v-if="compactToolbar" class="btn btn--ghost cron-toolbar__more" type="button" :aria-expanded="secondaryActionsOpen" aria-controls="cron-secondary-actions" @click="secondaryActionsOpen = !secondaryActionsOpen">
+          <Icon name="moreHorizontal" :size="16" /><span>{{ t('common.more') }}</span>
+        </button>
+        <div v-show="!compactToolbar || secondaryActionsOpen" id="cron-secondary-actions" class="cron-toolbar__secondary">
         <button class="btn btn--ghost cron-toolbar__refresh" :title="t('cronSkills.view.refresh')" :disabled="refreshing" @click="refreshCron">
           <Icon name="refresh" :size="16" />
           <span class="cron-toolbar__refresh-label" aria-live="polite">
@@ -25,7 +29,8 @@
         </button>        <button class="btn btn--ghost" type="button" @click="openTemplateGallery">
           <Icon name="copy" :size="16" /><span>{{ t('cronSkills.view.addFromTemplate') }}</span>
         </button>
-        <button class="btn btn--primary" type="button" @click="cronForm.openPanel(null)">
+        </div>
+        <button class="btn btn--primary cron-toolbar__primary" type="button" @click="cronForm.openPanel(null)">
           <Icon name="plus" :size="16" /><span>{{ t('cronSkills.view.addAutomation') }}</span>
         </button>
       </div>
@@ -57,8 +62,8 @@
       <template v-else>
         <div class="automation-launch__status-copy">
           <div class="automation-launch__status-line">
-            <span class="automation-launch__status-dot" aria-hidden="true" />
-            <h2 id="automation-status-title" class="automation-launch__status-title">{{ t('cronSkills.view.runningTitle') }}</h2>
+            <span class="automation-launch__status-dot" :class="{ 'is-paused': cronJobs.enabledCount.value === 0 }" aria-hidden="true" />
+            <h2 id="automation-status-title" class="automation-launch__status-title">{{ cronJobs.enabledCount.value ? t('cronSkills.view.activeSchedules') : t('cronSkills.list.paused') }}</h2>
           </div>
           <p class="automation-launch__status-summary">{{ t('cronSkills.view.runningSummary', { enabled: cronJobs.enabledCount.value, total: cronJobs.jobs.value.length }) }}</p>
         </div>
@@ -79,7 +84,7 @@
 
     <Transition name="modal">
       <div v-if="overviewOpen" class="automation-template-modal" role="dialog" aria-modal="true" aria-labelledby="automation-overview-title" @click.self="overviewOpen = false">
-        <section class="automation-template-modal__panel automation-overview-modal__panel">
+        <section ref="overviewPanelRef" class="automation-template-modal__panel automation-overview-modal__panel">
           <header class="automation-template-modal__head">
             <div>
               <div class="automation-templates__eyebrow">{{ t('cronSkills.view.overviewEyebrow') }}</div>
@@ -168,7 +173,7 @@
 
     <Transition name="modal">
       <div v-if="templateGalleryOpen" class="automation-template-modal" role="dialog" aria-modal="true" aria-labelledby="template-gallery-title" @click.self="templateGalleryOpen = false">
-        <section class="automation-template-modal__panel">
+        <section ref="templateGalleryPanelRef" class="automation-template-modal__panel">
           <header class="automation-template-modal__head">
             <div>
               <div class="automation-templates__eyebrow">{{ t('cronSkills.view.galleryEyebrow') }}</div>
@@ -202,6 +207,9 @@
     <CronJobPanel
       v-model:form="cronForm.form"
       :open="cronForm.panelOpen.value"
+      :saving="cronForm.saving.value"
+      :field-errors="cronForm.fieldErrors.value"
+      :save-error="cronForm.saveError.value"
       :editing-job="cronForm.editingJob.value"
       :cron-explain-human="cronForm.cronExplainHuman.value"
       :cron-explain-valid="cronForm.cronExplainValid.value"
@@ -235,7 +243,7 @@
 <script setup lang="ts">
 import { computed, inject, nextTick, onActivated, ref } from 'vue'
 import { useI18n } from 'vue-i18n'
-import { useRouter } from 'vue-router'
+import { onBeforeRouteLeave, useRouter } from 'vue-router'
 import Icon from '@/components/Icon.vue'
 import ErrorState from '@/components/ErrorState.vue'
 import LoadingSpinner from '@/components/LoadingSpinner.vue'
@@ -252,6 +260,8 @@ import type { IconName } from '@/utils/icons'
 import { humanCountdown } from '@/utils/cron/time'
 import { localizedCronJobName, localizedCronTemplate } from '@/utils/cron/templateNames'
 import { CRON_SCHEDULER_KEY } from '@/modules/cronScheduler'
+import { useDialogA11y } from '@/composables/useDialogA11y'
+import { useMediaQuery } from '@/composables/chat/useMediaQuery'
 
 const router = useRouter()
 const { t } = useI18n()
@@ -263,6 +273,10 @@ const deleteModalOpen = ref(false)
 const deleteTarget = ref<CronJob | null>(null)
 const templateGalleryOpen = ref(false)
 const overviewOpen = ref(false)
+const compactToolbar = useMediaQuery('(max-width: 760px)')
+const secondaryActionsOpen = ref(false)
+const overviewPanelRef = ref<HTMLElement | null>(null)
+const templateGalleryPanelRef = ref<HTMLElement | null>(null)
 const bulkMode = ref(false)
 const bulkWorking = ref(false)
 const selectedJobIds = ref<Set<string>>(new Set())
@@ -270,6 +284,11 @@ const selectedJobIds = ref<Set<string>>(new Set())
 const cronJobs = useCronJobs(cronScheduler)
 const cronRuns = useCronRuns(cronScheduler, selectedId)
 const cronForm = useCronForm(cronScheduler, { afterSaved: cronJobs.loadData })
+
+onBeforeRouteLeave(() => cronForm.panelOpen.value ? cronForm.closePanel() : true)
+
+useDialogA11y(overviewPanelRef, overviewOpen, () => { overviewOpen.value = false })
+useDialogA11y(templateGalleryPanelRef, templateGalleryOpen, () => { templateGalleryOpen.value = false })
 
 onActivated(() => {
   void cronForm.loadProjectWorkspaces().catch(() => undefined)
@@ -570,6 +589,18 @@ async function confirmDelete() {
 
 .cron-toolbar__actions {
   flex-wrap: wrap;
+}
+
+.cron-toolbar__secondary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.automation-launch__status-dot.is-paused {
+  background: var(--text-muted);
+  box-shadow: none;
+  animation: none;
 }
 
 .cron-toolbar__refresh-label {
@@ -2543,6 +2574,18 @@ async function confirmDelete() {
     grid-template-columns: 1fr 1fr;
   }
 
+  .cron-toolbar__secondary {
+    grid-column: 1 / -1;
+    grid-row: 3;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .cron-toolbar__more {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
   .cron-search-wrap {
     flex-basis: auto;
     grid-column: 1 / -1;
@@ -2550,11 +2593,12 @@ async function confirmDelete() {
   }
 
   .cron-toolbar__refresh {
-    display: none;
+    display: inline-flex;
   }
 
   .cron-toolbar__actions .btn--primary {
-    grid-column: 1 / -1;
+    grid-column: 1;
+    grid-row: 2;
   }
 
   .automation-template-modal {
