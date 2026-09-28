@@ -221,7 +221,6 @@
     "resize": "Arbeitsbereich-Breite ändern",
     "pixels": "Pixel",
     "empty": "Für dieses Element ist keine Vorschau verfügbar.",
-    "itemLimitReached": "Es sind bereits acht isolierte Vorschauen geöffnet. Schließe eine, bevor du eine weitere öffnest.",
     "resources": {
       "title": "Dateien", "count": "Dateien ({count})", "empty": "Noch keine Dateien oder Links.",
       "groups": { "files": "Dateien", "links": "Links", "attachments": "Dateien", "documents": "Dateien", "deliverables": "Dateien", "urls": "Links" },

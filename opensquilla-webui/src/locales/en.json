@@ -222,7 +222,6 @@
     "resize": "Resize workbench",
     "pixels": "pixels",
     "empty": "No preview is available for this item.",
-    "itemLimitReached": "Eight isolated previews are already open. Close one before opening another.",
     "resources": {
       "title": "Files", "count": "Files ({count})", "empty": "No files or links yet.",
       "groups": { "files": "Files", "links": "Links", "attachments": "Files", "documents": "Files", "deliverables": "Files", "urls": "Links" },

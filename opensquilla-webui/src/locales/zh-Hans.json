@@ -221,7 +221,6 @@
     "resize": "调整工作区宽度",
     "pixels": "像素",
     "empty": "此项目没有可用的预览。",
-    "itemLimitReached": "已打开 8 个隔离预览。请先关闭一个再继续。",
     "resources": {
       "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
       "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },

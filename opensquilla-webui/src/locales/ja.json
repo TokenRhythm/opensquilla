@@ -221,7 +221,6 @@
     "resize": "ワークベンチの幅を変更",
     "pixels": "ピクセル",
     "empty": "この項目には利用できるプレビューがありません。",
-    "itemLimitReached": "隔離プレビューが 8 件開いています。別のプレビューを開く前に 1 件閉じてください。",
     "resources": {
       "title": "ファイル", "count": "ファイル（{count}）", "empty": "ファイルまたはリンクはまだありません。",
       "groups": { "files": "ファイル", "links": "リンク", "attachments": "ファイル", "documents": "ファイル", "deliverables": "ファイル", "urls": "リンク" },

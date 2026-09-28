@@ -221,7 +221,6 @@
     "resize": "Redimensionner l’espace de travail",
     "pixels": "pixels",
     "empty": "Aucun aperçu n’est disponible pour cet élément.",
-    "itemLimitReached": "Huit aperçus isolés sont déjà ouverts. Fermez-en un avant d’en ouvrir un autre.",
     "resources": {
       "title": "Fichiers", "count": "Fichiers ({count})", "empty": "Aucun fichier ni lien pour le moment.",
       "groups": { "files": "Fichiers", "links": "Liens", "attachments": "Fichiers", "documents": "Fichiers", "deliverables": "Fichiers", "urls": "Liens" },

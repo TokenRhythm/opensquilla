@@ -294,7 +294,8 @@ export type NativeWorkbenchCreateSurfaceRequest =
 export interface NativeWorkbenchCapabilities {
   protocolVersions: Array<NativeWorkbenchProtocolVersion>
   modes: WorkbenchPreviewMode[]
-  maxSurfaces: number
+  /** Reported only by older desktop hosts that impose a surface count limit. */
+  maxSurfaces?: number
 }
 
 export interface NativeArtifactAnnotationCapabilities {
