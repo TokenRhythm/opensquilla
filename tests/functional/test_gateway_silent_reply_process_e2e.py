@@ -43,6 +43,8 @@ _SERVER_MODE_ENV = "OPENSQUILLA_SILENT_REPLY_E2E_SERVER"
 _DEFAULT_SAMPLE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SAMPLE"
 _SAMPLE_SOURCE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SOURCE"
 _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS = 45.0
+_GATEWAY_MIGRATION_PHASE_TIMEOUT_SECONDS = 90.0
+_MIGRATIONS_STARTED_LOG_MARKER = '"event": "build_services.migrations_started"'
 _MIGRATIONS_READY_LOG_MARKER = '"event": "build_services.migrations_ready"'
 
 
@@ -213,6 +215,7 @@ async def _wait_for_health(
     gateway_log: Path,
 ) -> None:
     deadline = time.monotonic() + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS
+    migrations_started = False
     migrations_ready = False
     last_error = ""
     async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
@@ -231,15 +234,20 @@ async def _wait_for_health(
                 last_error = str(exc)
             if not migrations_ready:
                 output = gateway_log.read_text(encoding="utf-8", errors="replace")
+                now = time.monotonic()
+                if (
+                    not migrations_started
+                    and _MIGRATIONS_STARTED_LOG_MARKER in output
+                ):
+                    migrations_started = True
+                    # Fresh-profile schema work is real disk I/O. Give only
+                    # that observed phase its own bounded Windows CI budget.
+                    deadline = now + _GATEWAY_MIGRATION_PHASE_TIMEOUT_SECONDS
                 if _MIGRATIONS_READY_LOG_MARKER in output:
                     migrations_ready = True
-                    # Fresh-profile migrations are a distinct startup phase.
-                    # Preserve a bounded post-migration readiness budget instead
-                    # of charging slow Windows disk I/O to later boot work.
-                    deadline = max(
-                        deadline,
-                        time.monotonic() + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS,
-                    )
+                    # Do not charge migration I/O to post-migration services,
+                    # and do not carry unused migration time into this phase.
+                    deadline = now + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS
             await asyncio.sleep(0.1)
     output = gateway_log.read_text(encoding="utf-8", errors="replace")
     raise AssertionError(
