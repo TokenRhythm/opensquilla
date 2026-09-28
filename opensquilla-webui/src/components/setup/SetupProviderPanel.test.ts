@@ -2663,7 +2663,7 @@ describe('primary thinking control', () => {
       expect(control.closest('[hidden]')).toBeNull()
       expect(document.body.querySelectorAll('[data-testid="provider-thinking-level"]')).toHaveLength(1)
       expect(control.value).toBe('high')
-      expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'adaptive'])
+      expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
       control.value = 'low'
       control.dispatchEvent(new Event('change', { bubbles: true }))
       expect(onUpdateLlmThinking).toHaveBeenLastCalledWith('low')

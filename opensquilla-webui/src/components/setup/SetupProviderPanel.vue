@@ -138,7 +138,7 @@ const emit = defineEmits<{
 
 const addOpen = ref(false)
 
-// Same vocabulary as llm.thinking accepts on the gateway (gateway/config.py);
+// Fixed thinking levels accepted by llm.thinking on the gateway (gateway/config.py);
 // '' is the unset default, where squilla_router may suggest per-tier levels.
 const thinkingLevelOptions = computed(() => [
   { value: '', label: t('setup.provider.thinkingDefault') },
@@ -148,7 +148,6 @@ const thinkingLevelOptions = computed(() => [
   { value: 'medium', label: 'medium' },
   { value: 'high', label: 'high' },
   { value: 'xhigh', label: 'xhigh' },
-  { value: 'adaptive', label: 'adaptive' },
 ])
 const editorOpen = ref(false)
 const listExpanded = ref(false)
