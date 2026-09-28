@@ -66,7 +66,7 @@ def _build_ollama_tool(tool: ToolDefinition) -> dict[str, Any]:
         "function": {
             "name": tool.name,
             "description": tool.description,
-            "parameters": tool.input_schema.model_dump(exclude_none=True),
+            "parameters": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
         },
     }
 

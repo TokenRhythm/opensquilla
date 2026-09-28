@@ -271,6 +271,54 @@ async def test_lists_every_page_without_losing_schema() -> None:
     assert sdk.list_tools.await_args_list[1].kwargs == {"cursor": "second-page"}
 
 
+async def test_discovered_root_constraint_violation_surfaces_server_error() -> None:
+    from opensquilla.mcp.discovery import close_active_clients, register_client_tools
+    from opensquilla.tool_boundary import ToolCall
+    from opensquilla.tools.dispatch import build_tool_handler, preflight_tool_call
+    from opensquilla.tools.registry import ToolRegistry
+
+    schema = {
+        "type": "object",
+        "properties": {"left": {"type": "string"}, "right": {"type": "string"}},
+        "oneOf": [{"required": ["left"]}, {"required": ["right"]}],
+    }
+    sdk = sdk_client(sdk_result("exactly one of left or right is required", is_error=True))
+    sdk.list_tools.return_value = SimpleNamespace(
+        tools=[SimpleNamespace(name="choose", description="Choose one", input_schema=schema)],
+        next_cursor=None,
+    )
+    client = Adapter(lambda: connected(sdk))
+    registry = ToolRegistry()
+    call = ToolCall(
+        tool_use_id="call-1",
+        tool_name="mcp__synthetic__choose",
+        arguments={"left": "a", "right": "b"},
+    )
+    try:
+        await register_client_tools(client, registry)
+        definition = next(
+            tool for tool in registry.to_tool_definitions()
+            if tool.name == call.tool_name
+        )
+        assert definition.input_schema.model_dump(exclude_none=True, by_alias=True)[
+            "oneOf"
+        ] == schema["oneOf"]
+
+        # The local preflight intentionally checks a small subset. The MCP
+        # server remains authoritative for other root constraints.
+        assert await preflight_tool_call(registry=registry, ctx=None, tool_call=call) is None
+        result = await build_tool_handler(registry)(call)
+
+        sdk.session.call_tool.assert_awaited_once()
+        assert sdk.session.call_tool.await_args.args[:2] == (
+            "choose", {"left": "a", "right": "b"},
+        )
+        assert result.is_error is True
+        assert "exactly one of left or right" in result.content
+    finally:
+        await close_active_clients(owner="synthetic")
+
+
 async def test_repeated_pagination_cursor_fails_instead_of_looping() -> None:
     sdk = sdk_client()
     sdk.list_tools.return_value = SimpleNamespace(tools=[], next_cursor="same")

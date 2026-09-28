@@ -9,9 +9,11 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any
 
+import structlog
 from anyascii import anyascii
 
 from opensquilla.contracts.attachments import (
@@ -34,6 +36,7 @@ from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import SafeToolError, ToolSpec, current_tool_context
 
 MCPToolSpecTransform = Callable[[MCPToolDef, ToolSpec], ToolSpec]
+log = structlog.get_logger(__name__)
 
 
 @dataclass(frozen=True)
@@ -352,16 +355,32 @@ def _make_tool_handler(
     spec_transform: MCPToolSpecTransform | None = None,
 ) -> None:
     """Register a single MCP tool in its server-scoped namespace."""
-    # Extract properties and required from input_schema
-    schema = tool_def.input_schema
-    raw_properties = schema.get("properties", {}) if isinstance(schema, Mapping) else {}
-    properties: dict[str, Any] = dict(raw_properties) if isinstance(raw_properties, Mapping) else {}
-    raw_required = schema.get("required", []) if isinstance(schema, Mapping) else []
+    # Retain the object schema for provider projection. The legacy pair remains
+    # available to integrations that inspect ToolSpec.parameters/required.
+    if not isinstance(tool_def.input_schema, Mapping):
+        raise ValueError(f"MCP tool '{tool_name}' inputSchema must be an object")
+    schema = deepcopy(dict(tool_def.input_schema))
+    if schema.get("type", "object") != "object":
+        raise ValueError(f"MCP tool '{tool_name}' inputSchema type must be object")
+    schema.setdefault("type", "object")
+    raw_properties = schema.get("properties", {})
+    if not isinstance(raw_properties, Mapping):
+        log.warning("mcp.invalid_optional_schema_properties", tool=tool_name)
+        raw_properties = {}
+    properties: dict[str, Any] = dict(raw_properties)
+    schema["properties"] = properties
+    raw_required = schema.get("required", [])
+    if not isinstance(raw_required, list | tuple) or any(
+        not isinstance(item, str) for item in raw_required
+    ):
+        log.warning("mcp.invalid_optional_schema_required", tool=tool_name)
+        raw_required = []
     required = (
         [item for item in raw_required if isinstance(item, str)]
         if isinstance(raw_required, list | tuple)
         else []
     )
+    schema["required"] = required
     if "_tool_use_id" in properties:
         raise ValueError("MCP input schema uses reserved runtime argument: _tool_use_id")
 
@@ -370,6 +389,7 @@ def _make_tool_handler(
         description=tool_def.description,
         parameters=properties,
         required=required,
+        input_schema=schema,
         execution_timeout_seconds=timeout_seconds + 5.0,
         runtime_only_arguments=frozenset({"_tool_use_id"}),
     )

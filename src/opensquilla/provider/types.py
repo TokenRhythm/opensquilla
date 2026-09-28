@@ -474,7 +474,7 @@ class ToolParam(BaseModel):
 class ToolInputSchema(BaseModel):
     """JSON schema for tool inputs."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, extra="allow")
 
     type: Literal["object"] = "object"
     properties: dict[str, Any] = {}

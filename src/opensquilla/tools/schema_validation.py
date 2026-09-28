@@ -123,7 +123,11 @@ def validate_tool_arguments(
 
 
 def tool_spec_schema_parts(spec: Any) -> tuple[Mapping[str, Any], list[str], Any]:
-    raw_parameters = getattr(spec, "parameters", None) or {}
+    canonical_schema = getattr(spec, "input_schema", None)
+    raw_parameters = (
+        canonical_schema if isinstance(canonical_schema, Mapping)
+        else getattr(spec, "parameters", None) or {}
+    )
     required = list(getattr(spec, "required", None) or [])
     additional_properties = None
     if isinstance(raw_parameters, Mapping) and raw_parameters.get("type") == "object":
