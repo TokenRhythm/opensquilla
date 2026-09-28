@@ -9,6 +9,11 @@ import {
 
 const CONTROL_URL = '/control/'
 const SESSION_KEY = 'agent:main:webchat:e2eworkbench'
+const BROWSER_SKILL_CANDIDATES = { generation: 1, candidates: [{
+  name: 'browser-use', instanceId: 'skill:browser-use', digest: 'a'.repeat(64),
+  generation: 1, description: 'Use the desktop browser', aliases: [],
+  kind: 'skill', source: 'bundled', disabled: false, manualOnly: false, ready: true,
+}] }
 const PNG_1x1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
   'base64',
@@ -44,6 +49,7 @@ async function installWorkbenchGateway(
   artifacts = ARTIFACTS,
   sends: Record<string, unknown>[] = [],
   delayedDrafts?: { requested: boolean; release?: () => void },
+  delayedSkills?: { requested: boolean; release?: () => void },
 ) {
   await page.route('**/api/**', route => route.fulfill({
     status: 404,
@@ -115,7 +121,10 @@ async function installWorkbenchGateway(
       const method = String(frame.method || '')
       if (method === 'connect') {
         ws.send(helloOkResponse({
-          ...(delayedDrafts ? { features: { methods: ['meta.drafts.list'] } } : {}),
+          features: { methods: [
+            'skills.candidates',
+            ...(delayedDrafts ? ['meta.drafts.list'] : []),
+          ] },
           auth: {
           principal: { isOwner: true, authenticated: true, authState: 'authenticated' },
           runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
@@ -173,6 +182,13 @@ async function installWorkbenchGateway(
         }))
         return
       }
+      if (method === 'skills.candidates' && delayedSkills && !delayedSkills.requested) {
+        delayedSkills.requested = true
+        delayedSkills.release = () => ws.send(JSON.stringify({
+          type: 'res', id: frame.id, ok: true, payload: BROWSER_SKILL_CANDIDATES,
+        }))
+        return
+      }
       const params = frame.params as Record<string, unknown> | undefined
       const key = String(params?.key || params?.sessionKey || SESSION_KEY)
       const payloads: Record<string, unknown> = {
@@ -193,6 +209,7 @@ async function installWorkbenchGateway(
         'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
         'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
         'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
+        'skills.candidates': BROWSER_SKILL_CANDIDATES,
         'usage.status': { sessions: [] },
       }
       ws.send(JSON.stringify({
@@ -461,6 +478,91 @@ test.describe('Application Workbench', () => {
     })
   }
 
+  test('selects Browser Use as a work style and sends its skill identity with the draft', async ({ page }) => {
+    const sends: Record<string, unknown>[] = []
+    await installDesktopWorkbenchV2Bridge(page)
+    await page.addInitScript(() => {
+      window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
+    })
+    await installWorkbenchGateway(page, new Map(), [], sends)
+    await page.goto(CONTROL_URL + 'chat/new')
+
+    const composer = page.locator('.chat-textarea')
+    await composer.fill('Inspect the release notes in the browser.')
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    const menu = page.getByRole('menu', { name: 'Add', exact: true })
+    const groups = menu.getByRole('group')
+    await expect(groups.first()).not.toContainText('Browser Use')
+    await expect(groups.last()).toContainText('Browser Use')
+    await menu.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
+
+    await expect(menu).toBeHidden()
+    await expect(page.getByTestId('selected-skills')).toContainText('/browser-use')
+    await expect(composer).toHaveValue('Inspect the release notes in the browser.')
+    await expect(composer).toBeFocused()
+    await expect(page.getByRole('dialog', { name: 'Browser Use' })).toHaveCount(0)
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => sends.length).toBe(1)
+    expect(sends[0]?.selectedSkills).toEqual([{
+      name: 'browser-use', instanceId: 'skill:browser-use', digest: 'a'.repeat(64),
+    }])
+  })
+
+  test('keeps the draft unsent while Browser Use selection is pending', async ({ page }) => {
+    const sends: Record<string, unknown>[] = []
+    const delayedSkills: { requested: boolean; release?: () => void } = { requested: false }
+    await installDesktopWorkbenchV2Bridge(page)
+    await page.addInitScript(() => {
+      window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
+    })
+    await installWorkbenchGateway(page, new Map(), [], sends, undefined, delayedSkills)
+    await page.goto(CONTROL_URL + 'chat/new')
+
+    const composer = page.locator('.chat-textarea')
+    await composer.fill('Inspect this page.')
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    await page.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
+    await expect.poll(() => delayedSkills.requested).toBe(true)
+    await expect(page.locator('.chat-send-btn')).toBeDisabled()
+    await composer.press('Enter')
+    expect(sends).toHaveLength(0)
+    await expect(composer).toHaveValue('Inspect this page.')
+
+    delayedSkills.release?.()
+    await expect(page.getByTestId('selected-skills')).toContainText('/browser-use')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => sends.length).toBe(1)
+    expect(sends[0]?.selectedSkills).toEqual([{
+      name: 'browser-use', instanceId: 'skill:browser-use', digest: 'a'.repeat(64),
+    }])
+  })
+
+  test('a pending Browser Use lookup does not block sending in another task', async ({ page }) => {
+    const sends: Record<string, unknown>[] = []
+    const delayedSkills: { requested: boolean; release?: () => void } = { requested: false }
+    await installDesktopWorkbenchV2Bridge(page)
+    await page.addInitScript(() => {
+      window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
+    })
+    await installWorkbenchGateway(page, new Map(), [], sends, undefined, delayedSkills)
+    await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+
+    const composer = page.locator('.chat-textarea')
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    await page.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
+    await expect.poll(() => delayedSkills.requested).toBe(true)
+    await page.getByRole('button', { name: 'New task', exact: true }).click()
+    await expect(page).toHaveURL(/\/chat\/new/)
+    await composer.fill('A separate task without Browser Use.')
+    await expect(page.locator('.chat-send-btn')).toBeEnabled()
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => sends.length).toBe(1)
+    expect(sends[0]?.selectedSkills).toBeUndefined()
+
+    delayedSkills.release?.()
+    await expect(page.getByTestId('selected-skills')).toHaveCount(0)
+  })
+
   test('opens manual browser tabs from a fresh draft and preserves their owner on first send', async ({ page }) => {
     const sends: Record<string, unknown>[] = []
     const delayedDrafts: { requested: boolean; release?: () => void } = { requested: false }
@@ -473,18 +575,13 @@ test.describe('Application Workbench', () => {
     const toggle = page.getByTestId('topbar-workbench-toggle')
     const composer = page.locator('.chat-textarea')
     const draft = 'Inspect the webpage already open beside this task.'
-    const add = page.getByRole('button', { name: 'Add', exact: true })
-    const menu = page.getByRole('menu', { name: 'Add', exact: true })
-    const openBrowserUse = async () => {
-      await add.click()
-      await menu.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
-      await expect(menu).toBeHidden()
-      await expect(add).toHaveAttribute('aria-expanded', 'false')
+    const revealBrowser = async () => {
+      await toggle.click()
       await expect(composer).toHaveValue(draft)
     }
     await expect(toggle).toBeVisible()
     await composer.fill(draft)
-    await openBrowserUse()
+    await revealBrowser()
     const workbench = page.getByTestId('workbench-host')
     const start = workbench.getByTestId('browser-start')
     await expect(start).toBeVisible()
@@ -514,7 +611,7 @@ test.describe('Application Workbench', () => {
 
     await toggle.click()
     await expect(workbench).toBeHidden()
-    await openBrowserUse()
+    await revealBrowser()
     await expect(workbench).toBeVisible()
     await expect(workbench.getByRole('tab')).toHaveCount(1)
     expect(await creates()).toHaveLength(1)
@@ -624,6 +721,46 @@ test.describe('Application Workbench', () => {
     })).toEqual({ version: 2, surfaceId: 'browser-retained', kind: 'url-preview',
       payload: { url: 'https://example.test/cart', scopeId: SESSION_KEY } })
   })
+
+  for (const panelWidth of [360, 480, 520, 560, 561]) {
+    test(`keeps browser tabs and actions on one line at ${panelWidth}px`, async ({ page }) => {
+      await page.setViewportSize({ width: 1440, height: 800 })
+      await page.addInitScript(width => {
+        localStorage.setItem('opensquilla.workbench.width.v1', JSON.stringify({
+          version: 1, width, source: 'user',
+        }))
+      }, panelWidth)
+      await installDesktopWorkbenchV2Bridge(page)
+      await openWorkbenchSession(page)
+      await page.evaluate(sessionKey => {
+        const probe = (window as unknown as {
+          __opensquillaNativeWorkbenchProbe: { surfaceListener: (event: unknown) => void }
+        }).__opensquillaNativeWorkbenchProbe
+        probe.surfaceListener({ version: 4, surfaceId: 'browser-responsive', type: 'browser-opened', detail: {
+          sessionKey, url: 'https://example.test/long-page-name',
+          title: 'A browser tab with a long title', targetRef: 'page-responsive',
+        } })
+      }, SESSION_KEY)
+
+      const host = page.getByTestId('workbench-host')
+      await expect(host).toBeVisible()
+      const chrome = host.locator('.workbench-host__chrome')
+      const tabs = host.locator('.workbench-host__tabs')
+      const actions = host.locator('.workbench-host__actions')
+      const toolbar = host.locator('.browser-preview__toolbar')
+      await expect.poll(async () => Math.round((await host.boundingBox())?.width ?? 0)).toBe(panelWidth)
+      await expect(toolbar).toBeVisible()
+      const [hostBox, chromeBox, tabsBox, actionsBox, toolbarBox] = await Promise.all([
+        host.boundingBox(), chrome.boundingBox(), tabs.boundingBox(),
+        actions.boundingBox(), toolbar.boundingBox(),
+      ])
+      expect(Math.abs(
+        tabsBox!.y + tabsBox!.height / 2 - actionsBox!.y - actionsBox!.height / 2,
+      )).toBeLessThan(2)
+      expect(chromeBox!.height).toBeLessThanOrEqual(52)
+      expect(toolbarBox!.x + toolbarBox!.width).toBeLessThanOrEqual(hostBox!.x + hostBox!.width + 1)
+    })
+  }
 
   for (const mode of ['full', 'offline'] as const) {
     test(`Desktop v2 ${mode} preview is positioned when its slot becomes ready`, async ({
@@ -861,7 +998,7 @@ test.describe('Application Workbench', () => {
     const guideRequestCount = requests.get('/api/v1/artifacts/workbench-guide') ?? 0
     expect(guideRequestCount).toBeGreaterThanOrEqual(1)
 
-    await page.getByTestId('topbar-workbench-toggle').click()
+    await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
     await expect(workbench).toBeHidden()
 
     await (await deliverablesHeaderAction(page)).click()
@@ -1012,7 +1149,7 @@ test.describe('Application Workbench', () => {
     await expect(workbench.locator('[data-workbench-item-id]')).toHaveCount(1)
     await expect(workbench.locator('.workbench-host__tabs')).toHaveCount(0)
 
-    await page.getByTestId('topbar-workbench-toggle').click()
+    await workbench.getByRole('button', { name: 'Collapse workbench' }).click()
     await expect(workbench).toBeHidden()
 
     await open.click()
@@ -1052,6 +1189,9 @@ test.describe('Application Workbench', () => {
 
   test('mobile PDF preview offers a focus-revealed exit after the browser viewer', async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 667 })
+    await page.addInitScript(() => {
+      Object.defineProperty(navigator, 'pdfViewerEnabled', { configurable: true, value: true })
+    })
     await openWorkbenchSession(page, new Map(), [{
       id: 'workbench-report',
       name: 'report.pdf',

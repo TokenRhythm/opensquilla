@@ -31,7 +31,10 @@
       @resize-end="previewWidth = null"
     />
 
-    <header class="workbench-host__chrome">
+    <header
+      class="workbench-host__chrome"
+      :class="{ 'workbench-host__chrome--browser': activeItem?.kind === 'browser' }"
+    >
       <div
         v-if="showTabStrip"
         class="workbench-host__tabs"
@@ -709,17 +712,17 @@ onBeforeUnmount(() => {
 }
 
 @container (max-width: 560px) {
-  .workbench-host__chrome:has(.workbench-host__tabs) {
+  .workbench-host__chrome:has(.workbench-host__tabs):not(.workbench-host__chrome--browser) {
     flex-wrap: wrap;
     gap: 0;
   }
 
-  .workbench-host__tabs {
+  .workbench-host__chrome:not(.workbench-host__chrome--browser) .workbench-host__tabs {
     flex-basis: 100%;
     min-height: 44px;
   }
 
-  .workbench-host__chrome:has(.workbench-host__tabs) .workbench-host__actions {
+  .workbench-host__chrome:has(.workbench-host__tabs):not(.workbench-host__chrome--browser) .workbench-host__actions {
     width: 100%;
     min-height: 44px;
     justify-content: flex-end;

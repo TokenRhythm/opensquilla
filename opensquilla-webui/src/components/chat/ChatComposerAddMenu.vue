@@ -24,12 +24,20 @@
           <strong>{{ t('chat.attachFiles') }}</strong>
         </span>
       </button>
+    </div>
+    <div
+      v-if="browserUseAvailable || planModeAvailable || goalModeAvailable"
+      class="composer-add-menu__group"
+      role="group"
+      :aria-label="t('chat.composer.workStyleGroup')"
+    >
+      <div class="composer-add-menu__heading" aria-hidden="true">{{ t('chat.composer.workStyleGroup') }}</div>
       <button
         v-if="browserUseAvailable"
         type="button"
         class="composer-add-menu__item"
         role="menuitem"
-        @click="openBrowserUse"
+        @click="selectBrowserUse"
       >
         <span class="composer-add-menu__icon" aria-hidden="true">
           <Icon name="languages" :size="17" />
@@ -39,14 +47,6 @@
           <span>{{ t('chat.composer.browserUseDescription') }}</span>
         </span>
       </button>
-    </div>
-    <div
-      v-if="planModeAvailable || goalModeAvailable"
-      class="composer-add-menu__group"
-      role="group"
-      :aria-label="t('chat.composer.workStyleGroup')"
-    >
-      <div class="composer-add-menu__heading" aria-hidden="true">{{ t('chat.composer.workStyleGroup') }}</div>
       <button
         v-if="planModeAvailable"
         type="button"
@@ -118,7 +118,7 @@ const emit = defineEmits<{
   activateGoalMode: []
   activatePlanMode: []
   attachFiles: []
-  openBrowserUse: []
+  selectBrowserUse: []
   close: []
 }>()
 
@@ -169,8 +169,8 @@ function attachFiles() {
   emit('close')
 }
 
-function openBrowserUse() {
-  emit('openBrowserUse')
+function selectBrowserUse() {
+  emit('selectBrowserUse')
   emit('close')
 }
 

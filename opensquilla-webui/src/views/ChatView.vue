@@ -640,7 +640,6 @@
     </div>
 
     <ChatModelSetupNotice v-if="!shareMode" />
-    <BrowserWindowDialog :open="browserWindowOpen" @close="browserWindowOpen = false" />
     <ChatComposer
       ref="composerRef"
       v-model="inputText"
@@ -687,7 +686,7 @@
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
       :goal-mode-existing="goalComposerExisting"
       :add-menu-avoid-element="goalRunDockRef"
-      :browser-use-available="workbenchEnabled && !shareMode"
+      :browser-use-available="browserUseAvailable"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -731,7 +730,7 @@
       @set-coding-mode-enabled="setComposerCodingModeEnabled"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
-      @open-browser-use="openBrowserUse"
+      @select-browser-use="void selectBrowserUse()"
       @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -853,8 +852,6 @@ import ChatArtifactList from '@/components/chat/ChatArtifactList.vue'
 import PromptCacheKeepaliveDialog from '@/components/chat/PromptCacheKeepaliveDialog.vue'
 import DeliverablesDrawer from '@/components/chat/DeliverablesDrawer.vue'
 import ChatComposer from '@/components/chat/ChatComposer.vue'
-import BrowserWindowDialog from '@/components/chat/BrowserWindowDialog.vue'
-import { requestBrowserWorkbenchReveal } from '@/workbench/browserItems'
 import ChatModelSetupNotice from '@/components/chat/ChatModelSetupNotice.vue'
 import ProjectWorkspacePickerDialog from '@/components/ProjectWorkspacePickerDialog.vue'
 import ChatMessageList from '@/components/chat/ChatMessageList.vue'
@@ -1544,18 +1541,14 @@ const promptCacheKeepaliveAvailable = computed(() => (
   promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
-const browserWindowOpen = ref(false)
-
-function openBrowserUse() {
-  if (!workbenchEnabled.value || shareMode.value) return
-  if (platform.capabilities.hasNativeWorkbenchSurfaces && platform.workbench.native) {
-    requestBrowserWorkbenchReveal(sessionKey.value)
-  } else {
-    composerRef.value?.composerElement()?.querySelector<HTMLButtonElement>('.chat-plus-btn')
-      ?.focus({ preventScroll: true })
-    browserWindowOpen.value = true
-  }
-}
+const browserUseAvailable = computed(() => workbenchEnabled.value && !shareMode.value
+  && platform.capabilities.hasNativeWorkbenchSurfaces === true
+  && Boolean(platform.workbench.native)
+  && gatewayConnectionState.value === 'connected'
+  && Boolean(skillCatalog?.supportsCandidates()))
+let browserUseSelectionSequence = 0
+const browserUseSelection = ref<{ sessionKey: string; requestId: number } | null>(null)
+const browserUseSelectionPending = computed(() => browserUseSelection.value?.sessionKey === sessionKey.value)
 
 const promptAnnotationDesktopAvailable = computed(() => (
   workbenchEnabled.value
@@ -3636,6 +3629,25 @@ const {
   executeSlashCommand,
   restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
+
+async function selectBrowserUse() {
+  if (!browserUseAvailable.value || browserUseSelectionPending.value) return
+  const requestId = ++browserUseSelectionSequence
+  const originSessionKey = sessionKey.value
+  browserUseSelection.value = { sessionKey: originSessionKey, requestId }
+  try {
+    if (await chatSlashCommands.selectSkillByName('browser-use')
+      && sessionKey.value === originSessionKey) {
+      await nextTick()
+      composerRef.value?.focusTextarea()
+    }
+  } finally {
+    if (browserUseSelection.value?.requestId === requestId) browserUseSelection.value = null
+  }
+}
+watch(sessionKey, current => {
+  if (browserUseSelection.value?.sessionKey !== current) browserUseSelection.value = null
+})
 watch([sessionKey, codingModeEnabled, gatewayConnectionState, () => activeWorkspace.value?.id], invalidateSkillCandidates)
 
 watch([slashIdx, filteredSlashCmds], () => {
@@ -3840,6 +3852,7 @@ watch(
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
+  if (browserUseSelectionPending.value) return
   markProvisionalDraftUsed()
   if (pendingAutoSendSessionKey.value === sessionKey.value) {
     pendingAutoSend.value = ''
@@ -4903,7 +4916,8 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  (forkTransition.value
+  (browserUseSelectionPending.value ? t('chat.skillPalette.loading') : '')
+  || (forkTransition.value
     ? t(
         forkTransition.value.phase === 'error'
           ? 'chat.forkOpenFailed'

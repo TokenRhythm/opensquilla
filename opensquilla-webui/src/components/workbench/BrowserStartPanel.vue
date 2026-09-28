@@ -1,8 +1,8 @@
 <template>
   <section class="browser-start" data-testid="browser-start">
     <Icon name="languages" :size="30" aria-hidden="true" />
-    <h2>{{ t(external ? 'chat.composer.browserUse' : 'workbench.browser.newTab') }}</h2>
-    <p>{{ t(external ? 'chat.composer.browserWindowHint' : 'workbench.browser.startHint') }}</p>
+    <h2>{{ t('workbench.browser.newTab') }}</h2>
+    <p>{{ t('workbench.browser.startHint') }}</p>
     <form class="browser-start__form" @submit.prevent="open">
       <input
         ref="addressRef"
@@ -19,7 +19,7 @@
         @input="invalid = false"
       >
       <button type="submit" class="btn btn--primary" :disabled="!ready">
-        {{ t(external ? 'workbench.openExternal' : 'workbench.browser.go') }}
+        {{ t('workbench.browser.go') }}
       </button>
     </form>
     <p v-if="invalid" class="browser-start__error" role="alert">
@@ -38,7 +38,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { normalizeBrowserAddress } from '@/workbench/browserItems'
 
-const props = defineProps<{ ready: boolean; canReopen: boolean; external?: boolean }>()
+const props = defineProps<{ ready: boolean; canReopen: boolean }>()
 const emit = defineEmits<{ open: [url: string]; reopen: [] }>()
 const { t } = useI18n()
 const address = ref('')

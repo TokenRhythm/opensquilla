@@ -8,14 +8,12 @@ import {
 } from './support/session-read-fixtures'
 
 const SESSION_A = 'agent:main:webchat:web-browser-a'
-const SITE = 'https://browser-workbench.example.test'
 const PNG_1x1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
   'base64',
 )
 
 async function installWebBrowserUse(page: Page) {
-  const visits = new Map<string, number>()
   await page.addInitScript(() => {
     window.OPENSQUILLA_FEATURES = {
       ...(window.OPENSQUILLA_FEATURES || {}),
@@ -31,25 +29,6 @@ async function installWebBrowserUse(page: Page) {
   await page.route('**/opensquilla-mark.png', route => route.fulfill({
     contentType: 'image/png', body: PNG_1x1,
   }))
-  // Context routing also covers the first navigation of an external window.
-  await page.context().route(`${SITE}/**`, route => {
-    const path = new URL(route.request().url()).pathname
-    visits.set(path, (visits.get(path) || 0) + 1)
-    return route.fulfill({
-      contentType: 'text/html',
-      body: `<!doctype html><html lang="en"><meta charset="utf-8">
-        <title>Browser fixture</title><h1>Browser fixture ${path}</h1>
-        <label>Draft value <input name="draft"></label>
-        <button type="button" id="increment">Increment</button>
-        <output aria-label="Counter">0</output>
-        <script>
-          document.querySelector('#increment').onclick = () => {
-            const counter = document.querySelector('output');
-            counter.value = String(Number(counter.value) + 1);
-          };
-        </script></html>`,
-    })
-  })
   await page.routeWebSocket(/\/ws$/, ws => {
     ws.send(JSON.stringify({ type: 'event', event: 'connect.challenge', payload: {} }))
     ws.onMessage(message => {
@@ -98,77 +77,21 @@ async function installWebBrowserUse(page: Page) {
   await expect(page.getByTestId('topbar-workbench-toggle')).toHaveCount(0)
   await expect(page.getByTestId('workbench-host')).toBeHidden()
   expect(await page.evaluate(() => Boolean(window.opensquillaDesktop))).toBe(false)
-  return visits
-}
-
-async function openBrowserFromComposer(page: Page) {
-  const add = page.getByRole('button', { name: 'Add', exact: true })
-  await add.click()
-  const menu = page.getByRole('menu', { name: 'Add', exact: true })
-  await menu.getByRole('menuitem', { name: /^Browser Use\b/ }).click()
-  await expect(menu).toBeHidden()
-  await expect(add).toHaveAttribute('aria-expanded', 'false')
 }
 
 test.describe('Web Browser Use', () => {
-  test('opens a webpage in a separate window from Add without creating a sidebar or changing the draft', async ({ page }) => {
-    await page.setViewportSize({ width: 1440, height: 900 })
-    const visits = await installWebBrowserUse(page)
-    const composer = page.locator('.chat-textarea')
-    const draft = 'Keep this composer draft'
-    await composer.fill(draft)
-    await openBrowserFromComposer(page)
-    const dialog = page.getByRole('dialog', { name: 'Browser Use', exact: true })
-    await expect(dialog).toBeVisible()
-    await expect(dialog).toContainText('Webpages open in a new window.')
-    const address = dialog.getByRole('textbox', { name: 'Web address' })
-    await expect(address).toBeFocused()
-    await address.fill('javascript:alert(1)')
-    await dialog.getByRole('button', { name: 'Open externally', exact: true }).click()
-    await expect(dialog.getByRole('alert')).toHaveText('Enter a valid HTTP or HTTPS web address.')
-    await expect(address).toHaveAttribute('aria-invalid', 'true')
-    expect(page.context().pages()).toHaveLength(1)
-    expect(visits.size).toBe(0)
-
-    await address.fill(`${SITE}/external`)
-    const opened = page.waitForEvent('popup')
-    await dialog.getByRole('button', { name: 'Open externally', exact: true }).click()
-    const popup = await opened
-    await expect(dialog).toBeHidden()
-    await expect(popup).toHaveURL(`${SITE}/external`)
-    await expect(popup.getByRole('heading')).toHaveText('Browser fixture /external')
-    await popup.getByRole('button', { name: 'Increment' }).click()
-    await expect(popup.getByLabel('Counter')).toHaveText('1')
-    expect(await popup.evaluate(() => window.opener === null)).toBe(true)
-    expect(await popup.evaluate(() => document.referrer)).toBe('')
-    await popup.close()
-    await expect(composer).toHaveValue(draft)
-    await expect(page.getByTestId('topbar-workbench-toggle')).toHaveCount(0)
-    await expect(page.getByTestId('workbench-host')).toBeHidden()
-    await expect(page.locator('.browser-preview iframe')).toHaveCount(0)
-  })
-
-  test('keeps Browser Use available on mobile and cancels its dialog without opening a window', async ({ page }) => {
-    await page.setViewportSize({ width: 390, height: 844 })
-    const visits = await installWebBrowserUse(page)
-    const composer = page.locator('.chat-textarea')
-    await composer.fill('Mobile draft')
-    await openBrowserFromComposer(page)
-    const dialog = page.getByRole('dialog', { name: 'Browser Use', exact: true })
-    const address = dialog.getByRole('textbox', { name: 'Web address' })
-    await expect(dialog).toHaveAttribute('aria-modal', 'true')
-    await address.fill(`${SITE}/cancelled`)
-    await address.press('Escape')
-    await expect(dialog).toBeHidden()
-    await expect(composer).toHaveValue('Mobile draft')
-    await openBrowserFromComposer(page)
-    await expect(address).toHaveValue('')
-    await dialog.getByRole('button', { name: 'Close', exact: true }).click()
-    await expect(dialog).toBeHidden()
-    await expect(composer).toHaveValue('Mobile draft')
-    await expect(page.getByTestId('topbar-workbench-toggle')).toHaveCount(0)
-    await expect(page.getByTestId('workbench-host')).toBeHidden()
-    expect(page.context().pages()).toHaveLength(1)
-    expect(visits.size).toBe(0)
-  })
+  for (const viewport of [{ width: 1440, height: 900 }, { width: 390, height: 844 }]) {
+    test(`offers Browser Use only with a desktop browser bridge at ${viewport.width}px`, async ({ page }) => {
+      await page.setViewportSize(viewport)
+      await installWebBrowserUse(page)
+      const composer = page.locator('.chat-textarea')
+      await composer.fill('Keep this composer draft')
+      await page.getByRole('button', { name: 'Add', exact: true }).click()
+      const menu = page.getByRole('menu', { name: 'Add', exact: true })
+      await expect(menu).toBeVisible()
+      await expect(menu.getByRole('menuitem', { name: /^Browser Use\b/ })).toHaveCount(0)
+      await expect(page.getByRole('dialog', { name: 'Browser Use' })).toHaveCount(0)
+      await expect(composer).toHaveValue('Keep this composer draft')
+    })
+  }
 })

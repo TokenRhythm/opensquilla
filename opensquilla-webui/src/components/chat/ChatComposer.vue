@@ -128,7 +128,7 @@
       <div v-if="selectedSkills.length" class="chat-selected-skills" data-testid="selected-skills">
         <span class="chat-selected-skills__label">{{ t('chat.skillPalette.thisMessage') }}</span>
         <span v-for="skill in selectedSkills" :key="skill.instanceId" class="attachment-chip">
-          <span class="attachment-chip__name">{{ skill.name }}</span>
+          <span class="attachment-chip__name">/{{ skill.name }}</span>
           <button type="button" class="attachment-action attachment-remove" :aria-label="t('chat.skillPalette.remove', { name: skill.name })" @click="emit('removeSkill', skill.instanceId)">
             <Icon name="x" :size="12" />
           </button>
@@ -208,7 +208,7 @@
                 @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
-                @open-browser-use="emit('openBrowserUse')"
+                @select-browser-use="emit('selectBrowserUse')"
                 @close="addMenuOpen = false"
               />
             </div>
@@ -657,7 +657,7 @@ const emit = defineEmits<{
   setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
-  openBrowserUse: []
+  selectBrowserUse: []
   disarmGoal: []
   cancelReplan: []
   voiceInput: []
