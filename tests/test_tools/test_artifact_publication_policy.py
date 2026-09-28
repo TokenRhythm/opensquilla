@@ -270,6 +270,75 @@ def test_protected_auto_publish_backstop_cannot_bypass_policy(protected) -> None
     _assert_nothing_published(ctx)
 
 
+def test_protected_turn_without_tracked_writes_has_no_spurious_delivery_failure(protected) -> None:
+    ctx, policy, _ = protected
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="The report is ready.")
+    assert not result.artifacts and not result.failure_summaries
+    assert not result.resolved_target_keys
+    assert policy.calls == []
+    _assert_nothing_published(ctx)
+
+
+@pytest.mark.parametrize("kind", ["not_created", "not_mentioned", "not_deliverable", "missing"])
+def test_protected_backstop_ignores_non_candidate_writes(protected, kind: str) -> None:
+    ctx, policy, target = protected
+    if kind == "not_deliverable":
+        target = target.with_suffix(".txt")
+        target.write_bytes(REPORT)
+    if kind == "missing":
+        target.unlink()
+    ctx.workspace_file_writes.append(
+        {"created": kind != "not_created", "path": str(target), "name": target.name}
+    )
+    final_text = "All done." if kind == "not_mentioned" else f"Created {target.name}."
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text=final_text)
+    assert not result.artifacts and not result.failure_summaries
+    assert policy.calls == []
+    _assert_nothing_published(ctx)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tracked", [False, True])
+async def test_explicitly_published_protected_artifact_is_not_reported_missing(
+    protected,
+    tracked: bool,
+) -> None:
+    ctx, policy, target = protected
+    await _publish(ctx)
+    if tracked:
+        ctx.workspace_file_writes.append(
+            {"created": True, "path": str(target), "name": target.name}
+        )
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text="Created report.html.")
+    assert not result.artifacts and not result.failure_summaries
+    assert len(policy.calls) == 1
+    assert len(ctx.published_artifacts) == 1
+    if tracked:
+        assert "name:report.html" in result.resolved_target_keys
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["digest", "name"])
+async def test_protected_backstop_does_not_suppress_real_omission_after_other_publication(
+    protected,
+    change: str,
+) -> None:
+    ctx, policy, target = protected
+    await _publish(ctx)
+    if change == "digest":
+        target.write_bytes(b"new unapproved report")
+    else:
+        target = target.with_name("other.html")
+        target.write_bytes(REPORT)
+    ctx.workspace_file_writes.append({"created": True, "path": str(target), "name": target.name})
+    result = auto_publish_omitted_workspace_artifacts(ctx, final_text=f"Created {target.name}.")
+    assert not result.artifacts
+    assert len(result.failure_summaries) == 1
+    assert "host validation" in result.failure_summaries[0]
+    assert len(policy.calls) == 1
+    assert len(ctx.published_artifacts) == 1
+
+
 def test_candidate_snapshot_rejects_directory_links_and_special_files(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()

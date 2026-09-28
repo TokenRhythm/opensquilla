@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
+from opensquilla.artifact_publication import read_publication_candidate
 from opensquilla.artifact_validation import (
     ArtifactValidationError,
     is_pptx_candidate,
@@ -200,13 +201,6 @@ def auto_publish_omitted_workspace_artifacts(
 
     if ctx is None:
         return OmittedArtifactPublishResult()
-    if ctx.artifact_publication_policy is not None:
-        return OmittedArtifactPublishResult(
-            failure_summaries=[
-                "Protected artifacts require explicit publish_artifact host validation; "
-                "automatic publication is disabled."
-            ]
-        )
     if (
         str(getattr(ctx, "plan_run_id", "") or "").strip()
         and attached_plan_run_ready is not True
@@ -269,7 +263,7 @@ def auto_publish_omitted_workspace_artifacts(
                 name=target.name,
                 mime=artifact_mime,
             )
-            if target_is_pptx:
+            if target_is_pptx and ctx.artifact_publication_policy is None:
                 target_size = target.stat().st_size
                 if publish_max_bytes is not None and target_size > publish_max_bytes:
                     raise ArtifactBudgetError(
@@ -291,9 +285,13 @@ def auto_publish_omitted_workspace_artifacts(
                     )
                     continue
 
-            target_sha256 = hashlib.sha256(
-                pptx_payload if pptx_payload is not None else target.read_bytes()
-            ).hexdigest()
+            target_sha256 = (
+                read_publication_candidate(workspace, target, publish_max_bytes).sha256
+                if ctx.artifact_publication_policy is not None
+                else hashlib.sha256(
+                    pptx_payload if pptx_payload is not None else target.read_bytes()
+                ).hexdigest()
+            )
             artifact_key = (target_sha256, _safe_filename(target.name))
             target_key = artifact_delivery_publish_target_key(
                 str(target),
@@ -307,6 +305,12 @@ def auto_publish_omitted_workspace_artifacts(
                         and resolved_key not in resolved_target_keys
                     ):
                         resolved_target_keys.append(resolved_key)
+                continue
+            if ctx.artifact_publication_policy is not None:
+                failure_summaries.append(
+                    f"Protected artifact {target.name} requires explicit publish_artifact "
+                    "host validation; automatic publication is disabled."
+                )
                 continue
             existing = store.find_existing_ref(
                 session_id=ctx.artifact_session_id,
