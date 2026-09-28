@@ -52,6 +52,28 @@
 # conservative: over-estimating a window causes silent server-side
 # truncation; under-estimating only triggers compaction earlier.
 
+# Tsubasa public service aliases and limits.
+[tsubasa."tsubasa-fast"]
+display_name = "Tsubasa Fast"
+context_window = 32768
+max_output_tokens = 8192
+supports_reasoning = false
+supports_tools = false
+supports_vision = false
+input_cost_per_mtok = 0.2
+output_cost_per_mtok = 1.0
+
+[tsubasa."tsubasa-pro"]
+display_name = "Tsubasa Pro"
+context_window = 32768
+max_output_tokens = 16384
+supports_reasoning = false
+supports_tools = false
+supports_vision = false
+input_cost_per_mtok = 0.5
+output_cost_per_mtok = 4.0
+
+
 [moonshot."moonshot-v1-8k"]
 context_window = 8192
 max_output_tokens = 8192

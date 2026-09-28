@@ -425,6 +425,13 @@ for _provider_spec in [
         catalog_source=("groq",),
     ),
     _spec(
+        "tsubasa",
+        "openai_compat",
+        "tsubasa",
+        "TSUBASA_API_KEY",
+        "https://api.tsubasa.sh/v1",
+    ),
+    _spec(
         "zhipu",
         "openai_compat",
         "zhipu",
