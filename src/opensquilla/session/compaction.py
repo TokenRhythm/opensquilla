@@ -684,9 +684,10 @@ def estimate_entry_model_replay_tokens(
     if _entry_get(entry, "role") == "user":
         projected_content, projection_complete = project_entry_content_for_provider(
             content,
-            preserve_images=False,
+            preserve_images=preserve_images,
             session_id=session_id or str(_entry_get(entry, "session_id") or ""),
             message_id=str(_entry_get(entry, "message_id") or ""),
+            media_root=media_root,
         )
     if projection_complete and projected_content != content:
         raw_tokens = _estimate_tokens(str(content)) if content else 0
@@ -994,7 +995,13 @@ def _provider_visible_envelope_text(envelope: Mapping[str, Any]) -> str:
     return text
 
 
-def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
+def _entry_model_replay_payload(
+    entry: Any,
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = False,
+) -> dict[str, Any]:
     """Return only fields that can affect provider-visible history replay."""
 
     payload: dict[str, Any] = {
@@ -1004,9 +1011,10 @@ def _entry_model_replay_payload(entry: Any) -> dict[str, Any]:
     if payload["role"] == "user":
         projected_content, estimate_complete = project_entry_content_for_provider(
             payload["content"],
-            preserve_images=False,
-            session_id=str(_entry_get(entry, "session_id") or ""),
+            preserve_images=preserve_images,
+            session_id=session_id or str(_entry_get(entry, "session_id") or ""),
             message_id=str(_entry_get(entry, "message_id") or ""),
+            media_root=media_root,
         )
         if estimate_complete:
             payload["content"] = projected_content
@@ -1038,7 +1046,13 @@ def estimate_entries_model_replay_chars(
 
     if not entries:
         return 0
-    payloads = [_entry_model_replay_payload(entry) for entry in entries]
+    payloads = [
+        _entry_model_replay_payload(
+            entry, media_root=media_root, session_id=session_id,
+            preserve_images=preserve_images,
+        )
+        for entry in entries
+    ]
     chars = len(_json_text(payloads))
     for entry, payload in zip(entries, payloads, strict=True):
         media_budget = _entry_model_replay_media_budget(

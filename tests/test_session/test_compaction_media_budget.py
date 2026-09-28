@@ -6,7 +6,9 @@ import io
 import json
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from PIL import Image
@@ -442,6 +444,80 @@ def test_invalid_image_still_needs_media_proof() -> None:
     assert isinstance(omitted, str)
     assert "invalid-base64" not in omitted
     assert "historical attachment omitted" in omitted
+
+
+@pytest.mark.parametrize("material", [
+    {"data": "!" * 10_000},
+    {"data": base64.b64encode(b"synthetic non-image bytes" * 1_000).decode("ascii")},
+    {"sha256_ref": "invalid-reference" * 1_000, "size": 123},
+    {"sha256_ref": "a" * 64, "size": 123},
+], ids=["invalid-base64", "invalid-pixels", "invalid-ref", "missing-ref"])
+@pytest.mark.parametrize("persisted_surplus", [-17, 17])
+def test_unproven_retained_image_estimates_keep_raw_floor(
+    tmp_path: Path, material: dict[str, Any], persisted_surplus: int,
+) -> None:
+    from opensquilla.engine.history import project_history_replay_capacity
+    from opensquilla.engine.runtime import TurnRunner
+    from opensquilla.gateway.config import GatewayConfig
+
+    content = json.dumps({
+        "text": "Inspect.", "attachments": [{"type": "image/png", **material}],
+    })
+    raw_tokens = estimate_tokens(content)
+    entry = {
+        "role": "user", "content": content, "token_count": raw_tokens + persisted_surplus,
+        "message_id": "synthetic-message",
+    }
+    media_root = tmp_path / "media"
+    session_id = "history-scope"
+    projected, complete = project_entry_content_for_provider(
+        content, preserve_images=True, media_root=media_root, session_id=session_id,
+        message_id=entry["message_id"],
+    )
+    assert (projected, complete) == (content, False)
+    # Preflight and compaction cut/skip decisions use these source estimators.
+    assert estimate_entry_model_replay_tokens(
+        entry, preserve_images=True, media_root=media_root, session_id=session_id,
+    ) == max(raw_tokens, entry["token_count"])
+    raw_payload = json.dumps(
+        [{"role": "user", "content": content}], ensure_ascii=False, sort_keys=True,
+    )
+    assert estimate_entries_model_replay_chars(
+        [entry], preserve_images=True, media_root=media_root, session_id=session_id,
+    ) == len(raw_payload)
+
+    runner = TurnRunner(
+        provider_selector=MagicMock(), session_manager=None, config=GatewayConfig(),
+    )
+    for preserve_images in (True, False):
+        replay = runner._project_history_replay(
+            [SimpleNamespace(**entry)], excluded_entry_indexes=(), trim_last_user=False,
+            bound_slice_applied=False, image_replay_entry_indexes=(0,) if preserve_images else (),
+            media_root=media_root, session_id=session_id, require_capacity_proof=True,
+        )
+        capacity = project_history_replay_capacity(replay)
+        assert capacity.media_block_count == 0
+        assert capacity.estimate_complete is not preserve_images
+        if preserve_images:
+            assert capacity.messages[0].content == content
+            assert capacity.estimated_tokens >= max(raw_tokens, entry["token_count"])
+        else:
+            assert capacity.messages[0].content != content
+            assert capacity.estimated_tokens < 1_000
+
+    omitted, omitted_complete = project_entry_content_for_provider(
+        content, preserve_images=False, media_root=media_root, session_id=session_id,
+        message_id=entry["message_id"],
+    )
+    assert omitted_complete is True
+    assert isinstance(omitted, str)
+    assert estimate_entry_model_replay_tokens(
+        entry, preserve_images=False, media_root=media_root, session_id=session_id,
+    ) == estimate_tokens(omitted) + max(0, persisted_surplus)
+    assert estimate_entries_model_replay_chars(
+        [entry], preserve_images=False, media_root=media_root, session_id=session_id,
+    ) < 2_000
+    assert not media_root.exists()
 
 
 @pytest.mark.parametrize("preserve_images", [False, True])
