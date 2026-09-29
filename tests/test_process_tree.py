@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 from types import SimpleNamespace
 
@@ -1670,6 +1671,275 @@ async def test_windows_controlled_launcher_waits_for_helper_ready_before_release
         "released",
         "gate-closed",
     ]
+
+
+@pytest.fixture(params=["windows", "posix"])
+def controlled_async_launch(request, tmp_path, monkeypatch):
+    events: list[str] = []
+    reference = _synthetic_owner_reference(
+        tmp_path / "registry.sqlite3", platform=request.param,
+    )
+
+    class Gate:
+        gate_name = "synthetic-gate"
+        ready_name = "synthetic-ready"
+        read_fd = 91
+
+        def wait_ready(self, _timeout):
+            pass
+
+        def child_pass_fds(self, _existing):
+            return (self.read_fd,)
+
+        def close_child_end(self):
+            pass
+
+        def release(self):
+            events.append("released")
+
+        def close(self):
+            events.append("gate-closed")
+
+    class Job:
+        def assign_pid(self, _pid):
+            pass
+
+        def close(self):
+            events.append("job-closed")
+
+    class Process:
+        pid = 7677
+        returncode = None
+
+        def terminate(self):
+            events.append("process-stopped")
+            self.returncode = -15
+
+        async def wait(self):
+            return self.returncode
+
+    class Anchor:
+        pgid = 7678
+        process = SimpleNamespace(pid=7678)
+
+        def bind(self, _owner):
+            pass
+
+        async def arm(self):
+            events.append("armed")
+
+    async def spawn(*_args, **_kwargs):
+        events.append("spawned")
+        return Process()
+
+    async def create_anchor(*_args, **_kwargs):
+        return Anchor()
+
+    async def stop_anchor(_anchor):
+        events.append("anchor-stopped")
+
+    def delete(ref):
+        assert ref is reference
+        events.append("row-deleted")
+
+    gate = Gate()
+    monkeypatch.setattr(process_tree._WindowsLaunchGate, "create", lambda: gate)
+    monkeypatch.setattr(process_tree._PosixLaunchGate, "create", lambda: gate)
+    monkeypatch.setattr(process_tree._WindowsJob, "create", lambda *_args: Job())
+    monkeypatch.setattr(process_tree, "_create_posix_anchor", create_anchor)
+    monkeypatch.setattr(process_tree, "_stop_unarmed_posix_anchor", stop_anchor)
+    monkeypatch.setattr(process_tree, "_insert_owner_record", lambda *_a, **_kw: reference)
+    monkeypatch.setattr(process_tree, "_delete_owner_record", delete)
+    monkeypatch.setattr(process_tree.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(process_tree.ProcessTreeOwner, "start_completion_monitor", lambda _s: None)
+    if request.param == "windows":
+        monkeypatch.setattr(process_tree.os, "name", "nt")
+
+    async def launch():
+        with process_tree.task_process_scope(
+            tmp_path / "runtime", session_key="synthetic-session", task_id="synthetic-task",
+        ):
+            if request.param == "windows":
+                return await process_tree.create_owned_subprocess_exec("synthetic.exe")
+            return await process_tree._create_owned_posix_subprocess(("synthetic",), {})
+
+    return SimpleNamespace(
+        launch=launch, events=events, reference=reference, gate=gate, platform=request.param,
+    )
+
+
+@pytest.mark.asyncio
+async def test_slow_owner_registration_keeps_event_loop_responsive(
+    controlled_async_launch, monkeypatch,
+):
+    case = controlled_async_launch
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    heartbeat = threading.Event()
+
+    def persist(*_args, **_kwargs):
+        loop.call_soon_threadsafe(started.set)
+        heartbeat.wait(1)
+        case.events.append("registration-finished")
+        return case.reference
+
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    launch = asyncio.create_task(case.launch())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        assert "registration-finished" not in case.events
+        assert "released" not in case.events
+    finally:
+        heartbeat.set()
+        await launch
+    assert case.events.index("registration-finished") < case.events.index("released")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registration_fails", [False, True])
+async def test_cancelled_owner_registration_drains_worker_and_cleanup(
+    controlled_async_launch, monkeypatch, registration_fails,
+):
+    case = controlled_async_launch
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    deleting = asyncio.Event()
+    finish_registration = threading.Event()
+    finish_deletion = threading.Event()
+
+    def persist(*_args, **_kwargs):
+        loop.call_soon_threadsafe(started.set)
+        assert finish_registration.wait(5)
+        case.events.append("registration-finished")
+        if registration_fails:
+            raise process_tree.ProcessTreeOwnershipError("synthetic registration failure")
+        return case.reference
+
+    def delete(reference):
+        assert reference is case.reference
+        loop.call_soon_threadsafe(deleting.set)
+        assert finish_deletion.wait(5)
+        case.events.append("row-deleted")
+
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    monkeypatch.setattr(process_tree, "_delete_owner_record", delete)
+    launch = asyncio.create_task(case.launch())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=3)
+        launch.cancel("first cancellation")
+        await asyncio.sleep(0)
+        launch.cancel("repeated during registration")
+        await asyncio.sleep(0)
+        assert not launch.done()
+        assert "released" not in case.events
+        finish_registration.set()
+        if not registration_fails:
+            await asyncio.wait_for(deleting.wait(), timeout=3)
+            launch.cancel("repeated during cleanup")
+            await asyncio.sleep(0)
+            assert not launch.done()
+        finish_deletion.set()
+        with pytest.raises(asyncio.CancelledError, match="first cancellation"):
+            await asyncio.wait_for(launch, timeout=3)
+    finally:
+        finish_registration.set()
+        finish_deletion.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await launch
+
+    assert "released" not in case.events
+    assert case.events[-1] == "gate-closed"
+    stopped = "job-closed" if case.platform == "windows" else "anchor-stopped"
+    assert case.events.index("registration-finished") < case.events.index(stopped)
+    if registration_fails:
+        assert "row-deleted" not in case.events
+    else:
+        assert case.events.count("row-deleted") == 1
+        assert case.events.index(stopped) < case.events.index("row-deleted")
+    if case.platform == "windows":
+        assert "process-stopped" in case.events
+    else:
+        assert "spawned" not in case.events
+
+
+@pytest.mark.asyncio
+async def test_owner_registration_failure_never_releases_target(
+    controlled_async_launch, monkeypatch,
+):
+    case = controlled_async_launch
+    failure = process_tree.ProcessTreeOwnershipError("synthetic registration failure")
+
+    def persist(*_args, **_kwargs):
+        raise failure
+
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    with pytest.raises(process_tree.ProcessTreeOwnershipError, match="failed closed") as exc_info:
+        await case.launch()
+    assert exc_info.value.__cause__ is failure
+    assert "released" not in case.events
+    assert "row-deleted" not in case.events
+    stopped = "job-closed" if case.platform == "windows" else "anchor-stopped"
+    assert stopped in case.events
+
+
+@pytest.mark.asyncio
+async def test_owner_registration_commit_before_cancelled_handoff_is_reclaimed(
+    controlled_async_launch, monkeypatch,
+):
+    case = controlled_async_launch
+    loop = asyncio.get_running_loop()
+
+    def persist(*_args, **_kwargs):
+        case.events.append("committed")
+        loop.call_soon_threadsafe(launch.cancel, "cancel after commit")
+        return case.reference
+
+    monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+    launch = asyncio.create_task(case.launch())
+    with pytest.raises(asyncio.CancelledError, match="cancel after commit"):
+        await asyncio.wait_for(launch, timeout=3)
+    assert "released" not in case.events
+    assert case.events.count("row-deleted") == 1
+    assert case.events.index("committed") < case.events.index("row-deleted")
+
+
+@pytest.mark.asyncio
+async def test_failed_launch_cleanup_survives_later_cancellation(
+    controlled_async_launch, monkeypatch,
+):
+    case = controlled_async_launch
+    loop = asyncio.get_running_loop()
+    deleting = asyncio.Event()
+    finish_deletion = threading.Event()
+
+    def fail_release():
+        raise OSError("synthetic launch gate failure")
+
+    def delete(reference):
+        assert reference is case.reference
+        loop.call_soon_threadsafe(deleting.set)
+        assert finish_deletion.wait(5)
+        case.events.append("row-deleted")
+
+    monkeypatch.setattr(case.gate, "release", fail_release)
+    monkeypatch.setattr(process_tree, "_delete_owner_record", delete)
+    launch = asyncio.create_task(case.launch())
+    try:
+        await asyncio.wait_for(deleting.wait(), timeout=3)
+        launch.cancel("cancel after launch failure")
+        await asyncio.sleep(0)
+        launch.cancel("cancel during cleanup")
+        await asyncio.sleep(0)
+        assert not launch.done()
+        finish_deletion.set()
+        with pytest.raises(asyncio.CancelledError, match="cancel after launch failure"):
+            await asyncio.wait_for(launch, timeout=3)
+    finally:
+        finish_deletion.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await launch
+    assert case.events.count("row-deleted") == 1
+    assert case.events[-1] == "gate-closed"
 
 
 @pytest.mark.asyncio
