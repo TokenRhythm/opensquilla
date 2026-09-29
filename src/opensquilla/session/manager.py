@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import structlog
 
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.contracts.turn_execution import AssistantMessageReservation
 from opensquilla.engine.steps.inject_time_prefix import stamp as _stamp_time_prefix
 from opensquilla.paths import default_opensquilla_home, native_io_path
@@ -602,7 +603,7 @@ def _compaction_target_fingerprint(config: CompactionConfig) -> str:
 
     plan = config.llm_plan
     if plan is not None:
-        target_payload = {
+        target_payload: dict[str, Any] = {
             "max_calls": plan.max_calls,
             "candidates": [
                 {
@@ -3825,12 +3826,10 @@ class SessionManager:
         if compaction_deadline_at_monotonic is not None:
             try:
                 deadline = float(compaction_deadline_at_monotonic)
-                total_timeout = float(compaction_timeout_seconds or 120.0)
             except (TypeError, ValueError):
                 deadline = 0.0
-                total_timeout = 120.0
             deadline_config = CompactionConfig(
-                total_timeout_seconds=total_timeout if total_timeout > 0 else 120.0,
+                total_timeout_seconds=resolve_compaction_total_timeout(compaction_timeout_seconds),
                 deadline_at_monotonic=deadline,
                 operation_id=persisted_compaction_id,
             )

@@ -53,36 +53,32 @@ def _write_small_config(path) -> None:
 
 
 @pytest.mark.parametrize("writer", ["set", "patch", "apply"])
-async def test_config_writers_reject_provider_only_compaction(
+async def test_config_writers_preserve_deprecated_provider_only_compaction(
     cfg_path,
     writer: str,
 ) -> None:
     cfg = GatewayConfig(config_path=str(cfg_path))
     ctx = _ctx(cfg)
 
-    with pytest.raises(
-        ValueError,
-        match="compaction.provider requires compaction.model",
-    ):
-        if writer == "set":
-            await _handle_config_set(
-                {"path": "compaction.provider", "value": "openai"},
-                ctx,
-            )
-        elif writer == "patch":
-            await _handle_config_patch(
-                {"patches": {"compaction.provider": "openai"}},
-                ctx,
-            )
-        else:
-            payload = cfg.model_dump(mode="python")
-            payload["compaction"]["provider"] = "openai"
-            payload["compaction"]["model"] = None
-            await _handle_config_apply({"config": payload}, ctx)
+    if writer == "set":
+        await _handle_config_set(
+            {"path": "compaction.provider", "value": "openai"},
+            ctx,
+        )
+    elif writer == "patch":
+        await _handle_config_patch(
+            {"patches": {"compaction.provider": "openai"}},
+            ctx,
+        )
+    else:
+        payload = cfg.model_dump(mode="python")
+        payload["compaction"]["provider"] = "openai"
+        payload["compaction"]["model"] = None
+        await _handle_config_apply({"config": payload}, ctx)
 
-    assert cfg.compaction.provider is None
-    assert cfg.compaction.model is None
-    assert not cfg_path.exists()
+    assert ctx.config.compaction.provider == "openai"
+    assert ctx.config.compaction.model is None
+    assert tomllib.loads(cfg_path.read_text())["compaction"]["provider"] == "openai"
 
 
 async def test_config_writer_accepts_complete_compaction_deployment(cfg_path) -> None:

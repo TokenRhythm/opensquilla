@@ -41,6 +41,7 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     redact_public_config as redact_public_config,
 )
+from opensquilla.compaction_timing import DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
 from opensquilla.gateway.config_migration import (
     DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
@@ -1502,16 +1503,17 @@ class AgentTokenSavingConfig(BaseSettings):
 class CompactionLlmConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENSQUILLA_COMPACTION_")
 
-    # A provider is meaningful only together with ``model``.  Model-only
-    # remains the backwards-compatible "override the selected provider's
-    # model" form; a complete pair selects an explicit physical deployment.
-    provider: str | None = None
-    model: str | None = None  # None = use session model
-    timeout_seconds: float = 90.0
-    # Absolute budget shared by all summarization chunks and fallbacks.  The
+    # Deprecated load/save compatibility. Summary generation always uses the
+    # current physical deployment; keep old values without rewriting profiles.
+    provider: str | None = Field(default=None, json_schema_extra={"deprecated": True})
+    model: str | None = Field(default=None, json_schema_extra={"deprecated": True})
+    # Legacy explicit values remain semantic idle limits. None inherits the
+    # normal request timeout; it never replaces the provider's I/O policy.
+    timeout_seconds: float | None = None
+    # Absolute budget shared by all summarization chunks and revisions. The
     # durable commit has separate bounded SQLite semantics and is reconciled if
     # cancellation races with commit completion.
-    total_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    total_timeout_seconds: float = Field(default=DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS, gt=0.0)
     heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
@@ -1521,32 +1523,11 @@ class CompactionLlmConfig(BaseSettings):
     def _normalize_explicit_deployment(self) -> CompactionLlmConfig:
         self.provider = str(self.provider or "").strip() or None
         self.model = str(self.model or "").strip() or None
-        if self.provider and not self.model:
-            logger.warning(
-                "Ignoring compaction.provider=%s because compaction.model is not set",
-                self.provider,
-            )
-            self.provider = None
         return self
 
 
 def validate_compaction_deployment_write(payload: dict[str, Any]) -> None:
-    """Reject newly saved provider-only compaction deployments.
-
-    Load-time validation remains deliberately tolerant so an older hand-written
-    config cannot brick gateway startup. Config writers call this stricter
-    validator on their post-mutation payload before persistence.
-    """
-
-    compaction = payload.get("compaction")
-    if not isinstance(compaction, dict):
-        return
-    provider = str(compaction.get("provider") or "").strip()
-    model = str(compaction.get("model") or "").strip()
-    if provider and not model:
-        raise ValueError(
-            "compaction.provider requires compaction.model when saving config"
-        )
+    """Compatibility hook: deprecated target fields have no routing effect."""
 
 
 class SessionNamingConfig(BaseSettings):

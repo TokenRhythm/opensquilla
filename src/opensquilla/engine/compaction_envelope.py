@@ -6,6 +6,7 @@ from dataclasses import fields, replace
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.engine.agent import Agent
 from opensquilla.engine.collaboration_prompt import with_collaboration_instructions
 from opensquilla.engine.types import AgentConfig
@@ -52,6 +53,7 @@ def prepare_manual_compaction_envelope(
     context_window_known: bool,
     provider_request_max_chars: int,
     workspace_dir: str | None,
+    provider_request_max_chars_explicit_cap: int | None = None,
     caller_tool_context: ToolContext | None = None,
 ) -> Agent:
     """Prepare projection only; never route, invoke a tool, or send an LLM request.
@@ -102,20 +104,25 @@ def prepare_manual_compaction_envelope(
         model_capabilities=capabilities,
         workspace_dir=workspace_dir,
         max_tokens=max_output_tokens,
+        request_timeout=runner._resolve_agent_request_timeout(str(session.session_key), None),
         context_window_tokens=context_window_tokens,
         context_window_known=context_window_known,
-        provider_request_proof_max_chars=provider_request_max_chars,
-        provider_request_proof_max_chars_explicit=False,
+        provider_request_proof_max_chars=(
+            provider_request_max_chars_explicit_cap or provider_request_max_chars
+        ),
+        provider_request_proof_max_chars_explicit=bool(provider_request_max_chars_explicit_cap),
         thinking=runner._resolve_turn_thinking(turn),
         temperature=getattr(llm_config, "temperature", None),
         top_p=getattr(llm_config, "top_p", None),
         materialize_historical_attachments=bool(workspace_dir),
         compaction_profile=getattr(compaction_config, "compaction_profile", "conversation"),
+        compaction_enabled=getattr(compaction_config, "enabled", True),
         compaction_protected_recent_messages=getattr(
             compaction_config, "protected_recent_messages", 0,
         ),
-        compaction_total_timeout_seconds=getattr(
-            compaction_config, "total_timeout_seconds", 120.0,
+        compaction_timeout_seconds=getattr(compaction_config, "timeout_seconds", None),
+        compaction_total_timeout_seconds=resolve_compaction_total_timeout(
+            getattr(compaction_config, "total_timeout_seconds", None),
         ),
         compaction_heartbeat_interval_seconds=getattr(
             compaction_config, "heartbeat_interval_seconds", 15.0,

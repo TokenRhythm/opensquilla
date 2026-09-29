@@ -529,7 +529,8 @@ async def test_compaction_task_facts_use_both_layouts_and_real_storage(
         return
     report = await operation
     assert report["ok"] is True
-    assert report["layout"] == layout
+    assert report["layout"] == "suffix"
+    assert report["requested_layout"] == layout
     assert report["model_calls"] == expected_summary_calls + 2
     assert report["critical_fact_checks"] == [{
         "summary": dict.fromkeys(facts, True), "answer": dict.fromkeys(facts, True),

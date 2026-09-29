@@ -319,7 +319,7 @@ async def test_call_times_out_without_marking_the_connection_failed() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("server_budget", "elapsed_s"), [
-    (120.0, 60.0), (300.0, 240.0), (None, 60.0), ("restricted", 60.0),
+    (120.0, 60.0), (300.0, 240.0), (None, 500.0), ("restricted", 500.0),
 ])
 async def test_synchronous_compaction_respects_gateway_budget(
     monkeypatch: pytest.MonkeyPatch, server_budget: object, elapsed_s: float,

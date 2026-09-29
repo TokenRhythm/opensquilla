@@ -139,7 +139,7 @@ async def test_inline_compaction_reduces_old_text_while_preserving_current_image
 
     monkeypatch.setattr(agent_module, "compact_context", record_compaction)
     monkeypatch.setattr(
-        "opensquilla.session.compaction.call_compaction_llm", synthetic_summary,
+        "opensquilla.session.compaction.call_compaction_provider", synthetic_summary,
     )
     agent = Agent(
         provider=OpenAIProvider(api_key="synthetic-offline", model="synthetic-model"),
@@ -157,7 +157,7 @@ async def test_inline_compaction_reduces_old_text_while_preserving_current_image
     for index in range(20):
         messages.extend([
             # Short words overflow the history window with either estimator
-            # while keeping the prefix within the two-call summary budget.
+            # while keeping each summary input within the physical window.
             Message(role="user", content=f"Archived batch {index}. " + "a b c d e f g h " * 50),
             Message(role="assistant", content=f"Batch {index} is complete."),
         ])

@@ -401,6 +401,10 @@ def run_gateway(
             raise
         assert server._task is not None
 
+        app = getattr(server, "app", None)
+        app_state = getattr(app, "state", None)
+        startup_ready_event = getattr(app_state, "gateway_start_ready_event", None)
+
         from opensquilla.telemetry.contracts.common import (
             ClientEntrypoint,
             ClientSurface,
@@ -409,16 +413,32 @@ def run_gateway(
 
         growth_sink = getattr(getattr(server, "_services", None), "growth_event_sink", None)
         record_launch = getattr(growth_sink, "record_client_launch", None)
+        record_launch_task: asyncio.Task[object] | None = None
         if callable(record_launch):
-            await record_launch(
-                surface=(
-                    ClientSurface.DESKTOP
-                    if desktop_profile_lifecycle_active()
-                    else ClientSurface.CLI
-                ),
-                entrypoint=ClientEntrypoint.GATEWAY_RUN,
-                execution_mode=ExecutionMode.GATEWAY,
-            )
+            async def _record_client_launch_after_ready() -> None:
+                if isinstance(startup_ready_event, asyncio.Event):
+                    await startup_ready_event.wait()
+                await record_launch(
+                    surface=(
+                        ClientSurface.DESKTOP
+                        if desktop_profile_lifecycle_active()
+                        else ClientSurface.CLI
+                    ),
+                    entrypoint=ClientEntrypoint.GATEWAY_RUN,
+                    execution_mode=ExecutionMode.GATEWAY,
+                )
+
+            if isinstance(startup_ready_event, asyncio.Event):
+                # Identity and marker writes include synchronous locking and
+                # fsync. Keep them out of the listener-startup critical path.
+                record_launch_task = asyncio.create_task(
+                    _record_client_launch_after_ready(),
+                    name="opensquilla-gateway-client-launch",
+                )
+            else:
+                # Embedded/fake servers from older integrations have no
+                # readiness event; preserve their existing behavior.
+                await _record_client_launch_after_ready()
 
         # Trigger OpenSquilla's graceful drain on SIGINT/SIGTERM. uvicorn's own
         # handlers are suppressed in start_gateway_server, so server.close() —
@@ -440,7 +460,6 @@ def run_gateway(
         # Expose the same trigger to the owner-only HTTP shutdown endpoint so a
         # graceful stop also works where POSIX signals can't drain — notably
         # Windows, where SIGTERM maps to an immediate TerminateProcess.
-        app = getattr(server, "app", None)
         if app is not None and hasattr(app, "state"):
             install_shutdown_handler = getattr(app.state, "install_shutdown_handler", None)
             if callable(install_shutdown_handler):
@@ -463,6 +482,12 @@ def run_gateway(
         finally:
             waiter.cancel()
             _remove_shutdown_handlers(loop, installed_signals)
+            if record_launch_task is not None:
+                record_launch_task.cancel()
+                try:
+                    await record_launch_task
+                except asyncio.CancelledError:
+                    pass
 
         # The serve task binds the listener after start_gateway_server returns.
         # Startup can still fail here (including uvicorn's SystemExit on a bind

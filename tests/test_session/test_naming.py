@@ -1033,13 +1033,13 @@ def _patch_provider_and_emit(
     provider_model: str = "deepseek-v4-pro",
 ):
     """Patch provider resolution, the LLM call, and the broadcast; capture emits."""
-    import opensquilla.gateway.compaction_target as compaction_target_mod
+    import opensquilla.gateway.selected_provider as compaction_target_mod
     import opensquilla.gateway.session_event_publisher as event_publisher_mod
     import opensquilla.session.naming as naming_mod
 
     monkeypatch.setattr(
         compaction_target_mod,
-        "resolve_selected_compaction_provider",
+        "resolve_selected_provider",
         # Match the packaged default config: the built-in tier table names the
         # tokenrhythm provider, and the provider-consistency guard skips tiers
         # aimed at another provider. The explicit model keeps resolution alive
@@ -1661,7 +1661,7 @@ async def test_call_naming_provider_checks_terminal_reasoning_budget(terminal):
 async def test_generate_session_title_does_not_send_mismatched_target(storage, mgr, monkeypatch):
     calls, emits = _patch_provider_and_emit(monkeypatch, title="Incorrect Target")
     monkeypatch.setattr(
-        "opensquilla.gateway.compaction_target.resolve_selected_compaction_provider",
+        "opensquilla.gateway.selected_provider.resolve_selected_provider",
         lambda ctx, session, **kwargs: _FakeProvider(
             provider_kind="tokenrhythm", model="chat-model",
         ),

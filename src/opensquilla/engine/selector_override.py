@@ -414,6 +414,8 @@ def report_profile_credential_failure(
     provider_id: str,
     session_key: str,
     failure_kind: Any,
+    *,
+    retry_after_seconds: float | None = None,
 ) -> None:
     """Report an ensemble member failure to the same process-wide pool."""
     try:
@@ -423,6 +425,7 @@ def report_profile_credential_failure(
             provider_id,
             session_key,
             failure_kind,
+            retry_after_seconds=retry_after_seconds,
         )
     except Exception:  # noqa: BLE001 - credential bookkeeping only
         log.debug("credential_pool.report_failed", provider=provider_id)

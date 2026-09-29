@@ -15,6 +15,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.agent import _CompactionSummaryMessage
 from opensquilla.engine.types import CompactionEvent
 from opensquilla.execution_status import normalize_execution_status
 from opensquilla.gateway.config import GatewayConfig
@@ -685,7 +686,10 @@ async def test_message_count_suffix_uses_current_source_and_request_without_pare
     assert "current user request" not in str(summary_messages)
     assert "Summarize the preceding conversation" in summary_messages[-1].content
     assert summary_tools == provider.ordinary_tools[0] == tools
-    assert summary_config.system == provider.ordinary_configs[0].system
+    assert summary_config.system.startswith("You are a conversation compactor.")
+    assert "Current shared request instructions." not in summary_config.system
+    assert summary_config.candidate_output_mode == "inert_artifact"
+    assert summary_config.tool_choice == "none"
     assert summary_config.max_tokens == provider.ordinary_configs[0].max_tokens == 8192
     assert summary_config.thinking_budget_tokens == 2048
     assert agent._history[:len(history)] == history
@@ -703,7 +707,7 @@ async def test_message_count_suffix_uses_current_source_and_request_without_pare
         assert not any(isinstance(event, ErrorEvent) for event in events)
 
 
-async def test_message_count_prefix_uses_current_generation_budget_across_turns(
+async def test_legacy_prefix_toggle_uses_current_suffix_generation_budget_across_turns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", "prefix")
@@ -742,9 +746,11 @@ async def test_message_count_prefix_uses_current_generation_budget_across_turns(
         assert summary_config.thinking is False
         assert summary_config.system.startswith("You are a conversation compactor.")
         assert "Parent-only synthetic system instruction." not in summary_config.system
-        assert "within 1024 tokens" in summary_config.system
-        assert summary_tools is None
-        assert len(summary_messages) == 1
+        assert "1024" not in summary_config.system
+        assert summary_tools == agent.tool_definitions
+        assert summary_config.tool_choice == "none"
+        assert len(summary_messages) > 1
+        assert "Summarize the preceding conversation" in summary_messages[-1].content
         assert agent._compaction_request_context is None
 
 
@@ -786,11 +792,12 @@ async def test_message_count_suffix_refreshes_config_and_tools_between_turns(
     assert len(provider.summary_calls) == 2
     _, first_tools, first_config = provider.summary_calls[0]
     _, second_tools, second_config = provider.summary_calls[1]
-    assert first_config.system == "First-turn instructions."
+    assert first_config.system.startswith("You are a conversation compactor.")
+    assert "First-turn instructions." not in first_config.system
     assert first_config.max_tokens == 8192
     assert [tool.name for tool in first_tools or []] == ["old_check"]
-    assert second_config.system == provider.ordinary_configs[2].system
-    assert second_config.system == "Second-turn instructions."
+    assert second_config.system == first_config.system
+    assert provider.ordinary_configs[2].system == "Second-turn instructions."
     assert second_config.max_tokens == provider.ordinary_configs[2].max_tokens == 4096
     assert [tool.name for tool in second_tools or []] == ["new_check"]
     assert agent._compaction_request_context is None
@@ -847,7 +854,7 @@ async def test_message_count_suffix_uses_latest_call_config_within_tool_turn(
     assert first_identity is not None and first_identity.model == "before-tool-model"
     assert latest_identity is not None and latest_identity.model == "after-tool-model"
     assert provider.summary_calls[0][2].execution_identity == latest_identity
-    assert provider.summary_calls[0][2].tool_choice is None
+    assert provider.summary_calls[0][2].tool_choice == "none"
     assert any("current-check" in str(message.content) for message in provider.calls[-1])
 
 
@@ -966,7 +973,12 @@ async def test_message_limit_recovery_preserves_referenced_and_uploaded_images(
         assert sum(
             "Current response execution:" in str(message.content) for message in messages
         ) == int(identity_enabled)
-    assert not any("b2xkLWltYWdl" in str(entry) for entry in compact_requests[0].entries)
+    # Native messages retain typed attachments for exact replay. Their encoded
+    # data must never be flattened into the text used for summarization.
+    assert not any("b2xkLWltYWdl" in str(entry["content"])
+                   for entry in compact_requests[0].entries)
+    assert not any("b2xkLWltYWdl" in str(entry)
+                   for entry in compact_requests[0].entries[:compact_requests[0].forced_prefix_cut])
     assert agent._request_image_context == []
 
 
@@ -1065,8 +1077,12 @@ async def test_failed_compaction_window_preserves_checkpoint_and_canonical_histo
     provider = _ExactMessageLimitProvider([100])
     agent = Agent(provider=provider, config=AgentConfig())
     history = [
-        Message(role="user", content="[Context summary]\nPrevious valid checkpoint."),
-        Message(role="assistant", content="Understood. Continuing from summary."),
+        _CompactionSummaryMessage(
+            role="user", content="[Context summary]\nPrevious valid checkpoint.",
+        ),
+        _CompactionSummaryMessage(
+            role="assistant", content="Understood. Continuing from summary.",
+        ),
         *_plain_history(),
     ]
     agent.set_history(history)
@@ -1518,8 +1534,9 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     assert outcome.projected_wire_messages <= (
         limit - agent._message_count_headroom(limit)
     )
-    assert outcome.messages[2] is active_user
-    assert outcome.messages[2].content == active_text
+    assert outcome.messages[0] is active_user
+    assert outcome.messages[0].content == active_text
+    assert "Tool execution receipts" in str(outcome.messages[1].content)
     # The approval is still live. The preceding completed error can be
     # summarized; it must not permanently anchor the raw request window.
     assert outcome.messages[-10:] == [
@@ -1582,7 +1599,7 @@ async def test_long_tool_loop_continues_after_live_turn_message_count_projection
         provider.limit - agent._message_count_headroom(provider.limit)
     )
     assert len(compact_requests) == 1
-    assert compact_requests[0].forced_prefix_cut == 16
+    assert compact_requests[0].forced_prefix_cut == provider.completed_rounds * 2
     assert any(
         isinstance(event, WarningEvent)
         and event.code == "provider_request_message_limit_recovery_success"
