@@ -92,3 +92,9 @@ fetch worker 最多 4 个实际工作线程，独立于 Gateway 默认 executor�
 下一优先验收改为同机旧/新 frozen 包、隔离相同 profile 下的 1/4/8 会话，分别跑纯对话、命令、网页抓取，再混合。保留相同输入和 Provider stub；不人工制造删除，不把注入慢 DNS/磁盘的机制测试冒充自然故障。同步核对 loop lag、nonce pong、目录/Stop 响应、当前存储 holder、工具具体阶段、进程身份和退出。若自然重现停顿，再在隔离进程捕获停顿栈，区分同步调用、CPU/GIL 与系统调度。Mac 对照还需同源构建及对应平台证据；目前没有 Mac 现场包，不能给平台故障率或唯一根因。
 
 已有 DNS/解析、进程登记、PTY/stdin 的隔离修改直接服务普通多会话稳定性，保留并首先做这组验收。大删除回收协议、reset 长事务及 ACK 专项保留为独立问题，不阻塞当前现场闭环，也不替代它。
+
+## 压力复现结果（2026-09-30）
+
+使用本地确定性 provider 和隔离 profile，旧现场 Windows 0.5.5 包与本分支候选包均跑了聊天、命令、抓取的 1/4/8 并发，并持续观察 WS nonce、目录 RPC 和 `/healthz`。新 profile 两包矩阵均完成。使用 139,763,712 字节的隔离大历史数据库快照（约 2,106 sessions、220,208 transcript rows）后，旧包在 8 个并发命令中出现一次 `Session storage is temporarily busy`；候选同一快照的 9 组全部完成，8 并发 Stop 约 21.7 ms 返回且仅目标任务取消。候选存储诊断最高事务约 320 ms、其中排队约 314 ms，没有 loop-lag 记录。该结果证明旧包存在可复现的并发存储失败边界，也显示本 session 修改有收益；它不是大历史删除事务或真实现场百秒断线的唯一根因证明。
+
+候选包另在完整 Gateway 内注入一次 5 秒 DNS 等待。等待位于 `fetch-work-0`，另一个运行中的会话在等待期间 Stop 约 25.3 ms 返回并正确取消；这是受控机制复现。旧包独立离线探针则显示 DNS/direct TLS/managed-proxy TLS 均会令主循环约 5 秒不调度；候选已隔离前两者，但 managed-proxy 的默认 TLS 构造仍是主线程遗漏路径。完整原始结果和边界见 [多会话压力结果](../../reports/gateway-scale-lab/concurrent-conversations-20260930-results.zh-CN.md)。
