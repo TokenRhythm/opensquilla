@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import tempfile
@@ -78,6 +79,7 @@ _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _COMMIT_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 _MAX_ARTIFACT_REDIRECTS = 5
+_ARTIFACT_FETCH_TIMEOUT_SECONDS = 30.0
 _MAX_REGISTRY_DESCRIPTION_LENGTH = 1_024
 _SHA256_RE = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
 
@@ -100,6 +102,24 @@ def _artifact_transport(url: str, vetted_ips: list[str], **kwargs: object) -> ob
     from opensquilla.tools.ssrf import pinned_transport
 
     return pinned_transport(url, vetted_ips, **kwargs)
+
+
+def _artifact_client_kwargs(url: str) -> dict[str, object]:
+    vetted = _validate_artifact_url(url)
+    transport_kwargs: dict[str, object] = {}
+    if _trust_env():
+        proxy_url = _artifact_proxy_url(url)
+        if proxy_url is not None:
+            transport_kwargs["proxy"] = proxy_url
+    transport = _artifact_transport(url, vetted, **transport_kwargs)
+    client_kwargs: dict[str, object] = {
+        "timeout": _ARTIFACT_FETCH_TIMEOUT_SECONDS,
+        "trust_env": _trust_env(),
+        "follow_redirects": False,
+    }
+    if transport is not None:
+        client_kwargs["transport"] = transport
+    return client_kwargs
 
 
 @dataclass(frozen=True)
@@ -755,6 +775,8 @@ class ClawHubSource(SkillSource):
 
         import httpx
 
+        from opensquilla.tools.fetch_work import run_blocking_fetch_work
+
         try:
             current_url = resolution.artifact_url
             archive_digest = hashlib.sha256()
@@ -768,20 +790,10 @@ class ClawHubSource(SkillSource):
                         ),
                         phase=DiagnosticPhase.SECURITY,
                     )
-                vetted = _validate_artifact_url(current_url)
-                transport_kwargs: dict[str, object] = {}
-                if _trust_env():
-                    proxy_url = _artifact_proxy_url(current_url)
-                    if proxy_url is not None:
-                        transport_kwargs["proxy"] = proxy_url
-                transport = _artifact_transport(current_url, vetted, **transport_kwargs)
-                client_kwargs: dict[str, object] = {
-                    "timeout": 30,
-                    "trust_env": _trust_env(),
-                    "follow_redirects": False,
-                }
-                if transport is not None:
-                    client_kwargs["transport"] = transport
+                async with asyncio.timeout(_ARTIFACT_FETCH_TIMEOUT_SECONDS):
+                    client_kwargs = await run_blocking_fetch_work(
+                        _artifact_client_kwargs, current_url,
+                    )
                 async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
                     stream = getattr(client, "stream", None)
                     if callable(stream):
