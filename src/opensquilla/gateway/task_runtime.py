@@ -4515,7 +4515,7 @@ class TaskRuntime:
                         provider_request_correlation=task.provider_request_correlation,
                         assistant_message_sink=(
                             task.capture_terminal_assistant_message
-                            if task.run_kind in {"channel_turn", "cron_turn"}
+                            if task.run_kind in {"channel_turn", "cron_turn", "goal"}
                             else None
                         ),
 

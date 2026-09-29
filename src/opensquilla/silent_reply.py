@@ -227,13 +227,24 @@ def normalize_silent_reply(
     """Normalize the silent-reply protocol without deleting ordinary prose.
 
     Exact sentinel-only output remains suppressed for every run kind for
-    compatibility. Mixed output is interpreted only for an internal system
-    event, Goal continuation, or heartbeat, and only when the token occupies a
-    complete leading or trailing logical line. Tokens embedded in prose or code
-    remain ordinary model output.
+    compatibility. A Goal continuation also accepts the two observed
+    bracketed sentinel aliases, but only when the entire payload is that alias.
+    Mixed output is interpreted for legacy system events, Goal continuations,
+    and heartbeats only when the token occupies a complete edge line. Tokens
+    embedded in prose or code remain ordinary model output.
     """
 
     stripped = text.strip()
+    if input_mode == "goal_continuation" and stripped in {
+        "[NO_REPLY]",
+        "[HEARTBEAT_OK]",
+    }:
+        return _result(
+            text,
+            "",
+            sentinel=stripped[1:-1],
+            suppressed=True,
+        )
     if stripped in SILENT_REPLY_SENTINELS:
         return _result(text, "", sentinel=stripped, suppressed=True)
 
@@ -277,7 +288,8 @@ def normalize_silent_reply(
                 )
 
     mixed_sentinels_allowed = (
-        input_mode == "system_event" or run_kind in _INTERNAL_MIXED_SENTINEL_RUN_KINDS
+        input_mode == "system_event"
+        or run_kind in _INTERNAL_MIXED_SENTINEL_RUN_KINDS
     )
     if mixed_sentinels_allowed:
         normalized, sentinels = _edge_sentinel_lines(normalized)
@@ -495,7 +507,7 @@ def _history_context(turn_context: Mapping[str, Any] | None) -> tuple[str, str |
     input_mode_raw = context.get("input_mode")
     input_mode = str(input_mode_raw) if input_mode_raw else None
     if str(context.get("intent") or "") == "goal_continuation":
-        return "goal", "system_event"
+        return "goal", "goal_continuation"
     return run_kind, input_mode
 
 

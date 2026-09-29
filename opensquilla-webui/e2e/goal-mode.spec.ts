@@ -1519,7 +1519,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
         suppression_reason: null,
         text: mixedBody,
         text_snapshot: mixedBody,
-        input_mode: 'system_event',
+        input_mode: 'goal_continuation',
         run_kind: 'goal',
       }),
       expect.objectContaining({
@@ -1527,7 +1527,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
         suppression_reason: 'no_reply',
         text: '',
         text_snapshot: '',
-        input_mode: 'system_event',
+        input_mode: 'goal_continuation',
         run_kind: 'goal',
       }),
       expect.objectContaining({
@@ -1535,7 +1535,7 @@ isolatedGatewayTest.describe('Goal silent-reply normalization through an isolate
         suppression_reason: null,
         text: formattedBody,
         text_snapshot: formattedBody,
-        input_mode: 'system_event',
+        input_mode: 'goal_continuation',
         run_kind: 'goal',
       }),
     ]))

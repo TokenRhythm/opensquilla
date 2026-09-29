@@ -2325,7 +2325,7 @@ async def test_post_driver_idle_starts_exactly_one_system_event_continuation(
         )
         assert automatic.task_id == expected_task_id
         assert automatic.run_kind == "goal"
-        assert automatic.input_mode == "system_event"
+        assert automatic.input_mode == "goal_continuation"
         assert automatic.persist_input is False
         assert automatic.history_has_persisted_user is False
         assert automatic.no_memory_capture is True
@@ -2526,7 +2526,7 @@ async def test_multi_turn_goal_completes_without_creating_plan_state(
                 sequence,
             )
             assert run.run_kind == "goal"
-            assert run.input_mode == "system_event"
+            assert run.input_mode == "goal_continuation"
             assert run.persist_input is False
             assert run.history_has_persisted_user is False
             assert run.no_memory_capture is True
@@ -2992,7 +2992,7 @@ async def test_plan_mode_defers_active_goal_then_default_starts_exactly_one(
         )
         assert complete.continuation_seq == 1
         assert len(runs) == 2
-        assert runs[1].input_mode == "system_event"
+        assert runs[1].input_mode == "goal_continuation"
         await asyncio.sleep(0.05)
         assert len(runs) == 2
 
@@ -4929,7 +4929,7 @@ async def test_real_turn_runner_continuation_reuses_durable_goal_context_and_com
 
         assert [run.task_id for run in runs] == [first_task_id, second_task_id]
         assert runs[1].run_kind == "goal"
-        assert runs[1].input_mode == "system_event"
+        assert runs[1].input_mode == "goal_continuation"
         assert runs[1].persist_input is False
         assert runs[1].history_has_persisted_user is False
         assert runs[1].no_memory_capture is True
@@ -5844,6 +5844,97 @@ async def test_three_empty_automatic_turns_pause_without_counting_user_turn(tmp_
         assert goal.turns_started == goal.turns_settled == 4
         assert len(runs) == 4
         assert [run.goal_context["automatic"] for run in runs] == [False, True, True, True]
+
+
+async def test_three_identical_visible_goal_turns_pause_for_no_progress(tmp_path: Path) -> None:
+    runs: list[TaskRun] = []
+
+    async def handler(run: TaskRun) -> None:
+        runs.append(run)
+        task = await stack.storage.get_agent_task(run.task_id)
+        assert task is not None
+        details = dict(task.details)
+        details["terminal_assistant_message_content"] = json.dumps(
+            {"text": "Still working on the same step."}, ensure_ascii=False
+        )
+        details["activity_snapshot"] = {
+            "version": 2,
+            "task_id": run.task_id,
+            "turn_id": run.task_id,
+            "complete": True,
+            "entries": [
+                {
+                    "type": "phase",
+                    "id": "writing",
+                    "order": 1,
+                    "kind": "write",
+                    "phase": "writing",
+                    "at": 1,
+                },
+                {
+                    "type": "segment",
+                    "id": "text:0",
+                    "order": 2,
+                    "segment_type": "text",
+                    "text_utf16_length": 30,
+                },
+            ],
+        }
+        await stack.storage.update_agent_task(run.task_id, details=details)
+
+    async with _open_goal_rpc_stack(
+        tmp_path / "no-progress-continuations.sqlite",
+        handler=handler,
+        wire_lifecycle=True,
+    ) as stack:
+        await _handle_goals_set(_set_params(), stack.context)
+        for expected_turns in range(1, 5):
+            await _wait_for_goal(
+                stack.storage,
+                lambda value, expected=expected_turns: value.turns_settled >= expected,
+            )
+        goal = await _wait_for_goal(
+            stack.storage,
+            lambda value: value.status == "paused" and value.active_task_id is None,
+        )
+        assert goal.pause_reason == "no_progress"
+        assert goal.turns_started == goal.turns_settled == 4
+        assert [run.goal_context["automatic"] for run in runs] == [False, True, True, True]
+        last_task = await stack.storage.get_agent_task(runs[-1].task_id)
+        assert last_task is not None
+        assert "Still working on the same step." in str(
+            last_task.details.get("terminal_assistant_message_content")
+        )
+
+
+def test_malformed_goal_sentinel_is_empty_for_the_empty_guard() -> None:
+    context = GoalTurnContext(
+        session_id="synthetic-session",
+        epoch=0,
+        goal_id="synthetic-goal",
+        objective_revision=1,
+        objective_snapshot="Do synthetic work.",
+        task_id="synthetic-task",
+        continuation_seq=1,
+        automatic=True,
+    )
+    task = SimpleNamespace(
+        status=AgentTaskStatus.SUCCEEDED,
+        details={
+            "terminal_assistant_message_content": json.dumps(
+                {"text": "[NO_REPLY]", "artifacts": []}
+            ),
+            "activity_snapshot": {
+                "version": 2,
+                "complete": True,
+                "entries": [
+                    {"type": "phase", "phase": "writing"},
+                    {"type": "segment", "segment_type": "text", "text_utf16_length": 10},
+                ],
+            },
+        },
+    )
+    assert GoalService._empty_automatic_turn(task, context) is True
 
 
 @pytest.mark.parametrize(

@@ -375,8 +375,8 @@ max_pending_per_session = 64
 # execution_enabled = true
 # Per-resume-window turn guardrail. The current turn is allowed to finish; if it
 # did not complete or block the Goal, the Goal pauses with reason `turn_limit`.
-# Valid range: 1-500. Default: 50.
-# max_turns = 50
+# Valid range: 1-500. Default: 256.
+# max_turns = 256
 # Per-resume-window active-running-time guardrail. Queue time, paused time, and
 # Gateway downtime do not count. The current turn is allowed to finish; if the
 # Goal is still active, it pauses with reason `runtime_limit`.

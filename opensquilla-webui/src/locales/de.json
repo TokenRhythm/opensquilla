@@ -4000,6 +4000,7 @@
     },
     "goal": {
       "emptyContinuations": "Nach mehreren Runden ohne Ausgabe oder Werkzeugaktivität pausiert. Prüfe das Ziel und setze es fort, wenn du bereit bist.",
+      "noProgress": "Nach mehreren Runden ohne messbaren Fortschritt pausiert. Prüfe das Ziel und setze es fort, wenn du bereit bist.",
       "placeholder": "Beschreibe das Ziel und sende, um daran zu arbeiten",
       "modeLabel": "Zielmodus",
       "modeDescription": "Ein langfristiges Ziel starten",

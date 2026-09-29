@@ -4000,6 +4000,7 @@
     },
     "goal": {
       "emptyContinuations": "En pause après plusieurs tours sans résultat ni utilisation d’outil. Vérifiez l’objectif et reprenez lorsque vous êtes prêt.",
+      "noProgress": "En pause après plusieurs tours sans progrès mesurable. Vérifiez l’objectif et reprenez lorsque vous êtes prêt.",
       "placeholder": "Décrivez l'objectif puis envoyez pour commencer à y travailler",
       "modeLabel": "Mode objectif",
       "modeDescription": "Démarrer un objectif de longue durée",

@@ -606,13 +606,13 @@ below are optional; absent keys keep the defaults.
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `execution_enabled` | `true` | Emergency kill switch. When false, no new Goal execution is accepted and unfinished active Goals pause. |
-| `max_turns` | `50` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
+| `max_turns` | `256` | Per-resume-window turn limit (`1`-`500`). The current turn finishes first; an otherwise active Goal then pauses with `turn_limit`. |
 | `runtime_budget_seconds` | `3600` | Per-resume-window active running-time limit (`60`-`86400` seconds). Queue time, pauses, and Gateway downtime do not count. An otherwise active Goal pauses with `runtime_limit`. |
 
 ```toml
 [goal]
 execution_enabled = true
-max_turns = 50
+max_turns = 256
 runtime_budget_seconds = 3600
 ```
 

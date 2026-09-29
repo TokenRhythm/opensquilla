@@ -4085,6 +4085,7 @@
     },
     "goal": {
       "emptyContinuations": "Paused after repeated turns with no output or tool activity. Review the Goal and resume when ready.",
+      "noProgress": "Paused after repeated turns without measurable progress. Review the Goal and resume when ready.",
       "placeholder": "Describe the goal, then press send to start working toward it",
       "modeLabel": "Goal mode",
       "modeDescription": "Start a long-running goal",

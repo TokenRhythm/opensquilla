@@ -2311,7 +2311,9 @@ class GoalConfig(BaseSettings):
     )
 
     execution_enabled: bool = True
-    max_turns: int = Field(default=50, ge=1, le=500)
+    # Match the reference Goal drivers' long-lived round cap. Semantic
+    # no-progress and explicit terminal decisions remain the normal exits.
+    max_turns: int = Field(default=256, ge=1, le=500)
     # Accumulated running time only. Queued, paused, and process downtime are
     # deliberately excluded from this limit.
     runtime_budget_seconds: int = Field(default=3_600, ge=60, le=86_400)
