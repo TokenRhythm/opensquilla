@@ -1832,6 +1832,16 @@ watch(
   { flush: 'sync' },
 )
 
+watch(
+  () => gatewayAccess.connectionHealth,
+  (health, previous) => {
+    if (health === 'healthy' && previous === 'suspect') {
+      automaticAppRpc.connectionHealthChanged(health)
+    }
+  },
+  { flush: 'sync' },
+)
+
 function handleKeydown(e: KeyboardEvent) {
   // Chord bindings carry the primary modifier as Cmd on Apple platforms and Ctrl
   // elsewhere — and require the other modifier to be absent — so we never match

@@ -84,6 +84,12 @@ describe('App sidebar chrome contract', () => {
     expect(appSource).toContain('automaticAppRpc.dispose()')
   })
 
+  it('refreshes the sidebar after transport health recovers without availability changing', () => {
+    expect(appSource).toContain('watch(\n  () => gatewayAccess.connectionHealth,')
+    expect(appSource).toContain('previous === \'suspect\'')
+    expect(appSource).toContain('automaticAppRpc.connectionHealthChanged(health)')
+  })
+
   it('keeps a materialized session visible until the directory snapshot catches up', () => {
     const ledgerStart = appSource.indexOf('// A just-materialized chat can reach')
     const ledgerEnd = appSource.indexOf('watch(allSessions', ledgerStart)
