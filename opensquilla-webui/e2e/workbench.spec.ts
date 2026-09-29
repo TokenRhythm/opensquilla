@@ -259,7 +259,6 @@ async function installDesktopWorkbenchV2Bridge(
       getWorkbenchCapabilities: async () => ({
         protocolVersions: [1, 2],
         modes: ['full', 'offline'],
-        maxSurfaces: 8,
       }),
       createArtifactPreviewLease: async (request: Record<string, unknown>) => {
         probe.leaseRequests.push(request)

@@ -244,7 +244,12 @@ function calls(requests: Observed[], method: string, connection?: number) {
 test('automatically replaces a stale snapshot after a lost subscribe and hydrates the recovered ACK', async ({ page }) => {
   const gateway = await prepare(page, 'lost-subscribe')
   await page.goto(`/control/chat?session=${encodeURIComponent(SESSION)}`)
-  await expect.poll(() => calls(gateway.requests, READ).length).toBe(1)
+  // This is the first Chromium page in the job. Bound its cold startup and
+  // mocked Gateway handshake separately from the fake-clock recovery budgets.
+  await expect.poll(() => ({
+    connects: calls(gateway.requests, 'connect').length,
+    reads: calls(gateway.requests, READ).length,
+  }), { timeout: 15_000 }).toEqual({ connects: 1, reads: 1 })
   await expect.poll(() => gateway.staged.length).toBe(1)
   const input = page.locator('.chat-textarea')
   const send = page.locator('.chat-send-btn[aria-label="Send"]')

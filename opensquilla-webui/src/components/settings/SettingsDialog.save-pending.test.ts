@@ -4,6 +4,7 @@ import { createApp, nextTick, reactive, ref, type App } from 'vue'
 import { createPinia } from 'pinia'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { OBSERVABILITY_KEY } from '@/modules/observability'
 import SettingsDialog from './SettingsDialog.vue'
 
 let catalogApi: Record<string, any>
@@ -17,6 +18,7 @@ const confirmChoiceAction = vi.fn()
 vi.mock('@/composables/setup/useSetupCatalog', () => ({
   SETTINGS_SECTIONS: [
     { id: 'general', label: 'General', icon: 'settings', client: false, group: 'preferences' },
+    { id: 'gateway', label: 'Gateway', icon: 'home', client: false, group: null },
     { id: 'provider', label: 'Model Service', icon: 'settings', client: false, group: 'ai' },
     { id: 'capabilities', label: 'Capabilities', icon: 'skills', client: false, group: 'ai' },
   ],
@@ -49,6 +51,7 @@ vi.mock('@/platform', () => {
 })
 
 let app: App<Element> | null = null
+const tailLogs = vi.fn()
 
 function mockCatalog() {
   const section = ref('general')
@@ -116,7 +119,7 @@ function mockCatalog() {
   }
 }
 
-async function mountDialog() {
+async function mountDialog(gatewayOverrides: Record<string, unknown> = {}) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   app = createApp(SettingsDialog)
@@ -125,8 +128,12 @@ async function mountDialog() {
   app.provide(GATEWAY_ACCESS_KEY, {
     availability: 'unavailable',
     requiresCredential: false,
+    supportBundleUnavailableReason: 'disconnected',
+    subscriptionEpoch: 0,
     loadConnectionEndpoint: () => 'ws://localhost:18790/ws',
+    ...gatewayOverrides,
   } as never)
+  app.provide(OBSERVABILITY_KEY, { downloadSupportBundle: vi.fn(), tailLogs } as never)
   app.mount(el)
   await nextTick()
   await nextTick()
@@ -134,6 +141,7 @@ async function mountDialog() {
 }
 
 beforeEach(() => {
+  tailLogs.mockReset()
   i18n.global.locale.value = 'en'
   confirmState = ref(false)
   confirmAction.mockReset()
@@ -206,7 +214,7 @@ describe('SettingsDialog save-all pending state', () => {
     const el = await mountDialog()
     expect(el.querySelector('#settings-rail-provider .settings-rail__dot')).toBeNull()
     expect(el.querySelector('#settings-rail-provider .settings-rail__warn')).toBeNull()
-    expect(el.querySelectorAll('.settings-rail__dot')).toHaveLength(0)
+    expect(el.querySelectorAll('.settings-rail__item:not(#settings-rail-gateway) .settings-rail__dot')).toHaveLength(0)
     expect(el.querySelector('#settings-rail-capabilities')?.getAttribute('aria-label')).toContain('Optional')
     expect(el.querySelector('.settings-rail__warn')).toBeNull()
   })
@@ -284,21 +292,53 @@ describe('SettingsDialog save-all pending state', () => {
 })
 
 describe('SettingsDialog search navigation', () => {
-  it('focuses the token input despite the optional suffix on its label', async () => {
+  it.each([
+    ['setup.connection.tokenLabel', '#conn-ws-token'],
+    ['setup.connection.wsUrlLabel', '#conn-ws-url'],
+  ])('opens collapsed connection details before focusing %s', async (labelKey, selector) => {
     mockCatalog().saveAllPending.value = false
-    const el = await mountDialog()
+    const el = await mountDialog({ availability: 'available', connectionPhase: 'healthy' })
     const search = el.querySelector<HTMLInputElement>('.settings-search input')!
     search.focus()
-    search.value = i18n.global.t('setup.connection.tokenLabel')
+    search.value = i18n.global.t('settings.rail.gateway')
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+    expect(el.querySelector<HTMLDetailsElement>('#settings-connection-details')?.open).toBe(false)
+
+    search.focus()
+    search.value = i18n.global.t(labelKey)
     search.dispatchEvent(new Event('input', { bubbles: true }))
     await nextTick()
     el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
     await nextTick()
 
-    const token = el.querySelector<HTMLInputElement>('#conn-ws-token')
-    expect(token).not.toBeNull()
-    expect(document.activeElement).toBe(token)
-    expect(token?.value).toBe('')
+    const input = el.querySelector<HTMLInputElement>(selector)
+    const disclosure = el.querySelector<HTMLDetailsElement>('#settings-connection-details')
+    expect(input).not.toBeNull()
+    expect(disclosure?.open).toBe(true)
+    expect(document.activeElement).toBe(input)
+    expect(input?.value).toBe(selector === '#conn-ws-token' ? '' : 'ws://localhost:18790/ws')
+    expect(routerMock.replace).toHaveBeenCalledWith({ path: '/settings/gateway' })
+  })
+
+  it('focuses the support container when offline download is disabled and catalog is not loaded', async () => {
+    mockCatalog().saveAllPending.value = false
+    catalogApi.loaded.value = false
+    const el = await mountDialog()
+    const search = el.querySelector<HTMLInputElement>('.settings-search input')!
+    search.focus()
+    search.value = i18n.global.t('monitorSupport.downloadBundle')
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+
+    const support = el.querySelector<HTMLElement>('#settings-gateway-support')
+    expect(support).not.toBeNull()
+    expect(support?.querySelector<HTMLButtonElement>('[data-testid="support-download-bundle"]')?.disabled).toBe(true)
+    expect(document.activeElement).toBe(support)
     expect(routerMock.replace).toHaveBeenCalledWith({ path: '/settings/gateway' })
   })
 
@@ -317,6 +357,40 @@ describe('SettingsDialog search navigation', () => {
     expect(catalogApi.setAutoSessionTitles).not.toHaveBeenCalled()
   })
 
+  it('finds and focuses the disabled offline log entry without reading logs', async () => {
+    mockCatalog().saveAllPending.value = false
+    catalogApi.loaded.value = false
+    const el = await mountDialog()
+    const search = el.querySelector<HTMLInputElement>('.settings-search input')!
+    search.focus()
+    search.value = i18n.global.t('gatewayLogs.viewLogs')
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+
+    const logs = el.querySelector<HTMLElement>('#settings-gateway-logs')!
+    expect(logs).not.toBeNull()
+    expect(logs.querySelector<HTMLButtonElement>('[data-testid="support-view-logs"]')?.disabled).toBe(true)
+    expect(document.activeElement).toBe(logs)
+    expect(tailLogs).not.toHaveBeenCalled()
+    expect(routerMock.replace).toHaveBeenCalledWith({ path: '/settings/gateway' })
+  })
+
+  it.each([
+    ['#logs', 'settings-gateway-logs'],
+    ['#support', 'settings-gateway-support'],
+  ])('focuses %s on a cold link without reading logs', async (hash, targetId) => {
+    mockCatalog().saveAllPending.value = false
+    routeState.params.section = 'gateway'
+    routeState.path = '/settings/gateway'
+    routeState.hash = hash
+    const el = await mountDialog()
+
+    expect(document.activeElement).toBe(el.querySelector(`#${targetId}`))
+    expect(tailLogs).not.toHaveBeenCalled()
+  })
+
   it('focuses the panel for a section-only match instead of an unrelated action', async () => {
     mockCatalog().saveAllPending.value = false
     const el = await mountDialog()
@@ -329,6 +403,69 @@ describe('SettingsDialog search navigation', () => {
     await nextTick()
 
     expect(document.activeElement).toBe(el.querySelector('.settings-panel'))
+  })
+})
+
+describe('SettingsDialog keyboard focus loop', () => {
+  async function mountHealthyGateway() {
+    const controls = mockCatalog()
+    controls.saveAllPending.value = false
+    controls.hasUnsavedChanges.value = false
+    catalogApi.dirtySections.value = []
+    const el = await mountDialog({ availability: 'available', connectionPhase: 'healthy' })
+    const search = el.querySelector<HTMLInputElement>('.settings-search input')!
+    search.focus()
+    search.value = i18n.global.t('settings.rail.gateway')
+    search.dispatchEvent(new Event('input', { bubbles: true }))
+    await nextTick()
+    el.querySelector<HTMLButtonElement>('.settings-search__result')!.click()
+    await nextTick()
+    return el
+  }
+
+  function pressTab(element: HTMLElement, shiftKey = false) {
+    element.focus()
+    expect(document.activeElement).toBe(element)
+    const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey, bubbles: true, cancelable: true })
+    element.dispatchEvent(event)
+    expect(event.defaultPrevented).toBe(true)
+  }
+
+  it.each([false, true])('wraps both ends of healthy Gateway with connection details open=%s', async (open) => {
+    const el = await mountHealthyGateway()
+    const disclosure = el.querySelector<HTMLDetailsElement>('#settings-connection-details')!
+    expect(disclosure.open).toBe(false)
+    if (open) {
+      disclosure.open = true
+      disclosure.dispatchEvent(new Event('toggle'))
+      await nextTick()
+    }
+    const first = el.querySelector<HTMLButtonElement>('#settings-rail-general')!
+    const last = disclosure.querySelector<HTMLElement>(open ? '.conn-actions button:last-child' : 'summary')!
+    expect(last).not.toBeNull()
+
+    pressTab(last)
+    expect(document.activeElement).toBe(first)
+    pressTab(first, true)
+    expect(document.activeElement).toBe(last)
+  })
+
+  it('keeps the first summary subtree reachable while excluding nested content under closed ancestors', async () => {
+    const el = await mountHealthyGateway()
+    const disclosure = document.createElement('details')
+    disclosure.innerHTML = `
+      <summary>More options <button type="button">Summary action</button></summary>
+      <details open><summary>Hidden inner summary</summary><button type="button">Hidden inner action</button></details>
+      <summary tabindex="0">Hidden later summary</summary>
+    `
+    el.querySelector('.settings-modal')!.appendChild(disclosure)
+    const first = el.querySelector<HTMLButtonElement>('#settings-rail-general')!
+    const last = disclosure.querySelector<HTMLButtonElement>('summary button')!
+
+    pressTab(first, true)
+    expect(document.activeElement).toBe(last)
+    pressTab(last)
+    expect(document.activeElement).toBe(first)
   })
 })
 

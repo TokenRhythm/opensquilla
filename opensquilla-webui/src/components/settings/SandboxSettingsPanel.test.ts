@@ -435,14 +435,15 @@ describe('SandboxSettingsPanel', () => {
       .toBe(false)
   })
 
-  it('requires explicit Windows setup even when Safe currently appears available', async () => {
+  it('persists Safe without setup when Windows readiness is already ready', async () => {
     const { el, operations } = await mountPanel()
 
     el.querySelector<HTMLButtonElement>('[data-testid="sandbox-safe-mode"]')!.click()
     await settle()
 
-    expect(operations.selectMode).not.toHaveBeenCalled()
-    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeTruthy()
+    expect(operations.selectMode).toHaveBeenCalledWith('safe')
+    expect(operations.ensureReady).not.toHaveBeenCalled()
+    expect(document.body.querySelector('[data-testid="sandbox-setup-confirm"]')).toBeNull()
     expect(el.querySelector('[data-testid="save-sandbox-section"]')).toBeNull()
   })
 

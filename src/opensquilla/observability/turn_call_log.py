@@ -119,6 +119,8 @@ class TurnCallLogger:
         source: dict[str, Any] | None = None,
         log_dir: Path | None = None,
         started_monotonic: float | None = None,
+        capture_enabled: Callable[[], bool] | None = None,
+        agent_trace_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.trace_id = trace_id or turn_id
         self.turn_id = turn_id
@@ -130,6 +132,8 @@ class TurnCallLogger:
         self.model = model
         self.source = source or {}
         self.log_dir = log_dir or _default_log_dir()
+        self._capture_enabled = capture_enabled
+        self._agent_trace_enabled = agent_trace_enabled
         self._seq = 0
         # ``ts`` is wall-clock time and can be coarse or adjusted by the OS.
         # Keep a monotonic, turn-relative clock as an additive field so the
@@ -148,6 +152,8 @@ class TurnCallLogger:
         """
 
         try:
+            if self._capture_enabled is not None and not self._capture_enabled():
+                return None
             self.log_dir.mkdir(parents=True, exist_ok=True)
             day = datetime.now(UTC).strftime("%Y%m%d")
             path = self.log_dir / f"turn-calls-{day}.jsonl"
@@ -158,6 +164,9 @@ class TurnCallLogger:
                 # distinguishable in the timeline while remaining compact JSONL.
                 "ts": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                 "privacy": "raw",
+                "agent_trace": (
+                    self._agent_trace_enabled() if self._agent_trace_enabled is not None else False
+                ),
                 "trace_id": self.trace_id,
                 "seq": self._seq,
                 "turn_id": self.turn_id,

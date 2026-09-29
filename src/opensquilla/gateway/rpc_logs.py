@@ -18,14 +18,11 @@ from opensquilla.gateway.adapters.observability_contract import (
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
 from opensquilla.gateway.log_status_runtime import _configured_trace_log_dir, find_log_file
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.observability.trace import load_trace_events
+from opensquilla.observability.trace import is_agent_trace_enabled, load_trace_events
 from opensquilla.observability.trace_details import build_trace_details, load_turn_call_records
 from opensquilla.observability.trace_lookup import find_turn_traces
 from opensquilla.observability.trace_projection import build_trace_projection
-from opensquilla.observability.turn_call_log import (
-    is_turn_call_log_enabled,
-    resolve_turn_call_log_dir_with_source,
-)
+from opensquilla.observability.turn_call_log import resolve_turn_call_log_dir_with_source
 from opensquilla.safety.secret_redaction import redact_secret_value
 
 _d = get_dispatcher()
@@ -68,6 +65,11 @@ async def _handle_logs_trace(params: dict | None, ctx: RpcContext) -> dict[str, 
 
     p = params or {}
     trace_id = str(p.get("trace_id") or "").strip()
+    view = str(p.get("view") or "").lower()
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        if view in {"projection", "timeline"}:
+            return build_trace_projection([], trace_id=trace_id)
+        return {"trace_id": trace_id, "events": [], "count": 0, "total": 0}
     try:
         limit = max(1, min(int(p.get("limit", 1000)), 5000))
     except (TypeError, ValueError):
@@ -78,7 +80,10 @@ async def _handle_logs_trace(params: dict | None, ctx: RpcContext) -> dict[str, 
         return {"trace_id": "", "events": [], "count": 0, "total": 0}
 
     events = await asyncio.to_thread(load_trace_events, trace_id)
-    view = str(p.get("view") or "").lower()
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        if view in {"projection", "timeline"}:
+            return build_trace_projection([], trace_id=trace_id)
+        return {"trace_id": trace_id, "events": [], "count": 0, "total": 0}
     if view in {"projection", "timeline"}:
         after_seq = _optional_non_negative_int(p.get("after_seq"))
         projection = build_trace_projection(
@@ -102,11 +107,11 @@ async def _handle_logs_turn_traces(params: dict | None, ctx: RpcContext) -> dict
     p = params or {}
     session_key = str(p.get("session_key") or "").strip()
     turn_id = str(p.get("turn_id") or "").strip()
-    raw_enabled = is_turn_call_log_enabled(getattr(ctx, "diagnostics_state", None))
+    trace_enabled = is_agent_trace_enabled(getattr(ctx, "config", None))
     traces: list[dict[str, Any]] = []
-    if session_key and turn_id:
+    if trace_enabled and session_key and turn_id:
         trace_dir, _ = _configured_trace_log_dir()
-        raw_dir = resolve_turn_call_log_dir_with_source()[0] if raw_enabled else None
+        raw_dir = resolve_turn_call_log_dir_with_source()[0]
         traces = await asyncio.to_thread(
             find_turn_traces,
             session_key,
@@ -114,12 +119,15 @@ async def _handle_logs_turn_traces(params: dict | None, ctx: RpcContext) -> dict
             trace_dir=trace_dir,
             raw_dir=raw_dir,
         )
+    trace_enabled = is_agent_trace_enabled(getattr(ctx, "config", None))
+    if not trace_enabled:
+        traces = []
     return {
         "session_key": session_key,
         "turn_id": turn_id,
         "traces": traces,
         "count": len(traces),
-        "raw_enabled": raw_enabled,
+        "raw_enabled": trace_enabled,
     }
 
 
@@ -146,9 +154,13 @@ async def _handle_logs_trace_projection(params: dict | None, ctx: RpcContext) ->
 
     p = params or {}
     trace_id = str(p.get("trace_id") or "").strip()
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return build_trace_projection([], trace_id=trace_id)
     if not trace_id:
         return build_trace_projection([], trace_id="")
     events = await asyncio.to_thread(load_trace_events, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return build_trace_projection([], trace_id=trace_id)
     projection = build_trace_projection(
         events,
         trace_id=trace_id,
@@ -163,31 +175,40 @@ async def _handle_logs_trace_projection(params: dict | None, ctx: RpcContext) ->
 async def _handle_logs_trace_details(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
     """Return the replay-oriented model/tool input-output rows for one trace.
 
-    Full payloads are available only while the explicit raw diagnostics mode is
-    enabled.  The durable ``turn-calls`` file is never rewritten by this
-    endpoint; the response is a bounded, redacted projection for the UI.
+    Full payloads are available only while agent trace is enabled. The durable
+    ``turn-calls`` file is never rewritten by this endpoint; the response is a
+    bounded, redacted projection for the UI.
     """
 
     p = params or {}
     trace_id = str(p.get("trace_id") or "").strip()
-    if not trace_id:
-        return build_trace_details([], trace_id="")
-    diagnostics_state = getattr(ctx, "diagnostics_state", None)
-    if not is_turn_call_log_enabled(diagnostics_state):
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
         return {
             "trace_id": trace_id,
             "available": False,
             "source": "turn_call_log",
-            "reason": "raw_diagnostics_disabled",
+            "reason": "trace_disabled",
             "rows": [],
             "count": 0,
             "total": 0,
         }
+    if not trace_id:
+        return build_trace_details([], trace_id="")
     try:
         limit = max(1, min(int(p.get("limit", 500)), 1000))
     except (TypeError, ValueError):
         limit = 500
     records = await asyncio.to_thread(load_turn_call_records, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return {
+            "trace_id": trace_id,
+            "available": False,
+            "source": "turn_call_log",
+            "reason": "trace_disabled",
+            "rows": [],
+            "count": 0,
+            "total": 0,
+        }
     return build_trace_details(
         records,
         trace_id=trace_id,
@@ -202,13 +223,18 @@ async def _handle_logs_trace_payload(params: dict | None, ctx: RpcContext) -> di
 
     p = params or {}
     trace_id = str(p.get("trace_id") or "").strip()
-    if not trace_id or not is_turn_call_log_enabled(getattr(ctx, "diagnostics_state", None)):
+    if not trace_id or not is_agent_trace_enabled(getattr(ctx, "config", None)):
         return {"trace_id": trace_id, "available": False, "payload": None}
     try:
-        seq = int(p.get("seq"))
+        raw_seq = p.get("seq")
+        if raw_seq is None:
+            raise ValueError("seq is required")
+        seq = int(raw_seq)
     except (TypeError, ValueError):
         return {"trace_id": trace_id, "available": False, "payload": None}
     records = await asyncio.to_thread(load_turn_call_records, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return {"trace_id": trace_id, "available": False, "payload": None}
     record = next(
         (item for item in records if int(item.get("seq") or -1) == seq),
         None,

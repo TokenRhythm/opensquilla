@@ -40,6 +40,7 @@ from opensquilla.engine.hooks import (
 )
 from opensquilla.engine.hooks.types import CompactionHook, ToolHook, TurnHook
 from opensquilla.engine.runtime import TurnRunner
+from opensquilla.gateway.config import GatewayConfig
 from opensquilla.observability.trace import TraceContext, TraceEvent
 from opensquilla.tool_boundary import ToolCall, ToolResult
 
@@ -268,7 +269,10 @@ def test_noop_compaction_hook_runs_clean() -> None:
 
 
 def _make_runtime_with_default_hook() -> TurnRunner:
-    return TurnRunner(provider_selector=None)
+    return TurnRunner(
+        provider_selector=None,
+        config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+    )
 
 
 def _emit_through_runtime(
@@ -372,6 +376,78 @@ def test_emit_turn_event_unknown_env_falls_back_to_default(
     assert event.payload == {"y": 2}
 
 
+@pytest.mark.parametrize("mode", ["legacy", "new"])
+def test_runtime_trace_opt_in_gates_builtin_emitter(
+    monkeypatch: pytest.MonkeyPatch,
+    trace_context: TraceContext,
+    captured_events: list[TraceEvent],
+    mode: str,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_HOOKS", mode)
+    config = GatewayConfig()
+    runner = TurnRunner(provider_selector=None, config=config)
+
+    _emit_through_runtime(
+        runner, trace_context, kind="turn_start", seq=1, attrs=None, payload=None
+    )
+    assert captured_events == []
+
+    config.privacy.agent_trace_enabled = True
+    _emit_through_runtime(
+        runner, trace_context, kind="turn_end", seq=2, attrs=None, payload=None
+    )
+    assert [event.kind for event in captured_events] == ["turn_end"]
+
+
+def test_runtime_trace_opt_in_gates_emitter_subclass(
+    monkeypatch: pytest.MonkeyPatch,
+    trace_context: TraceContext,
+    captured_events: list[TraceEvent],
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_HOOKS", "new")
+
+    class _InheritedTraceEmitter(DefaultTraceEmitterHook):
+        pass
+
+    config = GatewayConfig()
+    runner = TurnRunner(
+        provider_selector=None,
+        config=config,
+        turn_hooks=(_InheritedTraceEmitter(),),
+    )
+
+    _emit_through_runtime(
+        runner, trace_context, kind="turn_start", seq=1, attrs=None, payload=None
+    )
+    assert captured_events == []
+
+    config.privacy.agent_trace_enabled = True
+    _emit_through_runtime(
+        runner, trace_context, kind="turn_end", seq=2, attrs=None, payload=None
+    )
+    assert [event.kind for event in captured_events] == ["turn_end"]
+
+
+def test_trace_opt_out_preserves_custom_turn_hooks(trace_context: TraceContext) -> None:
+    seen: list[str] = []
+
+    class _RecordingHook:
+        name = "recording"
+
+        def on_event(self, ctx, event):  # type: ignore[no-untyped-def]
+            seen.append(event.kind)
+
+    runner = TurnRunner(
+        provider_selector=None,
+        config=GatewayConfig(),
+        turn_hooks=(_RecordingHook(), DefaultTraceEmitterHook()),
+    )
+    _emit_through_runtime(
+        runner, trace_context, kind="turn_start", seq=1, attrs=None, payload=None
+    )
+    assert seen == ["turn_start"]
+
+
 def test_runtime_hook_failure_does_not_break_emission(
     monkeypatch: pytest.MonkeyPatch,
     trace_context: TraceContext,
@@ -397,6 +473,7 @@ def test_runtime_hook_failure_does_not_break_emission(
     monkeypatch.setenv("OPENSQUILLA_HOOKS", "new")
     runner = TurnRunner(
         provider_selector=None,
+        config=GatewayConfig(privacy={"agent_trace_enabled": True}),
         turn_hooks=(_RaisingHook(), DefaultTraceEmitterHook()),
     )
     _emit_through_runtime(

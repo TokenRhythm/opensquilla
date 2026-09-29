@@ -33,7 +33,7 @@
 
     <!-- Thread -->
     <div class="chat-body">
-      <div v-if="!isNewChatLanding && !shareMode" class="chat-view-switcher">
+      <div v-if="agentTraceEnabled && !isNewChatLanding && !shareMode" class="chat-view-switcher">
         <div class="chat-view-switcher__tabs" role="group" :aria-label="t('chat.traceView.conversation')">
           <button type="button" :aria-pressed="conversationView === 'conversation'" @click="conversationView = 'conversation'">
             {{ t('chat.traceView.conversation') }}
@@ -86,7 +86,7 @@
           {{ t('common.cancel') }}
         </button>
       </div>
-      <div v-show="conversationView === 'conversation' || isNewChatLanding || shareMode" class="chat-thread-shell">
+      <div v-show="!agentTraceEnabled || conversationView === 'conversation' || isNewChatLanding || shareMode" class="chat-thread-shell">
         <div
           v-if="forkTransition"
           class="chat-fork-transition-overlay"
@@ -521,7 +521,7 @@
         />
       </div>
       <div
-        v-if="conversationView === 'trace' && !isNewChatLanding && !shareMode"
+        v-if="agentTraceEnabled && conversationView === 'trace' && !isNewChatLanding && !shareMode"
         class="chat-trace-view"
         role="region"
         :aria-label="t('chat.traceView.trajectory')"
@@ -831,6 +831,7 @@ import {
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { APP_SETTINGS_KEY } from '@/modules/appSettings'
+import { agentTraceEnabled, refreshAgentTraceEnabled, registerAgentTracePreferenceReader, setAgentTraceEnabled } from '@/modules/agentTracePreference'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
 import {
   SANDBOX_RUNTIME_KEY,
@@ -1194,7 +1195,7 @@ import {
 interface ChatComposerHandle {
   composerElement: () => HTMLElement | null
   canCollapse: () => boolean
-  focusTextarea: () => void
+  focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
 }
@@ -1263,6 +1264,10 @@ if (!injectedGoalContinuity) throw new Error('GoalContinuity was not provided')
 const goalContinuity: GoalContinuity = injectedGoalContinuity
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
+const unregisterAgentTracePreferenceReader = registerAgentTracePreferenceReader(
+  injectedAppSettings,
+  () => gatewayAccess.availability === 'available',
+)
 const injectedUsageReporting = inject(USAGE_REPORTING_KEY)
 if (!injectedUsageReporting) throw new Error('UsageReporting was not provided')
 const usageReporting: UsageReporting = injectedUsageReporting
@@ -2342,6 +2347,19 @@ const {
   turnId: traceTurnId,
   selectedRunning: traceTurnRunning,
 } = useChatTraceSelection({ sessionKey, messages, runStatus, isStreaming })
+
+watch(agentTraceEnabled, enabled => {
+  if (!enabled) conversationView.value = 'conversation'
+}, { flush: 'sync' })
+
+watch(
+  [() => gatewayAccess.availability, () => gatewayAccess.subscriptionEpoch],
+  ([availability]) => {
+    if (availability === 'available') void refreshAgentTraceEnabled(injectedAppSettings, () => gatewayAccess.availability === 'available')
+    else setAgentTraceEnabled(false)
+  },
+  { flush: 'sync' },
+)
 
 const chatRouterDecisionRuntime = useChatRouterDecisionRuntime({
   messages,
@@ -4898,7 +4916,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(current.revision)
       artifact.documentId = current.document.documentId
       artifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -4909,13 +4927,10 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: workbenchResourceKey(current.resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (!current && resource.resource.type === 'document') {
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: artifactPayloadFromWorkbenchResource(resource),
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -4926,9 +4941,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: workbenchResourceKey(resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (
@@ -4944,7 +4956,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       const artifact = artifactPayloadFromRevision(imported.revision)
       artifact.documentId = imported.document.documentId
       artifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact,
         initialSection: 'preview',
         nativeHtml: Boolean(
@@ -4955,9 +4967,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
         resourceIdentity: `document:${imported.document.documentId}`,
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     const readonlyResource = current?.resource || resource
@@ -4976,7 +4985,7 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
     )
     if (!preview) return
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       initialSection: 'preview',
       nativeHtml: false,
@@ -4985,9 +4994,6 @@ async function previewAttachmentResource(attachment: DisplayAttachment) {
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
   } catch (error) {
     const classified = classifyArtifactProductError(error)
     const translated = t(classified.messageKey)
@@ -5070,14 +5076,11 @@ async function openDeliverables() {
       const snapshot = await workbenchResourcesStore.load(sessionKey.value)
       const resources = workbenchResourcesStore.navigationResources(sessionKey.value)
       if (snapshot.available && resources.length > 0) {
-        const opened = workbenchStore.openItem(createResourceCollectionWorkbenchItem({
+        workbenchStore.openItem(createResourceCollectionWorkbenchItem({
           resources,
           sessionKey: sessionKey.value,
           title: t('workbench.resources.title'),
         }))
-        if (!opened) {
-          pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-        }
         return
       }
     } catch {
@@ -5172,7 +5175,7 @@ function openLegacyArtifactWorkbench(
   artifact: ArtifactPayload,
   initialSection: 'preview' | 'source' = 'preview',
 ): boolean {
-  const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+  return workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     navigationArtifacts: sessionArtifacts.value,
@@ -5182,10 +5185,6 @@ function openLegacyArtifactWorkbench(
     ),
     sessionKey: sessionKey.value,
   }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
-  return opened
 }
 
 async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
@@ -5211,7 +5210,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const currentArtifact = artifactPayloadFromRevision(current.revision)
       currentArtifact.documentId = current.document.documentId
       currentArtifact.revisionId = current.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: currentArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5223,9 +5222,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         resourceIdentity: workbenchResourceKey(current.resource.resource),
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     if (!current && resource.resource.type === 'document') {
@@ -5248,7 +5244,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       const importedArtifact = artifactPayloadFromRevision(imported.revision)
       importedArtifact.documentId = imported.document.documentId
       importedArtifact.revisionId = imported.revision.revisionId
-      const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+      workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
         artifact: importedArtifact,
         initialSection: 'preview',
         navigationArtifacts: sessionArtifacts.value,
@@ -5260,9 +5256,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
         resourceIdentity: `document:${imported.document.documentId}`,
         sessionKey: sessionKey.value,
       }))
-      if (!opened) {
-        pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-      }
       return
     }
     const readonlyResource = current?.resource || resource
@@ -5284,7 +5277,7 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       return
     }
     const preparedResource = resourceFromPreparedPreview(preview)
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact: artifactPayloadFromWorkbenchResource(preparedResource),
       navigationArtifacts: sessionArtifacts.value,
       nativeHtml: false,
@@ -5293,9 +5286,6 @@ async function openDeliverableWorkbenchResource(artifact: ArtifactPayload) {
       resourceIdentity: workbenchResourceKey(readonlyResource.resource),
       sessionKey: sessionKey.value,
     }))
-    if (!opened) {
-      pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-    }
   } catch (error) {
     // METHOD_NOT_FOUND is normalized to a null open result by the provider and
     // follows the compatibility path above. Any other failure must remain
@@ -5327,7 +5317,7 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
     artifact.documentId = current.document.documentId
     artifact.revisionId = current.revision.revisionId
     if (previewPagePath) artifact.previewPagePath = previewPagePath
-    const opened = workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
+    workbenchStore.openItem(artifactPreviewItemForExplicitOpen({
       artifact,
       initialSection: 'preview',
       navigationArtifacts: sessionArtifacts.value,
@@ -5336,7 +5326,6 @@ const workspacePreviewOpening = useWorkspacePreviewOpening({
       resourceIdentity: workbenchResourceKey(current.resource.resource),
       sessionKey: key,
     }))
-    if (!opened) pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
   },
   onError: error => {
     const classified = classifyArtifactProductError(error)
@@ -6763,7 +6752,9 @@ function enterDraft() {
     && agentIdFromSessionKey(sessionKey.value) === agentId
   if (!isFreshDraft) startDraftSession(agentId)
   consumeDraftPrefill()
-  if (isDesktopViewport.value) composerRef.value?.focusTextarea()
+  if (isDesktopViewport.value) {
+    composerRef.value?.focusTextarea({ preserveFocus: !landingPrefilled.value })
+  }
 }
 
 let chatViewActive = false
@@ -6810,6 +6801,8 @@ function bindBottomIntersectionObserver() {
 }
 
 onMounted(async () => {
+  if (gatewayAccess.availability === 'available') void refreshAgentTraceEnabled(injectedAppSettings, () => gatewayAccess.availability === 'available')
+  else setAgentTraceEnabled(false)
   chatViewActive = true
   chatViewDisposed = false
   // A native scrollbar drag can finish outside the thread element. Keep the
@@ -6926,9 +6919,9 @@ onMounted(async () => {
     publishComposerDockHeight()
   }
 
-  // Focus textarea on desktop
+  // Automatic entry preserves focus in overlays and their invoking controls.
   if (isDesktopViewport.value) {
-    composerRef.value?.focusTextarea()
+    composerRef.value?.focusTextarea({ preserveFocus: !explicitFreshTask })
   }
 
   if (initialDraftProjectGeneration !== null) {
@@ -6987,6 +6980,7 @@ watch(
 )
 
 onUnmounted(() => {
+  unregisterAgentTracePreferenceReader()
   chatSend.dispose()
   cancelDraftProjectChoice()
   window.removeEventListener('pointerup', onThreadPointerEnd)

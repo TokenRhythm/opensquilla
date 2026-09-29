@@ -5,6 +5,7 @@ import ControlSwitch from '@/components/ControlSwitch.vue'
 const { t } = useI18n()
 
 interface PrivacyPanelContract {
+  agentTraceEnabled: boolean
   networkReportingEnabled: boolean
   networkReportingForcedOff: boolean
 }
@@ -14,12 +15,27 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{
+  updateAgentTraceEnabled: [enabled: boolean]
   updateNetworkReportingEnabled: [enabled: boolean]
 }>()
 </script>
 
 <template>
   <div class="settings-subsection" id="settings-security-privacy" tabindex="-1">
+    <label class="control-row">
+      <div class="control-row__label-block">
+        <span class="control-row__label">{{ t('settings.securityPrivacy.agentTraceLabel') }}</span>
+        <span class="control-row__desc">{{ t('settings.securityPrivacy.agentTraceDesc') }}</span>
+      </div>
+      <div class="control-row__control">
+        <ControlSwitch
+          :checked="panel.agentTraceEnabled"
+          name="privacy_agent_trace_enabled"
+          :aria-label="t('settings.securityPrivacy.agentTraceLabel')"
+          @change="(value) => emit('updateAgentTraceEnabled', value)"
+        />
+      </div>
+    </label>
     <label class="control-row">
       <div class="control-row__label-block">
         <span class="control-row__label">{{ t('setup.privacy.networkReportingLabel') }}</span>

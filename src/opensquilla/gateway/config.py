@@ -352,6 +352,7 @@ class PrivacyConfig(BaseSettings):
     product_analytics_notice_version: str | None = None
     product_analytics_consented_at_utc: str | None = None
     disable_network_observability: bool = False
+    agent_trace_enabled: bool = False
 
     @model_validator(mode="after")
     def _migrate_scoped_telemetry_preferences(self) -> PrivacyConfig:

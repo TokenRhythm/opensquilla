@@ -22,11 +22,11 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 181
+    assert len(targets) == 178
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 171,
+        "result": 168,
         "params": 26,
         "payload": 9,
         "frame": 1,
@@ -103,6 +103,15 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
         "request", "params", "response", "result",
     }
     assert ("method", history_name) not in targets
+
+    # On-demand log snapshots keep a result validator; retired diagnostic pages
+    # no longer consume status validators. Full verification remains available.
+    assert targets[("method", "logs.tail")] == ("result",)
+    for name in ("doctor.status", "logs.status", "status"):
+        assert {role for role, _ in method_specs[name].targets} == {
+            "request", "params", "response", "result",
+        }
+        assert ("method", name) not in targets
 
 
 def test_sessions_list_uses_browser_safe_esm_for_its_selected_validator(

@@ -1,33 +1,14 @@
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
-  STATUS_METHOD,
-  type Result as RuntimeStatusResult,
-} from '@/contracts/generated/v4/runtimeStatus'
-import { validateResult as validateRuntimeStatusResult } from '@/contracts/generated/v4/runtimeStatusValidators.mjs'
-import {
-  DOCTOR_STATUS_METHOD,
-  type Result as DoctorStatusResult,
-} from '@/contracts/generated/v4/doctorStatus'
-import { validateResult as validateDoctorStatusResult } from '@/contracts/generated/v4/doctorStatusValidators.mjs'
-import {
-  LOGS_STATUS_METHOD,
-  type Result as LogsStatusResult,
-} from '@/contracts/generated/v4/logsStatus'
-import { validateResult as validateLogsStatusResult } from '@/contracts/generated/v4/logsStatusValidators.mjs'
-import {
   LOGS_TAIL_METHOD,
   type Result as LogsTailResult,
 } from '@/contracts/generated/v4/logsTail'
 import { validateResult as validateLogsTailResult } from '@/contracts/generated/v4/logsTailValidators.mjs'
 import { createV4UsageReporting } from './usageReportingV4'
 import { detailsFromApi, projectionFromApi } from '@/utils/traceProjection'
+import type { SupportBundleUnavailableReason } from '@/modules/gatewayAccess'
 import type {
-  GatewayLogBatch,
-  GatewayLogEntry,
-  GatewayLogStatus,
-  GatewayStatus,
   Observability,
-  ReadinessReport,
   UpdateNotice,
   TurnTracesSnapshot,
   TracePayloadSnapshot,
@@ -56,16 +37,12 @@ interface HttpTransport {
   }>
 }
 
-const callOptions = (signal?: AbortSignal): RpcCallOptions => ({
+const traceCallOptions = (signal?: AbortSignal): RpcCallOptions => ({
   timeoutMs: 15_000,
   timeoutAction: 'reject',
   abortAction: 'reject',
   ...(signal ? { signal } : {}),
 })
-
-function invalid(method: string): Error {
-  return new Error(`${method} returned an invalid response`)
-}
 
 function updateNotice(value: unknown): UpdateNotice | null | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
@@ -87,74 +64,46 @@ function updateNotice(value: unknown): UpdateNotice | null | undefined {
   }
 }
 
-export function createV4Observability(rpc: RpcTransport, http: HttpTransport): Observability {
+export function createV4Observability(
+  rpc: RpcTransport,
+  http: HttpTransport,
+  supportBundleUnavailableReason: () => SupportBundleUnavailableReason,
+): Observability {
   const usageReporting = createV4UsageReporting(rpc)
   return {
     async turnTraces(sessionKey, turnId, options) {
       await rpc.ready({ signal: options?.signal })
-      return rpc.request<TurnTracesSnapshot>('logs.turn_traces', { session_key: sessionKey, turn_id: turnId }, callOptions(options?.signal))
+      return rpc.request<TurnTracesSnapshot>('logs.turn_traces', { session_key: sessionKey, turn_id: turnId }, traceCallOptions(options?.signal))
     },
     async traceProjection(traceId, options) {
       await rpc.ready({ signal: options?.signal })
-      return projectionFromApi(await rpc.request('logs.trace_projection', { trace_id: traceId }, callOptions(options?.signal)))
+      return projectionFromApi(await rpc.request('logs.trace_projection', { trace_id: traceId }, traceCallOptions(options?.signal)))
     },
     async traceDetails(traceId, options) {
       await rpc.ready({ signal: options?.signal })
-      return detailsFromApi(await rpc.request('logs.trace_details', { trace_id: traceId, limit: options?.limit ?? 1000 }, callOptions(options?.signal)))
+      return detailsFromApi(await rpc.request('logs.trace_details', { trace_id: traceId, limit: options?.limit ?? 1000 }, traceCallOptions(options?.signal)))
     },
     async tracePayload(traceId, seq, options) {
       await rpc.ready({ signal: options?.signal })
-      return rpc.request<TracePayloadSnapshot>('logs.trace_payload', { trace_id: traceId, seq }, callOptions(options?.signal))
-    },
-    async gatewayStatus(options) {
-      await rpc.ready({ signal: options?.signal })
-      const result = await rpc.request<RuntimeStatusResult>(
-        STATUS_METHOD,
-        {},
-        callOptions(options?.signal),
-      )
-      if (!validateRuntimeStatusResult(result)) throw invalid(STATUS_METHOD)
-      return result as GatewayStatus
+      return rpc.request<TracePayloadSnapshot>('logs.trace_payload', { trace_id: traceId, seq }, traceCallOptions(options?.signal))
     },
     usage(range, options = {}) {
       return usageReporting.snapshot(range, options)
     },
-    async readiness(options) {
-      await rpc.ready({ signal: options.signal })
-      const result = await rpc.request<DoctorStatusResult>(
-        DOCTOR_STATUS_METHOD,
-        { agentId: options.agentId || 'main', deep: options.deep },
-        callOptions(options.signal),
-      )
-      if (!validateDoctorStatusResult(result)) throw invalid(DOCTOR_STATUS_METHOD)
-      return result as ReadinessReport
-    },
-    async logStatus(options) {
-      await rpc.ready({ signal: options?.signal })
-      const result = await rpc.request<LogsStatusResult>(
-        LOGS_STATUS_METHOD,
-        {},
-        callOptions(options?.signal),
-      )
-      if (!validateLogsStatusResult(result)) throw invalid(LOGS_STATUS_METHOD)
-      return result as GatewayLogStatus
-    },
     async tailLogs(options) {
-      await rpc.ready({ signal: options.signal })
-      const raw = await rpc.request<LogsTailResult>(
+      await rpc.ready({ signal: options?.signal })
+      const result = await rpc.request<LogsTailResult>(
         LOGS_TAIL_METHOD,
+        { cursor: 0, limit: 200, level: null },
         {
-          cursor: options.cursor,
-          limit: options.limit ?? 500,
-          level: options.level ?? null,
+          timeoutMs: 15_000,
+          timeoutAction: 'reject',
+          abortAction: 'reject',
+          ...(options?.signal ? { signal: options.signal } : {}),
         },
-        callOptions(options.signal),
       )
-      if (!validateLogsTailResult(raw)) throw invalid(LOGS_TAIL_METHOD)
-      return {
-        entries: raw.lines as GatewayLogEntry[],
-        cursor: raw.cursor,
-      } satisfies GatewayLogBatch
+      if (!validateLogsTailResult(result)) throw new Error(`${LOGS_TAIL_METHOD} returned an invalid response`)
+      return { entries: result.lines, truncated: result.has_more }
     },
     async updateNotice(options) {
       try {
@@ -168,6 +117,10 @@ export function createV4Observability(rpc: RpcTransport, http: HttpTransport): O
       }
     },
     async downloadSupportBundle(options) {
+      // Recheck the same capability used by the UI immediately before HTTP.
+      // A Gateway switch must not send its new token to the page's old origin.
+      const unavailable = supportBundleUnavailableReason()
+      if (unavailable !== null) throw new Error(`Support bundle unavailable: ${unavailable}`)
       const response = await http.requestBinary('/api/v1/diagnostics/bundle', {
         method: 'POST',
         json: {

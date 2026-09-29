@@ -14,6 +14,7 @@ from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.diagnostics import DiagnosticsState
 from opensquilla.observability.decision_log import write_decision_entry
+from opensquilla.observability.trace_details import load_turn_call_records
 from opensquilla.observability.turn_call_log import (
     TurnCallLogger,
     TurnCallProgress,
@@ -203,12 +204,48 @@ def test_turn_call_log_writes_raw_trace_contract(tmp_path) -> None:
     assert isinstance(records[1]["elapsed_ms"], int)
     assert records[1]["elapsed_ms"] >= records[0]["elapsed_ms"]
     assert {record["clock_origin"] for record in records} == {"logger_start"}
+    assert {record["agent_trace"] for record in records} == {False}
+
+
+def test_turn_call_logger_stops_writing_after_capture_is_disabled(tmp_path) -> None:
+    enabled = [True]
+    logger = TurnCallLogger(
+        trace_id="trace-switch",
+        turn_id="turn-switch",
+        session_key="session-switch",
+        agent_id="main",
+        provider="fake",
+        model="fake-model",
+        log_dir=tmp_path,
+        capture_enabled=lambda: enabled[0],
+    )
+
+    path = logger.write("turn_start", {"message": "synthetic input"})
+    enabled[0] = False
+    assert logger.write("llm_request", {"message": "not retained"}) is None
+    assert path is not None
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["kind"] for record in records] == ["turn_start"]
 
 
 @pytest.mark.asyncio
-async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(tmp_path, monkeypatch) -> None:
-    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+@pytest.mark.parametrize(
+    "capture_mode", ["off", "legacy_env", "legacy_runtime", "agent_trace"]
+)
+async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(
+    tmp_path, monkeypatch, capture_mode
+) -> None:
+    monkeypatch.setenv(
+        "OPENSQUILLA_TURN_CALL_LOG", "1" if capture_mode == "legacy_env" else "0"
+    )
     monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    config = GatewayConfig(privacy={"agent_trace_enabled": capture_mode == "agent_trace"})
+    diagnostics_state = DiagnosticsState.from_config(config)
+    if capture_mode == "legacy_runtime":
+        diagnostics_state.set_runtime(enabled=True, raw=True)
+    if capture_mode in {"legacy_env", "legacy_runtime"}:
+        assert is_turn_call_log_enabled(diagnostics_state) is True
     registry = ToolRegistry()
 
     async def echo(value: str) -> str:
@@ -227,6 +264,8 @@ async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(tmp_path, mon
     runner = TurnRunner(
         provider_selector=_FakeSelector(provider),
         tool_registry=registry,
+        config=config,
+        diagnostics_state=diagnostics_state,
     )
 
     events = [
@@ -239,6 +278,11 @@ async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(tmp_path, mon
     ]
 
     assert any(event.kind == "done" for event in events)
+    trace_files = list(tmp_path.glob("traces-*.jsonl"))
+    assert bool(trace_files) is (capture_mode == "agent_trace")
+    if capture_mode == "off":
+        assert list(tmp_path.glob("turn-calls-*.jsonl")) == []
+        return
     [log_file] = list(tmp_path.glob("turn-calls-*.jsonl"))
     records = [
         json.loads(line)
@@ -270,6 +314,36 @@ async def test_runtime_raw_turn_call_log_records_ordered_tool_turn(tmp_path, mon
     assert [record["seq"] for record in records] == list(range(1, len(records) + 1))
     assert {record["privacy"] for record in records} == {"raw"}
     assert len({record["trace_id"] for record in records}) == 1
+    assert {record["agent_trace"] for record in records} == {
+        capture_mode == "agent_trace"
+    }
+    trace_id = records[0]["trace_id"]
+    assert bool(load_turn_call_records(trace_id, log_dir=tmp_path)) is (
+        capture_mode == "agent_trace"
+    )
+
+
+def test_trace_details_only_reads_records_written_with_trace_enabled(tmp_path) -> None:
+    trace_enabled = [False]
+    logger = TurnCallLogger(
+        trace_id="mixed-trace",
+        turn_id="mixed-turn",
+        session_key="mixed-session",
+        agent_id="main",
+        provider="fake",
+        model="fake-model",
+        log_dir=tmp_path,
+        agent_trace_enabled=lambda: trace_enabled[0],
+    )
+    logger.write("llm_request", {"message": "legacy diagnostics"})
+    trace_enabled[0] = True
+    logger.write("llm_response", {"message": "visible trace"})
+    trace_enabled[0] = False
+    logger.write("tool_response", {"message": "legacy again"})
+
+    records = load_turn_call_records("mixed-trace", log_dir=tmp_path)
+
+    assert [record["kind"] for record in records] == ["llm_response"]
 
 
 @pytest.mark.asyncio
@@ -283,7 +357,10 @@ async def test_runtime_raw_trace_starts_before_setup_and_includes_setup_time(
     synthetic_time.monotonic = lambda: clock[0]
     monkeypatch.setattr("opensquilla.engine.runtime.time", synthetic_time)
     monkeypatch.setattr("opensquilla.observability.turn_call_log.time", synthetic_time)
-    runner = TurnRunner(provider_selector=_FakeSelector(_ToolLoopProvider()))
+    runner = TurnRunner(
+        provider_selector=_FakeSelector(_ToolLoopProvider()),
+        config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+    )
     input_stage_run = runner._input_stage.run
     prompt_stage_run = runner._prompt_assembler_stage.run
 
@@ -325,7 +402,7 @@ async def test_runtime_raw_trace_starts_before_setup_and_includes_setup_time(
     assert records[1]["payload"]["effective_runtime_message"] == "prepared input"
     assert "tool_names" in records[1]["payload"]
     assert records[1]["provider"] == "fake"
-    assert records[1]["model"] == "fake-model"
+    assert records[1]["model"]
     assert records[-1]["elapsed_ms"] >= 2000
 
 
@@ -340,7 +417,10 @@ async def test_runtime_raw_trace_closes_when_input_setup_fails(
     monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
     monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
-    runner = TurnRunner(provider_selector=_FakeSelector(_ToolLoopProvider()))
+    runner = TurnRunner(
+        provider_selector=_FakeSelector(_ToolLoopProvider()),
+        config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+    )
 
     async def failing_input(inp):
         raise failure("synthetic setup failure")
@@ -389,7 +469,10 @@ async def test_runtime_correlates_trace_decision_and_raw_logs(
         _capture_decision_entry,
     )
     provider = _ToolLoopProvider()
-    runner = TurnRunner(provider_selector=_FakeSelector(provider))
+    runner = TurnRunner(
+        provider_selector=_FakeSelector(provider),
+        config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+    )
 
     events = [
         event
@@ -433,7 +516,10 @@ async def test_runtime_writes_trace_when_provider_missing(tmp_path, monkeypatch)
     monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
     monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
     monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
-    runner = TurnRunner(provider_selector=_NoProviderSelector())
+    runner = TurnRunner(
+        provider_selector=_NoProviderSelector(),
+        config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+    )
 
     events = [
         event

@@ -121,6 +121,26 @@ async def test_config_set_is_sparse_and_preserves_foreign_disk_keys(cfg_path) ->
     assert len(text.splitlines()) < before_lines + 10
 
 
+async def test_agent_trace_setting_defaults_off_and_persists_through_safe_patch(cfg_path) -> None:
+    cfg_path.write_text("[privacy]\ndisable_network_observability = false\n")
+    cfg = GatewayConfig.load(str(cfg_path))
+    assert cfg.privacy.agent_trace_enabled is False
+    assert cfg.to_public_dict()["privacy"]["agent_trace_enabled"] is False
+
+    await _handle_config_patch_safe(
+        {"patches": {"privacy.agent_trace_enabled": True}}, _ctx(cfg)
+    )
+    assert cfg.privacy.agent_trace_enabled is True
+    assert GatewayConfig.load(str(cfg_path)).privacy.agent_trace_enabled is True
+    assert tomllib.loads(cfg_path.read_text())["privacy"]["agent_trace_enabled"] is True
+
+    await _handle_config_patch_safe(
+        {"patches": {"privacy.agent_trace_enabled": False}}, _ctx(cfg)
+    )
+    assert cfg.privacy.agent_trace_enabled is False
+    assert GatewayConfig.load(str(cfg_path)).privacy.agent_trace_enabled is False
+
+
 async def test_config_apply_force_persists_explicit_default_provider(cfg_path) -> None:
     cfg_path.write_text(
         '[llm]\napi_key = "sk_tr_abcdefghijklmnop"\n',

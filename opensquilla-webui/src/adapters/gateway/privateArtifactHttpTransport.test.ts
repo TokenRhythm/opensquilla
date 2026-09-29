@@ -216,7 +216,7 @@ describe('private Artifact HTTP transport', () => {
     expect(requestJson).toHaveBeenNthCalledWith(
       2,
       'https://control.example/api/v1/artifact-preview-leases/lease-1/renew',
-      { method: 'POST', sessionKey: 'session-a', timeoutMs: 0 },
+      { method: 'POST', sessionKey: 'session-a', timeoutMs: 15_000 },
     )
     expect(requestBlob).toHaveBeenCalledWith(
       'https://control.example/api/v1/artifact-preview-leases/lease-1',

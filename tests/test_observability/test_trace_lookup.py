@@ -35,6 +35,7 @@ def test_turn_trace_lookup_only_reads_raw_directory_when_authorized(tmp_path) ->
         "session_key": "session-test",
         "turn_id": "turn-test",
         "kind": "turn_end",
+        "agent_trace": True,
         "ts": "2026-01-01T00:00:00Z",
         "payload": {"messages": ["synthetic-content"]},
     }
@@ -48,3 +49,21 @@ def test_turn_trace_lookup_only_reads_raw_directory_when_authorized(tmp_path) ->
     assert trace["complete"] is True
     assert trace["status"] == "success"
     assert "synthetic-content" not in json.dumps(trace)
+
+
+def test_turn_trace_lookup_excludes_unmarked_legacy_diagnostics(tmp_path) -> None:
+    record = {
+        "trace_id": "legacy-raw",
+        "session_key": "session-test",
+        "turn_id": "turn-test",
+        "kind": "turn_end",
+        "ts": "2026-01-01T00:00:00Z",
+    }
+    (tmp_path / "turn-calls-20260101.jsonl").write_text(
+        json.dumps(record) + "\n" + json.dumps({**record, "agent_trace": False}),
+        encoding="utf-8",
+    )
+
+    assert find_turn_traces(
+        "session-test", "turn-test", trace_dir=tmp_path, raw_dir=tmp_path
+    ) == []

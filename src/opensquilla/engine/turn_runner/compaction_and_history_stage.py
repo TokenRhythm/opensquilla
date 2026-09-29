@@ -92,6 +92,7 @@ class PreflightCompactionPort(Protocol):
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
+        preserve_historical_images: bool = True,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -302,6 +303,9 @@ class CompactionAndHistoryStage:
                 preflight_kwargs["compaction_request_context"] = inp.compaction_request_context
             if inp.attachment_path_resolver is not None:
                 preflight_kwargs["attachment_path_resolver"] = inp.attachment_path_resolver
+            preflight_kwargs["preserve_historical_images"] = (
+                getattr(inp.agent.config, "preserve_historical_images", True)
+            )
             if inp.transcript_snapshot is not None:
                 preflight_kwargs["transcript_snapshot"] = inp.transcript_snapshot
             if inp.expected_session_id is not None or inp.expected_session_epoch is not None:

@@ -1,5 +1,6 @@
 import { computed, inject, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { OBSERVABILITY_KEY, type TurnTraceSummary } from '@/modules/observability'
+import { agentTraceEnabled } from '@/modules/agentTracePreference'
 import type { TraceDetails, TraceProjection, TraceSpan } from '@/types/traceView'
 
 function isAccessDenied(cause: unknown): boolean {
@@ -37,7 +38,7 @@ export function useChatTrace(options: {
   let finalRetries = 0
   const trackedLive = ref(false)
   const traceStillRunning = ref(false)
-  const live = computed(() => options.running() || (trackedLive.value && traceStillRunning.value))
+  const live = computed(() => agentTraceEnabled.value && (options.running() || (trackedLive.value && traceStillRunning.value)))
   let timer: ReturnType<typeof setTimeout> | undefined
   let request: AbortController | undefined
   let payloadRequest: AbortController | undefined
@@ -61,8 +62,22 @@ export function useChatTrace(options: {
     clearPayload()
   }
 
+  function disableTrace() {
+    generation += 1
+    request?.abort()
+    request = undefined
+    stopTimer()
+    traces.value = []
+    selectedTraceId.value = null
+    rawEnabled.value = false
+    traceStillRunning.value = false
+    loading.value = false
+    error.value = ''
+    clearTrace()
+  }
+
   async function refresh() {
-    if (!mounted || !hasTurn.value) return
+    if (!mounted || !hasTurn.value || !agentTraceEnabled.value) return
     stopTimer()
     request?.abort()
     const controller = new AbortController()
@@ -77,6 +92,12 @@ export function useChatTrace(options: {
     try {
       const response = await observability.turnTraces(sessionKey, turnId, callOptions)
       if (!valid()) return
+      // The server is authoritative for raw trace visibility. A stale panel
+      // must not retain historical data when capture is disabled remotely.
+      if (response.raw_enabled !== true) {
+        disableTrace()
+        return
+      }
       const incomingTraces = response.traces || []
       // Do not unmount an already visible live trace while the lookup catches
       // up with newly written records for this same session and turn.
@@ -187,6 +208,10 @@ export function useChatTrace(options: {
   }
 
   watch([options.sessionKey, options.turnId], resetBinding)
+  watch(agentTraceEnabled, enabled => {
+    if (!enabled) disableTrace()
+    else rawEnabled.value = null
+  }, { flush: 'sync' })
   watch(options.running, (running, previous) => {
     if (running) trackedLive.value = true
     if (previous && !running) finalRetries = 3

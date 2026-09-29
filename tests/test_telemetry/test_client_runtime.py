@@ -796,11 +796,19 @@ async def test_prepare_shutdown_releases_send_lock_and_keeps_producer_records_op
     runtime.prepare_shutdown()
     runtime.prepare_shutdown()
     # Producer shutdown can wait for this direct write before runtime.close.
-    assert (await asyncio.wait_for(runtime.record(_turn_event(2)), timeout=1)).status is (
-        RecordStatus.RECORDED
-    )
-    runtime.record_background(_turn_event(3))
-    await asyncio.wait_for(runtime.close(), timeout=1)
+    recording = asyncio.create_task(runtime.record(_turn_event(2)))
+    try:
+        # Keep the one-second send-cancellation assertion separate from real
+        # SQLite commit/fsync, which can exceed it on a loaded Windows runner.
+        await asyncio.wait_for(cancelled.wait(), timeout=1)
+        assert (await asyncio.wait_for(recording, timeout=10)).status is RecordStatus.RECORDED
+        runtime.record_background(_turn_event(3))
+        await asyncio.wait_for(runtime.close(), timeout=10)
+    finally:
+        if not recording.done():
+            recording.cancel()
+        await asyncio.gather(recording, return_exceptions=True)
+        await runtime.close(flush=False)
 
     assert cancelled.is_set()
     assert len(offline_uploads.requests) == 1

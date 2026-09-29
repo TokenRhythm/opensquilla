@@ -250,6 +250,7 @@ from opensquilla.session.compaction import (
     compaction_prompt_layout,
     compaction_replay_summary,
     effective_protected_recent_messages,
+    project_entry_content_for_provider,
 )
 from opensquilla.session.compaction_budget import (
     CompactionBudget,
@@ -2259,6 +2260,10 @@ class Agent:
             )
             tool_context.validate_path_roots()
         self._tool_context: ToolContext | None = tool_context
+        # Idle manual compaction has no ToolContext authority, but may still
+        # prove retained media from this session's read-only material store.
+        self._compaction_media_root: Path | None = None
+        self._compaction_session_id = ""
         self._current_request_execution: dict[str, str] = {}
         for context in (self._ingress_tool_context, self._tool_context):
             if context is not None:
@@ -3036,13 +3041,40 @@ class Agent:
                         break
 
         history: list[Message] = []
+        # A projection-only manual Agent carries an explicit read-only scope.
+        # Ambient tool authority may belong to a different active session.
+        tool_context = (
+            None if self._compaction_media_root is not None
+            else self._tool_context or current_tool_context.get()
+        )
+        material_root = self._compaction_media_root or getattr(
+            tool_context, "artifact_media_root", None
+        )
+        media_root = Path(material_root) if material_root else None
+        retained_session_id = str(
+            self._compaction_session_id
+            or getattr(tool_context, "artifact_session_id", "")
+        )
         for index, entry in enumerate(entries):
             if index in skip_indexes:
                 continue
+            role = str(entry.get("role") or "")
+            content = entry.get("content") or ""
+            if role == "user":
+                content, _projection_complete = project_entry_content_for_provider(
+                    content,
+                    preserve_images=self.config.preserve_historical_images,
+                    session_id=retained_session_id or str(entry.get("session_id") or ""),
+                    message_id=str(entry.get("message_id") or ""),
+                    media_root=media_root,
+                    require_media_proof=True,
+                )
+                if not _projection_complete:
+                    return None
             history.extend(
                 reconstruct_messages_from_entry(
-                    str(entry.get("role") or ""),
-                    entry.get("content") or "",
+                    role,
+                    content,
                     entry.get("tool_calls"),
                     entry.get("reasoning_content"),
                     assistant_replay=entry.get("assistant_replay"),
@@ -14810,12 +14842,22 @@ class Agent:
             context_window_tokens=self.config.context_window_tokens,
         )
         config.compaction_profile = self.config.compaction_profile
+        config.preserve_historical_images = self.config.preserve_historical_images
         config.request_context = self.build_compaction_request_context()
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
         config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
         config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds
-        tool_context = self._tool_context or current_tool_context.get()
+        # Projection-only manual admission uses its owning session scope, not
+        # an unrelated ToolContext currently bound on the event loop.
+        tool_context = (
+            None if self._compaction_media_root is not None
+            else self._tool_context or current_tool_context.get()
+        )
+        if self._compaction_media_root is not None:
+            config.attachment_media_root = self._compaction_media_root
         if tool_context is not None:
+            if tool_context.artifact_media_root:
+                config.attachment_media_root = Path(tool_context.artifact_media_root)
             gateway_config = tool_context.sandbox_gateway_config
             if (
                 tool_context.workspace_dir

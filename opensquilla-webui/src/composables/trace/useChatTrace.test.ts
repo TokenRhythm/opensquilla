@@ -4,6 +4,7 @@ import { createApp, nextTick, reactive } from 'vue'
 import { useChatTrace } from './useChatTrace'
 import { OBSERVABILITY_KEY } from '@/modules/observability'
 import { createV4Observability } from '@/adapters/gateway/observabilityV4'
+import { agentTraceEnabled, setAgentTraceEnabled } from '@/modules/agentTracePreference'
 
 const rpc = vi.hoisted(() => ({ call: vi.fn(), waitForConnection: vi.fn() }))
 
@@ -32,19 +33,24 @@ function mount(initial = { sessionKey: 'session-a', turnId: 'turn-a', running: f
   } })
   app.provide(OBSERVABILITY_KEY, createV4Observability({
     request: rpc.call, ready: rpc.waitForConnection, supports: () => true, markUnsupported: () => {},
-  }, { requestJson: vi.fn(), requestBinary: vi.fn() }))
+  }, { requestJson: vi.fn(), requestBinary: vi.fn() }, () => null))
   app.mount(document.createElement('div'))
   apps.push(app)
   return { state, result, app }
 }
 beforeEach(() => {
   vi.useFakeTimers()
+  setAgentTraceEnabled(true)
   rpc.call.mockReset()
   rpc.waitForConnection.mockReset().mockResolvedValue(undefined)
   rpc.call.mockImplementation(async (method, params) => response(method, params))
   complete = false
 })
-afterEach(() => { apps.splice(0).forEach(app => app.unmount()); vi.useRealTimers() })
+afterEach(() => {
+  apps.splice(0).forEach(app => app.unmount())
+  setAgentTraceEnabled(false)
+  vi.useRealTimers()
+})
 
 describe('useChatTrace', () => {
   it('queries the exact session and turn and rejects a late result after switching turns', async () => {
@@ -105,21 +111,43 @@ describe('useChatTrace', () => {
     expect(result.selectedRow.value).toBeNull()
   })
 
-  it('keeps all attempts selectable and respects the raw capture gate', async () => {
+  it('clears cached trace data when the server turns raw capture off', async () => {
+    let captureEnabled = true
     rpc.call.mockImplementation(async (method, params) => {
-      if (method === 'logs.turn_traces') return { raw_enabled: false, traces: ['first', 'second'].map(trace_id => ({ trace_id, complete: true, status: 'success', raw_available: false })) }
-      if (method === 'logs.trace_details') return { trace_id: params.trace_id, available: false, reason: 'raw_diagnostics_disabled', rows: [] }
+      if (method === 'logs.turn_traces') {
+        return captureEnabled
+          ? { raw_enabled: true, traces: [{ trace_id: 'first', complete: true, status: 'success', raw_available: true }] }
+          : { raw_enabled: false, traces: [{ trace_id: 'stale', complete: true, status: 'success', raw_available: false }] }
+      }
       return response(method, params)
     })
     const { result } = mount()
     await settle()
-    expect(result.traces.value).toHaveLength(2)
-    expect(result.activeTraceId.value).toBe('second')
-    result.selectTrace('first')
-    await settle()
+    expect(result.traces.value).toHaveLength(1)
     expect(result.activeTraceId.value).toBe('first')
-    expect(result.details.value?.reason).toBe('raw_diagnostics_disabled')
+    captureEnabled = false
+    await settle()
+    await result.refresh()
+    expect(result.traces.value).toHaveLength(0)
+    expect(result.activeTraceId.value).toBeNull()
+    expect(result.projection.value).toBeNull()
+    expect(result.details.value).toBeNull()
     expect(result.rawEnabled.value).toBe(false)
+  })
+
+  it('stops trace requests and clears data when the shared preference is disabled', async () => {
+    const { result } = mount()
+    await settle()
+    expect(result.activeTraceId.value).toBe('trace-turn-a')
+    setAgentTraceEnabled(false)
+    await settle()
+    expect(result.traces.value).toEqual([])
+    expect(result.projection.value).toBeNull()
+    expect(result.details.value).toBeNull()
+    const calls = rpc.call.mock.calls.length
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(rpc.call.mock.calls.length).toBe(calls)
+    expect(agentTraceEnabled.value).toBe(false)
   })
 
   it('keeps the safe projection visible when detailed records require admin access', async () => {

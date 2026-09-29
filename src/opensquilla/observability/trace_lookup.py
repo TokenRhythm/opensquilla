@@ -22,9 +22,10 @@ def find_turn_traces(
 ) -> list[dict[str, Any]]:
     """List every trace attempt for an exact session and turn identity.
 
-    The safe stream is available as soon as turn setup begins. Raw records
-    supplement older captures only when the caller passes an authorized raw
-    directory. Partial lines from an active writer are retried on the next read.
+    The safe stream is available as soon as turn setup begins. Only raw records
+    explicitly marked for Agent Trace supplement it when the caller passes an
+    authorized raw directory. Partial lines from an active writer are retried
+    on the next read.
     """
 
     if not session_key or not turn_id:
@@ -48,6 +49,7 @@ def find_turn_traces(
                             record.get("session_key") != session_key
                             or record.get("turn_id") != turn_id
                             or (not raw and record.get("privacy") == "raw")
+                            or (raw and record.get("agent_trace") is not True)
                         ):
                             continue
                         trace_id = record.get("trace_id")

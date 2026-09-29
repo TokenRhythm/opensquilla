@@ -30,7 +30,6 @@ import {
 import {
   clampNativeWorkbenchSurfaceRect,
   NATIVE_WORKBENCH_ARTIFACT_SCHEME,
-  NATIVE_WORKBENCH_MAX_SURFACES,
   NATIVE_WORKBENCH_PROTOCOL_VERSION,
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V3,
   NATIVE_WORKBENCH_PROTOCOL_VERSION_V4,
@@ -803,12 +802,6 @@ export class NativeWorkbenchSurfaceManager {
   ): Promise<NativeWorkbenchSurfaceResult> {
     const previous = this.surfaces.get(request.surfaceId)
     if (previous) await this.destroyRecord(previous)
-    if (this.surfaces.size >= NATIVE_WORKBENCH_MAX_SURFACES) {
-      return {
-        ok: false,
-        message: `Close a Workbench preview before opening more than ${NATIVE_WORKBENCH_MAX_SURFACES}.`,
-      }
-    }
     const owner = this.options.getWindow()
     if (!owner || owner.isDestroyed()) {
       return { ok: false, message: 'The OpenSquilla window is unavailable.' }

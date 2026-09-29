@@ -1,7 +1,7 @@
 """Detailed, replay-oriented projection for one agent trace.
 
-The operational trace is intentionally small.  When raw turn-call capture is
-enabled, this module joins the append-only ``turn-calls-*.jsonl`` records into
+The operational trace is intentionally small.  This module joins records
+explicitly captured for Agent Trace in the append-only ``turn-calls-*.jsonl`` log into
 step rows that retain the model-visible request and the resulting output.  The
 raw file remains the source of truth; this projection only bounds what the UI
 receives in one response.
@@ -54,7 +54,11 @@ def load_turn_call_records(trace_id: str, log_dir: Path | None = None) -> list[d
                         row = json.loads(line)
                     except (TypeError, ValueError):
                         continue
-                    if isinstance(row, dict) and row.get("trace_id") == trace_id:
+                    if (
+                        isinstance(row, dict)
+                        and row.get("trace_id") == trace_id
+                        and row.get("agent_trace") is True
+                    ):
                         records.append(row)
         except OSError:
             continue

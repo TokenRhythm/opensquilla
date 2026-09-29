@@ -15,6 +15,10 @@ from opensquilla.skills.io_worker import check_staging_cancelled, run_staging_wo
 from tests.test_skills.test_hub_management_service import FakeImmutableSource
 
 
+# This contract combines a real worker thread with a bounded responsiveness
+# assertion. Isolate it from the xdist pool so host scheduling cannot consume
+# the three-second entry budget before the worker starts.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_scan_keeps_status_responsive_and_cancel_waits_for_cleanup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

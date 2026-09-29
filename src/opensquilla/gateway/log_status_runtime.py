@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from opensquilla.gateway.diagnostics import diagnostics_status_payload
+from opensquilla.observability.trace import is_agent_trace_enabled
 from opensquilla.observability.turn_call_log import (
     LOG_DIR_ENV,
     TURN_CALL_LOG_DIR_ENV,
@@ -84,12 +85,10 @@ def read_log_status(
     """Build the stable logs-status projection from narrow runtime inputs."""
     raw_dir, raw_dir_source = resolve_turn_call_log_dir_with_source()
     configured_debug_log, configured_debug_log_source = _configured_debug_log_path()
-    trace_dir, trace_dir_source = _configured_trace_log_dir()
-    trace_files = sorted(trace_dir.glob("traces-*.jsonl")) if trace_dir.is_dir() else []
     active_tail_path = find_log_file()
     diagnostics_status = diagnostics_status_payload(diagnostics_state, config)
 
-    return {
+    status: dict[str, Any] = {
         "raw_turn_call_log": {
             "enabled": is_turn_call_log_enabled(diagnostics_state),
             "source": diagnostics_status["raw_turn_call"]["source"],
@@ -113,15 +112,6 @@ def read_log_status(
             "active_tail_path": str(active_tail_path) if active_tail_path is not None else None,
             "active_tail_path_exists": active_tail_path.exists() if active_tail_path else False,
         },
-        "trace_log": {
-            "directory": {
-                "path": str(trace_dir),
-                "source": trace_dir_source,
-                "exists": trace_dir.exists(),
-            },
-            "file_count": len(trace_files),
-            "latest_path": str(trace_files[-1]) if trace_files else None,
-        },
         "diagnostics_enabled": {
             "configured": bool(_config_value(config, "diagnostics_enabled", False)),
             "effective": diagnostics_status["enabled"],
@@ -140,6 +130,19 @@ def read_log_status(
             LOG_DIR_ENV: _env_status(LOG_DIR_ENV),
         },
     }
+    if is_agent_trace_enabled(config):
+        trace_dir, trace_dir_source = _configured_trace_log_dir()
+        trace_files = sorted(trace_dir.glob("traces-*.jsonl")) if trace_dir.is_dir() else []
+        status["trace_log"] = {
+            "directory": {
+                "path": str(trace_dir),
+                "source": trace_dir_source,
+                "exists": trace_dir.exists(),
+            },
+            "file_count": len(trace_files),
+            "latest_path": str(trace_files[-1]) if trace_files else None,
+        }
+    return status
 
 
 __all__ = ["find_log_file", "read_log_status"]

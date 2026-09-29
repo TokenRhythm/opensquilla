@@ -41,7 +41,7 @@
               <div class="bundle-dialog__contents-grid">
                 <span><Icon name="check" :size="14" />{{ t('monitorSupport.bundleReadiness') }}</span>
                 <span><Icon name="check" :size="14" />{{ t('monitorSupport.bundleConfig') }}</span>
-                <span><Icon name="check" :size="14" />{{ t('monitorSupport.bundleLogs') }}</span>
+                <span><Icon name="check" :size="14" />{{ t(agentTraceEnabled ? 'monitorSupport.bundleLogs' : 'monitorSupport.bundleLogsNoTrace') }}</span>
                 <span><Icon name="check" :size="14" />{{ t('monitorSupport.bundlePlatform') }}</span>
               </div>
             </section>
@@ -52,11 +52,11 @@
               </span>
               <span>
                 <strong>{{ t('monitorSupport.bundleScopeTitle') }}</strong>
-                <small>{{ t('monitorSupport.bundleScopeBody') }}</small>
+                <small>{{ t(agentTraceEnabled ? 'monitorSupport.bundleScopeBody' : 'monitorSupport.bundleScopeBodyNoTrace') }}</small>
               </span>
             </div>
 
-            <label class="bundle-dialog__option">
+            <label v-if="agentTraceEnabled" class="bundle-dialog__option">
               <input v-model="includeContent" type="checkbox" :disabled="busy" />
               <span>
                 <strong>{{ t('monitorSupport.bundleIncludeContentTitle') }}</strong>
@@ -77,7 +77,7 @@
             <button ref="cancelBtn" type="button" class="btn btn--ghost" :disabled="busy" @click="emit('close')">
               {{ t('monitorSupport.bundleCancel') }}
             </button>
-            <button type="button" class="btn btn--primary" :disabled="busy" @click="emit('confirm', { includeContent })">
+            <button type="button" class="btn btn--primary" :disabled="busy" @click="emit('confirm', { includeContent: agentTraceEnabled && includeContent })">
               <Icon name="download" :size="16" />
               {{ t('monitorSupport.bundleConfirm') }}
             </button>
@@ -93,6 +93,7 @@ import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
+import { agentTraceEnabled } from '@/modules/agentTracePreference'
 
 const props = withDefaults(defineProps<{ open: boolean; busy?: boolean }>(), {
   busy: false,

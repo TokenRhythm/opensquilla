@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { RouteLocationNormalized } from 'vue-router'
+import { createMemoryHistory, createRouter, type RouteLocationNormalized } from 'vue-router'
 import i18n from '@/i18n'
 import { LAST_ROUTE_KEY } from './lastRoute'
 import { defaultRootRedirect } from './sharedRoutes'
@@ -33,7 +33,7 @@ describe('defaultRootRedirect', () => {
   it('keeps browser desktop restore behavior', () => {
     localStorage.setItem(LAST_ROUTE_KEY, '/overview')
 
-    expect(defaultRootRedirect()).toBe('/overview')
+    expect(defaultRootRedirect()).toBe('/usage')
   })
 })
 
@@ -76,32 +76,49 @@ describe('route hubs', () => {
     expect(channels.meta?.nav).toBeUndefined()
   })
 
-  it('keeps runtime Logs and Channels outside the two-tab Overview hub', () => {
-    const overview = routeAt('/overview')
+  it('hosts Usage directly without a diagnostic hub', () => {
     const usage = routeAt('/usage')
-    const logs = routeAt('/logs')
     const channels = routeAt('/channels')
-
-    expect(usage.component).toBe(overview.component)
-    expect(logs.component).not.toBe(overview.component)
-    expect(overview.meta?.viewKey).toBe('overview-hub')
-    expect(usage.meta?.viewKey).toBe('overview-hub')
-    expect(logs.meta?.viewKey).toBeUndefined()
-    expect(logs.meta?.keepAlive).toBe(true)
-    expect(overview.meta?.titleKey).toBe('nav.status')
-    expect(overview.meta?.navLabelKey).toBeUndefined()
+    expect(usage.component).toBeTypeOf('function')
+    expect(usage.meta?.viewKey).toBeUndefined()
+    expect(usage.meta?.keepAlive).toBe(true)
     expect(usage.meta?.navLabelKey).toBe('nav.viewUsage')
-    expect(channels.component).not.toBe(overview.component)
-    expect(channels.meta?.viewKey).not.toBe('overview-hub')
+    expect(channels.component).not.toBe(usage.component)
   })
 
-  it('uses the explicit Status document title without changing canonical route names', () => {
-    const titles = ['/overview', '/usage', '/logs'].map((path) => {
-      const route = routeAt(path)
-      return routeTitle({ name: route.name, meta: route.meta } as unknown as RouteLocationNormalized)
-    })
+  it('keeps the Usage document title', () => {
+    const route = routeAt('/usage')
+    expect(routeTitle({ name: route.name, meta: route.meta } as unknown as RouteLocationNormalized)).toBe('Usage')
+  })
 
-    expect(titles).toEqual(['Status', 'Usage', 'Logs'])
+  it.each([
+    { path: '/overview', target: '/usage' },
+    { path: '/health', target: '/usage' },
+    { path: '/logs', target: { path: '/settings/gateway', hash: '#logs' } },
+  ])('redirects retired $path without loading a page component', ({ path, target }) => {
+    const route = routeAt(path)
+    expect(route.redirect).toEqual(target)
+    expect(route.component).toBeUndefined()
+    expect(route.meta?.keepAlive).toBeUndefined()
+  })
+
+  it.each([false, true])('preserves a Logs link token and query with an existing route=%s', async existingRoute => {
+    const memoryRouter = createRouter({
+      history: createMemoryHistory(),
+      routes: [
+        routeAt('/logs'),
+        { path: '/chat', component: { render: () => null } },
+        { path: '/settings/:section', component: { render: () => null } },
+      ],
+    })
+    if (existingRoute) await memoryRouter.push('/chat')
+    await memoryRouter.push('/logs?token=synthetic-link-token&traceId=linked-123#old-detail')
+
+    expect(memoryRouter.currentRoute.value.path).toBe('/settings/gateway')
+    expect(memoryRouter.currentRoute.value.hash).toBe('#logs')
+    expect(memoryRouter.currentRoute.value.query).toEqual({
+      token: 'synthetic-link-token', traceId: 'linked-123',
+    })
   })
 
   it('keeps the removed sessions page as a chat compatibility redirect', () => {

@@ -221,7 +221,6 @@
     "resize": "调整工作区宽度",
     "pixels": "像素",
     "empty": "此项目没有可用的预览。",
-    "itemLimitReached": "已打开 8 个隔离预览。请先关闭一个再继续。",
     "resources": {
       "title": "文件", "count": "文件（{count}）", "empty": "暂无文件或链接。",
       "groups": { "files": "文件", "links": "链接", "attachments": "文件", "documents": "文件", "deliverables": "文件", "urls": "链接" },
@@ -393,11 +392,8 @@
     "cron": "定时任务",
     "skills": "技能",
     "skillsChannels": "技能·渠道",
-    "overview": "概览",
-    "status": "状态",
     "usage": "用量",
     "viewUsage": "查看用量",
-    "logs": "日志",
     "settings": "设置",
     "groupBuild": "构建",
     "groupMonitor": "概览",
@@ -461,7 +457,8 @@
       "results": "设置搜索结果",
       "empty": "未找到匹配的设置",
       "defaultModel": "默认模型",
-      "permissions": "权限"
+      "permissions": "权限",
+      "supportBundle": "下载支持包"
     },
     "appearance": {
       "title": "界面",
@@ -808,7 +805,8 @@
     },
     "gateway": {
       "title": "网关",
-      "desc": "连接网关；在桌面端还可管理本地运行时。"
+      "desc": "管理当前浏览器的网关连接。",
+      "desktopDesc": "管理网关连接与本机服务。"
     },
     "general": {
       "title": "通用",
@@ -816,7 +814,9 @@
     },
     "securityPrivacy": {
       "title": "安全与隐私",
-      "desc": "管理诊断偏好、桌面预览和工具隔离。"
+      "desc": "管理诊断偏好、桌面预览和工具隔离。",
+      "agentTraceLabel": "执行轨迹（Trace）",
+      "agentTraceDesc": "记录并查看对话中的模型路由、模型请求和工具调用；轨迹可能包含输入与输出内容。关闭后停止记录新轨迹。"
     },
     "memoryOverview": {
       "title": "记忆",
@@ -870,6 +870,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "全局思考等级",
+      "globalDesc": "与主用服务商共用。设置后优先于路由层级建议；默认不覆盖层级建议。",
+      "tierDesc": "仅用于此路由层级。默认不指定等级。",
+      "proposerDesc": "仅用于此候选角色。默认不指定该角色的覆盖值。",
+      "aggregatorDesc": "仅用于此融合角色。默认不指定该角色的覆盖值。",
+      "presetDesc": "由预设方案指定；切换自定义方案后可编辑。",
+      "sharedSettings": "模型共用设置",
+      "overrideHint": "全局思考等级为 {level}，优先于单模型路由层级建议；融合成员使用各自设置。",
+      "inheritedAggregatorDesc": "仅用于此融合角色。设置等级后将固定此模型，不再跟随主用模型。"
+    },
     "capacity": {
       "customOpenAI": "自定义 · OpenAI 兼容",
       "customAnthropic": "自定义 · Anthropic 兼容",
@@ -1146,6 +1157,8 @@
       "timeoutLabel": "请求超时（秒）",
       "timeoutDesc": "等待单次模型响应的超时时长——对于较慢的本地模型（Ollama、vLLM、LM Studio）可调高此值。",
       "timeoutGlobalDesc": "所有服务商常规模型请求共享的网关超时；连接检查与模型测试使用各自独立的固定时限。",
+      "thinkingLabel": "思考等级",
+      "thinkingDefault": "默认（未设置）",
       "contextWindowLabel": "上下文窗口覆盖（token 数）",
       "contextWindowDesc": "为该模型设置提示组装预算上限。留空则使用自动检测的窗口。",
       "contextWindowIdentityLabel": "上下文窗口 · {provider} / {model}",
@@ -1700,12 +1713,12 @@
       "languageCode": "语言代码"
     },
     "connection": {
-      "title": "连接",
-      "desc": "将此浏览器指向某个网关。连接会立即生效——无需保存。",
+      "title": "网关连接",
+      "desc": "修改后点击“连接”或“重新连接”生效。",
       "connected": "已连接",
       "connecting": "连接中",
       "disconnected": "已断开",
-      "reasonConnected": "与网关套接字的实时连接。",
+      "reasonConnected": "已连接到网关。",
       "reasonConnecting": "正在连接网关…",
       "reasonFailed": "上次尝试失败：{error}",
       "reasonDisconnected": "未连接。请检查 WebSocket URL 并尝试连接。",
@@ -1717,8 +1730,11 @@
       "tokenRequired": "需要令牌",
       "reasonTokenRequired": "身份验证失败，已暂停自动重试。请输入有效的网关令牌，然后点击连接。",
       "reconnect": "重新连接",
+      "editConnection": "修改连接",
       "connect": "连接",
-      "disconnect": "断开"
+      "disconnect": "断开",
+      "actions": "连接操作",
+      "reasonManagedDisconnected": "客户端尚未连接到本地网关，请尝试重新连接。"
     },
     "runtime": {
       "title": "运行时",
@@ -1896,7 +1912,15 @@
       "migrationCompleteIndependent": "当前桌面安装现已独立，之后不会与来源自动同步。",
       "migrationCompleteReplacement": "原桌面端数据已完整备份；本次是整体替换，没有合并文件或聊天记录。",
       "migrationCompleteShowBackup": "显示完整备份",
-      "migrationCompleteDismiss": "关闭提示"
+      "migrationCompleteDismiss": "关闭提示",
+      "localGatewayTitle": "本地网关",
+      "localGatewayDescription": "管理桌面客户端启动的本地网关。",
+      "processStatus": "进程状态",
+      "restartLocalGateway": "重启本地网关",
+      "details": "地址与日志位置",
+      "address": "网关地址",
+      "refreshStatus": "刷新状态",
+      "openLocalLogLocation": "打开本机日志位置"
     },
     "keyboard": {
       "title": "快捷键",
@@ -1930,9 +1954,6 @@
       "dataMaintenanceDesc": "管理数据导入与备份；桌面端还可重置或删除本机档案数据。",
       "dataMaintenanceAction": "管理",
       "dataMaintenanceAria": "打开数据维护",
-      "runTraceLabel": "日志中的运行追踪抽屉",
-      "runTraceDesc": "使日志行可交互，并在日志视图中为每行打开节点步骤详情抽屉。",
-      "runTraceAria": "日志中的运行追踪抽屉（重新加载后生效）",
       "configFileLabel": "配置文件",
       "configFileDesc": "更多选项可在配置文件中调整。"
     },
@@ -2434,110 +2455,6 @@
       "abortDone": "运行已中止。",
       "abortNone": "没有可中止的运行。",
       "abortFailed": "中止失败。"
-    },
-    "overview": {
-      "title": "状态",
-      "subtitle": "就绪情况、用量与运行健康状态。",
-      "totalTokens": "总 token 数",
-      "totalSessions": "会话总数",
-      "totalSessionsTitle": "所有状态的会话总数",
-      "viewAll": "查看全部 →",
-      "provider": "服务商",
-      "manageAgents": "管理智能体 →",
-      "jumpToReadiness": "跳转到就绪报告",
-      "health": "健康状况",
-      "uptime": "运行时长",
-      "healthSummary": "健康概要",
-      "readiness": "就绪状态",
-      "healthContext": "健康报告上下文",
-      "ctxGateway": "网关",
-      "ctxConfig": "配置",
-      "ctxRequestedConfig": "请求的配置",
-      "ctxAgent": "智能体",
-      "needsAction": "需要处理",
-      "degraded": "降级",
-      "optional": "可选",
-      "ready": "就绪",
-      "healthFindings": "健康发现项",
-      "loadingHealth": "正在加载健康报告",
-      "noFindings": "未返回任何发现项。",
-      "recoveryRestart": "恢复需要重启",
-      "openSettings": "打开设置",
-      "findingDetails": "详情",
-      "findingFallback": "发现项 {n}",
-      "copyCommand": "复制命令",
-      "step": "步骤",
-      "checking": "检查中",
-      "waitingDoctor": "等待 doctor.status",
-      "healthUnavailable": "网关健康报告不可用",
-      "impact": {
-        "blocksReady": "阻塞就绪",
-        "degrades": "降级",
-        "optional": "可选",
-        "reference": "参考"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "就绪（有警告）",
-        "ready": "就绪",
-        "actionRequired": "需要处理",
-        "degraded": "降级",
-        "unavailable": "不可用"
-      },
-      "badge": {
-        "diagnostic": "诊断未完成",
-        "repair": "修复待处理",
-        "config": "配置不匹配"
-      },
-      "dotStatus": {
-        "active": "活跃",
-        "ready": "就绪",
-        "ok": "正常",
-        "paused": "已暂停",
-        "degraded": "降级",
-        "warn": "警告",
-        "error": "错误",
-        "failed": "失败",
-        "closed": "已关闭",
-        "ended": "已结束",
-        "offline": "离线",
-        "unknown": "未知"
-      },
-      "group": {
-        "action": {
-          "title": "需要处理",
-          "note": "请先修复这些问题，让 OpenSquilla 进入就绪状态。"
-        },
-        "degraded": {
-          "title": "降级的能力",
-          "note": "OpenSquilla 仍可运行，但这些能力需要关注。"
-        },
-        "optional": {
-          "title": "可选设置",
-          "note": "这些可提升能力或安全态势，但不影响就绪状态。"
-        },
-        "ready": {
-          "title": "就绪检查",
-          "note": "这些环节已正常工作。"
-        }
-      },
-      "gw": {
-        "cannotLoad": "无法从 {url} 加载 doctor.status。{reason}",
-        "inspectRemote": "检查远程网关",
-        "repairRemote": "修复远程部署",
-        "repairRemoteDetail": "启动或修复远程 OpenSquilla 网关部署，然后刷新健康状况。",
-        "runLocalDoctor": "运行本地 doctor",
-        "runLocalDoctorDetail": "在重启网关前检查本地配置和初始化设置。",
-        "startLocal": "启动本地网关",
-        "inspectLocal": "检查本地网关"
-      },
-      "checkedAgo": "{time}检查",
-      "rerunChecks": "重新检查",
-      "copyDiagnostics": "复制诊断 JSON",
-      "copiedDiagnostics": "诊断 JSON 已复制",
-      "diagnoseWithAgent": "让 Agent 排查",
-      "diagnosePrompt": "请根据下方的客户端上下文和 doctor 报告排查此 OpenSquilla 配置。优先使用适用的 App 内设置；hasTerminalWorkflow 为 false 时，不得建议裸 opensquilla 命令，Desktop 自有 gateway 由 App 管理。数据转移是先备份再整体替换，绝不合并。可选迁移项不代表故障，转移后也可能继续显示。只解释和引导：不得迁移数据、重启 gateway、写入设置或声称已经执行了更改。",
-      "environment": "环境",
-      "latency": "延迟"
     }
   },
   "console": {
@@ -2777,12 +2694,6 @@
         "botIdCopied": "Bot ID 已复制",
         "eventSubscriptionTitle": "检查飞书事件订阅"
       }
-    },
-    "overview": {
-      "channelsChip": "渠道",
-      "channelsChipConnected": "{connected} 已连接",
-      "channelsChipFailed": "{failed} 失败",
-      "channelsChipPending": "{pending} 人待审批"
     }
   },
   "cronSkills": {
@@ -3322,17 +3233,23 @@
       "tileNotDeclaredHint": "无清单"
     }
   },
+  "gatewayLogs": {
+    "viewLogs": "查看最近日志",
+    "title": "Gateway 日志",
+    "description": "当前连接的 Gateway 最近 200 行日志；点击刷新获取最新内容。",
+    "refresh": "刷新",
+    "loading": "正在读取日志…",
+    "empty": "暂无近期日志。",
+    "failed": "读取日志失败，请检查连接及 Gateway 权限后重试。",
+    "connectionRequired": "连接 Gateway 后可查看日志。",
+    "authenticationRequired": "通过 Gateway 身份验证后可查看日志。",
+    "saveCurrentLogs": "保存当前日志",
+    "saveFailed": "保存日志失败，请重试。"
+  },
   "monitorSupport": {
     "title": "支持与诊断",
-    "menuLabel": "支持与诊断操作",
-    "viewLogs": "查看运行日志",
-    "viewLogsDescription": "查看近期网关输出与错误",
-    "copyReport": "复制当前就绪报告",
-    "copyReportDescription": "用于快速排查当前连接、配置与运行状态",
-    "copySuccess": "当前就绪报告已复制",
-    "copyFailed": "复制就绪报告失败：{error}",
     "downloadBundle": "下载脱敏支持包",
-    "downloadBundleDescription": "包含日志、配置摘要与诊断结果，可提交给支持人员",
+    "downloadBundleDescription": "包含当前连接的 Gateway 的日志、配置摘要与诊断结果。",
     "privacySummary": "默认不包含会话正文，已知凭据字段会脱敏",
     "bundleTitle": "下载脱敏支持包",
     "bundleSubtitle": "创建可与 OpenSquilla 支持人员分享的 ZIP 文件。",
@@ -3340,9 +3257,11 @@
     "bundleReadiness": "就绪与诊断快照",
     "bundleConfig": "脱敏后的配置摘要",
     "bundleLogs": "错误、日志与 trace 信息",
+    "bundleLogsNoTrace": "错误与运行日志",
     "bundlePlatform": "版本与平台信息",
     "bundleScopeTitle": "近期诊断记录（最多 1 天）",
     "bundleScopeBody": "错误与追踪记录最多包含 1 天；运行日志按本地轮转收集，实际覆盖时间可能不同。",
+    "bundleScopeBodyNoTrace": "错误记录最多包含 1 天；运行日志按本地轮转收集，实际覆盖时间可能不同。",
     "bundleIncludeContentTitle": "包含会话正文",
     "bundleIncludeContentBody": "仅在支持人员明确要求时开启；可能含有敏感业务信息。",
     "bundleCredentialsTitle": "已知凭据字段会脱敏",
@@ -3350,7 +3269,10 @@
     "bundleConfirm": "生成并下载",
     "bundleCancel": "取消",
     "bundleFailed": "支持包下载失败",
-    "bundleReady": "支持包已下载"
+    "bundleReady": "支持包已下载",
+    "bundleConnectionRequired": "连接 Gateway 后可下载支持包。",
+    "bundleOwnerRequired": "仅 Gateway 的本机所有者可下载支持包。",
+    "bundleDifferentGateway": "请在当前连接的 Gateway 自己提供的 WebUI 中下载支持包。"
   },
   "usageLogs": {
     "tasks": {

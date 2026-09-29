@@ -13,6 +13,7 @@ import io
 import json
 import tempfile
 import zipfile
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,8 @@ def _client(
     tmp_path: Path,
     *,
     peer: tuple[str, int] = _OWNER_PEER,
+    agent_trace_enabled: bool = False,
+    config: GatewayConfig | None = None,
 ) -> TestClient:
     home = tmp_path / "home"
     (home / "logs").mkdir(parents=True)
@@ -46,7 +49,9 @@ def _client(
     monkeypatch.setenv("OPENSQUILLA_STATE_DIR", str(home))
     monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(home / "logs"))
     return TestClient(
-        create_gateway_app(GatewayConfig()),
+        create_gateway_app(
+            config or GatewayConfig(privacy={"agent_trace_enabled": agent_trace_enabled})
+        ),
         base_url="http://127.0.0.1:18791",
         client=peer,
     )
@@ -88,6 +93,64 @@ def test_bundle_route_honors_include_content(monkeypatch, tmp_path) -> None:
     with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
         manifest = json.loads(archive.read("manifest.json"))
     assert manifest["content_tier"] is True
+
+
+@pytest.mark.parametrize("agent_trace_enabled", [False, True])
+def test_bundle_route_uses_live_agent_trace_setting(
+    monkeypatch, tmp_path, agent_trace_enabled
+) -> None:
+    day = datetime.now(UTC).strftime("%Y%m%d")
+    with _client(monkeypatch, tmp_path, agent_trace_enabled=agent_trace_enabled) as client:
+        log_dir = tmp_path / "home" / "logs"
+        (log_dir / f"traces-{day}.jsonl").write_text('{"kind":"turn_start"}\n')
+        (log_dir / f"turn-calls-{day}.jsonl").write_text(
+            '{"kind":"llm_request","agent_trace":true}\n'
+        )
+        response = client.post(
+            "/api/v1/diagnostics/bundle", json={"include_content": True}
+        )
+
+    assert response.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = archive.namelist()
+    assert (f"traces/traces-{day}.jsonl" in names) is agent_trace_enabled
+    assert (f"content/turn-calls-{day}.jsonl" in names) is agent_trace_enabled
+
+
+def test_bundle_route_rebuilds_without_trace_if_disabled_during_collection(
+    monkeypatch, tmp_path
+) -> None:
+    from opensquilla.observability import bundle
+
+    config = GatewayConfig(privacy={"agent_trace_enabled": True})
+    original_collect = bundle.collect_bundle
+    capture_modes: list[bool] = []
+
+    def collect_then_disable(*args, **kwargs):
+        result = original_collect(*args, **kwargs)
+        capture_modes.append(kwargs["agent_trace_enabled"])
+        if len(capture_modes) == 1:
+            config.privacy.agent_trace_enabled = False
+        return result
+
+    monkeypatch.setattr(bundle, "collect_bundle", collect_then_disable)
+    day = datetime.now(UTC).strftime("%Y%m%d")
+    with _client(monkeypatch, tmp_path, config=config) as client:
+        log_dir = tmp_path / "home" / "logs"
+        (log_dir / f"traces-{day}.jsonl").write_text('{"kind":"turn_start"}\n')
+        (log_dir / f"turn-calls-{day}.jsonl").write_text(
+            '{"kind":"llm_request","agent_trace":true}\n'
+        )
+        response = client.post(
+            "/api/v1/diagnostics/bundle", json={"include_content": True}
+        )
+
+    assert response.status_code == 200
+    assert capture_modes == [True, False]
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        names = archive.namelist()
+    assert f"traces/traces-{day}.jsonl" not in names
+    assert f"content/turn-calls-{day}.jsonl" not in names
 
 
 def test_bundle_route_include_content_requires_json_true(monkeypatch, tmp_path) -> None:

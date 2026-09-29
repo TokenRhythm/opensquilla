@@ -33,12 +33,13 @@ describe('getWorkNavigationSection', () => {
     })
   })
 
-  it('uses Usage as the rail entry while preserving the Status deep link', () => {
+  it('uses Usage as the rail entry and redirects the retired Overview deep link', () => {
     const item = getWorkNavigationSection().find(candidate => candidate.path === '/usage')
     const route = sharedRoutes.find(candidate => candidate.path === '/overview')
 
     expect(item?.title).toBe('View usage')
-    expect(route?.meta?.titleKey).toBe('nav.status')
+    expect(route?.redirect).toBe('/usage')
+    expect(route?.component).toBeUndefined()
   })
 })
 

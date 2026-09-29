@@ -1091,6 +1091,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         consumer_admission: Any | None = None,
         consumer_admission_fingerprint: str = "",
         attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
+        preserve_historical_images: bool = True,
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
@@ -1111,6 +1112,11 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
             "attachment_path_resolver",
         ):
             correlation_kwargs["attachment_path_resolver"] = attachment_path_resolver
+        if _accepts_keyword_arg(
+            self._runner._maybe_preflight_compact,
+            "preserve_historical_images",
+        ):
+            correlation_kwargs["preserve_historical_images"] = preserve_historical_images
         if _accepts_keyword_arg(
             self._runner._maybe_preflight_compact,
             "provider_request_correlation",

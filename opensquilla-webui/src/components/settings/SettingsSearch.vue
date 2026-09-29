@@ -15,13 +15,13 @@ const focused = ref(false)
 // Reuse existing setting labels. This index is local, small, and does not mount
 // hidden panels or ask the Gateway to load configuration for a search.
 const labels: Partial<Record<SettingsRailSectionId, string[]>> = {
-  gateway: ['setup.connection.wsUrlLabel', 'setup.connection.tokenLabel'],
+  gateway: ['monitorSupport.title', 'monitorSupport.downloadBundle', 'settings.search.supportBundle', 'gatewayLogs.viewLogs'],
   provider: ['setup.provider.defaultModelLabel', 'settings.search.defaultModel'],
   modelStrategy: ['setup.modelStrategy.singleModelLabel', 'setup.modelStrategy.routerTitle', 'setup.modelStrategy.ensembleTitle'],
   capabilities: ['setup.search.title', 'setup.memory.title', 'setup.image.title', 'setup.audio.title'],
   general: ['settings.appearance.languageLabel', 'setup.behavior.autoTitlesLabel'],
   interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel'],
-  securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel'],
+  securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel', 'settings.securityPrivacy.agentTraceLabel'],
   memory: ['settings.memoryOverview.title'],
   advanced: ['settings.memoryOverview.autoCaptureLabel', 'setup.advanced.configFileLabel', 'setup.advanced.dataMaintenanceLabel'],
 }
@@ -30,8 +30,10 @@ const results = computed(() => {
   if (!terms.length) return []
   return SETTINGS_SECTIONS.filter(section => !section.desktopOnly || props.isDesktop).flatMap(section => {
     const title = t(`settings.rail.${section.id}`)
-    const keys = section.id === 'gateway' && props.isDesktop
-      ? ['setup.runtime.title']
+    const keys = section.id === 'gateway'
+      ? [...labels.gateway!, ...(props.isDesktop
+          ? ['setup.runtime.localGatewayTitle', 'setup.runtime.title', 'setup.runtime.openLocalLogLocation', 'updates.desktop.settingsTitle']
+          : ['setup.connection.wsUrlLabel', 'setup.connection.tokenLabel'])]
       : labels[section.id] ?? []
     const settingLabels = keys.map(key => ({ key, label: t(key) }))
     const haystack = [title, section.label, ...settingLabels.map(item => item.label)].join(' ').toLocaleLowerCase()

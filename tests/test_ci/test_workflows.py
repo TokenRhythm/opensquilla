@@ -2447,6 +2447,9 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "task-progress.spec.ts",
         "provider-error-experience.spec.ts",
         "retired-bgm-upgrade.spec.ts",
+        "support-bundle.spec.ts",
+        "console-clarity.spec.ts",
+        "mobile-tabs.spec.ts",
         "header-responsive.spec.ts",
         "topbar-global-controls.spec.ts",
         "topbar-visual.spec.ts",
@@ -2480,7 +2483,6 @@ def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
         "chat-virtualization.spec.ts",
         "conversation-minimap.spec.ts",
         "floating-composer.spec.ts",
-        "virtualized-logs.spec.ts",
         "long-task-resilience.spec.ts",
         "native-gateway.spec.ts",
         "sidebar-drag.spec.ts",
@@ -2741,7 +2743,13 @@ def test_native_desktop_cells_require_recommended_pty_before_managed_smoke() -> 
         assert f"matrix.shard == '{shard}'" in probe["if"]
     run = probe["run"]
     assert "set -euo pipefail" in run
-    assert "gateway-entry.py --_desktop-pty-probe" in run
+    assert run.count("gateway-entry.py --_desktop-pty-probe") == 2
+    assert 'pty_probe_statuses=("${PIPESTATUS[@]}")' in run
+    assert '"${RUNNER_OS}" != "Windows"' in run
+    assert '"available": false, "ioMode": "error"' in run
+    assert '\"reason\": \"PTY probe timed out\"' in run
+    assert '"${#pty_probe_lines[@]}" -ne 1' in run
+    assert 'pty-capability-attempt-2.log' in run
     assert "test_unified_exec_real_pty_reports_tty_and_accepts_input" in run
     assert run.index("--_desktop-pty-probe") < run.index("uv run --no-sync pytest")
     assert "continue-on-error" not in probe

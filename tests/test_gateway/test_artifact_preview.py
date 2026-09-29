@@ -668,20 +668,64 @@ def test_create_rejects_cross_origin_before_allocating_lease(tmp_path: Path) -> 
     assert len(service._leases_by_id) == 1
 
 
-def test_lease_limit_is_scoped_per_session(tmp_path: Path) -> None:
-    ref = _publish_html(tmp_path)
-    app, _service = _app(tmp_path)
+@pytest.mark.parametrize("preview_client", ["web", "desktop"])
+def test_many_previews_keep_independent_origins_and_lifecycles(
+    tmp_path: Path, preview_client: str,
+) -> None:
+    contents = [f"<!doctype html><h1>Preview {index}</h1>".encode() for index in range(12)]
+    artifacts = [_publish_html(tmp_path, content) for content in contents]
+    now = [1_700_000_000.0]
+    service = ArtifactPreviewLeaseService(config=_config(tmp_path), clock=lambda: now[0])
+    service.set_listener_port(43123)
+    app, _service = _app(tmp_path, service=service)
 
     with TestClient(
         app,
         base_url="http://127.0.0.1:18791",
         client=("127.0.0.1", 51000),
     ) as client:
-        responses = [_create(client, ref.id) for _ in range(9)]
+        payloads = []
+        for artifact in artifacts:
+            response = _create(
+                client, artifact.id, mode="full", preview_client=preview_client,
+                origin=None if preview_client == "desktop" else "http://127.0.0.1:18791",
+            )
+            assert response.status_code == 201, response.text
+            payloads.append(response.json())
 
-    assert [response.status_code for response in responses[:8]] == [201] * 8
-    assert responses[8].status_code == 429
-    assert responses[8].json()["code"] == "PREVIEW_LEASE_LIMIT"
+        assert len({payload["lease_id"] for payload in payloads}) == len(artifacts)
+        assert len({payload["preview_origin"] for payload in payloads}) == len(artifacts)
+        assert len({urlsplit(payload["launch_url"]).hostname for payload in payloads}) == len(
+            artifacts,
+        )
+
+        resource_app = create_artifact_preview_resource_app(service)
+        with TestClient(resource_app) as resource_client:
+            for payload, content in zip(payloads, contents, strict=True):
+                resource = resource_client.get(payload["launch_url"])
+                assert resource.status_code == 200
+                assert resource.content == content
+
+            now[0] += 1
+            controls = {**_AUTH_HEADERS, "Origin": "http://127.0.0.1:18791"}
+            renewed = client.post(
+                f"/api/v1/artifact-preview-leases/{payloads[-1]['lease_id']}/renew",
+                headers=controls,
+            )
+            assert renewed.status_code == 200
+            assert renewed.json()["lease_id"] == payloads[-1]["lease_id"]
+            assert renewed.json()["expires_at"] != payloads[-1]["expires_at"]
+
+            revoked = client.delete(
+                f"/api/v1/artifact-preview-leases/{payloads[0]['lease_id']}",
+                headers=controls,
+            )
+            assert revoked.status_code == 204
+            assert resource_client.get(payloads[0]["launch_url"]).status_code == 410
+            for payload, content in zip(payloads[1:], contents[1:], strict=True):
+                resource = resource_client.get(payload["launch_url"])
+                assert resource.status_code == 200
+                assert resource.content == content
 
 
 def test_renew_and_delete_require_the_original_session_scope(tmp_path: Path) -> None:

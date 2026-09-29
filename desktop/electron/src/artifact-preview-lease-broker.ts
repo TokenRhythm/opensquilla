@@ -80,11 +80,22 @@ interface IssuedArtifactPreview {
 
 }
 
+interface PendingArtifactPreviewRevocation {
+  leaseId: string
+  gatewayOrigin: string
+  scopeId: string
+  authToken?: string
+  failures: number
+  retryAtMs: number
+  inFlight?: Promise<ArtifactPreviewLeaseBrokerResult<undefined>>
+}
+
 interface ArtifactPreviewLeaseBrokerOptions {
   getOwnedGatewayUrl: () => string | null
   fetchImpl?: typeof fetch
   now?: () => number
   timeoutMs?: number
+  scheduleRetry?: (callback: () => void, delayMs: number) => () => void
 }
 
 const ARTIFACT_ID_PATTERN = /^art-[A-Za-z0-9_-]{1,200}$/
@@ -93,6 +104,7 @@ const PREVIEW_HOST_PATTERN = /^p-[a-f0-9]{32}\.localhost$/i
 const MAX_RESPONSE_BYTES = 1024 * 1024
 const MAX_CREDENTIAL_BYTES = 16 * 1024
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000
+const MAX_REVOCATION_RETRY_DELAY_MS = 60_000
 
 function objectRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
@@ -364,6 +376,11 @@ export class ArtifactPreviewLeaseBroker {
   private readonly now: () => number
   private readonly timeoutMs: number
   private readonly issued = new Map<string, IssuedArtifactPreview>()
+  // Cleanup ownership is separate from permission to create or renew a surface.
+  private readonly pendingRevocations = new Map<string, PendingArtifactPreviewRevocation>()
+  private cancelRevocationRetry: (() => void) | null = null
+  private revocationDrain: Promise<void> | null = null
+  private revocationEpoch = 0
   private readonly inFlightCreates = new Set<
     Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>>
   >()
@@ -378,6 +395,11 @@ export class ArtifactPreviewLeaseBroker {
   clear(): void {
     this.generation += 1
     this.issued.clear()
+    this.revocationEpoch += 1
+    this.pendingRevocations.clear()
+    this.cancelRevocationRetry?.()
+    this.cancelRevocationRetry = null
+    this.revocationDrain = null
   }
 
   /**
@@ -398,15 +420,7 @@ export class ArtifactPreviewLeaseBroker {
       if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== lease.gatewayOrigin) {
         return Promise.resolve()
       }
-      return this.request(
-        new URL(
-          `/api/v1/artifact-preview-leases/${encodeURIComponent(leaseId)}`,
-          lease.gatewayOrigin,
-        ),
-        'DELETE',
-        lease.scopeId,
-        lease.authToken,
-      )
+      return this.queueRevocation({ ...lease, leaseId })
     })
     await Promise.allSettled([...revocations, ...inFlightCreates])
   }
@@ -425,6 +439,7 @@ export class ArtifactPreviewLeaseBroker {
     value: unknown,
   ): Promise<ArtifactPreviewLeaseBrokerResult<ArtifactPreviewLeasePayload>> {
     const generation = this.generation
+    const revocationEpoch = this.revocationEpoch
     let request: ArtifactPreviewLeaseCreateRequest
     try {
       request = parseArtifactPreviewLeaseCreateRequest(value)
@@ -463,10 +478,10 @@ export class ArtifactPreviewLeaseBroker {
       const parsed = parseLeasePayload(response.payload, request.mode)
       if (request.pagePath && (parsed.payload.page_path !== request.pagePath
         || decodeURIComponent(new URL(parsed.payload.launch_url).pathname) !== `/${request.pagePath}`)) {
-        await this.request(
-          new URL(`/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`, gatewayOrigin),
-          'DELETE', request.scopeId, request.authToken,
-        )
+        await this.queueRevocation({
+          leaseId: parsed.payload.lease_id, gatewayOrigin,
+          scopeId: request.scopeId, authToken: request.authToken,
+        }, revocationEpoch)
         return failure(409, 'PREVIEW_PAGE_UNSUPPORTED', 'The Gateway cannot open this preview page.')
       }
       if (
@@ -474,15 +489,10 @@ export class ArtifactPreviewLeaseBroker {
         || parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) !== gatewayOrigin
       ) {
         if (parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl()) === gatewayOrigin) {
-          await this.request(
-            new URL(
-              `/api/v1/artifact-preview-leases/${encodeURIComponent(parsed.payload.lease_id)}`,
-              gatewayOrigin,
-            ),
-            'DELETE',
-            request.scopeId,
-            request.authToken,
-          )
+          await this.queueRevocation({
+            leaseId: parsed.payload.lease_id, gatewayOrigin,
+            scopeId: request.scopeId, authToken: request.authToken,
+          }, revocationEpoch)
         }
         return failure(
           409,
@@ -573,25 +583,141 @@ export class ArtifactPreviewLeaseBroker {
     }
     const issued = this.currentIssuedLease(request.leaseId, request.scopeId)
     if (!issued) {
+      const pending = this.pendingRevocations.get(request.leaseId)
+      if (pending && pending.scopeId === request.scopeId
+        && pending.gatewayOrigin === parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())) {
+        if (!pending.inFlight && request.authToken) pending.authToken = request.authToken
+        return await this.attemptRevocation(pending)
+      }
       return failure(404, 'BROKER_LEASE_NOT_FOUND', 'The Desktop preview lease is unavailable.')
     }
     // Revoke local authority before the network request. A failed Gateway call
     // must never leave a renderer-revoked launch URL eligible for a new surface.
     this.issued.delete(request.leaseId)
-    const response = await this.request(
-      new URL(
-        `/api/v1/artifact-preview-leases/${encodeURIComponent(request.leaseId)}`,
-        issued.gatewayOrigin,
-      ),
-      'DELETE',
-      request.scopeId,
-      request.authToken,
-    )
-    if (!response.ok) return response
-    if (response.status !== 204) {
-      return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
+    return await this.queueRevocation({
+      ...issued,
+      authToken: request.authToken ?? issued.authToken,
+    })
+  }
+
+  private queueRevocation(
+    lease: Pick<IssuedArtifactPreview, 'leaseId' | 'gatewayOrigin' | 'scopeId' | 'authToken'>,
+    epoch = this.revocationEpoch,
+  ): Promise<ArtifactPreviewLeaseBrokerResult<undefined>> {
+    const pending: PendingArtifactPreviewRevocation = {
+      leaseId: lease.leaseId,
+      gatewayOrigin: lease.gatewayOrigin,
+      scopeId: lease.scopeId,
+      authToken: lease.authToken,
+      failures: 0,
+      retryAtMs: Number.POSITIVE_INFINITY,
     }
-    return { ok: true, status: response.status, payload: undefined }
+    // A create retired by clear() still gets its existing best-effort DELETE,
+    // but cannot install background work for a retired Gateway lifecycle.
+    if (epoch === this.revocationEpoch) this.pendingRevocations.set(lease.leaseId, pending)
+    return this.attemptRevocation(pending)
+  }
+
+  private attemptRevocation(
+    pending: PendingArtifactPreviewRevocation,
+  ): Promise<ArtifactPreviewLeaseBrokerResult<undefined>> {
+    if (pending.inFlight) return pending.inFlight
+    const attempt = this.revokePending(pending)
+    pending.inFlight = attempt
+    void attempt.finally(() => {
+      if (pending.inFlight === attempt) pending.inFlight = undefined
+      this.scheduleRevocationRetry()
+    })
+    return attempt
+  }
+
+  private async revokePending(
+    pending: PendingArtifactPreviewRevocation,
+  ): Promise<ArtifactPreviewLeaseBrokerResult<undefined>> {
+    if (pending.gatewayOrigin !== parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())) {
+      if (this.pendingRevocations.get(pending.leaseId) === pending) {
+        this.pendingRevocations.delete(pending.leaseId)
+      }
+      return failure(404, 'BROKER_LEASE_NOT_FOUND', 'The Desktop preview lease is unavailable.')
+    }
+    const response = await this.request(
+      new URL(`/api/v1/artifact-preview-leases/${encodeURIComponent(pending.leaseId)}`,
+        pending.gatewayOrigin),
+      'DELETE', pending.scopeId, pending.authToken,
+    )
+    const result: ArtifactPreviewLeaseBrokerResult<undefined> = response.ok
+      ? response.status === 204
+        ? { ok: true, status: 204, payload: undefined }
+        : failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
+      : response
+    if (this.pendingRevocations.get(pending.leaseId) === pending) {
+      if (result.ok || result.status === 404 || result.status === 410) {
+        this.pendingRevocations.delete(pending.leaseId)
+      } else if ([401, 403, 408, 429].includes(result.status) || result.status >= 500) {
+        pending.failures += 1
+        const delayMs = result.status === 401 || result.status === 403
+          ? MAX_REVOCATION_RETRY_DELAY_MS
+          : Math.min(1000 * 2 ** Math.min(pending.failures - 1, 6),
+            MAX_REVOCATION_RETRY_DELAY_MS)
+        pending.retryAtMs = this.now() + delayMs * (0.8 + Math.random() * 0.2)
+      } else {
+        // Retain cleanup ownership for an explicit retry with corrected input;
+        // an invalid request is not proof that the remote lease was revoked.
+        pending.retryAtMs = Number.POSITIVE_INFINITY
+      }
+    }
+    return result
+  }
+
+  private scheduleRevocationRetry(): void {
+    this.cancelRevocationRetry?.()
+    this.cancelRevocationRetry = null
+    if (this.revocationDrain) return
+    const gatewayOrigin = parseOwnedGatewayOrigin(this.options.getOwnedGatewayUrl())
+    let retryAtMs = Number.POSITIVE_INFINITY
+    for (const [leaseId, pending] of this.pendingRevocations) {
+      if (pending.gatewayOrigin !== gatewayOrigin) {
+        this.pendingRevocations.delete(leaseId)
+      } else if (!pending.inFlight) {
+        retryAtMs = Math.min(retryAtMs, pending.retryAtMs)
+      }
+    }
+    if (!Number.isFinite(retryAtMs)) return
+    const callback = () => {
+      this.cancelRevocationRetry = null
+      const epoch = this.revocationEpoch
+      // Only one background DELETE is in flight; each failed attempt is put
+      // back on the timer instead of keeping close or shutdown waiting.
+      const drain = (async () => {
+        while (epoch === this.revocationEpoch) {
+          // Oldest due work goes first, so slow failures cannot monopolize the drain.
+          let pending: PendingArtifactPreviewRevocation | undefined
+          const now = this.now()
+          for (const candidate of this.pendingRevocations.values()) {
+            if (!candidate.inFlight && candidate.retryAtMs <= now
+              && (!pending || candidate.retryAtMs < pending.retryAtMs)) {
+              pending = candidate
+            }
+          }
+          if (!pending) return
+          await this.attemptRevocation(pending)
+        }
+      })()
+      this.revocationDrain = drain
+      void drain.finally(() => {
+        if (this.revocationDrain !== drain) return
+        this.revocationDrain = null
+        this.scheduleRevocationRetry()
+      })
+    }
+    const delayMs = Math.max(0, retryAtMs - this.now())
+    if (this.options.scheduleRetry) {
+      this.cancelRevocationRetry = this.options.scheduleRetry(callback, delayMs)
+    } else {
+      const timer = setTimeout(callback, delayMs)
+      timer.unref()
+      this.cancelRevocationRetry = () => clearTimeout(timer)
+    }
   }
 
   authorizesSurface(grant: ArtifactPreviewSurfaceGrant): boolean {
@@ -661,7 +787,13 @@ export class ArtifactPreviewLeaseBroker {
       if (Number.isFinite(contentLength) && contentLength > MAX_RESPONSE_BYTES) {
         return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
       }
-      const text = await response.response.text()
+      let text: string
+      try {
+        text = await response.response.text()
+      } catch {
+        return failure(503, 'PREVIEW_BROKER_UNAVAILABLE',
+          'The Desktop preview service is unavailable.')
+      }
       if (Buffer.byteLength(text, 'utf8') > MAX_RESPONSE_BYTES) {
         return failure(502, 'INVALID_RESPONSE', 'The Gateway returned an invalid preview response.')
       }

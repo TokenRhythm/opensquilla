@@ -20,6 +20,12 @@ TracePrivacy = Literal["operational", "diagnostic", "raw"]
 _VALID_PRIVACY: frozenset[str] = frozenset({"operational", "diagnostic", "raw"})
 
 
+def is_agent_trace_enabled(config: Any | None) -> bool:
+    """Return the persisted opt-in for local agent run trace capture."""
+
+    return bool(getattr(getattr(config, "privacy", None), "agent_trace_enabled", False))
+
+
 def _utc_ts() -> str:
     return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
