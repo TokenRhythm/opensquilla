@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import questionary
 import tomli_w
 import typer
 
@@ -23,6 +22,9 @@ def _default_model_for_provider(provider: str) -> str:
 
 def run_init() -> None:
     """Create a basic OpenSquilla home with env and config files."""
+    # Only the interactive init command needs the terminal prompt stack.
+    import questionary
+
     home = default_opensquilla_home()
     env_path = home / ".env"
     config_path = home / "config.toml"
