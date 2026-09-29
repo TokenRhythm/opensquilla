@@ -61,12 +61,13 @@ const SAFE_FAILURE_REASONS = new Set([
   'Timed out: new draft route', 'Timed out: persisted sidebar row', 'Timed out: history re-read and visible answer',
   'No child identity captured; cleanup remains unproven', 'Owned child still present',
   'A child missed by ownership observation leaves cleanup unproven',
+  'Every owned Gateway must exit naturally',
   'Exactly one synthetic user message must render', 'Exactly one synthetic answer must render',
   'Gateway child count must reflect the actual save outcome', 'Onboarding save must preserve the original renderer document',
   'Fresh onboarding must be an actual trusted setup window', 'Fresh onboarding must save the synthetic provider',
   'Fresh onboarding must finish a real persisted save', 'No hidden model calls during onboarding',
   'Synthetic stream must remain active until shutdown begins', 'Stream must finish only after shutdown was observed',
-  'Long history must require multiple snapshot segments', 'Long history recovery must use the original session',
+  'Long history recovery must use the original session',
   'Synthetic turns must not fail after displaying partial text',
   'Exactly one provider request for each submitted UI turn', 'No prior Gateway shutdown in the streaming fixture',
   'Timed out: native onboarding window', 'Timed out: main renderer document', 'Timed out: native onboarding save',
@@ -158,13 +159,17 @@ function structuredLogRecords(text) {
 export function gatewayShutdownCountFromLog(text) {
   return structuredLogRecords(text).filter(item => item.event === 'gateway.shutdown_requested').length
 }
-export function gatewayFlowFailureEvidence(text) {
+export function gatewayFlowFailureEvidence(text, expectedStarts = 1) {
   const allowed = new Set(['response_wire_limit', 'snapshot_epoch_mismatch', 'snapshot_delivery_id_invalid',
     'snapshot_delivery_missing', 'snapshot_delivery_kind_invalid', 'snapshot_reservation_rejected',
     'frame_wire_limit', 'control_buffer_limit', 'transport_reservation_rejected', 'flow_admission_unclassified'])
-  const result = { available: true, failures: 0, reasonCodes: {}, exceptionTypes: {} }
-  for (const item of structuredLogRecords(text)) {
-    if (item.event !== 'gateway.ws_flow_encode_or_budget_failed') continue
+  const records = structuredLogRecords(text)
+  const result = { available: Number.isSafeInteger(expectedStarts) && expectedStarts > 0
+      && records.filter(item => item?.event === 'gateway.started').length === expectedStarts
+      && records.filter(item => item?.event === 'gateway.stopped').length === expectedStarts,
+    failures: 0, reasonCodes: {}, exceptionTypes: {} }
+  for (const item of records) {
+    if (item?.event !== 'gateway.ws_flow_encode_or_budget_failed') continue
     result.failures++
     const reason = allowed.has(item.reason_code) ? item.reason_code : 'unclassified'
     const type = ['ValueError', '_FlowAdmissionError', 'FlowDeliveryStaleError'].includes(item.exception_type)
@@ -173,6 +178,13 @@ export function gatewayFlowFailureEvidence(text) {
     result.exceptionTypes[type] = (result.exceptionTypes[type] || 0) + 1
   }
   return result
+}
+export function hasNaturalGatewayExits(text, ownedPids) {
+  const exits = structuredLogRecords(text).filter(item => item?.event === 'gateway_exited')
+  return ownedPids.length > 0 && new Set(ownedPids).size === ownedPids.length
+    && exits.length === ownedPids.length
+    && ownedPids.every(pid => exits.filter(item => item.pid === pid && item.code === 0
+      && item.signal === null && item.abnormalExit === false).length === 1)
 }
 export function hasCleanGatewayFlowEvidence(evidence) {
   // None of the supported scenarios injects flow encoding or budget failures.
@@ -204,6 +216,26 @@ export function syntheticConfig(profile, providerUrl, sseUrl, { longHistory = fa
     ...(sseUrl ? ['[mcp]', 'enabled = true', 'connect_timeout_seconds = 135',
       '[[mcp.servers]]', 'name = "synthetic-late-ready"', 'transport = "sse"',
       `url = ${JSON.stringify(sseUrl)}`, 'tool_timeout_seconds = 180'] : []), ''].join('\n')
+}
+
+function syntheticHistoryIds(messages, includeStreaming) {
+  const expected = Array.from({ length: HISTORY_TURNS }, (_, index) => {
+    const turn = historyTurn(index)
+    return [['user', turn.message], ['assistant', turn.answer]]
+  }).flat()
+  if (includeStreaming) expected.push(['user', STREAM_MESSAGE], ['assistant', STREAM_ANSWER])
+  if (!Array.isArray(messages) || messages.length < expected.length
+    || messages.length > (HISTORY_TURNS + 1) * 2) return null
+  const ids = new Map()
+  for (const [index, [role, content]] of expected.entries()) {
+    const matches = messages.filter(message => message?.role === role
+      && typeof message.text === 'string' && message.text.includes(content))
+    if (matches.length !== 1) return null
+    const id = matches[0].message_id ?? matches[0].id
+    if (typeof id !== 'string' || !id.trim() || [...ids.values()].includes(id)) return null
+    ids.set(index, id)
+  }
+  return ids
 }
 
 // Only fixed classifications and numeric counters leave this passive observer.
@@ -257,6 +289,17 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
       summary.targetHistoryMaxWireBytes = Math.max(summary.targetHistoryMaxWireBytes || 0, Buffer.byteLength(payload))
       summary.targetHistoryMaxMessages = Math.max(summary.targetHistoryMaxMessages || 0,
         Array.isArray(frame.payload?.messages) ? frame.payload.messages.length : 0)
+      if (readProbe.historyPhase === 'capture' || readProbe.historyPhase === 'verify') {
+        const ids = syntheticHistoryIds(frame.payload?.messages, readProbe.historyPhase === 'verify')
+        if (ids) {
+          // IDs stay in the private probe; reports contain only counts and booleans.
+          if (readProbe.historyPhase === 'capture' && !readProbe.historyIds) readProbe.historyIds = ids
+          if (readProbe.historyIds && [...readProbe.historyIds].every(([index, id]) => ids.get(index) === id)) {
+            const key = readProbe.historyPhase === 'capture' ? 'targetSyntheticHistoryCaptured' : 'targetSyntheticHistoryVerified'
+            summary[key] = (summary[key] || 0) + 1
+          }
+        }
+      }
     }
     if (currentProbe && request.targetResume && ok) {
       summary.targetResumeCompleted = (summary.targetResumeCompleted || 0) + 1
@@ -687,15 +730,18 @@ async function run(options) {
       readProbe.key = historicalKey
       readProbe.armed = true
       readProbe.revision++
+      readProbe.historyPhase = 'capture'
+      readProbe.historyIds = null
       await historyRows.nth(historyIndex).locator('.sidebar-history-item').click()
-      await until(async () => report.sockets.some(socket => socket.targetMultiSegmentCompleted > 0 && socket.targetResumeCompleted > 0)
+      await until(async () => report.sockets.some(socket => socket.targetMultiSegmentCompleted > 0 && socket.targetResumeCompleted > 0
+        && socket.targetSyntheticHistoryCaptured > 0)
         && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(STREAM_ANSWER)), 'long history recovery', 60_000)
       await page.locator('.chat-stop-btn').waitFor({ state: 'visible', timeout: 15_000 })
       report.longHistory.multiSegmentActiveSnapshotBeforeRestart = true
       report.longHistory.maxSnapshotSegments = Math.max(...report.sockets.map(socket => socket.targetReadMaxSegments || 0))
-      const historyReadsBeforeRestart = report.sockets.reduce((sum, socket) => sum + (socket.targetHistoryCompleted || 0), 0)
       const socketCountBeforeRestart = report.sockets.length
       readProbe.revision++ // Pre-restart in-flight replies cannot satisfy recovery.
+      readProbe.historyPhase = 'verify'
       mark('restart-during-provider-stream')
       await beginRuntimeRestart()
       await until(async () => await gatewayShutdownCount() === 1, 'Gateway shutdown request', 20_000)
@@ -705,19 +751,20 @@ async function run(options) {
       streamResponse.finish()
       assert.equal(streamEnded, true, 'Stream must finish only after shutdown was observed')
       await finishRuntimeRestart(before, sentinel)
-      await until(async () => report.sockets.reduce((sum, socket) => sum + (socket.targetHistoryCompleted || 0), 0) > historyReadsBeforeRestart
-        && report.sockets.slice(socketCountBeforeRestart).some(socket => socket.targetHistoryCompleted > 0 && socket.targetResumeCompleted > 0)
+      await until(async () => report.sockets.slice(socketCountBeforeRestart)
+        .some(socket => socket.targetSyntheticHistoryVerified > 0 && socket.targetResumeCompleted > 0)
         && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(STREAM_ANSWER)), 'long history recovery', 60_000)
       assert.equal(new URL(page.url()).searchParams.get('session'), historicalKey, 'Long history recovery must use the original session')
-      assert.ok(report.longHistory.maxSnapshotSegments > 1, 'Long history must require multiple snapshot segments')
       assert.equal(chats, HISTORY_TURNS + 1, 'Exactly one provider request for each submitted UI turn')
       report.longHistory.recoveredAfterRestart = true
       report.longHistory.recoveredHistoryWireBytes = Math.max(...report.sockets.slice(socketCountBeforeRestart).map(socket => socket.targetHistoryMaxWireBytes || 0))
       report.longHistory.recoveredHistoryMessages = Math.max(...report.sockets.slice(socketCountBeforeRestart).map(socket => socket.targetHistoryMaxMessages || 0))
-      assert.ok(report.longHistory.recoveredHistoryWireBytes >= HISTORY_TURNS * HISTORY_ANSWER_BYTES,
-        'Long history recovery must use the original session')
+      report.longHistory.preservedHistoricalMessages = HISTORY_TURNS * 2
+      report.longHistory.messageIdsPreserved = true
       readProbe.armed = false
       readProbe.revision++
+      readProbe.historyPhase = null
+      readProbe.historyIds = null
       mark('long-history-streaming-recovered')
     } else {
       const before = await ready()
@@ -840,6 +887,8 @@ async function run(options) {
       report.cleanup.everySpawnIdentified = spawned.length === records.size && spawned.every(spawn =>
         [...records.values()].some(record => record.pid === spawn.pid && record.port === spawn.port))
       assert.ok(report.cleanup.everySpawnIdentified, 'A child missed by ownership observation leaves cleanup unproven')
+      assert.ok(hasNaturalGatewayExits(log, [...records.values()].map(record => record.pid)),
+        'Every owned Gateway must exit naturally')
       if (checkpoint) assert.deepEqual(shutdown.desktopShutdownEvidenceSince(checkpoint,
         log),
       { gatewayExitLogged: true, committedExitLogged: true })
@@ -858,7 +907,7 @@ async function run(options) {
     report.observationFailed = monitorError
     report.conversationFailures = report.sockets.reduce((sum, socket) => sum + (socket.conversationFailures || 0), 0)
     try {
-      report.gatewayFlowFailures = gatewayFlowFailureEvidence(await readFile(join(userData, 'logs', 'gateway.log'), 'utf8'))
+      report.gatewayFlowFailures = gatewayFlowFailureEvidence(await readFile(join(userData, 'logs', 'gateway.log'), 'utf8'), records.size)
     } catch { failure = true; report.gatewayFlowFailures = { available: false } }
     report.ok = !failure && !monitorError && pageErrors === 0 && report.conversationFailures === 0 && chats === expectedChats && report.cleanup.verified
       && hasCleanGatewayFlowEvidence(report.gatewayFlowFailures)

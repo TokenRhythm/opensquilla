@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
-import { HISTORY_ANSWER_BYTES, HISTORY_TURNS, gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, historyTurn, inside, isolatedEnvironment,
+import { HISTORY_ANSWER_BYTES, HISTORY_TURNS, gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, hasNaturalGatewayExits, historyTurn, inside, isolatedEnvironment,
   observeFrame, onboardingSaveEvidence, parseArguments, runtimeRestartControl, safeFailureReason, syntheticConfig } from './test-packaged-gateway-reliability.mjs'
 
 const script = fileURLToPath(new URL('./test-packaged-gateway-reliability.mjs', import.meta.url))
@@ -90,7 +90,7 @@ test('Gateway flow evidence preserves only closed reason classifications, never 
 })
 
 test('clean flow acceptance rejects a recovered error and unavailable evidence', () => {
-  const healthy = 'prefix logger: {"event":"gateway.ready"}\n'
+  const healthy = 'prefix logger: {"event":"gateway.started"}\nprefix logger: {"event":"gateway.stopped"}\n'
   assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(healthy)), true)
   for (const reason of ['snapshot_delivery_missing', 'control_buffer_limit', 'PRIVATE']) {
     const error = 'prefix logger: ' + JSON.stringify({ event: 'gateway.ws_flow_encode_or_budget_failed', reason_code: reason })
@@ -100,6 +100,31 @@ test('clean flow acceptance rejects a recovered error and unavailable evidence',
   for (const unavailable of [undefined, null, {}, { available: false, failures: 0 }, { available: true }]) {
     assert.equal(hasCleanGatewayFlowEvidence(unavailable), false)
   }
+  for (const incomplete of ['', 'unparseable gateway.ws_flow_encode_or_budget_failed',
+    '{"event":"unrelated"}', '{"event":"gateway.started"}', '{"event":"gateway.stopped"}']) {
+    assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(incomplete)), false)
+  }
+  assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(healthy, 2)), false,
+    'a log covering only the replacement cannot prove both Gateway lifecycles')
+  assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(healthy.repeat(2), 2)), true)
+  assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(healthy, 0)), false)
+})
+
+test('final clean quit cannot hide an abnormal, missing or duplicate earlier Gateway exit', () => {
+  const first = { event: 'gateway_exited', pid: 101, code: 0, signal: null, abnormalExit: false }
+  const final = { ...first, pid: 202 }
+  const log = events => events.concat([
+    { event: 'quit_gateway_exit', exited: true, hardTerminated: false },
+    { event: 'desktop_exit_phase', to: 'committed', reason: 'all lifecycle-owned Gateways exited' },
+  ]).map(event => JSON.stringify(event)).join('\n')
+  assert.equal(hasNaturalGatewayExits(log([first, final]), [101, 202]), true)
+  for (const exits of [
+    [{ ...first, code: 1, abnormalExit: true }, final],
+    [{ ...first, code: null, signal: 'SIGKILL', abnormalExit: true }, final],
+    [final], [first, first], [first, final, { ...first, pid: 303 }],
+  ]) assert.equal(hasNaturalGatewayExits(log(exits), [101, 202]), false)
+  assert.equal(hasNaturalGatewayExits(log([]), []), false)
+  assert.equal(hasNaturalGatewayExits(log([first, first]), [101, 101]), false)
 })
 
 test('long history fixture is bounded and contains distinct real UI turn markers', () => {
@@ -246,6 +271,61 @@ test('unrelated or failed large snapshots cannot prove multi-segment target reco
   }
   assert.equal(summary.targetReadMaxSegments, undefined)
   assert.equal(summary.targetReadCompleted, undefined)
+})
+
+test('long-history acceptance checks complete retained content and stable message IDs, not response size', () => {
+  const retained = Array.from({ length: HISTORY_TURNS }, (_, index) => [
+    { message_id: `PRIVATE-user-${index}`, role: 'user', text: `Synthetic retained history request ${index + 1}.` },
+    { message_id: `PRIVATE-assistant-${index}`, role: 'assistant', text: historyTurn(index).answer },
+  ]).flat()
+  const complete = [...retained,
+    { message_id: 'PRIVATE-stream-user', role: 'user', text: 'Synthetic request that crosses Gateway restart.' },
+    { message_id: 'PRIVATE-stream-assistant', role: 'assistant', text: 'Synthetic response started before Gateway restart.' },
+  ]
+  const probe = { key: 'PRIVATE-session', armed: true, revision: 1, historyPhase: 'capture' }
+  const summary = { methods: {}, requestedCaps: [] }
+  let sequence = 0
+  const request = (key = probe.key) => {
+    const id = String(++sequence)
+    observeFrame(summary, 'sent', JSON.stringify({ type: 'req', id, method: 'chat.history', params: { sessionKey: key } }), tmpdir(), probe)
+    return id
+  }
+  const response = (id, messages, ok = true) => observeFrame(summary, 'received',
+    JSON.stringify({ type: 'res', id, ok, payload: { messages } }), tmpdir(), probe)
+  response(request(), retained)
+  assert.equal(summary.targetSyntheticHistoryCaptured, 1)
+  const earlier = request()
+  probe.historyPhase = 'verify'; probe.revision++
+  response(earlier, complete) // A pre-restart request cannot establish preservation.
+  response(request('other-session'), complete)
+  response(request(), complete, false)
+  assert.equal(summary.targetSyntheticHistoryVerified, undefined)
+
+  const oversized = [{ ...complete.at(-1), text: complete.at(-1).text + 'x'.repeat(HISTORY_TURNS * HISTORY_ANSWER_BYTES) }]
+  response(request(), oversized)
+  assert.ok(summary.targetHistoryMaxWireBytes >= HISTORY_TURNS * HISTORY_ANSWER_BYTES,
+    'the old byte-only assertion would pass this one-message response')
+  for (const broken of [
+    complete.slice(1),
+    complete.map((message, index) => index < HISTORY_TURNS * 2
+      ? { ...message, text: message.text.split('\n')[0] } : message),
+    complete.map((message, index) => index === 0 ? { ...message, text: 'missing historical marker' } : message),
+    complete.map((message, index) => index === 0 ? { ...message, message_id: 'changed-id' } : message),
+    complete.map((message, index) => index === 0 ? { ...message, message_id: complete[1].message_id } : message),
+    complete.map((message, index) => index === 0 ? { ...message, message_id: '' } : message),
+    [...complete, complete[0]],
+  ]) response(request(), broken)
+  assert.equal(summary.targetSyntheticHistoryVerified, undefined)
+  response(request(), complete)
+  assert.equal(summary.targetSyntheticHistoryVerified, 1)
+  assert.equal(JSON.stringify(summary).includes('PRIVATE'), false)
+  assert.equal(JSON.stringify(summary).includes('Synthetic retained history'), false)
+
+  const uncaptured = { key: probe.key, armed: true, revision: 1, historyPhase: 'verify' }
+  const noBaseline = { methods: {}, requestedCaps: [] }
+  observeFrame(noBaseline, 'sent', JSON.stringify({ type: 'req', id: 'no-baseline', method: 'chat.history', params: { sessionKey: probe.key } }), tmpdir(), uncaptured)
+  observeFrame(noBaseline, 'received', JSON.stringify({ type: 'res', id: 'no-baseline', ok: true, payload: { messages: complete } }), tmpdir(), uncaptured)
+  assert.equal(noBaseline.targetSyntheticHistoryVerified, undefined)
 })
 
 test('no-argument CLI fails without creating evidence or importing a packaged runtime', () => {

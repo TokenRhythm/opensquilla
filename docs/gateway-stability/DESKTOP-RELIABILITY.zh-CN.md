@@ -4,7 +4,7 @@
 
 ## 隔离原生场景
 
-使用与源码匹配的 Windows 解包目录，先完成 `verify:prepared` 和 `verify:package`。以下命令从仓库根目录执行；`--workdir` 必须是尚不存在的绝对路径，每次运行使用新目录，报告也写入新文件。
+使用与源码匹配的 Windows 解包目录，先完成 `verify:prepared` 和 `verify:package`。以下命令从仓库根目录执行；相对路径会按当前目录解析，`--workdir` 必须尚不存在，每次运行使用新目录，报告也写入新文件。
 
 ```powershell
 node desktop/electron/scripts/test-packaged-gateway-reliability.mjs `
