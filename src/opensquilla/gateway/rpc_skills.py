@@ -890,6 +890,7 @@ async def _handle_skills_candidates(params: dict | None, ctx: RpcContext) -> dic
     snapshot = await _catalog_snapshot(loader, reason="rpc.skills.candidates")
     eligibility = _eligibility_context(ctx)
     eligibility.passive_managed_bins = True
+    from opensquilla.browser import get_desktop_browser
     from opensquilla.session.keys import parse_agent_id
     from opensquilla.tools.policy_helpers import apply_tool_policy_from_config
     from opensquilla.tools.policy_runtime import (
@@ -900,15 +901,16 @@ async def _handle_skills_candidates(params: dict | None, ctx: RpcContext) -> dic
     from opensquilla.tools.visibility import is_tool_visible, profile_allows_tool, resolve_profile
 
     registry = getattr(ctx, "tool_registry", None)
+    session_key = (params or {}).get("sessionKey", "")
     registered = set(registry.list_names()) if registry is not None else set()
     policy = apply_tool_policy_from_config(
         ToolContext(
             is_owner=ctx.principal.is_owner,
             caller_kind=CallerKind.WEB,
-            agent_id=parse_agent_id((params or {}).get("sessionKey", "")),
-            session_key=(params or {}).get("sessionKey"),
-
+            agent_id=parse_agent_id(session_key),
+            session_key=session_key,
             surfaced_tools={"skill_list", "skill_view"},
+            desktop_browser=get_desktop_browser() if ctx.principal.is_owner else None,
         ),
         available_tools=list(registered),
         config=getattr(ctx, "config", None),

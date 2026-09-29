@@ -213,6 +213,8 @@
     "title": "Área de trabajo",
     "expand": "Abrir área de trabajo",
     "collapse": "Contraer área de trabajo",
+    "maximize": "Maximizar espacio de trabajo",
+    "restore": "Restaurar espacio de trabajo",
     "close": "Cerrar área de trabajo",
     "closeItem": "Cerrar pestaña",
     "refresh": "Actualizar",
@@ -230,6 +232,11 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Este HTML no es UTF-8 válido y no se puede previsualizar ni editar de forma segura.", "htmlValidationFailed": "No se pudo validar este HTML para una vista previa o edición seguras.", "htmlEditTooLarge": "Este HTML es demasiado grande para editarlo en la aplicación. Aún puedes descargarlo.", "htmlPreviewTooLarge": "Este HTML es demasiado grande para previsualizarlo de forma segura. Aún puedes descargarlo.", "officeAdapterNotAvailable": "La edición de Office aún no está disponible.", "unsupported": "Esta acción no está disponible para este recurso." }
     },
     "browser": {
+      "newTab": "Nueva pestaña",
+      "startHint": "Abre una página web junto a esta tarea.",
+      "addressPlaceholder": "Introduce una URL, p. ej. example.com",
+      "invalidAddress": "Introduce una dirección HTTP o HTTPS válida.",
+      "reopen": "Reabrir pestaña cerrada",
       "back": "Atrás",
       "forward": "Adelante",
       "stop": "Detener carga",
@@ -3348,6 +3355,7 @@
       "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
       "disabled": "Disabled · Manage",
       "needsSetup": "Needs setup · Manage",
+      "toolsUnavailable": "Herramientas necesarias no disponibles",
       "manualOnly": "Manual use only",
       "thisMessage": "This message",
       "remove": "Remove {name} from this message",
@@ -4068,6 +4076,8 @@
     "composer": {
       "workStyleGroup": "Forma de trabajo",
       "contentGroup": "Contenido",
+      "browserUse": "Browser Use",
+      "browserUseDescription": "Completar una tarea en el navegador",
       "executionMode": "Modo de ejecución",
       "ownerOnlyUnavailable": "El modo solo para el propietario no está disponible para esta sesión del navegador.",
       "enabled": "Activado",

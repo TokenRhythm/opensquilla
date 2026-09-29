@@ -128,7 +128,7 @@
       <div v-if="selectedSkills.length" class="chat-selected-skills" data-testid="selected-skills">
         <span class="chat-selected-skills__label">{{ t('chat.skillPalette.thisMessage') }}</span>
         <span v-for="skill in selectedSkills" :key="skill.instanceId" class="attachment-chip">
-          <span class="attachment-chip__name">{{ skill.name }}</span>
+          <span class="attachment-chip__name">/{{ skill.name }}</span>
           <button type="button" class="attachment-action attachment-remove" :aria-label="t('chat.skillPalette.remove', { name: skill.name })" @click="emit('removeSkill', skill.instanceId)">
             <Icon name="x" :size="12" />
           </button>
@@ -197,6 +197,7 @@
                 v-if="addMenuOpen"
                 :avoid-element="addMenuAvoidElement"
                 :attachments-disabled="replanActive"
+                :browser-use-available="browserUseAvailable === true"
                 :goal-mode-active="goalDraftArmed"
                 :goal-mode-available="goalModeAvailable === true"
                 :goal-mode-busy="goalModeBusy === true"
@@ -207,6 +208,7 @@
                 @activate-goal-mode="emit('armGoal')"
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
+                @select-browser-use="emit('selectBrowserUse')"
                 @close="addMenuOpen = false"
               />
             </div>
@@ -577,6 +579,7 @@ const props = withDefaults(defineProps<{
   modelProviderErrors?: readonly ProviderListError[]
   modelSelectionDisabledReason?: 'routing' | 'busy' | 'unavailable' | null
   addMenuAvoidElement?: HTMLElement | null
+  browserUseAvailable?: boolean
   goalDraftArmed?: boolean
   goalModeAvailable?: boolean
   goalModeBusy?: boolean
@@ -637,6 +640,8 @@ const emit = defineEmits<{
   openModelSettings: []
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
+  selectBrowserUse: []
+  openAddMenu: []
   disarmGoal: []
   cancelReplan: []
   voiceInput: []
@@ -931,6 +936,7 @@ function toggleMoreActions() {
 function toggleAddMenu() {
   addMenuOpen.value = !addMenuOpen.value
   if (addMenuOpen.value) {
+    emit('openAddMenu')
     moreActionsOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false

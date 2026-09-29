@@ -24,6 +24,18 @@ describe('workbench layout', () => {
     expect(workbenchDynamicMax(960)).toBe(480)
   })
 
+  it('fills the workspace when maximized while retaining the mobile dialog behavior', () => {
+    expect(workbenchLayoutMode({ availableWidth: 1280, maximized: true })).toBe('maximized')
+    expect(workbenchLayoutMode({ availableWidth: 900, maximized: true })).toBe('maximized')
+    expect(workbenchLayoutMode({ availableWidth: 720, maximized: true })).toBe('mobile-dialog')
+    expect(workbenchLayoutMode({ availableWidth: 1280, coarseOnly: true, maximized: true }))
+      .toBe('mobile-dialog')
+    const preference = { version: 1 as const, width: 614, source: 'user' as const }
+    expect(workbenchEffectiveWidth(preference, 'maximized', 1280)).toBe(1280)
+    expect(workbenchEffectiveWidth(preference, 'split', 1280)).toBe(614)
+    expect(workbenchEffectiveWidth(preference, 'maximized', Number.NaN)).toBe(0)
+  })
+
   it('does not overwrite the desktop preference when resolving narrow modes', () => {
     const preference = { version: 1 as const, width: 600, source: 'user' as const }
     expect(workbenchEffectiveWidth(preference, 'split', 1080)).toBe(600)

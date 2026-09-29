@@ -249,6 +249,146 @@ async def test_malformed_optional_mcp_schema_fields_degrade_to_empty_schema(
 
 
 @pytest.mark.asyncio
+async def test_mcp_root_schema_survives_registration_and_provider_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.mcp import discovery
+    from opensquilla.provider.anthropic import _build_tool_payload
+    from opensquilla.provider.ollama import _build_ollama_tool
+    from opensquilla.provider.openai import _build_openai_tool
+    from opensquilla.provider.openai_codex import _codex_tool
+    from opensquilla.provider.openai_responses import _responses_tool
+    from opensquilla.tools.types import CallerKind, ToolContext
+
+    config = MCPServerConfig(name="schema", transport="stdio", command="mock-mcp")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "minLength": 2},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+        },
+        "required": ["query"],
+        "additionalProperties": False,
+        "oneOf": [
+            {"required": ["query"]},
+            {"required": ["limit"]},
+        ],
+        "$defs": {"label": {"type": "string"}},
+    }
+    client = FakeMCPClient(
+        config,
+        tools=[MCPToolDef(name="lookup", description="Lookup", input_schema=input_schema)],
+    )
+    monkeypatch.setattr(discovery, "create_client", lambda _config: client)
+    registry = ToolRegistry()
+    await discovery.discover_and_register(config, registry)
+    registered = registry.get("mcp__schema__lookup")
+    assert registered is not None
+    assert registered.spec.input_schema == input_schema
+    assert registered.spec.parameters == input_schema["properties"]
+    assert registered.spec.required == ["query"]
+    input_schema["properties"]["query"]["minLength"] = 99
+
+    definition = next(
+        tool for tool in registry.to_tool_definitions(
+            ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
+        ) if tool.name == "mcp__schema__lookup"
+    )
+    expected = {**input_schema, "properties": {
+        **input_schema["properties"], "query": {"type": "string", "minLength": 2},
+    }}
+    assert definition.input_schema.model_dump(exclude_none=True, by_alias=True) == expected
+    assert _build_openai_tool(definition)["function"]["parameters"] == expected
+    assert _responses_tool(definition)["parameters"] == expected
+    assert _codex_tool(definition)["parameters"] == expected
+    assert _build_tool_payload(definition)["input_schema"] == expected
+    assert _build_ollama_tool(definition)["function"]["parameters"] == expected
+
+
+@pytest.mark.asyncio
+async def test_browser_batch_action_schema_survives_provider_projection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.mcp import discovery
+    from opensquilla.provider.anthropic import _build_tool_payload
+    from opensquilla.provider.ollama import _build_ollama_tool
+    from opensquilla.provider.openai import _build_openai_tool
+    from opensquilla.provider.openai_codex import _codex_tool
+    from opensquilla.provider.openai_responses import _responses_tool
+    from opensquilla.tools.types import CallerKind, ToolContext
+
+    config = MCPServerConfig(name="desktop-browser", transport="stdio", command="mock-mcp")
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "targetRef": {"type": "string"},
+            "actions": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 3,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["click", "fill", "scroll"]},
+                        "ref": {"type": "string"},
+                        "text": {"type": "string"},
+                        "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["targetRef", "actions"],
+        "additionalProperties": False,
+    }
+    client = FakeMCPClient(
+        config,
+        tools=[
+            MCPToolDef(name="browser_batch", description="Batch actions", input_schema=input_schema)
+        ],
+    )
+    monkeypatch.setattr(discovery, "create_client", lambda _config: client)
+    registry = ToolRegistry()
+
+    await discovery.discover_and_register(config, registry)
+    registered = registry.get("mcp__desktop-browser__browser_batch")
+    assert registered is not None
+    assert registered.spec.input_schema == input_schema
+    definition = next(
+        tool for tool in registry.to_tool_definitions(
+            ToolContext(is_owner=True, caller_kind=CallerKind.AGENT)
+        ) if tool.name == "mcp__desktop-browser__browser_batch"
+    )
+    assert definition.input_schema.model_dump(exclude_none=True, by_alias=True) == input_schema
+    assert _build_openai_tool(definition)["function"]["parameters"] == input_schema
+    assert _responses_tool(definition)["parameters"] == input_schema
+    assert _codex_tool(definition)["parameters"] == input_schema
+    assert _build_tool_payload(definition)["input_schema"] == input_schema
+    assert _build_ollama_tool(definition)["function"]["parameters"] == input_schema
+
+
+@pytest.mark.asyncio
+async def test_mcp_non_object_root_schema_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.mcp import discovery
+
+    config = MCPServerConfig(name="invalid", transport="stdio", command="mock-mcp")
+    client = FakeMCPClient(
+        config,
+        tools=[MCPToolDef(name="lookup", description="Lookup", input_schema={"type": "array"})],
+    )
+    monkeypatch.setattr(discovery, "create_client", lambda _config: client)
+    registry = ToolRegistry()
+
+    with pytest.raises(ValueError, match="inputSchema type must be object"):
+        await discovery.discover_and_register(config, registry)
+    assert client.closed is True
+    assert registry.get("mcp__invalid__lookup") is None
+
+
+@pytest.mark.asyncio
 async def test_registered_handler_surfaces_client_error_flag(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

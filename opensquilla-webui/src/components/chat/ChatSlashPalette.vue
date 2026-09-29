@@ -49,6 +49,7 @@ function groupSize(start: number): number {
 function status(command: ChatSlashCommand): string {
   const skill = command.skill
   if (skill?.disabled) return t('chat.skillPalette.disabled')
+  if (skill?.reasonCode === 'tools_unavailable') return t('chat.skillPalette.toolsUnavailable')
   if (skill && !skill.ready) return t('chat.skillPalette.needsSetup')
   if (skill?.manualOnly) return t('chat.skillPalette.manualOnly')
   return ''

@@ -302,10 +302,20 @@
             </button>
           </div>
         </div>
+        <WorkbenchToggle
+          v-if="platform.capabilities.hasNativeWorkbenchSurfaces"
+          :enabled="appStore.features.artifactWorkbench === true && isChatRoute"
+          allow-empty
+          :session-id="workbenchSessionKey"
+          :blocked="workbenchModalBlocked"
+        />
       </div>
     </header>
     <div class="app-workspace">
       <main
+        v-show="!workbenchMaximized"
+        :inert="workbenchMaximized || undefined"
+        :aria-hidden="workbenchMaximized ? 'true' : undefined"
         class="content"
         :class="{ 'content--chat': isChatRoute }"
         id="content"
@@ -342,7 +352,7 @@
         )"
         :prompt-annotations-enabled="appStore.features.artifactPromptAnnotations === true"
         :route-active="isChatRoute"
-        :session-id="currentSessionKey"
+        :session-id="workbenchSessionKey"
         :modal-blocked="workbenchModalBlocked"
       />
       <ArtifactImageLightbox />
@@ -478,6 +488,8 @@ import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
+import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
+import { useWorkbenchStore } from './workbench/store'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
@@ -535,6 +547,7 @@ import {
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
+const workbenchStore = useWorkbenchStore()
 const platform = getPlatform()
 const injectedGatewayAccess = inject(GATEWAY_ACCESS_KEY)
 if (!injectedGatewayAccess) throw new Error('GatewayAccess was not provided')
@@ -570,6 +583,9 @@ const { backgroundRoute: settingsBackgroundRoute, contentRoute: settingsContentR
 // controls render on chat and non-chat routes, so route-scoped coordination
 // would allow sibling menus such as Language and Theme to overlap.
 const isChatRoute = computed(() => settingsContentRoute.value.path === '/chat' || settingsContentRoute.value.path === '/chat/new')
+const workbenchMaximized = computed(() => isChatRoute.value
+  && appStore.features.artifactWorkbench === true
+  && workbenchStore.expanded && workbenchStore.maximized)
 const topbarPopoverCoordinationEnabled = ref(true)
 const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
   topbarPopoverCoordinationEnabled,
@@ -838,6 +854,11 @@ useDocumentEvent('click', (e) => {
 const currentSessionKey = computed(() => {
   return ($route.query.session as string) || ''
 })
+// The draft already has the key that its first turn will use. Keep manually
+// opened browser pages on that identity before the URL gains a session query.
+const workbenchSessionKey = computed(() =>
+  currentSessionKey.value || chatRouteHeader.model.sessionKey.value,
+)
 const sessionTaskAttention = useSessionTaskAttention()
 
 function currentSessionIsVisible(): boolean {

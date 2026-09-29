@@ -148,6 +148,11 @@ APPROVED_PACKAGE_IMPORTS: frozenset[tuple[str, str]] = frozenset({
     ("git_runtime.py", "sandbox"),
     ("identity", "safety"),
     ("identity", "session"),
+    # MCP image results share the canonical attachment limits and byte validator.
+    # Contracts is a leaf; tool visibility and sandbox policy remain in tools.
+    ("mcp", "contracts"),
+    # MCP redacts long tool errors before storing them for later retrieval.
+    ("mcp", "safety"),
     ("mcp", "tools"),
     ("memory", "agents"),
     ("memory", "compat"),

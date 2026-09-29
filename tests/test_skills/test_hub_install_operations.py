@@ -130,7 +130,13 @@ async def test_postflight_settlement_preserves_result_and_recovery_state(
     waiter = asyncio.create_task(operations.run("owner", operation_id, request, install))
     cancellation = None
     try:
-        await asyncio.wait_for(entered.wait(), timeout=5)
+        # The postflight hook runs through a worker thread.  Windows shard
+        # load can delay its first scheduling turn; keep this entry watchdog
+        # bounded but separate from the shorter POSIX test budget.
+        await asyncio.wait_for(
+            entered.wait(),
+            timeout=30 if sys.platform == "win32" else 5,
+        )
         assert (managed / "demo" / "SKILL.md").exists()
         assert operations.store.read("owner", operation_id)["state"] == "running"
         if cancelled:

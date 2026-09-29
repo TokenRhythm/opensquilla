@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 import httpx
+import pytest
 
 from opensquilla.provider.ollama import _OLLAMA_DEFAULT_NUM_CTX, OllamaProvider
 from opensquilla.provider.selector import ProviderConfig, _build_provider
@@ -273,15 +274,19 @@ def test_stream_emits_text_and_done_with_usage(monkeypatch: Any) -> None:
     assert done.output_tokens == 2
 
 
-def test_stream_tool_call_emits_tool_events(monkeypatch: Any) -> None:
+@pytest.mark.parametrize("native_id", [None, "native-call-id"])
+def test_stream_tool_call_emits_tool_events(monkeypatch: Any, native_id: str | None) -> None:
     captured: dict[str, Any] = {}
+    tool_call: dict[str, Any] = {"function": {"name": "lookup", "arguments": {"q": "hi"}}}
+    if native_id is not None:
+        tool_call["id"] = native_id
     body = _ndjson(
         {
             "model": "llama3",
             "message": {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"function": {"name": "lookup", "arguments": {"q": "hi"}}}],
+                "tool_calls": [tool_call],
             },
         },
         {
@@ -306,6 +311,53 @@ def test_stream_tool_call_emits_tool_events(monkeypatch: Any) -> None:
     assert tool_end.tool_name == "lookup"
     assert tool_end.arguments == {"q": "hi"}
     assert captured["payload"]["tools"][0]["function"]["name"] == "lookup"
+    lifecycle = [
+        e for e in events if isinstance(e, ToolUseStartEvent | ToolUseDeltaEvent | ToolUseEndEvent)
+    ]
+    assert [type(e) for e in lifecycle] == [ToolUseStartEvent, ToolUseDeltaEvent, ToolUseEndEvent]
+    assert all(e.tool_use_id == tool_end.tool_use_id for e in lifecycle)
+    if native_id is not None:
+        assert tool_end.tool_use_id == native_id
+
+
+def test_synthetic_tool_ids_are_unique_within_and_across_responses(monkeypatch: Any) -> None:
+    captured: dict[str, Any] = {}
+    body = _ndjson(
+        {
+            "message": {
+                "role": "assistant",
+                "tool_calls": [
+                    {"function": {"name": name, "arguments": {}}}
+                    for name in ("lookup", "fetch")
+                ],
+            },
+            "done": True,
+        },
+    )
+    _patch_stream(monkeypatch, captured, body)
+    provider = OllamaProvider(model="llama3")
+    messages = [Message(role="user", content="look it up")]
+    call_ids = []
+    for _ in range(2):
+        events = _collect(provider, messages)
+        ends = [e for e in events if isinstance(e, ToolUseEndEvent)]
+        assert len(ends) == 2
+        call_ids.extend(e.tool_use_id for e in ends)
+        messages.extend([
+            Message(role="assistant", content=[
+                ContentBlockToolUse(id=e.tool_use_id, name=e.tool_name, input=e.arguments)
+                for e in ends
+            ]),
+            Message(role="user", content=[
+                ContentBlockToolResult(tool_use_id=e.tool_use_id, content="ok") for e in ends
+            ]),
+        ])
+
+    assert len(set(call_ids)) == 4
+    # Synthesized IDs still correlate replayed results with their tool names.
+    assert [m["tool_name"] for m in captured["payload"]["messages"] if m["role"] == "tool"] == [
+        "lookup", "fetch",
+    ]
 
 
 def test_stream_candidate_mode_demotes_oversized_tool_name(monkeypatch: Any) -> None:

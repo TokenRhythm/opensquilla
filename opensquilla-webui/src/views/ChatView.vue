@@ -660,6 +660,7 @@
       :goal-mode-busy="goalBusy || planModeBusy || replanActive"
       :goal-mode-existing="goalComposerExisting"
       :add-menu-avoid-element="goalRunDockRef"
+      :browser-use-available="browserUseAvailable"
       :voice-busy="voiceBusy"
       :voice-recording="voiceRecording"
       :voice-ready="voiceReady"
@@ -702,6 +703,8 @@
       @open-model-settings="openComposerModelSettings"
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
+      @select-browser-use="void selectBrowserUse()"
+      @open-add-menu="prepareAddMenu"
       @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -810,6 +813,7 @@ import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnota
 import { useWorkbenchResourcesStore } from '@/stores/workbenchResources'
 import { useWorkbenchStore } from '@/workbench/store'
 import { usePlatform } from '@/platform'
+import { useBrowserAutomationState } from '@/composables/chat/useBrowserAutomationState'
 import {
   focusArtifactPromptAnnotation,
   notifyPageAnnotationsSent,
@@ -1497,6 +1501,15 @@ const promptCacheKeepaliveAvailable = computed(() => (
   promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
+const browserUseSupported = computed(() => workbenchEnabled.value && !shareMode.value
+  && platform.capabilities.hasNativeWorkbenchSurfaces === true
+  && Boolean(platform.workbench.native)
+  && gatewayConnectionState.value === 'connected'
+  && Boolean(skillCatalog?.supportsCandidates()))
+let browserUseSelectionSequence = 0
+const browserUseSelection = ref<{ sessionKey: string; requestId: number } | null>(null)
+const browserUseSelectionPending = computed(() => browserUseSelection.value?.sessionKey === sessionKey.value)
+
 const promptAnnotationDesktopAvailable = computed(() => (
   workbenchEnabled.value
   && promptAnnotationsEnabled.value
@@ -1873,6 +1886,16 @@ const {
   ensureInterruptBubble,
   completeReasoningPresentation,
 } = chatStream
+useBrowserAutomationState({
+  native: platform.workbench.native,
+  sessionKey,
+  connected: computed(() => gatewayAccess.isAvailable
+    && gatewayAccess.isAuthenticated && gatewayAccess.isLocalOwner),
+  isStreaming,
+  runStatus,
+  activeStreamTaskId,
+  activeStreamSessionKey,
+})
 watch(
   () => gatewayAccess.isAvailable,
   available => setStreamConnectionAvailable(available),
@@ -3407,11 +3430,13 @@ const chatSlashCommands = useChatSlashCommands({
 const {
   slashOpen,
   slashIdx,
+  skillCandidates,
   skillsLoading,
   skillsError,
   invalidateSkillCandidates,
   filteredSlashCmds,
   loadSlashCommands,
+  loadSkillCandidates,
   handleSlashInput,
   closeSlashMenu,
   completeSlashCmd,
@@ -3419,6 +3444,34 @@ const {
   classifySlashCommand,
   executeSlashCommand,
 } = chatSlashCommands
+
+const browserUseAvailable = computed(() => browserUseSupported.value
+  && skillCandidates.value.some(candidate => candidate.name === 'browser-use' && candidate.ready))
+
+function prepareAddMenu() {
+  if (!browserUseSupported.value) return
+  invalidateSkillCandidates()
+  void loadSkillCandidates()
+}
+
+async function selectBrowserUse() {
+  if (!browserUseAvailable.value || browserUseSelectionPending.value) return
+  const requestId = ++browserUseSelectionSequence
+  const originSessionKey = sessionKey.value
+  browserUseSelection.value = { sessionKey: originSessionKey, requestId }
+  try {
+    if (await chatSlashCommands.selectSkillByName('browser-use')
+      && sessionKey.value === originSessionKey) {
+      await nextTick()
+      composerRef.value?.focusTextarea()
+    }
+  } finally {
+    if (browserUseSelection.value?.requestId === requestId) browserUseSelection.value = null
+  }
+}
+watch(sessionKey, current => {
+  if (browserUseSelection.value?.sessionKey !== current) browserUseSelection.value = null
+})
 watch([sessionKey, gatewayConnectionState, () => activeWorkspace.value?.id], invalidateSkillCandidates)
 
 watch([slashIdx, filteredSlashCmds], () => {
@@ -3628,6 +3681,7 @@ watch(
 async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
+  if (browserUseSelectionPending.value) return
   if (pendingAutoSendSessionKey.value === sessionKey.value) {
     pendingAutoSend.value = ''
     pendingAutoSendSessionKey.value = ''
@@ -4524,7 +4578,8 @@ const activeProjectComposerBlockMessage = computed(() => {
 })
 
 const composerSendBlockedMessage = computed(() =>
-  (forkTransition.value
+  (browserUseSelectionPending.value ? t('chat.skillPalette.loading') : '')
+  || (forkTransition.value
     ? t(
         forkTransition.value.phase === 'error'
           ? 'chat.forkOpenFailed'

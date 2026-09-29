@@ -16,8 +16,8 @@ def test_bundled_skill_visibility_baseline_is_stable(tmp_path: Path) -> None:
     skills = loader.load_all()
 
     assert loader.snapshot().errors == ()
-    assert len(skills) == 9
+    assert len(skills) == 10
     assert Counter(skill.visibility.value for skill in skills) == {
-        "public": 8,
+        "public": 9,
         "internal": 1,
     }

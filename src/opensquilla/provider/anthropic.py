@@ -97,7 +97,7 @@ def _build_tool_payload(tool: ToolDefinition) -> dict[str, Any]:
     return {
         "name": tool.name,
         "description": tool.description,
-        "input_schema": tool.input_schema.model_dump(exclude_none=True),
+        "input_schema": tool.input_schema.model_dump(exclude_none=True, by_alias=True),
     }
 
 

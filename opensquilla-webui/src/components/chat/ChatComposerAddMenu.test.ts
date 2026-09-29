@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChatComposerAddMenu from './ChatComposerAddMenu.vue'
 import addMenuSource from './ChatComposerAddMenu.vue?raw'
 import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPlacement'
+import zhHans from '@/locales/zh-Hans.json'
 
 const chatViewStyles = readFileSync(
   'src/styles/chat-view.css',
@@ -22,7 +23,12 @@ const i18n = createI18n({
       chat: {
         add: 'Add',
         attachFiles: 'Attach files',
-        composer: { contentGroup: 'Content', workStyleGroup: 'Work style' },
+        composer: {
+          contentGroup: 'Content',
+          workStyleGroup: 'Work style',
+          browserUse: 'Browser Use',
+          browserUseDescription: 'Use the browser to complete a task',
+        },
         planMode: {
           label: 'Plan mode',
           readOnly: 'Research and discuss before implementation. Tests and builds follow normal permissions.',
@@ -36,6 +42,7 @@ const i18n = createI18n({
         },
       },
     },
+    'zh-Hans': zhHans,
   },
 })
 
@@ -43,6 +50,7 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
   const attachFiles = vi.fn()
   const activatePlanMode = vi.fn()
   const activateGoalMode = vi.fn()
+  const selectBrowserUse = vi.fn()
   const close = vi.fn()
   const host = document.createElement('div')
   document.body.appendChild(host)
@@ -58,6 +66,7 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
       planModeBusy: false,
       onActivatePlanMode: activatePlanMode,
       onActivateGoalMode: activateGoalMode,
+      onSelectBrowserUse: selectBrowserUse,
       onAttachFiles: attachFiles,
       onClose: close,
       ...overrides,
@@ -66,12 +75,13 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
   mountedApps.push(app)
   app.use(i18n)
   app.mount(host)
-  return { activateGoalMode, activatePlanMode, attachFiles, close, host }
+  return { activateGoalMode, activatePlanMode, attachFiles, selectBrowserUse, close, host }
 }
 
 afterEach(() => {
   while (mountedApps.length) mountedApps.pop()?.unmount()
   document.body.innerHTML = ''
+  i18n.global.locale.value = 'en'
 })
 
 describe('ChatComposerAddMenu', () => {
@@ -144,6 +154,33 @@ describe('ChatComposerAddMenu', () => {
     await nextTick()
     expect(unavailable.querySelectorAll('[role="group"]')).toHaveLength(1)
     expect(unavailable.textContent).not.toContain('Work style')
+  })
+
+  it('offers Browser Use in Work style and emits the selection action', async () => {
+    const { host, selectBrowserUse, close } = mountMenu({ browserUseAvailable: true })
+    await nextTick()
+    const groups = [...host.querySelectorAll('[role="group"]')]
+    expect(groups[0]?.textContent).not.toContain('Browser Use')
+    expect(groups[1]?.textContent).toContain('Browser Use')
+    expect(groups[1]?.textContent).toContain('Use the browser to complete a task')
+
+    const item = [...groups[1]!.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(button => button.textContent?.includes('Browser Use'))
+    expect(item?.querySelector('.composer-add-menu__title')?.textContent).toBe('Browser Use[BETA]')
+    expect(item?.querySelector('.composer-add-menu__beta')?.textContent).toBe('[BETA]')
+    item?.click()
+    expect(selectBrowserUse).toHaveBeenCalledOnce()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the localized Browser Use title with the same beta marker', async () => {
+    i18n.global.locale.value = 'zh-Hans'
+    const { host } = mountMenu({ browserUseAvailable: true })
+    await nextTick()
+
+    const title = host.querySelector('.composer-add-menu__beta')?.parentElement
+    expect(title?.textContent).toBe('浏览器操作[BETA]')
+    expect(title?.closest('[role="menuitem"]')?.textContent).toContain('使用浏览器完成任务')
   })
 
   it('does not use the Add menu as an exit control for active Plan mode', async () => {

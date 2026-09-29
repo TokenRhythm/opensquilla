@@ -654,6 +654,77 @@ describe('unified skill palette', () => {
     expect(selectedSkills.value).toEqual([{ name: candidate.name, instanceId: candidate.instanceId, digest: candidate.digest }])
     expect(api.slashOpen.value).toBe(false)
   })
+  it('selects a named work-style skill using catalog identity without changing the draft', async () => {
+    const browser = { ...candidate, name: 'browser-use', instanceId: 'bundled:browser-use' }
+    const selectedSkills = ref<SelectedSkillRef[]>([])
+    const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [browser] }))
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, {
+      selectedSkills,
+      skillCatalog: { supportsCandidates: () => true, listCandidates } as unknown as SkillCatalog,
+    })
+    inputText.value = 'Find the latest release notes'
+
+    expect(await api.selectSkillByName('browser-use')).toBe(true)
+    expect(inputText.value).toBe('Find the latest release notes')
+    expect(selectedSkills.value).toEqual([{
+      name: browser.name, instanceId: browser.instanceId, digest: browser.digest,
+    }])
+    expect(listCandidates).toHaveBeenCalledWith({ sessionKey: 'agent:main:webchat:test' })
+    expect(await api.selectSkillByName('browser-use')).toBe(true)
+    expect(selectedSkills.value).toHaveLength(1)
+  })
+
+  it('does not select an unavailable or stale named skill', async () => {
+    const selectedSkills = ref<SelectedSkillRef[]>([])
+    const manageSkill = vi.fn()
+    const sessionKey = ref('agent:main:webchat:first')
+    let release!: (value: { generation: number; candidates: typeof candidate[] }) => void
+    const listCandidates = vi.fn(() => new Promise<{ generation: number; candidates: typeof candidate[] }>(resolve => {
+      release = resolve
+    }))
+    const { api } = harness(false, [], Promise.resolve(), undefined, {
+      selectedSkills, sessionKey, manageSkill,
+      skillCatalog: { supportsCandidates: () => true, listCandidates } as unknown as SkillCatalog,
+    })
+    const pending = api.selectSkillByName('browser-use')
+    sessionKey.value = 'agent:main:webchat:second'
+    release({ generation: 1, candidates: [{ ...candidate, name: 'browser-use' }] })
+    expect(await pending).toBe(false)
+    expect(selectedSkills.value).toEqual([])
+
+    listCandidates.mockImplementation(async () => ({ generation: 2, candidates: [{
+      ...candidate, name: 'browser-use', ready: false,
+    }] }))
+    expect(await api.selectSkillByName('browser-use')).toBe(false)
+    expect(manageSkill).toHaveBeenCalledWith('browser-use')
+    expect(selectedSkills.value).toEqual([])
+  })
+  it('reports unavailable tool requirements without sending users to Skill settings', async () => {
+    await loadLocaleMessages('en')
+    const selectedSkills = ref<SelectedSkillRef[]>([])
+    const manageSkill = vi.fn()
+    const notify = vi.fn()
+    const browser = {
+      ...candidate, name: 'browser-use', ready: false, reasonCode: 'tools_unavailable',
+    }
+    const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [browser] }))
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, {
+      selectedSkills, manageSkill, notify,
+      skillCatalog: { supportsCandidates: () => true, listCandidates } as unknown as SkillCatalog,
+    })
+
+    expect(await api.selectSkillByName('browser-use')).toBe(false)
+    expect(notify).toHaveBeenCalledWith('Required tools unavailable')
+    expect(manageSkill).not.toHaveBeenCalled()
+    expect(selectedSkills.value).toEqual([])
+
+    inputText.value = '/browser-use'
+    api.handleSlashInput()
+    await Promise.resolve()
+    api.completeSlashCmd(api.filteredSlashCmds.value[0]!)
+    expect(manageSkill).not.toHaveBeenCalled()
+    expect(selectedSkills.value).toEqual([])
+  })
   it('does not turn disabled candidates into selected skills', async () => {
     const manageSkill = vi.fn()
     const { api, inputText, selectedSkills } = skills({ manageSkill })

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
+from opensquilla.tools.browser_policy import BROWSER_MCP_TOOL_NAMES, browser_context_available
 from opensquilla.tools.types import CallerKind, InteractionMode, ToolContext
 
 _PRIVATE_MEMORY_READ_TOOL_NAMES: frozenset[str] = frozenset(
@@ -139,6 +140,9 @@ def resolve_runtime_tool_surface(
     caps = capabilities or ToolSurfaceCapabilities()
     denied_tools = set(ctx.denied_tools)
     allowed_tools = set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
+
+    if not browser_context_available(ctx):
+        denied_tools |= BROWSER_MCP_TOOL_NAMES
 
     if not caps.image_generation:
         denied_tools |= set(_IMAGE_GENERATION_TOOL_NAMES)

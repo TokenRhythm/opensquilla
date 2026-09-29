@@ -497,6 +497,10 @@ class ToolSpec:
     # the sixth positional argument now lands in ``default_access`` as a bool.
     # Both forms are normalized here so an old ``False`` cannot fail open.
     exposed_by_default: bool | None = field(default=None, repr=False)
+    # Full object schema for integrations whose root keywords cannot be
+    # represented by the legacy properties/required pair. Keep the pair above
+    # for existing in-process tools and integrations.
+    input_schema: dict[str, Any] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         raw_access = self.default_access

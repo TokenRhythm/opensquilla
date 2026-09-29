@@ -718,7 +718,9 @@ async def test_transcript_reader_observes_only_committed_writer_state(tmp_path) 
         ) == []
 
         gate.release_commit(0)
-        await asyncio.wait_for(write, timeout=1.0)
+        # Commit completion is not a latency contract; allow the SQLite worker
+        # thread to be scheduled under Windows shard load.
+        await asyncio.wait_for(write, timeout=5.0)
         committed = await storage.get_transcript(_TRANSCRIPT_SESSION_ID)
         assert [entry.message_id for entry in committed] == ["pending-commit"]
     finally:

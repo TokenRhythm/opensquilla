@@ -213,6 +213,8 @@
     "title": "Arbeitsbereich",
     "expand": "Arbeitsbereich öffnen",
     "collapse": "Arbeitsbereich einklappen",
+    "maximize": "Arbeitsbereich maximieren",
+    "restore": "Arbeitsbereich wiederherstellen",
     "close": "Arbeitsbereich schließen",
     "closeItem": "Tab schließen",
     "refresh": "Aktualisieren",
@@ -230,6 +232,11 @@
       "unavailableReasons": { "htmlEncodingUnsupported": "Dieses HTML ist kein gültiges UTF-8 und kann nicht sicher angezeigt oder bearbeitet werden.", "htmlValidationFailed": "Dieses HTML konnte nicht für eine sichere Vorschau oder Bearbeitung validiert werden.", "htmlEditTooLarge": "Dieses HTML ist für die Bearbeitung in der App zu groß. Es kann weiterhin heruntergeladen werden.", "htmlPreviewTooLarge": "Dieses HTML ist für eine sichere Vorschau in der App zu groß. Es kann weiterhin heruntergeladen werden.", "officeAdapterNotAvailable": "Die Office-Bearbeitung ist noch nicht verfügbar.", "unsupported": "Diese Aktion ist für diese Ressource nicht verfügbar." }
     },
     "browser": {
+      "newTab": "Neuer Tab",
+      "startHint": "Öffne eine Webseite neben dieser Aufgabe.",
+      "addressPlaceholder": "URL eingeben, z. B. example.com",
+      "invalidAddress": "Gib eine gültige HTTP- oder HTTPS-Webadresse ein.",
+      "reopen": "Geschlossenen Tab erneut öffnen",
       "back": "Zurück",
       "forward": "Vor",
       "stop": "Laden stoppen",
@@ -3348,6 +3355,7 @@
       "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
       "disabled": "Disabled · Manage",
       "needsSetup": "Needs setup · Manage",
+      "toolsUnavailable": "Benötigte Tools nicht verfügbar",
       "manualOnly": "Manual use only",
       "thisMessage": "This message",
       "remove": "Remove {name} from this message",
@@ -4068,6 +4076,8 @@
     "composer": {
       "workStyleGroup": "Arbeitsweise",
       "contentGroup": "Inhalt",
+      "browserUse": "Browser Use",
+      "browserUseDescription": "Eine Aufgabe im Browser erledigen",
       "executionMode": "Ausführungsmodus",
       "ownerOnlyUnavailable": "Der Nur-Eigentümer-Modus ist für diese Browser-Sitzung nicht verfügbar.",
       "enabled": "Aktiviert",

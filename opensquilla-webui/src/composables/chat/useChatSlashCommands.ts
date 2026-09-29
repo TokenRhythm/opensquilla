@@ -370,23 +370,65 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     filteredSlashCmds.value = []
   }
 
+  function addSelectedSkill(skill: SkillCandidate): boolean {
+    const selected = options.selectedSkills
+    if (!selected) return false
+    if (selected.value.some(item => item.instanceId === skill.instanceId)) return true
+    if (selected.value.length >= 16) {
+      options.notify(i18n.global.t('chat.skillPalette.limit'))
+      return false
+    }
+    selected.value = [...selected.value, {
+      name: skill.name,
+      instanceId: skill.instanceId,
+      digest: skill.digest,
+    }]
+    return true
+  }
+
+  function handleUnavailableSkill(skill: SkillCandidate) {
+    if (skill.reasonCode === 'tools_unavailable' && !skill.disabled) {
+      options.notify(i18n.global.t('chat.skillPalette.toolsUnavailable'))
+    } else {
+      options.manageSkill?.(skill.name)
+    }
+  }
+
+  async function selectSkillByName(name: string): Promise<boolean> {
+    if (!options.skillCatalog?.supportsCandidates()) {
+      options.notify(i18n.global.t('chat.skillPalette.upgrade'))
+      return false
+    }
+    const sessionKey = options.sessionKey.value
+    const epoch = candidateEpoch
+    try {
+      const result = await options.skillCatalog.listCandidates({ sessionKey })
+      if (epoch !== candidateEpoch || sessionKey !== options.sessionKey.value) return false
+      const skill = result.candidates.find(candidate => candidate.name === name)
+      if (!skill) {
+        options.notify(i18n.global.t('chat.skillPalette.empty'))
+        return false
+      }
+      if (skill.disabled || !skill.ready) {
+        handleUnavailableSkill(skill)
+        return false
+      }
+      return addSelectedSkill(skill)
+    } catch {
+      options.notify(i18n.global.t('chat.skillPalette.loadFailed'))
+      return false
+    }
+  }
+
   function completeSlashCmd(cmd: ChatSlashCommand) {
     if (cmd.kind === 'skill' && cmd.skill && queryRange) {
       const skill = cmd.skill
       if (skill.disabled || !skill.ready) {
-        options.manageSkill?.(skill.name)
+        handleUnavailableSkill(skill)
         closeSlashMenu()
         return
       }
-      const selected = options.selectedSkills
-      if (!selected) return
-      if (!selected.value.some(item => item.instanceId === skill.instanceId)) {
-        if (selected.value.length >= 16) {
-          options.notify(i18n.global.t('chat.skillPalette.limit'))
-          return
-        }
-        selected.value = [...selected.value, { name: skill.name, instanceId: skill.instanceId, digest: skill.digest }]
-      }
+      if (!addSelectedSkill(skill)) return
       const caret = queryRange.start
       options.inputText.value = replaceSlashQuery(options.inputText.value, queryRange)
       closeSlashMenu()
@@ -665,6 +707,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   return {
     slashOpen,
+    skillCandidates,
     skillsLoading,
     skillsError,
     loadSkillCandidates,
@@ -675,6 +718,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     handleSlashInput,
     closeSlashMenu,
     completeSlashCmd,
+    selectSkillByName,
     activateSlashCmd,
     selectSlashCmd,
     classifySlashCommand,

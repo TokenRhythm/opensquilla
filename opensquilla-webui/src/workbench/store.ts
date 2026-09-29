@@ -15,6 +15,8 @@ import type {
   WorkbenchScope,
 } from './types'
 
+const CLOSED_BROWSER_HISTORY_LIMIT = 8
+
 function hydrateWidthPreference(): WorkbenchWidthPreference {
   if (typeof localStorage === 'undefined') return defaultWorkbenchWidthPreference()
   try {
@@ -35,9 +37,14 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   const items = ref<WorkbenchItem[]>([])
   const activeItemId = ref<string | null>(null)
   const expanded = ref(false)
+  const maximized = ref(false)
   const hostAvailable = ref(true)
   const widthPreference = ref<WorkbenchWidthPreference>(hydrateWidthPreference())
   const activeSessionId = ref<string | null>(null)
+  // Closed browser tabs remain available as a scoped, in-memory reopen shelf.
+  // Native surface handles are deliberately stripped when reopened by the
+  // caller; the page gets a fresh safe surface instead of a stale targetRef.
+  const closedBrowserItems = ref<WorkbenchItem[]>([])
 
   // Both collections are runtime-only. They are intentionally not reactive or
   // persisted, and therefore cannot leak controller state into Pinia snapshots.
@@ -46,9 +53,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   const activeItem = computed<WorkbenchItem | null>(() =>
     items.value.find(item => item.id === activeItemId.value) ?? null)
+  const visibleItems = computed(() => items.value.filter(item =>
+    item.scope.type !== 'session'
+    || item.scope.id === activeSessionId.value,
+  ))
   const isVisible = computed(() =>
-    expanded.value && hostAvailable.value && activeItem.value !== null)
-  const hasMultipleItems = computed(() => items.value.length > 1)
+    expanded.value && hostAvailable.value)
+  const hasMultipleItems = computed(() => visibleItems.value.length > 1)
 
   function notify(event: WorkbenchLifecycleEvent) {
     for (const listener of lifecycleListeners) {
@@ -80,10 +91,12 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     for (let index = activationOrder.length - 1; index >= 0; index -= 1) {
       const id = activationOrder[index]
       const item = items.value.find(candidate => candidate.id === id)
-      if (item) return item
+      if (item && (item.scope.type !== 'session'
+        || item.scope.id === activeSessionId.value)) return item
+      if (item) continue
       activationOrder.splice(index, 1)
     }
-    return items.value.length > 0 ? items.value[items.value.length - 1] : null
+    return visibleItems.value[visibleItems.value.length - 1] ?? null
   }
 
   function findMostRecentItem(
@@ -127,13 +140,25 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     return true
   }
 
-  function openItem(item: WorkbenchItem): boolean {
+  function openItem(item: WorkbenchItem, options: { activate?: boolean } = {}): boolean {
+    if (item.kind === 'browser') {
+      closedBrowserItems.value = closedBrowserItems.value.filter(
+        candidate => candidate.id !== item.id,
+      )
+    }
     if (!updateItem(item)) {
       items.value.push(item)
       notify({ type: 'open', item })
     }
-    expanded.value = true
-    activateItem(item.id)
+    if (options.activate !== false) {
+      if (activeSessionId.value === null && item.scope.type === 'session') {
+        activeSessionId.value = item.scope.id
+      }
+      expanded.value = true
+      activateItem(item.id)
+    } else {
+      rememberActivation(item.id)
+    }
     return true
   }
 
@@ -153,6 +178,18 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const index = items.value.findIndex(item => item.id === id)
     if (index < 0) return false
     const [removed] = items.value.splice(index, 1)
+    if (removed.kind === 'browser' && reason === 'closed') {
+      closedBrowserItems.value = [
+        {
+          ...removed,
+          payload: {
+            initialUrl: removed.payload.initialUrl,
+            scopeId: removed.scope.type === 'session' ? removed.scope.id : '',
+          },
+        },
+        ...closedBrowserItems.value.filter(candidate => candidate.id !== removed.id),
+      ].slice(0, CLOSED_BROWSER_HISTORY_LIMIT)
+    }
     const wasActive = activeItemId.value === id
     forgetActivation(id)
     notify({ type: 'dispose', item: removed, reason })
@@ -166,10 +203,27 @@ export const useWorkbenchStore = defineStore('workbench', () => {
         notify({ type: 'activate', item: next })
         if (expanded.value && hostAvailable.value) resumeItem(next)
       } else {
-        expanded.value = false
+        if (removed.kind !== 'browser') {
+          expanded.value = false
+          maximized.value = false
+        }
       }
     }
     return true
+  }
+
+  function reopenBrowserForSession(sessionId: string): boolean {
+    const matches = (item: WorkbenchItem) => item.kind === 'browser'
+      && item.scope.type === 'session'
+      && item.scope.id === sessionId
+    const live = findMostRecentItem(matches)
+    if (live) {
+      activateItem(live.id)
+      setExpanded(true)
+      return true
+    }
+    const closed = closedBrowserItems.value.find(matches)
+    return closed ? openItem(closed) : false
   }
 
   function closeScope(
@@ -203,6 +257,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     const next = nextRecentItem()
     if (!next) {
       expanded.value = false
+      maximized.value = false
       return
     }
     activeItemId.value = next.id
@@ -213,22 +268,60 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   function setSessionScope(sessionId: string | null) {
     if (activeSessionId.value === sessionId) return
+    // Browser tabs represent live native pages. Keep them in the in-memory
+    // workbench shelf while the user moves between chat sessions so returning
+    // to the originating task can reveal the same page again. Other
+    // session-scoped panels still follow the existing disposal contract.
     closeMatchingItems(
-      item => item.scope.type === 'session' && item.scope.id !== sessionId,
+      item => item.scope.type === 'session'
+        && item.scope.id !== sessionId
+        && item.kind !== 'browser',
       'scope-changed',
     )
+    const active = activeItem.value
+    if (!active || active.scope.type === 'session' && active.scope.id !== sessionId) {
+      // Scope changes keep the native page alive, but it must stop consuming
+      // the current sidebar rectangle before another session can take focus.
+      suspendItem(active)
+      const replacement = findMostRecentItem(item =>
+        item.scope.type !== 'session'
+        || item.scope.id === sessionId,
+      )
+      activeItemId.value = replacement?.id ?? null
+      if (replacement) {
+        rememberActivation(replacement.id)
+        notify({ type: 'activate', item: replacement })
+        if (expanded.value && hostAvailable.value) resumeItem(replacement)
+      }
+    }
     activeSessionId.value = sessionId
   }
 
   function setExpanded(next: boolean) {
+    if (!next) maximized.value = false
     if (expanded.value === next) return
     if (!next && hostAvailable.value) suspendItem(activeItem.value)
-    expanded.value = next && activeItem.value !== null
+    expanded.value = next
     if (expanded.value && hostAvailable.value) resumeItem(activeItem.value)
+  }
+
+  function openEmpty() {
+    if (expanded.value && hostAvailable.value) suspendItem(activeItem.value)
+    activeItemId.value = null
+    expanded.value = true
   }
 
   function toggleExpanded() {
     setExpanded(!expanded.value)
+  }
+
+  function setMaximized(next: boolean) {
+    if (next) setExpanded(true)
+    maximized.value = next
+  }
+
+  function toggleMaximized() {
+    setMaximized(!maximized.value)
   }
 
   function setHostAvailable(next: boolean) {
@@ -266,8 +359,10 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     items.value = []
     activeItemId.value = null
     expanded.value = false
+    maximized.value = false
     activeSessionId.value = null
     activationOrder.splice(0)
+    closedBrowserItems.value = []
     for (const item of openItems) {
       notify({ type: 'dispose', item, reason: 'store-reset' })
     }
@@ -275,10 +370,13 @@ export const useWorkbenchStore = defineStore('workbench', () => {
 
   return {
     items,
+    visibleItems,
+    closedBrowserItems,
     activeItemId,
     activeItem,
     activeSessionId,
     expanded,
+    maximized,
     hostAvailable,
     widthPreference,
     isVisible,
@@ -290,11 +388,15 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     updateItem,
     activateItem,
     closeItem,
+    reopenBrowserForSession,
     closeAllItems,
     closeScope,
     setSessionScope,
     setExpanded,
+    openEmpty,
     toggleExpanded,
+    setMaximized,
+    toggleMaximized,
     setHostAvailable,
     setWidth,
     resetWidth,

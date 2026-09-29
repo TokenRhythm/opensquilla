@@ -112,7 +112,9 @@ async def run_probe(mode: str, state_root: Path) -> None:
                 assert denied.is_error is True
                 result = await build_tool_handler(registry, owner)(call)
                 assert result.is_error is False
-                assert result.content == "gateway-sdk-round-trip"
+                text, structured = result.content.split("\n", 1)
+                assert text == "gateway-sdk-round-trip"
+                assert json.loads(structured) == {"result": text}
             else:
                 assert active_clients_snapshot() == ()
                 assert processes == []

@@ -137,7 +137,7 @@ class ToolSearchIndex:
             schema = getattr(definition, "input_schema", None)
             model_dump = getattr(schema, "model_dump", None)
             if callable(model_dump):
-                schema_payload = model_dump(mode="json", exclude_none=True)
+                schema_payload = model_dump(mode="json", exclude_none=True, by_alias=True)
             elif isinstance(schema, Mapping):
                 schema_payload = dict(schema)
             else:

@@ -16,6 +16,7 @@ from opensquilla.skills.catalog_policy import (
 )
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.skills.types import SkillLayer, SkillSpec
+from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
@@ -39,6 +40,10 @@ def _ctx(loader: SkillLoader) -> TurnContext:
             SimpleNamespace(name="background_process"),
             SimpleNamespace(name="exec_command"),
             SimpleNamespace(name="process"),
+            *(
+                SimpleNamespace(name=f"mcp__desktop-browser__{name}")
+                for name in BROWSER_MCP_REQUIRED_TOOLS
+            ),
         ],
         system_prompt=("base", "dynamic"),
         skill_catalog=snapshot,
@@ -61,9 +66,6 @@ def test_public_bundled_contract_is_exact_and_ordered(tmp_path: Path) -> None:
     bundled = [skill.name for skill in projected if skill.layer is SkillLayer.BUNDLED]
     assert bundled == list(PUBLIC_BUNDLED_SKILLS)
 
-
-
-
 @pytest.mark.asyncio
 async def test_prompt_contains_only_public_ordinary_skills(tmp_path: Path) -> None:
     output = await resolve_skill_catalog(_ctx(_loader(tmp_path)))
@@ -74,9 +76,23 @@ async def test_prompt_contains_only_public_ordinary_skills(tmp_path: Path) -> No
     assert names == list(PUBLIC_BUNDLED_SKILLS)
     assert output.metadata["skills_catalog_omitted_count"] == 0
 
+@pytest.mark.asyncio
+async def test_browser_skill_requires_its_browser_tools_in_the_turn(tmp_path: Path) -> None:
+    loader = _loader(tmp_path)
+    available = _ctx(loader)
+    assert "browser-use" in _rendered_names(
+        (await resolve_skill_catalog(available)).system_prompt[0]
+    )
 
-
-
+    missing = _ctx(loader)
+    missing.tool_defs = [
+        tool
+        for tool in missing.tool_defs
+        if tool.name != "mcp__desktop-browser__browser_open"
+    ]
+    assert "browser-use" not in _rendered_names(
+        (await resolve_skill_catalog(missing)).system_prompt[0]
+    )
 
 
 @pytest.mark.asyncio

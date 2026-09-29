@@ -150,14 +150,19 @@ class SDKMCPClient(MCPClient):
             # This includes SDK output-schema failures. Discovery translates the
             # flag into SafeToolError at the normal tool execution boundary.
             return MCPToolResult(content=str(exc), is_error=True)
-        text_blocks = [block.text for block in result.content if block.type == "text"]
-        text = "\n".join(text_blocks)
+        projected = MCPToolResult.from_response(
+            {"result": result.model_dump(mode="json", by_alias=True, exclude_none=True)}
+        )
+        text_blocks = [block for block in result.content if block.type == "text"]
         if not text_blocks and result.structured_content is not None:
-            text = json.dumps(result.structured_content, ensure_ascii=False)
-        if not text_blocks and result.structured_content is None and result.content:
+            projected.content = json.dumps(result.structured_content, ensure_ascii=False)
+        if (
+            not text_blocks
+            and result.structured_content is None
+            and result.content
+            and not any(block.type == "image" for block in result.content)
+        ):
             kinds = ", ".join(sorted({block.type for block in result.content}))
-            return MCPToolResult(
-                content=f"MCP tool returned unsupported content types: {kinds}",
-                is_error=True,
-            )
-        return MCPToolResult(content=text, is_error=result.is_error)
+            projected.content = f"MCP tool returned unsupported content types: {kinds}"
+            projected.is_error = True
+        return projected

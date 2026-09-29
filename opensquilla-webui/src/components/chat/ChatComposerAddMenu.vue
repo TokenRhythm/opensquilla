@@ -26,12 +26,29 @@
       </button>
     </div>
     <div
-      v-if="planModeAvailable || goalModeAvailable"
+      v-if="browserUseAvailable || planModeAvailable || goalModeAvailable"
       class="composer-add-menu__group"
       role="group"
       :aria-label="t('chat.composer.workStyleGroup')"
     >
       <div class="composer-add-menu__heading" aria-hidden="true">{{ t('chat.composer.workStyleGroup') }}</div>
+      <button
+        v-if="browserUseAvailable"
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        @click="selectBrowserUse"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="languages" :size="17" />
+        </span>
+        <span class="composer-add-menu__copy">
+          <span class="composer-add-menu__title">
+            <strong>{{ t('chat.composer.browserUse') }}</strong><span class="composer-add-menu__beta">[BETA]</span>
+          </span>
+          <span>{{ t('chat.composer.browserUseDescription') }}</span>
+        </span>
+      </button>
       <button
         v-if="planModeAvailable"
         type="button"
@@ -89,6 +106,7 @@ import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPla
 const props = defineProps<{
   avoidElement?: HTMLElement | null
   attachmentsDisabled?: boolean
+  browserUseAvailable?: boolean
   goalModeActive: boolean
   goalModeAvailable: boolean
   goalModeBusy: boolean
@@ -102,6 +120,7 @@ const emit = defineEmits<{
   activateGoalMode: []
   activatePlanMode: []
   attachFiles: []
+  selectBrowserUse: []
   close: []
 }>()
 
@@ -149,6 +168,11 @@ function trackPlacement() {
 
 function attachFiles() {
   emit('attachFiles')
+  emit('close')
+}
+
+function selectBrowserUse() {
+  emit('selectBrowserUse')
   emit('close')
 }
 
@@ -250,12 +274,32 @@ onBeforeUnmount(() => {
   min-width: 0;
 }
 
+.composer-add-menu__title {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
 .composer-add-menu__copy strong {
   font-size: var(--fs-sm);
   font-weight: 600;
 }
 
-.composer-add-menu__copy span {
+.composer-add-menu__beta {
+  flex: 0 0 auto;
+  padding: 2px 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text-muted);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.composer-add-menu__copy > span:not(.composer-add-menu__title) {
   overflow: hidden;
   color: var(--text-muted);
   font-size: var(--fs-xs);
