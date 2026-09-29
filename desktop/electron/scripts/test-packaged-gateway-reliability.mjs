@@ -448,10 +448,11 @@ async function run(options) {
     return { url: `http://127.0.0.1:${server.address().port}`,
       close: () => shutdown.closeHttpServerWithDeadline(server, sockets, { label, timeoutMs: 5_000 }) }
   }
-  async function ready() {
+  async function ready(connectedPhase) {
     await until(async () => (await descriptor())?.status === 'ready', 'Gateway ready', 210_000)
     await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 45_000 })
     await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: 45_000 })
+    if (connectedPhase) mark(connectedPhase)
     observeOwner()
     const record = currentOwner()
     assert.ok(record && records.has(ownerKey(record)), 'Ready requires an observed owner')
@@ -477,12 +478,13 @@ async function run(options) {
     await page.locator('#settings-rail-gateway').click()
     const control = await runtimeRestartControl(page)
     report.runtimeControlLayout = control.layout
+    mark('runtime-restart-click')
     await control.button.click()
   }
   async function finishRuntimeRestart(before, sentinel) {
     await until(() => { observeOwner(); const next = currentOwner(); return next && !ownership.sameDesktopGatewayOwnershipInstance(before, next) }, 'replacement owner', 180_000)
     await page.locator('.settings-modal__close').click()
-    const after = await ready()
+    const after = await ready('runtime-restart-connected')
     assert.equal(records.size, 2, 'Exactly one runtime replacement')
     assert.equal(shutdown.gatewayProcessSnapshot(before).alive, false, 'Old Gateway must actually exit')
     assert.equal(await bounded(page.evaluate(() => window.__gatewayReliabilityDocument), 5_000), sentinel, 'Restart must preserve the original renderer document')
@@ -636,7 +638,7 @@ async function run(options) {
       assert.equal(sseClosed, 1, 'Timed-out MCP connection must converge before ready')
       mark('late-ready-recovered')
     } else if (options.scenario === 'restart') {
-      const before = await ready()
+      const before = await ready('initial-ui-connected')
       const sentinel = randomUUID()
       await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
       mark('runtime-restart')
@@ -756,10 +758,12 @@ async function run(options) {
     await page.locator('.chat-textarea').fill(MESSAGE)
     const send = page.locator('.chat-send-btn.btn--primary')
     await until(async () => await send.count() === 1 && !await send.isDisabled(), 'send enabled', 45_000)
+    mark('single-ui-send-click')
     await send.click()
     await until(async () => (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(ANSWER)), 'visible answer', 45_000)
     await until(async () => !await send.isDisabled(), 'turn finished', 45_000)
     await page.locator('.msg-ai').last().locator('.msg-meta__more-btn').waitFor({ state: 'visible', timeout: 45_000 })
+    mark('single-ui-send-complete')
     await verifySingleRenderedTurn()
     assert.equal(chats, expectedChats, 'One UI submission must produce exactly one provider chat request')
     if (options.scenario === 'configuration') assert.equal(alternateChats, 1, 'The edited endpoint must serve the actual user turn')
