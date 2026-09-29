@@ -406,7 +406,7 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     resume_owned = _section(
         main_ts,
         "async function resumeOwnedGatewayStartup",
-        "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS",
+        "const GATEWAY_LATE_READY_OBSERVATION_MS",
     )
 
     assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
@@ -515,7 +515,7 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
     resume_owned = _section(
         main_ts,
         "async function resumeOwnedGatewayStartup",
-        "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS",
+        "const GATEWAY_LATE_READY_OBSERVATION_MS",
     )
     assert resume_owned.rindex("|| !isCurrent()") < resume_owned.index(
         "gatewayState.status = 'ready'"
@@ -3030,7 +3030,7 @@ def test_desktop_second_launch_retries_lock_and_logs_instead_of_silent_quit() ->
         "desktopLog('launch',",
     )
     assert "Date.now() + 5_000" in retry
-    assert "app.requestSingleInstanceLock()" in retry
+    assert "app.requestSingleInstanceLock(" in retry
     # On give-up: explicit dialog + quit, not a bare silent app.quit().
     giveup = _section(main_ts, "if (!gotSingleInstanceLock) {", "app.on('second-instance'")
     assert "launch_aborted_lock_held" in giveup
@@ -3949,7 +3949,10 @@ def test_desktop_boot_does_not_run_legacy_typescript_import_recovery() -> None:
     assert "relocateLegacyDesktopStateLayout" not in main_ts
     assert "await prepareDesktopStartupConnection()" in start
     assert "let freshOnboardingProfileKey: string | null = null" in main_ts
-    assert "if (!pendingProviderSetup && !forceOnboardingOnNextStartup && existing === null)" in prepare
+    assert (
+        "if (!pendingProviderSetup && !forceOnboardingOnNextStartup "
+        "&& existing === null)" in prepare
+    )
     assert "const shouldRunFreshOnboarding" in start
     assert "await runOnboarding()" in start
     assert "await onboardingFlows.waitForAbandonedSave()" in start

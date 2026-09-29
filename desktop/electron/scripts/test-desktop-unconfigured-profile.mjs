@@ -5,19 +5,27 @@ import { parse } from 'smol-toml'
 import { freshDesktopSandboxConfigLines } from '../dist/desktop-sandbox-default.js'
 import { renderUnconfiguredDesktopConfig } from '../dist/desktop-unconfigured-profile.js'
 
+function toPlain(value) {
+  if (Array.isArray(value)) return value.map(toPlain)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, toPlain(nested)]))
+  }
+  return value
+}
+
 for (const platform of ['darwin', 'win32', 'linux']) {
   const config = parse(renderUnconfiguredDesktopConfig('zh-CN', platform))
-  assert.deepEqual(config.llm, {
+  assert.deepEqual(toPlain(config.llm), {
     provider: '', model: '', api_key: '', api_key_env: '', base_url: '',
   }, 'deferred setup must explicitly leave the model service unselected')
   assert.equal(config.squilla_router.enabled, false)
   assert.equal(config.llm_ensemble.enabled, false)
-  assert.deepEqual(config.control_ui, {
+  assert.deepEqual(toPlain(config.control_ui), {
     enabled: true, base_path: '/control', default_locale: 'zh-CN',
   }, 'the local client must remain available before model setup')
   assert.deepEqual(
-    config.sandbox,
-    parse(freshDesktopSandboxConfigLines(null, platform).join('\n')).sandbox,
+    toPlain(config.sandbox),
+    toPlain(parse(freshDesktopSandboxConfigLines(null, platform).join('\n')).sandbox),
     'deferred setup must use the same fresh-profile sandbox policy',
   )
   assert.deepEqual(Object.keys(config).sort(), [

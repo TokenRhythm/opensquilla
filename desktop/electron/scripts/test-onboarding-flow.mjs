@@ -19,6 +19,15 @@ const selectedCases = new Set(String(process.env.OPENSQUILLA_DESKTOP_ONBOARDING_
   .split(',').map(value => value.trim()).filter(Boolean))
 const onboardingDiagnosticContexts = new WeakMap()
 const reportedOnboardingFailures = new WeakSet()
+
+function toPlain(value) {
+  if (Array.isArray(value)) return value.map(toPlain)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, nested]) => [key, toPlain(nested)]))
+  }
+  return value
+}
+
 // Match the existing orphan-recovery native harness's cold-start budget:
 // Gateway readiness owns 120s, with 45s for the surrounding Desktop startup.
 // Each launch consumes one absolute deadline; it is not renewed by assertions.
@@ -1756,9 +1765,9 @@ try {
   assert.equal(afterSwitch.squilla_router.preset_binding, 'follow_primary')
   assert.equal(afterSwitch.squilla_router.enabled, true)
   assert.equal(afterSwitch.squilla_router.rollout_phase, 'observe')
-  assert.deepEqual(afterSwitch.squilla_router.budget_gate, beforeSwitch.squilla_router.budget_gate)
+  assert.deepEqual(toPlain(afterSwitch.squilla_router.budget_gate), beforeSwitch.squilla_router.budget_gate)
   assert.ok(Object.values(afterSwitch.squilla_router.tiers).every(tier => tier.provider === 'openrouter'))
-  assert.deepEqual(afterSwitch.llm_ensemble, beforeSwitch.llm_ensemble)
+  assert.deepEqual(toPlain(afterSwitch.llm_ensemble), beforeSwitch.llm_ensemble)
 
   afterSwitch.squilla_router.preset_binding = 'custom'
   await writeFile(routerConfigPath, stringify(afterSwitch))
