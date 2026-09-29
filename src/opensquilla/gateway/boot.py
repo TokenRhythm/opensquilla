@@ -4681,6 +4681,11 @@ async def start_gateway_server(
     listener_ready = not run
     runtime_state_ready = False
     app.state.gateway_start_ready = False
+    # This event is the explicit startup boundary for CLI/Desktop callers.
+    # ``uvicorn.Config.callback_notify`` is periodic (not a bind handshake),
+    # so callers must not use it to gate work that can block the event loop.
+    gateway_start_ready_event = asyncio.Event()
+    app.state.gateway_start_ready_event = gateway_start_ready_event
     gateway_ready_phase_emitted = False
     gateway_ready_wait_started_at = startup_phase_started_at
 
@@ -4710,6 +4715,7 @@ async def start_gateway_server(
             return
         gateway_ready_phase_emitted = True
         app.state.gateway_start_ready = True
+        gateway_start_ready_event.set()
         ready_at = time.monotonic()
         log.info(
             "gateway.startup_phase",
@@ -4726,6 +4732,14 @@ async def start_gateway_server(
             _record_gateway_ready_telemetry(
                 svc, duration_ms=_elapsed_monotonic_ms(startup_started_at, ready_at),
             )
+            if svc.deferred_warmups and svc.deferred_warmup_task is None:
+                # Warmups are allowed to do imports, disk I/O, and provider
+                # refreshes. Start them only after the listener and runtime
+                # state are both ready so first health/MCP probes cannot race
+                # those operations.
+                svc.deferred_warmup_task = create_background_task(
+                    _run_deferred_warmups(svc)
+                )
 
     server_handle = GatewayServer(app=app, config=config)
     server_handle._pid_lock = _pid_lock
@@ -4824,9 +4838,9 @@ async def start_gateway_server(
             "host": config.host,
             "port": config.port,
             "log_level": "info" if not config.debug else "debug",
-            # Uvicorn invokes this only after its socket server has been
-            # created. Keep the callback one-shot because callback_notify is
-            # also used for periodic worker health notifications.
+            # Keep this callback for Uvicorn's periodic notification hook. The
+            # startup wrapper above is the immediate listener-ready source;
+            # this callback remains harmlessly one-shot via the guard.
             "callback_notify": _notify_listener_ready,
             # Capability URLs and historical sessionKey query parameters are
             # bearer material. Keep request targets out of uvicorn's access
@@ -4851,6 +4865,21 @@ async def start_gateway_server(
         # setattr (not direct assignment) so this is robust to uvicorn type stubs
         # that don't expose install_signal_handlers — it exists at runtime.
         setattr(server, "install_signal_handlers", lambda: None)  # noqa: B010
+
+        # Uvicorn's ``callback_notify`` runs from its periodic main-loop tick
+        # (default interval: 30 seconds), so it cannot be the listener
+        # readiness handshake. Wrap startup itself; Uvicorn sets ``started``
+        # only after its socket server and lifespan startup have completed.
+        server_startup = getattr(server, "startup", None)
+        if callable(server_startup):
+            async def _startup_with_listener_ready(
+                sockets: list[socket.socket] | None = None,
+            ) -> None:
+                await server_startup(sockets=sockets)
+                if getattr(server, "started", False):
+                    await _notify_listener_ready()
+
+            setattr(server, "startup", _startup_with_listener_ready)
         server_handle._server = server
 
         listener_scheduled_at = time.monotonic()
@@ -4871,8 +4900,6 @@ async def start_gateway_server(
                 ),
             )
         log.info("gateway.started", host=config.host, port=config.port)
-        if _desktop_fast_start_enabled():
-            svc.deferred_warmup_task = create_background_task(_run_deferred_warmups(svc))
 
     # Start channels (after app is ready to receive webhooks)
     if channel_manager is not None:
