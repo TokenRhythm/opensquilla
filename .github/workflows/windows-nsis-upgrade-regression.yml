@@ -6,6 +6,11 @@ on:
   # CI owns change selection, cancellation, and the required aggregate result.
   # Reusing this workflow keeps manual diagnostics on the same acceptance path.
   workflow_call:
+    inputs:
+      acceptance_profile:
+        description: 'smoke: current legacy baseline and fresh installs; full: all historical fault cases'
+        type: string
+        default: full
   workflow_dispatch:
 
 permissions:
@@ -25,6 +30,13 @@ jobs:
     env:
       CSC_IDENTITY_AUTO_DISCOVERY: 'false'
     steps:
+      - name: Validate acceptance profile
+        env:
+          ACCEPTANCE_PROFILE: ${{ inputs.acceptance_profile || 'full' }}
+        run: |
+          if ($env:ACCEPTANCE_PROFILE -cnotin @('smoke', 'full')) {
+            throw "Unknown Windows NSIS acceptance profile: $env:ACCEPTANCE_PROFILE"
+          }
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
@@ -211,9 +223,11 @@ jobs:
       # Each acceptance case owns a hosted VM and only reads the built installer.
       # Let all cases start once that immutable candidate is available.
       matrix:
-        baseline: ['0.5.3', '0.5.4']
+        # PR smoke: four cases. Installer/migration changes, fail-closed plans,
+        # nightly and standalone manual runs retain all fourteen cases.
+        baseline: ${{ fromJSON(inputs.acceptance_profile == 'smoke' && '["0.5.4"]' || '["0.5.3","0.5.4"]') }}
         install-path: [default, custom]
-        scenario: [baseline, readlock, longpath]
+        scenario: ${{ fromJSON(inputs.acceptance_profile == 'smoke' && '["baseline"]' || '["baseline","readlock","longpath"]') }}
         include:
           - baseline: fresh
             install-path: default

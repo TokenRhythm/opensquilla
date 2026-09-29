@@ -72,6 +72,25 @@ _WINDOWS_NSIS_INPUTS: Final = (
     "scripts/release_dependency_inventory.py",
     "scripts/build_wheelhouse_zip.py",
 )
+# Ordinary dependency changes need install/start smoke coverage. Changes to the
+# installer, its verification harness, or historical data handling retain every
+# released-uninstaller fault case. Unknown changes still use full_fallback.
+_WINDOWS_NSIS_FULL_INPUTS: Final = (
+    *_WINDOWS_NSIS_INPUTS,
+    "desktop/electron/package.json",
+    "desktop/electron/package-lock.json",
+    "desktop/electron/electron-builder.*",
+    "desktop/electron/scripts/*installer*",
+    "desktop/electron/scripts/build-signed-windows.cjs",
+    "desktop/electron/src/*update*",
+    ".github/scripts/verify-release-windows*",
+    "migrations/**",
+    "src/opensquilla/migration/**",
+    "src/opensquilla/persistence/**",
+    "src/opensquilla/recovery/**",
+    "src/opensquilla/uninstall/**",
+    "src/opensquilla/profile*",
+)
 _TUI_DEPENDENCY_EXACT: Final = {
     "packages/opensquilla-tui-host/pyproject.toml",
     "src/opensquilla/cli/tui/opentui/package/.bun-version",
@@ -405,12 +424,8 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-2022", "build"),
         ("windows-2022", "wheelhouse-core"),
         ("windows-2022", "wheelhouse-recommended"),
-        *(("windows-2022", f"{baseline}-{path}-{scenario}")
-          for baseline in ("0.5.3", "0.5.4")
-          for path in ("default", "custom")
-          for scenario in ("baseline", "readlock", "longpath")),
-        ("windows-2022", "fresh-default-fresh"),
-        ("windows-2022", "fresh-custom-fresh"),
+        *(("windows-2022", f"candidate-{probe}")
+          for probe in ("startup-compat", "ownership", "migration", "session")),
     ),
     "skill-hub": (
         ("ubuntu-latest", "default"),
@@ -1547,12 +1562,30 @@ def suite_execution_digests(
     return result
 
 
+def windows_nsis_upgrade_cells(profile: str) -> list[dict[str, str]]:
+    """Return the installed-package cases for a validated acceptance profile."""
+    if profile not in {"smoke", "full"}:
+        raise ValueError(f"unknown Windows NSIS acceptance profile: {profile}")
+    baselines = ("0.5.3", "0.5.4") if profile == "full" else ("0.5.4",)
+    scenarios = ("baseline", "readlock", "longpath") if profile == "full" else ("baseline",)
+    return [
+        {"baseline": baseline, "install-path": path, "scenario": scenario}
+        for baseline in baselines
+        for path in ("default", "custom")
+        for scenario in scenarios
+    ] + [
+        {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
+        for path in ("default", "custom")
+    ]
+
+
 def _execution_matrices(
     required_suites: Sequence[str],
     desktop_cells: set[tuple[str, str]],
     targeted_windows_shards: set[str],
     windows_full_matrix: bool,
     config: Mapping[str, Any],
+    windows_nsis_profile: str = "full",
 ) -> tuple[dict[str, list[str]], list[dict[str, str]]]:
     """Return canonical Python and all-platform execution matrices."""
 
@@ -1585,6 +1618,12 @@ def _execution_matrices(
     for suite_id in suites:
         for os_name, shard in _FIXED_PLATFORM_MATRIX.get(suite_id, ()):
             cells.add((suite_id, os_name, shard))
+    if "windows-nsis-regression" in suites:
+        cells.update(
+            ("windows-nsis-regression", "windows-2022",
+             f"{cell['baseline']}-{cell['install-path']}-{cell['scenario']}")
+            for cell in windows_nsis_upgrade_cells(windows_nsis_profile)
+        )
     if "desktop-recovery-e2e" in suites:
         cells.update(
             ("desktop-recovery-e2e", os_name, shard)
@@ -1678,6 +1717,12 @@ def plan_changes(
     test_reverse_dependencies: dict[str, frozenset[str]] | None = None
     test_dependency_analysis_failed = False
     full_fallback = False
+    windows_nsis_full = any(
+        fnmatch.fnmatchcase(path, pattern)
+        for path in paths for pattern in _WINDOWS_NSIS_FULL_INPUTS
+    )
+    if windows_nsis_full:
+        suites.add("windows-nsis-regression")
     all_docs = bool(paths) and not invalid_paths
     merge_critical_inputs = config.get(_MERGE_CRITICAL_INPUTS_KEY)
     if not isinstance(merge_critical_inputs, frozenset):
@@ -2097,12 +2142,14 @@ def plan_changes(
         suites.add("frontend-artifact")
 
     required_suites = sorted(suites)
+    windows_nsis_profile = "full" if full_fallback or windows_nsis_full else "smoke"
     python_matrix, platform_matrix = _execution_matrices(
         required_suites,
         desktop_cells,
         targeted_windows_shards,
         windows_full_matrix,
         config,
+        windows_nsis_profile,
     )
     digests = suite_execution_digests(
         required_suites, repo=repo, config=config, ref=ref
@@ -2115,6 +2162,7 @@ def plan_changes(
         ],
         "python_matrix": python_matrix,
         "platform_matrix": platform_matrix,
+        "windows_nsis_profile": windows_nsis_profile,
         "python_targets": sorted(targets),
         "full_fallback": full_fallback,
         "reason_codes": sorted(reasons),
