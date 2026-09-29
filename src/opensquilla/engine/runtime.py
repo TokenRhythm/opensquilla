@@ -19,7 +19,6 @@ import json
 import math
 import os
 import platform
-import re
 import tempfile
 import time
 import uuid
@@ -53,6 +52,7 @@ from opensquilla.attachment_refs import (
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     render_attachment_material_marker,
+    render_historical_attachment_material_marker,
     workspace_attachment_budget_from_config,
 )
 from opensquilla.bootstrap_types import BootstrapFileReport
@@ -373,7 +373,6 @@ from opensquilla.tools.types import (
 
 if TYPE_CHECKING:
     from opensquilla.engine.routing.health import ProviderHealthLedger
-    from opensquilla.persistence.meta_run_writer import MetaRunWriter
 
 # Stable user-facing envelope for LLM timeouts.
 _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
@@ -385,9 +384,6 @@ _LLM_TIMEOUT_ENVELOPE: dict[str, Any] = {
 _DEFAULT_AGENT_RUNTIME_TIMEOUT_SECONDS: float = 48 * 60 * 60
 _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS: float = 120.0
 _DEFAULT_LLM_TIMEOUT_SECONDS: float = _DEFAULT_LLM_REQUEST_TIMEOUT_SECONDS
-_WEB_CHAT_META_EXEMPT_KEYS: Final[frozenset[str]] = frozenset(
-    {"meta_match", "meta_launch", "meta_resume", "meta_replay", "meta_replay_error"}
-)
 _ROUTER_PREV_ASSISTANT_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_CHARS: Final[int] = 8000
 _ROUTER_HISTORY_USER_MAX_TURNS: Final[int] = 4
@@ -601,7 +597,7 @@ def collect_invoked_skills(
             if segment.get("status") != "loaded":
                 continue
             skill_name = segment.get("name")
-        elif tool_name in {"skill_view", "meta_invoke"}:
+        elif tool_name == "skill_view":
             skill_name = (segment.get("input") or {}).get("name")
             if tool_name == "skill_view" and skill_name in receipt_names:
                 continue
@@ -801,6 +797,7 @@ class _EmergencyCompactionOverride:
     history_capacity_chars: int | None = None
     protected_recent_messages: int = 0
     protected_message_id: str | None = None
+    preserve_historical_images: bool = True
     consumer_admission: Callable[[str, list[dict[str, Any]]], bool] | None = field(
         default=None, repr=False
     )
@@ -4624,10 +4621,10 @@ def _resolve_identity_prompt_mode(config: object) -> str:
         "full",
         "minimal",
         "none",
-        "headless_source_edit",
-        "headless_repo_coding_scaffold",
     }
     env_prompt_mode = os.environ.get("OPENSQUILLA_PROMPT_MODE", "").strip()
+    if env_prompt_mode in {"headless_source_edit", "headless_repo_coding_scaffold"}:
+        env_prompt_mode = ""
     if env_prompt_mode:
         if env_prompt_mode not in allowed_modes:
             raise ValueError(
@@ -4720,7 +4717,6 @@ class TurnRunner:
         diagnostics_state: Any | None = None,
         turn_hooks: Sequence[TurnHook] | None = None,
         compaction_hooks: Sequence[CompactionHook] | None = None,
-        meta_run_writer: MetaRunWriter | None = None,
         turn_error_writer: Any | None = None,
         provider_call_observer: Callable[..., None] | None = None,
         usage_event_sink: UsageEventSink | None = None,
@@ -4752,7 +4748,6 @@ class TurnRunner:
         self._memory_retrievers = memory_retrievers
         self._turn_capture_services = turn_capture_services
         self._diagnostics_state = diagnostics_state
-        self._meta_run_writer = meta_run_writer
         self._turn_error_writer = turn_error_writer
         self._usage_event_sink = usage_event_sink
         self._prompt_cache_keepalive_recorder = prompt_cache_keepalive_recorder
@@ -7708,12 +7703,6 @@ class TurnRunner:
                 trace_id=trace_context.trace_id if trace_context is not None else None,
                 skills_invoked=collect_invoked_skills(turn_segments),
             )
-            self._emit_router_train_sample(
-                agent_id=agent_id,
-                session_key=session_key,
-                turn_obj=turn_obj,
-                message=message,
-            )
             if (
                 pending_error_event is not None
                 and not stream_state.terminal_generation_reset
@@ -8620,12 +8609,6 @@ class TurnRunner:
         if input_mode != "user":
             return None
 
-        metadata = turn_metadata or {}
-        if tool_context.coding_mode or bool(metadata.get("coding_mode")):
-            return None
-        if any(metadata.get(key) is not None for key in _WEB_CHAT_META_EXEMPT_KEYS):
-            return None
-
         base_timeout = self._resolve_agent_runtime_timeout(session_key)
         if base_timeout == 0:
             return 0.0
@@ -8923,10 +8906,6 @@ class TurnRunner:
         """Build tool definitions and handler from registry, filtered by ToolContext."""
         if self._tool_registry is None:
             return [], None
-        from opensquilla.skills.meta.enabled import (
-            is_meta_auto_trigger_enabled,
-            is_meta_skill_enabled,
-        )
         from opensquilla.tools.dispatch import build_tool_handler
         from opensquilla.tools.policy import apply_tool_policy_from_config
         from opensquilla.tools.registry import filter_by_profile, resolve_profile
@@ -8939,13 +8918,6 @@ class TurnRunner:
                 loaded_skills = list(self._skill_loader.load_all())
             except Exception:
                 loaded_skills = []
-        meta_skill_enabled = is_meta_skill_enabled(self._config)
-        meta_auto_trigger = is_meta_auto_trigger_enabled(self._config)
-        has_invokable_meta_skill = any(
-            getattr(skill, "kind", "skill") == "meta"
-            and not getattr(skill, "disable_model_invocation", False)
-            for skill in loaded_skills
-        )
         plan_mode = ctx is not None and str(getattr(ctx, "collaboration_mode", "default")) == "plan"
         attached_plan_run = bool(
             ctx is not None and str(getattr(ctx, "plan_run_id", "") or "").strip()
@@ -8958,7 +8930,7 @@ class TurnRunner:
             if isinstance(ctx.skill_install_turn, SkillInstallTurn):
                 skill_tools.update(ctx.skill_install_turn.surface_tools())
             if project_public_catalog(
-                loaded_skills, coding_mode=ctx.coding_mode, include_stable_meta=False,
+                loaded_skills,
             ):
                 skill_tools.update({"skill_list", "skill_view"})
             if ctx.selected_skills:
@@ -8978,12 +8950,6 @@ class TurnRunner:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
                 ctx.surfaced_tools.add("retrieve_tool_result")
-            if meta_skill_enabled and meta_auto_trigger and has_invokable_meta_skill:
-                if ctx.surfaced_tools is None:
-                    ctx.surfaced_tools = set()
-                ctx.surfaced_tools.add("meta_invoke")
-            else:
-                ctx.denied_tools.add("meta_invoke")
             if plan_mode:
                 if ctx.surfaced_tools is None:
                     ctx.surfaced_tools = set()
@@ -8991,7 +8957,7 @@ class TurnRunner:
                 if ctx.interaction_mode is InteractionMode.INTERACTIVE:
                     plan_control_tools.add("request_user_input")
                 ctx.surfaced_tools.update(plan_control_tools)
-                ctx.denied_tools.update({"submit", "meta_invoke"})
+                ctx.denied_tools.add("submit")
             elif (
                 ctx.subagent_depth == 0 and ctx.collaboration_mode == "default"
                 and ctx.caller_kind in {CallerKind.AGENT, CallerKind.WEB, CallerKind.CLI,
@@ -9008,15 +8974,12 @@ class TurnRunner:
                     # Normal allow/deny/profile policy still applies below.
                     ctx.surfaced_tools.discard("update_plan")
                     ctx.explicitly_allowed_tools.add("update_plan")
-                if attached_plan_run:
-                    controls.add("plan_run_checkpoint")
                 if ctx.goal_service is not None or is_goal_owned_main_default_turn(ctx):
                     controls.update(
-                        {"get_goal", "create_goal", "update_goal", "update_goal_progress"}
+                        {"get_goal", "create_goal", "update_goal"}
                     )
                 ctx.surfaced_tools.update(controls)
         if metadata is not None:
-            metadata["meta_skill_enabled"] = meta_skill_enabled
             if skill_catalog is not None:
                 metadata["skill_catalog_generation"] = int(getattr(skill_catalog, "generation", 0))
 
@@ -9043,15 +9006,6 @@ class TurnRunner:
             # ceiling below may still remove it.
             if ctx.allowed_tools is not None and "tool_search" not in ctx.denied_tools:
                 ctx.allowed_tools = set(ctx.allowed_tools) | {"tool_search"}
-            # Surfacing lifts the default-access deny gate but deliberately does
-            # not relax a profile allowlist. Explicit denies still win in the
-            # registry visibility check.
-            from opensquilla.tools.policy_config import coding_mode_denied_tools
-
-            skills_cfg = getattr(self._config, "skills", None)
-            coding_mode = bool(getattr(skills_cfg, "coding_mode", False))
-            ctx.denied_tools.update(coding_mode_denied_tools(coding_mode))
-            ctx.coding_mode = coding_mode
             if ctx is not caller_ctx:
                 caller_ctx.allowed_tools = (
                     set(ctx.allowed_tools) if ctx.allowed_tools is not None else None
@@ -9060,7 +9014,6 @@ class TurnRunner:
                 caller_ctx.denied_tools.clear()
                 caller_ctx.denied_tools.update(ctx.denied_tools)
                 caller_ctx.workspace_write_deny_globs[:] = ctx.workspace_write_deny_globs
-                caller_ctx.coding_mode = ctx.coding_mode
             log.debug(
                 "tool_policy.policy_pre",
                 allowed_tool_count=len(self._tool_registry.to_tool_definitions(ctx)),
@@ -9115,7 +9068,7 @@ class TurnRunner:
             skill.name
             for skill in loaded_skills
             if not getattr(skill, "disable_model_invocation", False)
-            and (meta_skill_enabled or getattr(skill, "kind", "skill") != "meta")
+            and getattr(skill, "kind", "skill") == "skill"
         }
         tool_handler = build_tool_handler(
             self._tool_registry,
@@ -9261,7 +9214,7 @@ class TurnRunner:
             "messages and saved progress can help locate work, but inspect the relevant "
             "current state before relying on them.\n\n"
             "Optional progress view:\n"
-            "- update_plan is optional; update_goal_progress is its legacy adapter. "
+            "- update_plan is optional. "
             "Use it only when a concise current-state "
             "view helps with meaningful multi-step work, and replace the view when reality "
             "changes. It must not define fixed phases or turn boundaries, schedule future "
@@ -9788,44 +9741,6 @@ class TurnRunner:
             return content[:max_chars] + "\n..."
         return content
 
-    def _make_meta_llm_chat(
-        self,
-        provider: Any,
-        session_key: str,
-        usage_execution_context: UsageExecutionContext | None = None,
-        provider_request_correlation: ProviderRequestCorrelation | None = None,
-    ) -> Any:
-        """Construct the (system_prompt, user_message) -> str callable that
-        meta_resolution's awaiting branch invokes for ``nl_extract: true``.
-
-        Returns None when the provider isn't available — the awaiting
-        branch silently falls back to the deterministic parser's errors,
-        which is exactly the behavior we want for non-LLM unit tests.
-        """
-        if provider is None:
-            return None
-        # Lazy import keeps the runtime cold-start independent of meta.
-        from opensquilla.engine.types import AgentConfig
-        from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
-
-        # ``make_llm_chat_from_provider`` only reads ``model_id`` /
-        # ``metadata`` off base_config (via getattr). ``self._config`` is
-        # the GatewayConfig (different shape — no .model_id), so build a
-        # minimal AgentConfig() rather than passing the wrong type.
-        meta_correlation = derive_provider_request_correlation(
-            provider_request_correlation,
-            execution_id=uuid.uuid4().hex,
-            call_kind="auxiliary.meta",
-        )
-        return make_llm_chat_from_provider(
-            provider=provider,
-            base_config=AgentConfig(),
-            usage_tracker=getattr(self, "_usage_tracker", None),
-            session_key=session_key,
-            usage_event_sink=self._usage_event_sink,
-            usage_execution_context=usage_execution_context,
-            provider_request_correlation=meta_correlation,
-        )
 
     def _load_daily_notes(self, workspace_dir: Any) -> dict[str, str]:
         from opensquilla.identity.workspace import load_daily_notes
@@ -9889,12 +9804,9 @@ class TurnRunner:
         from opensquilla.engine.steps import (
             apply_prompt_cache,
             apply_squilla_router,
-            enforce_coding_mode,
             finalize_squilla_router_capacity,
             inject_platform_hint,
             inject_subagent_grounding,
-            meta_command_launch,
-            meta_resolution,
             observe_reasoning_hint,
             resolve_model,
             resolve_skill_catalog,
@@ -9973,52 +9885,13 @@ class TurnRunner:
             from opensquilla.skills.loader import PinnedSkillLoader
 
             agent_skill_loader = PinnedSkillLoader(skill_catalog, self._skill_loader)
-        from opensquilla.skills.meta.readiness import (
-            META_READINESS_ENV_ALIASES_METADATA_KEY,
-            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY,
-            configured_meta_readiness_env_aliases,
-            configured_meta_skill_runtime_env,
-        )
-
         turn_config = self._turn_config()
         initial_metadata: dict[str, Any] = {
-            # Agent-side skill_view coercion, meta execution, and child
-            # orchestrators must resolve against the same generation used for
-            # prompt/tool selection. The pinned loader view preserves configured
-            # roots while keeping every catalog read free of filesystem probes.
             "skill_loader": agent_skill_loader,
-            "meta_run_writer": getattr(self, "_meta_run_writer", None),
-            # A content-free callback for the authoritative MetaSkill run
-            # boundary. It is copied to sub-Agent configs by the orchestrator
-            # and never enters persisted run inputs or telemetry payloads.
-            "metaskill_usage_recorder": getattr(
-                getattr(self, "growth_event_sink", None),
-                "observe_metaskill_usage",
-                None,
-            ),
-            # PR9+: meta_resolution's awaiting branch calls this first when
-            # the SKILL.md has ``nl_extract: true``. None keeps clarify reply
-            # parsing on the deterministic compatibility path.
-            "meta_llm_chat": self._make_meta_llm_chat(
-                provider,
-                session_key,
-                usage_execution_context,
-                provider_request_correlation,
-            ),
             "router_control_hold_store": self._router_control_hold_store,
             "router_control_routing_revision": getattr(
                 tool_context, "router_control_routing_revision", None
             ),
-            # Surface the resolved per-agent workspace so the meta_invoke
-            # handler in Agent._run_one_streaming (agent.py ~L4724) can
-            # find it without falling through to default_workspace_dir().
-            # Prefer tool_context.workspace_dir (already resolved with
-            # the gateway config in rpc_sessions / channel_dispatch /
-            # scheduler); fall back to resolving from agent_id on the
-            # tool_context, then to an empty string. When this key was
-            # absent the meta_invoke handler dropped to
-            # default_workspace_dir() and exec_command sandbox blocked
-            # paths under ``/root/`` instead of the gateway workspace.
             "bootstrap_workspace_dir": (
                 getattr(tool_context, "workspace_dir", None)
                 or (
@@ -10029,31 +9902,6 @@ class TurnRunner:
                     )
                     if tool_context is not None
                     else ""
-                )
-            ),
-            # Opaque callable only: credential bytes never enter metadata,
-            # transcripts, persisted inputs, or manifest-rendered arguments.
-            # The Agent must supply the current parent spec and the exact plan
-            # it is about to execute; the callable fails closed for any
-            # workspace/project parent or paid-step contract drift.
-            META_SKILL_RUNTIME_ENV_PROVIDER_METADATA_KEY: (
-                lambda parent_spec, plan: configured_meta_skill_runtime_env(
-                    turn_config,
-                    parent_spec=parent_spec,
-                    plan=plan,
-                    session_key=session_key,
-                    skill_resolver=agent_skill_loader,
-                )
-            ),
-            # Names only, likewise parent+plan scoped. A global alias would
-            # make an untrusted MetaSkill appear executable even though no
-            # capability lease could safely be injected into its child.
-            META_READINESS_ENV_ALIASES_METADATA_KEY: (
-                lambda parent_spec, plan: configured_meta_readiness_env_aliases(
-                    turn_config,
-                    parent_spec=parent_spec,
-                    plan=plan,
-                    skill_resolver=agent_skill_loader,
                 )
             ),
         }
@@ -10277,10 +10125,6 @@ class TurnRunner:
         from opensquilla.engine.steps.selected_skills import load_selected_skills
 
         turn = await load_selected_skills(turn, tool_context)
-        planning_turn = (
-            tool_context is not None
-            and str(getattr(tool_context, "collaboration_mode", "default")) == "plan"
-        )
         pipeline_steps: list[TurnStep] = [resolve_model]
         pipeline_steps.extend(
             [
@@ -10288,8 +10132,6 @@ class TurnRunner:
                 observe_reasoning_hint,
             ]
         )
-        if not planning_turn:
-            pipeline_steps.extend([meta_resolution, enforce_coding_mode])
         pipeline_steps.extend(
             [
                 resolve_skill_catalog,
@@ -10298,8 +10140,6 @@ class TurnRunner:
                 apply_prompt_cache,
             ]
         )
-        if not planning_turn:
-            pipeline_steps.insert(-4, meta_command_launch)
         turn = await run_pipeline(turn, pipeline_steps)
         if router_history_replay_request is not None:
             history_capacity = await self._router_history_capacity_for_request(
@@ -10891,8 +10731,9 @@ class TurnRunner:
 
         Ordinary JSON is not treated as an attachment envelope and remains a
         conservative text input. The result is ``(recognized, valid,
-        estimate_complete)``. Invalid recognized envelopes remain raw text;
-        only a valid envelope may replace its persisted raw-token floor.
+        estimate_complete)``. Once the outer envelope is recognized, corrupt
+        non-image material remains a bounded replay marker; only retained
+        image media requires a material proof.
         """
 
         if not content or not content.lstrip().startswith("{"):
@@ -10905,22 +10746,30 @@ class TurnRunner:
             return False, True, True
         if not isinstance(parsed.get("text"), str):
             return True, False, False
-        attachments = parsed.get("attachments") or []
+        attachments = parsed.get("attachments")
         if not isinstance(attachments, list):
             return True, False, False
-        for attachment in attachments:
+        from opensquilla.session.attachment_manifest import (
+            extract_attachment_occurrences_from_envelope,
+        )
+
+        occurrences = extract_attachment_occurrences_from_envelope(
+            content,
+            session_id=session_id or "capacity",
+            source_message_id="capacity",
+        )
+        image_occurrences = {occurrence.ordinal: occurrence for occurrence in occurrences}
+        for ordinal, attachment in enumerate(attachments):
             if not isinstance(attachment, dict):
-                return True, False, False
-            media_type = (
+                # The replay decoder skips malformed list members entirely.
+                continue
+            raw_media_type = (
                 attachment.get("type")
                 or attachment.get("mime")
                 or attachment.get("media_type")
             )
-            if (
-                not isinstance(media_type, str)
-                or media_type not in _ALLOWED_ENGINE_MEDIA_TYPES
-            ):
-                return True, False, False
+            if not isinstance(raw_media_type, str):
+                continue
             data = attachment.get("data")
             sha_ref = attachment.get("sha256_ref")
             missing_reason = attachment.get("missing_reason")
@@ -10928,114 +10777,52 @@ class TurnRunner:
             sha_ref_text = sha_ref if isinstance(sha_ref, str) and sha_ref else None
             has_missing_reason = isinstance(missing_reason, str) and bool(missing_reason)
             if not (data_text is not None or sha_ref_text is not None or has_missing_reason):
+                # The historical decoder skips MIME-only and alias-only rows.
+                continue
+            # Historical non-image material is never included in a provider
+            # message. A corrupt or missing file changes only its bounded
+            # workspace/omission marker, not whether the storage Base64 is
+            # replayed. Only images retained by this route need material proof.
+            if not preserve_image_attachments or raw_media_type not in _IMAGE_ATTACHMENT_MIMES:
+                continue
+            media_type = _normalize_attachment_mime(raw_media_type)
+            if media_type is None:
+                return True, False, False
+            occurrence = image_occurrences.get(ordinal)
+            if occurrence is None:
                 return True, False, False
             if data_text is not None:
                 try:
-                    base64.b64decode(data_text, validate=True)
+                    decoded = base64.b64decode(data_text, validate=True)
+                    validate_image_bytes(decoded, media_type)
                 except (binascii.Error, ValueError):
                     return True, False, False
-            if not preserve_image_attachments or media_type not in _IMAGE_ATTACHMENT_MIMES:
                 continue
-            if data_text is not None:
-                continue
-            if sha_ref_text is None:
-                # A persisted missing_reason-only record intentionally replays
-                # as an unavailable marker and needs no media hydration.
-                continue
-            if media_root is None or not session_id:
-                return True, True, False
-            raw_size = attachment.get("size")
-            size = raw_size if isinstance(raw_size, int) else -1
-            label = attachment.get("name")
-            if not isinstance(label, str) or not label.strip():
-                label = "image"
-            try:
-                ref = make_attachment_ref(
-                    sha256=sha_ref_text,
-                    name=label,
-                    mime=media_type,
-                    size=size,
-                    session_id=session_id,
-                    source="transcript",
-                )
-                read_attachment_ref_bytes(ref, media_root=media_root)
-            except (OSError, ValueError):
-                return True, True, False
+            if occurrence.material_state == "invalid" and sha_ref_text is None:
+                return True, False, False
+            if data_text is None and sha_ref_text is not None:
+                # Retained images can enter the provider request as media, so
+                # prove their reference before reserving the media budget.
+                if media_root is None or not session_id:
+                    return True, True, False
+                raw_size = attachment.get("size")
+                size = raw_size if isinstance(raw_size, int) else -1
+                label = attachment.get("name")
+                if not isinstance(label, str) or not label.strip():
+                    label = "attachment"
+                try:
+                    ref = make_attachment_ref(
+                        sha256=sha_ref_text,
+                        name=label,
+                        mime=media_type,
+                        size=size,
+                        session_id=session_id,
+                        source="transcript",
+                    )
+                    read_attachment_ref_bytes(ref, media_root=media_root)
+                except (OSError, ValueError):
+                    return True, True, False
         return True, True, True
-
-    @staticmethod
-    def _attachment_history_residual_token_floor(
-        content: str,
-        projected_content: Any,
-        persisted_token_count: int,
-    ) -> int:
-        """Remove only replayed inline-image data from a persisted raw floor.
-
-        A transcript token_count is row-scoped, so clearing it wholesale can
-        also discount ordinary text, PDF bytes, or a legacy provider-usage
-        surplus. Replace the exact canonical ``data`` JSON values for images
-        that became typed blocks, then subtract only that measured delta.
-        Failure to locate every value keeps the original conservative floor.
-        """
-
-        raw_tokens = estimate_tokens(content)
-        raw_floor = max(0, persisted_token_count, raw_tokens)
-        if not isinstance(projected_content, list):
-            return raw_floor
-        from opensquilla.provider.types import ContentBlockImage
-
-        typed_image_count = sum(
-            isinstance(block, ContentBlockImage) and block.source_type == "base64"
-            for block in projected_content
-        )
-        if typed_image_count <= 0:
-            return raw_floor
-        try:
-            parsed = json.loads(content)
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return raw_floor
-        if not isinstance(parsed, dict):
-            return raw_floor
-        attachments = parsed.get("attachments") or []
-        if not isinstance(attachments, list):
-            return raw_floor
-        inline_image_data = [
-            attachment["data"]
-            for attachment in attachments
-            if isinstance(attachment, dict)
-            and (
-                attachment.get("type")
-                or attachment.get("mime")
-                or attachment.get("media_type")
-            )
-            in _IMAGE_ATTACHMENT_MIMES
-            and isinstance(attachment.get("data"), str)
-            and bool(attachment.get("data"))
-        ]
-        if not inline_image_data or typed_image_count < len(inline_image_data):
-            return raw_floor
-
-        residual = content
-        for data in set(inline_image_data):
-            encoded_data = json.dumps(data, ensure_ascii=False)
-            placeholder = json.dumps(
-                f"[history_image_omitted: {len(data)} chars]",
-                ensure_ascii=False,
-            )
-            pattern = re.compile(r'("data"\s*:\s*)' + re.escape(encoded_data))
-            expected_replacements = inline_image_data.count(data)
-            if len(pattern.findall(residual)) != expected_replacements:
-                return raw_floor
-            residual, replacements = pattern.subn(
-                lambda match: match.group(1) + placeholder,
-                residual,
-            )
-            if replacements != expected_replacements:
-                return raw_floor
-
-        residual_tokens = estimate_tokens(residual)
-        image_data_delta = max(0, raw_tokens - residual_tokens)
-        return max(0, residual_tokens, persisted_token_count - image_data_delta)
 
     def _project_history_replay(
         self,
@@ -11093,6 +10880,7 @@ class TurnRunner:
 
             estimate_complete = True
             raw_token_floor_applies = True
+            persisted_token_surplus = 0
             if raw_content and role == "user":
                 preserve_image = entry_index in image_indexes
                 recognized = False
@@ -11111,8 +10899,9 @@ class TurnRunner:
                     and recognized
                     and (not valid or not estimate_complete)
                 ):
-                    # Do not partially unpack unproven attachment envelopes:
-                    # retaining their raw JSON/base64 is the conservative view.
+                    # An unproven retained image or malformed outer envelope
+                    # retains its conservative raw estimate. Opaque material
+                    # is always projected through the history decoder.
                     projected_content = raw_content
                 else:
                     projected_content = self._maybe_unpack_attachments(
@@ -11134,14 +10923,59 @@ class TurnRunner:
                         allowed_image_attachment_ids=allowed_image_attachment_ids,
                         source_message_id=getattr(entry, "message_id", None),
                     )
-                if require_capacity_proof and recognized and valid:
-                    persisted_token_count = (
-                        self._attachment_history_residual_token_floor(
-                            raw_content,
-                            projected_content,
-                            persisted_token_count,
-                        )
+                if require_capacity_proof and recognized and valid and estimate_complete:
+                    # Capacity measurement uses the same side-effect-free
+                    # projection as compaction admission. It reserves possible
+                    # materialized path text for both opaque files and images;
+                    # the ordinary history load remains the actual replay.
+                    from opensquilla.session.compaction import (
+                        project_entry_content_for_provider,
                     )
+
+                    budget_content, budget_complete = project_entry_content_for_provider(
+                        raw_content,
+                        preserve_images=preserve_image,
+                        session_id=session_id or "",
+                        message_id=str(getattr(entry, "message_id", "") or ""),
+                    )
+                    if budget_complete:
+                        if (
+                            preserve_image
+                            and self._attachment_envelope_has_image(raw_content)
+                            and isinstance(budget_content, list)
+                        ):
+                            # A retained ref must use the decoder's proven
+                            # base64 media. The pure projection cannot read
+                            # it and uses a URL placeholder, which the
+                            # capacity proof would correctly reject. Add
+                            # only its conservative text markers to the
+                            # decoded media replay, without materializing.
+                            from opensquilla.provider.types import ContentBlockText
+
+                            reserve_blocks = [
+                                block for block in budget_content[1:]
+                                if isinstance(block, ContentBlockText)
+                            ]
+                            if isinstance(projected_content, list):
+                                projected_content = [*projected_content, *reserve_blocks]
+                            elif reserve_blocks:
+                                projected_content = "\n".join([
+                                    str(projected_content),
+                                    *(block.text for block in reserve_blocks),
+                                ])
+                        else:
+                            projected_content = budget_content
+                    else:
+                        projected_content = raw_content
+                        estimate_complete = False
+                if require_capacity_proof and recognized and valid and estimate_complete:
+                    # Keep only usage that exceeds the raw storage envelope;
+                    # its Base64 estimate must not become a history floor.
+                    persisted_token_surplus = max(
+                        0, persisted_token_count - estimate_tokens(raw_content),
+                    )
+                    persisted_token_count = 0
+                    raw_token_floor_applies = False
             elif raw_content and role == "assistant":
                 projected_content = self._maybe_unpack_assistant_artifacts(raw_content)
             else:
@@ -11156,6 +10990,7 @@ class TurnRunner:
                 turn_context=(turn_context if isinstance(turn_context, dict) else None),
                 estimate_complete=estimate_complete,
                 persisted_token_count=persisted_token_count,
+                persisted_token_surplus=persisted_token_surplus,
                 raw_token_floor_applies=raw_token_floor_applies,
                 last_entry_was_user=role == "user",
             )
@@ -12073,52 +11908,6 @@ class TurnRunner:
         except Exception as exc:  # pragma: no cover — observability must not break turns
             log.warning("decision_log.write_failed", error=str(exc))
 
-    def _emit_router_train_sample(
-        self,
-        *,
-        agent_id: str,
-        session_key: str,
-        turn_obj: Any | None,
-        message: str,
-    ) -> None:
-        """Append one self-learning sample for this turn (best-effort).
-
-        Opt-in (``squilla_router.self_learning.{enabled,capture_enabled}``) and
-        kill-switched. Writes the float16 feature vectors the model produced plus
-        the routing decision; never raw prompt text (unless the audit sidecar is
-        explicitly enabled). Must never break turn execution.
-        """
-
-        try:
-            if turn_obj is None:
-                return
-            router_cfg = getattr(self._turn_config(), "squilla_router", None)
-            sl = getattr(router_cfg, "self_learning", None)
-            if sl is None or not getattr(sl, "enabled", False):
-                return
-            if not getattr(sl, "capture_enabled", True):
-                return
-
-            from opensquilla.squilla_router.self_learning import (
-                self_learning_disabled_by_env,
-                write_sample,
-            )
-            from opensquilla.squilla_router.self_learning.capture import build_train_sample
-
-            if self_learning_disabled_by_env():
-                return
-
-            sample = build_train_sample(
-                session_key=session_key,
-                metadata=turn_obj.metadata,
-                store_audit_summary=bool(getattr(sl, "store_audit_summary", False)),
-                message=message,
-            )
-            if sample is None:
-                return
-            write_sample(sample, agent_id)
-        except Exception as exc:  # pragma: no cover — capture must not break turns
-            log.warning("router_self_learning.capture_failed", error=str(exc))
 
     @staticmethod
     def _active_persisted_user_index(
@@ -12253,6 +12042,7 @@ class TurnRunner:
         compaction_request_context: Any | None = None,
         compaction_budget: CompactionBudget | None = None,
         attachment_path_resolver: Callable[[dict[str, Any], str], str | None] | None = None,
+        preserve_historical_images: bool = True,
         history_capacity_tokens: int | None = None,
         history_capacity_chars: int | None = None,
         history_has_persisted_user: bool = False,
@@ -12337,6 +12127,8 @@ class TurnRunner:
         compaction_config.request_context = compaction_request_context
         compaction_config.budget = compaction_budget
         compaction_config.attachment_path_resolver = attachment_path_resolver
+        compaction_config.attachment_media_root = self._attachment_media_root()
+        compaction_config.preserve_historical_images = preserve_historical_images
         if self.has_attempted_compaction_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
@@ -12388,12 +12180,30 @@ class TurnRunner:
         )
 
         durable_prefix_end = len(transcript) - protected_suffix_count
+        replay_session_id = expected_session_id or next(
+            (
+                str(getattr(entry, "session_id"))
+                for entry in transcript
+                if getattr(entry, "session_id", None)
+            ),
+            "",
+        )
+        replay_measure_kwargs: dict[str, Any] = {
+            "media_root": compaction_config.attachment_media_root,
+            "session_id": replay_session_id,
+            "preserve_images": preserve_historical_images,
+        }
 
         def measure_replay() -> tuple[list[int], int, int]:
             return (
-                [estimate_entry_model_replay_tokens(entry) for entry in transcript],
-                estimate_entries_model_replay_chars(transcript),
-                estimate_entries_model_replay_chars(transcript[:durable_prefix_end]),
+                [
+                    estimate_entry_model_replay_tokens(entry, **replay_measure_kwargs)
+                    for entry in transcript
+                ],
+                estimate_entries_model_replay_chars(transcript, **replay_measure_kwargs),
+                estimate_entries_model_replay_chars(
+                    transcript[:durable_prefix_end], **replay_measure_kwargs,
+                ),
             )
 
         # Long histories must not block unrelated SQLite completions on the
@@ -12462,6 +12272,7 @@ class TurnRunner:
         protected_request_chars = (
             await asyncio.to_thread(
                 estimate_entry_model_replay_chars, transcript[active_user_index],
+                **replay_measure_kwargs,
             )
             if active_user_index is not None
             else 0
@@ -12506,6 +12317,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
         if protected_suffix_count and not self._durable_compaction_accepts_config():
@@ -12523,6 +12335,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
 
@@ -12607,6 +12420,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
         except Exception as exc:
@@ -12784,6 +12598,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             return
         except Exception as exc:  # noqa: BLE001
@@ -12806,6 +12621,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             if emergency_applied:
                 return
@@ -12860,6 +12676,7 @@ class TurnRunner:
                 expected_session_id=expected_session_id,
                 expected_session_epoch=expected_session_epoch,
                 consumer_admission=consumer_admission,
+                preserve_historical_images=preserve_historical_images,
             )
             if emergency_applied:
                 return
@@ -12961,6 +12778,7 @@ class TurnRunner:
             turn_context=turn_context if isinstance(turn_context, dict) else None,
         )
         return {
+            "session_id": getattr(entry, "session_id", None),
             "message_id": getattr(entry, "message_id", None),
             "role": role,
             "content": silent_reply.content or "",
@@ -12976,6 +12794,7 @@ class TurnRunner:
     @staticmethod
     def _emergency_replay_entry(raw: Mapping[str, Any]) -> Any:
         return SimpleNamespace(
+            session_id=raw.get("session_id"),
             message_id=raw.get("message_id"),
             role=str(raw.get("role") or "user"),
             content=str(raw.get("content") or ""),
@@ -13010,6 +12829,7 @@ class TurnRunner:
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
         consumer_admission: Callable[[str, list[dict[str, Any]]], bool] | None = None,
+        preserve_historical_images: bool = True,
     ) -> bool:
         """Select a local request view; never summarize or mutate session storage."""
         self._turn_compaction_failed_sessions.add(session_key)
@@ -13028,6 +12848,11 @@ class TurnRunner:
         from opensquilla.session.tokenizer import estimate_tokens
 
         raw_entries = [self._entry_for_emergency_compaction(entry) for entry in transcript]
+        replay_measure_kwargs: dict[str, Any] = {
+            "media_root": self._attachment_media_root(),
+            "session_id": expected_session_id or "",
+            "preserve_images": preserve_historical_images,
+        }
         complete_summary = await self._compaction_summary_context(
             session_key, [], expected_session_id=expected_session_id,
             expected_session_epoch=expected_session_epoch, emit_event=False, raw_complete=True,
@@ -13042,8 +12867,11 @@ class TurnRunner:
                 return bool(consumer_admission(summary, kept))
             # Compatibility callers supply history capacity with the fixed
             # envelope already deducted. Production uses the exact wire gate.
-            tokens = sum(estimate_entry_model_replay_tokens(e) for e in kept)
-            chars = estimate_entries_model_replay_chars(kept)
+            tokens = sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in kept
+            )
+            chars = estimate_entries_model_replay_chars(kept, **replay_measure_kwargs)
             return (
                 tokens + estimate_tokens(rendered or "") <= history_window_tokens
                 and (history_capacity_chars is None
@@ -13123,6 +12951,7 @@ class TurnRunner:
             history_window_tokens=history_window_tokens,
             history_capacity_chars=history_capacity_chars,
             protected_recent_messages=protected_count, protected_message_id=protected_message_id,
+            preserve_historical_images=preserve_historical_images,
             consumer_admission=consumer_admission,
         )
         self.mark_compacted_this_turn(session_key)
@@ -13130,8 +12959,14 @@ class TurnRunner:
             session_key, source="automatic", phase=phase, status="emergency_ephemeral",
             reason=reason, removed_count=omitted_count, kept_count=len(kept),
             omitted_count=omitted_count, archived_count=0,
-            tokens_before=sum(estimate_entry_model_replay_tokens(e) for e in raw_entries),
-            tokens_after=sum(estimate_entry_model_replay_tokens(e) for e in kept)
+            tokens_before=sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in raw_entries
+            ),
+            tokens_after=sum(
+                estimate_entry_model_replay_tokens(e, **replay_measure_kwargs)
+                for e in kept
+            )
                          + estimate_tokens(_format_compaction_summary_context([summary]) or ""),
             **compaction_effect_payload(status="emergency_ephemeral", reason=reason),
             **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
@@ -13508,6 +13343,9 @@ class TurnRunner:
                             expected_session_id=expected_session_id,
                             expected_session_epoch=expected_session_epoch,
                             consumer_admission=emergency_override.consumer_admission,
+                            preserve_historical_images=(
+                                emergency_override.preserve_historical_images
+                            ),
                         )
                         emergency_override = emergency_overrides.pop(session_key, None)
                 if emergency_override is not None:
@@ -14464,14 +14302,12 @@ class TurnRunner:
         preserved_image = False
         occurrence_ids: dict[int, str] = {}
         attachment_identity_session_id = session_id or "history"
-        try:
-            from opensquilla.session.attachment_manifest import (
-                extract_attachment_occurrences_from_envelope,
-            )
+        from opensquilla.session import attachment_manifest
 
+        try:
             occurrence_ids = {
                 occurrence.ordinal: occurrence.attachment_id
-                for occurrence in extract_attachment_occurrences_from_envelope(
+                for occurrence in attachment_manifest.extract_attachment_occurrences_from_envelope(
                     content,
                     session_id=attachment_identity_session_id,
                     source_message_id=source_message_id or "unknown",
@@ -14516,15 +14352,17 @@ class TurnRunner:
             name = att.get("name")
             fallback = "image" if media_type.startswith("image/") else "attachment"
             label = name if isinstance(name, str) and name.strip() else fallback
+            display_name = attachment_manifest.normalize_attachment_name(
+                label, fallback=fallback,
+            )
+            display_mime = attachment_manifest.normalize_attachment_mime(media_type)
             attachment_id = occurrence_ids.get(ordinal)
             if attachment_id is None:
                 # Keep legacy IDs deterministic when an old envelope omitted
                 # them. This is metadata-only; no bytes or paths enter the
                 # marker or persisted state.
                 try:
-                    from opensquilla.session.attachment_manifest import legacy_attachment_id
-
-                    attachment_id = legacy_attachment_id(
+                    attachment_id = attachment_manifest.legacy_attachment_id(
                         session_id=attachment_identity_session_id,
                         message_id=source_message_id or "unknown",
                         index=ordinal,
@@ -14542,7 +14380,7 @@ class TurnRunner:
                 image_path = historical_materializer.materialize_image_path(att, session_id)
                 if image_path:
                     image_material_marker = TurnRunner._image_attachment_material_marker(
-                        name, media_type, image_path,
+                        display_name, display_mime, image_path,
                     )
             image_replay_allowed = (
                 allowed_image_attachment_ids is None
@@ -14603,17 +14441,17 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root and session_id:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
-                        name=label,
-                        mime=media_type,
-                        size=size,
-                        session_id=session_id,
-                        source="transcript",
-                    )
                     try:
+                        ref = make_attachment_ref(
+                            sha256=sha_ref,
+                            name=label,
+                            mime=media_type,
+                            size=size,
+                            session_id=session_id,
+                            source="transcript",
+                        )
                         raw_bytes = read_attachment_ref_bytes(ref, media_root=media_root)
-                    except (FileNotFoundError, ValueError):
+                    except (OSError, ValueError):
                         omitted.append(
                             image_marker(
                                 ImageMarkerState.UNAVAILABLE,
@@ -14666,14 +14504,22 @@ class TurnRunner:
                 if isinstance(sha_ref, str) and sha_ref and media_root is not None:
                     raw_size = att.get("size")
                     size = raw_size if isinstance(raw_size, int) else -1
-                    ref = make_attachment_ref(
-                        sha256=sha_ref,
-                        name=label,
-                        mime=media_type,
-                        size=size,
-                        session_id=session_id,
-                        source="transcript",
-                    )
+                    try:
+                        ref = make_attachment_ref(
+                            sha256=sha_ref,
+                            name=label,
+                            mime=media_type,
+                            size=size,
+                            session_id=session_id,
+                            source="transcript",
+                        )
+                    except ValueError:
+                        omitted.append(
+                            "[historical attachment unavailable: "
+                            f"{display_name} ({display_mime}): "
+                            "invalid attachment reference]"
+                        )
+                        continue
                     result = materializer.materialize(ref, session_id=session_id)
                 elif isinstance(data, str) and data:
                     try:
@@ -14681,7 +14527,8 @@ class TurnRunner:
                     except (binascii.Error, ValueError):
                         omitted.append(
                             "[historical attachment unavailable: "
-                            f"{label} ({media_type}): attachment data is not valid base64]"
+                            f"{display_name} ({display_mime}): "
+                            "attachment data is not valid base64]"
                         )
                         continue
                     result = materializer.materialize_bytes(
@@ -14691,12 +14538,7 @@ class TurnRunner:
                         session_id=session_id,
                     )
                 if result is not None:
-                    prefix = (
-                        "historical attachment available"
-                        if result.available
-                        else "historical attachment unavailable"
-                    )
-                    omitted.append(render_attachment_material_marker(result, prefix=prefix))
+                    omitted.append(render_historical_attachment_material_marker(result))
                     continue
             if media_type in _IMAGE_ATTACHMENT_MIMES:
                 if image_material_marker:
@@ -14713,11 +14555,13 @@ class TurnRunner:
                 # it, while adding the explicit state and stable ID required
                 # for a model switch after compaction.
                 omitted.append(
-                    f"[historical attachment omitted: {label} ({media_type}); "
+                    f"[historical attachment omitted: {display_name} ({display_mime}); "
                     f"{marker[1:-1]}]"
                 )
             else:
-                omitted.append(f"[historical attachment omitted: {label} ({media_type})]")
+                omitted.append(
+                    f"[historical attachment omitted: {display_name} ({display_mime})]"
+                )
         if preserved_image:
             if omitted:
                 from opensquilla.provider.types import ContentBlockText

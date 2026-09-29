@@ -671,12 +671,9 @@ async def test_post_uses_event_id_as_idempotency_key(monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("disabled,child", [(True, False), (False, True)])
-async def test_standalone_veto_does_not_create_usage_store(tmp_path, monkeypatch, disabled, child):
+async def test_standalone_veto_does_not_create_usage_store(tmp_path, monkeypatch):
     _enable_telemetry_for_test(monkeypatch)
-    if child:
-        monkeypatch.setenv("OPENSQUILLA_CODETASK_CHILD", "1")
-    config = _config(tmp_path, disabled=disabled)
+    config = _config(tmp_path, disabled=True)
     runtime = usage_telemetry.StandaloneUsageTelemetry(config=config, legacy_storage=None)
     runtime.start()
     await runtime.record_turn(run_kind="default", done_event=_done())

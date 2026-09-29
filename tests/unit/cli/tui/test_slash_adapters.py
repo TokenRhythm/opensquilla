@@ -108,8 +108,6 @@ class _StubGatewayClient:
     async def call(self, method: str, params: dict | None = None) -> Any:
         self.calls.append(("call", (method, params)))
         self._maybe_raise("call")
-        if method == "meta.list":
-            return {"skills": []}
         return {"ok": True}
 
     async def create_session(
@@ -469,7 +467,8 @@ def _standalone_context(
 def test_handler_word_sets_derive_from_engine_registry() -> None:
     assert GATEWAY_SLASH_HANDLER_WORDS == registry_handler_words(Surface.CLI_GATEWAY)
     assert STANDALONE_SLASH_HANDLER_WORDS == registry_handler_words(Surface.CLI_STANDALONE)
-    assert "/meta" in GATEWAY_SLASH_HANDLER_WORDS
+    assert {"/meta", "/coding"}.isdisjoint(GATEWAY_SLASH_HANDLER_WORDS)
+    assert {"/meta", "/coding"}.isdisjoint(STANDALONE_SLASH_HANDLER_WORDS)
     assert "/usage" not in STANDALONE_SLASH_HANDLER_WORDS
 
 
@@ -502,19 +501,23 @@ async def test_standalone_handler_chain_covers_every_registry_word(
 # --------------------------------------------------------------------------- #
 
 
+@pytest.mark.parametrize("command", ["/definitely-unknown", "/meta", "/meta sample", "/coding on"])
 async def test_gateway_unknown_command_returns_false(
     monkeypatch: pytest.MonkeyPatch,
+    command: str,
 ) -> None:
     _patch_gateway_io(monkeypatch)
-    handled = await handle_gateway_slash_command("/definitely-unknown", _gateway_context())
+    handled = await handle_gateway_slash_command(command, _gateway_context())
     assert handled is False
 
 
+@pytest.mark.parametrize("command", ["/definitely-unknown", "/meta", "/meta sample", "/coding on"])
 async def test_standalone_unknown_command_prints_notice_and_returns_true(
     monkeypatch: pytest.MonkeyPatch,
+    command: str,
 ) -> None:
     recorder = _patch_standalone_io(monkeypatch)
-    handled = await handle_standalone_slash_command("/definitely-unknown", _standalone_context())
+    handled = await handle_standalone_slash_command(command, _standalone_context())
     assert handled is True
     assert "Unknown command" in recorder.text()
 
@@ -1318,8 +1321,10 @@ def test_classify_model_strategy_as_immediate_control(command: str) -> None:
     assert classify(command) is SlashCategory.CONTROL
 
 
-@pytest.mark.parametrize("command", ["/strategy", "/router on", "/ensemble", "/meta foo"])
-def test_standalone_gateway_only_commands_stay_off_the_turn_plane(command: str) -> None:
+@pytest.mark.parametrize(
+    "command", ["/strategy", "/router on", "/ensemble", "/meta foo", "/coding on"],
+)
+def test_standalone_unsupported_commands_stay_off_the_turn_plane(command: str) -> None:
     assert classify(command, surface=Surface.CLI_STANDALONE) is SlashCategory.COMMAND
 
 

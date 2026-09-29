@@ -171,6 +171,41 @@ describe('native Workbench platform bridge', () => {
     expect(platform.capabilities.hasNativeWorkbenchSurfaces).toBe(false)
   })
 
+  it.each([
+    {
+      name: 'current host',
+      getCapabilities: async () => ({ protocolVersions: [1, 2, 3, 4], modes: ['full'] }),
+      expected: { protocolVersions: [1, 2, 3, 4], modes: ['full'] },
+    },
+    {
+      name: 'legacy host with an explicit limit',
+      getCapabilities: async () => ({ protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 }),
+      expected: { protocolVersions: [1, 2], modes: ['offline'], maxSurfaces: 8 },
+    },
+    {
+      name: 'host without a capability bridge',
+      getCapabilities: undefined,
+      expected: { protocolVersions: [1], modes: ['offline'] },
+    },
+    {
+      name: 'unavailable capability bridge',
+      getCapabilities: async () => { throw new Error('unavailable') },
+      expected: { protocolVersions: [1], modes: ['offline'] },
+    },
+  ])('does not invent a surface limit for $name', async ({ getCapabilities, expected }) => {
+    setDesktopApi({
+      createWorkbenchSurface: async () => ({ ok: true }),
+      setWorkbenchSurfaceRect: async () => ({ ok: true }),
+      activateWorkbenchSurface: async () => ({ ok: true }),
+      destroyWorkbenchSurface: async () => ({ ok: true }),
+      onWorkbenchSurfaceEvent: () => () => undefined,
+      getWorkbenchCapabilities: getCapabilities,
+    })
+
+    const native = createDesktopPlatform().workbench.native!
+    await expect(native.getCapabilities?.()).resolves.toEqual(expected)
+  })
+
   it('normalizes the v3 annotation bridge and rejects untrusted event fields', async () => {
     let emit: ((payload: unknown) => void) | undefined
     const setMode = vi.fn(async () => ({ ok: true }))

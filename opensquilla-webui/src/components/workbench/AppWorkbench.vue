@@ -558,7 +558,7 @@ function openResourceArtifact(
   initialSection: 'preview' | 'source' = 'preview',
 ) {
   const nativeArtifact = resourceUsesNativeHtmlPreview(resource)
-  const opened = store.openItem(artifactPreviewItemForExplicitOpen({
+  store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     initialSection,
     nativeHtml: Boolean(
@@ -571,9 +571,6 @@ function openResourceArtifact(
     resourceIdentity: workbenchResourceKey(resource.resource),
     sessionKey,
   }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
 }
 
 async function openWorkbenchResource(resource: WorkbenchResource, item: WorkbenchItem) {
@@ -849,7 +846,7 @@ function selectNavigationArtifact(
   if (!artifact || select.value === item.id) return
   const navigationArtifacts = navigationArtifactsFromWorkbenchItem(item)
   const sessionKey = sessionKeyFromWorkbenchItem(item)
-  const opened = store.openItem(artifactPreviewItemForExplicitOpen({
+  store.openItem(artifactPreviewItemForExplicitOpen({
     artifact,
     navigationArtifacts,
     nativeHtml: Boolean(
@@ -858,9 +855,6 @@ function selectNavigationArtifact(
     ),
     sessionKey,
   }))
-  if (!opened) {
-    pushToast(t('workbench.itemLimitReached'), { tone: 'warn', duration: 6000 })
-  }
 }
 
 function panelHeader(item: WorkbenchItem | null): WorkbenchPanelHeader {

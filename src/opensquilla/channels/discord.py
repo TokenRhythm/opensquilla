@@ -397,15 +397,15 @@ class DiscordChannel:
             if data.get("author", {}).get("id") == self.bot_user_id:
                 return
             msg_id = str(data.get("id") or "")
-            if msg_id and not self._dedupe.check_and_add(f"message:{msg_id}"):
-                return
             msg = self.parse_event(self._annotate_channel_context(data))
-            self.enqueue(msg)
+            await self._dedupe.run_once(
+                f"message:{msg_id}" if msg_id else None, lambda: self.enqueue(msg)
+            )
         elif event_type == "MESSAGE_REACTION_ADD":
             reaction_key = self._reaction_dedupe_key(data)
-            if reaction_key and not self._dedupe.check_and_add(reaction_key):
-                return
-            self._enqueue_reaction(self._annotate_channel_context(data))
+            await self._dedupe.run_once(
+                reaction_key, lambda: self._enqueue_reaction(self._annotate_channel_context(data))
+            )
         elif event_type == "INTERACTION_CREATE":
             # Gateway interactions still use the same interaction callback
             # contract as HTTP-delivered interactions.  Defer before doing any
@@ -413,11 +413,12 @@ class DiscordChannel:
             # met, then resolve the original response when the turn completes.
             deferred = await self._defer_interaction(data)
             interaction_id = str(data.get("id") or "")
-            if interaction_id and not self._dedupe.check_and_add(f"interaction:{interaction_id}"):
-                return
             enriched = self._annotate_channel_context(data)
             enriched["interaction_deferred"] = deferred
-            self._handle_interaction(enriched)
+            await self._dedupe.run_once(
+                f"interaction:{interaction_id}" if interaction_id else None,
+                lambda: self._handle_interaction(enriched),
+            )
         elif event_type in {"CHANNEL_CREATE", "CHANNEL_UPDATE", "THREAD_CREATE", "THREAD_UPDATE"}:
             self._cache_channel_context(data)
         elif event_type == "GUILD_CREATE":
@@ -465,7 +466,7 @@ class DiscordChannel:
             return ""
         return f"reaction:{data.get('message_id', '')}:{data.get('user_id', '')}:{emoji_key}"
 
-    def _enqueue_reaction(self, data: dict[str, Any]) -> None:
+    async def _enqueue_reaction(self, data: dict[str, Any]) -> None:
         user_id = data.get("user_id", "unknown")
         channel_id = data.get("channel_id", "unknown")
         emoji = data.get("emoji", {})
@@ -501,9 +502,9 @@ class DiscordChannel:
                 principal=AuthenticatedPrincipal(subject_id=str(user_id)),
             ),
         )
-        self.enqueue(msg)
+        await self.enqueue(msg)
 
-    def _handle_interaction(self, data: dict[str, Any]) -> None:
+    async def _handle_interaction(self, data: dict[str, Any]) -> None:
         """Parse a slash command interaction into IncomingMessage."""
         interaction_data = data.get("data", {})
         user = data.get("member", {}).get("user", data.get("user", {}))
@@ -549,7 +550,7 @@ class DiscordChannel:
                 principal=AuthenticatedPrincipal(subject_id=str(user.get("id", "unknown"))),
             ),
         )
-        self.enqueue(msg)
+        await self.enqueue(msg)
 
     async def _defer_interaction(self, data: dict[str, Any]) -> bool:
         """Acknowledge an interaction with a deferred channel response."""
@@ -664,10 +665,10 @@ class DiscordChannel:
     # Inbound
     # ------------------------------------------------------------------
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    async def enqueue(self, message: IncomingMessage) -> None:
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, message, self._queue)
+        await durable_enqueue(self, message, self._queue)
         self._last_message_at = datetime.now(UTC)
 
     async def receive(self) -> IncomingMessage:

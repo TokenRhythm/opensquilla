@@ -24,7 +24,7 @@ and upgrade compatibility, see [`sandbox-security.md`](sandbox-security.md).
 | Sessions | `sessions_send`, `sessions_spawn`, `sessions_list`, `sessions_history`, `session_status`. |
 | Artifacts | `publish_artifact`. |
 | Media | image generation, PDF, TTS, and media helpers. |
-| Skills | `skill_list`, `skill_view`, `skill_create`, `skill_edit`, `install_skill_deps`, `meta_invoke`. |
+| Skills | `skill_list`, `skill_view`, `skill_create`, `skill_edit`, `install_skill_deps`. |
 | Admin | cron and gateway administration. |
 | Channels/platforms | messaging and Feishu/Lark docs, chat, drive, wiki, media, and permission helpers. |
 

@@ -20,18 +20,13 @@ from opensquilla.paths import default_opensquilla_home
 from opensquilla.skills.file_hash import _TreeChangedDuringHashError
 from opensquilla.skills.manifest import (
     MAX_SKILL_FILE_BYTES,
+    RETIRED_SKILL_MESSAGE,
+    RetiredSkillError,
     SkillCompileProfile,
-    _string_list,
     _validated_skill_name,
     compile_skill_manifest,
     normalize_skill_triggers,
     skill_instance_id,
-)
-from opensquilla.skills.meta.sop_compiler import (
-    SOPCompileError,
-)
-from opensquilla.skills.meta.sop_compiler import (
-    compile as _sop_compile,
 )
 from opensquilla.skills.tree import compute_tree_sha256, compute_tree_state
 from opensquilla.skills.types import (
@@ -52,8 +47,8 @@ MAX_SKILLS_PER_SOURCE = 200  # per layer cap
 # v14 adds stable instance identities, full-tree digests, and the complete
 # candidate/shadow view. v15 records the managed lock profile so Community
 # instruction projection can never be restored from a stale trusted snapshot.
-# v16 persists public/internal/meta visibility and invocation ownership.
-_SNAPSHOT_SCHEMA_VERSION = 16
+# v17 invalidates executable workflow manifests and legacy catalog fields.
+_SNAPSHOT_SCHEMA_VERSION = 17
 _SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({_SNAPSHOT_SCHEMA_VERSION})
 _COMPAT_PROBE_INTERVAL_SECONDS = 0.250
 
@@ -105,6 +100,12 @@ class SkillCatalogSnapshot:
             object.__setattr__(self, "candidates", self.skills)
         if not self.diagnostics and self.errors:
             object.__setattr__(self, "diagnostics", self.errors)
+        # Retired files remain explainable in an explicit Doctor report, but
+        # their presence must not degrade startup or ordinary catalog refreshes.
+        if any(error.message == RETIRED_SKILL_MESSAGE for error in self.errors):
+            object.__setattr__(self, "errors", tuple(
+                error for error in self.errors if error.message != RETIRED_SKILL_MESSAGE
+            ))
 
     def load_all(self) -> list[SkillSpec]:
         """Return this generation without probing the live filesystem."""
@@ -121,15 +122,6 @@ class SkillCatalogSnapshot:
             None,
         )
 
-    def list_meta_specs(self) -> list[SkillSpec]:
-        """Return invokable compiled meta skills from this generation only."""
-        from opensquilla.skills.catalog_policy import is_invokable_meta
-
-        return [
-            skill
-            for skill in self.skills
-            if is_invokable_meta(skill) and not skill.disable_model_invocation
-        ]
 
 
 class PinnedSkillLoader:
@@ -153,14 +145,6 @@ class PinnedSkillLoader:
     def get_by_name(self, name: str) -> SkillSpec | None:
         return next((skill for skill in self.load_all() if skill.name == name), None)
 
-    def list_meta_specs(self) -> list[SkillSpec]:
-        from opensquilla.skills.catalog_policy import is_invokable_meta
-
-        return [
-            skill
-            for skill in self.load_all()
-            if is_invokable_meta(skill) and not skill.disable_model_invocation
-        ]
 
     def find_by_trigger(self, text: str) -> list[SkillSpec]:
         text_lower = text.lower()
@@ -314,8 +298,6 @@ def _skill_to_snapshot(skill: SkillSpec) -> dict[str, object]:
                 "primary_env": metadata.primary_env,
                 "homepage": metadata.homepage,
                 "always": metadata.always,
-                "risk_level": metadata.risk_level,
-                "capabilities": metadata.capabilities,
                 "requires_bins": requires.bins if requires else [],
                 "requires_any_bins": requires.any_bins if requires else [],
                 "requires_env": requires.env if requires else [],
@@ -342,18 +324,8 @@ def _skill_to_snapshot(skill: SkillSpec) -> dict[str, object]:
         "requires_tools": skill.requires_tools,
         "fallback_for_toolsets": skill.fallback_for_toolsets,
         "kind": skill.kind,
-        "meta_priority": skill.meta_priority,
-        "composition_raw": skill.composition_raw,
-        "final_text_mode": skill.final_text_mode,
-        "request_template": skill.request_template,
-        "output_contract": skill.output_contract,
-        "eval_prompts": skill.eval_prompts,
-        "preference_keys": skill.preference_keys,
-        "policy_tags": skill.policy_tags,
-        "entrypoint": skill.entrypoint,
         "visibility": skill.visibility.value,
         "invocation": skill.invocation.value,
-        "owner_meta_skills": skill.owner_meta_skills,
     }
 
 
@@ -775,6 +747,8 @@ class SkillLoader:
     ) -> list[SkillSpec]:
         skills = []
         for s in data.get(key, []):
+            if s.get("kind", "skill") != "skill" or s.get("name") == "code-task":
+                raise ValueError("unsupported cached Skill kind")
             name = _validated_skill_name(s.get("name"))
             # Restore metadata from snapshot
             meta = None
@@ -815,8 +789,6 @@ class SkillLoader:
                         config=raw_meta.get("requires_config", []),
                     ),
                     install=install_specs,
-                    risk_level=str(raw_meta.get("risk_level", "")).strip().lower(),
-                    capabilities=raw_meta.get("capabilities", []),
                 )
 
             layer = SkillLayer(s.get("layer", "bundled"))
@@ -864,30 +836,8 @@ class SkillLoader:
                     requires_tools=s.get("requires_tools", []),
                     fallback_for_toolsets=s.get("fallback_for_toolsets", []),
                     kind=s.get("kind", "skill"),
-                    meta_priority=int(s.get("meta_priority", 0) or 0),
-                    composition_raw=s.get("composition_raw"),
-                    final_text_mode=str(s.get("final_text_mode", "auto") or "auto"),
-                    request_template=(
-                        dict(s.get("request_template") or {})
-                        if isinstance(s.get("request_template"), dict)
-                        else {}
-                    ),
-                    output_contract=(
-                        dict(s.get("output_contract") or {})
-                        if isinstance(s.get("output_contract"), dict)
-                        else {}
-                    ),
-                    eval_prompts=(
-                        [dict(item) for item in s.get("eval_prompts", []) if isinstance(item, dict)]
-                        if isinstance(s.get("eval_prompts", []), list)
-                        else []
-                    ),
-                    preference_keys=_string_list(s.get("preference_keys", [])),
-                    policy_tags=_string_list(s.get("policy_tags", [])),
-                    entrypoint=(s["entrypoint"] if isinstance(s.get("entrypoint"), dict) else None),
                     visibility=SkillVisibility(str(s.get("visibility", "public"))),
                     invocation=SkillInvocation(str(s.get("invocation", "direct"))),
-                    owner_meta_skills=_string_list(s.get("owner_meta_skills", [])),
                 )
             )
         return skills
@@ -1095,7 +1045,7 @@ class SkillLoader:
                 not self._initialized
                 or manifest != old.manifest
                 or bool(added or removed or modified)
-                or errors_tuple != old.errors
+                or errors_tuple != old.diagnostics
                 or candidates_tuple != old.candidates
                 or shadowed_tuple != old.shadowed
             )
@@ -1147,7 +1097,7 @@ class SkillLoader:
     ) -> tuple[dict[str, SkillCompileProfile], tuple[str, ...]]:
         """Resolve trusted lock records to exact managed directories.
 
-        The managed layer also contains user-accepted local Meta Skills, so the
+        The managed layer also contains locally installed Skills, so the
         layer itself is not a Community trust signal. Only a supported parser
         profile in a structurally valid lockfile, bound to an exact direct child
         of the configured managed root, activates instruction projection.
@@ -1362,17 +1312,27 @@ class SkillLoader:
                         continue
 
                     digests[file_path] = hashlib.sha256(skill_bytes).hexdigest()
-                    spec = self._load_skill(
-                        skill_dir,
-                        layer,
-                        root=dir_path,
-                        skill_bytes=skill_bytes,
-                        profile=(
-                            managed_profiles.get(str(skill_dir.resolve(strict=False)))
-                            if layer is SkillLayer.MANAGED
-                            else None
-                        ),
-                    )
+                    # Retirement takes precedence over last-known-good recovery:
+                    # a replaced ordinary Skill must not keep its prior body active.
+                    try:
+                        spec = self._load_skill(
+                            skill_dir,
+                            layer,
+                            root=dir_path,
+                            skill_bytes=skill_bytes,
+                            profile=(
+                                managed_profiles.get(str(skill_dir.resolve(strict=False)))
+                                if layer is SkillLayer.MANAGED
+                                else None
+                            ),
+                        )
+                    except RetiredSkillError:
+                        errors.append(SkillLoadError(
+                            name=previous.name if previous else skill_dir.name,
+                            path=file_path,
+                            message=RETIRED_SKILL_MESSAGE,
+                        ))
+                        continue
                     if spec is None:
                         errors.append(
                             SkillLoadError(
@@ -1404,35 +1364,7 @@ class SkillLoader:
                 merged[spec.name] = spec
                 layer_count += 1
 
-        self._build_local.skills = tuple(merged.values())
-        try:
-            for sop_name in [name for name, spec in merged.items() if spec.kind == "meta_sop"]:
-                sop_spec = merged[sop_name]
-                try:
-                    merged[sop_name] = _sop_compile(sop_spec, skill_loader=self)
-                    record_candidate(merged[sop_name])
-                    self._build_local.skills = tuple(merged.values())
-                except SOPCompileError as exc:
-                    previous = old_by_path.get(sop_spec.file_path)
-                    kept_previous = previous is not None
-                    errors.append(
-                        SkillLoadError(
-                            name=sop_name,
-                            path=sop_spec.file_path,
-                            message=str(exc),
-                            kept_previous=kept_previous,
-                        )
-                    )
-                    log.warning("sop_compile_failed", skill=sop_name, error=str(exc))
-                    if previous is None:
-                        del merged[sop_name]
-                        forget_candidate(sop_spec.instance_id)
-                    else:
-                        merged[sop_name] = previous
-                        record_candidate(previous)
-                    self._build_local.skills = tuple(merged.values())
-        finally:
-            del self._build_local.skills
+
 
         active_instance_ids = {spec.instance_id for spec in merged.values()}
         shadowed = [spec for spec in candidates if spec.instance_id not in active_instance_ids]
@@ -1617,6 +1549,10 @@ class SkillLoader:
             )
             skill.tree_digest = compute_tree_sha256(skill_dir)
             return skill
+        except RetiredSkillError:
+            # The caller records an inert diagnostic instead of restoring a
+            # previously loaded ordinary body for this retired definition.
+            raise
         except _TreeChangedDuringHashError:
             # A tree digest is an integrity boundary, not a per-Skill parse
             # concern.  Publishing a catalog that silently omits this Skill
@@ -1666,22 +1602,3 @@ class SkillLoader:
             if skill.name == name:
                 return skill
         return None
-
-    def list_meta_specs(self) -> list[SkillSpec]:
-        """Return invokable loaded specs with kind == 'meta'.
-
-        Note: loader Pass 2 compiles authored 'meta_sop' specs into
-        'meta' shape before they reach this function, so meta_sop authors
-        ARE included. The helper exists to centralize that contract — do
-        not filter against 'meta_sop' here. Compatibility definitions with
-        ``disable-model-invocation: true`` stay addressable through
-        :meth:`get_by_name` for persisted-run recovery, but are not part of
-        fresh-run discovery.
-        """
-        from opensquilla.skills.catalog_policy import is_invokable_meta
-
-        return [
-            spec
-            for spec in self.load_all()
-            if is_invokable_meta(spec) and not spec.disable_model_invocation
-        ]

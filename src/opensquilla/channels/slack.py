@@ -285,11 +285,11 @@ class SlackChannel:
     # Inbound
     # ------------------------------------------------------------------
 
-    def enqueue(self, message: IncomingMessage) -> None:
+    async def enqueue(self, message: IncomingMessage) -> None:
         """Push an inbound Slack message into the receive queue."""
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        durable_enqueue(self, message, self._queue)
+        await durable_enqueue(self, message, self._queue)
 
     async def receive(self) -> IncomingMessage:
         """Block until an inbound message is available."""
@@ -733,7 +733,7 @@ class SlackChannel:
             and isinstance(payload, dict)
             and payload.get("type") == "event_callback"
         ):
-            self._ingest_event_callback(
+            await self._ingest_event_callback(
                 payload,
                 verification=IngressVerification.SDK_SESSION,
             )
@@ -796,14 +796,14 @@ class SlackChannel:
             return JSONResponse({"challenge": challenge})
 
         if event_type == "event_callback":
-            self._ingest_event_callback(
+            await self._ingest_event_callback(
                 data,
                 verification=IngressVerification.WEBHOOK_SIGNATURE,
             )
 
         return Response(status_code=200)
 
-    def _ingest_event_callback(
+    async def _ingest_event_callback(
         self,
         data: dict[str, Any],
         *,
@@ -828,9 +828,10 @@ class SlackChannel:
         dedupe_key = str(
             event.get("client_msg_id") or event_instance_key or data.get("event_id") or ""
         ).strip(":")
-        if dedupe_key and not self._dedupe.check_and_add(dedupe_key):
-            return
-        self.enqueue(self.parse_event(event, verification=verification))
+        await self._dedupe.run_once(
+            dedupe_key,
+            lambda: self.enqueue(self.parse_event(event, verification=verification)),
+        )
 
     def _is_own_message(self, event: dict[str, Any]) -> bool:
         """Drop the bot's own messages so replies never loop back as input."""

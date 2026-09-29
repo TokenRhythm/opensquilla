@@ -743,7 +743,7 @@ test.describe('Completed assistant activity disclosure', () => {
       }))
       await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
         contentType: 'image/png',
-        body: fs.readFileSync(new URL('../public/opensquilla-mark.png', import.meta.url)),
+        body: fs.readFileSync(new URL('../public-assets/opensquilla-mark.png', import.meta.url)),
       }))
       await mockActivityHistory(page, { recoveredEdit: true })
       await page.setViewportSize({ width, height: width === 390 ? 844 : 900 })

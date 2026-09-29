@@ -81,7 +81,7 @@ Read next:
 
 ## Build a Repeatable Workflow
 
-Goal: turn recurring work into reusable skills or meta-skills.
+Goal: turn recurring work into reusable skills.
 
 Find an existing skill:
 
@@ -90,23 +90,9 @@ opensquilla skills search report
 opensquilla skills view <skill-name>
 ```
 
-Inspect a meta-skill before running it:
-
-```sh
-opensquilla skills inspect <meta-skill-name>
-```
-
-Review historical meta-skill runs:
-
-```sh
-opensquilla skills meta runs list
-opensquilla skills meta runs show <run-id>
-```
-
 Read next:
 
 - [`features/skills.md`](features/skills.md)
-- [`features/meta-skills.md`](features/meta-skills.md)
 - [`artifacts-and-media.md`](artifacts-and-media.md)
 
 ## Remember Useful Context
@@ -189,7 +175,6 @@ Read next:
 
 - [`artifacts-and-media.md`](artifacts-and-media.md)
 - [`features/skills.md`](features/skills.md)
-- [`features/meta-skills.md`](features/meta-skills.md)
 
 ## Recover From a Bad Run
 

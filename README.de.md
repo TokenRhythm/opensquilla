@@ -687,9 +687,6 @@ Details zu den einzelnen Versionen stehen in [`CHANGELOG.md`](CHANGELOG.md) und 
 | **Dauerhafte Sitzungen, Subagents und Scheduling** | SQLite-gestützte Speicherung von Sitzungen, Transkripten und Replays mit Arbeitsbereichen pro Agent. Agents starten tiefenbegrenzte Subagents, und eine `SchedulerEngine` mit einem in den Code integrierten Cron-Parser führt wiederkehrende Jobs über `opensquilla cron` aus. |
 | **Operator-Steuerung** | Human-in-the-Loop-Freigaben können sensible Tool-Aufrufe für eine Entscheidung pausieren; Token- und Kostenaufstellungen pro Turn und pro Sitzung (`opensquilla cost`) sowie Diagnosen sind über CLI und Web UI verfügbar. |
 
-MetaSkill-Doku: [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md)
-und [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md).
 
 ---
 

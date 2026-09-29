@@ -1,3 +1,4 @@
+import { clearRetiredBrowserFeatureState } from './utils/retiredFeatureState'
 import { createApp, watch } from 'vue'
 import { createPinia } from 'pinia'
 import App from './App.vue'
@@ -12,12 +13,14 @@ import { SESSION_DIRECTORY_CHANGES_KEY } from './modules/sessionDirectoryChanges
 import { SESSION_LIFECYCLE_KEY } from './modules/sessionLifecycle'
 import { SESSION_ROUTING_KEY } from './modules/sessionRouting'
 import { TURN_COMMANDS_KEY } from './modules/turnCommands'
+import { DURABLE_DELIVERY_KEY } from './modules/delivery'
+import { createDurableDelivery } from './runtime/durableDelivery'
+import { createPendingInputWal } from './utils/chat/pendingInputWal'
 import { PENDING_INPUT_QUEUE_KEY } from './modules/pendingInputQueue'
 import { APPROVAL_CENTER_KEY } from './modules/approvalCenter'
 import { GOAL_CENTER_KEY } from './modules/goalCenter'
 import { GOAL_CONTINUITY_KEY } from './modules/goalContinuity'
 import { PLAN_CENTER_KEY } from './modules/planCenter'
-import { META_RUN_CENTER_KEY } from './modules/metaRunCenter'
 import { APP_SETTINGS_KEY } from './modules/appSettings'
 import { PRODUCT_ACTIVITY_KEY } from './modules/productActivity'
 import { PROVIDER_CONFIGURATION_KEY } from './modules/providerConfiguration'
@@ -29,11 +32,9 @@ import { WORKSPACE_FILES_KEY } from './modules/workspaceFiles'
 import { SANDBOX_RUNTIME_KEY } from './modules/sandboxRuntime'
 import { USAGE_REPORTING_KEY } from './modules/usageReporting'
 import { COMMAND_CATALOG_KEY } from './modules/commandCatalog'
-import { ROUTE_FEEDBACK_KEY } from './modules/routeFeedback'
 import { PROMPT_CACHE_LEASE_KEY } from './modules/promptCacheLease'
 import { CLARIFICATION_SUBMISSION_KEY } from './modules/clarificationSubmission'
 import { SESSION_MAINTENANCE_KEY } from './modules/sessionMaintenance'
-import { SESSION_PROCESSES_KEY } from './modules/sessionProcesses'
 import { OBSERVABILITY_KEY } from './modules/observability'
 import { SKILL_CATALOG_KEY } from './modules/skillCatalog'
 import { AGENT_CATALOG_KEY } from './modules/agentCatalog'
@@ -56,6 +57,8 @@ import './styles/chat-markdown.css'
 import './styles/chat-shared.css'
 import './styles/apple-modern.css'
 
+clearRetiredBrowserFeatureState(window)
+
 const app = createApp(App)
 app.use(createPinia())
 app.use(router)
@@ -69,6 +72,36 @@ rpcStore.init()
 const gatewayAdapters = createGatewayAdapters(rpcStore, {
   http: createPrivateHttpTransport(),
 })
+const durableDelivery = createDurableDelivery({
+  commands: gatewayAdapters.turnCommands,
+  wal: createPendingInputWal(),
+  access: {
+    identity: () => gatewayAdapters.gatewayAccess.deliveryIdentity,
+    available: () => gatewayAdapters.gatewayAccess.isAvailable
+      && gatewayAdapters.gatewayAccess.connectionPhase === 'healthy',
+    generation: () => gatewayAdapters.gatewayAccess.subscriptionEpoch,
+  },
+})
+const stopDeliveryWatch = watch(() => [
+  gatewayAdapters.gatewayAccess.deliveryIdentity,
+  gatewayAdapters.gatewayAccess.isAvailable,
+  gatewayAdapters.gatewayAccess.connectionPhase,
+  gatewayAdapters.gatewayAccess.subscriptionEpoch,
+], () => { void durableDelivery.wake() }, { immediate: true })
+const stopDeliveryEvents = gatewayAdapters.conversationEvents.subscribe({
+  onEvent(message) {
+    if (message.kind !== 'conversation' || message.event.semanticKind !== 'input-disposition') return
+    const event = message.event
+    const requestId = event.payload.client_request_id
+    if (!requestId) return
+    // This observer opens no session read or remote subscription. Only an
+    // authenticated semantic disposition can wake its exact pending receipt.
+    const token = JSON.stringify([event.payload.revision, event.payload.promoted_turn_id,
+      event.payload.target_turn_id, event.payload.disposition])
+    void durableDelivery.noteReceiptChanged(requestId, token).catch(() => {})
+  },
+})
+app.onUnmount(() => { stopDeliveryWatch(); stopDeliveryEvents(); durableDelivery.dispose() })
 appStore.bindAppSettings(gatewayAdapters.appSettings)
 watch(() => rpcStore.state, (state) => {
   if (state === 'connected' && appStore.pendingChannelNoticeLocale) {
@@ -95,13 +128,13 @@ app.provide(
   gatewayAdapters.sessionLifecycle,
 )
 app.provide(SESSION_ROUTING_KEY, gatewayAdapters.sessionRouting)
-app.provide(TURN_COMMANDS_KEY, gatewayAdapters.turnCommands)
+app.provide(TURN_COMMANDS_KEY, durableDelivery.commands)
+app.provide(DURABLE_DELIVERY_KEY, durableDelivery)
 app.provide(PENDING_INPUT_QUEUE_KEY, gatewayAdapters.pendingInputQueue)
 app.provide(APPROVAL_CENTER_KEY, gatewayAdapters.approvalCenter)
 app.provide(GOAL_CENTER_KEY, gatewayAdapters.goalCenter)
 app.provide(GOAL_CONTINUITY_KEY, gatewayAdapters.goalContinuity)
 app.provide(PLAN_CENTER_KEY, gatewayAdapters.planCenter)
-app.provide(META_RUN_CENTER_KEY, gatewayAdapters.metaRunCenter)
 app.provide(APP_SETTINGS_KEY, gatewayAdapters.appSettings)
 app.provide(PRODUCT_ACTIVITY_KEY, gatewayAdapters.productActivity)
 app.provide(PROVIDER_CONFIGURATION_KEY, gatewayAdapters.providerConfiguration)
@@ -113,11 +146,9 @@ app.provide(WORKSPACE_FILES_KEY, gatewayAdapters.workspaceFiles)
 app.provide(SANDBOX_RUNTIME_KEY, gatewayAdapters.sandboxRuntime)
 app.provide(USAGE_REPORTING_KEY, gatewayAdapters.usageReporting)
 app.provide(COMMAND_CATALOG_KEY, gatewayAdapters.commandCatalog)
-app.provide(ROUTE_FEEDBACK_KEY, gatewayAdapters.routeFeedback)
 app.provide(PROMPT_CACHE_LEASE_KEY, gatewayAdapters.promptCacheLease)
 app.provide(CLARIFICATION_SUBMISSION_KEY, gatewayAdapters.clarificationSubmission)
 app.provide(SESSION_MAINTENANCE_KEY, gatewayAdapters.sessionMaintenance)
-app.provide(SESSION_PROCESSES_KEY, gatewayAdapters.sessionProcesses)
 app.provide(OBSERVABILITY_KEY, gatewayAdapters.observability)
 app.provide(SKILL_CATALOG_KEY, gatewayAdapters.skillCatalog)
 app.provide(AGENT_CATALOG_KEY, gatewayAdapters.agentCatalog)

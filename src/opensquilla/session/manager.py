@@ -1609,15 +1609,6 @@ class SessionManager:
             evict_cache_break_state(session_key)
         except Exception:
             pass
-        if session_id:
-            try:
-                from opensquilla.engine.steps.meta_resolution import (
-                    evict_meta_sticky,
-                )
-
-                evict_meta_sticky(session_id)
-            except Exception:
-                pass
 
     async def _task_owner_is_verified_fork_ancestor(
         self,

@@ -36,6 +36,7 @@ class ModelCatalogError(TypedDict):
 class ModelCatalogResult(TypedDict):
     models: list[ModelDescriptor]
     errors: list[ModelCatalogError]
+    catalog: NotRequired[dict[str, object]]
 
 
 type ModelRoutingMode = Literal["direct", "router", "ensemble"]
@@ -206,7 +207,10 @@ class ModelCatalog:
                 for row in models
                 if required.issubset({str(item) for item in row.get("capabilities", ())})
             ]
-        return ModelCatalogResult(models=models, errors=errors)
+        projection = ModelCatalogResult(models=models, errors=errors)
+        if "catalog" in result:
+            projection["catalog"] = dict(result["catalog"])
+        return projection
 
 
 class ModelRouting:

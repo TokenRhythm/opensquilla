@@ -223,7 +223,6 @@
     "resize": "Cambiar el ancho del área de trabajo",
     "pixels": "píxeles",
     "empty": "No hay una vista previa disponible para este elemento.",
-    "itemLimitReached": "Ya hay ocho vistas previas aisladas abiertas. Cierra una antes de abrir otra.",
     "resources": {
       "title": "Archivos", "count": "Archivos ({count})", "empty": "Aún no hay archivos ni enlaces.",
       "groups": { "files": "Archivos", "links": "Enlaces", "attachments": "Archivos", "documents": "Archivos", "deliverables": "Archivos", "urls": "Enlaces" },
@@ -396,16 +395,12 @@
     "chat": "Tarea",
     "chat-new": "Nueva tarea",
     "sessions": "Sesiones",
-    "agents": "Agentes",
     "channels": "Canales",
     "cron": "Cron",
     "skills": "Habilidades",
     "skillsChannels": "Habilidades y canales",
-    "overview": "Resumen",
-    "status": "Estado",
     "usage": "Uso",
     "viewUsage": "Ver uso",
-    "logs": "Registros",
     "settings": "Ajustes",
     "groupBuild": "Construir",
     "groupMonitor": "Resumen",
@@ -451,14 +446,6 @@
       "reconnecting": "Reconectando con Gateway",
       "disconnected": "Desconectado"
     },
-    "bgm": {
-      "label": "Música de fondo",
-      "play": "Reproducir música de fondo",
-      "pause": "Pausar música de fondo",
-      "volume": "Volumen",
-      "chooseLocalFile": "Elegir archivo local…",
-      "noTracks": "Sin pistas — añade archivos a music/ o elige un archivo local"
-    },
     "brandHome": "Inicio de OpenSquilla",
     "controlNav": "Navegación de control",
     "primaryNav": "Principal",
@@ -477,7 +464,8 @@
       "results": "Resultados de ajustes",
       "empty": "No hay ajustes coincidentes",
       "defaultModel": "Modelo predeterminado",
-      "permissions": "Permisos"
+      "permissions": "Permisos",
+      "supportBundle": "Descargar paquete de soporte"
     },
     "appearance": {
       "title": "Interfaz",
@@ -496,8 +484,6 @@
       "visualEffectsDesc": "Anima las decisiones de enrutamiento de modelos y las transiciones de respuestas.",
       "composerFxLabel": "Compositor flotante",
       "composerFxDesc": "Flota el campo de entrada sobre la conversación y lo colapsa a una sola línea al desplazarse hacia arriba.",
-      "bgmLabel": "Música de fondo",
-      "bgmDesc": "Muestra el control de música de fondo en la barra superior. Desactivado por defecto; también se puede alternar desde la paleta de comandos.",
       "sidebarWidthLabel": "Ancho de la barra lateral",
       "sidebarWidthDesc": "Elige el ancho de la barra lateral en el escritorio. Los diseños compacto y de cajón usan un ancho fijo.",
       "sidebarWidthCompact": "Compacto",
@@ -744,7 +730,8 @@
     },
     "gateway": {
       "title": "Puerta de enlace",
-      "desc": "Conecta con la puerta de enlace y, en escritorio, gestiona el entorno local."
+      "desc": "Gestiona la conexión de este navegador al Gateway.",
+      "desktopDesc": "Gestiona la conexión al Gateway y el servicio local."
     },
     "general": {
       "title": "General",
@@ -756,11 +743,9 @@
     },
     "memoryOverview": {
       "title": "Memoria",
-      "desc": "Elige qué recuerda OpenSquilla y gestiona las funciones opcionales de aprendizaje.",
+      "desc": "Elige qué recuerda OpenSquilla y gestiona la consolidación de memoria.",
       "autoCaptureLabel": "Captura de conversaciones",
       "autoCaptureDesc": "Guarda localmente conversaciones y turnos sin procesar para auditoría y recuperación. No se añaden a la memoria a largo plazo ni se indexan para su consulta.",
-      "learningSummary": "Memoria y autoaprendizaje (avanzado)",
-      "learningDesc": "Las funciones de aprendizaje opcionales pueden usar tokens adicionales y requerir un reinicio.",
       "profileImportLabel": "Importación del perfil",
       "profileImportDesc": "Revisa e importa datos compatibles de identidad y memoria.",
       "profileImportAction": "Abrir"
@@ -808,6 +793,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "Nivel de razonamiento global",
+      "globalDesc": "Compartido con el proveedor principal. Un valor explícito prevalece sobre las sugerencias de enrutamiento; el predeterminado las mantiene.",
+      "tierDesc": "Solo para este nivel de enrutamiento. El valor predeterminado no fija un nivel.",
+      "proposerDesc": "Solo para este rol de candidato. El valor predeterminado no fija una anulación.",
+      "aggregatorDesc": "Solo para este rol de agregador. El valor predeterminado no fija una anulación.",
+      "presetDesc": "Definido por el preajuste. Cambia a una selección personalizada para editarlo.",
+      "sharedSettings": "Ajustes compartidos del modelo",
+      "overrideHint": "Nivel global: {level}. Prevalece sobre las sugerencias de enrutamiento de un solo modelo. Los miembros de fusión usan sus propios ajustes.",
+      "inheritedAggregatorDesc": "Solo para este rol de agregador. Al fijar un nivel, este modelo deja de seguir al modelo principal."
+    },
     "capacity": {
       "customOpenAI": "Personalizado · compatible con OpenAI",
       "customAnthropic": "Personalizado · compatible con Anthropic",
@@ -1084,6 +1080,8 @@
       "timeoutLabel": "Tiempo de espera de la solicitud (segundos)",
       "timeoutDesc": "Cuánto esperar la respuesta de un modelo antes de agotar el tiempo de espera; aumenta este valor para modelos locales lentos (Ollama, vLLM, LM Studio).",
       "timeoutGlobalDesc": "Tiempo de espera global para solicitudes normales de todos los proveedores. Las comprobaciones de conexión y las pruebas del modelo usan límites fijos independientes.",
+      "thinkingLabel": "Nivel de razonamiento",
+      "thinkingDefault": "Predeterminado (sin establecer)",
       "contextWindowLabel": "Anulación de la ventana de contexto (tokens)",
       "contextWindowDesc": "Limita el presupuesto de ensamblado del prompt para este modelo. Déjalo en blanco para usar la ventana detectada automáticamente.",
       "contextWindowIdentityLabel": "Ventana de contexto · {provider} / {model}",
@@ -1178,8 +1176,14 @@
       "failureGeneric": "La verificación de configuración falló.",
       "modelListLabel": "Modelos descubiertos",
       "modelOptionsToggle": "Catálogo de modelos · {count}",
-      "modelListReadout": "Disponibles · {count}",
-      "modelLiveSource": "En vivo",
+      "modelListReadout": "Modelos · {count}",
+      "modelCatalogLoading": "Cargando modelos…",
+      "modelCatalogRefreshing": "Actualizando modelos…",
+      "modelCatalogRefreshFailed": "No se pudo actualizar. Se muestra la lista anterior.",
+      "modelCatalogLoadFailed": "No se pudieron cargar los modelos. Reintenta o introduce un ID de modelo.",
+      "modelCatalogAccessRejected": "No se pudo leer la lista. Comprueba la clave API o los permisos de acceso.",
+      "modelCatalogEmpty": "No se devolvieron modelos. Puedes introducir un ID de modelo.",
+      "modelCatalogSelectionMissing": "No está en la lista de modelos más reciente.",
       "modelMaxOutput": "Salida máx. {tokens}",
       "modelPublishedContext": "Contexto oficial {tokens}",
       "modelCatalogContext": "Contexto del catálogo {tokens}",
@@ -1190,11 +1194,12 @@
       "modelOutputShort": "Salida",
       "modelStatusTesting": "En pruebas",
       "modelStatusOffline": "Sin conexión",
+      "modelStatusSpecialOffer": "Oferta especial",
       "modelCatalogValue": "Valor del catálogo",
       "refreshModels": "Actualizar modelos",
-      "modelCatalogSynced": "Metadatos del modelo sincronizados {ago}",
-      "modelCatalogStaleSince": "Usando metadatos del modelo sincronizados {ago}",
-      "modelCatalogStale": "Los metadatos del modelo pueden estar desactualizados",
+      "modelCatalogSynced": "Lista de modelos actualizada {ago}",
+      "modelCatalogStaleSince": "Se muestra la lista actualizada {ago}",
+      "modelCatalogStale": "Se muestra la lista de modelos guardada",
       "effectiveMaxTokens": "Límite de salida efectivo: {tokens} tokens · Fuente: {source}",
       "effectiveMaxTokensAfterSave": "Se calcula después de guardar",
       "effectiveSourceConfig": "configuración del usuario",
@@ -1205,8 +1210,8 @@
       "modelUseTyped": "Usar \"{value}\"",
       "modelNoMatches": "No hay modelos coincidentes — puedes usar lo que escribiste.",
       "modelListTruncated": "Mostrando {shown} de {total} modelos — sigue escribiendo para acotar.",
-      "modelProvenance": "Lista del proveedor en vivo · fuente de capacidades: {sources}",
-      "modelMetadataProvenance": "Lista del proveedor en vivo · valores oficiales si están disponibles; si no, valores del catálogo",
+      "modelProvenance": "Lista del proveedor · origen de capacidades: {sources}",
+      "modelMetadataProvenance": "Lista del proveedor · valores oficiales si están disponibles; si no, los del catálogo",
       "modelMultimodal": "Multimodal",
       "modelMultimodalTitle": "Admite entradas de imagen",
       "saveAndStart": "Guardar y empezar",
@@ -1631,12 +1636,12 @@
       "languageCode": "Código de idioma"
     },
     "connection": {
-      "title": "Conexión",
-      "desc": "Apunta este navegador a una puerta de enlace. La conexión se aplica de inmediato; no es necesario guardar.",
+      "title": "Conexión al Gateway",
+      "desc": "Edita los campos y pulsa Conectar o Reconectar para aplicar los cambios.",
       "connected": "Conectado",
       "connecting": "Conectando",
       "disconnected": "Desconectado",
-      "reasonConnected": "Enlace en vivo con el socket de la puerta de enlace.",
+      "reasonConnected": "Conectado al Gateway.",
       "reasonConnecting": "Contactando con la puerta de enlace…",
       "reasonFailed": "El último intento falló: {error}",
       "reasonDisconnected": "Sin conexión. Comprueba la URL del WebSocket e inténtalo con Conectar.",
@@ -1648,8 +1653,11 @@
       "tokenRequired": "Se requiere un token",
       "reasonTokenRequired": "La autenticación falló. Los reintentos automáticos están en pausa. Introduce un token de pasarela válido y selecciona Conectar.",
       "reconnect": "Reconectar",
+      "editConnection": "Modificar conexión",
       "connect": "Conectar",
-      "disconnect": "Desconectar"
+      "disconnect": "Desconectar",
+      "actions": "Acciones de conexión",
+      "reasonManagedDisconnected": "El cliente no está conectado al Gateway local. Intenta volver a conectarte."
     },
     "runtime": {
       "title": "Tiempo de ejecución",
@@ -1827,7 +1835,15 @@
       "migrationCompleteIndependent": "Esta instalación de Desktop ahora es independiente y no se sincronizará con el origen.",
       "migrationCompleteReplacement": "Los datos anteriores de Desktop están en una copia completa. Se sustituyeron como una unidad; los archivos y chats nunca se combinaron.",
       "migrationCompleteShowBackup": "Mostrar copia completa",
-      "migrationCompleteDismiss": "Cerrar"
+      "migrationCompleteDismiss": "Cerrar",
+      "localGatewayTitle": "Gateway local",
+      "localGatewayDescription": "Gestiona el Gateway local iniciado por la aplicación de escritorio.",
+      "processStatus": "Estado del proceso",
+      "restartLocalGateway": "Reiniciar Gateway local",
+      "details": "Dirección y ubicación de registros",
+      "address": "Dirección del Gateway",
+      "refreshStatus": "Actualizar estado",
+      "openLocalLogLocation": "Abrir ubicación de registros locales"
     },
     "keyboard": {
       "title": "Atajos",
@@ -1857,16 +1873,10 @@
       "experimental": "experimental",
       "historyMergeDesc": "En la sincronización del historial, fusiona por id de mensaje y conserva los campos exclusivos del modo en vivo (desactivado por defecto, en transición a activado).",
       "historyMergeAria": "Fusión de historial por reconciliación de id (surte efecto tras recargar)",
-      "agentConfigLabel": "Configuración de agentes (avanzada)",
-      "agentConfigDesc": "Gestiona las configuraciones de agentes existentes. Esta área cambiará en un futuro rediseño multiagente.",
-      "agentConfigAction": "Abrir",
       "dataMaintenanceLabel": "Mantenimiento de datos",
       "dataMaintenanceDesc": "Revisa importaciones y copias. En escritorio también puedes restablecer o eliminar los datos del perfil local.",
       "dataMaintenanceAction": "Gestionar",
       "dataMaintenanceAria": "Abrir el mantenimiento de datos",
-      "runTraceLabel": "Panel de traza de ejecución en Registros",
-      "runTraceDesc": "Hace que las líneas de registro sean interactivas y abre un panel de detalle de pasos por nodo para cada línea en la vista de Registros.",
-      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)",
       "configFileLabel": "Archivo de configuración",
       "configFileDesc": "Puedes ajustar más opciones en el archivo de configuración."
     },
@@ -1876,9 +1886,9 @@
       "reliabilityDiagnosticsLabel": "Diagnósticos de estabilidad",
       "reliabilityDiagnosticsDesc": "Comparte resultados de operaciones, duraciones y huellas de error que preservan la privacidad para diagnosticar cierres y fallos. Nunca se incluye el contenido de conversaciones o archivos.",
       "productAnalyticsLabel": "Análisis de producto y crecimiento",
-      "productAnalyticsDesc": "Comparte hitos de activación y el número de ejecuciones de MetaSkill y del modo de programación una vez iniciadas realmente, para medir la conversión y el uso de funciones. Nunca se incluyen el contenido de las conversaciones, los parámetros de tareas, los archivos ni los ID de cuenta sin transformar; se utiliza un identificador analítico aleatorio y específico.",
+      "productAnalyticsDesc": "Comparte hitos de activación para medir el uso del producto. Nunca se incluyen el contenido de las conversaciones, los parámetros de tareas, los archivos ni los ID de cuenta sin transformar; se utiliza un identificador analítico aleatorio y específico.",
       "networkReportingLabel": "Envío de diagnósticos y estadísticas de uso",
-      "networkReportingDesc": "Envía diagnósticos y estadísticas de uso anónimos, incluido el número de ejecuciones reales de MetaSkill y del modo de programación. También controla la búsqueda de actualizaciones. No incluye conversaciones, parámetros de tareas ni archivos."
+      "networkReportingDesc": "Envía diagnósticos y estadísticas de uso anónimos. También controla la búsqueda de actualizaciones. No incluye conversaciones, parámetros de tareas ni archivos."
     },
     "toast": {
       "loadFailed": "No se pudieron cargar los ajustes: {error}",
@@ -1950,34 +1960,11 @@
       "audioEnvVar": "Variable de entorno que se lee para el acceso al proveedor de audio.",
       "remoteEmbeddingKey": "Clave API de embedding remoto o referencia de entorno."
     },
-    "memoryLearning": {
-      "groupTitle": "Memoria y autoaprendizaje",
+    "memoryDream": {
       "dreamLabel": "Consolidación de memoria (dream)",
       "tokenBadge": "consumo de tokens",
-      "dreamDesc": "Ejecuta periódicamente una pasada del modelo para consolidar la memoria de sesión (cada 24 h). El autoaprendizaje del enrutamiento de modelos depende de estas ventanas de inactividad para entrenar.",
-      "selfLearningLabel": "Autoaprendizaje del enrutamiento de modelos",
-      "selfLearningDesc": "Aprende preferencias de enrutamiento a partir de tus correcciones. Totalmente local: almacena vectores de características, nunca el texto de las conversaciones.",
-      "depDefault": "Depende de la consolidación de memoria de arriba: activarlo aquí también la habilita; desactivar solo la consolidación mantiene la recopilación pero pausa el entrenamiento automático.",
-      "depLinked": "La consolidación de memoria se habilitó junto con esta opción. Puedes desactivarla por separado: el autoaprendizaje sigue recopilando, solo se pausa el entrenamiento automático.",
-      "depPaused": "La consolidación de memoria está desactivada: las muestras se siguen recopilando, pero no hay entrenamiento automático. Reactívala para reanudarlo.",
-      "restartRequired": "Se necesita reiniciar la pasarela para aplicar el cambio de programación.",
-      "statusModel": "Modelo de enrutamiento",
-      "statusSamples": "Correcciones",
-      "statusLastAction": "Última acción",
-      "modelBaseline": "Línea base de fábrica",
-      "modelLearned": "Versión aprendida v{version}",
-      "samplesTotal": "{total} recopiladas en total",
-      "gatePausedDream": "Entrenamiento en pausa: esperando a que se reactive la consolidación de memoria",
-      "gateReason": {
-        "ready": "Listo: entrenará en la próxima ventana",
-        "disabled": "Desactivado",
-        "no_data": "Aún no hay muestras recopiladas",
-        "agent_active": "Esperando una ventana de inactividad",
-        "cooldown": "En enfriamiento tras un entrenamiento reciente",
-        "insufficient_data": "Sin entrenar: correcciones insuficientes",
-        "insufficient_class_diversity": "Sin entrenar: las correcciones cubren muy pocos niveles de enrutamiento"
-      },
-      "detachedNote": "Los pesos base del enrutamiento se han actualizado. El aprendizaje construido sobre los pesos antiguos se archivó; tus correcciones no se ven afectadas y se reentrenarán automáticamente con los nuevos pesos. No se requiere ninguna acción."
+      "dreamDesc": "Ejecuta periódicamente una pasada del modelo para consolidar la memoria de sesión.",
+      "restartRequired": "Se necesita reiniciar la pasarela para aplicar el cambio de programación."
     },
     "field": {
       "keepCurrentPlaceholder": "déjalo en blanco para conservar el valor actual",
@@ -2391,110 +2378,6 @@
       "abortDone": "Ejecución abortada.",
       "abortNone": "No hay ninguna ejecución activa que abortar.",
       "abortFailed": "Error al abortar."
-    },
-    "overview": {
-      "title": "Estado",
-      "subtitle": "Preparación, uso y estado de ejecución.",
-      "totalTokens": "Total de tokens",
-      "totalSessions": "Total de sesiones",
-      "totalSessionsTitle": "Total de sesiones en todos los estados",
-      "viewAll": "ver todas →",
-      "provider": "Proveedor",
-      "manageAgents": "gestionar agentes →",
-      "jumpToReadiness": "Ir al informe de preparación",
-      "health": "Estado",
-      "uptime": "Tiempo en funcionamiento",
-      "healthSummary": "Resumen del estado",
-      "readiness": "Preparación",
-      "healthContext": "Contexto del informe de estado",
-      "ctxGateway": "Puerta de enlace",
-      "ctxConfig": "Configuración",
-      "ctxRequestedConfig": "Configuración solicitada",
-      "ctxAgent": "Agente",
-      "needsAction": "Requiere acción",
-      "degraded": "Degradado",
-      "optional": "Opcional",
-      "ready": "Listo",
-      "healthFindings": "Hallazgos del estado",
-      "loadingHealth": "Cargando informe de estado",
-      "noFindings": "No se devolvieron hallazgos.",
-      "recoveryRestart": "La recuperación requiere reiniciar",
-      "openSettings": "Abrir ajustes",
-      "findingDetails": "Detalles",
-      "findingFallback": "Hallazgo {n}",
-      "copyCommand": "Copiar comando",
-      "step": "Paso",
-      "checking": "Comprobando",
-      "waitingDoctor": "Esperando doctor.status",
-      "healthUnavailable": "Informe de estado de la puerta de enlace no disponible",
-      "impact": {
-        "blocksReady": "Bloquea la preparación",
-        "degrades": "Degrada",
-        "optional": "Opcional",
-        "reference": "Referencia"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "Listo con advertencias",
-        "ready": "Listo",
-        "actionRequired": "Acción requerida",
-        "degraded": "Degradado",
-        "unavailable": "No disponible"
-      },
-      "badge": {
-        "diagnostic": "Diagnósticos incompletos",
-        "repair": "Reparación pendiente",
-        "config": "Discrepancia de configuración"
-      },
-      "dotStatus": {
-        "active": "Activo",
-        "ready": "Listo",
-        "ok": "OK",
-        "paused": "Pausado",
-        "degraded": "Degradado",
-        "warn": "Advertencia",
-        "error": "Error",
-        "failed": "Falló",
-        "closed": "Cerrado",
-        "ended": "Finalizado",
-        "offline": "Sin conexión",
-        "unknown": "Desconocido"
-      },
-      "group": {
-        "action": {
-          "title": "Requiere acción",
-          "note": "Corrige esto primero para que OpenSquilla esté listo."
-        },
-        "degraded": {
-          "title": "Capacidades degradadas",
-          "note": "OpenSquilla puede ejecutarse, pero estas capacidades requieren atención."
-        },
-        "optional": {
-          "title": "Configuración opcional",
-          "note": "Estas mejoran la capacidad o la postura, pero no bloquean la preparación."
-        },
-        "ready": {
-          "title": "Comprobaciones listas",
-          "note": "Estas superficies ya están funcionando."
-        }
-      },
-      "gw": {
-        "cannotLoad": "No se puede cargar doctor.status desde {url}. {reason}",
-        "inspectRemote": "Inspeccionar puerta de enlace remota",
-        "repairRemote": "Reparar despliegue remoto",
-        "repairRemoteDetail": "Inicia o repara el despliegue remoto de la puerta de enlace de OpenSquilla y, a continuación, actualiza el estado.",
-        "runLocalDoctor": "Ejecutar doctor local",
-        "runLocalDoctorDetail": "Comprueba la configuración local y la incorporación antes de reiniciar la puerta de enlace.",
-        "startLocal": "Iniciar puerta de enlace local",
-        "inspectLocal": "Inspeccionar puerta de enlace local"
-      },
-      "checkedAgo": "Comprobado {time}",
-      "rerunChecks": "Volver a comprobar",
-      "copyDiagnostics": "Copiar el JSON de diagnóstico",
-      "copiedDiagnostics": "JSON de diagnóstico copiado",
-      "diagnoseWithAgent": "Diagnosticar con el agente",
-      "diagnosePrompt": "Diagnostica esta configuración de OpenSquilla usando el contexto del cliente y el informe de doctor siguientes. Da prioridad a los ajustes aplicables dentro de la app. Cuando hasTerminalWorkflow sea false, no sugieras comandos opensquilla sin adaptar; un gateway propio de Desktop lo gestiona la app. La transferencia de datos implica copia de seguridad y sustitución completa, nunca fusión. Una migración opcional no es un fallo y puede seguir visible después. Limítate a explicar y orientar: no migres datos, reinicies el gateway, escribas ajustes ni afirmes haber realizado cambios.",
-      "environment": "Entorno",
-      "latency": "Latencia"
     }
   },
   "console": {
@@ -2505,72 +2388,6 @@
       "confirm": "Confirmar",
       "refreshing": "Actualizando…",
       "retry": "Reintentar"
-    },
-    "agents": {
-      "title": "Agentes",
-      "subtitle": "Personalidades y conjuntos de habilidades personalizados con los que puedes chatear.",
-      "settingsHint": "Los valores predeterminados de proveedor y modelo están en Ajustes",
-      "openSettings": "Abrir ajustes",
-      "totalAgents": "Total de agentes",
-      "builtinCount": "{n} integrados",
-      "customCount": "{n} personalizados",
-      "modelsInUse": "Modelos en uso",
-      "distinctModels": "modelos distintos",
-      "unset": "sin establecer",
-      "toolsWired": "Herramientas conectadas",
-      "acrossAllAgents": "en todos los agentes",
-      "agentId": "ID del agente",
-      "displayName": "Nombre para mostrar",
-      "optional": "(opcional)",
-      "defaultsToId": "Por defecto, el ID",
-      "add": "Añadir",
-      "createHint": "Los agentes creados heredan el modelo predeterminado global. Haz clic en una tarjeta para ver o editar los detalles.",
-      "configuredAgents": "Agentes configurados",
-      "emptyTitle": "No hay agentes configurados.",
-      "emptyTextBefore": "Usa el formulario de arriba para añadir uno. El agente",
-      "emptyTextAfter": "predeterminado siempre está disponible.",
-      "builtin": "integrado",
-      "custom": "personalizado",
-      "openChat": "Abrir chat",
-      "chat": "Chat",
-      "customizeHint": "Úsalo como punto de partida para un nuevo agente",
-      "customize": "Personalizar",
-      "model": "Modelo",
-      "tools": "Herramientas",
-      "skills": "Habilidades",
-      "identity": "Identidad",
-      "description": "Descripción",
-      "descriptionPlaceholder": "Una breve descripción de una línea",
-      "capabilitiesAdvanced": "Capacidades · Avanzado",
-      "toolsCommaSeparated": "Herramientas (separadas por comas)",
-      "toolsPlaceholder": "Déjalo en blanco para heredar los valores predeterminados",
-      "workspace": "Espacio de trabajo",
-      "workspacePlaceholder": "Déjalo en blanco para usar la ruta predeterminada",
-      "agentDir": "Directorio del agente",
-      "optionalPlaceholder": "Opcional",
-      "enabled": "Activado",
-      "inheritedModel": "Modelo heredado",
-      "systemPrompt": "Prompt del sistema",
-      "systemPromptHint": "Almacenado en la configuración; el tiempo de ejecución actualmente lo toma del SOUL.md del agente en su lugar.",
-      "saveChanges": "Guardar cambios",
-      "drawerTitleEdit": "Editar agente: {id}",
-      "drawerTitleView": "Agente: {id}",
-      "loadFailed": "No se pudieron cargar los agentes",
-      "deleteTitle": "Eliminar agente",
-      "deleteBody": "¿Eliminar el agente {id}? Los chats existentes con este agente seguirán funcionando, pero quedarán sin gestionar.",
-      "discardTitle": "¿Descartar los cambios sin guardar?",
-      "discardBody": "Tienes ediciones sin guardar. Si cierras ahora, las perderás.",
-      "toastCreated": "Agente creado: {id}",
-      "toastExists": "El agente «{id}» ya existe",
-      "toastCreateFailed": "No se pudo crear el agente: {msg}",
-      "toastTweakId": "Ajusta el ID y luego haz clic en Añadir para crear tu copia",
-      "toastNothingToSave": "Nada que guardar",
-      "toastUpdated": "Agente actualizado: {id}",
-      "toastSaveFailed": "Error al guardar: {msg}",
-      "toastNotFound": "El agente «{id}» ya no existe.",
-      "toastBuiltinImmutable": "«{id}» es un agente integrado y no se puede modificar.",
-      "toastDeleted": "Agente eliminado: {id}",
-      "toastDeleteFailed": "No se pudo eliminar el agente: {msg}"
     },
     "channels": {
       "title": "Canales",
@@ -2800,12 +2617,6 @@
         "botIdCopied": "ID del bot copiado",
         "eventSubscriptionTitle": "Comprobar la suscripción de eventos de Feishu"
       }
-    },
-    "overview": {
-      "channelsChip": "Canales",
-      "channelsChipConnected": "{connected} conectado(s)",
-      "channelsChipFailed": "{failed} con error",
-      "channelsChipPending": "{pending} esperando aprobación"
     }
   },
   "cronSkills": {
@@ -3158,79 +2969,7 @@
       "tabsLabel": "Origen de la habilidad",
       "tabInstalled": "Instaladas",
       "tabCommunity": "Comunidad",
-      "metaSkillsTitle": "Metahabilidades",
-      "metaSkillsDesc": "Flujos de trabajo compuestos que controlan un DAG de subhabilidades.",
       "noMatchFilter": "Ninguna habilidad coincide con {filter}."
-    },
-    "autoPropose": {
-      "title": "Ajustes de propuesta automática",
-      "on": "activado",
-      "off": "desactivado",
-      "meta": "Síntesis no supervisada de nuevas metahabilidades a partir de tus patrones de uso.",
-      "scheduledLabel": "Programada (cron)",
-      "scheduledHint": "Se ejecuta según {cron}. Controla el DAG de meta-skill-creator con tus principales patrones de coocurrencia.",
-      "dreamLabel": "Tras la consolidación de memoria (sueño)",
-      "dreamHint": "Se acopla a la finalización del sueño de memoria. Independiente del conmutador de cron.",
-      "autoEnableLabel": "Activar automáticamente las propuestas que pasen las compuertas",
-      "autoEnableHint": "Promueve solo las propuestas que pasan todas las compuertas y se mantienen dentro del techo de riesgo {risk} configurado.",
-      "riskCeilingLabel": "Techo de riesgo para la activación automática",
-      "riskLow": "Bajo",
-      "riskMedium": "Medio",
-      "riskHigh": "Alto",
-      "riskCeilingHint": "Bajo es el predeterminado. Los techos más altos siguen ejecutando la comprobación previa de seguridad estática y conservan los metadatos de auditoría."
-    },
-    "autoEnabled": {
-      "title": "Metahabilidades activadas automáticamente",
-      "meta": "Promovidas por la activación automática. Desactivarlas devuelve la habilidad a las propuestas pendientes.",
-      "enabled": "activada",
-      "unknown": "desconocido",
-      "risk": "riesgo: {level}",
-      "proposalId": "id de propuesta",
-      "disable": "Desactivar"
-    },
-    "proposals": {
-      "title": "Propuestas pendientes",
-      "meta": "candidatas de meta-skill-creator a la espera de tu decisión de aceptar/rechazar.",
-      "gatesOk": "compuertas correctas",
-      "gatesBlocked": "compuertas bloqueadas",
-      "auto": "auto",
-      "autoGeneratedBy": "Generada automáticamente por {by}",
-      "autoEnableStatus": "activación automática: {status}",
-      "validationProfile": "perfil de validación",
-      "chainHash": "hash de la cadena",
-      "show": "Mostrar",
-      "accept": "Aceptar",
-      "reject": "Rechazar",
-      "unknown": "desconocido",
-      "acceptAnywayTitle": "¿Aceptar la propuesta de todos modos?",
-      "acceptAnywayBody": "La propuesta {id} no pasó todas las compuertas.\n\n{reason}\n\n¿Aceptar de todos modos (forzar)?",
-      "forceAccept": "Forzar aceptación",
-      "rejectTitle": "Rechazar propuesta",
-      "rejectBody": "¿Rechazar y eliminar la propuesta {id}? Esto no se puede deshacer.",
-      "disableTitle": "Desactivar habilidad activada automáticamente",
-      "disableBody": "¿Desactivar la habilidad activada automáticamente {name} y devolverla a las propuestas pendientes?",
-      "disable": "Desactivar",
-      "toastSettingsFailed": "No se pudo actualizar la configuración: {reason}",
-      "toastShowFailed": "Error al mostrar: {reason}",
-      "toastAcceptFailed": "Error al aceptar: {reason}",
-      "toastRejectFailed": "Error al rechazar: {reason}",
-      "toastDisableFailed": "Error al desactivar: {reason}"
-    },
-    "proposalDetail": {
-      "dialogLabel": "Detalles de la propuesta: {id}",
-      "heading": "Propuesta {id}",
-      "auditTitle": "Auditoría de activación automática",
-      "status": "Estado",
-      "risk": "Riesgo",
-      "staticSafetyProfile": "perfil de seguridad estática",
-      "reason": "Motivo",
-      "skills": "Habilidades",
-      "tools": "Herramientas",
-      "staticSafetyReasons": "Motivos de seguridad estática",
-      "none": "ninguno",
-      "unknown": "desconocido",
-      "noAudit": "No se registró ninguna decisión de activación automática.",
-      "gates": "Compuertas"
     },
     "tile": {
       "installed": "Instalado",
@@ -3250,15 +2989,12 @@
       "refreshPending": "Saved, but live refresh failed. Restart the Gateway before using this skill.",
       "disabledContent": "Use is disabled. Allow use to read the skill instructions.",
       "dialogLabel": "Detalles de la habilidad: {name}",
-      "triggers": "Disparadores",
-      "composition": "Composición ({kind}, {count} subhabilidades)",
       "missing": "Faltan",
       "binary": "binario",
       "envVar": "variable de entorno",
       "install": "Instalar",
       "installVia": "Instalar mediante {kind}",
       "installing": "Instalando...",
-      "toolchainSetupGuidance": "Ejecuta esta MetaSkill desde el chat para revisar el origen, el tamaño y la licencia, y aprobar su configuración. Las cadenas de herramientas gestionadas solo se pueden instalar mediante ese flujo.",
       "homepage": "Página de inicio",
       "loadingContent": "Cargando SKILL.md...",
       "emptyContent": "No hay contenido de SKILL.md disponible.",
@@ -3277,9 +3013,6 @@
       "inferredPython": "Inferido de {source}",
       "inferredEnv": "Variable de entorno inferida",
       "scanAdvisory": "Aviso del análisis de dependencias",
-      "subSkillRollup": "Resumen de dependencias de la metahabilidad",
-      "subSkillStatus": "{missing} faltantes · {advisory} avisos",
-      "missingSubSkill": "La subhabilidad referenciada no está disponible",
       "installUnavailable": "Ningún instalador coincide con las dependencias que faltan.",
       "installIncomplete": "{count} dependencias aún requieren atención.",
       "installComplete": "Las dependencias están listas."
@@ -3384,7 +3117,6 @@
     },
     "skills": {
       "statusReady": "lista",
-      "statusProviderAtLaunch": "El proveedor se comprobará al iniciar",
       "statusNoDeps": "sin dependencias declaradas",
       "statusNeedsDeps": "necesita dependencias",
       "dotReady": "Lista",
@@ -3422,24 +3154,25 @@
       "tileNeedsSetupHintNone": "todo listo",
       "tileNotDeclared": "No declaradas",
       "tileNotDeclaredHint": "sin manifiesto"
-    },
-    "stats": {
-      "proposalsTitle": "Propuestas de metahabilidades pendientes, sintetizadas por meta-skill-creator a partir de tus patrones de uso",
-      "proposalsLabel": "Propuestas pendientes",
-      "awaitingReview": "a la espera de revisión"
     }
+  },
+  "gatewayLogs": {
+    "viewLogs": "Ver registros recientes",
+    "title": "Registros del Gateway",
+    "description": "Últimas 200 líneas del Gateway conectado. Actualiza manualmente para obtener los datos más recientes.",
+    "refresh": "Actualizar",
+    "loading": "Cargando registros…",
+    "empty": "No hay registros recientes.",
+    "failed": "No se pudieron leer los registros. Comprueba la conexión y los permisos del Gateway e inténtalo de nuevo.",
+    "connectionRequired": "Conéctate al Gateway para ver los registros.",
+    "authenticationRequired": "Autentícate en el Gateway para ver los registros.",
+    "saveCurrentLogs": "Guardar registros actuales",
+    "saveFailed": "No se pudieron guardar los registros. Inténtalo de nuevo."
   },
   "monitorSupport": {
     "title": "Soporte y diagnóstico",
-    "menuLabel": "Acciones de soporte y diagnóstico",
-    "viewLogs": "Ver registros de ejecución",
-    "viewLogsDescription": "Revisar la salida reciente y los errores de la puerta de enlace",
-    "copyReport": "Copiar informe actual de disponibilidad",
-    "copyReportDescription": "Compartir el estado actual de conexión, configuración y ejecución",
-    "copySuccess": "Informe de disponibilidad copiado",
-    "copyFailed": "No se pudo copiar el informe de disponibilidad: {error}",
     "downloadBundle": "Descargar paquete de soporte con datos confidenciales ocultos",
-    "downloadBundleDescription": "Incluye registros, un resumen de configuración y resultados del diagnóstico",
+    "downloadBundleDescription": "Incluye registros, un resumen de configuración y resultados de diagnóstico del Gateway conectado.",
     "privacySummary": "El contenido de las conversaciones se excluye de forma predeterminada y se ocultan las credenciales conocidas",
     "bundleTitle": "Descargar paquete de soporte con datos confidenciales ocultos",
     "bundleSubtitle": "Crea un archivo ZIP para compartir con el soporte de OpenSquilla.",
@@ -3457,7 +3190,10 @@
     "bundleConfirm": "Generar y descargar",
     "bundleCancel": "Cancelar",
     "bundleFailed": "No se pudo descargar el paquete de soporte",
-    "bundleReady": "Paquete de soporte descargado"
+    "bundleReady": "Paquete de soporte descargado",
+    "bundleConnectionRequired": "Conéctese al Gateway para descargar un paquete de soporte.",
+    "bundleOwnerRequired": "Solo el propietario local del Gateway puede descargar un paquete de soporte.",
+    "bundleDifferentGateway": "Abra la WebUI del Gateway conectado para descargar su paquete de soporte."
   },
   "usageLogs": {
     "tasks": {
@@ -3601,51 +3337,6 @@
     },
     "errors": {
       "loadFailed": "No se pudo cargar el uso"
-    },
-    "logs": {
-      "breadcrumbLabel": "Ruta de navegación",
-      "title": "Registros",
-      "subtitle": "Flujo de registros en vivo de la puerta de enlace: filtra y sigue.",
-      "statusUnavailable": "Estado de los registros no disponible",
-      "statusUnavailableAria": "Estado de los registros no disponible; el seguimiento de registros aún puede funcionar.",
-      "statusUnavailableTitle": "logs.status no está disponible; el seguimiento de registros aún puede funcionar.",
-      "fileLogOn": "Registro en archivo activado",
-      "fileLogOff": "Registro en archivo desactivado",
-      "fileLogTitle": "El registro en archivo de la puerta de enlace es configurable mediante log_file_enabled, log_level, los ajustes de rotation y OPENSQUILLA_LOG_DIR. Ruta: {path}.",
-      "fileLogOffTitle": "Los registros no se escriben en disco; los paquetes de diagnóstico carecerán de historial. Activa log_file_enabled en la configuración. Ruta: {path}.",
-      "rawOn": "Captura cruda activada",
-      "rawOff": "Captura cruda desactivada",
-      "rawRecordingPill": "Captura cruda grabando",
-      "rawTitle": "La captura cruda registra las solicitudes y respuestas completas del modelo, incluido el contenido de la conversación. Actívala con OPENSQUILLA_TURN_CALL_LOG=1 o con opensquilla diagnostics on --raw; desactívala con opensquilla diagnostics off. Origen: {source}. Directorio: {path}.",
-      "bundleButton": "Paquete de diagnóstico",
-      "bundleButtonTitle": "Descargar un paquete de diagnóstico depurado",
-      "bundleTitle": "Descargar paquete de diagnóstico",
-      "bundleBody": "Reúne los registros de la puerta de enlace, los registros de errores y la configuración depurada en un único zip que puedes adjuntar a un informe de errores. Los secretos y las claves de API se eliminan; el contenido de las conversaciones queda excluido salvo que lo actives abajo.",
-      "bundleIncludeContent": "Incluir el contenido de las conversaciones (prompts y respuestas)",
-      "bundleConfirm": "Descargar",
-      "bundleCancel": "Cancelar",
-      "bundleFailed": "Error al descargar el diagnóstico",
-      "bundleReady": "Paquete de diagnóstico descargado",
-      "inView": "En vista",
-      "ofLoaded": "de {total} cargadas",
-      "errors": "Errores",
-      "reviewNeeded": "requiere revisión",
-      "allClear": "todo en orden",
-      "warnings": "Advertencias",
-      "recentAdvisories": "avisos recientes",
-      "none": "ninguno",
-      "infoDebug": "Información / Depuración",
-      "routineOutput": "salida rutinaria",
-      "levels": "Niveles",
-      "filterPlaceholder": "Filtrar mensajes…",
-      "autoFollow": "Seguimiento automático",
-      "loading": "Cargando registros…",
-      "empty": "Aún no hay registros de ejecución.",
-      "loadFailed": "No se pudieron cargar los registros de ejecución.",
-      "retry": "Reintentar",
-      "noMatch": "Ninguna línea coincide con el filtro actual.",
-      "lineDetail": "Detalle de la línea de registro",
-      "ofLoadedFoot": "{visible} visibles · {total} en búfer"
     }
   },
   "chat": {
@@ -3657,7 +3348,6 @@
       "title": "Commands and skills",
       "command": "Commands",
       "skill": "Skills",
-      "meta": "Workflows",
       "empty": "No matching commands or skills",
       "loading": "Loading skills…",
       "autoHint": "Desplázate o busca por nombre · Selección automática de habilidades",
@@ -3671,12 +3361,9 @@
       "remove": "Remove {name} from this message",
       "queuedHint": "This message will run after the current task.",
       "limit": "Select up to 16 skills per message.",
-      "metaTextOnly": "This workflow accepts text. Keep attachments and selected skills in a separate message.",
       "commandAtStart": "Use this command at the start of a message.",
       "usage": "Usage: {tokens} tokens",
       "usageFailed": "Unable to load usage. Try again.",
-      "workflowTitle": "Start {name}",
-      "workflowRequest": "What would you like this workflow to do?",
       "loaded": "Loaded",
       "failed": "Load failed",
       "loadingSkill": "Loading",
@@ -3690,7 +3377,6 @@
         "new": "Iniciar un chat nuevo",
         "compact": "Reducir el contexto actual",
         "goal": "Establecer un objetivo continuo",
-        "meta": "Elegir un flujo de trabajo",
         "plan": "Planificar la tarea actual",
         "reset": "Restablecer la conversación",
         "usage": "Ver el uso de tokens"
@@ -3719,26 +3405,6 @@
         "html": {
           "name": "Web pages",
           "description": "Build and edit HTML pages"
-        },
-        "webpage": {
-          "name": "Website builder",
-          "description": "Build a complete website"
-        },
-        "kidsProject": {
-          "name": "Kids’ projects",
-          "description": "Plan a creative project for children"
-        },
-        "shortDrama": {
-          "name": "Short drama",
-          "description": "Turn an idea into a video"
-        },
-        "skillCreator": {
-          "name": "Workflow builder",
-          "description": "Combine skills into a workflow"
-        },
-        "paperWriting": {
-          "name": "Academic writing",
-          "description": "Research and draft a paper"
         }
       }
     },
@@ -3819,6 +3485,7 @@
     "projectFileLiveTarget": "Archivo actual del proyecto: {path}",
     "importedFileWorkingTarget": "Archivo importado; los cambios usan una copia de trabajo",
     "fileLabel": "Archivo",
+    "pastedTextLabel": "Texto pegado",
     "add": "Añadir",
     "attachFiles": "Adjuntar archivos",
     "attachFilesTitle": "Adjuntar archivos: cualquier tipo de archivo (imágenes, PDF, Office y texto se leen directamente; los demás van al espacio de trabajo del agente)",
@@ -4030,6 +3697,10 @@
       "setup": "Configurar"
     },
     "usageDetails": "Detalles de uso",
+    "messageFeedback": {
+      "up": "Útil (solo en esta página)",
+      "down": "No útil (solo en esta página)"
+    },
     "regenerate": "Regenerar",
     "forkConversation": "Crear una rama desde aquí",
     "forkCreating": "Creando rama…",
@@ -4402,16 +4073,6 @@
         "requestConflict": "Esta acción ya se usó para otra solicitud. Inténtalo de nuevo."
       }
     },
-    "codingMode": {
-      "enabled": "Coding mode activado para todos los chats.",
-      "disabled": "Coding mode desactivado.",
-      "usage": "Usa /coding para alternar, o /coding on, /coding off o /coding status.",
-      "updateFailed": "No se pudo actualizar Coding mode.",
-      "commandEnable": "Activar Coding mode.",
-      "commandDisable": "Desactivar Coding mode.",
-      "activeLabel": "Coding ACTIVO",
-      "disableLabel": "Desactivar Coding mode"
-    },
     "composer": {
       "workStyleGroup": "Forma de trabajo",
       "contentGroup": "Contenido",
@@ -4486,75 +4147,6 @@
       "offlineQueued": "Guardado localmente. Se enviará cuando se restablezca la conexión.",
       "identityChanged": "La identidad de la conexión ha cambiado. Vuelve a conectarte a la puerta de enlace y la cuenta originales para enviar este mensaje.",
       "annotationUpgradeRequired": "Esta anotación pendiente usa el editor anterior. Edita el mensaje y vuelve a seleccionar la página antes de enviarlo."
-    },
-    "metaRuns": {
-      "draft": "Borrador",
-      "noPreviousMessage": "No hay ningún mensaje anterior que reintentar",
-      "replayUnavailable": "Esta ejecución ya no tiene un comando de repetición válido. Actualiza la página e inténtalo de nuevo.",
-      "replayFailed": "Error al reproducir — {message}",
-      "toastInstallDependency": "Instala la dependencia que falta y luego reintenta esta ejecución de metahabilidad.",
-      "toastContinueTextOnly": "Continúa solo con salidas de texto y luego reintenta si todavía se necesita un artefacto.",
-      "toastReviewPaidSubmit": "Es posible que el proveedor ya haya aceptado el envío de pago. Revisa su panel o la salida antes de iniciar otra generación; la repetición automática está desactivada para evitar un cobro duplicado.",
-      "toastUnsupportedRescueAction": "Esta aplicación no admite esta acción de recuperación. No se inició ningún reintento.",
-      "needsSetup": "Requiere configuración",
-      "setupRequired": "{skill} aún no se puede ejecutar. Configura primero: {dependencies}",
-      "unknownDependency": "el entorno de ejecución requerido",
-      "couldNotRunSkill": "No se pudo ejecutar la metahabilidad {skill}.",
-      "couldNotRunSkillError": "No se pudo ejecutar la metahabilidad: {error}",
-      "savedForRetry": "La solicitud de {skill} se guardó con su identidad original. Vuelve a este chat para reintentarlo.",
-      "cancelNotSaved": "No se pudo guardar esta cancelación de forma segura. La solicitud sigue pendiente y no se eliminó.",
-      "cancelAlreadyAccepted": "Esta solicitud de MetaSkill ya había comenzado, por lo que no se pudo cancelar ni se devolvió al cuadro de redacción. No la envíes de nuevo."
-    },
-    "metaSetup": {
-      "title": "Configurar {skill}",
-      "badgeConfirm": "Confirmación necesaria",
-      "badgeInstalling": "Instalando",
-      "badgeVerifying": "Verificando",
-      "badgeFailed": "Error",
-      "badgeBlocked": "Requiere atención",
-      "intro": "Esta MetaSkill necesita algunos requisitos antes de ejecutarse. Revisa las herramientas locales y las conexiones de servicio siguientes.",
-      "missingDependencies": "Requisitos pendientes",
-      "installActions": "Instalación prevista",
-      "source": "Origen",
-      "version": "Versión {version}",
-      "license": "Licencia",
-      "downloadSize": "Descarga",
-      "paperToolchain": "Cadena TeX para artículos gestionada por OpenSquilla",
-      "mediaToolchain": "Cadena multimedia FFmpeg compatible",
-      "missingRuntimeCapabilities": "Aún faltan capacidades de ejecución: {capabilities}",
-      "requiresAdmin": "Esta instalación puede requerir autorización de administrador. El sistema pedirá confirmación antes de realizar cambios con privilegios.",
-      "confirmHint": "OpenSquilla instala los componentes seleccionados desde los orígenes indicados y verifica su compatibilidad en tiempo de ejecución. No modifica los archivos del proyecto.",
-      "homebrewHint": "En macOS se ejecuta brew install --force-bottle ffmpeg-full. Homebrew resuelve la fórmula actual y la instala fuera del directorio de herramientas gestionado por OpenSquilla. OpenSquilla no desinstala esa fórmula ni sus dependencias.",
-      "installAndContinue": "Instalar y continuar",
-      "notNow": "Ahora no",
-      "hide": "Dejar de observar",
-      "backgroundHint": "La configuración sigue en segundo plano. Al cerrar no se iniciará automáticamente; ejecuta esta MetaSkill de nuevo para continuar.",
-      "installingStatus": "Instalando los componentes seleccionados…",
-      "finishingStatus": "Descarga completada. Finalizando la configuración local de herramientas…",
-      "verifyingStatus": "Verificando la cadena de herramientas…",
-      "downloadProgress": "Progreso de descarga",
-      "completedActions": "{completed} de {total} pasos completados",
-      "failedTitle": "La configuración no se completó",
-      "blockedTitle": "La configuración no puede continuar",
-      "retry": "Reintentar",
-      "checkAgain": "Comprobar de nuevo",
-      "providerTitle": "Conecta {provider} para continuar",
-      "providerCapabilities": "Se usa para: {capabilities}.",
-      "providerReasonMissingCredential": "Añade una credencial para este proveedor.",
-      "providerReasonPoolExhausted": "Todas las credenciales configuradas están ocupadas. Vuelve a comprobarlo en breve.",
-      "providerReasonEndpointMismatch": "La credencial configurada no coincide con el endpoint de este proveedor.",
-      "providerReasonMissingEndpoint": "Añade un endpoint para este proveedor.",
-      "providerReasonInvalidEndpoint": "Revisa la configuración del endpoint de este proveedor.",
-      "providerReasonRuntimeUnsupported": "Este proveedor no está disponible en el entorno de ejecución actual.",
-      "providerReasonUnknownProvider": "Este proveedor no está disponible en el catálogo actual.",
-      "providerReasonConnectionRequired": "Se requiere una conexión válida con el proveedor.",
-      "providerNoChargeHint": "Guardar esta conexión no inicia la generación ni genera cargos de generación. Confirmarás la generación por separado.",
-      "configureProvider": "Conectar {provider}",
-      "providerNavigationFailed": "No se pudo abrir la configuración del proveedor de forma segura. Tu solicitud sigue aquí; inténtalo de nuevo.",
-      "close": "Cerrar",
-      "noAutomaticSetup": "No hay una configuración automática segura para esta plataforma. Instala los requisitos manualmente y vuelve a intentarlo.",
-      "sessionChanged": "El chat activo cambió y la MetaSkill no se inició. Vuelve al chat original para continuar.",
-      "launchFailed": "La cadena de herramientas se instaló, pero no se pudo iniciar la MetaSkill."
     },
     "compact": {
       "failureIntegrity": "El resumen no superó la comprobación de integridad",
@@ -4638,21 +4230,6 @@
       "planWeek": "Esboza un plan para mi semana",
       "searchAiNews": "Busca las noticias de IA de hoy",
       "generateImage": "Genera una imagen de una mascota de calamar diminuto"
-    },
-    "metaQuick": {
-      "webpage": "Crear una web multimedia",
-      "shortDrama": "Crear un corto con IA",
-      "paperWriting": "Redactar un artículo académico",
-      "webpageDesc": "Crear un sitio completo y listo para usar",
-      "shortDramaDesc": "Crear guion, planos y vídeo final",
-      "paperWritingDesc": "Investigar, redactar y compilar un artículo"
-    },
-    "metaDescriptions": {
-      "webpage": "Crear un sitio multimedia completo a partir de un tema.",
-      "kidsProject": "Planificar un proyecto creativo seguro y adecuado para niños.",
-      "shortDrama": "Crear un corto con IA, del guion al vídeo final.",
-      "skillCreator": "Combinar habilidades en un flujo de trabajo reutilizable.",
-      "paperWriting": "Investigar, redactar y compilar un artículo académico."
     },
     "toast": {
       "downloadFailedHttp": "Error al descargar — HTTP {status}",
@@ -4754,14 +4331,6 @@
       "sessionModelBusy": "Podrás cambiar el modelo cuando termine la respuesta actual.",
       "router": "Enrutamiento inteligente de modelos",
       "ensemble": "Ensamble de modelos"
-    },
-    "routeFeedback": {
-      "up": "Buena elección de modelo para este turno",
-      "down": "Mala elección de modelo para este turno",
-      "upEnsemble": "Satisfecho con esta respuesta agregada",
-      "downEnsemble": "Insatisfecho con esta respuesta agregada",
-      "expired": "El registro de enrutamiento de este mensaje ha caducado",
-      "failed": "No se pudo registrar tu valoración"
     }
   },
   "shared": {
@@ -4783,9 +4352,7 @@
       "groupMessages": "Mensajes",
       "actionNewChat": "Nueva tarea",
       "actionOpenSettings": "Abrir Ajustes",
-      "actionToggleTheme": "Cambiar tema",
-      "actionBgmEnable": "Activar música de fondo",
-      "actionBgmDisable": "Desactivar música de fondo"
+      "actionToggleTheme": "Cambiar tema"
     },
     "toast": {
       "dismiss": "Descartar notificación"
@@ -4950,6 +4517,35 @@
       "copied": "Comando copiado",
       "copyFailed": "No se pudo copiar el comando",
       "copyLabel": "Copiar el comando de reinicio del gateway"
+    }
+  },
+  "deliveryRecovery": {
+    "label": "Comprobaciones de entrega pendientes",
+    "count": "Hay {count} resultados de entrega por confirmar",
+    "show": "Ver detalles",
+    "collapse": "Ocultar detalles",
+    "open": "Abrir conversación",
+    "check": "Comprobar de nuevo",
+    "checking": "Comprobando…",
+    "more": "Mostrar más",
+    "stop": "Detener solicitud original",
+    "stopPending": "La detención continuará tras confirmar la tarea original.",
+    "reason": {
+      "not-sent": "Este mensaje no se ha enviado. Abre la conversación para revisar el borrador y enviarlo.",
+      "pending": "Se está comprobando la entrega original.",
+      "stop": "Esperando a que se detenga la tarea.",
+      "offline": "Vuelve a conectarte para comprobar la entrega original.",
+      "identity": "Vuelve al Gateway y a la cuenta originales para comprobar esta entrega.",
+      "receipt-unsupported": "Este Gateway no permite consultar recibos. Abre la conversación para comprobar el resultado.",
+      "receipt-missing": "No se encontró ningún recibo. La entrega original sigue sin confirmar.",
+      "storage-check": "No se pudo acceder al estado de recuperación. Vuelve a comprobar cuando el almacenamiento local esté disponible.",
+      "storage": "No se pudo guardar la solicitud de detención. Comprueba la tarea antes de cerrar; no se garantiza la detención al volver a abrir.",
+      "lease": "Otra ventana está comprobando esta entrega.",
+      "budget": "Las comprobaciones automáticas están en pausa. Puedes comprobar de nuevo.",
+      "permission": "No tienes permiso para comprobar esta entrega. Restablece el acceso antes de volver a comprobar.",
+      "conflict": "La solicitud guardada y el recibo no coinciden. Abre la conversación para revisar el resultado.",
+      "reload": "La recuperación se pausó porque otra ventana actualizó el almacenamiento. Guarda los borradores sin enviar y vuelve a cargar esta ventana.",
+      "legacy": "Una entrega antigua no tiene una identidad de conexión verificada. Revisa la conversación original."
     }
   }
 }

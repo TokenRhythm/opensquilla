@@ -664,9 +664,6 @@ Les détails de chaque version se trouvent dans [`CHANGELOG.md`](CHANGELOG.md) e
 | **Sessions durables, sous-Agents et planification** | Stockage des sessions, des transcriptions et des relectures adossé à SQLite, avec des espaces de travail par Agent. Les Agents engendrent des sous-Agents à profondeur bornée, et un `SchedulerEngine` doté d'un analyseur cron intégré exécute des tâches récurrentes via `opensquilla cron`. |
 | **Contrôles de l'opérateur** | Les approbations avec humain dans la boucle peuvent mettre en pause les appels d'outils sensibles en attendant une décision ; les récapitulatifs de Token et de coût par tour et par session (`opensquilla cost`) ainsi que les diagnostics sont accessibles depuis la CLI et la Web UI. |
 
-Documentation MetaSkill : [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md),
-et [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md).
 
 ---
 

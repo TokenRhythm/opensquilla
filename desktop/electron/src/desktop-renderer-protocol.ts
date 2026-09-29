@@ -8,10 +8,8 @@ export const DESKTOP_RENDERER_ENTRY = 'desktop.html'
 
 const DESKTOP_RENDERER_DOCUMENT_PATHS = new Set([
   '/',
-  '/agents',
   '/approvals',
   '/channels',
-  '/changelog',
   '/chat',
   '/chat/new',
   '/config',
@@ -100,7 +98,6 @@ export function routeDesktopRendererRequest(
   }
   if (
     pathname.startsWith('/assets/')
-    || pathname.startsWith('/music/')
     || pathname === '/opensquilla-mark.png'
     || pathname === '/desktop.html'
     || pathname === '/webui-artifact-manifest.json'

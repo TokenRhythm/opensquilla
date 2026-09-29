@@ -250,19 +250,7 @@
               <span>{{ t('workspaces.chooseProject') }}</span>
               <Icon class="chat-project-choose__chevron" name="chevronDown" :size="12" />
             </button>
-            <button
-              v-if="codingModeEnabled"
-              type="button"
-              class="chat-coding-mode-chip"
-              :title="t('chat.codingMode.disableLabel')"
-              :aria-label="t('chat.codingMode.disableLabel')"
-              :aria-busy="codingModeSettingsBusy ? 'true' : 'false'"
-              :disabled="codingModeSettingsBusy"
-              @click="emit('setCodingModeEnabled', false)"
-            >
-              <span>{{ t('chat.codingMode.activeLabel') }}</span>
-              <Icon name="x" :size="12" aria-hidden="true" />
-            </button>
+
             <div ref="runModeAnchorEl" class="chat-settings-anchor chat-run-mode-anchor">
               <button
                 class="btn btn--ghost chat-run-mode-btn"
@@ -549,7 +537,7 @@ import { fileTypeLabel } from '@/utils/fileType'
 interface ChatComposerExpose {
   composerElement: () => HTMLElement | null
   canCollapse: () => boolean
-  focusTextarea: () => void
+  focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
 }
@@ -590,8 +578,6 @@ const props = withDefaults(defineProps<{
   modelsError?: string | null
   modelProviderErrors?: readonly ProviderListError[]
   modelSelectionDisabledReason?: 'routing' | 'busy' | 'unavailable' | null
-  codingModeEnabled?: boolean
-  codingModeSettingsBusy?: boolean
   addMenuAvoidElement?: HTMLElement | null
   browserUseAvailable?: boolean
   goalDraftArmed?: boolean
@@ -624,8 +610,6 @@ const props = withDefaults(defineProps<{
   floating?: boolean
 }>(), {
   canChooseProject: true,
-  codingModeEnabled: false,
-  codingModeSettingsBusy: false,
   sessionRoutingAvailable: true,
   sessionRoutingControlBlocked: false,
   goalDraftArmed: false,
@@ -654,7 +638,6 @@ const emit = defineEmits<{
   selectModel: [selection: { model: string; provider: string } | null]
   refreshModels: []
   openModelSettings: []
-  setCodingModeEnabled: [enabled: boolean]
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
   selectBrowserUse: []
@@ -993,15 +976,16 @@ function attachmentIcon(att: Attachment): IconName {
 }
 
 function attachmentMeta(att: Attachment): string {
+  const pasted = att.origin === 'paste' ? t('chat.pastedTextLabel') : ''
   if (att.kind === 'failed') {
     const failed = t('chat.status.failed')
-    return att.error ? `${failed} · ${att.error}` : failed
+    return [pasted, att.error ? `${failed} · ${att.error}` : failed].filter(Boolean).join(' · ')
   }
   const label = fileTypeLabel(att, t('chat.fileLabel'))
   const size = typeof att.size === 'number'
     ? `${Math.max(1, Math.round(att.size / 1024))} KB`
     : ''
-  return [label, size].filter(Boolean).join(' · ')
+  return [pasted, label, size].filter(Boolean).join(' · ')
 }
 
 function attachmentTitle(att: Attachment): string {
@@ -1033,13 +1017,20 @@ function documentCanReceiveFocus(): boolean {
   return document.visibilityState === 'visible' && document.hasFocus()
 }
 
-function focusTextarea() {
+function focusTextarea(options?: { preserveFocus?: boolean }) {
   // Programmatic focus must never reactivate a background/minimized browser
   // window. Recheck inside nextTick because the page can lose focus between
   // scheduling and execution (GitHub issue 382).
-  if (!documentCanReceiveFocus()) return
+  const canFocus = () => {
+    if (!documentCanReceiveFocus()) return false
+    if (!options?.preserveFocus) return true
+    const active = document.activeElement
+    return !active || active === document.body || active === document.documentElement
+      || active === textareaEl.value || !document.contains(active)
+  }
+  if (!canFocus()) return
   nextTick(() => {
-    if (documentCanReceiveFocus()) textareaEl.value?.focus()
+    if (canFocus()) textareaEl.value?.focus()
   })
 }
 
@@ -1156,49 +1147,6 @@ defineExpose<ChatComposerExpose>({
   background: color-mix(in srgb, var(--warn) 7%, transparent);
 }
 
-.chat-coding-mode-chip {
-  flex: 0 1 auto;
-  min-width: 0;
-  max-width: 100%;
-  min-height: 30px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px 7px 3px 9px;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  border-radius: var(--radius-full);
-  background: color-mix(in srgb, var(--accent) 9%, transparent);
-  color: var(--accent);
-  font: inherit;
-  font-size: var(--fs-xs);
-  font-weight: 650;
-  line-height: 1;
-  cursor: pointer;
-  transition:
-    border-color var(--dur-fast),
-    background var(--dur-fast),
-    color var(--dur-fast);
-}
-.chat-coding-mode-chip > span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.chat-coding-mode-chip:hover,
-.chat-coding-mode-chip:focus-visible {
-  outline: 0;
-  border-color: color-mix(in srgb, var(--accent) 48%, transparent);
-  background: color-mix(in srgb, var(--accent) 15%, transparent);
-  color: var(--accent-hover);
-}
-.chat-coding-mode-chip:focus-visible {
-  box-shadow: var(--focus-ring);
-}
-.chat-coding-mode-chip:disabled {
-  cursor: default;
-  opacity: var(--state-disabled-opacity);
-}
 .chat-project-choose {
   flex-shrink: 0;
   max-width: 100%;

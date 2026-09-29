@@ -124,7 +124,9 @@ async def test_natural_goal_write_failure_restores_only_current_authority(
 
     async with _open_goal_rpc_stack(tmp_path / "rollback.sqlite", handler=handler) as stack:
         sent = await _send(stack)
-        task = await stack.runtime.wait(sent["task_id"], timeout=2)
+        # This contract performs several real SQLite transactions. The wait is
+        # a deadlock guard, not a two-second product-latency assertion.
+        task = await stack.runtime.wait(sent["task_id"], timeout=10)
         assert task.status == AgentTaskStatus.SUCCEEDED
         assert checked.is_set()
 

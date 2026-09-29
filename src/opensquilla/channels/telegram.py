@@ -357,7 +357,7 @@ class TelegramChannel:
                     if isinstance(update_id, int):
                         self._update_offset = update_id + 1
                     continue
-                self.enqueue(msg)
+                await self.enqueue(msg)
                 # Confirm an update only after its normalized message has been
                 # accepted by the local queue. The durable ingress journal can
                 # replace this checkpoint without changing adapter semantics.
@@ -376,16 +376,16 @@ class TelegramChannel:
             payload["offset"] = self._update_offset
         return payload
 
-    def enqueue(self, message: IncomingMessage) -> bool:
+    async def enqueue(self, message: IncomingMessage) -> bool:
         msg_id = str(message.metadata.get("message_id", ""))
         update_id = message.metadata.get("update_id")
         dedupe_key = f"{update_id}:{msg_id}" if update_id is not None else msg_id
-        if dedupe_key and not self._dedupe.check_and_add(dedupe_key):
-            log.debug("telegram.duplicate_dropped", key=dedupe_key)
-            return False
         from opensquilla.channels.delivery_store import durable_enqueue
 
-        if not durable_enqueue(self, message, self._queue):
+        if not await self._dedupe.run_once(
+            dedupe_key,
+            lambda: durable_enqueue(self, message, self._queue),
+        ):
             return False
         self._last_message_at = datetime.now(UTC)
         return True
@@ -422,7 +422,7 @@ class TelegramChannel:
             log.debug("telegram.unsupported_update_ignored", update_id=update.get("update_id"))
             await self._maybe_notify_edit_ignored(update)
             return Response(status_code=200)
-        self.enqueue(msg)
+        await self.enqueue(msg)
         return Response(status_code=200)
 
     async def _maybe_notify_edit_ignored(self, update: dict[str, Any]) -> None:

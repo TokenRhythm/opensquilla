@@ -25,12 +25,14 @@ from __future__ import annotations
 import asyncio
 import inspect
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import structlog
 
 from opensquilla.engine.cache_break_monitor import notify_compaction
 from opensquilla.gateway.config import ContextOverflowPolicy, GatewayConfig
+from opensquilla.paths import media_root_from_config
 from opensquilla.provider.model_catalog import resolve_effective_context_window, shared_catalog
 from opensquilla.provider.types import (
     ProviderRequestCorrelation,
@@ -103,7 +105,9 @@ class OverflowOutcome:
     trimmed_history: list[Any] = field(default_factory=list)
 
 
-def _estimate_payload_tokens(message: str, transcript: list[Any]) -> int:
+def _estimate_payload_tokens(
+    message: str, transcript: list[Any], *, media_root: Path | None = None,
+) -> int:
     """Estimate the token cost of (history + new message).
 
     Uses the shared :func:`opensquilla.session.tokenizer.estimate_tokens` so
@@ -112,7 +116,9 @@ def _estimate_payload_tokens(message: str, transcript: list[Any]) -> int:
 
     total = estimate_tokens(message or "")
     for entry in transcript or []:
-        total += estimate_entry_model_replay_tokens(entry)
+        # The model-replay estimator applies the canonical provider-visible
+        # history projection, including attachment markers/media reserves.
+        total += estimate_entry_model_replay_tokens(entry, media_root=media_root)
     return total
 
 
@@ -153,8 +159,9 @@ async def _estimate_session_payload_tokens(
     session_manager: Any | None = None,
     session_key: str = "",
     fallback_summary: str = "",
+    media_root: Path | None = None,
 ) -> int:
-    total = _estimate_payload_tokens(message, transcript)
+    total = _estimate_payload_tokens(message, transcript, media_root=media_root)
     summaries: list[Any] = []
     get_summaries = getattr(session_manager, "get_summaries", None)
     if callable(get_summaries):
@@ -297,7 +304,8 @@ async def apply_context_overflow_policy(
             provider=config.llm.provider,
             global_override=config.llm.context_window_tokens,
         )
-    estimated = _estimate_payload_tokens(message, transcript)
+    media_root = media_root_from_config(config)
+    estimated = _estimate_payload_tokens(message, transcript, media_root=media_root)
 
     outcome = OverflowOutcome(
         policy=policy,
@@ -326,7 +334,9 @@ async def apply_context_overflow_policy(
     if policy == ContextOverflowPolicy.HARD_TRUNCATE:
         # Drop oldest transcript entries until estimated tokens fit.
         trimmed = list(transcript or [])
-        while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
+        while trimmed and _estimate_payload_tokens(
+            message, trimmed, media_root=media_root,
+        ) > budget:
             trimmed.pop(0)
             outcome.truncated_entries += 1
         outcome.trimmed_history = trimmed
@@ -353,6 +363,7 @@ async def apply_context_overflow_policy(
                     compacted_transcript,
                     session_manager=session_manager,
                     session_key=session_key,
+                    media_root=media_root,
                 )
                 outcome.tokens_after = post_estimate
                 outcome.remaining_budget_tokens = max(budget - post_estimate, 0)
@@ -365,6 +376,7 @@ async def apply_context_overflow_policy(
                 return outcome
 
             effective_compaction_config = compaction_config or CompactionConfig()
+            effective_compaction_config.attachment_media_root = media_root
             arm_compaction_deadline(
                 effective_compaction_config,
                 operation_id=compaction_id,
@@ -473,6 +485,7 @@ async def apply_context_overflow_policy(
                     session_manager=session_manager,
                     session_key=session_key,
                     fallback_summary=str(summary or ""),
+                    media_root=media_root,
                 ),
                 effective_compaction_config,
                 phase="verifying",
@@ -662,10 +675,12 @@ async def apply_context_overflow_policy(
                 )
                 raise
             trimmed = list(transcript or [])
-            while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
+            while trimmed and _estimate_payload_tokens(
+                message, trimmed, media_root=media_root,
+            ) > budget:
                 trimmed.pop(0)
                 outcome.truncated_entries += 1
-            post_estimate = _estimate_payload_tokens(message, trimmed)
+            post_estimate = _estimate_payload_tokens(message, trimmed, media_root=media_root)
             outcome.trimmed_history = trimmed
             outcome.tokens_after = post_estimate
             outcome.remaining_budget_tokens = max(budget - post_estimate, 0)
@@ -745,7 +760,9 @@ async def apply_context_overflow_policy(
         # the turn still fits. This path is exercised by unit tests; the
         # production gateway always wires a real session manager.
         trimmed = list(transcript or [])
-        while trimmed and _estimate_payload_tokens(message, trimmed) > budget:
+        while trimmed and _estimate_payload_tokens(
+            message, trimmed, media_root=media_root,
+        ) > budget:
             trimmed.pop(0)
             outcome.truncated_entries += 1
         outcome.trimmed_history = trimmed

@@ -147,7 +147,7 @@ test.describe('Settings modal', () => {
     await railTab(page, 'Model Routing').click()
     await expect(railTab(page, 'Model Routing')).toHaveAttribute('aria-selected', 'true')
     await expect(page).toHaveURL(/\/settings\/modelStrategy$/)
-    await expect(dialog(page).getByRole('radiogroup', { name: 'Model routing', exact: true })).toBeVisible()
+    await expect(dialog(page).getByRole('heading', { name: 'Model routing', exact: true })).toBeVisible()
 
     // Section navigation uses replace, so a single Back exits Settings rather
     // than walking section history.
@@ -358,8 +358,14 @@ test.describe('Settings modal', () => {
     await page.keyboard.press('Escape')
     await expect(dialog(page)).toBeHidden()
     await expect(page).not.toHaveURL(/\/settings/)
-    // No detached focus: it lands on the sidebar Settings button.
+    // Cold entry mounts Chat and then canonicalizes its empty draft. Neither
+    // automatic focus step may replace Settings' restored keyboard location.
+    await expect(page).toHaveURL(/\/chat\/new$/)
+    await expect(page.locator('.chat-textarea')).toBeVisible()
     await expect(settingsRow(page)).toBeFocused()
+
+    await page.locator('.sidebar-new-session').click()
+    await expect(page.locator('.chat-textarea')).toBeFocused()
   })
 
   test('/config deep link redirects into the settings overlay', async ({ page }) => {
@@ -653,12 +659,6 @@ test.describe('Settings modal', () => {
     // the Gateway-backed conversation-capture row above still does.
     await expect(dialog(page).locator('.settings-dirtybar')).toBeHidden()
 
-    // Long-lived Agent management is available only from this advanced escape
-    // hatch; routing through Vue preserves the /control base path.
-    await dialog(page).getByRole('button', { name: 'Open: Agent configuration (advanced)' }).click()
-    await expect(page).toHaveURL(/\/agents$/)
-    await expect(dialog(page)).toHaveCount(0)
-    await expect(page.locator('.agents-view, .agents-page, .ag-stage').first()).toBeVisible()
-    await expect(page.getByRole('heading', { name: 'Agents', level: 1 })).toBeFocused()
+    await expect(dialog(page).getByRole('button', { name: 'Open: Agent configuration (advanced)' })).toHaveCount(0)
   })
 })

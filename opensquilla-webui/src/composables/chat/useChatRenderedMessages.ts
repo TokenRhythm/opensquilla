@@ -125,13 +125,10 @@ const ROUTER_LEGACY_DECOY_MODELS = [
 
 function clarifyInterruptFromValue(value: unknown): ToPartsInterrupt | null {
   const data = clarifyRequestFromValue(value)
-  if (!data) return null
-  const composite = `${data.runId}|${data.step}`
-  const approvalId = data.requestId
-    || (composite === '|' ? 'clarify:history' : composite)
+  if (!data?.requestId) return null
   return {
     kind: 'clarify',
-    approvalId,
+    approvalId: data.requestId,
     data,
   }
 }

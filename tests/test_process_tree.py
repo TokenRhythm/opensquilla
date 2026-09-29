@@ -326,6 +326,297 @@ async def test_posix_anchor_owns_signalling_and_closes_with_its_lifecycle(
 
 
 @pytest.mark.asyncio
+async def test_posix_pre_eof_capture_requires_its_own_ack() -> None:
+    stream = asyncio.StreamReader()
+    commands: list[bytes] = []
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, command: bytes) -> None:
+            commands.append(command)
+            if command == process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURE:
+                # A terminate ACK must not authorize an EOF capture.
+                stream.feed_data(process_tree._POSIX_ANCHOR_CAPTURED)
+
+        async def drain(self) -> None:
+            return None
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        capture_task = asyncio.create_task(owner.capture_before_eof())
+        assert await asyncio.wait_for(anchor._term_reports.get(), timeout=0.2)
+        assert not capture_task.done()
+        stream.feed_data(process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURED)
+        assert await capture_task
+        assert commands == [process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURE]
+        assert anchor.cleanup_incomplete is False
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_marker", ["empty", "reader_eof"])
+async def test_posix_capture_rejects_anchor_close_without_ack(close_marker: str) -> None:
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        closed = False
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            if command == process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURE:
+                if close_marker == "empty":
+                    stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY)
+                else:
+                    stream.feed_eof()
+
+        async def drain(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert not await owner.capture_before_eof()
+        assert not await owner.capture_before_eof()
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_marker",
+    [process_tree._POSIX_ANCHOR_PRE_EOF_INCOMPLETE, process_tree._POSIX_ANCHOR_INCOMPLETE],
+)
+async def test_posix_incomplete_empty_keeps_unproven_owner_record(
+    monkeypatch, failure_marker: bytes,
+) -> None:
+    stream = asyncio.StreamReader()
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=0), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+    persisted = object()
+    owner.persisted_owner = persisted
+    deleted: list[object] = []
+    monkeypatch.setattr(process_tree, "_delete_owner_record", deleted.append)
+
+    class Input:
+        closed = False
+        commands: list[bytes] = []
+
+        def is_closing(self) -> bool:
+            return self.closed
+
+        def write(self, command: bytes) -> None:
+            self.commands.append(command)
+
+        def close(self) -> None:
+            self.closed = True
+
+    async def wait() -> int:
+        anchor_process.returncode = 125
+        return 125
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    stream.feed_data(failure_marker)
+    stream.feed_data(process_tree._POSIX_ANCHOR_EMPTY_INCOMPLETE)
+    await asyncio.wait_for(anchor._monitor_task, timeout=0.2)
+
+    assert anchor.cleanup_incomplete is True
+    assert anchor.empty is False
+    assert anchor_process.stdin.commands == [process_tree._POSIX_ANCHOR_RELEASE]
+    assert anchor_process.stdin.closed
+    assert owner.persisted_owner is persisted
+    assert owner._closed is False
+    assert deleted == []
+    term_reports = []
+    while not anchor._term_reports.empty():
+        term_reports.append(anchor._term_reports.get_nowait())
+    assert term_reports == (
+        [True, False]
+        if failure_marker == process_tree._POSIX_ANCHOR_INCOMPLETE else [False]
+    )
+    assert not await anchor._kill_reports.get()
+    assert not await owner.terminate(graceful_timeout=0.01, kill_timeout=0.01)
+    assert deleted == [persisted]
+
+
+@pytest.mark.asyncio
+async def test_posix_late_capture_ack_cannot_authorize_retried_eof(monkeypatch) -> None:
+    monkeypatch.setattr(process_tree, "_CONTROL_READY_TIMEOUT_SECONDS", 0.01)
+    stream = asyncio.StreamReader()
+    commands: list[bytes] = []
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, command: bytes) -> None:
+            commands.append(command)
+
+        async def drain(self) -> None:
+            return None
+
+    async def wait() -> int:
+        anchor_process.returncode = 0
+        return 0
+
+    anchor_process.stdin = Input()
+    anchor_process.wait = wait
+    anchor._monitor_task = asyncio.create_task(anchor._watch_empty(stream))
+    try:
+        assert not await owner.capture_before_eof()
+        assert anchor.cleanup_incomplete is True
+        stream.feed_data(process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURED)
+        await asyncio.sleep(0)
+        assert not await owner.capture_before_eof()
+        assert commands == [process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURE]
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [OSError("pipe closed"), ValueError("invalid pipe")])
+async def test_posix_capture_transport_error_permanently_rejects_eof(error) -> None:
+    anchor_process = SimpleNamespace(returncode=None)
+    anchor = process_tree._PosixGroupAnchor(process=anchor_process, pgid=4242)
+    owner = process_tree.ProcessTreeOwner(
+        process=SimpleNamespace(returncode=None), pid=4242, pgid=4242, posix_anchor=anchor,
+    )
+    anchor.bind(owner)
+    attempts = 0
+
+    class Input:
+        def is_closing(self) -> bool:
+            return False
+
+        def write(self, command: bytes) -> None:
+            nonlocal attempts
+            attempts += 1
+            raise error
+
+        async def drain(self) -> None:
+            return None
+
+    anchor_process.stdin = Input()
+    anchor._monitor_task = asyncio.create_task(asyncio.sleep(60))
+    try:
+        assert not await owner.capture_before_eof()
+        assert anchor.cleanup_incomplete is True
+        assert not await owner.capture_before_eof()
+        assert attempts == 1
+    finally:
+        anchor._monitor_task.cancel()
+        await asyncio.gather(anchor._monitor_task, return_exceptions=True)
+
+
+def test_posix_repeated_eof_capture_retains_live_precise_identities(monkeypatch) -> None:
+    old = process_tree._CapturedPosixProcess(10, 501, "start-a", 1)
+    departed = process_tree._CapturedPosixProcess(11, 501, "start-b", 1)
+    duplicate = process_tree._CapturedPosixProcess(10, 501, "start-a", 2)
+    new = process_tree._CapturedPosixProcess(12, 501, "start-c", 2)
+    closed: list[process_tree._CapturedPosixProcess] = []
+    process_info = {
+        10: process_tree._PosixProcessInfo(10, 1, 10, 501, "start-a"),
+        11: process_tree._PosixProcessInfo(11, 1, 11, 501, "reused-pid"),
+    }
+    monkeypatch.setattr(
+        process_tree, "_posix_process_info", lambda pid: process_info.get(pid),
+    )
+    monkeypatch.setattr(
+        process_tree, "_close_captured_posix_processes",
+        lambda processes: closed.extend(processes),
+    )
+
+    merged, complete = process_tree._merge_live_posix_captures(
+        (old, departed), (duplicate, new),
+    )
+
+    assert complete
+    assert merged == (old, new)
+    assert closed == [departed, duplicate]
+
+
+def test_posix_repeated_eof_keeps_identity_when_libproc_is_unavailable(monkeypatch) -> None:
+    old = process_tree._CapturedPosixProcess(10, 501, "start-a", 1)
+    monkeypatch.setattr(process_tree, "_posix_process_info", lambda pid: None)
+    probes: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        process_tree.os, "kill", lambda pid, sig: probes.append((pid, sig)),
+    )
+
+    merged, complete = process_tree._merge_live_posix_captures((old,), ())
+
+    assert not complete
+    assert merged == (old,)
+    assert probes == [(10, 0)]
+
+
+@pytest.mark.parametrize("probe_result", ["gone", "exists", "unknown"])
+def test_posix_captured_liveness_requires_proof_of_exit(monkeypatch, probe_result) -> None:
+    captured = process_tree._CapturedPosixProcess(10, 501, "start-a", 1)
+    monkeypatch.setattr(process_tree, "_posix_process_info", lambda pid: None)
+    probes: list[tuple[int, int]] = []
+
+    def probe(pid: int, sig: int) -> None:
+        probes.append((pid, sig))
+        if probe_result == "gone":
+            raise ProcessLookupError
+        if probe_result == "unknown":
+            raise PermissionError
+
+    monkeypatch.setattr(process_tree.os, "kill", probe)
+
+    assert process_tree._captured_posix_processes_alive((captured,)) is (
+        probe_result != "gone"
+    )
+    assert probes == [(10, 0)]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("exit_during_drain", [False, True])
 async def test_posix_natural_completion_racing_stop_preserves_empty_confirmation(
     exit_during_drain: bool,
@@ -713,6 +1004,29 @@ def test_posix_captured_pid_identity_change_is_not_signalled(
     assert signalled == []
 
 
+@pytest.mark.parametrize("definitively_gone", [False, True])
+def test_posix_unverifiable_live_pid_cannot_prove_signal_cleanup(
+    monkeypatch: pytest.MonkeyPatch, definitively_gone: bool,
+) -> None:
+    captured = process_tree._CapturedPosixProcess(4242, 501, "original-start", 1)
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(process_tree, "_posix_process_info", lambda _pid: None)
+
+    def kill(pid: int, sig: int) -> None:
+        signals.append((pid, sig))
+        if definitively_gone:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(process_tree.os, "kill", kill)
+
+    complete = process_tree._signal_captured_posix_processes(
+        (captured,), signal.SIGTERM,
+    )
+
+    assert complete is definitively_gone
+    assert signals == [(4242, 0)]
+
+
 @pytest.mark.parametrize("members", [(100,), (100, 101), None])
 def test_posix_no_root_capture_requires_independent_empty_group_confirmation(
     monkeypatch: pytest.MonkeyPatch, members: tuple[int, ...] | None,
@@ -766,6 +1080,125 @@ def test_linux_descendant_capture_does_not_fall_back_to_numeric_pid(
 
     assert capture.complete is False
     assert capture.processes == ()
+
+
+@pytest.mark.parametrize("probe_result", ["gone", "exists", "unknown"])
+def test_darwin_capture_requires_proof_for_missing_second_identity(
+    monkeypatch: pytest.MonkeyPatch, probe_result: str,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    root = process_tree._PosixProcessInfo(101, 100, 100, uid, "root")
+    escaped = process_tree._PosixProcessInfo(102, 101, 102, uid, "escaped")
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid, raising=False)
+    monkeypatch.setattr(
+        process_tree, "_posix_process_snapshot",
+        lambda: {100: anchor, 101: root, 102: escaped},
+    )
+    monkeypatch.setattr(
+        process_tree, "_posix_process_info", lambda pid: None if pid == 102 else root,
+    )
+    probes: list[tuple[int, int]] = []
+
+    def probe(pid: int, sig: int) -> None:
+        probes.append((pid, sig))
+        if probe_result == "gone":
+            raise ProcessLookupError
+        if probe_result == "unknown":
+            raise PermissionError
+
+    monkeypatch.setattr(process_tree.os, "kill", probe)
+
+    capture = process_tree._capture_posix_group_descendants(100, 100)
+
+    assert capture.processes == ()
+    assert capture.complete is (probe_result == "gone")
+    assert probes == [(102, 0)]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX anchor uses file descriptors")
+@pytest.mark.parametrize("target_visible", [True, False])
+def test_darwin_pre_eof_requires_identity_bound_direct_target(
+    monkeypatch: pytest.MonkeyPatch, target_visible: bool,
+) -> None:
+    uid = 501
+    anchor = process_tree._PosixProcessInfo(100, 1, 100, uid, "anchor")
+    # The target is still the anchor's child, but has moved to its own group.
+    target = process_tree._PosixProcessInfo(101, 100, 101, uid, "target")
+    group_root = process_tree._PosixProcessInfo(102, 1, 100, uid, "orphaned-root")
+    escaped = process_tree._PosixProcessInfo(103, 102, 103, uid, "escaped-child")
+    snapshot = {
+        100: anchor, 102: group_root, 103: escaped,
+        **({101: target} if target_visible else {}),
+    }
+    capture_flags: list[bool] = []
+    captured_ids: list[tuple[int, ...]] = []
+    original_capture = process_tree._capture_posix_group_descendants
+
+    def capture(pgid: int, anchor_pid: int, *, include_anchor_children: bool = False):
+        capture_flags.append(include_anchor_children)
+        result = original_capture(
+            pgid, anchor_pid, include_anchor_children=include_anchor_children,
+        )
+        captured_ids.append(tuple(process.pid for process in result.processes))
+        return result
+
+    class Target:
+        pid = 101
+        returncode = None
+
+        def poll(self) -> int | None:
+            return 0 if b"V" in output_pipe.getvalue() or b"F" in output_pipe.getvalue() else None
+
+    monkeypatch.setattr(process_tree.sys, "platform", "darwin")
+    monkeypatch.setattr(process_tree.os, "getpid", lambda: 100)
+    monkeypatch.setattr(process_tree.os, "getpgrp", lambda: 100)
+    monkeypatch.setattr(process_tree.os, "geteuid", lambda: uid)
+    monkeypatch.setattr(process_tree.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(process_tree.subprocess, "Popen", lambda *_args, **_kwargs: Target())
+    monkeypatch.setattr(process_tree, "_posix_process_snapshot", lambda: snapshot)
+    monkeypatch.setattr(process_tree, "_posix_process_info", snapshot.get)
+    monkeypatch.setattr(process_tree, "_posix_group_members", lambda _pgid: (100,))
+    monkeypatch.setattr(process_tree, "_captured_posix_processes_alive", lambda _items: False)
+    monkeypatch.setattr(process_tree, "_capture_posix_group_descendants", capture)
+
+    read_fd, write_fd = os.pipe()
+
+    class Output(io.BytesIO):
+        def write(self, data: bytes) -> int:
+            written = super().write(data)
+            if data in {
+                process_tree._POSIX_ANCHOR_EMPTY,
+                process_tree._POSIX_ANCHOR_EMPTY_INCOMPLETE,
+            }:
+                os.write(write_fd, process_tree._POSIX_ANCHOR_RELEASE)
+            return written
+
+    output_pipe = Output()
+    real_select = process_tree.select.select
+    select_calls = 0
+
+    def select_after_empty_check(readers, writers, errors, timeout):
+        nonlocal select_calls
+        select_calls += 1
+        if select_calls == 2:
+            os.write(write_fd, process_tree._POSIX_ANCHOR_PRE_EOF_CAPTURE)
+        return real_select(readers, writers, errors, min(timeout, 0.01))
+
+    monkeypatch.setattr(process_tree.select, "select", select_after_empty_check)
+    try:
+        os.write(write_fd, process_tree._POSIX_ANCHOR_ARM)
+        with os.fdopen(read_fd, "rb", buffering=0) as input_pipe:
+            result = process_tree._run_posix_group_anchor(
+                "-", input_pipe=input_pipe, output_pipe=output_pipe, target_argv=["target"],
+            )
+        assert result == (0 if target_visible else 125)
+        assert capture_flags == [True]
+        assert set(captured_ids[0]) == ({101, 102, 103} if target_visible else {102, 103})
+        assert output_pipe.getvalue() == (b"YVE" if target_visible else b"YFU")
+    finally:
+        os.close(write_fd)
 
 
 def test_linux_adopted_children_use_pidfds_without_python_bindings(
@@ -2229,6 +2662,7 @@ def test_windows_registry_retries_main_file_identity_change_before_acl(
         directory: bool,
         expected_device: int,
         expected_inode: int,
+        **_kwargs: object,
     ) -> None:
         nonlocal attempts
         if directory:
@@ -2332,6 +2766,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     state_dir = tmp_path / "synthetic-runtime-state"
     state_dir.mkdir()
     directory_attempts = 0
+    directory_fast_path_flags: list[object] = []
 
     def apply_acl(
         *_args: object,
@@ -2342,6 +2777,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
         if not directory:
             return
         directory_attempts += 1
+        directory_fast_path_flags.append(_kwargs.get("skip_if_private_directory"))
         if directory_attempts < 3:
             error = PermissionError("synthetic sharing violation")
             error.winerror = 32
@@ -2355,6 +2791,7 @@ def test_windows_registry_retries_transient_directory_acl_sharing_failures(
     process_tree._prepare_private_file(database_path)
 
     assert directory_attempts == 3
+    assert directory_fast_path_flags == [True, True, True]
     assert database_path.is_file()
 
 

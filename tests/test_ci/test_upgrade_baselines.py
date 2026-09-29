@@ -383,9 +383,15 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     job = workflow["jobs"]["upgrade-and-start"]
     matrix = job["strategy"]["matrix"]
-    assert matrix["baseline"] == ["0.5.3", "0.5.4"]
+    assert matrix["baseline"] == (
+        "${{ fromJSON(inputs.acceptance_profile == 'smoke' && '[\"0.5.4\"]' || "
+        "'[\"0.5.3\",\"0.5.4\"]') }}"
+    )
     assert matrix["install-path"] == ["default", "custom"]
-    assert matrix["scenario"] == ["baseline", "readlock", "longpath"]
+    assert matrix["scenario"] == (
+        "${{ fromJSON(inputs.acceptance_profile == 'smoke' && '[\"baseline\"]' || "
+        "'[\"baseline\",\"readlock\",\"longpath\"]') }}"
+    )
     assert matrix["include"] == [
         {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
         for path in ("default", "custom")
@@ -393,6 +399,11 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     download = next(step for step in job["steps"]
                     if step.get("name") == "Download pinned official baseline")
     assert download["if"] == "matrix.scenario != 'fresh'"
+    download_script = download["run"]
+    assert "for ($attempt = 1; $attempt -le 3; $attempt++)" in download_script
+    assert "Remove-Item -LiteralPath $asset" in download_script
+    assert "HTTP (429|5\\d\\d)" in download_script
+    assert "if (-not $retryable -or $attempt -eq 3)" in download_script
     verify = next(step["run"] for step in job["steps"]
                   if "--candidate-source-sha" in step.get("run", ""))
     baseline_branch = "if ('${{ matrix.scenario }}' -ne 'fresh')"
@@ -1473,6 +1484,10 @@ def _assert_windows_signature_arguments(
     assert Path(captured["InstalledRoot"]) == installed
 
 
+# These subprocess contracts cold-start PowerShell and compile native PE version
+# resources. Keep them out of the parallel migration workers so the existing
+# 45-second process watchdog measures the helper, not competing cold starts.
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 @pytest.mark.parametrize(
     ("candidate", "installed"),
@@ -1510,6 +1525,7 @@ def test_windows_replacement_rejects_successful_installer_with_stale_app(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 @pytest.mark.parametrize("candidate", ["0.5.5", "0.5.5-rc1"])
 def test_windows_replacement_accepts_exact_installed_candidate_version(
@@ -1531,6 +1547,7 @@ def test_windows_replacement_accepts_exact_installed_candidate_version(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 def test_windows_upgrade_accepts_zero_revision_for_stable_pe_versions(
     windows_upgrade_harness: tuple[str, Path], install_mode: str
@@ -1551,6 +1568,7 @@ def test_windows_upgrade_accepts_zero_revision_for_stable_pe_versions(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("baseline_product_version", ["0.5.4.1", "0.5.40"])
 def test_windows_upgrade_rejects_other_baseline_pe_versions(
     windows_upgrade_harness: tuple[str, Path], baseline_product_version: str
@@ -1570,6 +1588,7 @@ def test_windows_upgrade_rejects_other_baseline_pe_versions(
     assert "POST_INSTALL_LAUNCH_REACHED" not in result.stderr
 
 
+@pytest.mark.ci_serial
 def test_windows_default_install_rejects_unrelated_executable_outside_known_folder(
     windows_upgrade_harness: tuple[str, Path],
 ) -> None:
@@ -1589,6 +1608,7 @@ def test_windows_default_install_rejects_unrelated_executable_outside_known_fold
     assert not (windows_upgrade_harness[1].parent / "signature-arguments.json").exists()
 
 
+@pytest.mark.ci_serial
 def test_windows_default_install_refuses_existing_installation_before_download(
     windows_upgrade_harness: tuple[str, Path],
 ) -> None:
@@ -1648,6 +1668,7 @@ $after = Get-NSISUserProgramsDirectory
     assert not Path(paths["after"]).is_relative_to(wrapper.parent)
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("install_mode", ["default", "custom"])
 @pytest.mark.parametrize("signature_failure", ["exit", "throw"])
 def test_windows_upgrade_propagates_signature_failure_before_launch(
@@ -1675,6 +1696,7 @@ def test_windows_upgrade_propagates_signature_failure_before_launch(
     )
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize(
     "candidate_name",
     [
@@ -1694,6 +1716,7 @@ def test_windows_upgrade_rejects_noncanonical_asset_before_side_effects(
     assert not (windows_upgrade_harness[1].parent / "runner").exists()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.parametrize("manifest_version", ["0.5.6", "0.5.5-rc1"])
 def test_windows_upgrade_rejects_manifest_candidate_mismatch_before_side_effects(
     windows_upgrade_harness: tuple[str, Path], manifest_version: str

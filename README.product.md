@@ -45,7 +45,6 @@ single-turn chat alone.
 | --- | --- |
 | SquillaRouter | Local, on-device routing that chooses an appropriate model tier per turn so simple tasks avoid premium-model cost. |
 | Tool compression | Large tool outputs stay useful without flooding the model context; raw results can be preserved while compact previews are sent to the model. |
-| Meta-skills | Repeatable workflows can be packaged as composable skills, so users can turn recurring multi-step work into reusable agent routines. |
 | Unified surfaces | CLI, Web UI, gateway RPC, and channels share the same runtime path, tools, memory, approvals, and usage accounting. |
 | Durable sessions | Conversations, transcripts, compaction summaries, artifacts, cost, and replay data are persisted for later inspection. |
 | Goal mode | One session can keep a persistent multi-turn objective, structured progress, usage totals, and bounded automatic continuation without bypassing the shared runtime or approvals. |
@@ -70,7 +69,6 @@ single-turn chat alone.
 | Understand the main product capabilities | [`docs/features.md`](docs/features.md) |
 | Use SquillaRouter | [`docs/features/squilla-router.md`](docs/features/squilla-router.md) |
 | Understand tool compression and tool-result handles | [`docs/features/tool-compression.md`](docs/features/tool-compression.md) |
-| Use MetaSkills | [`docs/features/meta-skills.md`](docs/features/meta-skills.md) |
 | Work with memory | [`docs/features/memory.md`](docs/features/memory.md) |
 | Work with skills | [`docs/features/skills.md`](docs/features/skills.md) |
 | Understand compaction, cache, and long-session continuity | [`docs/features/compaction-and-cache.md`](docs/features/compaction-and-cache.md) |
@@ -161,27 +159,13 @@ without throwing away the user's working state.
 
 Read: [`docs/features/tool-compression.md`](docs/features/tool-compression.md)
 
-### Meta-Skills
-
-Meta-skills let OpenSquilla present higher-level workflows instead of making the
-user re-describe the same multi-step process. They are useful for repeatable
-research reports, document-to-decision work, daily operating briefs, account
-watching, job-search preparation, academic paper drafting, short-drama production,
-and MetaSkill proposal creation.
-
-By default, launch them deliberately with `/meta` and `/meta <name>`.
-
-Read: [`docs/features/meta-skills.md`](docs/features/meta-skills.md),
-[`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md),
-and [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md)
-
 ## What OpenSquilla Can Do
 
 - Run chat from Web UI, CLI, gateway RPC, terminal channels, and supported
   messaging platforms.
 - Use tools for files, shell commands, code execution, git, web search/fetch,
   memory, sessions, artifacts, media, Feishu, scheduled jobs, and subagents.
-- Install, inspect, publish, and compose skills.
+- Install, inspect, and publish skills.
 - Schedule recurring runs with `opensquilla cron`.
 - Save durable memory and search previous sessions.
 - Track usage and estimated cost with `opensquilla cost`.
@@ -211,8 +195,6 @@ trust. For tool behavior, approval flow, and workspace containment, see
 
 - [`README.md`](README.md) - release/package README
 - [`MIGRATION.md`](MIGRATION.md) - migration from OpenClaw and Hermes Agent
-- [`docs/features/meta-skill-user-guide.md`](docs/features/meta-skill-user-guide.md) - MetaSkill user guide
-- [`docs/authoring/meta-skills.md`](docs/authoring/meta-skills.md) - MetaSkill authoring guide
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) - contributor workflow
 - [`CHANGELOG.md`](CHANGELOG.md) - release history
 

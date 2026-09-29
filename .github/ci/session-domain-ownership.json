@@ -16,7 +16,6 @@
         "src/opensquilla/gateway/rpc_chat.py": [
           "_GatewayClarificationSubmissionPort",
           "_canonical_webchat_session_key",
-          "_clarify_fields_to_text",
           "_handle_chat_clarify_submit_contract",
           "_submit_clarification"
         ],
@@ -24,7 +23,6 @@
           "_GatewayCommandCatalogPort",
           "_command_catalog",
           "_handle_commands_list_for_surface_contract",
-          "_meta_skill_argument_choices",
           "_serialize"
         ],
         "src/opensquilla/gateway/rpc_prompt_cache_keepalive.py": [
@@ -34,11 +32,6 @@
           "_set_contract",
           "_status_contract",
           "_stored_session_key"
-        ],
-        "src/opensquilla/gateway/rpc_router.py": [
-          "_GatewayRouteFeedbackPort",
-          "_handle_router_feedback_submit_contract",
-          "_submit_route_feedback"
         ],
         "src/opensquilla/gateway/rpc_sessions.py": [
           "_GatewaySessionLifecyclePorts",

@@ -22,26 +22,24 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     specs = runner.discover_contracts()
     targets = runner.load_production_targets(specs)
 
-    assert len(targets) == 207
+    assert len(targets) == 178
     assert targets[("method", "skills.candidates")] == ("result",)
     assert targets[("method", "skills.setEnabled")] == ("result",)
     assert Counter(role for roles in targets.values() for role in roles) == {
-        "result": 197,
-        "params": 28,
+        "result": 168,
+        "params": 26,
         "payload": 9,
         "frame": 1,
     }
-    assert sum(len(spec.targets) for spec in specs) == 910
-    for method in ("sessions.processes.list", "sessions.processes.log", "sessions.processes.stop"):
-        assert targets[("method", method)] == ("params", "result")
+    assert sum(len(spec.targets) for spec in specs) == 818
+    assert targets[("method", "agents.list")] == ("result",)
+    assert targets[("method", "turns.receipt.get")] == ("params", "result")
     assert targets[("method", "models.list")] == ("params", "result")
     assert targets[("method", "models.capacity.resolve")] == ("params", "result")
     assert targets[("method", "workspaces.references.read")] == ("params", "result")
     assert targets[("method", "sessions.executionLog.read")] == ("params", "result")
     assert targets[("method", "sessions.list")] == ("result",)
     assert targets[("method", "skills.install.status")] == ("result",)
-    assert targets[("method", "meta.list")] == ("result",)
-    assert targets[("method", "meta.inspect")] == ("result",)
     assert targets[("method", "telemetry.product_active.record")] == ("result",)
     assert targets[("method", "sessions.messages.snapshot.read")] == ("params", "result")
     assert targets[("method", "sessions.messages.resume")] == ("params", "result")
@@ -55,6 +53,9 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
     assert targets[("event", "transport.flow.dirty")] == ("payload",)
 
     retired_writes = {
+        "agents.create",
+        "agents.update",
+        "agents.delete",
         "documents.editSessions.start",
         "documents.editSessions.heartbeat",
         "documents.editSessions.close",
@@ -65,6 +66,29 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
         "artifacts.source.patch",
     }
     method_specs = {spec.wire_name: spec for spec in specs if spec.contract_type == "method"}
+    retired_workflows = {
+        "meta.drafts.discard",
+        "meta.drafts.list",
+        "meta.inspect",
+        "meta.list",
+        "meta.run",
+        "meta.runs.confirm_preflight",
+        "meta.runs.recovery",
+        "meta.runs.replay",
+        "meta.setup.install",
+        "meta.setup.plan",
+        "meta.setup.status",
+        "exec.proposals.accept",
+        "exec.proposals.auto_enabled.disable",
+        "exec.proposals.auto_enabled.list",
+        "exec.proposals.list",
+        "exec.proposals.reject",
+        "exec.proposals.settings.get",
+        "exec.proposals.settings.set",
+        "exec.proposals.show",
+    }
+    assert retired_workflows.isdisjoint(method_specs)
+    assert all(("method", name) not in targets for name in retired_workflows)
     assert {role for role, _ in method_specs["plans.setPresentation"].targets} == {
         "request", "params", "response", "result",
     }
@@ -79,6 +103,15 @@ def test_production_targets_preserve_every_approved_validator_role() -> None:
         "request", "params", "response", "result",
     }
     assert ("method", history_name) not in targets
+
+    # On-demand log snapshots keep a result validator; retired diagnostic pages
+    # no longer consume status validators. Full verification remains available.
+    assert targets[("method", "logs.tail")] == ("result",)
+    for name in ("doctor.status", "logs.status", "status"):
+        assert {role for role, _ in method_specs[name].targets} == {
+            "request", "params", "response", "result",
+        }
+        assert ("method", name) not in targets
 
 
 def test_sessions_list_uses_browser_safe_esm_for_its_selected_validator(

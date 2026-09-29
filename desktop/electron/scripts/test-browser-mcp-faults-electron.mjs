@@ -93,6 +93,25 @@ try {
   const first = success(await call('browser_open', { url: origin }))
   const second = success(await call('browser_open', { url: origin }))
 
+  const retainedDuringUnresponsive = await app.evaluate((_electron, targetRef) => {
+    const { manager } = globalThis.faultFixture
+    const record = [...manager.surfaces.values()].find(value => value.targetRef === targetRef)
+    if (!record) throw new Error('The browser target must exist before becoming unresponsive')
+    record.view.webContents.emit('unresponsive')
+    return manager.surfaces.get(record.id) === record && !record.disposed
+  }, first.targetRef)
+  assert.equal(retainedDuringUnresponsive, true)
+  assert.equal(success(await call('browser_tabs')).targets.find(
+    target => target.targetRef === first.targetRef)?.pageState, 'unresponsive')
+  await app.evaluate((_electron, targetRef) => {
+    const record = [...globalThis.faultFixture.manager.surfaces.values()]
+      .find(value => value.targetRef === targetRef)
+    if (!record) throw new Error('The browser target was lost while unresponsive')
+    record.view.webContents.emit('responsive')
+  }, first.targetRef)
+  assert.equal(success(await call('browser_tabs')).targets.find(
+    target => target.targetRef === first.targetRef)?.pageState, 'ready')
+
   // Failed navigation is recoverable page state, not an instruction to close a tab.
   const failedOpenArgs = { url: origin + '/disconnect' }
   const failedOpen = failure(await call('browser_open', failedOpenArgs,

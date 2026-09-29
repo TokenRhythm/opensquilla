@@ -23,8 +23,6 @@ const BASE_PROPS = {
   sessionRoutingMode: 'llm_ensemble',
   sessionRoutingBusy: false,
   routerVisualEffectsEnabled: true,
-  codingModeEnabled: false,
-  codingModeSettingsBusy: false,
   voiceBusy: false,
   voiceRecording: false,
   voiceReady: true,

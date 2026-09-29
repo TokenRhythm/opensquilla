@@ -732,11 +732,7 @@ class AgentBootstrapStage:
         # ``bootstrap_workspace_dir`` (written by ``_run_pipeline`` from
         # the call-site's ToolContext/agent-resolved value — see
         # runtime.py initial_metadata). This makes AgentConfig.workspace_dir
-        # the single authoritative source for downstream code (meta_invoke
-        # handler, sub-Agent factory, etc.). Without this, the bootstrap
-        # stage left workspace_dir=None, the meta_invoke fallback chain
-        # collapsed to ContextVar lookups, and sub-Agents ended up using
-        # the process default workspace instead of the configured one.
+        # the authoritative workspace for tools and child agents.
         agent_config = AgentConfig(
             max_iterations=budgets.max_iterations,
             system_prompt=inp.final_prompt,

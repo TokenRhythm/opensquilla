@@ -1,5 +1,4 @@
 import { describe, expect, it } from 'vitest'
-import { ref } from 'vue'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { Skill } from '@/types/skills'
 import { useSkillsCatalog } from './useSkillsCatalog'
@@ -12,19 +11,7 @@ import { useSkillsCatalog } from './useSkillsCatalog'
 
 function makeCatalog(skills: unknown[]) {
   const catalog: Pick<SkillCatalog, 'list'> = { list: async () => skills as Skill[] }
-  const options = {
-    proposals: ref([]),
-    autoEnabledSkills: ref([]),
-    proposalsSettings: ref({
-      available: false,
-      enabled: false,
-      on_dream_complete: false,
-      auto_enable: false,
-      auto_enable_max_risk: '',
-    }),
-    loadProposals: async () => {},
-  }
-  return useSkillsCatalog(catalog as SkillCatalog, options)
+  return useSkillsCatalog(catalog as SkillCatalog)
 }
 
 describe('useSkillsCatalog trigger filtering', () => {

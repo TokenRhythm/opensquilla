@@ -1164,21 +1164,115 @@ def test_openrouter_choice_usage_epilogue_rejects_semantic_changes(
     _assert_not_committed(events, "invalid_stream_order")
 
 
+@pytest.mark.parametrize("delta", [{}, {"tool_calls": []}, {"tool_calls": None}])
 def test_post_terminal_noop_choice_requires_explicit_provider_policy(
     monkeypatch: pytest.MonkeyPatch,
+    delta: dict[str, Any],
 ) -> None:
     _patch_body(
         monkeypatch,
         _sse(
             {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
             {
-                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "choices": [{"index": 0, "delta": delta, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 1, "completion_tokens": 1},
             },
         ),
     )
 
     events = _collect(OpenAIProvider(api_key="test", model="gpt-test"))
+
+    _assert_not_committed(events, "invalid_stream_order")
+
+
+@pytest.mark.parametrize("provider_kind", ["tokenrhythm", "openrouter"])
+@pytest.mark.parametrize("empty_tool_calls", [None, []], ids=["null", "empty-list"])
+@pytest.mark.parametrize("with_tool", [False, True], ids=["text", "tool"])
+def test_empty_tool_tail_preserves_completion_and_usage(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+    empty_tool_calls: Any,
+    with_tool: bool,
+) -> None:
+    delta: dict[str, Any] = {"content": "OK"}
+    if with_tool:
+        delta["tool_calls"] = [{
+            "index": 0,
+            "id": "lookup-call",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"q":"example"}'},
+        }]
+    finish_reason = "tool_calls" if with_tool else "stop"
+    usage = {"prompt_tokens": 3, "completion_tokens": 2}
+    receipt: dict[str, Any] = {"choices": [], "usage": usage}
+    if provider_kind == "tokenrhythm":
+        receipt.update(billing_pending=False, cost_cny="0.000001")
+    else:
+        receipt["usage"] = {**usage, "cost": 0.000001}
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}]},
+            {
+                "choices": [{
+                    "index": 0,
+                    "delta": {"tool_calls": empty_tool_calls},
+                    "finish_reason": finish_reason,
+                }],
+                "usage": usage,
+            },
+            receipt,
+        ),
+    )
+
+    events = _collect(OpenAIProvider(
+        api_key="test", model="test-model", provider_kind=provider_kind,
+        base_url=(
+            "https://tokenrhythm.studio/v1" if provider_kind == "tokenrhythm"
+            else "https://openrouter.ai/api/v1"
+        ),
+    ))
+
+    assert not any(isinstance(event, ErrorEvent) for event in events)
+    assert [event.text for event in events if isinstance(event, TextDeltaEvent)] == ["OK"]
+    ends = [event for event in events if isinstance(event, ToolUseEndEvent)]
+    assert len(ends) == int(with_tool)
+    if with_tool:
+        assert ends[0].tool_use_id == "lookup-call"
+        assert ends[0].arguments == {"q": "example"}
+    dones = [event for event in events if isinstance(event, DoneEvent)]
+    assert len(dones) == 1
+    assert dones[0].stop_reason == finish_reason
+    assert (dones[0].input_tokens, dones[0].output_tokens) == (3, 2)
+    assert dones[0].cost_source == "provider_billed"
+    assert dones[0].billing_receipt is not None
+    assert dones[0].billing_receipt.amount_nanos == 1_000
+
+
+@pytest.mark.parametrize("provider_kind", ["tokenrhythm", "openrouter"])
+@pytest.mark.parametrize("tool_calls", [{}, False, 0, "", [{}], [{"index": 0}]])
+def test_post_terminal_tool_payload_or_malformed_value_is_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+    provider_kind: str,
+    tool_calls: Any,
+) -> None:
+    _patch_body(
+        monkeypatch,
+        _sse(
+            {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]},
+            {
+                "choices": [{
+                    "index": 0, "delta": {"tool_calls": tool_calls}, "finish_reason": "stop",
+                }],
+                "usage": {},
+            },
+        ),
+    )
+
+    events = _collect(OpenAIProvider(
+        api_key="test", model="test-model", provider_kind=provider_kind,
+    ))
 
     _assert_not_committed(events, "invalid_stream_order")
 
@@ -1193,7 +1287,15 @@ def test_post_terminal_noop_choice_requires_explicit_provider_policy(
         },
         {
             "choices": [
-                {"index": 0, "delta": {"tool_calls": []}, "finish_reason": "stop"}
+                {
+                    "index": 0,
+                    "delta": {"tool_calls": [{
+                        "index": 0,
+                        "id": "late-call",
+                        "function": {"name": "lookup", "arguments": '{"q":"late"}'},
+                    }]},
+                    "finish_reason": "stop",
+                }
             ],
             "usage": {},
         },

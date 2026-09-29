@@ -20,7 +20,6 @@ CONVERSATION_ANCILLARY_CONTRACT_METHODS: Final = (
     "usage.query",
     "usage.cost",
     "commands.list_for_surface",
-    "router.feedback.submit",
     "sessions.promptCacheKeepalive.status",
     "sessions.promptCacheKeepalive.set",
     "chat.clarify_submit",

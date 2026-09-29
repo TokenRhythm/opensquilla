@@ -44,7 +44,7 @@ from opensquilla.telemetry.uploader import TelemetryUploader
 
 
 @pytest.mark.parametrize(
-    "entrypoint", ["startup", "activity", "launch", "coding", "rejected_again"],
+    "entrypoint", ["startup", "activity", "launch", "rejected_again"],
 )
 async def test_retained_growth_records_recover_after_device_contract_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str,
@@ -107,8 +107,6 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
                     surface=ClientSurface.CLI, entrypoint=ClientEntrypoint.AGENT,
                     execution_mode=ExecutionMode.ONE_SHOT,
                 )
-                assert await sink.record_metaskill_usage("synthetic-meta-run", occurred)
-                assert await sink.record_coding_mode_usage("synthetic-code-run", occurred)
                 await sink.record_turn_started(occurred)
                 await sink.record_turn_succeeded(occurred)
                 desktop_state = {
@@ -133,7 +131,7 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
                 await runtime.upload_once(TelemetryScope.GROWTH)
                 outbox = runtime._scopes[TelemetryScope.GROWTH].outbox
                 assert (await outbox.stats()).pending_events == 0
-                assert (await outbox.stats()).rejected_events == 8
+                assert (await outbox.stats()).rejected_events == 6
                 original = {item["event_id"]: item for item in requests[0]["events"]}
             finally:
                 await sink.close()
@@ -151,14 +149,12 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
                         surface=ClientSurface.CLI, entrypoint=ClientEntrypoint.AGENT,
                         execution_mode=ExecutionMode.ONE_SHOT,
                     )
-                else:
-                    assert not await sink.record_coding_mode_usage("synthetic-code-run", occurred)
                 await runtime.upload_once(TelemetryScope.GROWTH)
                 outbox = runtime._scopes[TelemetryScope.GROWTH].outbox
                 assert (await outbox.stats()).pending_events == 0
                 assert {item["event_id"]: item for item in requests[1]["events"]} == original
                 if reject_device_field:
-                    assert (await outbox.stats()).rejected_events == 8
+                    assert (await outbox.stats()).rejected_events == 6
                 else:
                     assert await outbox.list_rejections() == ()
                     with sqlite3.connect(settings.database_path) as connection:
@@ -169,7 +165,7 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
                     receipt = await client.post(
                         "https://collector.invalid" + settings.endpoint_path, json=requests[1],
                     )
-                    assert receipt.json()["duplicates"] == 8
+                    assert receipt.json()["duplicates"] == 6
                     queries = DashboardQueries(
                         reliability_db_path=tmp_path / "unused.sqlite3",
                         growth_db_path=settings.database_path,
@@ -177,8 +173,6 @@ async def test_retained_growth_records_recover_after_device_contract_upgrade(
                     summary = queries.growth(UtcCohortWindow.from_dates("2026-09-02", "2026-09-02"))
                     assert summary["productActivity"]["dau"] == 1
                     assert summary["clientUsage"]["totals"]["cliUsers"] == 1
-                    assert summary["metaskillUsage"]["totalUses"] == 1
-                    assert summary["codingModeUsage"]["totalUses"] == 1
                     assert queries.growth(UtcCohortWindow.from_dates("2026-09-03", "2026-09-03"))[
                         "productActivity"
                     ]["dau"] == 0
@@ -307,7 +301,7 @@ async def test_spool_retry_upload_advances_collector_watermark_and_dashboard_dat
                 await runtime.close()
 
 
-@pytest.mark.parametrize("event_name", ["app_start_result", "metaskill_usage", "coding_mode_usage"])
+@pytest.mark.parametrize("event_name", ["app_start_result", "product_active"])
 async def test_unified_default_upload_pause_resume_and_dashboard(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -329,7 +323,9 @@ async def test_unified_default_upload_pause_resume_and_dashboard(
         payload.pop("failure_stage")
         payload.update(
             event_name=event_name,
-            source="runtime",
+            source="gateway",
+            surface="cli",
+            device_id="a" * 64,
             outcome=None,
             duration_ms=None,
             consent_scope="growth",
@@ -351,8 +347,7 @@ async def test_unified_default_upload_pause_resume_and_dashboard(
     def dashboard_count() -> int:
         if scope is TelemetryScope.RELIABILITY:
             return queries.reliability(window)["appStart"]["estimatedEvents"]
-        key = "metaskillUsage" if event_name == "metaskill_usage" else "codingModeUsage"
-        return queries.growth(window)[key]["totalUses"]
+        return queries.growth(window)["productActivity"]["dau"]
 
     requests = []
     async with (

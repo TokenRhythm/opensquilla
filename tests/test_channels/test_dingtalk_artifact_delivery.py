@@ -14,7 +14,7 @@ from opensquilla.channels.contract import (
     ChannelSendResult,
     ChannelSendStatus,
 )
-from opensquilla.channels.delivery_store import ChannelDeliveryStore, install_outbox
+from opensquilla.channels.delivery_store import install_outbox
 from opensquilla.channels.dingtalk import (
     DingTalkChannel,
     DingTalkChannelConfig,
@@ -412,9 +412,10 @@ async def test_explicit_invalid_upload_token_refreshes_once(tmp_path: Path) -> N
 
 @pytest.mark.asyncio
 async def test_visible_transport_failure_is_not_retried_and_outbox_is_unknown(
+    channel_store,
     tmp_path: Path,
 ) -> None:
-    delivery_store = ChannelDeliveryStore(tmp_path / "delivery.sqlite")
+    delivery_store = await channel_store(tmp_path / "delivery.sqlite")
     visible_send_calls = 0
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -452,7 +453,7 @@ async def test_visible_transport_failure_is_not_retried_and_outbox_is_unknown(
     )
     assert "secret-token" not in row[2]
     assert request.file_path not in row[2]
-    delivery_store.close()
+    (await delivery_store.close())
 
 
 @pytest.mark.parametrize(

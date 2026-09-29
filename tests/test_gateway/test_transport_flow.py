@@ -94,7 +94,14 @@ def test_snapshot_reply_rejects_non_integer_delivery_without_using_reserved_cred
             res_frame=ResFrame(
                 id="snapshot",
                 ok=True,
-                payload={"delivery": {**receipt, "delivery_id": delivery_id}},
+                payload={
+                    "key": "s",
+                    "snapshot_id": "snapshot",
+                    "sync_revision": "revision",
+                    "data": "payload",
+                    "segment_index": 0,
+                    "delivery": {**receipt, "delivery_id": delivery_id},
+                },
             ),
         )
         with pytest.raises(ValueError, match="Snapshot delivery reservation is not current"):
@@ -358,6 +365,47 @@ async def test_bad_event_is_dirty_without_poisoning_the_writer() -> None:
         assert "a" in conn._flow.dirty
         assert any(frame["type"] == "pong" for frame in ws.frames)
         assert ws.closed == []
+    finally:
+        await conn._stop_writer()
+        conn._cleanup_transport()
+
+
+async def test_stale_snapshot_delivery_resyncs_without_closing_connection() -> None:
+    """A stale recovery receipt is a resync, not a transport-limit failure."""
+
+    ws = _FastSocket()
+    conn = WsConnection("stale-snapshot", ws)  # type: ignore[arg-type]
+    conn._enable_flow()
+    conn._start_writer(maxsize=512, enabled=True)
+    try:
+        receipt = conn.reserve_snapshot_delivery(1000, "session", "snapshot", "revision")
+        # Simulate the transfer being retired before its queued response is
+        # admitted. This is connection-local stale state after a restart or
+        # reconcile race; it must not kill the authenticated socket.
+        conn._flow.close()
+        await conn.send_res(ResFrame(
+            id="snapshot-read",
+            ok=True,
+            payload={
+                "key": "session",
+                "snapshot_id": "snapshot",
+                "sync_revision": "revision",
+                "data": "payload",
+                "segment_index": 0,
+                "delivery": receipt,
+            },
+        ))
+        await asyncio.sleep(0)
+        assert ws.closed == []
+        assert any(
+            frame.get("event") == "transport.flow.dirty"
+            and frame.get("payload", {}).get("dirty_keys") == ["session"]
+            for frame in ws.frames
+        )
+        fallback = next(frame for frame in ws.frames if frame.get("id") == "snapshot-read")
+        assert fallback["ok"] is False
+        assert fallback["error"]["code"] == "SNAPSHOT_STALE"
+        assert conn._closing is False
     finally:
         await conn._stop_writer()
         conn._cleanup_transport()

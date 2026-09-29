@@ -73,6 +73,7 @@
       "type": "object",
       "additionalProperties": true,
       "properties": {
+        "cacheOnly": { "type": "boolean" },
         "providerId": {
           "type": [
             "string",

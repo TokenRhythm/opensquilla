@@ -25,6 +25,10 @@ function recordFromValue(value: unknown): Record<string, unknown> | null {
 export function clarifyRequestFromValue(value: unknown): InterruptClarifyData | null {
   const raw = recordFromValue(value)
   if (!raw || raw.kind !== 'user_input' || raw.paused !== true) return null
+  const requestId = typeof raw.request_id === 'string'
+    ? raw.request_id.trim()
+    : typeof raw.requestId === 'string' ? raw.requestId.trim() : ''
+  if (!requestId) return null
 
   const schema = recordFromValue(raw.clarify_schema)
   if (!schema) return null
@@ -61,9 +65,6 @@ export function clarifyRequestFromValue(value: unknown): InterruptClarifyData | 
   }
   if (!fields.length) return null
 
-  const requestId = typeof raw.request_id === 'string'
-    ? raw.request_id
-    : typeof raw.requestId === 'string' ? raw.requestId : ''
   const presentation = typeof schema.presentation === 'string'
     ? schema.presentation.trim()
     : ''
@@ -71,7 +72,7 @@ export function clarifyRequestFromValue(value: unknown): InterruptClarifyData | 
     intro: String(schema.intro || ''),
     fields,
     ...(presentation ? { presentation } : {}),
-    ...(requestId ? { requestId } : {}),
+    requestId,
     runId: typeof raw.run_id === 'string' ? raw.run_id : '',
     step: typeof raw.step === 'string' ? raw.step : '',
   }

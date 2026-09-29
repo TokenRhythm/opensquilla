@@ -302,43 +302,6 @@ def prepare_plan_run(
         }
     )
 
-
-def checkpoint_plan_progress(
-    proposed: Sequence[Mapping[str, Any]],
-    progress: Sequence[Mapping[str, Any]],
-    *,
-    step_id: str,
-    step_status: str,
-    next_step_id: str | None = None,
-    reason: str | None = None,
-) -> list[dict[str, Any]]:
-    """Adapt an old proposed-step reference to the current descriptive progress.
-
-    Accept legacy next_step_id without imposing execution order. Blocked and
-    skipped are represented as pending work with the caller's explanation;
-    neither is a task lifecycle operation. Completed items may be reopened.
-    """
-    if step_status not in {"in_progress", "completed", "blocked", "skipped"}:
-        raise PlanValidationError(f"invalid checkpoint step status: {step_status}")
-    if step_status in {"blocked", "skipped"}:
-        _bounded_text(reason, field="reason", maximum=MAX_PLAN_STEP_REASON_CHARS)
-    selected = next((step for step in proposed if step.get("step_id") == step_id), None)
-    if selected is None:
-        raise PlanValidationError(f"unknown proposed step id: {step_id}; use update_plan")
-    updated = [dict(item) for item in progress]
-    title = str(selected["title"])
-    target = next((item for item in updated if item.get("step") == title), None)
-    if target is None:
-        target = {"step": title, "status": "pending"}
-        updated.append(target)
-    if step_status == "in_progress":
-        for item in updated:
-            if item.get("status") == "in_progress":
-                item["status"] = "pending"
-    target["status"] = step_status if step_status in {"completed", "in_progress"} else "pending"
-    return updated
-
-
 def plan_revision_snapshot(
     revision: PlanRevisionRecord,
     *,

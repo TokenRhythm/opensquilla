@@ -841,7 +841,7 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
     requestOverride?: ChatClarifyRequest,
   ) {
     const request = requestOverride || pendingClarify.value
-    if (clarifyBusy.value || !request) return
+    if (clarifyBusy.value || !request?.requestId) return
     const key = clarifyFrameKey(request)
     if (interruptState.value.get(key)?.resolution || interruptState.value.get(key)?.busy) return
     if (request.requestId && settledClarifyTasks.has(request.runId)) {
@@ -865,17 +865,12 @@ export function useChatApprovals(options: UseChatApprovalsOptions) {
       await clarificationSubmission.submit({
         sessionKey: ownerSession,
         fields,
-        ...(request.requestId ? { requestId: request.requestId } : {}),
-        ...(request.runId ? { runId: request.runId } : {}),
+        requestId: request.requestId,
       })
       if (!ownsCurrentContext()) return
       setInterruptState(key, { resolution: 'replied', busy: false })
-      // request_id submissions resolve the exact paused tool call in the same
-      // turn. A successful RPC is therefore authoritative and can release the
-      // dock/composer immediately. Legacy clarifications create a new chat turn
-      // and intentionally retain their existing submitted receipt.
-      if (request.requestId) clearPendingClarify(key)
-      else if (pendingClarifyMatches(key)) clarifySubmitted.value = true
+      // A successful submission resolves the exact paused tool call in this turn.
+      clearPendingClarify(key)
     } catch (err) {
       if (!ownsCurrentContext()) return
       const message = 'Send failed — ' + (err instanceof Error ? err.message : String(err))

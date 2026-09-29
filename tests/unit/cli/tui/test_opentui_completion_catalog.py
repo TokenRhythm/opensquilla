@@ -49,46 +49,44 @@ def test_build_completion_catalog_includes_commands_and_skills() -> None:
     assert "/skill:internal-only" not in items
 
 
-@pytest.mark.parametrize("coding_mode", [False, True])
 def test_skill_completion_respects_catalog_and_operator_policy(
-    coding_mode: bool,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(eligibility, "_live_skills_cfg_getter", None)
     specs = [
         SkillSpec("ordinary", "", SkillLayer.PERSONAL, False, [], ""),
         SkillSpec("disabled", "", SkillLayer.PERSONAL, False, [], ""),
+        SkillSpec("code-review", "", SkillLayer.PERSONAL, False, [], ""),
         SkillSpec("code-task", "", SkillLayer.PERSONAL, False, [], ""),
         SkillSpec(
             "internal-helper", "", SkillLayer.PERSONAL, False, [], "",
             visibility=SkillVisibility.INTERNAL,
-            invocation=SkillInvocation.META_ONLY,
+            invocation=SkillInvocation.EXPERIMENTAL_INTERNAL,
         ),
         SkillSpec(
-            "supported-meta", "", SkillLayer.PERSONAL, False, [], "", kind="meta",
-            visibility=SkillVisibility.META,
-            invocation=SkillInvocation.META_ONLY,
+            "retired-workflow", "", SkillLayer.PERSONAL, False, [], "", kind="meta",
+            visibility=SkillVisibility.TOMBSTONE,
+            invocation=SkillInvocation.EXPERIMENTAL_INTERNAL,
         ),
     ]
     loader = completion._ConfiguredSkillCompletionLoader(
         loader=SimpleNamespace(get_user_invocable=lambda: specs),
-        skills_config=SkillsConfig(coding_mode=coding_mode, disabled=["disabled"]),
+        skills_config=SkillsConfig(disabled=["disabled"]),
     )
     items = _by_label(build_completion_catalog(surface="tui", skill_loader=loader))
     actual = {label for label in items if label.startswith("/skill:")}
-    expected = {"/skill:ordinary"}
-    if coding_mode:
-        expected.add("/skill:code-task")
+    expected = {"/skill:ordinary", "/skill:code-review"}
     assert actual == expected
 
     monkeypatch.setattr(
         eligibility,
         "_live_skills_cfg_getter",
-        lambda: SkillsConfig(coding_mode=not coding_mode, disabled=["ordinary", "disabled"]),
+        lambda: SkillsConfig(disabled=["ordinary", "disabled"]),
     )
     refreshed = _by_label(build_completion_catalog(surface="tui", skill_loader=loader))
     assert "/skill:ordinary" not in refreshed
-    assert ("/skill:code-task" in refreshed) is not coding_mode
+    assert "/skill:code-review" in refreshed
+    assert "/skill:code-task" not in refreshed
 
 
 def test_build_completion_catalog_has_one_row_per_registered_command() -> None:

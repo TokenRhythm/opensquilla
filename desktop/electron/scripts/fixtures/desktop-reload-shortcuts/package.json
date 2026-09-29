@@ -1,0 +1,6 @@
+{
+  "name": "desktop-reload-shortcuts-fixture",
+  "private": true,
+  "type": "module",
+  "main": "main.mjs"
+}

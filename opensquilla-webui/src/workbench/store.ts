@@ -15,7 +15,7 @@ import type {
   WorkbenchScope,
 } from './types'
 
-export const WORKBENCH_PREVIEW_ITEM_LIMIT = 8
+const BROWSER_TAB_LIMIT = 8
 
 function hydrateWidthPreference(): WorkbenchWidthPreference {
   if (typeof localStorage === 'undefined') return defaultWorkbenchWidthPreference()
@@ -146,15 +146,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
       !existing
       && item.kind === 'browser'
       && items.value.filter(candidate => candidate.kind === 'browser').length
-        >= WORKBENCH_PREVIEW_ITEM_LIMIT
-    ) {
-      return false
-    }
-    if (
-      !existing
-      && item.hostKind === 'native-webcontents'
-      && items.value.filter(candidate => candidate.hostKind === 'native-webcontents').length
-        >= WORKBENCH_PREVIEW_ITEM_LIMIT
+        >= BROWSER_TAB_LIMIT
     ) {
       return false
     }
@@ -176,33 +168,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
     } else {
       rememberActivation(item.id)
     }
-    evictLeastRecentArtifactPreviews(item.id)
     return true
-  }
-
-  /**
-   * Preview tabs are intentionally bounded. Eviction follows the same
-   * activation order used when closing tabs, so a newly opened document and
-   * recently inspected documents survive while stale Blob-backed previews are
-   * disposed deterministically.
-   */
-  function evictLeastRecentArtifactPreviews(protectedId: string) {
-    let previewCount = items.value.filter(
-      candidate => candidate.kind === 'artifact-preview',
-    ).length
-    while (previewCount > WORKBENCH_PREVIEW_ITEM_LIMIT) {
-      const staleId = activationOrder.find(id => {
-        if (id === protectedId) return false
-        return items.value.some(
-          candidate =>
-            candidate.id === id
-            && candidate.kind === 'artifact-preview'
-            && candidate.hostKind !== 'native-webcontents',
-        )
-      })
-      if (!staleId || !closeItem(staleId, 'evicted')) break
-      previewCount -= 1
-    }
   }
 
   /** Refresh a descriptor without stealing focus from the active panel. */
@@ -231,7 +197,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           },
         },
         ...closedBrowserItems.value.filter(candidate => candidate.id !== removed.id),
-      ].slice(0, WORKBENCH_PREVIEW_ITEM_LIMIT)
+      ].slice(0, BROWSER_TAB_LIMIT)
     }
     const wasActive = activeItemId.value === id
     forgetActivation(id)

@@ -5,6 +5,7 @@ import {
   openTopbarSession,
   TOPBAR_GEOMETRY_VIEWPORTS,
   TOPBAR_SESSION_KEY,
+  TOPBAR_SESSION_TITLE,
 } from './support/topbar-fixture'
 
 test.afterEach(({ page }) => {
@@ -22,7 +23,6 @@ test.describe('Responsive chat header actions', () => {
       locale: 'zh-Hans',
       deliverableCount: 1,
       approvalCount: 1,
-      bgm: { enabled: true, playing: false },
     })
 
     const systemStatus = page.getByTestId('chat-system-status')
@@ -34,7 +34,6 @@ test.describe('Responsive chat header actions', () => {
     await systemTrigger.click()
     await expect(page.getByTestId('chat-system-approval')).toBeVisible()
     await expect(page.getByTestId('chat-system-connection')).toBeVisible()
-    await expect(page.getByTestId('bgm-toggle')).toBeHidden()
     await expect(page.getByTestId('chat-session-actions-trigger')).toBeVisible()
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
   })
@@ -46,7 +45,6 @@ test.describe('Responsive chat header actions', () => {
         sessionKey: `${TOPBAR_SESSION_KEY}-${viewport.width}`,
         locale: 'zh-Hans',
         deliverableCount: 1,
-        bgm: { enabled: true, playing: false },
       })
 
       const header = page.locator('.chat-header')
@@ -112,13 +110,13 @@ test.describe('Responsive chat header actions', () => {
   }
 
   for (const viewport of WIDE_VIEWPORTS) {
-    test(`${viewport.width}px exposes direct actions when the content pane is wide`, async ({ page }) => {
+    test(`${viewport.width}px exposes direct actions when the content pane is wide`, async ({ page, context }) => {
+      await context.grantPermissions(['clipboard-read', 'clipboard-write'])
       await page.setViewportSize(viewport)
-      await openTopbarSession(page, {
+      const harness = await openTopbarSession(page, {
         sessionKey: `${TOPBAR_SESSION_KEY}-${viewport.width}`,
         locale: 'zh-Hans',
         deliverableCount: 1,
-        bgm: { enabled: true, playing: false },
       })
 
       // Make the content pane itself wide at both viewport sizes. Layout is
@@ -136,16 +134,25 @@ test.describe('Responsive chat header actions', () => {
       await expect(page.getByTestId('chat-session-action-runs')).toHaveCount(0)
       await expect(page.getByTestId('chat-session-action-share')).toBeVisible()
       await expect(page.getByTestId('chat-session-action-share')).toHaveAccessibleName('分享')
-      await expect(page.getByTestId('chat-session-actions-trigger')).toHaveCount(0)
+      await expect(header.locator('.chat-header__title')).toHaveAttribute('title', TOPBAR_SESSION_TITLE)
+      const menuTrigger = page.getByTestId('chat-session-actions-trigger')
+      await expect(menuTrigger).toBeVisible()
+      await expectTopbarGeometry(page)
 
-      const identityGap = await page.locator('.chat-header').evaluate(element => {
-        const title = element.querySelector<HTMLElement>('.chat-header__title')
-        const copy = element.querySelector<HTMLElement>('.chat-header__copy')
-        if (!title || !copy) return Number.POSITIVE_INFINITY
-        return copy.getBoundingClientRect().left - title.getBoundingClientRect().right
-      })
-      expect(identityGap).toBeGreaterThanOrEqual(0)
-      expect(identityGap).toBeLessThanOrEqual(8)
+      // Wide mode keeps frequent actions direct and copy operations in the
+      // same session menu used by narrower layouts.
+      await menuTrigger.click()
+      const menu = page.getByTestId('chat-session-actions-menu')
+      await expect(menu.getByRole('menuitem')).toHaveCount(3)
+      await expect(page.getByTestId('chat-session-action-copy-app-link')).toBeVisible()
+      await expect(page.getByTestId('chat-session-action-copy-gateway-link')).toBeVisible()
+      await expect(page.getByTestId('chat-session-action-copy')).toHaveAccessibleName('复制会话 ID')
+      await expectTopbarGeometry(page)
+      await page.getByTestId('chat-session-action-copy').click()
+      await expect(menu).toHaveCount(0)
+      await expect.poll(() => page.evaluate(() => navigator.clipboard.readText()))
+        .toBe(harness.sessionKey)
+      await expect(menuTrigger).toBeFocused()
       await expectTopbarGeometry(page)
     })
   }

@@ -2246,6 +2246,7 @@ async def _list_transcript_titles(
         return titles
 
     title_inputs: dict[str, list[str]] = {session_id: [] for session_id in session_ids}
+    batch_succeeded = False
     storage_batch = getattr(storage, "list_user_transcript_content_batch", None)
     if callable(storage_batch):
         try:
@@ -2256,10 +2257,13 @@ async def _list_transcript_titles(
                     for session_id, values in grouped.items()
                 }
             )
+            batch_succeeded = True
         except Exception:
             log.warning("sessions.transcript_title_batch_failed", exc_info=True)
 
-    if not any(title_inputs.values()):
+    # An empty successful batch is authoritative. Falling back in that case
+    # turns an empty-history page into one extra query per session.
+    if not batch_succeeded:
         storage_get_transcript = getattr(storage, "get_transcript", None)
         if callable(storage_get_transcript):
             for session_id in session_ids:

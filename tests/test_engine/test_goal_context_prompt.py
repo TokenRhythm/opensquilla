@@ -92,7 +92,7 @@ def test_goal_turn_renders_frozen_objective_and_structured_progress() -> None:
     assert "Implementation is underway." in block
     assert "Define the contract" in block
     assert "Wire the runtime" in block
-    assert "update_goal_progress" in block
+    assert "update_plan" in block
     assert "update_goal" in block
     assert "Keep the full objective intact across turns" in block
     assert "redefine success around completed work" in block
@@ -227,9 +227,10 @@ def test_goal_tools_visible_only_to_matching_main_default_turn(tmp_path: Path) -
         ),
     )
 
-    goal_tools = {"update_goal", "update_goal_progress"}
+    goal_tools = {"update_goal", "update_plan"}
     assert goal_tools <= main_names
-    assert {"get_goal", "create_goal"} | goal_tools <= ordinary_names
+    assert {"get_goal", "create_goal", "update_goal"} <= ordinary_names
+    assert "update_plan" not in ordinary_names
     assert goal_tools.isdisjoint(plan_names)
     assert goal_tools.isdisjoint(subagent_names)
     assert goal_tools.isdisjoint(cron_names)
@@ -262,7 +263,7 @@ def test_artifact_note_keeps_goal_guidance_scoped_without_forcing_other_turns_to
 
     assert "Follow the Active Goal instructions" in note
     assert "continue any remaining work with the ordinary tools" in note
-    assert "update_goal_progress remains optional" in note
+    assert "update_plan remains optional" in note
     assert "concise current-state view" in note
     assert "replace that view when reality changes" in note
     assert "fixed phases or turn boundaries" in note
@@ -303,7 +304,7 @@ def test_artifact_note_keeps_goal_guidance_scoped_without_forcing_other_turns_to
         assert "Send the final response now" not in non_goal_note
         assert "Do not run more tools" not in non_goal_note
         assert "Follow the Active Goal instructions" not in non_goal_note
-        assert "update_goal_progress remains optional" not in non_goal_note
+        assert "update_plan remains optional" not in non_goal_note
     assert "Follow the Active Goal instructions" in named_agent_note
     assert "Send the final response now" not in named_agent_note
 
@@ -323,7 +324,7 @@ def test_generic_artifact_prompt_defers_to_active_goal_without_dynamic_flag() ->
 def test_goal_tools_do_not_terminate_the_turn() -> None:
     registry = get_default_registry()
     update_goal = registry.get("update_goal")
-    update_progress = registry.get("update_goal_progress")
+    update_progress = registry.get("update_plan")
 
     assert update_goal is not None
     assert update_progress is not None
@@ -336,7 +337,7 @@ def test_goal_tools_do_not_terminate_the_turn() -> None:
 def test_goal_tool_contract_requires_evidence_and_keeps_progress_optional() -> None:
     registry = get_default_registry()
     update_goal = registry.get("update_goal")
-    update_progress = registry.get("update_goal_progress")
+    update_progress = registry.get("update_plan")
 
     assert update_goal is not None
     assert update_progress is not None
@@ -355,16 +356,13 @@ def test_goal_tool_contract_requires_evidence_and_keeps_progress_optional() -> N
     )
 
     progress_description = update_progress.spec.description
-    assert progress_description.startswith("Optionally replace")
-    assert "current reality" in progress_description
-    assert "fixed phases or future turns" in progress_description
-    assert "determine when a turn ends" in progress_description
-    assert "narrow the objective" in progress_description
-    assert "substitute for doing the work" in progress_description
-    assert "strict terminal conditions" in progress_description
-    assert "not a phase or future-turn instruction" in (
-        update_progress.spec.parameters["explanation"]["description"]
-    )
+    assert progress_description.startswith("Replace the optional progress list")
+    assert "aligned" in progress_description
+    assert "with actual work" in progress_description
+    assert "do not mark unperformed or unverified" in progress_description
+    assert "does not enter Plan mode or create a Goal" in progress_description
+    assert "does not control tool permissions" in progress_description
+    assert "execution order or task completion" in progress_description
 
 
 def test_goal_controls_do_not_advertise_retired_budget_or_execution_policy() -> None:

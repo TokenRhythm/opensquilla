@@ -55,28 +55,30 @@ def _health(scope: str, fingerprint: str) -> dict[str, object]:
     }
 
 
-def test_protocol_approved_predecessor_diff_is_only_optional_device_field(
+def test_protocol_retirement_does_not_expand_approved_legacy_compatibility(
     protocol_preflight: ModuleType,
 ) -> None:
     raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
     current = protocol_preflight.manifest_fingerprint(raw)
-    manifest = json.loads(raw)
-    assert manifest.pop("device_identity") == {
-        "field": "device_id",
-        "format": "sha256-lowercase-hex",
-        "optional": True,
-        "scope": "application-events",
-        "deduplication_unit": "device",
-    }
-    assert manifest["manifest_version"] == 2
-    manifest["manifest_version"] = 1
-    previous = protocol_preflight.manifest_fingerprint(json.dumps(manifest).encode())
-    assert protocol_preflight.COMPATIBLE_PAIRS == {(current, previous)}
+    # This released pair approved only the optional device-field addition.
+    # Removing event types creates a distinct protocol requiring an exact
+    # collector match; it must not inherit that historical approval.
+    legacy_server = "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
+    legacy_client = "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
+    assert protocol_preflight.COMPATIBLE_PAIRS == {(legacy_server, legacy_client)}
+    assert current not in {legacy_server, legacy_client}
     for scope in ("growth", "reliability"):
         protocol_preflight.validate_health(_health(scope, current), scope, current)
-        protocol_preflight.validate_health(_health(scope, current), scope, previous)
+        protocol_preflight.validate_health(
+            _health(scope, legacy_server), scope, legacy_client,
+        )
         with pytest.raises(ValueError, match="does not support"):
-            protocol_preflight.validate_health(_health(scope, previous), scope, current)
+            protocol_preflight.validate_health(_health(scope, legacy_client), scope, legacy_server)
+        for legacy in (legacy_server, legacy_client):
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, legacy), scope, current)
+            with pytest.raises(ValueError, match="does not support"):
+                protocol_preflight.validate_health(_health(scope, current), scope, legacy)
 
 
 def test_protocol_source_reads_fixed_commit_not_mutated_checkout_or_tag(

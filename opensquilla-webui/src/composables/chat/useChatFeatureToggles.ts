@@ -55,9 +55,6 @@ interface ChatFeatureConfig {
   permissions?: {
     default_mode?: string
   }
-  skills?: {
-    coding_mode?: boolean
-  }
   llm_ensemble?: {
     enabled?: boolean
     selection_mode?: string
@@ -128,8 +125,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
   } = useRouterVisualEffectsPreference()
   const routerVisualMode = ref(DEFAULT_ROUTER_VISUAL_MODE)
   const routerSettingsBusy = ref(false)
-  const codingModeEnabled = ref(false)
-  const codingModeSettingsBusy = ref(false)
   const llmEnsembleEnabled = ref(false)
   const llmEnsembleSelectionMode = ref('')
   const llmEnsembleSettingsBusy = ref(false)
@@ -238,7 +233,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     const ensembleEnabled = cfg?.llm_ensemble?.enabled === true
 
     routerEnabled.value = ensembleEnabled || Boolean(router.enabled && router.rollout_phase !== 'observe')
-    codingModeEnabled.value = cfg?.skills?.coding_mode === true
     llmEnsembleEnabled.value = ensembleEnabled
     llmEnsembleSelectionMode.value = String(cfg?.llm_ensemble?.selection_mode || '')
     if (!hasCanonicalImageAdmission) {
@@ -386,25 +380,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     await setModelRoutingMode(enabled ? 'squilla_router' : 'off')
   }
 
-  async function setCodingModeEnabled(enabled: boolean): Promise<boolean> {
-    if (codingModeSettingsBusy.value) return false
-    const nextEnabled = Boolean(enabled)
-    const previous = codingModeEnabled.value
-    codingModeSettingsBusy.value = true
-    try {
-      await options.appSettings.patchSafe([{ path: 'skills.coding_mode', value: nextEnabled }])
-      const cfg = await options.appSettings.readAll()
-      await applyFeatureConfig(cfg)
-      return codingModeEnabled.value === nextEnabled
-    } catch (err) {
-      codingModeEnabled.value = previous
-      console.warn('Failed to update Coding mode:', err instanceof Error ? err.message : String(err))
-      return false
-    } finally {
-      codingModeSettingsBusy.value = false
-    }
-  }
-
   async function setLlmEnsembleEnabled(enabled: boolean) {
     await setModelRoutingMode(enabled ? 'llm_ensemble' : 'off')
   }
@@ -479,8 +454,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     globalImageInputAdmission,
     globalImageInputAdmissionReason,
     modelRoutingCapabilitiesByMode,
-    codingModeEnabled,
-    codingModeSettingsBusy,
     llmEnsembleEnabled,
     llmEnsembleSelectionMode,
     llmEnsembleSettingsBusy,
@@ -491,7 +464,6 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     loadFeatureToggles,
     setRouterEnabled,
     setModelRoutingMode,
-    setCodingModeEnabled,
     setLlmEnsembleEnabled,
     setRouterVisualEffectsEnabled,
     bindFeatureRefresh,

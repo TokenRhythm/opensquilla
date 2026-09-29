@@ -52,7 +52,7 @@ function status(command: ChatSlashCommand): string {
   if (skill?.reasonCode === 'tools_unavailable') return t('chat.skillPalette.toolsUnavailable')
   if (skill && !skill.ready) return t('chat.skillPalette.needsSetup')
   if (skill?.manualOnly) return t('chat.skillPalette.manualOnly')
-  return command.metaStatus === 'needs_setup' ? t('chat.metaRuns.needsSetup') : ''
+  return ''
 }
 </script>
 

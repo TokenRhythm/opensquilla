@@ -657,7 +657,7 @@ async def test_parallel_calls_each_settle_exactly_once() -> None:
 async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
     provider = _ToolBatchProvider(
         [
-            ("checkpoint", "plan_run_checkpoint", {}),
+            ("terminal", "terminal_control", {}),
             ("trailing-write", "write_file", {}),
         ]
     )
@@ -669,7 +669,7 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
             tc.tool_use_id,
             tc.tool_name,
             "boundary",
-            terminates_turn=tc.tool_name == "plan_run_checkpoint",
+            terminates_turn=tc.tool_name == "terminal_control",
         )
 
     facts: list[ToolCallReliabilityFacts] = []
@@ -677,7 +677,7 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
         provider=provider,
         config=AgentConfig(max_iterations=2),
         tool_definitions=[
-            _definition("plan_run_checkpoint"),
+            _definition("terminal_control"),
             _definition("write_file"),
         ],
         tool_handler=handler,
@@ -686,7 +686,7 @@ async def test_dispatch_boundary_trailing_call_is_not_reported() -> None:
 
     events = await _collect_agent(agent)
 
-    assert dispatched == ["plan_run_checkpoint"]
+    assert dispatched == ["terminal_control"]
     assert len(facts) == 1
     assert facts[0].outcome is ToolOutcome.SUCCESS
     trailing = next(
@@ -740,48 +740,6 @@ async def test_tool_batch_timeouts_settle_facts_and_allow_provider_to_continue(
     assert any(isinstance(event, DoneEvent) and event.text == "done" for event in events)
 
 
-@pytest.mark.asyncio
-async def test_meta_invoke_special_path_settles_once() -> None:
-    provider = _ToolBatchProvider(
-        [("meta-call", "meta_invoke", {"name": "private-meta-name"})]
-    )
-    agent = Agent(
-        provider=provider,
-        config=AgentConfig(max_iterations=1),
-        tool_definitions=[
-            _definition("meta_invoke", {"name": {"type": "string"}})
-        ],
-        tool_handler=None,
-    )
-
-    async def fake_meta_stream(
-        _self: Agent,
-        tc: ToolCall,
-        _ctx: ToolContext,
-    ) -> AsyncIterator[Any]:
-        yield ToolResult(
-            tc.tool_use_id,
-            tc.tool_name,
-            "SECRET meta result",
-            terminates_turn=True,
-        )
-
-    agent._run_one_streaming = types.MethodType(fake_meta_stream, agent)
-    facts: list[ToolCallReliabilityFacts] = []
-    agent.set_tool_reliability_sink(facts.append)
-
-    await _collect_agent(agent)
-
-    assert facts == [
-        ToolCallReliabilityFacts(
-            tool_category=ToolCategory.COLLABORATION,
-            outcome=ToolOutcome.SUCCESS,
-            error_code=None,
-            duration_ms=facts[0].duration_ms,
-            retry_count=0,
-        )
-    ]
-    assert "private-meta-name" not in repr(asdict(facts[0]))
 
 
 @pytest.mark.asyncio

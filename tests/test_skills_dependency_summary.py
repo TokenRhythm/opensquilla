@@ -197,55 +197,6 @@ description: Imports a local module and a project dependency alias.
     assert summary["inferred"]["python_imports"] == []
 
 
-def test_meta_skill_rolls_up_sub_skill_dependency_issues(tmp_path: Path) -> None:
-    _write_skill(
-        tmp_path,
-        "child",
-        """---
-name: child
-description: Needs a missing binary.
-metadata:
-  opensquilla:
-    requires:
-      bins: [missing-tool]
----
-
-# body
-""",
-    )
-    _write_skill(
-        tmp_path,
-        "parent",
-        """---
-name: parent
-description: Meta parent.
-kind: meta
-composition:
-  steps:
-    - id: child-step
-      skill: child
-    - id: route-step
-      routes:
-        - label: fallback
-          skill: missing-child
----
-
-# body
-""",
-    )
-    loader = SkillLoader(bundled_dir=tmp_path, snapshot_path=tmp_path / "snapshot.json")
-    spec = loader.get_by_name("parent")
-    assert spec is not None
-
-    summary = build_dependency_summary(
-        spec,
-        loader=loader,
-        ctx=EligibilityContext(os_name="linux", has_bin_cache={"missing-tool": False}),
-    )
-
-    assert summary["sub_skill_dependencies"]["missing_count"] == 1
-    assert summary["sub_skill_dependencies"]["missing_references"] == ["missing-child"]
-    assert summary["sub_skill_dependencies"]["skills"][0]["name"] == "child"
 
 
 def test_summary_collects_scan_errors_without_crashing(tmp_path: Path) -> None:

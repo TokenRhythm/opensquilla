@@ -8,14 +8,15 @@ afterEach(() => {
   while (mounted.length) mounted.pop()!.unmount()
   document.body.innerHTML = ''
   localStorage.clear()
-  vi.doUnmock('@/components/settings/MemoryLearningGroup.vue')
+  vi.doUnmock('@/components/settings/MemoryDreamSettings.vue')
 })
 
 describe('SettingsAdvancedPanel data maintenance entry', () => {
   it('keeps memory controls in Advanced and maintenance last', async () => {
+    localStorage.setItem('opensquilla.logs.runTrace', '1')
     vi.resetModules()
-    vi.doMock('@/components/settings/MemoryLearningGroup.vue', () => ({
-      default: { template: '<div data-testid="memory-learning-group" />' },
+    vi.doMock('@/components/settings/MemoryDreamSettings.vue', () => ({
+      default: { template: '<div data-testid="memory-dream-settings" />' },
     }))
     const { createApp, nextTick } = await import('vue')
     const i18n = (await import('@/i18n')).default
@@ -47,12 +48,23 @@ describe('SettingsAdvancedPanel data maintenance entry', () => {
     const memoryGroup = el.querySelector<HTMLElement>('[data-testid="advanced-memory-group"]')!
     const capture = memoryGroup.querySelector<HTMLInputElement>('input[name="memory_auto_capture"]')!
     expect(memoryGroup.textContent).toContain('Memory')
-    expect(memoryGroup.querySelector('[data-testid="memory-learning-group"]')).toBeTruthy()
+    expect(memoryGroup.querySelector('[data-testid="memory-dream-settings"]')).toBeTruthy()
     expect(capture.checked).toBe(true)
     capture.checked = false
     capture.dispatchEvent(new Event('change', { bubbles: true }))
     await nextTick()
     expect(updateAutoCapture).toHaveBeenCalledWith(false)
+
+    expect(el.textContent).not.toContain('Agent configuration')
+    expect(el.querySelector('[name="labs_run_trace"]')).toBeNull()
+    expect(el.textContent).not.toContain('Run-trace drawer in Logs')
+
+    const approvalPoll = el.querySelector<HTMLInputElement>('input[name="labs_approval_poll"]')!
+    expect(approvalPoll.checked).toBe(false)
+    approvalPoll.checked = true
+    approvalPoll.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    expect(localStorage.getItem('opensquilla.chat.approvalPoll')).toBe('1')
 
     const rows = el.querySelectorAll('.control-row')
     const maintenance = el.querySelector<HTMLElement>('[data-testid="advanced-data-maintenance"]')!

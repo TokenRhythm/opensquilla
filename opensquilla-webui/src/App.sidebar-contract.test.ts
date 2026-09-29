@@ -84,6 +84,23 @@ describe('App sidebar chrome contract', () => {
     expect(appSource).toContain('automaticAppRpc.dispose()')
   })
 
+  it('keeps a materialized session visible until the directory snapshot catches up', () => {
+    const ledgerStart = appSource.indexOf('// A just-materialized chat can reach')
+    const ledgerEnd = appSource.indexOf('watch(allSessions', ledgerStart)
+    const ledger = appSource.slice(ledgerStart, ledgerEnd)
+    expect(ledger).toContain('optimisticCurrentSessionTitle')
+    expect(ledger).toContain('chatRouteHeaderSessionKey.value !== key')
+    expect(ledger).toContain('chatRouteHeaderTitle.value.trim()')
+    expect(ledger).toContain("t('chat.chatWithSuffix', { suffix })")
+    expect(ledger).toContain('flush: \'sync\'')
+
+    const changeStart = appSource.indexOf('const sessionDirectoryChangesSubscription')
+    const changeEnd = appSource.indexOf('function subscribeCronEventsWhenAdmitted', changeStart)
+    const changeHandler = appSource.slice(changeStart, changeEnd)
+    expect(changeHandler).toContain("change.reason === 'deleted'")
+    expect(changeHandler).toContain('removeLocalSessions(new Set([change.key]))')
+  })
+
   it('keeps app-wide approval awareness behind ApprovalCenter', () => {
     expect(appSource).toContain('APPROVAL_CENTER_KEY')
     expect(appSource).toContain('approvalCenter.snapshot()')

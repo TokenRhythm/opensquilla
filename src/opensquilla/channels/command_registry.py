@@ -103,15 +103,6 @@ class CommandRegistry:
         )
         if compact_reply is not None:
             return compact_reply
-        meta_reply = _format_channel_meta_list_reply(
-            name=name,
-            method=method,
-            res=res,
-            reply_to=reply_to,
-            config=config,
-        )
-        if meta_reply is not None:
-            return meta_reply
         denied = bool(not res.ok and getattr(res.error, "code", "") == "UNAUTHORIZED")
         reason = "" if res.ok else f": {getattr(res.error, 'message', 'command failed')}"
         if res.ok:
@@ -229,53 +220,6 @@ def _format_channel_compact_reply(
         )
     return OutgoingMessage(
         content=render_channel_message("command_completed", config=config, name="compact"),
-        reply_to=reply_to,
-        metadata=metadata,
-    )
-
-
-def _format_channel_meta_list_reply(
-    *,
-    name: str,
-    method: str,
-    res: Any,
-    reply_to: str | None,
-    config: Any = None,
-) -> OutgoingMessage | None:
-    if name != "meta" or method != "meta.list":
-        return None
-    denied = bool(not res.ok and getattr(res.error, "code", "") == "UNAUTHORIZED")
-    metadata = {"command": name, "method": method, "denied": denied}
-    if not res.ok:
-        error_message = getattr(res.error, "message", "command failed")
-        message_key: ChannelSystemMessageKey = (
-            "command_meta_denied" if denied else "command_meta_failed"
-        )
-        return OutgoingMessage(
-            content=render_channel_message(
-                message_key, config=config, reason=error_message
-            ),
-            reply_to=reply_to,
-            metadata=metadata,
-        )
-    payload = res.payload if isinstance(res.payload, dict) else {}
-    skills = payload.get("skills") if isinstance(payload.get("skills"), list) else []
-    if payload.get("disabled") or not skills:
-        return OutgoingMessage(
-            content=render_channel_message("command_meta_empty", config=config),
-            reply_to=reply_to,
-            metadata=metadata,
-        )
-    lines = [render_channel_message("command_meta_heading", config=config)]
-    for skill in skills:
-        if not isinstance(skill, dict):
-            continue
-        skill_name = str(skill.get("name") or "")
-        description = skill.get("description")
-        suffix = f" — {description}" if description else ""
-        lines.append(f"- {skill_name}{suffix}")
-    return OutgoingMessage(
-        content="\n".join(lines),
         reply_to=reply_to,
         metadata=metadata,
     )

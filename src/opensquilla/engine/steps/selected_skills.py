@@ -36,9 +36,8 @@ async def load_selected_skills(ctx: TurnContext, tool_context: Any) -> TurnConte
     if not refs:
         return ctx
     cfg = getattr(ctx.config, "skills", None)
-    coding_mode = bool(getattr(cfg, "coding_mode", False))
     eligibility = EligibilityContext.auto(
-        disabled_set=set(effective_disabled(getattr(cfg, "disabled", []) or [], coding_mode)),
+        disabled_set=set(effective_disabled(getattr(cfg, "disabled", []) or [])),
     )
     catalog = ctx.skill_catalog
     skills = {skill.name: skill for skill in getattr(catalog, "skills", ())}
@@ -76,7 +75,7 @@ async def load_selected_skills(ctx: TurnContext, tool_context: Any) -> TurnConte
                 or skill.instance_id != ref["instanceId"] or skill.tree_digest != ref["digest"]
             ):
                 error = f"Selected Skill '{name}' changed. Remove it and select it again."
-            elif not is_user_invocable_ordinary(skill, coding_mode=coding_mode):
+            elif not is_user_invocable_ordinary(skill):
                 error = f"Skill '{name}' cannot be selected manually in the current mode."
             elif not is_skill_available_live(name):
                 error = f"Skill '{name}' is disabled. Allow it in Skill settings before retrying."

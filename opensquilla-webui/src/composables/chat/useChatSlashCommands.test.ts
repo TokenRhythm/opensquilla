@@ -1,16 +1,14 @@
-import { nextTick, ref, watch } from 'vue'
-import { describe, expect, it, vi } from 'vitest'
 import i18n, { loadLocaleMessages } from '@/i18n'
+import { ref, watch } from 'vue'
+import { describe, expect, it, vi } from 'vitest'
 
-import { parseMetaCommandInvocation, useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
+import { useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
 import { useChatCompaction } from './useChatCompaction'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { RpcCallOptions } from '@/lib/rpc'
-import type { MetaRunCenter } from '@/modules/metaRunCenter'
 import type { SessionMaintenance } from '@/modules/sessionMaintenance'
 import { usageReportingDouble } from '@/testing/usage.test-helper'
-import type { MetaSetupReadiness } from '@/types/metaSetup'
 import {
   commandCatalogFromTestRpc,
 } from '@/testing/conversationAncillary.test-helper'
@@ -43,34 +41,7 @@ function harness(
     ready: vi.fn(() => ready),
     call,
   }
-  const metaRunCenter: MetaRunCenter = {
-    launch: vi.fn(async input => {
-      const raw = await rpc.call('meta.run', input) as Record<string, unknown>
-      return {
-        ok: raw.ok === true,
-        error: typeof raw.error === 'string' ? raw.error : undefined,
-        drafted: raw.drafted === true,
-        setupRequired: raw.setup_required === true,
-        readiness: raw.readiness as MetaSetupReadiness | undefined,
-      }
-    }),
-    listDrafts: vi.fn(async () => ({ drafts: [], durable: true })),
-    discardDraft: vi.fn(async () => ({ discarded: true, accepted: false })),
-    recover: vi.fn(async () => null),
-    confirmPreflight: vi.fn(async () => ({})),
-    replay: vi.fn(async () => ({})),
-    setupPlan: vi.fn(async () => { throw new Error('Setup planning is not configured') }),
-    setupStatus: vi.fn(async () => { throw new Error('Setup polling is not configured') }),
-    setupInstall: vi.fn(async () => { throw new Error('Installation is not configured') }),
-    subscribe: vi.fn(() => ({ close: vi.fn() })),
-  }
   const activatePlanMode = vi.fn(async () => true)
-  const codingModeEnabled = ref(false)
-  const setCodingModeEnabled = vi.fn(async (enabled: boolean) => {
-    codingModeEnabled.value = enabled
-    return true
-  })
-  const dispatchHidden = vi.fn()
   const dispatchPlanPrompt = vi.fn()
   const notify = vi.fn()
   const armGoal = vi.fn(async () => true)
@@ -103,7 +74,6 @@ function harness(
     commandCatalog: commandCatalogFromTestRpc(rpc),
     usageReporting: usageReportingDouble(),
     sessionMaintenance,
-    metaRunCenter,
     catalogCallOptions,
     inputText,
     sessionKey: ref('agent:main:webchat:test'),
@@ -114,12 +84,9 @@ function harness(
     showCompactStatus: vi.fn(),
     showCompactionToast: vi.fn(),
     notify,
-    dispatchHidden,
     dispatchPlanPrompt,
     activatePlanMode,
     planModeAvailable: () => planModeAvailable,
-    codingModeEnabled,
-    setCodingModeEnabled,
     armGoal,
     startGoal,
     goalStatus,
@@ -134,8 +101,6 @@ function harness(
     api,
     armGoal,
     startGoal,
-    codingModeEnabled,
-    dispatchHidden,
     dispatchPlanPrompt,
     inputText,
     goalStatus,
@@ -143,11 +108,9 @@ function harness(
     goalPause,
     goalResume,
     goalClear,
-    metaRunCenter,
     notify,
     rpc,
     sessionMaintenance,
-    setCodingModeEnabled,
   }
 }
 
@@ -229,21 +192,6 @@ describe('useChatSlashCommands plan compatibility', () => {
     expect(notify).toHaveBeenCalledOnce()
     expect(inputText.value).toBe('/plan')
     expect(selectedSkills.value).toEqual([skill])
-  })
-
-  it('requires an explicit -- separator before treating Meta trailing text as a request', () => {
-    expect(parseMetaCommandInvocation('meta-paper-write')).toEqual({
-      skillName: 'meta-paper-write',
-      launchText: '/meta meta-paper-write',
-    })
-    expect(parseMetaCommandInvocation('meta-paper-write accidental trailing words')).toEqual({
-      skillName: 'meta-paper-write',
-      launchText: '/meta meta-paper-write',
-    })
-    expect(parseMetaCommandInvocation('meta-paper-write -- preserve this request')).toEqual({
-      skillName: 'meta-paper-write',
-      launchText: '/meta meta-paper-write -- preserve this request',
-    })
   })
 
   it('adds and executes /plan when the connected gateway advertises plan mode', async () => {
@@ -335,7 +283,6 @@ describe('useChatSlashCommands plan compatibility', () => {
     const {
       activatePlanMode,
       api,
-      dispatchHidden,
       dispatchPlanPrompt,
       inputText,
     } = harness(true)
@@ -349,7 +296,6 @@ describe('useChatSlashCommands plan compatibility', () => {
       'inspect the logging flow',
       '/plan inspect the logging flow',
     )
-    expect(dispatchHidden).not.toHaveBeenCalled()
     expect(inputText.value).toBe('/plan inspect the logging flow')
   })
 
@@ -357,7 +303,6 @@ describe('useChatSlashCommands plan compatibility', () => {
     const {
       activatePlanMode,
       api,
-      dispatchHidden,
       dispatchPlanPrompt,
       inputText,
     } = harness(true)
@@ -370,386 +315,7 @@ describe('useChatSlashCommands plan compatibility', () => {
     await Promise.resolve()
 
     expect(inputText.value).toBe('/plan')
-    expect(dispatchHidden).not.toHaveBeenCalled()
     expect(dispatchPlanPrompt).not.toHaveBeenCalled()
-  })
-})
-
-describe('useChatSlashCommands meta requests', () => {
-  const metaCommand = {
-    name: '/meta',
-    description: 'Run a meta-skill.',
-    aliases: [],
-    execution: { action: 'meta.menu' },
-    argument_choices: [
-      { value: 'meta-skill-creator', description: 'Create a meta-skill.' },
-    ],
-  }
-
-  it('keeps the concrete request after the explicit Meta request separator', async () => {
-    const { api, dispatchHidden, rpc } = harness(false, [metaCommand])
-    rpc.call.mockImplementation(async (method: string) => {
-      if (method === 'commands.list_for_surface') return { commands: [metaCommand] }
-      if (method === 'meta.run') return { ok: true }
-      return {}
-    })
-
-    await api.executeSlashCommand(
-      '/meta meta-skill-creator -- create a competitor research meta-skill',
-    )
-    await vi.waitFor(() => expect(dispatchHidden).toHaveBeenCalledOnce())
-
-    expect(rpc.call).toHaveBeenCalledWith('meta.run', expect.objectContaining({
-      name: 'meta-skill-creator',
-      sessionKey: 'agent:main:webchat:test',
-      clientRequestId: expect.any(String),
-      launchText: '/meta meta-skill-creator -- create a competitor research meta-skill',
-    }))
-    expect(dispatchHidden).toHaveBeenCalledWith(
-      '/meta meta-skill-creator -- create a competitor research meta-skill',
-      '/meta meta-skill-creator -- create a competitor research meta-skill',
-      expect.any(String),
-      'agent:main:webchat:test',
-    )
-  })
-})
-
-describe('unified Meta request collector', () => {
-  const metaCommand = {
-    name: '/meta',
-    description: 'Run a workflow.',
-    aliases: [],
-    execution: { action: 'meta.menu' },
-    argument_choices: [{ value: 'meta-research', description: 'Research a topic.' }],
-  }
-  const selectedSkill = { name: 'tables', instanceId: 'skill:tables', digest: 'a'.repeat(64) }
-
-  async function collector(extra: Partial<UseChatSlashCommandsOptions> = {}) {
-    const result = harness(false, [metaCommand], Promise.resolve(), undefined, extra)
-    await result.api.loadSlashCommands()
-    result.inputText.value = 'Compare products /meta-research'
-    result.api.handleSlashInput()
-    const choice = result.api.filteredSlashCmds.value.find(item => item.kind === 'meta')!
-    expect(choice?.argValue).toBe('meta-research')
-    return { ...result, choice }
-  }
-
-  it('opens a concrete workflow request without sending or changing the composer', async () => {
-    const original = 'Compare /meta-research two products'
-    const { api, inputText, metaRunCenter, dispatchHidden } = await collector({
-      getCaret: () => original.indexOf(' two'),
-    })
-    inputText.value = original
-    api.handleSlashInput()
-    api.activateSlashCmd(api.filteredSlashCmds.value.find(item => item.kind === 'meta')!)
-
-    expect(api.metaDraft.value).toEqual({
-      name: 'meta-research',
-      label: 'meta-research',
-      text: 'Compare  two products',
-      originalText: original,
-      sessionKey: 'agent:main:webchat:test',
-    })
-    expect(inputText.value).toBe(original)
-    expect(api.slashOpen.value).toBe(false)
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-    expect(dispatchHidden).not.toHaveBeenCalled()
-
-    api.metaDraft.value = null
-    expect(inputText.value).toBe(original)
-  })
-
-  it.each(['attachments', 'skill tags'])('blocks workflow selection with %s', async kind => {
-    const selectedSkills = ref<SelectedSkillRef[]>(kind === 'skill tags' ? [selectedSkill] : [])
-    const { api, inputText, choice, metaRunCenter, dispatchHidden, notify } = await collector({
-      hasNonTextInput: () => kind === 'attachments',
-      selectedSkills,
-    })
-    const original = inputText.value
-
-    api.activateSlashCmd(choice)
-
-    expect(api.metaDraft.value).toBeNull()
-    expect(inputText.value).toBe(original)
-    expect(selectedSkills.value).toEqual(kind === 'skill tags' ? [selectedSkill] : [])
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-    expect(dispatchHidden).not.toHaveBeenCalled()
-    expect(notify).toHaveBeenCalledOnce()
-  })
-
-  it('keeps edited workflow text through reconnect and catalog invalidation', async () => {
-    const { api, choice, inputText, metaRunCenter } = await collector()
-    api.activateSlashCmd(choice)
-    api.metaDraft.value!.text = 'Compare battery life\nand price'
-    const original = inputText.value
-
-    api.invalidateSkillCandidates()
-    api.invalidateSkillCandidates()
-
-    expect(api.metaDraft.value?.text).toBe('Compare battery life\nand price')
-    expect(inputText.value).toBe(original)
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-  })
-
-  it('restores edited workflow text only to its source session when navigating away', async () => {
-    const sessionKey = ref('agent:main:webchat:test')
-    const restoreDraft = vi.fn()
-    const { api, choice, inputText, metaRunCenter } = await collector({ sessionKey, restoreDraft })
-    api.activateSlashCmd(choice)
-    api.metaDraft.value!.text = 'Compare battery life\nand price'
-
-    sessionKey.value = 'agent:main:webchat:other'
-    inputText.value = 'Unrelated draft in another session'
-    api.invalidateSkillCandidates()
-    await nextTick()
-
-    expect(restoreDraft).toHaveBeenCalledExactlyOnceWith(
-      '/meta meta-research -- Compare battery life\nand price',
-      'agent:main:webchat:test',
-    )
-    expect(api.metaDraft.value).toBeNull()
-    expect(inputText.value).toBe('Unrelated draft in another session')
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-  })
-
-  it.each(['attachments', 'skill tags'])('rechecks %s added after the request dialog opens', async kind => {
-    const hasAttachment = ref(false)
-    const selectedSkills = ref<SelectedSkillRef[]>([])
-    const { api, inputText, choice, metaRunCenter, notify } = await collector({
-      hasNonTextInput: () => hasAttachment.value,
-      selectedSkills,
-    })
-    api.activateSlashCmd(choice)
-    const draft = { ...api.metaDraft.value! }
-    const original = inputText.value
-    if (kind === 'attachments') hasAttachment.value = true
-    else selectedSkills.value = [selectedSkill]
-
-    await api.launchMetaDraft()
-
-    expect(api.metaDraft.value).toEqual(draft)
-    expect(inputText.value).toBe(original)
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-    expect(notify).toHaveBeenCalledOnce()
-  })
-
-  it('submits edited request text through the existing launch with one stable identity', async () => {
-    const { api, inputText, choice, metaRunCenter, dispatchHidden } = await collector()
-    vi.mocked(metaRunCenter.launch).mockResolvedValue({ ok: true })
-    api.activateSlashCmd(choice)
-    api.metaDraft.value!.text = '  Compare battery life\nand price  '
-
-    await api.launchMetaDraft()
-
-    expect(metaRunCenter.launch).toHaveBeenCalledExactlyOnceWith({
-      name: 'meta-research',
-      sessionKey: 'agent:main:webchat:test',
-      clientRequestId: expect.any(String),
-      launchText: '/meta meta-research -- Compare battery life\nand price',
-    })
-    const request = vi.mocked(metaRunCenter.launch).mock.calls[0]![0]
-    expect(dispatchHidden).toHaveBeenCalledExactlyOnceWith(
-      request.launchText, request.launchText, request.clientRequestId, request.sessionKey,
-    )
-    expect(api.metaDraft.value).toBeNull()
-    expect(inputText.value).toBe('')
-  })
-
-  it('keeps newer composer input while the workflow launch is pending', async () => {
-    const launch = deferred()
-    const { api, inputText, choice, metaRunCenter, dispatchHidden } = await collector()
-    vi.mocked(metaRunCenter.launch).mockImplementation(async () => {
-      await launch.promise
-      return { ok: true }
-    })
-    api.activateSlashCmd(choice)
-    const sending = api.launchMetaDraft()
-    inputText.value = 'A separate next request'
-    launch.resolve()
-    await sending
-
-    expect(dispatchHidden).toHaveBeenCalledOnce()
-    expect(inputText.value).toBe('A separate next request')
-  })
-
-  it('passes setup and durable recovery the exact same request identity', async () => {
-    const readiness: MetaSetupReadiness = {
-      ready: false,
-      status: 'needs_setup',
-      missing_bins: ['research-tool'],
-    }
-    const requestMetaSetup = vi.fn(async () => 'visible' as const)
-    const { api, inputText, choice, metaRunCenter, dispatchHidden } = await collector({ requestMetaSetup })
-    vi.mocked(metaRunCenter.launch)
-      .mockResolvedValueOnce({ ok: false, setupRequired: true, readiness })
-      .mockResolvedValueOnce({ ok: true })
-    api.activateSlashCmd(choice)
-
-    await api.launchMetaDraft()
-
-    const request = vi.mocked(metaRunCenter.launch).mock.calls[0]![0]
-    expect(requestMetaSetup).toHaveBeenCalledExactlyOnceWith(
-      request.name, readiness, request.sessionKey, request.launchText, request.clientRequestId,
-    )
-    expect(dispatchHidden).not.toHaveBeenCalled()
-    expect(inputText.value).toBe('')
-
-    await expect(api.restoreDurableMetaDrafts([{
-      ...request,
-      clientRequestId: request.clientRequestId!,
-      launchText: request.launchText!,
-      createdAt: 1,
-      expiresAt: 2,
-      sessionExists: true,
-    }])).resolves.toEqual([request.clientRequestId])
-    expect(metaRunCenter.launch).toHaveBeenLastCalledWith(request)
-    expect(dispatchHidden).toHaveBeenCalledExactlyOnceWith(
-      request.launchText, request.launchText, request.clientRequestId, request.sessionKey,
-    )
-  })
-
-  it('keeps a failed staged launch on the existing retry path', async () => {
-    const requestMetaSetup = vi.fn(async () => 'visible' as const)
-    const restoreDraft = vi.fn()
-    const { api, choice, metaRunCenter, dispatchHidden } = await collector({ requestMetaSetup, restoreDraft })
-    vi.mocked(metaRunCenter.launch).mockResolvedValue({
-      ok: false,
-      drafted: true,
-      error: 'Setup interrupted',
-    })
-    api.activateSlashCmd(choice)
-
-    await api.launchMetaDraft()
-
-    const request = vi.mocked(metaRunCenter.launch).mock.calls[0]![0]
-    expect(requestMetaSetup).toHaveBeenCalledExactlyOnceWith(
-      request.name,
-      expect.objectContaining({ status: 'needs_setup', reasons: ['Setup interrupted'] }),
-      request.sessionKey,
-      request.launchText,
-      request.clientRequestId,
-    )
-    expect(dispatchHidden).not.toHaveBeenCalled()
-    expect(restoreDraft).not.toHaveBeenCalled()
-  })
-
-  it('does not launch an empty request or one collected for another session', async () => {
-    const sessionKey = ref('agent:main:webchat:test')
-    const { api, choice, metaRunCenter } = await collector({ sessionKey })
-    api.activateSlashCmd(choice)
-    api.metaDraft.value!.text = '  '
-    await api.launchMetaDraft()
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-
-    api.metaDraft.value!.text = 'Compare products'
-    sessionKey.value = 'agent:main:webchat:other'
-    await api.launchMetaDraft()
-    expect(metaRunCenter.launch).not.toHaveBeenCalled()
-  })
-})
-
-describe('useChatSlashCommands Coding mode', () => {
-  const codingCommand = {
-    name: '/coding',
-    description: 'Turn Coding mode on or off.',
-    aliases: [],
-    execution: { action: 'coding.mode' },
-  }
-
-  it('toggles Coding mode when /coding is entered without arguments', async () => {
-    const {
-      api,
-      codingModeEnabled,
-      inputText,
-      setCodingModeEnabled,
-    } = harness(false, [codingCommand])
-    inputText.value = '/coding'
-
-    await api.executeSlashCommand(inputText.value)
-    await Promise.resolve()
-
-    expect(setCodingModeEnabled).toHaveBeenCalledWith(true)
-    expect(inputText.value).toBe('')
-
-    codingModeEnabled.value = true
-    await api.executeSlashCommand('/coding')
-    await Promise.resolve()
-    expect(setCodingModeEnabled).toHaveBeenLastCalledWith(false)
-  })
-
-  it('keeps explicit on, off, and status arguments compatible without advertising them', async () => {
-    const {
-      api,
-      codingModeEnabled,
-      inputText,
-      setCodingModeEnabled,
-    } = harness(false, [codingCommand])
-
-    await api.loadSlashCommands()
-    inputText.value = '/coding '
-    api.handleSlashInput()
-    expect(api.filteredSlashCmds.value).toEqual([])
-
-    await api.executeSlashCommand('/coding on')
-    await Promise.resolve()
-    expect(setCodingModeEnabled).toHaveBeenCalledWith(true)
-
-    await api.executeSlashCommand('/coding off')
-    await Promise.resolve()
-    expect(setCodingModeEnabled).toHaveBeenCalledWith(false)
-
-    codingModeEnabled.value = true
-    await api.executeSlashCommand('/coding status')
-    expect(setCodingModeEnabled).toHaveBeenCalledTimes(2)
-    expect(inputText.value).toBe('')
-  })
-
-  it('describes the next /coding action from the current global state', async () => {
-    const { api, codingModeEnabled, inputText } = harness(false, [codingCommand])
-    await api.loadSlashCommands()
-    inputText.value = '/coding'
-
-    api.handleSlashInput()
-    expect(api.filteredSlashCmds.value[0].desc).toBe('Enable Coding mode.')
-
-    codingModeEnabled.value = true
-    api.handleSlashInput()
-    expect(api.filteredSlashCmds.value[0].desc).toBe('Disable Coding mode.')
-  })
-
-  it('completes a partial /coding candidate without toggling the mode', async () => {
-    const {
-      api,
-      inputText,
-      setCodingModeEnabled,
-    } = harness(false, [codingCommand])
-    await api.loadSlashCommands()
-    inputText.value = '/co'
-    api.handleSlashInput()
-    const candidate = api.filteredSlashCmds.value[0]
-
-    api.activateSlashCmd(candidate)
-
-    expect(inputText.value).toBe('/coding')
-    expect(setCodingModeEnabled).not.toHaveBeenCalled()
-    expect(api.slashOpen.value).toBe(false)
-  })
-
-  it('executes an exact /coding candidate only after completion', async () => {
-    const {
-      api,
-      inputText,
-      setCodingModeEnabled,
-    } = harness(false, [codingCommand])
-    await api.loadSlashCommands()
-    inputText.value = '/coding'
-    api.handleSlashInput()
-
-    api.activateSlashCmd(api.filteredSlashCmds.value[0])
-    await Promise.resolve()
-
-    expect(setCodingModeEnabled).toHaveBeenCalledWith(true)
-    expect(inputText.value).toBe('')
   })
 })
 
@@ -992,7 +558,8 @@ describe('unified skill palette', () => {
     const skillCatalog = { supportsCandidates: () => true, listCandidates } as unknown as SkillCatalog
     return { ...harness(false, [], Promise.resolve(), undefined, { skillCatalog, selectedSkills, ...extra }), selectedSkills, listCandidates }
   }
-  it('omits reset and usage from the menu while keeping all skills and workflows browseable', async () => {
+
+  it('omits reset and usage from the menu while keeping all ordinary skills browseable', async () => {
     const candidates = ['pdf-toolkit', 'github', 'docx', 'html-coder', 'pptx', 'xlsx', 'custom-skill']
       .map(name => ({ ...candidate, name, instanceId: `skill:${name}`,
         description: 'A brief purpose. Later details contain unique-search-term.' }))
@@ -1000,27 +567,20 @@ describe('unified skill palette', () => {
       supportsCandidates: () => true,
       listCandidates: vi.fn(async () => ({ generation: 1, candidates })),
     } as unknown as SkillCatalog
-    const commands = ['/usage', '/goal', '/new', '/coding', '/compact', '/reset'].map(name => ({ name, aliases: [] }))
-    const { api, inputText } = harness(false, [...commands, {
-      name: '/meta', aliases: [], execution: { action: 'meta.menu' },
-      argument_choices: ['meta-paper-write', 'meta-skill-creator', 'meta-short-drama', 'AwesomeWebpageMetaSkill']
-        .map(value => ({ value, description: 'A complete workflow description.' })),
-    }], Promise.resolve(), undefined, { skillCatalog })
+    const commands = ['/usage', '/goal', '/new', '/compact', '/reset'].map(name => ({ name, aliases: [] }))
+    const { api, inputText } = harness(false, commands, Promise.resolve(), undefined, { skillCatalog })
     await api.loadSlashCommands()
     inputText.value = '/'
     api.handleSlashInput()
     await Promise.resolve()
 
     expect(api.filteredSlashCmds.value.map(item => item.name)).toEqual([
-      '/goal', '/new', '/coding', '/compact', '/meta',
+      '/goal', '/new', '/compact',
       'pdf-toolkit', 'github', 'docx', 'html-coder', 'pptx', 'xlsx', 'custom-skill',
-      '/meta meta-paper-write', '/meta meta-skill-creator', '/meta meta-short-drama',
-      '/meta AwesomeWebpageMetaSkill',
     ])
     expect(api.filteredSlashCmds.value.map(item => item.kind)).toEqual([
-      ...commands.filter(command => !['/usage', '/reset'].includes(command.name)).map(() => 'command'), 'command',
+      ...commands.filter(command => !['/usage', '/reset'].includes(command.name)).map(() => 'command'),
       ...candidates.map(() => 'skill'),
-      'meta', 'meta', 'meta', 'meta',
     ])
     expect(api.filteredSlashCmds.value.find(item => item.name === 'custom-skill')?.desc).toBe('A brief purpose.')
 
@@ -1035,6 +595,30 @@ describe('unified skill palette', () => {
     expect(api.filteredSlashCmds.value).toHaveLength(candidates.length)
     expect(api.filteredSlashCmds.value.find(item => item.name === 'custom-skill')?.desc).toBe('A brief purpose.')
     expect(skillCatalog.listCandidates).toHaveBeenCalledOnce()
+  })
+
+  it('uses maintained Chinese product copy while preserving bilingual search', async () => {
+    const previousLocale = i18n.global.locale.value
+    await loadLocaleMessages('zh-Hans')
+    i18n.global.locale.value = 'zh-Hans'
+    try {
+      const { api, inputText } = harness(false, ['/new', '/compact'].map(name => ({ name, aliases: [] })),
+        Promise.resolve(), undefined, { skillCatalog: {
+          supportsCandidates: () => true,
+          listCandidates: vi.fn(async () => ({ generation: 1, candidates: [{ ...candidate, descriptionZh: 'Use an implementation package and lengthy trigger rules.' }] })),
+        } as unknown as SkillCatalog })
+      await api.loadSlashCommands()
+      inputText.value = '/'
+      api.handleSlashInput()
+      await Promise.resolve()
+      expect(api.filteredSlashCmds.value.slice(0, 2).map(item => item.desc)).toEqual(['新建聊天', '压缩当前对话上下文'])
+      expect(api.filteredSlashCmds.value.find(item => item.name === 'xlsx')).toMatchObject({ label: 'Excel 表格', desc: '创建、编辑与分析电子表格' })
+      inputText.value = '/EXCEL'
+      api.handleSlashInput()
+      expect(api.filteredSlashCmds.value[0]?.name).toBe('xlsx')
+    } finally {
+      i18n.global.locale.value = previousLocale
+    }
   })
 
   it('preserves catalog skill order without promoting built-ins or hiding later entries', async () => {
@@ -1053,30 +637,6 @@ describe('unified skill palette', () => {
     inputText.value = '/'
     api.handleSlashInput()
     expect(api.filteredSlashCmds.value.map(item => item.name)).toEqual(['custom-first', 'github', 'docx', 'custom-last'])
-  })
-
-  it('uses maintained Chinese product copy while preserving bilingual search', async () => {
-    const previousLocale = i18n.global.locale.value
-    await loadLocaleMessages('zh-Hans')
-    i18n.global.locale.value = 'zh-Hans'
-    try {
-      const { api, inputText } = harness(false, ['/new', '/coding', '/compact'].map(name => ({ name, aliases: [] })),
-        Promise.resolve(), undefined, { skillCatalog: {
-          supportsCandidates: () => true,
-          listCandidates: vi.fn(async () => ({ generation: 1, candidates: [{ ...candidate, descriptionZh: 'Use an implementation package and lengthy trigger rules.' }] })),
-        } as unknown as SkillCatalog })
-      await api.loadSlashCommands()
-      inputText.value = '/'
-      api.handleSlashInput()
-      await Promise.resolve()
-      expect(api.filteredSlashCmds.value.slice(0, 3).map(item => item.desc)).toEqual(['新建聊天', '开启编程模式', '压缩当前对话上下文'])
-      expect(api.filteredSlashCmds.value.find(item => item.name === 'xlsx')).toMatchObject({ label: 'Excel 表格', desc: '创建、编辑与分析电子表格' })
-      inputText.value = '/EXCEL'
-      api.handleSlashInput()
-      expect(api.filteredSlashCmds.value[0]?.name).toBe('xlsx')
-    } finally {
-      i18n.global.locale.value = previousLocale
-    }
   })
   it('loads lazily, searches Chinese and English locally, and only replaces the query', async () => {
     const { api, inputText, selectedSkills, listCandidates } = skills()

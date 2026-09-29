@@ -4,7 +4,6 @@ import type { RpcCallOptions } from '@/lib/rpc'
 import type { ClarificationSubmission } from '@/modules/clarificationSubmission'
 import type { CommandCatalog } from '@/modules/commandCatalog'
 import type { PromptCacheLease } from '@/modules/promptCacheLease'
-import type { RouteFeedback } from '@/modules/routeFeedback'
 
 export interface AncillaryTestRpc {
   call(
@@ -34,15 +33,6 @@ export function clarificationSubmissionFromTestRpc(
   rpc: AncillaryTestRpc,
 ): ClarificationSubmission {
   return createV4ClarificationSubmission(transport(rpc))
-}
-
-export function routeFeedbackTestDouble(
-  overrides: Partial<RouteFeedback> = {},
-): RouteFeedback {
-  return {
-    submit: async () => ({ accepted: true }),
-    ...overrides,
-  }
 }
 
 export function promptCacheLeaseTestDouble(

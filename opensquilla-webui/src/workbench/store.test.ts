@@ -2,10 +2,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPinia, setActivePinia } from 'pinia'
 import { WORKBENCH_WIDTH_STORAGE_KEY } from './layout'
-import {
-  useWorkbenchStore,
-  WORKBENCH_PREVIEW_ITEM_LIMIT,
-} from './store'
+import { useWorkbenchStore } from './store'
 import type { WorkbenchItem } from './types'
 
 function item(
@@ -160,64 +157,88 @@ describe('workbench store', () => {
     )).toBeNull()
   })
 
-  it('evicts the least recently used preview after the bounded tab limit', () => {
+  it.each(['dom', 'native-webcontents'] as const)(
+    'keeps %s tabs available when opening more previews from a collapsed pane',
+    hostKind => {
+      const store = useWorkbenchStore()
+      const disposed = vi.fn()
+      store.onLifecycle(event => {
+        if (event.type === 'dispose') disposed(event)
+      })
+      const preview = (id: string): WorkbenchItem => ({ ...item(id), hostKind })
+      for (let index = 0; index < 12; index += 1) {
+        expect(store.openItem(preview(`preview-${index}`))).toBe(true)
+      }
+      store.activateItem('preview-0')
+      store.setExpanded(false)
+      expect(store.openItem(preview('preview-new'))).toBe(true)
+
+      expect(store.items.map(candidate => candidate.id)).toEqual([
+        ...Array.from({ length: 12 }, (_, index) => `preview-${index}`),
+        'preview-new',
+      ])
+      expect(disposed).not.toHaveBeenCalled()
+      expect(store.activeItemId).toBe('preview-new')
+      expect(store.isVisible).toBe(true)
+
+      expect(store.openItem({ ...preview('preview-0'), title: 'Updated' })).toBe(true)
+      expect(store.items).toHaveLength(13)
+      expect(store.activeItem?.title).toBe('Updated')
+      expect(disposed).not.toHaveBeenCalled()
+    },
+  )
+
+  it('retains ordinary previews until closed and keeps browser tabs across sessions', () => {
     const store = useWorkbenchStore()
     const disposed: string[] = []
     store.onLifecycle(event => {
-      if (event.type === 'dispose') {
-        disposed.push(`${event.item.id}:${event.reason}`)
-      }
+      if (event.type === 'dispose') disposed.push(`${event.item.id}:${event.reason}`)
     })
-
-    for (let index = 0; index < WORKBENCH_PREVIEW_ITEM_LIMIT; index += 1) {
-      store.openItem(item(`preview-${index}`))
+    store.openItem(item('document'))
+    for (let index = 0; index < 12; index += 1) {
+      store.openItem({
+        ...item(`native-${index}`),
+        kind: index % 2 === 0 ? 'artifact-preview' : 'browser',
+        hostKind: 'native-webcontents',
+      })
     }
-    store.activateItem('preview-0')
-    store.openItem(item('preview-new'))
+    expect(store.items).toHaveLength(13)
+    expect(disposed).toEqual([])
 
-    expect(store.items).toHaveLength(WORKBENCH_PREVIEW_ITEM_LIMIT)
-    expect(store.items.some(candidate => candidate.id === 'preview-0')).toBe(true)
-    expect(store.items.some(candidate => candidate.id === 'preview-1')).toBe(false)
-    expect(disposed).toContain('preview-1:evicted')
-    expect(store.activeItemId).toBe('preview-new')
-  })
+    store.closeItem('native-11')
+    expect(store.items).toHaveLength(12)
+    expect(store.activeItemId).toBe('native-10')
+    expect(disposed).toEqual(['native-11:closed'])
 
-  it('refuses a ninth native surface without evicting a hidden item', () => {
-    const store = useWorkbenchStore()
-    const nativeItem = (id: string): WorkbenchItem => ({
-      ...item(id),
-      hostKind: 'native-webcontents',
-    })
-    for (let index = 0; index < WORKBENCH_PREVIEW_ITEM_LIMIT; index += 1) {
-      expect(store.openItem(nativeItem(`native-${index}`))).toBe(true)
-    }
-
-    expect(store.openItem(nativeItem('native-new'))).toBe(false)
-    expect(store.items).toHaveLength(WORKBENCH_PREVIEW_ITEM_LIMIT)
-    expect(store.items.map(candidate => candidate.id)).toEqual(
-      Array.from(
-        { length: WORKBENCH_PREVIEW_ITEM_LIMIT },
-        (_, index) => `native-${index}`,
-      ),
-    )
-    expect(store.activeItemId).toBe('native-7')
+    store.setSessionScope('session-b')
+    expect(store.items.map(candidate => candidate.id)).toEqual([
+      'native-1', 'native-3', 'native-5', 'native-7', 'native-9',
+    ])
+    expect(store.visibleItems).toEqual([])
+    expect(store.activeItemId).toBeNull()
+    expect(disposed).toEqual([
+      'native-11:closed',
+      'document:scope-changed',
+      ...Array.from({ length: 6 }, (_, index) => `native-${index * 2}:scope-changed`),
+    ])
   })
 
   it('bounds web browser tabs across sessions without evicting a retained page', () => {
     const store = useWorkbenchStore()
+    const browserTabLimit = 8
     const webPage = (index: number): WorkbenchItem => ({
       ...browserItem(`web-${index}`, `session-${index}`),
       hostKind: 'dom',
     })
-    for (let index = 0; index < WORKBENCH_PREVIEW_ITEM_LIMIT; index += 1) {
+    for (let index = 0; index < browserTabLimit; index += 1) {
       expect(store.openItem(webPage(index), { activate: false })).toBe(true)
     }
-    expect(store.openItem(webPage(WORKBENCH_PREVIEW_ITEM_LIMIT))).toBe(false)
-    expect(store.items).toHaveLength(WORKBENCH_PREVIEW_ITEM_LIMIT)
+    expect(store.openItem(webPage(browserTabLimit))).toBe(false)
+    expect(store.items).toHaveLength(browserTabLimit)
     expect(store.openItem(webPage(0))).toBe(true)
     expect(store.activeItemId).toBe('web-0')
     store.closeItem('web-1')
-    expect(store.openItem(webPage(WORKBENCH_PREVIEW_ITEM_LIMIT))).toBe(true)
+    expect(store.openItem(webPage(browserTabLimit))).toBe(true)
   })
 
   it('updates background item payloads without stealing the active tab', () => {

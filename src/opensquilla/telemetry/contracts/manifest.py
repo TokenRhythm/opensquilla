@@ -52,8 +52,6 @@ _EVENT_SPECS: Final = (
     ("first_turn_started", 1, "growth"),
     ("first_turn_result", 1, "growth"),
     ("client_launch", 1, "growth"),
-    ("metaskill_usage", 1, "growth"),
-    ("coding_mode_usage", 1, "growth"),
     ("product_active", 1, "growth"),
 )
 

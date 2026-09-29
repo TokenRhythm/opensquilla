@@ -72,6 +72,18 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
+
+class FlowDeliveryStaleError(ValueError):
+    """A flow receipt no longer belongs to the current connection state.
+
+    This is a connection-local recovery condition.  It must not be treated as
+    transport exhaustion: the caller can restart snapshot reconciliation on the
+    same authenticated socket without weakening the memory/queue limits.
+    """
+
+    pass
+
+
 _SnapshotIdentity = tuple[str | None, int | None]
 _FlowInstallReceipt = tuple[Any, Any, Any, Any, Any]
 _InstalledFlowReceipt = tuple[Any, Any, Any, Any, Any, _SnapshotIdentity]
@@ -149,6 +161,7 @@ _CONCURRENT_OPTIONAL_READ_METHODS: frozenset[str] = frozenset(
         "sandbox.run_mode.preference.get",
         "sessions.list",
         "sessions.messages.hydrate",
+        "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     }
@@ -164,7 +177,7 @@ _PROVIDER_PROBE_MODES: tuple[str, ...] = ("model", "reachability")
 _ACTIVE_PROVIDER_PROBE_LEASES: set[object] = set()
 _MAX_ACTIVE_PROVIDER_PROBES = 16
 _BASE_DETACHED_RPC_METHODS: frozenset[str] = frozenset(
-    {"meta.drafts.list", "skills.install"}
+    {"skills.install"}
 ).union(
     _CONCURRENT_OPTIONAL_READ_METHODS,
 )
@@ -272,6 +285,19 @@ def _payload_field(payload: Any, key: str) -> Any:
     if isinstance(payload, dict):
         return payload.get(key)
     return None
+
+
+def _is_snapshot_delivery_payload(payload: Any) -> bool:
+    """Identify the recovery snapshot envelope before applying flow rules."""
+    if not isinstance(payload, dict):
+        return False
+    return (
+        all(isinstance(payload.get(name), str) and payload[name] for name in (
+            "key", "snapshot_id", "sync_revision",
+        ))
+        and isinstance(payload.get("data"), str)
+        and type(payload.get("segment_index")) is int
+    )
 
 
 @dataclass
@@ -1730,18 +1756,29 @@ class WsConnection:
             if wire_size > MAX_PAYLOAD_BYTES:
                 raise ValueError("Outbound frame exceeds the wire limit")
             receipt = _payload_field(frame.res_frame.payload, "delivery")
-            if isinstance(receipt, dict) and receipt.get("delivery_epoch") == self._flow.epoch:
+            if isinstance(receipt, dict) and _is_snapshot_delivery_payload(frame.res_frame.payload):
+                if receipt.get("delivery_epoch") != self._flow.epoch:
+                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
                 delivery_id = receipt.get("delivery_id")
                 if not isinstance(delivery_id, int) or isinstance(delivery_id, bool):
-                    raise ValueError("Snapshot delivery reservation is not current")
+                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
                 delivery = self._flow.deliveries.get(delivery_id)
                 if delivery is None or not delivery.recovery:
-                    raise ValueError("Snapshot delivery reservation is not current")
+                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
                 extra = max(0, size - delivery.size)
                 if extra and not self.reserve_transport_bytes(extra, kind="recovery"):
                     raise ValueError("Snapshot response exceeds the transport budget")
                 delivery.size += extra
                 if self._recovery_enabled and not self._flow.claim(delivery_id, "original"):
+                    # ``claim`` can lose a race with a cancellation/tombstone
+                    # after the response was encoded.  A delivery already
+                    # published as a tombstone (or as the original response)
+                    # is an idempotent duplicate and must remain suppressed;
+                    # it is not a new stale receipt requiring resync.  Undo
+                    # any size growth before dropping that duplicate.
+                    if extra:
+                        delivery.size -= extra
+                        self.release_transport_bytes(extra, kind="recovery")
                     return False
                 frame.delivery_id = delivery_id
                 frame.encoded_text = encoded
@@ -1903,15 +1940,50 @@ class WsConnection:
             try:
                 if not self._prepare_flow_frame(frame):
                     return
-            except Exception:
+            except Exception as exc:
                 # Admission may have reserved bytes before a later flow
                 # validation/encoding step failed.  The frame will never
                 # enter the outbox, so release that reservation here before
                 # taking either the dirty-session or force-close path.
                 self._release_outbound_budget(frame)
                 log.warning(
-                    "gateway.ws_flow_encode_or_budget_failed", conn_id=self.conn_id, exc_info=True
+                    "gateway.ws_flow_encode_or_budget_failed",
+                    conn_id=self.conn_id,
+                    exception_type=type(exc).__name__,
+                    failure_class=(
+                        "stale_delivery" if isinstance(exc, FlowDeliveryStaleError)
+                        else "flow_admission"
+                    ),
+                    exc_info=True,
                 )
+                if isinstance(exc, FlowDeliveryStaleError):
+                    # A stale snapshot response is recoverable.  Mark only its
+                    # session dirty and return a retryable RPC error so the
+                    # client performs a complete snapshot resync.  The error
+                    # frame has no delivery receipt, so it is safe to enqueue
+                    # through the ordinary control path on this same socket.
+                    key = _payload_field(
+                        frame.res_frame.payload if frame.res_frame is not None else None,
+                        "key",
+                    )
+                    if isinstance(key, str):
+                        self._mark_flow_dirty({"session_key": key})
+                    if frame.res_frame is not None:
+                        self._enqueue_frame(_OutboundFrame(
+                            kind="res",
+                            classification="control",
+                            payload=None,
+                            event_name=None,
+                            res_frame=make_error_res(
+                                frame.res_frame.id,
+                                "SNAPSHOT_STALE",
+                                "Snapshot synchronization is temporarily unavailable",
+                                retryable=True,
+                                accepted=False,
+                            ),
+                            is_control=True,
+                        ))
+                    return
                 if frame.event_name and frame.event_name.startswith("session.event."):
                     self._mark_flow_dirty(frame.payload)
                     return
@@ -2258,7 +2330,6 @@ async def handle_ws_connection(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2446,10 +2517,16 @@ async def handle_ws_connection(
         conn._enable_flow()
 
     # Step 6: Send HelloOk
+    from opensquilla.gateway.turn_receipts import (
+        TURN_RECEIPT_CAPABILITY,
+        TURN_RECEIPT_METHOD,
+        can_read_turn_receipts,
+    )
+
     hello = HelloOk(
         protocol=negotiated,
         server=ServerInfo(version=__version__, conn_id=conn_id),
-        features=_build_features(dispatcher),
+        features=_build_features(dispatcher, principal=conn.principal),
         snapshot=SnapshotInfo(
             uptime_ms=int(time.time() * 1000),
             config_path=config.config_path,
@@ -2457,6 +2534,12 @@ async def handle_ws_connection(
             auth_mode=config.auth.mode,
         ),
         policy=PolicyInfo(
+            turn_receipt_lookup=(
+                TURN_RECEIPT_CAPABILITY
+                if can_read_turn_receipts(conn.principal)
+                and TURN_RECEIPT_METHOD in dispatcher.list_methods()
+                else None
+            ),
             transport_probe_nonce=PROBE_CAPABILITY in conn.client_caps,
             transport_flow=(
                 {
@@ -2531,7 +2614,6 @@ async def handle_ws_connection(
             channel_manager,
             usage_tracker,
             usage_event_sink,
-            meta_run_writer,
             skill_loader,
             skill_management_state,
             cron_scheduler,
@@ -2745,7 +2827,6 @@ async def _message_loop(
     channel_manager: Any = None,
     usage_tracker: Any = None,
     usage_event_sink: Any = None,
-    meta_run_writer: Any = None,
     skill_loader: Any = None,
     skill_management_state: dict[str, Any] | None = None,
     cron_scheduler: Any = None,
@@ -2923,7 +3004,6 @@ async def _message_loop(
                 ),
                 usage_tracker=usage_tracker,
                 usage_event_sink=usage_event_sink,
-                meta_run_writer=meta_run_writer,
                 skill_loader=skill_loader,
                 skill_management_service=skill_management_service,
                 skill_management_state=(
@@ -3133,11 +3213,14 @@ async def _dispatch_and_send(
     await conn.send_res(response)
 
 
-def _build_features(dispatcher: RpcDispatcher) -> Any:
+def _build_features(dispatcher: RpcDispatcher, *, principal: Principal | None = None) -> Any:
     from opensquilla.contracts.gateway_transport import TURN_COMMITTED_EVENT
     from opensquilla.gateway.protocol import FeaturesInfo
+    from opensquilla.gateway.turn_receipts import TURN_RECEIPT_METHOD, can_read_turn_receipts
 
     methods = dispatcher.list_methods()
+    if principal is not None and not can_read_turn_receipts(principal):
+        methods = [method for method in methods if method != TURN_RECEIPT_METHOD]
     events = [
         "connect.challenge",
         "agent",

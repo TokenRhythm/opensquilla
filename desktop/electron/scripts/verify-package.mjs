@@ -282,10 +282,8 @@ async function verifyRuntime(root, label, { platform, executeCommands }) {
   if (executeCommands) {
     if (!binary) return
     verifyGatewayCommand(binary, label, ['--help'])
-    verifyGatewayCommand(binary, label, ['code-task', '--help'])
-    verifyGatewayCommand(binary, label, ['code-task', 'stage-task-file'], { input: 'desktop package smoke\n' })
-    verifyGatewayCommand(binary, label, ['code-task', 'smoke-imports'], { timeout: 120000 })
-    verifyGatewayCommand(binary, label, ['code-task', 'smoke-router'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-imports'], { timeout: 120000 })
+    verifyGatewayCommand(binary, label, ['diagnostics', 'smoke-router'], { timeout: 120000 })
   }
 
   if (platform === 'darwin') {

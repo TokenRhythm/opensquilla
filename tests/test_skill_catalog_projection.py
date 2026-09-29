@@ -10,21 +10,13 @@ from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.steps.skill_catalog_projection import resolve_skill_catalog
 from opensquilla.gateway import config_migration
 from opensquilla.gateway.config import GatewayConfig, SkillsConfig
-from opensquilla.gateway.rpc import RpcContext
-from opensquilla.gateway.rpc_meta_runs import _handle_meta_inspect, _handle_meta_list
-from opensquilla.gateway.rpc_skills import _handle_skills_list
 from opensquilla.skills.catalog_policy import (
     PUBLIC_BUNDLED_SKILLS,
-    STABLE_META_DEPENDENCIES,
-    STABLE_META_SKILLS,
     project_public_catalog,
 )
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.skills.types import SkillLayer, SkillSpec
 from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
-from opensquilla.tools.builtin import skill_tools as skill_tools_module
-from opensquilla.tools.registry import get_default_registry
-from opensquilla.tools.types import current_meta_skill_owner
 
 ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
@@ -34,12 +26,9 @@ def _loader(tmp_path: Path) -> SkillLoader:
     return SkillLoader(bundled_dir=BUNDLED, snapshot_path=tmp_path / "snapshot.json")
 
 
-def _ctx(loader: SkillLoader, *, coding_mode: bool = False, meta_auto: bool = True) -> TurnContext:
+def _ctx(loader: SkillLoader) -> TurnContext:
     config = GatewayConfig()
-    config.skills.coding_mode = coding_mode
     config.skills.max_skills_prompt_chars = 100_000
-    config.meta_skill.enabled = True
-    config.meta_skill.auto_trigger = meta_auto
     snapshot = loader.snapshot_for_turn("test")
     return TurnContext(
         message="synthetic catalog contract",
@@ -51,8 +40,10 @@ def _ctx(loader: SkillLoader, *, coding_mode: bool = False, meta_auto: bool = Tr
             SimpleNamespace(name="background_process"),
             SimpleNamespace(name="exec_command"),
             SimpleNamespace(name="process"),
-            *(SimpleNamespace(name=f"mcp__desktop-browser__{name}")
-              for name in BROWSER_MCP_REQUIRED_TOOLS),
+            *(
+                SimpleNamespace(name=f"mcp__desktop-browser__{name}")
+                for name in BROWSER_MCP_REQUIRED_TOOLS
+            ),
         ],
         system_prompt=("base", "dynamic"),
         skill_catalog=snapshot,
@@ -71,46 +62,19 @@ def test_public_bundled_contract_is_exact_and_ordered(tmp_path: Path) -> None:
     snapshot = loader.snapshot_for_turn("test")
     projected = project_public_catalog(
         snapshot.skills,
-        coding_mode=False,
-        include_stable_meta=False,
     )
     bundled = [skill.name for skill in projected if skill.layer is SkillLayer.BUNDLED]
     assert bundled == list(PUBLIC_BUNDLED_SKILLS)
 
-
-def test_stable_meta_roots_and_dependencies_remain_in_internal_snapshot(tmp_path: Path) -> None:
-    snapshot = _loader(tmp_path).snapshot_for_turn("test")
-    index = {skill.name: skill for skill in snapshot.skills}
-    assert all(name in index for name in STABLE_META_SKILLS)
-    for owner, dependencies in STABLE_META_DEPENDENCIES.items():
-        assert index[owner].visibility == "meta"
-        for dependency in dependencies:
-            assert dependency in index
-            assert index[dependency].visibility == "internal"
-            assert owner in index[dependency].owner_meta_skills
-
-
 @pytest.mark.asyncio
-async def test_prompt_contains_public_eight_then_stable_meta_only(tmp_path: Path) -> None:
+async def test_prompt_contains_only_public_ordinary_skills(tmp_path: Path) -> None:
     output = await resolve_skill_catalog(_ctx(_loader(tmp_path)))
     base, suffix = output.system_prompt
     assert suffix == "dynamic"
     names = _rendered_names(base)
     assert names[: len(PUBLIC_BUNDLED_SKILLS)] == list(PUBLIC_BUNDLED_SKILLS)
-    assert names[len(PUBLIC_BUNDLED_SKILLS) :] == [
-        name for name in STABLE_META_SKILLS if name in names
-    ]
-    assert "meta-skill-creator" in names
-    assert "paper-section-author" not in base
-    assert "meta-kid-project-planner" not in base
+    assert names == list(PUBLIC_BUNDLED_SKILLS)
     assert output.metadata["skills_catalog_omitted_count"] == 0
-
-
-@pytest.mark.asyncio
-async def test_manual_meta_mode_removes_meta_roots_from_prompt(tmp_path: Path) -> None:
-    output = await resolve_skill_catalog(_ctx(_loader(tmp_path), meta_auto=False))
-    assert _rendered_names(output.system_prompt[0]) == list(PUBLIC_BUNDLED_SKILLS)
-
 
 @pytest.mark.asyncio
 async def test_browser_skill_requires_its_browser_tools_in_the_turn(tmp_path: Path) -> None:
@@ -122,20 +86,13 @@ async def test_browser_skill_requires_its_browser_tools_in_the_turn(tmp_path: Pa
 
     missing = _ctx(loader)
     missing.tool_defs = [
-        tool for tool in missing.tool_defs
+        tool
+        for tool in missing.tool_defs
         if tool.name != "mcp__desktop-browser__browser_open"
     ]
     assert "browser-use" not in _rendered_names(
         (await resolve_skill_catalog(missing)).system_prompt[0]
     )
-
-
-@pytest.mark.asyncio
-async def test_code_task_is_visible_only_in_coding_mode(tmp_path: Path) -> None:
-    off = await resolve_skill_catalog(_ctx(_loader(tmp_path), coding_mode=False))
-    on = await resolve_skill_catalog(_ctx(_loader(tmp_path), coding_mode=True))
-    assert "code-task" not in _rendered_names(off.system_prompt[0])
-    assert "code-task" in _rendered_names(on.system_prompt[0])
 
 
 @pytest.mark.asyncio
@@ -270,8 +227,6 @@ def test_user_owned_layers_remain_public_and_stably_sorted() -> None:
             spec("alpha", SkillLayer.MANAGED),
             spec("gamma", SkillLayer.PROJECT),
         ],
-        coding_mode=False,
-        include_stable_meta=False,
     )
     assert [(skill.layer, skill.name) for skill in projected] == [
         (SkillLayer.PERSONAL, "beta"),
@@ -279,56 +234,3 @@ def test_user_owned_layers_remain_public_and_stably_sorted() -> None:
         (SkillLayer.PROJECT, "gamma"),
         (SkillLayer.WORKSPACE, "zeta"),
     ]
-
-
-@pytest.mark.asyncio
-async def test_rpc_keeps_legacy_meta_catalog_and_adds_meta_inspection(tmp_path: Path) -> None:
-    loader = _loader(tmp_path)
-    ctx = RpcContext(conn_id="test", skill_loader=loader)
-    ordinary = await _handle_skills_list(None, ctx)
-    metas = await _handle_meta_list(None, ctx)
-    assert [row["name"] for row in ordinary["skills"]] == [
-        *PUBLIC_BUNDLED_SKILLS, *STABLE_META_SKILLS,
-    ]
-    assert [row["name"] for row in metas["skills"]] == list(STABLE_META_SKILLS)
-
-    detail = await _handle_meta_inspect({"name": "meta-paper-write"}, ctx)
-    assert [item["name"] for item in detail["dependencies"]] == list(
-        STABLE_META_DEPENDENCIES["meta-paper-write"]
-    )
-    assert all(item["visibility"] == "internal" for item in detail["dependencies"])
-    assert "content" not in detail
-
-
-@pytest.mark.asyncio
-async def test_internal_body_requires_trusted_meta_execution_domain(tmp_path: Path) -> None:
-    loader = _loader(tmp_path)
-    previous = skill_tools_module._loader
-    skill_tools_module.create_skill_tools(loader)
-    registered = get_default_registry().get("skill_view")
-    assert registered is not None
-    try:
-        denied = await registered.handler(name="paper-section-author", file_path=None)
-        assert "Skill not found" in denied
-
-        wrong = current_meta_skill_owner.set("meta-short-drama")
-        try:
-            denied_wrong_owner = await registered.handler(
-                name="paper-section-author",
-                file_path=None,
-            )
-        finally:
-            current_meta_skill_owner.reset(wrong)
-        assert "Skill not found" in denied_wrong_owner
-
-        trusted = current_meta_skill_owner.set("meta-paper-write")
-        try:
-            body = await registered.handler(name="paper-section-author", file_path=None)
-        finally:
-            current_meta_skill_owner.reset(trusted)
-        assert "You are drafting one section" in body
-
-        meta_root = await registered.handler(name="meta-paper-write", file_path=None)
-        assert "Skill not found" in meta_root
-    finally:
-        skill_tools_module._loader = previous

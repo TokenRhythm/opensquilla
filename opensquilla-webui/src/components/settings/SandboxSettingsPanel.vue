@@ -403,6 +403,7 @@ const {
   capabilityLoading,
   loadError,
   capability,
+  sandboxSetupStatus,
   canRequestSandboxSetup,
   draft,
   builtinDenyWritePaths,
@@ -665,11 +666,9 @@ function runtimeInstallLabel(status: SandboxRuntimeComponentStatus): string {
 function selectSafeMode(): void {
   sandboxSetupStore.resetOutcome()
   sandboxSetupStore.noteRunModeSelection('safe')
-  const windowsNeedsExplicitSetup = (
-    capability.value?.available === true
-    && capability.value.platform === 'win32'
-  )
-  if (capability.value?.available && !windowsNeedsExplicitSetup) {
+  const isWindows = capability.value?.platform === 'win32'
+  const setupReady = sandboxSetupStatus.value?.state === 'ready'
+  if (capability.value?.available && (!isWindows || setupReady)) {
     void setDefaultRunMode('safe')
     return
   }

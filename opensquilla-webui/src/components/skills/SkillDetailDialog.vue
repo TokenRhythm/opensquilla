@@ -31,7 +31,7 @@
           <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.useInTaskHint') }}</p>
         </div>
 
-        <div v-if="canSetEnabled && !isMetaSkill(skill) && skill.name !== 'code-task'" class="sk-detail__section">
+        <div v-if="canSetEnabled" class="sk-detail__section">
           <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.allowUse') }}</div>
           <p class="sk-detail__advisory-note">{{ t('cronSkills.skillDetail.allowUseHelp') }}</p>
           <button
@@ -45,20 +45,6 @@
           >
             {{ settingEnabled ? t('cronSkills.skillDetail.saving') : skill.disabled ? t('cronSkills.skillDetail.enable') : t('cronSkills.skillDetail.disable') }}
           </button>
-        </div>
-
-        <div v-if="isMetaSkill(skill) && skill.triggers && skill.triggers.length" class="sk-detail__section">
-          <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.triggers') }}</div>
-          <div class="sk-detail__sub-list">
-            <code v-for="trg in skill.triggers" :key="trg" class="sk-chip sk-chip--trigger">{{ trg }}</code>
-          </div>
-        </div>
-
-        <div v-if="isMetaSkill(skill) && skill.sub_skills && skill.sub_skills.length" class="sk-detail__section">
-          <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.composition', { kind: skill.kind === 'meta_sop' ? 'meta_sop' : 'meta', count: skill.sub_skills.length }) }}</div>
-          <div class="sk-detail__sub-list">
-            <span v-for="n in skill.sub_skills" :key="n" class="sk-chip sk-chip--sub">{{ n }}</span>
-          </div>
         </div>
 
         <div class="sk-detail__section">
@@ -143,23 +129,6 @@
           </ul>
         </div>
 
-        <div v-if="hasSubSkillRollup" class="sk-detail__section">
-          <div class="sk-detail__section-title">{{ t('cronSkills.skillDetail.subSkillRollup') }}</div>
-          <ul class="sk-detail__missing">
-            <li v-for="child in dependencySummary.sub_skill_dependencies.skills" :key="`child:${child.name}`">
-              <code>{{ child.name }}</code>
-              <span class="sk-dim">{{ t('cronSkills.skillDetail.subSkillStatus', {
-                missing: child.summary.missing.count,
-                advisory: childAdvisoryCount(child.summary),
-              }) }}</span>
-            </li>
-            <li v-for="name in dependencySummary.sub_skill_dependencies.missing_references" :key="`missing-child:${name}`">
-              <code>{{ name }}</code>
-              <span class="sk-dim">{{ t('cronSkills.skillDetail.missingSubSkill') }}</span>
-            </li>
-          </ul>
-        </div>
-
         <div v-if="installFeedback" class="sk-detail__content-state sk-detail__content-state--warn" role="status">
           {{ installFeedback }}
         </div>
@@ -170,14 +139,9 @@
             v-for="i in installActions"
             :key="i.id"
             class="sk-detail__install-row"
-            :class="{ 'sk-detail__install-row--toolchain': usesMetaToolchainSetup(i.kind) }"
           >
             <span>{{ i.label || t('cronSkills.skillDetail.installVia', { kind: i.kind }) }}{{ i.bins?.length ? ` (${i.bins.join(', ')})` : '' }}</span>
-            <span v-if="usesMetaToolchainSetup(i.kind)" class="sk-dim sk-detail__toolchain-guidance">
-              {{ t('cronSkills.skillDetail.toolchainSetupGuidance') }}
-            </span>
             <button
-              v-else
               class="btn btn--primary btn--sm"
               :disabled="mutationDisabled || installingDepsId === i.id"
               @click="emit('installDeps', skill.name, i.id)"
@@ -207,7 +171,6 @@
       </footer>
     </div>
 
-    <ProposalDetailPanel v-else-if="proposal" :proposal="proposal" @close="requestClose" />
   </dialog>
 </template>
 
@@ -215,10 +178,8 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import Icon from '@/components/Icon.vue'
-import ProposalDetailPanel from '@/components/skills/ProposalDetailPanel.vue'
-import type { Proposal, Skill } from '@/types/skills'
+import type { Skill } from '@/types/skills'
 import {
-  isMetaSkill,
   installActionsForCurrentDependencies,
   localizedSkillDescription,
   skillDependencyCounts,
@@ -233,7 +194,6 @@ const { t, locale } = useI18n()
 
 const props = defineProps<{
   skill: Skill | null
-  proposal: Proposal | null
   loadingContent: boolean
   contentError: string
   installFeedback: string
@@ -258,19 +218,8 @@ const dialogLabel = computed(() => {
   if (props.skill) {
     return t('cronSkills.skillDetail.dialogLabel', { name: props.skill.name })
   }
-  if (props.proposal) {
-    return t('cronSkills.proposalDetail.dialogLabel', { id: props.proposal.proposal_id })
-  }
   return undefined
 })
-
-function isToolchainInstall(kind: string | undefined) {
-  return kind?.trim().toLowerCase() === 'toolchain'
-}
-
-function usesMetaToolchainSetup(kind: string | undefined) {
-  return Boolean(props.skill && isMetaSkill(props.skill) && isToolchainInstall(kind))
-}
 
 const dependencySummary = computed(() => props.skill
   ? skillDependencySummary(props.skill)
@@ -290,25 +239,10 @@ const hasDeclaredDependencies = computed(() => {
     || declared.api_env.any.length > 0
 })
 const hasAdvisories = computed(() => dependencyCounts.value.advisory > 0)
-const hasSubSkillRollup = computed(() => {
-  const rollup = dependencySummary.value.sub_skill_dependencies
-  return rollup.skills.length > 0 || rollup.missing_references.length > 0
-})
-
-function childAdvisoryCount(summary: ReturnType<typeof skillDependencySummary>): number {
-  return summary.inferred.python_imports.length
-    + summary.inferred.api_env.length
-    + summary.inferred.scan_errors.length
-    + summary.sub_skill_dependencies.inferred_count
-    + summary.sub_skill_dependencies.missing_references.length
-}
-
 function selectionKey(): string {
   return props.skill
     ? `skill:${props.skill.name}`
-    : props.proposal
-      ? `proposal:${props.proposal.proposal_id}`
-      : ''
+    : ''
 }
 
 function syncDialog(key = selectionKey()) {
@@ -333,7 +267,7 @@ function requestClose() {
 function onNativeClose() {
   // Keep parent selection in sync with native close paths so the same card can
   // be selected again without leaving stale truthy state in the parent.
-  if (props.skill || props.proposal) requestClose()
+  if (props.skill) requestClose()
 }
 
 function onBackdropClick(e: MouseEvent) {

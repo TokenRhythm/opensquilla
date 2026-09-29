@@ -2049,7 +2049,11 @@ class TokenRhythmCatalogCoordinator:
         force: bool,
         persist_entitlement: bool,
         activate: bool,
+        cache_only: bool = False,
     ) -> _CatalogView:
+        if cache_only:
+            async with self._lock:
+                return self._view_locked(request, now=float(self._clock()))
         return await self.refresh(
             request,
             force=force,
@@ -2210,6 +2214,7 @@ async def discover_tokenrhythm_models(
     force: bool = False,
     persist_entitlement: bool = False,
     config: object | None = None,
+    cache_only: bool = False,
 ) -> ProviderModelsDiscoverResult:
     """Admin discovery entry point returning the additive onboarding contract."""
 
@@ -2238,6 +2243,7 @@ async def discover_tokenrhythm_models(
             force=force,
             persist_entitlement=persist_entitlement,
             activate=activate,
+            cache_only=cache_only,
         )
     except Exception as error:  # noqa: BLE001 - discovery returns typed failure
         return ProviderModelsDiscoverResult(
@@ -2247,29 +2253,37 @@ async def discover_tokenrhythm_models(
             detail="TokenRhythm model catalog refresh failed.",
             catalog={"lastSyncedAt": None, "stale": True},
         )
+    catalog_status = {
+        **view.catalog,
+        "cacheHit": view.declared_available,
+        "accessRejected": bool(
+            view.declared_error is not None
+            and _is_declared_access_rejection(view.declared_error)
+        ),
+    }
     infos = _model_infos(
         view.published,
         view.declared,
         catalog=coordinator._catalog,
         request=request,
     )
-    if view.declared_error is not None and (
-        not view.declared_available
-        or _is_declared_access_rejection(view.declared_error)
-    ):
+    if view.declared_error is not None:
+        retained = infos if not catalog_status["accessRejected"] else []
         return ProviderModelsDiscoverResult(
             ok=False,
             provider_id=provider_id,
             failure_kind=_error_failure_kind(view.declared_error),
             detail="TokenRhythm authenticated model catalog is unavailable.",
-            catalog=view.catalog,
+            source="live" if retained else "none",
+            models=_discovery_rows(retained),
+            catalog=catalog_status,
         )
     return ProviderModelsDiscoverResult(
         ok=True,
         provider_id=provider_id,
         source="live" if infos else "none",
         models=_discovery_rows(infos),
-        catalog=view.catalog,
+        catalog=catalog_status,
     )
 
 

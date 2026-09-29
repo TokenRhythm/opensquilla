@@ -68,7 +68,7 @@ async function prepareGateway(page: Page, options: {
   await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
   await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
   await page.route('**/control/static/dist/opensquilla-mark.png', route => route.fulfill({
-    path: fileURLToPath(new URL('../public/opensquilla-mark.png', import.meta.url)),
+    path: fileURLToPath(new URL('../public-assets/opensquilla-mark.png', import.meta.url)),
   }))
 
   let durable = delivery === 'history'

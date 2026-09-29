@@ -1,6 +1,7 @@
 // @vitest-environment happy-dom
 
 import { createPinia, setActivePinia } from 'pinia'
+import { computed } from 'vue'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { useRpcStore } from './rpc'
 import { createV4GatewayAccess } from '@/adapters/gateway/gatewayAccessV4'
@@ -86,6 +87,34 @@ describe('rpc link-token bootstrap', () => {
     sessionStorage.clear()
     delete window.opensquillaDesktop
     window.history.replaceState(null, '', '/control/sessions')
+  })
+
+  it('exposes the reactive browser connection target independently of saved endpoint drift', async () => {
+    const initial = 'ws://localhost:3000/ws'
+    localStorage.setItem('opensquilla.wsUrl', initial)
+    const store = useRpcStore()
+    const endpoint = computed(() => store.getConnectionEndpoint())
+    const access = createV4GatewayAccess(store)
+    const unavailableReason = computed(() => access.supportBundleUnavailableReason)
+    expect(endpoint.value).toBeNull()
+    store.init()
+    clients[0].emit('_hello', deliveryHello())
+    expect(endpoint.value).toBe(initial)
+    expect(unavailableReason.value).toBeNull()
+    localStorage.setItem('opensquilla.wsUrl', 'ws://other-tab.example/ws')
+    expect(endpoint.value).toBe(initial)
+    expect(unavailableReason.value).toBeNull()
+    await store.connect('ws://remote.example:18791/ws', 'synthetic-token')
+    clients[0].emit('_hello', deliveryHello())
+    expect(endpoint.value).toBe('ws://remote.example:18791/ws')
+    expect(unavailableReason.value).toBe('differentGateway')
+    localStorage.setItem('opensquilla.wsUrl', initial)
+    expect(endpoint.value).toBe('ws://remote.example:18791/ws')
+    expect(unavailableReason.value).toBe('differentGateway')
+    store.disconnect()
+    expect(endpoint.value).toBeNull()
+    expect(unavailableReason.value).toBe('disconnected')
+    store.$dispose()
   })
 
   it('retains proven delivery identity through transport retry but retires blocked or malformed authority', async () => {
@@ -629,6 +658,7 @@ describe('rpc link-token bootstrap', () => {
     expect(access.availability).toBe('preparing')
     expect(access.isRuntimeStarting).toBe(true)
     expect(access.isAvailable).toBe(false)
+    expect(store.getConnectionEndpoint()).toBeNull()
 
     publishRef.current?.({
       schemaVersion: 1,
@@ -648,6 +678,7 @@ describe('rpc link-token bootstrap', () => {
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe('desktop-instance-token')
     expect(access.isRuntimeStarting).toBe(false)
     expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
+    expect(store.getConnectionEndpoint()).toBe('ws://127.0.0.1:18791/ws')
 
     publishRef.current?.({
       schemaVersion: 1,
@@ -666,6 +697,7 @@ describe('rpc link-token bootstrap', () => {
     expect(access.availability).toBe('unavailable')
     expect(access.isRuntimeStarting).toBe(false)
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBeNull()
+    expect(store.getConnectionEndpoint()).toBeNull()
   })
   it('applies same-address token rotation and never revives an old token for an empty descriptor', async () => {
     let publish!: (payload: unknown) => void
@@ -870,6 +902,7 @@ describe('rpc link-token bootstrap', () => {
     await access.connect({ endpoint: 'ws://desktop/ws', credential: 'stale-form-token' })
     expect(getConnection).toHaveBeenCalledTimes(2)
     expect(connectCalls[connectCalls.length - 1]).toEqual({ url: next.wsUrl, token: next.authToken })
+    expect(store.getConnectionEndpoint()).toBe(next.wsUrl)
     expect(localStorage.getItem('opensquilla.wsUrl')).toBeNull()
     expect(sessionStorage.getItem('opensquilla.wsToken')).toBe(next.authToken)
     store.$dispose()
@@ -909,6 +942,7 @@ describe('rpc link-token bootstrap', () => {
     expect(store.error).toBeTruthy()
     expect(store.state).toBe('connected')
     expect(store.isLocalOwner).toBe(true)
+    expect(store.getConnectionEndpoint()).toBe(payload.wsUrl)
     expect(connectCalls).toHaveLength(1)
     expect(clients[0].disconnect).not.toHaveBeenCalled()
     expect(access.deliveryIdentity).not.toBeNull()

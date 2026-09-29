@@ -32,6 +32,32 @@ export function collectClipboardFiles(data: DataTransfer | null): File[] {
   return files
 }
 
+/** Return plain clipboard text without treating rich HTML as the model input. */
+export function collectClipboardText(data: DataTransfer | null): string {
+  if (!data) return ''
+  const text = data.getData('text/plain')
+  return typeof text === 'string' ? text : ''
+}
+
+// Keep the UI trigger close to Codex-style paste behavior. The Gateway keeps
+// its separate 20k raw-text safety backstop for clients that do not attach in
+// the composer.
+export const LONG_PASTE_CHARS = 5_000
+
+export function isLongPlainTextPaste(text: string): boolean {
+  return text.length >= LONG_PASTE_CHARS
+}
+
+export function pastedTextAttachmentName(text: string, now = Date.now()): string {
+  const firstLine = text.split(/\r?\n/).map(line => line.trim()).find(Boolean) || ''
+  const safeTitle = firstLine
+    .replace(/[\\/:*?"<>|]/g, '_')
+    .replace(/\s+/g, ' ')
+    .slice(0, 80)
+    .trim()
+  return safeTitle ? `${safeTitle}${firstLine.length > 80 ? '…' : ''}.txt` : `pasted-text-${now}.txt`
+}
+
 /**
  * Decide whether a document-level file paste belongs to the chat composer.
  * Pastes aimed at another editable surface — clarify/approval inputs, the
@@ -139,6 +165,7 @@ export function serializeSendableAttachment(attachment: SendableAttachment): Cha
       file_uuid: attachment.file_uuid,
       mime: attachment.mime,
       name: attachment.name,
+      ...(attachment.origin ? { origin: attachment.origin } : {}),
     }
   }
   return {
@@ -146,6 +173,7 @@ export function serializeSendableAttachment(attachment: SendableAttachment): Cha
     data: attachment.data,
     mime: attachment.mime,
     name: attachment.name,
+    ...(attachment.origin ? { origin: attachment.origin } : {}),
   }
 }
 
@@ -175,6 +203,7 @@ export function serializeDisplayAttachment(attachment: SendableAttachment): Disp
     name: attachment.name,
     mime: attachment.mime,
     size: attachment.size,
+    ...(attachment.origin ? { origin: attachment.origin } : {}),
   }
   if (attachment.kind === 'workspace') {
     return { ...base, kind: 'file', workspaceFile: attachment.workspaceFile }
@@ -271,6 +300,7 @@ export function normalizeDisplayAttachment(
       : typeof record.attachment_id === 'string' && record.attachment_id.trim()
         ? record.attachment_id.trim()
         : undefined,
+    origin: record.origin === 'paste' ? 'paste' : undefined,
   }
 }
 

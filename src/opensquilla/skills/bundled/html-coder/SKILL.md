@@ -49,7 +49,7 @@ For a new runnable webpage when workspace file-authoring tools are available:
 
 Do not bundle the entire workspace. When a caller explicitly requests
 source-only output, forbids tool calls, or supplies its own deterministic
-writer—as AwesomeWebpageMetaSkill does—follow that narrower caller contract
+writer, follow that narrower caller contract
 instead. When file authoring or `open_workspace_preview` is unavailable, return
 only the requested guidance or source and do not claim that a runnable project
 was opened.

@@ -1034,7 +1034,7 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
     writer_queue_enabled: bool,
 ) -> None:
     requests = (
-        ("drafts", "meta.drafts.list"),
+        ("receipt", "turns.receipt.get"),
         ("workspaces", "workspaces.list"),
         ("onboarding", "onboarding.status"),
         ("run-mode", "sandbox.run_mode.preference.get"),
@@ -1100,6 +1100,7 @@ async def test_webui_bootstrap_optional_reads_do_not_reject_catalog_or_block_int
         "sandbox.run_mode.preference.get",
         "sessions.list",
         "sessions.messages.hydrate",
+        "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     ]
@@ -1465,6 +1466,7 @@ async def test_detached_hydrate_does_not_block_session_subscription_handoff(
         "sandbox.run_mode.preference.get",
         "sessions.list",
         "sessions.messages.hydrate",
+        "turns.receipt.get",
         "usage.status",
         "workspaces.list",
     ]

@@ -44,7 +44,6 @@ from opensquilla.provider.selector import ModelSelector, ProviderConfig, Selecto
 from opensquilla.provider.types import ContentBlockImage, ProviderBillingReceipt
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.storage import SessionStorage
-from opensquilla.skills.meta.orchestrator import make_llm_chat_from_provider
 from opensquilla.tools.types import CallerKind, ToolContext
 from opensquilla.usage_reasons import (
     normalize_usage_unknown_reason,
@@ -1448,31 +1447,6 @@ async def test_real_subagent_rollup_preserves_three_physical_ledger_calls() -> N
 
 
 @pytest.mark.asyncio
-async def test_direct_meta_llm_helper_records_usage_with_parent_attribution() -> None:
-    sink = _RecordingSink()
-    provider = _DoneProvider(sink)
-    chat = make_llm_chat_from_provider(
-        provider=provider,
-        base_config=AgentConfig(provider_id="fake", model_id="model-a"),
-        usage_event_sink=sink,
-        usage_execution_context=_context(),
-    )
-
-    result = await chat("system", "user")
-
-    assert result == "ok"
-    assert len(sink.started) == 1
-    call = sink.started[0]
-    assert call.execution_id != "turn-1"
-    assert call.parent_turn_id == "turn-1"
-    assert call.session_id == "session-1"
-    assert call.session_epoch == 7
-    assert call.run_kind == "meta_llm"
-    assert len(sink.finalized) == 1
-    assert sink.unknown == []
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("max_provider_retries", [0, 3])
 async def test_selector_fallback_accounts_each_physical_leg_without_outer_duplicate(
     monkeypatch, max_provider_retries
@@ -1603,45 +1577,6 @@ async def test_selector_wrapper_without_ledger_scope_is_streaming_compatible(
     assert (events[6].phase, events[6].reason) == ("fallback", "rate_limited")
     assert events[6].retry_attempt == 1
     assert all(event.started_at > 0 for event in events[:7])
-    assert primary.calls == 4
-    assert fallback.calls == 1
-    assert len(selector_retry_sleeps) == 3
-
-
-@pytest.mark.asyncio
-async def test_meta_helper_with_selector_records_only_physical_legs(
-    selector_retry_sleeps: list[float],
-) -> None:
-    sink = _RecordingSink()
-    fallback = _PhysicalLegProvider(
-        "anthropic",
-        [ProviderText(text="ok"), ProviderDone(model="fallback-model")],
-    )
-    primary = _PhysicalLegProvider(
-        "openai",
-        [ProviderError(message="rate limited", code="429")],
-    )
-    primary.streams *= 4
-    wrapper = _SelectorFallbackProvider(primary, _FallbackSelector(fallback))
-    chat = make_llm_chat_from_provider(
-        provider=wrapper,
-        base_config=AgentConfig(provider_id="openai", model_id="primary-model"),
-        usage_event_sink=sink,
-        usage_execution_context=_context(),
-    )
-
-    assert await chat("system", "user") == "ok"
-
-    assert [(call.call_index, call.provider, call.model) for call in sink.started] == [
-        *[(index, "openai", "primary-model") for index in range(1, 5)],
-        (5, "anthropic", "fallback-model"),
-    ]
-    assert {call.execution_id for call in sink.started} != {"turn-1"}
-    assert all(call.run_kind == "meta_llm" for call in sink.started)
-    assert [call.call_index for call, _ in sink.finalized] == [5]
-    assert [(call.call_index, reason) for call, reason in sink.unknown] == [
-        (index, "provider_error:429") for index in range(1, 5)
-    ]
     assert primary.calls == 4
     assert fallback.calls == 1
     assert len(selector_retry_sleeps) == 3

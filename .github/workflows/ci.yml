@@ -186,6 +186,7 @@ jobs:
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
       python_matrix: ${{ steps.plan.outputs.python_matrix }}
       platform_matrix: ${{ steps.plan.outputs.platform_matrix }}
+      windows_nsis_profile: ${{ steps.plan.outputs.windows_nsis_profile }}
       python_targets: ${{ steps.plan.outputs.python_targets }}
       full_fallback: ${{ steps.plan.outputs.full_fallback }}
       reason_codes: ${{ steps.plan.outputs.reason_codes }}
@@ -276,6 +277,7 @@ jobs:
                   "desktop_matrix",
                   "python_matrix",
                   "platform_matrix",
+                  "windows_nsis_profile",
                   "python_targets",
                   "full_fallback",
                   "reason_codes",
@@ -301,6 +303,7 @@ jobs:
           DESKTOP_MATRIX: ${{ steps.plan.outputs.desktop_matrix }}
           PYTHON_MATRIX: ${{ steps.plan.outputs.python_matrix }}
           PLATFORM_MATRIX: ${{ steps.plan.outputs.platform_matrix }}
+          WINDOWS_NSIS_PROFILE: ${{ steps.plan.outputs.windows_nsis_profile }}
           FULL_FALLBACK: ${{ steps.plan.outputs.full_fallback }}
           REASON_CODES: ${{ steps.plan.outputs.reason_codes }}
         shell: bash
@@ -324,6 +327,7 @@ jobs:
           print(f"- Python matrix: `{json.dumps(python_matrix, separators=(',', ':'))}`")
           print(f"- Desktop matrix: `{json.dumps(desktop_matrix, separators=(',', ':'))}`")
           print(f"- Suite cells: `{len(platform_matrix)}`")
+          print(f"- Windows NSIS profile: `{os.environ['WINDOWS_NSIS_PROFILE']}`")
           PY
 
       - name: Summarize merge-group fallback decision
@@ -394,9 +398,9 @@ jobs:
         working-directory: opensquilla-webui
         shell: bash
         run: |
-          # Vite copies public/ verbatim. Prove the canonical normalization
+          # Vite copies public-assets/ verbatim. Prove the canonical normalization
           # strips harmless Finder metadata before the manifest is written.
-          printf 'CI-only Finder metadata\n' > public/.DS_Store
+          printf 'CI-only Finder metadata\n' > public-assets/.DS_Store
           npm run build:artifact
           if [[ -e dist/.DS_Store || -e ../src/opensquilla/gateway/static/dist/.DS_Store ]]; then
             echo "ERROR: Finder metadata survived WebUI artifact normalization" >&2
@@ -559,7 +563,6 @@ jobs:
             exit 1
           fi
           python scripts/verify_webui_artifact.py \
-            --forbid-personal-bgm \
             --dist src/opensquilla/gateway/static/dist \
             --wheel "${wheels[0]}"
 
@@ -872,6 +875,13 @@ jobs:
           idle-chat-recovery.spec.ts
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
+          retired-bgm-upgrade.spec.ts
+          support-bundle.spec.ts
+          console-clarity.spec.ts
+          mobile-tabs.spec.ts
+          header-responsive.spec.ts
+          topbar-global-controls.spec.ts
+          topbar-visual.spec.ts
           router-physical-model.spec.ts
           user-message-newlines.spec.ts
           session-created-card.spec.ts
@@ -895,7 +905,6 @@ jobs:
           chat-virtualization.spec.ts
           conversation-minimap.spec.ts
           floating-composer.spec.ts
-          virtualized-logs.spec.ts
           long-task-resilience.spec.ts
           native-gateway.spec.ts
           sidebar-drag.spec.ts
@@ -1042,6 +1051,7 @@ jobs:
           node scripts/test-desktop-renderer-log.mjs
           node scripts/test-artifact-preview-lease-broker.mjs
           node scripts/test-native-workbench-surface.mjs
+          node scripts/test-working-preview-refresh.mjs
           node scripts/test-resource-file-actions.mjs
           node --test scripts/fixtures/workspace-inline-preview/provider.test.mjs
           npm run test:live-html-harness
@@ -1253,6 +1263,7 @@ jobs:
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
@@ -1262,6 +1273,7 @@ jobs:
           elif [[ "${{ matrix.shard }}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_plan_rpc.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
               tests/test_gateway/test_task_runtime_wait_slots.py
@@ -1535,6 +1547,7 @@ jobs:
               tests/test_ci/test_architecture_import_contracts.py
               tests/test_engine/turn_runner/test_stage_test_boundaries.py
               tests/test_engine/test_runtime_artifacts.py
+              tests/test_engine/test_tool_concurrency.py
               tests/test_engine/test_tokenjuice_tool_result_projection.py
               tests/test_tools/test_tool_upgrade_compatibility.py
               tests/test_gateway/test_goal_rpc.py
@@ -1544,6 +1557,7 @@ jobs:
           elif [[ "${family}" == "gateway-sqlite" ]]; then
             regression_args+=(
               tests/test_gateway/test_channel_turn_ingress.py
+              tests/test_gateway/test_plan_rpc.py
               tests/test_gateway/test_goal_registry_cleanup.py
               tests/test_gateway/test_task_runtime_terminal_cleanup.py
               tests/test_gateway/test_task_runtime_wait_slots.py
@@ -1701,6 +1715,11 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: opensquilla-webui/.node-version
+
       - name: Set up uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -1760,6 +1779,9 @@ jobs:
             tests/test_persistence/test_migration_compatibility.py
             tests/test_migrations/test_v045_goal_runtime_accounting.py
             tests/test_tools/test_plan_access.py
+            tests/test_scripts/test_verify_webui_artifact.py
+            tests/test_scripts/test_stage_webui_artifact.py
+            tests/test_packaging/test_webui_build_contract.py
             -vv
             --tb=short
             -o faulthandler_timeout=60
@@ -1903,8 +1925,29 @@ jobs:
           set -euo pipefail
           # This probe fails when the recommended backend is absent; the
           # optional-dependency skip in the core pytest suite cannot mask it.
+          pty_probe_log="${CI_REPORT_DIR}/pty-capability.log"
+          set +e
           uv run --no-sync python desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
-            2>&1 | tee "${CI_REPORT_DIR}/pty-capability.log"
+            2>&1 | tee "${pty_probe_log}"
+          pty_probe_statuses=("${PIPESTATUS[@]}")
+          set -e
+          if [[ "${pty_probe_statuses[1]}" -ne 0 ]]; then
+            exit "${pty_probe_statuses[1]}"
+          fi
+          if [[ "${pty_probe_statuses[0]}" -ne 0 ]]; then
+            expected_pty_timeout='{"probe": "opensquilla-desktop-pty", "available": false, "ioMode": "error", "reason": "PTY probe timed out"}'
+            mapfile -t pty_probe_lines < "${pty_probe_log}"
+            first_pty_line="${pty_probe_lines[0]-}"
+            if [[ "${RUNNER_OS}" != "Windows" ]] ||
+               [[ "${#pty_probe_lines[@]}" -ne 1 ]] ||
+               [[ "${first_pty_line%$'\r'}" != "${expected_pty_timeout}" ]]; then
+              exit "${pty_probe_statuses[0]}"
+            fi
+            printf '%s\n' 'Retrying the transient Windows PTY timeout once.'
+            uv run --no-sync python \
+              desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
+              2>&1 | tee "${CI_REPORT_DIR}/pty-capability-attempt-2.log"
+          fi
           uv run --no-sync pytest \
             tests/test_tools/test_shell_process_isolation.py::test_unified_exec_real_pty_reports_tty_and_accepts_input \
             -vv --tb=short \
@@ -1938,8 +1981,7 @@ jobs:
           set -euo pipefail
           git lfs pull --include="src/opensquilla/squilla_router/models/v4.2_phase3_inference/**"
           mcp_image="opensquilla-mcp-ci:${GITHUB_SHA}"
-          docker build --file Dockerfile --tag "${mcp_image}" \
-            --build-arg OPENSQUILLA_FORBID_PERSONAL_BGM=1 . \
+          docker build --file Dockerfile --tag "${mcp_image}" . \
             2>&1 | tee "${CI_REPORT_DIR}/mcp-docker-build.log"
           docker image inspect --format '{{json .Size}}' "${mcp_image}" \
             | tee "${CI_REPORT_DIR}/mcp-docker-size-bytes.json"
@@ -2584,11 +2626,10 @@ jobs:
             tests/test_skills_bundled_baseline.py \
             tests/test_skills_hot_reload.py \
             tests/test_skill_catalog_projection.py \
-            tests/test_gateway/test_meta_catalog_compatibility.py \
+            tests/test_skills/test_retired_workflows.py \
             tests/test_gateway/test_rpc_commands.py \
             tests/test_migration/test_legacy_config_fixtures.py \
             tests/test_skills/test_catalog_upgrade_retirement.py \
-            tests/test_skills/test_sop_compiler.py \
             tests/unit/cli/tui/test_opentui_completion_catalog.py \
             tests/test_skills_loader_namespaces.py \
             tests/test_skills_tree.py \
@@ -2615,7 +2656,7 @@ jobs:
             tests/test_skills/test_hub_transaction_process_gates.py \
             tests/test_gateway/test_rpc_skills_install_visibility.py \
             tests/test_gateway/test_rpc_skills_exact_identity.py \
-            tests/test_gateway/test_rpc_skills_coding_gate.py \
+            tests/test_gateway/test_retired_product_config.py \
             tests/test_gateway/test_rpc_skills_reload.py \
             tests/test_gateway/test_skill_management_service_injection.py \
             tests/test_tools/test_skill_view_resources.py \
@@ -2793,6 +2834,8 @@ jobs:
     needs: plan-ci
     if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
     uses: ./.github/workflows/windows-nsis-upgrade-regression.yml
+    with:
+      acceptance_profile: ${{ needs.plan-ci.outputs.windows_nsis_profile }}
 
   ci-result:
     name: CI result

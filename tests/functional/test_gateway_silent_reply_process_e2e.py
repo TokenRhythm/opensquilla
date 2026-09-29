@@ -42,6 +42,10 @@ _OBJECTIVE = "Exercise automatic Goal continuation."
 _SERVER_MODE_ENV = "OPENSQUILLA_SILENT_REPLY_E2E_SERVER"
 _DEFAULT_SAMPLE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SAMPLE"
 _SAMPLE_SOURCE_ENV = "OPENSQUILLA_DEFAULT_TURN_TIMING_SOURCE"
+_GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS = 45.0
+_GATEWAY_MIGRATION_PHASE_TIMEOUT_SECONDS = 90.0
+_MIGRATIONS_STARTED_LOG_MARKER = '"event": "build_services.migrations_started"'
+_MIGRATIONS_READY_LOG_MARKER = '"event": "build_services.migrations_ready"'
 
 
 def _verify_source_imports(source_root: Path) -> None:
@@ -179,7 +183,6 @@ async def _serve_gateway() -> None:
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
     config.memory.ttl_sweep_interval_minutes = 0
-    config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.task_runtime.max_concurrency = 1
     config.task_runtime.max_pending_per_session = 4
@@ -211,7 +214,9 @@ async def _wait_for_health(
     process: subprocess.Popen[bytes],
     gateway_log: Path,
 ) -> None:
-    deadline = time.monotonic() + 45.0
+    deadline = time.monotonic() + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS
+    migrations_started = False
+    migrations_ready = False
     last_error = ""
     async with httpx.AsyncClient(timeout=1.0, trust_env=False) as client:
         while time.monotonic() < deadline:
@@ -227,6 +232,22 @@ async def _wait_for_health(
                     return
             except Exception as exc:  # noqa: BLE001 - included in timeout evidence
                 last_error = str(exc)
+            if not migrations_ready:
+                output = gateway_log.read_text(encoding="utf-8", errors="replace")
+                now = time.monotonic()
+                if (
+                    not migrations_started
+                    and _MIGRATIONS_STARTED_LOG_MARKER in output
+                ):
+                    migrations_started = True
+                    # Fresh-profile schema work is real disk I/O. Give only
+                    # that observed phase its own bounded Windows CI budget.
+                    deadline = now + _GATEWAY_MIGRATION_PHASE_TIMEOUT_SECONDS
+                if _MIGRATIONS_READY_LOG_MARKER in output:
+                    migrations_ready = True
+                    # Do not charge migration I/O to post-migration services,
+                    # and do not carry unused migration time into this phase.
+                    deadline = now + _GATEWAY_STARTUP_PHASE_TIMEOUT_SECONDS
             await asyncio.sleep(0.1)
     output = gateway_log.read_text(encoding="utf-8", errors="replace")
     raise AssertionError(
@@ -392,7 +413,8 @@ async def _drain_available_frames(
             return
 
 
-# Fresh-profile migrations can exhaust the health deadline under CI worker load.
+# Fresh-profile migrations and post-migration service startup have independent
+# readiness budgets; keep the real process contract out of parallel CI workers.
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_real_gateway_suppresses_goal_sentinel_everywhere(

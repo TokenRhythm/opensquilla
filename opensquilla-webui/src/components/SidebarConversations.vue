@@ -220,26 +220,47 @@ function toggleSection(family: SidebarFamilyId) {
   writeSidebarCollapsedState(next)
 }
 
-function projectCollapseKey(workspaceId: string): string {
-  return `project:${workspaceId}`
+function projectCollapseKey(identity: string): string {
+  return `project:${identity}`
+}
+
+/**
+ * The persisted project catalog normally gives rows a stable workspace id.
+ * During startup, on older gateways, and for non-owner sessions the sidebar
+ * can temporarily use its path-only compatibility projection instead. Keep
+ * both identities when available: a compatibility header can be path-only
+ * while its session rows already carry the catalog id (or the reverse).
+ */
+function projectIdentities(row: SidebarConversationItem): string[] {
+  return [...new Set([row.workspaceId, row.workspace].filter(
+    (value): value is string => Boolean(value),
+  ))]
 }
 
 function isProjectCollapsed(row: SidebarConversationItem): boolean {
-  return Boolean(row.workspaceId && collapsed.value[projectCollapseKey(row.workspaceId)] === true)
+  return projectIdentities(row).some(identity =>
+    collapsed.value[projectCollapseKey(identity)] === true,
+  )
 }
 
 function toggleProject(row: SidebarConversationItem) {
-  if (!row.workspaceId) return
-  const key = projectCollapseKey(row.workspaceId)
-  const next = { ...collapsed.value, [key]: !isProjectCollapsed(row) }
+  const identities = projectIdentities(row)
+  if (identities.length === 0) return
+  const next = { ...collapsed.value }
+  const collapsedState = !isProjectCollapsed(row)
+  for (const identity of identities) {
+    next[projectCollapseKey(identity)] = collapsedState
+  }
   collapsed.value = next
   writeSidebarCollapsedState(next)
 }
 
 function startProjectTask(row: SidebarConversationItem) {
   if (!row.workspaceId || row.workspaceAvailable === false) return
-  const key = projectCollapseKey(row.workspaceId)
-  const next = { ...collapsed.value, [key]: false }
+  const next = { ...collapsed.value }
+  for (const identity of projectIdentities(row)) {
+    next[projectCollapseKey(identity)] = false
+  }
   collapsed.value = next
   writeSidebarCollapsedState(next)
   emit('new-project-task', row.workspaceId)
@@ -250,11 +271,13 @@ function filterCollapsedProjectRows<T extends SidebarConversationItem>(rows: T[]
   const result: T[] = []
   for (const row of rows) {
     if (row.rowKind === 'workspace') {
-      if (row.workspaceId && isProjectCollapsed(row)) hiddenProjects.add(row.workspaceId)
+      if (isProjectCollapsed(row)) {
+        for (const identity of projectIdentities(row)) hiddenProjects.add(identity)
+      }
       result.push(row)
       continue
     }
-    if (row.workspaceId && hiddenProjects.has(row.workspaceId)) continue
+    if (projectIdentities(row).some(identity => hiddenProjects.has(identity))) continue
     result.push(row)
   }
   return result
@@ -328,7 +351,9 @@ watch(
     for (const ancestor of taskHierarchy.value.ancestors.get(row.key) ?? []) {
       next[taskCollapseKey(ancestor)] = false
     }
-    if (row.workspaceId) next[projectCollapseKey(row.workspaceId)] = false
+    for (const identity of projectIdentities(row)) {
+      next[projectCollapseKey(identity)] = false
+    }
     collapsed.value = next
     writeSidebarCollapsedState(next)
   },

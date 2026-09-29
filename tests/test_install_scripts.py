@@ -191,9 +191,9 @@ def test_source_install_pins_python_312_and_refuses_below() -> None:
     # the pip fallback refuses to install on python < 3.12 (no silent broken install)
     assert "sys.version_info >= (3, 12)" in sh
     assert "astral.sh/uv/install.sh" in sh
-    # Windows pip fallback also gated; self-check targets code-task, not just --version
+    # Windows pip fallback also gated; self-check targets agent startup, not just --version
     assert "sys.version_info >= (3, 12)" in ps1
-    assert "code-task --help" in sh
+    assert "agent --help" in sh
 
 
 def test_source_installers_build_webui_and_keep_dry_run_non_mutating() -> None:

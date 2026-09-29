@@ -652,7 +652,6 @@ def _config(
     config.memory.auto_capture_enabled = False
     config.memory.capture_mode = "off"
     config.memory.dream.enabled = False
-    config.meta_skill.enabled = False
     config.heartbeat.enabled = False
     config.agent_max_iterations = 5
     config.agent_max_provider_retries = 0

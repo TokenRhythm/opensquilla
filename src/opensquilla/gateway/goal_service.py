@@ -57,7 +57,8 @@ _AUTOMATIC_GOAL_MESSAGE = (
     "This is a new automatic continuation turn. The previous turn has ended. "
     "Inspect the current state and make concrete progress on the remaining work toward "
     "the full active Goal. Use its durable objective and progress as context, and use "
-    "the Goal controls when progress or a terminal result can be recorded."
+    "update_plan for useful progress updates and update_goal when its terminal "
+    "conditions are satisfied."
 )
 
 
@@ -1717,35 +1718,10 @@ class GoalService:
         assert snapshot is not None
         return snapshot
 
-    async def update_progress(
-        self,
-        context_value: Mapping[str, Any],
-        *,
-        explanation: str | None,
-        steps: list[dict[str, Any]],
-    ) -> dict[str, Any]:
-        """Compatibility entry point into the ordinary task progress store."""
-        context = GoalTurnContext.from_task_detail(context_value)
-        if context is None:
-            raise GoalConflictError("STALE_GOAL", "Invalid Goal turn context")
-        goal = await self._storage.get_goal_by_id(context.goal_id)
-        if goal is None or goal.active_task_id != context.task_id:
-            raise GoalConflictError("STALE_GOAL", "The task no longer owns this Goal")
-        await self._storage.update_task_progress(
-            context.task_id,
-            session_key=goal.session_key,
-            session_id=context.session_id,
-            session_epoch=context.epoch,
-            goal_context=context,
-            explanation=explanation,
-            steps=steps,
-        )
-        return await self.progress_updated(context_value, session_key=goal.session_key)
-
     async def progress_updated(
-        self, context_value: Mapping[str, Any], *, session_key: str, publish: bool = True,
+        self, context_value: Mapping[str, Any], *, session_key: str,
     ) -> dict[str, Any]:
-        """Read the owning Goal projection, optionally publishing the committed update."""
+        """Read the owning Goal projection and publish the committed update."""
         context = GoalTurnContext.from_task_detail(context_value)
         if context is None:
             raise GoalConflictError("STALE_GOAL", "Invalid Goal turn context")
@@ -1760,16 +1736,15 @@ class GoalService:
                 or updated.active_task_id != context.task_id
             ):
                 raise GoalConflictError("STALE_GOAL", "The task no longer owns this Goal")
-            if publish:
-                await self._emit_goal(
-                    updated,
-                    event_type="updated",
-                    session_key=updated.session_key,
-                    session_id=updated.session_id,
-                    epoch=updated.session_epoch,
-                    state_revision=updated.state_revision,
-                    progress_revision=updated.progress_revision,
-                )
+            await self._emit_goal(
+                updated,
+                event_type="updated",
+                session_key=updated.session_key,
+                session_id=updated.session_id,
+                epoch=updated.session_epoch,
+                state_revision=updated.state_revision,
+                progress_revision=updated.progress_revision,
+            )
             snapshot = await self.snapshot(updated, include_runtime_defer=False)
         assert snapshot is not None
         return snapshot

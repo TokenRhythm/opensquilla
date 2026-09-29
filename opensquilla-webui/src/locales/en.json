@@ -224,7 +224,6 @@
     "resize": "Resize workbench",
     "pixels": "pixels",
     "empty": "No preview is available for this item.",
-    "itemLimitReached": "Eight isolated previews are already open. Close one before opening another.",
     "resources": {
       "title": "Files", "count": "Files ({count})", "empty": "No files or links yet.",
       "groups": { "files": "Files", "links": "Links", "attachments": "Files", "documents": "Files", "deliverables": "Files", "urls": "Links" },
@@ -397,16 +396,12 @@
     "chat": "Task",
     "chat-new": "New task",
     "sessions": "Sessions",
-    "agents": "Agents",
     "channels": "Channels",
     "cron": "Cron",
     "skills": "Skills",
     "skillsChannels": "Skills & Channels",
-    "overview": "Overview",
-    "status": "Status",
     "usage": "Usage",
     "viewUsage": "View usage",
-    "logs": "Logs",
     "settings": "Settings",
     "groupBuild": "Build",
     "groupMonitor": "Overview",
@@ -452,14 +447,6 @@
       "reconnecting": "Reconnecting to Gateway",
       "disconnected": "Disconnected"
     },
-    "bgm": {
-      "label": "Background music",
-      "play": "Play background music",
-      "pause": "Pause background music",
-      "volume": "Volume",
-      "chooseLocalFile": "Choose local file…",
-      "noTracks": "No tracks bundled — add files to music/ or pick a local file"
-    },
     "brandHome": "OpenSquilla home",
     "controlNav": "Control navigation",
     "primaryNav": "Primary",
@@ -478,7 +465,8 @@
       "results": "Settings results",
       "empty": "No matching settings",
       "defaultModel": "Default model",
-      "permissions": "Permissions"
+      "permissions": "Permissions",
+      "supportBundle": "Download support bundle"
     },
     "appearance": {
       "title": "Interface",
@@ -497,8 +485,6 @@
       "visualEffectsDesc": "Animate model-routing decisions and answer transitions in conversations.",
       "composerFxLabel": "Floating composer",
       "composerFxDesc": "Float the input over the transcript and collapse it to a single line while scrolling up.",
-      "bgmLabel": "Background music",
-      "bgmDesc": "Show the background-music control in the top bar. Off by default; also toggleable from the command palette.",
       "sidebarWidthLabel": "Sidebar width",
       "sidebarWidthDesc": "Choose the desktop sidebar width. Compact and drawer layouts use a fixed width.",
       "sidebarWidthCompact": "Compact",
@@ -827,7 +813,8 @@
     },
     "gateway": {
       "title": "Gateway",
-      "desc": "Connect to the Gateway and, on Desktop, manage the local runtime."
+      "desc": "Manage this browser's Gateway connection.",
+      "desktopDesc": "Manage the Gateway connection and local service."
     },
     "general": {
       "title": "General",
@@ -839,11 +826,9 @@
     },
     "memoryOverview": {
       "title": "Memory",
-      "desc": "Choose what OpenSquilla remembers and manage optional learning features.",
+      "desc": "Choose what OpenSquilla remembers and manage memory consolidation.",
       "autoCaptureLabel": "Conversation capture",
       "autoCaptureDesc": "Store raw conversations and turn records locally for audit and recovery. They are not added to long-term memory or indexed for recall.",
-      "learningSummary": "Memory and self-learning (advanced)",
-      "learningDesc": "Optional learning controls can use additional model tokens and may require a restart.",
       "profileImportLabel": "Profile import",
       "profileImportDesc": "Review and import compatible identity and memory data.",
       "profileImportAction": "Open"
@@ -891,6 +876,17 @@
     }
   },
   "setup": {
+    "thinking": {
+      "globalLabel": "Global thinking level",
+      "globalDesc": "Shared with the primary provider. An explicit value overrides router tier suggestions; default leaves them in effect.",
+      "tierDesc": "Applies only to this routing tier. Default leaves the level unset.",
+      "proposerDesc": "Applies only to this proposer role. Default leaves its override unset.",
+      "aggregatorDesc": "Applies only to this aggregator role. Default leaves its override unset.",
+      "presetDesc": "Defined by the preset. Switch to a custom lineup to edit.",
+      "sharedSettings": "Shared model settings",
+      "overrideHint": "Global thinking override: {level}. It takes precedence over single-model tier suggestions. Fusion members use their own settings.",
+      "inheritedAggregatorDesc": "Applies only to this aggregator role. Setting a level pins this model instead of following the primary model."
+    },
     "capacity": {
       "customOpenAI": "Custom · OpenAI-compatible",
       "customAnthropic": "Custom · Anthropic-compatible",
@@ -1167,6 +1163,8 @@
       "timeoutLabel": "Request timeout (seconds)",
       "timeoutDesc": "How long to wait for a single model response before timing out — raise this for slow local models (Ollama, vLLM, LM Studio).",
       "timeoutGlobalDesc": "Gateway-wide timeout for normal model requests across all providers. Connection checks and model tests use separate fixed limits.",
+      "thinkingLabel": "Thinking level",
+      "thinkingDefault": "Default (unset)",
       "contextWindowLabel": "Context window override (tokens)",
       "contextWindowDesc": "Cap the prompt-assembly budget for this model. Leave blank to use the auto-detected window.",
       "contextWindowIdentityLabel": "Context window · {provider} / {model}",
@@ -1261,8 +1259,14 @@
       "failureGeneric": "Configuration verification failed.",
       "modelListLabel": "Discovered models",
       "modelOptionsToggle": "Model catalog · {count}",
-      "modelListReadout": "Available · {count}",
-      "modelLiveSource": "Live",
+      "modelListReadout": "Models · {count}",
+      "modelCatalogLoading": "Loading models…",
+      "modelCatalogRefreshing": "Refreshing models…",
+      "modelCatalogRefreshFailed": "Refresh failed. Showing the previous list.",
+      "modelCatalogLoadFailed": "Could not load models. Retry or enter a model ID.",
+      "modelCatalogAccessRejected": "Could not read models. Check your API key or access permissions.",
+      "modelCatalogEmpty": "No models returned. You can enter a model ID.",
+      "modelCatalogSelectionMissing": "Not in the latest model list.",
       "modelMaxOutput": "Max output {tokens}",
       "modelPublishedContext": "Official context {tokens}",
       "modelCatalogContext": "Catalog context {tokens}",
@@ -1273,11 +1277,12 @@
       "modelOutputShort": "Output",
       "modelStatusTesting": "Testing",
       "modelStatusOffline": "Offline",
+      "modelStatusSpecialOffer": "Special offer",
       "modelCatalogValue": "Catalog value",
       "refreshModels": "Refresh models",
-      "modelCatalogSynced": "Model metadata synced {ago}",
-      "modelCatalogStaleSince": "Using model metadata synced {ago}",
-      "modelCatalogStale": "Model metadata may be stale",
+      "modelCatalogSynced": "Models updated {ago}",
+      "modelCatalogStaleSince": "Showing models last updated {ago}",
+      "modelCatalogStale": "Showing the saved model list",
       "effectiveMaxTokens": "Effective output limit: {tokens} tokens · Source: {source}",
       "effectiveMaxTokensAfterSave": "Calculated after saving",
       "effectiveSourceConfig": "user configuration",
@@ -1288,8 +1293,8 @@
       "modelUseTyped": "Use \"{value}\"",
       "modelNoMatches": "No matching models — you can keep what you typed.",
       "modelListTruncated": "Showing {shown} of {total} models — keep typing to narrow the list.",
-      "modelProvenance": "Live provider list · capability source: {sources}",
-      "modelMetadataProvenance": "Live provider list · official values when available, catalog fallback otherwise",
+      "modelProvenance": "Provider list · capability source: {sources}",
+      "modelMetadataProvenance": "Provider list · official values when available, catalog fallback otherwise",
       "modelMultimodal": "Multimodal",
       "modelMultimodalTitle": "Supports image input",
       "saveAndStart": "Save and start using",
@@ -1714,12 +1719,12 @@
       "languageCode": "Language code"
     },
     "connection": {
-      "title": "Connection",
-      "desc": "Point this browser at a gateway. Connecting applies immediately — no save needed.",
+      "title": "Gateway connection",
+      "desc": "Edit the fields, then click Connect or Reconnect to apply.",
       "connected": "Connected",
       "connecting": "Connecting",
       "disconnected": "Disconnected",
-      "reasonConnected": "Live link to the gateway socket.",
+      "reasonConnected": "Connected to the Gateway.",
       "reasonConnecting": "Reaching the gateway…",
       "reasonFailed": "Last attempt failed: {error}",
       "reasonDisconnected": "Not connected. Check the WebSocket URL and try Connect.",
@@ -1731,8 +1736,11 @@
       "tokenRequired": "Token required",
       "reasonTokenRequired": "Authentication failed. Automatic retries are paused. Enter a valid gateway token and choose Connect.",
       "reconnect": "Reconnect",
+      "editConnection": "Edit connection",
       "connect": "Connect",
-      "disconnect": "Disconnect"
+      "disconnect": "Disconnect",
+      "actions": "Connection actions",
+      "reasonManagedDisconnected": "The client is not connected to the local Gateway. Try reconnecting."
     },
     "runtime": {
       "title": "Runtime",
@@ -1910,7 +1918,15 @@
       "migrationCompleteIndependent": "This Desktop installation is now independent and will not sync with the source.",
       "migrationCompleteReplacement": "The previous Desktop data is available in a complete backup. It was replaced as a whole; files and chats were never merged.",
       "migrationCompleteShowBackup": "Show complete backup",
-      "migrationCompleteDismiss": "Dismiss"
+      "migrationCompleteDismiss": "Dismiss",
+      "localGatewayTitle": "Local Gateway",
+      "localGatewayDescription": "Manage the local Gateway started by the desktop app.",
+      "processStatus": "Process status",
+      "restartLocalGateway": "Restart local Gateway",
+      "details": "Address and log location",
+      "address": "Gateway address",
+      "refreshStatus": "Refresh status",
+      "openLocalLogLocation": "Open local log location"
     },
     "keyboard": {
       "title": "Shortcuts",
@@ -1940,16 +1956,10 @@
       "experimental": "experimental",
       "historyMergeDesc": "On history sync, merge by message id and keep live-only fields (default off, transitioning on).",
       "historyMergeAria": "History reconcile-by-id merge (takes effect after reload)",
-      "agentConfigLabel": "Agent configuration (advanced)",
-      "agentConfigDesc": "Manage existing agent configurations. This area will change in a future multi-agent redesign.",
-      "agentConfigAction": "Open",
       "dataMaintenanceLabel": "Data maintenance",
       "dataMaintenanceDesc": "Review imports and backups. Desktop can also reset or delete local profile data.",
       "dataMaintenanceAction": "Manage",
       "dataMaintenanceAria": "Open data maintenance",
-      "runTraceLabel": "Run-trace drawer in Logs",
-      "runTraceDesc": "Make log lines interactive and open a per-line node-step detail drawer in the Logs view.",
-      "runTraceAria": "Run-trace drawer in Logs (takes effect after reload)",
       "configFileLabel": "Configuration file",
       "configFileDesc": "More options can be adjusted in the configuration file."
     },
@@ -1959,9 +1969,9 @@
       "reliabilityDiagnosticsLabel": "Stability diagnostics",
       "reliabilityDiagnosticsDesc": "Share operation outcomes, timings, and privacy-safe error fingerprints to help diagnose crashes and failures. Conversation and file content are never included.",
       "productAnalyticsLabel": "Product and growth analytics",
-      "productAnalyticsDesc": "Share activation milestones and counts of MetaSkill and Coding Mode runs after they actually start, to measure conversion and feature use. Conversation content, task parameters, files, and raw account IDs are never included; a random, purpose-specific analytics identifier is used.",
+      "productAnalyticsDesc": "Share activation milestones to measure product use. Conversation content, task parameters, files, and raw account IDs are never included; a random, purpose-specific analytics identifier is used.",
       "networkReportingLabel": "Diagnostics and usage reporting",
-      "networkReportingDesc": "Send anonymous diagnostics and usage statistics, including actual MetaSkill and Coding Mode run counts. Also controls update checks. Conversation content, task parameters, and files are not included."
+      "networkReportingDesc": "Send anonymous diagnostics and usage statistics. Also controls update checks. Conversation content, task parameters, and files are not included."
     },
     "toast": {
       "loadFailed": "Failed to load settings: {error}",
@@ -2033,34 +2043,11 @@
       "audioEnvVar": "Environment variable to read for audio provider access.",
       "remoteEmbeddingKey": "Remote embedding API key or env reference."
     },
-    "memoryLearning": {
-      "groupTitle": "Memory & self-learning",
+    "memoryDream": {
       "dreamLabel": "Memory consolidation (dream)",
       "tokenBadge": "token usage",
-      "dreamDesc": "Periodically runs a model pass to consolidate session memory (every 24h). Model-routing self-learning relies on it for idle training windows.",
-      "selfLearningLabel": "Model-routing self-learning",
-      "selfLearningDesc": "Learns routing preferences from your corrections. Fully on-device — stores feature vectors, never raw conversation text.",
-      "depDefault": "Depends on memory consolidation above: turning this on enables it too; turning consolidation off alone keeps sampling but pauses automatic training.",
-      "depLinked": "Memory consolidation was enabled together with this. You can switch it off independently — self-learning keeps sampling, only automatic training pauses.",
-      "depPaused": "Memory consolidation is off — samples are still collected, but no automatic training runs. Re-enable it to resume.",
-      "restartRequired": "A gateway restart is needed for the schedule change to take effect.",
-      "statusModel": "Routing model",
-      "statusSamples": "Corrections",
-      "statusLastAction": "Last action",
-      "modelBaseline": "Factory baseline",
-      "modelLearned": "Learned v{version}",
-      "samplesTotal": "{total} collected in total",
-      "gatePausedDream": "Training paused — waiting for memory consolidation to be re-enabled",
-      "gateReason": {
-        "ready": "Ready — will train at the next window",
-        "disabled": "Disabled",
-        "no_data": "No samples collected yet",
-        "agent_active": "Waiting for an idle window",
-        "cooldown": "Cooling down after a recent training run",
-        "insufficient_data": "Not trained yet — not enough corrections",
-        "insufficient_class_diversity": "Not trained yet — corrections cover too few routing tiers"
-      },
-      "detachedNote": "The base routing weights were upgraded. Learning built on the old weights was archived; your corrections are unaffected and will retrain automatically on the new weights. No action needed."
+      "dreamDesc": "Periodically runs a model pass to consolidate session memory.",
+      "restartRequired": "A gateway restart is needed for the schedule change to take effect."
     },
     "field": {
       "keepCurrentPlaceholder": "leave blank to keep current",
@@ -2474,110 +2461,6 @@
       "abortDone": "Run aborted.",
       "abortNone": "No active run to abort.",
       "abortFailed": "Abort failed."
-    },
-    "overview": {
-      "title": "Status",
-      "subtitle": "Readiness, usage, and runtime health.",
-      "totalTokens": "Total tokens",
-      "totalSessions": "Total sessions",
-      "totalSessionsTitle": "Total sessions across all statuses",
-      "viewAll": "view all →",
-      "provider": "Provider",
-      "manageAgents": "manage agents →",
-      "jumpToReadiness": "Jump to the readiness report",
-      "health": "Health",
-      "uptime": "Uptime",
-      "healthSummary": "Health summary",
-      "readiness": "Readiness",
-      "healthContext": "Health report context",
-      "ctxGateway": "Gateway",
-      "ctxConfig": "Config",
-      "ctxRequestedConfig": "Requested config",
-      "ctxAgent": "Agent",
-      "needsAction": "Needs action",
-      "degraded": "Degraded",
-      "optional": "Optional",
-      "ready": "Ready",
-      "healthFindings": "Health findings",
-      "loadingHealth": "Loading health report",
-      "noFindings": "No findings returned.",
-      "recoveryRestart": "Recovery requires restart",
-      "openSettings": "Open settings",
-      "findingDetails": "Details",
-      "findingFallback": "Finding {n}",
-      "copyCommand": "Copy command",
-      "step": "Step",
-      "checking": "Checking",
-      "waitingDoctor": "Waiting for doctor.status",
-      "healthUnavailable": "Gateway health report unavailable",
-      "impact": {
-        "blocksReady": "Blocks readiness",
-        "degrades": "Degrades",
-        "optional": "Optional",
-        "reference": "Reference"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "Ready with warnings",
-        "ready": "Ready",
-        "actionRequired": "Action required",
-        "degraded": "Degraded",
-        "unavailable": "Unavailable"
-      },
-      "badge": {
-        "diagnostic": "Diagnostics incomplete",
-        "repair": "Repair pending",
-        "config": "Config mismatch"
-      },
-      "dotStatus": {
-        "active": "Active",
-        "ready": "Ready",
-        "ok": "OK",
-        "paused": "Paused",
-        "degraded": "Degraded",
-        "warn": "Warning",
-        "error": "Error",
-        "failed": "Failed",
-        "closed": "Closed",
-        "ended": "Ended",
-        "offline": "Offline",
-        "unknown": "Unknown"
-      },
-      "group": {
-        "action": {
-          "title": "Needs action",
-          "note": "Fix these first to make OpenSquilla ready."
-        },
-        "degraded": {
-          "title": "Degraded capabilities",
-          "note": "OpenSquilla can run, but these capabilities need attention."
-        },
-        "optional": {
-          "title": "Optional setup",
-          "note": "These improve capability or posture but do not block readiness."
-        },
-        "ready": {
-          "title": "Ready checks",
-          "note": "These surfaces are already working."
-        }
-      },
-      "gw": {
-        "cannotLoad": "Cannot load doctor.status from {url}. {reason}",
-        "inspectRemote": "Inspect remote gateway",
-        "repairRemote": "Repair remote deployment",
-        "repairRemoteDetail": "Start or repair the remote OpenSquilla gateway deployment, then refresh health.",
-        "runLocalDoctor": "Run local doctor",
-        "runLocalDoctorDetail": "Checks local config and onboarding before restarting the gateway.",
-        "startLocal": "Start local gateway",
-        "inspectLocal": "Inspect local gateway"
-      },
-      "checkedAgo": "Checked {time}",
-      "rerunChecks": "Re-run checks",
-      "copyDiagnostics": "Copy diagnostics JSON",
-      "copiedDiagnostics": "Diagnostics JSON copied",
-      "diagnoseWithAgent": "Diagnose with agent",
-      "diagnosePrompt": "Please troubleshoot this OpenSquilla configuration using the client context and doctor report below. Prefer applicable in-app Settings. When hasTerminalWorkflow is false, do not suggest bare opensquilla commands; an owned Desktop gateway is managed by the app. Data transfer means backup followed by whole-data replacement, never a merge. An optional migration item is not a fault and may remain visible after transfer. Explain and guide only: do not migrate data, restart the gateway, write settings, or claim changes were performed.",
-      "environment": "Environment",
-      "latency": "Latency"
     }
   },
   "console": {
@@ -2588,72 +2471,6 @@
       "confirm": "Confirm",
       "refreshing": "Refreshing…",
       "retry": "Retry"
-    },
-    "agents": {
-      "title": "Agents",
-      "subtitle": "Custom personalities and skill sets you can chat with.",
-      "settingsHint": "Provider and model defaults live in Settings",
-      "openSettings": "Open settings",
-      "totalAgents": "Total agents",
-      "builtinCount": "{n} built-in",
-      "customCount": "{n} custom",
-      "modelsInUse": "Models in use",
-      "distinctModels": "distinct models",
-      "unset": "unset",
-      "toolsWired": "Tools wired",
-      "acrossAllAgents": "across all agents",
-      "agentId": "Agent ID",
-      "displayName": "Display name",
-      "optional": "(optional)",
-      "defaultsToId": "Defaults to ID",
-      "add": "Add",
-      "createHint": "Created agents inherit the global default model. Click a card to view or edit details.",
-      "configuredAgents": "Configured agents",
-      "emptyTitle": "No agents configured.",
-      "emptyTextBefore": "Use the form above to add one. The default",
-      "emptyTextAfter": "agent is always available.",
-      "builtin": "builtin",
-      "custom": "custom",
-      "openChat": "Open chat",
-      "chat": "Chat",
-      "customizeHint": "Use as starting point for a new agent",
-      "customize": "Customize",
-      "model": "Model",
-      "tools": "Tools",
-      "skills": "Skills",
-      "identity": "Identity",
-      "description": "Description",
-      "descriptionPlaceholder": "A short one-liner",
-      "capabilitiesAdvanced": "Capabilities · Advanced",
-      "toolsCommaSeparated": "Tools (comma-separated)",
-      "toolsPlaceholder": "Leave blank to inherit defaults",
-      "workspace": "Workspace",
-      "workspacePlaceholder": "Leave blank to use the default path",
-      "agentDir": "Agent dir",
-      "optionalPlaceholder": "Optional",
-      "enabled": "Enabled",
-      "inheritedModel": "Inherited model",
-      "systemPrompt": "System prompt",
-      "systemPromptHint": "Stored in config — runtime currently sources from agent SOUL.md instead.",
-      "saveChanges": "Save changes",
-      "drawerTitleEdit": "Edit agent: {id}",
-      "drawerTitleView": "Agent: {id}",
-      "loadFailed": "Failed to load agents",
-      "deleteTitle": "Delete agent",
-      "deleteBody": "Delete agent {id}? Existing chats with this agent will keep working but become unmanaged.",
-      "discardTitle": "Discard unsaved changes?",
-      "discardBody": "You have unsaved edits. Closing now will lose them.",
-      "toastCreated": "Agent created: {id}",
-      "toastExists": "Agent \"{id}\" already exists",
-      "toastCreateFailed": "Failed to create agent: {msg}",
-      "toastTweakId": "Tweak the ID, then click Add to create your copy",
-      "toastNothingToSave": "Nothing to save",
-      "toastUpdated": "Agent updated: {id}",
-      "toastSaveFailed": "Failed to save: {msg}",
-      "toastNotFound": "Agent \"{id}\" no longer exists.",
-      "toastBuiltinImmutable": "\"{id}\" is a built-in agent and cannot be modified.",
-      "toastDeleted": "Agent deleted: {id}",
-      "toastDeleteFailed": "Failed to delete agent: {msg}"
     },
     "channels": {
       "title": "Channels",
@@ -2883,12 +2700,6 @@
         "botIdCopied": "Bot ID copied",
         "eventSubscriptionTitle": "Check Feishu event subscription"
       }
-    },
-    "overview": {
-      "channelsChip": "Channels",
-      "channelsChipConnected": "{connected} connected",
-      "channelsChipFailed": "{failed} failed",
-      "channelsChipPending": "{pending} awaiting approval"
     }
   },
   "cronSkills": {
@@ -3241,79 +3052,7 @@
       "tabsLabel": "Skill source",
       "tabInstalled": "Installed",
       "tabCommunity": "Community",
-      "metaSkillsTitle": "Meta-Skills",
-      "metaSkillsDesc": "Composed workflows that drive a DAG of sub-skills.",
       "noMatchFilter": "No skills match {filter}."
-    },
-    "autoPropose": {
-      "title": "Auto-Propose Settings",
-      "on": "on",
-      "off": "off",
-      "meta": "Unattended synthesis of new meta-skills from your usage patterns.",
-      "scheduledLabel": "Scheduled (cron)",
-      "scheduledHint": "Run on {cron}. Drives the meta-skill-creator DAG against your top co-occurrence patterns.",
-      "dreamLabel": "After memory consolidation (dream)",
-      "dreamHint": "Piggyback on the memory-dream completion. Independent of the cron toggle.",
-      "autoEnableLabel": "Auto-enable gated proposals",
-      "autoEnableHint": "Promote only proposals that pass all gates and stay within the configured {risk} risk ceiling.",
-      "riskCeilingLabel": "Auto-enable risk ceiling",
-      "riskLow": "Low",
-      "riskMedium": "Medium",
-      "riskHigh": "High",
-      "riskCeilingHint": "Low is the default. Higher ceilings still run the static safety preflight and keep audit metadata."
-    },
-    "autoEnabled": {
-      "title": "Auto-Enabled Meta-Skills",
-      "meta": "Promoted by auto-enable. Disable moves the skill back to pending proposals.",
-      "enabled": "enabled",
-      "unknown": "unknown",
-      "risk": "risk: {level}",
-      "proposalId": "proposal id",
-      "disable": "Disable"
-    },
-    "proposals": {
-      "title": "Pending Proposals",
-      "meta": "meta-skill-creator candidates awaiting your accept/reject decision.",
-      "gatesOk": "gates ok",
-      "gatesBlocked": "gates blocked",
-      "auto": "auto",
-      "autoGeneratedBy": "Auto-generated by {by}",
-      "autoEnableStatus": "auto-enable: {status}",
-      "validationProfile": "validation profile",
-      "chainHash": "chain hash",
-      "show": "Show",
-      "accept": "Accept",
-      "reject": "Reject",
-      "unknown": "unknown",
-      "acceptAnywayTitle": "Accept proposal anyway?",
-      "acceptAnywayBody": "Proposal {id} did not pass all gates.\n\n{reason}\n\nAccept anyway (force)?",
-      "forceAccept": "Force accept",
-      "rejectTitle": "Reject proposal",
-      "rejectBody": "Reject and delete proposal {id}? This cannot be undone.",
-      "disableTitle": "Disable auto-enabled skill",
-      "disableBody": "Disable auto-enabled skill {name} and move it back to pending proposals?",
-      "disable": "Disable",
-      "toastSettingsFailed": "Settings update failed: {reason}",
-      "toastShowFailed": "Show failed: {reason}",
-      "toastAcceptFailed": "Accept failed: {reason}",
-      "toastRejectFailed": "Reject failed: {reason}",
-      "toastDisableFailed": "Disable failed: {reason}"
-    },
-    "proposalDetail": {
-      "dialogLabel": "Proposal details: {id}",
-      "heading": "Proposal {id}",
-      "auditTitle": "Auto-enable Audit",
-      "status": "Status",
-      "risk": "Risk",
-      "staticSafetyProfile": "static-safety profile",
-      "reason": "Reason",
-      "skills": "Skills",
-      "tools": "Tools",
-      "staticSafetyReasons": "Static-safety reasons",
-      "none": "none",
-      "unknown": "unknown",
-      "noAudit": "No auto-enable decision recorded.",
-      "gates": "Gates"
     },
     "tile": {
       "installed": "Installed",
@@ -3333,15 +3072,12 @@
       "refreshPending": "Saved, but live refresh failed. Restart the Gateway before using this skill.",
       "disabledContent": "Use is disabled. Allow use to read the skill instructions.",
       "dialogLabel": "Skill details: {name}",
-      "triggers": "Triggers",
-      "composition": "Composition ({kind}, {count} sub-skills)",
       "missing": "Missing",
       "binary": "binary",
       "envVar": "env var",
       "install": "Install",
       "installVia": "Install via {kind}",
       "installing": "Installing...",
-      "toolchainSetupGuidance": "Launch this MetaSkill from Chat to review the source, size, and license, then approve its setup. Managed toolchains can only be installed through that setup flow.",
       "homepage": "Homepage",
       "loadingContent": "Loading SKILL.md...",
       "emptyContent": "No SKILL.md content available.",
@@ -3360,9 +3096,6 @@
       "inferredPython": "Inferred from {source}",
       "inferredEnv": "Inferred environment variable",
       "scanAdvisory": "Dependency scan advisory",
-      "subSkillRollup": "Meta-skill dependency rollup",
-      "subSkillStatus": "{missing} missing · {advisory} advisory",
-      "missingSubSkill": "Referenced sub-skill is unavailable",
       "installUnavailable": "No installer matches the current missing dependencies.",
       "installIncomplete": "{count} dependencies still need attention.",
       "installComplete": "Dependencies are ready."
@@ -3467,7 +3200,6 @@
     },
     "skills": {
       "statusReady": "ready",
-      "statusProviderAtLaunch": "Provider will be checked at launch",
       "statusNoDeps": "no deps declared",
       "statusNeedsDeps": "needs deps",
       "dotReady": "Ready",
@@ -3505,24 +3237,25 @@
       "tileNeedsSetupHintNone": "all set",
       "tileNotDeclared": "Not declared",
       "tileNotDeclaredHint": "no manifest"
-    },
-    "stats": {
-      "proposalsTitle": "Pending meta-skill proposals - synthesised by meta-skill-creator from your usage patterns",
-      "proposalsLabel": "Pending Proposals",
-      "awaitingReview": "awaiting review"
     }
+  },
+  "gatewayLogs": {
+    "viewLogs": "View recent logs",
+    "title": "Gateway logs",
+    "description": "Latest 200 lines from the connected Gateway. Refresh manually to update.",
+    "refresh": "Refresh",
+    "loading": "Loading logs…",
+    "empty": "No recent logs.",
+    "failed": "Unable to read logs. Check your connection and Gateway permissions, then retry.",
+    "connectionRequired": "Connect to the Gateway to view logs.",
+    "authenticationRequired": "Sign in to the Gateway to view logs.",
+    "saveCurrentLogs": "Save current logs",
+    "saveFailed": "Could not save logs. Try again."
   },
   "monitorSupport": {
     "title": "Support & diagnostics",
-    "menuLabel": "Support and diagnostics actions",
-    "viewLogs": "View runtime logs",
-    "viewLogsDescription": "Inspect recent gateway output and errors",
-    "copyReport": "Copy current readiness report",
-    "copyReportDescription": "Share the current connection, configuration, and runtime status",
-    "copySuccess": "Readiness report copied",
-    "copyFailed": "Could not copy readiness report: {error}",
     "downloadBundle": "Download redacted support bundle",
-    "downloadBundleDescription": "Includes logs, a configuration summary, and diagnostic results",
+    "downloadBundleDescription": "Includes logs, a configuration summary, and diagnostic results from the connected Gateway.",
     "privacySummary": "Conversation content is excluded by default and known credentials are redacted",
     "bundleTitle": "Download redacted support bundle",
     "bundleSubtitle": "Create a ZIP to share with OpenSquilla support.",
@@ -3540,7 +3273,10 @@
     "bundleConfirm": "Generate and download",
     "bundleCancel": "Cancel",
     "bundleFailed": "Support bundle download failed",
-    "bundleReady": "Support bundle downloaded"
+    "bundleReady": "Support bundle downloaded",
+    "bundleConnectionRequired": "Connect to the Gateway to download a support bundle.",
+    "bundleOwnerRequired": "Only the Gateway's local owner can download a support bundle.",
+    "bundleDifferentGateway": "Open the connected Gateway's own WebUI to download its support bundle."
   },
   "usageLogs": {
     "tasks": {
@@ -3684,51 +3420,6 @@
     },
     "errors": {
       "loadFailed": "Failed to load usage"
-    },
-    "logs": {
-      "breadcrumbLabel": "Breadcrumb",
-      "title": "Logs",
-      "subtitle": "Live gateway log stream — filter and follow.",
-      "statusUnavailable": "Log status unavailable",
-      "statusUnavailableAria": "Log status unavailable; log tailing can still work.",
-      "statusUnavailableTitle": "logs.status is unavailable; log tailing can still work.",
-      "fileLogOn": "File log on",
-      "fileLogOff": "File log off",
-      "fileLogTitle": "Gateway file logging is configurable via log_file_enabled, log_level, rotation settings, and OPENSQUILLA_LOG_DIR. Path: {path}.",
-      "fileLogOffTitle": "Logs are not written to disk; diagnostic bundles will lack history. Enable log_file_enabled in config. Path: {path}.",
-      "rawOn": "Raw capture on",
-      "rawOff": "Raw capture off",
-      "rawRecordingPill": "Raw capture recording",
-      "rawTitle": "Raw capture records full model requests and responses, including conversation content. Enable with OPENSQUILLA_TURN_CALL_LOG=1 or opensquilla diagnostics on --raw; turn off with opensquilla diagnostics off. Source: {source}. Directory: {path}.",
-      "bundleButton": "Diagnostic bundle",
-      "bundleButtonTitle": "Download a redacted diagnostics bundle",
-      "bundleTitle": "Download diagnostics bundle",
-      "bundleBody": "Collects gateway logs, error records, and redacted configuration into one zip you can attach to a bug report. Secrets and API keys are removed; conversation content is excluded unless you opt in below.",
-      "bundleIncludeContent": "Include conversation content (prompts and responses)",
-      "bundleConfirm": "Download",
-      "bundleCancel": "Cancel",
-      "bundleFailed": "Diagnostics download failed",
-      "bundleReady": "Diagnostics bundle downloaded",
-      "inView": "In view",
-      "ofLoaded": "of {total} loaded",
-      "errors": "Errors",
-      "reviewNeeded": "review needed",
-      "allClear": "all clear",
-      "warnings": "Warnings",
-      "recentAdvisories": "recent advisories",
-      "none": "none",
-      "infoDebug": "Info / Debug",
-      "routineOutput": "routine output",
-      "levels": "Levels",
-      "filterPlaceholder": "Filter messages…",
-      "autoFollow": "Auto-follow",
-      "loading": "Loading logs…",
-      "empty": "No runtime logs yet.",
-      "loadFailed": "Could not load runtime logs.",
-      "retry": "Retry",
-      "noMatch": "No lines match the current filter.",
-      "lineDetail": "Log line detail",
-      "ofLoadedFoot": "{visible} in view · {total} buffered"
     }
   },
   "chat": {
@@ -3740,7 +3431,6 @@
       "title": "Commands and skills",
       "command": "Commands",
       "skill": "Skills",
-      "meta": "Workflows",
       "empty": "No matching commands or skills",
       "loading": "Loading skills…",
       "autoHint": "Scroll or type to search · Skills match automatically",
@@ -3754,12 +3444,9 @@
       "remove": "Remove {name} from this message",
       "queuedHint": "This message will run after the current task.",
       "limit": "Select up to 16 skills per message.",
-      "metaTextOnly": "This workflow accepts text. Keep attachments and selected skills in a separate message.",
       "commandAtStart": "Use this command at the start of a message.",
       "usage": "Usage: {tokens} tokens",
       "usageFailed": "Unable to load usage. Try again.",
-      "workflowTitle": "Start {name}",
-      "workflowRequest": "What would you like this workflow to do?",
       "loaded": "Loaded",
       "failed": "Load failed",
       "loadingSkill": "Loading",
@@ -3773,7 +3460,6 @@
         "new": "Start a new chat",
         "compact": "Shorten the current context",
         "goal": "Set a long-running goal",
-        "meta": "Choose a workflow",
         "plan": "Plan the current task",
         "reset": "Reset this conversation",
         "usage": "View token usage"
@@ -3802,26 +3488,6 @@
         "html": {
           "name": "Web pages",
           "description": "Build and edit HTML pages"
-        },
-        "webpage": {
-          "name": "Website builder",
-          "description": "Build a complete website"
-        },
-        "kidsProject": {
-          "name": "Kids’ projects",
-          "description": "Plan a creative project for children"
-        },
-        "shortDrama": {
-          "name": "Short drama",
-          "description": "Turn an idea into a video"
-        },
-        "skillCreator": {
-          "name": "Workflow builder",
-          "description": "Combine skills into a workflow"
-        },
-        "paperWriting": {
-          "name": "Academic writing",
-          "description": "Research and draft a paper"
         }
       }
     },
@@ -3904,6 +3570,7 @@
     "projectFileLiveTarget": "Live project file: {path}",
     "importedFileWorkingTarget": "Imported file; edits use a working copy",
     "fileLabel": "File",
+    "pastedTextLabel": "Pasted text",
     "add": "Add",
     "attachFiles": "Attach files",
     "attachFilesTitle": "Attach files: any file type (images, PDF, Office, and text are read directly; other files go to the agent workspace)",
@@ -4115,6 +3782,10 @@
       "setup": "Set up"
     },
     "usageDetails": "Usage details",
+    "messageFeedback": {
+      "up": "Helpful (this page only)",
+      "down": "Not helpful (this page only)"
+    },
     "regenerate": "Regenerate",
     "forkConversation": "Fork from here",
     "forkCreating": "Creating branch…",
@@ -4487,16 +4158,6 @@
         "requestConflict": "That goal action was already used for a different request. Try again."
       }
     },
-    "codingMode": {
-      "enabled": "Coding mode enabled for all chats.",
-      "disabled": "Coding mode disabled.",
-      "usage": "Use /coding to toggle, or /coding on, /coding off, or /coding status.",
-      "updateFailed": "Coding mode could not be updated.",
-      "commandEnable": "Enable Coding mode.",
-      "commandDisable": "Disable Coding mode.",
-      "activeLabel": "Coding ON",
-      "disableLabel": "Disable Coding mode"
-    },
     "composer": {
       "workStyleGroup": "Work style",
       "contentGroup": "Content",
@@ -4571,75 +4232,6 @@
       "offlineQueued": "Saved locally. Will send when the connection is restored.",
       "identityChanged": "Connection identity changed. Reconnect to the original gateway and account to send this message.",
       "annotationUpgradeRequired": "This queued annotation uses the retired editor. Edit the message and select the page again before sending."
-    },
-    "metaRuns": {
-      "draft": "Draft",
-      "noPreviousMessage": "No previous message to retry",
-      "replayUnavailable": "This run no longer has a valid replay command. Refresh and try again.",
-      "replayFailed": "Replay failed — {message}",
-      "toastInstallDependency": "Install the missing dependency, then retry this MetaSkill run.",
-      "toastContinueTextOnly": "Continue with text outputs only, then retry if an artifact is still needed.",
-      "toastReviewPaidSubmit": "The paid submission may already have been accepted. Check the provider dashboard or output before starting another generation; automatic replay is disabled to avoid a duplicate charge.",
-      "toastUnsupportedRescueAction": "This recovery action is not supported by this app. No retry was started.",
-      "needsSetup": "Setup needed",
-      "setupRequired": "{skill} cannot run yet. Set up: {dependencies}",
-      "unknownDependency": "the required runtime",
-      "couldNotRunSkill": "Could not run meta-skill {skill}.",
-      "couldNotRunSkillError": "Could not run meta-skill: {error}",
-      "savedForRetry": "The {skill} request is saved with its original identity. Return to this chat to retry it.",
-      "cancelNotSaved": "Could not save this cancellation safely. The request remains pending and was not removed.",
-      "cancelAlreadyAccepted": "This MetaSkill request had already started, so it could not be cancelled and was not returned to the composer. Do not resend it."
-    },
-    "metaSetup": {
-      "title": "Set up {skill}",
-      "badgeConfirm": "Confirmation needed",
-      "badgeInstalling": "Installing",
-      "badgeVerifying": "Verifying",
-      "badgeFailed": "Failed",
-      "badgeBlocked": "Needs attention",
-      "intro": "This MetaSkill needs a few requirements before it can run. Review the local tools and service connections below.",
-      "missingDependencies": "Missing requirements",
-      "installActions": "Planned installation",
-      "source": "Source",
-      "version": "Version {version}",
-      "license": "License",
-      "downloadSize": "Download",
-      "paperToolchain": "Managed TeX paper toolchain",
-      "mediaToolchain": "Compatible FFmpeg media toolchain",
-      "missingRuntimeCapabilities": "Runtime capabilities still missing: {capabilities}",
-      "requiresAdmin": "This installation may require administrator approval. Your system will ask before privileged changes are made.",
-      "confirmHint": "OpenSquilla installs the selected components from the listed sources and verifies runtime compatibility. Your project files are not modified.",
-      "homebrewHint": "On macOS, this runs brew install --force-bottle ffmpeg-full. Homebrew resolves the current formula and installs it outside OpenSquilla's managed toolchain directory. OpenSquilla does not uninstall that formula or its dependencies.",
-      "installAndContinue": "Install and continue",
-      "notNow": "Not now",
-      "hide": "Stop watching",
-      "backgroundHint": "Setup keeps running. Closing stops automatic launch; run this MetaSkill again to resume.",
-      "installingStatus": "Installing the selected components…",
-      "finishingStatus": "Download complete. Finishing local toolchain setup…",
-      "verifyingStatus": "Verifying the toolchain…",
-      "downloadProgress": "Download progress",
-      "completedActions": "{completed} of {total} steps complete",
-      "failedTitle": "Setup did not complete",
-      "blockedTitle": "Setup cannot continue",
-      "retry": "Retry",
-      "checkAgain": "Check again",
-      "providerTitle": "Connect {provider} to continue",
-      "providerCapabilities": "Used for: {capabilities}.",
-      "providerReasonMissingCredential": "Add a credential for this provider.",
-      "providerReasonPoolExhausted": "All configured credentials are currently busy. Check again shortly.",
-      "providerReasonEndpointMismatch": "The configured credential does not match this provider endpoint.",
-      "providerReasonMissingEndpoint": "Add an endpoint for this provider.",
-      "providerReasonInvalidEndpoint": "Review this provider’s endpoint configuration.",
-      "providerReasonRuntimeUnsupported": "This provider is not available in the current runtime.",
-      "providerReasonUnknownProvider": "This provider is not available in the current provider catalog.",
-      "providerReasonConnectionRequired": "A valid provider connection is required.",
-      "providerNoChargeHint": "Saving this connection does not start generation or incur generation charges. You will confirm generation separately.",
-      "configureProvider": "Connect {provider}",
-      "providerNavigationFailed": "Provider settings could not be opened safely. Your request is still here; try again.",
-      "close": "Close",
-      "noAutomaticSetup": "No safe automatic setup is available on this platform. Install the listed requirements manually, then retry.",
-      "sessionChanged": "The active chat changed, so this MetaSkill was not started. Return to the original chat to continue.",
-      "launchFailed": "The toolchain was installed, but the MetaSkill could not be started."
     },
     "compact": {
       "failureIntegrity": "The summary did not pass the completeness check",
@@ -4723,21 +4315,6 @@
       "planWeek": "Draft a plan for my week",
       "searchAiNews": "Search today's AI news",
       "generateImage": "Generate an image of a tiny squid mascot"
-    },
-    "metaQuick": {
-      "webpage": "Create a multimedia webpage",
-      "shortDrama": "Create an AI short drama",
-      "paperWriting": "Write an academic paper",
-      "webpageDesc": "Build a polished, ready-to-use website",
-      "shortDramaDesc": "Create scripts, shots, and a final video",
-      "paperWritingDesc": "Research, draft, and compile a paper"
-    },
-    "metaDescriptions": {
-      "webpage": "Build a complete multimedia website from a topic.",
-      "kidsProject": "Plan a safe, age-appropriate creative project for children.",
-      "shortDrama": "Create an AI short drama from script to final video.",
-      "skillCreator": "Combine existing skills into a reusable workflow.",
-      "paperWriting": "Research, draft, and compile an academic paper."
     },
     "toast": {
       "downloadFailedHttp": "Download failed — HTTP {status}",
@@ -4839,14 +4416,6 @@
       "sessionModelBusy": "Finish the current response before changing its model.",
       "router": "Intelligent model routing",
       "ensemble": "Model ensemble"
-    },
-    "routeFeedback": {
-      "up": "Right model choice for this turn",
-      "down": "Wrong model choice for this turn",
-      "upEnsemble": "Satisfied with this aggregated answer",
-      "downEnsemble": "Unsatisfied with this aggregated answer",
-      "expired": "This message’s routing record has expired",
-      "failed": "Could not record your rating"
     }
   },
   "shared": {
@@ -4868,9 +4437,7 @@
       "groupMessages": "Messages",
       "actionNewChat": "New task",
       "actionOpenSettings": "Open Settings",
-      "actionToggleTheme": "Toggle theme",
-      "actionBgmEnable": "Enable background music",
-      "actionBgmDisable": "Disable background music"
+      "actionToggleTheme": "Toggle theme"
     },
     "toast": {
       "dismiss": "Dismiss notification"
@@ -5035,6 +4602,35 @@
       "copied": "Command copied",
       "copyFailed": "Could not copy the command",
       "copyLabel": "Copy the gateway restart command"
+    }
+  },
+  "deliveryRecovery": {
+    "label": "Pending delivery checks",
+    "count": "{count} delivery results need confirmation",
+    "show": "View details",
+    "collapse": "Hide details",
+    "open": "Open conversation",
+    "check": "Check again",
+    "checking": "Checking…",
+    "more": "Show more",
+    "stop": "Stop original request",
+    "stopPending": "Stop will continue after the original task is confirmed.",
+    "reason": {
+      "not-sent": "This message has not been sent. Open the conversation to review the draft and send it.",
+      "pending": "The original delivery is being checked.",
+      "stop": "Waiting for the task to stop.",
+      "offline": "Reconnect to check the original delivery.",
+      "identity": "Switch to the original Gateway and account to check this delivery.",
+      "receipt-unsupported": "This Gateway cannot check delivery receipts. Open the conversation to inspect the result.",
+      "receipt-missing": "No receipt was found. The original delivery remains unconfirmed.",
+      "storage-check": "Recovery state could not be accessed. You can check again when local storage is available.",
+      "storage": "The Stop request could not be saved. Check the task before closing; Stop cannot be guaranteed after reopening.",
+      "lease": "Another open window is checking this delivery.",
+      "budget": "Automatic checks have paused. You can check again.",
+      "permission": "Permission to check this delivery was denied. Restore access before checking again.",
+      "conflict": "The saved request and receipt disagree. Open the conversation to inspect the result.",
+      "reload": "Delivery recovery paused because storage was upgraded in another window. Save your unsent draft, then reload this window.",
+      "legacy": "An older delivery has no verified connection identity. Open the original conversation to inspect it."
     }
   }
 }

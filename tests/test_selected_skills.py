@@ -69,8 +69,8 @@ async def test_explicit_manual_only_load_preserves_auto_policy_and_support_files
     spec = skill(tmp_path)
     spec.disable_model_invocation = True
     ctx, tools, receipts = turn([spec])
-    assert not is_public_ordinary(spec, coding_mode=False)
-    assert is_user_invocable_ordinary(spec, coding_mode=False)
+    assert not is_public_ordinary(spec)
+    assert is_user_invocable_ordinary(spec)
     skill_tools.create_skill_tools(SimpleNamespace(get_by_name=lambda _: spec))
     view = get_default_registry().get("skill_view").handler
     token = current_tool_context.set(tools)
@@ -196,7 +196,7 @@ async def test_cancellation_closes_all_started_loads_without_injecting(tmp_path,
 async def test_live_disable_during_later_digest_prevents_entire_batch(tmp_path, monkeypatch):
     one, two = skill(tmp_path, "one"), skill(tmp_path, "two")
     ctx, tools, receipts = turn([one, two])
-    live_config = SimpleNamespace(disabled=[], coding_mode=False)
+    live_config = SimpleNamespace(disabled=[])
     eligibility.set_live_skills_config_getter(lambda: live_config)
     digest_started, finish_digest = asyncio.Event(), asyncio.Event()
     original_to_thread = asyncio.to_thread

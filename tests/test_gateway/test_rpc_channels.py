@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -243,7 +244,7 @@ async def test_channels_status_explains_admission_policy_and_denials():
         )
 
     class FakeStore:
-        def admission_reason_counts(self, name: str) -> dict:
+        async def admission_reason_counts(self, name: str) -> dict:
             assert name == "telegram-main"
             return {
                 "dm_admitted": {"count": 9, "first_at": 1700000000.0, "last_at": 1700000300.0},
@@ -628,7 +629,7 @@ async def test_channels_restart_unloaded_channel_returns_typed_error():
 @pytest.mark.asyncio
 async def test_channels_status_counts_pending_pairings_per_channel():
     class _Store:
-        def list_pairings(self, *, channel_name=None, status=None):
+        async def list_pairings(self, *, channel_name=None, status=None):
             assert status == "pending"
             mk = type("P", (), {})
             out = []
@@ -696,15 +697,23 @@ class _NoticeStore:
             reply_to=reply_to,
         )
 
-    def list_pairings(self, *, channel_name=None, status=None):
+    async def list_pairings(self, *, channel_name=None, status=None):
         if status is not None and self.record.status != status:
             return []
         return [self.record]
 
-    def set_pairing_status(self, *, channel_name, pairing_id, status):
+    async def set_pairing_status(self, *, channel_name, pairing_id, status):
         self.record.status = status
         self.record.approved_at = 2.0
         return self.record
+
+    async def approve_pairing_once(self, *, channel_name, pairing_id):
+        changed = self.record.status != "approved"
+        if changed:
+            await self.set_pairing_status(
+                channel_name=channel_name, pairing_id=pairing_id, status="approved",
+            )
+        return self.record, changed
 
 
 def _notice_ctx(adapter, store, *, notice: bool = True):
@@ -733,6 +742,44 @@ def _notice_ctx(adapter, store, *, notice: bool = True):
 
     ctx.channel_manager = _Manager()
     return ctx
+
+
+@pytest.mark.asyncio
+async def test_async_store_status_and_concurrent_pairing_approval_notify_once(tmp_path):
+    from opensquilla.channels.storage_worker import AsyncChannelDeliveryStore
+
+    store = AsyncChannelDeliveryStore(tmp_path / "channels.db")
+    adapter = _NoticeAdapter()
+    ctx = _notice_ctx(adapter, store)
+    try:
+        record = await store.request_pairing(
+            channel_name="work", provider="slack", account_id="acct", sender_id="U-1",
+            reply_to="dm-chat-1",
+        )
+        assert record is not None
+        before = await get_dispatcher().dispatch("status-before", "channels.status", {}, ctx)
+        assert before.error is None, before.error
+        assert before.payload["channels"][0]["pendingPairings"] == 1
+
+        approvals = await asyncio.gather(*(
+            get_dispatcher().dispatch(
+                f"approve-{index}", "channels.pairing.approve",
+                {"channelName": "work", "pairingId": record.pairing_id}, ctx,
+            ) for index in range(2)
+        ))
+        assert all(result.error is None for result in approvals)
+        assert all(result.payload["pairing"]["status"] == "approved" for result in approvals)
+        assert len(adapter.sent) == 1
+        assert adapter.sent[0].reply_to == "dm-chat-1"
+        assert adapter.sent[0].metadata["pairing_approved"] is True
+
+        after = await get_dispatcher().dispatch("status-after", "channels.status", {}, ctx)
+        assert after.error is None, after.error
+        assert after.payload["channels"][0]["pendingPairings"] == 0
+        persisted = await store.list_pairings(channel_name="work", status="approved")
+        assert [row.pairing_id for row in persisted] == [record.pairing_id]
+    finally:
+        await store.close()
 
 
 @pytest.mark.asyncio

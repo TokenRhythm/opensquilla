@@ -45,7 +45,7 @@ const submenuOpen = ref(false)
 const activeModel = ref(-1)
 const compact = ref(false)
 const position = ref({ left: '12px', bottom: '12px', width: '224px', '--routing-height': '400px' })
-const submenuPosition = ref({ left: '12px', top: '12px', height: '360px' })
+const submenuPosition = ref({ left: '12px', top: '12px', height: '520px' })
 const submenuSide = ref<'left' | 'right' | 'compact'>('right')
 const hasModelPicker = computed(() =>
   Boolean(props.modelSelectionAvailable || props.modelSelection),
@@ -203,9 +203,9 @@ const showProviderGroups = computed(() => new Set(
 ).size > 1)
 const issue = computed(() => {
   if (props.modelSelectionDisabledReason === 'unavailable') return t('chat.newTaskModel.unavailable')
-  if (props.modelsError && !props.availableModels?.length) return props.modelsError
-  // A compatible last-good catalog remains usable during a discovery outage.
-  // Only surface provider failures that actually leave its options unavailable.
+  if (props.modelsError) return t(props.availableModels?.length
+    ? 'setup.provider.modelCatalogRefreshFailed' : 'setup.provider.modelCatalogLoadFailed')
+  // Keep last-good options usable, but disclose that refresh failed once.
   const failures = (props.modelProviderErrors ?? []).filter((error) =>
     !props.availableModels?.some((model) => model.provider === error.provider),
   )
@@ -213,7 +213,8 @@ const issue = computed(() => {
     ? t('chat.newTaskModel.partialFailure', {
         providers: failures.map((error) => error.provider).join(', '),
       })
-    : ''
+    : props.modelProviderErrors?.length
+      ? t('setup.provider.modelCatalogRefreshFailed') : ''
 })
 function modelDisabled(model: (typeof models.value)[number]) {
   return (
@@ -531,7 +532,11 @@ defineExpose({ element: () => rootRef.value })
             <Icon name="chevronLeft" :size="16" />
           </button>
           <strong>{{ pickerTitle }}</strong>
-          <span class="routing-catalog-label">{{ t('chat.newTaskModel.catalog') }}</span>
+          <span class="routing-catalog-label" :role="modelsLoading ? 'status' : undefined">{{
+            modelsLoading
+              ? t(availableModels?.length ? 'setup.provider.modelCatalogRefreshing' : 'setup.provider.modelCatalogLoading')
+              : t('chat.newTaskModel.catalog')
+          }}</span>
         </header>
         <label class="routing-search">
           <Icon name="search" :size="16" />
@@ -606,27 +611,25 @@ defineExpose({ element: () => rootRef.value })
               }}
             </p>
           </div>
-        </div>
-        <button
-          v-if="hasHiddenModels"
-          ref="showAllRef"
-          type="button"
-          class="routing-show-all"
-          @click="showAllModels"
-        >{{ t('chat.newTaskModel.showAll') }}</button>
-        <div v-if="issue || (modelsLoading && !availableModels?.length)" class="routing-issue" role="status">
-          <span>{{ modelsLoading && !availableModels?.length ? t('chat.newTaskModel.loading') : issue }}</span>
           <button
-            v-if="issue"
+            v-if="hasHiddenModels"
+            ref="showAllRef"
+            type="button"
+            class="routing-show-all"
+            @click="showAllModels"
+          >{{ t('chat.newTaskModel.showAll') }}</button>
+        </div>
+        <div v-if="issue && !modelsLoading" class="routing-issue" role="status">
+          <span>{{ issue }}</span>
+          <button
             type="button"
             class="routing-retry"
-            :disabled="modelsLoading"
             @click="emit('refreshModels')"
           >
             {{ t('chat.newTaskModel.retry') }}
           </button>
         </div>
-        <p class="routing-model-scope">{{ pickerHint }}</p>
+        <p v-else class="routing-model-scope">{{ pickerHint }}</p>
       </section>
     </div>
   </Teleport>
@@ -659,7 +662,7 @@ defineExpose({ element: () => rootRef.value })
 .new-task-model-menu {
   position: fixed;
   width: 316px;
-  height: min(360px, var(--routing-height));
+  height: min(520px, var(--routing-height));
   container: model-routing-menu / size;
   animation: routing-submenu-in var(--dur-fast) var(--ease-out);
 }
@@ -966,9 +969,11 @@ defineExpose({ element: () => rootRef.value })
 }
 .routing-issue {
   display: flex;
+  flex-shrink: 0;
   align-items: center;
   gap: 6px;
   padding: 8px 14px;
+  border-top: 1px solid var(--border);
   color: var(--warn);
   font-size: var(--fs-xs);
 }

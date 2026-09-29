@@ -9,7 +9,7 @@ import { useArtifactPromptAnnotationsStore } from '@/stores/artifactPromptAnnota
 import type { Attachment, ChatMessage } from '@/types/chat'
 import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { UseChatSendOptions } from './useChatSend'
-import { useChatSend } from './useChatSend'
+import { createChatSendHarness } from './chatSendTestHarness'
 
 function snapshot(annotationId: string, sentOrder: number): PromptAnnotationSnapshot {
   return {
@@ -57,7 +57,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     appendFrame: vi.fn(),
     appendToolEnd: vi.fn(),
   }
-  const options: UseChatSendOptions = {
+  const options: Omit<UseChatSendOptions, 'durableDelivery'> = {
     turnCommands: createV4TurnCommandsFromRpcClient(rpc),
     inputText: ref(''),
     messages: ref<ChatMessage[]>([]),
@@ -110,7 +110,7 @@ function createHarness(overrides: Partial<UseChatSendOptions> = {}) {
     scrollToBottom: vi.fn(),
     ...overrides,
   }
-  return { api: useChatSend(options), options, rpc }
+  return { ...createChatSendHarness(options), rpc }
 }
 
 describe('sending with empty page annotation drafts', () => {
@@ -161,7 +161,7 @@ describe('sending with empty page annotation drafts', () => {
       pageContext: expect.objectContaining({
         annotations: [{ text: 'Enlarge this heading', selectionText: 'Welcome', locatorHint: 'h1' }],
       }),
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
   })
 
@@ -170,7 +170,7 @@ describe('sending with empty page annotation drafts', () => {
     await harness.api.onSend()
     expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
       message: 'Update the page title',
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('pageContext')
     expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
@@ -217,7 +217,7 @@ describe('sending with empty page annotation drafts', () => {
       attachments: [
         { file_uuid: 'reference-file', type: 'image/png', mime: 'image/png', name: 'reference.png' },
       ],
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('pageContext')
     expect(Object.keys(harness.store.annotations)).toEqual(['empty-draft'])
@@ -246,7 +246,7 @@ describe('ordinary page annotation input', () => {
           { text: 'Change annotation-1', selectionText: '<button>', locatorHint: '#button' },
         ],
       },
-    }))
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
     const params = harness.rpc.call.mock.calls[0]?.[1] as Record<string, unknown>
     expect(params).not.toHaveProperty('promptAnnotationIds')
     expect(params).not.toHaveProperty('documentContext')
@@ -321,7 +321,7 @@ describe('ordinary page annotation input', () => {
       pendingUiId: 'pending-1', text: 'Update the heading', attachments: [], intent: null,
       ownerSessionKey: 'agent:main:webchat:test', pageContext,
     })
-    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({ pageContext }))
+    expect(harness.rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({ pageContext }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
   })
 })
 
@@ -417,7 +417,7 @@ describe('explicit skill send boundaries', () => {
     return result
   }
 
-  it.each(['/compact', '/meta report -- summarize', '/plan', '!pwd'])('keeps explicit selection out of %s controls', async command => {
+  it.each(['/compact', '/plan', '!pwd'])('keeps explicit selection out of %s controls', async command => {
     const result = harness()
     result.options.inputText.value = command
     result.options.classifySlashCommand = vi.fn(async () => 'registered' as const)

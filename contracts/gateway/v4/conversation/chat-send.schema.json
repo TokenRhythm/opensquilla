@@ -89,10 +89,6 @@
         "retryable": false
       },
       {
-        "code": "META_CONTROL_CONFLICT",
-        "retryable": false
-      },
-      {
         "code": "COLLECT_RACE",
         "retryable": true
       },

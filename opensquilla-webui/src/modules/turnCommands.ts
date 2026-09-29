@@ -10,6 +10,8 @@ import type { ArtifactProductFailure } from '@/utils/artifactProductErrors'
 /** Options shared by turn commands without exposing transport details. */
 export interface TurnCommandRequestOptions {
   signal?: AbortSignal
+  /** Fence a request against a connection/profile change after the caller's identity check. */
+  expectedGeneration?: number
 }
 
 export type TurnCommandFailureKind =
@@ -187,6 +189,15 @@ export type TurnSendRequest =
   | { kind: 'new-turn'; params: TurnSendParams }
   | { kind: 'pending-input'; params: PendingInputDispatchRequest }
 
+/** Only these durable operations have a read-only acceptance lookup. */
+export type TurnReceiptRequest =
+  | { kind: 'send'; request: TurnSendRequest }
+  | { kind: 'steer'; request: TurnSteerRequest }
+
+export type TurnReceiptResult =
+  | { status: 'found'; response: TurnSendResponse | TurnSteerResponse }
+  | { status: 'not-found' | 'unsupported' }
+
 export interface TurnCancelRequest {
   sessionKey: string
   source?: string
@@ -216,6 +227,12 @@ export type TurnCommandCapability = 'same-turn-steer' | 'durable-steer' | 'expli
  * Module; generated wire types remain confined to the Adapter.
  */
 export interface TurnCommands {
+  /** Missing support keeps unknown delivery pending; it never permits resubmission. */
+  lookupReceipt?(
+    request: TurnReceiptRequest,
+    options?: TurnCommandRequestOptions,
+  ): Promise<TurnReceiptResult>
+  supportsReceiptLookup?(): boolean
   send(
     request: TurnSendRequest,
     options?: TurnCommandRequestOptions,

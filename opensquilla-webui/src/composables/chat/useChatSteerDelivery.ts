@@ -237,7 +237,7 @@ export function useChatSteerDelivery(
       ...(existing?.stopRequested ? { stopRequested: true } : {}),
     }
     item.steerAttempt = attempt
-    // `deliveryState` remains the generic queue/hidden-control lease. Once an
+    // `deliveryState` remains the generic queue lease. Once an
     // item is a Steer, its phase is the single source of delivery truth.
     item.deliveryState = undefined
     // `item` can be the raw object that was just inserted into a Vue array;

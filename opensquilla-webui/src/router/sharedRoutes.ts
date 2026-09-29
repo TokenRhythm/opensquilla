@@ -4,10 +4,7 @@ import { readLastRoute } from './lastRoute'
 
 const ChatView = () => import('@/views/ChatView.vue')
 const CronView = () => import('@/views/CronView.vue')
-const AgentsView = () => import('@/views/AgentsView.vue')
-const ChangelogView = () => import('@/views/ChangelogView.vue')
-const OverviewHubView = () => import('@/views/OverviewHubView.vue')
-const LogsView = () => import('@/views/LogsView.vue')
+const UsageView = () => import('@/views/UsageView.vue')
 const SkillsChannelsHubView = () => import('@/views/SkillsChannelsHubView.vue')
 
 export function defaultRootRedirect(): string {
@@ -34,24 +31,17 @@ export const sharedRoutes: RouteRecordRaw[] = [
   { path: '/chat/new',  name: 'chat-new',  component: ChatView,      meta: { title: 'Chat', group: 'Work', icon: 'chat', platforms: ['web', 'desktop'], viewKey: 'chat' } },
   // Legacy deep link: sessions are managed from the sidebar and chat.
   { path: '/sessions', redirect: '/chat' },
-  // Status and Usage share the Overview destination. Runtime logs remain a
-  // kept-alive diagnostic deep link rather than a peer navigation tab.
-  { path: '/overview',  name: 'overview',  component: OverviewHubView, meta: { title: 'Status', titleKey: 'nav.status', icon: 'home', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
-  { path: '/usage',     name: 'usage',     component: OverviewHubView, meta: { title: 'Usage', group: 'Work', icon: 'usage', nav: 'primary', navOrder: 60, navLabelKey: 'nav.viewUsage', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'overview-hub' } },
-  { path: '/logs',      name: 'logs',      component: LogsView, meta: { title: 'Logs', icon: 'logs', platforms: ['web', 'desktop'], keepAlive: true } },
+  { path: '/usage',     name: 'usage',     component: UsageView, meta: { title: 'Usage', group: 'Work', icon: 'usage', nav: 'primary', navOrder: 60, navLabelKey: 'nav.viewUsage', platforms: ['web', 'desktop'], keepAlive: true } },
+  // Preserve old bookmarks without loading the retired diagnostic pages.
+  { path: '/overview', redirect: '/usage' },
+  // Keep link-token/query parameters while replacing the retired page's hash.
+  { path: '/logs', redirect: { path: '/settings/gateway', hash: '#logs' } },
   // Approvals resolve inline in the chat transcript and via the topbar pill.
   { path: '/approvals', redirect: '/chat' },
-  // Agent administration remains available as an advanced deep link, but is
-  // intentionally absent from primary navigation and cold-start restoration.
-  { path: '/agents',    name: 'agents',    component: AgentsView,    meta: { title: 'Agents', icon: 'agents', platforms: ['web', 'desktop'], keepAlive: true } },
   // Skills and Channels form one primary destination. /skills remains the
   // rail target while both canonical routes share the same kept-alive hub.
   { path: '/skills',    name: 'skills',    component: SkillsChannelsHubView, meta: { title: 'Skills', group: 'Work', icon: 'skills', nav: 'primary', navOrder: 40, navLabelKey: 'nav.skillsChannels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
   { path: '/channels',  name: 'channels',  component: SkillsChannelsHubView, meta: { title: 'Channels', icon: 'channels', platforms: ['web', 'desktop'], keepAlive: true, viewKey: 'skills-channels-hub' } },
   { path: '/cron',      name: 'cron',      component: CronView,      meta: { title: 'Cron', group: 'Work', icon: 'cron', nav: 'primary', navOrder: 50, platforms: ['web', 'desktop'], keepAlive: true } },
-  // Editorial surface (read, not operated): the first route to opt into an
-  // Axis-B expressive skin. Not in the primary nav — reached by URL / links.
-  { path: '/changelog', name: 'changelog', component: ChangelogView, meta: { title: 'Changelog', platforms: ['web', 'desktop'], skin: 'out-of-register' } },
-  // Readiness/doctor moved inline into Overview; the old deep link stays valid.
-  { path: '/health',    redirect: '/overview' },
+  { path: '/health', redirect: '/usage' },
 ]

@@ -23,7 +23,6 @@ const props = defineProps<{
   variant: 'installed' | 'registry'
   installed?: boolean
   busy?: boolean
-  meta?: boolean
   source?: string
   trustLevel?: string
   lifecycleLabel?: string
@@ -60,7 +59,7 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
     :is="variant === 'installed' ? 'button' : 'div'"
     :type="variant === 'installed' ? 'button' : undefined"
     class="sk-tile"
-    :class="{ 'sk-tile--interactive': variant === 'installed', 'sk-tile--meta': meta }"
+    :class="{ 'sk-tile--interactive': variant === 'installed' }"
     :title="name + (desc ? ': ' + desc : '')"
     @click="variant === 'installed' ? emit('open') : undefined"
   >
@@ -289,33 +288,8 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
 .sk-tile__add--done { border-radius: var(--radius-sm); font-size: 11px; width: auto; padding: 0 var(--sp-2); }
 .sk-tile__spinner { height: 14px; width: 14px; }
 
-.sk-tile--meta {
-  background:
-    radial-gradient(circle at 0 0, color-mix(in srgb, var(--accent) 9%, transparent), transparent 44%),
-    var(--bg-surface);
-  border-color: color-mix(in srgb, var(--accent) 24%, var(--border));
-}
 
-.sk-tile--meta:hover {
-  border-color: color-mix(in srgb, var(--accent) 48%, var(--border));
-  box-shadow: 0 12px 28px color-mix(in srgb, var(--accent) 11%, transparent);
-}
 
-.sk-tile__meta-mark {
-  align-items: center;
-  background: var(--bg-surface);
-  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
-  border-radius: 999px;
-  bottom: -4px;
-  color: var(--accent);
-  display: inline-flex;
-  font-size: 9px;
-  height: 17px;
-  justify-content: center;
-  position: absolute;
-  right: -4px;
-  width: 17px;
-}
 
 .sk-tile__dot {
   box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 10%, transparent);
@@ -358,31 +332,7 @@ const fallbackIcon = computed<IconName>(() => assignedFallbackIcon(props.name ||
   min-height: 3.4em;
   white-space: normal;
 }
-.sk-tile--meta {
-  background: color-mix(in srgb, var(--accent) 4%, var(--bg-elevated));
-  border-color: transparent;
-}
-.sk-tile--meta:hover {
-  border-color: color-mix(in srgb, var(--accent) 22%, var(--border));
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--accent) 7%, transparent);
-}
-.sk-tile__meta-mark {
-  bottom: -3px;
-  height: 15px;
-  right: -3px;
-  width: 15px;
-}
 
-/* Meta and built-in skills share one card treatment; grouping carries meaning. */
-.sk-tile--meta {
-  background: color-mix(in srgb, var(--bg-elevated) 64%, var(--bg-surface));
-  border-color: transparent;
-}
-.sk-tile--meta:hover {
-  background: var(--bg-elevated);
-  border-color: color-mix(in srgb, var(--border) 70%, transparent);
-  box-shadow: 0 8px 22px color-mix(in srgb, var(--text) 7%, transparent);
-}
 
 /* One visual system, distinct glyphs: colour no longer varies by name hash. */
 .sk-tile__avatar,

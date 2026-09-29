@@ -42,9 +42,9 @@ from opensquilla.gateway.config import (
 from opensquilla.gateway.config_migration import (
     ConfigParseError,
     atomic_write_config,
-    backup_and_write_migrated_config,
     make_config_backup,
     migrate_config_payload,
+    rewrite_migrated_config_best_effort,
 )
 from opensquilla.paths import default_opensquilla_home, native_io_path
 
@@ -221,7 +221,7 @@ def load_config(
     migration = migrate_config_payload(data)
     cfg = GatewayConfig.model_validate(migration.payload)
     if migration.changed and persist_migrations:
-        backup_and_write_migrated_config(target, migration.payload, migration)
+        rewrite_migrated_config_best_effort(target, migration)
     _mark_env_absorbed_runtime_secrets(cfg, data)
     cfg.config_path = str(target)
     _remember_load_baseline(cfg, migration.payload)

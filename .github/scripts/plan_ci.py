@@ -33,7 +33,6 @@ _DOC_EXACT: Final = {
     "CODE_OF_CONDUCT.md",
     "CONTRIBUTING.md",
     "LICENSE",
-    "META_SKILL_GUIDE.md",
     "MIGRATION.md",
     "README.md",
     "SECURITY.md",
@@ -72,6 +71,25 @@ _WINDOWS_NSIS_INPUTS: Final = (
     "desktop/electron/scripts/gateway-integrity.mjs",
     "scripts/release_dependency_inventory.py",
     "scripts/build_wheelhouse_zip.py",
+)
+# Ordinary dependency changes need install/start smoke coverage. Changes to the
+# installer, its verification harness, or historical data handling retain every
+# released-uninstaller fault case. Unknown changes still use full_fallback.
+_WINDOWS_NSIS_FULL_INPUTS: Final = (
+    *_WINDOWS_NSIS_INPUTS,
+    "desktop/electron/package.json",
+    "desktop/electron/package-lock.json",
+    "desktop/electron/electron-builder.*",
+    "desktop/electron/scripts/*installer*",
+    "desktop/electron/scripts/build-signed-windows.cjs",
+    "desktop/electron/src/*update*",
+    ".github/scripts/verify-release-windows*",
+    "migrations/**",
+    "src/opensquilla/migration/**",
+    "src/opensquilla/persistence/**",
+    "src/opensquilla/recovery/**",
+    "src/opensquilla/uninstall/**",
+    "src/opensquilla/profile*",
 )
 _TUI_DEPENDENCY_EXACT: Final = {
     "packages/opensquilla-tui-host/pyproject.toml",
@@ -172,11 +190,9 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills_bundled_baseline.py",
         "tests/test_skills_hot_reload.py",
         "tests/test_skill_catalog_projection.py",
-        "tests/test_gateway/test_meta_catalog_compatibility.py",
         "tests/test_gateway/test_rpc_commands.py",
         "tests/test_migration/test_legacy_config_fixtures.py",
         "tests/test_skills/test_catalog_upgrade_retirement.py",
-        "tests/test_skills/test_sop_compiler.py",
         "tests/unit/cli/tui/test_opentui_completion_catalog.py",
         "tests/test_skills_loader_namespaces.py",
         "tests/test_skills_tree.py",
@@ -203,15 +219,12 @@ _SKILL_HUB_TESTS: Final = frozenset(
         "tests/test_skills/test_hub_transaction_process_gates.py",
         "tests/test_gateway/test_rpc_skills_install_visibility.py",
         "tests/test_gateway/test_rpc_skills_exact_identity.py",
-        "tests/test_gateway/test_rpc_skills_coding_gate.py",
         "tests/test_gateway/test_rpc_skills_reload.py",
         "tests/test_gateway/test_skill_catalog_adapter.py",
         "tests/test_gateway/test_skill_catalog_application.py",
         "tests/test_gateway/test_skill_management_adapter.py",
         "tests/test_gateway/test_skill_management_application.py",
         "tests/test_gateway/test_skill_management_service_injection.py",
-        "tests/test_gateway/test_skill_proposal_review_adapter.py",
-        "tests/test_gateway/test_skill_proposal_review_application.py",
         "tests/test_tools/test_skill_view_resources.py",
         "tests/test_scripts/test_bench_skill_integrity.py",
         "tests/test_cli/test_cli_product_completeness.py",
@@ -226,27 +239,22 @@ _SKILL_HUB_SOURCE_EXACT: Final = frozenset(
         "src/opensquilla/cli/gateway_client.py",
         "src/opensquilla/cli/main.py",
         "src/opensquilla/cli/skills_cmd.py",
-        "src/opensquilla/cli/skills_meta_cmd.py",
         "src/opensquilla/application/skill_catalog.py",
         "src/opensquilla/application/skill_management.py",
         "src/opensquilla/engine/runtime.py",
         "src/opensquilla/engine/agent.py",
         "src/opensquilla/application/skill_source.py",
-        "src/opensquilla/application/skill_proposal_review.py",
         "src/opensquilla/gateway/app.py",
         "src/opensquilla/gateway/adapters/skill_catalog.py",
         "src/opensquilla/gateway/adapters/skill_catalog_contract.py",
         "src/opensquilla/gateway/adapters/skill_management.py",
         "src/opensquilla/gateway/adapters/skill_management_contract.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review.py",
-        "src/opensquilla/gateway/adapters/skill_proposal_review_contract.py",
         "src/opensquilla/gateway/boot.py",
         "src/opensquilla/gateway/config.py",
         "src/opensquilla/gateway/protocol.py",
         "src/opensquilla/gateway/rpc/__init__.py",
         "src/opensquilla/gateway/rpc/registry.py",
         "src/opensquilla/gateway/rpc_skills.py",
-        "src/opensquilla/gateway/rpc_proposals.py",
         "src/opensquilla/gateway/scopes.py",
         "src/opensquilla/gateway/websocket.py",
         "src/opensquilla/tools/builtin/skill_tools.py",
@@ -260,7 +268,6 @@ _SKILL_HUB_TEST_PREFIXES: Final = (
     "tests/test_gateway/test_rpc_skills_",
     "tests/test_gateway/test_skill_catalog_",
     "tests/test_gateway/test_skill_management_",
-    "tests/test_gateway/test_skill_proposal_review_",
     "tests/test_skills/test_hub_",
     "tests/test_skills/test_loader_",
     "tests/test_skills_hub_",
@@ -350,38 +357,8 @@ _MANAGED_TOOLCHAIN_SHARED_TARGETS: Final = {
     "tests/test_skills/test_toolchain_runtime_integration.py",
     "tests/test_skills/test_toolchain_state_scope.py",
 }
-_MANAGED_TOOLCHAIN_SOURCE_TARGETS: Final[tuple[tuple[str, tuple[str, ...]], ...]] = (
-    (
-        "src/opensquilla/skills/bundled/meta-paper-write/",
-        (
-            "tests/test_skills/test_meta_paper*.py",
-            "tests/test_skills/test_paper_*.py",
-        ),
-    ),
-    (
-        "src/opensquilla/skills/bundled/paper-",
-        (
-            "tests/test_skills/test_meta_paper*.py",
-            "tests/test_skills/test_paper_*.py",
-        ),
-    ),
-    (
-        "src/opensquilla/skills/bundled/meta-short-drama/",
-        ("tests/test_skills/test_meta_short_drama*.py",),
-    ),
-    (
-        "src/opensquilla/skills/bundled/subtitle-burner/",
-        ("tests/test_skills/test_subtitle_burner.py",),
-    ),
-    ("src/opensquilla/skills/bundled/video-still-animator/", ()),
-)
 _MANAGED_TOOLCHAIN_TEST_PREFIXES: Final = (
     "tests/test_skills/test_toolchain_",
-    "tests/test_skills/test_meta_paper",
-    "tests/test_skills/test_paper_",
-    "tests/test_skills/test_meta_short_drama",
-    "tests/test_skills/test_subtitle_burner",
-    "tests/test_skills/test_video_still_animator",
 )
 _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]] = (
     (
@@ -409,7 +386,7 @@ _PYTHON_TARGET_RULES: Final[tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]]
     (("src/opensquilla/scheduler/",), ("tests/test_scheduler",)),
     (
         ("src/opensquilla/skills/",),
-        ("tests/test_meta_skill*.py", "tests/test_skills", "tests/test_skills*.py"),
+        ("tests/test_skills", "tests/test_skills*.py"),
     ),
     (
         ("src/opensquilla/cli/",),
@@ -447,12 +424,8 @@ _FIXED_PLATFORM_MATRIX: Final[dict[str, tuple[tuple[str, str], ...]]] = {
         ("windows-2022", "build"),
         ("windows-2022", "wheelhouse-core"),
         ("windows-2022", "wheelhouse-recommended"),
-        *(("windows-2022", f"{baseline}-{path}-{scenario}")
-          for baseline in ("0.5.3", "0.5.4")
-          for path in ("default", "custom")
-          for scenario in ("baseline", "readlock", "longpath")),
-        ("windows-2022", "fresh-default-fresh"),
-        ("windows-2022", "fresh-custom-fresh"),
+        *(("windows-2022", f"candidate-{probe}")
+          for probe in ("startup-compat", "ownership", "migration", "session")),
     ),
     "skill-hub": (
         ("ubuntu-latest", "default"),
@@ -484,11 +457,6 @@ def _managed_toolchain_targets(path: str) -> set[str] | None:
         or path.startswith(_MANAGED_TOOLCHAIN_TEST_PREFIXES)
     ):
         targets = set(_MANAGED_TOOLCHAIN_SHARED_TARGETS)
-    for prefix, domain_targets in _MANAGED_TOOLCHAIN_SOURCE_TARGETS:
-        if path.startswith(prefix):
-            targets = set(_MANAGED_TOOLCHAIN_SHARED_TARGETS)
-            targets.update(domain_targets)
-            break
     if targets is not None and path.startswith("tests/"):
         targets.add(path)
     return targets
@@ -1594,12 +1562,30 @@ def suite_execution_digests(
     return result
 
 
+def windows_nsis_upgrade_cells(profile: str) -> list[dict[str, str]]:
+    """Return the installed-package cases for a validated acceptance profile."""
+    if profile not in {"smoke", "full"}:
+        raise ValueError(f"unknown Windows NSIS acceptance profile: {profile}")
+    baselines = ("0.5.3", "0.5.4") if profile == "full" else ("0.5.4",)
+    scenarios = ("baseline", "readlock", "longpath") if profile == "full" else ("baseline",)
+    return [
+        {"baseline": baseline, "install-path": path, "scenario": scenario}
+        for baseline in baselines
+        for path in ("default", "custom")
+        for scenario in scenarios
+    ] + [
+        {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
+        for path in ("default", "custom")
+    ]
+
+
 def _execution_matrices(
     required_suites: Sequence[str],
     desktop_cells: set[tuple[str, str]],
     targeted_windows_shards: set[str],
     windows_full_matrix: bool,
     config: Mapping[str, Any],
+    windows_nsis_profile: str = "full",
 ) -> tuple[dict[str, list[str]], list[dict[str, str]]]:
     """Return canonical Python and all-platform execution matrices."""
 
@@ -1632,6 +1618,12 @@ def _execution_matrices(
     for suite_id in suites:
         for os_name, shard in _FIXED_PLATFORM_MATRIX.get(suite_id, ()):
             cells.add((suite_id, os_name, shard))
+    if "windows-nsis-regression" in suites:
+        cells.update(
+            ("windows-nsis-regression", "windows-2022",
+             f"{cell['baseline']}-{cell['install-path']}-{cell['scenario']}")
+            for cell in windows_nsis_upgrade_cells(windows_nsis_profile)
+        )
     if "desktop-recovery-e2e" in suites:
         cells.update(
             ("desktop-recovery-e2e", os_name, shard)
@@ -1725,6 +1717,12 @@ def plan_changes(
     test_reverse_dependencies: dict[str, frozenset[str]] | None = None
     test_dependency_analysis_failed = False
     full_fallback = False
+    windows_nsis_full = any(
+        fnmatch.fnmatchcase(path, pattern)
+        for path in paths for pattern in _WINDOWS_NSIS_FULL_INPUTS
+    )
+    if windows_nsis_full:
+        suites.add("windows-nsis-regression")
     all_docs = bool(paths) and not invalid_paths
     merge_critical_inputs = config.get(_MERGE_CRITICAL_INPUTS_KEY)
     if not isinstance(merge_critical_inputs, frozenset):
@@ -2144,12 +2142,14 @@ def plan_changes(
         suites.add("frontend-artifact")
 
     required_suites = sorted(suites)
+    windows_nsis_profile = "full" if full_fallback or windows_nsis_full else "smoke"
     python_matrix, platform_matrix = _execution_matrices(
         required_suites,
         desktop_cells,
         targeted_windows_shards,
         windows_full_matrix,
         config,
+        windows_nsis_profile,
     )
     digests = suite_execution_digests(
         required_suites, repo=repo, config=config, ref=ref
@@ -2162,6 +2162,7 @@ def plan_changes(
         ],
         "python_matrix": python_matrix,
         "platform_matrix": platform_matrix,
+        "windows_nsis_profile": windows_nsis_profile,
         "python_targets": sorted(targets),
         "full_fallback": full_fallback,
         "reason_codes": sorted(reasons),

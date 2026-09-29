@@ -1,7 +1,7 @@
 <template>
   <details v-if="skills.length" class="sk-group sk-group--skills" :class="groupClass" open>
     <summary class="sk-group__head">
-      <span class="sk-group__icon" :class="{ 'is-meta': meta }"><Icon name="skills" :size="15" /></span>
+      <span class="sk-group__icon"><Icon name="skills" :size="15" /></span>
       <span class="sk-group__label">{{ title }}</span>
       <span class="sk-group__count">{{ skills.length }}</span>
       <span class="sk-group__meta">{{ description }}</span>
@@ -15,7 +15,6 @@
         :description="skill.description"
         :description-zh="skill.description_zh"
         :emoji="skill.emoji"
-        :meta="meta"
         :lifecycle-label="skillLifecyclePresentation(skill, 'installed')?.label"
         :lifecycle-tone="skillLifecyclePresentation(skill, 'installed')?.tone"
         :status-dot-class="skillStatusDotClass(skill)"
@@ -42,7 +41,6 @@ defineProps<{
   description: string
   skills: Skill[]
   groupClass?: string
-  meta?: boolean
 }>()
 
 const emit = defineEmits<{
@@ -61,10 +59,6 @@ const emit = defineEmits<{
   justify-content: center;
   width: 28px;
 }
-.sk-group__icon.is-meta {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--accent);
-}
 .sk-tile-grid {
   display: grid;
   gap: var(--sp-2);
@@ -80,10 +74,6 @@ const emit = defineEmits<{
   height: 28px;
   justify-content: center;
   width: 28px;
-}
-.sk-group__icon.is-meta {
-  background: color-mix(in srgb, var(--accent) 12%, transparent);
-  color: var(--accent);
 }
 .sk-tile-grid { grid-template-columns: 1fr; }
 }
@@ -107,8 +97,7 @@ const emit = defineEmits<{
 }
 
 /* Keep the section glyph on the same baseline and canvas as its label. */
-.sk-group__icon,
-.sk-group__icon.is-meta {
+.sk-group__icon {
   align-items: center;
   background: transparent;
   display: inline-flex;

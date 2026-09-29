@@ -18,7 +18,6 @@ export interface SettingsMutation {
   restartRequired?: boolean
   readonly restartSections?: readonly string[]
   readonly patched?: readonly string[]
-  readonly linked?: readonly string[]
   readonly modelRouting?: Record<string, unknown>
   readonly [key: string]: unknown
 }

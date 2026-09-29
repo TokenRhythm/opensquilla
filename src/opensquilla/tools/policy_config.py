@@ -96,94 +96,6 @@ _TOOL_GROUPS: Mapping[str, frozenset[str]] = {
     ),
 }
 
-_REPO_CODING_SOURCE_EDIT_TOOLS: frozenset[str] = frozenset(
-    {
-        "read_source",
-        "edit_source",
-        "read_file",
-        "grep_search",
-        "glob_search",
-        "list_dir",
-        "git_status",
-        "git_diff",
-        "retrieve_tool_result",
-        "exec_command",
-        "process",
-    }
-)
-
-_REPO_CODING_SOURCE_EDIT_STRICT_TOOLS: frozenset[str] = frozenset(
-    {
-        "read_source",
-        "edit_source",
-        "grep_search",
-        "glob_search",
-        "git_status",
-        "git_diff",
-        "retrieve_tool_result",
-        "exec_command",
-        "process",
-    }
-)
-
-_REPO_CODING_SOURCE_EDIT_V2_TOOLS: frozenset[str] = frozenset(
-    {
-        "read_source",
-        "edit_source",
-        "source_symbols",
-        "grep_search",
-        "glob_search",
-        "git_status",
-        "git_diff",
-        "retrieve_tool_result",
-        "exec_command",
-        "process",
-    }
-)
-
-_REPO_CODING_SOURCE_EDIT_BALANCED_TOOLS: frozenset[str] = frozenset(
-    {
-        "read_source",
-        "edit_source",
-        "create_source",
-        "write_scratch",
-        "source_symbols",
-        "read_file",
-        "grep_search",
-        "glob_search",
-        "list_dir",
-        "git_status",
-        "git_diff",
-        "retrieve_tool_result",
-        "exec_command",
-        "process",
-    }
-)
-
-_REPO_CODING_SOURCE_EDIT_PATCH_FALLBACK_TOOLS: frozenset[str] = (
-    _REPO_CODING_SOURCE_EDIT_BALANCED_TOOLS | frozenset({"apply_patch"})
-)
-
-_REPO_CODING_SCAFFOLD_EDIT_TOOLS: frozenset[str] = frozenset(
-    {
-        "exec_command",
-        "process",
-        "read_file",
-        "edit_file",
-        "write_file",
-        "glob_search",
-        "grep_search",
-        "list_dir",
-        "git_status",
-        "git_diff",
-        "retrieve_tool_result",
-    }
-)
-
-_REPO_CODING_SCAFFOLD_PATCH_TOOLS: frozenset[str] = (
-    _REPO_CODING_SCAFFOLD_EDIT_TOOLS | frozenset({"apply_patch"})
-)
-
 _TOOL_PROFILES: Mapping[str, frozenset[str] | None] = {
     "full": None,
     "minimal": frozenset({"session_status"}),
@@ -194,18 +106,22 @@ _TOOL_PROFILES: Mapping[str, frozenset[str] | None] = {
         | _TOOL_GROUPS["group:sessions"]
         | _TOOL_GROUPS["group:memory"]
     ),
-    "repo_coding_source_edit": _REPO_CODING_SOURCE_EDIT_TOOLS,
-    "repo_coding_source_edit_strict": _REPO_CODING_SOURCE_EDIT_STRICT_TOOLS,
-    "repo_coding_source_edit_v2": _REPO_CODING_SOURCE_EDIT_V2_TOOLS,
-    "repo_coding_source_edit_balanced": _REPO_CODING_SOURCE_EDIT_BALANCED_TOOLS,
-    "repo_coding_source_edit_patch_fallback": _REPO_CODING_SOURCE_EDIT_PATCH_FALLBACK_TOOLS,
-    "repo_coding_scaffold_edit": _REPO_CODING_SCAFFOLD_EDIT_TOOLS,
-    "repo_coding_scaffold_patch": _REPO_CODING_SCAFFOLD_PATCH_TOOLS,
     "messaging": _TOOL_GROUPS["group:messaging"]
     | frozenset({"sessions_list", "sessions_history", "sessions_send", "session_status"}),
 }
 _SENDER_SCOPED_TOOL_GROUPS: frozenset[str] = frozenset({"channel:perm"})
 _SENDER_SCOPED_TOOL_NAMES: frozenset[str] = _TOOL_GROUPS["channel:perm"]
+_RETIRED_REPO_CODING_PROFILES = frozenset(
+    {
+        "repo_coding_source_edit",
+        "repo_coding_source_edit_strict",
+        "repo_coding_source_edit_v2",
+        "repo_coding_source_edit_balanced",
+        "repo_coding_source_edit_patch_fallback",
+        "repo_coding_scaffold_edit",
+        "repo_coding_scaffold_patch",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -227,26 +143,10 @@ class ToolPolicy:
     file_edit_flexible_recovery: bool | None = None
     by_sender: Mapping[str, ToolPolicy] = field(default_factory=dict)
 
-
-# Coding mode (operator toggle): the in-session write tools that let the
-# agent hand-edit a repository. When coding mode is ON these are denied so
-# every code change is forced through the code-task plugin instead. Shell
-# (exec_command) is intentionally kept so the agent can still LAUNCH
-# code-task; ``process`` is its companion for long-running runs.
-CODING_MODE_DENIED_TOOLS: frozenset[str] = frozenset(
-    {
-        "write_file",
-        "edit_file",
-        "apply_patch",
-        "execute_code",
-        "git_commit",
-    }
-)
-
-
-def coding_mode_denied_tools(coding_mode: bool) -> frozenset[str]:
-    """Tools to deny while the coding-mode toggle is on (empty when off)."""
-    return CODING_MODE_DENIED_TOOLS if coding_mode else frozenset()
+    def __post_init__(self) -> None:
+        # Per-agent and channel policies may bypass the gateway config model.
+        if self.profile and self.profile.strip().lower() in _RETIRED_REPO_CODING_PROFILES:
+            object.__setattr__(self, "profile", "coding")
 
 
 def expand_selectors(selectors: frozenset[str], available_tools: frozenset[str]) -> set[str]:
@@ -385,6 +285,8 @@ def policy_from_config(value: object) -> ToolPolicy | None:
         return None
     if isinstance(value, ToolPolicy):
         return value
+    if isinstance(value, str) and value.strip().lower() in _RETIRED_REPO_CODING_PROFILES:
+        return ToolPolicy(profile="coding")
 
     tools_value = get_field(value, "tools")
     sender_value = get_field(value, "toolsBySender", get_field(value, "tools_by_sender"))

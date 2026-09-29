@@ -77,8 +77,8 @@ def test_ingress_accept_claim_complete_and_restart_recovery(tmp_path) -> None:
     restarted.close()
 
 
-def test_durable_enqueue_commits_before_memory_visibility(tmp_path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_durable_enqueue_commits_before_memory_visibility(channel_store, tmp_path) -> None:
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     queue: list[IncomingMessage] = []
 
     class Queue:
@@ -93,15 +93,16 @@ def test_durable_enqueue_commits_before_memory_visibility(tmp_path) -> None:
         _delivery_channel_name="slack-main",
     )
 
-    assert durable_enqueue(channel, _message(), Queue()) is True
+    assert (await durable_enqueue(channel, _message(), Queue())) is True
     assert len(queue) == 1
-    store.close()
+    (await store.close())
 
 
 @contextlib.contextmanager
 def _blocked_journal(store: ChannelDeliveryStore) -> Iterator[None]:
     """Hold the write lock from a second connection to force SQLITE_BUSY."""
-    store._conn.execute("PRAGMA busy_timeout=100;")
+    if isinstance(store, ChannelDeliveryStore):
+        store._conn.execute("PRAGMA busy_timeout=100;")
     blocker = sqlite3.connect(store.path)
     blocker.execute("BEGIN IMMEDIATE")
     try:
@@ -163,10 +164,12 @@ def _durable_ingress_count(store: ChannelDeliveryStore) -> int:
     return int(row[0])
 
 
-def test_recovery_after_degraded_accept_does_not_double_dispatch(tmp_path) -> None:
+async def test_recovery_after_degraded_accept_does_not_double_dispatch(
+    channel_store, tmp_path
+) -> None:
     """A redelivery after storage recovers must not add a durable row alongside
     the memory-only marker, which would let the same event be claimed twice."""
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     message = _message()
     event_key = inbound_event_key("slack-main", message)
     assert event_key is not None
@@ -181,35 +184,37 @@ def test_recovery_after_degraded_accept_does_not_double_dispatch(tmp_path) -> No
     # Delivery A during a storage fault: degrades to memory-only acceptance but
     # is still enqueued for dispatch, with no durable journal row.
     with _blocked_journal(store):
-        assert durable_enqueue(channel, message, Queue()) is True
-    assert event_key in store._unjournaled_events
+        assert (await durable_enqueue(channel, message, Queue())) is True
+    assert event_key in store._store._unjournaled_events
     assert _durable_ingress_count(store) == 0
     assert len(queue) == 1
 
     # Delivery B after storage recovers: a redelivery of the SAME event must be
     # treated as a duplicate — no durable row is committed and nothing is
     # re-enqueued — so it cannot produce a second, independently claimable row.
-    assert durable_enqueue(channel, message, Queue()) is False
-    assert store.accept_inbound("slack-main", message) is False
+    assert (await durable_enqueue(channel, message, Queue())) is False
+    assert (await store.accept_inbound("slack-main", message)) is False
     assert _durable_ingress_count(store) == 0
     assert len(queue) == 1
 
     # End to end, exactly one claim is dispatchable. Since storage recovered,
     # claiming reconciles the marker into a durable processing record.
-    claim = store.claim_inbound("slack-main", queue[0])
+    claim = await store.claim_inbound("slack-main", queue[0])
     assert claim is not None
     assert claim.event_key == event_key
     assert claim.claim_token
-    assert event_key not in store._unjournaled_events
+    assert event_key not in store._store._unjournaled_events
     assert _durable_ingress_count(store) == 1
-    assert store.claim_inbound("slack-main", message) is None
-    store.complete_inbound(claim, "turn_dispatched")
-    store.close()
+    assert (await store.claim_inbound("slack-main", message)) is None
+    (await store.complete_inbound(claim, "turn_dispatched"))
+    (await store.close())
 
 
-def test_claim_while_journal_blocked_retains_same_process_dedupe(tmp_path) -> None:
+async def test_claim_while_journal_blocked_retains_same_process_dedupe(
+    channel_store, tmp_path
+) -> None:
     """A pass-through claim must retain bounded dedupe while storage is unavailable."""
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     message = _message()
     event_key = inbound_event_key("slack-main", message)
     assert event_key is not None
@@ -224,24 +229,24 @@ def test_claim_while_journal_blocked_retains_same_process_dedupe(tmp_path) -> No
     # The original delivery remains available even though both acceptance and
     # claim happen while SQLite is unavailable.
     with _blocked_journal(store):
-        assert durable_enqueue(channel, message, Queue()) is True
-        claim = store.claim_inbound("slack-main", queue[0])
+        assert (await durable_enqueue(channel, message, Queue())) is True
+        claim = await store.claim_inbound("slack-main", queue[0])
         assert claim is not None
         assert claim.event_key == ""
-        assert event_key not in store._unjournaled_events
-        assert event_key in store._claimed_unjournaled_events
-        assert durable_enqueue(channel, message, Queue()) is False
+        assert event_key not in store._store._unjournaled_events
+        assert event_key in store._store._claimed_unjournaled_events
+        assert (await durable_enqueue(channel, message, Queue())) is False
 
     # Recovery after the pass-through claim must not make a provider redelivery
     # visible a second time in this process.
-    assert durable_enqueue(channel, message, Queue()) is False
+    assert (await durable_enqueue(channel, message, Queue())) is False
     assert len(queue) == 1
-    assert event_key not in store._unjournaled_events
-    assert event_key in store._claimed_unjournaled_events
+    assert event_key not in store._store._unjournaled_events
+    assert event_key in store._store._claimed_unjournaled_events
     assert _durable_ingress_count(store) == 0
-    assert store.claim_inbound("slack-main", message) is None
-    store.complete_inbound(claim, "turn_dispatched")  # pass-through no-op
-    store.close()
+    assert (await store.claim_inbound("slack-main", message)) is None
+    (await store.complete_inbound(claim, "turn_dispatched"))  # pass-through no-op
+    (await store.close())
 
 
 def test_persistent_journal_outage_bounds_claimed_event_dedupe(tmp_path) -> None:
@@ -340,11 +345,11 @@ def test_normal_duplicate_without_fault_is_still_rejected(tmp_path) -> None:
     store.close()
 
 
-async def test_telegram_poll_loop_survives_journal_write_failure(tmp_path) -> None:
+async def test_telegram_poll_loop_survives_journal_write_failure(channel_store, tmp_path) -> None:
     """One SQLite fault must not kill the Telegram receive path."""
     from opensquilla.channels.telegram import TelegramChannel, TelegramChannelConfig
 
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     channel = TelegramChannel(TelegramChannelConfig(token="synthetic-token"))
     channel._delivery_store = store
     channel._delivery_channel_name = "telegram-main"
@@ -377,14 +382,16 @@ async def test_telegram_poll_loop_survives_journal_write_failure(tmp_path) -> No
 
     assert channel._update_offset == 8
     assert channel._queue.get_nowait().content == "hello"
-    store.close()
+    (await store.close())
 
 
-async def test_discord_dispatch_enqueue_survives_journal_write_failure(tmp_path) -> None:
+async def test_discord_dispatch_enqueue_survives_journal_write_failure(
+    channel_store, tmp_path
+) -> None:
     """A journal fault in the Discord dispatch path must not raise."""
     from opensquilla.channels.discord import DiscordChannel, DiscordChannelConfig
 
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     channel = DiscordChannel(DiscordChannelConfig(token="synthetic-token"))
     channel.bot_user_id = "bot-1"
     channel._delivery_store = store
@@ -402,32 +409,32 @@ async def test_discord_dispatch_enqueue_survives_journal_write_failure(tmp_path)
         )
 
     assert channel._queue.get_nowait().content == "hello"
-    store.close()
+    (await store.close())
 
 
-def test_qq_enqueue_survives_journal_write_failure(tmp_path) -> None:
+async def test_qq_enqueue_survives_journal_write_failure(channel_store, tmp_path) -> None:
     """A journal fault in the QQ message hook must not raise."""
     from opensquilla.channels.qq import QQChannel, QQChannelConfig
 
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
-    channel = QQChannel(
-        QQChannelConfig(name="qq", app_id="app-id", app_secret="app-secret")
-    )
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
+    channel = QQChannel(QQChannelConfig(name="qq", app_id="app-id", app_secret="app-secret"))
     channel._delivery_store = store
     channel._delivery_channel_name = "qq-main"
 
     with _blocked_journal(store):
-        channel._enqueue_message(
-            SimpleNamespace(
-                id="message-1",
-                author=SimpleNamespace(user_openid="user-1"),
-                content="hello",
-            ),
-            is_group=False,
+        (
+            await channel._enqueue_message(
+                SimpleNamespace(
+                    id="message-1",
+                    author=SimpleNamespace(user_openid="user-1"),
+                    content="hello",
+                ),
+                is_group=False,
+            )
         )
 
     assert channel._inbound_queue.get_nowait().content == "hello"
-    store.close()
+    (await store.close())
 
 
 def test_transport_lease_uses_fencing_and_exclusive_ownership(tmp_path) -> None:
@@ -471,11 +478,13 @@ def test_transport_lease_uses_fencing_and_exclusive_ownership(tmp_path) -> None:
         second_store.close()
 
 
-def test_manager_construction_does_not_recover_an_active_owners_claim(tmp_path) -> None:
-    owner = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_manager_construction_does_not_recover_an_active_owners_claim(
+    channel_store, tmp_path
+) -> None:
+    owner = await channel_store(tmp_path / "channel_delivery.sqlite")
     message = _message()
-    assert owner.accept_inbound("discord-main", message) is True
-    claim = owner.claim_inbound("discord-main", message)
+    assert (await owner.accept_inbound("discord-main", message)) is True
+    claim = await owner.claim_inbound("discord-main", message)
     assert claim is not None
 
     manager = ChannelManager.from_config(
@@ -485,19 +494,21 @@ def test_manager_construction_does_not_recover_an_active_owners_claim(tmp_path) 
         config=SimpleNamespace(state_dir=str(tmp_path)),
     )
     try:
-        diagnostics = owner.diagnostics("discord-main")
+        diagnostics = await owner.diagnostics("discord-main")
         assert diagnostics["ingress"]["processing"]["count"] == 1
-        owner.complete_inbound(claim, "turn_dispatched")
-        assert owner.diagnostics("discord-main")["ingress"]["completed"]["count"] == 1
+        (await owner.complete_inbound(claim, "turn_dispatched"))
+        assert (await owner.diagnostics("discord-main"))["ingress"]["completed"]["count"] == 1
     finally:
-        manager._delivery_store.close()
-        owner.close()
+        (await manager._delivery_store.close())
+        (await owner.close())
 
 
 @pytest.mark.asyncio
 async def test_stop_failure_still_releases_transport_lease() -> None:
     adapter = SimpleNamespace(stop=AsyncMock(side_effect=RuntimeError("stop failed")))
     delivery_store = MagicMock()
+    delivery_store.release_transport_lease = AsyncMock()
+    delivery_store.drain_channel = AsyncMock()
     lease = object()
     manager = ChannelManager(
         _channels={"discord-main": adapter},
@@ -517,8 +528,8 @@ async def test_stop_failure_still_releases_transport_lease() -> None:
 
 
 @pytest.mark.asyncio
-async def test_outbox_records_provider_receipt(tmp_path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_outbox_records_provider_receipt(channel_store, tmp_path) -> None:
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
 
     class Channel:
         _delivery_store = store
@@ -540,14 +551,16 @@ async def test_outbox_records_provider_receipt(tmp_path) -> None:
         OutgoingMessage(content="hello", reply_to="chat-1"),
     )
 
-    diagnostics = store.diagnostics("discord-main")
+    diagnostics = await store.diagnostics("discord-main")
     assert diagnostics["outbox"]["sent"]["count"] == 1
-    store.close()
+    (await store.close())
 
 
 @pytest.mark.asyncio
-async def test_outbox_marks_ambiguous_exception_unknown_without_retry(tmp_path) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+async def test_outbox_marks_ambiguous_exception_unknown_without_retry(
+    channel_store, tmp_path
+) -> None:
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     attempts = 0
 
     class Channel:
@@ -569,16 +582,17 @@ async def test_outbox_marks_ambiguous_exception_unknown_without_retry(tmp_path) 
         )
 
     assert attempts == 1
-    diagnostics = store.diagnostics("discord-main")
+    diagnostics = await store.diagnostics("discord-main")
     assert diagnostics["outbox"]["unknown"]["count"] == 1
-    store.close()
+    (await store.close())
 
 
 @pytest.mark.asyncio
 async def test_outbox_wraps_declared_file_edit_delete_reaction_and_streaming(
+    channel_store,
     tmp_path,
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
     calls: list[tuple[str, tuple[object, ...]]] = []
 
     class Channel:
@@ -669,14 +683,15 @@ async def test_outbox_wraps_declared_file_edit_delete_reaction_and_streaming(
     assert all(row[2] == "chat-1" or row[2].startswith("chat-1|") for row in rows)
     assert "/private/local/file.txt" not in "".join(row[3] for row in rows)
     assert len(calls) == 5
-    store.close()
+    (await store.close())
 
 
 @pytest.mark.asyncio
 async def test_outbox_only_wraps_declared_operations_and_redacts_failure(
+    channel_store,
     tmp_path,
 ) -> None:
-    store = ChannelDeliveryStore(tmp_path / "channel_delivery.sqlite")
+    store = await channel_store(tmp_path / "channel_delivery.sqlite")
 
     class Channel:
         _delivery_store = store
@@ -715,7 +730,7 @@ async def test_outbox_only_wraps_declared_operations_and_redacts_failure(
     # it now that error_class carries the taxonomy value instead.
     assert error_message == "RuntimeError: bot token=[REDACTED]"
     assert "do-not-persist" not in error_message
-    store.close()
+    (await store.close())
 
 
 def test_fail_send_persists_the_taxonomy_class_not_the_exception_type(tmp_path) -> None:

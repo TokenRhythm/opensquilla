@@ -16,8 +16,6 @@
 
 FROM --platform=$BUILDPLATFORM node:22.12.0-bookworm-slim AS webui-builder
 
-ARG OPENSQUILLA_FORBID_PERSONAL_BGM=0
-
 WORKDIR /build/opensquilla-webui
 
 # Cache dependency installation independently from application source. Vite
@@ -28,10 +26,7 @@ WORKDIR /build/opensquilla-webui
 COPY opensquilla-webui/package.json opensquilla-webui/package-lock.json ./
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci
 COPY opensquilla-webui/ ./
-RUN npm run build:artifact \
-    && if [ "${OPENSQUILLA_FORBID_PERSONAL_BGM}" = "1" ]; then \
-        npm run verify:release-dist; \
-    fi
+RUN npm run build:artifact
 
 
 FROM python:3.13-slim-bookworm

@@ -24,10 +24,6 @@ export function prepareSkillTaskPrefill(
   candidates: readonly SkillCandidate[],
 ): SkillTaskPrefill | null {
   if (!isSkillTaskEligible(skill)) return null
-  if (skill.kind === 'meta' || skill.kind === 'meta_sop') {
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/.test(skill.name)) return null
-    return { prefill: `/meta ${skill.name} `, selectedSkillPrefill: [], autosend: false }
-  }
   const matches = candidates.filter(candidate => candidate.name === skill.name
     && (!skill.instance_id || candidate.instanceId === skill.instance_id))
   const candidate = matches.length === 1 ? matches[0] : undefined

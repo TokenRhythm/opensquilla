@@ -1,5 +1,28 @@
 # Migration Guide
 
+## Retired workflow modes
+
+MetaSkill, Coding Mode, and the `code-task` command have been removed. Ordinary
+Agent conversations, file editing, Shell tools, and ordinary skills continue to
+use their existing permissions.
+
+Loading an old profile discards `[meta_skill]` and `skills.coding_mode`; normal
+config loading rewrites those fields out, while read-only loading leaves the
+file untouched. Old MetaSkill definitions and the retired `code-task` skill are
+ignored. Retired coding prompt and tool-profile values resolve to the ordinary
+prompt defaults and coding tool profile. No execution or RPC compatibility layer
+is provided.
+
+Upgrading cancels unfinished MetaSkill control tasks, removes their unaccepted
+drafts and authorizations, and disables old automatic-proposal jobs. Conversation
+history is retained. Execution audit rows remain in the SQLite tables
+`retired_meta_skill_runs` and `retired_meta_skill_run_steps` for offline export;
+they cannot be resumed or replayed. Deleting a session also removes its retained
+audit rows. Existing migration files remain to preserve the database upgrade
+chain. Use the pre-upgrade database backup if reverting to an older release.
+
+## Importing another agent's data
+
 OpenSquilla can import state from OpenClaw and Hermes Agent into OpenSquilla
 native files. The migration commands are designed to be previewed first, then
 applied explicitly.

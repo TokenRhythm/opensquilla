@@ -92,7 +92,6 @@ import { useI18n } from 'vue-i18n'
 import { useRouter } from 'vue-router'
 import Icon from './Icon.vue'
 import { useDialogA11y } from '@/composables/useDialogA11y'
-import { useBgm } from '@/composables/useBgm'
 import { getWorkNavigationSection } from '@/router/nav'
 import {
   SESSION_DIRECTORY_KEY,
@@ -128,7 +127,6 @@ const router = useRouter()
 const injectedSessionDirectory = inject(SESSION_DIRECTORY_KEY)
 if (!injectedSessionDirectory) throw new Error('SessionDirectory was not provided')
 const sessionDirectory: SessionDirectory = injectedSessionDirectory
-const { enabled: bgmEnabled, setEnabled: setBgmEnabled } = useBgm()
 
 const dialogRef = ref<HTMLElement | null>(null)
 const listRef = ref<HTMLElement | null>(null)
@@ -205,7 +203,7 @@ const allCommands = computed<Command[]>(() => {
     })
     // Channels is the second route in the Skills & Channels hub. Keep its
     // direct command beside the pinned hub entry instead of burying it among
-    // Overview's operational subpages.
+    // unrelated settings actions.
     if (item.path === '/skills') {
       const title = t('nav.channels')
       out.push({
@@ -217,23 +215,6 @@ const allCommands = computed<Command[]>(() => {
         run: navTo('/channels'),
       })
     }
-  }
-
-  // Diagnostic Logs remains directly reachable without promoting it back into
-  // the rail; the Overview command already opens Status.
-  const demoted: Array<{ path: string; name: string; icon: IconName; group: string }> = [
-    { path: '/logs', name: 'logs', icon: 'logs', group: 'Observe' },
-  ]
-  for (const item of demoted) {
-    const title = t(`nav.${item.name}`)
-    out.push({
-      id: `nav:${item.path}`,
-      title,
-      icon: item.icon,
-      keywords: `${title} ${item.path}`.toLowerCase(),
-      group: item.group,
-      run: navTo(item.path),
-    })
   }
 
   // The Channels hub entry opens the workspace; this separate action lands in
@@ -273,17 +254,6 @@ const allCommands = computed<Command[]>(() => {
       keywords: 'theme dark light appearance toggle',
       group: 'Actions',
       run: () => emit('toggle-theme'),
-    },
-    // Background-music gate: writes the useBgm singleton directly (no App-level
-    // routing or handler to reuse, unlike the emit-based actions above). The
-    // title tracks the current state via the reactive `enabled` ref.
-    {
-      id: 'action:toggle-bgm',
-      title: bgmEnabled.value ? t('shared.cmdp.actionBgmDisable') : t('shared.cmdp.actionBgmEnable'),
-      icon: 'music',
-      keywords: 'music bgm background sound audio 音乐 背景音乐',
-      group: 'Actions',
-      run: () => setBgmEnabled(!bgmEnabled.value),
     },
   )
 

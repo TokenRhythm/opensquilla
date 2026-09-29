@@ -233,7 +233,7 @@
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
           @open-approval="openBlockedApprovalSession"
-          @open-update="openDesktopRuntimeSettings"
+          @open-update="openDesktopUpdateSettings"
         />
         <template v-else>
           <button
@@ -256,12 +256,6 @@
           <span v-else class="conn-pill" :class="connectionState">{{ connectionStateLabel }}</span>
           <DesktopUpdateIndicator />
         </template>
-        <!-- Opt-in (Settings → Appearance or the command palette); off by
-             default so the topbar stays music-free until asked for. -->
-        <BgmControl
-          v-if="bgmEnabled"
-          :presentation="isChatRoute && systemHeaderLayout !== 'wide' ? 'pause-only' : 'full'"
-        />
         <LanguageSwitcher />
         <div class="theme-menu-wrap">
           <button
@@ -324,8 +318,6 @@
         :aria-hidden="workbenchMaximized ? 'true' : undefined"
         class="content"
         :class="{ 'content--chat': isChatRoute }"
-        :data-skin="skinId || undefined"
-        :data-skin-variant="variants || undefined"
         id="content"
       >
         <ErrorBoundary @error-captured="clearChatRouteHeaderAfterError">
@@ -365,10 +357,13 @@
       />
       <ArtifactImageLightbox />
     </div>
+    <!-- Keep recovery actions in normal flow, clear of the floating console
+         topbar. The main shell already reserves the mobile tab-bar inset. -->
+    <DeliveryRecoveryNotice @open-session="switchToSession" />
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
-       Chat, Overview, then More for the sidebar drawer with session history,
+       Chat, Usage, then More for the sidebar drawer with session history,
        navigation, and Settings. -->
   <nav
     class="mobile-tabbar"
@@ -386,13 +381,13 @@
       <span class="mobile-tab__label">{{ t('nav.chat') }}</span>
     </router-link>
     <router-link
-      to="/overview"
+      to="/usage"
       class="mobile-tab"
-      :class="{ 'is-active': isOverviewNavActive }"
+      :class="{ 'is-active': isNavActive('/usage') }"
       @click="handleNavClick"
     >
-      <Icon name="home" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.overview') }}</span>
+      <Icon name="usage" :size="20" />
+      <span class="mobile-tab__label">{{ t('nav.usage') }}</span>
     </router-link>
     <button
       type="button"
@@ -486,16 +481,15 @@ import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
+import DeliveryRecoveryNotice from './components/DeliveryRecoveryNotice.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
 import LanguageSwitcher from './components/LanguageSwitcher.vue'
-import BgmControl from './components/BgmControl.vue'
 import ArtifactImageLightbox from './components/chat/ArtifactImageLightbox.vue'
 import AppWorkbench from './components/workbench/AppWorkbench.vue'
 import WorkbenchToggle from './components/workbench/WorkbenchToggle.vue'
 import { useWorkbenchStore } from './workbench/store'
-import { useBgm } from './composables/useBgm'
 import { useDesktopUpdate } from './composables/useDesktopUpdate'
 import { useSidebarLayout } from './composables/useSidebarLayout'
 import { useSystemHeaderLayout } from './composables/useSystemHeaderLayout'
@@ -518,7 +512,6 @@ import { useProjectWorkspaces } from './composables/useProjectWorkspaces'
 import { useFreshTaskDraft } from './composables/useFreshTaskDraft'
 import { useNavigation } from './app/useNavigation'
 import { bindDesktopSessionDeepLinks } from './app/desktopSessionDeepLinks'
-import { useSurfaceSkin } from './themes/useSurfaceSkin'
 import { themePickerOptions, getManifest } from './themes/registry'
 import { normalizeAgentId } from './utils/chat/sessionKeys'
 import { effectiveChatConnectionState } from './utils/chat/chatConnectionState'
@@ -599,6 +592,7 @@ const topbarPopoverCoordinator = provideChatTopbarPopoverCoordinator(
 )
 const chatRouteHeader = provideChatRouteHeaderBridge()
 const {
+  sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
   title: chatRouteHeaderTitle,
   copyState: chatRouteHeaderCopyState,
@@ -689,8 +683,6 @@ const {
   cancelPendingRequests,
 } = useSessions(sessionDirectory)
 const { bottomRoutes, workNav } = useNavigation()
-// Axis-B: the active expressive skin for the routed content area (meta.skin).
-const { skinId, variants } = useSurfaceSkin()
 const { pushToast } = useToasts()
 const { confirm } = useConfirm()
 const projectWorkspaces = useProjectWorkspaces()
@@ -725,9 +717,6 @@ watch(
     editingProjectId.value = ''
   },
 )
-// Feature-gated topbar music control; the singleton `enabled` ref is written by
-// Settings → Appearance and the command palette.
-const { enabled: bgmEnabled } = useBgm()
 const desktopUpdate = useDesktopUpdate()
 const webConfigEnabled = getPlatform().capabilities.hasWebConfig
 
@@ -897,7 +886,6 @@ const systemHeaderPressureCount = computed(() => (
   Number(effectiveConnectionState.value !== 'connected')
   + Number(appStore.approvalCount > 0)
   + Number(desktopUpdate.visible.value)
-  + Number(bgmEnabled.value)
 ))
 const systemHeaderLayout = useSystemHeaderLayout({
   target: topbarRef,
@@ -951,19 +939,14 @@ function isNavActive(path: string): boolean {
   return $route.path === path
 }
 
-// Overview owns the Status/Usage hub plus its diagnostic Logs route, while
-// Skills fronts the Skills/Channels hub. Keep those active families disjoint so
-// diagnostic routes never light an unrelated primary destination.
-const OVERVIEW_NAV_PATHS = new Set(['/overview', '/usage', '/logs'])
+// Skills fronts the Skills/Channels hub; Usage is a standalone destination.
 const SKILLS_CHANNELS_HUB_PATHS = new Set(['/skills', '/channels'])
 const MOBILE_MORE_PATHS = new Set(['/skills', '/channels', '/cron'])
-const isOverviewNavActive = computed(() => OVERVIEW_NAV_PATHS.has($route.path))
 const isSkillsChannelsHubActive = computed(() => SKILLS_CHANNELS_HUB_PATHS.has($route.path))
 const isMobileMoreActive = computed(() =>
   appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
-  if (path === '/usage') return isOverviewNavActive.value
   if (path === '/skills') return isSkillsChannelsHubActive.value
   return isNavActive(path)
 }
@@ -1098,6 +1081,55 @@ const sidebarSessionItems = computed((): SessionItem[] => {
   }
   return items
 })
+
+// A just-materialized chat can reach the route before the next sessions.list
+// snapshot. Keep an optimistic ledger entry for it so switching to another
+// conversation does not make the new task disappear from the sidebar. When
+// ChatView has the first user message, reuse its resolved header title so the
+// sidebar shows the same text immediately. The key guard prevents a title from
+// the previous ChatView instance leaking into the new session during navigation.
+function optimisticCurrentSessionTitle(key: string, allowHeaderTitle = true): string {
+  if (!allowHeaderTitle || chatRouteHeaderSessionKey.value !== key) {
+    return t('shared.sidebar.currentTask')
+  }
+  const title = chatRouteHeaderTitle.value.trim()
+  if (!isSensibleChatTitle(title)) return t('shared.sidebar.currentTask')
+  const suffix = key.split(':').pop() || ''
+  const genericTitles = new Set([
+    t('chat.newChat'),
+    t('chat.chatWithSuffix', { suffix }),
+    t('shared.sidebar.currentTask'),
+  ])
+  return genericTitles.has(title) ? t('shared.sidebar.currentTask') : title
+}
+
+watch(
+  [currentSessionKey, chatRouteHeaderSessionKey, chatRouteHeaderTitle],
+  ([key], oldValues) => {
+    if (!key || allSessions.value.some(item => item.key === key)) return
+    const existing = localChatSessions.value[key]
+    const previousKey = oldValues?.[0] || ''
+    const previousHeaderKey = oldValues?.[1] || ''
+    const sessionChanged = Boolean(
+      (previousKey && key && previousKey !== key)
+      || (previousHeaderKey
+        && chatRouteHeaderSessionKey.value
+        && previousHeaderKey !== chatRouteHeaderSessionKey.value),
+    )
+    const title = optimisticCurrentSessionTitle(key, !sessionChanged)
+    if (existing && existing.title === title) return
+    const effectiveAgentId = normalizeAgentId(key.split(':')[1] || 'main')
+    localChatSessions.value = {
+      ...localChatSessions.value,
+      [key]: {
+        effectiveAgentId: existing?.effectiveAgentId || effectiveAgentId,
+        title,
+        updatedAt: existing?.updatedAt || Date.now(),
+      },
+    }
+  },
+  { flush: 'sync', immediate: true },
+)
 
 watch(allSessions, sessions => {
   for (const item of sessions) {
@@ -1310,8 +1342,6 @@ watch(sidebarDynamicMaximum, () => {
 })
 
 // Primary new-chat path: ordinary tasks always start against the default Agent.
-// Explicit custom-Agent launches still receive their Agent-scoped session key
-// from advanced Agent administration.
 function openDefaultDraft() {
   freshTaskDraft.requestFreshTask('main')
   return router.push({ path: '/chat/new', query: { agent: 'main' } })
@@ -1719,8 +1749,8 @@ function openConnectionSettings() {
 
 // Compact chat headers hand off to the complete Desktop update workflow rather
 // than recreating update actions inside the status summary.
-function openDesktopRuntimeSettings() {
-  router.push('/settings/gateway#runtime')
+function openDesktopUpdateSettings() {
+  router.push('/settings/gateway#updates')
 }
 
 function scheduleSessionRefresh() {
@@ -1762,6 +1792,7 @@ function handleAppForeground() {
 }
 
 const sessionDirectoryChangesSubscription = sessionDirectoryChanges.subscribe(change => {
+  if (change.reason === 'deleted') removeLocalSessions(new Set([change.key]))
   scheduleSessionRefresh()
   sessionTaskAttention.handleSessionDirectoryChange(change, {
     currentSessionKey: currentSessionKey.value,

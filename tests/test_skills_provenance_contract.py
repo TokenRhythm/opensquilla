@@ -7,7 +7,6 @@ from opensquilla.skills.loader import SkillLoader
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ROOT / "src" / "opensquilla" / "skills"
 BUNDLED = SKILLS_DIR / "bundled"
-EXP = SKILLS_DIR / "exp"
 DEFAULTS = {
     "deep-research",
     "docx",
@@ -52,60 +51,23 @@ def test_default_bundled_skills_have_release_provenance(tmp_path: Path) -> None:
 
 def test_provenance_survives_snapshot_roundtrip(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshot.json"
-    loader = SkillLoader(bundled_dir=BUNDLED, extra_dirs=[EXP], snapshot_path=snapshot)
+    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=snapshot)
     first = {skill.name: skill.provenance for skill in loader.load_all()}
     loader.save_snapshot()
 
-    reloaded = SkillLoader(bundled_dir=BUNDLED, extra_dirs=[EXP], snapshot_path=snapshot)
+    reloaded = SkillLoader(bundled_dir=BUNDLED, snapshot_path=snapshot)
     second = {skill.name: skill.provenance for skill in reloaded.load_all()}
 
     for name in DEFAULTS:
         assert second[name] == first[name]
 
 
-def test_entrypoint_manifest_survives_snapshot_roundtrip(tmp_path: Path) -> None:
-    """skill_exec depends on the entrypoint manifest surviving the snapshot
-    cache — a gateway cold-start that loads from snapshot must see the same
-    entrypoint dict as a fresh frontmatter parse."""
-
-    snapshot = tmp_path / "snapshot.json"
-    loader = SkillLoader(bundled_dir=BUNDLED, snapshot_path=snapshot)
-    fresh = {skill.name: skill.entrypoint for skill in loader.load_all()}
-    loader.save_snapshot()
-
-    reloaded = SkillLoader(bundled_dir=BUNDLED, snapshot_path=snapshot)
-    from_snapshot = {skill.name: skill.entrypoint for skill in reloaded.load_all()}
-
-    # multi-search-engine is the canonical skill_exec target — its entrypoint
-    # must round-trip intact.
-    assert fresh["multi-search-engine"] is not None
-    assert fresh["multi-search-engine"] == from_snapshot["multi-search-engine"]
-    assert "command" in fresh["multi-search-engine"]
-    # Skills without an entrypoint manifest should still round-trip as None.
-    for name, ep in fresh.items():
-        assert from_snapshot[name] == ep, f"entrypoint mismatch for {name}"
 
 
-def test_meta_final_text_mode_survives_snapshot_roundtrip(tmp_path: Path) -> None:
-    """Gateway cold-starts often load skills from snapshot; meta final output
-    controls must not degrade back to auto-summary mode."""
-
-    snapshot = tmp_path / "snapshot.json"
-    loader = SkillLoader(bundled_dir=BUNDLED, extra_dirs=[EXP], snapshot_path=snapshot)
-    fresh = {skill.name: skill.final_text_mode for skill in loader.load_all()}
-    loader.save_snapshot()
-
-    reloaded = SkillLoader(bundled_dir=BUNDLED, extra_dirs=[EXP], snapshot_path=snapshot)
-    from_snapshot = {
-        skill.name: skill.final_text_mode for skill in reloaded.load_all()
-    }
-
-    assert fresh["meta-travel-planner"] == "step:final_plan"
-    assert from_snapshot["meta-travel-planner"] == fresh["meta-travel-planner"]
 
 
-def test_capability_risk_metadata_survives_snapshot_roundtrip(tmp_path: Path) -> None:
-    """Auto-enable decisions must see the same risk manifest after cold-start."""
+def test_retired_advisory_metadata_stays_inert_after_snapshot_roundtrip(tmp_path: Path) -> None:
+    """Removed auto-enable metadata does not regain semantics after a cold start."""
 
     skill_root = tmp_path / "skills"
     skill_dir = skill_root / "writes-files"
@@ -136,5 +98,5 @@ metadata:
 
     assert from_snapshot is not None
     assert from_snapshot.metadata is not None
-    assert from_snapshot.metadata.risk_level == "medium"
-    assert from_snapshot.metadata.capabilities == ["filesystem-write"]
+    assert not hasattr(from_snapshot.metadata, "risk_level")
+    assert not hasattr(from_snapshot.metadata, "capabilities")

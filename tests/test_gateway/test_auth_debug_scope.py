@@ -6,7 +6,6 @@ from opensquilla.gateway.auth import OpenScopeResolver
 from opensquilla.gateway.config import AuthConfig, GatewayConfig
 from opensquilla.gateway.scopes import (
     CLI_DEFAULT_OPERATOR_SCOPES,
-    PROPOSALS_SCOPE,
     REMOTE_OPERATOR_SCOPES,
 )
 
@@ -49,7 +48,6 @@ def test_open_auth_exposed_operator_gets_remote_scopes_when_debug_false() -> Non
     )
 
     assert principal.scopes == REMOTE_OPERATOR_SCOPES
-    assert PROPOSALS_SCOPE not in principal.scopes
     assert principal.is_owner is False
     assert principal.authenticated is False
 

@@ -96,6 +96,7 @@ def pending_input_projection(
                 "mime": attachment.get("mime") or attachment.get("type"),
                 "type": attachment.get("type") or attachment.get("mime"),
                 "size": attachment.get("size"),
+                **({"origin": "paste"} if attachment.get("origin") == "paste" else {}),
             }
         )
     result: dict[str, Any] = {

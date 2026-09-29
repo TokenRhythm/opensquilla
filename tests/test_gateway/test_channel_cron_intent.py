@@ -34,6 +34,7 @@ async def test_schedule_like_channel_text_reaches_normal_runtime() -> None:
         metadata={"account_id": "tenant-a", "native_thread_id": "thread-1"},
     )
     channel = MagicMock()
+    channel._delivery_store = None
     channel.channel_id = "feishu"
     channel.send = AsyncMock()
     channel.build_reply_message = None

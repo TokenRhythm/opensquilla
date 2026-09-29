@@ -2864,9 +2864,8 @@ def test_desktop_gateway_build_and_verifier_cover_runtime_capabilities() -> None
     assert "bundled libomp.dylib" in verifier
     assert "otool" in verifier
     assert "@loader_path/libomp.dylib" in verifier
-    assert "code-task', 'stage-task-file'" in verifier
-    assert "code-task', 'smoke-imports'" in verifier
-    assert "code-task', 'smoke-router'" in verifier
+    assert "diagnostics', 'smoke-imports'" in verifier
+    assert "diagnostics', 'smoke-router'" in verifier
     assert "timeout: 120000" in verifier
     gateway_smoke = _read("desktop/electron/scripts/smoke-gateway.mjs")
     assert "OPENSQUILLA_GATEWAY_SMOKE_TIMEOUT_MS" in gateway_smoke

@@ -168,7 +168,7 @@ def test_offline_skills_list_marks_rows_validated_for_next_start(
     )
     config = SimpleNamespace(
         state_dir=str(state_root),
-        skills=SimpleNamespace(disabled=[], coding_mode=False),
+        skills=SimpleNamespace(disabled=[]),
     )
     loader = SimpleNamespace(
         managed_dir=managed,
@@ -207,7 +207,7 @@ def test_offline_skills_list_fails_closed_during_writer_and_pending_recovery(
     managed = profile_home / "skills"
     config = SimpleNamespace(
         state_dir=str(state_root),
-        skills=SimpleNamespace(disabled=[], coding_mode=False),
+        skills=SimpleNamespace(disabled=[]),
     )
     builds = 0
     scans = 0

@@ -6,6 +6,7 @@ import asyncio
 import threading
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +19,9 @@ from opensquilla.session.storage import (
     StorageBusyError,
     StorageConnectionPoisonedError,
 )
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
+
+_CLOSE_PROBE = Path(__file__).resolve().parents[1] / "fixtures" / "recovery_close_probe.py"
 
 
 @pytest.fixture(params=[False, True], ids=["aiosqlite", "sqlite3-fallback"])
@@ -250,36 +254,46 @@ async def test_memory_native_cancel_retains_writer_gate(sqlite_backend: None) ->
         await storage.close()
 
 
-async def test_close_drains_native_before_reconnect(
-    storage: SessionStorage, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.ci_serial
+@pytest.mark.parametrize("close_delay_seconds", [0.0, 2.1])
+def test_close_drains_native_before_reconnect(
+    tmp_path: Path, sqlite_backend: None,
+    close_delay_seconds: float,
 ) -> None:
-    gate = NativeGate()
-    await install_gate(storage, monkeypatch, gate)
-    with recovery_read_scope("agent:main:webchat:slow", deadline=time.monotonic() + 5) as budget:
-        read = asyncio.create_task(storage._read_history_query("SELECT recovery_test_gate()", ()))
-    close = None
-    try:
-        await gate.wait()
-        read.cancel()
-        await asyncio.gather(read, return_exceptions=True)
-        close = asyncio.create_task(storage.close())
-        await asyncio.sleep(0.02)
-        assert not close.done()
-        with recovery_read_scope("agent:main:webchat:healthy", deadline=time.monotonic() + 1):
-            with pytest.raises(StorageBusyError):
-                await storage.get_session("agent:main:webchat:healthy")
-    finally:
-        gate.release.set()
-        await asyncio.gather(read, return_exceptions=True)
-        await budget.drain()
-        if close is not None:
-            await asyncio.wait_for(close, 2)
-    pool = storage._recovery_read_pool
-    assert pool is not None and pool.physical_count == 0 and pool.active_count == 0
-    await storage.connect()
-    assert storage._recovery_read_pool is None
-    with recovery_read_scope("agent:main:webchat:healthy", deadline=time.monotonic() + 1):
-        assert await storage.get_session("agent:main:webchat:healthy")
+    result = run_sqlite_probe(
+        tmp_path, _CLOSE_PROBE,
+        (str(int(aiosqlite._FORCE_SQLITE3_FALLBACK)), str(close_delay_seconds), "none"),
+    )
+    assert result.timed_out is None, result.output
+    assert result.returncode == 0, result.output
+    assert "recovery_close_contract=passed" in result.output
+
+
+@pytest.mark.ci_serial
+@pytest.mark.parametrize(("fault", "message"), [
+    ("skip-drain", "connection close started before native reader drained"),
+    ("no-close", "writer close returned without closing the connection"),
+])
+def test_close_probe_rejects_broken_resource_contracts(
+    tmp_path: Path, sqlite_backend: None, fault: str, message: str,
+) -> None:
+    result = run_sqlite_probe(
+        tmp_path, _CLOSE_PROBE,
+        (str(int(aiosqlite._FORCE_SQLITE3_FALLBACK)), "0", fault),
+    )
+    assert result.timed_out is None, result.output
+    assert result.returncode != 0, result.output
+    assert message in result.output
+
+
+@pytest.mark.ci_serial
+def test_close_probe_watchdog_terminates_noncooperative_close(tmp_path: Path) -> None:
+    result = run_sqlite_probe(
+        tmp_path, _CLOSE_PROBE, ("0", "0", "hang-close"), execution_seconds=3,
+    )
+    assert result.timed_out == "execution/cleanup", result.output
+    assert result.returncode != 0
+    assert "phase=writer-close" in result.output
 
 
 async def test_read_transaction_is_rolled_back_before_reader_reuse(storage: SessionStorage) -> None:

@@ -23,6 +23,8 @@ export interface UseChatComposerShortcutsOptions {
   popPendingTail: () => boolean
   enqueuePendingInput: (text: string) => boolean | Promise<boolean>
   sendCurrentInput: () => void
+  /** Consume a large paste delivered only as a post-insertion input event. */
+  handleLongPaste?: (text: string, event?: InputEvent) => boolean
   /**
    * Undo an uncommitted message edit, returning whether it had one to undo.
    * Escape has to offer this before it clears the composer: edit mode has no
@@ -75,6 +77,13 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
   function onTextareaInput(event?: Event) {
     updateTextareaUndoStateAfterInput(event)
     options.autoResizeTextarea()
+    const inputType = event && 'inputType' in event ? event.inputType : undefined
+    if (
+      (inputType === 'insertFromPaste' || inputType === 'insertFromPasteAsQuotation')
+      && event
+      && event.target instanceof HTMLTextAreaElement
+      && options.handleLongPaste?.(event.target.value, event as InputEvent)
+    ) return
     if (options.composing.value || (event && 'isComposing' in event && event.isComposing)) return
     options.handleSlashInput()
   }

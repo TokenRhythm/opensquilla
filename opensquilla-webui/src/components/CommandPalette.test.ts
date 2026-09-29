@@ -16,13 +16,6 @@ vi.mock('vue-router', () => ({
   useRouter: () => ({ push: routerPush }),
 }))
 
-vi.mock('@/composables/useBgm', () => ({
-  useBgm: () => ({
-    enabled: { value: false },
-    setEnabled: vi.fn(),
-  }),
-}))
-
 function emptySearch(): SessionSearchResult {
   return { sessions: [], messages: [] }
 }
@@ -95,6 +88,13 @@ describe('CommandPalette navigation and conversation search', () => {
     expect(Array.from(el.querySelectorAll('.cmdp-option__label')).map(node => node.textContent))
       .toEqual(['View usage'])
     expect(el.querySelector('.cmdp-group-label')?.textContent).toBe('Work')
+  })
+
+  it.each(['logs', 'overview', 'health'])('does not advertise the retired %s page', async (query) => {
+    const { el } = await mountPalette()
+    await search(el, query)
+    await settleSearch()
+    expect(el.querySelectorAll('.cmdp-option')).toHaveLength(0)
   })
 
   it('debounces search by 180ms and sends the domain request', async () => {

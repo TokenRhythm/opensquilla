@@ -412,13 +412,6 @@ test.describe('Sidebar', () => {
     }
   })
 
-  test('Agent administration deep links without reappearing in the primary rail', async ({ page }) => {
-    await openControl(page, 'agents')
-    await expect(page).toHaveURL(/\/agents$/)
-    await expect(page.locator('.sidebar-core').getByText('Agents', { exact: true })).toHaveCount(0)
-    await expect(page.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
-  })
-
   test('only the Recents list scrolls at a 900px viewport', async ({ page }) => {
     await page.setViewportSize({ width: 1440, height: 900 })
     await openControl(page)

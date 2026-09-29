@@ -17,9 +17,6 @@ from opensquilla.gateway.adapters.contract_method import (
 
 AGENT_CATALOG_CONTRACT_METHODS: Final = (
     "agents.list",
-    "agents.create",
-    "agents.update",
-    "agents.delete",
 )
 
 

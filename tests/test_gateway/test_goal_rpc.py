@@ -1326,10 +1326,9 @@ async def test_edit_reactivates_complete_goal_and_returns_new_continuity(
 ) -> None:
     async def handler(run: TaskRun) -> None:
         assert run.goal_context is not None
-        await stack.service.update_progress(
-            run.goal_context,
-            explanation="The original objective was delivered.",
-            steps=[{"step": "Deliver it", "status": "completed"}],
+        await run.envelope.runtime_services["update_progress"](
+            [{"step": "Deliver it", "status": "completed"}],
+            "The original objective was delivered.",
         )
 
     async with _open_goal_rpc_stack(
@@ -4278,12 +4277,11 @@ async def test_goal_event_observer_failure_never_changes_durable_tool_result(
     async def handler(run: TaskRun) -> None:
         assert service is not None
         assert run.goal_context is not None
-        progress = await service.update_progress(
-            run.goal_context,
-            explanation="synthetic progress",
-            steps=[{"step": "Finish", "status": "completed"}],
+        progress = await run.envelope.runtime_services["update_progress"](
+            [{"step": "Finish", "status": "completed"}],
+            "synthetic progress",
         )
-        assert progress["progressRevision"] == 1
+        assert progress["revision"] == 1
         terminal = await service.commit_model_status(
             run.goal_context,
             status="complete",
@@ -4541,7 +4539,7 @@ def _durable_goal_artifact_registry(
         publish_artifact,
     )
     builtins = get_default_registry()
-    for name in ("update_goal", "update_goal_progress"):
+    for name in ("update_goal", "update_plan"):
         registered = builtins.get(name)
         assert registered is not None
         registry.register(registered.spec, registered.handler)
@@ -4642,7 +4640,7 @@ async def test_goal_artifact_loop_commits_and_settles_durable_terminal_state(
         assert task.status == expected_task_status
         assert provider.calls == 3
         assert all(
-            {"publish_artifact", "update_goal", "update_goal_progress"}
+            {"publish_artifact", "update_goal", "update_plan"}
             <= set(tool_names)
             for tool_names in provider.tool_names_seen
         )
@@ -4729,7 +4727,7 @@ class _DurableGoalContinuationProvider:
         self.request_contexts_seen.append(request_context)
         self.messages_seen.append(message_text)
 
-        goal_tools = {"update_goal", "update_goal_progress"}
+        goal_tools = {"update_goal", "update_plan"}
         if call == 1:
             assert goal_tools <= set(tool_names)
             assert self.objective in request_context
@@ -4809,7 +4807,7 @@ class _DurableGoalContinuationSelector:
 def _durable_goal_control_registry() -> ToolRegistry:
     registry = ToolRegistry()
     builtins = get_default_registry()
-    for name in ("update_goal", "update_goal_progress"):
+    for name in ("update_goal", "update_plan"):
         registered = builtins.get(name)
         assert registered is not None
         registry.register(registered.spec, registered.handler)
@@ -4984,7 +4982,7 @@ async def test_real_turn_runner_continuation_reuses_durable_goal_context_and_com
         if retry_automatic:
             assert provider.request_contexts_seen[1] == provider.request_contexts_seen[2]
         assert all(
-            {"update_goal", "update_goal_progress"} <= set(tool_names)
+            {"update_goal", "update_plan"} <= set(tool_names)
             for tool_names in provider.tool_names_seen
         )
         assert goal.status == "complete"
@@ -5069,7 +5067,7 @@ class _RunningGoalEditProvider:
         self.request_texts.append(request_text)
         self.tool_names_seen.append(tool_names)
 
-        goal_tools = {"update_goal", "update_goal_progress"}
+        goal_tools = {"update_goal", "update_plan"}
         if call == 1:
             assert goal_tools <= set(tool_names)
             assert self.initial_objective in request_text
@@ -5110,11 +5108,11 @@ class _RunningGoalEditProvider:
         if call == 2:
             yield ProviderToolUseStart(
                 tool_use_id="goal-progress-rev2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
             )
             yield ProviderToolUseEnd(
                 tool_use_id="goal-progress-rev2",
-                tool_name="update_goal_progress",
+                tool_name="update_plan",
                 arguments={
                     "steps": [
                         {
@@ -5286,7 +5284,7 @@ async def test_running_goal_edit_adopts_revision_in_same_task_without_transcript
         assert [run.task_id for run in runs] == [created["taskId"]]
         assert provider.calls == 4
         assert provider.partial_text in provider.request_texts[1]
-        assert {"update_goal", "update_goal_progress"} <= set(provider.tool_names_seen[3])
+        assert {"update_goal", "update_plan"} <= set(provider.tool_names_seen[3])
         assert goal.objective_revision == 2
         assert goal.objective == provider.edited_objective
         assert goal.terminal_task_id == created["taskId"]

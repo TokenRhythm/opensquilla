@@ -4,6 +4,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, reactive } from 'vue'
 import i18n from '@/i18n'
 import zhHans from '@/locales/zh-Hans.json'
+import { MODEL_CAPACITY_KEY, useModelCapacityForm } from '@/composables/setup/useModelCapacityForm'
+import type { ProviderConfiguration, ModelCapacityTarget } from '@/modules/providerConfiguration'
 import SetupProviderPanel from './SetupProviderPanel.vue'
 import type { ConnectionState, DiscoveredModel } from '@/composables/setup/useSetupProviderForm'
 
@@ -103,6 +105,7 @@ function panel(overrides: Record<string, unknown> = {}) {
     providerEnvKey: '',
     providerEnvCommand: '',
     llmTimeoutSeconds: 120,
+    llmThinking: '',
     contextWindowTokens: '',
     contextWindowGlobal: null,
     effectiveMaxTokens: null,
@@ -139,12 +142,18 @@ function panel(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function mountPanel(props: Record<string, unknown> = {}, listeners: Record<string, unknown> = {}) {
+async function mountPanel(props: Record<string, unknown> = {}, listeners: Record<string, unknown> = {}, withCapacity = false) {
   const el = document.createElement('div')
   document.body.appendChild(el)
   const panelState = reactive(panel(props))
   const app = createApp(SetupProviderPanel, { panel: panelState, ...listeners })
   app.use(i18n)
+  if (withCapacity) app.provide(MODEL_CAPACITY_KEY, useModelCapacityForm({ capacitySupported: true,
+    resolveCapacity: async (items: ModelCapacityTarget[]) => ({ models: items.map(item => ({ ...item, localRuntime: false,
+      contextWindow: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+      maxOutputTokens: { automatic: 8192, automaticSource: 'default', override: null, value: 8192, source: 'default', editable: true },
+    })) }),
+  } as unknown as ProviderConfiguration))
   app.mount(el)
   await nextTick()
   return { app, el, panelState }
@@ -362,7 +371,7 @@ describe('SetupProviderPanel — visible verification dialog', () => {
       const dialog = await openConfiguredEditor(el)
       const refresh = dialog.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')!
       const status = () => dialog.querySelector('[data-testid="setup-model-catalog-sync"]')
-      expect(status()?.textContent).toBe('Discovering models…')
+      expect(status()?.textContent).toBe('Loading models…')
       expect(status()?.getAttribute('role')).toBe('status')
       expect(refresh.disabled).toBe(true)
       expect(dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')?.disabled)
@@ -370,15 +379,41 @@ describe('SetupProviderPanel — visible verification dialog', () => {
 
       panelState.connection = connection({ discoverError: 'HTTP 401' })
       await nextTick()
-      expect(status()?.textContent).toContain('Couldn\'t list models — type a model id.')
-      expect(status()?.textContent).toContain('HTTP 401')
+      expect(status()?.textContent).toBe('Could not load models. Retry or enter a model ID.')
+      expect(status()?.textContent).not.toContain('HTTP 401')
       expect(refresh.disabled).toBe(false)
       refresh.click()
       expect(onRefreshModels).toHaveBeenCalledOnce()
 
       panelState.connection = connection({ modelSource: 'live' })
       await nextTick()
-      expect(status()?.textContent).toBe('Available · 0')
+      expect(status()?.textContent).toBe('No models returned. You can enter a model ID.')
+    } finally { app.unmount() }
+  })
+
+  it('retains an editable model and explains transient versus access failures without raw errors', async () => {
+    const { app, el, panelState } = await mountPanel({
+      connection: connection({ models: DISCOVERED, modelSource: 'live', discovering: true }),
+    })
+    try {
+      const dialog = await openConfiguredEditor(el)
+      const status = () => dialog.querySelector('[data-testid="setup-model-catalog-sync"]')
+      const input = dialog.querySelector<HTMLInputElement>('input[name="setup_provider_model"]')!
+      expect(status()?.textContent).toBe('Refreshing models…')
+      expect(input.disabled).toBe(false)
+      expect(input.getAttribute('aria-describedby')).toContain('setup-model-catalog-sync-editor')
+      panelState.connection = connection({ models: DISCOVERED, modelSource: 'live', discoverError: 'upstream private detail' })
+      await nextTick()
+      expect(status()?.textContent).toBe('Refresh failed. Showing the previous list.')
+      expect(input.disabled).toBe(false)
+      panelState.connection = connection({
+        discoverError: 'upstream private detail',
+        catalog: { lastSyncedAt: null, stale: true, accessRejected: true },
+      })
+      await nextTick()
+      expect(status()?.textContent).toBe('Could not read models. Check your API key or access permissions.')
+      expect(dialog.textContent).not.toContain('upstream private detail')
+      expect(input.disabled).toBe(false)
     } finally { app.unmount() }
   })
 
@@ -2423,7 +2458,7 @@ describe('SetupProviderPanel — effective output limit', () => {
     }, { onRefreshModels })
 
     const status = el.querySelector('[data-testid="setup-model-catalog-sync"]')
-    expect(status?.textContent).toContain('Model metadata may be stale')
+    expect(status?.textContent).toContain('Showing the saved model list')
     expect(status?.classList.contains('is-stale')).toBe(true)
 
     const refresh = el.querySelector<HTMLButtonElement>('[data-testid="setup-refresh-models"]')
@@ -2622,5 +2657,38 @@ describe('SetupProviderPanel — model strategy wayfinding', () => {
     expect(onGoToSection).toHaveBeenCalledTimes(1)
     expect(onGoToSection).toHaveBeenCalledWith('modelStrategy')
     app.unmount()
+  })
+})
+
+describe('primary thinking control', () => {
+  it('keeps thinking edits local until the model settings dialog is completed', async () => {
+    const onUpdateLlmThinking = vi.fn()
+    const { app, el } = await mountPanel({ llmThinking: 'high', providerFieldValue: () => 'example-model' }, { onUpdateLlmThinking }, true)
+    try {
+      const editor = await openConfiguredEditor(el)
+      expect(editor.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
+      editor.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
+      await Promise.resolve(); await nextTick(); await nextTick()
+      const dialog = document.querySelector('.model-capacity-dialog')!
+      const control = dialog.querySelector<HTMLSelectElement>('[data-testid="model-thinking-level"]')!
+      expect(control.value).toBe('high')
+      expect(Array.from(control.options, option => option.value)).toEqual(['', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh'])
+      control.value = ''
+      control.dispatchEvent(new Event('change', { bubbles: true }))
+      await nextTick()
+      expect(onUpdateLlmThinking).not.toHaveBeenCalled()
+      dialog.querySelector<HTMLButtonElement>('.btn--primary')!.click()
+      expect(onUpdateLlmThinking).toHaveBeenCalledWith('')
+    } finally { app.unmount() }
+  })
+
+  it('does not expose global thinking in a secondary provider settings dialog', async () => {
+    const { app, el } = await mountPanel({ editingPrimary: false, selectedStoredProfile: true, providerFieldValue: () => 'example-model' }, {}, true)
+    try {
+      const editor = await openConfiguredEditor(el)
+      editor.querySelector<HTMLButtonElement>('.model-capacity-menu')!.click()
+      await nextTick()
+      expect(document.querySelector('[data-testid="model-thinking-level"]')).toBeNull()
+    } finally { app.unmount() }
   })
 })

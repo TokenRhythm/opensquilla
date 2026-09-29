@@ -83,10 +83,39 @@ function isTestFile(entry) {
   return /\.(test|spec)\.(ts|tsx)$/.test(entry)
 }
 
+function hasRuntimeVueDependency(body, rel) {
+  const source = ts.createSourceFile(rel, body, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS)
+  const isVue = node => node && ts.isStringLiteralLike(node)
+    && (node.text === 'vue' || node.text.startsWith('vue/') || node.text.startsWith('@vue/'))
+  function visit(node) {
+    if (ts.isImportDeclaration(node) && isVue(node.moduleSpecifier)) {
+      const clause = node.importClause
+      if (!clause) return true
+      if (!clause.isTypeOnly && (clause.name || !clause.namedBindings
+        || ts.isNamespaceImport(clause.namedBindings)
+        || clause.namedBindings.elements.length === 0
+        || clause.namedBindings.elements.some(element => !element.isTypeOnly))) return true
+    }
+    if (ts.isExportDeclaration(node) && isVue(node.moduleSpecifier) && !node.isTypeOnly) {
+      if (!node.exportClause || !ts.isNamedExports(node.exportClause)
+        || node.exportClause.elements.length === 0
+        || node.exportClause.elements.some(element => !element.isTypeOnly)) return true
+    }
+    if (ts.isCallExpression(node) && isVue(node.arguments[0])
+      && (node.expression.kind === ts.SyntaxKind.ImportKeyword
+        || (ts.isIdentifier(node.expression) && node.expression.text === 'require'))) return true
+    return ts.forEachChild(node, visit)
+  }
+  return Boolean(visit(source))
+}
+
 const failures = []
 for (const file of walkFiles(srcRoot, /\.(ts|vue)$/, { skipFile: isTestFile })) {
   const rel = relative(root, file).replace(/\\/g, '/')
   const body = readFileSync(file, 'utf8')
+  if (rel === 'src/utils/chat/parkedPendingQueueCache.ts' && hasRuntimeVueDependency(body, rel)) {
+    failures.push(`${rel}: Vue runtime dependencies belong in the composable; inject object normalization into the cache.`)
+  }
   const desktopAccessCount = desktopGlobalAccesses(body, rel)
   if (desktopAccessCount > 0) {
     failures.push(

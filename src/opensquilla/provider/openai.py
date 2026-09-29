@@ -217,7 +217,7 @@ _OPENAI_STREAM_USAGE_ONLY_KEYS = frozenset(
 _OPENAI_STREAM_NOOP_CHOICE_KEYS = frozenset(
     {"index", "delta", "finish_reason", "native_finish_reason"}
 )
-_OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role"})
+_OPENAI_STREAM_NOOP_DELTA_KEYS = frozenset({"content", "role", "tool_calls"})
 _EPHEMERAL_CACHE_CONTROL: dict[str, str] = {"type": "ephemeral"}
 _DASHSCOPE_MAX_CACHE_MARKERS = 4
 _DASHSCOPE_CACHE_MARKER_ROLES = {"system", "user", "assistant", "tool"}
@@ -289,6 +289,8 @@ def _is_inert_post_terminal_stream_frame(
     if delta.get("content") not in (None, ""):
         return False
     if delta.get("role") not in (None, "assistant"):
+        return False
+    if _has_native_tool_payload(delta.get("tool_calls")):
         return False
 
     repeated_finish = choice.get("finish_reason")

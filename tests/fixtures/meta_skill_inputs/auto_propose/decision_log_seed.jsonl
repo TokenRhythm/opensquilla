@@ -1,5 +1,0 @@
-{"ts":"2026-05-31T08:00:00Z","session_id":"s1","skills":["history-explorer","summarize"],"user_intent":"Summarize recent project decisions"}
-{"ts":"2026-05-31T08:10:00Z","session_id":"s2","skills":["history-explorer","summarize"],"user_intent":"Brief me on yesterday's decisions"}
-{"ts":"2026-05-31T08:20:00Z","session_id":"s3","skills":["history-explorer","summarize"],"user_intent":"Create an operations recap from history"}
-{"ts":"2026-05-31T08:30:00Z","session_id":"s4","skills":["history-explorer","summarize"],"user_intent":"Summarize the operator decision log"}
-{"ts":"2026-05-31T08:40:00Z","session_id":"s5","skills":["history-explorer","summarize"],"user_intent":"Find recent decisions and make a short summary"}

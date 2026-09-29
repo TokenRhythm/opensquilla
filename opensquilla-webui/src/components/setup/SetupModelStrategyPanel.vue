@@ -84,10 +84,12 @@ interface SinglePanelContract {
   model: string
   models: DiscoveredModelCatalog['models']
   modelSource: DiscoveredModelCatalog['source']
+  catalogState?: DiscoveredModelCatalog
 }
 
 interface ModelStrategyPanelContract {
   activeStrategy: ModelStrategy
+  llmThinking?: string
   hasSavedProvider: boolean
   profileSaveSupported: boolean
   providerLabel: string
@@ -120,6 +122,8 @@ const emit = defineEmits<{
   updateStrategy: [value: ModelStrategy]
   updateFixedProvider: [value: string]
   updateFixedModel: [value: string]
+  updateLlmThinking: [value: string]
+  updateEnsembleThinking: [candidate: { provider: string; model: string; role?: string }, value: string]
   updateRouterDefaultTier: [value: string]
   updateRouterVisualMode: [value: string]
   updateTierField: [name: string, key: 'provider' | 'model' | 'thinkingLevel' | 'ensembleEnabled' | 'ensembleSelectionMode', value: string | boolean]
@@ -892,6 +896,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
           </span>
         </div>
 
+        <p v-if="panel.activeStrategy === 'router' && panel.llmThinking" class="control-row__desc" role="status" data-testid="global-thinking-override">{{ t('setup.thinking.overrideHint', { level: panel.llmThinking }) }}</p>
         <SetupTierTable
           :rows="panel.router.tierRows"
           :tier-label="panel.router.tierLabel"
@@ -1127,7 +1132,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 role="listitem"
               >
                 <SetupModelIdentity :provider="candidate.provider" :provider-label="displayProvider(candidate.provider)" :model="candidate.model" />
-                <SetupModelCapacity :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" />
+                <SetupModelCapacity :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" :thinking="candidate.thinkingLevel || ''" thinking-scope="preset" thinking-readonly />
                 <span
                   class="setup-model-strategy__credential"
                   :class="{ 'is-missing': candidate.credential && !candidate.credential.available, 'is-ready': candidate.credential?.available }"
@@ -1152,7 +1157,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             <div class="setup-model-strategy__candidate-list setup-model-strategy__candidate-list--aggregator" role="list">
               <div class="setup-model-strategy__candidate" role="listitem">
                 <SetupModelIdentity :provider="panel.ensemble.fixedProfile.aggregator.provider" :provider-label="displayProvider(panel.ensemble.fixedProfile.aggregator.provider)" :model="panel.ensemble.fixedProfile.aggregator.model" />
-                <SetupModelCapacity :provider="panel.ensemble.fixedProfile.aggregator.provider" :model="panel.ensemble.fixedProfile.aggregator.model" :disabled="routingModeBusy" />
+                <SetupModelCapacity :provider="panel.ensemble.fixedProfile.aggregator.provider" :model="panel.ensemble.fixedProfile.aggregator.model" :disabled="routingModeBusy" :thinking="panel.ensemble.fixedProfile.aggregator.thinkingLevel || ''" thinking-scope="preset" thinking-readonly />
                 <span
                   class="setup-model-strategy__credential"
                   :class="{ 'is-missing': panel.ensemble.fixedProfile.aggregator.credential && !panel.ensemble.fixedProfile.aggregator.credential.available, 'is-ready': panel.ensemble.fixedProfile.aggregator.credential?.available }"
@@ -1226,7 +1231,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                     <Icon name="moreHorizontal" :size="17" aria-hidden="true" />
                   </summary>
                   <div class="setup-model-strategy__candidate-menu">
-                    <SetupModelCapacity menu :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" />
+                    <SetupModelCapacity menu :provider="candidate.provider" :model="candidate.model" :disabled="routingModeBusy" :thinking="candidate.thinkingLevel || ''" thinking-scope="proposer" @update-thinking="emit('updateEnsembleThinking', candidate, $event)" />
                     <button
                       type="button"
                       data-testid="ensemble-replace-proposer"
@@ -1298,6 +1303,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="replacementModel"
                 :models="replacementModelCatalog.models"
                 :model-source="replacementModelCatalog.source"
+                :catalog-state="replacementModelCatalog"
                 @update="replacementModel = $event"
               />
               <p
@@ -1356,6 +1362,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="newCandidateModel"
                 :models="candidateModelCatalog.models"
                 :model-source="candidateModelCatalog.source"
+                :catalog-state="candidateModelCatalog"
                 @update="newCandidateModel = $event"
               />
               <div class="setup-model-strategy__editor-actions">
@@ -1435,7 +1442,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 data-testid="ensemble-custom-aggregator"
               >
                 <SetupModelIdentity :provider="customLineup.aggregator.provider" :provider-label="displayProvider(customLineup.aggregator.provider)" :model="customLineup.aggregator.model" />
-                <SetupModelCapacity :provider="customLineup.aggregator.provider" :model="customLineup.aggregator.model" :disabled="routingModeBusy" />
+                <SetupModelCapacity :provider="customLineup.aggregator.provider" :model="customLineup.aggregator.model" :disabled="routingModeBusy" :thinking="customLineup.aggregator.thinkingLevel || ''" thinking-scope="aggregator" @update-thinking="emit('updateEnsembleThinking', customLineup.aggregator, $event)" />
                 <span
                   class="setup-model-strategy__credential"
                   :class="{ 'is-missing': customLineup.aggregator.credential && !customLineup.aggregator.credential.available, 'is-ready': customLineup.aggregator.credential?.available }"
@@ -1464,7 +1471,9 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 data-testid="ensemble-custom-aggregator-inherited"
               >
                 <SetupModelIdentity :provider="customLineup.inheritedAggregatorProvider" :provider-label="displayProvider(customLineup.inheritedAggregatorProvider)" :model="customLineup.inheritedAggregatorModel || currentModel" :note="t('setup.modelStrategy.aggregatorInheritedNote')" />
-                <SetupModelCapacity :provider="customLineup.inheritedAggregatorProvider" :model="customLineup.inheritedAggregatorModel || currentModel" :disabled="routingModeBusy" />
+                <SetupModelCapacity :provider="customLineup.inheritedAggregatorProvider" :model="customLineup.inheritedAggregatorModel || currentModel" :disabled="routingModeBusy"
+                  :thinking="''" thinking-scope="inheritedAggregator"
+                  @update-thinking="emit('updateEnsembleThinking', { provider: customLineup.inheritedAggregatorProvider, model: customLineup.inheritedAggregatorModel || currentModel, role: 'aggregator' }, $event)" />
                 <button
                   type="button"
                   class="setup-model-strategy__replace-aggregator"
@@ -1526,6 +1535,7 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
                 :value="aggregatorModel"
                 :models="aggregatorModelCatalog.models"
                 :model-source="aggregatorModelCatalog.source"
+                :catalog-state="aggregatorModelCatalog"
                 @update="aggregatorModel = $event"
               />
               <div class="setup-model-strategy__editor-actions">
@@ -1774,9 +1784,10 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
             :value="panel.single.model"
             :models="panel.single.models"
             :model-source="panel.single.modelSource"
+            :catalog-state="panel.single.catalogState"
             @update="emit('updateFixedModel', $event)"
           >
-            <template #actions><SetupModelCapacity :provider="panel.single.providerId" :model="panel.single.model" :disabled="routingModeBusy" /></template>
+            <template #actions><SetupModelCapacity :provider="panel.single.providerId" :model="panel.single.model" :disabled="routingModeBusy" :thinking="panel.llmThinking || ''" thinking-scope="global" @update-thinking="emit('updateLlmThinking', $event)" /></template>
           </SetupModelCombobox>
           <p v-if="fixedModelIsPrimaryStrategy" class="setup-model-strategy__muted">
             {{ t('setup.modelStrategy.singleDesc') }}
@@ -2164,8 +2175,14 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 .setup-model-strategy__fixed-model-row.control-row--stack {
   align-items: center;
   flex-direction: row;
-  gap: var(--sp-4);
+  flex-wrap: wrap;
+  gap: var(--sp-2) var(--sp-4);
   padding: var(--sp-2) 0;
+}
+
+.setup-model-strategy__fixed-model-row :deep(.setup-model-combobox__sync) {
+  flex-basis: 100%;
+  text-align: right;
 }
 
 .setup-model-strategy__fixed-model-row :deep(.control-row__label-block) {
@@ -2630,6 +2647,11 @@ function credentialLabel(candidate: EnsembleCandidateView): string {
 
   .setup-model-strategy__fixed-model-row :deep(.control-row__control) {
     width: 100%;
+  }
+
+  .setup-model-strategy__fixed-model-row :deep(.setup-model-combobox__sync) {
+    flex-basis: auto;
+    text-align: left;
   }
 }
 

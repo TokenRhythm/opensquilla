@@ -186,64 +186,6 @@ async def test_direct_turn_uses_prepared_authority_and_existing_runner(
     assert run.await_args.kwargs["session_intent"] is SessionIntent.CONTINUE
 
 
-@pytest.mark.parametrize(
-    ("message", "semantic_message", "kind", "name", "correlation"),
-    [
-        ("/meta sample -- request", "/meta sample -- request", "manual", "sample", "request:one"),
-        (
-            "/meta-replay " + "a" * 32,
-            "/meta-replay " + "a" * 32,
-            "replay",
-            None,
-            "nonce:" + "a" * 32,
-        ),
-        ("/meta sample", "/meta other", None, None, None),
-        ("/meta-replay invalid", "/meta sample", None, None, None),
-    ],
-)
-def test_meta_control_projection_preserves_exact_native_grammar(
-    tmp_path, message, semantic_message, kind, name, correlation
-):
-    result = _ports(tmp_path).parse_meta_control(
-        message, semantic_message, client_request_id="one"
-    )
-    if kind is None:
-        assert result is None
-    else:
-        assert result.kind == kind
-        assert result.name == name
-        assert result.correlation_id == correlation
-
-
-def test_meta_marker_primitives_preserve_identity_rollback_and_consumption(tmp_path, monkeypatch):
-    from opensquilla.engine.steps import meta_command
-
-    monkeypatch.setattr(meta_command, "_pending_meta_launch", {})
-    monkeypatch.setattr(meta_command, "_consumed_meta_launch", {})
-    ports = _ports(tmp_path)
-    key = "agent:main:webchat:marker-primitives"
-    request = {"client_request_id": "one"}
-    assert meta_command.pending_meta_launch_put(key, "sample", **request) == "stamped"
-    assert meta_command.pending_meta_launch_put(key, "other", client_request_id="two") == "stamped"
-    assert ports.peek_meta_launch(key, **request) == "sample"
-    assert ports.peek_meta_launch(key, client_request_id="missing") is None
-    assert ports.cancel_accepted_meta_launch(key, **request) is False
-    assert ports.promote_meta_launch(
-        key, message="ordinary", semantic_message="ordinary", **request
-    ) is None
-    launch = {"message": "/meta sample", "semantic_message": "/meta sample"}
-    assert ports.promote_meta_launch(key, **launch, **request) == "promoted"
-    assert ports.promote_meta_launch(key, **launch, **request) == "accepted"
-    assert ports.restage_meta_launch(key, **request) is True
-    assert ports.restage_meta_launch(key, **request) is False
-    assert ports.promote_meta_launch(key, **launch, **request) == "promoted"
-    assert ports.cancel_accepted_meta_launch(key, **request) is True
-    assert ports.cancel_accepted_meta_launch(key, **request) is False
-    assert ports.peek_meta_launch(key, **request) is None
-    assert meta_command.pending_meta_launch_put(key, "sample", **request) == "replayed"
-    assert ports.peek_meta_launch(key, client_request_id="two") == "other"
-
-
 async def test_collect_admission_releases_native_guard_before_rejection_mapping(tmp_path):
     key = "agent:main:webchat:primitive"
     events = []

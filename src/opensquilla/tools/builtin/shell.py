@@ -201,7 +201,6 @@ _EXEC_TOOL_TIMEOUT_PADDING = _APPROVAL_RETRY_WAIT_SECONDS + 5.0
 _DEFAULT_BACKGROUND_TIMEOUT = 1800.0
 _MAX_BACKGROUND_TIMEOUT = 5400.0
 _DEFAULT_PROCESS_WAIT_TIMEOUT = 600.0
-_CODING_PROCESS_WAIT_TIMEOUT = 5400.0
 _MAX_PROCESS_WAIT_TIMEOUT = 5400.0
 _PROCESS_WAIT_TIMEOUT_PADDING = 5.0
 _BACKGROUND_TERMINATE_TIMEOUT = 1.0
@@ -1067,21 +1066,6 @@ def _base_shell_environment() -> dict[str, str]:
     else:
         environment = _runtime_shell_environment(dict(os.environ))
 
-    # Carry the live turn's gate and authoritative config path into a code-task
-    # CLI child. ``gateway run --config`` does not mutate the parent process
-    # environment, so rediscovery in the child can otherwise select the wrong
-    # profile. These runtime-only values are removed before the nested coding
-    # Agent starts and are never serialized into telemetry.
-    if ctx is not None:
-        environment["OPENSQUILLA_CODING_MODE_ACTIVE"] = (
-            "1" if bool(getattr(ctx, "coding_mode", False)) else "0"
-        )
-        config = getattr(ctx, "sandbox_gateway_config", None)
-        config_path = str(getattr(config, "config_path", "") or "").strip()
-        if config_path:
-            environment["OPENSQUILLA_CODING_MODE_CONFIG_PATH"] = config_path
-        else:
-            environment.pop("OPENSQUILLA_CODING_MODE_CONFIG_PATH", None)
     return environment
 
 
@@ -1565,7 +1549,6 @@ class _BgSession:
     local_urls: list[str] = field(default_factory=list)
     output_capture: BoundedOutputCapture = field(default_factory=BoundedOutputCapture)
     output_lines: list[str] = field(default_factory=list)
-    code_task_marker: dict[str, str] | None = None
     done: bool = False
     timed_out: bool = False
     killed: bool = False
@@ -5887,9 +5870,6 @@ def _resolve_background_timeout(timeout: float | int | None) -> float:
 
 
 def _process_wait_default() -> float:
-    ctx = current_tool_context.get()
-    if ctx is not None and getattr(ctx, "coding_mode", False):
-        return _CODING_PROCESS_WAIT_TIMEOUT
     return _DEFAULT_PROCESS_WAIT_TIMEOUT
 
 
@@ -6151,63 +6131,11 @@ def _bg_session_payload(session: _BgSession) -> dict[str, object]:
     )
     if runtime_failure is not None:
         payload["runtime_failure"] = runtime_failure
-    code_task = _code_task_status_payload(session)
-    if code_task:
-        payload["code_task"] = code_task
     return payload
 
 
-def _code_task_status_payload(session: _BgSession) -> dict[str, object] | None:
-    if "code-task" not in session.command:
-        return None
-    output = _bg_rendered_output(session)
-    marker = session.code_task_marker or _parse_code_task_marker(output)
-    if marker is None:
-        return None
-    status_path = Path(marker["status_path"]).expanduser()
-    payload: dict[str, object] = dict(marker)
-    if status_path.is_file():
-        try:
-            status = json.loads(status_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            status = {}
-        if isinstance(status, dict):
-            for key in (
-                "phase",
-                "updated",
-                "pid",
-                "current_command",
-                "last_output_at",
-                "quiet_for_seconds",
-                "state",
-                "verified",
-                "error",
-                "final_failure_reason",
-                "installer_path",
-                "log_paths",
-            ):
-                if key in status:
-                    payload[key] = status[key]
-    return payload
 
 
-def _parse_code_task_marker(output: str) -> dict[str, str] | None:
-    for line in output.splitlines():
-        if "[code-task] run started:" not in line or "status=" not in line:
-            continue
-        status_tail = line.split("status=", 1)[1]
-        status_end = status_tail.find("status.json")
-        if status_end < 0:
-            continue
-        status_path = status_tail[: status_end + len("status.json")]
-        payload = {"status_path": status_path}
-        run_match = re.search(r"run_id=([^\s]+)", line)
-        if run_match:
-            payload["run_id"] = run_match.group(1)
-        if "artifact_dir=" in line and " status=" in line:
-            payload["artifact_dir"] = line.split("artifact_dir=", 1)[1].split(" status=", 1)[0]
-        return payload
-    return None
 
 
 def _local_server_urls_from_command(command: str) -> list[str]:
@@ -6505,8 +6433,6 @@ def _finalize_bg_session(session: _BgSession) -> None:
 
 
 async def _finalize_bg_session_async(session: _BgSession) -> None:
-    if "code-task" in session.command and session.code_task_marker is None:
-        session.code_task_marker = _parse_code_task_marker(_bg_rendered_output(session))
     await session.output_capture.finish_async()
     session.output_capture.release_preview()
     _finalize_bg_session(session)

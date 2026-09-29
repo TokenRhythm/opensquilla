@@ -246,6 +246,7 @@ test('keeps an empty-token tab connected as a legal guest after enabling token a
     expect(wire.hellos[1].principal).toMatchObject({ authenticated: false, authState: 'guest' })
     await expect(connection).toHaveText('Connected')
     await connection.click()
+    await page.locator('#settings-connection-details > summary').click()
     const token = page.locator('#conn-ws-token')
     await expect(page.locator('.conn-status__pill')).toHaveText('Connected')
     await expect(page.locator('.conn-status__reason')).not.toContainText('Authentication failed')
