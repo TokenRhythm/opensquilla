@@ -17,8 +17,8 @@ from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+from opensquilla.observability.redact import scrub_json
 from opensquilla.paths import default_opensquilla_home
-from opensquilla.safety.secret_redaction import redact_secret_value
 
 _LOG_DIR_ENV = "OPENSQUILLA_LOG_DIR"
 _RAW_DIR_ENV = "OPENSQUILLA_TURN_CALL_LOG_DIR"
@@ -70,7 +70,7 @@ def _safe(value: Any) -> Any:
     """Redact secrets before a raw detail leaves the local trace endpoint."""
 
     try:
-        return redact_secret_value(value)
+        return scrub_json(value)
     except Exception:
         return "[redacted]"
 

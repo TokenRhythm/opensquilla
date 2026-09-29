@@ -607,7 +607,7 @@ async def test_logs_trace_details_exposes_redacted_boundary_payload_with_trace_g
     assert row["kind"] == "routing_decision"
     assert row["status"] == "success"
     assert row["output"]["selected_model"] == "test-model"
-    assert row["output"]["api_key"] == "[REDACTED]"
+    assert row["output"]["api_key"] == "[redacted]"
     assert "duration_ms" not in row
 
     raw = await get_dispatcher().dispatch(

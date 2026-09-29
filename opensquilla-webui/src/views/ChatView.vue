@@ -831,7 +831,7 @@ import {
 import { SESSION_LIFECYCLE_KEY } from '@/modules/sessionLifecycle'
 import { PENDING_INPUT_QUEUE_KEY } from '@/modules/pendingInputQueue'
 import { APP_SETTINGS_KEY } from '@/modules/appSettings'
-import { agentTraceEnabled, refreshAgentTraceEnabled, registerAgentTracePreferenceReader, setAgentTraceEnabled } from '@/modules/agentTracePreference'
+import { agentTraceEnabled, registerAgentTracePreferenceReader, setAgentTraceEnabled } from '@/modules/agentTracePreference'
 import { PROVIDER_CONFIGURATION_KEY } from '@/modules/providerConfiguration'
 import {
   SANDBOX_RUNTIME_KEY,
@@ -2181,6 +2181,7 @@ const chatFeatureToggles = useChatFeatureToggles({
   readOptions: optionalSessionReadOptions,
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
   connectionAvailable: computed(() => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated),
+  onConfigLoaded: config => setAgentTraceEnabled(config.privacy?.agent_trace_enabled),
   setGlobalElevatedMode,
   loadCurrentSessionUsage,
 })
@@ -2354,10 +2355,7 @@ watch(agentTraceEnabled, enabled => {
 
 watch(
   [() => gatewayAccess.availability, () => gatewayAccess.subscriptionEpoch],
-  ([availability]) => {
-    if (availability === 'available') void refreshAgentTraceEnabled(injectedAppSettings, () => gatewayAccess.availability === 'available')
-    else setAgentTraceEnabled(false)
-  },
+  () => setAgentTraceEnabled(false),
   { flush: 'sync' },
 )
 
@@ -6801,8 +6799,7 @@ function bindBottomIntersectionObserver() {
 }
 
 onMounted(async () => {
-  if (gatewayAccess.availability === 'available') void refreshAgentTraceEnabled(injectedAppSettings, () => gatewayAccess.availability === 'available')
-  else setAgentTraceEnabled(false)
+  setAgentTraceEnabled(false)
   chatViewActive = true
   chatViewDisposed = false
   // A native scrollbar drag can finish outside the thread element. Keep the

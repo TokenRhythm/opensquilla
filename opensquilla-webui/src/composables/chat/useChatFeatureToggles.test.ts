@@ -50,6 +50,7 @@ function createHarness(options: {
   hasRpcMethod?: (method: string) => boolean
   connectionEpoch?: Readonly<Ref<unknown>>
   connectionAvailable?: Readonly<Ref<boolean>>
+  onConfigLoaded?: (config: { privacy?: { agent_trace_enabled?: boolean } }) => void
 } = {}) {
   const configGetResults = [...(options.configGetResults ?? [{}])]
   const routingGetResults = [...(options.routingGetResults ?? [])]
@@ -129,6 +130,7 @@ function createHarness(options: {
     readOptions: options.readCallOptions,
     connectionEpoch: options.connectionEpoch,
     connectionAvailable: options.connectionAvailable,
+    onConfigLoaded: options.onConfigLoaded,
     setGlobalElevatedMode,
     loadCurrentSessionUsage,
   })
@@ -170,6 +172,36 @@ describe('useChatFeatureToggles default model display', () => {
     expect(api.defaultModelForAgent('DEFAULT')).toEqual(primaryModel)
     expect(api.modelRoutingMode.value).toBe('squilla_router')
     expect(rpc.call.mock.calls.map(([method]) => method)).toEqual(['config.get', 'models.routing.get'])
+  })
+
+  it('hydrates the trace preference from the existing config request after reconnect', async () => {
+    const scope = effectScope()
+    try {
+      const connectionEpoch = ref(1)
+      const connectionAvailable = ref(true)
+      const onConfigLoaded = vi.fn()
+      const { api, rpc } = scope.run(() => createHarness({
+        configGetResults: [
+          { privacy: { agent_trace_enabled: true } },
+          { privacy: { agent_trace_enabled: false } },
+        ],
+        connectionEpoch,
+        connectionAvailable,
+        onConfigLoaded,
+      }))!
+
+      await api.loadFeatureToggles()
+      expect(onConfigLoaded).toHaveBeenCalledWith({ privacy: { agent_trace_enabled: true } })
+      connectionAvailable.value = false
+      connectionEpoch.value = 2
+      connectionAvailable.value = true
+      await api.loadFeatureToggles()
+      expect(onConfigLoaded).toHaveBeenLastCalledWith({ privacy: { agent_trace_enabled: false } })
+      expect(onConfigLoaded).toHaveBeenCalledTimes(2)
+      expect(rpc.call.mock.calls.filter(([method]) => method === 'config.get')).toHaveLength(2)
+    } finally {
+      scope.stop()
+    }
   })
 
   it('never invents a provider for a different enabled agent override', async () => {
@@ -230,10 +262,12 @@ describe('useChatFeatureToggles default model display', () => {
       const connectionAvailable = ref(true)
       const oldConfig = deferred<Record<string, unknown>>()
       const nextModel = { model: 'new-model', provider: 'openrouter' }
+      const onConfigLoaded = vi.fn()
       const { api } = scope.run(() => createHarness({
         configGetResults: [primaryConfig, oldConfig.promise, { llm: nextModel }],
         connectionEpoch,
         connectionAvailable,
+        onConfigLoaded,
       }))!
       await api.loadFeatureToggles()
       expect(api.defaultModelForAgent('main')).toEqual(primaryModel)
@@ -245,8 +279,10 @@ describe('useChatFeatureToggles default model display', () => {
       oldConfig.resolve(primaryConfig)
       await oldRead
       expect(api.defaultModelForAgent('main')).toBeNull()
+      expect(onConfigLoaded).toHaveBeenCalledTimes(1)
       await api.loadFeatureToggles()
       expect(api.defaultModelForAgent('main')).toEqual(nextModel)
+      expect(onConfigLoaded).toHaveBeenCalledTimes(2)
       connectionEpoch.value = 3
       expect(api.defaultModelForAgent('main')).toBeNull()
     } finally {

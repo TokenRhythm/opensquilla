@@ -265,8 +265,8 @@ def test_trace_details_routing_payload_is_redacted_and_preserves_measured_millis
     assert decision["model"] == "selected-model"
     assert decision["provider"] == "selected-provider"
     assert decision["attrs"]["requested_mode"] == "smart"
-    assert decision["output"]["api_key"] == "[REDACTED]"
-    assert decision["output"]["reason"]["authorization"] == "[REDACTED]"
+    assert decision["output"]["api_key"] == "[redacted]"
+    assert decision["output"]["reason"]["authorization"] == "[redacted]"
     assert retry["call_id"] == "model-a"
     assert retry["attempt"] == 2
     assert "duration_ms" not in retry
