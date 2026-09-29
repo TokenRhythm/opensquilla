@@ -82,6 +82,43 @@ describe('buildChatMarkdown', () => {
     expect(markdown).not.toContain('HEARTBEAT_OK')
   })
 
+  it('exports only explicit answer text from a failed terminal turn', () => {
+    const markdown = buildChatMarkdown({
+      title: 'Failed tool projection',
+      exportedAt: '2026-08-11T10:00:00.000Z',
+      aiGeneratedLabel: 'AI generated',
+      messages: [{
+        displayRole: 'assistant',
+        roleLabel: 'Assistant',
+        text: 'Checking the repository.\n\nThe final answer.',
+        terminalFailure: true,
+        turnOutcome: {
+          turnId: 'turn-failed-projection',
+          status: 'failed',
+        },
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Checking the repository.',
+            rawText: 'Checking the repository.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'The final answer.',
+            rawText: 'The final answer.',
+            presentation: 'answer',
+          },
+        ],
+      } as ChatRenderedMessage],
+    })
+
+    expect(markdown).toContain('The final answer.')
+    expect(markdown).not.toContain('Checking the repository.')
+  })
+
   it('retains mixed sentinel-looking text exported from an ordinary user turn', () => {
     const markdown = buildChatMarkdown({
       title: 'Literal marker documentation',

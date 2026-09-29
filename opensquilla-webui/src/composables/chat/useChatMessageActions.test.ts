@@ -1147,6 +1147,67 @@ describe('useChatMessageActions protocol-shaped copy text', () => {
     expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
   })
 
+  it('copies only the explicit final answer after a failed tool', async () => {
+    const { api } = makeOptions([], text => text, () => 'AI generated')
+
+    await api.copyMessage(renderedMessage({
+      role: 'assistant',
+      displayRole: 'assistant',
+      text: 'Working note.\n\nFinal answer.',
+      terminalFailure: true,
+      turnOutcome: {
+        turnId: 'turn-copy-failed-tool',
+        status: 'failed',
+      },
+      timelineItems: [
+        {
+          type: 'text',
+          key: 'work',
+          html: 'Working note.',
+          rawText: 'Working note.',
+          presentation: 'intermediate',
+        },
+        {
+          type: 'tool-group',
+          key: 'failed-tool',
+          group: {
+            groupId: 'failed-tool',
+            operationKey: 'web.search',
+            label: 'Search',
+            iconName: 'search',
+            calls: [{
+              toolId: 'failed-tool',
+              renderKey: 'failed-tool',
+              name: 'web_search',
+              displayName: 'Search',
+              inputRaw: '{}',
+              inputPreview: '{}',
+              isRunning: false,
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+              isOpen: false,
+            }],
+            secondary: '',
+            isRunning: false,
+            isError: true,
+            status: 'error',
+          },
+        },
+        {
+          type: 'text',
+          key: 'answer',
+          html: 'Final answer.',
+          rawText: 'Final answer.',
+          presentation: 'answer',
+        },
+      ],
+    }))
+
+    expect(copyTextWithFallback).toHaveBeenCalledWith('Final answer.\n\nAI generated')
+  })
+
   it('does not copy explicit intermediate-only activity as an answer', async () => {
     const { api } = makeOptions([], text => text, () => 'AI generated')
 

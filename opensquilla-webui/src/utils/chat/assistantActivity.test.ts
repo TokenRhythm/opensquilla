@@ -159,6 +159,206 @@ describe('projectAssistantActivity', () => {
     expect(tools.map(item => item.toolId)).toEqual(['ok', 'failed'])
   })
 
+  it('uses explicit answer presentation after a failed settled tool', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting the repository.\n\nThe final answer.',
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'The final answer.',
+            rawText: 'The final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-presentation')
+    expect(projection.answerPart?.rawText).toBe('The final answer.')
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'narration',
+      'failed-tool',
+    ])
+  })
+
+  it('keeps answer text containing process-like phrases when marked as answer', () => {
+    const answer = 'Now let me examine the flow and explain the result.'
+    const projection = projectAssistantActivity(
+      message({
+        text: `Inspecting the repository.\n\n${answer}`,
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool-with-natural-language-answer'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: answer,
+            rawText: answer,
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-presentation')
+    expect(projection.answerPart?.rawText).toBe(answer)
+  })
+
+  it('keeps explicit intermediate-only failure out of the answer body', () => {
+    const projection = projectAssistantActivity(
+      message({
+        text: 'Inspecting the repository.',
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool'),
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-no-answer')
+    expect(projection.answerPart).toBeNull()
+    expect(projection.activityItems.map(item => item.key)).toEqual([
+      'narration',
+      'failed-tool',
+    ])
+  })
+
+  it('fails open when explicit presentation meets a pending tool', () => {
+    const canonical = 'Inspecting the repository.\n\nThe final answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('pending', { status: '', isRunning: true }),
+          ], 'pending-tool'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'The final answer.',
+            rawText: 'The final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'settled' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
+  it('fails open when an earlier answer marker makes the terminal span ambiguous', () => {
+    const canonical = 'Earlier answer.\n\nWork after it.\n\nFinal answer.'
+    const projection = projectAssistantActivity(
+      message({
+        text: canonical,
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'earlier-answer',
+            html: 'Earlier answer.',
+            rawText: 'Earlier answer.',
+            presentation: 'answer',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool'),
+          {
+            type: 'text',
+            key: 'work',
+            html: 'Work after it.',
+            rawText: 'Work after it.',
+            presentation: 'intermediate',
+          },
+          {
+            type: 'text',
+            key: 'answer',
+            html: 'Final answer.',
+            rawText: 'Final answer.',
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('canonical')
+    expect(projection.answerPart?.rawText).toBe(canonical)
+  })
+
   it('keeps tool-bounded candidate text as activity without repeating the final answer', () => {
     const projection = projectAssistantActivity(
       message({

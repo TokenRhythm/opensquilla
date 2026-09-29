@@ -197,6 +197,7 @@ import { captureVisibleTextScrollAnchor, restoreTextScrollAnchor, type TextScrol
 import { readDistanceFromEnd, remeasureVirtualizer, type VirtualizerAnchor } from '@/utils/virtualizerLayout'
 import { sandboxResumeMessageTurnId } from '@/utils/chat/sandboxResumeGuard'
 import { isProcessRestartOutcome, turnOutcomePresentation } from '@/utils/chat/turnOutcome'
+import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
 import {
   isUsageAccountingBarrierMessage,
   strictUsageBarrierRetryUserMessageIndex,
@@ -312,7 +313,22 @@ function forwardSandboxResume(message: ChatRenderedMessage) {
 }
 
 const visibleAnswerTurns = computed(() => new Set(props.messages
-  .filter(message => message.displayRole === 'assistant' && message.text.trim() && message.turnId)
+  .filter(message => {
+    if (message.displayRole !== 'assistant' || !message.turnId) return false
+    const outcome = turnOutcomePresentation(message.turnOutcome)
+    const lifecycle = outcome === 'stopped' || outcome === 'interrupted' || message.interrupted
+      ? 'interrupted' as const
+      : outcome === 'timeout' || outcome === 'failed' || message.terminalFailure
+        ? 'failed' as const
+        : message.isStreaming
+          ? 'working' as const
+          : 'settled' as const
+    return Boolean(resolveAssistantAnswer(
+      message,
+      message.timelineItems ?? [],
+      lifecycle,
+    ).text.trim())
+  })
   .map(message => message.turnId!)))
 
 function outcomeTurnIdentity(message: ChatRenderedMessage): string {
