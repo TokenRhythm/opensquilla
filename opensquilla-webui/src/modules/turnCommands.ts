@@ -12,6 +12,9 @@ export interface TurnCommandRequestOptions {
   signal?: AbortSignal
   /** Fence a request against a connection/profile change after the caller's identity check. */
   expectedGeneration?: number
+  /** Recheck local permission immediately before first admission, after durable waits.
+   * Receipt lookup and already accepted delivery must not consult this guard. */
+  beforeDispatch?: () => boolean
 }
 
 export type TurnCommandFailureKind =

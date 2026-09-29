@@ -4221,6 +4221,10 @@
         "generic": "当前任务暂不支持同轮引导。消息仍在排队。"
       },
       "clearQueue": "清空队列",
+      "autoSendPaused": "自动发送已暂停",
+      "resumeQueue": "继续队列",
+      "sendOne": "发送这一条",
+      "pauseSaveFailed": "无法保存队列暂停设置。本窗口已暂停自动发送，请检查浏览器存储后重试。",
       "removeMessage": "移除待发送消息 {index}",
       "offlineRejected": "消息未被接收。请编辑后重试，或移除消息。",
       "offlineQueued": "已保存到本地，连接恢复后自动发送。",

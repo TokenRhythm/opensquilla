@@ -17,6 +17,9 @@ from opensquilla.tools.types import (
     current_tool_context,
 )
 
+# These tests assert cancellation ordering, not filesystem latency.
+_MUTATION_WAIT_TIMEOUT = 10.0
+
 
 def _original_async(fn: Callable[..., Awaitable[str]]) -> Callable[..., Awaitable[str]]:
     while hasattr(fn, "__wrapped__"):
@@ -30,7 +33,8 @@ async def _wait_for_mutation_start(
     ready = asyncio.create_task(started.wait())
     try:
         done, _ = await asyncio.wait(
-            (ready, operation), timeout=0.5, return_when=asyncio.FIRST_COMPLETED,
+            (ready, operation), timeout=_MUTATION_WAIT_TIMEOUT,
+            return_when=asyncio.FIRST_COMPLETED,
         )
         if operation in done:
             await operation  # Surface worker/preparation failures, not a readiness timeout.
@@ -145,7 +149,7 @@ async def test_write_file_repeated_stop_waits_for_commit_and_receipt(
     ) -> int:
         if path == target:
             loop.call_soon_threadsafe(worker_started.set)
-            assert release_worker.wait(timeout=2.0)
+            assert release_worker.wait(timeout=_MUTATION_WAIT_TIMEOUT)
         return real_write_text(path, data, *args, **kwargs)
 
     monkeypatch.setattr(Path, "write_text", gated_write_text)
@@ -162,11 +166,15 @@ async def test_write_file_repeated_stop_waits_for_commit_and_receipt(
         assert not target.exists()
 
         release_worker.set()
+        done, _ = await asyncio.wait((task,), timeout=_MUTATION_WAIT_TIMEOUT)
+        assert task in done, "filesystem mutation did not settle"
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=0.5)
+            await task
     finally:
         release_worker.set()
         task.cancel()
+        done, _ = await asyncio.wait((task,), timeout=_MUTATION_WAIT_TIMEOUT)
+        assert task in done, "filesystem mutation cleanup did not settle"
         await asyncio.gather(task, return_exceptions=True)
 
     assert target.read_text(encoding="utf-8") == "settled = True\n"
@@ -200,7 +208,7 @@ async def test_executor_mutation_tools_settle_before_repeated_stop(
     ) -> Any:
         def gated_worker() -> Any:
             loop.call_soon_threadsafe(worker_started.set)
-            assert release_worker.wait(timeout=2.0)
+            assert release_worker.wait(timeout=_MUTATION_WAIT_TIMEOUT)
             return worker()
 
         return await real_run_executor_mutation(gated_worker, settle=settle)
@@ -248,11 +256,15 @@ async def test_executor_mutation_tools_settle_before_repeated_stop(
         assert not task.done()
 
         release_worker.set()
+        done, _ = await asyncio.wait((task,), timeout=_MUTATION_WAIT_TIMEOUT)
+        assert task in done, "filesystem mutation did not settle"
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(task, timeout=0.5)
+            await task
     finally:
         release_worker.set()
         task.cancel()
+        done, _ = await asyncio.wait((task,), timeout=_MUTATION_WAIT_TIMEOUT)
+        assert task in done, "filesystem mutation cleanup did not settle"
         await asyncio.gather(task, return_exceptions=True)
 
     assert target.read_text(encoding="utf-8") == expected

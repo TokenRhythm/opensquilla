@@ -27,6 +27,7 @@ import {
 } from '@/modules/pendingInputQueue'
 import { snapshotSteerRequest } from './useChatSteerDelivery'
 import { ParkedPendingQueueCache } from '@/utils/chat/parkedPendingQueueCache'
+import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
 
 const MAX_PENDING = 5
 const MAX_REMOVAL_TOMBSTONES = 256
@@ -143,6 +144,7 @@ export interface UseChatPendingQueueOptions {
   resetInputHistory: () => void
   hasComposer: () => boolean
   pendingInputWal?: PendingInputWal | null
+  pendingQueuePolicy?: ReturnType<typeof createPendingQueuePolicy>
   pendingInputQueue?: PendingInputQueuePort | null
   connectionState?: Readonly<Ref<string>>
   deliveryIdentity?: Readonly<Ref<string | null>>
@@ -152,7 +154,7 @@ export interface UseChatPendingQueueOptions {
     isCurrent?: () => boolean
   }) => Promise<boolean>
   onPendingPersistenceError?: (
-    reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected' | 'order_conflict',
+    reason: 'wal_failed' | 'attachments_unsupported' | 'server_rejected' | 'order_conflict' | 'pause_failed',
   ) => void
   // The WebUI drains visible queue items through the same composer-preserving
   // transport used by explicit Steer. The legacy callback remains as a
@@ -160,12 +162,23 @@ export interface UseChatPendingQueueOptions {
   dispatchPendingItem?: (
     item: ChatPendingItem,
     ownerSessionKey: string,
+    preDispatchGuard?: () => boolean,
   ) => Promise<PendingDeliveryOutcome>
 }
 
 export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   const pendingInputQueue = options.pendingInputQueue
   const pendingQueue = ref<ChatPendingItem[]>([])
+  const queuePolicy = options.pendingQueuePolicy ?? createPendingQueuePolicy()
+  const queuePolicyRevision = ref(0)
+  const queueScope = () => ({
+    sessionKey: options.sessionKey.value,
+    deliveryIdentity: options.deliveryIdentity?.value || '',
+  })
+  const autoSendPaused = computed(() => {
+    void queuePolicyRevision.value
+    return queuePolicy.read(queueScope()).paused
+  })
   const parkedQueues: ParkedPendingQueueCache = new ParkedPendingQueueCache({
     unwrapObject: toRaw,
     isPinned: item => Boolean(item.steerAttempt || item.deliveryState
@@ -215,6 +228,59 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       ),
     ),
   )
+  const canSendFollowup = computed(() => !options.isStreaming.value
+    && !options.isBlocked() && !isReordering.value)
+
+  function refreshQueuePolicy() {
+    queuePolicyRevision.value += 1
+    if (autoSendPaused.value) clearPendingDrainAfterTerminalTimer()
+  }
+  const policyStorageListener = (event: StorageEvent) => {
+    if (event.key === null || queuePolicy.isScopeStorageKey(queueScope(), event.key)) refreshQueuePolicy()
+  }
+  if (typeof window !== 'undefined') window.addEventListener('storage', policyStorageListener)
+
+  function pausePendingAutoSend() {
+    const result = queuePolicy.pause(queueScope())
+    refreshQueuePolicy()
+    broadcastChange(options.sessionKey.value)
+    if (!result.persisted) options.onPendingPersistenceError?.('pause_failed')
+  }
+
+  function resumePendingAutoSend() {
+    const result = queuePolicy.resume(queueScope())
+    refreshQueuePolicy()
+    broadcastChange(options.sessionKey.value)
+    if (!result.persisted) options.onPendingPersistenceError?.('pause_failed')
+    if (!result.paused) schedulePendingDrainAfterTerminal()
+  }
+
+  function capturePendingAutoSendResume(): () => void {
+    const scope = queueScope()
+    const captured = queuePolicy.read(scope)
+    return () => {
+      if (disposed || !captured.paused || !captured.persisted
+        || scope.sessionKey !== options.sessionKey.value
+        || scope.deliveryIdentity !== (options.deliveryIdentity?.value || '')) return
+      const result = queuePolicy.resumeGeneration(scope, captured.generation)
+      if (!result) return
+      refreshQueuePolicy()
+      broadcastChange(scope.sessionKey)
+      if (!result.persisted) options.onPendingPersistenceError?.('pause_failed')
+      if (!result.paused) schedulePendingDrainAfterTerminal()
+    }
+  }
+
+  // A permit belongs to one dispatch. An explicit click may send one held item,
+  // but cannot change the policy for the rest or survive a later Stop.
+  function captureFollowupGuard(ownerSessionKey: string, explicit = false): () => boolean {
+    const scope = queueScope()
+    const permit = queuePolicy.capture(scope, explicit)
+    return () => !disposed && ownerSessionKey === options.sessionKey.value
+      && scope.sessionKey === ownerSessionKey
+      && scope.deliveryIdentity === (options.deliveryIdentity?.value || '')
+      && queuePolicy.allows(permit)
+  }
 
   // Busy-composer delivery mode: 'queue' holds the message until the turn
   // ends (pending queue), 'steer' sends it immediately into the active run.
@@ -931,6 +997,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   if (broadcast) {
     broadcast.onmessage = event => {
+      refreshQueuePolicy()
       const message = event.data as PendingQueueBroadcastMessage | null
       const sessionKey = typeof message?.sessionKey === 'string' ? message.sessionKey : ''
       const pendingInputId = typeof message?.pendingInputId === 'string'
@@ -1459,18 +1526,30 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   async function acceptDurableHandoff(
+    sourceSessionKey: string,
     targetSessionKey: string,
     ownerRequestId: string,
     shouldApply: () => boolean = () => true,
     handoffSignal?: AbortSignal,
   ): Promise<boolean> {
     if (disposed || !options.pendingInputWal?.acceptHandoff) return false
+    const deliveryIdentity = options.deliveryIdentity?.value || ''
     if (options.pendingInputWal.listHandoffs) {
       const records = await options.pendingInputWal.listHandoffs()
       if (disposed || !shouldApply()) return false
       if (!records.some(record => record.ownerRequestId === ownerRequestId)) return false
     }
     if (disposed || !shouldApply()) return false
+    const sourceScope = { sessionKey: sourceSessionKey, deliveryIdentity }
+    const targetScope = { sessionKey: targetSessionKey, deliveryIdentity }
+    // The child must already be held before any row can move there. This also
+    // covers a reload after the WAL commit but before its promise is resumed.
+    const preparedPolicy = queuePolicy.beginHandoff(sourceScope, targetScope, ownerRequestId)
+    refreshQueuePolicy()
+    if (!preparedPolicy.persisted) {
+      options.onPendingPersistenceError?.('pause_failed')
+      throw new Error('Could not persist the pending queue handoff policy')
+    }
     const commit = await options.pendingInputWal.acceptHandoff(
       ownerRequestId,
       targetSessionKey,
@@ -1478,10 +1557,13 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       handoffSignal,
     )
     if (!commit) return false
+    const completedPolicy = queuePolicy.completeHandoff(sourceScope, targetScope, ownerRequestId)
+    if (!completedPolicy.persisted) options.onPendingPersistenceError?.('pause_failed')
     // A WAL transaction already in progress may finish after page cleanup.
     // Its committed rows belong to the next queue owner; do not reconstruct
     // attachments or install them into this disposed page's cache.
     if (!disposed && shouldApply()) {
+      refreshQueuePolicy()
       applyAcceptedHandoffCommit(commit, targetSessionKey, ownerRequestId)
     }
     return true
@@ -1493,7 +1575,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     ownerRequestId: string,
   ): Promise<void> {
     if (disposed || !sourceSessionKey || !targetSessionKey || !ownerRequestId) return
-    const committed = await acceptDurableHandoff(targetSessionKey, ownerRequestId)
+    const committed = await acceptDurableHandoff(sourceSessionKey, targetSessionKey, ownerRequestId)
     if (!committed || disposed) return
     if (options.sessionKey.value === targetSessionKey) {
       const restored = parkedQueues.get(targetSessionKey) || []
@@ -1531,12 +1613,24 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     if (disposed || !shouldCommit()) return
     const sourceSessionKey = options.sessionKey.value
     const durableCommitApplied = await acceptDurableHandoff(
+      sourceSessionKey,
       targetSessionKey,
       ownerRequestId,
       shouldCommit,
       handoffSignal,
     )
     if (disposed || !shouldCommit()) return
+    if (!durableCommitApplied && pendingQueue.value.some(item => (
+      item.ownerSessionKey === sourceSessionKey && item.ownerRequestId === ownerRequestId
+    ))) {
+      const deliveryIdentity = options.deliveryIdentity?.value || ''
+      const sourceScope = { sessionKey: sourceSessionKey, deliveryIdentity }
+      const targetScope = { sessionKey: targetSessionKey, deliveryIdentity }
+      queuePolicy.beginHandoff(sourceScope, targetScope, ownerRequestId)
+      const policy = queuePolicy.completeHandoff(sourceScope, targetScope, ownerRequestId)
+      refreshQueuePolicy()
+      if (!policy.persisted) options.onPendingPersistenceError?.('pause_failed')
+    }
     // The source queue still owns its terminal drain signal until the durable
     // handoff has committed and this epoch is current. Clearing it before the
     // await would strand A if IndexedDB failed or A→B was superseded by A.
@@ -1787,7 +1881,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
 
   function drainQueueHead() {
     clearPendingDrainAfterTerminalTimer()
-    if (pendingQueue.value.length === 0) return
+    if (pendingQueue.value.length === 0 || queuePolicy.read(queueScope()).paused) return
     const head = pendingQueue.value[0]
     if (head?.retiredAnnotationInput || head?.pendingRetainAfterCancel === true) return
     const ownerSessionKey = head?.ownerSessionKey || options.sessionKey.value
@@ -1796,14 +1890,17 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       return
     }
     if (options.dispatchPendingItem) {
+      const preDispatchGuard = captureFollowupGuard(ownerSessionKey)
       const item = beginPendingDelivery(head.pendingUiId)
       if (!item) return
       nextTick(() => {
         void (async () => {
           let outcome: PendingDeliveryOutcome = 'retryable_failure'
           try {
-            if (options.sessionKey.value === ownerSessionKey) {
-              outcome = await options.dispatchPendingItem!(item, ownerSessionKey)
+            if (preDispatchGuard()) {
+              outcome = await options.dispatchPendingItem!(item, ownerSessionKey, preDispatchGuard)
+            } else {
+              outcome = 'deferred'
             }
           } catch {
             // Keep the queue item as an explicit idempotent retry. The send
@@ -1821,7 +1918,12 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     // identity. Such drafts require the guarded pending-item dispatch port.
     if (!head || head.pendingDeliveryIdentity) return
     head.deliveryState = 'steering'
+    const preDispatchGuard = captureFollowupGuard(ownerSessionKey)
     nextTick(() => {
+      if (!preDispatchGuard()) {
+        delete head.deliveryState
+        return
+      }
       if (
         options.sessionKey.value !== ownerSessionKey
         || pendingQueue.value[0] !== head
@@ -1836,6 +1938,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   }
 
   function schedulePendingDrainAfterTerminal() {
+    if (queuePolicy.read(queueScope()).paused) return
     if (pendingQueue.value.length === 0) {
       // A terminal subscription replay can arrive while response handoff is
       // still hydrating, before the matching follow-up reaches the queue.
@@ -1859,6 +1962,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
       }
       if (
         options.isStreaming.value
+        || queuePolicy.read(queueScope()).paused
         || options.isBlocked()
         || hasDeliveryBarrier.value
         || isReordering.value
@@ -1871,6 +1975,7 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
   function flushDeferredPendingDrain() {
     if (
       !deferredDrainRequested
+      || queuePolicy.read(queueScope()).paused
       || pendingQueue.value.length === 0
       || hasDeliveryBarrier.value
       || isReordering.value
@@ -2107,11 +2212,18 @@ export function useChatPendingQueue(options: UseChatPendingQueueOptions) {
     clearPendingDrainAfterTerminalTimer()
     parkedQueues.dispose()
     broadcast?.close()
+    if (typeof window !== 'undefined') window.removeEventListener('storage', policyStorageListener)
     options.pendingInputWal?.close()
   }
 
   return {
     pendingQueue,
+    autoSendPaused,
+    canSendFollowup,
+    pausePendingAutoSend,
+    resumePendingAutoSend,
+    capturePendingAutoSendResume,
+    captureFollowupGuard,
     getParkedQueueUsage: () => parkedQueues.usage(),
     canQueueMore,
     canReorder,

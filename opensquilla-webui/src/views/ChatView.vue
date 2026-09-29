@@ -581,6 +581,10 @@
       :steer-unavailable-message="sameTurnSteerUnavailableMessage"
       :delivery-identity="gatewayAccess.deliveryIdentity"
       :offline="!gatewayAccess.isAvailable"
+      :auto-send-paused="pendingAutoSendPaused"
+      :followup-available="canSendPendingFollowup"
+      :has-active-turn="isStreaming || !!taskOwnership.runningTaskId.value"
+      :stopping="isStopPending"
       @clear="clearPendingQueue"
       @edit="editPendingMessage"
       @remove="removePendingChip"
@@ -588,6 +592,8 @@
       @reorder-end="endPendingReorder"
       @reorder-start="beginPendingReorder"
       @steer="steerPendingMessage"
+      @send="sendPendingMessage"
+      @resume="resumePendingAutoSend"
     />
 
     <div
@@ -1956,6 +1962,7 @@ let isLiveDeliveryBlocked: () => boolean = () => true
 let dispatchQueuedItem: (
   item: ChatPendingItem,
   ownerSessionKey?: string,
+  preDispatchGuard?: () => boolean,
 ) => Promise<ChatSendOutcome> = async () => 'not_sent'
 const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const pendingInputWal = createPendingInputWal()
@@ -1991,7 +1998,9 @@ const chatPendingQueue = useChatPendingQueue({
   composerRevision,
   prepareAttachmentsForSend,
   onPendingPersistenceError: reason => {
-    const message = reason === 'order_conflict'
+    const message = reason === 'pause_failed'
+      ? t('chat.pending.pauseSaveFailed')
+      : reason === 'order_conflict'
       ? 'Queue order changed in another tab. The server order was restored.'
       : reason === 'attachments_unsupported'
       ? 'Queued attachments are not supported yet. Your draft was kept.'
@@ -2002,11 +2011,17 @@ const chatPendingQueue = useChatPendingQueue({
       tone: ['server_rejected', 'order_conflict'].includes(reason) ? 'warn' : 'danger',
     })
   },
-  dispatchPendingItem: (item, ownerSessionKey) =>
-    dispatchQueuedItem(item, ownerSessionKey),
+  dispatchPendingItem: (item, ownerSessionKey, preDispatchGuard) =>
+    dispatchQueuedItem(item, ownerSessionKey, preDispatchGuard),
 })
 const {
   pendingQueue,
+  autoSendPaused: pendingAutoSendPaused,
+  canSendFollowup: canSendPendingFollowup,
+  pausePendingAutoSend,
+  resumePendingAutoSend,
+  capturePendingAutoSendResume,
+  captureFollowupGuard,
   canQueueMore,
   canReorder: canReorderPendingQueue,
   isReordering: pendingQueueReorderPending,
@@ -3442,7 +3457,12 @@ const chatComposerShortcuts = useChatComposerShortcuts({
   completeSlashCmd,
   activateSlashCmd,
   popPendingTail,
-  enqueuePendingInput,
+  enqueuePendingInput: async text => {
+    const resume = !isStopPending.value ? capturePendingAutoSendResume() : undefined
+    const queued = await enqueuePendingInput(text)
+    if (queued) resume?.()
+    return queued
+  },
   sendCurrentInput: () => sendCurrentInput(),
   handleLongPaste: handleLongPastedInput,
   cancelMessageEdit: () => cancelEdit(),
@@ -3481,6 +3501,8 @@ const chatSend = useChatSend({
   sessionKey,
   pendingQueueOwnerContext,
   hasPendingQueueWork: () => pendingQueue.value.length > 0,
+  pausePendingAutoSend,
+  capturePendingAutoSendResume,
   pendingInputWal,
   busySendMode,
   modelRoutingMode,
@@ -3716,7 +3738,7 @@ async function onComposerSend() {
   }
   const target = replanTarget.value
   if (!target) {
-    onSend()
+    onSend({ resumeQueueOnSuccess: !isStopPending.value })
     return
   }
   const prompt = inputText.value.trim()
@@ -3746,7 +3768,24 @@ function editPendingMessage(pendingUiId: string) {
 
 const pendingSteerClicks = new WeakSet<ChatPendingItem>()
 
+async function sendPendingMessage(pendingUiId: string) {
+  if (isStopPending.value || !canSendPendingFollowup.value) return
+  const ownerSessionKey = sessionKey.value
+  const preDispatchGuard = captureFollowupGuard(ownerSessionKey, true)
+  const candidate = pendingQueue.value.find(item => item.pendingUiId === pendingUiId)
+  if (!candidate || candidate.steerAttempt) return
+  const item = beginPendingDelivery(pendingUiId)
+  if (!item) return
+  let outcome: ChatSendOutcome = 'retryable_failure'
+  try {
+    outcome = await sendQueuedFollowup(item, ownerSessionKey, preDispatchGuard)
+  } finally {
+    settlePendingDelivery(item, outcome)
+  }
+}
+
 async function steerPendingMessage(pendingUiId: string) {
+  if (isStopPending.value) return
   const candidate = pendingQueue.value.find(item => item.pendingUiId === pendingUiId)
   if (
     candidate?.steerAttempt

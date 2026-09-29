@@ -4137,6 +4137,10 @@
         "generic": "La redirección no está disponible para la tarea actual. El mensaje permanece en cola."
       },
       "clearQueue": "Vaciar cola",
+      "autoSendPaused": "Envío automático en pausa",
+      "resumeQueue": "Reanudar cola",
+      "sendOne": "Enviar este mensaje",
+      "pauseSaveFailed": "No se pudo guardar la pausa de la cola. El envío automático está en pausa en esta ventana. Revisa el almacenamiento del navegador e inténtalo de nuevo.",
       "removeMessage": "Quitar el mensaje pendiente {index}",
       "offlineRejected": "El mensaje no fue aceptado. Edítalo para volver a intentarlo o elimínalo.",
       "offlineQueued": "Guardado localmente. Se enviará cuando se restablezca la conexión.",

@@ -495,6 +495,31 @@ describe('useChatSessionSubscription domain lease', () => {
     })
   })
 
+  it.each(['running', 'queued'] as const)(
+    'ignores an unscoped terminal while B is %s, then accepts authoritative idle reconciliation', async status => {
+      const ownership = useChatTaskOwnership()
+      ownership.noteAccepted('task-B', status)
+      const subject = harness(leaseFixture().lease, {
+        taskOwnership: ownership,
+        runStatus: ref({ status, label: status, task: { task_id: 'task-B' } }),
+        isStreaming: ref(true),
+        activeStreamTaskId: ref('task-B'),
+        activeTaskGroups: ref(new Set(['cancelled-group'])),
+      })
+
+      subject.api.applySessionRunState({ run_status: 'cancelled', last_task: { status: 'cancelled' } })
+      expect(subject.runStatus.value.status).toBe(status)
+      expect(ownership.stopTargetTaskId.value).toBe('task-B')
+
+      await expect(subject.api.reconcileSession()).resolves.toMatchObject({ authoritative: true, live: false })
+      expect(subject.runStatus.value.status).toBe('idle')
+      expect(ownership.runningTaskId.value).toBe('')
+      expect(ownership.queuedTaskIds.value.size).toBe(0)
+      expect(subject.activeTaskGroups.value.size).toBe(0)
+      expect(subject.isStreaming.value).toBe(false)
+    },
+  )
+
   it('preserves rich task capability across compact lifecycle state', () => {
     const currentRunStatus = ref<ChatRunStatus>({
       status: 'running',
@@ -575,6 +600,134 @@ describe('useChatSessionSubscription domain lease', () => {
     })
     expect(subject.resetStreamLiveTurnState).toHaveBeenCalledOnce()
     expect(subject.onAuthoritativeIdle).toHaveBeenCalledOnce()
+  })
+
+  it('clears a stale exact Stop after a complete current idle read, without requiring its terminal row', async () => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-A')
+    taskOwnership.beginStop()
+    taskOwnership.noteRunning('task-B')
+    const subject = harness(leaseFixture().lease, { taskOwnership })
+
+    await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true, live: false })
+
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('')
+    taskOwnership.noteRunning('task-C')
+    expect(taskOwnership.beginStop()).toBe('task-C')
+  })
+
+  it.each([
+    ['failed', 'failed'],
+    ['timeout', 'timeout'],
+    ['cancelled', 'cancelled'],
+    ['abandoned', 'interrupted'],
+  ])('clears an older Stop after successor B ends %s and fresh metadata is %s', async (taskStatus, runStatus) => {
+    const taskOwnership = useChatTaskOwnership()
+    taskOwnership.noteRunning('task-A')
+    taskOwnership.beginStop()
+    taskOwnership.noteRunning('task-B')
+    const lastTask = { taskId: 'task-B', status: taskStatus }
+    const subject = harness(leaseFixture({
+      live: live({ initialMetadata: metadata({ runStatus, lastTask, tasks: [lastTask] }) }),
+    }).lease, { taskOwnership })
+
+    await expect(subject.api.subscribeSession()).resolves.toMatchObject({ authoritative: true, live: false })
+
+    expect(subject.runStatus.value.status).toBe(runStatus)
+    expect(taskOwnership.stopRequestedTaskId.value).toBe('')
+    expect(taskOwnership.hasAuthoritativeWork.value).toBe(false)
+    taskOwnership.noteRunning('task-C')
+    expect(taskOwnership.beginStop()).toBe('task-C')
+  })
+
+  it.each(['idle', 'failed', 'timeout', 'cancelled', 'interrupted'])(
+    'rejects a %s live read when a newer task and Stop arrived on the same lease', async runStatus => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      try {
+        const pendingLive = deferred<SessionReadLive>()
+        const taskOwnership = useChatTaskOwnership()
+        taskOwnership.noteRunning('task-A')
+        taskOwnership.beginStop()
+        const subject = harness(leaseFixture({ live: pendingLive.promise }).lease, { taskOwnership })
+        const pending = subject.api.subscribeSession()
+        taskOwnership.noteTerminal('task-A')
+        subject.api.applySessionRunState({
+          run_status: 'running', active_task: { task_id: 'task-C', status: 'running' },
+        })
+        taskOwnership.beginStop()
+        pendingLive.resolve(live({ initialMetadata: metadata({ runStatus }) }))
+
+        await expect(pending).resolves.toMatchObject({
+          authoritative: false, error: { kind: 'busy', retryable: true },
+        })
+        expect(taskOwnership.runningTaskId.value).toBe('task-C')
+        expect(taskOwnership.stopRequestedTaskId.value).toBe('task-C')
+        expect(subject.runStatus.value.status).toBe('running')
+        expect(subject.onAuthoritativeIdle).not.toHaveBeenCalled()
+      } finally {
+        warn.mockRestore()
+      }
+    },
+  )
+
+  it('rejects deferred idle metadata after newer ownership, then accepts a fresh retry', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pendingMetadata = deferred<SessionReadMetadata>()
+      const taskOwnership = useChatTaskOwnership()
+      taskOwnership.noteRunning('task-A')
+      taskOwnership.beginStop()
+      const fixture = leaseFixture({
+        live: live({ initialMetadata: metadata({ hydrationComplete: false }) }),
+        metadata: pendingMetadata.promise,
+        retryMetadata: async () => metadata(),
+      })
+      const subject = harness(fixture.lease, { taskOwnership })
+      await subject.api.subscribeSession()
+      taskOwnership.noteTerminal('task-A')
+      subject.api.applySessionRunState({
+        run_status: 'running', active_task: { task_id: 'task-C', status: 'running' },
+      })
+      taskOwnership.beginStop()
+      pendingMetadata.resolve(metadata())
+
+      await vi.waitFor(() => expect(subject.api.metadataRecoveryError.value).toMatchObject({
+        kind: 'busy', retryable: true,
+      }))
+      expect(taskOwnership.runningTaskId.value).toBe('task-C')
+      expect(taskOwnership.stopRequestedTaskId.value).toBe('task-C')
+      expect(subject.runStatus.value.status).toBe('running')
+      expect(subject.onAuthoritativeIdle).not.toHaveBeenCalled()
+
+      await expect(subject.api.retrySessionMetadata()).resolves.toBe(true)
+      expect(taskOwnership.stopRequestedTaskId.value).toBe('')
+      expect(subject.runStatus.value.status).toBe('idle')
+    } finally {
+      warn.mockRestore()
+    }
+  })
+
+  it('does not let a metadata retry clear a Stop created after that retry started', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const pendingMetadata = deferred<SessionReadMetadata>()
+      const taskOwnership = useChatTaskOwnership()
+      taskOwnership.noteRunning('task-C')
+      const subject = harness(leaseFixture({ retryMetadata: () => pendingMetadata.promise }).lease, {
+        taskOwnership,
+        runStatus: ref(runStatus({ run_status: 'running', active_task: { task_id: 'task-C' } })),
+      })
+      const retry = subject.api.retrySessionMetadata()
+      taskOwnership.beginStop()
+      pendingMetadata.resolve(metadata())
+
+      await expect(retry).resolves.toBe(false)
+      expect(taskOwnership.runningTaskId.value).toBe('task-C')
+      expect(taskOwnership.stopRequestedTaskId.value).toBe('task-C')
+      expect(subject.runStatus.value.status).toBe('running')
+    } finally {
+      warn.mockRestore()
+    }
   })
 
   it('stays hydrating until the initial live projection resolves', async () => {

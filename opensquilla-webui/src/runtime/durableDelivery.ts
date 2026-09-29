@@ -102,6 +102,10 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   const manualRetries = new Set<string>()
   const receiptEventTokens = new Map<string, string>()
   const activeLeases = new Map<string, number>()
+  // A revoked first dispatch has direct not-sent evidence even if its WAL
+  // update fails. Keep that evidence only for this identity and lease epoch;
+  // a receipt lookup's not-found answer can never create it.
+  const revokedDispatches = new Map<string, { identity: string; epoch: number }>()
   let disposed = false
   let invalidated = false
   let quarantineChecked = false
@@ -313,6 +317,23 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     reportStopStorage(id, pending)
   }
 
+  async function persistRevokedDispatch(id: string): Promise<DeliveryWalRecord | null> {
+    const proof = revokedDispatches.get(id)
+    if (!proof || disposed || invalidated || proof.identity !== options.access.identity()) return null
+    const result = await update(id, current => {
+      if (disposed || invalidated || options.access.identity() !== proof.identity) return null
+      if (current.deliveryIdentity !== proof.identity || current.lease?.owner !== owner
+        || current.lease.epoch !== proof.epoch || current.response || current.phase === 'accepted') {
+        revokedDispatches.delete(id)
+        return null
+      }
+      return { ...current, phase: 'not-sent',
+        ...(current.stop ? { stop: { ...current.stop, completed: true } } : {}) }
+    })
+    if (!result || result.phase === 'not-sent') revokedDispatches.delete(id)
+    return result
+  }
+
   async function lookupRecord(record: DeliveryWalRecord, signal: AbortSignal | undefined, epoch: number): Promise<TurnReceiptResult> {
     if (!record.request || !options.commands.lookupReceipt || options.commands.supportsReceiptLookup?.() === false) {
       publish(record, 'receipt-unsupported')
@@ -334,6 +355,14 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
     if (!identity) throw new TurnCommandError('unavailable', 'Delivery identity is unavailable', 'DELIVERY_IDENTITY_REQUIRED', false, true)
     const operation = (async () => {
       storageReady()
+      // Repair original not-sent evidence before claiming a newer epoch or
+      // treating the saved submitting state as an unknown remote admission.
+      if (revokedDispatches.has(id)) {
+        await persistRevokedDispatch(id).catch(() => {
+          throw new TurnCommandError('unavailable', 'The unsent delivery state could not be saved',
+            'DELIVERY_STORAGE_UNAVAILABLE', false, true)
+        })
+      }
       const created = await wal!.prepareDelivery!({
         schemaVersion: 2, ownerRequestId: id, deliveryIdentity: identity, requestSessionKey: session,
         request: structuredClone(request), phase: 'prepared', revision: 1, createdAt: now(), updatedAt: now(),
@@ -392,14 +421,38 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
           commandOptions?.signal?.addEventListener('abort', abort, { once: true })
           if (commandOptions?.signal?.aborted) controller.abort()
           let response: TurnSendResponse | TurnSteerResponse
-          try { response = await fenced(armed, controller.signal, opts => frozen.kind === 'send'
-            ? options.commands.send(frozen.request, opts) : options.commands.steer(frozen.request, opts))
+          try { response = await fenced(armed, controller.signal, opts => {
+            // No asynchronous work may separate this check from the first
+            // transport call. A peer Stop can revoke queue permission during
+            // WAL preparation, slot acquisition, claiming or arming. Unknown
+            // and accepted records took the receipt path above instead.
+            if (commandOptions?.beforeDispatch?.() === false) {
+              revokedDispatches.set(id, { identity, epoch })
+              throw new TurnCommandError('aborted', 'Delivery permission was revoked before dispatch',
+                'DELIVERY_DISPATCH_REVOKED', false, true)
+            }
+            return frozen.kind === 'send'
+              ? options.commands.send(frozen.request, opts) : options.commands.steer(frozen.request, opts)
+          })
           } finally { commandOptions?.signal?.removeEventListener('abort', abort) }
           initialResponseReceived = true
           initiallyRejected = frozen.kind === 'steer' && 'accepted' in response && response.accepted === false
           await receive(id, response, epoch)
           return response
         } catch (error) {
+          if (error instanceof TurnCommandError && error.failureCode === 'DELIVERY_DISPATCH_REVOKED') {
+            const settled = await persistRevokedDispatch(id).catch(() => {
+              publish(claimed, 'storage')
+              // Keep the caller's original request identity until this proof
+              // is durable. Returning a normal deferral here could discard
+              // the only way to retry a server-staged input with the same ID.
+              throw new TurnCommandError('unavailable', 'The unsent delivery state could not be saved',
+                'DELIVERY_STORAGE_UNAVAILABLE', false, true)
+            })
+            if (settled?.phase !== 'not-sent') throw new TurnCommandError('session-changed',
+              'Delivery lease changed', 'DELIVERY_LEASE_LOST', null, true)
+            throw error
+          }
           const notSent = initiallyRejected || (!initialResponseReceived && error instanceof TurnCommandError && error.accepted === false)
           let rejectedCandidate: DeliveryWalRecord | undefined
           await update(id, current => {
@@ -687,6 +740,10 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
   }
 
   async function round(record: DeliveryWalRecord): Promise<void> {
+    if (revokedDispatches.has(record.ownerRequestId)) {
+      try { record = await persistRevokedDispatch(record.ownerRequestId) || record }
+      catch { publish(record, 'storage'); return }
+    }
     if (record.request?.kind === 'send'
       && record.request.request.kind === 'new-turn'
       && isRetiredControlMessage(record.request.request.params.clientMessageId)) {
@@ -886,13 +943,25 @@ export function createDurableDelivery(options: DeliveryOptions): DurableDelivery
       renewals.clear()
       stopInvalidation?.()
       for (const resolve of [...ordinaryWaiters.splice(0), ...stopWaiters.splice(0)]) resolve()
-      listeners.clear(); changes.clear(); summaries.clear(); summaryIdentities.clear(); observed.clear(); handoffOwners.clear(); stopIntents.clear(); receiptEventTokens.clear()
+      listeners.clear()
+      changes.clear()
+      summaries.clear()
+      summaryIdentities.clear()
+      observed.clear()
+      handoffOwners.clear()
+      stopIntents.clear()
+      receiptEventTokens.clear()
+      revokedDispatches.clear()
       wal?.close()
     },
   }
 
   async function lookup(request: TurnReceiptRequest): Promise<TurnReceiptResult> {
-    const record = await wal?.getDelivery?.(requestIdentity(request).id)
+    const { id } = requestIdentity(request)
+    if (revokedDispatches.has(id)) {
+      await persistRevokedDispatch(id)
+    }
+    const record = await wal?.getDelivery?.(id)
     if (!record || allowed(record)) return { status: 'not-found' }
     if (record.phase === 'accepted' && record.response) return { status: 'found', response: record.response }
     // Recovery stays owned by the app scheduler and its bounded leases.

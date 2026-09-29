@@ -4222,6 +4222,10 @@
         "generic": "Steer unavailable for the current task. The message remains queued."
       },
       "clearQueue": "Clear queue",
+      "autoSendPaused": "Automatic sending paused",
+      "resumeQueue": "Resume queue",
+      "sendOne": "Send this message",
+      "pauseSaveFailed": "Could not save the queue pause setting. Automatic sending is paused in this window. Check browser storage and try again.",
       "removeMessage": "Remove pending message {index}",
       "offlineRejected": "The message was not accepted. Edit it to retry, or remove it.",
       "offlineQueued": "Saved locally. Will send when the connection is restored.",

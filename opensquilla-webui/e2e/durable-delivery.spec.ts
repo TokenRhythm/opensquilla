@@ -22,6 +22,7 @@ test.beforeAll(async () => {
       load: id => id === entry ? `
         import { createPendingInputWal } from ${source('src/utils/chat/pendingInputWal.ts')};
         import { createDurableDelivery } from ${source('src/runtime/durableDelivery.ts')};
+        import { createPendingQueuePolicy } from ${source('src/utils/chat/pendingQueuePolicy.ts')};
         import { TurnCommandError } from ${source('src/modules/turnCommands.ts')};
         import { useChatPendingQueue } from ${source('src/composables/chat/useChatPendingQueue.ts')};
         import { PARKED_PENDING_QUEUE_LIMITS } from ${source('src/utils/chat/parkedPendingQueueCache.ts')};
@@ -53,7 +54,7 @@ test.beforeAll(async () => {
             cleanup() { queue.cleanup(); scope.stop(); },
           };
         }
-        window.deliveryFixture = { createPendingInputWal, createDurableDelivery, TurnCommandError,
+        window.deliveryFixture = { createPendingInputWal, createDurableDelivery, createPendingQueuePolicy, TurnCommandError,
           createOfflinePendingQueue, PARKED_PENDING_QUEUE_LIMITS, recoveryPagination, nextTick };
         window.deliveryFixture.wal = createPendingInputWal();
       ` : undefined,
@@ -807,3 +808,81 @@ test('finished Stop clears the stale offline notification', async ({ context }) 
   expect(result.after.stopPending).toBe(false)
   expect(result.after.waitReason).toBeUndefined()
 })
+
+
+for (const stage of ['prepare', 'arm'] as const) {
+  test(`peer Stop revokes an unsent queue delivery during native WAL ${stage}`, async ({ context }) => {
+    const sender = await fixturePage(context)
+    const peer = await fixturePage(context)
+    try {
+      await sender.evaluate(stage => {
+        const f = (window as any).deliveryFixture
+        f.policy = f.createPendingQueuePolicy()
+        f.policyScope = { sessionKey: 'synthetic-session', deliveryIdentity: 'synthetic-identity' }
+        const permit = f.policy.capture(f.policyScope)
+        f.sends = 0
+        f.waiting = false
+        let first = true
+        const barrier = new Promise<void>(resolve => { f.release = resolve })
+        const original = (stage === 'prepare' ? f.wal.prepareDelivery : f.wal.compareAndSwapDelivery).bind(f.wal)
+        if (stage === 'prepare') {
+          f.wal.prepareDelivery = async (...args: any[]) => {
+            if (first) { first = false; f.waiting = true; await barrier }
+            return original(...args)
+          }
+        } else {
+          f.wal.compareAndSwapDelivery = async (...args: any[]) => {
+            const result = await original(...args)
+            // The real IndexedDB transaction has committed. Pause only the
+            // callback returning it, before durable delivery invokes transport.
+            if (first && result.applied && result.record?.phase === 'submitting') {
+              first = false; f.waiting = true; await barrier
+            }
+            return result
+          }
+        }
+        f.owner = f.createDurableDelivery({ wal: f.wal,
+          access: { identity: () => 'synthetic-identity', available: () => true, generation: () => 1 },
+          commands: {
+            send: async () => { f.sends += 1; return { taskId: 'task-C', sessionKey: 'synthetic-session' } },
+            cancel: async () => ({ aborted: true }), steer: async () => ({ accepted: true }),
+            supports: () => true, supportsReceiptLookup: () => true,
+            lookupReceipt: async () => ({ status: 'not-found' }),
+          },
+        })
+        f.request = { kind: 'new-turn', params: { sessionKey: 'synthetic-session',
+          clientRequestId: 'queued-C', clientMessageId: 'message-C', message: 'C' } }
+        f.sending = f.owner.commands.send(f.request, { beforeDispatch: () => f.policy.allows(permit) })
+          .then(() => ({ accepted: true }), (error: any) => ({ accepted: error.accepted, code: error.failureCode }))
+      }, stage)
+      await expect.poll(() => sender.evaluate(() => (window as any).deliveryFixture.waiting)).toBe(true)
+      expect(await sender.evaluate(() => (window as any).deliveryFixture.sends)).toBe(0)
+      await peer.evaluate(() => {
+        const f = (window as any).deliveryFixture
+        f.createPendingQueuePolicy().pause({ sessionKey: 'synthetic-session', deliveryIdentity: 'synthetic-identity' })
+      })
+      const stopped = await sender.evaluate(async () => {
+        const f = (window as any).deliveryFixture
+        f.release()
+        const outcome = await f.sending
+        await f.owner.wake()
+        return { outcome, sends: f.sends, row: await f.wal.getDelivery('queued-C'), paused: f.policy.read(f.policyScope).paused }
+      })
+      expect(stopped).toMatchObject({ sends: 0, paused: true,
+        outcome: { accepted: false, code: 'DELIVERY_DISPATCH_REVOKED' }, row: { phase: 'not-sent' } })
+      // A manual resume and a fresh permit can still send the original item
+      // once. A revoked permit must not create a permanent retry barrier.
+      const resumed = await sender.evaluate(async () => {
+        const f = (window as any).deliveryFixture
+        f.policy.resume(f.policyScope)
+        const permit = f.policy.capture(f.policyScope)
+        await f.owner.commands.send(f.request, { beforeDispatch: () => f.policy.allows(permit) })
+        return { sends: f.sends, row: await f.wal.getDelivery('queued-C') }
+      })
+      expect(resumed).toMatchObject({ sends: 1, row: { phase: 'accepted', ownerRequestId: 'queued-C' } })
+    } finally {
+      await sender.evaluate(() => { const f = (window as any).deliveryFixture; f.release?.(); f.owner?.dispose(); f.wal.close() })
+      await peer.evaluate(() => (window as any).deliveryFixture.wal.close())
+    }
+  })
+}

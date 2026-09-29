@@ -5,6 +5,8 @@ import { createApp, defineComponent, h, nextTick, reactive, ref } from 'vue'
 import i18n, { loadLocaleMessages } from '@/i18n'
 import PendingQueue from './PendingQueue.vue'
 import type { Attachment, PendingSteerAttempt } from '@/types/chat'
+import { useChatPendingQueue } from '@/composables/chat/useChatPendingQueue'
+import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
 
 afterEach(() => {
   document.body.innerHTML = ''
@@ -20,12 +22,15 @@ async function mountQueue(
     onReorderEnd: () => void
     onReorderStart: (index: number) => void
     onSteer: (pendingUiId: string) => void
+    onSend: (pendingUiId: string) => void
+    onResume: () => void
   }> = {},
   items: Array<{
     pendingUiId?: string
     text: string
     pendingInputId?: string
     pendingDeliveryIdentity?: string
+    pendingRetainAfterCancel?: boolean
     pendingPersistenceState?: 'saving' | 'staged' | 'local_only' | 'retryable' | 'cancelling'
     deliveryState?: 'steering' | 'retryable'
     steerAttempt?: PendingSteerAttempt
@@ -40,6 +45,10 @@ async function mountQueue(
     steerUnavailableMessage?: string
     offline?: boolean
     deliveryIdentity?: string | null
+    autoSendPaused?: boolean
+    followupAvailable?: boolean
+    hasActiveTurn?: boolean
+    stopping?: boolean
   } = {},
 ) {
   const el = document.createElement('div')
@@ -51,6 +60,7 @@ async function mountQueue(
     items,
     maxPending: 5,
     steerAvailable: true,
+    hasActiveTurn: true,
     ...listeners,
     ...props,
   })
@@ -60,7 +70,125 @@ async function mountQueue(
   return { app, el }
 }
 
+function primaryActions(el: ParentNode): HTMLButtonElement[] {
+  return [...el.querySelectorAll<HTMLButtonElement>(
+    '.chat-pending-actions > .chat-pending-action:not(.chat-pending-action--icon)',
+  )]
+}
+
 describe('PendingQueue', () => {
+  it.each([false, true])('keeps the ordinary retry entry after Resume queue (identity=%s)', async identityBound => {
+    vi.useFakeTimers()
+    const automaticSend = vi.fn(async () => 'accepted' as const)
+    const onSend = vi.fn()
+    const queue = useChatPendingQueue({
+      sessionKey: ref('retry-chat'), deliveryIdentity: ref('retry-account'), connectionState: ref('connected'),
+      pendingQueuePolicy: createPendingQueuePolicy(null),
+      inputText: ref(''), pendingAttachments: ref([]), pendingSessionIntent: ref(null),
+      isStreaming: ref(false), isBlocked: () => false, hasComposer: () => true,
+      autoResizeTextarea: vi.fn(), resetInputHistory: vi.fn(), sendCurrentInput: vi.fn(),
+      dispatchPendingItem: automaticSend,
+    })
+    queue.pendingQueue.value = ['C', 'D'].map(text => ({
+      pendingUiId: text, text, attachments: [], intent: null,
+      ...(identityBound ? { pendingDeliveryIdentity: 'retry-account' } : {}),
+    }))
+    queue.pausePendingAutoSend()
+    queue.settlePendingDelivery(queue.beginPendingDelivery('C')!, 'retryable_failure')
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(defineComponent(() => () => h(PendingQueue, {
+      items: queue.pendingQueue.value, maxPending: 5,
+      autoSendPaused: queue.autoSendPaused.value, followupAvailable: queue.canSendFollowup.value,
+      deliveryIdentity: 'retry-account',
+      steerAvailable: false, onSend, onResume: queue.resumePendingAutoSend,
+    }))).use(i18n)
+    app.mount(el)
+    try {
+      await nextTick()
+      ;[...el.querySelectorAll('button')].find(button => button.textContent?.trim() === 'Resume queue')!.click()
+      await nextTick()
+      await vi.advanceTimersByTimeAsync(100)
+      expect(queue.autoSendPaused.value).toBe(false)
+      expect(automaticSend).not.toHaveBeenCalled()
+      expect(queue.pendingQueue.value[0]?.deliveryState).toBe('retryable')
+      const send = primaryActions(el.querySelector('[data-pending-ui-id="C"]')!)[0]!
+      expect(send).toBeDefined()
+      expect(send.textContent?.trim()).toBe('Retry')
+      expect(send.disabled).toBe(false)
+      send.click()
+      expect(onSend).toHaveBeenCalledExactlyOnceWith('C')
+    } finally { app.unmount(); queue.cleanup(); vi.useRealTimers() }
+  })
+
+  it.each(['another-account', null])('disables send-one after the delivery identity changes to %s', async deliveryIdentity => {
+    const onSend = vi.fn()
+    const { app, el } = await mountQueue({ onSend }, [{
+      text: 'C', pendingDeliveryIdentity: 'original-account', pendingPersistenceState: 'staged',
+    }], { autoSendPaused: true, followupAvailable: true, deliveryIdentity, hasActiveTurn: false })
+    try {
+      const send = primaryActions(el)[0]!
+      expect(send.disabled).toBe(true)
+      send.click()
+      expect(onSend).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it('permits an explicit retry of its own delivery while holding other items', async () => {
+    const onSend = vi.fn()
+    const { app, el } = await mountQueue({ onSend }, [
+      { text: 'retry C', deliveryState: 'retryable' }, { text: 'D' },
+    ], { autoSendPaused: true, followupAvailable: true, hasActiveTurn: false })
+    try {
+      const buttons = primaryActions(el)
+      expect(buttons).toHaveLength(2)
+      expect(buttons[0]!.textContent?.trim()).toBe('Retry')
+      expect(buttons[1]!.textContent?.trim()).toBe('Send')
+      expect(buttons[0]!.disabled).toBe(false)
+      expect(buttons[1]!.disabled).toBe(true)
+      buttons[0]!.click()
+      expect(onSend).toHaveBeenCalledExactlyOnceWith('pending-ui-0')
+    } finally { app.unmount() }
+  })
+  it('does not offer direct sending for a cancelled delivery retained as an editable draft', async () => {
+    const { app, el } = await mountQueue({}, [{ text: 'retained', pendingRetainAfterCancel: true }], {
+      autoSendPaused: true, followupAvailable: true, hasActiveTurn: false,
+    })
+    try {
+      expect(primaryActions(el)).toHaveLength(0)
+      expect(el.textContent).toContain('retained')
+    } finally { app.unmount() }
+  })
+  it('separates send-one from resume-all while paused', async () => {
+    const onSend = vi.fn()
+    const onResume = vi.fn()
+    const { app, el } = await mountQueue({ onSend, onResume }, [{ text: 'C' }, { text: 'D' }], {
+      autoSendPaused: true, followupAvailable: true, hasActiveTurn: false,
+    })
+    try {
+      const buttons = [...el.querySelectorAll('button')]
+      const send = primaryActions(el)[0]!
+      expect(send.textContent?.trim()).toBe('Send')
+      send.click()
+      expect(onSend).toHaveBeenCalledExactlyOnceWith('pending-ui-0')
+      expect(onResume).not.toHaveBeenCalled()
+      buttons.find(button => button.textContent?.trim() === 'Resume queue')!.click()
+      expect(onResume).toHaveBeenCalledOnce()
+    } finally { app.unmount() }
+  })
+
+  it('keeps the primary action disabled while the active turn is stopping', async () => {
+    const onSend = vi.fn()
+    const { app, el } = await mountQueue({ onSend }, [{ text: 'C' }], {
+      autoSendPaused: true, followupAvailable: false, stopping: true,
+    })
+    try {
+      const send = primaryActions(el)[0]!
+      expect(send.disabled).toBe(true)
+      send.click()
+      expect(onSend).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
   it('shows Saving instead of Saved locally until the offline WAL has committed', async () => {
     const items = reactive([{
       text: 'Waiting for local durability', pendingDeliveryIdentity: 'synthetic-owner',
@@ -99,6 +227,122 @@ describe('PendingQueue', () => {
     surface_id: 'webui',
     _source: { runMode: 'safe' as const },
   }
+
+  it('keeps one primary button while a draft changes from busy through Stop to idle and back', async () => {
+    const state = reactive({ hasActiveTurn: true, stopping: false, steerAvailable: true, followupAvailable: false })
+    const onSteer = vi.fn()
+    const onSend = vi.fn()
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(defineComponent(() => () => h(PendingQueue, {
+      items: [{ pendingUiId: 'C', text: 'C' }], maxPending: 5, ...state,
+      steerUnavailableMessage: 'Steer unavailable: no active turn.', onSteer, onSend,
+    }))).use(i18n)
+    app.mount(el)
+    try {
+      await nextTick()
+      const button = primaryActions(el)[0]!
+      expect(primaryActions(el)).toHaveLength(1)
+      expect(button.textContent).toContain('Steer')
+      expect(button.disabled).toBe(false)
+      button.click()
+      expect(onSteer).toHaveBeenCalledExactlyOnceWith('C')
+
+      Object.assign(state, { stopping: true, steerAvailable: false })
+      await nextTick()
+      expect(primaryActions(el)).toEqual([button])
+      expect(button.textContent?.trim()).toBe('Send')
+      expect(button.disabled).toBe(true)
+      button.click()
+      expect(onSend).not.toHaveBeenCalled()
+      expect(el.textContent).not.toContain('Steer unavailable')
+
+      Object.assign(state, { hasActiveTurn: false, stopping: false, followupAvailable: true })
+      await nextTick()
+      expect(primaryActions(el)).toEqual([button])
+      expect(button.textContent?.trim()).toBe('Send')
+      expect(button.disabled).toBe(false)
+      expect(el.textContent).not.toContain('Steer unavailable')
+      button.click()
+      expect(onSend).toHaveBeenCalledExactlyOnceWith('C')
+
+      Object.assign(state, { hasActiveTurn: true, steerAvailable: true, followupAvailable: false })
+      await nextTick()
+      expect(primaryActions(el)).toEqual([button])
+      expect(button.textContent).toContain('Steer')
+      expect(button.disabled).toBe(false)
+    } finally { app.unmount() }
+  })
+
+  it('keeps a follow-up retry on send even while a new turn supports steering', async () => {
+    const state = reactive({ hasActiveTurn: true, followupAvailable: false })
+    const onSteer = vi.fn()
+    const onSend = vi.fn()
+    const el = document.createElement('div')
+    document.body.appendChild(el)
+    const app = createApp(defineComponent(() => () => h(PendingQueue, {
+      items: [{ pendingUiId: 'C', text: 'C', deliveryState: 'retryable' }],
+      maxPending: 5, ...state, steerAvailable: true, onSteer, onSend,
+    }))).use(i18n)
+    app.mount(el)
+    try {
+      await nextTick()
+      const button = primaryActions(el)[0]!
+      expect(primaryActions(el)).toHaveLength(1)
+      expect(button.textContent?.trim()).toBe('Retry')
+      expect(button.classList.contains('chat-pending-action--steer')).toBe(false)
+      expect(button.disabled).toBe(true)
+      button.click()
+      expect(onSteer).not.toHaveBeenCalled()
+      expect(onSend).not.toHaveBeenCalled()
+      Object.assign(state, { hasActiveTurn: false, followupAvailable: true })
+      await nextTick()
+      expect(button.disabled).toBe(false)
+      button.click()
+      expect(onSend).toHaveBeenCalledExactlyOnceWith('C')
+      expect(onSteer).not.toHaveBeenCalled()
+    } finally { app.unmount() }
+  })
+
+  it.each(['retryable_rejected', 'acceptance_unknown'] as const)(
+    'keeps a %s steer attempt on its original protocol while idle and after another turn starts', async phase => {
+      const state = reactive({ hasActiveTurn: false, stopping: false, steerAvailable: false })
+      const attempt = { phase, request: steerRequest }
+      const onSteer = vi.fn()
+      const onSend = vi.fn()
+      const el = document.createElement('div')
+      document.body.appendChild(el)
+      const app = createApp(defineComponent(() => () => h(PendingQueue, {
+        items: [{ pendingUiId: 'C', text: 'C', steerAttempt: attempt }], maxPending: 5,
+        ...state, followupAvailable: true, onSteer, onSend,
+        steerUnavailableMessage: 'Steer unavailable: no active turn.',
+      }))).use(i18n)
+      app.mount(el)
+      try {
+        await nextTick()
+        const button = primaryActions(el)[0]!
+        expect(primaryActions(el)).toHaveLength(1)
+        expect(button.classList.contains('chat-pending-action--steer')).toBe(true)
+        expect(button.disabled).toBe(false)
+        button.click()
+        expect(onSteer).toHaveBeenCalledExactlyOnceWith('C')
+        expect(onSend).not.toHaveBeenCalled()
+        expect(el.textContent).not.toContain('Steer unavailable')
+        state.stopping = true
+        await nextTick()
+        expect(button.disabled).toBe(true)
+        button.click()
+        expect(onSteer).toHaveBeenCalledTimes(1)
+        Object.assign(state, { hasActiveTurn: true, stopping: false, steerAvailable: true })
+        await nextTick()
+        expect(primaryActions(el)).toEqual([button])
+        button.click()
+        expect(onSteer).toHaveBeenCalledTimes(2)
+        expect(onSend).not.toHaveBeenCalled()
+        expect(attempt.request).toBe(steerRequest)
+      } finally { app.unmount() }
+    },
+  )
 
   it('keeps the original steer affordance disabled and visibly explains queue-only delivery', async () => {
     const reason = 'Steer unavailable: the active task identity has not synchronized yet.'
@@ -305,12 +549,16 @@ describe('PendingQueue', () => {
   })
 
   it('keeps a retryable item available for an explicit retry', async () => {
-    let steered = 0
+    const onSteer = vi.fn()
+    const onSend = vi.fn()
     let edited = 0
     const { app, el } = await mountQueue({
-      onSteer: () => { steered += 1 },
+      onSteer,
+      onSend,
       onEdit: () => { edited += 1 },
-    }, [{ text: 'Retry this steer', deliveryState: 'retryable' }], {
+    }, [{ text: 'Retry this follow-up', deliveryState: 'retryable' }], {
+      hasActiveTurn: false,
+      followupAvailable: true,
       steerAvailable: false,
       steerUnavailableMessage: 'New messages will queue after the current response.',
     })
@@ -322,7 +570,8 @@ describe('PendingQueue', () => {
     expect(retry?.title).toBe('Retry')
     expect(el.querySelector('.chat-pending-steer-status')).toBeNull()
     retry?.click()
-    expect(steered).toBe(1)
+    expect(onSend).toHaveBeenCalledExactlyOnceWith('pending-ui-0')
+    expect(onSteer).not.toHaveBeenCalled()
 
     el.querySelector<HTMLButtonElement>('[aria-label="More"]')?.click()
     await nextTick()
@@ -357,13 +606,11 @@ describe('PendingQueue', () => {
       { text: 'Must wait' },
     ])
 
-    const steerButtons = [...el.querySelectorAll<HTMLButtonElement>(
-      '.chat-pending-action--steer',
-    )]
-    expect(steerButtons).toHaveLength(2)
-    expect(steerButtons.every(button => button.disabled)).toBe(true)
-    expect(steerButtons[0]?.title).toContain('already being applied')
-    expect(steerButtons[1]?.title).toContain('another queued message is being delivered')
+    const actions = primaryActions(el)
+    expect(actions).toHaveLength(2)
+    expect(actions.every(button => button.disabled)).toBe(true)
+    expect(el.querySelector('[data-delivery-state="busy"]')).not.toBeNull()
+    expect(actions[1]?.title).toContain('another queued message is being delivered')
     app.unmount()
   })
 
