@@ -25,6 +25,11 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import {
+  acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
+  createDesktopActivationRequest, disposeDesktopActivationRequest,
+  hasDesktopActivationAcknowledgement,
+} from './desktop-single-instance.js'
 import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
@@ -15568,37 +15573,54 @@ const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.
 // held. Without a retry the new process silently quits and no window appears
 // (issue #446). Retry synchronously for a short window, then — if still
 // unavailable — surface an explicit error instead of exiting silently.
+let existingDesktopActivationAccepted = false
 function acquireSingleInstanceLockWithRetry(): boolean {
   const deadline = Date.now() + 5_000
   // Atomics.wait blocks this thread without an event loop (app.whenReady has not
-  // fired) and, unlike a Date.now() spin, does not peg a CPU core. Larger sleep
-  // slices also cut the retry count — each failed requestSingleInstanceLock
-  // notifies the running instance (firing its second-instance handler).
+  // fired) without pegging a CPU core. Lock retries remain 400 ms apart because
+  // every failed request notifies the primary; receipt polls do not notify it.
   const sleepSignal = new Int32Array(new SharedArrayBuffer(4))
+  const activationRequest = initialDesktopDeepLinkArguments.length === 0
+    ? createDesktopActivationRequest() : null
+  const userData = app.getPath('userData')
   let attempt = 0
-  for (;;) {
-    attempt += 1
-    if (app.requestSingleInstanceLock()) {
-      desktopLog('single_instance_lock_acquired', {
-        elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
-        attempt,
-      })
-      return true
+  const acceptActivation = (): boolean => {
+    if (!activationRequest || !hasDesktopActivationAcknowledgement(userData, activationRequest)) return false
+    existingDesktopActivationAccepted = true
+    desktopLog('single_instance_activation_accepted', { attempt })
+    return true
+  }
+  try {
+    for (;;) {
+      if (attempt > 0 && acceptActivation()) return false
+      attempt += 1
+      if (app.requestSingleInstanceLock(activationRequest ? { desktopActivation: activationRequest } : undefined)) {
+        desktopLog('single_instance_lock_acquired', {
+          elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+          attempt,
+        })
+        return true
+      }
+      // Protocol launches already hand their target to the existing instance.
+      // Keep their one-delivery behavior, including compatibility with old apps.
+      if (initialDesktopDeepLinkArguments.length > 0) {
+        desktopLog('single_instance_deep_link_forwarded', { attempt })
+        return false
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        desktopLog('single_instance_lock_unavailable', { attempt })
+        return false
+      }
+      const nextAttemptAt = Date.now() + Math.min(400, remaining)
+      do {
+        if (acceptActivation()) return false
+        // A healthy primary normally acknowledges before a second activation.
+        Atomics.wait(sleepSignal, 0, 0, Math.min(50, Math.max(0, nextAttemptAt - Date.now())))
+      } while (Date.now() < nextAttemptAt)
     }
-    // A Windows/Linux protocol launch targets the current instance and does not need
-    // the normal close/relaunch race retry. The failed lock request has already
-    // delivered its command line through second-instance; exit the forwarding
-    // process immediately instead of sending the same deep link for five seconds.
-    if (initialDesktopDeepLinkArguments.length > 0) {
-      desktopLog('single_instance_deep_link_forwarded', { attempt })
-      return false
-    }
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
-      desktopLog('single_instance_lock_unavailable', { attempt })
-      return false
-    }
-    Atomics.wait(sleepSignal, 0, 0, Math.min(400, remaining))
+  } finally {
+    if (activationRequest) disposeDesktopActivationRequest(userData, activationRequest)
   }
 }
 
@@ -15619,10 +15641,10 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held', {
+  desktopLog(existingDesktopActivationAccepted ? 'launch_forwarded_to_existing_instance' : 'launch_aborted_lock_held', {
     deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
   })
-  if (initialDesktopDeepLinkArguments.length === 0) {
+  if (initialDesktopDeepLinkArguments.length === 0 && !existingDesktopActivationAccepted) {
     try {
       // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
       // to the persisted onboarding locale (a plain file read) for this dialog.
@@ -15661,11 +15683,18 @@ if (!gotSingleInstanceLock) {
   })
   handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
-  app.on('second-instance', (_event, commandLine) => {
+  app.once('will-quit', clearDesktopActivationAcknowledgements)
+  app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
     desktopLog('second_instance', { hadDeepLink })
     if (hadDeepLink) return
     revealDesktopApp()
+    if (!canRevealDesktopApp(appExitPhase) || isQuitting) return
+    const revealed = currentOnboardingWindow() ?? currentMainWindow()
+    if (revealed && !revealed.isDestroyed() && revealed.isVisible()
+      && !revealed.isMinimized() && revealed.isFocused()) {
+      acknowledgeDesktopActivation(app.getPath('userData'), additionalData)
+    }
   })
 
   void app.whenReady().then(async () => {
