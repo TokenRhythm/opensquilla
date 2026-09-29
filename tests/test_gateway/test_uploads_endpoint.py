@@ -55,7 +55,6 @@ def store(tmp_path: Path) -> UploadStore:
     return UploadStore(
         marker_dir=tmp_path / "inbound",
         ttl_seconds=600,
-        max_file_bytes=30 * 1024 * 1024,
     )
 
 
@@ -351,9 +350,8 @@ def test_cancelled_upload_finishes_worker_before_releasing_files(
     asyncio.run(run())
 
 
-def test_upload_too_large_30mb_plus_rejected(store: UploadStore) -> None:
-    # 30 MB + 1 byte exceeds the locked cap.
-    too_big = b"%PDF-1.4\n" + b"a" * MAX_STAGED_PDF_BYTES
+def test_upload_too_large_fifty_mib_plus_rejected(store: UploadStore) -> None:
+    too_big = _exact_pdf(50 * 1024 * 1024 + 1)
     with pytest.raises(UploadOversizeError):
         asyncio.run(store.put("big.pdf", "application/pdf", too_big))
 
@@ -430,7 +428,7 @@ def test_failed_upload_does_not_leak_uuid(store: UploadStore) -> None:
             store.put(
                 "big.pdf",
                 "application/pdf",
-                b"%PDF-1.4\n" + b"a" * (30 * 1024 * 1024 + 1),
+                _exact_pdf(store.max_file_bytes + 1),
             )
         )
     final_markers = list((store.marker_dir).glob("*.meta")) if store.marker_dir.exists() else []
@@ -852,6 +850,76 @@ def _zip_bytes() -> bytes:
     return buffer.getvalue()
 
 
+@pytest.mark.parametrize("size", [48 * 1024 * 1024, 50 * 1024 * 1024, 50 * 1024 * 1024 + 1])
+@pytest.mark.parametrize(
+    ("name", "mime", "prefix", "fill"),
+    [
+        ("large.pdf", "application/pdf", b"%PDF-1.4\n", b"a"),
+        ("large.txt", "text/plain", b"bounded source text\n", b"a"),
+        (
+            "large.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            b"PK\x03\x04",
+            b"\0",
+        ),
+        ("large.bin", "application/octet-stream", b"\0", b"\0"),
+    ],
+)
+def test_default_upload_route_fifty_mib_boundary(tmp_path, size, name, mime, prefix, fill) -> None:
+    # Test production defaults, not a store whose constructor silently pins 30 MiB.
+    store = UploadStore(marker_dir=tmp_path / "inbound")
+    payload = prefix + fill * (size - len(prefix))
+    with _route_client(store=store) as client:
+        response = client.post("/api/v1/files/upload", files={"file": (name, payload, mime)})
+    if size > 50 * 1024 * 1024:
+        assert response.status_code == 413
+        assert not store._entries
+        return
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["size"] == size
+    assert body["mime"] == mime
+    # A fresh store can still consume the large UUID within its original TTL.
+    reopened = UploadStore(marker_dir=tmp_path / "inbound")
+    restored, metadata = asyncio.run(reopened.get(body["file_uuid"]))
+    assert hashlib.sha256(restored).digest() == hashlib.sha256(payload).digest()
+    assert metadata["size"] == size
+
+
+def test_explicit_lower_store_limit_remains_effective(tmp_path) -> None:
+    store = UploadStore(marker_dir=tmp_path / "inbound", max_file_bytes=30 * 1024 * 1024)
+    with pytest.raises(UploadOversizeError):
+        asyncio.run(store.put("large.pdf", "application/pdf", _exact_pdf(30 * 1024 * 1024 + 1)))
+    assert not store._entries
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_byte", [0, 1])
+async def test_fifty_plus_ten_mib_is_checked_at_message_admission(tmp_path, extra_byte) -> None:
+    store = UploadStore(marker_dir=tmp_path / "inbound")
+    refs = []
+    for index, size in enumerate([50 * 1024 * 1024, 10 * 1024 * 1024 + extra_byte]):
+        name = f"part-{index}.pdf"
+        file_uuid = await store.put(name, "application/pdf", _exact_pdf(size))
+        refs.append({"file_uuid": file_uuid, "mime": "application/pdf", "name": name})
+    validated, failures = validate_attachments(refs)
+    assert not failures
+    if extra_byte:
+        with pytest.raises(ValueError, match="total raw bytes"):
+            await resolve_attachments(
+                validated, store=store, material_root=tmp_path / "media", session_id="total"
+            )
+    else:
+        resolved, consumed = await resolve_attachments(
+            validated,
+            store=store,
+            material_root=tmp_path / "media",
+            session_id="total",
+        )
+        assert len(consumed) == 2
+        assert sum(item["size"] for item in resolved) == 60 * 1024 * 1024
+
+
 def test_upload_route_accepts_zip_as_opaque() -> None:
     with _route_client() as client:
         response = client.post(
@@ -1131,6 +1199,7 @@ def test_app_factory_wires_strict_admission_into_route_and_store(tmp_path: Path)
         assert response.status_code == 415
         assert response.json()["code"] == "UNSUPPORTED_MEDIA_TYPE"
         assert get_upload_store().accept_opaque is False
+        assert get_upload_store().max_file_bytes == 50 * 1024 * 1024
         assert get_upload_store().max_total_bytes == 7 * 1024 * 1024
     finally:
         set_upload_store(original_store)

@@ -335,7 +335,7 @@
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "82a949807303afc9ff05b162102fb656a993c031752a6221c956ffddbcae5912"
+      "schemaSha256": "f59f97c1df4b988219ad9cc6aa2120b5352a5b19686b6dcb928994228353c99f"
     },
     {
       "lifecycle": "stable",
@@ -1073,7 +1073,7 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.enqueue",
       "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
-      "schemaSha256": "0b0cb5de384ec9284528cf67888d712cfad8df98642ba0064ebbaefc83bf4abb"
+      "schemaSha256": "a9e539a88a78c8c2aa479311f473ceb91a9398c3f27d9928ee72e0dce3aafd34"
     },
     {
       "lifecycle": "stable",
@@ -1175,7 +1175,7 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "e547a6b6899709a35148fc4ad9f10028cb5dc00f9d98d64c4e6443b9fbc2abb1"
+      "schemaSha256": "9ddc69110c093e7f5733a0383ff7354e7d3d33fedfa8ccd4461064e58eed6770"
     },
     {
       "lifecycle": "stable",
@@ -1295,7 +1295,7 @@
       "lifecycle": "stable",
       "name": "turns.receipt.get",
       "schema": "conversation/turns-receipt-get.schema.json",
-      "schemaSha256": "77cc0ff556b4dac77c096a1f6d2bc37128dd2f867085cb7a19b99f900b9e6029"
+      "schemaSha256": "671ef57d67778dc771b464d41b9234c8e64c95054a70f5ff47a40832a2372dd0"
     },
     {
       "lifecycle": "stable",

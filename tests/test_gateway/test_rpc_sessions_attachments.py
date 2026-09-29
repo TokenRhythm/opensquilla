@@ -63,7 +63,7 @@ def test_rendered_media_types_set_contents() -> None:
 
 
 def test_max_attachments_per_turn_is_ten() -> None:
-    assert MAX_ATTACHMENTS == 10
+    assert MAX_ATTACHMENTS == 16
 
 
 # ---------------------------------------------------------------------------

@@ -9,6 +9,7 @@ import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
+import { chooseLocalFilePaths } from './native-path-picker.js'
 import { saveArtifactFile, performSourceFileAction, performWorkspaceFileAction, type SaveArtifactRequest, type SourceFileActionRequest, type WorkspaceFileActionRequest } from './resource-file-actions.js'
 import {
   DESKTOP_LOCALES,
@@ -12575,6 +12576,40 @@ ipcMain.handle('desktop:workspace-file:action', async (event, payload: Workspace
     // receives controlled metadata; renderer errors remain path-free.
     throw new Error('Workspace file action failed')
   })
+})
+ipcMain.handle('desktop:files:choose-paths', async (event, request: unknown) => {
+  if (!trustedControlUiIpc(event)) throw new Error('Untrusted local path request')
+  const connectionRevision = gatewayConnectionRevision
+  let invalidated = false
+  const invalidate = () => { invalidated = true }
+  const onNavigation = (_event: Electron.Event, _url: string, _inPlace: boolean, mainFrame: boolean) => {
+    if (mainFrame) invalidate()
+  }
+  event.sender.on('did-start-navigation', onNavigation)
+  event.sender.once('destroyed', invalidate)
+  try {
+    return await chooseLocalFilePaths(request, {
+      connection: () => {
+        if (invalidated || connectionRevision !== gatewayConnectionRevision
+          || event.sender.isDestroyed() || !trustedControlUiIpc(event)
+          || !gatewayState.owned || gatewayState.status !== 'ready' || !gatewayProcess) return null
+        const snapshot = desktopGatewayConnectionSnapshot()
+        const nonce = gatewayProcessOwnershipContexts.get(gatewayProcess)?.nonce
+        if (!snapshot.instanceId || !snapshot.httpUrl || !snapshot.authToken || !nonce) return null
+        return { instanceId: snapshot.instanceId, profile: snapshot.profileFingerprint,
+          url: snapshot.httpUrl, authToken: snapshot.authToken, nonce }
+      },
+      pick: async () => {
+        const window = BrowserWindow.fromWebContents(event.sender)
+        if (!window) throw new Error('Main window unavailable')
+        const choice = await dialog.showOpenDialog(window, { properties: ['openFile', 'multiSelections'] })
+        return choice.canceled ? [] : choice.filePaths
+      },
+    })
+  } finally {
+    event.sender.removeListener('did-start-navigation', onNavigation)
+    event.sender.removeListener('destroyed', invalidate)
+  }
 })
 // File paths enter this broker only from the native picker or isolated preload's
 // webUtils.getPathForFile(File); renderer-facing calls never accept a path string.

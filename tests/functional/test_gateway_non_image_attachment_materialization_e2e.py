@@ -469,8 +469,10 @@ async def _e2e_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("size_mib", [0, 48, 50])
 async def test_current_turn_pdf_is_materialized_to_workspace_path(
     _e2e_stack: dict[str, Any],
+    size_mib: int,
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
@@ -481,6 +483,8 @@ async def test_current_turn_pdf_is_materialized_to_workspace_path(
     session = await manager.create(session_key=key, agent_id="main")
     subscription_manager.subscribe_messages(sink.conn_id, key)
     pdf_bytes = _sample_pdf_bytes()
+    if size_mib:
+        pdf_bytes += b" " * (size_mib * 1024 * 1024 - len(pdf_bytes))
 
     file_uuid = await _upload_file(
         _e2e_stack["app"],
@@ -573,8 +577,10 @@ async def test_current_turn_inline_pdf_is_materialized_to_workspace_path(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("size_mib", [0, 50])
 async def test_historical_pdf_followup_materializes_path_from_sha256_ref(
     _e2e_stack: dict[str, Any],
+    size_mib: int,
 ) -> None:
     manager: SessionManager = _e2e_stack["manager"]
     subscription_manager: SubscriptionManager = _e2e_stack["subscription_manager"]
@@ -585,6 +591,8 @@ async def test_historical_pdf_followup_materializes_path_from_sha256_ref(
     await manager.create(session_key=key, agent_id="main")
     subscription_manager.subscribe_messages(sink.conn_id, key)
     pdf_bytes = _sample_pdf_bytes()
+    if size_mib:
+        pdf_bytes += b" " * (size_mib * 1024 * 1024 - len(pdf_bytes))
 
     file_uuid = await _upload_file(
         _e2e_stack["app"],

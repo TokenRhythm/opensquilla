@@ -24,6 +24,23 @@
           <strong>{{ t('chat.attachFiles') }}</strong>
         </span>
       </button>
+      <button
+        v-if="localPathsAvailable"
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        :disabled="localPathsDisabled"
+        :title="t('chat.referenceLocalPathsHint')"
+        @click="referenceLocalPaths"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="paperclip" :size="17" />
+        </span>
+        <span class="composer-add-menu__copy">
+          <strong>{{ t('chat.referenceLocalPaths') }}</strong>
+          <span>{{ t('chat.referenceLocalPathsHint') }}</span>
+        </span>
+      </button>
     </div>
     <div
       v-if="planModeAvailable || goalModeAvailable"
@@ -89,6 +106,8 @@ import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPla
 const props = defineProps<{
   avoidElement?: HTMLElement | null
   attachmentsDisabled?: boolean
+  localPathsAvailable?: boolean
+  localPathsDisabled?: boolean
   goalModeActive: boolean
   goalModeAvailable: boolean
   goalModeBusy: boolean
@@ -102,6 +121,7 @@ const emit = defineEmits<{
   activateGoalMode: []
   activatePlanMode: []
   attachFiles: []
+  referenceLocalPaths: []
   close: []
 }>()
 
@@ -149,6 +169,11 @@ function trackPlacement() {
 
 function attachFiles() {
   emit('attachFiles')
+  emit('close')
+}
+
+function referenceLocalPaths() {
+  emit('referenceLocalPaths')
   emit('close')
 }
 

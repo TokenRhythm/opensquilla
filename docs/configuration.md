@@ -337,7 +337,7 @@ until an appropriate tool inspects or converts them.
 # rendered-types-only admission gate on every surface.
 accept_opaque = true
 # Per-file ceiling for opaque attachments (bytes).
-opaque_max_bytes = 31457280            # 30 MiB
+opaque_max_bytes = 52428800            # 50 MiB
 # Aggregate byte ceiling for the disk-backed staged-upload store. When reached,
 # new uploads get HTTP 507 UPLOAD_STORE_FULL (retryable; staged entries
 # expire within the 10-minute TTL); a payload larger than the cap itself is a
@@ -362,9 +362,11 @@ Env overrides use the `OPENSQUILLA_ATTACHMENTS_` prefix
 
 Size policy at a glance: inline attachments up to 2 MB ride the RPC message;
 larger files stage through `POST /api/v1/files/upload`. Staged text (validated as
-whole-payload UTF-8), PDF, Office and opaque files allow up to 30 MiB each; images
-allow 5 MiB and email retains its 2 MB limit. Each turn accepts at most 10 uploaded
-attachments and 60 MiB total. Staged uploads are stored on disk with their hashes
+whole-payload UTF-8), PDF, Office and opaque files allow up to 50 MiB each; images
+allow 5 MiB and email retains its 2 MB limit. Each turn accepts at most 16 uploaded
+attachments/project references combined and 60 MiB of attachment payloads total.
+Known live project references count toward the item limit, not uploaded bytes.
+Staged uploads are stored on disk with their hashes
 and survive a Gateway restart within their original 10-minute lifetime.
 
 Behavior notes:
@@ -383,6 +385,19 @@ Behavior notes:
 - Desktop project-file references point to the current project file rather than
   an uploaded snapshot. Every use, including queued execution, checks the current
   workspace binding and file permissions. Selecting a file grants no extra access.
+- Desktop's **Reference local path (no upload)** action inserts a local path
+  reference from a system file picker. The message carries the path string,
+  not the file contents or an attachment. It is available only for a
+  Desktop-owned local Gateway, including before the first message, and does
+  not read or upload file contents. Files outside the workspace and files
+  larger than the upload limit can be selected. The tool's execution
+  environment and existing permissions still determine whether the path is
+  readable or editable; no path mapping or automatic upload occurs. The path
+  may be sent to the selected model.
+- In the Desktop composer, dropping a native non-image OS file uses the same
+  local path-input route without creating a session or attachment. Images, browser
+  Files, pasted Blobs, and drops without a native path retain the byte-upload
+  route; remote or non-owned Gateways do not receive a local Windows path.
 - When known context capacity is exhausted by older history, attachment admission
   can compact that history once and retry with a fresh budget, including images.
   Unknown capacity, a failed compaction, or new material that cannot fit still
@@ -391,12 +406,14 @@ Behavior notes:
 The WebUI and Desktop composer can recover unsent attachments from local browser
 storage when IndexedDB is available. Drafts are scoped to the authenticated
 Gateway/account or verified Desktop profile and conversation. They expire 24 hours
-after their latest save and allow at most 10 items and 60 MiB per draft, with a
+after their latest save and allow at most 16 items and 60 MiB per draft, with a
 120 MiB aggregate limit across at most 20 drafts. Storage or quota failures are
 reported in the composer. An expired staged upload can be re-uploaded only when
 the draft retained its file bytes; otherwise the user must select it again.
 Native file-selection capabilities are never saved in drafts. Removing a draft
 only removes the unsent selection, not accepted or queued attachment material.
+Known live project references retain display metadata but use no file-content
+quota in drafts. Actual stored Blobs always count, even on malformed mixed records.
 
 ## Memory Configuration
 

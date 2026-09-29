@@ -680,6 +680,9 @@
       @composition-change="composing = $event; !$event && handleSlashInput()"
       @beforeinput="onTextareaBeforeInput"
       :choose-attachments="chooseAttachments"
+      :choose-local-file-paths="localPathPicker.choose"
+      :local-paths-available="localPathPicker.available.value"
+      :local-paths-busy="localPathPicker.busy.value"
       @file-change="onFileInputChange"
       @input="onTextareaInput"
       @keydown="onTextareaKeydown"
@@ -844,6 +847,7 @@ import HistoryLoadSentinel from '@/components/HistoryLoadSentinel.vue'
 import type { ChatMessageListVirtualizer } from '@/types/chatVirtualizer'
 import { useChatApprovals } from '@/composables/chat/useChatApprovals'
 import { useChatAttachments } from '@/composables/chat/useChatAttachments'
+import { useLocalPathPicker } from '@/composables/chat/useLocalPathPicker'
 import { useChatCompaction } from '@/composables/chat/useChatCompaction'
 import { useChatComposerShortcuts } from '@/composables/chat/useChatComposerShortcuts'
 import { useDeliverableUpdateIndicator } from '@/composables/chat/useDeliverableUpdateIndicator'
@@ -4703,6 +4707,34 @@ function appendComposerText(text: string) {
   composerRef.value?.focusTextarea()
 }
 
+const localPathPicker = useLocalPathPicker({
+  available: () => platform.id === 'desktop' && gatewayAccess.isLocalOwner && gatewayAccess.isAvailable
+    // This existing profile identity is obtained from main's owned-child binding, not owner role/localhost.
+    && Boolean(attachmentDraftIdentity.value) && typeof platform.files.chooseLocalFilePaths === 'function',
+  scope: () => [sessionKey.value, pendingSessionIntent.value, pendingForkBeforeMessageId.value,
+    deliveryIdentity.value, gatewayConnectionState.value, gatewayAccess.subscriptionEpoch,
+    attachmentDraftIdentity.value, pendingWorkspaceId.value, boundWorkspaceId.value,
+    activeWorkspace.value?.id, landingAgentId.value, draftAgentId(), runMode.value, composerRevision.value,
+    chatSend.sendPending.value, replanActive.value, Boolean(dockedPlanQuestionnaire.value),
+    Boolean(forkTransition.value), historyState.value.sessionMissing, router.currentRoute.value.fullPath],
+  getBinding: () => platform.gateway.getAttachmentBinding?.() ?? Promise.resolve(null),
+  choosePaths: request => platform.files.chooseLocalFilePaths!(request),
+  nativeDropAvailable: () => platform.id === 'desktop' && gatewayAccess.isLocalOwner && gatewayAccess.isAvailable
+    && typeof platform.files.resolveNativeFilePath === 'function',
+  resolveNativeFilePath: async file => {
+    // A Desktop bridge alone does not identify the Gateway that will execute
+    // the path. Require the non-secret owned-child binding, without requiring
+    // a durable session/workspace binding for the first message.
+    const binding = await platform.gateway.getAttachmentBinding?.()
+    if (!binding || typeof platform.files.resolveNativeFilePath !== 'function') return null
+    return platform.files.resolveNativeFilePath(file)
+  },
+  text: () => inputText.value,
+  append: appendComposerText,
+  onError: kind => pushToast(t(kind === 'too-long' ? 'chat.localPathTextTooLong' : 'chat.localPathSelectionFailed'),
+    { tone: 'warn' }),
+})
+
 function onVoiceInput() {
   void toggleVoiceInput(appendComposerText)
 }
@@ -6253,7 +6285,12 @@ function onChatDragLeave(e: DragEvent) {
   }
 }
 
-function onChatDrop(e: DragEvent) {
+function isImageDropFile(file: File): boolean {
+  const mime = typeof file.type === 'string' ? file.type.toLowerCase() : ''
+  return mime.startsWith('image/') || /\.(?:png|jpe?g|gif|webp)$/i.test(file.name || '')
+}
+
+async function onChatDrop(e: DragEvent) {
   e.preventDefault()
   threadDragDepth.value = 0
   threadDragOver.value = false
@@ -6264,7 +6301,9 @@ function onChatDrop(e: DragEvent) {
   }
   const files = Array.from(e.dataTransfer?.files || [])
   if (files.length === 0) return
-  void addAttachments(files)
+  const fallbackFiles = await localPathPicker.appendNativeDrop(files, isImageDropFile)
+  if (fallbackFiles === null) return
+  if (fallbackFiles.length > 0) await addAttachments(fallbackFiles)
   composerRef.value?.focusTextarea()
 }
 
