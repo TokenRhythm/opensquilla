@@ -70,3 +70,14 @@ unit tests are unchanged. A 1.1-second injected write delay reproduces the old
 failure and must still pass all authority and removed-project assertions.
 This guard covers cooperative dispatch, not cancellation-resistant cleanup;
 the telemetry process watchdog is not generalized to these tests.
+
+PR run `36548527552` then exposed an independent ingress fixture deadline:
+`wait_until_running()` allowed two seconds for durable task activation. Its
+failure log recorded 1342 ms for task-state persistence and 907 ms for transcript
+context persistence before handler readiness. The fixture now has a named
+30-second readiness guard with phase/task-state diagnostics, and a negative
+control verifies that missing readiness still fails. The concurrent collect
+case injects a 2.1-second activation delay (old guard fails), waits for actual
+second-request admission contention rather than sleeping 50 ms, and bounds
+request completion/cleanup. Single-task acceptance and durable row-count
+assertions are retained. Product cancellation/storage deadlines are unchanged.
