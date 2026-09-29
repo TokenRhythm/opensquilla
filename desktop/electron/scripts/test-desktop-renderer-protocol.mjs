@@ -18,6 +18,18 @@ assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/changelog')
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/api/system/status'), false)
 assert.equal(isDesktopRendererDocumentUrl('opensquilla-app://desktop/assets/app.js'), false)
 
+// Legacy diagnostic URLs remain trusted SPA documents long enough for the
+// renderer router to redirect them to Usage or Settings support.
+for (const path of ['/overview', '/health', '/logs']) {
+  const url = `opensquilla-app://desktop${path}`
+  assert.equal(isDesktopRendererDocumentUrl(url), true, path)
+  assert.deepEqual(
+    routeDesktopRendererRequest(url),
+    { kind: 'spa', relativePath: 'desktop.html' },
+    path,
+  )
+}
+
 assert.deepEqual(
   routeDesktopRendererRequest('opensquilla-app://desktop/api/v1/files?q=1', 'POST'),
   { kind: 'gateway', pathAndQuery: '/api/v1/files?q=1' },

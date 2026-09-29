@@ -203,7 +203,7 @@ const allCommands = computed<Command[]>(() => {
     })
     // Channels is the second route in the Skills & Channels hub. Keep its
     // direct command beside the pinned hub entry instead of burying it among
-    // Overview's operational subpages.
+    // unrelated settings actions.
     if (item.path === '/skills') {
       const title = t('nav.channels')
       out.push({
@@ -215,23 +215,6 @@ const allCommands = computed<Command[]>(() => {
         run: navTo('/channels'),
       })
     }
-  }
-
-  // Diagnostic Logs remains directly reachable without promoting it back into
-  // the rail; the Overview command already opens Status.
-  const demoted: Array<{ path: string; name: string; icon: IconName; group: string }> = [
-    { path: '/logs', name: 'logs', icon: 'logs', group: 'Observe' },
-  ]
-  for (const item of demoted) {
-    const title = t(`nav.${item.name}`)
-    out.push({
-      id: `nav:${item.path}`,
-      title,
-      icon: item.icon,
-      keywords: `${title} ${item.path}`.toLowerCase(),
-      group: item.group,
-      run: navTo(item.path),
-    })
   }
 
   // The Channels hub entry opens the workspace; this separate action lands in

@@ -126,9 +126,12 @@ def prepare_manual_compaction_envelope(
     )
     # No dispatch handler, ToolContext, hooks, session writer, memory warmer or
     # usage sink is bound to this projection-only Agent.
-    return Agent(
+    agent = Agent(
         provider=provider,
         config=agent_config,
         tool_definitions=tool_defs,
         session_key=ctx.session_key,
     )
+    agent._compaction_media_root = runner._attachment_media_root()
+    agent._compaction_session_id = str(getattr(session, "session_id", "") or "")
+    return agent

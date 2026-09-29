@@ -13,6 +13,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from opensquilla.engine.history import HISTORY_REPLAY_PROJECTION_VERSION
 from opensquilla.provider.request_proof import projected_generation_budget
 from opensquilla.session.compaction_deployment import DEFAULT_COMPACTION_OUTPUT_TOKENS
 
@@ -116,6 +117,7 @@ def resolve_compaction_budget(
     )
     fingerprint = payload_hash({
         "schema": "compaction_consumer_v1", "provider": provider_identity,
+        "history_projection_version": HISTORY_REPLAY_PROJECTION_VERSION,
         "physical_window": physical_context_window_tokens,
         "generation": generation, "template": template_hash,
         "capacity_template": capacity_template_hash,

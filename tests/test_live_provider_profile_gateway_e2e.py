@@ -717,14 +717,17 @@ def test_attachment_capacity_fixture_is_over_raw_admission_but_media_bounded() -
     )
     assert metrics["raw_history_fits_at_zero_thinking"] is False
     assert metrics["projected_media_fits_at_max_thinking"] is True
-    assert not e2e._attachment_capacity_request_fits(  # noqa: SLF001
-        metrics["raw_history_estimated_tokens"],
-        thinking_budget_tokens=0,
-    )
-    assert e2e._attachment_capacity_request_fits(  # noqa: SLF001
-        metrics["projected_media_tokens"],
-        thinking_budget_tokens=e2e.MAX_THINKING_BUDGET_TOKENS,
-    )
+    for model in fixture["tier_models"].values():
+        assert not e2e._attachment_capacity_request_fits(  # noqa: SLF001
+            metrics["raw_history_estimated_tokens"],
+            model=model,
+            thinking_budget_tokens=0,
+        )
+        assert e2e._attachment_capacity_request_fits(  # noqa: SLF001
+            metrics["projected_media_tokens"],
+            model=model,
+            thinking_budget_tokens=e2e.MAX_THINKING_BUDGET_TOKENS,
+        )
     assert (
         metrics["projected_media_tokens"]
         < metrics["router_max_thinking_admission_token_limit"]
@@ -779,8 +782,8 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
         llm_request_timeout_seconds=e2e.ATTACHMENT_CAPACITY_PROVIDER_TIMEOUT_SECONDS,
         agent_runtime_timeout_seconds=e2e.ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS,
         turn_hard_deadline_seconds=e2e.ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS,
-        model_context_window_tokens=e2e.ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS,
-        model_supports_vision_override=e2e.ATTACHMENT_CAPACITY_MODEL,
+        llm_context_window_tokens=e2e.ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS,
+        model_supports_vision_override=str(tiers["c2"]["model"]),
     )
 
     data = tomllib.loads(config_path.read_text(encoding="utf-8"))
@@ -793,20 +796,24 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     assert data["naming"]["enabled"] is False
     assert "image_model" not in data["squilla_router"]["tiers"]
     assert data["squilla_router"]["tiers"]["c2"] == tiers["c2"]
-    assert tiers["c2"]["model"] == "kimi-k2.6"
+    assert str(tiers["c2"]["model"]).strip()
     assert tiers["c2"]["image_only"] is False
     assert all("supports_image" not in tiers[slot] for slot in ("c0", "c1", "c2", "c3"))
-    assert (
-        data["models"]["tokenrhythm"][tiers["c1"]["model"]]["context_window"]
-        == e2e.ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS
-    )
-    assert data["models"]["tokenrhythm"]["kimi-k2.6"]["supports_vision"] is True
+    assert data["llm"]["context_window_tokens"] == e2e.ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS
+    assert data["models"]["tokenrhythm"][tiers["c2"]["model"]]["supports_vision"] is True
     for slot in ("c0", "c1", "c3"):
-        assert data["models"]["tokenrhythm"][tiers[slot]["model"]]["supports_vision"] is False
+        if tiers[slot]["model"] != tiers["c2"]["model"]:
+            assert data["models"]["tokenrhythm"][tiers[slot]["model"]]["supports_vision"] is False
 
 
+@pytest.mark.parametrize(
+    ("synthetic_vision_capability_override", "expected_tier"),
+    [(False, "c0"), (True, "c2")],
+)
 def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
     tmp_path: Path,
+    synthetic_vision_capability_override: bool,
+    expected_tier: str,
 ) -> None:
     requests: list[dict[str, object]] = []
 
@@ -821,7 +828,7 @@ def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
             length = int(self.headers.get("content-length") or "0")
             payload = json.loads(self.rfile.read(length))
             requests.append(payload)
-            model = str(payload.get("model") or "kimi-k2.6")
+            model = str(payload.get("model") or "")
             chunks = [
                 {
                     "model": model,
@@ -861,7 +868,7 @@ def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
             api_key="synthetic-attachment-capacity-key",
             base_url=f"http://{host}:{port}/v1",
             tmp_path=tmp_path,
-            synthetic_vision_capability_override=True,
+            synthetic_vision_capability_override=synthetic_vision_capability_override,
         )
     finally:
         server.shutdown()
@@ -870,7 +877,7 @@ def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
 
     assert result["ok"] is True, result
     assert len(requests) == 1, result
-    assert requests[0]["model"] == "kimi-k2.6"
+    assert requests[0]["model"] == e2e._tokenrhythm_attachment_tiers()[expected_tier]["model"]  # noqa: SLF001
     case = result["cases"][0]
     assert case["usage"]["physical_request_count"] == 1
     assert case["usage"]["physical_response_count"] == 1
@@ -1160,11 +1167,12 @@ def _attachment_capacity_evidence_records(
                 {"role": "assistant", "content": turn["assistant"]},
             ]
         )
+    configured_model = str(fixture["tier_models"]["c2"])
     request = {
         "session_key": session_key,
         "kind": "llm_request",
         "provider": "tokenrhythm",
-        "model": "kimi-k2.6",
+        "model": configured_model,
         "payload": {
             "messages": [
                 {"role": "system", "content": "bounded system"},
@@ -1178,17 +1186,17 @@ def _attachment_capacity_evidence_records(
                     "content": [{"type": "image", "data": current["data"]}],
                 },
             ],
-            "config": {"model": "kimi-k2.6"},
+            "config": {"model": configured_model},
         },
     }
     response = {
         "session_key": session_key,
         "kind": "llm_response",
         "provider": "tokenrhythm",
-        "model": "kimi-k2.6",
+        "model": configured_model,
         "payload": {
             "usage": {
-                "model": "kimi-k2.6",
+                "model": configured_model,
                 "input_tokens": 123,
                 "output_tokens": 7,
             }
@@ -1238,8 +1246,8 @@ def test_attachment_capacity_evidence_enforces_zero_or_one_call_boundary(
     assert evidence["ok"] is (physical_request_count == 1)
     if physical_request_count == 1:
         assert evidence["response_count"] == 1
-        assert evidence["actual_request_model"] == "kimi-k2.6"
-        assert evidence["actual_response_model"] == "kimi-k2.6"
+        assert evidence["actual_request_model"] == fixture["tier_models"]["c2"]
+        assert evidence["actual_response_model"] == fixture["tier_models"]["c2"]
         assert evidence["request_projection"] == {
             "history_user_turn_count": 3,
             "media_blocks": 5,
@@ -1273,6 +1281,30 @@ def test_attachment_capacity_evidence_requires_no_compaction(
     )
 
     assert evidence["ok"] is (compaction_count == 0)
+
+
+def test_attachment_capacity_evidence_accepts_natural_image_route() -> None:
+    fixture = e2e._attachment_capacity_fixture()  # noqa: SLF001
+    session_key = "agent:main:webchat:offline-natural-image-route"
+    records, decisions = _attachment_capacity_evidence_records(fixture, session_key)
+    records[0]["model"] = fixture["tier_models"]["c0"]
+    records[0]["payload"]["config"]["model"] = fixture["tier_models"]["c0"]
+    records[1]["model"] = fixture["tier_models"]["c0"]
+    records[1]["payload"]["usage"]["model"] = fixture["tier_models"]["c0"]
+    decisions[0]["pipeline_steps"][0]["routed_tier"] = "c0"
+
+    evidence = e2e._evaluate_attachment_capacity_evidence(  # noqa: SLF001
+        records=records,
+        decisions=decisions,
+        session_key=session_key,
+        fixture=fixture,
+        session_metrics={"compaction_count": 0},
+        proof={"fits": True, "media_blocks": 5},
+        turn_error=None,
+    )
+
+    assert evidence["ok"] is True
+    assert evidence["expected_model"] == fixture["tier_models"]["c0"]
 
 
 @pytest.mark.parametrize(
@@ -1385,6 +1417,7 @@ def test_attachment_capacity_failure_taxonomy_uses_safe_llm_error_code(
     [
         "llm_error",
         "routing_source",
+        "routed_tier",
         "image_route_reason",
         "proof_fits",
         "proof_media_count",
@@ -1418,6 +1451,8 @@ def test_attachment_capacity_evidence_rejects_each_safety_invariant(
         )
     elif broken_invariant == "routing_source":
         decisions[0]["pipeline_steps"][0]["routing_source"] = "classifier"
+    elif broken_invariant == "routed_tier":
+        decisions[0]["pipeline_steps"][0]["routed_tier"] = "c0"
     elif broken_invariant == "image_route_reason":
         decisions[0]["image_route_reason"] = "gate_history"
     elif broken_invariant == "proof_fits":
@@ -1607,19 +1642,26 @@ def test_attachment_capacity_upload_rejects_invalid_file_uuid(
 
 
 @pytest.mark.parametrize(
-    ("request_model", "response_model"),
+    ("request_model_case", "response_model_case"),
     [
-        ("", "kimi-k2.6"),
-        ("wrong-model", "kimi-k2.6"),
-        ("kimi-k2.6", ""),
-        ("kimi-k2.6", "wrong-model"),
+        ("", "configured"),
+        ("wrong-model", "configured"),
+        ("configured", ""),
+        ("configured", "wrong-model"),
     ],
 )
 def test_attachment_capacity_requires_independent_request_and_response_models(
-    request_model: str,
-    response_model: str,
+    request_model_case: str,
+    response_model_case: str,
 ) -> None:
     fixture = e2e._attachment_capacity_fixture()  # noqa: SLF001
+    configured_model = str(fixture["tier_models"]["c2"])
+    request_model = (
+        configured_model if request_model_case == "configured" else request_model_case
+    )
+    response_model = (
+        configured_model if response_model_case == "configured" else response_model_case
+    )
     session_key = "agent:main:webchat:offline-model-evidence"
     records, decisions = _attachment_capacity_evidence_records(fixture, session_key)
     records[0]["model"] = request_model

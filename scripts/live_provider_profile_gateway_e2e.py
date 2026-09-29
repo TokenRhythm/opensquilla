@@ -47,7 +47,6 @@ from opensquilla.engine.capacity_admission import (  # noqa: E402
 )
 from opensquilla.engine.pricing import estimate_cost, resolve_model_price  # noqa: E402
 from opensquilla.gateway.config import GatewayConfig  # noqa: E402
-from opensquilla.provider.model_catalog import ModelCatalog  # noqa: E402
 from opensquilla.provider.preset_registry import (  # noqa: E402
     LEGACY_PROVIDER_PRESET_IDS,
     get_preset,
@@ -110,12 +109,12 @@ LIVE_AGENT_RUNTIME_TIMEOUT_SECONDS = 75.0
 LIVE_TURN_HARD_DEADLINE_SECONDS = 90.0
 ATTACHMENT_CAPACITY_OPT_IN_ENV = "OPENSQUILLA_LIVE_TOKENRHYTHM_ATTACHMENT_CAPACITY"
 ATTACHMENT_CAPACITY_PROVIDER = "tokenrhythm"
-ATTACHMENT_CAPACITY_MODEL = "kimi-k2.6"
-ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS = 1_000_000
-# Kimi may return provider-billed reasoning tokens even when the request turns
-# explicit thinking off. A real 64-token gate consumed 63 reasoning tokens and
-# truncated before its completion marker, so use the same bounded smoke floor
-# as the TokenRhythm profile matrix. The prompt still requests a short answer.
+# Bound every configured route to the same test window. The natural image
+# route may select any catalog-supported c-tier; the raw fixture must exceed
+# that route's budget rather than only a hard-coded model's budget.
+ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS = 256_000
+# TokenRhythm models may spend most of a small output cap on reasoning before
+# emitting the completion marker. The prompt still requests a short answer.
 ATTACHMENT_CAPACITY_MAX_OUTPUT_TOKENS = 4_096
 ATTACHMENT_CAPACITY_PROVIDER_TIMEOUT_SECONDS = 60.0
 ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS = 75.0
@@ -387,7 +386,7 @@ def _write_config(
     llm_request_timeout_seconds: float = 90.0,
     agent_runtime_timeout_seconds: float = LIVE_AGENT_RUNTIME_TIMEOUT_SECONDS,
     turn_hard_deadline_seconds: float = LIVE_TURN_HARD_DEADLINE_SECONDS,
-    model_context_window_tokens: int | None = None,
+    llm_context_window_tokens: int | None = None,
     model_supports_vision_override: str | None = None,
 ) -> None:
     tier_override_toml = _render_tier_overrides(tier_overrides)
@@ -400,12 +399,12 @@ def _write_config(
     tier_profile_toml = (
         f'tier_profile = "{provider}"' if provider in LEGACY_PROVIDER_PRESET_IDS else ""
     )
+    llm_context_window_toml = (
+        f"context_window_tokens = {max(1, int(llm_context_window_tokens))}"
+        if llm_context_window_tokens is not None
+        else ""
+    )
     model_override_fields: dict[str, dict[str, Any]] = {}
-    if model_context_window_tokens is not None:
-        model_override_fields.setdefault(model, {})["context_window"] = max(
-            1,
-            int(model_context_window_tokens),
-        )
     if model_supports_vision_override is not None:
         # The offline single-call fixture supplies deployment facts for every
         # configured leg; retired tier switches cannot stand in for metadata.
@@ -467,6 +466,7 @@ model = "{model}"
 api_key_env = "{get_provider_spec(provider).env_key}"
 base_url = "{base_url}"
 max_tokens = {max_tokens}
+{llm_context_window_toml}
 {llm_thinking_toml}
 
 [squilla_router]
@@ -499,8 +499,8 @@ def _tokenrhythm_attachment_tiers() -> dict[str, dict[str, Any]]:
     image_tier = tiers.get("image_model")
     if not isinstance(image_tier, dict):
         raise RuntimeError("TokenRhythm preset has no image_model tier")
-    if image_tier.get("model") != ATTACHMENT_CAPACITY_MODEL:
-        raise RuntimeError("TokenRhythm image_model does not match the verified live fixture")
+    if not str(image_tier.get("model") or "").strip():
+        raise RuntimeError("TokenRhythm image_model has no configured model")
     missing_slots = [
         slot
         for slot in TEXT_PROFILE_SLOTS
@@ -522,13 +522,8 @@ def _attachment_capacity_admission_token_limit(
 ) -> int:
     """Return the exact input ceiling used by this special gate's config."""
 
-    catalog = ModelCatalog()
-    context_window = catalog.resolve_context_window(
-        ATTACHMENT_CAPACITY_MODEL,
-        ATTACHMENT_CAPACITY_PROVIDER,
-    )
     governor = ContextBudgetGovernor.from_values(
-        context_window_tokens=context_window,
+        context_window_tokens=ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS,
         max_output_tokens=ATTACHMENT_CAPACITY_MAX_OUTPUT_TOKENS,
         thinking_budget_tokens=thinking_budget_tokens,
         context_overflow_threshold=0.85,
@@ -542,16 +537,18 @@ def _attachment_capacity_admission_token_limit(
 def _attachment_capacity_request_fits(
     request_input_tokens: int,
     *,
+    model: str,
     thinking_budget_tokens: int,
 ) -> bool:
     """Run the production admission predicate with the special gate's limits."""
 
     return model_has_request_capacity(
         provider=ATTACHMENT_CAPACITY_PROVIDER,
-        model=ATTACHMENT_CAPACITY_MODEL,
+        model=model,
         material_tokens=max(0, int(request_input_tokens)),
         request_input_tokens=max(0, int(request_input_tokens)),
         thinking_budget_tokens=max(0, int(thinking_budget_tokens)),
+        context_window_override_tokens=ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS,
         max_output_override_tokens=ATTACHMENT_CAPACITY_MAX_OUTPUT_TOKENS,
     )
 
@@ -637,6 +634,11 @@ def _upload_inline_attachment(
 def _attachment_capacity_fixture() -> dict[str, Any]:
     """Return isolated synthetic history whose raw envelope falsely exceeds admission."""
 
+    tier_models = {
+        slot: str(tier["model"])
+        for slot, tier in _tokenrhythm_attachment_tiers().items()
+        if slot in TEXT_PROFILE_SLOTS
+    }
     admission_limit = _attachment_capacity_admission_token_limit(thinking_budget_tokens=0)
     max_thinking_admission_limit = _attachment_capacity_admission_token_limit(
         thinking_budget_tokens=MAX_THINKING_BUDGET_TOKENS
@@ -691,16 +693,25 @@ def _attachment_capacity_fixture() -> dict[str, Any]:
         projected_media_tokens = history_media_tokens + estimate_provider_media_tokens(
             "image", len(current_payload), encoded_data=current_attachment["data"]
         )
-        raw_fits = _attachment_capacity_request_fits(
-            raw_tokens,
-            thinking_budget_tokens=0,
+        raw_fits = any(
+            _attachment_capacity_request_fits(
+                raw_tokens,
+                model=model,
+                thinking_budget_tokens=0,
+            )
+            for model in tier_models.values()
         )
-        projected_fits_at_max_thinking = _attachment_capacity_request_fits(
-            projected_media_tokens,
-            thinking_budget_tokens=MAX_THINKING_BUDGET_TOKENS,
+        projected_fits_at_max_thinking = all(
+            _attachment_capacity_request_fits(
+                projected_media_tokens,
+                model=model,
+                thinking_budget_tokens=MAX_THINKING_BUDGET_TOKENS,
+            )
+            for model in tier_models.values()
         )
         fixture = {
             "turns": turns,
+            "tier_models": tier_models,
             "current_attachment": current_attachment,
             "history_base64": [image["data"] for image in images],
             "metrics": {
@@ -1074,6 +1085,9 @@ def _evaluate_attachment_capacity_evidence(
     response_usage = (response.get("payload") or {}).get("usage") or {}
     request_model = str(request.get("model") or "")
     response_model = str(response_usage.get("model") or "")
+    routed_tier = str(router_step.get("routed_tier") or "")
+    configured_tier_models = fixture.get("tier_models") or {}
+    expected_model = str(configured_tier_models.get(routed_tier) or "")
     input_tokens = int(response_usage.get("input_tokens") or 0)
     output_tokens = int(response_usage.get("output_tokens") or 0)
     physical_request_count = int(
@@ -1090,8 +1104,9 @@ def _evaluate_attachment_capacity_evidence(
             not errors,
             request.get("provider") == ATTACHMENT_CAPACITY_PROVIDER,
             response.get("provider") == ATTACHMENT_CAPACITY_PROVIDER,
-            request_model == ATTACHMENT_CAPACITY_MODEL,
-            response_model == ATTACHMENT_CAPACITY_MODEL,
+            bool(expected_model),
+            request_model == expected_model,
+            response_model == request_model,
             router_step.get("routing_source") == "image_route",
             decision.get("image_route_reason") == "current_turn",
             projection.get("history_user_turn_count") == ATTACHMENT_CAPACITY_EXPECTED_HISTORY_TURNS,
@@ -1138,6 +1153,7 @@ def _evaluate_attachment_capacity_evidence(
         "ok": ok,
         "failure_kind": failure_kind,
         "actual_model": request_model,
+        "expected_model": expected_model,
         "actual_request_model": request_model,
         "actual_response_model": response_model,
         "request_count": len(requests),
@@ -1619,9 +1635,9 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
         llm_request_timeout_seconds=ATTACHMENT_CAPACITY_PROVIDER_TIMEOUT_SECONDS,
         agent_runtime_timeout_seconds=ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS,
         turn_hard_deadline_seconds=ATTACHMENT_CAPACITY_AGENT_TIMEOUT_SECONDS,
-        model_context_window_tokens=ATTACHMENT_CAPACITY_BASE_CONTEXT_WINDOW_TOKENS,
+        llm_context_window_tokens=ATTACHMENT_CAPACITY_CONTEXT_WINDOW_TOKENS,
         model_supports_vision_override=(
-            ATTACHMENT_CAPACITY_MODEL if synthetic_vision_capability_override else None
+            str(tiers["c2"]["model"]) if synthetic_vision_capability_override else None
         ),
     )
     port = _free_port()
@@ -1799,7 +1815,7 @@ def _run_tokenrhythm_attachment_capacity_in_temp(
     case = {
         "ok": evidence["ok"],
         "failure_kind": evidence["failure_kind"],
-        "expected_model": ATTACHMENT_CAPACITY_MODEL,
+        "expected_model": str(evidence.get("expected_model") or ""),
         "actual_request_model": actual_request_model,
         "actual_response_model": actual_response_model,
         "usage": usage,

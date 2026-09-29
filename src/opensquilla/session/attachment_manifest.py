@@ -25,6 +25,15 @@ from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Protocol, cast
 
+from opensquilla.contracts.attachment_display import (
+    bounded_attachment_text as _bounded_text,
+)
+from opensquilla.contracts.attachment_display import (
+    normalize_attachment_display_mime as normalize_attachment_mime,
+)
+from opensquilla.contracts.attachment_display import (
+    normalize_attachment_display_name as normalize_attachment_name,
+)
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.models import SessionContextState
 
@@ -41,8 +50,6 @@ MATERIAL_STATES = frozenset(
 
 _ATTACHMENT_ID_RE = re.compile(r"^att_[A-Za-z0-9_-]{8,160}$")
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
-_MAX_NAME_BYTES = 160
-_MAX_MIME_BYTES = 120
 _MAX_REASON_BYTES = 256
 _MAX_MESSAGE_ID_BYTES = 512
 _MAX_MANIFEST_OCCURRENCES = 100_000
@@ -92,46 +99,6 @@ def _field(value: object, name: str, default: object = None) -> object:
     if isinstance(value, Mapping):
         return value.get(name, default)
     return getattr(value, name, default)
-
-
-def _bounded_text(value: object, *, fallback: str, max_bytes: int) -> str:
-    if not isinstance(value, str):
-        return fallback
-    normalized = " ".join(value.strip().split())
-    if not normalized:
-        return fallback
-    # Slice by encoded bytes, not code points, so the serialized state stays
-    # bounded for non-ASCII filenames and MIME-like values.
-    encoded = normalized.encode("utf-8")
-    if len(encoded) <= max_bytes:
-        return normalized
-    return encoded[:max_bytes].decode("utf-8", errors="ignore") or fallback
-
-
-def normalize_attachment_name(value: object, *, fallback: str = "attachment") -> str:
-    """Return a bounded display name safe for a model-visible descriptor."""
-
-    if isinstance(value, str):
-        # Persisted attachment names are display metadata, never storage
-        # locations. Treat both separators as path separators so manifests
-        # created on one platform cannot expose a path when read on another.
-        value = value.strip().replace("\\", "/").rsplit("/", 1)[-1]
-    return _bounded_text(value, fallback=fallback, max_bytes=_MAX_NAME_BYTES)
-
-
-def normalize_attachment_mime(value: object) -> str:
-    """Normalize a MIME value without retaining parameters or control chars."""
-
-    if not isinstance(value, str):
-        return "application/octet-stream"
-    normalized = value.split(";", 1)[0].strip().lower()
-    if "/" not in normalized or any(char in normalized for char in "\r\n"):
-        return "application/octet-stream"
-    return _bounded_text(
-        normalized,
-        fallback="application/octet-stream",
-        max_bytes=_MAX_MIME_BYTES,
-    )
 
 
 def valid_sha256(value: object) -> str | None:

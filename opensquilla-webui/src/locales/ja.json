@@ -392,11 +392,8 @@
     "cron": "スケジュール",
     "skills": "スキル",
     "skillsChannels": "スキル・チャンネル",
-    "overview": "概要",
-    "status": "状態",
     "usage": "使用量",
     "viewUsage": "使用量を表示",
-    "logs": "ログ",
     "settings": "設定",
     "groupBuild": "構築",
     "groupMonitor": "概要",
@@ -460,7 +457,8 @@
       "results": "設定の検索結果",
       "empty": "一致する設定がありません",
       "defaultModel": "既定のモデル",
-      "permissions": "権限"
+      "permissions": "権限",
+      "supportBundle": "サポートバンドルをダウンロード"
     },
     "appearance": {
       "title": "インターフェース",
@@ -725,7 +723,8 @@
     },
     "gateway": {
       "title": "ゲートウェイ",
-      "desc": "ゲートウェイへ接続し、デスクトップではローカルランタイムも管理します。"
+      "desc": "このブラウザーの Gateway 接続を管理します。",
+      "desktopDesc": "Gateway 接続とローカルサービスを管理します。"
     },
     "general": {
       "title": "一般",
@@ -1630,12 +1629,12 @@
       "languageCode": "言語コード"
     },
     "connection": {
-      "title": "接続",
-      "desc": "このブラウザーをゲートウェイに接続します。接続は即時に適用され、保存は不要です。",
+      "title": "Gateway 接続",
+      "desc": "変更後に「接続」または「再接続」をクリックして適用します。",
       "connected": "接続済み",
       "connecting": "接続中",
       "disconnected": "切断済み",
-      "reasonConnected": "ゲートウェイソケットへのライブリンクです。",
+      "reasonConnected": "Gateway に接続済みです。",
       "reasonConnecting": "ゲートウェイに接続しています…",
       "reasonFailed": "前回の試行が失敗しました: {error}",
       "reasonDisconnected": "未接続です。WebSocket URL を確認し、接続をお試しください。",
@@ -1647,8 +1646,11 @@
       "tokenRequired": "トークンが必要です",
       "reasonTokenRequired": "認証に失敗しました。自動再試行を一時停止しました。有効なゲートウェイトークンを入力し、接続を選択してください。",
       "reconnect": "再接続",
+      "editConnection": "接続を変更",
       "connect": "接続",
-      "disconnect": "切断"
+      "disconnect": "切断",
+      "actions": "接続操作",
+      "reasonManagedDisconnected": "クライアントがローカル Gateway に接続されていません。再接続してください。"
     },
     "runtime": {
       "title": "ランタイム",
@@ -1826,7 +1828,15 @@
       "migrationCompleteIndependent": "この Desktop インストールは独立しており、移行元とは同期されません。",
       "migrationCompleteReplacement": "以前の Desktop データは完全なバックアップに保存されています。データ全体を置換し、ファイルやチャットは結合していません。",
       "migrationCompleteShowBackup": "完全なバックアップを表示",
-      "migrationCompleteDismiss": "閉じる"
+      "migrationCompleteDismiss": "閉じる",
+      "localGatewayTitle": "ローカル Gateway",
+      "localGatewayDescription": "デスクトップアプリが起動したローカル Gateway を管理します。",
+      "processStatus": "プロセスの状態",
+      "restartLocalGateway": "ローカル Gateway を再起動",
+      "details": "アドレスとログの場所",
+      "address": "Gateway アドレス",
+      "refreshStatus": "状態を更新",
+      "openLocalLogLocation": "ローカルログの場所を開く"
     },
     "keyboard": {
       "title": "ショートカット",
@@ -1860,9 +1870,6 @@
       "dataMaintenanceDesc": "データのインポートとバックアップを管理します。デスクトップ版ではローカルプロファイルのリセットや削除もできます。",
       "dataMaintenanceAction": "管理",
       "dataMaintenanceAria": "データメンテナンスを開く",
-      "runTraceLabel": "ログの実行トレースドロワー",
-      "runTraceDesc": "ログ行を操作可能にし、ログビューで行ごとのノードステップ詳細ドロワーを開きます。",
-      "runTraceAria": "ログの実行トレースドロワー（再読み込み後に有効）",
       "configFileLabel": "設定ファイル",
       "configFileDesc": "その他のオプションは設定ファイルで変更できます。"
     },
@@ -2364,110 +2371,6 @@
       "abortDone": "実行を中止しました。",
       "abortNone": "中止できるアクティブな実行はありません。",
       "abortFailed": "中止に失敗しました。"
-    },
-    "overview": {
-      "title": "状態",
-      "subtitle": "準備状況、使用量、実行時の健全性を表示します。",
-      "totalTokens": "合計トークン数",
-      "totalSessions": "合計セッション数",
-      "totalSessionsTitle": "すべての状態を含む合計セッション数",
-      "viewAll": "すべて表示 →",
-      "provider": "プロバイダー",
-      "manageAgents": "エージェントを管理 →",
-      "jumpToReadiness": "準備状況レポートに移動",
-      "health": "ヘルス",
-      "uptime": "稼働時間",
-      "healthSummary": "ヘルスの概要",
-      "readiness": "準備状況",
-      "healthContext": "ヘルスレポートのコンテキスト",
-      "ctxGateway": "ゲートウェイ",
-      "ctxConfig": "設定",
-      "ctxRequestedConfig": "要求された設定",
-      "ctxAgent": "エージェント",
-      "needsAction": "対応が必要",
-      "degraded": "劣化",
-      "optional": "任意",
-      "ready": "準備完了",
-      "healthFindings": "ヘルスの検出結果",
-      "loadingHealth": "ヘルスレポートを読み込み中",
-      "noFindings": "検出結果はありません。",
-      "recoveryRestart": "リカバリには再起動が必要です",
-      "openSettings": "設定を開く",
-      "findingDetails": "詳細",
-      "findingFallback": "検出結果 {n}",
-      "copyCommand": "コマンドをコピー",
-      "step": "ステップ",
-      "checking": "確認中",
-      "waitingDoctor": "doctor.status を待機中",
-      "healthUnavailable": "ゲートウェイのヘルスレポートを利用できません",
-      "impact": {
-        "blocksReady": "準備をブロック",
-        "degrades": "劣化",
-        "optional": "任意",
-        "reference": "参考"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "警告ありで準備完了",
-        "ready": "準備完了",
-        "actionRequired": "対応が必要",
-        "degraded": "劣化",
-        "unavailable": "利用不可"
-      },
-      "badge": {
-        "diagnostic": "診断が未完了",
-        "repair": "修復が保留中",
-        "config": "設定の不一致"
-      },
-      "dotStatus": {
-        "active": "アクティブ",
-        "ready": "準備完了",
-        "ok": "OK",
-        "paused": "一時停止",
-        "degraded": "劣化",
-        "warn": "警告",
-        "error": "エラー",
-        "failed": "失敗",
-        "closed": "クローズ",
-        "ended": "終了",
-        "offline": "オフライン",
-        "unknown": "不明"
-      },
-      "group": {
-        "action": {
-          "title": "対応が必要",
-          "note": "OpenSquilla を準備完了にするため、まずこれらを修正してください。"
-        },
-        "degraded": {
-          "title": "劣化している機能",
-          "note": "OpenSquilla は動作できますが、これらの機能には対応が必要です。"
-        },
-        "optional": {
-          "title": "任意のセットアップ",
-          "note": "これらは機能や運用態勢を向上させますが、準備状況をブロックしません。"
-        },
-        "ready": {
-          "title": "準備完了のチェック",
-          "note": "これらの項目はすでに動作しています。"
-        }
-      },
-      "gw": {
-        "cannotLoad": "{url} から doctor.status を読み込めません。{reason}",
-        "inspectRemote": "リモートゲートウェイを確認",
-        "repairRemote": "リモートデプロイを修復",
-        "repairRemoteDetail": "リモートの OpenSquilla ゲートウェイデプロイを開始または修復し、ヘルスを更新します。",
-        "runLocalDoctor": "ローカル doctor を実行",
-        "runLocalDoctorDetail": "ゲートウェイを再起動する前に、ローカルの設定とオンボーディングを確認します。",
-        "startLocal": "ローカルゲートウェイを起動",
-        "inspectLocal": "ローカルゲートウェイを確認"
-      },
-      "checkedAgo": "{time}に確認",
-      "rerunChecks": "再チェック",
-      "copyDiagnostics": "診断 JSON をコピー",
-      "copiedDiagnostics": "診断 JSON をコピーしました",
-      "diagnoseWithAgent": "エージェントで診断",
-      "diagnosePrompt": "以下のクライアントコンテキストと doctor レポートをもとに、この OpenSquilla 設定を診断してください。利用可能なアプリ内 Settings を優先し、hasTerminalWorkflow が false の場合は裸の opensquilla コマンドを提案しないでください。Desktop が所有する gateway はアプリが管理します。データ転送はバックアップ後の全体置換であり、マージではありません。任意の移行項目は障害ではなく、転送後も表示される場合があります。説明と案内だけを行い、移行、gateway の再起動、設定の書き込み、変更を実行したとの主張はしないでください。",
-      "environment": "環境",
-      "latency": "レイテンシ"
     }
   },
   "console": {
@@ -2707,12 +2610,6 @@
         "botIdCopied": "Bot ID をコピーしました",
         "eventSubscriptionTitle": "飛書のイベント購読を確認"
       }
-    },
-    "overview": {
-      "channelsChip": "チャンネル",
-      "channelsChipConnected": "{connected} 接続済み",
-      "channelsChipFailed": "{failed} 失敗",
-      "channelsChipPending": "承認待ち {pending} 件"
     }
   },
   "cronSkills": {
@@ -3252,17 +3149,23 @@
       "tileNotDeclaredHint": "マニフェストなし"
     }
   },
+  "gatewayLogs": {
+    "viewLogs": "最近のログを表示",
+    "title": "Gateway ログ",
+    "description": "接続中の Gateway の最新 200 行です。更新ボタンで最新の内容を取得できます。",
+    "refresh": "更新",
+    "loading": "ログを読み込み中…",
+    "empty": "最近のログはありません。",
+    "failed": "ログを読み込めませんでした。接続と Gateway の権限を確認して再試行してください。",
+    "connectionRequired": "ログを表示するには Gateway に接続してください。",
+    "authenticationRequired": "ログを表示するには Gateway の認証が必要です。",
+    "saveCurrentLogs": "現在のログを保存",
+    "saveFailed": "ログを保存できませんでした。もう一度お試しください。"
+  },
   "monitorSupport": {
     "title": "サポートと診断",
-    "menuLabel": "サポートと診断の操作",
-    "viewLogs": "実行ログを表示",
-    "viewLogsDescription": "最近のゲートウェイ出力とエラーを確認します",
-    "copyReport": "現在の準備状況レポートをコピー",
-    "copyReportDescription": "現在の接続、設定、実行状態を共有します",
-    "copySuccess": "準備状況レポートをコピーしました",
-    "copyFailed": "準備状況レポートをコピーできませんでした：{error}",
     "downloadBundle": "機密情報を除去したサポートバンドルをダウンロード",
-    "downloadBundleDescription": "ログ、設定の要約、診断結果が含まれます",
+    "downloadBundleDescription": "接続中の Gateway のログ、設定概要、診断結果を含みます。",
     "privacySummary": "会話内容はデフォルトで除外され、既知の認証情報は除去されます",
     "bundleTitle": "機密情報を除去したサポートバンドルをダウンロード",
     "bundleSubtitle": "OpenSquilla サポートと共有するための ZIP ファイルを作成します。",
@@ -3280,7 +3183,10 @@
     "bundleConfirm": "生成してダウンロード",
     "bundleCancel": "キャンセル",
     "bundleFailed": "サポートバンドルをダウンロードできませんでした",
-    "bundleReady": "サポートバンドルをダウンロードしました"
+    "bundleReady": "サポートバンドルをダウンロードしました",
+    "bundleConnectionRequired": "サポートバンドルをダウンロードするには Gateway に接続してください。",
+    "bundleOwnerRequired": "サポートバンドルをダウンロードできるのは Gateway のローカル所有者のみです。",
+    "bundleDifferentGateway": "接続中の Gateway 自身の WebUI を開いて、サポートバンドルをダウンロードしてください。"
   },
   "usageLogs": {
     "tasks": {
@@ -3424,51 +3330,6 @@
     },
     "errors": {
       "loadFailed": "使用量の読み込みに失敗しました"
-    },
-    "logs": {
-      "breadcrumbLabel": "パンくずリスト",
-      "title": "ログ",
-      "subtitle": "ライブのゲートウェイログストリームです — フィルターと追従ができます。",
-      "statusUnavailable": "ログの状態を利用できません",
-      "statusUnavailableAria": "ログの状態を利用できません。ログの追従は引き続き動作します。",
-      "statusUnavailableTitle": "logs.status は利用できません。ログの追従は引き続き動作します。",
-      "fileLogOn": "ファイルログ オン",
-      "fileLogOff": "ファイルログ オフ",
-      "fileLogTitle": "ゲートウェイのファイルログは log_file_enabled、log_level、rotation 設定、OPENSQUILLA_LOG_DIR で設定できます。パス: {path}。",
-      "fileLogOffTitle": "ログはディスクに書き込まれず、診断バンドルに履歴が含まれなくなります。設定で log_file_enabled を有効にしてください。パス: {path}。",
-      "rawOn": "生キャプチャ オン",
-      "rawOff": "生キャプチャ オフ",
-      "rawRecordingPill": "生キャプチャを記録中",
-      "rawTitle": "生キャプチャは、会話内容を含むモデルへのリクエストとレスポンスの全文を記録します。OPENSQUILLA_TURN_CALL_LOG=1 または opensquilla diagnostics on --raw で有効化し、opensquilla diagnostics off で無効化します。ソース: {source}。ディレクトリ: {path}。",
-      "bundleButton": "診断バンドル",
-      "bundleButtonTitle": "機密情報を除去した診断バンドルをダウンロード",
-      "bundleTitle": "診断バンドルをダウンロード",
-      "bundleBody": "ゲートウェイのログ、エラー記録、機密情報を除去した設定を 1 つの zip にまとめ、バグ報告に添付できます。シークレットと API キーは削除されます。会話内容は、下でオプトインしない限り含まれません。",
-      "bundleIncludeContent": "会話内容を含める（プロンプトと応答）",
-      "bundleConfirm": "ダウンロード",
-      "bundleCancel": "キャンセル",
-      "bundleFailed": "診断のダウンロードに失敗しました",
-      "bundleReady": "診断バンドルをダウンロードしました",
-      "inView": "表示中",
-      "ofLoaded": "/ 読み込み済み {total} 件",
-      "errors": "エラー",
-      "reviewNeeded": "要確認",
-      "allClear": "問題なし",
-      "warnings": "警告",
-      "recentAdvisories": "最近の注意事項",
-      "none": "なし",
-      "infoDebug": "情報 / デバッグ",
-      "routineOutput": "通常の出力",
-      "levels": "レベル",
-      "filterPlaceholder": "メッセージを絞り込む…",
-      "autoFollow": "自動追従",
-      "loading": "ログを読み込み中…",
-      "empty": "実行ログはまだありません。",
-      "loadFailed": "実行ログを読み込めませんでした。",
-      "retry": "再試行",
-      "noMatch": "現在のフィルターに一致する行はありません。",
-      "lineDetail": "ログ行の詳細",
-      "ofLoadedFoot": "表示中 {visible} 件 · バッファ {total} 件"
     }
   },
   "chat": {

@@ -535,7 +535,7 @@ import { fileTypeLabel } from '@/utils/fileType'
 interface ChatComposerExpose {
   composerElement: () => HTMLElement | null
   canCollapse: () => boolean
-  focusTextarea: () => void
+  focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
 }
@@ -1011,13 +1011,20 @@ function documentCanReceiveFocus(): boolean {
   return document.visibilityState === 'visible' && document.hasFocus()
 }
 
-function focusTextarea() {
+function focusTextarea(options?: { preserveFocus?: boolean }) {
   // Programmatic focus must never reactivate a background/minimized browser
   // window. Recheck inside nextTick because the page can lose focus between
   // scheduling and execution (GitHub issue 382).
-  if (!documentCanReceiveFocus()) return
+  const canFocus = () => {
+    if (!documentCanReceiveFocus()) return false
+    if (!options?.preserveFocus) return true
+    const active = document.activeElement
+    return !active || active === document.body || active === document.documentElement
+      || active === textareaEl.value || !document.contains(active)
+  }
+  if (!canFocus()) return
   nextTick(() => {
-    if (documentCanReceiveFocus()) textareaEl.value?.focus()
+    if (canFocus()) textareaEl.value?.focus()
   })
 }
 

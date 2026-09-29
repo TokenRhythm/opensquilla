@@ -127,6 +127,9 @@ export const useRpcStore = defineStore('rpc', () => {
   let deliveryTargetId = ''
   let deliveryProof: Record<string, unknown> | null = null
   let browserConnectionUrl = ''
+  // Track the endpoint admitted by this tab's connection owner, independently
+  // of cross-tab localStorage edits. The ref keeps capability guards reactive.
+  const connectionEndpoint = ref<string | null>(null)
   let browserAuthToken = ''
   let desktopConnectionRevision = -1
   let desktopConnectionKey = ''
@@ -257,6 +260,7 @@ export const useRpcStore = defineStore('rpc', () => {
     const provenAuth = sameTarget && state.value === 'connected' ? auth.value : null
     beginDeliveryIntent(JSON.stringify(['browser', url, token || '']))
     browserConnectionUrl = url
+    connectionEndpoint.value = url
     browserAuthToken = token || ''
     if (!sameTarget) clearConnectionIdentity()
     client.value?.connect(url, token)
@@ -290,6 +294,7 @@ export const useRpcStore = defineStore('rpc', () => {
         error.value = payload.error || 'Gateway is not ready to connect'
         return
       }
+      connectionEndpoint.value = null
       desktopConnectionKey = ''
       if (desktopAuthToken) {
         try {
@@ -308,6 +313,7 @@ export const useRpcStore = defineStore('rpc', () => {
     const nextAuthToken = typeof payload.authToken === 'string'
       ? payload.authToken.trim()
       : ''
+    connectionEndpoint.value = nextUrl
     const nextKey = `${payload.profileFingerprint}\0${nextInstance}\0${nextUrl}`
     const explicitRestart = manual && (
       client.value?.lifecycle === 'stopped' || client.value?.lifecycle === 'blocked'
@@ -488,6 +494,7 @@ export const useRpcStore = defineStore('rpc', () => {
     isResuming.value = false
     resumeSource.value = null
     desktopConnectionKey = ''
+    connectionEndpoint.value = null
     state.value = 'disconnected'
     clearConnectionIdentity()
   }
@@ -601,6 +608,7 @@ export const useRpcStore = defineStore('rpc', () => {
     isLocalOwner,
     canManageProjectWorkspaces,
     canChooseProject,
+    getConnectionEndpoint: () => connectionEndpoint.value,
     init,
     connect,
     applyLinkTokenFromUrl,

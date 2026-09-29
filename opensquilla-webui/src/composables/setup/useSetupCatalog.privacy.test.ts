@@ -104,6 +104,7 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
     detachedSessionHydration: false,
     turnCommittedEvents: false,
     subscriptionEpoch: 0,
+    supportBundleUnavailableReason: null,
     loadConnectionEndpoint: () => 'ws://example.invalid/ws',
     connect: async () => undefined,
     disconnect: () => undefined,
