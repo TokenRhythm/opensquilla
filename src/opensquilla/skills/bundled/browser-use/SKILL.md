@@ -15,6 +15,14 @@ triggers:
 metadata:
   opensquilla:
     risk: medium
+    requires_tools:
+      - mcp__desktop-browser__browser_tabs
+      - mcp__desktop-browser__browser_open
+      - mcp__desktop-browser__browser_navigate
+      - mcp__desktop-browser__browser_reload
+      - mcp__desktop-browser__browser_inspect
+      - mcp__desktop-browser__browser_act
+      - mcp__desktop-browser__browser_screenshot
     capabilities:
       - browser-automation
       - network-read

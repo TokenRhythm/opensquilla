@@ -1139,6 +1139,32 @@ describe('unified skill palette', () => {
     expect(manageSkill).toHaveBeenCalledWith('browser-use')
     expect(selectedSkills.value).toEqual([])
   })
+  it('reports unavailable tool requirements without sending users to Skill settings', async () => {
+    await loadLocaleMessages('en')
+    const selectedSkills = ref<SelectedSkillRef[]>([])
+    const manageSkill = vi.fn()
+    const notify = vi.fn()
+    const browser = {
+      ...candidate, name: 'browser-use', ready: false, reasonCode: 'tools_unavailable',
+    }
+    const listCandidates = vi.fn(async () => ({ generation: 1, candidates: [browser] }))
+    const { api, inputText } = harness(false, [], Promise.resolve(), undefined, {
+      selectedSkills, manageSkill, notify,
+      skillCatalog: { supportsCandidates: () => true, listCandidates } as unknown as SkillCatalog,
+    })
+
+    expect(await api.selectSkillByName('browser-use')).toBe(false)
+    expect(notify).toHaveBeenCalledWith('Required tools unavailable')
+    expect(manageSkill).not.toHaveBeenCalled()
+    expect(selectedSkills.value).toEqual([])
+
+    inputText.value = '/browser-use'
+    api.handleSlashInput()
+    await Promise.resolve()
+    api.completeSlashCmd(api.filteredSlashCmds.value[0]!)
+    expect(manageSkill).not.toHaveBeenCalled()
+    expect(selectedSkills.value).toEqual([])
+  })
   it('does not turn disabled candidates into selected skills', async () => {
     const manageSkill = vi.fn()
     const { api, inputText, selectedSkills } = skills({ manageSkill })

@@ -1,16 +1,23 @@
 """Manual candidates stay lightweight and independent from model discovery."""
 
 import json
+from pathlib import Path
 
 import pytest
 
 from opensquilla.gateway import rpc_skills
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext
+from opensquilla.mcp.desktop_browser import browser_tool_policy
+from opensquilla.mcp.discovery import close_active_clients, register_client_tools
+from opensquilla.mcp.types import MCPServerConfig, MCPToolDef
 from opensquilla.skills import eligibility
 from opensquilla.skills.loader import SkillLoader
+from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
 from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import ToolSpec
+
+BUNDLED = Path(__file__).resolve().parents[2] / "src" / "opensquilla" / "skills" / "bundled"
 
 
 @pytest.fixture
@@ -122,6 +129,107 @@ async def test_candidates_require_wired_tool_capability(
     assert row["ready"] is available
     if not available:
         assert row["reasonCode"] == "tools_unavailable"
+
+
+async def test_browser_candidate_tracks_registered_and_authorized_tools(
+    skill_context, tmp_path, monkeypatch,
+):
+    skill_context.skill_loader = SkillLoader(
+        bundled_dir=BUNDLED, snapshot_path=tmp_path / "bundled-snapshot.json",
+    )
+    monkeypatch.setattr("opensquilla.browser.get_desktop_browser", lambda: object())
+    registry = skill_context.tool_registry
+    required = {f"mcp__desktop-browser__{name}" for name in BROWSER_MCP_REQUIRED_TOOLS}
+    spec = skill_context.skill_loader.snapshot_for_turn("test").get_by_name("browser-use")
+    assert spec is not None
+    assert set(spec.requires_tools) == required
+
+    async def candidate():
+        result = await rpc_skills._handle_skills_candidates(
+            {"sessionKey": "agent:main:webchat:synthetic"}, skill_context,
+        )
+        return next(row for row in result["candidates"] if row["name"] == "browser-use")
+
+    assert (await candidate())["reasonCode"] == "tools_unavailable"
+    for name in BROWSER_MCP_REQUIRED_TOOLS:
+        registry.register(
+            browser_tool_policy(
+                MCPToolDef(name, "Synthetic browser tool", {"type": "object"}),
+                ToolSpec(f"mcp__desktop-browser__{name}", "Synthetic browser tool", {}),
+            ),
+            lambda: "",
+        )
+    assert (await candidate())["ready"] is True
+
+    registry.unregister("mcp__desktop-browser__browser_open")
+    assert (await candidate())["reasonCode"] == "tools_unavailable"
+    registry.register(
+        ToolSpec("mcp__desktop-browser__browser_open", "Synthetic browser tool", {}),
+        lambda: "",
+    )
+    skill_context.config.tools.deny = ["mcp__desktop-browser__*"]
+    assert (await candidate())["reasonCode"] == "tools_unavailable"
+    skill_context.config.tools.deny = []
+    monkeypatch.setattr("opensquilla.browser.get_desktop_browser", lambda: None)
+    assert (await candidate())["reasonCode"] == "tools_unavailable"
+
+
+async def test_browser_registration_failure_clears_candidate_readiness(
+    skill_context, tmp_path, monkeypatch,
+):
+    skill_context.skill_loader = SkillLoader(
+        bundled_dir=BUNDLED, snapshot_path=tmp_path / "bundled-snapshot.json",
+    )
+    monkeypatch.setattr("opensquilla.browser.get_desktop_browser", lambda: object())
+
+    class BrowserCatalogClient:
+        config = MCPServerConfig(name="desktop-browser", transport="streamable-http")
+
+        async def connect(self):
+            pass
+
+        async def list_tools(self):
+            return [
+                MCPToolDef(name, "Synthetic browser tool", {"type": "object", "properties": {}})
+                for name in sorted(BROWSER_MCP_REQUIRED_TOOLS)
+            ]
+
+        async def close(self):
+            pass
+
+    registry = skill_context.tool_registry
+    original_register = registry.register
+
+    def fail_mid_registration(spec, handler):
+        if spec.name == "mcp__desktop-browser__browser_navigate":
+            raise RuntimeError("synthetic registration fault")
+        original_register(spec, handler)
+
+    monkeypatch.setattr(registry, "register", fail_mid_registration)
+    with pytest.raises(RuntimeError, match="synthetic registration fault"):
+        await register_client_tools(
+            BrowserCatalogClient(), registry, spec_transform=browser_tool_policy,
+        )
+    assert not any(name.startswith("mcp__desktop-browser__") for name in registry.list_names())
+    result = await rpc_skills._handle_skills_candidates(
+        {"sessionKey": "agent:main:webchat:synthetic"}, skill_context,
+    )
+    row = next(item for item in result["candidates"] if item["name"] == "browser-use")
+    assert row["ready"] is False
+    assert row["reasonCode"] == "tools_unavailable"
+
+    monkeypatch.setattr(registry, "register", original_register)
+    try:
+        await register_client_tools(
+            BrowserCatalogClient(), registry, spec_transform=browser_tool_policy,
+        )
+        result = await rpc_skills._handle_skills_candidates(
+            {"sessionKey": "agent:main:webchat:synthetic"}, skill_context,
+        )
+        row = next(item for item in result["candidates"] if item["name"] == "browser-use")
+        assert row["ready"] is True
+    finally:
+        await close_active_clients(owner="desktop-browser")
 
 
 async def test_set_enabled_changes_only_requested_name(skill_context):

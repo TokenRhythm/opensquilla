@@ -21,6 +21,7 @@ from opensquilla.skills.catalog_policy import (
 )
 from opensquilla.skills.loader import SkillLoader
 from opensquilla.skills.types import SkillLayer, SkillSpec
+from opensquilla.tools.browser_policy import BROWSER_MCP_REQUIRED_TOOLS
 from opensquilla.tools.builtin import skill_tools as skill_tools_module
 from opensquilla.tools.registry import get_default_registry
 from opensquilla.tools.types import current_meta_skill_owner
@@ -50,6 +51,8 @@ def _ctx(loader: SkillLoader, *, coding_mode: bool = False, meta_auto: bool = Tr
             SimpleNamespace(name="background_process"),
             SimpleNamespace(name="exec_command"),
             SimpleNamespace(name="process"),
+            *(SimpleNamespace(name=f"mcp__desktop-browser__{name}")
+              for name in BROWSER_MCP_REQUIRED_TOOLS),
         ],
         system_prompt=("base", "dynamic"),
         skill_catalog=snapshot,
@@ -107,6 +110,24 @@ async def test_prompt_contains_public_eight_then_stable_meta_only(tmp_path: Path
 async def test_manual_meta_mode_removes_meta_roots_from_prompt(tmp_path: Path) -> None:
     output = await resolve_skill_catalog(_ctx(_loader(tmp_path), meta_auto=False))
     assert _rendered_names(output.system_prompt[0]) == list(PUBLIC_BUNDLED_SKILLS)
+
+
+@pytest.mark.asyncio
+async def test_browser_skill_requires_its_browser_tools_in_the_turn(tmp_path: Path) -> None:
+    loader = _loader(tmp_path)
+    available = _ctx(loader)
+    assert "browser-use" in _rendered_names(
+        (await resolve_skill_catalog(available)).system_prompt[0]
+    )
+
+    missing = _ctx(loader)
+    missing.tool_defs = [
+        tool for tool in missing.tool_defs
+        if tool.name != "mcp__desktop-browser__browser_open"
+    ]
+    assert "browser-use" not in _rendered_names(
+        (await resolve_skill_catalog(missing)).system_prompt[0]
+    )
 
 
 @pytest.mark.asyncio

@@ -658,6 +658,7 @@ const emit = defineEmits<{
   setCollaborationMode: [mode: CollaborationMode]
   armGoal: []
   selectBrowserUse: []
+  openAddMenu: []
   disarmGoal: []
   cancelReplan: []
   voiceInput: []
@@ -952,6 +953,7 @@ function toggleMoreActions() {
 function toggleAddMenu() {
   addMenuOpen.value = !addMenuOpen.value
   if (addMenuOpen.value) {
+    emit('openAddMenu')
     moreActionsOpen.value = false
     modelRoutingOpen.value = false
     runModeOpen.value = false

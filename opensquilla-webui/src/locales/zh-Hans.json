@@ -3747,6 +3747,7 @@
       "loadFailed": "技能加载失败，关闭并重新打开菜单可重试。",
       "disabled": "已禁用 · 管理",
       "needsSetup": "需要准备 · 管理",
+      "toolsUnavailable": "所需工具不可用",
       "manualOnly": "仅手动使用",
       "thisMessage": "本条消息",
       "remove": "从本条消息移除 {name}",

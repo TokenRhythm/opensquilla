@@ -50,7 +50,9 @@ async function installWorkbenchGateway(
   sends: Record<string, unknown>[] = [],
   delayedDrafts?: { requested: boolean; release?: () => void },
   delayedSkills?: { requested: boolean; release?: () => void },
+  browserCandidates: Record<string, unknown> = BROWSER_SKILL_CANDIDATES,
 ) {
+  let candidateRequests = 0
   await page.route('**/api/**', route => route.fulfill({
     status: 404,
     body: 'Unmocked Workbench API request',
@@ -182,12 +184,16 @@ async function installWorkbenchGateway(
         }))
         return
       }
-      if (method === 'skills.candidates' && delayedSkills && !delayedSkills.requested) {
-        delayedSkills.requested = true
-        delayedSkills.release = () => ws.send(JSON.stringify({
-          type: 'res', id: frame.id, ok: true, payload: BROWSER_SKILL_CANDIDATES,
-        }))
-        return
+      if (method === 'skills.candidates') {
+        candidateRequests += 1
+        requests.set(method, candidateRequests)
+        if (delayedSkills && candidateRequests === 2) {
+          delayedSkills.requested = true
+          delayedSkills.release = () => ws.send(JSON.stringify({
+            type: 'res', id: frame.id, ok: true, payload: browserCandidates,
+          }))
+          return
+        }
       }
       const params = frame.params as Record<string, unknown> | undefined
       const key = String(params?.key || params?.sessionKey || SESSION_KEY)
@@ -209,7 +215,7 @@ async function installWorkbenchGateway(
         'sessions.messages.snapshot': sessionMessagesSnapshotPayload(key),
         'sessions.messages.hydrate': sessionMessagesHydratePayload(key),
         'sandbox.run_mode.preference.get': { runMode: 'full', source: 'config' },
-        'skills.candidates': BROWSER_SKILL_CANDIDATES,
+        'skills.candidates': browserCandidates,
         'usage.status': { sessions: [] },
       }
       ws.send(JSON.stringify({
@@ -408,6 +414,12 @@ async function deliverablesHeaderAction(page: Page): Promise<Locator> {
   return action
 }
 
+async function openNewWorkbenchDraft(page: Page) {
+  await page.goto(CONTROL_URL + 'chat?session=' + encodeURIComponent(SESSION_KEY))
+  await page.getByRole('button', { name: 'New task', exact: true }).click()
+  await expect(page).toHaveURL(/\/chat\/new/)
+}
+
 async function tabUntilFocused(page: Page, target: Locator, attempts = 8) {
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     await page.keyboard.press('Tab')
@@ -485,7 +497,7 @@ test.describe('Application Workbench', () => {
       window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
     })
     await installWorkbenchGateway(page, new Map(), [], sends)
-    await page.goto(CONTROL_URL + 'chat/new')
+    await openNewWorkbenchDraft(page)
 
     const composer = page.locator('.chat-textarea')
     await composer.fill('Inspect the release notes in the browser.')
@@ -508,6 +520,40 @@ test.describe('Application Workbench', () => {
     }])
   })
 
+  test('hides the Browser Use shortcut when its required tools are unavailable', async ({ page }) => {
+    const requests = new Map<string, number>()
+    await installDesktopWorkbenchV2Bridge(page)
+    await page.addInitScript(() => {
+      window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
+    })
+    const browserCandidates: Record<string, unknown> = {
+      generation: 1, candidates: [...BROWSER_SKILL_CANDIDATES.candidates],
+    }
+    await installWorkbenchGateway(page, requests, [], [], undefined, undefined, browserCandidates)
+    await openNewWorkbenchDraft(page)
+
+    await page.getByRole('button', { name: 'Add', exact: true }).click()
+    await expect.poll(() => requests.get('skills.candidates')).toBe(1)
+    const addButton = page.getByRole('button', { name: 'Add', exact: true })
+    let menu = page.getByRole('menu', { name: 'Add', exact: true })
+    await expect(menu.getByRole('menuitem', { name: /^Browser Use\b/ })).toBeVisible()
+    await addButton.click()
+    browserCandidates.candidates = [{
+      ...BROWSER_SKILL_CANDIDATES.candidates[0],
+      ready: false,
+      reasonCode: 'tools_unavailable',
+      reason: 'Required tools are unavailable in this conversation.',
+    }]
+    await addButton.click()
+    await expect.poll(() => requests.get('skills.candidates')).toBe(2)
+    menu = page.getByRole('menu', { name: 'Add', exact: true })
+    await expect(menu.getByRole('menuitem', { name: /^Browser Use\b/ })).toHaveCount(0)
+
+    await page.locator('.chat-textarea').fill('/browser-use')
+    await expect(page.getByRole('option', { name: /browser-use/ }))
+      .toContainText('Required tools unavailable')
+  })
+
   test('keeps the draft unsent while Browser Use selection is pending', async ({ page }) => {
     const sends: Record<string, unknown>[] = []
     const delayedSkills: { requested: boolean; release?: () => void } = { requested: false }
@@ -516,7 +562,7 @@ test.describe('Application Workbench', () => {
       window.OPENSQUILLA_FEATURES = { ...(window.OPENSQUILLA_FEATURES || {}), artifactWorkbench: true }
     })
     await installWorkbenchGateway(page, new Map(), [], sends, undefined, delayedSkills)
-    await page.goto(CONTROL_URL + 'chat/new')
+    await openNewWorkbenchDraft(page)
 
     const composer = page.locator('.chat-textarea')
     await composer.fill('Inspect this page.')

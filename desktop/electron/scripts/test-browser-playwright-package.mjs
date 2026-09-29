@@ -81,6 +81,8 @@ try {
   driver = new BrowserPlaywrightDriver(view.webContents, () => pointerVisible)
   await driver.pointer.setTask('synthetic-package-turn')
   await driver.pointer.touch()
+  assert.equal(await view.webContents.executeJavaScript('Boolean(document.getElementById("__opensquilla-browser-pointer"))'), false,
+    'the packaged browser must start without an agent cursor')
   const signal = new AbortController().signal
   let snapshot = await driver.snapshot(1, () => {}, signal)
   assert.equal(view.webContents.getBackgroundThrottling(), true)
@@ -141,9 +143,9 @@ try {
   await driver.act({ action: 'click', ref: preserved.refs.find(node => node.name === 'Increment').ref }, 1, () => {}, signal)
   assert.equal(view.webContents.getBackgroundThrottling(), false)
   assert.equal(await view.webContents.executeJavaScript('Boolean(document.getElementById("__opensquilla-browser-pointer"))'), true)
-  await new Promise(resolve => setTimeout(resolve, 1_700))
-  assert.equal(await view.webContents.executeJavaScript('Boolean(document.getElementById("__opensquilla-browser-pointer"))'), true,
-    'the active task cursor must survive idle time under strict CSP')
+  await new Promise(resolve => setTimeout(resolve, 2_300))
+  assert.equal(await view.webContents.executeJavaScript('Boolean(document.getElementById("__opensquilla-browser-pointer"))'), false,
+    'the active task cursor must hide after idle time under strict CSP')
   await driver.pointer.setTask(null)
   await new Promise(resolve => setTimeout(resolve, 260))
   assert.equal(await view.webContents.executeJavaScript('Boolean(document.getElementById("__opensquilla-browser-pointer"))'), false,

@@ -1,6 +1,8 @@
 import type { WebContents } from 'electron'
 import { browserPointerRenderer, clearBrowserPointer, type BrowserPointerPayload } from './browser-pointer.js'
 
+const POINTER_IDLE_MS = 2_000
+
 /** Keeps visual state separate from input dispatch and document lifetime. */
 export class BrowserPointerController {
   private taskId: string | null = null
@@ -8,6 +10,7 @@ export class BrowserPointerController {
   private touched = false
   private lastTouchedTaskId: string | null = null
   private position: { x: number; y: number } | undefined
+  private visibleUntil = 0
   private ready = true
   private disposed = false
   private generation = 0
@@ -24,6 +27,7 @@ export class BrowserPointerController {
     this.generation++
     this.taskId = taskId
     this.touched = keepTouched
+    this.visibleUntil = 0
     if (keepTouched) this.lastTouchedTaskId = taskId
     await this.clear(taskId === null)
     if (keepTouched) await this.sync()
@@ -60,33 +64,46 @@ export class BrowserPointerController {
     return this.enqueue(() => this.evaluate(`(${clearBrowserPointer.toString()})(${fade})`))
   }
 
-  async update(payload: BrowserPointerPayload): Promise<void> {
+  async update(payload: Omit<BrowserPointerPayload, 'hideAfterMs'>): Promise<void> {
+    const moved = !this.position || this.position.x !== payload.x || this.position.y !== payload.y
     this.position = { x: payload.x, y: payload.y }
+    if (this.canShow()) {
+      if (moved || (payload.action !== 'move' && payload.action !== 'scroll')) {
+        this.visibleUntil = Date.now() + POINTER_IDLE_MS
+      }
+    } else this.visibleUntil = 0
     const generation = this.generation
     await this.enqueue(async () => {
       if (generation !== this.generation) return
-      if (!this.canShow()) {
+      if (!this.canShow() || this.visibleUntil <= Date.now()) {
         await this.evaluate(`(${clearBrowserPointer.toString()})()`)
         return
       }
       await this.evaluate(`(${browserPointerRenderer.toString()})(${JSON.stringify({
-        ...payload, persistent: this.persistent(),
+        ...payload, hideAfterMs: this.visibleUntil - Date.now(),
       })})`)
     })
   }
 
   async sync(): Promise<void> {
-    if (this.persistent() && this.canShow()) {
-      if (!this.position) {
-        await this.enqueue(async () => {
-          if (this.position || !this.canShow()) return
-          const center = await this.contents.executeJavaScriptInIsolatedWorld(1004, [{
-            code: '({ x: innerWidth / 2, y: innerHeight / 2 })',
-          }]) as { x: number; y: number }
-          if (!this.position && Number.isFinite(center?.x) && Number.isFinite(center?.y)) this.position = center
-        })
-      }
-      if (this.position) await this.update({ ...this.position, action: 'idle', immediate: true })
+    if (!this.position && this.persistent() && this.canShow()) {
+      await this.enqueue(async () => {
+        if (this.position || !this.canShow()) return
+        const center = await this.contents.executeJavaScriptInIsolatedWorld(1004, [{
+          code: '({ x: innerWidth / 2, y: innerHeight / 2 })',
+        }]) as { x: number; y: number }
+        if (!this.position && Number.isFinite(center?.x) && Number.isFinite(center?.y)) this.position = center
+      })
+    }
+    if (this.position && this.visibleUntil > Date.now() && this.canShow()) {
+      const position = this.position
+      const generation = this.generation
+      await this.enqueue(async () => {
+        if (generation !== this.generation || !this.canShow() || this.visibleUntil <= Date.now()) return
+        await this.evaluate(`(${browserPointerRenderer.toString()})(${JSON.stringify({
+          ...position, action: 'idle', immediate: true, hideAfterMs: this.visibleUntil - Date.now(),
+        })})`)
+      })
     } else await this.clear()
   }
 
@@ -95,6 +112,7 @@ export class BrowserPointerController {
   navigationStarted(): void {
     this.generation++
     this.ready = false
+    this.visibleUntil = 0
     void this.clear()
   }
 
@@ -119,6 +137,7 @@ export class BrowserPointerController {
     this.taskId = null
     this.touched = false
     this.lastTouchedTaskId = null
+    this.visibleUntil = 0
     await this.clear()
   }
 }

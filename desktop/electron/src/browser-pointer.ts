@@ -3,7 +3,7 @@ export interface BrowserPointerPayload {
   y: number
   action: string
   immediate?: boolean
-  persistent?: boolean
+  hideAfterMs: number
 }
 
 /** Self-contained so CDP can run the same renderer in an isolated world. */
@@ -87,7 +87,6 @@ export function browserPointerRenderer(payload: BrowserPointerPayload): void {
   }
   const token = `${Date.now()}-${Math.random()}`
   host.dataset.pointerToken = token
-  if (payload.persistent) return
   const current = host
   setTimeout(() => {
     if (current.dataset.pointerToken !== token) return
@@ -95,7 +94,7 @@ export function browserPointerRenderer(payload: BrowserPointerPayload): void {
     setTimeout(() => {
       if (current.dataset.pointerToken === token) current.remove()
     }, 180)
-  }, 1_350)
+  }, payload.hideAfterMs)
 }
 
 /** Screenshots must show website pixels without the transient action cursor. */

@@ -66,6 +66,25 @@ try {
     globalThis.pointerFixture = record
   }, origin)
 
+  const initialPointer = await app.evaluate(async () => {
+    const f = globalThis.pointerFixture
+    return { present: await f.read('!!document.getElementById("__opensquilla-browser-pointer")'),
+      position: f.driver.pointer.currentPosition() }
+  })
+  assert.equal(initialPointer.present, false, 'browser use must start without a visible agent cursor')
+  assert.deepEqual(initialPointer.position, { x: 400, y: 300 },
+    'the hidden initial position must still anchor the first mouse trajectory')
+  const initialScrollPointer = await app.evaluate(async () => {
+    const f = globalThis.pointerFixture
+    await f.act('scroll', null, { direction: 'down', amount: 80 })
+    const present = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.read('scrollTo(0,0)')
+    await f.inspect()
+    return present
+  })
+  assert.equal(initialScrollPointer, false,
+    'scrolling without moving the mouse must not draw a stationary cursor')
+
   const movement = await app.evaluate(async () => {
     const f = globalThis.pointerFixture
     const first = await f.act('click', 'Far button')
@@ -129,12 +148,17 @@ try {
         position: cursor.style.transform, origin: getComputedStyle(arrow).transformOrigin,
         hit: document.elementFromPoint(70, 40).id };
     })()`)
-    await f.read('new Promise(resolve => setTimeout(resolve, 1700))')
-    const afterThinking = await f.read(`(() => {
-      const host = document.getElementById('__opensquilla-browser-pointer');
-      return { present: !!host, opacity: host ? getComputedStyle(host).opacity : null,
-        activeAnimations: host ? host.shadowRoot.getAnimations().length : 0 };
-    })()`)
+    await f.read('new Promise(resolve => setTimeout(resolve, 2300))')
+    await f.driver.pointer.sync()
+    const afterThinking = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.driver.screenshot(() => {}, new AbortController().signal)
+    const afterIdleCapture = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.act('hover', 'Near button')
+    const samePointAfterIdle = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.act('hover', 'Far button')
+    const resumedMovement = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.read('new Promise(resolve => setTimeout(resolve, 2300))')
+    const afterSecondIdle = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
     await f.view.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', {
       features: [{ name: 'prefers-reduced-motion', value: 'reduce' }],
     })
@@ -152,7 +176,8 @@ try {
       await f.view.webContents.debugger.sendCommand('Emulation.setEmulatedMedia', { features: [] })
     }
     await f.act('hover', 'Near button')
-    return { animation, afterThinking, reduced }
+    return { animation, afterThinking, afterIdleCapture, samePointAfterIdle,
+      resumedMovement, afterSecondIdle, reduced }
   })
   assert.equal(feedback.animation.animated, true, 'a real click must animate both its arrow and ripple')
   assert.notEqual(feedback.animation.start.arrow, feedback.animation.middle.arrow,
@@ -165,9 +190,11 @@ try {
     'click animation must not displace the real input hotspot')
   assert.equal(feedback.animation.origin, '2px 2px')
   assert.equal(feedback.animation.hit, 'near')
-  assert.equal(feedback.afterThinking.present, true, 'the cursor must remain during model thinking gaps')
-  assert.equal(feedback.afterThinking.opacity, '1')
-  assert.equal(feedback.afterThinking.activeAnimations, 0, 'a resting cursor must not keep pulsing')
+  assert.equal(feedback.afterThinking, false, 'the agent cursor must hide after inactivity')
+  assert.equal(feedback.afterIdleCapture, false, 'a screenshot must not revive an idle cursor')
+  assert.equal(feedback.samePointAfterIdle, false, 'a zero-distance input must not revive an idle cursor')
+  assert.equal(feedback.resumedMovement, true, 'real movement must reveal the cursor after an idle interval')
+  assert.equal(feedback.afterSecondIdle, false, 'the cursor must hide again after renewed inactivity')
   assert.equal(feedback.reduced.hit, 'far')
   assert.ok(feedback.reduced.frames.every(frame => !frame.transform && !frame.width && !frame.height),
     'reduced-motion feedback must not scale the arrow or expand a ripple')
@@ -330,6 +357,9 @@ try {
     f.view.setVisible(true)
     await f.driver.pointer.sync()
     const restoredAfterReopen = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.inspect()
+    await f.act('hover', 'Near button')
+    const shownAfterReopenMovement = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
     await f.driver.pointer.setTask(null)
     await f.read('new Promise(resolve=>setTimeout(resolve,260))')
     const afterTask = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
@@ -344,7 +374,8 @@ try {
     const next = await f.read('({title:document.querySelector("h1").textContent,pointer:!!document.getElementById("__opensquilla-browser-pointer")})')
     return { presentAtCapture, restoredAfterCapture, captureFailure, restoredAfterFailure,
       width: image.width, collapsedDuringMove, collapsedAction, hiddenAction, hiddenHover,
-      hiddenScroll, hiddenScrollY, failedFrameScroll, hiddenPointer, restoredAfterReopen, afterTask,
+      hiddenScroll, hiddenScrollY, failedFrameScroll, hiddenPointer, restoredAfterReopen,
+      shownAfterReopenMovement, afterTask,
       undecorated, undecoratedClicks, navigation, next }
   })
   assert.equal(lifecycle.presentAtCapture, false)
@@ -360,7 +391,8 @@ try {
   assert.ok(lifecycle.hiddenScrollY > 0)
   assert.equal(lifecycle.failedFrameScroll.performed, true, 'frame failure must not invite a duplicate wheel')
   assert.equal(lifecycle.hiddenPointer, false)
-  assert.equal(lifecycle.restoredAfterReopen, true, 'reopening the active surface must restore the cursor')
+  assert.equal(lifecycle.restoredAfterReopen, false, 'reopening the surface must not revive a hidden cursor')
+  assert.equal(lifecycle.shownAfterReopenMovement, true, 'fresh mouse movement must show the cursor again')
   assert.equal(lifecycle.afterTask, false, 'finishing the task must remove the cursor')
   assert.equal(lifecycle.undecorated.performed, true)
   assert.equal(lifecycle.undecoratedClicks, 1)
@@ -391,11 +423,8 @@ try {
     f.driver.pointer.navigationStarted()
     await f.view.webContents.loadURL(origin)
     await f.driver.pointer.documentReady()
-    const activeAfterNavigation = await f.read(`(() => {
-      const root = document.getElementById('__opensquilla-browser-pointer')?.shadowRoot;
-      return { present: !!root, transform: root?.querySelector('svg').style.transform,
-        animations: root?.getAnimations().length || 0 };
-    })()`)
+    const activeAfterNavigation = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    const rememberedPosition = f.driver.pointer.currentPosition()
     await f.driver.pointer.pauseForScreenshot(async () => {
       await f.driver.pointer.setTask(null)
     })
@@ -403,26 +432,29 @@ try {
     const stoppedDuringCapture = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
     await f.driver.pointer.setTask('synthetic-next-turn')
     const reconnected = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
+    await f.inspect()
+    await f.act('hover', 'Far button')
+    const afterNewMovement = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
     await f.driver.pointer.setTask('synthetic-untouched-turn')
     const untouchedTurn = await f.read('!!document.getElementById("__opensquilla-browser-pointer")')
-    return { inactive, activeAgain, activeAfterNavigation, stoppedDuringCapture, reconnected, untouchedTurn,
+    return { inactive, activeAgain, activeAfterNavigation, rememberedPosition,
+      stoppedDuringCapture, reconnected, afterNewMovement, untouchedTurn,
       acceptedRelease, clicks }
   }, origin)
   assert.equal(taskEnd.inactive, false, 'a completed task must not regain a cursor from late actions')
-  assert.equal(taskEnd.activeAgain, true, 'a new task must be able to start a fresh cursor')
-  assert.equal(taskEnd.activeAfterNavigation.present, true, 'the task cursor must return on its next document')
+  assert.equal(taskEnd.activeAgain, false, 'a new task must wait for real mouse activity')
+  assert.equal(taskEnd.activeAfterNavigation, false, 'navigation must not revive old cursor pixels')
   assert.equal(taskEnd.clicks.length, 1)
   assert.equal(taskEnd.clicks[0].target, 'near')
   assert.equal(taskEnd.clicks[0].trusted, true)
   assert.deepEqual(taskEnd.acceptedRelease, { x: taskEnd.clicks[0].x, y: taskEnd.clicks[0].y })
-  assert.equal(taskEnd.activeAfterNavigation.transform,
-    `translate3d(${taskEnd.acceptedRelease.x - 2}px, ${taskEnd.acceptedRelease.y - 2}px, 0px)`,
-    'navigation must retain the actual viewport mouse position during the active task')
-  assert.equal(taskEnd.activeAfterNavigation.animations, 0, 'navigation must not replay the previous click')
+  assert.deepEqual(taskEnd.rememberedPosition, taskEnd.acceptedRelease,
+    'navigation must retain the mouse position for the next trajectory without showing it')
   assert.equal(taskEnd.stoppedDuringCapture, false, 'capture cleanup must not revive a finished task')
-  assert.equal(taskEnd.reconnected, true, 'reconnecting the same task restores the cursor without another action')
+  assert.equal(taskEnd.reconnected, false, 'reconnecting the same task must not restore an idle cursor')
+  assert.equal(taskEnd.afterNewMovement, true, 'a new action must reveal the agent cursor')
   assert.equal(taskEnd.untouchedTurn, false, 'a different task waits for its first browser use')
-  console.log('Playwright Mouse passed: curved/eased trusted movement, ordered single clicks, mid-motion cancellation/navigation, press/rebound feedback, persistent task cursor, reduced motion, hidden/reopened surfaces and clean screenshots.')
+  console.log('Playwright Mouse passed: curved/eased trusted movement, ordered single clicks, mid-motion cancellation/navigation, press/rebound feedback, idle cursor hiding, reduced motion, hidden/reopened surfaces and clean screenshots.')
 } finally {
   await app?.close().catch(() => {})
   await new Promise(resolve => server.close(resolve))

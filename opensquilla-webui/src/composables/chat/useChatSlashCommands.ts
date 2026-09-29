@@ -730,6 +730,14 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     return true
   }
 
+  function handleUnavailableSkill(skill: SkillCandidate) {
+    if (skill.reasonCode === 'tools_unavailable' && !skill.disabled) {
+      options.notify(i18n.global.t('chat.skillPalette.toolsUnavailable'))
+    } else {
+      options.manageSkill?.(skill.name)
+    }
+  }
+
   async function selectSkillByName(name: string): Promise<boolean> {
     if (!options.skillCatalog?.supportsCandidates()) {
       options.notify(i18n.global.t('chat.skillPalette.upgrade'))
@@ -746,7 +754,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         return false
       }
       if (skill.disabled || !skill.ready) {
-        options.manageSkill?.(skill.name)
+        handleUnavailableSkill(skill)
         return false
       }
       return addSelectedSkill(skill)
@@ -760,7 +768,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
     if (cmd.kind === 'skill' && cmd.skill && queryRange) {
       const skill = cmd.skill
       if (skill.disabled || !skill.ready) {
-        options.manageSkill?.(skill.name)
+        handleUnavailableSkill(skill)
         closeSlashMenu()
         return
       }
@@ -1139,6 +1147,7 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
 
   return {
     slashOpen,
+    skillCandidates,
     skillsLoading,
     skillsError,
     loadSkillCandidates,

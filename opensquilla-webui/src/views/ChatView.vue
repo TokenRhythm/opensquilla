@@ -731,6 +731,7 @@
       @set-collaboration-mode="setCollaborationMode"
       @arm-goal="void activateGoalComposerMode()"
       @select-browser-use="void selectBrowserUse()"
+      @open-add-menu="prepareAddMenu"
       @disarm-goal="disarmGoalMode"
       @cancel-replan="cancelPlanRevision"
       @voice-input="onVoiceInput"
@@ -1541,7 +1542,7 @@ const promptCacheKeepaliveAvailable = computed(() => (
   promptCacheLease.isAvailable()
 ))
 const workbenchEnabled = computed(() => appStore.features.artifactWorkbench === true)
-const browserUseAvailable = computed(() => workbenchEnabled.value && !shareMode.value
+const browserUseSupported = computed(() => workbenchEnabled.value && !shareMode.value
   && platform.capabilities.hasNativeWorkbenchSurfaces === true
   && Boolean(platform.workbench.native)
   && gatewayConnectionState.value === 'connected'
@@ -3614,6 +3615,7 @@ const chatSlashCommands = useChatSlashCommands({
 const {
   slashOpen,
   slashIdx,
+  skillCandidates,
   skillsLoading,
   skillsError,
   metaDraft,
@@ -3621,6 +3623,7 @@ const {
   invalidateSkillCandidates,
   filteredSlashCmds,
   loadSlashCommands,
+  loadSkillCandidates,
   handleSlashInput,
   closeSlashMenu,
   completeSlashCmd,
@@ -3629,6 +3632,15 @@ const {
   executeSlashCommand,
   restoreDurableMetaDrafts: restoreServerMetaDrafts,
 } = chatSlashCommands
+
+const browserUseAvailable = computed(() => browserUseSupported.value
+  && skillCandidates.value.some(candidate => candidate.name === 'browser-use' && candidate.ready))
+
+function prepareAddMenu() {
+  if (!browserUseSupported.value) return
+  invalidateSkillCandidates()
+  void loadSkillCandidates()
+}
 
 async function selectBrowserUse() {
   if (!browserUseAvailable.value || browserUseSelectionPending.value) return

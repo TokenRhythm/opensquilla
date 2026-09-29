@@ -3665,6 +3665,7 @@
       "loadFailed": "Skills could not be loaded. Close and reopen the menu to retry.",
       "disabled": "Disabled · Manage",
       "needsSetup": "Needs setup · Manage",
+      "toolsUnavailable": "Benötigte Tools nicht verfügbar",
       "manualOnly": "Manual use only",
       "thisMessage": "This message",
       "remove": "Remove {name} from this message",
