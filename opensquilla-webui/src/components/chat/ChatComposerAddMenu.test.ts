@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import ChatComposerAddMenu from './ChatComposerAddMenu.vue'
 import addMenuSource from './ChatComposerAddMenu.vue?raw'
 import { resolveComposerAddMenuPlacement } from '@/utils/chat/composerAddMenuPlacement'
+import zhHans from '@/locales/zh-Hans.json'
 
 const chatViewStyles = readFileSync(
   'src/styles/chat-view.css',
@@ -41,6 +42,7 @@ const i18n = createI18n({
         },
       },
     },
+    'zh-Hans': zhHans,
   },
 })
 
@@ -79,6 +81,7 @@ function mountMenu(overrides: Record<string, unknown> = {}) {
 afterEach(() => {
   while (mountedApps.length) mountedApps.pop()?.unmount()
   document.body.innerHTML = ''
+  i18n.global.locale.value = 'en'
 })
 
 describe('ChatComposerAddMenu', () => {
@@ -163,9 +166,21 @@ describe('ChatComposerAddMenu', () => {
 
     const item = [...groups[1]!.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
       .find(button => button.textContent?.includes('Browser Use'))
+    expect(item?.querySelector('.composer-add-menu__title')?.textContent).toBe('Browser Use[BETA]')
+    expect(item?.querySelector('.composer-add-menu__beta')?.textContent).toBe('[BETA]')
     item?.click()
     expect(selectBrowserUse).toHaveBeenCalledOnce()
     expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('keeps the localized Browser Use title with the same beta marker', async () => {
+    i18n.global.locale.value = 'zh-Hans'
+    const { host } = mountMenu({ browserUseAvailable: true })
+    await nextTick()
+
+    const title = host.querySelector('.composer-add-menu__beta')?.parentElement
+    expect(title?.textContent).toBe('浏览器操作[BETA]')
+    expect(title?.closest('[role="menuitem"]')?.textContent).toContain('使用浏览器完成任务')
   })
 
   it('does not use the Add menu as an exit control for active Plan mode', async () => {
