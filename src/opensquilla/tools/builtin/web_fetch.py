@@ -139,6 +139,17 @@ def _web_fetch_httpx_client_kwargs(
         **managed_kwargs,
     }
     if "proxy" in managed_kwargs:
+        # AsyncClient constructs its default AsyncHTTPTransport synchronously.
+        # This function already runs in the bounded fetch worker, so construct
+        # the managed transport here and pass the ready instance to the event
+        # loop.  Keep the explicit proxy and trust_env semantics while avoiding
+        # proxy/TLS setup on Gateway's loop.
+        proxy = managed_kwargs.get("proxy")
+        client_kwargs.pop("proxy", None)
+        client_kwargs["transport"] = httpx.AsyncHTTPTransport(
+            proxy=proxy,
+            trust_env=bool(managed_kwargs.get("trust_env")),
+        )
         return client_kwargs
 
     trust_env = bool(managed_kwargs.get("trust_env"))

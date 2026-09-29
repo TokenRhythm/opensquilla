@@ -100,3 +100,5 @@ fetch worker 最多 4 个实际工作线程，独立于 Gateway 默认 executor�
 候选包另在完整 Gateway 内注入一次 5 秒 DNS 等待。等待位于 `fetch-work-0`，另一个运行中的会话在等待期间 Stop 约 25.3 ms 返回并正确取消；这是受控机制复现。旧包独立离线探针则显示 DNS/direct TLS/managed-proxy TLS 均会令主循环约 5 秒不调度；候选已隔离前两者，但 managed-proxy 的默认 TLS 构造仍是主线程遗漏路径。完整原始结果和边界见 [多会话压力结果](../../reports/gateway-scale-lab/concurrent-conversations-20260930-results.zh-CN.md)。
 
 同一 225 万文件 ACL 目录的候选对照约 1.0 ms 完成，事件循环最大 tick 间隔约 31.6 ms，目录身份与 ACL 摘要未变；旧包则在 `set_protected_dacl` 连续采样停留。它支持权限复用与异步隔离的具体收益，但仍属于合成机制实验。
+
+随后补上了候选包发现的 managed-proxy Transport 构造遗漏：`_web_fetch_httpx_client_kwargs` 已在现有 fetch worker 中构造显式 `AsyncHTTPTransport`，事件循环只接收已构造的 transport。源码和 fresh frozen 的 DNS、direct TLS、managed-proxy 5 秒探针最大 tick 间隔约 20–40 ms；31 项 managed-network 定向测试、Ruff、大历史 8 并发抓取及 Stop 通过。该修复没有改变代理/证书/SSRF/重定向语义；完整 Desktop 包和真实代理证书环境仍需验收。
