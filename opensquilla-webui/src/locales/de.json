@@ -4132,6 +4132,10 @@
         "generic": "Lenken ist für die aktuelle Aufgabe nicht verfügbar. Die Nachricht bleibt in der Warteschlange."
       },
       "clearQueue": "Warteschlange leeren",
+      "autoSendPaused": "Automatisches Senden pausiert",
+      "resumeQueue": "Warteschlange fortsetzen",
+      "sendOne": "Diese Nachricht senden",
+      "pauseSaveFailed": "Die Pauseneinstellung konnte nicht gespeichert werden. Automatisches Senden ist in diesem Fenster pausiert. Prüfen Sie den Browserspeicher und versuchen Sie es erneut.",
       "removeMessage": "Ausstehende Nachricht {index} entfernen",
       "offlineRejected": "Die Nachricht wurde nicht angenommen. Bearbeite sie, um es erneut zu versuchen, oder entferne sie.",
       "offlineQueued": "Lokal gespeichert. Die Nachricht wird gesendet, sobald die Verbindung wiederhergestellt ist.",

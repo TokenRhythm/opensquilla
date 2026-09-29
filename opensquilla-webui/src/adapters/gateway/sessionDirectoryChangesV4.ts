@@ -107,6 +107,7 @@ function normalizeReason(reason: string): SessionDirectoryChangeReason {
     case 'cron_static_message':
       return 'cronStaticMessage'
     case 'turn_complete':
+    case 'cancellation_completed':
     case 'cron_result':
     case 'cron_system_event':
     case 'updated':

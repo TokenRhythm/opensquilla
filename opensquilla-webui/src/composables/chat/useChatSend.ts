@@ -193,6 +193,7 @@ interface SendAttempt {
   acceptanceResolved?: boolean
   acceptanceInFlight?: boolean
   acceptedSessionKey?: string
+  onAccepted?: () => void
   stopOwner?: symbol
 }
 
@@ -240,6 +241,8 @@ interface DispatchSendOptions {
   retryAttempt?: SendAttempt | null
   idempotentReplay?: boolean
   rememberRetryableAttempt?: (attempt: SendAttempt) => void
+  /** Return a definitely unsent queue item to its draft without a retry barrier. */
+  deferUnsentAttempt?: () => void
   retainStoppedDraft?: (attempt: SendAttempt) => Promise<boolean> | boolean
   durablePendingItem?: ChatPendingItem
   /** Delay branch truncation and optimistic rendering until ingress accepts. */
@@ -250,6 +253,9 @@ interface DispatchSendOptions {
   includeEmptyAttachments?: boolean
   /** Revalidate protocol-owned sends after every awaited pre-dispatch step. */
   preDispatchGuard?: (stage: 'preflight' | 'before_rpc') => boolean
+  /** Queue permission remains revocable while the durable owner prepares admission. */
+  beforeDispatch?: () => boolean
+  onAccepted?: () => void
   /** Require a non-replayable WAL preparation that is armed immediately before RPC. */
   requirePreparedHandoff?: boolean
   /** Stable cross-tab identity for one protocol-owned replay. */
@@ -530,6 +536,9 @@ export interface UseChatSendOptions {
   autoScroll: Ref<boolean>
   stream: ChatRpcStreamApi
   canStop?: () => boolean
+  /** Revoke automatic follow-ups before Stop can race a terminal or ready event. */
+  pausePendingAutoSend?: () => void
+  capturePendingAutoSendResume?: () => () => void
   /** A retained task id cannot outrank a request while its session is hydrating. */
   canStopKnownTask?: () => boolean
   normalizeElevatedMode: (mode: string) => string
@@ -1092,6 +1101,7 @@ export function useChatSend(options: UseChatSendOptions) {
     response: TurnSendResponse,
   ): boolean {
     if (disposed) return false
+    notifySendAccepted(attempt)
     consumeAcceptedComposer(attempt)
     acknowledgeAttemptPromptAnnotations(attempt, response)
     attempt.acceptanceResolved = true
@@ -1130,6 +1140,12 @@ export function useChatSend(options: UseChatSendOptions) {
     }
     if (isCurrentRequest) options.taskOwnership?.requestStop(taskId)
     return false
+  }
+
+  function notifySendAccepted(attempt: SendAttempt) {
+    const onAccepted = attempt.onAccepted
+    attempt.onAccepted = undefined
+    onAccepted?.()
   }
 
   function observePendingAcceptance(attempt: SendAttempt) {
@@ -2173,6 +2189,7 @@ export function useChatSend(options: UseChatSendOptions) {
     composerText?: string
     textOverride?: string
     cancelIfComposerChanged?: boolean
+    resumeQueueOnSuccess?: boolean
   }
 
   async function onSend(invocation: SendInvocation = {}) {
@@ -2185,14 +2202,16 @@ export function useChatSend(options: UseChatSendOptions) {
     composerSubmissions.set(token, { sessionKey: key, snapshot: captureComposerSnapshot() })
     composerSubmissionVersion.value += 1
     try {
-      await sendComposerInput(invocation)
+      const onAccepted = invocation.resumeQueueOnSuccess
+        ? options.capturePendingAutoSendResume?.() : undefined
+      await sendComposerInput(invocation, onAccepted)
     } finally {
       composerSubmissions.delete(token)
       if (!disposed) composerSubmissionVersion.value += 1
     }
   }
 
-  async function sendComposerInput(invocation: SendInvocation) {
+  async function sendComposerInput(invocation: SendInvocation, onAccepted?: () => void) {
     const requestSessionKey = options.sessionKey.value
     const requestDeliveryIdentity = options.deliveryIdentity?.value
     const deliveryStillMatches = () => (
@@ -2255,6 +2274,7 @@ export function useChatSend(options: UseChatSendOptions) {
         retryAttempt: exactReplayAttempt,
         idempotentReplay: true,
         preDispatchGuard: deliveryStillMatches,
+        onAccepted,
       })
       return
     }
@@ -2280,6 +2300,7 @@ export function useChatSend(options: UseChatSendOptions) {
       const queued = await options.enqueuePendingInput(durableText, undefined, {
         deliveryIdentity: offlineIdentity,
       })
+      if (!disposed && queued) onAccepted?.()
       if (!disposed && !queued) pushToast(i18n.global.t('chat.toast.offlineQueueFailed'), { tone: 'warn' })
       return
     }
@@ -2335,6 +2356,7 @@ export function useChatSend(options: UseChatSendOptions) {
         composerSnapshot,
         cancelIfComposerChanged: invocation.cancelIfComposerChanged,
         preDispatchGuard: deliveryStillMatches,
+        onAccepted,
       })
       return
     }
@@ -2470,6 +2492,7 @@ export function useChatSend(options: UseChatSendOptions) {
                   queueOwnerFromSnapshot(composerSnapshot),
                 ),
         )
+        if (!disposed && queued) onAccepted?.()
         if (!disposed && !queued) {
           pushToast(i18n.global.t('chat.toast.queueFull'), { tone: 'info' })
         }
@@ -2491,6 +2514,7 @@ export function useChatSend(options: UseChatSendOptions) {
       composerSnapshot,
       cancelIfComposerChanged: invocation.cancelIfComposerChanged,
       preDispatchGuard: deliveryStillMatches,
+      onAccepted,
     })
   }
 
@@ -2514,6 +2538,7 @@ export function useChatSend(options: UseChatSendOptions) {
     item: ChatPendingItem,
     delivery: 'followup' | 'steer',
     expectedSessionKey?: string,
+    preDispatchGuard?: () => boolean,
   ): Promise<ChatSendOutcome> {
     if (disposed) return 'not_sent'
     const text = item.text.trim()
@@ -2523,15 +2548,16 @@ export function useChatSend(options: UseChatSendOptions) {
     const ownerSessionKey = expectedSessionKey
       || item.ownerSessionKey
       || options.sessionKey.value
-    const identityStillMatches = () => !disposed && (!item.pendingDeliveryIdentity || (
+    const identityStillMatches = () => !disposed && preDispatchGuard?.() !== false && (!item.pendingDeliveryIdentity || (
       item.pendingDeliveryIdentity === options.deliveryIdentity?.value
       && !options.offlineQueueIdentity?.value
     ))
     const retryAttempt = recoveredQueuedAttempts.get(item) ?? null
     let retainedStoppedDraft = false
+    let deferredUnsentAttempt = false
     const steerRetryAttempt = options.steerDelivery.attemptForItem(item)
     const preserveRetryState = (outcome: ChatSendOutcome): ChatSendOutcome => (
-      !retainedStoppedDraft && (retryAttempt || steerRetryAttempt)
+      !retainedStoppedDraft && !deferredUnsentAttempt && (retryAttempt || steerRetryAttempt)
       && (outcome === 'deferred' || outcome === 'not_sent')
         ? 'retryable_failure'
         : outcome
@@ -2664,9 +2690,14 @@ export function useChatSend(options: UseChatSendOptions) {
       },
       preserveComposer: true,
       preDispatchGuard: identityStillMatches,
+      beforeDispatch: identityStillMatches,
       retryAttempt,
       rememberRetryableAttempt: attempt => {
         recoveredQueuedAttempts.set(item, attempt)
+      },
+      deferUnsentAttempt: () => {
+        deferredUnsentAttempt = true
+        recoveredQueuedAttempts.delete(item)
       },
       retainStoppedDraft: async () => {
         recoveredQueuedAttempts.delete(item)
@@ -2700,8 +2731,9 @@ export function useChatSend(options: UseChatSendOptions) {
   function sendQueuedFollowup(
     item: ChatPendingItem,
     expectedSessionKey?: string,
+    preDispatchGuard?: () => boolean,
   ): Promise<ChatSendOutcome> {
-    return sendQueuedItem(item, 'followup', expectedSessionKey)
+    return sendQueuedItem(item, 'followup', expectedSessionKey, preDispatchGuard)
   }
 
   async function dispatchSend(
@@ -2818,6 +2850,9 @@ export function useChatSend(options: UseChatSendOptions) {
       ),
     )
     const retryAttempt = isRecoveredRetry ? retryCandidate : null
+    if (retryAttempt && !retryAttempt.requiresIdempotentReplay && sendOpts.onAccepted) {
+      retryAttempt.onAccepted = sendOpts.onAccepted
+    }
     if (retryAttempt?.deliveryIdentity !== undefined
       && retryAttempt.deliveryIdentity !== requestDeliveryIdentity) return 'not_sent'
     // The automatic receipt recovery and a user-triggered retry share the
@@ -2991,6 +3026,7 @@ export function useChatSend(options: UseChatSendOptions) {
         composerText: sendOpts?.composerText ?? text,
         requestSessionKey,
         deliveryIdentity: requestDeliveryIdentity,
+        onAccepted: sendOpts.onAccepted,
         draftIds: [...attemptAnnotationDraftIds],
         promptAnnotations: sentSnapshots,
         pageContext: attemptPageContext,
@@ -3177,8 +3213,11 @@ export function useChatSend(options: UseChatSendOptions) {
         if (receipt?.status !== 'found') throw new TurnCommandError('unavailable',
           'Delivery receipt is still unknown', 'DELIVERY_RECEIPT_UNKNOWN', null, true)
         res = receipt.response
-      } else res = await options.turnCommands.send(acceptanceRequest)
+      } else res = await options.turnCommands.send(acceptanceRequest, {
+        beforeDispatch: sendOpts.beforeDispatch,
+      })
       if (disposed) return 'accepted'
+      notifySendAccepted(attempt)
       consumeAcceptedComposer(attempt)
       acknowledgeAttemptPromptAnnotations(attempt, res)
 
@@ -3343,11 +3382,34 @@ export function useChatSend(options: UseChatSendOptions) {
       // Keep that WAL for the next page without reviving this one's composer,
       // queue callbacks, navigation or global error notices.
       if (disposed) return acceptedError ? 'accepted' : 'retryable_failure'
+      if (acceptedError) notifySendAccepted(attempt)
       const stoppedBeforeAdmission = attempt.stoppedBeforeAdmission === true || (
         commandError?.failureCode === 'DELIVERY_STOPPED' && commandError.accepted === false
         && !attempt.requiresIdempotentReplay
       )
       if (stoppedBeforeAdmission) releaseStoppedAttempt(attempt)
+      if (!stoppedBeforeAdmission && !attempt.requiresIdempotentReplay && sendOpts.deferUnsentAttempt
+        && commandError?.failureCode === 'DELIVERY_DISPATCH_REVOKED' && commandError.accepted === false) {
+        // The durable owner proved that this invocation never reached the
+        // transport. Keep the queue card editable and let an explicit resume
+        // obtain fresh permission; do not leave a retryable delivery barrier.
+        attempt.acceptanceResolved = true
+        observedAttempts.delete(attempt.clientRequestId)
+        setAttemptPromptAnnotations(attempt, [])
+        if (options.sessionKey.value === requestSessionKey) {
+          options.messages.value = options.messages.value.filter(message => (
+            message.clientId !== attempt.clientMessageId || Boolean(message.messageId || message.turnId)
+          ))
+          if (!wasStreaming && freshSendToken && activeFreshSendToken === freshSendToken) {
+            activeFreshSendToken = null
+            options.activeStreamTaskId.value = ''
+            options.activeStreamSessionKey.value = ''
+            options.stream.endStreaming()
+          }
+        }
+        sendOpts.deferUnsentAttempt()
+        return 'deferred'
+      }
       const retainStoppedDraft = async (): Promise<ChatSendOutcome> => {
         try {
           const retained = await sendOpts.retainStoppedDraft?.(attempt)
@@ -3761,6 +3823,7 @@ export function useChatSend(options: UseChatSendOptions) {
     const knownTaskReady = options.canStopKnownTask?.() ?? true
     const handoffCanStop = knownTaskReady && responseHandoffBlocksCurrentSession()
     if (!(handoffCanStop || (options.canStop?.() ?? options.stream.isStreaming.value))) return
+    options.pausePendingAutoSend?.()
     const handoff = handoffCanStop ? activeResponseHandoff : null
     const acceptance = knownTaskReady && activeAcceptanceTransaction?.requestSessionKey === options.sessionKey.value
       ? activeAcceptanceTransaction

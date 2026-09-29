@@ -253,11 +253,17 @@ def test_failure_injector_defaults_to_none_on_the_agent() -> None:
     assert Agent(provider=_FakeProvider())._failure_injector is None
 
 
-async def test_no_injector_and_empty_script_produce_identical_turns() -> None:
+async def test_no_injector_and_empty_script_produce_identical_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     plain_provider = _FakeProvider()
     injected_provider = _FakeProvider()
     plain_agent = _agent(plain_provider, injector=None)
     injected_agent = _agent(injected_provider, injector=FailureInjector(script=[]))
+
+    # Compare both paths with the same context even across a minute boundary.
+    runtime_context = plain_agent._runtime_context_block()
+    monkeypatch.setattr(Agent, "_runtime_context_block", lambda self: runtime_context)
 
     plain_events = [event async for event in plain_agent.run_turn("hello")]
     injected_events = [event async for event in injected_agent.run_turn("hello")]

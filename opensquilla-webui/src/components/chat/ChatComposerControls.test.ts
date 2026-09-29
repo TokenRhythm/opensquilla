@@ -104,7 +104,7 @@ describe('ChatComposer model routing contract', () => {
     const routingBusyGate = sendSource.indexOf(
       'if (modelRoutingMutationBusy.value || planModeBusy.value) return',
     )
-    const ordinarySend = sendSource.indexOf('onSend()')
+    const ordinarySend = sendSource.indexOf('onSend(')
 
     expect(start).toBeGreaterThanOrEqual(0)
     expect(end).toBeGreaterThan(start)
