@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import random
 import re
 import secrets
@@ -1779,6 +1780,20 @@ class SessionListPage:
     has_more: bool
 
 
+@dataclass(slots=True)
+class _TransactionTiming:
+    clock: Callable[[], float]
+    phase_started: float
+    phase: str
+    timings: dict[str, float]
+
+    def advance(self, phase: str) -> None:
+        now = self.clock()
+        self.timings[self.phase] = max(0.0, (now - self.phase_started) * 1000)
+        self.phase_started = now
+        self.phase = phase
+
+
 class SessionStorage:
     """Low-level async SQLite operations for session persistence."""
 
@@ -1794,6 +1809,8 @@ class SessionStorage:
         self._pending_reader_operations: set[asyncio.Task[Any]] = set()
         self._operation_lock = asyncio.Lock()
         self._operation_holder: tuple[str, float] | None = None
+        self._diagnostics_enabled = os.environ.get("OPENSQUILLA_STORAGE_DIAGNOSTICS") == "1"
+        self._diagnostic_count = 0
         self._transcript_reader_lock = asyncio.Lock()
         self._transcript_reader_fallback_warned = False
         self._usage_backfill_index_lock = asyncio.Lock()
@@ -1934,11 +1951,11 @@ class SessionStorage:
             "session_storage.transcript_reader_fallback reason=%s journal_mode=%s",
             safe_reason,
             safe_journal_mode,
-            extra={
+            extra={"_opensquilla_log_metadata": {
                 "event": "session_storage.transcript_reader_fallback",
-                "reason": safe_reason,
+                "reason_code": safe_reason,
                 "journal_mode": safe_journal_mode,
-            },
+            }},
         )
 
     @staticmethod
@@ -2087,6 +2104,51 @@ class SessionStorage:
             )
 
     @contextlib.contextmanager
+    def _transaction_diagnostics(
+        self, operation: str, role: str,
+    ) -> Iterator[_TransactionTiming | None]:
+        # Local opt-in only. Bound volume even if the switch is left enabled.
+        if not self._diagnostics_enabled or self._diagnostic_count >= 256:
+            yield None
+            return
+        self._diagnostic_count += 1
+        sequence = self._diagnostic_count
+        generation = self._connection_generation
+        # Python 3.12 on Windows can quantize monotonic() to ~15 ms. Use a
+        # separate high-resolution clock for observation, never for deadlines.
+        started = time.perf_counter()
+        timing = _TransactionTiming(time.perf_counter, started, "queue_ms", {})
+        status = "ok"
+        failure: BaseException | None = None
+        try:
+            yield timing
+        except BaseException as exc:
+            failure = exc
+            status = "cancelled" if isinstance(exc, asyncio.CancelledError) else "error"
+            raise
+        finally:
+            phase = timing.phase
+            timing.advance("finished")
+            # The caller has released its gate; no SQL, handlers or awaits are
+            # added inside the transaction. These are await spans, not SQL CPU.
+            log.info("session_storage.transaction_timing", extra={
+                "_opensquilla_log_metadata": {
+                    "event": "session_storage.transaction_timing",
+                    "operation": operation, "role": role, "status": status,
+                    "phase": phase, "operation_id": sequence,
+                    "connection_generation": generation,
+                    "duration_ms": max(0.0, (timing.phase_started - started) * 1000),
+                    "timings": timing.timings,
+                    "exception_type": type(failure).__name__ if failure else None,
+                    "connection_in_transaction": (
+                        bool(self._conn.in_transaction) if self._conn is not None else None
+                    ),
+                    "poisoned": self._poisoned,
+                    "capture_limit_reached": sequence == 256,
+                },
+            })
+
+    @contextlib.contextmanager
     def _observe_operation(self, operation: str) -> Iterator[None]:
         started = self._monotonic()
         self._operation_holder = (operation, started)
@@ -2181,6 +2243,12 @@ class SessionStorage:
                 "session_storage.rollback_failed operation=%s error=%s",
                 operation,
                 type(exc).__name__,
+                extra={"_opensquilla_log_metadata": {
+                    "event": "session_storage.rollback_failed",
+                    "operation": operation,
+                    "exception_type": type(exc).__name__,
+                    "phase": "rollback",
+                }},
             )
             await self._retire_poisoned_connection()
             raise StorageConnectionPoisonedError(
@@ -2191,6 +2259,12 @@ class SessionStorage:
                 "session_storage.rollback_failed operation=%s error=%s",
                 operation,
                 type(exc).__name__,
+                extra={"_opensquilla_log_metadata": {
+                    "event": "session_storage.rollback_failed",
+                    "operation": operation,
+                    "exception_type": type(exc).__name__,
+                    "phase": "rollback",
+                }},
             )
             await self._retire_poisoned_connection()
             raise StorageConnectionPoisonedError(
@@ -2279,30 +2353,39 @@ class SessionStorage:
         budget = self._busy_budget_seconds if budget_seconds is None else budget_seconds
         deadline = started + max(0.0, budget)
         acquired = False
-        try:
-            remaining = max(0.0, deadline - self._monotonic())
+        with self._transaction_diagnostics(operation, "write") as timing:
             try:
-                # asyncio.timeout(0) still permits an uncontended Lock.acquire
-                # to complete synchronously, while refusing to queue behind an
-                # existing holder or waiter once the budget is exhausted.
-                async with asyncio.timeout(remaining):
-                    await self._operation_lock.acquire()
-            except TimeoutError as exc:
-                raise self._operation_busy_error(operation, started) from exc
-            acquired = True
-            self._raise_if_poisoned()
-            conn = self.conn
-            with self._observe_operation(operation):
-                await self._begin_immediate(conn, operation, deadline, started)
+                remaining = max(0.0, deadline - self._monotonic())
                 try:
-                    yield conn
-                    await self._commit_transaction(conn, operation, deadline, started)
-                except BaseException:
-                    await self._rollback_transaction(conn, operation)
-                    raise
-        finally:
-            if acquired:
-                self._operation_lock.release()
+                    # asyncio.timeout(0) still permits an uncontended Lock.acquire
+                    # to complete synchronously, while refusing to queue behind an
+                    # existing holder or waiter once the budget is exhausted.
+                    async with asyncio.timeout(remaining):
+                        await self._operation_lock.acquire()
+                except TimeoutError as exc:
+                    raise self._operation_busy_error(operation, started) from exc
+                acquired = True
+                if timing is not None:
+                    timing.advance("begin_await_ms")
+                self._raise_if_poisoned()
+                conn = self.conn
+                with self._observe_operation(operation):
+                    await self._begin_immediate(conn, operation, deadline, started)
+                    try:
+                        if timing is not None:
+                            timing.advance("body_ms")
+                        yield conn
+                        if timing is not None:
+                            timing.advance("commit_await_ms")
+                        await self._commit_transaction(conn, operation, deadline, started)
+                    except BaseException:
+                        if timing is not None:
+                            timing.advance("rollback_await_ms")
+                        await self._rollback_transaction(conn, operation)
+                        raise
+            finally:
+                if acquired:
+                    self._operation_lock.release()
 
     @property
     def connection_generation(self) -> int:
@@ -2323,15 +2406,23 @@ class SessionStorage:
         """
 
         qualified_operation = f"read.{operation}"
-        async with self._operation_lock:
-            self._raise_if_poisoned()
-            conn = self.conn
-            try:
-                await self._finish_sqlite_call(conn.execute("BEGIN"))
-                yield conn
-            finally:
-                if bool(getattr(conn, "in_transaction", False)):
-                    await self._rollback_transaction(conn, qualified_operation)
+        with self._transaction_diagnostics(qualified_operation, "read") as timing:
+            async with self._operation_lock:
+                if timing is not None:
+                    timing.advance("begin_await_ms")
+                self._raise_if_poisoned()
+                conn = self.conn
+                with self._observe_operation(qualified_operation):
+                    try:
+                        await self._finish_sqlite_call(conn.execute("BEGIN"))
+                        if timing is not None:
+                            timing.advance("body_ms")
+                        yield conn
+                    finally:
+                        if bool(getattr(conn, "in_transaction", False)):
+                            if timing is not None:
+                                timing.advance("rollback_await_ms")
+                            await self._rollback_transaction(conn, qualified_operation)
 
     async def _initialize_schema(
         self,

@@ -802,8 +802,8 @@ async def test_memory_transcript_reader_warns_once_and_falls_back(
         "session_storage.transcript_reader_fallback "
         "reason=memory_database journal_mode=memory"
     )
-    assert warnings[0].reason == "memory_database"
-    assert warnings[0].journal_mode == "memory"
+    assert warnings[0]._opensquilla_log_metadata["reason_code"] == "memory_database"
+    assert warnings[0]._opensquilla_log_metadata["journal_mode"] == "memory"
 
 
 @pytest.mark.asyncio
@@ -825,8 +825,8 @@ async def test_non_wal_transcript_reader_warns_once_without_database_path(
         if "session_storage.transcript_reader_fallback" in record.getMessage()
     ]
     assert len(warnings) == 1
-    assert warnings[0].reason == "journal_mode_not_wal"
-    assert warnings[0].journal_mode == "delete"
+    assert warnings[0]._opensquilla_log_metadata["reason_code"] == "journal_mode_not_wal"
+    assert warnings[0]._opensquilla_log_metadata["journal_mode"] == "delete"
     assert str(private_path) not in warnings[0].getMessage()
 
 
@@ -868,8 +868,8 @@ async def test_transcript_reader_open_failure_warns_once_and_uses_writer_fallbac
         if "session_storage.transcript_reader_fallback" in record.getMessage()
     ]
     assert len(warnings) == 1
-    assert warnings[0].reason == "open_failed"
-    assert warnings[0].journal_mode == "wal"
+    assert warnings[0]._opensquilla_log_metadata["reason_code"] == "open_failed"
+    assert warnings[0]._opensquilla_log_metadata["journal_mode"] == "wal"
     assert str(private_path) not in warnings[0].getMessage()
     assert "sensitive reader failure body" not in warnings[0].getMessage()
 

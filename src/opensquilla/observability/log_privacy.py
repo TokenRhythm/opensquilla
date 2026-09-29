@@ -50,7 +50,12 @@ _CONTAINERS = frozenset({
 })
 # Retain only producer-owned enum values for fields that could otherwise be
 # mistaken for free-form reason text. These codes are consumed by diagnostics.
-_CLASSIFICATIONS = {"image_route_reason": frozenset({"current_turn", "history_context"})}
+_CLASSIFICATIONS = {
+    "image_route_reason": frozenset({"current_turn", "history_context"}),
+    "journal_mode": frozenset({
+        "delete", "memory", "off", "persist", "truncate", "wal", "unknown",
+    }),
+}
 _FIELD = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _CONTENT_FIELDS = frozenset({
     "content", "text", "prompt", "query", "message", "messages", "input", "output",
