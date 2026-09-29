@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 BUNDLED = ROOT / "src" / "opensquilla" / "skills" / "bundled"
 NOTICES = ROOT / "THIRD_PARTY_NOTICES.md"
 ORIGINALS = {
-    "deep-research", "docx", "github", "pdf-toolkit", "pptx",
+    "browser-use", "deep-research", "docx", "github", "pdf-toolkit", "pptx",
     "skill-creator", "sub-agent", "xlsx",
 }
 

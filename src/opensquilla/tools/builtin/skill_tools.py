@@ -78,6 +78,15 @@ def _skill_available(name: str) -> bool:
     return is_skill_available_live(name)
 
 
+def _missing_required_tools(skill: Any) -> tuple[str, ...]:
+    """Check requirements against this turn's complete post-policy tool catalog."""
+    ctx = current_tool_context.get()
+    authorized = getattr(ctx, "authorized_tool_names", None)
+    if authorized is None:
+        return ()
+    return tuple(name for name in skill.requires_tools if name not in authorized)
+
+
 def _active_catalog() -> Any | None:
     """Return the catalog pinned to the current agent turn, if any."""
     ctx = current_tool_context.get()
@@ -439,6 +448,12 @@ def create_skill_tools(
         for s in skills:
             report = diagnose_eligibility(s, ctx)
             lines.append(f"  - {s.name}: {s.description}")
+            missing_tools = _missing_required_tools(s)
+            if missing_tools:
+                lines.append(
+                    "      [unavailable] Required tools unavailable in this turn: "
+                    + ", ".join(missing_tools)
+                )
             if not report.eligible:
                 missing = []
                 for b in report.missing_bins:
@@ -525,12 +540,24 @@ def create_skill_tools(
                 "becomes visible next turn; absence here does not mean installation failed."
             )
 
-        if body_requested:
-            source = (
-                "user" if getattr(skill, "instance_id", "")
-                in getattr(tool_ctx, "verified_skill_ids", set())
-                else "auto"
+        source = (
+            "user" if getattr(skill, "instance_id", "")
+            in getattr(tool_ctx, "verified_skill_ids", set())
+            else "auto"
+        )
+        missing_tools = _missing_required_tools(skill)
+        if missing_tools:
+            error = "Required tools unavailable in this turn: " + ", ".join(missing_tools)
+            if body_requested:
+                await emit_skill_load(
+                    tool_ctx, skill, source=source, status="failed", error=error,
+                )
+            return (
+                f"Skill unavailable: {name}. {error}. "
+                "Use skill_list to inspect available skills."
             )
+
+        if body_requested:
             await emit_skill_load(tool_ctx, skill, source=source, status="loading")
             body = _expanded_skill_body(skill)
             await emit_skill_load(

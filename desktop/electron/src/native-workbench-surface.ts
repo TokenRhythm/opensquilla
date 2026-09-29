@@ -1927,8 +1927,12 @@ export class NativeWorkbenchSurfaceManager {
       return { targets: [...this.surfaces.values()].filter(record => record.scopeId === request.sessionKey
         && record.kind === 'url-preview' && !record.disposed && !record.crashed
         && !record.owner.isDestroyed() && !record.view.webContents.isDestroyed())
-        .map(record => ({ ...this.describeBrowserRecord(record), hostBlockers: this.browserHostBlockers(record),
-          ...(record.playwright?.pendingDialog ? { dialog: record.playwright.pendingDialog } : {}) })) }
+        .map(record => {
+          const target = this.describeBrowserRecord(record)
+          return { ...target, pageState: target.pageState === 'ready' && !record.cdpReady ? 'loading' : target.pageState,
+            hostBlockers: this.browserHostBlockers(record),
+            ...(record.playwright?.pendingDialog ? { dialog: record.playwright.pendingDialog } : {}) }
+        }) }
     }
     if (request.operation === 'open' && !request.targetRef) {
       const opened = await this.executeBrowser(request, signal) as Record<string, unknown>
@@ -2068,7 +2072,10 @@ export class NativeWorkbenchSurfaceManager {
           throw this.browserNavigationFailure(record, request.operation)
         }
         if (!record.browserDocumentReady || !record.cdpReady) {
-          throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.')
+          throw new DesktopBrowserError('PAGE_NOT_READY', 'The browser page is still loading or unavailable.', 409,
+            { targetRef: record.targetRef, operation: request.operation,
+              pageState: record.browserDocumentReady ? 'initializing' : 'loading',
+              outcome: 'not_started', retryable: true })
         }
         const page = await driver()
         const generation = record.annotationDocumentGeneration

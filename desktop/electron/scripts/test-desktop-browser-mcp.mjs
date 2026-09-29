@@ -20,6 +20,7 @@ const calls = []
 const audit = []
 const gates = new Map()
 const failures = new Map()
+const listStates = new Map()
 const ownedTargets = new Map([
   ['session-a', 'opaque-primary-target'], ['session-b', 'opaque-secondary-target'],
 ])
@@ -50,7 +51,8 @@ const server = new DesktopBrowserServer(
     if (request.operation === 'screenshot') {
       return { targetRef: request.targetRef, mime: 'image/png', width: 1, height: 1, dataBase64: png }
     }
-    if (request.operation === 'list') return { targets: [{ targetRef: targetFor(request.sessionKey) }] }
+    if (request.operation === 'list') return { targets: [{ targetRef: targetFor(request.sessionKey),
+      ...(listStates.has(request.sessionKey) ? { pageState: listStates.get(request.sessionKey) } : {}) }] }
     if (['observe', 'batch', 'dialog'].includes(request.operation)
       || request.operation === 'tab' && request.tabAction === 'switch') {
       const observationId = `observation-${++observationSequence}`
@@ -721,6 +723,81 @@ try {
     assert.equal(count(session), beforeBlocked, 'listing tabs cannot reset repeated failures')
     assert.equal((await scopedCall('browser_inspect', { targetRef }, session, 'synthetic-new-turn')).result.structuredContent.code, code)
   }
+
+  for (const code of ['TIMEOUT', 'PAGE_NOT_READY']) {
+    const session = `synthetic-ready-probe-${code.toLowerCase()}`
+    const targetRef = `ready-probe-${code.toLowerCase()}`
+    ownedTargets.set(session, targetRef)
+    listStates.set(session, 'loading')
+    let failReads = true
+    failures.set(session, request => {
+      if (failReads && ['snapshot', 'observe', 'screenshot'].includes(request.operation)) {
+        throw new DesktopBrowserError(code, 'Synthetic page still loading.', 409, {
+          targetRef, operation: request.operation, pageState: 'loading',
+          outcome: 'not_started', retryable: true,
+        })
+      }
+    })
+    const scope = 'ready-probe-turn'
+    for (const name of ['browser_inspect', 'browser_screenshot']) {
+      const failure = (await scopedCall(name, { targetRef }, session, scope)).result
+      assert.equal(failure.structuredContent.code, code)
+    }
+    const beforeBlocked = count(session)
+    assertExhausted((await scopedCall('browser_observe', { targetRef }, session, scope)).result, code)
+    assert.equal(count(session), beforeBlocked)
+    await scopedCall('browser_tabs', {}, session, scope)
+    assertExhausted((await scopedCall('browser_observe', { targetRef }, session, scope)).result, code)
+    listStates.set(session, 'ready')
+    await scopedCall('browser_tabs', {}, session, scope)
+    const beforeReadyBlocked = count(session)
+    const blockedScreenshot = (await scopedCall('browser_screenshot', { targetRef }, session, scope)).result
+    assertExhausted(blockedScreenshot, code)
+    assert.equal(blockedScreenshot.structuredContent.recovery, 'observe')
+    assert.match(blockedScreenshot.structuredContent.message, /browser_observe.*browser_inspect/)
+    assert.doesNotMatch(blockedScreenshot.structuredContent.message, /new task/)
+    const blockedAction = (await scopedCall('browser_act', {
+      targetRef, action: 'click', ref: 'element-1',
+    }, session, scope)).result
+    assertExhausted(blockedAction, code)
+    assert.equal(blockedAction.structuredContent.recovery, 'observe')
+    assert.equal(count(session), beforeReadyBlocked,
+      'ready state must not execute screenshots or state-changing actions before observation')
+    failReads = false
+    assert.equal((await scopedCall('browser_observe', { targetRef }, session, scope)).result.isError, false,
+      'a page that became ready should admit one non-destructive observation')
+    assert.equal((await scopedCall('browser_inspect', { targetRef }, session, scope)).result.isError, false,
+      'a consistent observation should clear the old loading fault')
+  }
+
+  const unavailableSession = 'synthetic-ready-probe-still-unavailable'
+  const unavailableTarget = 'still-unavailable-target'
+  ownedTargets.set(unavailableSession, unavailableTarget)
+  listStates.set(unavailableSession, 'ready')
+  failures.set(unavailableSession, request => {
+    throw new DesktopBrowserError('PAGE_NOT_READY', 'Synthetic driver remains unavailable.', 409, {
+      targetRef: unavailableTarget, operation: request.operation, pageState: 'loading',
+      outcome: 'not_started', retryable: true,
+    })
+  })
+  const unavailableScope = 'still-unavailable-turn'
+  for (const name of ['browser_inspect', 'browser_screenshot']) {
+    await scopedCall(name, { targetRef: unavailableTarget }, unavailableSession, unavailableScope)
+  }
+  await scopedCall('browser_tabs', {}, unavailableSession, unavailableScope)
+  const failedProbe = (await scopedCall('browser_observe', {
+    targetRef: unavailableTarget,
+  }, unavailableSession, unavailableScope)).result
+  assert.equal(failedProbe.structuredContent.code, 'PAGE_NOT_READY')
+  const beforeRepeatedProbe = count(unavailableSession)
+  await scopedCall('browser_tabs', {}, unavailableSession, unavailableScope)
+  const repeatedProbe = (await scopedCall('browser_observe', {
+    targetRef: unavailableTarget,
+  }, unavailableSession, unavailableScope)).result
+  assertExhausted(repeatedProbe, 'PAGE_NOT_READY')
+  assert.equal(repeatedProbe.structuredContent.recovery, 'stop')
+  assert.equal(count(unavailableSession), beforeRepeatedProbe + 1,
+    'repeated ready tab lists must not admit another probe for an unavailable target')
 
   const progressSession = 'synthetic-progress-session'
   const progressTarget = 'progress-page'

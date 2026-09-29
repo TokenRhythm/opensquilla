@@ -223,22 +223,44 @@ describe('workbench store', () => {
     ])
   })
 
-  it('bounds web browser tabs across sessions without evicting a retained page', () => {
+  it('adopts native browser pages beyond eight retained tabs across sessions', () => {
     const store = useWorkbenchStore()
-    const browserTabLimit = 8
-    const webPage = (index: number): WorkbenchItem => ({
-      ...browserItem(`web-${index}`, `session-${index}`),
-      hostKind: 'dom',
+    const opened: string[] = []
+    const disposed: string[] = []
+    store.onLifecycle(event => {
+      if (event.type === 'open') opened.push(event.item.id)
+      if (event.type === 'dispose') disposed.push(event.item.id)
     })
-    for (let index = 0; index < browserTabLimit; index += 1) {
-      expect(store.openItem(webPage(index), { activate: false })).toBe(true)
+    const nativePage = (index: number): WorkbenchItem => ({
+      ...browserItem(`web-${index}`, `session-${index}`),
+      payload: { initialUrl: 'https://example.test/', adoptedNativeSurface: true },
+    })
+    for (let index = 0; index < 9; index += 1) {
+      expect(store.openItem(nativePage(index), { activate: false })).toBe(true)
     }
-    expect(store.openItem(webPage(browserTabLimit))).toBe(false)
-    expect(store.items).toHaveLength(browserTabLimit)
-    expect(store.openItem(webPage(0))).toBe(true)
-    expect(store.activeItemId).toBe('web-0')
-    store.closeItem('web-1')
-    expect(store.openItem(webPage(browserTabLimit))).toBe(true)
+    expect(store.items).toHaveLength(9)
+    expect(opened).toEqual(Array.from({ length: 9 }, (_, index) => `web-${index}`))
+    expect(disposed).toEqual([])
+
+    store.setSessionScope('session-8')
+    expect(store.visibleItems.map(candidate => candidate.id)).toEqual(['web-8'])
+    expect(store.activateItem('web-8')).toBe(true)
+    expect(store.activeItemId).toBe('web-8')
+    store.setSessionScope('session-0')
+    expect(store.visibleItems.map(candidate => candidate.id)).toEqual(['web-0'])
+    expect(disposed).toEqual([])
+  })
+
+  it('bounds the closed browser history independently of live tabs', () => {
+    const store = useWorkbenchStore()
+    for (let index = 0; index < 10; index += 1) {
+      const page = browserItem(`web-${index}`, 'session-a')
+      store.openItem(page)
+      store.closeItem(page.id)
+    }
+    expect(store.closedBrowserItems.map(candidate => candidate.id)).toEqual(
+      Array.from({ length: 8 }, (_, index) => `web-${9 - index}`),
+    )
   })
 
   it('updates background item payloads without stealing the active tab', () => {

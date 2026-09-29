@@ -15,7 +15,7 @@ import type {
   WorkbenchScope,
 } from './types'
 
-const BROWSER_TAB_LIMIT = 8
+const CLOSED_BROWSER_HISTORY_LIMIT = 8
 
 function hydrateWidthPreference(): WorkbenchWidthPreference {
   if (typeof localStorage === 'undefined') return defaultWorkbenchWidthPreference()
@@ -141,15 +141,6 @@ export const useWorkbenchStore = defineStore('workbench', () => {
   }
 
   function openItem(item: WorkbenchItem, options: { activate?: boolean } = {}): boolean {
-    const existing = items.value.some(candidate => candidate.id === item.id)
-    if (
-      !existing
-      && item.kind === 'browser'
-      && items.value.filter(candidate => candidate.kind === 'browser').length
-        >= BROWSER_TAB_LIMIT
-    ) {
-      return false
-    }
     if (item.kind === 'browser') {
       closedBrowserItems.value = closedBrowserItems.value.filter(
         candidate => candidate.id !== item.id,
@@ -197,7 +188,7 @@ export const useWorkbenchStore = defineStore('workbench', () => {
           },
         },
         ...closedBrowserItems.value.filter(candidate => candidate.id !== removed.id),
-      ].slice(0, BROWSER_TAB_LIMIT)
+      ].slice(0, CLOSED_BROWSER_HISTORY_LIMIT)
     }
     const wasActive = activeItemId.value === id
     forgetActivation(id)

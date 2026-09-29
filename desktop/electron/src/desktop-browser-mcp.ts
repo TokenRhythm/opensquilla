@@ -24,6 +24,7 @@ interface RecoveryFault {
   limit: number
   terminal: boolean
   failure: DesktopBrowserError
+  readyProbe?: 'available' | 'used'
 }
 const protocols = ['2025-06-18', '2024-11-05']
 const hasCoordinates = (request: DesktopBrowserRequest) => request.operation === 'batch'
@@ -184,12 +185,16 @@ export class DesktopBrowserMcp {
     validateLegacyObservationPolicy(meta.observationPolicy)
     const execute = async (): Promise<JsonObject> => {
       const blocked = this.blockedFault(scope, request)
-      if (blocked) {
+      if (blocked && (signal.aborted || !this.useReadyProbe(blocked, request))) {
+        const readyProbeAvailable = blocked.readyProbe === 'available'
         return this.result({ ...blocked.failure.details, ok: false, code: 'BROWSER_RECOVERY_EXHAUSTED',
           targetRef: blocked.targetRef,
           causeCode: blocked.failure.code, operation: request.operation, operationId,
-          message: 'Browser recovery stopped after repeated failure without progress. Inspect the retained target or choose another site; retry after the underlying problem is resolved in a new task.',
-          outcome: 'not_started', retryable: false, recovery: 'stop', recoveryBudget: recoveryBudget(blocked) }, true)
+          message: readyProbeAvailable
+            ? 'The target reports ready. Use browser_observe or browser_inspect without ref or downloadId to verify recovery before other operations.'
+            : 'Browser recovery stopped after repeated failure without progress. Inspect the retained target or choose another site; retry after the underlying problem is resolved in a new task.',
+          outcome: 'not_started', retryable: false, recovery: readyProbeAvailable ? 'observe' : 'stop',
+          recoveryBudget: recoveryBudget(blocked) }, true)
       }
       try {
         if (signal.aborted) throw new DesktopBrowserError('TIMEOUT', 'Browser request ended before execution.', 504, { outcome: 'not_started' })
@@ -328,7 +333,8 @@ export class DesktopBrowserMcp {
     const key = JSON.stringify([scope, domain, domain === 'navigation' ? originScoped ? navigationOrigin : url : targetRef ?? 'browser'])
     const previous = this.faults.get(key)
     const fault: RecoveryFault = { scope, domain, origin: navigationOrigin, url, originScoped, targetRef,
-      attempts: (previous?.attempts ?? 0) + 1, limit: terminal || domain === 'action' ? 1 : 2, terminal, failure }
+      attempts: (previous?.attempts ?? 0) + 1, limit: terminal || domain === 'action' ? 1 : 2, terminal, failure,
+      readyProbe: previous?.readyProbe }
     if (previous || this.faults.size < MAX_RECOVERY_FAULTS) this.faults.set(key, fault)
     return fault
   }
@@ -356,8 +362,36 @@ export class DesktopBrowserMcp {
     return transport
   }
 
+  private useReadyProbe(fault: RecoveryFault, request: DesktopBrowserRequest): boolean {
+    // A ready tab grants one read-only check; only a valid observation clears the fault.
+    if (fault.readyProbe !== 'available' || request.operation !== 'observe'
+      && (request.operation !== 'snapshot' || request.ref || request.downloadId)) return false
+    fault.readyProbe = 'used'
+    return true
+  }
+
   private recordProgress(scope: string, request: DesktopBrowserRequest, result: JsonObject, completed: boolean): void {
-    if (request.operation === 'list') return
+    if (request.operation === 'list') {
+      if (!completed) return
+      const targets = Array.isArray(result.targets) ? result.targets : []
+      for (const target of targets) {
+        const state = maybeObject(target)
+        if (state?.pageState !== 'ready' || typeof state.targetRef !== 'string') continue
+        for (const fault of this.faults.values()) {
+          const failedOperation = fault.failure.details.operation
+          if (fault.scope === scope && fault.domain === 'target' && fault.targetRef === state.targetRef
+            && fault.attempts >= fault.limit && fault.readyProbe === undefined && !fault.terminal
+            && transientCodes.has(fault.failure.code)
+            && failedOperation !== undefined && readOperations.has(failedOperation)
+            && fault.failure.details.outcome === 'not_started'
+            && (fault.failure.details.pageState === undefined
+              || ['loading', 'initializing'].includes(fault.failure.details.pageState))) {
+            fault.readyProbe = 'available'
+          }
+        }
+      }
+      return
+    }
     const observation = maybeObject(result.observation)
     const observed = observation?.consistency === 'consistent'
       || request.operation === 'snapshot' && typeof result.text === 'string' && result.refs !== undefined

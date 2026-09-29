@@ -857,7 +857,7 @@ const currentSessionKey = computed(() => {
 // The draft already has the key that its first turn will use. Keep manually
 // opened browser pages on that identity before the URL gains a session query.
 const workbenchSessionKey = computed(() =>
-  chatRouteHeader.model.sessionKey.value || currentSessionKey.value,
+  currentSessionKey.value || chatRouteHeader.model.sessionKey.value,
 )
 const sessionTaskAttention = useSessionTaskAttention()
 

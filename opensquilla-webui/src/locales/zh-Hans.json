@@ -4160,7 +4160,7 @@
     "composer": {
       "workStyleGroup": "工作方式",
       "contentGroup": "内容",
-      "browserUse": "Browser Use",
+      "browserUse": "浏览器操作",
       "browserUseDescription": "使用浏览器完成任务",
       "executionMode": "执行模式",
       "ownerOnlyUnavailable": "此浏览器会话不支持仅限所有者模式。",

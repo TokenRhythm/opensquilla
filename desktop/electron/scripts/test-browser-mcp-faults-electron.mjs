@@ -93,6 +93,30 @@ try {
   const first = success(await call('browser_open', { url: origin }))
   const second = success(await call('browser_open', { url: origin }))
 
+  await app.evaluate((_electron, targetRef) => {
+    const record = [...globalThis.faultFixture.manager.surfaces.values()]
+      .find(value => value.targetRef === targetRef)
+    record.cdpReady = false
+  }, first.targetRef)
+  assert.equal(success(await call('browser_tabs')).targets.find(
+    target => target.targetRef === first.targetRef)?.pageState, 'loading',
+  'MCP readiness must include the browser driver, not only document load')
+  for (const attempt of [1, 2]) {
+    const unavailable = failure(await call('browser_inspect', { targetRef: first.targetRef }), 'PAGE_NOT_READY')
+    assert.equal(unavailable.pageState, 'initializing')
+    assert.equal(unavailable.recoveryBudget.attempts, attempt)
+  }
+  failure(await call('browser_observe', { targetRef: first.targetRef }), 'BROWSER_RECOVERY_EXHAUSTED')
+  await app.evaluate((_electron, targetRef) => {
+    const record = [...globalThis.faultFixture.manager.surfaces.values()]
+      .find(value => value.targetRef === targetRef)
+    record.cdpReady = true
+  }, first.targetRef)
+  assert.equal(success(await call('browser_tabs')).targets.find(
+    target => target.targetRef === first.targetRef)?.pageState, 'ready')
+  success(await call('browser_observe', { targetRef: first.targetRef }))
+  success(await call('browser_inspect', { targetRef: first.targetRef }))
+
   const retainedDuringUnresponsive = await app.evaluate((_electron, targetRef) => {
     const { manager } = globalThis.faultFixture
     const record = [...manager.surfaces.values()].find(value => value.targetRef === targetRef)

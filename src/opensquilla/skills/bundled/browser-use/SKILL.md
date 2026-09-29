@@ -4,6 +4,10 @@ visibility: public
 invocation: direct
 description: Operate and verify webpages in the OpenSquilla Desktop sidebar using the conversation-owned browser MCP tools. Use for interactive browsing, forms, page navigation, and visual checks.
 description_zh: "通过当前对话的浏览器 MCP 工具操作和验证 OpenSquilla 客户端侧边栏网页。适用于交互浏览、表单填写、页面导航和视觉检查。"
+provenance:
+  origin: opensquilla-original
+  license: Apache-2.0
+  maintained_by: OpenSquilla
 triggers:
   - browser use
   - browser-use
