@@ -66,6 +66,7 @@ type MockGatewayState = {
   enqueueCount: number
   firstSessionKey: string
   handoffTargets: Record<string, string>
+  nextSendTarget?: string
   pendingRows: PendingRow[]
   reorderCount: number
   supportsPendingQueue: boolean
@@ -83,6 +84,8 @@ type MockGateway = {
   dispatchCount: number
   enqueueCount: number
   finishFirst: () => void
+  finishLatest: () => void
+  holdCompletions: (hold?: boolean) => void
   pendingRow: () => PendingRow | null
   pendingRows: () => PendingRow[]
   reorderCount: number
@@ -172,6 +175,7 @@ async function preparePage(page: Page) {
   }))
   await page.route('**/api/system/update', route => route.fulfill({ json: {} }))
   await page.route('**/api/elevated-mode', route => route.fulfill({ json: { enabled: false } }))
+  await page.route('**/opensquilla-mark.png', route => route.fulfill({ status: 204, body: '' }))
   // `vite preview` owns only the built frontend. The packaged Gateway normally
   // serves this backend-owned brand asset from static/img; keep the standalone
   // production-bundle fixture console-clean without starting a second server.
@@ -280,6 +284,7 @@ async function installMockGateway(
   let subscribedConnection = 0
   let holdingConnections = false
   let holdingReceiptReplies = false
+  let holdingCompletions = false
   let peakReceiptInFlight = 0
   const waitingHandshakes = new Set<WebSocketRoute>()
   const receiptReplies = new Map<() => void, WebSocketRoute>()
@@ -475,7 +480,7 @@ async function installMockGateway(
           task_id: queuedTaskId,
           message_id: committed?.clientMessageId,
         }))
-        queueMicrotask(() => sendDone(queuedTaskId))
+        if (!holdingCompletions) queueMicrotask(() => sendDone(queuedTaskId))
         return
       }
       if (method === 'sessions.pending_inputs.cancel') {
@@ -490,7 +495,12 @@ async function installMockGateway(
         const ordinal = state.chatSends.length
         const sessionKey = String(params.sessionKey || '')
         const responseSessionKey = state.handoffTargets[String(params.clientRequestId || '')]
+          || state.nextSendTarget
           || sessionKey
+        if (state.nextSendTarget) {
+          state.handoffTargets[String(params.clientRequestId || '')] = responseSessionKey
+          state.nextSendTarget = undefined
+        }
         if (ordinal === 1) state.firstSessionKey = responseSessionKey
         const taskId = ordinal === 1 ? firstTaskId : `p1-5-follow-up-${ordinal}`
         // Real admission commits the user transcript, task, and receipt before
@@ -534,7 +544,7 @@ async function installMockGateway(
         }
 
         acknowledge()
-        queueMicrotask(() => sendDone(taskId))
+        if (!holdingCompletions) queueMicrotask(() => sendDone(taskId))
         return
       }
 
@@ -580,6 +590,12 @@ async function installMockGateway(
     finishFirst() {
       sendDone(firstTaskId)
     },
+    finishLatest() {
+      const turn = state.turns.findLast(turn => !turn.finished)
+      if (!turn) throw new Error('No unfinished task is available to complete')
+      sendDone(turn.taskId)
+    },
+    holdCompletions(hold = true) { holdingCompletions = hold },
     pendingRow: () => state.pendingRows[0] || null,
     pendingRows: () => state.pendingRows.slice(),
     get reorderCount() { return state.reorderCount },
@@ -1257,3 +1273,162 @@ test.describe('durable handoff and pending order release gate', () => {
     ])
   })
 })
+
+
+test('Stop before fork ACK keeps adopted follow-ups paused through reload and single send', async ({ page }) => {
+  test.setTimeout(60_000)
+  const errors = collectRendererErrors(page)
+  await preparePage(page)
+  const state = createMockGatewayState()
+  const parent = 'agent:main:webchat:stop-fork-parent'
+  const child = 'agent:main:webchat:stop-fork-child'
+  state.firstSessionKey = parent
+  state.nextSendTarget = child
+  commitTurn(state, parent, 'historical-task', { clientMessageId: 'historical-message', message: 'Historical prompt to edit' })
+  state.turns[0]!.finished = true
+  state.turns[0]!.terminalStatus = 'succeeded'
+  const gateway = await installMockGateway(page, 'delayed', state)
+  await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(parent)}`)
+  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  const historical = page.locator('.msg-user').filter({ hasText: 'Historical prompt to edit' })
+  await expect(historical).toBeVisible()
+  await historical.hover()
+  await historical.getByRole('button', { name: 'Edit', exact: true }).click()
+  const composer = page.locator('.chat-textarea')
+  await composer.fill('Fork A awaiting acceptance')
+  await page.locator('.chat-send-btn[aria-label="Send"]').click()
+  await expect.poll(() => gateway.chatSends.length).toBe(1)
+  expect(gateway.chatSends[0]?.forkBeforeMessageId).toBeTruthy()
+  const followups = ['C paused after fork Stop', 'D waits for explicit resume']
+  for (const text of followups) {
+    await composer.fill(text)
+    await composer.press('Enter')
+    await expect(page.locator('.chat-pending-card').filter({ hasText: text })).toBeVisible()
+    await expectWalContains(page, text)
+  }
+  await page.getByRole('button', { name: 'Stop current response', exact: true }).click()
+  await expect(page.getByRole('button', { name: 'Resume queue', exact: true })).toBeVisible()
+  const primaryAction = '.chat-pending-actions > .chat-pending-action:not(.chat-pending-action--icon)'
+  for (const text of followups) {
+    const card = page.locator('.chat-pending-card').filter({ hasText: text })
+    await expect(card.locator(primaryAction)).toHaveCount(1)
+    await expect(card.locator(primaryAction)).toBeDisabled()
+  }
+  await expect(page.locator('.chat-pending-steer-status').filter({ hasText: 'Steer unavailable' })).toHaveCount(0)
+  expect(gateway.dispatchCount).toBe(0)
+  gateway.releaseFirstAck()
+  await expect(page).toHaveURL(url => url.searchParams.get('session') === child)
+  await expect.poll(() => gateway.aborts.length).toBe(1)
+  expect(gateway.aborts[0]).toMatchObject({ sessionKey: child, taskId: 'p1-5-first-task', scope: 'task' })
+  await expect.poll(() => gateway.enqueueCount).toBe(2)
+  await page.reload()
+  await expect(page.locator('.conn-pill.connected')).toBeVisible()
+  const firstCard = page.locator('.chat-pending-card').filter({ hasText: followups[0] })
+  const secondCard = page.locator('.chat-pending-card').filter({ hasText: followups[1] })
+  await expect(firstCard.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
+  await expect(secondCard).toBeVisible()
+  await expect(firstCard.locator(primaryAction)).toHaveCount(1)
+  await expect(secondCard.locator(primaryAction)).toHaveCount(1)
+  await expect(page.locator('.chat-pending-action--steer')).toHaveCount(0)
+  await expect(page.locator('.chat-pending-steer-status').filter({ hasText: 'Steer unavailable' })).toHaveCount(0)
+  await page.waitForTimeout(300)
+  expect(gateway.dispatchCount).toBe(0)
+  await firstCard.getByRole('button', { name: 'Send', exact: true }).click()
+  await expect.poll(() => gateway.dispatchMessages).toEqual([followups[0]])
+  await expect(firstCard).toHaveCount(0)
+  await expect(secondCard.locator(primaryAction)).toHaveCount(1)
+  await expect(secondCard.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
+  await page.waitForTimeout(300)
+  expect(gateway.dispatchCount).toBe(1)
+  await page.getByRole('button', { name: 'Resume queue', exact: true }).click()
+  await expect.poll(() => gateway.dispatchMessages).toEqual(followups)
+  expect(gateway.chatSends).toHaveLength(1)
+  const allErrors = [...errors.pageErrors, ...errors.consoleErrors]
+  expect(allErrors, allErrors.join('\n')).toEqual([])
+})
+
+for (const action of ['composer Send', 'idle Alt+ArrowDown Queue', 'busy Enter Queue'] as const) {
+  test(`Explicit ${action} resumes the stopped queue after reload`, async ({ page }) => {
+    test.setTimeout(60_000)
+    const errors = collectRendererErrors(page)
+    await preparePage(page)
+    const state = createMockGatewayState()
+    const session = 'agent:main:webchat:explicit-queue-resume'
+    state.firstSessionKey = session
+    commitTurn(state, session, 'historical-task', {
+      clientMessageId: 'historical-message', message: 'Existing conversation',
+    })
+    state.turns[0]!.finished = true
+    state.turns[0]!.terminalStatus = 'succeeded'
+    const gateway = await installMockGateway(page, 'delayed', state)
+    await page.goto(`${CONTROL_URL}chat?session=${encodeURIComponent(session)}`)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.msg-user').filter({ hasText: 'Existing conversation' })).toBeVisible()
+    const composer = page.locator('.chat-textarea')
+    await composer.fill('A stopped while acceptance is pending')
+    await page.locator('.chat-send-btn[aria-label="Send"]').click()
+    await expect.poll(() => gateway.chatSends.length).toBe(1)
+
+    const followups = ['C saved before Stop', 'E saved before Stop']
+    for (const text of followups) {
+      await composer.fill(text)
+      await composer.press('Enter')
+      await expect(page.locator('.chat-pending-card').filter({ hasText: text })).toBeVisible()
+      await expectWalContains(page, text)
+    }
+    await page.getByRole('button', { name: 'Stop current response', exact: true }).click()
+    const resume = page.getByRole('button', { name: 'Resume queue', exact: true })
+    await expect(resume).toBeVisible()
+    gateway.releaseFirstAck()
+    await expect.poll(() => gateway.aborts.length).toBe(1)
+    expect(gateway.aborts[0]).toMatchObject({ sessionKey: session, taskId: 'p1-5-first-task', scope: 'task' })
+    await expect.poll(() => gateway.enqueueCount).toBe(2)
+    await page.reload()
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(resume).toBeVisible()
+    const firstCard = page.locator('.chat-pending-card').filter({ hasText: followups[0] })
+    const secondCard = page.locator('.chat-pending-card').filter({ hasText: followups[1] })
+    await expect(firstCard.getByRole('button', { name: 'Send', exact: true })).toBeEnabled()
+    await expect(secondCard).toBeVisible()
+    await page.waitForTimeout(300)
+    expect(gateway.dispatchCount).toBe(0)
+
+    if (action === 'composer Send') {
+      await composer.fill('B explicitly sent after Stop')
+      await page.locator('.chat-send-btn[aria-label="Send"]').click()
+      await expect.poll(() => gateway.chatSends.length).toBe(2)
+      expect(gateway.chatSends[1]?.message).toBe('B explicitly sent after Stop')
+      await expect.poll(() => gateway.dispatchMessages).toEqual(followups)
+    } else {
+      const queuedText = 'D explicitly queued after Stop'
+      if (action === 'busy Enter Queue') {
+        gateway.holdCompletions()
+        await firstCard.getByRole('button', { name: 'Send', exact: true }).click()
+        await expect.poll(() => gateway.dispatchMessages).toEqual([followups[0]])
+        await expect(firstCard).toHaveCount(0)
+        await expect(resume).toBeVisible()
+        await expect(secondCard).toBeVisible()
+        await expect(page.getByRole('button', { name: 'Stop current response', exact: true })).toBeVisible()
+        await page.waitForTimeout(300)
+        expect(gateway.dispatchMessages).toEqual([followups[0]])
+      }
+      await composer.fill(queuedText)
+      await composer.press(action === 'idle Alt+ArrowDown Queue' ? 'Alt+ArrowDown' : 'Enter')
+      await expect.poll(() => gateway.enqueueCount).toBe(3)
+      await expect(resume).toHaveCount(0)
+      if (action === 'busy Enter Queue') {
+        // The explicit Queue action resumes automatic delivery, but C still
+        // owns the running turn until its normal terminal event arrives.
+        expect(gateway.dispatchMessages).toEqual([followups[0]])
+        gateway.holdCompletions(false)
+        gateway.finishLatest()
+      }
+      await expect.poll(() => gateway.dispatchMessages).toEqual([...followups, queuedText])
+      expect(gateway.chatSends).toHaveLength(1)
+    }
+    await expect(resume).toHaveCount(0)
+    await expect(page.locator('.chat-pending-card')).toHaveCount(0)
+    const allErrors = [...errors.pageErrors, ...errors.consoleErrors]
+    expect(allErrors, allErrors.join('\n')).toEqual([])
+  })
+}

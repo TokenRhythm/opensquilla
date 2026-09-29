@@ -3543,9 +3543,11 @@ class _GatewayCancellationPorts(CancellationPrimitives):
                 "sessions.changed",
                 build_sessions_changed_payload(
                     key,
-                    "task_terminal",
-                    run_status="cancelled",
-                    last_task={"status": "cancelled", "terminal_reason": "user_abort"},
+                    # The tree scan has finished, but another task may already
+                    # own this session. Task lifecycle events carry the exact
+                    # terminal identities; this operation-level notification
+                    # only invalidates the client's task/group projection.
+                    "cancellation_completed",
                 ),
             )
 

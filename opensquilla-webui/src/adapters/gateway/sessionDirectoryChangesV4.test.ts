@@ -116,7 +116,7 @@ describe('v4 SessionDirectoryChanges Adapter', () => {
   })
 
   it('maps known generic invalidations to updated while preserving unknown reasons', () => {
-    for (const reason of ['turn_complete', 'cron_result', 'cron_system_event', 'updated']) {
+    for (const reason of ['turn_complete', 'cancellation_completed', 'cron_result', 'cron_system_event', 'updated']) {
       expect(decodeSessionDirectoryChange({ key: 'k', reason }))
         .toEqual({ key: 'k', reason: 'updated' })
     }

@@ -1974,6 +1974,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
   function handleRpcSessionsChanged(payload: ConversationEventData) {
     if (isStaleEpoch(payload)) return
     if (!isCurrentSessionPayload(payload)) return
+    if (payload.reason === 'cancellation_completed') {
+      // A completed cancellation operation is not a terminal task identity.
+      // Reconciliation also clears cancelled background-only task groups.
+      markRecoveryDirty()
+      return
+    }
     const changedTask = payload.changed_task
     const changedTaskStatus = String(changedTask?.status || '').toLowerCase()
     if (changedTaskStatus === 'queued') options.taskOwnership?.noteQueued(changedTask || '')
@@ -2012,6 +2018,12 @@ export function useChatRpcEventHandlers(options: UseChatRpcEventHandlersOptions)
       && !isCurrentTaskPayload(payload)
     ) return
     if (sessionChangeIsTerminal(payload)) {
+      if (!payloadTerminalTaskId && options.taskOwnership?.stopTargetTaskId.value) {
+        // Older Gateways' unscoped cancellation summaries cannot settle a
+        // queued or running successor. Read fresh task and group ownership.
+        markRecoveryDirty()
+        return
+      }
       const terminalStatus = String(payloadTerminalTask?.status || '').toLowerCase()
       const interrupted = ['cancelled', 'abandoned', 'interrupted'].includes(terminalStatus)
       if (activeTaskGroups.value.size > 0 && !interrupted) {

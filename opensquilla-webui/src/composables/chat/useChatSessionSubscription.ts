@@ -211,7 +211,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadataGeneration: number | undefined,
     metadata: SessionReadMetadata,
     activity: SessionReadActivity = 'unknown',
+    ownershipRevision?: number,
   ): SessionSubscriptionOutcome {
+    assertOwnershipSnapshotCurrent(ownershipRevision)
     metadataRecoveryError.value = null
     if (metadataGeneration !== undefined) {
       options.onSessionMetadata?.(key, metadataGeneration, metadata)
@@ -229,7 +231,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       : metadata
     const effectiveSource = metadataRunStatusSource(effectiveMetadata)
     options.onSnapshot?.(effectiveMetadata)
-    options.taskOwnership?.applySnapshot(effectiveSource, true)
+    options.taskOwnership?.applySnapshot(effectiveSource, true, ownershipRevision)
     // Do not clear an acceptance-result-unknown Stop from an idle snapshot.
     // The subscription can race ahead of the original ingress commit, so only
     // the matching send transaction (receipt/rejection) or an explicit session
@@ -327,6 +329,15 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       && signal?.aborted !== true
   }
 
+  function assertOwnershipSnapshotCurrent(revision: number | undefined) {
+    if (
+      revision !== undefined
+      && options.taskOwnership?.captureSnapshotRevision() !== revision
+    ) {
+      throw new SessionReadFailure('busy', 'Task ownership changed while reading session metadata.', true)
+    }
+  }
+
   function scheduleMetadataHydration(
     lease: SessionReadLease,
     key: string,
@@ -335,6 +346,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     metadataGeneration: number | undefined,
     activity: SessionReadActivity,
     signal: AbortSignal,
+    ownershipRevision: number | undefined,
   ): void {
     void lease.metadata.then((metadata) => {
       if (
@@ -344,7 +356,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!metadata.hydrationComplete) {
         throw new Error('Session state hydration remained incomplete')
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity)
+      applyHydratedSubscriptionState(key, metadataGeneration, metadata, activity, ownershipRevision)
     }).catch((cause) => {
       if (
         !isCurrentSubscription(lease, key, sequence, signal)
@@ -369,6 +381,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     bootstrap?: SessionBootstrapPhaseContext,
     reconciliation = false,
   ): Promise<SessionSubscriptionOutcome> {
+    let ownershipRevision = options.taskOwnership?.captureSnapshotRevision()
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
     if (options.lastStreamSeq.value === 0) isHydrating.value = true
@@ -381,6 +394,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!isCurrentSubscription(lease, key, sequence, signal)) {
         return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
       }
+      assertOwnershipSnapshotCurrent(ownershipRevision)
       async function finishInstallation() {
         await live.confirmInstalled?.()
         if (!isCurrentSubscription(lease, key, sequence, signal)) throw localAbortError('Snapshot owner changed.')
@@ -408,6 +422,9 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         if (!settledSnapshot) options.onLiveSnapshot?.(snapshot)
         snapshotTaskLive = Boolean(snapshotTaskId) && !settledSnapshot
       }
+      // Applying this read's own live snapshot can legitimately claim its task.
+      // Only changes arriving after that installation invalidate the metadata.
+      ownershipRevision = options.taskOwnership?.captureSnapshotRevision()
       if (live.reloadRequired) {
         if (!reconciliation) void options.loadHistory()
       }
@@ -429,6 +446,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
           metadataGeneration,
           live.initialMetadata,
           live.activity,
+          ownershipRevision,
         )
         if (reconciliation) await options.onReconciliationInstalled?.()
         if (!isCurrentSubscription(lease, key, sequence, signal)) return { ...UNAVAILABLE_SUBSCRIPTION, cancelled: true }
@@ -449,6 +467,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
         metadataGeneration,
         live.activity,
         signal,
+        ownershipRevision,
       )
       // Fast ACK is authoritative for delivery registration. Deferred storage
       // metadata may refine task/workspace state later but cannot make history
@@ -502,6 +521,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     if (!key) return false
     const lease = options.sessionReadLeaseReader.current()
     if (!lease) return false
+    const ownershipRevision = options.taskOwnership?.captureSnapshotRevision()
 
     const metadataHydration = ++metadataHydrationSequence
     const metadataGeneration = options.beginSessionMetadataResolution?.(key)
@@ -534,7 +554,7 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
       if (!hydration.hydrationComplete) {
         throw new Error('Session state hydration remained incomplete')
       }
-      applyHydratedSubscriptionState(key, metadataGeneration, hydration)
+      applyHydratedSubscriptionState(key, metadataGeneration, hydration, 'unknown', ownershipRevision)
       return true
     } catch (cause) {
       if (isCurrent() && metadataGeneration !== undefined) {
@@ -577,6 +597,16 @@ export function useChatSessionSubscription(options: UseChatSessionSubscriptionOp
     const current = options.runStatus.value
     const currentTaskId = chatTaskId(current.task)
     const nextTaskId = chatTaskId(next.task)
+    if (
+      !LIVE_RUN_STATES.includes(next.status)
+      && !nextTaskId
+      && options.taskOwnership?.stopTargetTaskId.value
+    ) {
+      // A compact, unscoped terminal summary cannot settle a known running
+      // or queued task. A complete read first reconciles ownership via
+      // applySnapshot, so genuine idle hydration still reaches this setter.
+      return
+    }
     if (next.status === 'queued' && nextTaskId) {
       options.taskOwnership?.noteQueued(next.task || nextTaskId)
       const runningTaskId = options.taskOwnership?.runningTaskId.value || ''

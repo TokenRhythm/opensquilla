@@ -4,6 +4,7 @@ import { createDurableDelivery } from './durableDelivery'
 import { TurnCommandError } from '@/modules/turnCommands'
 import type { TurnCommands, TurnSendRequest, TurnReceiptResult, TurnSendResponse, TurnSteerResponse, TurnCancelResponse } from '@/modules/turnCommands'
 import type { DeliveryWalRecord, PendingInputWal } from '@/utils/chat/pendingInputWal'
+import { createPendingQueuePolicy } from '@/utils/chat/pendingQueuePolicy'
 
 function memoryWal() {
   const records = new Map<string, DeliveryWalRecord>()
@@ -54,9 +55,204 @@ function harness(overrides: Partial<TurnCommands> = {}, storage = memoryWal()) {
 
 async function flush() { for (let index = 0; index < 60; index += 1) await Promise.resolve() }
 
+function sharedQueuePermission() {
+  const values = new Map<string, string>()
+  const storage = { getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value) } }
+  const local = createPendingQueuePolicy(storage)
+  const peer = createPendingQueuePolicy(storage)
+  const scope = { sessionKey: 'synthetic-session', deliveryIdentity: 'synthetic-identity' }
+  const permit = local.capture(scope)
+  return { pause: () => peer.pause(scope), resume: () => local.resume(scope),
+    guard: vi.fn(() => local.allows(permit)) }
+}
+
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers() })
 
 describe('application-owned durable delivery', () => {
+  it.each(['prepare', 'claim', 'arm'] as const)('honors a peer queue Stop during WAL %s and keeps the unsent request retryable', async stage => {
+    const storage = memoryWal()
+    const permission = sharedQueuePermission()
+    const prepare = storage.wal.prepareDelivery!
+    const compare = storage.wal.compareAndSwapDelivery!
+    let reached = false
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    storage.wal.prepareDelivery = async record => {
+      const result = await prepare(record)
+      if (stage === 'prepare' && !reached) { reached = true; await barrier }
+      return result
+    }
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      const result = await compare(id, revision, record)
+      if (!reached && result.applied && ((stage === 'claim' && record?.phase === 'prepared' && record.lease)
+        || (stage === 'arm' && record?.phase === 'submitting'))) {
+        reached = true
+        await barrier
+      }
+      return result
+    }
+    const test = harness({}, storage)
+    try {
+      const sending = test.owner.commands.send(request(), { beforeDispatch: permission.guard })
+      const rejected = expect(sending).rejects.toMatchObject({ failureCode: 'DELIVERY_DISPATCH_REVOKED', accepted: false })
+      await vi.waitFor(() => expect(reached).toBe(true))
+      expect(test.commands.send).not.toHaveBeenCalled()
+      permission.pause()
+      release()
+      await rejected
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'not-sent' })
+      expect(storage.records.get('synthetic-request')?.stop).toBeUndefined()
+      await test.owner.wake()
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      permission.resume()
+      await expect(test.owner.commands.send(request(), { beforeDispatch: () => true })).resolves.toMatchObject({ taskId: 'synthetic-task' })
+      expect(test.commands.send).toHaveBeenCalledExactlyOnceWith(request(), expect.objectContaining({ expectedGeneration: 1 }))
+    } finally { release(); test.owner.dispose() }
+  })
+
+  it('honors a peer queue Stop while the first dispatch waits for a send slot', async () => {
+    const releases: Array<() => void> = []
+    const permission = sharedQueuePermission()
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>(resolve => {
+      releases.push(() => resolve({ taskId: 'occupied-task' }))
+    })) })
+    try {
+      const occupied = [test.owner.commands.send(request('slot-a')), test.owner.commands.send(request('slot-b'))]
+      await vi.waitFor(() => expect(test.commands.send).toHaveBeenCalledTimes(2))
+      const sending = test.owner.commands.send(request(), { beforeDispatch: permission.guard })
+      const rejected = expect(sending).rejects.toMatchObject({ failureCode: 'DELIVERY_DISPATCH_REVOKED', accepted: false })
+      await vi.waitFor(() => expect(test.records.get('synthetic-request')?.phase).toBe('prepared'))
+      permission.pause()
+      for (const release of releases) release()
+      await Promise.all(occupied)
+      await rejected
+      expect(test.commands.send).toHaveBeenCalledTimes(2)
+      expect(test.records.get('synthetic-request')?.phase).toBe('not-sent')
+    } finally { for (const release of releases) release(); test.owner.dispose() }
+  })
+
+  it.each(['unknown', 'accepted'] as const)('keeps %s receipt recovery independent of revoked queue permission', async phase => {
+    const storage = memoryWal()
+    const response = { taskId: 'already-admitted-task' }
+    storage.records.set('synthetic-request', {
+      schemaVersion: 2, ownerRequestId: 'synthetic-request', deliveryIdentity: 'synthetic-identity',
+      requestSessionKey: 'synthetic-session', request: { kind: 'send', request: request() }, phase,
+      ...(phase === 'accepted' ? { response } : {}), revision: 1, createdAt: 1, updatedAt: 1,
+    })
+    const permission = sharedQueuePermission()
+    permission.pause()
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response })) }, storage)
+    try {
+      await expect(test.owner.commands.send(request(), { beforeDispatch: permission.guard })).resolves.toEqual(response)
+      expect(permission.guard).not.toHaveBeenCalled()
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(phase === 'unknown' ? 1 : 0)
+      expect([...storage.records.keys()]).toEqual(['synthetic-request'])
+    } finally { test.owner.dispose() }
+  })
+
+  it('consumes an in-flight acceptance after a peer pauses the queue', async () => {
+    const permission = sharedQueuePermission()
+    let accept!: (response: TurnSendResponse) => void
+    const test = harness({ send: vi.fn(() => new Promise<TurnSendResponse>(resolve => { accept = resolve })) })
+    try {
+      const sending = test.owner.commands.send(request(), { beforeDispatch: permission.guard })
+      await vi.waitFor(() => expect(test.commands.send).toHaveBeenCalledOnce())
+      permission.pause()
+      accept({ taskId: 'already-in-flight-task' })
+      await expect(sending).resolves.toEqual({ taskId: 'already-in-flight-task' })
+      expect(permission.guard).toHaveBeenCalledOnce()
+      expect(test.records.get('synthetic-request')?.phase).toBe('accepted')
+    } finally { test.owner.dispose() }
+  })
+
+  it('repairs a failed not-sent write from original revocation proof before retrying the same staged request', async () => {
+    const storage = memoryWal()
+    const compare = storage.wal.compareAndSwapDelivery!
+    let failNotSent = true
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (record?.phase === 'not-sent' && failNotSent) throw new Error('synthetic revoke write failure')
+      return compare(id, revision, record)
+    }
+    const test = harness({}, storage)
+    const staged: TurnSendRequest = { kind: 'pending-input', params: { key: 'synthetic-session',
+      pendingInputId: 'staged-C', clientRequestId: 'synthetic-request', requestFingerprint: 'fingerprint-C' } }
+    try {
+      await expect(test.owner.commands.send(staged, { beforeDispatch: () => false })).rejects.toMatchObject({
+        failureCode: 'DELIVERY_STORAGE_UNAVAILABLE', accepted: false, retryable: true,
+      })
+      expect(test.commands.send).not.toHaveBeenCalled()
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')?.phase).toBe('submitting')
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      failNotSent = false
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')?.phase).toBe('not-sent')
+      expect(test.commands.send).not.toHaveBeenCalled()
+      await expect(test.owner.commands.send(staged, { beforeDispatch: () => true })).resolves.toMatchObject({ taskId: 'synthetic-task' })
+      expect(test.commands.send).toHaveBeenCalledExactlyOnceWith(staged, expect.anything())
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+      expect([...storage.records.keys()]).toEqual(['synthetic-request'])
+    } finally { test.owner.dispose() }
+  })
+
+  it.each(['successor-epoch', 'accepted-receipt'] as const)('discards a revoked dispatch proof superseded by %s', async superseding => {
+    const storage = memoryWal()
+    const compare = storage.wal.compareAndSwapDelivery!
+    let failNotSent = true
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (record?.phase === 'not-sent' && failNotSent) throw new Error('synthetic revoke write failure')
+      return compare(id, revision, record)
+    }
+    const response = { taskId: 'successor-task' }
+    const test = harness({ lookupReceipt: vi.fn(async () => ({ status: 'found' as const, response })) }, storage)
+    try {
+      await expect(test.owner.commands.send(request(), { beforeDispatch: () => false }))
+        .rejects.toMatchObject({ failureCode: 'DELIVERY_STORAGE_UNAVAILABLE' })
+      await test.owner.wake()
+      const current = storage.records.get('synthetic-request')!
+      storage.records.set('synthetic-request', { ...current, revision: current.revision + 1,
+        ...(superseding === 'successor-epoch' ? {
+          phase: 'unknown', lease: { owner: 'peer-owner', epoch: current.lease!.epoch + 1, expiresAt: 0 },
+        } : { phase: 'accepted', response }),
+      })
+      failNotSent = false
+      await test.owner.wake()
+      await expect(test.owner.commands.send(request(), { beforeDispatch: () => false })).resolves.toEqual(response)
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(storage.records.get('synthetic-request')).toMatchObject({ phase: 'accepted', response })
+      expect(test.commands.lookupReceipt).toHaveBeenCalledTimes(superseding === 'successor-epoch' ? 1 : 0)
+    } finally { test.owner.dispose() }
+  })
+
+  it('repairs revocation evidence only while its original Gateway identity is active', async () => {
+    const storage = memoryWal()
+    const compare = storage.wal.compareAndSwapDelivery!
+    let failNotSent = true
+    storage.wal.compareAndSwapDelivery = async (id, revision, record) => {
+      if (record?.phase === 'not-sent' && failNotSent) throw new Error('synthetic revoke write failure')
+      return compare(id, revision, record)
+    }
+    const test = harness({}, storage)
+    try {
+      await expect(test.owner.commands.send(request(), { beforeDispatch: () => false }))
+        .rejects.toMatchObject({ failureCode: 'DELIVERY_STORAGE_UNAVAILABLE' })
+      await test.owner.wake()
+      test.identity('different-subject')
+      failNotSent = false
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')?.phase).toBe('submitting')
+      test.identity('synthetic-identity')
+      await test.owner.wake()
+      expect(storage.records.get('synthetic-request')?.phase).toBe('not-sent')
+      expect(test.commands.send).not.toHaveBeenCalled()
+      expect(test.commands.lookupReceipt).not.toHaveBeenCalled()
+    } finally { test.owner.dispose() }
+  })
+
   it.each(['prepared', 'unknown'] as const)('drops a retired workflow %s record without sending or replaying', async phase => {
     const storage = memoryWal()
     const oldRequest = request('retired-workflow')

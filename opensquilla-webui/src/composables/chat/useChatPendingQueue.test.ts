@@ -2246,7 +2246,7 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(dispatchPendingItem).toHaveBeenCalledWith(expect.objectContaining({
         text: 'next queued item',
-      }), 'agent:main:webchat:test')
+      }), 'agent:main:webchat:test', expect.any(Function))
       expect(inputText.value).toBe('draft written while steering')
       expect(queue.pendingQueue.value).toEqual([])
     } finally {
@@ -2283,7 +2283,7 @@ describe('useChatPendingQueue delivery state', () => {
 
       expect(dispatchPendingItem).toHaveBeenCalledWith(expect.objectContaining({
         text: 'second queued message',
-      }), 'agent:main:webchat:test')
+      }), 'agent:main:webchat:test', expect.any(Function))
       expect(queue.pendingQueue.value.map(item => item.text)).toEqual([
         'first queued message',
       ])
@@ -2394,6 +2394,7 @@ describe('useChatPendingQueue delivery state', () => {
           attachments: [expect.objectContaining({ name: 'queued-image.png' })],
         }),
         'agent:main:webchat:test',
+        expect.any(Function),
       )
       expect(queue.pendingQueue.value).toEqual([])
     } finally {
@@ -2736,6 +2737,7 @@ describe('useChatPendingQueue delivery state', () => {
       expect(dispatchPendingItem).toHaveBeenCalledWith(
         expect.objectContaining({ text: 'source item must still drain' }),
         'agent:main:webchat:test',
+        expect.any(Function),
       )
     } finally {
       source.queue.cleanup()

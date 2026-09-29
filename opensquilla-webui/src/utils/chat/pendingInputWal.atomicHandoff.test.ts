@@ -1,4 +1,7 @@
-import { describe, expect, it, vi } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { nextTick, ref } from 'vue'
+import { useChatPendingQueue } from '@/composables/chat/useChatPendingQueue'
+import { createPendingQueuePolicy } from './pendingQueuePolicy'
 
 import {
   createPendingInputWal,
@@ -9,6 +12,155 @@ import {
 
 const PENDING_STORE = 'pending_chat_inputs'
 const HANDOFF_STORE = 'response_handoffs'
+afterEach(() => vi.unstubAllGlobals())
+
+async function stoppedQueueHandoffFixture() {
+  vi.stubGlobal('IDBKeyRange', { bound: (lower: unknown, upper: unknown) => ({ lower, upper }) })
+  const factory = new ControlledIdbFactory()
+  const wal = createPendingInputWal(factory.idbFactory)!
+  const source = { sessionKey: 'handoff-parent', deliveryIdentity: 'handoff-account' }
+  const target = { ...source, sessionKey: 'handoff-child' }
+  const ownerRequestId = 'handoff-request'
+  const values = new Map<string, string>()
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value) },
+  }
+  for (const [position, text] of ['C', 'D'].entries()) {
+    await wal.put({ schemaVersion: 1, pendingInputId: text, sessionKey: source.sessionKey,
+      clientRequestId: `request-${text}`, clientMessageId: `message-${text}`,
+      text, attachments: [], intent: null, ownerRequestId, state: 'local_only',
+      position, walRevision: 1, createdAt: 1, updatedAt: 1 })
+  }
+  await wal.putHandoff!({ schemaVersion: 1, ownerRequestId, requestSessionKey: source.sessionKey,
+    clientRequestId: ownerRequestId, clientMessageId: 'message-A',
+    params: { sessionKey: source.sessionKey, message: 'A', clientRequestId: ownerRequestId,
+      clientMessageId: 'message-A' }, composerText: 'A',
+    recoveryAttachments: [], state: 'submitting', createdAt: 1, updatedAt: 1 })
+  const makeQueue = (initialSession = source.sessionKey) => {
+    const policy = createPendingQueuePolicy(storage)
+    const sessionKey = ref(initialSession)
+    const send = vi.fn(async () => 'accepted' as const)
+    const queue = useChatPendingQueue({ sessionKey, deliveryIdentity: ref(source.deliveryIdentity),
+      pendingInputWal: wal, pendingQueuePolicy: policy, inputText: ref(''),
+      pendingAttachments: ref([]), pendingSessionIntent: ref(null), isStreaming: ref(false),
+      isBlocked: () => false, hasComposer: () => true, autoResizeTextarea: vi.fn(),
+      resetInputHistory: vi.fn(), sendCurrentInput: vi.fn(),
+      dispatchPendingItem: async (_item, _key, guard) => guard?.() === false ? 'deferred' : send(),
+    })
+    return { queue, policy, sessionKey, send }
+  }
+  return { factory, wal, source, target, ownerRequestId, storage, makeQueue }
+}
+
+describe('queue Stop across the real WAL handoff', () => {
+  it.each(['adopt', 'recover'] as const)('releases only the temporary hold after an ordinary %s', async path => {
+    const f = await stoppedQueueHandoffFixture()
+    const first = f.makeQueue()
+    try {
+      f.factory.holdNextAtomicTransaction()
+      const moving = path === 'adopt'
+        ? first.queue.adoptPendingQueue(f.target.sessionKey, f.ownerRequestId)
+        : first.queue.recoverPendingQueueHandoff(f.source.sessionKey, f.target.sessionKey, f.ownerRequestId)
+      await f.factory.waitForHeldWrites()
+      expect(first.policy.read(f.target).paused).toBe(true)
+      f.factory.releaseHeldTransaction()
+      await moving
+      expect(first.policy.read(f.target).paused).toBe(false)
+      expect(first.policy.read(f.source).paused).toBe(false)
+      expect((await f.wal.list(f.target.sessionKey)).map(item => item.text)).toEqual(['C', 'D'])
+    } finally { first.queue.cleanup(); f.wal.close() }
+  })
+
+  it.each([
+    ['adopt', 'before'], ['recover', 'before'],
+    ['adopt', 'during'], ['recover', 'during'],
+  ] as const)('keeps C/D paused when Stop is %s / %s the migration wait', async (path, stopAt) => {
+    const f = await stoppedQueueHandoffFixture()
+    const first = f.makeQueue()
+    let reloaded: ReturnType<typeof f.makeQueue> | undefined
+    try {
+      await first.queue.hydratePendingQueue(f.source.sessionKey)
+      const peer = createPendingQueuePolicy(f.storage)
+      if (stopAt === 'before') peer.pause(f.source)
+      f.factory.holdNextAtomicTransaction()
+      const moving = path === 'adopt'
+        ? first.queue.adoptPendingQueue(f.target.sessionKey, f.ownerRequestId)
+        : first.queue.recoverPendingQueueHandoff(f.source.sessionKey, f.target.sessionKey, f.ownerRequestId)
+      await f.factory.waitForHeldWrites()
+      expect(createPendingQueuePolicy(f.storage).read(f.target).paused).toBe(true)
+      if (stopAt === 'during') peer.pause(f.source)
+      // Unmount before commit: durable state still has to be correct for the next page.
+      first.queue.cleanup()
+      f.factory.releaseHeldTransaction()
+      await moving
+      expect(await f.wal.list(f.source.sessionKey)).toEqual([])
+      expect((await f.wal.list(f.target.sessionKey)).map(item => item.text)).toEqual(['C', 'D'])
+      reloaded = f.makeQueue(f.target.sessionKey)
+      await reloaded.queue.hydratePendingQueue(f.target.sessionKey)
+      expect(reloaded.queue.autoSendPaused.value).toBe(true)
+      reloaded.queue.schedulePendingDrainAfterTerminal()
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(reloaded.send).not.toHaveBeenCalled()
+      expect(reloaded.queue.pendingQueue.value.map(item => item.text)).toEqual(['C', 'D'])
+      expect(peer.read(f.source).paused).toBe(true)
+      // A repeated accepted receipt must preserve a later explicit child Resume.
+      reloaded.policy.resume(f.target)
+      const resumed = reloaded.policy.read(f.target)
+      await reloaded.queue.recoverPendingQueueHandoff(f.source.sessionKey, f.target.sessionKey, f.ownerRequestId)
+      expect(reloaded.policy.read(f.target)).toMatchObject(resumed)
+      reloaded.queue.pausePendingAutoSend()
+      const stopped = reloaded.policy.read(f.target)
+      await reloaded.queue.recoverPendingQueueHandoff(f.source.sessionKey, f.target.sessionKey, f.ownerRequestId)
+      expect(reloaded.policy.read(f.target)).toMatchObject(stopped)
+    } finally { first.queue.cleanup(); reloaded?.queue.cleanup(); f.wal.close() }
+  })
+
+  it('keeps the child held after WAL commit even before the accepting page resumes', async () => {
+    const f = await stoppedQueueHandoffFixture()
+    const first = f.makeQueue()
+    let reloaded: ReturnType<typeof f.makeQueue> | undefined
+    let release!: () => void
+    try {
+      const accept = f.wal.acceptHandoff!.bind(f.wal)
+      let committed = false
+      f.wal.acceptHandoff = async (...args) => {
+        const result = await accept(...args)
+        committed = true
+        await new Promise<void>(resolve => { release = resolve })
+        return result
+      }
+      const moving = first.queue.adoptPendingQueue(f.target.sessionKey, f.ownerRequestId)
+      await vi.waitFor(() => expect(committed).toBe(true))
+      first.queue.pausePendingAutoSend()
+      first.queue.cleanup()
+      reloaded = f.makeQueue(f.target.sessionKey)
+      await reloaded.queue.hydratePendingQueue(f.target.sessionKey)
+      await nextTick()
+      expect(reloaded.queue.autoSendPaused.value).toBe(true)
+      reloaded.queue.schedulePendingDrainAfterTerminal()
+      await new Promise(resolve => setTimeout(resolve, 100))
+      expect(reloaded.send).not.toHaveBeenCalled()
+      f.wal.acceptHandoff = accept
+      await reloaded.queue.recoverPendingQueueHandoff(f.source.sessionKey, f.target.sessionKey, f.ownerRequestId)
+      expect(reloaded.queue.autoSendPaused.value).toBe(true)
+      release()
+      await moving
+    } finally { release?.(); first.queue.cleanup(); reloaded?.queue.cleanup(); f.wal.close() }
+  })
+
+  it('does not move durable rows when the child hold cannot be persisted', async () => {
+    const f = await stoppedQueueHandoffFixture()
+    const first = f.makeQueue()
+    try {
+      f.storage.setItem = () => { throw new Error('synthetic quota failure') }
+      await expect(first.queue.adoptPendingQueue(f.target.sessionKey, f.ownerRequestId))
+        .rejects.toThrow('Could not persist the pending queue handoff policy')
+      expect((await f.wal.list(f.source.sessionKey)).map(item => item.text)).toEqual(['C', 'D'])
+      expect(await f.wal.list(f.target.sessionKey)).toEqual([])
+    } finally { first.queue.cleanup(); f.wal.close() }
+  })
+})
 
 type StoreName = typeof PENDING_STORE | typeof HANDOFF_STORE
 type StoredValue = PendingInputWalRecord | ResponseHandoffWalRecord | DeliveryWalRecord
@@ -52,7 +204,9 @@ class ControlledIdbFactory {
     queueMicrotask(() => {
       const database = new ControlledDatabase(this)
       request.result = database as unknown as IDBDatabase
-      request.onupgradeneeded?.(new Event('upgradeneeded') as IDBVersionChangeEvent)
+      if (!this.hasStore(PENDING_STORE)) {
+        request.onupgradeneeded?.(new Event('upgradeneeded') as IDBVersionChangeEvent)
+      }
       request.onsuccess?.(new Event('success'))
     })
     return request as unknown as IDBOpenDBRequest
@@ -128,6 +282,10 @@ class ControlledIdbFactory {
     return this.heldTransaction?.isActive() === true
   }
 
+  releaseHeldTransaction(): void {
+    this.heldTransaction?.release()
+  }
+
   record(store: StoreName, key: IDBValidKey): StoredValue | undefined {
     const value = this.stores.get(store)?.get(key)
     return value ? clone(value) : undefined
@@ -177,7 +335,7 @@ class ControlledTransaction {
   constructor(
     private readonly factory: ControlledIdbFactory,
     names: StoreName[],
-    private readonly held: boolean,
+    private held: boolean,
   ) {
     this.working = factory.snapshot(names)
   }
@@ -193,8 +351,8 @@ class ControlledTransaction {
     })
   }
 
-  getAll(store: StoreName): IDBRequest<StoredValue[]> {
-    return this.request(() => [...(this.working.get(store)?.values() || [])].map(clone))
+  getAll(store: StoreName, filter: (value: StoredValue) => boolean = () => true): IDBRequest<StoredValue[]> {
+    return this.request(() => [...(this.working.get(store)?.values() || [])].filter(filter).map(clone))
   }
 
   put(store: StoreName, value: StoredValue): IDBRequest<IDBValidKey> {
@@ -221,6 +379,11 @@ class ControlledTransaction {
 
   isActive(): boolean {
     return this.active
+  }
+
+  release(): void {
+    this.held = false
+    this.queueCompletion()
   }
 
   private request<T>(read: () => T): IDBRequest<T> {
@@ -260,6 +423,15 @@ class ControlledObjectStore {
 
   getAll(): IDBRequest<StoredValue[]> {
     return this.transaction.getAll(this.name)
+  }
+
+  index(name: string): IDBIndex {
+    if (name !== 'session_created') throw new Error(`Unsupported controlled index: ${name}`)
+    return {
+      getAll: (range: IDBKeyRange) => this.transaction.getAll(this.name, value => (
+        (value as PendingInputWalRecord).sessionKey === range.lower[0]
+      )),
+    } as unknown as IDBIndex
   }
 
   put(value: StoredValue): IDBRequest<IDBValidKey> {
