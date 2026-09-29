@@ -32,7 +32,7 @@
 
 - 📢 **2026-08-22** —— 技术报告英文版已登陆 aiXiv：[aixiv.260822.000001](https://aixiv.science/abs/aixiv.260822.000001)，中文版已登陆 ChinaXiv：[202608.00176](https://chinaxiv.org/abs/202608.00176)。如何引用 OpenSquilla 请见[引用](#引用)。
 
-- 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型集成路由如何超越 Fable 5**。
+- 📢 **2026-07-14** —— 我们的技术报告 **[Agentic Routing: The Harness-Native Data Flywheel](https://arxiv.org/abs/2607.11399)** 已登陆 arXiv。报告展示了 harness 原生路由如何把日常 Agent 流量转化为自我改进的数据飞轮，以及**多模型融合路由如何超越 Fable 5**。
 
 ---
 
@@ -583,14 +583,105 @@ docker build -t opensquilla:local .
 
 ## 基准测试结果
 
-PinchBench 1.2.1 在 25 个任务上的平均结果:
+结果来自我们的[技术报告](https://aixiv.science/abs/aixiv.260822.000001)。得分由各基准自己的
+评分器给出，成本在所有框架间使用同一份供应商价目表。OpenSquilla 的行要么是强制单模型运行
+（完整框架、关闭路由，用来隔离框架本身的贡献），要么是多档路由模型池。
 
-| Agent | 基座模型 | 平均分 | 总输入 token | 总输出 token | 总成本 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| OpenSquilla | 模型路由（Opus4.7、GLM5.1、DS4 Flash） | 0.9251 | 1,721,328 | 61,475 | $0.688 |
-| OpenClaw | Claude Opus 4.7 | 0.9255 | 3,066,243 | 50,890 | $6.233 |
+### PinchBench
 
-分数是 25 个任务的均值；token 数和成本是整次运行的总计。
+25 个任务，覆盖文件操作、数据处理、网页检索、创意输出、工具调用和记忆召回。
+得分是跨题均值，成本是整次运行的总计。
+
+| 框架 | 模型（池） | 得分 | 成本 |
+| --- | --- | ---: | ---: |
+| OpenClaw | Opus-4.7 | 92.55 | $6.23 |
+| OpenClaw | GLM-5.1 | 88.33 | $1.60 |
+| OpenClaw | OpenRouter Auto | 88.10 | $3.01 |
+| Hermes Agent | Opus-4.7 | 92.65 | $6.66 |
+| OpenSquilla | Opus-4.7 | 93.85 | $4.84 |
+| OpenSquilla | {DeepSeek-V4 Flash, DeepSeek-V4 Flash, GLM-5.1, Opus-4.7} | 92.51 | $0.69 |
+| OpenSquilla | {MiniMax M2.5 (free), DeepSeek-V4 Flash, DeepSeek-V4 Flash, GLM-5.1} | 90.48 | $0.13 |
+
+强制单模型的 OpenSquilla 取得最高分，比 OpenClaw 的 Opus-4.7 直跑高 1.3 分、成本低 22%。
+以 Opus-4.7 兜底的路由模型池以 $0.69 保留基线 92.55 分的 99.96%。OpenRouter Auto 一行是
+另一套协议下的查询级路由基线，与其他行不可直接比较。
+
+### ClawMark
+
+100 个领域化的业务任务，覆盖 13 个行业，从临床辅助、内容运营到法律、HR、保险和房产。
+成本是单题平均计费成本。
+
+| 框架 | 模型（池） | 得分 | 单题成本 |
+| --- | --- | ---: | ---: |
+| OpenClaw | GLM-5.1 | 71.2 | $0.62 |
+| OpenSquilla | GLM-5.1 | 77.0 | $0.87 |
+| OpenSquilla | {MiniMax M2.5 (free), DeepSeek-V4 Pro, GLM-5.1, GLM-5.1} | 70.6 | $0.39 |
+
+只用框架就为同一模型加上 5.8 分，代价是成本更高——这是唯一一个质量工作点在价格上高于基线
+的基准。路由模型池把这份收益换回 37% 的成本降幅，落到接近 GLM-5.1 直跑的位置。
+
+### ClawSWEBench
+
+350 个多语言 SWE-bench 式修复任务，来自 8 种语言、43 个仓库；任务集、容器、提示词、
+最大轮数和超时全部固定。成本是单题平均计费成本。
+
+| 框架 | 模型（池） | 解决率 | 单题成本 |
+| --- | --- | ---: | ---: |
+| OpenClaw | Opus-4.7 | 77.1% | $3.09 |
+| OpenClaw | GLM-5.2 | 74.3% | $0.87 |
+| OpenClaw | GLM-5.1 | 73.4% | $0.79 |
+| OpenClaw | Qwen3.7-Max | 73.1% | $1.25 |
+| OpenSquilla | GLM-5.2 | 79.4% | $0.95 |
+| OpenSquilla | GLM-5.1 | 74.9% | $0.87 |
+| OpenSquilla | {DeepSeek-V4 Flash, GLM-5.1, GLM-5.2} | 74.0% | $0.44 |
+
+强制单模型的 GLM-5.2 解决的任务最多：比 OpenClaw 的 GLM-5.2 直跑高 5.1 个百分点，并且
+以约 31% 的成本超过了 OpenClaw 最强的单模型。路由模型池以一半的成本与 OpenClaw 的
+GLM-5.2 直跑持平，把 350 题中的 207 题（59%）交给便宜的 DeepSeek-V4 Flash 档，
+139 题升级到最高档。
+
+### DRACO
+
+100 个跨领域深度研究任务，按事实准确性、完整性、客观性、呈现质量和引用质量五个维度评分。
+成本是单题平均计费成本；token 是输入加输出，单位为千。
+
+| 框架 | 模型（池） | 得分 | 单题成本 | token（K） |
+| --- | --- | ---: | ---: | ---: |
+| OpenClaw | Opus-4.8 | 52.13 | $1.1420 | 54.2 |
+| OpenSquilla | Opus-4.8 | 52.36 | $0.6559 | 103.5 |
+| OpenSquilla | {DeepSeek-V4 Pro, GLM-5.2, Opus-4.8} | 52.33 | $0.3729 | 108.6 |
+
+只用框架就略高于 OpenClaw 直跑，同时成本几乎减半；开启路由后以低于 OpenClaw 直跑 67% 的
+成本保留该得分的 99.94%。路由运行的 token 反而更多，所以省下的不是提示词长度，
+而是调用的价格结构。
+
+### 多模型融合路由
+
+高精度模式用多个 proposer 模型各自起草，再由 aggregator 融合。下表每一行都在同一个
+OpenSquilla 框架内、同一套 DRACO 上运行，执行底座固定，变的只有模型分配。
+
+| 搜索源 | 方法 | 得分 | 单题成本 | token（K） |
+| --- | --- | ---: | ---: | ---: |
+| DuckDuckGo | Fable 5 | 59.80 | $1.2122 | 93.7 |
+| DuckDuckGo | Opus-4.8 | 52.36 | $0.6559 | 103.5 |
+| DuckDuckGo | DeepSeek-V4 Pro | 50.32 | $0.1320 | 83.4 |
+| DuckDuckGo | GPT-5.5 | 50.22 | $0.4505 | 81.9 |
+| DuckDuckGo | Qwen3.7-Max | 49.34 | $0.0432 | 99.5 |
+| DuckDuckGo | GLM-5.2 | 48.28 | $0.1214 | 116.8 |
+| DuckDuckGo | Kimi K2.7 Code | 45.48 | $0.0676 | 86.3 |
+| DuckDuckGo | Gemini-3 Flash | 40.79 | $0.0117 | 9.5 |
+| DuckDuckGo | 多模型融合路由（ours） | 60.82 | $0.3766 | 579.7 |
+| Brave | Fable 5 | 62.06 | $1.3241 | 106.7 |
+| Brave | Opus-4.8 | 59.11 | $1.6177 | 257.7 |
+| Brave | GPT-5.5 | 53.28 | $0.8407 | 189.4 |
+| Brave | 多模型融合路由（ours） | 64.09 | $0.1218 | 500.1 |
+
+两种搜索源下，融合路由都超过最强单模型：DuckDuckGo 下高 1.02 分、成本为其 31%；Brave 下
+高 2.03 分、成本低 90.8%。Fable 5 在 DuckDuckGo 下完成 100 题中的 94 题、在 Brave 下完成
+93 题，得分按已完成题目计算；其余每一行都完成了全部 100 题。让 router 在运行时自行组装
+proposer 集合、只固定 aggregator，结果与手工挑选的配置只差 0.51 分，成本却低 15.8%。
+
+这些质量是用 token 和墙钟时间换来的，可由 proposer 并行执行、早停和单 proposer 预算来控制。
 
 ---
 
