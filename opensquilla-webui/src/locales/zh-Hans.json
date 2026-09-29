@@ -4076,6 +4076,7 @@
     },
     "goal": {
       "emptyContinuations": "连续多个回合没有输出或工具活动，已暂停。检查目标后可继续。",
+      "noProgress": "连续多个回合没有可验证的进展，已暂停。检查目标后可继续。",
       "placeholder": "描述目标，然后按发送开始朝目标工作",
       "modeLabel": "Goal 模式",
       "modeDescription": "设定并持续推进一个目标",

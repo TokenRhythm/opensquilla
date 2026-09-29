@@ -570,7 +570,7 @@ async def test_real_gateway_suppresses_goal_sentinel_everywhere(
     assert silent_done["text"] == ""
     assert silent_done["text_snapshot"] == ""
     assert silent_done["suppression_reason"] == "no_reply"
-    assert silent_done["input_mode"] == "system_event"
+    assert silent_done["input_mode"] == "goal_continuation"
     assert silent_done["run_kind"] == "goal"
     silent_task_id = silent_done["task_id"]
     assert not any(

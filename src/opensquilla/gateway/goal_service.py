@@ -177,6 +177,9 @@ class GoalService:
         self._closed = False
         # Process-local: a restart pauses Goals instead of inferring prior empty work.
         self._empty_automatic_turns: dict[str, tuple[str, int, int]] = {}
+        # Repeated visible output/tool shape without a durable progress change
+        # is a separate safety condition from a completely empty turn.
+        self._no_progress_automatic_turns: dict[str, tuple[int, str, int]] = {}
 
     @property
     def execution_enabled(self) -> bool:
@@ -287,6 +290,7 @@ class GoalService:
             structured_user_input=connection_supports_user_input(ctx.conn_id),
         )
         self._empty_automatic_turns.pop(goal.goal_id, None)
+        self._no_progress_automatic_turns.pop(goal.goal_id, None)
         self._leases[goal.session_key] = lease
         self._continuity_grants[goal.session_key] = lease
         return lease
@@ -349,6 +353,7 @@ class GoalService:
         self._continuity_grants.pop(key, None)
         if authority is not None:
             self._empty_automatic_turns.pop(authority.goal_id, None)
+            self._no_progress_automatic_turns.pop(authority.goal_id, None)
 
     def _detach_authority(
         self,
@@ -1912,24 +1917,173 @@ class GoalService:
         entries = snapshot.get("entries")
         if not isinstance(entries, list):
             return False
+        terminal_payload: dict[str, Any] | None = None
+        terminal_content = details.get("terminal_assistant_message_content")
+        if isinstance(terminal_content, str) and terminal_content.strip():
+            try:
+                parsed = json.loads(terminal_content)
+            except (TypeError, ValueError):
+                parsed = None
+            if isinstance(parsed, dict):
+                terminal_payload = parsed
+            else:
+                terminal_payload = {"text": terminal_content}
+        terminal_text = (
+            str(terminal_payload.get("text") or "").strip()
+            if terminal_payload is not None
+            else ""
+        )
+        malformed_silent_marker = terminal_text in {"[NO_REPLY]", "[HEARTBEAT_OK]"}
+        has_only_malformed_text = (
+            malformed_silent_marker
+            and terminal_payload is not None
+            and not any(
+                terminal_payload.get(name)
+                for name in ("reasoning", "artifacts", "tool_calls")
+            )
+        )
+
         # Text, tools, reasoning, maintenance and interaction waits all count
-        # as activity. Only bookkeeping phases can constitute an empty turn.
+        # as activity. A provider's bracketed sentinel is malformed protocol,
+        # but it is still an empty Goal round when it is the only payload.
         for entry in entries:
-            if not isinstance(entry, dict) or entry.get("type") != "phase":
+            if not isinstance(entry, dict):
+                return False
+            if entry.get("type") == "segment" and has_only_malformed_text:
+                if entry.get("segment_type") == "text":
+                    continue
+                return False
+            if entry.get("type") != "phase":
                 return False
             if entry.get("reason") or entry.get("phase") in {"waiting", "retrying", "backoff"}:
                 return False
-        content = details.get("terminal_assistant_message_content")
-        if isinstance(content, str) and content.strip():
-            try:
-                payload = json.loads(content)
-            except (TypeError, ValueError):
-                return False
-            if not isinstance(payload, dict) or any(
-                payload.get(name) for name in ("text", "reasoning", "artifacts", "tool_calls")
+        if terminal_payload is not None:
+            if has_only_malformed_text:
+                return True
+            if any(
+                terminal_payload.get(name)
+                for name in ("text", "reasoning", "artifacts", "tool_calls")
             ):
                 return False
         return True
+
+    @staticmethod
+    def _goal_turn_progress_signature(task: Any, goal: Any, context: GoalTurnContext) -> str | None:
+        """Return a stable, privacy-safe shape for semantic no-progress checks."""
+
+        if not context.automatic or task is None or task.status != AgentTaskStatus.SUCCEEDED:
+            return None
+        details = task.details if isinstance(task.details, dict) else {}
+        terminal_content = details.get("terminal_assistant_message_content")
+        payload: dict[str, Any] | None = None
+        if isinstance(terminal_content, str) and terminal_content.strip():
+            try:
+                parsed = json.loads(terminal_content)
+            except (TypeError, ValueError):
+                parsed = None
+            payload = parsed if isinstance(parsed, dict) else {"text": terminal_content}
+
+        snapshot = details.get("activity_snapshot")
+        entries = snapshot.get("entries") if isinstance(snapshot, dict) else None
+        stable_entries: list[tuple[Any, ...]] = []
+        has_tool_or_interrupt = False
+        if isinstance(entries, list):
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                entry_type = entry.get("type")
+                if entry_type == "phase":
+                    stable_entries.append(
+                        (
+                            "phase",
+                            str(entry.get("kind") or ""),
+                            str(entry.get("phase") or ""),
+                            str(entry.get("reason") or ""),
+                        )
+                    )
+                elif entry_type == "segment":
+                    if entry.get("segment_type") == "tool":
+                        has_tool_or_interrupt = True
+                    stable_entries.append(
+                        (
+                            "segment",
+                            str(entry.get("segment_type") or ""),
+                            str(entry.get("name") or ""),
+                            bool(entry.get("is_error")),
+                            int(entry.get("text_utf16_length") or 0),
+                        )
+                    )
+                elif entry_type == "interrupt":
+                    has_tool_or_interrupt = True
+                    stable_entries.append(
+                        (
+                            "interrupt",
+                            str(entry.get("interrupt_type") or ""),
+                            str(entry.get("resolution") or ""),
+                        )
+                    )
+
+        text = ""
+        artifacts: Any = None
+        if payload is not None:
+            raw_text = payload.get("text")
+            if isinstance(raw_text, str):
+                text = " ".join(raw_text.split()).casefold()
+            artifacts = payload.get("artifacts")
+        # Tool and interaction results are evidence of attempted work, but the
+        # compact activity snapshot intentionally omits their arguments and
+        # result bodies. Do not call equal tool shapes "no progress" here.
+        if has_tool_or_interrupt or (not text and not artifacts):
+            return None
+        encoded = json.dumps(
+            {
+                "progress_revision": int(getattr(goal, "progress_revision", 0) or 0),
+                "text": text[:8_000],
+                "artifacts": artifacts,
+                "entries": stable_entries,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    async def _guard_no_progress_continuations(
+        self,
+        goal: GoalRecord,
+        task: Any,
+        context: GoalTurnContext,
+    ) -> GoalRecord:
+        if goal.status != GoalStatus.ACTIVE.value:
+            self._no_progress_automatic_turns.pop(goal.goal_id, None)
+            return goal
+        signature = self._goal_turn_progress_signature(task, goal, context)
+        if signature is None:
+            self._no_progress_automatic_turns.pop(goal.goal_id, None)
+            return goal
+        previous = self._no_progress_automatic_turns.get(goal.goal_id)
+        count = (
+            previous[2] + 1
+            if previous is not None
+            and previous[0] == context.objective_revision
+            and previous[1] == signature
+            else 1
+        )
+        self._no_progress_automatic_turns[goal.goal_id] = (
+            context.objective_revision,
+            signature,
+            count,
+        )
+        if count < 3:
+            return goal
+        paused = await self._storage.pause_goal_for_system(
+            session_key=goal.session_key,
+            goal_id=goal.goal_id,
+            expected_state_revision=goal.state_revision,
+            reason="no_progress",
+        )
+        self._no_progress_automatic_turns.pop(goal.goal_id, None)
+        return paused or goal
 
     async def _guard_empty_continuations(
         self,
@@ -2028,7 +2182,7 @@ class GoalService:
                 try:
                     updated = await self._storage.settle_goal_task(
                         context,
-                        max_turns=int(getattr(self.config, "max_turns", 50)),
+                        max_turns=int(getattr(self.config, "max_turns", 256)),
                         runtime_budget_seconds=int(
                             getattr(self.config, "runtime_budget_seconds", 3600)
                         ),
@@ -2058,6 +2212,14 @@ class GoalService:
                     )
             if updated is not None:
                 updated = await self._guard_empty_continuations(updated, task, context)
+                if not context.automatic:
+                    # A human-authored turn is a new opportunity for progress;
+                    # never carry an automatic no-progress streak across it.
+                    self._no_progress_automatic_turns.pop(context.goal_id, None)
+                elif updated.status == GoalStatus.ACTIVE.value:
+                    updated = await self._guard_no_progress_continuations(
+                        updated, task, context
+                    )
                 if updated.status != GoalStatus.ACTIVE.value:
                     self._revoke_authority(key)
                 classification = "active"
@@ -2067,7 +2229,12 @@ class GoalService:
                     classification = "blocked"
                 elif updated.status == GoalStatus.USAGE_LIMITED.value:
                     classification = "usage_limited"
-                elif updated.pause_reason in {"runtime_limit", "turn_limit"}:
+                elif updated.pause_reason in {
+                    "runtime_limit",
+                    "turn_limit",
+                    "empty_continuations",
+                    "no_progress",
+                }:
                     classification = str(updated.pause_reason)
                     _emit_goal_metric(
                         "goal_guardrail_pauses_total",
@@ -2290,7 +2457,7 @@ class GoalService:
                 "turn_context_disposition": "applied",
                 "turn_context_revision": 1,
                 "goal_id": goal.goal_id,
-                "input_mode": "system_event",
+                "input_mode": "goal_continuation",
             }
         )
         if session is None:
@@ -2334,7 +2501,7 @@ class GoalService:
                 mode="followup",
                 run_kind="goal",
                 no_memory_capture=True,
-                input_mode="system_event",
+                input_mode="goal_continuation",
                 persist_input=False,
                 history_has_persisted_user=False,
                 goal_context=context.as_task_detail(),
@@ -2386,7 +2553,7 @@ class GoalService:
                                 ),
                                 expected_continuation_seq=goal.continuation_seq,
                                 task_record=reservation.task_record,
-                                max_turns=int(getattr(self.config, "max_turns", 50)),
+                                max_turns=int(getattr(self.config, "max_turns", 256)),
                                 runtime_budget_seconds=int(
                                     getattr(
                                         self.config,

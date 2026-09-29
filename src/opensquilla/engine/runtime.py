@@ -7754,12 +7754,12 @@ class TurnRunner:
             )
             partial_text = partial_normalization.text.rstrip()
             human_prefix_was_withheld = (
-                input_mode != "system_event"
+                input_mode not in {"system_event", "goal_continuation"}
                 and bool(raw_partial_text_untrimmed)
                 and _could_be_human_silent_reply_prefix(raw_partial_text_untrimmed)
             )
             if (
-                input_mode == "system_event"
+                input_mode in {"system_event", "goal_continuation"}
                 and run_kind in {"goal", "heartbeat"}
                 and is_silent_reply_prefix(raw_partial_text)
             ) or human_prefix_was_withheld:

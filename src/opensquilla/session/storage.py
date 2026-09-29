@@ -8433,7 +8433,7 @@ class SessionStorage:
         expected: ExpectedGoal,
         expected_continuation_seq: int,
         task_record: AgentTaskRecord,
-        max_turns: int = 50,
+        max_turns: int = 256,
         runtime_budget_seconds: int = 3_600,
         workspace_guard: ProjectWorkspaceGuard | None = None,
         now_ms: int | None = None,

@@ -3992,6 +3992,7 @@
     },
     "goal": {
       "emptyContinuations": "En pausa tras varios turnos sin salida ni actividad de herramientas. Revisa el objetivo y reanúdalo cuando estés listo.",
+      "noProgress": "En pausa tras varios turnos sin progreso medible. Revisa el objetivo y reanúdalo cuando estés listo.",
       "placeholder": "Describe el objetivo y envía para empezar a trabajar en él",
       "modeLabel": "Modo objetivo",
       "modeDescription": "Iniciar un objetivo de larga duración",

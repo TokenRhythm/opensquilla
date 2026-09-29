@@ -294,7 +294,7 @@ Configure Goal execution in `config.toml`:
 ```toml
 [goal]
 execution_enabled = true
-max_turns = 50
+max_turns = 256
 runtime_budget_seconds = 3600
 ```
 
@@ -339,7 +339,12 @@ Three consecutive automatic turns with complete activity evidence but no body,
 tools, reasoning, or useful waits pause with `empty_continuations`. User turns,
 steering and meaningful activity reset the count; missing activity evidence is
 not treated as proof of an empty turn. Existing turn/runtime guardrails still
-apply. An ordinary failure or timeout blocks the Goal instead of replaying work.
+apply. Three consecutive successful automatic turns with the same visible
+result shape and no durable progress revision pause with `no_progress`; turns
+that contain tools or interaction waits are left to the normal continuation
+path because the compact activity snapshot cannot prove that their arguments
+and results were identical. An ordinary failure or timeout blocks the Goal
+instead of replaying work.
 
 ## Emergency stop and rollback
 
