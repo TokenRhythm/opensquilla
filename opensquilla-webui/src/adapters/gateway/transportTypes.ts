@@ -17,7 +17,8 @@ export type TransportConsumptionHandler = (
   payload: unknown, meta: Record<string, unknown>,
 ) => 'applied' | 'dirty' | Promise<'applied' | 'dirty'>
 
-export type TransportGapHandler = (detail: unknown) => Promise<boolean>
+export type TransportRecoveryResult = boolean | { readonly retryable: false }
+export type TransportGapHandler = (detail: unknown) => Promise<TransportRecoveryResult>
 
 /** Request lifecycle policy shared only between the private transport and its Adapters. */
 export interface TransportCallOptions {

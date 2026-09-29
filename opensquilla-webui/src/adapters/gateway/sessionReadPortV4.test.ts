@@ -1,4 +1,8 @@
-import { RpcTimeoutError } from '@/lib/rpc'
+import { RpcClient, RpcTimeoutError } from '@/lib/rpc'
+import { createConversationEventHub } from '@/modules/conversationEventHub'
+import { createConversationEventTransport } from './conversationEventTransport'
+import { TransportFlowV4 } from './transportFlowV4'
+import type { TransportEventHandler } from './transportTypes'
 import { createSessionReadLifecycle, type SessionReadPortLease } from '@/modules/sessionReadLifecycle'
 import { createConversationRuntime } from '@/modules/conversationRuntime'
 import { createConversationSubscriptionLifecycle } from '@/modules/conversationSubscriptionLifecycle'
@@ -311,6 +315,90 @@ function installationHarness(modern = true) {
 }
 
 describe('SessionReadPort installation error boundary', () => {
+  it('stops automatic flow recovery at a terminal snapshot without ACKing its unowned delivery', async () => {
+    vi.useFakeTimers()
+    const h = installationHarness()
+    let flow: TransportFlowV4 | undefined
+    const rpc = {
+      ...h.rpc,
+      recoveryVersion: (key: string) => flow?.recoveryVersion(key) ?? 'before-flow',
+      snapshotInstalled: (key: string, version: string) => flow?.snapshotInstalled(key, version),
+    }
+    const originalRequest = h.requestMock.getMockImplementation()!
+    h.requestMock.mockImplementation(async (method, params, options) => {
+      if (method === SNAPSHOT_READ) {
+        h.calls.push({ method, params, options })
+        options?.onSent?.(h.rpc.generation)
+        throw Object.assign(new Error('snapshot too large'), { code: 'SNAPSHOT_TOO_LARGE' })
+      }
+      return originalRequest(method, params, options)
+    })
+    let lease = createV4SessionReadPort(rpc).open(openRequest(undefined, false))
+    await expect(lease.live).rejects.toMatchObject({ kind: 'too-large', retryable: false })
+    const client = new RpcClient()
+    const listeners = new Map<string, Set<TransportEventHandler>>()
+    const on = (event: string, handler: TransportEventHandler) => {
+      if (!listeners.has(event)) listeners.set(event, new Set())
+      listeners.get(event)!.add(handler)
+      return () => { listeners.get(event)?.delete(handler) }
+    }
+    const emit = (event: string, ...args: unknown[]) => {
+      for (const handler of listeners.get(event) ?? []) handler(...args)
+    }
+    const hub = createConversationEventHub(createConversationEventTransport({
+      subscribe: (event, handler) => ({ close: on(event, handler) }),
+      subscribeGap: handler => ({ close: client.onGap(handler) }),
+    }))
+    hub.prepareReadRetirement('alpha')
+    hub.prepareReadRetirement('beta')
+    const reconcile = vi.fn(async () => { await lease.reconcile(); return true })
+    const beta = vi.fn(async () => true)
+    hub.observeRecoveryRequired(scope => scope.keys[0] === 'alpha' ? reconcile() : beta())
+    const control = vi.fn(async (_method: string, params: Record<string, unknown> = {}) => ({
+      delivery_epoch: params.delivery_epoch, ack_delivery_id: params.ack_delivery_id,
+      dirty_keys: [], global_dirty: false,
+    }))
+    flow = new TransportFlowV4({
+      connectionGeneration: 1, on, enableConsumptionFlow() {},
+      consumeEvent: async () => { throw new Error('Consumer requires authoritative recovery') },
+      recoverGap: detail => client.recoverGap(detail), supportsRecovery: () => true,
+      request: async <T>(method: string, params?: Record<string, unknown>) => control(method, params) as Promise<T>,
+    })
+    try {
+      emit('_hello', { policy: { transport_flow: { delivery_epoch: 'epoch', window_frames: 128, window_bytes: 4194304 } } })
+      for (const [id, key] of [[1, 'beta'], [2, 'alpha']] as const) emit('*', 'session.event.text_delta', {
+        session_key: key, text_delta: 'x',
+      }, { flow: { delivery_epoch: 'epoch', delivery_id: id } })
+      await vi.advanceTimersByTimeAsync(5_100)
+      expect(reconcile).toHaveBeenCalledOnce()
+      expect(beta).toHaveBeenCalledOnce()
+      expect(flow.diagnostics).toMatchObject({ pendingFrames: 1, unownedFrames: 1, ackDeliveryId: 1, queuedRecoveryKeys: 0 })
+      expect(control).toHaveBeenCalledWith('transport.flow.update', {
+        delivery_epoch: 'epoch', ack_delivery_id: 1,
+      })
+      expect(h.calls.filter(call => call.method === SNAPSHOT_RELEASE)).toHaveLength(1)
+      expect(h.calls.filter(call => call.method === SNAPSHOT_READ)).toHaveLength(1)
+      // Explicit retry replaces the read admission. Only a new snapshot with
+      // a validated install proof can cover the suspended unowned receipt.
+      const oldVersion = '1:0:1'
+      flow.snapshotInstalled('alpha', oldVersion)
+      expect(flow.diagnostics.ackDeliveryId).toBe(1)
+      h.requestMock.mockImplementation(originalRequest)
+      await lease.close()
+      hub.prepareReadRetirement('alpha')
+      lease = createV4SessionReadPort(rpc).open(openRequest(undefined, false))
+      await (await lease.live).confirmInstalled!()
+      await vi.advanceTimersByTimeAsync(50)
+      expect(flow.diagnostics).toMatchObject({ pendingFrames: 0, unownedFrames: 0, ackDeliveryId: 2 })
+    } finally {
+      flow.close()
+      hub.dispose()
+      client.disconnect()
+      await lease.close()
+      vi.useRealTimers()
+    }
+  })
+
   for (const source of ['initial', 'reconciliation'] as const) {
     it.each([
       ['SNAPSHOT_STALE', 'unavailable', true],

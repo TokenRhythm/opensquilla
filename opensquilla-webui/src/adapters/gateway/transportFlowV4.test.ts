@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { TransportFlowV4 } from './transportFlowV4'
-import type { TransportCallOptions, TransportEventHandler } from './transportTypes'
+import type { TransportCallOptions, TransportEventHandler, TransportRecoveryResult } from './transportTypes'
 
 const EPOCH = 'delivery-epoch-1'
 const METHOD = 'transport.flow.update'
@@ -26,7 +26,7 @@ function harness(modern = false) {
   const listeners = new Map<string, Set<TransportEventHandler>>()
   const enable = vi.fn()
   const consume = vi.fn(async (_event: string, _payload: unknown, _meta: Record<string, unknown>): Promise<'applied' | 'dirty'> => 'applied')
-  const recover = vi.fn(async (_detail: unknown): Promise<boolean> => true)
+  const recover = vi.fn(async (_detail: unknown): Promise<TransportRecoveryResult> => true)
   const request = vi.fn(async (_method: string, params: Record<string, unknown> = {}, _options?: TransportCallOptions): Promise<unknown> => reply(params))
   const controller = new TransportFlowV4({
     get connectionGeneration() { return generation },
@@ -73,6 +73,114 @@ afterEach(() => {
 })
 
 describe('connection-local consumption flow', () => {
+  it.each([false, true])('suspends terminal receipts until a current later installation (modern=%s)', async modern => {
+    const h = harness(modern)
+    h.consume.mockRejectedValue(new Error('No owner'))
+    h.recover.mockResolvedValue({ retryable: false })
+    h.hello()
+    h.deliver(1)
+    await vi.advanceTimersByTimeAsync(0)
+    const firstVersion = h.controller.recoveryVersion('alpha')
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(h.recover).toHaveBeenCalledOnce()
+    expect(h.request).not.toHaveBeenCalled()
+    h.dirty()
+    await vi.advanceTimersByTimeAsync(0)
+    const nextVersion = h.controller.recoveryVersion('alpha')
+    expect(nextVersion).not.toBe(firstVersion)
+    h.controller.snapshotInstalled('alpha', firstVersion)
+    expect(h.controller.diagnostics.unownedFrames).toBe(1)
+    h.controller.snapshotInstalled('alpha', nextVersion)
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.controller.diagnostics).toMatchObject({ ackDeliveryId: 1, unownedFrames: 0 })
+  })
+
+  it('does not suspend or ACK a replacement generation for a late terminal recovery', async () => {
+    const h = harness(true)
+    const old = deferred<TransportRecoveryResult>()
+    h.consume.mockRejectedValue(new Error('No owner'))
+    h.recover.mockReturnValueOnce(old.promise).mockResolvedValue(true)
+    h.hello()
+    h.deliver(1)
+    await vi.advanceTimersByTimeAsync(0)
+    const oldVersion = h.controller.recoveryVersion('alpha')
+    h.emit('_state', 'disconnected')
+    h.replaceGeneration()
+    h.hello('epoch-new')
+    old.resolve({ retryable: false })
+    h.controller.snapshotInstalled('alpha', oldVersion)
+    h.deliver(1, 'alpha', 'epoch-new')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.recover).toHaveBeenCalledTimes(2)
+    expect(h.request).toHaveBeenCalledWith(METHOD, {
+      delivery_epoch: 'epoch-new', ack_delivery_id: 1,
+    }, expect.anything())
+  })
+
+  it('does not retain a receipt retired by a tombstone while terminal recovery was pending', async () => {
+    const h = harness(true)
+    const recovery = deferred<TransportRecoveryResult>()
+    h.consume.mockRejectedValue(new Error('No owner'))
+    h.recover.mockReturnValue(recovery.promise)
+    h.hello()
+    h.deliver(1)
+    await vi.advanceTimersByTimeAsync(0)
+    const version = h.controller.recoveryVersion('alpha')
+    h.emit('*', 'transport.flow.dirty', {
+      delivery_epoch: EPOCH, dirty_keys: [], global_dirty: false,
+    }, { flow: h.receipt(1) })
+    recovery.resolve({ retryable: false })
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.controller.diagnostics).toMatchObject({ unownedFrames: 0, ackDeliveryId: 1 })
+    expect(h.controller.recoveryVersion('alpha')).toBe(version)
+  })
+
+  it('lets a current snapshot cover suspended credit after invalidation-map rollover', async () => {
+    const h = harness(true)
+    h.consume.mockRejectedValue(new Error('No owner'))
+    h.recover.mockResolvedValue({ retryable: false })
+    h.hello()
+    h.deliver(1, 'alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    const oldVersion = h.controller.recoveryVersion('alpha')
+    for (let key = 0; key < 256; key++) {
+      h.dirty([`other-${key}`])
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    const currentVersion = h.controller.recoveryVersion('alpha')
+    expect(currentVersion).not.toBe(oldVersion)
+    h.controller.snapshotInstalled('alpha', oldVersion)
+    expect(h.controller.diagnostics.ackDeliveryId).toBe(0)
+    h.controller.snapshotInstalled('alpha', currentVersion)
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.controller.diagnostics).toMatchObject({ ackDeliveryId: 1, unownedFrames: 0 })
+  })
+
+  it('keeps B recovery and staging available behind terminal A without fabricating a cumulative ACK', async () => {
+    const h = harness(true)
+    h.consume.mockRejectedValue(new Error('No owner'))
+    h.recover.mockImplementation(async detail => {
+      const keys = (detail as { keys: string[] }).keys
+      return keys[0] === 'alpha' ? { retryable: false } : true
+    })
+    h.hello()
+    h.deliver(1, 'alpha')
+    await vi.advanceTimersByTimeAsync(0)
+    h.deliver(2, 'beta')
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.recover).toHaveBeenCalledWith({ reason: 'transport_flow_dirty', keys: ['beta'], global: false })
+    expect(h.controller.diagnostics).toMatchObject({ ackDeliveryId: 0, unownedFrames: 1, pendingFrames: 1 })
+    const staged = h.controller.acknowledgeDelivery(h.receipt(3))
+    await vi.advanceTimersByTimeAsync(50)
+    await staged
+    expect(h.request).toHaveBeenCalledWith(METHOD, {
+      delivery_epoch: EPOCH, ack_delivery_id: 0, staged_delivery_ids: [3],
+    }, expect.anything())
+    h.controller.snapshotInstalled('alpha', h.controller.recoveryVersion('alpha'))
+    await vi.advanceTimersByTimeAsync(50)
+    expect(h.controller.diagnostics.ackDeliveryId).toBe(3)
+  })
+
   it('exposes immutable on-demand queue counts without payloads or session identities', async () => {
     const h = harness()
     const recovery = deferred<boolean>()

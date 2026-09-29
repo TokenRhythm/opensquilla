@@ -167,6 +167,7 @@ export interface RpcConnectionIntent {
 
 export type RpcLifecycle = 'stopped' | 'connecting' | 'connected' | 'recovering' | 'blocked';
 export type RpcConsumptionResult = 'applied' | 'dirty';
+export type RpcRecoveryResult = boolean | { readonly retryable: false };
 export type RecoveryClass = 'safe-read' | 'read' | 'mutation' | 'ephemeral';
 export type RpcRecoveryClass = RecoveryClass;
 export type RpcConsumptionHandler = (
@@ -391,7 +392,7 @@ export class RpcClient {
   private _maxLoopLagMs = 0;
   private _recoveryStartedAt: number | null = null;
   private _lastProbeAt = 0;
-  private _gapHandlers = new Set<(detail: unknown) => Promise<boolean>>();
+  private _gapHandlers = new Set<(detail: unknown) => Promise<RpcRecoveryResult>>();
   private _gapRecovery: Promise<void> | null = null;
   private _pendingGap: unknown = null;
   private _gapRetryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -793,20 +794,22 @@ export class RpcClient {
   get health(): 'healthy' | 'suspect' { return this._health; }
   get phase(): RpcTransportPhase { return this._phase; }
 
-  onGap(handler: (detail: unknown) => Promise<boolean>): () => void {
+  onGap(handler: (detail: unknown) => Promise<RpcRecoveryResult>): () => void {
     this._gapHandlers.add(handler);
     return () => this._gapHandlers.delete(handler);
   }
 
   enableConsumptionFlow(): void { this._consumptionFlowEnabled = true; }
 
-  async recoverGap(detail: unknown): Promise<boolean> {
+  async recoverGap(detail: unknown): Promise<RpcRecoveryResult> {
     const handlers = [...this._gapHandlers];
     if (!handlers.length) return false;
     const results = await Promise.allSettled(handlers.map(handler => Promise.resolve().then(
       () => handler(detail),
     )));
-    return results.every(result => result.status === 'fulfilled' && result.value === true);
+    if (results.some(result => result.status === 'rejected' || result.value === false)) return false;
+    return results.every(result => result.status === 'fulfilled' && result.value === true)
+      ? true : { retryable: false };
   }
 
   /** Only domain owners register here; observation listeners do not ACK data. */
@@ -1905,7 +1908,7 @@ export class RpcClient {
       return this.recoverGap(pending);
     }).catch(() => false).then(recovered => {
       if (generation !== this._socketGeneration || !this._autoReconnect || this._blockedReason) return;
-      if (!recovered) {
+      if (recovered === false) {
         // A missing domain owner or a failed snapshot does not prove transport
         // failure. Keep responsibility without closing the healthy socket.
         if (this._pendingGap === null) this._pendingGap = pending;

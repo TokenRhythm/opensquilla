@@ -933,6 +933,7 @@ import {
  } from '@/composables/chat/useChatSessionBootstrap'
  import {
    autoSendDraftIsUnchanged,
+   sessionRecoverySucceeded,
  } from '@/composables/chat/sessionBootstrapContract'
 import {
   acquireSessionBootstrapAdmission,
@@ -3887,7 +3888,7 @@ const rpcEventHandlers = useChatRpcEventHandlers({
     liveSkillLoads.value[turnId] = mergeSkillLoad(liveSkillLoads.value[turnId] || [], receipt)
     if (receipt.status === 'failed') invalidateSkillCandidates()
   },
-  onRecoveryRequired: () => { void recoverCurrentSession() },
+  onRecoveryRequired: () => { void recoverCurrentSession().catch(() => {}) },
   onTaskProgress: taskProgress.applyEvent,
   onTaskSettled: (taskId, epoch) => {
     chatPlans.noteTaskSettled(taskId, epoch)
@@ -4208,8 +4209,10 @@ function recoverCurrentSession(scope?: { readonly keys: readonly string[], reado
   if (!lease) return Promise.resolve(false)
   const prior = sessionRecoveries.get(lease)
   if (prior) return prior
-  const pending = retryLive(false).then(result => key === sessionKey.value
-    && sessionReadLifecycle.current() === lease && result.authoritative).catch(() => false)
+  const pending = retryLive(false).then(result => {
+    if (key !== sessionKey.value || sessionReadLifecycle.current() !== lease) return false
+    return sessionRecoverySucceeded(result)
+  })
   const observed = pending.finally(() => {
     if (sessionRecoveries.get(lease) === observed) sessionRecoveries.delete(lease)
   })

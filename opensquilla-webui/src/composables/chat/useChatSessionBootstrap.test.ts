@@ -10,6 +10,7 @@ import type { SessionSubscriptionOutcome } from './useChatSessionSubscription'
 import {
   autoSendDraftIsUnchanged,
   shouldRetrySessionPhase,
+  sessionRecoverySucceeded,
   type SessionBootstrapPhaseContext,
   type SessionPhaseResult,
 } from './sessionBootstrapContract'
@@ -97,6 +98,31 @@ afterEach(() => {
 })
 
 describe('useChatSessionBootstrap', () => {
+  it.each(['too-large', 'budget-exhausted'] as const)(
+    'preserves %s from the bootstrap result into the Conversation recovery callback', async kind => {
+      const terminal = new SessionReadFailure(kind, 'Explicit retry required', false)
+      const h = createBootstrap({
+        reconcileSession: async () => ({ ...LIVE_READY, authoritative: false, error: terminal }),
+      })
+      try {
+        await h.api.startSessionBootstrap().live
+        await expect(h.api.retryLive(false).then(sessionRecoverySucceeded)).rejects.toBe(terminal)
+        expect(h.api.livePhase.value).toBe('degraded')
+        expect(h.openSessionRead).toHaveBeenCalledOnce()
+        await expect(h.api.retryLive(true).then(sessionRecoverySucceeded)).resolves.toBe(true)
+        expect(h.openSessionRead).toHaveBeenCalledTimes(2)
+      } finally { h.api.cancelSessionBootstrap() }
+    },
+  )
+
+  it('does not classify raw wire retryability or a cancelled read as a terminal domain failure', () => {
+    const raw = Object.assign(new Error('stale'), { code: 'SNAPSHOT_STALE', retryable: false })
+    expect(sessionRecoverySucceeded({ authoritative: false, error: raw })).toBe(false)
+    expect(sessionRecoverySucceeded({ authoritative: false, error: new SessionReadFailure('unavailable', 'retry', true) })).toBe(false)
+    expect(sessionRecoverySucceeded({ authoritative: false, cancelled: true,
+      error: new SessionReadFailure('too-large', 'stale owner', false) })).toBe(false)
+  })
+
   it('does not queue another snapshot when an ordinary heartbeat arrives during a slow live transfer', async () => {
     vi.useFakeTimers()
     let complete!: (result: SessionSubscriptionOutcome) => void
