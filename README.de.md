@@ -692,15 +692,119 @@ Details zu den einzelnen Versionen stehen in [`CHANGELOG.md`](CHANGELOG.md) und 
 
 ## Benchmark-Ergebnisse
 
-PinchBench-1.2.1-Durchschnittsergebnisse über 25 Aufgaben:
+Ergebnisse aus unserem [technischen Bericht](https://aixiv.science/abs/aixiv.260822.000001).
+Die Scores stammen vom jeweiligen Bewerter des Benchmarks, die Kosten nutzen für alle
+Frameworks dieselbe Anbieter-Preisliste. Eine OpenSquilla-Zeile ist entweder ein erzwungener
+Einzelmodell-Lauf — der vollständige Harness mit deaktiviertem Routing, was den Beitrag des
+Harness isoliert — oder ein mehrstufiger Routing-Pool.
 
-| Agent | Basismodell | Ø-Score | Eingabe-Tokens gesamt | Ausgabe-Tokens gesamt | Gesamtkosten |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| OpenSquilla | Modell-Router (Opus4.7, GLM5.1, DS4 Flash) | 0.9251 | 1,721,328 | 61,475 | $0.688 |
-| OpenClaw | Claude Opus 4.7 | 0.9255 | 3,066,243 | 50,890 | $6.233 |
+### PinchBench
 
-Der Score ist der Mittelwert über die 25 Aufgaben; Token-Zahlen und
-Kosten sind Summen für den gesamten Lauf.
+25 Aufgaben aus Dateioperationen, Datenverarbeitung, Web-Recherche, kreativer Ausgabe,
+Tool-Nutzung und Gedächtnisabruf. Der Score ist der Mittelwert über die Aufgaben, die Kosten
+sind die Summe für den Lauf.
+
+| Framework | Modell (Pool) | Score | Kosten |
+| --- | --- | ---: | ---: |
+| OpenClaw | Opus-4.7 | 92.55 | $6.23 |
+| OpenClaw | GLM-5.1 | 88.33 | $1.60 |
+| OpenClaw | OpenRouter Auto | 88.10 | $3.01 |
+| Hermes Agent | Opus-4.7 | 92.65 | $6.66 |
+| OpenSquilla | Opus-4.7 | 93.85 | $4.84 |
+| OpenSquilla | {DeepSeek-V4 Flash, DeepSeek-V4 Flash, GLM-5.1, Opus-4.7} | 92.51 | $0.69 |
+| OpenSquilla | {MiniMax M2.5 (free), DeepSeek-V4 Flash, DeepSeek-V4 Flash, GLM-5.1} | 90.48 | $0.13 |
+
+OpenSquilla im erzwungenen Einzelmodell erzielt den höchsten Score: +1.3 gegenüber OpenClaws
+Opus-4.7-Lauf bei 22% geringeren Kosten. Der mit Opus-4.7 abgesicherte Routing-Pool hält
+99.96% des Basis-Scores von 92.55 für $0.69. Die Zeile OpenRouter Auto ist eine
+Routing-Baseline auf Anfrageebene aus einem separaten Protokoll und nicht direkt vergleichbar.
+
+### ClawMark
+
+100 domänenspezifische Geschäftsaufgaben aus 13 Domänen, von klinischer Assistenz und
+Content-Betrieb bis Recht, HR, Versicherung und Immobilien. Die Kosten sind die durchschnittlich
+abgerechneten Kosten pro Aufgabe.
+
+| Framework | Modell (Pool) | Score | Kosten pro Aufgabe |
+| --- | --- | ---: | ---: |
+| OpenClaw | GLM-5.1 | 71.2 | $0.62 |
+| OpenSquilla | GLM-5.1 | 77.0 | $0.87 |
+| OpenSquilla | {MiniMax M2.5 (free), DeepSeek-V4 Pro, GLM-5.1, GLM-5.1} | 70.6 | $0.39 |
+
+Der Harness allein bringt 5.8 Punkte auf dasselbe Modell, allerdings zu höheren Kosten: das
+einzige Benchmark, bei dem der Qualitätspunkt preislich über der Basis liegt. Der Routing-Pool
+tauscht den Gewinn gegen eine 37% günstigere Aufgabe und landet nahe am direkten GLM-5.1-Lauf.
+
+### ClawSWEBench
+
+350 mehrsprachige Reparaturaufgaben im SWE-bench-Stil aus 8 Sprachen und 43 Repositories, mit
+festem Aufgabensatz, Containern, Prompts, maximalen Runden und Timeouts. Die Kosten sind die
+durchschnittlich abgerechneten Kosten pro Aufgabe.
+
+| Framework | Modell (Pool) | Lösungsrate | Kosten pro Aufgabe |
+| --- | --- | ---: | ---: |
+| OpenClaw | Opus-4.7 | 77.1% | $3.09 |
+| OpenClaw | GLM-5.2 | 74.3% | $0.87 |
+| OpenClaw | GLM-5.1 | 73.4% | $0.79 |
+| OpenClaw | Qwen3.7-Max | 73.1% | $1.25 |
+| OpenSquilla | GLM-5.2 | 79.4% | $0.95 |
+| OpenSquilla | GLM-5.1 | 74.9% | $0.87 |
+| OpenSquilla | {DeepSeek-V4 Flash, GLM-5.1, GLM-5.2} | 74.0% | $0.44 |
+
+Im erzwungenen Einzelmodell löst GLM-5.2 die meisten Aufgaben: +5.1 Punkte gegenüber OpenClaws
+direktem GLM-5.2-Lauf und vor OpenClaws stärkstem Einzelmodell bei etwa 31% von dessen Kosten.
+Der Routing-Pool erreicht OpenClaws GLM-5.2-Lauf zum halben Preis, delegiert 207 der 350
+Aufgaben (59%) an die günstige DeepSeek-V4-Flash-Stufe und hebt 139 auf die oberste Stufe.
+
+### DRACO
+
+100 domänenübergreifende Deep-Research-Aufgaben, bewertet nach Faktenrichtigkeit,
+Vollständigkeit, Objektivität, Präsentationsqualität und Zitatqualität. Die Kosten sind die
+durchschnittlich abgerechneten Kosten pro Aufgabe; Tokens sind Eingabe plus Ausgabe in Tausend.
+
+| Framework | Modell (Pool) | Score | Kosten pro Aufgabe | Tokens (K) |
+| --- | --- | ---: | ---: | ---: |
+| OpenClaw | Opus-4.8 | 52.13 | $1.1420 | 54.2 |
+| OpenSquilla | Opus-4.8 | 52.36 | $0.6559 | 103.5 |
+| OpenSquilla | {DeepSeek-V4 Pro, GLM-5.2, Opus-4.8} | 52.33 | $0.3729 | 108.6 |
+
+Der Harness allein liegt knapp über OpenClaws direktem Lauf und halbiert dabei fast die Kosten;
+mit eingeschaltetem Routing bleiben 99.94% dieses Scores bei 67% unter dem OpenClaw-Lauf. Der
+geroutete Lauf verbraucht mehr Tokens als der feste, die Ersparnis kommt also aus dem
+Preis-Mix der Aufrufe und nicht aus kürzeren Prompts.
+
+### Multi-Modell-Ensemble-Routing
+
+Der High-Accuracy-Modus lässt mehrere Proposer-Modelle entwerfen und fusioniert die Entwürfe
+mit einem Aggregator. Jede Zeile läuft im selben OpenSquilla-Harness auf DRACO: das
+Ausführungssubstrat ist fest, es ändert sich nur die Modellzuteilung.
+
+| Suche | Methode | Score | Kosten pro Aufgabe | Tokens (K) |
+| --- | --- | ---: | ---: | ---: |
+| DuckDuckGo | Fable 5 | 59.80 | $1.2122 | 93.7 |
+| DuckDuckGo | Opus-4.8 | 52.36 | $0.6559 | 103.5 |
+| DuckDuckGo | DeepSeek-V4 Pro | 50.32 | $0.1320 | 83.4 |
+| DuckDuckGo | GPT-5.5 | 50.22 | $0.4505 | 81.9 |
+| DuckDuckGo | Qwen3.7-Max | 49.34 | $0.0432 | 99.5 |
+| DuckDuckGo | GLM-5.2 | 48.28 | $0.1214 | 116.8 |
+| DuckDuckGo | Kimi K2.7 Code | 45.48 | $0.0676 | 86.3 |
+| DuckDuckGo | Gemini-3 Flash | 40.79 | $0.0117 | 9.5 |
+| DuckDuckGo | Multi-Modell-Ensemble-Routing (unseres) | 60.82 | $0.3766 | 579.7 |
+| Brave | Fable 5 | 62.06 | $1.3241 | 106.7 |
+| Brave | Opus-4.8 | 59.11 | $1.6177 | 257.7 |
+| Brave | GPT-5.5 | 53.28 | $0.8407 | 189.4 |
+| Brave | Multi-Modell-Ensemble-Routing (unseres) | 64.09 | $0.1218 | 500.1 |
+
+Das Ensemble übertrifft das stärkste Einzelmodell bei beiden Suchanbietern: +1.02 Punkte bei
+31% von dessen Kosten mit DuckDuckGo und +2.03 Punkte bei 90.8% geringeren Kosten mit Brave.
+Fable 5 hat mit DuckDuckGo 94 der 100 Aufgaben abgeschlossen und mit Brave 93, und wird auf den
+abgeschlossenen Aufgaben bewertet; alle anderen Zeilen haben alle 100 abgeschlossen. Lässt man
+den Router den Proposer-Satz zur Laufzeit zusammenstellen und hält nur den Aggregator fest,
+liegt das Ergebnis 0.51 Punkte von der handverlesenen Konfiguration entfernt bei 15.8%
+geringeren Kosten.
+
+Diese Qualität wird mit Tokens und Wanduhrzeit bezahlt, was parallele Proposer-Ausführung,
+frühzeitiges Stoppen und Budgets pro Proposer begrenzen.
 
 ---
 
