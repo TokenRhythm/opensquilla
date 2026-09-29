@@ -264,8 +264,17 @@ export interface ChatSendOriginalRequestIdentityAndFrozenMaterial {
     | []
     | [ChatSendOriginalWorkspaceFileReference]
     | [ChatSendOriginalWorkspaceFileReference, ChatSendOriginalWorkspaceFileReference]
-    | [ChatSendOriginalWorkspaceFileReference, ChatSendOriginalWorkspaceFileReference, ChatSendOriginalWorkspaceFileReference]
-    | [ChatSendOriginalWorkspaceFileReference, ChatSendOriginalWorkspaceFileReference, ChatSendOriginalWorkspaceFileReference, ChatSendOriginalWorkspaceFileReference]
+    | [
+        ChatSendOriginalWorkspaceFileReference,
+        ChatSendOriginalWorkspaceFileReference,
+        ChatSendOriginalWorkspaceFileReference
+      ]
+    | [
+        ChatSendOriginalWorkspaceFileReference,
+        ChatSendOriginalWorkspaceFileReference,
+        ChatSendOriginalWorkspaceFileReference,
+        ChatSendOriginalWorkspaceFileReference
+      ]
     | [
         ChatSendOriginalWorkspaceFileReference,
         ChatSendOriginalWorkspaceFileReference,
@@ -865,8 +874,17 @@ export interface SessionsSendOriginalRequestIdentityAndFrozenMaterial {
     | []
     | [SessionsSendOriginalWorkspaceFileReference]
     | [SessionsSendOriginalWorkspaceFileReference, SessionsSendOriginalWorkspaceFileReference]
-    | [SessionsSendOriginalWorkspaceFileReference, SessionsSendOriginalWorkspaceFileReference, SessionsSendOriginalWorkspaceFileReference]
-    | [SessionsSendOriginalWorkspaceFileReference, SessionsSendOriginalWorkspaceFileReference, SessionsSendOriginalWorkspaceFileReference, SessionsSendOriginalWorkspaceFileReference]
+    | [
+        SessionsSendOriginalWorkspaceFileReference,
+        SessionsSendOriginalWorkspaceFileReference,
+        SessionsSendOriginalWorkspaceFileReference
+      ]
+    | [
+        SessionsSendOriginalWorkspaceFileReference,
+        SessionsSendOriginalWorkspaceFileReference,
+        SessionsSendOriginalWorkspaceFileReference,
+        SessionsSendOriginalWorkspaceFileReference
+      ]
     | [
         SessionsSendOriginalWorkspaceFileReference,
         SessionsSendOriginalWorkspaceFileReference,

@@ -294,7 +294,7 @@ OpenSquilla关键依据均以第1节SHA为准：`workspace_files.py:118`（实�
 
 ### 独立 Windows 打包交互验收
 
-最终记录：`C:/Users/weihe/AppData/Local/Temp/opensquilla-jpg-409-bd378e93041d44a1be0418fba83951e5/packaged-attachment-chv7zp/report.json`，`ok=true`，进程 exit 0。运行时为真实 Electron 42.11.4 / Node 24.19.0 → 冻结 Python 3.12.13，而不是模拟 native HTTP 回包。
+最终记录：`<temp>/opensquilla-jpg-409-<run-id>/packaged-attachment-<id>/report.json`，`ok=true`，进程 exit 0。运行时为真实 Electron 42.11.4 / Node 24.19.0 → 冻结 Python 3.12.13，而不是模拟 native HTTP 回包。
 
 | 场景 | 结果 |
 | --- | --- |
