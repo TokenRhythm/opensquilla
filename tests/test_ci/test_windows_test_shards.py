@@ -581,6 +581,56 @@ def test_bounded_latency_contracts_are_marked_ci_serial(
     assert "pytest.mark.ci_serial" in _function_decorators(Path(test_file), function_name)
 
 
+@pytest.mark.parametrize("function_name", [
+    "test_close_releases_stalled_send_lock_before_draining_accepted_record",
+    "test_prepare_shutdown_releases_send_lock_and_keeps_producer_records_open",
+    "test_shutdown_probe_rejects_broken_contracts",
+    "test_shutdown_probe_bounds_noncooperative_cleanup",
+])
+def test_telemetry_process_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_telemetry/test_client_runtime.py"), function_name,
+    )
+
+
+@pytest.mark.parametrize("function_name", [
+    "test_close_drains_native_before_reconnect",
+    "test_close_probe_rejects_broken_resource_contracts",
+    "test_close_probe_watchdog_terminates_noncooperative_close",
+])
+def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_session/test_recovery_reads.py"), function_name,
+    )
+
+
+@pytest.mark.ci_serial
+@pytest.mark.parametrize(("target", "serial_count"), [
+    ("tests/test_telemetry/test_client_runtime.py", 5),
+    ("tests/test_session/test_recovery_reads.py", 9),
+])
+def test_sqlite_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
+    """Exercise actual pytest collection, not fixture-setup-time marker changes."""
+    def collect(marker: str | None) -> set[str]:
+        command = [sys.executable, "-m", "pytest", target, "--collect-only", "-q"]
+        if marker is not None:
+            command += ["-m", marker]
+        result = subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        nodes = [line for line in result.stdout.splitlines() if line.startswith(f"{target}::")]
+        assert nodes and len(nodes) == len(set(nodes)), result.stdout
+        return set(nodes)
+
+    all_nodes = collect(None)
+    parallel = collect("not ci_serial")
+    serial = collect("ci_serial")
+    assert not parallel & serial
+    assert parallel | serial == all_nodes
+    assert len(serial) == serial_count
+
+
 def test_real_skill_install_cancellation_is_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_engine/test_skill_install_turn.py"),
