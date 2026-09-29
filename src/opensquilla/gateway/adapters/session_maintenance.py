@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
@@ -36,11 +37,13 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionUnavailableError,
     SessionCompactionUsagePort,
     SessionMaintenance,
+    _deadline_has_no_underlying_failure,
 )
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     workspace_attachment_budget_from_config,
 )
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.engine.cache_break_monitor import (
     compaction_terminal_status,
     notify_compaction,
@@ -118,6 +121,7 @@ class _GatewayCompactionPlan:
     budget: GatewayConsumerBudget
     config: CompactionConfig
     compaction_correlation: ProviderRequestCorrelation | None
+    failure_scope: tuple[Any, ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -262,7 +266,9 @@ class GatewaySessionMaintenancePorts(
     ) -> SessionCompactionPlan:
         raw_session = session.runtime_value if session is not None else None
         budget = self._consumer_budget(session, requested_tokens)
-        target = resolve_gateway_compaction_target(self._context, raw_session)
+        target = resolve_gateway_compaction_target(
+            self._context, raw_session, consumer_budget=budget,
+        )
         config = build_compaction_config_from_provider(
             target.provider,
             model_override=target.model or effective_session_model(raw_session),
@@ -280,6 +286,11 @@ class GatewaySessionMaintenancePorts(
         )
         consumer_agent = None
         if callable(prepare_envelope) and raw_session is not None and budget.provider is not None:
+            envelope_options: dict[str, Any] = {}
+            if _accepts_keyword_arg(prepare_envelope, "provider_request_max_chars_explicit_cap"):
+                envelope_options["provider_request_max_chars_explicit_cap"] = (
+                    budget.provider_request_max_chars_explicit_cap
+                )
             consumer_agent = prepare_envelope(
                 raw_session,
                 provider=budget.provider,
@@ -306,21 +317,34 @@ class GatewaySessionMaintenancePorts(
                         raw_session, "active_plan_revision_id", None,
                     ),
                 ),
+                **envelope_options,
             )
+        failure_scope = None
+        if consumer_agent is not None:
+            config.request_context = consumer_agent.build_compaction_request_context()
+            identity = getattr(self._context.turn_runner, "_compaction_failure_identity", None)
+            policy = getattr(self._context.turn_runner, "_compaction_failure_policy", None)
+            if callable(identity) and callable(policy):
+                failure_scope = identity(
+                    provider=budget.provider, provider_config=None,
+                    chat_config=config.request_context.chat_config,
+                    policy=policy(consumer_agent.config),
+                )
         config.budget = build_gateway_compaction_budget(
             budget,
             consumer_agent=consumer_agent,
             trigger_ratio=float(getattr(self._context.config, "preflight_compact_ratio", 0.85)),
             retained_tail_messages=effective_protected_recent_messages(config),
-            summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 1024),
+            summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 0),
         )
         config.attachment_media_root = media_root_from_config(self._context.config)
         config.preserve_historical_images = (
             consumer_agent.config.preserve_historical_images
             if consumer_agent is not None else False
         )
-        config.deadline_at_monotonic = operation_deadline
-        arm_compaction_deadline(config, operation_id=compaction_id)
+        arm_compaction_deadline(
+            config, operation_id=compaction_id, deadline_at_monotonic=operation_deadline,
+        )
         if (
             workspace_dir is not None and session_id
             and getattr(
@@ -352,6 +376,7 @@ class GatewaySessionMaintenancePorts(
             budget=budget,
             config=config,
             compaction_correlation=compaction_correlation,
+            failure_scope=failure_scope,
         )
         return SessionCompactionPlan(
             context_window_tokens=config.budget.history_capacity_tokens,
@@ -371,6 +396,75 @@ class GatewaySessionMaintenancePorts(
         return plan.runtime_value
 
     async def compact(
+        self,
+        command: CompactSession,
+        plan: SessionCompactionPlan,
+    ) -> SessionCompactionExecutionResult:
+        runtime = self._runtime_plan(plan)
+        summary_attempted = False
+
+        def on_summary_call_started() -> None:
+            nonlocal summary_attempted
+            summary_attempted = True
+
+        # SessionManager copies config for its owned operation. A callback
+        # survives that copy while its runtime counters deliberately reset.
+        runtime.config.on_summary_call_started = on_summary_call_started
+        try:
+            outcome = await self._compact(command, plan)
+        except SessionCompactionPhaseTimeoutError as exc:
+            if exc.definitively_uncommitted and exc.phase == "summarizing":
+                self._report_summary_outcome(
+                    command.session_key, summary_attempted=summary_attempted, success=False,
+                    failure_scope=runtime.failure_scope,
+                )
+            raise
+        except asyncio.CancelledError as exc:
+            # The outer operation deadline can win the race against the inner
+            # summary timeout. User cancellation and failed-commit causes do
+            # not represent an auxiliary provider failure.
+            deadline = runtime.config.deadline_at_monotonic
+            if deadline is not None and time.monotonic() >= deadline and exc.__cause__ is None:
+                self._report_summary_outcome(
+                    command.session_key, summary_attempted=summary_attempted, success=False,
+                    failure_scope=runtime.failure_scope,
+                )
+            raise
+        if outcome.applied:
+            self._report_summary_outcome(
+                command.session_key, summary_attempted=summary_attempted, success=True,
+                failure_scope=runtime.failure_scope,
+            )
+        elif compaction_failure_status(outcome.skip_reason or "empty_summary") == "failed":
+            self._report_summary_outcome(
+                command.session_key, summary_attempted=summary_attempted, success=False,
+                failure_scope=runtime.failure_scope,
+            )
+        return outcome
+
+    def _report_summary_outcome(
+        self, session_key: str, *, summary_attempted: bool, success: bool,
+        failure_scope: tuple[Any, ...] | None = None,
+    ) -> None:
+        if not summary_attempted:
+            return
+        runner = self._context.turn_runner
+        callback = getattr(
+            runner, "_record_compaction_success" if success else "_record_compaction_failure", None,
+        )
+        if callable(callback):
+            # Explicit manual maintenance bypasses the circuit, but reports one
+            # actual summary outcome to the same session ledger, under the
+            # frozen physical responder and controls that produced it.
+            try:
+                bind = getattr(runner, "_bind_compaction_failure_scope", None)
+                if failure_scope is not None and callable(bind):
+                    bind(session_key, failure_scope)
+                callback(session_key)
+            except Exception as exc:  # A circuit observer cannot change a committed result.
+                log.warning("manual_compaction.outcome_report_failed", error=type(exc).__name__)
+
+    async def _compact(
         self,
         command: CompactSession,
         plan: SessionCompactionPlan,
@@ -420,7 +514,12 @@ class GatewaySessionMaintenancePorts(
                     phase="summarizing",
                 )
             except CompactionTimeoutError as exc:
-                raise SessionCompactionPhaseTimeoutError(exc.phase) from exc
+                raise SessionCompactionPhaseTimeoutError(
+                    exc.phase,
+                    definitively_uncommitted=exc.phase in {
+                        "snapshotting", "summarizing", "validating",
+                    } and _deadline_has_no_underlying_failure(exc),
+                ) from exc
             summary = str(getattr(result, "summary", "") or "")
             removed_count = int(getattr(result, "removed_count", 0) or 0)
             return SessionCompactionExecutionResult(

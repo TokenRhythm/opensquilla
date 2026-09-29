@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 from PIL import Image
@@ -15,6 +15,8 @@ from PIL import Image
 from opensquilla.application.session_maintenance import (
     CompactSession,
     SessionCompactionDeadlineError,
+    SessionCompactionExecutionResult,
+    SessionCompactionPhaseTimeoutError,
     SessionCompactionResult,
     SessionCompactionSession,
 )
@@ -193,7 +195,84 @@ def test_manual_plan_keeps_generation_budget_without_fabricating_active_request(
     assert compaction.preserve_historical_images is False
     assert compaction.request_context is None
     assert compaction.llm_plan.primary.max_generation_tokens == 8192
-    assert compaction.llm_plan.primary.max_output_tokens == 1024
+    assert compaction.llm_plan.primary.max_output_tokens == 8192
+
+
+def test_manual_plan_preserves_inherited_deadline_on_first_operation() -> None:
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-manual", "api_key": "synthetic-key",
+        "context_window_tokens": 32_000,
+    })
+    ports = GatewaySessionMaintenancePorts(RpcContext(
+        conn_id="manual-deadline", config=config, session_manager=SimpleNamespace(storage=None),
+        provider_selector=SimpleNamespace(current_config=ProviderConfig(
+            provider="openai", model="synthetic-manual", api_key="synthetic-key",
+        )),
+    ))
+    inherited_deadline = time.monotonic() + 10
+    plan = ports.build_plan(None, None, "manual-short-deadline", inherited_deadline)
+    assert plan.runtime_value.config.operation_id == "manual-short-deadline"
+    assert plan.runtime_value.config.deadline_at_monotonic == inherited_deadline
+
+
+def _manual_recovery_ports(*, manager=None, runner=None):
+    config = GatewayConfig(llm={
+        "provider": "openai", "model": "synthetic-manual", "api_key": "synthetic-key",
+        "context_window_tokens": 32_000,
+    })
+    ports = GatewaySessionMaintenancePorts(RpcContext(
+        conn_id="manual-recovery", config=config,
+        session_manager=manager or SimpleNamespace(storage=None), turn_runner=runner,
+        provider_selector=SimpleNamespace(current_config=ProviderConfig(
+            provider="openai", model="synthetic-manual", api_key="synthetic-key",
+        )),
+    ))
+    return ports, ports.build_plan(None, None, "manual-recovery", time.monotonic() + 10)
+
+
+async def test_adapter_does_not_treat_unclassified_storage_timeout_as_safe_skip():
+    manager = SimpleNamespace(
+        storage=None, compact_with_result=AsyncMock(side_effect=TimeoutError("storage timeout")),
+    )
+    ports, plan = _manual_recovery_ports(manager=manager)
+    with pytest.raises(SessionCompactionPhaseTimeoutError) as error:
+        await ports.compact(CompactSession("agent:main:webchat:one"), plan)
+    assert error.value.definitively_uncommitted is False
+
+
+@pytest.mark.parametrize(
+    ("summary_calls", "reason", "applied", "failures", "successes"),
+    [
+        (0, "summary_failed", False, 0, 0),
+        (3, "summary_failed", False, 1, 0),
+        (3, "no_compression_benefit", False, 0, 0),
+        (3, "stale_preimage", False, 0, 0),
+        (3, "", True, 0, 1),
+    ],
+)
+async def test_manual_reports_one_summary_outcome_to_existing_ledger(
+    monkeypatch, summary_calls, reason, applied, failures, successes,
+):
+    runner = SimpleNamespace(_record_compaction_failure=Mock(), _record_compaction_success=Mock())
+    ports, plan = _manual_recovery_ports(runner=runner)
+    expected = SessionCompactionExecutionResult(
+        applied=applied, summary_len=20 if applied else 0, skip_reason=reason,
+    )
+    async def compact_from_operation_copy(*_):
+        from dataclasses import replace
+
+        owned_config = replace(plan.runtime_value.config)
+        for _ in range(summary_calls):
+            owned_config.llm_calls_started += 1
+            owned_config.on_summary_call_started()
+        assert plan.runtime_value.config.llm_calls_started == 0
+        return expected
+
+    monkeypatch.setattr(ports, "_compact", compact_from_operation_copy)
+    result = await ports.compact(CompactSession("agent:main:webchat:one"), plan)
+    assert result is expected
+    assert runner._record_compaction_failure.call_count == failures
+    assert runner._record_compaction_success.call_count == successes
 
 
 def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(
@@ -360,7 +439,7 @@ async def test_manual_compaction_image_paths_use_validated_session_workspace(
     ))
     monkeypatch.setattr(
         "opensquilla.gateway.adapters.session_maintenance.resolve_gateway_compaction_target",
-        lambda *_: GatewayCompactionTarget(),
+        lambda *_, **__: GatewayCompactionTarget(),
     )
     monkeypatch.setattr(
         ports, "_consumer_budget", lambda *_: GatewayConsumerBudget(context_window_tokens=8192),

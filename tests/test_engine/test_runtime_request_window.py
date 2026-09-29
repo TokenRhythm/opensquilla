@@ -27,6 +27,8 @@ class FailingSummaryManager(SessionManager):
         self.attempts += 1
         if self.failure == "cancel":
             raise asyncio.CancelledError
+        if config.on_summary_call_started is not None:
+            config.on_summary_call_started()
         if self.failure == "timeout":
             raise CompactionTimeoutError("summarizing", 0.01)
         return CompactionResult(
@@ -76,16 +78,18 @@ async def fingerprint(manager, key):
     return [entry.model_dump(mode="json") for entry in await manager.get_canonical_transcript(key)]
 
 
-async def test_ten_failed_turns_open_circuit_without_changing_durable_history(history):
+async def test_twenty_failed_turns_open_circuit_without_changing_durable_history(history):
     storage, manager, key, session = history
     await populate(manager, key)
     before = await fingerprint(manager, key)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    for _ in range(10):
+    for _ in range(20):
         runner.clear_compaction_turn_state(key)
-        await runner._maybe_preflight_compact(key, 1000)
+        prepared_window = await runner._maybe_preflight_compact(key, 1000)
         agent = history_agent()
-        context = await runner._load_history(agent, key, trim_last_user=False)
+        context = await runner._load_history(
+            agent, key, trim_last_user=False, prepared_window=prepared_window,
+        )
         assert context and "Temporary history window" in context
         assert len(agent.set_history.call_args.args[0]) < 8
         assert await fingerprint(manager, key) == before
@@ -103,11 +107,13 @@ async def test_soft_pressure_failure_keeps_full_history_without_window(history):
     _, manager, key, _ = history
     entries = await populate(manager, key, tokens=100)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    await runner._maybe_preflight_compact(key, 900)
+    prepared_window = await runner._maybe_preflight_compact(key, 900)
     assert manager.attempts == 1
-    assert key not in runner._emergency_compaction_overrides
+    assert not hasattr(runner, "_emergency_compaction_overrides")
     agent = history_agent()
-    context = await runner._load_history(agent, key, trim_last_user=False)
+    context = await runner._load_history(
+            agent, key, trim_last_user=False, prepared_window=prepared_window,
+        )
     assert context is None
     assert [message.content for message in agent.set_history.call_args.args[0]] == [
         entry.content for entry in entries
@@ -115,11 +121,32 @@ async def test_soft_pressure_failure_keeps_full_history_without_window(history):
     assert runner._compaction_failures[key].count == 1
 
 
+async def test_window_stops_planning_when_first_candidate_is_admitted(history, monkeypatch):
+    _, manager, key, _ = history
+    entries = await populate(manager, key)
+    before = await fingerprint(manager, key)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
+
+    def candidates(size, **kwargs):
+        yield tuple(range(2, size))
+        raise AssertionError("The admitted request does not need further history windows")
+
+    monkeypatch.setattr(
+        "opensquilla.engine.request_window.iter_window_index_candidates", candidates,
+    )
+    window = await runner._prepare_request_window(
+        key, entries, 1000, compaction_id="lazy-window", phase="preflight",
+        reason="summary_failed", consumer_admission=lambda _summary, kept: len(kept) <= 6,
+    )
+    assert window is not None and len(window.kept_entries) == 6
+    assert await fingerprint(manager, key) == before
+
+
 async def test_load_recomputes_window_after_append_and_preserves_new_messages(history):
     _, manager, key, _ = history
     entries = await populate(manager, key)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    assert await runner._record_emergency_ephemeral_compaction(
+    prepared_window = await runner._prepare_request_window(
         key, entries, 1000, compaction_id="synthetic-append", phase="preflight",
         reason="summary_failed",
     )
@@ -127,14 +154,16 @@ async def test_load_recomputes_window_after_append_and_preserves_new_messages(hi
     await manager.append_message(key, "assistant", "new queued answer", token_count=10)
     before_load = await fingerprint(manager, key)
     agent = history_agent()
-    context = await runner._load_history(agent, key, trim_last_user=False)
+    context = await runner._load_history(
+            agent, key, trim_last_user=False, prepared_window=prepared_window,
+        )
     loaded = [message.content for message in agent.set_history.call_args.args[0]]
     assert loaded[-2:] == ["new queued request", "new queued answer"]
     assert entries[-2].content in loaded
     assert entries[-1].content in loaded
     assert context and "Temporary history window" in context
     assert await fingerprint(manager, key) == before_load
-    assert key not in runner._emergency_compaction_overrides
+    assert not hasattr(runner, "_emergency_compaction_overrides")
 
 
 @pytest.mark.parametrize("quoted_headers", [False, True])
@@ -152,12 +181,14 @@ async def test_window_preserves_complete_previous_checkpoint_once(history, quote
     ))
     before = await fingerprint(manager, key)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    assert await runner._record_emergency_ephemeral_compaction(
+    prepared_window = await runner._prepare_request_window(
         key, entries, 1000, compaction_id="synthetic-old-checkpoint", phase="preflight",
         reason="summary_failed",
     )
     agent = history_agent()
-    context = await runner._load_history(agent, key, trim_last_user=False)
+    context = await runner._load_history(
+            agent, key, trim_last_user=False, prepared_window=prepared_window,
+        )
     assert context and "Temporary history window" in context
     # Legacy checkpoint prose can quote section markers. Preserve its complete
     # body once; only the renderer-owned wrapper determines replay integrity.
@@ -183,12 +214,12 @@ async def test_exact_consumer_gate_can_reject_every_local_window(history, stale)
         return False
 
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    assert not await runner._record_emergency_ephemeral_compaction(
+    assert not await runner._prepare_request_window(
         key, entries, 1000, compaction_id="synthetic-reject", phase="preflight",
         reason="summary_failed", consumer_admission=reject,
     )
     assert observed
-    assert key not in runner._emergency_compaction_overrides
+    assert not hasattr(runner, "_emergency_compaction_overrides")
     assert await fingerprint(manager, key) == before
 
 
@@ -201,12 +232,12 @@ async def test_cancel_and_timeout_preserve_storage_and_only_timeout_can_window(h
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
     if failure == "cancel":
         with pytest.raises(asyncio.CancelledError):
-            await runner._maybe_preflight_compact(key, 1000)
-        assert key not in runner._emergency_compaction_overrides
+            prepared_window = await runner._maybe_preflight_compact(key, 1000)
+        assert not hasattr(runner, "_emergency_compaction_overrides")
         assert key not in runner._compaction_failures
     else:
-        await runner._maybe_preflight_compact(key, 1000)
-        assert key in runner._emergency_compaction_overrides
+        prepared_window = await runner._maybe_preflight_compact(key, 1000)
+        assert prepared_window is not None
         assert runner._compaction_failures[key].count == 1
     assert await fingerprint(manager, key) == before
 
@@ -237,12 +268,47 @@ async def test_window_retains_complete_tool_round_with_dict_execution_status(his
     entries = list(await manager.get_transcript(key))
     before = await fingerprint(manager, key)
     runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
-    assert await runner._record_emergency_ephemeral_compaction(
+    prepared_window = await runner._prepare_request_window(
         key, entries, 1000, compaction_id="synthetic-tool-round", phase="preflight",
         reason="summary_failed", consumer_admission=lambda summary, kept: len(kept) <= 6,
     )
-    override = runner._emergency_compaction_overrides[key]
+    override = prepared_window
+    assert override is not None
     assert entries[2].message_id in [entry.message_id for entry in override.kept_entries]
     preserved = next(entry for entry in override.kept_entries if entry.tool_calls)
     assert preserved.tool_calls == tool_segments
     assert await fingerprint(manager, key) == before
+
+
+@pytest.mark.parametrize("stale", [False, True])
+async def test_prepared_window_rechecks_consumer_before_use(history, stale):
+    _, manager, key, _ = history
+    entries = await populate(manager, key)
+    gate_changed = False
+    checks = 0
+
+    def admit(summary, kept):
+        nonlocal checks
+        checks += 1
+        if gate_changed:
+            if stale:
+                raise ConsumerAdmissionStaleError("deployment changed after preparation")
+            return False
+        return len(kept) <= 4
+
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=manager)
+    prepared = await runner._prepare_request_window(
+        key, entries, 1000, compaction_id="synthetic-stale-gate", phase="preflight",
+        reason="summary_failed", consumer_admission=admit,
+    )
+    assert prepared is not None
+    prior_checks = checks
+    gate_changed = True
+    agent = history_agent()
+    context = await runner._load_history(
+        agent, key, trim_last_user=False, prepared_window=prepared,
+    )
+    assert checks == prior_checks + 1
+    assert context is None
+    assert len(agent.set_history.call_args.args[0]) == len(entries)
+    assert not hasattr(runner, "_emergency_compaction_overrides")

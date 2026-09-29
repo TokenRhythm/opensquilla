@@ -21,6 +21,39 @@ from typing import Protocol
 from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.session_key import canonicalize_session_key
 
+# These results prove that the optional candidate was not installed. The next
+# real request owns admission; manual maintenance cannot promise that it fits.
+_RECOVERABLE_CANDIDATE_REASONS = frozenset({
+    "consumer_admission_failed",
+    "coverage_blocked",
+    "disabled",
+    "empty_summary",
+    "non_history_envelope_exhausts_budget",
+    "quality_gate_failed",
+    "summary_does_not_fit",
+    "summary_call_budget_exceeded",
+    "summary_failed",
+    "summary_replay_incomplete",
+    "summary_target_unavailable",
+    "suffix_summary_failed",
+    "suffix_target_unavailable",
+})
+
+
+def _deadline_has_no_underlying_failure(error: BaseException) -> bool:
+    """Do not turn a failed commit reconciled against cancellation into a skip."""
+
+    cause = error.__cause__
+    while cause is not None:
+        if not isinstance(cause, (asyncio.CancelledError, TimeoutError)):
+            return False
+        if type(cause) is TimeoutError and cause.__cause__ is None:
+            # An unclassified I/O timeout is not proof that our own asyncio
+            # deadline cancelled pre-commit work.
+            return False
+        cause = cause.__cause__
+    return True
+
 
 @dataclass(frozen=True, slots=True)
 class CompactSession:
@@ -144,6 +177,9 @@ class SessionCompactionDeadlineError(TimeoutError):
 @dataclass(slots=True)
 class SessionCompactionPhaseTimeoutError(TimeoutError):
     phase: str
+    # Set only when the owner can prove that no summary was installed. An
+    # unknown commit result and ordinary storage timeouts remain errors.
+    definitively_uncommitted: bool = False
 
     def __str__(self) -> str:
         return f"compaction phase timed out: {self.phase}"
@@ -195,7 +231,13 @@ class SessionCompactionExecutorPort(Protocol):
         self,
         command: CompactSession,
         plan: SessionCompactionPlan,
-    ) -> SessionCompactionExecutionResult: ...
+    ) -> SessionCompactionExecutionResult:
+        """Settle an entered commit barrier before propagating cancellation.
+
+        A successful commit returns an applied result even if its caller's
+        deadline raced it; a failed commit retains its underlying error.
+        """
+        ...
 
 
 class SessionCompactionLifecyclePort(Protocol):
@@ -323,6 +365,7 @@ class _ManualCompactionOperation:
         self._started_emitted = False
         self._terminal_emitted = False
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._committed_result: SessionCompactionExecutionResult | None = None
         self._stage = "admission"
         self._operation_deadline = time.monotonic() + timing.total_timeout_seconds
 
@@ -432,8 +475,10 @@ class _ManualCompactionOperation:
         try:
             self._stage = "summarizing"
             outcome = await self._executor.compact(self._command, plan)
+            self._stage = "publishing"
             if outcome.applied:
                 committed = outcome
+                self._committed_result = outcome
                 for milestone in (
                     SessionCompactionMilestone.CHUNK_SUMMARIZED,
                     SessionCompactionMilestone.SUMMARY_VERIFIED,
@@ -487,7 +532,11 @@ class _ManualCompactionOperation:
         )
         # A stale preimage is a safe refusal to commit. Keep the manual wire
         # lifecycle bounded to completed/skipped/failed and retain its cause.
-        if status == "stale":
+        if status == "stale" or (
+            not outcome.applied and outcome.skip_reason in _RECOVERABLE_CANDIDATE_REASONS
+        ):
+            status = "skipped"
+        if not outcome.applied and not outcome.skip_reason:
             status = "skipped"
         reason = None if outcome.applied else (outcome.skip_reason or "empty_summary")
         terminal = self._event(
@@ -513,6 +562,15 @@ class _ManualCompactionOperation:
                     observation_error=None if isinstance(exc, asyncio.CancelledError) else str(exc),
                 ))
             raise
+        return self._result(outcome, status=status, reason=reason)
+
+    def _result(
+        self,
+        outcome: SessionCompactionExecutionResult,
+        *,
+        status: str,
+        reason: str | None,
+    ) -> SessionCompactionResult:
         return SessionCompactionResult(
             session_key=self._command.session_key,
             compaction_id=self._compaction_id,
@@ -535,6 +593,22 @@ class _ManualCompactionOperation:
             reason=reason,
         )
 
+    async def _skip_timeout(self, phase: str) -> SessionCompactionResult:
+        if not self._started_emitted:
+            await self._publish(self._event(
+                "started", heartbeat_interval_seconds=self._timing.heartbeat_interval_seconds,
+            ))
+        outcome = SessionCompactionExecutionResult(
+            applied=False,
+            summary_len=0,
+            summary_source="skipped",
+            skip_reason="compaction_deadline_exceeded",
+        )
+        await self._publish(self._event(
+            "skipped", reason=outcome.skip_reason, stage=phase, result=outcome,
+        ))
+        return self._result(outcome, status="skipped", reason=outcome.skip_reason)
+
     async def _run_accounted(self) -> SessionCompactionResult:
         async with self._usage.account(self._command.session_key):
             return await self._run_locked()
@@ -545,33 +619,57 @@ class _ManualCompactionOperation:
         try:
             if lock is not None:
                 remaining = max(0.0, self._operation_deadline - time.monotonic())
+                admission_timeout = asyncio.timeout(remaining)
                 try:
-                    async with asyncio.timeout(remaining):
+                    async with admission_timeout:
                         await lock.acquire()
                 except TimeoutError as exc:
-                    raise SessionCompactionPhaseTimeoutError("admission") from exc
+                    if not admission_timeout.expired():
+                        raise
+                    raise SessionCompactionPhaseTimeoutError(
+                        "admission", definitively_uncommitted=True,
+                    ) from exc
                 acquired = True
             remaining = max(0.0, self._operation_deadline - time.monotonic())
             if remaining <= 0:
-                raise SessionCompactionPhaseTimeoutError("admission")
+                raise SessionCompactionPhaseTimeoutError(
+                    "admission", definitively_uncommitted=True,
+                )
+            timeout = asyncio.timeout(remaining)
             try:
-                async with asyncio.timeout(remaining):
+                async with timeout:
                     return await self._run_accounted()
             except SessionCompactionPhaseTimeoutError:
                 raise
             except TimeoutError as exc:
-                raise SessionCompactionPhaseTimeoutError(self._stage) from exc
+                if not timeout.expired():
+                    # A storage/observer timeout is not this optional operation's
+                    # deadline and must retain its original error semantics.
+                    raise
+                raise SessionCompactionPhaseTimeoutError(
+                    self._stage,
+                    definitively_uncommitted=(
+                        self._stage in {"admission", "summarizing"}
+                        and _deadline_has_no_underlying_failure(exc)
+                    ),
+                ) from exc
         except asyncio.CancelledError:
             if self._started_emitted and not self._terminal_emitted:
                 await self._publish(
                     self._event(
-                        "failed",
+                        "cancelled",
                         reason="cancelled",
                         message="Compaction was cancelled.",
                     )
                 )
             raise
         except SessionCompactionPhaseTimeoutError as exc:
+            if self._committed_result is not None:
+                return self._result(
+                    self._committed_result, status="completed", reason="deadline_after_commit",
+                )
+            if exc.definitively_uncommitted and _deadline_has_no_underlying_failure(exc):
+                return await self._skip_timeout(exc.phase)
             if self._started_emitted and not self._terminal_emitted:
                 await self._publish(
                     self._event(
@@ -622,7 +720,7 @@ class _ManualCompactionOperation:
                 if self._started_emitted and not self._terminal_emitted:
                     await self._publish(
                         self._event(
-                            "failed",
+                            "cancelled",
                             reason="cancelled",
                             message="Compaction was cancelled.",
                         )

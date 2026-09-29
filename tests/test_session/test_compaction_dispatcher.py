@@ -226,9 +226,9 @@ async def test_new_prev_summary_marker_remains_backward_compatible():
     assert "__prev_summary__:" not in result.summary
     assert config.llm_plan is not None
     [(messages, _, chat_config)] = config.llm_plan.primary.provider.calls
-    assert "[Existing portable checkpoint to replace]\nprior context here" in messages[0].content
-    assert "normal instructions" in messages[0].content
-    assert "__prev_summary__:" not in messages[0].content + chat_config.system
+    assert "<previous-summary>\nprior context here\n</previous-summary>" in messages[-1].content
+    assert "normal instructions" in messages[-1].content
+    assert "__prev_summary__:" not in messages[-1].content + chat_config.system
 
 
 @pytest.mark.asyncio

@@ -247,7 +247,6 @@ from opensquilla.session.compaction import (
     arm_compaction_deadline,
     build_compaction_config_from_provider,
     compact_context,
-    compaction_prompt_layout,
     compaction_replay_summary,
     effective_protected_recent_messages,
     project_entry_content_for_provider,
@@ -341,6 +340,10 @@ from .types import (
 )
 
 logger = structlog.get_logger("opensquilla.engine.agent")
+
+
+class _CompactionParentDeadlineError(TimeoutError):
+    """The owning turn expired; auxiliary fallback must not extend its lifetime."""
 
 
 _PROVIDER_OUTPUT_TRUNCATED_REPLY = build_terminal_reply(
@@ -2935,6 +2938,14 @@ class Agent:
         resolve_config = getattr(self.provider, "compaction_chat_config", None)
         if callable(resolve_config):
             chat_config = resolve_config(chat_config)
+        parent_deadline = getattr(self._execution_context, "deadline", None)
+        if parent_deadline is not None:
+            existing = chat_config.turn_deadline_at_monotonic
+            chat_config = chat_config.model_copy(update={
+                "turn_deadline_at_monotonic": min(
+                    parent_deadline, existing if existing is not None else parent_deadline,
+                ),
+            })
         if getattr(chat_config.model_capabilities, "supports_tools", None) is False:
             tools = None
         return CompactionRequestContext(
@@ -3263,7 +3274,7 @@ class Agent:
         consumer_provider_request_max_chars: int | None = None,
         trigger_ratio: float = 0.85,
         retained_tail_messages: int = 0,
-        summary_output_tokens: int = 1024,
+        summary_output_tokens: int = 0,
         history_limit_tokens: int | None = None,
         envelope_reserve_tokens: int = 0,
         envelope_reserve_chars: int = 0,
@@ -6258,6 +6269,12 @@ class Agent:
         # Provider adapters own transport inactivity limits.
         _loop = asyncio.get_running_loop()
         _total_deadline = _loop.time() + self.config.timeout if self.config.timeout > 0 else None
+        _parent_deadline = getattr(self._execution_context, "deadline", None)
+        if _parent_deadline is not None:
+            _total_deadline = min(
+                _total_deadline if _total_deadline is not None else _parent_deadline,
+                _parent_deadline,
+            )
         configured_capabilities = self.config.model_capabilities
         tools_supported = bool(
             configured_capabilities is None
@@ -10450,25 +10467,19 @@ class Agent:
                                     stable_source_messages = overflow_outcome.messages
                                     stable_source_request_index = next_request_context_insert_index
                                     stable_source_runtime_index = next_runtime_context_insert_index
-                                    stable_keep_recent_rounds = 2
                                     if overflow_outcome.ephemeral_only:
-                                        # The first request-scoped summary keeps
-                                        # two raw rounds. If exact final-envelope
-                                        # admission still fails, retry within the
-                                        # same compaction deadline/call budget by
-                                        # summarizing one more completed round.
+                                        # Rebuild from authoritative input, never
+                                        # promote an omitted window to coverage.
                                         stable_source_messages = turn_messages
                                         stable_protected_start = current_turn_start_index
                                         stable_source_request_index = request_context_insert_index
                                         stable_source_runtime_index = runtime_context_insert_index
-                                        stable_keep_recent_rounds = 1
                                     if (
                                         next_active_user_index is not None
                                         and durable_next_projection is not None
                                         and self._live_turn_compaction_boundary(
                                             stable_source_messages,
                                             protected_turn_start_index=(stable_protected_start),
-                                            keep_recent_rounds=(stable_keep_recent_rounds),
                                         )
                                         is not None
                                     ):
@@ -10492,7 +10503,6 @@ class Agent:
                                                     context_window_chars=(
                                                         provider_request_window_chars
                                                     ),
-                                                    keep_recent_rounds=(stable_keep_recent_rounds),
                                                     request_context_insert_index=(
                                                         stable_source_request_index
                                                     ),
@@ -10509,6 +10519,11 @@ class Agent:
                                                 )
                                             )
                                         except asyncio.CancelledError:
+                                            raise
+                                        except (
+                                            _CompactionParentDeadlineError,
+                                            UsageAccountingUnavailableError,
+                                        ):
                                             raise
                                         except Exception as exc:  # noqa: BLE001
                                             logger.warning(
@@ -10680,13 +10695,11 @@ class Agent:
                                 routed_source_messages = overflow_outcome.messages
                                 routed_source_request_index = next_request_context_insert_index
                                 routed_source_runtime_index = next_runtime_context_insert_index
-                                routed_keep_recent_rounds = 2
                                 if overflow_outcome.ephemeral_only:
                                     routed_source_messages = turn_messages
                                     routed_protected_start = current_turn_start_index
                                     routed_source_request_index = request_context_insert_index
                                     routed_source_runtime_index = runtime_context_insert_index
-                                    routed_keep_recent_rounds = 1
                                 if (
                                     routed_recovery is None
                                     and next_active_user_index is not None
@@ -10698,7 +10711,6 @@ class Agent:
                                     and self._live_turn_compaction_boundary(
                                         routed_source_messages,
                                         protected_turn_start_index=(routed_protected_start),
-                                        keep_recent_rounds=(routed_keep_recent_rounds),
                                     )
                                     is not None
                                 ):
@@ -10714,7 +10726,6 @@ class Agent:
                                                 context_window_chars=(
                                                     provider_request_window_chars
                                                 ),
-                                                keep_recent_rounds=(routed_keep_recent_rounds),
                                                 request_context_insert_index=(
                                                     routed_source_request_index
                                                 ),
@@ -10727,6 +10738,11 @@ class Agent:
                                             )
                                         )
                                     except asyncio.CancelledError:
+                                        raise
+                                    except (
+                                        _CompactionParentDeadlineError,
+                                        UsageAccountingUnavailableError,
+                                    ):
                                         raise
                                     except Exception as exc:  # noqa: BLE001
                                         logger.warning(
@@ -11860,6 +11876,8 @@ class Agent:
                                 _total_deadline += max(
                                     0.0, _loop.time() - user_input_wait_started,
                                 )
+                                if _parent_deadline is not None:
+                                    _total_deadline = min(_total_deadline, _parent_deadline)
                         result = ToolResult(
                             tool_use_id=tc.tool_use_id,
                             tool_name=tc.tool_name,
@@ -11977,6 +11995,8 @@ class Agent:
                                     _total_deadline += max(
                                         0.0, _loop.time() - approval_wait_started,
                                     )
+                                    if _parent_deadline is not None:
+                                        _total_deadline = min(_total_deadline, _parent_deadline)
                             if approval_entry is None or not approval_entry.resolved:
                                 self._set_tool_reliability_terminal(
                                     tool_use_id=tc.tool_use_id,
@@ -13469,6 +13489,15 @@ class Agent:
                     context_window_tokens=self.config.context_window_tokens,
                 )
             )
+        parent_deadline = self._require_compaction_parent_time(chat_config)
+        if parent_deadline is not None:
+            context = config.request_context or self.build_compaction_request_context()
+            existing = context.chat_config.turn_deadline_at_monotonic
+            config.request_context = replace(context, chat_config=context.chat_config.model_copy(
+                update={"turn_deadline_at_monotonic": min(
+                    parent_deadline, existing if existing is not None else parent_deadline,
+                )},
+            ))
         if request_context_message is None:
             request_context_message = self._request_context_message(
                 self.config.request_context_prompt,
@@ -13514,7 +13543,7 @@ class Agent:
                 replace(config, budget=None),
             ),
             summary_output_tokens=(
-                config.llm_plan.primary.max_output_tokens if config.llm_plan else 1024
+                config.llm_plan.primary.max_output_tokens if config.llm_plan else 0
             ),
         )
         config.budget = budget
@@ -13602,14 +13631,16 @@ class Agent:
                         })
                 if segments:
                     entries[-1]["tool_calls"] = segments
-            if compaction_prompt_layout() == "suffix":
-                entries[-1]["_provider_message"] = message.model_copy(deep=True)
+            entries[-1]["_provider_message"] = message.model_copy(deep=True)
         return entries
 
     @staticmethod
     def _tool_result_requires_raw_preservation(message: Message) -> bool:
         """Keep active protocol state; completed errors may leave a request window."""
-        from opensquilla.session.compaction import _execution_status_is_live
+        from opensquilla.session.compaction import (
+            _execution_status_is_live,
+            _tool_result_payload_is_live,
+        )
 
         if not isinstance(message.content, list):
             return False
@@ -13618,15 +13649,7 @@ class Agent:
                 continue
             if _execution_status_is_live(block.execution_status):
                 return True
-            if not isinstance(block.content, str):
-                continue
-            try:
-                parsed = json.loads(block.content)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if isinstance(parsed, dict) and _execution_status_is_live(
-                parsed.get("execution_status") or parsed
-            ):
+            if _tool_result_payload_is_live(block.content):
                 return True
         return False
 
@@ -13635,7 +13658,6 @@ class Agent:
         messages: list[Message],
         *,
         protected_turn_start_index: int,
-        keep_recent_rounds: int = 2,
     ) -> tuple[int, int] | None:
         """Return the active-user index and raw-tail start for a live tool loop."""
 
@@ -13656,13 +13678,10 @@ class Agent:
             for index in range(active_user_index + 1, len(messages))
             if messages[index].role == "assistant"
         ]
-        protected_round_count = max(1, int(keep_recent_rounds))
-        # Preserve two complete physical rounds by default. Final-envelope
-        # admission may retry once with one raw round when the first summary is
-        # still too large. At least one older round must exist before a live
-        # summary is worthwhile.
-        if len(assistant_starts) <= protected_round_count:
+        if not assistant_starts:
             return None
+
+        from opensquilla.session.compaction import _api_round_requires_raw
 
         rounds: list[tuple[int, int, bool]] = []
         for position, start in enumerate(assistant_starts):
@@ -13672,20 +13691,20 @@ class Agent:
                 else len(messages)
             )
             group = messages[start:end]
-            has_result = any(_message_has_tool_result(message) for message in group)
-            unresolved = _message_has_tool_use(messages[start]) and not has_result
-            critical = unresolved or any(
-                self._tool_result_requires_raw_preservation(message) for message in group
-            )
+            critical = _api_round_requires_raw(
+                self._message_count_compaction_entries(group),
+            ) or any(self._tool_result_requires_raw_preservation(message) for message in group)
             rounds.append((start, end, critical))
 
-        keep_round = max(0, len(rounds) - protected_round_count)
+        keep_round = len(rounds)
         critical_rounds = [index for index, (_, _, critical) in enumerate(rounds) if critical]
         if critical_rounds:
             keep_round = min(keep_round, min(critical_rounds))
         if keep_round <= 0:
             return None
-        return active_user_index, rounds[keep_round][0]
+        return active_user_index, (
+            rounds[keep_round][0] if keep_round < len(rounds) else len(messages)
+        )
 
     @staticmethod
     def _live_turn_mapped_index(
@@ -13724,18 +13743,29 @@ class Agent:
     ) -> CompactionOutcome | None:
         """Admit a temporary raw window without changing canonical history."""
 
+        self._require_compaction_parent_time(config)
         protected_start = max(0, min(protected_turn_start_index, len(messages)))
         protected_indexes = {
             index for index, message in enumerate(messages)
             if self._tool_result_requires_raw_preservation(message)
         }
-        assistant_indexes = [
-            index for index, message in enumerate(messages) if message.role == "assistant"
-        ]
-        protected_indexes.update(assistant_indexes[-2:])
-        live_boundary = self._live_turn_compaction_boundary(
-            messages, protected_turn_start_index=protected_start,
+        pending_calls: dict[str, int] = {}
+        for index, message in enumerate(messages):
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if isinstance(block, ContentBlockToolUse):
+                    pending_calls[block.id] = index
+                elif isinstance(block, ContentBlockToolResult):
+                    pending_calls.pop(block.tool_use_id, None)
+        protected_indexes.update(pending_calls.values())
+        active_user = _active_user_message_index_for_request(
+            messages[protected_start:],
+            current_user_text=getattr(self, "_current_turn_message", "") or "",
         )
+        if active_user is not None:
+            active_user += protected_start
+            protected_indexes.update(range(protected_start, active_user + 1))
         chat_config = config or self._provider_admission_chat_config(
             getattr(self, "_current_turn_message", "") or "",
             context_window_tokens=self.config.context_window_tokens,
@@ -13786,6 +13816,7 @@ class Agent:
             message_limit=target_wire_messages,
         )
         if _fits(unchanged_projection) and allow_unchanged:
+            self._require_compaction_parent_time(chat_config)
             return CompactionOutcome(
                 messages=messages,
                 request_context_insert_index=request_context_insert_index,
@@ -13814,14 +13845,14 @@ class Agent:
             protected_start_index=protected_start,
             protected_indexes=protected_indexes,
             retained_indexes=retained_indexes,
-            live_boundary=live_boundary,
+            active_user_index=active_user,
         )
         without_summary = (
             iter_request_window_candidates(
                 pruned_messages,
                 protected_start_index=protected_start,
                 protected_indexes=protected_indexes - retained_indexes,
-                live_boundary=live_boundary,
+                active_user_index=active_user,
             ) if retained_indexes else ()
         )
         for candidate in chain(candidates, window_candidates, without_summary):
@@ -13857,6 +13888,7 @@ class Agent:
             )
             if not _fits(projection):
                 continue
+            self._require_compaction_parent_time(chat_config)
             compaction_id = (
                 compaction_config.operation_id
                 if compaction_config is not None and compaction_config.operation_id
@@ -13903,7 +13935,6 @@ class Agent:
         protected_turn_start_index: int,
         context_window_tokens: int,
         context_window_chars: int | None = None,
-        keep_recent_rounds: int = 2,
         request_context_insert_index: int | None,
         runtime_context_insert_index: int | None,
         shared_compaction_config: CompactionConfig | None = None,
@@ -13914,7 +13945,8 @@ class Agent:
     ) -> CompactionOutcome | None:
         """Summarize completed live rounds into an ephemeral provider view."""
 
-        if self._compaction_failed_this_turn:
+        self._require_compaction_parent_time(consumer_chat_config)
+        if unavailable := self._compaction_unavailable_reason():
             return self._recover_local_request_window(
                 messages,
                 protected_turn_start_index=protected_turn_start_index,
@@ -13926,12 +13958,11 @@ class Agent:
                 request_suffix_messages=request_suffix_messages,
                 input_budget_tokens=context_window_tokens,
                 input_budget_chars=context_window_chars,
-                reason="already_attempted_this_turn",
+                reason=unavailable,
             )
         boundary = self._live_turn_compaction_boundary(
             messages,
             protected_turn_start_index=protected_turn_start_index,
-            keep_recent_rounds=keep_recent_rounds,
         )
         if boundary is None:
             return None
@@ -14001,7 +14032,7 @@ class Agent:
                 request_context_message=request_context_message,
                 runtime_context_message=runtime_context_message,
             )
-            result = await compact_context(
+            result = await self._execute_compaction_request(
                 CompactionRequest(
                     session_id="agent-live-turn-request-view",
                     entries=self._message_count_compaction_entries(summary_messages),
@@ -14022,6 +14053,8 @@ class Agent:
                 )
             )
         except asyncio.CancelledError:
+            raise
+        except (_CompactionParentDeadlineError, UsageAccountingUnavailableError):
             raise
         except Exception:  # noqa: BLE001 - local recovery needs no working summarizer
             return self._recover_local_request_window(
@@ -14085,7 +14118,7 @@ class Agent:
         ]
         if projected[2 : 2 + len(active_prefix)] != active_prefix:
             return None
-        if projected[-len(raw_tail) :] != raw_tail:
+        if raw_tail and projected[-len(raw_tail) :] != raw_tail:
             return None
         if repair_tool_pairing(projected) != projected:
             return None
@@ -14160,6 +14193,8 @@ class Agent:
                 runtime_context_message=runtime_context_message,
             )
         except asyncio.CancelledError:
+            raise
+        except (_CompactionParentDeadlineError, UsageAccountingUnavailableError):
             raise
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable reason
             outcome = None
@@ -14264,6 +14299,7 @@ class Agent:
         ``CompactionEvent``.
         """
 
+        self._require_compaction_parent_time(config)
         limit = int(proof.limit)
         target = limit - self._message_count_headroom(limit)
         if target <= 0:
@@ -14282,7 +14318,7 @@ class Agent:
         if projected_current.actual_wire_messages <= limit:
             return None, "local_wire_count_not_over_limit"
 
-        if self._compaction_failed_this_turn:
+        if self._compaction_unavailable_reason():
             return await self._recover_live_turn_message_count_limit(
                 messages,
                 request_suffix_messages=request_suffix_messages,
@@ -14398,8 +14434,10 @@ class Agent:
             ),
         )
         try:
-            result = await compact_context(request)
+            result = await self._execute_compaction_request(request)
         except asyncio.CancelledError:
+            raise
+        except (_CompactionParentDeadlineError, UsageAccountingUnavailableError):
             raise
         except Exception:  # noqa: BLE001 - refusal is surfaced as a stable terminal state
             result = CompactionResult(
@@ -14723,6 +14761,91 @@ class Agent:
             and payload.get("reason") == "prior_tool_dispatch_boundary"
         )
 
+    def _require_compaction_parent_time(self, config: ChatConfig | None = None) -> float | None:
+        """Keep summary generation and local recovery inside the owning turn."""
+        current = self._compaction_request_context
+        deadlines = [
+            candidate.turn_deadline_at_monotonic
+            for candidate in (config, current.chat_config if current is not None else None)
+            if candidate is not None and candidate.turn_deadline_at_monotonic is not None
+        ]
+        parent_deadline = getattr(self._execution_context, "deadline", None)
+        if parent_deadline is not None:
+            deadlines.append(parent_deadline)
+        deadline = min(deadlines) if deadlines else None
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _CompactionParentDeadlineError("Agent turn expired during compaction")
+        return deadline
+
+    def _compaction_unavailable_reason(self) -> str | None:
+        if not self.config.compaction_enabled:
+            return "disabled"
+        if self._compaction_failed_this_turn:
+            return "already_attempted_this_turn"
+        circuit = self.config.compaction_circuit_open
+        if circuit is not None and circuit():
+            return "durable_compaction_circuit_open"
+        return None
+
+    async def _execute_compaction_request(self, request: CompactionRequest) -> CompactionResult:
+        """Report each auxiliary operation to the same cross-turn circuit once."""
+        config = request.config
+        parent_config = config.request_context.chat_config if config.request_context else None
+        parent_deadline = self._require_compaction_parent_time(parent_config)
+        if not self.config.compaction_enabled:
+            return CompactionResult(
+                summary="", kept_entries=request.entries, removed_count=0,
+                chunks_processed=0, summary_source="skipped", skip_reason="disabled",
+            )
+        if not config.operation_id:
+            arm_compaction_deadline(config, operation_id=new_compaction_id())
+        arm_compaction_deadline(config, deadline_at_monotonic=parent_deadline)
+
+        def report(success: bool) -> None:
+            operation_id = config.operation_id
+            if operation_id == getattr(self, "_last_reported_compaction_operation", None):
+                return
+            self._last_reported_compaction_operation = operation_id
+            reporter = self.config.compaction_outcome_reporter
+            if reporter is not None:
+                reporter(success)
+
+        summary_started = False
+        previous_started = config.on_summary_call_started
+
+        def on_summary_started() -> None:
+            nonlocal summary_started
+            if previous_started is not None:
+                previous_started()
+            summary_started = True
+
+        config.on_summary_call_started = on_summary_started
+        parent_timeout = asyncio.timeout_at(parent_deadline)
+        try:
+            async with parent_timeout:
+                result = await compact_context(request)
+        except (asyncio.CancelledError, UsageAccountingUnavailableError):
+            raise
+        except Exception:
+            if parent_timeout.expired():
+                raise _CompactionParentDeadlineError(
+                    "Agent turn expired during compaction",
+                ) from None
+            self._require_compaction_parent_time(parent_config)
+            if summary_started:
+                report(False)
+            raise
+        finally:
+            config.on_summary_call_started = previous_started
+        self._require_compaction_parent_time(parent_config)
+        if not summary_started:
+            return result
+        if result.removed_count > 0 or result.replaced_previous_summary:
+            report(True)
+        elif compaction_failure_status(result.skip_reason or "") == "failed":
+            report(False)
+        return result
+
     def _build_compaction_config(self) -> CompactionConfig:
         compaction_plan = self.config.compaction_execution_plan
         plan_factory = self.config.compaction_execution_plan_factory
@@ -14747,6 +14870,7 @@ class Agent:
             default_model=self.config.model_id,
             compaction_plan=compaction_plan,
             context_window_tokens=self.config.context_window_tokens,
+            active_chat_config=self.build_compaction_request_context().chat_config,
         )
         config.compaction_profile = self.config.compaction_profile
         config.preserve_historical_images = self.config.preserve_historical_images
@@ -14890,6 +15014,7 @@ class Agent:
 
         Preserve canonical history while selecting a provider-compatible request view.
         """
+        self._require_compaction_parent_time(consumer_chat_config)
         self._last_compaction_refusal_reason = None
         window_tokens = compaction_window_tokens or self.config.context_window_tokens
         pressure_window_tokens = request_window_tokens or window_tokens
@@ -14965,8 +15090,8 @@ class Agent:
         routed_window_is_narrower = (
             durable_window_tokens > window_tokens and durable_consumer_overflow_proven is not True
         )
-        if self._compaction_failed_this_turn:
-            return _local_after_failure("already_attempted_this_turn")
+        if unavailable := self._compaction_unavailable_reason():
+            return _local_after_failure(unavailable)
         if request_scoped_only or routed_window_is_narrower:
             # A temporary route/member window is request scope. Preflight has
             # already admitted durable history against the stable session
@@ -14994,6 +15119,8 @@ class Agent:
                         request_suffix_messages=request_suffix_messages,
                     )
                 except asyncio.CancelledError:
+                    raise
+                except (_CompactionParentDeadlineError, UsageAccountingUnavailableError):
                     raise
                 except Exception as exc:  # noqa: BLE001 - refusal remains bounded
                     logger.warning(
@@ -15044,6 +15171,8 @@ class Agent:
                         request_suffix_messages=request_suffix_messages,
                     )
                 except asyncio.CancelledError:
+                    raise
+                except (_CompactionParentDeadlineError, UsageAccountingUnavailableError):
                     raise
                 except Exception as exc:  # noqa: BLE001 - refusal remains bounded
                     logger.warning(
@@ -15166,7 +15295,7 @@ class Agent:
         )
 
         try:
-            result = await compact_context(request)
+            result = await self._execute_compaction_request(request)
         except asyncio.CancelledError:
             if self._session_key:
                 notify_compaction(
@@ -15184,8 +15313,13 @@ class Agent:
                     ),
                 )
             raise
+        except (_CompactionParentDeadlineError, UsageAccountingUnavailableError):
+            raise
         except CompactionTimeoutError as exc:
             self._last_compaction_refusal_reason = "compaction_deadline_exceeded"
+            local = _local_after_failure("compaction_deadline_exceeded")
+            if local is not None:
+                return local
             if self._session_key:
                 notify_compaction(
                     self._session_key,
@@ -15201,9 +15335,12 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return _local_after_failure("compaction_deadline_exceeded")
+            return None
         except Exception as exc:  # noqa: BLE001
             self._last_compaction_refusal_reason = "compaction_failed"
+            local = _local_after_failure("compaction_failed")
+            if local is not None:
+                return local
             if self._session_key:
                 notify_compaction(
                     self._session_key,
@@ -15220,7 +15357,7 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return _local_after_failure("compaction_failed")
+            return None
 
         if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
             self._compaction_failed_this_turn = False
@@ -15278,6 +15415,9 @@ class Agent:
                 kept_count=len(result.kept_entries),
             )
             self._last_compaction_refusal_reason = "empty_summary_rejected"
+            local = _local_after_failure("empty_summary_rejected")
+            if local is not None:
+                return local
             if self._session_key:
                 notify_compaction(
                     self._session_key,
@@ -15295,7 +15435,7 @@ class Agent:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-            return _local_after_failure("empty_summary_rejected")
+            return None
 
         # A skip (nothing removed, no summary) is a no-op regardless of whether
         # the in-memory history is structured or string-only. Reporting it as
@@ -16097,6 +16237,7 @@ class Agent:
             context_window_known=child_target.context_window_known,
             workspace_dir=spec.workspace_dir or self.config.workspace_dir,
             compaction_profile=self.config.compaction_profile,
+            compaction_enabled=self.config.compaction_enabled,
             compaction_trigger_ratio=self.config.compaction_trigger_ratio,
             compaction_protected_recent_messages=(self.config.compaction_protected_recent_messages),
             compaction_total_timeout_seconds=self.config.compaction_total_timeout_seconds,

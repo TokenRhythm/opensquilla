@@ -534,6 +534,7 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     target = resolve_gateway_compaction_target(
         gateway_context,
         session,
+        consumer_budget=consumer_budget,
     )
     compaction_provider = target.provider
     if compaction_provider is None and not target.blocked_reason:
@@ -552,6 +553,19 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
     if callable(prepare_envelope) and consumer_budget.provider is not None:
         from opensquilla.tools.types import ToolContext
 
+        envelope_options: dict[str, Any] = {}
+        try:
+            envelope_parameters = tuple(inspect.signature(prepare_envelope).parameters.values())
+        except (TypeError, ValueError):
+            envelope_parameters = ()
+        if any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD
+            or parameter.name == "provider_request_max_chars_explicit_cap"
+            for parameter in envelope_parameters
+        ):
+            envelope_options["provider_request_max_chars_explicit_cap"] = (
+                consumer_budget.provider_request_max_chars_explicit_cap
+            )
         consumer_agent = prepare_envelope(
             session,
             provider=consumer_budget.provider,
@@ -566,13 +580,15 @@ async def _compact_standalone_context(context: StandaloneSlashContext) -> None:
             caller_tool_context=(
                 context.tool_ctx if isinstance(context.tool_ctx, ToolContext) else None
             ),
+            **envelope_options,
         )
+        compaction_config.request_context = consumer_agent.build_compaction_request_context()
     resolved_budget = build_gateway_compaction_budget(
         consumer_budget,
         consumer_agent=consumer_agent,
         trigger_ratio=float(getattr(config, "preflight_compact_ratio", 0.85)),
         retained_tail_messages=effective_protected_recent_messages(compaction_config),
-        summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 1024),
+        summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 0),
     )
     context_window = resolved_budget.history_capacity_tokens
     consumer_admission = resolved_budget.consumer_admission

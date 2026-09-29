@@ -673,8 +673,8 @@ class ChatConfig(BaseModel):
         repr=False,
     )
     # Runtime-only bound for adapter-internal physical transport attempts.
-    # Zero preserves each adapter's compatibility behavior; auxiliary
-    # compaction binds this to one so its operation-level two-call cap is real.
+    # Zero preserves each adapter's bounded retry policy. Auxiliary callers
+    # additionally bind the operation's absolute deadline across all retries.
     physical_attempt_limit: int = Field(
         default=0,
         ge=0,

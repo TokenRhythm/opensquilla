@@ -11,21 +11,21 @@ from dataclasses import dataclass, field, replace
 from typing import Any
 
 from opensquilla.context_budget import ContextBudgetGovernor
-from opensquilla.provider.deployment import (
-    CredentialPoolAcquirer,
-    resolve_provider_deployment,
-)
+from opensquilla.provider.deployment import CredentialPoolAcquirer
 from opensquilla.provider.model_catalog import shared_catalog
 from opensquilla.provider.protocol import (
     LLMProvider,
     configured_provider_id,
+    provider_connection_config,
     provider_metadata,
 )
 from opensquilla.provider.selector import ProviderConfig, build_provider_from_config
 from opensquilla.provider.types import ChatConfig
 
-MAX_COMPACTION_LLM_CALLS = 2
-DEFAULT_COMPACTION_OUTPUT_TOKENS = 1024
+# Compatibility names: None delegates necessary chunks to the operation deadline;
+# zero requests the current deployment's generation allowance as a soft target.
+MAX_COMPACTION_LLM_CALLS: int | None = None
+DEFAULT_COMPACTION_OUTPUT_TOKENS = 0
 _COMPACTION_CONTEXT_THRESHOLD = 0.85
 # Fingerprints reach telemetry, so make credential guesses unverifiable off-process.
 _DEPLOYMENT_FINGERPRINT_KEY = secrets.token_bytes(32)
@@ -102,8 +102,8 @@ class CompactionExecutionTarget:
     context_window_tokens: int = 0
     context_window_source: str = "model_catalog"
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS
-    # The portable body cap is independent of the provider's whole generation
-    # allowance, which may also be consumed by unavoidable reasoning.
+    # A planning/prompt target, never a summary-body acceptance limit.
+    # The API generation allowance may also include unavoidable reasoning.
     max_generation_tokens: int | None = None
     provider_request_max_chars: int = 0
     provider_request_max_chars_explicit_cap: int | None = field(default=None, repr=False)
@@ -125,12 +125,19 @@ class CompactionExecutionTarget:
             raise ValueError("compaction deployment model must not be empty")
         if self.context_window_tokens < 0:
             raise ValueError("context_window_tokens must be non-negative")
-        if self.max_output_tokens <= 0:
-            raise ValueError("max_output_tokens must be positive")
+        if self.max_output_tokens < 0:
+            raise ValueError("max_output_tokens must be non-negative")
         if self.max_generation_tokens is not None and self.max_generation_tokens <= 0:
             raise ValueError("max_generation_tokens must be positive")
         if self.provider_request_max_chars < 0:
             raise ValueError("provider_request_max_chars must be non-negative")
+        if not self.max_output_tokens:
+            output = self.max_generation_tokens or shared_catalog().resolve_max_tokens(
+                self.model, user_override=0, provider=self.provider_id,
+            )
+            if self.context_window_tokens > 0:
+                output = min(output, self.context_window_tokens)
+            object.__setattr__(self, "max_output_tokens", max(1, int(output)))
         if not self.deployment_fingerprint:
             object.__setattr__(
                 self,
@@ -174,15 +181,13 @@ class CompactionExecutionPlan:
     """
 
     candidates: tuple[CompactionExecutionTarget, ...]
-    max_calls: int = MAX_COMPACTION_LLM_CALLS
+    max_calls: int | None = None
 
     def __post_init__(self) -> None:
         if not self.candidates:
             raise ValueError("compaction execution plan needs at least one target")
-        if not 1 <= self.max_calls <= MAX_COMPACTION_LLM_CALLS:
-            raise ValueError(
-                f"compaction max_calls must be between 1 and {MAX_COMPACTION_LLM_CALLS}"
-            )
+        if self.max_calls is not None and self.max_calls < 1:
+            raise ValueError("compaction max_calls must be positive when specified")
 
     @property
     def primary(self) -> CompactionExecutionTarget:
@@ -236,9 +241,8 @@ def _resolved_target_budgets(
         catalog.resolve_max_tokens(model, user_override=0, provider=provider_id)
         or 0
     )
-    requested_output = max(1, int(max_output_tokens or 0))
+    requested_output = max(1, int(max_output_tokens or catalog_output or resolved_window))
     resolved_output = min(
-        DEFAULT_COMPACTION_OUTPUT_TOKENS,
         requested_output,
         catalog_output if catalog_output > 0 else requested_output,
         resolved_window,
@@ -269,18 +273,17 @@ def build_compaction_llm_plan_from_provider_config(
     model_override: str | None = None,
     context_window_tokens: int = 0,
     provider_request_max_chars: int = 0,
-    max_calls: int = MAX_COMPACTION_LLM_CALLS,
+    max_calls: int | None = None,
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
     max_generation_tokens: int | None = None,
     deployment_fingerprint: str = "",
     portable: bool = True,
     source: str = "provider_config",
-    replay_provider_state: bool | None = False,
+    replay_provider_state: bool | None = None,
 ) -> CompactionExecutionPlan:
     """Build an isolated auxiliary provider from a complete deployment config.
 
-    Prefix summaries serialize portable history with replay disabled. Suffix
-    summaries pass ``None`` to preserve the active request's serialization.
+    Preserve the current deployment's serialization policy by default.
     """
 
     model = str(model_override or config.model or "").strip()
@@ -293,7 +296,7 @@ def build_compaction_llm_plan_from_provider_config(
         provider_id=str(config.provider or "").strip(),
         model=model,
         context_window_tokens=context_window_tokens,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=max_generation_tokens or max_output_tokens,
         provider_request_max_chars=provider_request_max_chars,
     )
     isolated = replace(
@@ -316,7 +319,7 @@ def build_compaction_llm_plan_from_provider_config(
                 context_window_tokens=resolved_window,
                 context_window_source=window_source,
                 max_output_tokens=resolved_output,
-                max_generation_tokens=max_generation_tokens,
+                max_generation_tokens=resolved_output,
                 provider_request_max_chars=resolved_chars,
                 provider_request_max_chars_explicit_cap=max(
                     0, int(provider_request_max_chars or 0),
@@ -339,7 +342,7 @@ def build_compaction_llm_plan_from_provider(
     model: str | None = None,
     context_window_tokens: int = 0,
     provider_request_max_chars: int = 0,
-    max_calls: int = MAX_COMPACTION_LLM_CALLS,
+    max_calls: int | None = None,
     max_output_tokens: int = DEFAULT_COMPACTION_OUTPUT_TOKENS,
     max_generation_tokens: int | None = None,
     deployment_fingerprint: str = "",
@@ -367,6 +370,7 @@ def build_compaction_llm_plan_from_provider(
         return None
 
     provider_id = configured_provider_id(provider)
+    connection = provider_connection_config(provider)
     provider_kind = str(metadata.provider_kind or "").strip().lower()
     if provider_kind == "ensemble" or str(provider_id).strip().lower() == "ensemble":
         return None
@@ -379,7 +383,7 @@ def build_compaction_llm_plan_from_provider(
         provider_id=provider_id or metadata.provider_name or provider_kind,
         model=resolved_model,
         context_window_tokens=context_window_tokens,
-        max_output_tokens=max_output_tokens,
+        max_output_tokens=max_generation_tokens or max_output_tokens,
         provider_request_max_chars=provider_request_max_chars,
     )
 
@@ -392,12 +396,19 @@ def build_compaction_llm_plan_from_provider(
                 context_window_tokens=resolved_window,
                 context_window_source=window_source,
                 max_output_tokens=resolved_output,
-                max_generation_tokens=max_generation_tokens,
+                max_generation_tokens=resolved_output,
                 provider_request_max_chars=resolved_chars,
                 provider_request_max_chars_explicit_cap=max(
                     0, int(provider_request_max_chars or 0),
                 ),
-                deployment_fingerprint=deployment_fingerprint,
+                deployment_fingerprint=(
+                    deployment_fingerprint or compaction_deployment_fingerprint(
+                        provider=provider_id or metadata.provider_name or provider_kind,
+                        model=resolved_model,
+                        api_key=connection.api_key,
+                        base_url=connection.base_url,
+                    )
+                ),
                 portable=portable,
                 source=source,
             ),
@@ -426,156 +437,84 @@ def resolve_compaction_execution_plan(
     credential_pool_acquirer: CredentialPoolAcquirer | None = None,
     credential_pool_failure_reporter: Callable[[str, str, Any], None] | None = None,
     active_only: bool = False,
+    active_chat_config: ChatConfig | None = None,
 ) -> CompactionExecutionPlan | None:
-    """Freeze the ordered physical targets for one compaction operation.
+    """Freeze only the current physical responder, never route for a summary.
 
-    Composite providers contribute only their concrete aggregator deployment;
-    proposer fanout is never a compaction target. The routed/base deployment
-    and configured single-provider fallbacks follow it. Explicit provider and
-    model configuration, when complete and executable, takes precedence.
-    ``active_only`` retains only the current physical deployment for suffix
-    requests, including its replay policy. Previous turns and configured
-    summary overrides cannot change that request's model or serialization.
+    Legacy override/fallback/active_only arguments remain accepted for callers
+    upgrading in place. They cannot change the summary deployment. A composite
+    provider resolves its already-selected response leg, including a sticky
+    fixed takeover; this never executes proposers or selects a new fallback.
     """
 
-    candidates: list[CompactionExecutionTarget] = []
-    seen: set[str] = set()
-
-    def add_config(
-        config: ProviderConfig | None,
-        *,
-        source: str,
-        credential_pool: object | None = None,
-    ) -> None:
-        if config is None:
-            return
+    config = active_provider_config
+    provider = active_provider
+    chat_config = active_chat_config
+    source = "active_deployment"
+    resolve_current = getattr(provider, "current_response_deployment", None)
+    if callable(resolve_current):
         try:
-            target_window = (
-                context_window_tokens
-                if source in {"routed_deployment", "active_deployment"}
-                else 0
-            )
-            if source == "ensemble_aggregator":
-                resolve_config = getattr(active_provider, "compaction_chat_config", None)
-                if callable(resolve_config):
-                    target_window = resolve_config(ChatConfig()).provider_context_window_tokens
-            plan = build_compaction_execution_plan_from_provider_config(
-                config,
-                context_window_tokens=target_window,
-                source=source,
-                replay_provider_state=None if active_only else False,
-            )
+            provider, config, chat_config = resolve_current(chat_config or ChatConfig())
         except Exception:
-            return
-        target = plan.primary
-        if isinstance(credential_pool, Mapping):
-            pool_provider = str(credential_pool.get("provider") or "").strip()
-            pool_session_key = str(credential_pool.get("session_key") or "").strip()
-            if pool_provider and pool_session_key:
-                target = replace(
-                    target,
-                    credential_pool_provider=pool_provider,
-                    credential_pool_session_key=pool_session_key,
-                    credential_pool_failure_reporter=(
-                        credential_pool_failure_reporter
-                    ),
-                )
-        if target.deployment_fingerprint in seen:
-            return
-        seen.add(target.deployment_fingerprint)
-        candidates.append(target)
+            return None
+        source = "current_response_deployment"
+        if provider is None and config is None:
+            return None
+    else:
+        # Extension composites may expose a resolved aggregator config without
+        # implementing the richer current-response protocol.
+        aggregator = getattr(provider, "aggregator", None)
+        aggregator_config = getattr(aggregator, "provider_config", None)
+        if isinstance(aggregator_config, ProviderConfig):
+            if not bool(getattr(aggregator, "ready", True)):
+                return None
+            config = aggregator_config
+            source = "ensemble_aggregator"
+            resolve_chat = getattr(provider, "compaction_chat_config", None)
+            if callable(resolve_chat):
+                chat_config = resolve_chat(chat_config or ChatConfig())
+            provider = None
 
-    def add_identity(identity: CompactionDeploymentIdentity) -> None:
-        resolution_metadata: dict[str, Any] = {}
-        resolution = resolve_provider_deployment(
-            app_config,
-            identity.provider_id,
-            identity.model,
-            inherited_provider_config=active_provider_config,
-            session_key=session_key,
-            turn_metadata=resolution_metadata,
-            replay_provider_state=False,
-            credential_pool_acquirer=credential_pool_acquirer,
-        )
-        if resolution.ready:
-            add_config(
-                resolution.provider_config,
-                source=identity.source,
-                credential_pool=resolution_metadata.get("credential_pool"),
-            )
-
-    aggregator = getattr(active_provider, "aggregator", None)
-    aggregator_config = getattr(aggregator, "provider_config", None)
-    aggregator_ready = bool(getattr(aggregator, "ready", True))
-    if active_only:
-        if isinstance(aggregator_config, ProviderConfig) and aggregator_ready:
-            add_config(aggregator_config, source="ensemble_aggregator")
-        else:
-            add_config(active_provider_config, source="active_deployment")
-        if candidates:
-            return CompactionExecutionPlan(candidates=tuple(candidates))
-        # Providers without a complete factory config retain their existing
-        # serialization policy; never infer replay from the suffix switch.
-        return build_compaction_execution_plan_from_provider(
-            active_provider,
-            context_window_tokens=context_window_tokens,
-            source="active_deployment",
-        )
-
-    explicit_provider = str(
-        getattr(compaction_config, "provider", "") or ""
-    ).strip()
-    explicit_model = str(getattr(compaction_config, "model", "") or "").strip()
-    if explicit_provider and explicit_model:
-        resolution_metadata: dict[str, Any] = {}
-        resolution = resolve_provider_deployment(
-            app_config,
-            explicit_provider,
-            explicit_model,
-            inherited_provider_config=active_provider_config,
-            session_key=session_key,
-            turn_metadata=resolution_metadata,
-            replay_provider_state=False,
-            credential_pool_acquirer=credential_pool_acquirer,
-        )
-        if resolution.ready:
-            add_config(
-                resolution.provider_config,
-                source="explicit",
-                credential_pool=resolution_metadata.get("credential_pool"),
-            )
-    elif explicit_model and active_provider_config is not None:
-        add_config(
-            replace(
-                active_provider_config,
-                model=explicit_model,
-                provider_routing=dict(active_provider_config.provider_routing),
-                replay_provider_state=False,
-            ),
-            source="explicit_model_current_provider",
-        )
-
-    if isinstance(aggregator_config, ProviderConfig) and aggregator_ready:
-        add_config(aggregator_config, source="ensemble_aggregator")
-
-    add_config(active_provider_config, source="routed_deployment")
-    for identity in previous_deployment_identities:
-        add_identity(identity)
-    for config in fallback_provider_configs:
-        add_config(config, source="selector_fallback")
-
-    if not candidates:
-        fallback_plan = build_compaction_execution_plan_from_provider(
-            active_provider,
-            context_window_tokens=context_window_tokens,
-            source="active_deployment",
-        )
-        if fallback_plan is not None:
-            candidates.extend(fallback_plan.candidates)
-
-    if not candidates:
-        return None
-    return CompactionExecutionPlan(
-        candidates=tuple(candidates),
-        max_calls=MAX_COMPACTION_LLM_CALLS,
+    window = (
+        int(chat_config.provider_context_window_tokens or 0)
+        if chat_config is not None else int(context_window_tokens or 0)
     )
+    generation = int(chat_config.max_tokens or 0) if chat_config is not None else None
+    char_cap = (
+        int(chat_config.provider_request_max_chars_explicit_cap or 0)
+        if chat_config is not None else 0
+    )
+    # The already-bound physical adapter is authoritative for every connection
+    # and serialization option, including ones the public identity protocol
+    # does not expose. The summary supplies a detached ChatConfig and never
+    # mutates the selector or the adapter's model binding.
+    try:
+        if provider is None and isinstance(config, ProviderConfig):
+            plan = build_compaction_execution_plan_from_provider_config(
+                config, context_window_tokens=window,
+                max_generation_tokens=generation,
+                provider_request_max_chars=char_cap,
+                source=source,
+            )
+        else:
+            plan = build_compaction_execution_plan_from_provider(
+                provider, context_window_tokens=window,
+                max_generation_tokens=generation,
+                provider_request_max_chars=char_cap,
+                source=source,
+            )
+        if plan is not None and session_key and credential_pool_failure_reporter is not None:
+            # Report against the existing session pin only. Never acquire a
+            # different credential to run a summary; an unpinned session is a
+            # no-op in the shared pool manager.
+            plan = replace(plan, candidates=(replace(
+                plan.primary,
+                credential_pool_provider=plan.primary.provider_id,
+                credential_pool_session_key=session_key,
+                credential_pool_failure_reporter=credential_pool_failure_reporter,
+            ),))
+        return plan
+    except Exception:
+        # A broken current deployment is a summary failure, not permission to
+        # send history to another model or credential configuration.
+        return None

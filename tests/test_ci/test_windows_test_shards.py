@@ -559,7 +559,23 @@ def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
         ),
         (
             "tests/test_gateway/test_manual_compaction_contract.py",
-            "test_absolute_deadline_closes_provider_and_emits_one_failed_terminal",
+            "test_absolute_deadline_closes_provider_and_emits_one_skipped_terminal",
+        ),
+        (
+            "tests/test_engine/test_compaction_parent_turn_deadline.py",
+            "test_parent_deadline_cancels_inflight_preflight_without_auxiliary_failure",
+        ),
+        (
+            "tests/test_engine/test_compaction_parent_turn_deadline.py",
+            "test_parent_deadline_after_sqlite_commit_does_not_rollback_checkpoint",
+        ),
+        (
+            "tests/test_engine/test_compaction_runtime_boundaries.py",
+            "test_parent_expiry_cancels_inflight_summary_without_failure_or_window",
+        ),
+        (
+            "tests/test_engine/test_compaction_runtime_boundaries.py",
+            "test_real_turn_reports_parent_timeout_without_auxiliary_failure",
         ),
         (
             "tests/test_gateway/test_rpc_sessions.py",

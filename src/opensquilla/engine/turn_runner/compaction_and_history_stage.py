@@ -12,8 +12,9 @@ Side-effect contract:
 - Unless ``skip_compaction`` is requested, ``preflight.maybe_compact`` MAY mutate
   the DB transcript via ``SessionManager.compact``. They MAY also mutate
   the runner's per-turn ``has_compacted_this_turn`` flag and the
-  per-session compaction-failure circuit state. All exceptions other
-  than ``asyncio.CancelledError`` are swallowed internally.
+  per-session compaction-failure circuit state. Recoverable summary refusal
+  can select a request window; cancellation, accounting, ownership and storage
+  exceptions propagate to the turn owner.
 - ``history_loader.load`` mutates ``agent._history`` via
   ``agent.set_history`` and returns a (possibly ``None``) durable
   compaction-summary context string.
@@ -26,7 +27,7 @@ Side-effect contract:
 are supplied. Hook invocations are isolated with ``except Exception: pass`` so
 observer failures do not break the turn.
 
-NEVER terminates. Always returns ``StageOutcome.success(...)``. The
+On normal completion returns ``StageOutcome.success(...)``. The
 ``StageOutcome`` shape is preserved for forward-compatibility with a
 future ``ErrorEvent`` early-yield branch.
 
@@ -49,6 +50,7 @@ from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 if TYPE_CHECKING:
     from opensquilla.engine.agent import Agent
     from opensquilla.engine.hooks.types import CompactionHook
+    from opensquilla.engine.runtime import PreparedRequestWindow
     from opensquilla.engine.turn_runner.outcome import StageOutcome
     from opensquilla.engine.turn_runner.transcript_snapshot import (
         TurnTranscriptSnapshot,
@@ -66,12 +68,11 @@ if TYPE_CHECKING:
 class PreflightCompactionPort(Protocol):
     """Wraps ``TurnRunner._maybe_preflight_compact``.
 
-    Returns ``None``. The CALLER does NOT branch on the return; the side
-    effect is implicit (DB rewrite + ``mark_compacted_this_turn`` if a
-    compaction actually fired).
+    Returns an optional prepared request window for the history loader. Durable
+    compaction still commits atomically through the existing session manager.
 
-    Exceptions other than ``CancelledError`` are logged and swallowed by the
-    runtime helper; cancellation is re-raised.
+    The runtime helper handles recoverable summary refusal. Cancellation and
+    failures whose durable outcome is not a verified refusal propagate.
     """
 
     async def maybe_compact(
@@ -96,7 +97,7 @@ class PreflightCompactionPort(Protocol):
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> None: ...
+    ) -> PreparedRequestWindow | None: ...
 
 @runtime_checkable
 class HistoryLoaderPort(Protocol):
@@ -121,6 +122,7 @@ class HistoryLoaderPort(Protocol):
         agent: Agent,
         session_key: str,
         trim_last_user: bool,
+        prepared_window: PreparedRequestWindow | None = None,
         bound_user_message_id: str | None = None,
         transcript_snapshot: TurnTranscriptSnapshot[Any] | None = None,
         expected_session_id: str | None = None,
@@ -286,6 +288,7 @@ class CompactionAndHistoryStage:
             inp.compaction_provider if inp.compaction_provider is not None else inp.provider
         )
         compaction_model = inp.compaction_model or inp.resolved_model
+        prepared_window = None
 
         if not inp.skip_compaction:
             preflight_state = CompactionState(
@@ -311,7 +314,7 @@ class CompactionAndHistoryStage:
             if inp.expected_session_id is not None or inp.expected_session_epoch is not None:
                 preflight_kwargs["expected_session_id"] = inp.expected_session_id
                 preflight_kwargs["expected_session_epoch"] = inp.expected_session_epoch
-            await self._preflight.maybe_compact(
+            prepared_window = await self._preflight.maybe_compact(
                 session_key=inp.session_key,
                 context_window_tokens=compaction_context_window_tokens,
                 compaction_provider=compaction_provider,
@@ -330,6 +333,8 @@ class CompactionAndHistoryStage:
 
         # 3. Load history (transcript + reconstructed messages + durable summary).
         history_kwargs: dict[str, Any] = {}
+        if prepared_window is not None:
+            history_kwargs["prepared_window"] = prepared_window
         if inp.transcript_snapshot is not None:
             history_kwargs["transcript_snapshot"] = inp.transcript_snapshot
         if inp.expected_session_id is not None or inp.expected_session_epoch is not None:

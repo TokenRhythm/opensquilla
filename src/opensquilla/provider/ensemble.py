@@ -1893,9 +1893,37 @@ class EnsembleProvider:
         return aggregator_cfg
 
     def compaction_chat_config(self, config: ChatConfig) -> ChatConfig:
-        """Bind summary generation to the aggregator without invoking proposers."""
+        """Bind a summary to the current answer leg without invoking proposers."""
 
-        return self._aggregator_chat_config(config, ())
+        return self.current_response_deployment(config)[2]
+
+    def current_response_deployment(
+        self, config: ChatConfig,
+    ) -> tuple[LLMProvider | None, ProviderConfig | None, ChatConfig]:
+        """Snapshot the physical responder already selected for this turn.
+
+        Resolving this tuple never starts a request or activates a fallback.
+        Compaction and its consumer proof must both use the sticky fixed leg
+        after takeover, rather than silently returning to the aggregator.
+        """
+        if self._fixed_takeover_active:
+            role: Literal["fixed_aggregator", "fixed_direct"] = (
+                "fixed_aggregator"
+                if self._fixed_takeover_role == "fixed_aggregator" else "fixed_direct"
+            )
+            member = self._fallback_request_budget_member
+            return (
+                self._fixed_provider,
+                member.provider_config if member is not None else None,
+                self._fixed_chat_config(config, role=role) or config,
+            )
+        if not self.aggregator.ready:
+            return None, None, config
+        return (
+            self._primary_provider if self._primary_takeover_active else None,
+            self.aggregator.provider_config,
+            self._aggregator_chat_config(config, ()),
+        )
 
     def _fixed_chat_config(
         self,

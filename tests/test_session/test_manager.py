@@ -3041,7 +3041,7 @@ async def test_compact_with_result_returns_source_and_persists(manager):
         ),
         pytest.param(
             CompactionConfig(compaction_profile="coding"),
-            12,
+            2,
             id="profile-protection",
         ),
     ],
@@ -3568,6 +3568,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
         "agent:main:main",
         context_window_tokens=1_200,
         config=synthetic_compaction_config(safety_margin=1.2),
+        trigger_reason="manual",
     )
 
     assert result.removed_count > 0
@@ -5358,9 +5359,10 @@ async def test_suffix_manual_compaction_preserves_sqlite_source_until_valid_summ
     result = await manager.compact_with_result(
         node.session_key, context_window_tokens=1000, config=config, trigger_reason="manual",
     )
-    assert len(requests) == 1
+    assert len(requests) == (2 if failure == "oversized" else 1)
     messages, tools, sent_config = requests[0]
-    assert sent_config.system == "Current system"
+    assert "conversation compactor" in sent_config.system
+    assert sent_config.system != "Current system"
     assert sent_config.max_tokens == 4096
     assert tools[0].name == "lookup"
     assert "portable checkpoint" in messages[-1].content

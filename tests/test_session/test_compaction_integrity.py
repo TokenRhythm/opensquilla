@@ -11,6 +11,7 @@ from opensquilla.provider.types import (
     ChatConfig,
     DoneEvent,
     ErrorEvent,
+    Message,
     ProviderFinalRequestProjection,
     ReasoningDeltaEvent,
     TextDeltaEvent,
@@ -50,6 +51,19 @@ from opensquilla.session.tokenizer import estimate_tokens
 from tests.helpers.compaction import SyntheticCompactionProvider, synthetic_compaction_config
 
 
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    attempts = []
+
+    async def reject_network(*args, **kwargs):
+        attempts.append(True)
+        raise AssertionError("integrity tests must use a fixed provider stream")
+
+    monkeypatch.setattr("httpx.AsyncClient.send", reject_network)
+    yield
+    assert not attempts, "an integrity test attempted an external request"
+
+
 def source_entries():
     return [
         {"role": "user", "content": "Old task " + "background " * 200, "token_count": 500},
@@ -60,7 +74,7 @@ def source_entries():
 
 
 @pytest.mark.parametrize("layout", ["prefix", "suffix"])
-@pytest.mark.parametrize("failure", ["empty", "whitespace", "length", "error", "oversized"])
+@pytest.mark.parametrize("failure", ["empty", "whitespace", "length", "error"])
 async def test_failed_summary_never_replaces_source(monkeypatch, layout, failure):
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", layout)
 
@@ -68,9 +82,6 @@ async def test_failed_summary_never_replaces_source(monkeypatch, layout, failure
         async def chat(self, messages, tools=None, config=None):
             if failure == "error":
                 yield ErrorEvent(message="synthetic unavailable", code="429")
-            elif failure == "oversized":
-                yield TextDeltaEvent(text="long " * 2000)
-                yield DoneEvent()
             else:
                 if failure == "length":
                     yield TextDeltaEvent(text="unfinished")
@@ -92,9 +103,7 @@ async def test_failed_summary_never_replaces_source(monkeypatch, layout, failure
     assert result.removed_count == 0
     assert result.kept_entries == original
     assert result.summary == ""
-    assert result.skip_reason == (
-        "suffix_summary_failed" if layout == "suffix" else "summary_failed"
-    )
+    assert result.skip_reason == "summary_failed"
 
 
 @pytest.mark.parametrize("layout", ["prefix", "suffix"])
@@ -249,7 +258,9 @@ async def test_fitting_refuses_to_delete_unextracted_fact_from_nonempty_summary(
 
 @pytest.mark.parametrize("window", [200_000, 1_000_000])
 @pytest.mark.parametrize("character_limit", [None, 18_000])
-async def test_proportional_tail_scales_with_capacity_without_fixed_cap(window, character_limit):
+async def test_tail_uses_available_capacity_without_a_twenty_percent_target(
+    window, character_limit,
+):
     entries = [
         {
             "role": "user" if index % 2 == 0 else "assistant",
@@ -263,7 +274,7 @@ async def test_proportional_tail_scales_with_capacity_without_fixed_cap(window, 
         cfg.llm_plan.primary, context_window_tokens=2_000_000,
     ),))
     result = await compact_context(CompactionRequest(
-        session_id="proportional-tail", entries=entries, context_window_tokens=window,
+        session_id="capacity-tail", entries=entries, context_window_tokens=window,
         context_window_chars=character_limit, config=cfg,
     ))
 
@@ -271,19 +282,14 @@ async def test_proportional_tail_scales_with_capacity_without_fixed_cap(window, 
     assert result.kept_entries == entries[result.removed_count:]
     assert result.removed_count % 2 == 0
     kept_tokens = sum(estimate_entry_model_replay_tokens(entry) for entry in result.kept_entries)
-    assert kept_tokens <= window // 5
+    assert kept_tokens < window
     if character_limit is None:
-        # The shared policy retains one fifth of available history, capped by
-        # consumer capacity, so manual compaction of a short transcript has a
-        # useful prefix without sacrificing the same recent tail as automatic.
-        history_tokens = sum(estimate_entry_model_replay_tokens(entry) for entry in entries)
-        assert kept_tokens == min(window, history_tokens) // 5
-        assert kept_tokens > 20_000
+        # A soft pressure trigger selects completed history without imposing a
+        # second, arbitrary retention ratio on the final consumer capacity.
+        assert kept_tokens > window // 5
     else:
-        assert estimate_entries_model_replay_chars(result.kept_entries) <= character_limit // 5
-        preceding_round_and_tail = entries[result.removed_count - 2:]
-        assert estimate_entries_model_replay_chars(preceding_round_and_tail) > character_limit // 5
-    assert result.quality_report["pressure_released"] is True
+        assert estimate_entries_model_replay_chars(result.kept_entries) < character_limit
+    assert result.quality_report["passes_structural_gate"] is True
 
 
 @pytest.mark.parametrize("dimension", ["tokens", "chars"])
@@ -402,6 +408,54 @@ async def test_stale_consumer_returns_unchanged_source():
     assert result.skip_reason == "consumer_admission_stale"
 
 
+@pytest.mark.parametrize("consumer_fits", [True, False])
+async def test_complete_body_above_1024_requires_actual_consumer_admission(consumer_fits):
+    from opensquilla.provider.openai import OpenAIProvider
+
+    body = ("Completed ordinary finding. " * 600).strip()
+    assert estimate_tokens(body) > 1024
+    entries = source_entries()
+    entries[0]["content"] = "Earlier detailed background. " * 4000
+    original = deepcopy(entries)
+    consumer = OpenAIProvider(api_key="synthetic-key", model="synthetic-consumer")
+    consumer_config = ChatConfig(
+        max_tokens=1024, provider_context_window_tokens=16_000,
+        provider_request_max_chars=100_000 if consumer_fits else 1000,
+    )
+    projections = []
+
+    def admit(summary, kept):
+        messages = [
+            Message(role="user", content=format_compaction_summary_context([summary])),
+            *(Message(role=entry["role"], content=entry["content"]) for entry in kept),
+        ]
+        projection = consumer.project_final_request(messages, config=consumer_config)
+        projections.append(projection)
+        return projection.fits
+
+    cfg = synthetic_compaction_config(summary=body)
+    result = await compact_context(CompactionRequest(
+        session_id="complete-long-body", entries=entries, context_window_tokens=8000,
+        config=cfg, forced_prefix_cut=2, trigger="message_count", consumer_admission=admit,
+    ))
+
+    assert entries == original
+    assert projections, "acceptance must evaluate the actual next-request payload"
+    assert all(projection.fits is consumer_fits for projection in projections)
+    assert all(projection.proof["token_budget_source"] == "physical_context_window"
+               for projection in projections)
+    if consumer_fits:
+        assert result.removed_count == 2
+        assert result.kept_entries == original[2:]
+        assert body in result.summary
+        assert result.quality_report["consumer_admission_fits"] is True
+    else:
+        assert result.removed_count == 0
+        assert result.kept_entries == original
+        assert result.summary == ""
+        assert result.skip_reason == "consumer_admission_failed"
+
+
 @pytest.mark.parametrize("rejection", ["consumer", "stale", "replay"])
 async def test_rejected_candidate_does_not_report_pressure_released(rejection):
     def admit(summary, kept):
@@ -472,9 +526,9 @@ async def test_nonshrinking_candidate_does_not_report_pressure_released(manual, 
 
 
 @pytest.mark.parametrize("reasoning_control", [True, False])
-@pytest.mark.parametrize("failure", [None, "body_cap", "input_reserve"])
-async def test_prefix_reasoning_uses_current_generation_budget_without_control_metadata(
-    monkeypatch, reasoning_control, failure,
+@pytest.mark.parametrize("output_case", ["short_body", "long_body", "input_reserve"])
+async def test_reasoning_and_body_use_current_generation_budget_without_a_body_cap(
+    monkeypatch, reasoning_control, output_case,
 ):
     from opensquilla.provider.types import ProviderFinalRequestProjection
     from opensquilla.session.tokenizer import estimate_tokens
@@ -496,21 +550,24 @@ async def test_prefix_reasoning_uses_current_generation_budget_without_control_m
         reasoning = "synthetic reasoning " * 600
         assert 1024 < estimate_tokens(reasoning) < 4096
         yield ReasoningDeltaEvent(text=reasoning)
-        yield TextDeltaEvent(text="body " * 2000 if failure == "body_cap" else "short body")
+        yield TextDeltaEvent(text="body " * 2000 if output_case == "long_body" else "short body")
         yield DoneEvent(output_tokens=3000, reasoning_tokens=2995)
 
     monkeypatch.setattr(provider, "project_final_request", project, raising=False)
     monkeypatch.setattr(provider, "chat", chat)
     plan = CompactionExecutionPlan(candidates=(CompactionExecutionTarget(
         provider=provider, provider_id="synthetic", model="reasoning-only",
-        context_window_tokens=4000 if failure == "input_reserve" else 8000,
+        context_window_tokens=4000 if output_case == "input_reserve" else 8000,
     ),))
     result = await call_compaction_provider(
         "history", "", plan,
         request_context=CompactionRequestContext(chat_config=ChatConfig(max_tokens=4096)),
     )
-    assert result == (None if failure else "short body")
-    if failure == "input_reserve":
+    expected = {
+        "short_body": "short body", "long_body": ("body " * 2000).strip(), "input_reserve": None,
+    }
+    assert result == expected[output_case]
+    if output_case == "input_reserve":
         assert provider.calls == []
         return
     assert provider.calls[0][2].max_tokens == 4096
@@ -518,7 +575,7 @@ async def test_prefix_reasoning_uses_current_generation_budget_without_control_m
 
 
 @pytest.mark.parametrize("forced", [False, True])
-async def test_call_budget_keeps_unprocessed_rounds_raw(forced):
+async def test_necessary_chunks_can_use_more_than_two_calls_without_losing_source(forced):
     cfg = synthetic_compaction_config(safety_margin=1.0, protected_recent_messages=2)
     provider = cfg.llm_plan.primary.provider
     cfg.llm_plan = CompactionExecutionPlan(candidates=(replace(
@@ -533,20 +590,20 @@ async def test_call_budget_keeps_unprocessed_rounds_raw(forced):
         for index in range(20)
     ]
     result = await compact_context(CompactionRequest(
-        session_id="bounded-calls", entries=entries, context_window_tokens=8000,
+        session_id="necessary-chunks", entries=entries, context_window_tokens=8000,
         config=cfg, forced_prefix_cut=18 if forced else None,
     ))
     if forced:
-        assert result.removed_count == 0
-        assert result.kept_entries == entries
-        assert result.skip_reason == "summary_call_budget_exceeded"
-        assert provider.calls == []
-        return
-    assert 0 < result.removed_count < 18
+        assert result.removed_count == 18
+    else:
+        assert 0 < result.removed_count < 18
     assert result.removed_count % 2 == 0
     assert result.kept_entries == entries[result.removed_count:]
-    assert len(provider.calls) == 2
-    prompts = "\n".join(call[0][0].content for call in provider.calls)
+    assert len(provider.calls) > 2
+    prompts = json.dumps([
+        [message.model_dump(mode="json") for message in messages]
+        for messages, _tools, _config in provider.calls
+    ])
     for entry in entries[:result.removed_count]:
         assert entry["content"] in prompts
     for entry in result.kept_entries:
@@ -623,8 +680,12 @@ async def test_dense_text_character_cap_does_not_become_a_token_chunk_cap(
 
     result = await compact_context(request)
 
-    assert result.removed_count == 6
-    assert result.kept_entries == source[6:]
+    if forced:
+        assert result.removed_count == 6
+    else:
+        assert 0 < result.removed_count <= 6
+        assert result.removed_count % 2 == 0
+    assert result.kept_entries == source[result.removed_count:]
     assert request.entries == source
     assert result.summary_source == "llm"
     assert len(capture.calls) == 1
@@ -636,9 +697,9 @@ async def test_dense_text_character_cap_does_not_become_a_token_chunk_cap(
     assert projection.proof["estimated_chars"] < char_cap
     assert config.max_tokens == 4096
     wire = json.dumps(projection.payload, ensure_ascii=False)
-    for entry in source[:6]:
+    for entry in source[:result.removed_count]:
         assert entry["content"] in wire
-    for entry in source[6:]:
+    for entry in source[result.removed_count:]:
         assert entry["content"] not in wire
 
 
@@ -698,31 +759,38 @@ async def test_character_admission_splits_complete_token_fitting_rounds(monkeypa
         assert source[index * 2 + 1]["content"] in prompt
         assert source[(1 - index) * 2]["content"] not in prompt
         assert config.max_tokens == 4096
-        if layout == "suffix":
-            assert tools == list(request.config.request_context.tools)
-            assert config.system == request.config.request_context.chat_config.system
-            assert config.thinking is True
-            assert messages[-1].content.startswith("Summarize the preceding conversation")
+        assert tools == list(request.config.request_context.tools)
+        assert config.system.startswith("You are a conversation compactor")
+        assert config.thinking is True
+        assert messages[-1].content.startswith("Summarize the preceding conversation")
 
 
 @pytest.mark.parametrize("layout", ["prefix", "suffix"])
-async def test_character_chunks_cannot_shrink_a_forced_cut_to_meet_call_limit(monkeypatch, layout):
+@pytest.mark.parametrize("max_calls", [None, 2])
+async def test_necessary_character_chunks_obey_only_an_explicit_call_limit(
+    monkeypatch, layout, max_calls,
+):
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", layout)
     provider, request = character_bounded_compaction_case(rounds=3)
+    request.config.llm_plan = replace(request.config.llm_plan, max_calls=max_calls)
     result = await compact_context(request)
+    if max_calls is None:
+        assert result.removed_count == 6
+        assert result.kept_entries == request.entries[6:]
+        assert len(provider.calls) == 3
+        return
     assert result.removed_count == 0
     assert result.kept_entries == request.entries
     assert result.summary == ""
-    assert result.skip_reason == (
-        "suffix_call_budget_exceeded" if layout == "suffix" else "summary_call_budget_exceeded"
-    )
+    assert result.skip_reason == "summary_call_budget_exceeded"
     assert provider.calls == []
 
 
 @pytest.mark.parametrize("layout", ["prefix", "suffix"])
-async def test_automatic_character_chunks_keep_unprocessed_rounds_raw(monkeypatch, layout):
+async def test_explicit_call_limit_keeps_unprocessed_automatic_rounds_raw(monkeypatch, layout):
     monkeypatch.setenv("OPENSQUILLA_COMPACTION_PROMPT_LAYOUT", layout)
     provider, request = character_bounded_compaction_case(rounds=4)
+    request.config.llm_plan = replace(request.config.llm_plan, max_calls=2)
     request = replace(request, forced_prefix_cut=None, context_window_chars=15000)
     result = await compact_context(request)
     assert len(provider.calls) == 2
@@ -747,9 +815,7 @@ async def test_larger_rolling_checkpoint_must_pass_actual_character_admission(mo
     assert result.removed_count == 0
     assert result.kept_entries == request.entries
     assert result.summary == ""
-    assert result.skip_reason == (
-        "suffix_summary_failed" if layout == "suffix" else "summary_failed"
-    )
+    assert result.skip_reason == "summary_failed"
 
 
 async def test_broken_final_projection_never_falls_back_to_estimates(monkeypatch):
@@ -763,39 +829,20 @@ async def test_broken_final_projection_never_falls_back_to_estimates(monkeypatch
 
 @pytest.mark.parametrize("finish_reason,content", [
     ("length", "unfinished summary"), ("stop", ""), ("tool_calls", "not a summary"),
-    ("stop", "over budget " * 2000),
 ])
-async def test_legacy_http_rejects_incomplete_output(monkeypatch, finish_reason, content):
-    from unittest.mock import AsyncMock
-
+async def test_legacy_helper_uses_provider_stream_and_rejects_incomplete_output(
+    monkeypatch, finish_reason, content,
+):
     from opensquilla.session.compaction import call_compaction_llm
 
-    class Response:
-        text = "synthetic response"
+    calls = []
 
-        def raise_for_status(self):
-            return None
+    async def stream(self, messages, tools=None, config=None):
+        calls.append(config)
+        yield TextDeltaEvent(text=content)
+        yield DoneEvent(stop_reason=finish_reason)
 
-        def json(self):
-            return {"choices": [{
-                "finish_reason": finish_reason, "message": {"content": content},
-            }]}
-
-    class Client:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return False
-
-        async def post(self, *args, **kwargs):
-            return Response()
-
-    monkeypatch.setattr(
-        "opensquilla.session.compaction.httpx.AsyncClient", lambda **kwargs: Client(),
-    )
-    monkeypatch.setattr(
-        "opensquilla.engine.usage_http.reserve_direct_usage_call", AsyncMock(),
-    )
+    monkeypatch.setattr("opensquilla.provider.openai.OpenAIProvider.chat", stream)
     result = await call_compaction_llm("synthetic history", "", "synthetic", "unused-synthetic")
+    assert calls and calls[0].candidate_output_mode == "inert_artifact"
     assert result is None

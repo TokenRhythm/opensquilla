@@ -1095,7 +1095,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> None:
+    ) -> Any | None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
@@ -1171,7 +1171,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         if expected_session_id is not None or expected_session_epoch is not None:
             correlation_kwargs["expected_session_id"] = expected_session_id
             correlation_kwargs["expected_session_epoch"] = expected_session_epoch
-        await self._runner._maybe_preflight_compact(
+        return await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
             compaction_provider=compaction_provider,
@@ -1197,6 +1197,7 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         agent: Agent,
         session_key: str,
         trim_last_user: bool,
+        prepared_window: Any | None = None,
         bound_user_message_id: str | None = None,
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
@@ -1229,6 +1230,8 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
                 raise RuntimeError(
                     "session history reader does not support exact ownership"
                 )
+        if prepared_window is not None:
+            kwargs["prepared_window"] = prepared_window
         return await self._runner._load_history(
             agent,
             session_key,
