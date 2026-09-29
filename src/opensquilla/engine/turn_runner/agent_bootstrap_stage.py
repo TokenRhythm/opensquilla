@@ -143,6 +143,7 @@ class _AgentConfigAuxiliaries:
     tool_result_store_retention_seconds: int
     # Inert compatibility slot for older bootstrap integrations.
     finalize_evidence_gate: bool = False
+    compaction_timeout_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -777,6 +778,7 @@ class AgentBootstrapStage:
             ),
             compaction_profile=aux.compaction_profile,
             compaction_protected_recent_messages=(aux.compaction_protected_recent_messages),
+            compaction_timeout_seconds=aux.compaction_timeout_seconds,
             compaction_total_timeout_seconds=aux.compaction_total_timeout_seconds,
             compaction_heartbeat_interval_seconds=aux.compaction_heartbeat_interval_seconds,
             model_capabilities=catalog.capabilities,

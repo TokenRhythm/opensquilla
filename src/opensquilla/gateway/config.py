@@ -41,6 +41,7 @@ from opensquilla.application.config_secrets import (
 from opensquilla.application.config_secrets import (
     redact_public_config as redact_public_config,
 )
+from opensquilla.compaction_timing import DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
 from opensquilla.gateway.config_migration import (
     DEPRECATED_MEMORY_LEAVES,
     LATEST_CONFIG_VERSION,
@@ -1506,11 +1507,13 @@ class CompactionLlmConfig(BaseSettings):
     # current physical deployment; keep old values without rewriting profiles.
     provider: str | None = Field(default=None, json_schema_extra={"deprecated": True})
     model: str | None = Field(default=None, json_schema_extra={"deprecated": True})
-    timeout_seconds: float = 90.0
-    # Absolute budget shared by all summarization chunks and fallbacks.  The
+    # Legacy explicit values remain semantic idle limits. None inherits the
+    # normal request timeout; it never replaces the provider's I/O policy.
+    timeout_seconds: float | None = None
+    # Absolute budget shared by all summarization chunks and revisions. The
     # durable commit has separate bounded SQLite semantics and is reconciled if
     # cancellation races with commit completion.
-    total_timeout_seconds: float = Field(default=120.0, gt=0.0)
+    total_timeout_seconds: float = Field(default=DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS, gt=0.0)
     heartbeat_interval_seconds: float = Field(default=15.0, gt=0.0)
     enabled: bool = True
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"

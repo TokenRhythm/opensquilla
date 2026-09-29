@@ -1146,8 +1146,10 @@ def test_compaction_time_budget_defaults_allow_long_chain_work() -> None:
     gateway_config = GatewayConfig()
     compaction_config = CompactionConfig()
 
-    assert gateway_config.compaction.timeout_seconds == 90.0
-    assert compaction_config.timeout_seconds == 90.0
+    assert gateway_config.compaction.timeout_seconds is None
+    assert compaction_config.timeout_seconds is None
+    assert gateway_config.compaction.total_timeout_seconds == 600.0
+    assert compaction_config.total_timeout_seconds == 600.0
 
 
 def test_gateway_home_uses_configured_state_parent(tmp_path: Path) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 
 def effective_session_model(session: object | None) -> str | None:
     """Return a recorded/session model for features such as auto-naming."""
@@ -42,6 +44,6 @@ def resolve_selected_provider(
     if not callable(resolver):
         return None
     try:
-        return resolver()
+        return cast(object | None, resolver())
     except Exception:
         return None

@@ -19,6 +19,10 @@ from enum import StrEnum
 from typing import Protocol
 
 from opensquilla.compaction_status import compaction_failure_status
+from opensquilla.compaction_timing import (
+    DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS,
+    resolve_compaction_total_timeout,
+)
 from opensquilla.session_key import canonicalize_session_key
 
 # These results prove that the optional candidate was not installed. The next
@@ -65,7 +69,7 @@ class CompactSession:
 
 @dataclass(frozen=True, slots=True)
 class SessionCompactionTiming:
-    total_timeout_seconds: float = 120.0
+    total_timeout_seconds: float = DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
     heartbeat_interval_seconds: float = 15.0
 
 
@@ -99,6 +103,8 @@ class SessionCompactionExecutionResult:
     state_kind: str = "text"
     skip_reason: str = ""
     quality_report: Mapping[str, object] = field(default_factory=dict)
+    # Internal recovery classification; the existing transport payload stays unchanged.
+    failure_kind: str = ""
 
 
 class SessionCompactionMilestone(StrEnum):
@@ -367,7 +373,9 @@ class _ManualCompactionOperation:
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._committed_result: SessionCompactionExecutionResult | None = None
         self._stage = "admission"
-        self._operation_deadline = time.monotonic() + timing.total_timeout_seconds
+        self._operation_deadline = time.monotonic() + resolve_compaction_total_timeout(
+            timing.total_timeout_seconds,
+        )
 
     async def _publish(self, event: SessionCompactionEvent) -> None:
         if event.terminal and self._terminal_emitted:

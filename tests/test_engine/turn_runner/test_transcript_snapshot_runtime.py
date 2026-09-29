@@ -314,7 +314,7 @@ async def test_runtime_preflight_inherits_current_generation_budget(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["body_cap", "timeout", "circuit"])
+@pytest.mark.parametrize("failure", ["consumer_capacity", "timeout", "circuit"])
 @pytest.mark.parametrize("hard_overflow", [False, True])
 async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str, hard_overflow: bool,
@@ -324,6 +324,12 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     active_timeouts: list[asyncio.Timeout] = []
     summary_cancelled = False
     if failure == "timeout":
+        from opensquilla.provider import retry_after
+
+        monkeypatch.setattr(
+            retry_after, "_provider_retry_after_cooldowns",
+            retry_after.ProviderRetryAfterCooldowns(clock=lambda: compaction_clock.now),
+        )
         # Expire the shared deadline after the paid call starts. Preparation
         # speed must not turn this into a different, zero-provider-call case.
         monkeypatch.setattr(
@@ -387,7 +393,9 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
                     summary_cancelled = True
                     raise
                 raise AssertionError("expired summary stream must be cancelled")
-            yield ProviderText(text="synthetic oversized summary " * 2_000)
+            # Exceed the complete consumer request's 100k character cap.
+            # A local body cap no longer owns candidate admission.
+            yield ProviderText(text="synthetic oversized summary " * 3_350)
             yield ProviderDone(stop_reason="stop", output_tokens=5_000)
 
     storage = SessionStorage(":memory:")
@@ -425,7 +433,10 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
             runner._record_compaction_failure(key)
     try:
         events = await _run(runner, key)
-        expected_calls = 0 if failure == "circuit" else 1 if failure == "timeout" else 2
+        # The over-capacity checkpoint cannot itself fit a shortening request;
+        # local admission prevents a second paid dispatch. None of these
+        # failures may restart summarization when the ordinary Agent starts.
+        expected_calls = 0 if failure == "circuit" else 1
         assert provider.summary_calls == expected_calls
         assert summary_cancelled is (failure == "timeout")
         assert provider.main_calls == 1

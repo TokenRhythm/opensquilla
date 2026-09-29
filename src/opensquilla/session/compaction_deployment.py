@@ -488,6 +488,7 @@ def resolve_compaction_execution_plan(
     # and serialization option, including ones the public identity protocol
     # does not expose. The summary supplies a detached ChatConfig and never
     # mutates the selector or the adapter's model binding.
+    plan: CompactionExecutionPlan | None
     try:
         if provider is None and isinstance(config, ProviderConfig):
             plan = build_compaction_execution_plan_from_provider_config(

@@ -168,7 +168,7 @@ async def test_summary_does_not_fit_preserves_sqlite_and_returns_idle(manual_com
 
     assert case.calls
     assert result["status"] == "skipped"
-    assert result["reason"] == "summary_does_not_fit"
+    assert result["reason"] == "consumer_admission_failed"
     assert result["applied"] is False
     assert result["durability"] == "none"
     assert await case.manager.get_transcript(key) == before

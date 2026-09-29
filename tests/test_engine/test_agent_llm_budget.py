@@ -22,6 +22,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.agent import _LiveTurnCheckpointMessage, _LiveTurnContinuationMessage
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.engine.session_sanitize import session_payload_chars
 from opensquilla.engine.types import CompactionEvent
@@ -2583,7 +2584,7 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
         current_user,
         *rounds,
     ]
-    canonical_snapshot = list(messages)
+    canonical_snapshot = [message.model_copy(deep=True) for message in messages]
     agent = Agent(
         provider=_ContextOverflowProvider(),
         config=AgentConfig(
@@ -2600,8 +2601,27 @@ async def test_inline_overflow_projects_completed_live_rounds_without_mutating_p
 
     assert outcome is not None
     assert outcome.ephemeral_only is True
-    assert outcome.messages[2] is current_user
+    assert outcome.messages[0] is current_user
+    assert sum(message is current_user for message in outcome.messages) == 1
+    assert outcome.protected_turn_start_index == 0
     assert len(outcome.messages) == 3
+    checkpoint = outcome.messages[1]
+    assert isinstance(checkpoint, _LiveTurnCheckpointMessage)
+    assert checkpoint.role == "assistant"
+    assert "completed work summary" in str(checkpoint.content)
+    assert isinstance(outcome.messages[2], _LiveTurnContinuationMessage)
+    assert outcome.messages[2].role == "user"
+    assert outcome.messages[2].content != current_user.content
+    receipts = checkpoint._compaction_tool_receipts
+    assert [receipt["tool_call_id"] for receipt in receipts] == [
+        f"live-{index}" for index in range(3)
+    ]
+    assert [receipt["name"] for receipt in receipts] == ["read_file"] * 3
+    assert [receipt["arguments"] for receipt in receipts] == [
+        {"path": f"part-{index}.txt"} for index in range(3)
+    ]
+    assert all(receipt["result_received"] for receipt in receipts)
+    assert all(receipt["execution_status"]["status"] == "unknown" for receipt in receipts)
     assert compact_requests[0].forced_prefix_cut == len(rounds) + 2
     assert all(message not in outcome.messages for message in rounds)
     assert messages == canonical_snapshot

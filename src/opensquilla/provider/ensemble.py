@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import copy
 import json
+import math
 import random
 import time
 import uuid
@@ -29,6 +30,13 @@ from opensquilla.contracts.turn_execution import (
     RecoveryContext,
     StickyExecutionRole,
     TurnExecutionContext,
+)
+from opensquilla.provider.retry_after import (
+    RetryAfterDeferredError,
+    mark_retry_after_physical_start,
+    provider_retry_after_cooldowns,
+    provider_retry_after_scope,
+    record_provider_retry_after,
 )
 from opensquilla.router_tiers import (
     CUSTOM_B5_SELECTION_MODE,
@@ -473,6 +481,8 @@ async def _provider_stream_with_lifecycle(
     reset_deadline_on_event: bool,
     on_request_start: Callable[[], Awaitable[None]] | None = None,
     request_activity: ProviderActivityEvent | None = None,
+    physical_provider: object | None = None,
+    physical_config: ChatConfig | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Run one provider stream under the turn-local admission lease.
 
@@ -484,6 +494,29 @@ async def _provider_stream_with_lifecycle(
     including cancellation and provider exceptions.
     """
 
+    if physical_provider is not None:
+        try:
+            async for delay in provider_retry_after_cooldowns().wait(
+                physical_provider,
+                scope=provider_retry_after_scope(physical_provider),
+                deadline_at_monotonic=(
+                    physical_config.turn_deadline_at_monotonic
+                    if physical_config is not None else None
+                ),
+            ):
+                yield ProviderActivityEvent(
+                    model=str(getattr(physical_provider, "active_model_id", "") or ""),
+                    phase="retry_wait",
+                    reason=provider_retry_after_cooldowns().reason(
+                        physical_provider, scope=provider_retry_after_scope(physical_provider),
+                    ),
+                    retry_after_ms=math.ceil(delay * 1000),
+                )
+        except RetryAfterDeferredError as exc:
+            yield ErrorEvent(
+                message=exc.message, code=exc.code, retry_after_s=exc.remaining_seconds,
+            )
+            return
     lease = None
     request_started = False
     saw_terminal = False
@@ -527,6 +560,7 @@ async def _provider_stream_with_lifecycle(
 
     heartbeat_stream: AsyncGenerator[StreamEvent, None] | None = None
     try:
+        mark_retry_after_physical_start()
         stream = stream_factory()
         heartbeat_stream = _stream_with_heartbeats(
             stream,
@@ -538,6 +572,8 @@ async def _provider_stream_with_lifecycle(
             request_activity=request_activity,
         )
         async for event in heartbeat_stream:
+            if physical_provider is not None:
+                record_provider_retry_after(physical_provider, event)
             if execution_context is not None and not isinstance(
                 event,
                 ProviderGenerationResetEvent,
@@ -1494,6 +1530,7 @@ class EnsembleProvider:
     """G8 fusion provider: proposer candidates first, one aggregator stream after."""
 
     accounts_physical_usage = True
+    owns_retry_after_admission = True
     final_request_admission_guaranteed = True
     # Agent must pass the turn context through to this provider instead of
     # opening a second outer lease for the whole ensemble envelope.  The
@@ -2768,6 +2805,7 @@ class EnsembleProvider:
                 model=model,
             ),
             execution_context=execution_context,
+            physical_provider=provider, physical_config=request_config,
             role=role,
             logical_call_index=logical_index,
             attempt_index=0,
@@ -3578,6 +3616,7 @@ class EnsembleProvider:
                 model=member.provider_config.model,
             ),
             execution_context=execution_context,
+            physical_provider=provider, physical_config=chat_cfg,
             role=StickyExecutionRole.PROPOSER,
             logical_call_index=result.index,
             attempt_index=attempt_index,
@@ -4030,6 +4069,7 @@ class EnsembleProvider:
                         model=self.aggregator.provider_config.model,
                     ),
                     execution_context=execution_context,
+                    physical_provider=provider, physical_config=config,
                     role=StickyExecutionRole.PRIMARY_AGGREGATOR,
                     logical_call_index=logical_call_index,
                     attempt_index=attempt,
@@ -4716,6 +4756,7 @@ class EnsembleProvider:
                         model=physical_model,
                     ),
                     execution_context=execution_context,
+                    physical_provider=provider, physical_config=config,
                     role=role,
                     logical_call_index=logical_call_index,
                     attempt_index=fixed_attempt - 1,

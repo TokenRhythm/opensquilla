@@ -304,7 +304,7 @@ async def test_default_soft_trigger_is_85_percent_for_tokens_and_characters(
     ]
     if dimension == "tokens":
         for entry in entries:
-            entry.update(content="Ordinary completed history", token_count=pressure // 4)
+            entry.update(content="Ordinary completed history. " * 50, token_count=pressure // 4)
         window, char_window = 10_000, None
     else:
         entries[0]["content"] = "b" * (

@@ -1167,8 +1167,8 @@ async def test_shared_budget_controls_automatic_trigger_and_preserves_retained_t
     else:
         assert provider.calls
         # Explicit retention is a minimum protection, not an exact keep count.
-        assert result.removed_count == 2
-        assert result.kept_entries == entries[2:]
+        assert result.removed_count == 8
+        assert result.kept_entries == entries[8:]
         assert result.quality_report["protected_tail_preserved"] is True
         assert result.quality_report["passes_structural_gate"] is True
         assert result.quality_report["pressure_released"] is False
@@ -1656,9 +1656,11 @@ async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatc
 
     clock = Clock()
     request_timeouts: list[float] = []
+    request_deadlines: list[float] = []
 
     async def fake_llm(**kwargs):
         request_timeouts.append(kwargs["timeout"])
+        request_deadlines.append(kwargs["deadline_at_monotonic"])
         clock.now += 6.0
         return f"summary {len(request_timeouts)}"
 
@@ -1684,7 +1686,9 @@ async def test_multichunk_compaction_reuses_remaining_absolute_budget(monkeypatc
         )
 
     assert exc_info.value.phase == "summarizing"
-    assert request_timeouts == pytest.approx([10.0, 4.0])
+    # Idle allowance is stable; the shared absolute deadline bounds both calls.
+    assert request_timeouts == pytest.approx([90.0, 90.0])
+    assert request_deadlines == pytest.approx([110.0, 110.0])
     assert config.deadline_at_monotonic == 110.0
 
 
@@ -1808,7 +1812,7 @@ async def test_latest_completed_assistant_can_compact_when_it_exceeds_window():
         {"role": "assistant", "content": "old answer", "token_count": 400},
         {
             "role": "assistant",
-            "content": "LATEST_ASSISTANT_RAW",
+            "content": "Completed earlier assistant explanation. " * 400 + "LATEST_ASSISTANT_RAW",
             "token_count": 2_000,
         },
     ]
@@ -1846,8 +1850,8 @@ async def test_recent_error_tool_result_and_its_call_fit_in_raw_tail() -> None:
         "token_count": 100,
     }
     entries = [
-        {"role": "user", "content": "ancient request", "token_count": 1_000},
-        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "ancient request " * 100, "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer " * 100, "token_count": 1_000},
         {"role": "user", "content": "tool request", "token_count": 10},
         call,
         error_result,
@@ -2182,8 +2186,8 @@ async def test_latest_legacy_untyped_tool_call_remains_raw() -> None:
 @pytest.mark.asyncio
 async def test_protected_tail_retreats_to_tool_boundary():
     entries = [
-        {"role": "user", "content": "ancient request", "token_count": 1_000},
-        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "ancient request " * 100, "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer " * 100, "token_count": 1_000},
         {"role": "user", "content": "tool request", "token_count": 5},
         {
             "role": "assistant",
@@ -2221,8 +2225,8 @@ async def test_protected_tail_retreats_to_tool_boundary():
 @pytest.mark.asyncio
 async def test_protected_tail_retreats_over_multi_result_tool_segment():
     entries = [
-        {"role": "user", "content": "ancient request", "token_count": 1_000},
-        {"role": "assistant", "content": "ancient answer", "token_count": 1_000},
+        {"role": "user", "content": "ancient request " * 100, "token_count": 1_000},
+        {"role": "assistant", "content": "ancient answer " * 100, "token_count": 1_000},
         {"role": "user", "content": "tool request", "token_count": 5},
         {
             "role": "assistant",

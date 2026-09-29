@@ -371,7 +371,8 @@ async def test_live_completed_prefix_keeps_pending_native_tail_without_profile_q
         return
     assert len(requests) == 1
     assert outcome is not None and outcome.ephemeral_only and outcome.compacted
-    assert outcome.messages[2] is messages[0]
+    assert outcome.messages[0] is messages[0]
+    assert "Tool execution receipts" in str(outcome.messages[1].content)
     assert all(left is right for left, right in zip(outcome.messages[-2:], messages[-2:]))
     assert len(requests[0].entries) == 10
     assert messages == original

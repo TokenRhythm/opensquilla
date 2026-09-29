@@ -3523,6 +3523,7 @@ async def test_compact_with_result_summarizes_completed_tool_round(manager):
             "Goal: finish continuity work.\n"
             "Constraint: do not enable coverage blocking by default.\n"
             "Keep src/opensquilla/session/models.py and docs/Long Task Report.md."
+            + " Earlier background discussion and completed work." * 120
         ),
         token_count=500,
     )
@@ -3609,7 +3610,7 @@ async def test_compact_with_result_strict_coverage_installs_verified_backfill(ma
     await manager.append_message(
         "agent:main:main",
         "user",
-        "Goal: preserve strict continuity. " + ("padding " * 40) + late_critical_path,
+        "Goal: preserve strict continuity. " + ("padding " * 400) + late_critical_path,
         token_count=650,
     )
     for index in range(4):
@@ -3662,7 +3663,8 @@ async def test_compact_with_result_writes_portable_context_state(
     await manager.append_message(
         "agent:main:main",
         "user",
-        "Goal: keep portable state. File src/opensquilla/session/models.py.",
+        "Goal: keep portable state. File src/opensquilla/session/models.py."
+        + " Earlier completed discussion and ordinary details." * 100,
         token_count=1500,
     )
     for i in range(8):
@@ -3705,13 +3707,13 @@ async def test_compact_with_result_preserves_tool_metadata_for_boundary_cut(mana
     await manager.append_message(
         "agent:main:main",
         "user",
-        "ancient request",
+        "ancient request " * 100,
         token_count=500,
     )
     await manager.append_message(
         "agent:main:main",
         "assistant",
-        "ancient answer",
+        "ancient answer " * 100,
         token_count=500,
     )
     await manager.append_message(

@@ -1088,6 +1088,10 @@ async def test_manual_generation_budget_preserves_prefix_and_rejects_incomplete_
         max_generation_tokens=8192,
     )
     entries = _entries(6)
+    # Generation controls and exact source retention are tested with a source
+    # that is actually longer than the complete structured checkpoint.
+    for entry in entries[:4]:
+        entry["content"] += " Earlier completed discussion and ordinary details." * 30
     result = await compact_context(
         CompactionRequest(
             session_id="manual-generation",
@@ -1163,11 +1167,14 @@ async def test_manual_without_current_context_uses_same_summary_builder(
     provider = _Provider(_successful_stream)
     config = _suffix_config(provider)
     config.request_context = None
+    entries = _entries(6)
+    for entry in entries[:4]:
+        entry["content"] += " Earlier completed discussion and ordinary details." * 30
 
     result = await compact_context(
         CompactionRequest(
             session_id="first-or-restored-session",
-            entries=_entries(6),
+            entries=entries,
             context_window_tokens=1000,
             forced_prefix_cut=4,
             config=config,
@@ -1905,8 +1912,8 @@ async def test_compaction_timeout_logs_a_distinct_reason() -> None:
 
     assert result is None
     (failure,) = [entry for entry in logs if entry["event"] == "compaction.llm_call_failed"]
-    assert failure["reason_code"] == "request_timeout"
-    assert failure["error_type"] == "TimeoutError"
+    assert failure["reason_code"] == "idle_timeout"
+    assert failure["error_type"] == "CompactionIdleTimeoutError"
     assert provider.streams[0].closed
 
 

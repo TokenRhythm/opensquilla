@@ -15,6 +15,7 @@ from opensquilla.engine import (
     ToolResult,
     WarningEvent,
 )
+from opensquilla.engine.agent import _CompactionSummaryMessage
 from opensquilla.engine.types import CompactionEvent
 from opensquilla.execution_status import normalize_execution_status
 from opensquilla.gateway.config import GatewayConfig
@@ -1076,8 +1077,12 @@ async def test_failed_compaction_window_preserves_checkpoint_and_canonical_histo
     provider = _ExactMessageLimitProvider([100])
     agent = Agent(provider=provider, config=AgentConfig())
     history = [
-        Message(role="user", content="[Context summary]\nPrevious valid checkpoint."),
-        Message(role="assistant", content="Understood. Continuing from summary."),
+        _CompactionSummaryMessage(
+            role="user", content="[Context summary]\nPrevious valid checkpoint.",
+        ),
+        _CompactionSummaryMessage(
+            role="assistant", content="Understood. Continuing from summary.",
+        ),
         *_plain_history(),
     ]
     agent.set_history(history)
@@ -1529,8 +1534,9 @@ async def test_message_limit_projects_completed_live_rounds_when_durable_prefix_
     assert outcome.projected_wire_messages <= (
         limit - agent._message_count_headroom(limit)
     )
-    assert outcome.messages[2] is active_user
-    assert outcome.messages[2].content == active_text
+    assert outcome.messages[0] is active_user
+    assert outcome.messages[0].content == active_text
+    assert "Tool execution receipts" in str(outcome.messages[1].content)
     # The approval is still live. The preceding completed error can be
     # summarized; it must not permanently anchor the raw request window.
     assert outcome.messages[-10:] == [

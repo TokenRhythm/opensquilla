@@ -21,6 +21,7 @@ from opensquilla.application.session_maintenance import (
     SessionCompactionSession,
 )
 from opensquilla.attachment_refs import write_transcript_material
+from opensquilla.compaction_status import compaction_failure_status
 from opensquilla.gateway.adapters.session_maintenance import (
     GatewaySessionMaintenanceAdapter,
     GatewaySessionMaintenancePorts,
@@ -245,7 +246,10 @@ async def test_adapter_does_not_treat_unclassified_storage_timeout_as_safe_skip(
     [
         (0, "summary_failed", False, 0, 0),
         (3, "summary_failed", False, 1, 0),
-        (3, "no_compression_benefit", False, 0, 0),
+        (0, "no_compression_benefit", False, 0, 0),
+        (3, "no_compression_benefit", False, 1, 0),
+        (0, "no_progress", False, 0, 0),
+        (3, "no_progress", False, 1, 0),
         (3, "stale_preimage", False, 0, 0),
         (3, "", True, 0, 1),
     ],
@@ -273,6 +277,12 @@ async def test_manual_reports_one_summary_outcome_to_existing_ledger(
     assert result is expected
     assert runner._record_compaction_failure.call_count == failures
     assert runner._record_compaction_success.call_count == successes
+    if reason in {"no_compression_benefit", "no_progress"}:
+        assert compaction_failure_status(result.skip_reason) == "skipped"
+        if summary_calls:
+            runner._record_compaction_failure.assert_called_once_with(
+                "agent:main:webchat:one", failure_kind="unproductive",
+            )
 
 
 def test_manual_plan_uses_real_runner_prompt_and_tools_without_starting_turn(

@@ -27,6 +27,15 @@ from opensquilla.attachment_workspace import (
     historical_attachment_capacity_marker,
     historical_image_material_capacity_marker,
 )
+from opensquilla.compaction_timing import (
+    DEFAULT_COMPACTION_REQUEST_TIMEOUT_SECONDS,
+    DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS,
+    CompactionIdleTimeoutError,
+    CompactionOperationTimeoutError,
+    compaction_progress_timeout,
+    resolve_compaction_idle_timeout,
+    resolve_compaction_total_timeout,
+)
 from opensquilla.contracts.image_validation import validate_image_bytes
 from opensquilla.provider.failures import ProviderFailureKind, classify_provider_error
 from opensquilla.provider.image_projection import (
@@ -40,6 +49,13 @@ from opensquilla.provider.protocol import (
 )
 from opensquilla.provider.replay_budget import project_message_replay_budget
 from opensquilla.provider.request_proof import projected_generation_budget
+from opensquilla.provider.retry_after import (
+    RetryAfterDeferredError,
+    RetryAfterWaitTimeoutError,
+    provider_retry_after_cooldowns,
+    provider_retry_after_scope,
+    record_provider_retry_after,
+)
 from opensquilla.provider.types import (
     ChatConfig,
     ContentBlockImage,
@@ -86,7 +102,7 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger(__name__)
 
-_COMPACTION_TIMEOUT = 90.0
+_COMPACTION_TIMEOUT = DEFAULT_COMPACTION_REQUEST_TIMEOUT_SECONDS
 _COMPACTION_STREAM_CLOSE_TIMEOUT_SECONDS = 0.25
 _COMPACTION_STREAM_CANCEL_GRACE_SECONDS = 0.05
 # A transport memory guard, independent of token estimates and summary quality.
@@ -103,7 +119,10 @@ _COMPACTION_STATE_UPDATE_INSTRUCTION = (
     "Merge any prior checkpoint with the newer conversation into one current account. "
     "Mark completed work as completed, remove resolved questions and obsolete next steps, "
     "and preserve still-relevant decisions and constraints. Do not present an earlier plan "
-    "as pending when later messages show that it was completed or superseded."
+    "as pending when later messages show that it was completed or superseded. "
+    "For each retained fact, preserve which entity or field each value belongs to, "
+    "and any explicitly stated current status; do not replace facts with an unlabelled "
+    "list of values."
 )
 CompactionProfile = Literal["conversation", "coding", "research", "support"]
 CompactionTrigger = Literal["token_budget", "message_count"]
@@ -148,11 +167,11 @@ class CompactionConfig:
     model: str | None = None  # None = use session model
     api_key: str = field(default="", repr=False)
     base_url: str = "https://openrouter.ai/api/v1"
-    timeout_seconds: float = 90.0
+    timeout_seconds: float | None = None
     # One wall-clock budget shared by checkpoint creation, every summary chunk,
     # validation, and commit admission. Invalid/non-positive values fail back
     # to the bounded default rather than silently disabling the safety guard.
-    total_timeout_seconds: float = 120.0
+    total_timeout_seconds: float = DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
     heartbeat_interval_seconds: float = 15.0
     # Runtime-only fields. They are armed once when a logical operation starts
     # and then propagated through the existing synchronous call chain.
@@ -167,6 +186,7 @@ class CompactionConfig:
         compare=False,
     )
     llm_calls_started: int = field(default=0, init=False, repr=False)
+    last_failure_kind: str = field(default="", init=False, repr=False)
     on_summary_call_started: Callable[[], None] | None = field(
         default=None,
         repr=False,
@@ -288,6 +308,7 @@ class CompactionResult:
     # True when an oversized portable checkpoint was rolled forward without
     # removing additional raw transcript rows.
     replaced_previous_summary: bool = False
+    failure_kind: str = ""
 
 
 def compaction_replay_summary(result: CompactionResult) -> str:
@@ -392,13 +413,7 @@ def build_compaction_config_from_provider(
 ) -> CompactionConfig:
     """Build CompactionConfig from a resolved provider without owning selection."""
 
-    timeout_seconds = getattr(compaction_config, "timeout_seconds", _COMPACTION_TIMEOUT)
-    try:
-        timeout = float(timeout_seconds)
-    except (TypeError, ValueError):
-        timeout = _COMPACTION_TIMEOUT
-
-    cfg = CompactionConfig(timeout_seconds=timeout)
+    cfg = CompactionConfig(timeout_seconds=getattr(compaction_config, "timeout_seconds", None))
     for attr in (
         "compaction_profile",
         "protected_recent_messages",
@@ -462,16 +477,12 @@ def arm_compaction_deadline(
             config.operation_started_at_monotonic = None
             config.last_attempted_target = None
             config.successful_target = None
+            config.last_failure_kind = ""
         config.operation_id = operation_id
     if config.operation_started_at_monotonic is None:
         config.operation_started_at_monotonic = time.monotonic()
-    try:
-        total = float(config.total_timeout_seconds)
-    except (TypeError, ValueError):
-        total = 120.0
-    if not math.isfinite(total) or total <= 0:
-        total = 120.0
-        config.total_timeout_seconds = total
+    total = resolve_compaction_total_timeout(config.total_timeout_seconds)
+    config.total_timeout_seconds = total
     deadlines = [config.operation_started_at_monotonic + total]
     if config.deadline_at_monotonic is not None:
         deadlines.append(config.deadline_at_monotonic)
@@ -490,7 +501,7 @@ def compaction_remaining_seconds(config: CompactionConfig) -> float | None:
 
     deadline = arm_compaction_deadline(config)
     if deadline is None:  # defensive; arm_compaction_deadline always bounds
-        return 120.0
+        return DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
     return max(0.0, deadline - time.monotonic())
 
 
@@ -1297,7 +1308,8 @@ def _tool_result_payload_is_live(value: Any) -> bool:
         # metadata or JSON examples inside unrelated fields.
         for block in value:
             text = (
-                block.text if isinstance(block, ContentBlockText)
+                block.text
+                if isinstance(block, ContentBlockText)
                 else block.get("text")
                 if isinstance(block, dict) and block.get("type") == "text"
                 else None
@@ -1455,6 +1467,9 @@ def _compaction_quality_report(
     context_window_chars: int | None = None,
     trigger: CompactionTrigger = "token_budget",
     replaces_previous_summary: bool = False,
+    consumer_capacity_fits: bool | None = None,
+    replay_tokens_before: int | None = None,
+    replay_tokens_after: int | None = None,
 ) -> dict[str, Any]:
     protected_recent = effective_protected_recent_messages(cfg)
     protected_tail_preserved = True
@@ -1463,7 +1478,11 @@ def _compaction_quality_report(
         protected_tail_preserved = (
             len(kept) >= len(protected_tail) and kept[-len(protected_tail) :] == protected_tail
         )
-    compression_ratio = float(tokens_after) / float(tokens_before) if tokens_before > 0 else 1.0
+    reduction_before = tokens_before if replay_tokens_before is None else replay_tokens_before
+    reduction_after = tokens_after if replay_tokens_after is None else replay_tokens_after
+    compression_ratio = (
+        float(reduction_after) / float(reduction_before) if reduction_before > 0 else 1.0
+    )
     # The caller passes the consumer history capacity after its own reserves.
     # Safety margin controls when compaction starts; applying it again to the
     # candidate double-counts headroom and rejects otherwise admissible output.
@@ -1471,7 +1490,7 @@ def _compaction_quality_report(
     fits_character_window = bool(
         context_window_chars is None or chars_after is None or chars_after <= context_window_chars
     )
-    reduces_tokens = tokens_after < tokens_before
+    reduces_tokens = reduction_after < reduction_before
     # A valid, smaller checkpoint may still leave the consumer above its soft
     # trigger. Report that separately; it is not a second persistence gate.
     if cfg.budget is not None:
@@ -1495,8 +1514,11 @@ def _compaction_quality_report(
     passes_structural_gate = bool(
         (removed_count > 0 or replaces_previous_summary)
         and protected_tail_preserved
-        and fits_context_window
-        and fits_character_window
+        and (
+            consumer_capacity_fits
+            if consumer_capacity_fits is not None
+            else fits_context_window and fits_character_window
+        )
         and (reduces_tokens or trigger == "message_count")
     )
     return {
@@ -1504,9 +1526,14 @@ def _compaction_quality_report(
         "protected_recent_messages": protected_recent,
         "protected_tail_preserved": protected_tail_preserved,
         "compression_ratio": compression_ratio,
+        "replay_tokens_before": reduction_before,
+        "replay_tokens_after": reduction_after,
         "pressure_released": pressure_released,
         "fits_context_window": fits_context_window,
         "fits_character_window": fits_character_window,
+        "capacity_verdict_source": (
+            "consumer_request" if consumer_capacity_fits is not None else "history_estimate"
+        ),
         "chars_after": chars_after,
         "context_window_chars": context_window_chars,
         "passes_structural_gate": passes_structural_gate,
@@ -1660,6 +1687,30 @@ def _compaction_source_size(
             session_id=session_id,
             preserve_images=preserve_images,
         ),
+    )
+
+
+def _current_replay_tokens(
+    entries: list[dict[str, Any]],
+    *,
+    media_root: Path | None = None,
+    session_id: str = "",
+    preserve_images: bool = True,
+) -> int:
+    """Measure reduction without treating cached historical usage as source text.
+
+    Conservative persisted counts still own pressure/planning. Benefit compares
+    current replay on both sides, including media, tools and reasoning, so an
+    inflated old token_count cannot authorize growing the actual transcript.
+    """
+    return sum(
+        _entry_tokens(
+            {**entry, "token_count": None},
+            media_root=media_root,
+            session_id=session_id,
+            preserve_images=preserve_images,
+        )
+        for entry in entries
     )
 
 
@@ -2293,7 +2344,7 @@ def _build_suffix_compaction_call(
     provider: Any,
     context_window_tokens: int,
     summary_output_tokens: int,
-    timeout: float,
+    timeout: float | None,
     provider_request_correlation: ProviderRequestCorrelation | None,
     deployment: CompactionExecutionTarget | None = None,
     replay_policy: CompactionReplayPolicy | None = None,
@@ -2348,7 +2399,7 @@ def _build_suffix_compaction_call(
                 )
             ),
             "model_capabilities": capabilities,
-            "timeout": min(timeout, source_config.timeout),
+            "timeout": source_config.timeout,
             "provider_context_window_tokens": context_window_tokens,
             "candidate_output_mode": "inert_artifact",
             # Normal adapters own bounded transient retries. All attempts share the
@@ -2485,7 +2536,8 @@ def _build_suffix_compaction_call(
         "Summarize the preceding conversation into a portable checkpoint. "
         "Preserve key facts, decisions, unresolved questions and action items. "
         "Write in the conversation's language. Return only the summary; do not call tools. "
-        f"Aim for about {summary_output_tokens} tokens while preserving the necessary facts."
+        "Keep the checkpoint concise and complete. Use only the space needed to preserve "
+        "the necessary facts; do not add detail merely to fill the available budget."
     )
     instruction += f" {_COMPACTION_STATE_UPDATE_INSTRUCTION}"
     normalized = _normalize_custom_instructions(custom_instructions)
@@ -2725,6 +2777,10 @@ def _compaction_failure_metadata(exc: Exception, *, provider: str = "") -> dict[
         fields["reason_code"] = "usage_accounting_busy"
     elif isinstance(exc, UsageAccountingUnavailableError):
         fields["reason_code"] = "usage_accounting_unavailable"
+    elif isinstance(exc, CompactionIdleTimeoutError):
+        fields["reason_code"] = "idle_timeout"
+    elif isinstance(exc, CompactionOperationTimeoutError):
+        fields["reason_code"] = "operation_timeout"
     elif isinstance(exc, (TimeoutError, httpx.TimeoutException)):
         fields["reason_code"] = "request_timeout"
     elif isinstance(exc, httpx.HTTPStatusError):
@@ -2760,11 +2816,20 @@ def _report_compaction_credential_failure(
             raw_code=code,
             message=str(event.message or ""),
         )
-        reporter(
-            deployment.credential_pool_provider,
-            deployment.credential_pool_session_key,
-            kind,
-        )
+        args = (deployment.credential_pool_provider, deployment.credential_pool_session_key, kind)
+        kwargs: dict[str, Any] = {}
+        if event.retry_after_s is not None:
+            try:
+                inspect.signature(reporter).bind(
+                    *args, retry_after_seconds=event.retry_after_s,
+                )
+            except (TypeError, ValueError):
+                # Legacy three-argument callbacks still run once. Never retry a
+                # callback after it has started and raised its own TypeError.
+                pass
+            else:
+                kwargs["retry_after_seconds"] = event.retry_after_s
+        reporter(*args, **kwargs)
     except Exception:  # noqa: BLE001 - credential bookkeeping only
         log.debug(
             "compaction.credential_pool_report_failed",
@@ -2789,6 +2854,7 @@ async def call_compaction_provider(
     deadline_at_monotonic: float | None = None,
     summary_output_tokens: int | None = None,
     on_summary_call_started: Callable[[], None] | None = None,
+    on_summary_failure: Callable[[str], None] | None = None,
 ) -> str | None:
     """Summarize a selected source range through the provider protocol."""
 
@@ -2797,6 +2863,11 @@ async def call_compaction_provider(
 
     if candidate_index < 0 or candidate_index >= len(plan.candidates):
         return None
+    if deadline_at_monotonic is None:
+        # Compatibility callers may omit the operation owner. Keep their
+        # progressing stream bounded too; production supplies its shared
+        # absolute deadline, which must never restart for a later chunk.
+        deadline_at_monotonic = time.monotonic() + resolve_compaction_total_timeout()
     deployment = plan.candidates[candidate_index]
     tools: list[ToolDefinition] | None = None
 
@@ -2850,9 +2921,28 @@ async def call_compaction_provider(
             chat_config,
         )
         if chat_config.turn_deadline_at_monotonic is not None:
-            timeout = min(timeout, chat_config.turn_deadline_at_monotonic - time.monotonic())
-            if timeout <= 0:
-                raise TimeoutError("summary parent deadline expired before dispatch")
+            if chat_config.turn_deadline_at_monotonic <= time.monotonic():
+                raise CompactionOperationTimeoutError("summary deadline expired before dispatch")
+        try:
+            async for _delay in provider_retry_after_cooldowns().wait(
+                deployment.provider,
+                scope=provider_retry_after_scope(deployment.provider),
+                deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
+            ):
+                pass  # Deliberate cooling is outside provider inactivity timing.
+        except RetryAfterDeferredError as exc:
+            raise _CompactionProviderError(
+                exc.reason, failure_kind=(
+                    ProviderFailureKind.PROVIDER_OVERLOADED
+                    if provider_retry_after_cooldowns().reason(
+                        deployment.provider, scope=provider_retry_after_scope(deployment.provider),
+                    ) == "provider_overloaded" else ProviderFailureKind.RATE_LIMITED
+                ),
+            ) from None
+        except RetryAfterWaitTimeoutError:
+            raise CompactionOperationTimeoutError(
+                "summary deadline expired during cooldown",
+            ) from None
         if provider_accounts_physical_usage(deployment.provider):
             if on_summary_call_started is not None:
                 on_summary_call_started()
@@ -2891,8 +2981,15 @@ async def call_compaction_provider(
             if received_bytes > _MAX_COMPACTION_STREAM_BYTES:
                 raise _CompactionProviderError("summary_stream_resource_limit")
 
-        async with asyncio.timeout(timeout):
+        async with compaction_progress_timeout(
+            idle_timeout_seconds=timeout,
+            deadline_at_monotonic=chat_config.turn_deadline_at_monotonic,
+        ) as progress:
             async for event in accounted_stream:
+                # Retain a real upstream hint even if the same frame also
+                # crosses the operation deadline in progress.observe().
+                record_provider_retry_after(deployment.provider, event)
+                progress.observe(event)
                 if isinstance(event, ErrorEvent) or getattr(event, "kind", "") == "error":
                     message = str(getattr(event, "message", "") or "provider error")
                     code = str(getattr(event, "code", "") or "")
@@ -2976,6 +3073,10 @@ async def call_compaction_provider(
         # auxiliary summary. Preserve its typed retry and replay-safety proof.
         if isinstance(exc, UsageAccountingUnavailableError):
             raise
+        if isinstance(exc, CompactionOperationTimeoutError):
+            raise
+        if on_summary_failure is not None:
+            on_summary_failure(str(_compaction_failure_metadata(exc)["reason_code"]))
         return None
     finally:
         # The raw provider iterator owns the transport. Close it first so a
@@ -3267,11 +3368,26 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         # Automatic compaction chooses an adaptive tail. Manual maintenance
         # selects the full safe prefix below; physical consumer capacity,
         # protected history and validation still apply to either entry point.
-        # A generation ceiling is not a mandatory summary body reservation.
-        # Choose the recent raw tail first; its actual remainder is the goal.
-        keep_budget = max(0, window - 1)
+        # Plan below the existing pressure trigger, leaving working space for
+        # the checkpoint. This is a planning goal, never an output rejection
+        # ceiling. The complete consumer request decides admission below.
+        planning_target = (
+            cfg.budget.auto_trigger_tokens
+            if cfg.budget is not None
+            else int(window / max(1.0, cfg.safety_margin))
+        )
+        keep_budget = max(0, min(window, planning_target) - previous_summary_tokens)
         keep_char_budget = (
-            max(0, int(request.context_window_chars) - 1)
+            max(
+                0,
+                min(
+                    int(request.context_window_chars),
+                    cfg.budget.auto_trigger_chars
+                    if cfg.budget is not None
+                    else int(request.context_window_chars / max(1.0, cfg.safety_margin)),
+                )
+                - len(previous_replay),
+            )
             if request.context_window_chars is not None
             else None
         )
@@ -3361,6 +3477,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         _build_strict_identifier_instruction() if cfg.identifier_policy == "strict" else ""
     )
 
+    replay_tokens_before = previous_summary_tokens + await await_compaction_phase(
+        asyncio.to_thread(_current_replay_tokens, entries, **replay_measure_kwargs),
+        cfg,
+        phase="summarizing",
+    )
     chunks: list[list[dict[str, Any]]]
     if replace_previous_only:
         chunks = [[]]
@@ -3433,7 +3554,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         cut = sum(len(chunk) for chunk in chunks)
         to_compact = [entry for chunk in chunks for entry in chunk]
         kept = entries[cut:]
-    processed_chunk_count = len(chunks)
+    processed_chunk_count = 0
 
     execution_plan = cfg.llm_plan
     deployment = execution_plan.primary
@@ -3452,7 +3573,9 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         instructions: str | None = None,
         goal: int | None = None,
     ) -> str | None:
+        require_compaction_time(cfg, phase="summarizing")
         if not _reserve_compaction_llm_call(cfg):
+            cfg.last_failure_kind = "summary_call_budget_exceeded"
             return None
         cfg.last_attempted_target = deployment
         correlation = request.provider_request_correlation
@@ -3461,10 +3584,11 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
                 correlation, execution_id=uuid.uuid4().hex
             )
         require_compaction_time(cfg, phase="summarizing")
-        remaining = compaction_remaining_seconds(cfg)
-        timeout = min(
-            float(cfg.timeout_seconds), remaining if remaining is not None else float("inf")
+        timeout = resolve_compaction_idle_timeout(
+            cfg.request_context.chat_config.timeout if cfg.request_context else None,
+            cfg.timeout_seconds,
         )
+        cfg.last_failure_kind = ""
         result = await call_compaction_provider(
             chunk_text="",
             identifier_instruction=id_instruction,
@@ -3481,6 +3605,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             deadline_at_monotonic=cfg.deadline_at_monotonic,
             summary_output_tokens=(goal if goal is not None else summary_goal),
             on_summary_call_started=cfg.on_summary_call_started,
+            on_summary_failure=lambda kind: setattr(cfg, "last_failure_kind", kind),
         )
         require_compaction_time(cfg, phase="summarizing")
         if result:
@@ -3497,257 +3622,354 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             goal=max(1, goal),
             instructions=custom_instructions or None,
         )
-        return revised if revised and len(revised) < len(checkpoint) else None
+        # Character count is not a proxy for token or full-request capacity.
+        # Both callers validate this complete candidate against their actual
+        # next request; final admission also requires real compression benefit.
+        return revised
 
-    for chunk_index, chunk in enumerate(chunks, start=1):
+    completed_source: list[dict[str, Any]] = []
+    replan_count = 0
+    while True:
+        chunk_offset = processed_chunk_count
+        for batch_index, chunk in enumerate(chunks, start=1):
+            chunk_index = chunk_offset + batch_index
+            processed_chunk_count = chunk_index
 
-        def fit_chunk(
-            source: list[dict[str, Any]],
-            *,
-            allow_generation_reduction: bool = False,
-            checkpoint: str | None = None,
-        ) -> str | None:
-            return _fit_compaction_input_to_target(
-                request=request,
-                target=deployment,
-                previous_summary=rolling_summary if checkpoint is None else checkpoint,
-                chunk=source,
-                identifier_instruction=id_instruction,
-                custom_instructions=custom_instructions or None,
-                allow_generation_reduction=allow_generation_reduction,
-            )
+            def fit_chunk(
+                source: list[dict[str, Any]],
+                *,
+                allow_generation_reduction: bool = False,
+                checkpoint: str | None = None,
+            ) -> str | None:
+                return _fit_compaction_input_to_target(
+                    request=request,
+                    target=deployment,
+                    previous_summary=rolling_summary if checkpoint is None else checkpoint,
+                    chunk=source,
+                    identifier_instruction=id_instruction,
+                    custom_instructions=custom_instructions or None,
+                    allow_generation_reduction=allow_generation_reduction,
+                )
 
-        fits = await await_compaction_phase(
-            asyncio.to_thread(fit_chunk, chunk),
-            cfg,
-            phase="summarizing",
-        )
-        single_round = len(_api_round_groups(chunk)) == 1
-        if fits is None and rolling_summary and single_round:
-            source_fits_full_generation = await await_compaction_phase(
-                asyncio.to_thread(fit_chunk, chunk, checkpoint=""),
+            fits = await await_compaction_phase(
+                asyncio.to_thread(fit_chunk, chunk),
                 cfg,
                 phase="summarizing",
             )
-            if source_fits_full_generation is None:
-                # This indivisible source already needs a smaller generation
-                # allowance without any checkpoint. Shortening a tiny rolling
-                # summary cannot restore the full allowance; try the actual
-                # legal remainder before spending another model call on it.
+            single_round = len(_api_round_groups(chunk)) == 1
+            if fits is None and rolling_summary and single_round:
+                source_fits_full_generation = await await_compaction_phase(
+                    asyncio.to_thread(fit_chunk, chunk, checkpoint=""),
+                    cfg,
+                    phase="summarizing",
+                )
+                if source_fits_full_generation is None:
+                    # This indivisible source already needs a smaller generation
+                    # allowance without any checkpoint. Shortening a tiny rolling
+                    # summary cannot restore the full allowance; try the actual
+                    # legal remainder before spending another model call on it.
+                    fits = await await_compaction_phase(
+                        asyncio.to_thread(fit_chunk, chunk, allow_generation_reduction=True),
+                        cfg,
+                        phase="summarizing",
+                    )
+            if fits is None and rolling_summary:
+                revised = await shorten(
+                    rolling_summary,
+                    chunk_index=chunk_index,
+                    goal=min(
+                        deployment.max_output_tokens, max(1, _estimate_tokens(rolling_summary) // 2)
+                    ),
+                )
+                if revised:
+                    rolling_summary = revised
+                    fits = await await_compaction_phase(
+                        asyncio.to_thread(fit_chunk, chunk),
+                        cfg,
+                        phase="summarizing",
+                    )
+            if fits is None and single_round:
+                # Packing preserves the current generation allowance. Only an
+                # indivisible source round may use its smaller physical remainder;
+                # a multi-round batch must split instead of starving generation.
                 fits = await await_compaction_phase(
                     asyncio.to_thread(fit_chunk, chunk, allow_generation_reduction=True),
                     cfg,
                     phase="summarizing",
                 )
-        if fits is None and rolling_summary:
-            revised = await shorten(
-                rolling_summary,
-                chunk_index=chunk_index,
-                goal=min(
-                    deployment.max_output_tokens, max(1, _estimate_tokens(rolling_summary) // 2)
-                ),
-            )
-            if revised:
-                rolling_summary = revised
-                fits = await await_compaction_phase(
-                    asyncio.to_thread(fit_chunk, chunk),
-                    cfg,
-                    phase="summarizing",
-                )
-        if fits is None and single_round:
-            # Packing preserves the current generation allowance. Only an
-            # indivisible source round may use its smaller physical remainder;
-            # a multi-round batch must split instead of starving generation.
-            fits = await await_compaction_phase(
-                asyncio.to_thread(fit_chunk, chunk, allow_generation_reduction=True),
-                cfg,
-                phase="summarizing",
-            )
-        if fits is None and forced_cut is None and 1 < chunk_index == len(chunks):
-            # The actual rolling checkpoint may be larger than planned. A
-            # smaller complete final prefix is legal; never expand the frozen cut.
-            remaining_chunks = await await_compaction_phase(
-                asyncio.to_thread(
-                    _chunk_entries,
-                    chunk,
-                    _compaction_target_input_budget(request, deployment),
-                    request_fits=lambda prefix, _later: fit_chunk(prefix) is not None,
-                ),
-                cfg,
-                phase="summarizing",
-            )
-            if remaining_chunks and len(remaining_chunks[0]) < len(chunk):
-                candidate = remaining_chunks[0]
-                fits = await await_compaction_phase(
-                    asyncio.to_thread(fit_chunk, candidate),
-                    cfg,
-                    phase="summarizing",
-                )
-                if fits is not None:
-                    chunk = candidate
-                    chunks[chunk_index - 1] = chunk
-                    to_compact = [entry for part in chunks for entry in part]
-                    cut = len(to_compact)
-                    kept = entries[cut:]
-        llm_result = (
-            await summarize(chunk, rolling_summary, chunk_index=chunk_index)
-            if fits is not None
-            else None
-        )
-        if llm_result:
-            rolling_summary = llm_result.strip()
-        else:
-            return CompactionResult(
-                summary="",
-                kept_entries=entries,
-                removed_count=0,
-                chunks_processed=chunk_index,
-                summary_source="skipped",
-                tokens_before=total_tokens,
-                tokens_after=total_tokens,
-                remaining_budget_tokens=max(window - total_tokens, 0),
-                skip_reason="summary_failed",
-            )
-
-    merged = rolling_summary
-    summary_source = "llm"
-
-    obligation_entries = await await_compaction_phase(
-        asyncio.to_thread(_attachment_safe_obligation_entries, to_compact),
-        cfg,
-        phase="validating",
-    )
-    if prev_summary:
-        obligation_entries.insert(
-            0,
-            {"role": "assistant", "content": prev_summary},
-        )
-    obligations = await await_compaction_phase(
-        asyncio.to_thread(extract_compaction_obligations, obligation_entries),
-        cfg,
-        phase="validating",
-    )
-    # These paths come from verified materialization, not prose extraction or
-    # envelope fields. Preserve each full path even if the model summary omits it.
-    retained_paths = (
-        {path for entry in to_compact for path in entry.get("_compaction_image_paths", {}).values()}
-        if cfg.attachment_path_resolver is not None
-        else set()
-    )
-    existing_paths = {item.value for item in obligations if item.kind == "file_path"}
-    obligations.extend(
-        CompactionObligation(kind="file_path", value=path, critical=True)
-        for path in sorted(retained_paths - existing_paths)
-    )
-    kept_tokens, kept_chars = await await_compaction_phase(
-        asyncio.to_thread(_compaction_source_size, kept, **replay_measure_kwargs),
-        cfg,
-        phase="validating",
-    )
-    wrapper_probe = "__OPEN_SQUILLA_SUMMARY_BODY__"
-    try:
-        probed_wrapper = (
-            request.summary_replay_renderer(wrapper_probe)
-            if request.summary_replay_renderer is not None
-            else ""
-        )
-    except Exception:
-        probed_wrapper = ""
-    # Reserve the complete probe, including its tiny body, so token-boundary
-    # interactions cannot make the wrapper estimate optimistic.
-    wrapper_tokens = _estimate_tokens(probed_wrapper) if probed_wrapper else 0
-    wrapper_chars = max(0, len(probed_wrapper) - len(wrapper_probe)) if probed_wrapper else 0
-    admission_failure = "consumer_admission_failed"
-    admitted = False
-    for revision in range(2):
-        structured_summary, coverage = build_structured_summary_from_text(
-            merged,
-            obligations,
-            block_missing_critical=cfg.coverage_blocking,
-        )
-        structured_summary.source_coverage.update(
-            {
-                "replaces_prior_context": bool(prev_summary),
-                "previous_summary_tokens": previous_summary_tokens,
-            }
-        )
-        fitted = _fit_structured_summary_current_status(
-            structured_summary,
-            max_tokens=max(1, window - kept_tokens - wrapper_tokens),
-            max_chars=(
-                max(1, int(request.context_window_chars) - kept_chars - wrapper_chars)
-                if request.context_window_chars is not None
-                else None
-            ),
-        )
-        merged = structured_summary.current_status
-        summary_payload = structured_summary.model_dump(mode="json")
-        replay_summary = render_structured_summary(summary_payload)
-        coverage, artifact_error = validate_compaction_artifact(
-            replay_summary,
-            obligations,
-            summary_replay_renderer=request.summary_replay_renderer,
-        )
-        structured_summary.source_coverage.update(
-            {
-                "status": coverage.status,
-                "checked_obligations": coverage.checked_obligations,
-                "covered_obligations": coverage.covered_obligations,
-            }
-        )
-        summary_payload = structured_summary.model_dump(mode="json")
-        try:
-            consumer_replay_summary = (
-                request.summary_replay_renderer(replay_summary)
-                if request.summary_replay_renderer is not None
-                else replay_summary
-            ) or ""
-        except Exception:
-            consumer_replay_summary = ""
-            artifact_error = "summary_replay_incomplete"
-        tokens_after = _estimate_tokens(consumer_replay_summary) + kept_tokens
-        chars_after = len(consumer_replay_summary) + kept_chars
-        if artifact_error is None:
-            try:
-                admitted = await await_compaction_phase(
+            if fits is None and forced_cut is None and 1 < batch_index == len(chunks):
+                # The actual rolling checkpoint may be larger than planned. A
+                # smaller complete final prefix is legal; never expand the frozen cut.
+                remaining_chunks = await await_compaction_phase(
                     asyncio.to_thread(
-                        consumer_admission_accepts,
-                        request.consumer_admission,
-                        replay_summary,
-                        kept,
+                        _chunk_entries,
+                        chunk,
+                        _compaction_target_input_budget(request, deployment),
+                        request_fits=lambda prefix, _later: fit_chunk(prefix) is not None,
                     ),
                     cfg,
-                    phase="validating",
+                    phase="summarizing",
                 )
-            except ConsumerAdmissionStaleError:
-                admission_failure = "consumer_admission_stale"
-                admitted = False
-        needs_revision = (
-            not fitted
-            or not admitted
-            or (request.trigger != "message_count" and tokens_after >= total_tokens)
-        )
-        if not fitted and artifact_error is None:
-            artifact_error = "summary_does_not_fit"
-        if (
-            revision == 0
-            and needs_revision
-            and artifact_error in {None, "summary_does_not_fit"}
-            and admission_failure != "consumer_admission_stale"
-        ):
-            revised = await shorten(
-                merged,
-                chunk_index=processed_chunk_count + 1,
-                goal=min(
-                    deployment.max_output_tokens,
-                    max(1, window - kept_tokens - wrapper_tokens),
-                    max(1, _estimate_tokens(merged) // 2),
-                ),
+                if remaining_chunks and len(remaining_chunks[0]) < len(chunk):
+                    candidate = remaining_chunks[0]
+                    fits = await await_compaction_phase(
+                        asyncio.to_thread(fit_chunk, candidate),
+                        cfg,
+                        phase="summarizing",
+                    )
+                    if fits is not None:
+                        chunk = candidate
+                        chunks[batch_index - 1] = chunk
+                        to_compact = completed_source + [entry for part in chunks for entry in part]
+                        cut = len(to_compact)
+                        kept = entries[cut:]
+            llm_result = (
+                await summarize(chunk, rolling_summary, chunk_index=chunk_index)
+                if fits is not None
+                else None
             )
-            if revised:
-                merged = revised
-                continue
-        break
+            if llm_result:
+                rolling_summary = llm_result.strip()
+            else:
+                return CompactionResult(
+                    summary="",
+                    kept_entries=entries,
+                    removed_count=0,
+                    chunks_processed=chunk_index,
+                    summary_source="skipped",
+                    tokens_before=total_tokens,
+                    tokens_after=total_tokens,
+                    remaining_budget_tokens=max(window - total_tokens, 0),
+                    skip_reason="summary_failed",
+                    failure_kind=cfg.last_failure_kind or "summary_input_does_not_fit",
+                )
+
+        merged = rolling_summary
+        summary_source = "llm"
+
+        obligation_entries = await await_compaction_phase(
+            asyncio.to_thread(_attachment_safe_obligation_entries, to_compact),
+            cfg,
+            phase="validating",
+        )
+        if prev_summary:
+            obligation_entries.insert(
+                0,
+                {"role": "assistant", "content": prev_summary},
+            )
+        obligations = await await_compaction_phase(
+            asyncio.to_thread(extract_compaction_obligations, obligation_entries),
+            cfg,
+            phase="validating",
+        )
+        # These paths come from verified materialization, not prose extraction or
+        # envelope fields. Preserve each full path even if the model summary omits it.
+        retained_paths = (
+            {
+                path
+                for entry in to_compact
+                for path in entry.get("_compaction_image_paths", {}).values()
+            }
+            if cfg.attachment_path_resolver is not None
+            else set()
+        )
+        existing_paths = {item.value for item in obligations if item.kind == "file_path"}
+        obligations.extend(
+            CompactionObligation(kind="file_path", value=path, critical=True)
+            for path in sorted(retained_paths - existing_paths)
+        )
+        kept_tokens, kept_chars = await await_compaction_phase(
+            asyncio.to_thread(_compaction_source_size, kept, **replay_measure_kwargs),
+            cfg,
+            phase="validating",
+        )
+        kept_replay_tokens = await await_compaction_phase(
+            asyncio.to_thread(_current_replay_tokens, kept, **replay_measure_kwargs),
+            cfg,
+            phase="validating",
+        )
+        wrapper_probe = "__OPEN_SQUILLA_SUMMARY_BODY__"
+        try:
+            probed_wrapper = (
+                request.summary_replay_renderer(wrapper_probe)
+                if request.summary_replay_renderer is not None
+                else ""
+            )
+        except Exception:
+            probed_wrapper = ""
+        # Reserve the complete probe, including its tiny body, so token-boundary
+        # interactions cannot make the wrapper estimate optimistic.
+        wrapper_tokens = _estimate_tokens(probed_wrapper) if probed_wrapper else 0
+        admission_failure = "consumer_admission_failed"
+        admitted = False
+        for revision in range(2):
+            structured_summary, coverage = build_structured_summary_from_text(
+                merged,
+                obligations,
+                block_missing_critical=cfg.coverage_blocking,
+            )
+            structured_summary.source_coverage.update(
+                {
+                    "replaces_prior_context": bool(prev_summary),
+                    "previous_summary_tokens": previous_summary_tokens,
+                }
+            )
+            merged = structured_summary.current_status
+            summary_payload = structured_summary.model_dump(mode="json")
+            replay_summary = render_structured_summary(summary_payload)
+            coverage, artifact_error = validate_compaction_artifact(
+                replay_summary,
+                obligations,
+                summary_replay_renderer=request.summary_replay_renderer,
+            )
+            structured_summary.source_coverage.update(
+                {
+                    "status": coverage.status,
+                    "checked_obligations": coverage.checked_obligations,
+                    "covered_obligations": coverage.covered_obligations,
+                }
+            )
+            summary_payload = structured_summary.model_dump(mode="json")
+            try:
+                consumer_replay_summary = (
+                    request.summary_replay_renderer(replay_summary)
+                    if request.summary_replay_renderer is not None
+                    else replay_summary
+                ) or ""
+            except Exception:
+                consumer_replay_summary = ""
+                artifact_error = "summary_replay_incomplete"
+            tokens_after = _estimate_tokens(consumer_replay_summary) + kept_tokens
+            replay_tokens_after = _estimate_tokens(consumer_replay_summary) + kept_replay_tokens
+            chars_after = len(consumer_replay_summary) + kept_chars
+            if artifact_error is None:
+                try:
+                    admitted = (
+                        await await_compaction_phase(
+                            asyncio.to_thread(
+                                consumer_admission_accepts,
+                                request.consumer_admission,
+                                replay_summary,
+                                kept,
+                            ),
+                            cfg,
+                            phase="validating",
+                        )
+                        if request.consumer_admission is not None
+                        else (
+                            tokens_after <= window
+                            and (
+                                request.context_window_chars is None
+                                or chars_after <= request.context_window_chars
+                            )
+                        )
+                    )
+                except ConsumerAdmissionStaleError:
+                    admission_failure = "consumer_admission_stale"
+                    admitted = False
+            needs_revision = not admitted or (
+                request.trigger != "message_count" and replay_tokens_after >= replay_tokens_before
+            )
+            if not admitted and artifact_error is None and request.consumer_admission is None:
+                admission_failure = "summary_does_not_fit"
+            if (
+                revision == 0
+                and needs_revision
+                and artifact_error in {None, "summary_does_not_fit"}
+                and admission_failure != "consumer_admission_stale"
+            ):
+                revised = await shorten(
+                    merged,
+                    chunk_index=processed_chunk_count + 1,
+                    goal=min(
+                        deployment.max_output_tokens,
+                        max(1, window - kept_tokens - wrapper_tokens),
+                        max(1, _estimate_tokens(merged) // 2),
+                    ),
+                )
+                if revised:
+                    merged = revised
+                    continue
+            break
+
+        # A complete draft that cannot coexist with the raw tail can absorb
+        # more eligible history. Never publish this intermediate checkpoint or
+        # move a caller-selected exact boundary. Each pass strictly advances
+        # the source cut, and all calls share the original deadline/call ledger.
+        if (
+            artifact_error is not None
+            or admitted
+            or admission_failure == "consumer_admission_stale"
+            or forced_cut is not None
+        ):
+            break
+        safe_limit = _retreat_to_api_round_boundary(
+            entries, _apply_protected_tail(entries, len(entries), cfg)
+        )
+        next_boundaries = sorted(
+            boundary for boundary in _api_round_boundaries(entries) if cut < boundary <= safe_limit
+        )
+        if not next_boundaries:
+            break
+        require_compaction_time(cfg, phase="planning")
+        checkpoint_tokens = _estimate_tokens(consumer_replay_summary)
+        next_cut = await await_compaction_phase(
+            asyncio.to_thread(
+                _find_turn_boundary_cut,
+                entries,
+                max(0, window - checkpoint_tokens),
+                (
+                    max(0, request.context_window_chars - len(consumer_replay_summary))
+                    if request.context_window_chars is not None
+                    else None
+                ),
+                **replay_measure_kwargs,
+            ),
+            cfg,
+            phase="planning",
+        )
+        next_cut = min(safe_limit, max(next_boundaries[0], next_cut))
+        additional_source = entries[cut:next_cut]
+        if cfg.attachment_path_resolver is not None:
+            additional_source = _prepare_compaction_image_paths(
+                additional_source,
+                session_id=request.session_id,
+                resolver=cfg.attachment_path_resolver,
+            )
+        completed_source = list(to_compact)
+        to_compact = completed_source + additional_source
+        cut = next_cut
+        kept = entries[cut:]
+        rolling_summary = replay_summary
+        chunks = await await_compaction_phase(
+            asyncio.to_thread(
+                _chunk_entries,
+                additional_source,
+                _compaction_target_input_budget(request, deployment),
+                request_fits=lambda source, _later: (
+                    _fit_compaction_input_to_target(
+                        request=request,
+                        target=deployment,
+                        previous_summary=rolling_summary,
+                        chunk=source,
+                        identifier_instruction=id_instruction,
+                        custom_instructions=custom_instructions or None,
+                    )
+                    is not None
+                ),
+            ),
+            cfg,
+            phase="planning",
+        )
+        # The goal adjusts to the newly released space; it is not an acceptance
+        # cap. Re-evaluate attachments, obligations and final admission next pass.
+        next_kept_tokens, _ = await await_compaction_phase(
+            asyncio.to_thread(_compaction_source_size, kept, **replay_measure_kwargs),
+            cfg,
+            phase="planning",
+        )
+        summary_goal = min(deployment.max_output_tokens, max(1, window - next_kept_tokens))
+        replan_count += 1
     if artifact_error is not None:
         quality_report = _compaction_quality_report(
             cfg=cfg,
@@ -3808,6 +4030,9 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         context_window_chars=request.context_window_chars,
         trigger=request.trigger,
         replaces_previous_summary=replace_previous_only,
+        consumer_capacity_fits=(admitted if request.consumer_admission is not None else None),
+        replay_tokens_before=replay_tokens_before,
+        replay_tokens_after=replay_tokens_after,
     )
     if not admitted:
         log.warning(
@@ -3837,6 +4062,7 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
             },
         )
     quality_report["consumer_admission_fits"] = True
+    quality_report["replan_count"] = replan_count
     if not bool(quality_report.get("passes_structural_gate", False)):
         # A complete, admissible replacement can still be larger than its
         # source, especially when manually compacting an existing checkpoint.
@@ -3844,11 +4070,10 @@ async def compact_context_new(request: CompactionRequest) -> CompactionResult:
         # an integrity failure. Any independent structural defect stays failed.
         no_compression_benefit = bool(
             request.trigger != "message_count"
-            and tokens_after >= total_tokens
+            and replay_tokens_after >= replay_tokens_before
             and (to_compact or replace_previous_only)
             and quality_report.get("protected_tail_preserved")
-            and quality_report.get("fits_context_window")
-            and quality_report.get("fits_character_window")
+            and admitted
         )
         rejection_reason = (
             "no_compression_benefit" if no_compression_benefit else "quality_gate_failed"
@@ -3913,6 +4138,10 @@ async def compact_context(request: CompactionRequest) -> CompactionResult:
         phase="summarizing",
     )
     cfg = request.config
+    if not result.failure_kind and result.skip_reason:
+        result.failure_kind = (
+            cfg.last_failure_kind if result.skip_reason == "summary_failed" else result.skip_reason
+        )
     target = cfg.successful_target or cfg.last_attempted_target
     started_at = cfg.operation_started_at_monotonic
     telemetry = dict(result.quality_report)

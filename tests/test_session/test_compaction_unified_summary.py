@@ -697,6 +697,8 @@ async def test_indivisible_round_revises_only_when_checkpoint_causes_pressure(
 
 @pytest.mark.asyncio
 async def test_expired_context_parent_prevents_summary_dispatch():
+    from opensquilla.compaction_timing import CompactionOperationTimeoutError
+
     config = synthetic_compaction_config()
     config.request_context = CompactionRequestContext(
         chat_config=ChatConfig(
@@ -705,14 +707,14 @@ async def test_expired_context_parent_prevents_summary_dispatch():
     )
     assert arm_compaction_deadline(config, operation_id="parent-expired") == 0
     attempted = []
-    result = await call_compaction_provider(
-        "source",
-        "",
-        config.llm_plan,
-        request_context=config.request_context,
-        on_summary_call_started=lambda: attempted.append(True),
-    )
-    assert result is None
+    with pytest.raises(CompactionOperationTimeoutError):
+        await call_compaction_provider(
+            "source",
+            "",
+            config.llm_plan,
+            request_context=config.request_context,
+            on_summary_call_started=lambda: attempted.append(True),
+        )
     assert attempted == []
     assert config.llm_plan.primary.provider.calls == []
 

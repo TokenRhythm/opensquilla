@@ -56,6 +56,7 @@ from opensquilla.attachment_workspace import (
     workspace_attachment_budget_from_config,
 )
 from opensquilla.bootstrap_types import BootstrapFileReport
+from opensquilla.compaction_status import UNPRODUCTIVE_COMPACTION_REASONS
 from opensquilla.context_budget import ContextBudgetGovernor
 from opensquilla.contracts.attachments import (
     ALLOWED_MEDIA_TYPES as _ALLOWED_ENGINE_MEDIA_TYPES,
@@ -265,6 +266,13 @@ from opensquilla.provider.protocol import (
     provider_connection_config,
     provider_metadata,
     validate_provider_chat_admission,
+)
+from opensquilla.provider.retry_after import (
+    RetryAfterDeferredError,
+    mark_retry_after_physical_start,
+    provider_retry_after_cooldowns,
+    provider_retry_after_scope,
+    record_provider_retry_after,
 )
 from opensquilla.provider.types import (
     ChatConfig,
@@ -782,6 +790,9 @@ class _ComprehensiveTurnSavings:
 class _CompactionFailureState:
     count: int = 0
     opened_at: float | None = None
+    failure_kind: str = "summary_failed"
+    timeout_cooldown: bool = False
+    overflow_retry_used: bool = False
 
 
 @dataclass(frozen=True)
@@ -2279,6 +2290,7 @@ class _SelectorFallbackProvider:
     """Provider wrapper that switches to selector fallback on pre-content errors."""
 
     projects_image_input_per_leg = True
+    owns_retry_after_admission = True
 
     def __init__(
         self,
@@ -2330,7 +2342,7 @@ class _SelectorFallbackProvider:
         bound_config = self.compaction_chat_config(config)
         resolve = getattr(self._provider, "current_response_deployment", None)
         if callable(resolve):
-            return resolve(bound_config)
+            return cast("tuple[Any, ProviderConfig | None, ChatConfig]", resolve(bound_config))
         return self._provider, None, bound_config
 
     def configure_retry_policy(self, policy: FallbackPolicy) -> None:
@@ -2353,14 +2365,40 @@ class _SelectorFallbackProvider:
         activity_id = uuid.uuid4().hex
         physical_limit = max(0, int(getattr(config, "physical_attempt_limit", 0) or 0))
         while True:
+            try:
+                async for delay in provider_retry_after_cooldowns().wait(
+                    provider,
+                    scope=provider_retry_after_scope(provider),
+                    deadline_at_monotonic=getattr(config, "turn_deadline_at_monotonic", None),
+                    sleep=sleep_before_retry,
+                ):
+                    yield ProviderActivityEvent(
+                        activity_id=activity_id, model=model,
+                        phase="retry_wait",
+                        reason=provider_retry_after_cooldowns().reason(
+                            provider, scope=provider_retry_after_scope(provider),
+                        ),
+                        retry_attempt=rate_retries, retry_limit=self._retry_policy.max_retries,
+                        retry_after_ms=math.ceil(delay * 1000),
+                        started_at=time.time_ns() // 1_000_000,
+                    )
+            except RetryAfterDeferredError as exc:
+                yield ProviderErrorEvent(
+                    message=exc.message, code=exc.code, retry_after_s=exc.remaining_seconds,
+                )
+                return
             attempts += 1
             retry_error: ProviderErrorEvent | None = None
+            if not getattr(provider, "owns_retry_after_admission", False):
+                mark_retry_after_physical_start()
             stream = stream_factory()
             try:
                 async for event in stream:
                     if not isinstance(event, ProviderErrorEvent):
                         yield event
                         continue
+                    if not getattr(provider, "owns_retry_after_admission", False):
+                        record_provider_retry_after(provider, event)
                     can_retry = (
                         event.tool_argument_rejection is None
                         and not content_started()
@@ -7073,16 +7111,18 @@ class TurnRunner:
                     ),
                 )
 
-            def circuit_open() -> bool:
+            def circuit_open(*, provider_overflow: bool = False) -> bool:
                 bind_compaction_scope()
-                return self._compaction_circuit_open(session_key)
+                return self._compaction_circuit_open(
+                    session_key, provider_overflow=provider_overflow,
+                )
 
-            def report_compaction(success: bool) -> None:
+            def report_compaction(success: bool, failure_kind: str = "summary_failed") -> None:
                 bind_compaction_scope()
                 if success:
                     self._record_compaction_success(session_key)
                 else:
-                    self._record_compaction_failure(session_key)
+                    self._record_compaction_failure(session_key, failure_kind=failure_kind)
 
             bind_compaction_scope()
             agent.config.compaction_circuit_open = circuit_open
@@ -12149,7 +12189,7 @@ class TurnRunner:
 
         require_parent_time()
         if self._session_manager is None:
-            return
+            return None
         if compaction_budget is not None:
             history_capacity_tokens = compaction_budget.history_capacity_tokens
             history_capacity_chars = compaction_budget.history_capacity_chars
@@ -12169,7 +12209,7 @@ class TurnRunner:
                     context_window_tokens=context_window_tokens,
                     history_capacity_tokens=history_capacity_tokens,
                 )
-                return
+                return None
         if history_capacity_chars is not None and int(history_capacity_chars) <= 0:
             log.info(
                 "preflight_compaction.skipped",
@@ -12178,17 +12218,17 @@ class TurnRunner:
                 context_window_tokens=context_window_tokens,
                 history_capacity_chars=history_capacity_chars,
             )
-            return
+            return None
         # Skip ephemeral sessions
         if session_key.startswith(("cron:", "subagent:")):
-            return
+            return None
         if self.has_compacted_this_turn(session_key):
             log.info(
                 "preflight_compaction.skipped",
                 session_key=session_key,
                 reason="already_compacted_this_turn",
             )
-            return
+            return None
 
         from opensquilla.session.compaction import (
             CompactionConfig,
@@ -12223,7 +12263,7 @@ class TurnRunner:
                 session_key=session_key,
                 reason="already_attempted_this_turn",
             )
-            return
+            return None
         try:
             if transcript_snapshot is not None:
                 transcript = list(await transcript_snapshot.get_entries())
@@ -12244,7 +12284,7 @@ class TurnRunner:
                         )
                 transcript = await get_transcript(session_key, **transcript_kwargs)
         except KeyError:
-            return  # session doesn't exist yet
+            return None  # session doesn't exist yet
         (
             checkpoint_tokens,
             checkpoint_chars,
@@ -12254,7 +12294,7 @@ class TurnRunner:
             expected_session_epoch=expected_session_epoch,
         )
         if not transcript and checkpoint_tokens <= 0 and checkpoint_chars <= 0:
-            return
+            return None
         protected_suffix_count = self._protected_current_turn_suffix_count(
             transcript,
             history_has_persisted_user=history_has_persisted_user,
@@ -12338,7 +12378,7 @@ class TurnRunner:
                     threshold=threshold,
                     char_threshold=char_threshold,
                 )
-            return
+            return None
         if transcript and protected_suffix_count >= len(transcript):
             log.info(
                 "preflight_compaction.skipped",
@@ -12346,7 +12386,7 @@ class TurnRunner:
                 reason="current_request_only",
                 protected_recent_messages=protected_suffix_count,
             )
-            return
+            return None
         active_user_index = self._active_persisted_user_index(
             transcript,
             history_has_persisted_user=history_has_persisted_user,
@@ -12385,7 +12425,7 @@ class TurnRunner:
                 history_capacity_chars=history_capacity_chars,
                 safety_margin=safety_margin,
             )
-            return
+            return None
         compaction_config.protected_recent_messages = max(
             effective_protected_recent_messages(compaction_config),
             protected_suffix_count,
@@ -12680,7 +12720,7 @@ class TurnRunner:
                 phase=exc.phase,
             )
             if summary_started:
-                self._record_compaction_failure(session_key)
+                self._record_compaction_failure(session_key, failure_kind="operation_timeout")
             prepared_window = await self._prepare_request_window(
                 session_key, transcript, history_window_tokens,
                 compaction_id=compaction_id, phase="preflight",
@@ -12739,6 +12779,8 @@ class TurnRunner:
             require_parent_time(terminalize=True)
             skip_reason = str(getattr(compaction_result, "skip_reason", None) or "empty_summary")
             outcome_status = compaction_failure_status(skip_reason)
+            if summary_started and skip_reason in UNPRODUCTIVE_COMPACTION_REASONS:
+                self._record_compaction_failure(session_key, failure_kind="unproductive")
             if outcome_status != "failed":
                 notify_compaction(
                     session_key,
@@ -12757,9 +12799,12 @@ class TurnRunner:
                         COMPACTION_TRIGGERED_EVENT,
                     ),
                 )
-                return
+                return None
             if summary_started:
-                self._record_compaction_failure(session_key)
+                self._record_compaction_failure(
+                    session_key,
+                    failure_kind=str(getattr(compaction_result, "failure_kind", "") or skip_reason),
+                )
             prepared_window = await self._prepare_request_window(
                 session_key,
                 transcript,
@@ -12823,6 +12868,7 @@ class TurnRunner:
                 ),
             )
         require_parent_time()
+        return None
 
 
     @staticmethod
@@ -12830,7 +12876,7 @@ class TurnRunner:
         return (
             config.compaction_enabled, config.compaction_profile,
             config.context_window_tokens, config.compaction_total_timeout_seconds,
-            config.compaction_protected_recent_messages,
+            config.compaction_protected_recent_messages, config.compaction_timeout_seconds,
         )
 
     @staticmethod
@@ -12883,9 +12929,13 @@ class TurnRunner:
             self._record_compaction_success(session_key)
         scopes[session_key] = scope
 
-    def _compaction_circuit_open(self, session_key: str) -> bool:
+    def _compaction_circuit_open(
+        self, session_key: str, *, provider_overflow: bool = False,
+    ) -> bool:
         state = getattr(self, "_compaction_failures", {}).get(session_key)
-        if state is None or state.count < _COMPACTION_FAILURE_LIMIT:
+        if state is None or (
+            state.opened_at is None and state.count < _COMPACTION_FAILURE_LIMIT
+        ):
             return False
         opened_at = state.opened_at if state.opened_at is not None else time.monotonic()
         cooldown_elapsed = time.monotonic() - opened_at
@@ -12894,13 +12944,21 @@ class TurnRunner:
                 "compaction_circuit.half_open",
                 session_key=session_key,
                 consecutive_failures=state.count,
+                failure_kind=state.failure_kind,
                 cooldown_elapsed_s=round(cooldown_elapsed, 1),
             )
+            return False
+        if provider_overflow and not state.timeout_cooldown and not state.overflow_retry_used:
+            # A confirmed provider overflow may probe a circuit opened by
+            # quick failures once. It cannot repeat a fully spent operation
+            # budget, or turn repeated overflow responses into a retry loop.
+            state.overflow_retry_used = True
             return False
         log.warning(
             "compaction_circuit.open",
             session_key=session_key,
             consecutive_failures=state.count,
+            failure_kind=state.failure_kind,
             cooldown_remaining_s=round(
                 _COMPACTION_CIRCUIT_COOLDOWN_SECONDS - cooldown_elapsed,
                 1,
@@ -12908,13 +12966,37 @@ class TurnRunner:
         )
         return True
 
-    def _record_compaction_failure(self, session_key: str) -> None:
+    def _record_compaction_failure(
+        self, session_key: str, *, failure_kind: str = "summary_failed",
+    ) -> None:
+        # Only an auxiliary candidate failure belongs to this ledger. Parent
+        # ownership, cancellation and uncertain durability must keep their own
+        # error semantics and cannot make a healthy provider appear unavailable.
+        if failure_kind in {
+            "cancelled", "parent_deadline", "turn_deadline_exceeded",
+            "usage_error", "storage_error", "commit_failed", "stale_source",
+            "stale_preimage", "stale_context_state", "consumer_admission_stale",
+            "consumer_admission_stale_or_failed",
+        }:
+            return
         self._turn_compaction_failed_sessions.add(session_key)
         if not hasattr(self, "_compaction_failures"):
             self._compaction_failures = {}
         state = self._compaction_failures.setdefault(session_key, _CompactionFailureState())
+        if (
+            state.opened_at is not None
+            and time.monotonic() - state.opened_at >= _COMPACTION_CIRCUIT_COOLDOWN_SECONDS
+        ):
+            state.timeout_cooldown = False
+            state.overflow_retry_used = False
         state.count += 1
-        state.opened_at = time.monotonic() if state.count >= _COMPACTION_FAILURE_LIMIT else None
+        state.failure_kind = failure_kind
+        state.timeout_cooldown = state.timeout_cooldown or failure_kind == "operation_timeout"
+        if failure_kind == "operation_timeout" or state.count >= _COMPACTION_FAILURE_LIMIT:
+            # A full operation budget was already spent. Unlike a quick
+            # disconnect/5xx, repeating it on the immediately following turn
+            # would spend a second full window under unchanged conditions.
+            state.opened_at = time.monotonic()
 
     def _record_compaction_success(self, session_key: str) -> None:
         if not hasattr(self, "_compaction_failures"):
@@ -13020,7 +13102,7 @@ class TurnRunner:
         def fits(summary: str, kept: list[dict[str, Any]]) -> bool:
             rendered = _format_compaction_summary_context([summary]) if summary else None
             if summary and not compaction_replay_is_complete([summary], rendered):
-                return None
+                return False
             if consumer_admission is not None:
                 return bool(consumer_admission(summary, kept))
             # Compatibility callers supply history capacity with the fixed

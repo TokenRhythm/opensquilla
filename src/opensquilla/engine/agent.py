@@ -19,22 +19,26 @@ import re
 import stat
 import time
 import uuid
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from itertools import chain
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, cast
 
 import structlog
+from pydantic import PrivateAttr
 
 from opensquilla.artifacts import artifact_payload
 from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     workspace_attachment_budget_from_config,
 )
-from opensquilla.compaction_status import compaction_failure_status
+from opensquilla.compaction_status import (
+    UNPRODUCTIVE_COMPACTION_REASONS,
+    compaction_failure_status,
+)
 from opensquilla.context_budget import ContextBudgetClass, ContextBudgetGovernor
 from opensquilla.contracts.attachments import IMAGE_ATTACHMENT_MIMES, normalize_attachment_mime
 from opensquilla.contracts.image_validation import validate_image_bytes
@@ -132,6 +136,7 @@ from opensquilla.engine.web_search_projection import (
 )
 from opensquilla.execution_status import (
     mark_execution_status_truncated,
+    normalize_legacy_execution_status,
     runtime_execution_status,
 )
 from opensquilla.git_runtime import GitRunState, run_git
@@ -208,6 +213,16 @@ from opensquilla.provider.request_proof import (
     prove_provider_payload,
     provider_request_character_budget,
     provider_request_token_budget,
+)
+from opensquilla.provider.retry_after import (
+    RetryAfterDeferredError,
+    RetryAfterDispatchEvidence,
+    RetryAfterWaitTimeoutError,
+    observe_retry_after_dispatch,
+    provider_retry_after_cooldowns,
+    provider_retry_after_scope,
+    record_provider_retry_after,
+    resolve_retry_delay_seconds,
 )
 from opensquilla.provider.types import (
     ContentBlockImage,
@@ -340,6 +355,10 @@ from .types import (
 )
 
 logger = structlog.get_logger("opensquilla.engine.agent")
+
+
+class _ClassifiedCompactionOutcomeReporter(Protocol):
+    def __call__(self, success: bool, *, failure_kind: str) -> None: ...
 
 
 class _CompactionParentDeadlineError(TimeoutError):
@@ -1499,7 +1518,8 @@ def _active_user_message_index_for_request(
     if normalized_current:
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
-            if message.role != "user" or _message_has_tool_result(message):
+            if (message.role != "user" or _message_has_tool_result(message)
+                    or isinstance(message, _LiveTurnContinuationMessage)):
                 continue
             content = (
                 message.content
@@ -1511,7 +1531,8 @@ def _active_user_message_index_for_request(
 
     for index in range(len(messages) - 1, -1, -1):
         message = messages[index]
-        if message.role != "user" or _message_has_tool_result(message):
+        if (message.role != "user" or _message_has_tool_result(message)
+                or isinstance(message, _LiveTurnContinuationMessage)):
             continue
         content = (
             message.content
@@ -1868,20 +1889,11 @@ def _provider_retry_delay_seconds(
     surfaces a retryable terminal outcome.
     """
 
-    local = max(0.0, float(local_delay_s))
-    hint = 0.0
-    if provider_retry_after_s is not None:
-        try:
-            parsed_hint = float(provider_retry_after_s)
-        except (TypeError, ValueError):
-            parsed_hint = 0.0
-        if parsed_hint == math.inf:
-            return None
-        if math.isfinite(parsed_hint) and parsed_hint > 0:
-            hint = parsed_hint
-    if hint > _MAX_PROVIDER_RETRY_WAIT_SECONDS:
-        return None
-    return min(max(local, hint), _MAX_PROVIDER_RETRY_WAIT_SECONDS)
+    return resolve_retry_delay_seconds(
+        local_delay_s=local_delay_s,
+        provider_retry_after_s=provider_retry_after_s,
+        maximum_wait_seconds=_MAX_PROVIDER_RETRY_WAIT_SECONDS,
+    )
 
 
 class _RaisedProviderBoundaryError(RuntimeError):
@@ -1998,6 +2010,25 @@ class _ProviderRetryPolicy:
         return provider_retry_attempt < self.max_provider_retries
 
 
+class _CompactionSummaryMessage(Message):
+    """Runtime-generated summary or acknowledgement; never inferred from user text."""
+
+
+class _LiveTurnCheckpointMessage(Message):
+    """Request-local checkpoint with non-wire execution provenance.
+
+    Later count recovery may summarize this view again. Retain tool receipts
+    independently of model prose without accepting user-authored receipt text.
+    """
+
+    _compaction_tool_receipts: tuple[dict[str, Any], ...] = PrivateAttr(default=())
+    _compaction_has_summary: bool = PrivateAttr(default=False)
+
+
+class _LiveTurnContinuationMessage(Message):
+    """Internal continuation, not another user instruction awaiting its own answer."""
+
+
 @dataclass(frozen=True)
 class _MessageCountRecoveryOutcome:
     """Ephemeral provider-view rewrite produced by count-aware compaction."""
@@ -2008,6 +2039,17 @@ class _MessageCountRecoveryOutcome:
     protected_turn_start_index: int
     projected_wire_messages: int
     removed_count: int
+
+
+@dataclass(frozen=True, repr=False)
+class _PendingCompactionSource:
+    compaction_id: str | None
+    messages: list[Message]
+    rejected_messages: list[Message]
+    request_context_insert_index: int
+    runtime_context_insert_index: int
+    protected_turn_start_index: int
+    config: CompactionConfig | None
 
 
 @dataclass(frozen=True)
@@ -2310,6 +2352,7 @@ class Agent:
         self._last_compaction_refusal_reason: str | None = None
         self._compaction_failed_this_turn = False
         self._pending_durable_compaction_event: CompactionEvent | None = None
+        self._pending_durable_compaction_source: _PendingCompactionSource | None = None
         self._compaction_request_context: CompactionRequestContext | None = None
         # Stable session/base consumer identity. Turn routing and ensemble
         # wrapping may replace ``self.provider`` with a narrower physical leg,
@@ -2602,6 +2645,7 @@ class Agent:
         if event is None:
             return
         self._pending_durable_compaction_event = None
+        self._pending_durable_compaction_source = None
         if not self._session_key:
             return
         compaction_id = event.compaction_id or new_compaction_id()
@@ -2623,6 +2667,8 @@ class Agent:
     def _stage_pending_durable_compaction(
         self,
         outcome: CompactionOutcome,
+        *,
+        source: _PendingCompactionSource | None = None,
     ) -> None:
         """Track a durable candidate before any fallible request rebuilding.
 
@@ -2631,7 +2677,9 @@ class Agent:
         path can emit a terminal event with the same operation id.
         """
 
+        self._pending_durable_compaction_source = source
         if outcome.ephemeral_only:
+            self._pending_durable_compaction_source = None
             return
         self._pending_durable_compaction_event = CompactionEvent(
             compaction_id=outcome.compaction_id,
@@ -6111,6 +6159,9 @@ class Agent:
         iterations = 0
         tool_images_pending_admission = False
         overflow_retries = 0
+        completed_tool_progress: set[str] = set()
+        last_overflow_recovery_progress: frozenset[str] | None = None
+        overflow_recovery_views: set[bytes] = set()
         # Keep lifetime usage separate from the live context-window gauge.
         # Compaction shrinks what the model sees next; it must not erase the
         # turn's already-spent provider tokens from the final DoneEvent.
@@ -6194,6 +6245,7 @@ class Agent:
         # A durable inline candidate is installed only after the rebuilt
         # request crosses the provider adapter's final admission boundary.
         self._pending_durable_compaction_event = None
+        self._pending_durable_compaction_source = None
 
         async def _review_inflight_sandbox_request(
             payload: dict[str, object],
@@ -7458,6 +7510,146 @@ class Agent:
                             ensemble_request_count_baseline = (
                                 continuation_snapshot.physical_request_count
                             )
+                    async def _recover_pending_cooling_window(reason: str) -> bool:
+                        nonlocal turn_messages, request_context_insert_index
+                        nonlocal runtime_context_insert_index, current_turn_start_index
+                        nonlocal message_count_request_view
+                        pending = self._pending_durable_compaction_event
+                        source = self._pending_durable_compaction_source
+                        if (pending is None or source is None or not source.compaction_id
+                                or source.compaction_id != pending.compaction_id):
+                            return False
+                        window = await self._recover_progressed_request_window(
+                            source.messages, rejected_messages=source.rejected_messages,
+                            protected_turn_start_index=source.protected_turn_start_index,
+                            request_context_insert_index=source.request_context_insert_index,
+                            runtime_context_insert_index=source.runtime_context_insert_index,
+                            chat_config=call_chat_cfg, tools=provider_tools_for_call,
+                            request_context_message=request_context_message,
+                            runtime_context_message=runtime_context_message,
+                            request_suffix_messages=request_suffix_messages,
+                            compaction_config=source.config,
+                            reason=reason,
+                        )
+                        if window is None:
+                            return False
+                        # Admission awaited local work. Recheck the operation owner
+                        # before replacing any view or emitting its sole terminal.
+                        if self._pending_durable_compaction_event is not pending:
+                            return False
+                        turn_messages = list(source.messages)
+                        request_context_insert_index = source.request_context_insert_index
+                        runtime_context_insert_index = source.runtime_context_insert_index
+                        current_turn_start_index = source.protected_turn_start_index
+                        message_count_request_view = _MessageCountRequestView(
+                            messages=window.messages, canonical_tail_start=len(turn_messages),
+                            request_context_insert_index=(
+                                window.request_context_insert_index
+                                if window.request_context_insert_index is not None
+                                else request_context_insert_index
+                            ),
+                            runtime_context_insert_index=(
+                                window.runtime_context_insert_index
+                                if window.runtime_context_insert_index is not None
+                                else runtime_context_insert_index
+                            ),
+                            protected_turn_start_index=(
+                                window.protected_turn_start_index
+                                if window.protected_turn_start_index is not None
+                                else current_turn_start_index
+                            ),
+                        )
+                        self._pending_durable_compaction_event = None
+                        self._pending_durable_compaction_source = None
+                        self._compaction_failed_this_turn = True
+                        self._last_compaction_refusal_reason = None
+                        self._notify_admitted_request_window(
+                            window, source_count=len(source.messages),
+                            reason=reason,
+                        )
+                        return True
+
+                    if not getattr(self.provider, "owns_retry_after_admission", False):
+                        cooling_deadline = _total_deadline
+                        pending_compaction = self._pending_durable_compaction_event
+                        if pending_compaction is not None:
+                            install_deadline = pending_compaction.compaction_deadline_at_monotonic
+                            if install_deadline is not None:
+                                cooling_deadline = (
+                                    min(cooling_deadline, install_deadline)
+                                    if cooling_deadline is not None else install_deadline
+                                )
+                        try:
+                            async for retry_delay in provider_retry_after_cooldowns().wait(
+                                self.provider,
+                                scope=provider_retry_after_scope(self.provider),
+                                deadline_at_monotonic=cooling_deadline,
+                                sleep=sleep_before_retry,
+                            ):
+                                yield ProviderActivityEvent(
+                                    activity_id=provider_activity_id,
+                                    model=self._provider_activity_model(),
+                                    phase="retry_wait",
+                                    reason=_normalize_provider_activity_reason(
+                                        provider_retry_after_cooldowns().reason(
+                                            self.provider,
+                                            scope=provider_retry_after_scope(self.provider),
+                                        )
+                                    ),
+                                    retry_attempt=_retry_attempt,
+                                    retry_limit=_fallback.max_retries,
+                                    retry_after_ms=math.ceil(retry_delay * 1000),
+                                    started_at=time.time_ns() // 1_000_000,
+                                )
+                        except RetryAfterDeferredError as exc:
+                            if (
+                                pending_compaction is not None
+                                and cooling_deadline != _total_deadline
+                                and (_total_deadline is None or _loop.time() < _total_deadline)
+                                and await _recover_pending_cooling_window(exc.code)
+                            ):
+                                _call_attempt += 1
+                                continue
+                            if self._switch_to_invalid_response_fallback(
+                                exc.code,
+                                requires_tools=bool(provider_tools_for_call),
+                                exclude_current_authority=True,
+                            ):
+                                continue
+                            self._terminalize_pending_durable_compaction(
+                                status="failed", reason=exc.code,
+                            )
+                            yield self._transition(AgentState.ERROR)
+                            terminal_error = ErrorEvent(
+                                message=exc.message, code=exc.code,
+                                failure_kind=exc.failure_reason,
+                            )
+                            yield terminal_error
+                            break
+                        except RetryAfterWaitTimeoutError as exc:
+                            if (
+                                pending_compaction is not None
+                                and exc.deadline_at_monotonic
+                                == pending_compaction.compaction_deadline_at_monotonic
+                                and (_total_deadline is None or _loop.time() < _total_deadline)
+                            ):
+                                if await _recover_pending_cooling_window(
+                                    "compaction_deadline_exceeded",
+                                ):
+                                    _call_attempt += 1
+                                    continue
+                                self._terminalize_pending_durable_compaction(
+                                    status="timed_out", reason="compaction_deadline_exceeded",
+                                )
+                                yield self._transition(AgentState.ERROR)
+                                terminal_error = ErrorEvent(
+                                    message=("Context compaction could not be installed "
+                                             "before its deadline."),
+                                    code="compaction_deadline_exceeded",
+                                )
+                                yield terminal_error
+                                break
+                            raise
                     turn_llm_calls += 1
                     cache_prompt_snapshot = None
                     if self._session_key:
@@ -7521,6 +7713,7 @@ class Agent:
                         started_at=time.time_ns() // 1_000_000,
                     )
 
+                    dispatch_evidence = RetryAfterDispatchEvidence()
                     try:
                         try:
                             if self._failure_injector is None:
@@ -7567,7 +7760,9 @@ class Agent:
                                 timeout=isinstance(exc, TimeoutError),
                                 connection_failed=is_connection_failure(exc),
                             ) from None
-                        raw_stream = guard_provider_text_stream(raw_stream)
+                        raw_stream = observe_retry_after_dispatch(
+                            guard_provider_text_stream(raw_stream), dispatch_evidence,
+                        )
                         pending_install_deadline: float | None = (
                             self._pending_durable_compaction_event.compaction_deadline_at_monotonic
                             if self._pending_durable_compaction_event is not None
@@ -7590,6 +7785,8 @@ class Agent:
                             total_deadline=provider_stream_deadline,
                             deadline_provider=_active_stream_deadline,
                         ):
+                            if not getattr(self.provider, "owns_retry_after_admission", False):
+                                record_provider_retry_after(self.provider, raw_ev)
                             if isinstance(raw_ev, ProviderGenerationResetEvent):
                                 if (
                                     self._execution_context is not None
@@ -7825,8 +8022,17 @@ class Agent:
                                     continue
 
                             if (
-                                not isinstance(raw_ev, ProviderErrorEvent)
-                                or raw_ev.tool_argument_rejection is not None
+                                (
+                                    not isinstance(
+                                        raw_ev, (ProviderErrorEvent, ProviderDomainActivityEvent),
+                                    )
+                                    or isinstance(raw_ev, ProviderErrorEvent)
+                                    and raw_ev.tool_argument_rejection is not None
+                                )
+                                and (
+                                    not getattr(self.provider, "owns_retry_after_admission", False)
+                                    or dispatch_evidence.physical_started
+                                )
                             ):
                                 # Provider.chat commonly returns an async
                                 # generator before it performs network I/O.
@@ -7843,6 +8049,7 @@ class Agent:
                                     # immediately after persisting this event, the
                                     # wrapper must not emit a second terminal state.
                                     self._pending_durable_compaction_event = None
+                                    self._pending_durable_compaction_source = None
                                     yield pending_event
                             if first_event_at is None:
                                 first_event_at = time.monotonic()
@@ -8658,6 +8865,20 @@ class Agent:
                             and self._pending_durable_compaction_event is not None
                             and pending_install_timeout
                         ):
+                            if (
+                                enforced_stream_deadline == pending_install_deadline
+                                and enforced_stream_deadline is not None
+                                and getattr(self.provider, "owns_retry_after_admission", False)
+                                and dispatch_evidence.cooling_observed
+                                and not dispatch_evidence.physical_started
+                                and usage_call is None
+                                and (_total_deadline is None or _loop.time() < _total_deadline)
+                                and await _recover_pending_cooling_window(
+                                    "compaction_deadline_exceeded",
+                                )
+                            ):
+                                _call_attempt += 1
+                                continue
                             usage_unknown_reason = "compaction_install_timeout"
                             _notify_call_outcome(
                                 ok=False,
@@ -10279,12 +10500,77 @@ class Agent:
                                 1,
                                 max(0, int(self.config.max_overflow_retries or 0)),
                             )
+                            recovery_progress = frozenset(completed_tool_progress)
+                            recovery_view = hashlib.sha256(json.dumps(
+                                self._live_request_jsonable(request_messages),
+                                ensure_ascii=False, sort_keys=True,
+                            ).encode()).digest()
                             if overflow_retries >= effective_overflow_retries:
+                                # Paid recovery is exhausted. A later completed
+                                # tool round can still admit a smaller local view;
+                                # the same retry/view must never reopen this path.
+                                if (
+                                    effective_overflow_retries > 0
+                                    and provider_error.code == "provider_request_budget_exhausted"
+                                    and last_overflow_recovery_progress is not None
+                                    and bool(recovery_progress - last_overflow_recovery_progress)
+                                    and recovery_view not in overflow_recovery_views
+                                ):
+                                    last_overflow_recovery_progress = recovery_progress
+                                    overflow_recovery_views.add(recovery_view)
+                                    window = await self._recover_progressed_request_window(
+                                        base_request_turn_messages,
+                                        rejected_messages=request_messages,
+                                        protected_turn_start_index=active_protected_turn_start_index,
+                                        request_context_insert_index=active_request_context_insert_index,
+                                        runtime_context_insert_index=active_runtime_context_insert_index,
+                                        chat_config=call_chat_cfg,
+                                        tools=provider_tools_for_call,
+                                        request_context_message=request_context_message,
+                                        runtime_context_message=runtime_context_message,
+                                        request_suffix_messages=request_suffix_messages,
+                                    )
+                                    if window is not None:
+                                        message_count_request_view = _MessageCountRequestView(
+                                            messages=window.messages,
+                                            canonical_tail_start=len(turn_messages),
+                                            request_context_insert_index=(
+                                                window.request_context_insert_index
+                                                if (
+                                                    window.request_context_insert_index is not None
+                                                )
+                                                else active_request_context_insert_index
+                                            ),
+                                            runtime_context_insert_index=(
+                                                window.runtime_context_insert_index
+                                                if (
+                                                    window.runtime_context_insert_index is not None
+                                                )
+                                                else active_runtime_context_insert_index
+                                            ),
+                                            protected_turn_start_index=(
+                                                window.protected_turn_start_index
+                                                if (
+                                                    window.protected_turn_start_index is not None
+                                                )
+                                                else active_protected_turn_start_index
+                                            ),
+                                        )
+                                        self._last_compaction_refusal_reason = None
+                                        self._notify_admitted_request_window(
+                                            window,
+                                            source_count=len(base_request_turn_messages),
+                                            reason="later_tool_progress",
+                                        )
+                                        _call_attempt += 1
+                                        continue
                                 yield self._transition(AgentState.ERROR)
                                 terminal_error = self._context_overflow_error()
                                 yield terminal_error
                                 break
                             overflow_retries += 1
+                            last_overflow_recovery_progress = recovery_progress
+                            overflow_recovery_views.add(recovery_view)
                             yield WarningEvent(
                                 code="context_auto_compaction_start",
                                 message=(
@@ -10321,7 +10607,18 @@ class Agent:
                                 self._last_compaction_refusal_reason = (
                                     provider_compaction_refusal_reason
                                 )
-                            self._stage_pending_durable_compaction(overflow_outcome)
+                            self._stage_pending_durable_compaction(
+                                overflow_outcome,
+                                source=_PendingCompactionSource(
+                                    compaction_id=overflow_outcome.compaction_id,
+                                    messages=list(turn_messages),
+                                    rejected_messages=list(request_messages),
+                                    request_context_insert_index=request_context_insert_index,
+                                    runtime_context_insert_index=runtime_context_insert_index,
+                                    protected_turn_start_index=current_turn_start_index,
+                                    config=overflow_outcome.runtime_compaction_config,
+                                ),
+                            )
                             next_request_context_insert_index = (
                                 overflow_outcome.request_context_insert_index
                                 if overflow_outcome.request_context_insert_index is not None
@@ -10332,6 +10629,7 @@ class Agent:
                                 if overflow_outcome.runtime_context_insert_index is not None
                                 else runtime_context_insert_index
                             )
+                            rebuild_timeout_scope: asyncio.Timeout | None = None
                             try:
                                 rebuild_deadline = (
                                     overflow_outcome.compaction_deadline_at_monotonic
@@ -10353,7 +10651,8 @@ class Agent:
                                         )
                                     )
                                 else:
-                                    async with asyncio.timeout_at(rebuild_deadline):
+                                    rebuild_timeout_scope = asyncio.timeout_at(rebuild_deadline)
+                                    async with rebuild_timeout_scope:
                                         next_request_messages = (
                                             await self._provider_request_messages_async(
                                                 [
@@ -10377,6 +10676,82 @@ class Agent:
                                 )
                                 raise
                             except TimeoutError:
+                                if (
+                                    rebuild_timeout_scope is None
+                                    or not rebuild_timeout_scope.expired()
+                                ):
+                                    # A timeout raised by the rebuild body belongs
+                                    # to that operation, not the summary deadline.
+                                    self._terminalize_pending_durable_compaction(
+                                        status="failed", reason="request_rebuild_failed",
+                                    )
+                                    raise
+                                try:
+                                    # The generated checkpoint is still uninstalled.
+                                    # Recover only from canonical history/current
+                                    # work and retain the original parent's deadline.
+                                    window = await self._recover_progressed_request_window(
+                                        turn_messages,
+                                        rejected_messages=request_messages,
+                                        protected_turn_start_index=current_turn_start_index,
+                                        request_context_insert_index=request_context_insert_index,
+                                        runtime_context_insert_index=runtime_context_insert_index,
+                                        chat_config=call_chat_cfg,
+                                        tools=provider_tools_for_call,
+                                        request_context_message=request_context_message,
+                                        runtime_context_message=runtime_context_message,
+                                        request_suffix_messages=request_suffix_messages,
+                                        compaction_config=overflow_outcome.runtime_compaction_config,
+                                        reason="compaction_deadline_exceeded",
+                                    )
+                                except asyncio.CancelledError:
+                                    self._terminalize_pending_durable_compaction(
+                                        status="cancelled", reason="request_window_cancelled",
+                                    )
+                                    raise
+                                except _CompactionParentDeadlineError:
+                                    self._terminalize_pending_durable_compaction(
+                                        status="cancelled", reason="parent_deadline_exceeded",
+                                    )
+                                    raise
+                                except Exception:
+                                    self._terminalize_pending_durable_compaction(
+                                        status="failed", reason="request_rebuild_failed",
+                                    )
+                                    raise
+                                if window is not None:
+                                    message_count_request_view = _MessageCountRequestView(
+                                        messages=window.messages,
+                                        canonical_tail_start=len(turn_messages),
+                                        request_context_insert_index=(
+                                            window.request_context_insert_index
+                                            if window.request_context_insert_index is not None
+                                            else request_context_insert_index
+                                        ),
+                                        runtime_context_insert_index=(
+                                            window.runtime_context_insert_index
+                                            if window.runtime_context_insert_index is not None
+                                            else runtime_context_insert_index
+                                        ),
+                                        protected_turn_start_index=(
+                                            window.protected_turn_start_index
+                                            if window.protected_turn_start_index is not None
+                                            else current_turn_start_index
+                                        ),
+                                    )
+                                    # This request-scoped recovery owns the one
+                                    # terminal for the expired operation. Never
+                                    # persist the abandoned checkpoint candidate.
+                                    self._pending_durable_compaction_event = None
+                                    self._pending_durable_compaction_source = None
+                                    self._compaction_failed_this_turn = True
+                                    self._last_compaction_refusal_reason = None
+                                    self._notify_admitted_request_window(
+                                        window, source_count=len(turn_messages),
+                                        reason="compaction_deadline_exceeded",
+                                    )
+                                    _call_attempt += 1
+                                    continue
                                 self._terminalize_pending_durable_compaction(
                                     status="timed_out",
                                     reason="compaction_deadline_exceeded",
@@ -10629,6 +11004,7 @@ class Agent:
                                     # persistence cannot produce a second
                                     # terminal lifecycle event.
                                     self._pending_durable_compaction_event = None
+                                    self._pending_durable_compaction_source = None
                                     yield pending_event
                                     turn_messages = overflow_outcome.messages
                                     request_context_insert_index = next_request_context_insert_index
@@ -10912,7 +11288,9 @@ class Agent:
                         # authority above. Never replay the rate-limited leg.
                         should_retry = (
                             provider_error.code not in {
-                                "provider_retry_after_deadline", "rate_limit_retry_exhausted"
+                                "provider_retry_after_deadline", "rate_limit_retry_exhausted",
+                                "provider_overload_retry_after_deadline",
+                                "provider_overload_retry_wait_exhausted"
                             }
                             and (
                                 _fallback.should_retry(kind, _retry_attempt)
@@ -11309,6 +11687,7 @@ class Agent:
                     images: list[ContentBlockImage | ContentBlockText] | None = None,
                 ) -> None:
                     nonlocal tool_images_pending_admission
+                    completed_tool_progress.add(result.tool_use_id)
                     image_blocks = (
                         _tool_result_images(result.tool_use_id) if images is None else images
                     )
@@ -13287,6 +13666,11 @@ class Agent:
                 event = next_event.result()
             except StopAsyncIteration:
                 return
+            except RetryAfterWaitTimeoutError as exc:
+                raise _provider_stream_deadline_timeout(
+                    timeout_seconds=self.config.timeout,
+                    deadline_at_monotonic=exc.deadline_at_monotonic,
+                ) from None
             except (
                 asyncio.CancelledError,
                 UsageAccountingUnavailableError,
@@ -13690,7 +14074,10 @@ class Agent:
                 if position + 1 < len(assistant_starts)
                 else len(messages)
             )
-            group = messages[start:end]
+            group = [
+                message for message in messages[start:end]
+                if not isinstance(message, _LiveTurnContinuationMessage)
+            ]
             critical = _api_round_requires_raw(
                 self._message_count_compaction_entries(group),
             ) or any(self._tool_result_requires_raw_preservation(message) for message in group)
@@ -13707,6 +14094,137 @@ class Agent:
         )
 
     @staticmethod
+    def _live_turn_receipt_arguments(arguments: dict[str, Any]) -> dict[str, Any]:
+        """Retain call identity without pinning completed bulk input in every request.
+
+        This is an explicit, non-executable view of returned tool calls. Source
+        messages are not changed; omitted values are unavailable in this view.
+        """
+        from opensquilla.provider.request_proof import _compact_argument_string
+
+        def serialized(value: Any) -> str:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+        def path_field(key: str) -> bool:
+            return key.lower().replace("_", "").replace("-", "").endswith(("path", "paths"))
+
+        def contains_path(value: Any) -> bool:
+            if isinstance(value, dict):
+                return any(path_field(key) or contains_path(item) for key, item in value.items())
+            return isinstance(value, list) and any(contains_path(item) for item in value)
+
+        def project(value: Any) -> Any:
+            text = value if isinstance(value, str) else serialized(value)
+            if isinstance(value, (str, dict, list)) and not contains_path(value):
+                # Reuse the provider's existing eligibility and explicit digest
+                # marker, rather than introduce another receipt-size ceiling.
+                if _compact_argument_string(text) != text:
+                    omitted = _compact_argument_string(text, preview=False)
+                    if len(serialized(omitted)) < len(serialized(value)):
+                        return omitted
+            if isinstance(value, dict):
+                return {
+                    key: copy.deepcopy(item) if path_field(key) else project(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [project(item) for item in value]
+            return copy.deepcopy(value)
+
+        projected = {
+            key: copy.deepcopy(value) if path_field(key) else project(value)
+            for key, value in arguments.items()
+        }
+        intact = {"arguments": copy.deepcopy(arguments)}
+        if projected == arguments:
+            return intact
+        original = serialized(arguments)
+        result = {
+            "arguments": projected,
+            "arguments_complete": False,
+            "arguments_projection": {
+                "original_chars": len(original),
+                "sha256": hashlib.sha256(original.encode("utf-8")).hexdigest(),
+                "reason": "completed tool input omitted from this request view",
+            },
+        }
+        return result if len(serialized(result)) < len(serialized(intact)) else intact
+
+    @staticmethod
+    def _live_turn_execution_receipts(messages: list[Message]) -> list[dict[str, Any]] | None:
+        """Capture returned calls, preserving actual status rather than inferring success."""
+        receipts: dict[str, dict[str, Any]] = {}
+        pending: dict[str, ContentBlockToolUse] = {}
+        for message in messages:
+            if isinstance(message, _LiveTurnCheckpointMessage):
+                for receipt in message._compaction_tool_receipts:
+                    identifier = str(receipt["tool_call_id"])
+                    if identifier in receipts and receipts[identifier] != receipt:
+                        return None
+                    receipts[identifier] = copy.deepcopy(receipt)
+            if not isinstance(message.content, list):
+                continue
+            for block in message.content:
+                if isinstance(block, ContentBlockToolUse):
+                    if block.id in pending or block.id in receipts:
+                        return None
+                    pending[block.id] = block
+                elif isinstance(block, ContentBlockToolResult):
+                    call = pending.pop(block.tool_use_id, None)
+                    if call is None:
+                        return None
+                    receipts[block.tool_use_id] = {
+                        "tool_call_id": block.tool_use_id,
+                        "name": call.name,
+                        **Agent._live_turn_receipt_arguments(call.input),
+                        "result_received": True,
+                        "is_error": block.is_error,
+                        "execution_status": copy.deepcopy(block.execution_status)
+                        if block.execution_status is not None
+                        else normalize_legacy_execution_status(is_error=block.is_error),
+                    }
+        return None if pending else list(receipts.values())
+
+    @staticmethod
+    def _live_turn_checkpoint_messages(
+        summary: str | None, receipts: list[dict[str, Any]],
+    ) -> list[Message]:
+        """Put completed execution after its initiating request, never ahead of it."""
+        introduction = (
+            "[Context summary]\nHistorical context and completed work:\n"
+            f"{summary}\n\n"
+            if summary is not None else
+            "[Temporary tool execution record]\nThe raw results of these calls were "
+            "omitted from this request window. Their contents are unavailable here; "
+            "do not infer missing result details.\n\n"
+        )
+        checkpoint = _LiveTurnCheckpointMessage(role="assistant", content=(
+            introduction
+            + "[Tool execution receipts for the current request]\n"
+            "These are records of calls that already returned results, not new tool "
+            "instructions. A returned result does not imply success; consult the recorded "
+            "status and error flag. Do not repeat completed work merely because its raw "
+            "transcript was summarized or omitted.\n"
+            + (
+                "Some recorded arguments are explicitly omitted and unavailable in this "
+                "request view. Their digests identify the original values; omission markers "
+                "are not executable arguments.\n"
+                if any(receipt.get("arguments_complete") is False for receipt in receipts) else ""
+            )
+            + json.dumps(receipts, ensure_ascii=False, sort_keys=True)
+        ))
+        checkpoint._compaction_tool_receipts = tuple(copy.deepcopy(receipts))
+        checkpoint._compaction_has_summary = summary is not None
+        return [
+            checkpoint,
+            _LiveTurnContinuationMessage(role="user", content=(
+                "Continue the same request from the recorded progress above. "
+                "Use the recorded execution status to decide what remains; do not restart "
+                "completed calls solely because their raw results were summarized or omitted."
+            )),
+        ]
+
+    @staticmethod
     def _live_turn_mapped_index(
         original_index: int | None,
         *,
@@ -13718,7 +14236,7 @@ class Agent:
         if original_index is None:
             return None
         if original_index <= active_user_index:
-            return 2 + max(0, original_index - protected_start)
+            return max(0, original_index - protected_start)
         if original_index >= keep_start:
             return 2 + active_prefix_count + (original_index - keep_start)
         return 2 + active_prefix_count
@@ -13740,6 +14258,7 @@ class Agent:
         allow_unchanged: bool = False,
         compaction_config: CompactionConfig | None = None,
         reason: str = "summary_failed",
+        notify_recovery: bool = True,
     ) -> CompactionOutcome | None:
         """Admit a temporary raw window without changing canonical history."""
 
@@ -13824,52 +14343,124 @@ class Agent:
                 protected_turn_start_index=protected_start,
             )
         pruned_messages = compact_request_window_tools(messages)
-        retained_indexes: set[int] = set()
-        if (
-            len(messages) > 1 and isinstance(messages[0].content, str)
-            and messages[0].content.startswith("[Context summary]\n")
-            and messages[1].role == "assistant"
-            and messages[1].content == "Understood. Continuing from summary."
-        ):
-            summary_body = messages[0].content.removeprefix("[Context summary]\n")
-            replayed = format_compaction_summary_context([summary_body]) or ""
-            if summary_body in replayed:
-                retained_indexes.update((0, 1))
+        # Prefer complete checkpoints produced by this runtime before discarding
+        # raw completed rounds. User-authored prefix strings are not provenance.
+        summary_groups: list[set[int]] = []
+        for index, message in enumerate(messages):
+            if isinstance(message, _CompactionSummaryMessage):
+                if (
+                    message.role == "assistant"
+                    and index
+                    and isinstance(messages[index - 1], _CompactionSummaryMessage)
+                    and messages[index - 1].role == "user"
+                ):
+                    summary_groups[-1].add(index)
+                else:
+                    summary_groups.append({index})
+            elif (
+                isinstance(message, _LiveTurnCheckpointMessage)
+                and message._compaction_has_summary
+            ):
+                group = {index}
+                if (
+                    index + 1 < len(messages)
+                    and isinstance(messages[index + 1], _LiveTurnContinuationMessage)
+                ):
+                    group.add(index + 1)
+                summary_groups.append(group)
+        retained_indexes: set[int] = set().union(*summary_groups)
         candidates = []
         if pruned_messages is not messages:
             candidates.append(RequestWindowCandidate(
                 pruned_messages, tuple(range(len(messages))), 0,
             ))
-        window_candidates = iter_request_window_candidates(
-            pruned_messages,
-            protected_start_index=protected_start,
-            protected_indexes=protected_indexes,
-            retained_indexes=retained_indexes,
-            active_user_index=active_user,
-        )
-        without_summary = (
-            iter_request_window_candidates(
-                pruned_messages,
-                protected_start_index=protected_start,
-                protected_indexes=protected_indexes - retained_indexes,
-                active_user_index=active_user,
-            ) if retained_indexes else ()
-        )
-        for candidate in chain(candidates, window_candidates, without_summary):
+
+        def preferred_windows() -> Iterator[RequestWindowCandidate]:
+            retained = set(retained_indexes)
+            # Exhaust complete fitting windows with all checkpoints first. If
+            # needed, release older checkpoints one group at a time, preserving
+            # newer knowledge before falling back to an explicitly omitted view.
+            for released in range(len(summary_groups) + 1):
+                yield from iter_request_window_candidates(
+                    pruned_messages,
+                    protected_start_index=protected_start,
+                    protected_indexes=protected_indexes - (retained_indexes - retained),
+                    retained_indexes=retained,
+                    active_user_index=active_user,
+                )
+                if released < len(summary_groups):
+                    retained.difference_update(summary_groups[released])
+
+        for candidate in chain(candidates, preferred_windows()):
+            self._require_compaction_parent_time(chat_config)
             request_index = candidate.map_index(request_context_insert_index)
             runtime_index = candidate.map_index(runtime_context_insert_index)
+            protected_index = (
+                candidate.map_index(protected_start)
+                if candidate.omitted_count else protected_start
+            )
             if not candidate.omitted_count:
                 request_index = request_context_insert_index
                 runtime_index = runtime_context_insert_index
+            candidate_messages = candidate.messages
+            if candidate.omitted_count and active_user is not None:
+                kept_indices = set(candidate.kept_indices)
+                omitted_live_indices = [
+                    index for index in range(active_user + 1, len(messages))
+                    if index not in kept_indices
+                ]
+                receipts = self._live_turn_execution_receipts(
+                    [messages[index] for index in omitted_live_indices],
+                )
+                if receipts is None:
+                    continue
+                if receipts:
+                    retained_receipts = self._live_turn_execution_receipts(
+                        [messages[index] for index in sorted(kept_indices)
+                         if index > active_user],
+                    )
+                    if retained_receipts is None:
+                        continue
+                    retained_by_id = {r["tool_call_id"]: r for r in retained_receipts}
+                    if any(
+                        r["tool_call_id"] in retained_by_id
+                        and r != retained_by_id[r["tool_call_id"]]
+                        for r in receipts
+                    ):
+                        continue
+                    receipts = [r for r in receipts if r["tool_call_id"] not in retained_by_id]
+                if receipts:
+                    # Preserve chronological progress: insert omitted receipts
+                    # after earlier checkpoints and before later retained rounds.
+                    insertion = candidate.map_index(omitted_live_indices[-1] + 1)
+                    assert insertion is not None
+                    progress = self._live_turn_checkpoint_messages(None, receipts)
+                    # The generated window notice belongs with the execution
+                    # record. Moving it avoids an extra wire message while
+                    # keeping every omission explicit after the current user.
+                    progress[0].content = (
+                        f"{candidate_messages[0].content}\n\n{progress[0].content}"
+                    )
+                    candidate_messages = [
+                        *candidate_messages[1:insertion],
+                        *progress,
+                        *candidate_messages[insertion:],
+                    ]
+                    if request_index is not None:
+                        request_index += 1 if request_index >= insertion else -1
+                    if runtime_index is not None:
+                        runtime_index += 1 if runtime_index >= insertion else -1
+                    if protected_index is not None:
+                        protected_index += 1 if protected_index >= insertion else -1
             request_messages = self._provider_request_messages_for_count_projection(
-                [*candidate.messages, *(request_suffix_messages or [])],
+                [*candidate_messages, *(request_suffix_messages or [])],
                 request_context_message=request_context_message,
                 request_context_insert_index=(
-                    request_index if request_index is not None else len(candidate.messages)
+                    request_index if request_index is not None else len(candidate_messages)
                 ),
                 runtime_context_message=runtime_context_message,
                 runtime_context_insert_index=(
-                    runtime_index if runtime_index is not None else len(candidate.messages)
+                    runtime_index if runtime_index is not None else len(candidate_messages)
                 ),
             )
             active_index = _active_user_message_index_for_request(
@@ -13894,7 +14485,7 @@ class Agent:
                 if compaction_config is not None and compaction_config.operation_id
                 else new_compaction_id()
             )
-            if self._session_key:
+            if notify_recovery and self._session_key:
                 notify_compaction(
                     self._session_key,
                     source="automatic",
@@ -13907,16 +14498,13 @@ class Agent:
                     **compaction_lifecycle_payload(compaction_id, COMPACTION_TRIGGERED_EVENT),
                 )
             return CompactionOutcome(
-                messages=candidate.messages,
+                messages=candidate_messages,
                 compacted=True,
                 removed_count=candidate.omitted_count,
                 compaction_id=compaction_id,
                 request_context_insert_index=request_index,
                 runtime_context_insert_index=runtime_index,
-                protected_turn_start_index=(
-                    candidate.map_index(protected_start)
-                    if candidate.omitted_count else protected_start
-                ),
+                protected_turn_start_index=protected_index,
                 ephemeral_only=True,
                 runtime_compaction_config=compaction_config,
             )
@@ -13927,6 +14515,125 @@ class Agent:
                 ) or "provider_protected_context_too_large"
             )
         return None
+
+    async def _recover_progressed_request_window(
+        self,
+        messages: list[Message],
+        *,
+        rejected_messages: list[Message],
+        protected_turn_start_index: int,
+        request_context_insert_index: int,
+        runtime_context_insert_index: int,
+        chat_config: ChatConfig,
+        tools: list[ToolDefinition] | None,
+        request_context_message: Message | None,
+        runtime_context_message: Message,
+        request_suffix_messages: list[Message] | None,
+        compaction_config: CompactionConfig | None = None,
+        reason: str = "later_tool_progress",
+    ) -> CompactionOutcome | None:
+        """Admit a local request window without starting another summary."""
+        parent_deadline = self._require_compaction_parent_time(chat_config)
+        rejected = project_provider_final_request(
+            self.provider, rejected_messages, tools, chat_config,
+        )
+        if rejected is None or rejected.fits:
+            return None
+        proof = rejected.proof
+        outcome = self._recover_local_request_window(
+            messages,
+            protected_turn_start_index=protected_turn_start_index,
+            request_context_insert_index=request_context_insert_index,
+            runtime_context_insert_index=runtime_context_insert_index,
+            config=chat_config,
+            request_context_message=request_context_message,
+            runtime_context_message=runtime_context_message,
+            request_suffix_messages=request_suffix_messages,
+            input_budget_tokens=self._positive_int(proof.get("effective_proof_token_budget")),
+            input_budget_chars=self._positive_int(proof.get("effective_proof_budget")),
+            reason=reason,
+            compaction_config=compaction_config,
+            notify_recovery=False,
+        )
+        if outcome is None:
+            return None
+        parent_timeout = asyncio.timeout_at(parent_deadline)
+        try:
+            async with parent_timeout:
+                candidate = await self._provider_request_messages_async(
+                    [*outcome.messages, *(request_suffix_messages or [])],
+                    request_context_message=request_context_message,
+                    request_context_insert_index=(
+                        outcome.request_context_insert_index
+                        if outcome.request_context_insert_index is not None
+                        else request_context_insert_index
+                    ),
+                    runtime_context_message=runtime_context_message,
+                    runtime_context_insert_index=(
+                        outcome.runtime_context_insert_index
+                        if outcome.runtime_context_insert_index is not None
+                        else runtime_context_insert_index
+                    ),
+                )
+        except TimeoutError:
+            if parent_timeout.expired():
+                raise _CompactionParentDeadlineError(
+                    "Agent turn expired during local recovery",
+                ) from None
+            raise
+        self._require_compaction_parent_time(chat_config)
+        active_index = _active_user_message_index_for_request(
+            candidate, current_user_text=self._current_turn_message or "",
+        )
+        if active_index is None:
+            return None
+        candidate_config = chat_config.model_copy(
+            update={"active_user_message_index": active_index},
+        )
+        physical = project_provider_final_request(self.provider, candidate, tools, candidate_config)
+        stable = self._project_durable_consumer_final_request(
+            candidate, tools=tools, active_config=candidate_config,
+        )
+        if physical is None or not physical.fits or stable is None or not stable.fits:
+            return None
+        # Compare complete requests under the unchanged physical controls. Do
+        # not gain admission by increasing generation capacity or by merely
+        # moving bytes into tools/system framing. Every pressured dimension
+        # must shrink; final proofs decide admissibility of the other dimensions.
+        pressured = False
+        for metric, capacity in (
+            ("estimated_chars", "effective_proof_budget"),
+            ("estimated_tokens", "effective_proof_token_budget"),
+        ):
+            before = self._positive_int(proof.get(metric))
+            after = self._positive_int(physical.proof.get(metric))
+            limit = self._positive_int(proof.get(capacity))
+            if before is not None and limit is not None and before > limit:
+                pressured = True
+                if after is None or after >= before:
+                    return None
+        if not pressured:
+            return None
+        self._require_compaction_parent_time(chat_config)
+        return outcome
+
+    def _notify_admitted_request_window(
+        self, outcome: CompactionOutcome, *, source_count: int, reason: str,
+    ) -> None:
+        """Publish only after the caller installs the admitted request view."""
+        if self._session_key:
+            notify_compaction(
+                self._session_key, source="automatic", phase="agent_request_window",
+                status="emergency_ephemeral", reason=reason,
+                removed_count=outcome.removed_count,
+                kept_count=source_count - outcome.removed_count,
+                **compaction_effect_payload(
+                    status="emergency_ephemeral", reason=reason,
+                ),
+                **compaction_lifecycle_payload(
+                    outcome.compaction_id or new_compaction_id(), COMPACTION_TRIGGERED_EVENT,
+                ),
+            )
 
     async def _recover_live_turn_request_overflow(
         self,
@@ -13942,11 +14649,12 @@ class Agent:
         request_suffix_messages: list[Message] | None = None,
         request_context_message: Message | None = None,
         runtime_context_message: Message | None = None,
+        compaction_admitted: bool = False,
     ) -> CompactionOutcome | None:
         """Summarize completed live rounds into an ephemeral provider view."""
 
         self._require_compaction_parent_time(consumer_chat_config)
-        if unavailable := self._compaction_unavailable_reason():
+        if not compaction_admitted and (unavailable := self._compaction_unavailable_reason()):
             return self._recover_local_request_window(
                 messages,
                 protected_turn_start_index=protected_turn_start_index,
@@ -13978,6 +14686,11 @@ class Agent:
             *messages[active_user_index + 1 : keep_start],
         ]
         if not summary_messages:
+            return None
+        receipts = self._live_turn_execution_receipts(
+            messages[active_user_index + 1 : keep_start],
+        )
+        if receipts is None:
             return None
 
         config = shared_compaction_config or self._build_compaction_config()
@@ -14014,12 +14727,8 @@ class Agent:
             list[Message], int, int
         ]:
             return ([
-                Message(role="user", content=(
-                    "[Context summary]\nCompleted work from this still-active request:\n"
-                    f"{summary}"
-                )),
-                Message(role="assistant", content="Understood. Continuing the active request."),
                 *active_prefix,
+                *self._live_turn_checkpoint_messages(summary, receipts),
                 *(summary_messages[-len(kept):] if kept else []),
                 *raw_tail,
                 *(request_suffix_messages or []),
@@ -14075,7 +14784,14 @@ class Agent:
             if shared_compaction_config is not None:
                 config.protect_semantic_tail = original_protect_semantic_tail
                 config.protected_recent_messages = original_protected_recent_messages
-        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+        if (
+            compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped"
+            and not (
+                result.skip_reason in UNPRODUCTIVE_COMPACTION_REASONS
+                and config.operation_id
+                == getattr(self, "_last_reported_compaction_operation", None)
+            )
+        ):
             self._compaction_failed_this_turn = False
         replacement_applied = bool(
             result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
@@ -14100,23 +14816,10 @@ class Agent:
                 compaction_config=config,
             )
 
-        projected = [
-            Message(
-                role="user",
-                content=(
-                    "[Context summary]\n"
-                    "Completed work from this still-active request:\n"
-                    f"{replay_summary}"
-                ),
-            ),
-            Message(
-                role="assistant",
-                content="Understood. Continuing the active request.",
-            ),
-            *active_prefix,
-            *raw_tail,
-        ]
-        if projected[2 : 2 + len(active_prefix)] != active_prefix:
+        projected, _, _ = project_messages(replay_summary, [])
+        if request_suffix_messages:
+            projected = projected[:-len(request_suffix_messages)]
+        if projected[:len(active_prefix)] != active_prefix:
             return None
         if raw_tail and projected[-len(raw_tail) :] != raw_tail:
             return None
@@ -14154,7 +14857,7 @@ class Agent:
             compaction_timeout_seconds=config.total_timeout_seconds,
             request_context_insert_index=mapped_request_index,
             runtime_context_insert_index=mapped_runtime_index,
-            protected_turn_start_index=2,
+            protected_turn_start_index=0,
             ephemeral_only=True,
             runtime_compaction_config=config,
         )
@@ -14318,7 +15021,7 @@ class Agent:
         if projected_current.actual_wire_messages <= limit:
             return None, "local_wire_count_not_over_limit"
 
-        if self._compaction_unavailable_reason():
+        if self._compaction_unavailable_reason(provider_overflow=True):
             return await self._recover_live_turn_message_count_limit(
                 messages,
                 request_suffix_messages=request_suffix_messages,
@@ -14335,7 +15038,7 @@ class Agent:
             role="user",
             content="[Context summary]\n[message-count projection placeholder]",
         )
-        summary_ack = Message(
+        summary_ack = _CompactionSummaryMessage(
             role="assistant",
             content="Understood. Continuing from summary.",
         )
@@ -14404,7 +15107,7 @@ class Agent:
         ]:
             cut = len(messages) - len(kept)
             return ([
-                Message(role="user", content=f"[Context summary]\n{summary}"),
+                _CompactionSummaryMessage(role="user", content=f"[Context summary]\n{summary}"),
                 summary_ack,
                 *messages[cut:],
                 *request_suffix_messages,
@@ -14444,7 +15147,14 @@ class Agent:
                 summary="", kept_entries=request.entries, removed_count=0,
                 chunks_processed=0, skip_reason="summary_failed",
             )
-        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+        if (
+            compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped"
+            and not (
+                result.skip_reason in UNPRODUCTIVE_COMPACTION_REASONS
+                and compaction_config.operation_id
+                == getattr(self, "_last_reported_compaction_operation", None)
+            )
+        ):
             self._compaction_failed_this_turn = False
         replacement_applied = bool(
             result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
@@ -14497,7 +15207,7 @@ class Agent:
             return None, str(getattr(result, "skip_reason", None) or "summary_failed")
 
         compacted = [
-            Message(role="user", content=f"[Context summary]\n{replay_summary}"),
+            _CompactionSummaryMessage(role="user", content=f"[Context summary]\n{replay_summary}"),
             summary_ack,
             *messages[selected_cut:],
         ]
@@ -14777,14 +15487,21 @@ class Agent:
             raise _CompactionParentDeadlineError("Agent turn expired during compaction")
         return deadline
 
-    def _compaction_unavailable_reason(self) -> str | None:
+    def _compaction_unavailable_reason(self, *, provider_overflow: bool = False) -> str | None:
         if not self.config.compaction_enabled:
             return "disabled"
         if self._compaction_failed_this_turn:
             return "already_attempted_this_turn"
         circuit = self.config.compaction_circuit_open
-        if circuit is not None and circuit():
-            return "durable_compaction_circuit_open"
+        if circuit is not None:
+            try:
+                inspect.signature(circuit).bind(provider_overflow=provider_overflow)
+            except (TypeError, ValueError):
+                opened = circuit()
+            else:
+                opened = circuit(provider_overflow=provider_overflow)
+            if opened:
+                return "durable_compaction_circuit_open"
         return None
 
     async def _execute_compaction_request(self, request: CompactionRequest) -> CompactionResult:
@@ -14801,14 +15518,21 @@ class Agent:
             arm_compaction_deadline(config, operation_id=new_compaction_id())
         arm_compaction_deadline(config, deadline_at_monotonic=parent_deadline)
 
-        def report(success: bool) -> None:
+        def report(success: bool, failure_kind: str = "") -> None:
             operation_id = config.operation_id
             if operation_id == getattr(self, "_last_reported_compaction_operation", None):
                 return
             self._last_reported_compaction_operation = operation_id
             reporter = self.config.compaction_outcome_reporter
             if reporter is not None:
-                reporter(success)
+                try:
+                    inspect.signature(reporter).bind(success, failure_kind=failure_kind)
+                except (TypeError, ValueError):
+                    reporter(success)
+                else:
+                    cast(_ClassifiedCompactionOutcomeReporter, reporter)(
+                        success, failure_kind=failure_kind,
+                    )
 
         summary_started = False
         previous_started = config.on_summary_call_started
@@ -14826,14 +15550,14 @@ class Agent:
                 result = await compact_context(request)
         except (asyncio.CancelledError, UsageAccountingUnavailableError):
             raise
-        except Exception:
+        except Exception as exc:
             if parent_timeout.expired():
                 raise _CompactionParentDeadlineError(
                     "Agent turn expired during compaction",
                 ) from None
             self._require_compaction_parent_time(parent_config)
-            if summary_started:
-                report(False)
+            if summary_started and isinstance(exc, CompactionTimeoutError):
+                report(False, "operation_timeout")
             raise
         finally:
             config.on_summary_call_started = previous_started
@@ -14842,8 +15566,13 @@ class Agent:
             return result
         if result.removed_count > 0 or result.replaced_previous_summary:
             report(True)
+        elif result.skip_reason in UNPRODUCTIVE_COMPACTION_REASONS:
+            report(False, "unproductive")
         elif compaction_failure_status(result.skip_reason or "") == "failed":
-            report(False)
+            report(
+                False,
+                getattr(result, "failure_kind", "") or result.skip_reason or "summary_failed",
+            )
         return result
 
     def _build_compaction_config(self) -> CompactionConfig:
@@ -14876,6 +15605,7 @@ class Agent:
         config.preserve_historical_images = self.config.preserve_historical_images
         config.request_context = self.build_compaction_request_context()
         config.protected_recent_messages = self.config.compaction_protected_recent_messages
+        config.timeout_seconds = self.config.compaction_timeout_seconds
         config.total_timeout_seconds = self.config.compaction_total_timeout_seconds
         config.heartbeat_interval_seconds = self.config.compaction_heartbeat_interval_seconds
         # Projection-only manual admission uses its owning session scope, not
@@ -15090,7 +15820,7 @@ class Agent:
         routed_window_is_narrower = (
             durable_window_tokens > window_tokens and durable_consumer_overflow_proven is not True
         )
-        if unavailable := self._compaction_unavailable_reason():
+        if unavailable := self._compaction_unavailable_reason(provider_overflow=provider_overflow):
             return _local_after_failure(unavailable)
         if request_scoped_only or routed_window_is_narrower:
             # A temporary route/member window is request scope. Preflight has
@@ -15108,6 +15838,7 @@ class Agent:
                 try:
                     ephemeral = await self._recover_live_turn_request_overflow(
                         messages,
+                        compaction_admitted=True,
                         protected_turn_start_index=protected_turn_start_index,
                         context_window_tokens=pressure_window_tokens,
                         context_window_chars=request_window_chars,
@@ -15160,6 +15891,7 @@ class Agent:
                 try:
                     ephemeral = await self._recover_live_turn_request_overflow(
                         messages,
+                        compaction_admitted=True,
                         protected_turn_start_index=protected_tail_start,
                         context_window_tokens=pressure_window_tokens,
                         context_window_chars=request_window_chars,
@@ -15215,8 +15947,10 @@ class Agent:
         ]:
             cut = len(messages) - len(kept)
             return ([
-                Message(role="user", content=f"[Context summary]\n{summary}"),
-                Message(role="assistant", content="Understood. Continuing from summary."),
+                _CompactionSummaryMessage(role="user", content=f"[Context summary]\n{summary}"),
+                _CompactionSummaryMessage(
+                    role="assistant", content="Understood. Continuing from summary.",
+                ),
                 *messages[cut:],
                 *(request_suffix_messages or []),
             ], int((
@@ -15359,7 +16093,14 @@ class Agent:
                 )
             return None
 
-        if compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped":
+        if (
+            compaction_failure_status(str(getattr(result, "skip_reason", None) or "")) == "skipped"
+            and not (
+                result.skip_reason in UNPRODUCTIVE_COMPACTION_REASONS
+                and compaction_config.operation_id
+                == getattr(self, "_last_reported_compaction_operation", None)
+            )
+        ):
             self._compaction_failed_this_turn = False
         replacement_applied = bool(
             result.removed_count > 0 or getattr(result, "replaced_previous_summary", False)
@@ -15508,9 +16249,13 @@ class Agent:
         # projection used solely as summarizer input.
         compacted: list[Message] = []
         if replay_summary:
-            compacted.append(Message(role="user", content=f"[Context summary]\n{replay_summary}"))
+            compacted.append(_CompactionSummaryMessage(
+                role="user", content=f"[Context summary]\n{replay_summary}",
+            ))
             compacted.append(
-                Message(role="assistant", content="Understood. Continuing from summary.")
+                _CompactionSummaryMessage(
+                    role="assistant", content="Understood. Continuing from summary.",
+                )
             )
         compacted.extend(messages[kept_start_index:])
 

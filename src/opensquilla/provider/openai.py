@@ -3352,6 +3352,8 @@ class OpenAIProvider:
             model=self._model,
             api_key=self._api_key,
             base_url=self._base_url,
+            org_id=self._org_id or "",
+            retry_after_scope_known=True,
         )
 
     def _api_url(self, path: str) -> str:

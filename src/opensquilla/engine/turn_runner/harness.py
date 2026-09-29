@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 from opensquilla.attachment_workspace import (
     workspace_attachment_budget_from_config,
 )
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.contracts.turn_execution import (
     SurfaceCapabilities,
     TurnExecutionContext,
@@ -879,10 +880,9 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "protected_recent_messages",
                 0,
             ),
-            compaction_total_timeout_seconds=getattr(
-                compaction_cfg,
-                "total_timeout_seconds",
-                120.0,
+            compaction_timeout_seconds=getattr(compaction_cfg, "timeout_seconds", None),
+            compaction_total_timeout_seconds=resolve_compaction_total_timeout(
+                getattr(compaction_cfg, "total_timeout_seconds", None),
             ),
             compaction_heartbeat_interval_seconds=getattr(
                 compaction_cfg,

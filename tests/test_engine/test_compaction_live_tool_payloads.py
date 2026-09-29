@@ -70,7 +70,8 @@ def test_live_tool_payload_survives_core_and_agent_window_recovery(status, neste
     else:
         assert outcome is not None
         assert outcome.removed_count == 2
-        assert outcome.messages[-1] == messages[0]
+        assert outcome.messages[0] is messages[0]
+        assert "Tool execution receipts" in str(outcome.messages[1].content)
     assert messages == before
 
 

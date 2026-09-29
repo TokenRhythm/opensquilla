@@ -43,7 +43,11 @@ from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     workspace_attachment_budget_from_config,
 )
-from opensquilla.compaction_status import compaction_failure_status
+from opensquilla.compaction_status import (
+    UNPRODUCTIVE_COMPACTION_REASONS,
+    compaction_failure_status,
+)
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.engine.cache_break_monitor import (
     compaction_terminal_status,
     notify_compaction,
@@ -169,12 +173,7 @@ class GatewaySessionMaintenancePorts(
 
     def timing(self) -> SessionCompactionTiming:
         settings = getattr(getattr(self._context, "config", None), "compaction", None)
-        try:
-            total = float(getattr(settings, "total_timeout_seconds", 120.0))
-        except (TypeError, ValueError):
-            total = 120.0
-        if total <= 0:
-            total = 120.0
+        total = resolve_compaction_total_timeout(getattr(settings, "total_timeout_seconds", None))
         try:
             heartbeat = float(getattr(settings, "heartbeat_interval_seconds", 15.0))
         except (TypeError, ValueError):
@@ -417,6 +416,7 @@ class GatewaySessionMaintenancePorts(
                 self._report_summary_outcome(
                     command.session_key, summary_attempted=summary_attempted, success=False,
                     failure_scope=runtime.failure_scope,
+                    failure_kind="operation_timeout",
                 )
             raise
         except asyncio.CancelledError as exc:
@@ -428,6 +428,7 @@ class GatewaySessionMaintenancePorts(
                 self._report_summary_outcome(
                     command.session_key, summary_attempted=summary_attempted, success=False,
                     failure_scope=runtime.failure_scope,
+                    failure_kind="operation_timeout",
                 )
             raise
         if outcome.applied:
@@ -435,16 +436,23 @@ class GatewaySessionMaintenancePorts(
                 command.session_key, summary_attempted=summary_attempted, success=True,
                 failure_scope=runtime.failure_scope,
             )
+        elif outcome.skip_reason in UNPRODUCTIVE_COMPACTION_REASONS:
+            self._report_summary_outcome(
+                command.session_key, summary_attempted=summary_attempted, success=False,
+                failure_scope=runtime.failure_scope, failure_kind="unproductive",
+            )
         elif compaction_failure_status(outcome.skip_reason or "empty_summary") == "failed":
             self._report_summary_outcome(
                 command.session_key, summary_attempted=summary_attempted, success=False,
                 failure_scope=runtime.failure_scope,
+                failure_kind=outcome.failure_kind or "summary_failed",
             )
         return outcome
 
     def _report_summary_outcome(
         self, session_key: str, *, summary_attempted: bool, success: bool,
         failure_scope: tuple[Any, ...] | None = None,
+        failure_kind: str = "summary_failed",
     ) -> None:
         if not summary_attempted:
             return
@@ -460,7 +468,15 @@ class GatewaySessionMaintenancePorts(
                 bind = getattr(runner, "_bind_compaction_failure_scope", None)
                 if failure_scope is not None and callable(bind):
                     bind(session_key, failure_scope)
-                callback(session_key)
+                if not success:
+                    try:
+                        inspect.signature(callback).bind(session_key, failure_kind=failure_kind)
+                    except (TypeError, ValueError):
+                        callback(session_key)
+                    else:
+                        callback(session_key, failure_kind=failure_kind)
+                else:
+                    callback(session_key)
             except Exception as exc:  # A circuit observer cannot change a committed result.
                 log.warning("manual_compaction.outcome_report_failed", error=type(exc).__name__)
 
@@ -553,6 +569,7 @@ class GatewaySessionMaintenancePorts(
                 ),
                 state_kind=str(getattr(result, "summary_format", "text") or "text"),
                 skip_reason=str(getattr(result, "skip_reason", "") or ""),
+                failure_kind=str(getattr(result, "failure_kind", "") or ""),
                 quality_report=dict(getattr(result, "quality_report", None) or {}),
             )
 

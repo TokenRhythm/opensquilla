@@ -155,7 +155,8 @@ def test_completed_error_can_leave_live_turn_but_pending_tool_cannot(live):
         assert outcome is None
     else:
         assert outcome and outcome.ephemeral_only
-        assert outcome.messages[-1] is messages[0]
+        assert outcome.messages[0] is messages[0]
+        assert "Tool execution receipts" in str(outcome.messages[1].content)
 
 
 def test_circuit_is_scoped_to_deployment_and_policy():
