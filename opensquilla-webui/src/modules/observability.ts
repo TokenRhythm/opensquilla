@@ -1,4 +1,5 @@
 import type { InjectionKey } from 'vue'
+import type { TraceDetails, TraceProjection } from '@/types/traceView'
 import type {
   UsageRangeSelection,
   UsageSnapshot,
@@ -33,7 +34,26 @@ export interface SupportBundle {
   readonly filename: string
 }
 
+export interface TurnTraceSummary {
+  trace_id: string
+  started_at?: string
+  status: string
+  complete: boolean
+  raw_available: boolean
+}
+
+export interface TurnTracesSnapshot {
+  traces: TurnTraceSummary[]
+  raw_enabled: boolean
+}
+
+export interface TracePayloadSnapshot { available: boolean; payload: unknown }
+
 export interface Observability {
+  turnTraces(sessionKey: string, turnId: string, options?: { signal?: AbortSignal }): Promise<TurnTracesSnapshot>
+  traceProjection(traceId: string, options?: { signal?: AbortSignal }): Promise<TraceProjection | null>
+  traceDetails(traceId: string, options?: { signal?: AbortSignal; limit?: number }): Promise<TraceDetails | null>
+  tracePayload(traceId: string, seq: number, options?: { signal?: AbortSignal }): Promise<TracePayloadSnapshot>
   usage(
     range: UsageRangeSelection,
     options?: UsageSnapshotOptions,

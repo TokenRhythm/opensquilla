@@ -38,7 +38,9 @@ def _hermetic_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     migration path could rewrite.
     """
     config_path = tmp_path / "synthetic-config.toml"
-    config_path.write_text("# synthetic bundle-test config\n", encoding="utf-8")
+    config_path.write_text(
+        "[privacy]\nagent_trace_enabled = true\n", encoding="utf-8"
+    )
     monkeypatch.setenv("OPENSQUILLA_GATEWAY_CONFIG_PATH", str(config_path))
     return config_path
 
@@ -70,7 +72,9 @@ def _make_home(tmp_path: Path, *, desktop: bool = False) -> tuple[Path, Path]:
     day = datetime.now(UTC).strftime("%Y%m%d")
     (log_dir / f"decisions-{day}.jsonl").write_text('{"model":"fake"}\n', encoding="utf-8")
     (log_dir / f"traces-{day}.jsonl").write_text('{"kind":"turn_start"}\n', encoding="utf-8")
-    (log_dir / f"turn-calls-{day}.jsonl").write_text('{"kind":"llm_request"}\n', encoding="utf-8")
+    (log_dir / f"turn-calls-{day}.jsonl").write_text(
+        '{"kind":"llm_request","agent_trace":true}\n', encoding="utf-8"
+    )
     # Hard-excluded material: .env files and the raw decision debug mirror
     # must never make it into any bundle tier.
     (home / ".env").write_text(f"OPENSQUILLA_API_KEY={FAKE_KEY}\n", encoding="utf-8")
@@ -126,7 +130,9 @@ def test_all_json_artifacts_parse_and_preserve_metadata(tmp_path, include_conten
     payload = {"providers": [{**metadata, **secrets}], "states": [True, False, 3, None]}
     before = json.dumps(payload)
     day = datetime.now(UTC).strftime("%Y%m%d")
-    (log_dir / f"turn-calls-{day}.jsonl").write_text(json.dumps(payload) + "\n")
+    (log_dir / f"turn-calls-{day}.jsonl").write_text(
+        json.dumps({**payload, "agent_trace": True}) + "\n"
+    )
     dest = tmp_path / "bundle.zip"
 
     result = collect_bundle(
@@ -146,7 +152,9 @@ def test_all_json_artifacts_parse_and_preserve_metadata(tmp_path, include_conten
     assert live["states"] == payload["states"]
     assert live["providers"][0] == {**metadata, **dict.fromkeys(secrets, "[redacted]")}
     if include_content:
-        assert json.loads(entries[f"content/turn-calls-{day}.jsonl"]) == live
+        assert json.loads(entries[f"content/turn-calls-{day}.jsonl"]) == {
+            **live, "agent_trace": True,
+        }
     assert result.manifest == json.loads(entries["manifest.json"])
     assert not result.manifest["collection_errors"]
     assert json.dumps(payload) == before
@@ -191,7 +199,7 @@ def test_malformed_content_jsonl_is_omitted_with_line_error(tmp_path) -> None:
     home, log_dir = _make_home(tmp_path)
     day = datetime.now(UTC).strftime("%Y%m%d")
     name = f"turn-calls-{day}.jsonl"
-    (log_dir / name).write_text('{"kind":"llm_request"}\n{"password":"synthetic',
+    (log_dir / name).write_text('{"kind":"llm_request","agent_trace":true}\n{"password":"synthetic',
                                 encoding="utf-8")
     dest = tmp_path / "bundle.zip"
     result = collect_bundle(dest, home_dir=home, log_dir=log_dir, include_content=True)
@@ -211,6 +219,7 @@ def test_content_jsonl_preserves_unicode_inside_string_values(tmp_path, separato
     logger = TurnCallLogger(
         turn_id="synthetic-turn", session_key="agent:synthetic", agent_id="synthetic",
         provider="synthetic", model="synthetic", log_dir=log_dir,
+        agent_trace_enabled=lambda: True,
     )
     message = f"synthetic{separator}message"
     path = logger.write("llm_request", {"message": message, "api_key": "dummy credential"})
@@ -456,6 +465,104 @@ def test_content_tier_includes_turn_calls(tmp_path) -> None:
     assert any("turn-calls" in name for name in entries)
     manifest = json.loads(entries["manifest.json"])
     assert manifest["content_tier"] is True
+
+
+def test_content_tier_filters_legacy_raw_rows_from_mixed_file(tmp_path) -> None:
+    home, log_dir = _make_home(tmp_path)
+    day = datetime.now(UTC).strftime("%Y%m%d")
+    name = f"turn-calls-{day}.jsonl"
+    records = [
+        {"kind": "legacy_missing", "payload": {"text": "legacy-missing"}},
+        {"agent_trace": False, "kind": "legacy_disabled", "payload": {"text": "legacy-false"}},
+        {"agent_trace": "true", "kind": "legacy_string", "payload": {"text": "legacy-string"}},
+        {
+            "agent_trace": True,
+            "kind": "llm_request",
+            "payload": {"text": "trace-visible", "api_key": "synthetic credential"},
+        },
+    ]
+    (log_dir / name).write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    dest = tmp_path / "bundle.zip"
+
+    result = collect_bundle(dest, home_dir=home, log_dir=log_dir, include_content=True)
+
+    data = _read_zip(dest)[f"content/{name}"]
+    assert [json.loads(line) for line in data.splitlines()] == [
+        {
+            "agent_trace": True,
+            "kind": "llm_request",
+            "payload": {"text": "trace-visible", "api_key": "[redacted]"},
+        }
+    ]
+    assert b"legacy-" not in data
+    assert not result.manifest["collection_errors"]
+
+
+def test_content_tier_omits_file_with_only_legacy_raw_rows(tmp_path) -> None:
+    home, log_dir = _make_home(tmp_path)
+    day = datetime.now(UTC).strftime("%Y%m%d")
+    name = f"turn-calls-{day}.jsonl"
+    (log_dir / name).write_text(
+        '{"kind":"legacy_missing","payload":{"text":"legacy-only"}}\n'
+        '{"agent_trace":false,"kind":"legacy_disabled"}\n',
+        encoding="utf-8",
+    )
+    dest = tmp_path / "bundle.zip"
+
+    result = collect_bundle(dest, home_dir=home, log_dir=log_dir, include_content=True)
+
+    entries = _read_zip(dest)
+    assert f"content/{name}" not in entries
+    assert f"content/{name}" not in result.manifest["entries"]
+    assert not result.manifest["collection_errors"]
+
+
+def test_capped_agent_trace_content_has_no_unmarked_truncation_row(tmp_path) -> None:
+    from opensquilla.observability.bundle import _add_agent_trace_turn_calls
+
+    source = tmp_path / "turn-calls-synthetic.jsonl"
+    legacy_line = json.dumps({"kind": "legacy", "payload": {"text": "x" * 256}}) + "\n"
+    trace_line = json.dumps({"agent_trace": True, "kind": "llm_response"}) + "\n"
+    source.write_text(legacy_line + trace_line, encoding="utf-8")
+    dest = tmp_path / "bundle.zip"
+    truncations = []
+    entry_name = f"content/{source.name}"
+
+    with zipfile.ZipFile(dest, "w") as archive:
+        _add_agent_trace_turn_calls(
+            archive, entry_name, source, truncations, cap=len(trace_line.encode()) + 8
+        )
+
+    rows = [json.loads(line) for line in _read_zip(dest)[entry_name].splitlines()]
+    assert rows == [{"agent_trace": True, "kind": "llm_response"}]
+    assert truncations[0]["entry"] == entry_name
+
+
+@pytest.mark.parametrize("include_content", [False, True])
+@pytest.mark.parametrize("configured", [None, False, True])
+def test_bundle_trace_files_require_agent_trace_opt_in(
+    tmp_path, _hermetic_config, include_content, configured
+) -> None:
+    config_text = (
+        "# pre-trace config\n" if configured is None else
+        f"[privacy]\nagent_trace_enabled = {str(configured).lower()}\n"
+    )
+    _hermetic_config.write_text(config_text, encoding="utf-8")
+    home, log_dir = _make_home(tmp_path)
+    day = datetime.now(UTC).strftime("%Y%m%d")
+    dest = tmp_path / "bundle.zip"
+
+    result = collect_bundle(dest, home_dir=home, log_dir=log_dir, include_content=include_content)
+
+    entries = _read_zip(dest)
+    assert f"decisions/decisions-{day}.jsonl" in entries
+    assert (f"traces/traces-{day}.jsonl" in entries) is (configured is True)
+    assert (f"content/turn-calls-{day}.jsonl" in entries) is (
+        configured is True and include_content
+    )
+    assert set(result.manifest["entries"]) == set(entries)
 
 
 def test_desktop_logs_are_derived_and_credential_excluded(tmp_path) -> None:

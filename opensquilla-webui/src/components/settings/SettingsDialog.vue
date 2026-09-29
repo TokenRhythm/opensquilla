@@ -85,6 +85,7 @@
           <SettingsGatewayPanel
             v-if="section === 'gateway'"
             :is-desktop="isDesktop"
+            :initial-trace-id="routeTraceId"
           />
 
           <!-- Memory & Export is first-level and owns its own RPC gate. -->
@@ -109,6 +110,7 @@
             :panel="privacyPanel"
             :loaded="loaded"
             :is-desktop="isDesktop"
+            @update-agent-trace-enabled="setAgentTraceDraft"
             @update-network-reporting-enabled="setNetworkReportingEnabled"
           />
           <SettingsAppearancePanel v-else-if="section === 'interface'" />
@@ -261,6 +263,12 @@ import '@/styles/settings-forms.css'
 
 const route = useRoute()
 const router = useRouter()
+const routeTraceId = computed(() => {
+  const value = route.query?.traceId
+  if (typeof value !== 'string') return ''
+  const traceId = value.trim()
+  return traceId.length <= 256 ? traceId : ''
+})
 const capacityTarget = computed(() => {
   const provider = route.query.capacityProvider
   const model = route.query.capacityModel
@@ -303,6 +311,7 @@ const {
   cancelProviderEdit,
   setAutoSessionTitles,
   setNetworkReportingEnabled,
+  setAgentTraceDraft,
   setMemoryAutoCapture,
   setProviderImageGenerationOptIn,
   setModelStrategy,

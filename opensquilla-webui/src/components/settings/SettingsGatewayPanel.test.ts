@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createApp, nextTick, type App } from 'vue'
 import i18n from '@/i18n'
 import SettingsGatewayPanel from './SettingsGatewayPanel.vue'
+import { setAgentTraceEnabled } from '@/modules/agentTracePreference'
 
 vi.mock('@/components/settings/SetupConnectionPanel.vue', async () => {
   const { defineComponent, h } = await import('vue')
@@ -33,14 +34,35 @@ vi.mock('@/components/GatewayLogViewer.vue', async () => {
   const { defineComponent, h } = await import('vue')
   return { default: defineComponent({ setup: () => () => h('button', { 'data-testid': 'support-view-logs' }, 'View logs') }) }
 })
+vi.mock('@/components/trace/TraceInspectorDialog.vue', async () => {
+  const { defineComponent, h } = await import('vue')
+  return { default: defineComponent({ setup: () => () => h('button', { 'data-testid': 'trace-inspector' }, 'Trace inspector') }) }
+})
 
 const mounted: App[] = []
 afterEach(() => {
+  setAgentTraceEnabled(false)
   mounted.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
 })
 
 describe('SettingsGatewayPanel support entry', () => {
+  it('shows the manual Trace entry only while the privacy switch is enabled', async () => {
+    setAgentTraceEnabled(false)
+    const host = document.createElement('div')
+    const app = createApp(SettingsGatewayPanel, { isDesktop: false })
+    app.use(i18n)
+    app.mount(host)
+    mounted.push(app)
+    expect(host.querySelector('[data-testid="trace-inspector"]')).toBeNull()
+    setAgentTraceEnabled(true)
+    await nextTick()
+    expect(host.querySelector('[data-testid="trace-inspector"]')).not.toBeNull()
+    setAgentTraceEnabled(false)
+    await nextTick()
+    expect(host.querySelector('[data-testid="trace-inspector"]')).toBeNull()
+  })
+
   it.each([false, true])('keeps support separate from local runtime with isDesktop=%s', async isDesktop => {
     i18n.global.locale.value = 'en'
     const el = document.createElement('div')

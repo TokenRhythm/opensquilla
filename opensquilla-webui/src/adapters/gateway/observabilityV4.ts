@@ -5,10 +5,13 @@ import {
 } from '@/contracts/generated/v4/logsTail'
 import { validateResult as validateLogsTailResult } from '@/contracts/generated/v4/logsTailValidators.mjs'
 import { createV4UsageReporting } from './usageReportingV4'
+import { detailsFromApi, projectionFromApi } from '@/utils/traceProjection'
 import type { SupportBundleUnavailableReason } from '@/modules/gatewayAccess'
 import type {
   Observability,
   UpdateNotice,
+  TurnTracesSnapshot,
+  TracePayloadSnapshot,
 } from '@/modules/observability'
 
 interface RpcTransport {
@@ -33,6 +36,13 @@ interface HttpTransport {
     blob(): Promise<Blob>
   }>
 }
+
+const traceCallOptions = (signal?: AbortSignal): RpcCallOptions => ({
+  timeoutMs: 15_000,
+  timeoutAction: 'reject',
+  abortAction: 'reject',
+  ...(signal ? { signal } : {}),
+})
 
 function updateNotice(value: unknown): UpdateNotice | null | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
@@ -61,6 +71,22 @@ export function createV4Observability(
 ): Observability {
   const usageReporting = createV4UsageReporting(rpc)
   return {
+    async turnTraces(sessionKey, turnId, options) {
+      await rpc.ready({ signal: options?.signal })
+      return rpc.request<TurnTracesSnapshot>('logs.turn_traces', { session_key: sessionKey, turn_id: turnId }, traceCallOptions(options?.signal))
+    },
+    async traceProjection(traceId, options) {
+      await rpc.ready({ signal: options?.signal })
+      return projectionFromApi(await rpc.request('logs.trace_projection', { trace_id: traceId }, traceCallOptions(options?.signal)))
+    },
+    async traceDetails(traceId, options) {
+      await rpc.ready({ signal: options?.signal })
+      return detailsFromApi(await rpc.request('logs.trace_details', { trace_id: traceId, limit: options?.limit ?? 1000 }, traceCallOptions(options?.signal)))
+    },
+    async tracePayload(traceId, seq, options) {
+      await rpc.ready({ signal: options?.signal })
+      return rpc.request<TracePayloadSnapshot>('logs.trace_payload', { trace_id: traceId, seq }, traceCallOptions(options?.signal))
+    },
     usage(range, options = {}) {
       return usageReporting.snapshot(range, options)
     },

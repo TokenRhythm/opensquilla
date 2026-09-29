@@ -5,6 +5,7 @@ import { localizeImageActionableDetail, useSetupCatalog } from './useSetupCatalo
 import { LEGACY_OPENROUTER_MODEL_OPTIONS } from './useSetupEnsembleForm'
 import { PROVIDER_CREDENTIAL_REVEAL_TIMEOUT_MS } from './useSetupProviderForm'
 import { SetupWorkflowError } from '@/modules/setupWorkflow'
+import { agentTraceEnabled, setAgentTraceEnabled } from '@/modules/agentTracePreference'
 import type { GatewayAvailability } from '@/modules/gatewayAccess'
 
 const rpcCall = vi.hoisted(() => vi.fn())
@@ -69,7 +70,11 @@ async function primaryTransitionScenario(first = false, mutate: (method: string,
   return { ...await mountCatalog(), saved }
 }
 
-async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('available')) {
+async function mountCatalog(
+  gatewayAvailability = ref<GatewayAvailability>('available'),
+  readSetting: import('@/modules/appSettings').AppSettings['read'] = async () => null,
+  gatewayEpoch = ref(0),
+) {
   let api!: ReturnType<typeof useSetupCatalog>
   const el = document.createElement('div')
   document.body.appendChild(el)
@@ -103,7 +108,7 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
     sessionsRoutingModelSelection: false,
     detachedSessionHydration: false,
     turnCommittedEvents: false,
-    subscriptionEpoch: 0,
+    get subscriptionEpoch() { return gatewayEpoch.value },
     supportBundleUnavailableReason: null,
     loadConnectionEndpoint: () => 'ws://example.invalid/ws',
     connect: async () => undefined,
@@ -112,7 +117,7 @@ async function mountCatalog(gatewayAvailability = ref<GatewayAvailability>('avai
   })
   app.provide(APP_SETTINGS_KEY, {
     readAll: async () => await rpcCall('config.get') as import('@/modules/appSettings').SettingsObject,
-    read: async () => null,
+    read: readSetting,
     readEffective: async () => await rpcCall('config.effective') as import('@/modules/appSettings').EffectiveSettings,
     patch: async (changes: readonly { path: string; value: unknown }[]) => await rpcCall(
       'config.patch',
@@ -398,6 +403,7 @@ function mockConfigSequence(configs: Array<Record<string, unknown>>) {
 }
 
 afterEach(() => {
+  setAgentTraceEnabled(false)
   vi.useRealTimers()
   vi.restoreAllMocks()
   rpcCall.mockReset()
@@ -579,6 +585,44 @@ describe('useSetupCatalog initial connection readiness', () => {
     } finally { app.unmount() }
   })
 
+  it('rejects an initial response from a same-epoch reconnect', async () => {
+    const availability = ref<GatewayAvailability>('available')
+    let resolveInitialConfig!: (value: Record<string, unknown>) => void
+    const initialConfig = new Promise<Record<string, unknown>>(resolve => {
+      resolveInitialConfig = resolve
+    })
+    let configReads = 0
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'onboarding.catalog' || method === 'onboarding.status') return {}
+      if (method === 'config.effective') return { fields: {} }
+      if (method === 'config.get') {
+        configReads += 1
+        return configReads === 1
+          ? initialConfig
+          : { privacy: { agent_trace_enabled: false } }
+      }
+      if (method === 'channels.status') return { channels: [] }
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+
+    const { api, app } = await mountCatalog(availability)
+    try {
+      expect(configReads).toBe(1)
+      availability.value = 'unavailable'
+      await nextTick()
+      availability.value = 'available'
+      await nextTick()
+
+      resolveInitialConfig({ privacy: { agent_trace_enabled: true } })
+      await initialConfig
+      await vi.waitFor(() => expect(api.loaded.value).toBe(true))
+
+      expect(configReads).toBe(2)
+      expect(api.privacyPanel.value.agentTraceEnabled).toBe(false)
+      expect(agentTraceEnabled.value).toBe(false)
+    } finally { app.unmount() }
+  })
+
   it('keeps existing settings drafts when an already loaded Gateway reconnects', async () => {
     const availability = ref<GatewayAvailability>('available')
     mockConfigSequence([{ privacy: { disable_network_observability: false } }])
@@ -604,6 +648,159 @@ describe('useSetupCatalog initial connection readiness', () => {
 })
 
 describe('useSetupCatalog privacy settings', () => {
+  it('updates a clean trace switch after another tab changes this Gateway', async () => {
+    mockConfigSequence([{ privacy: { agent_trace_enabled: false } }])
+    const readSetting = vi.fn().mockResolvedValue(true)
+    const { api, app } = await mountCatalog(ref('available'), readSetting)
+    try {
+      expect(api.privacyPanel.value.agentTraceEnabled).toBe(false)
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'opensquilla.agent-trace-preference-change',
+        newValue: JSON.stringify({ nonce: 'saved-in-another-tab' }),
+      }))
+      await vi.waitFor(() => expect(api.privacyPanel.value.agentTraceEnabled).toBe(true))
+      expect(agentTraceEnabled.value).toBe(true)
+      expect(api.sectionDirty('securityPrivacy')).toBe(false)
+
+      api.setAgentTraceDraft(false)
+      expect(api.sectionDirty('securityPrivacy')).toBe(true)
+      window.dispatchEvent(new StorageEvent('storage', {
+        key: 'opensquilla.agent-trace-preference-change',
+        newValue: JSON.stringify({ nonce: 'another-change' }),
+      }))
+      await vi.waitFor(() => expect(readSetting).toHaveBeenCalledTimes(2))
+      expect(api.privacyPanel.value.agentTraceEnabled).toBe(false)
+      expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    } finally { app.unmount() }
+  })
+
+  it('hides trace on disconnect and reads the new connection before showing it', async () => {
+    const availability = ref<GatewayAvailability>('available')
+    mockConfigSequence([{ privacy: { agent_trace_enabled: true } }])
+    let resolveRead: ((value: boolean) => void) | undefined
+    const readSetting = vi.fn(() => new Promise<boolean>(resolve => { resolveRead = resolve }))
+    const { api, app } = await mountCatalog(availability, readSetting)
+    expect(agentTraceEnabled.value).toBe(true)
+
+    availability.value = 'unavailable'
+    await nextTick()
+    expect(agentTraceEnabled.value).toBe(false)
+    expect(api.privacyPanel.value.agentTraceEnabled).toBe(false)
+
+    availability.value = 'available'
+    await nextTick()
+    expect(readSetting).toHaveBeenCalledWith('privacy.agent_trace_enabled')
+    expect(agentTraceEnabled.value).toBe(false)
+    expect(api.privacyPanel.value.agentTraceEnabled).toBe(false)
+    resolveRead?.(true)
+    await vi.waitFor(() => expect(agentTraceEnabled.value).toBe(true))
+    expect(api.privacyPanel.value.agentTraceEnabled).toBe(true)
+    app.unmount()
+  })
+
+  it('rebases the trace switch when the Gateway connection changes', async () => {
+    const epoch = ref(0)
+    mockConfigSequence([{ privacy: { agent_trace_enabled: true } }])
+    const readSetting = vi.fn().mockResolvedValue(false)
+    const { api, app } = await mountCatalog(ref('available'), readSetting, epoch)
+    await vi.waitFor(() => expect(api.loaded.value).toBe(true))
+    expect(api.privacyPanel.value.agentTraceEnabled).toBe(true)
+
+    epoch.value += 1
+    await vi.waitFor(() => expect(readSetting).toHaveBeenCalledWith('privacy.agent_trace_enabled'))
+    await vi.waitFor(() => expect(api.privacyPanel.value.agentTraceEnabled).toBe(false))
+    expect(agentTraceEnabled.value).toBe(false)
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+
+    api.setAgentTraceDraft(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    app.unmount()
+  })
+
+  it('hides the previous Gateway trace setting if loading this Gateway fails', async () => {
+    setAgentTraceEnabled(true)
+    rpcCall.mockImplementation(async (method: string) => {
+      if (method === 'config.get') throw new Error('unavailable')
+      if (method === 'onboarding.catalog' || method === 'onboarding.status') return {}
+      throw new Error(`Unexpected RPC method: ${method}`)
+    })
+    const { app } = await mountCatalog()
+    await vi.waitFor(() => expect(pushToast).toHaveBeenCalled())
+    expect(agentTraceEnabled.value).toBe(false)
+    app.unmount()
+  })
+
+  it('keeps agent trace hidden by default and publishes it only after saving', async () => {
+    window.localStorage.removeItem('opensquilla.agent-trace-preference-change')
+    mockConfigSequence([
+      { privacy: { agent_trace_enabled: false } },
+      { privacy: { agent_trace_enabled: true } },
+    ])
+    const { api, app } = await mountCatalog()
+
+    expect(api.privacyPanel.value.agentTraceEnabled).toBe(false)
+    expect(agentTraceEnabled.value).toBe(false)
+    api.setAgentTraceDraft(true)
+    expect(api.sectionDirty('securityPrivacy')).toBe(true)
+    expect(agentTraceEnabled.value).toBe(false)
+
+    await api.saveDirtySections()
+
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'privacy.agent_trace_enabled': true },
+    })
+    expect(api.sectionDirty('securityPrivacy')).toBe(false)
+    expect(agentTraceEnabled.value).toBe(true)
+    expect(JSON.parse(window.localStorage.getItem('opensquilla.agent-trace-preference-change') || '{}')).toEqual({
+      nonce: expect.any(String),
+    })
+    app.unmount()
+  })
+
+  it('publishes the disabled state after saving', async () => {
+    mockConfigSequence([
+      { privacy: { agent_trace_enabled: true } },
+      { privacy: { agent_trace_enabled: false } },
+    ])
+    const { api, app } = await mountCatalog()
+    expect(agentTraceEnabled.value).toBe(true)
+
+    api.setAgentTraceDraft(false)
+    await api.saveDirtySections()
+
+    expect(rpcCall).toHaveBeenCalledWith('config.patch.safe', {
+      patches: { 'privacy.agent_trace_enabled': false },
+    })
+    expect(agentTraceEnabled.value).toBe(false)
+    app.unmount()
+  })
+
+  it('does not let a pending trace read overwrite a value saved afterwards', async () => {
+    const epoch = ref(0)
+    mockConfigSequence([
+      { privacy: { agent_trace_enabled: false } },
+      { privacy: { agent_trace_enabled: true } },
+    ])
+    let resolveRead!: (value: boolean) => void
+    const readSetting = vi.fn(() => new Promise<boolean>(resolve => { resolveRead = resolve }))
+    const { api, app } = await mountCatalog(ref('available'), readSetting, epoch)
+    try {
+      await vi.waitFor(() => expect(api.loaded.value).toBe(true))
+      epoch.value += 1
+      await vi.waitFor(() => expect(readSetting).toHaveBeenCalledWith('privacy.agent_trace_enabled'))
+
+      api.setAgentTraceDraft(true)
+      await expect(api.saveDirtySections()).resolves.toBeUndefined()
+      expect(api.privacyPanel.value.agentTraceEnabled).toBe(true)
+      expect(agentTraceEnabled.value).toBe(true)
+
+      resolveRead(false)
+      await nextTick()
+      expect(api.privacyPanel.value.agentTraceEnabled).toBe(true)
+      expect(agentTraceEnabled.value).toBe(true)
+    } finally { app.unmount() }
+  })
+
   it.each([
     {},
     { privacy: { disable_network_observability: false } },
@@ -614,6 +811,7 @@ describe('useSetupCatalog privacy settings', () => {
     const { api, app } = await mountCatalog()
 
     expect(api.privacyPanel.value).toEqual({
+      agentTraceEnabled: false,
       networkReportingEnabled: true,
       networkReportingForcedOff: false,
     })
@@ -671,6 +869,7 @@ describe('useSetupCatalog privacy settings', () => {
     })
     expect(rpcCall).not.toHaveBeenCalledWith('telemetry.consent.set', expect.anything())
     expect(api.privacyPanel.value).toEqual({
+      agentTraceEnabled: false,
       networkReportingEnabled: true,
       networkReportingForcedOff: false,
     })
@@ -716,6 +915,7 @@ describe('useSetupCatalog privacy settings', () => {
     const { api, app } = await mountCatalog()
 
     expect(api.privacyPanel.value).toEqual({
+      agentTraceEnabled: false,
       networkReportingEnabled: true,
       networkReportingForcedOff: false,
     })

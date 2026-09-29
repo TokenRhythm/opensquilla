@@ -21,7 +21,7 @@ const labels: Partial<Record<SettingsRailSectionId, string[]>> = {
   capabilities: ['setup.search.title', 'setup.memory.title', 'setup.image.title', 'setup.audio.title'],
   general: ['settings.appearance.languageLabel', 'setup.behavior.autoTitlesLabel'],
   interface: ['settings.appearance.themeLabel', 'settings.appearance.sidebarWidthLabel', 'settings.appearance.toolDetailsLabel', 'settings.appearance.visualEffectsLabel', 'settings.appearance.composerFxLabel'],
-  securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel'],
+  securityPrivacy: ['settings.sandbox.title', 'settings.sandbox.mode.title', 'settings.search.permissions', 'setup.privacy.networkReportingLabel', 'settings.securityPrivacy.agentTraceLabel'],
   memory: ['settings.memoryOverview.title'],
   advanced: ['settings.memoryOverview.autoCaptureLabel', 'setup.advanced.configFileLabel', 'setup.advanced.dataMaintenanceLabel'],
 }

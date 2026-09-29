@@ -4,6 +4,7 @@ import { createApp, nextTick, reactive, type App } from 'vue'
 import i18n from '@/i18n'
 import { GATEWAY_ACCESS_KEY, type GatewayAccess } from '@/modules/gatewayAccess'
 import { OBSERVABILITY_KEY } from '@/modules/observability'
+import { setAgentTraceEnabled } from '@/modules/agentTracePreference'
 import SupportBundleButton from './SupportBundleButton.vue'
 
 const mocks = vi.hoisted(() => ({
@@ -57,6 +58,7 @@ function dialogButton(key: string): HTMLButtonElement {
 
 beforeEach(() => {
   document.body.innerHTML = ''
+  setAgentTraceEnabled(false)
   vi.clearAllMocks()
   i18n.global.locale.value = 'en'
   mocks.downloadSupportBundle.mockResolvedValue({
@@ -65,6 +67,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  setAgentTraceEnabled(false)
   mounted.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
   vi.restoreAllMocks()
@@ -72,6 +75,7 @@ afterEach(() => {
 
 describe('SupportBundleButton', () => {
   it('opens the bundle confirmation directly and keeps content excluded by default', async () => {
+    setAgentTraceEnabled(true)
     const { el, trigger } = await mountButton()
     expect(trigger.disabled).toBe(false)
     expect(trigger.textContent).toContain('Download redacted support bundle')
@@ -97,6 +101,7 @@ describe('SupportBundleButton', () => {
   })
 
   it('uses an explicit content opt-in for one download and resets it for the next', async () => {
+    setAgentTraceEnabled(true)
     const { trigger } = await mountButton()
     trigger.click()
     await flush()

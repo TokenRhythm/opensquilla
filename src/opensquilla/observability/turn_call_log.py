@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from collections.abc import Callable
 from dataclasses import asdict, is_dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,6 +30,9 @@ LOG_DIR_ENV = "OPENSQUILLA_LOG_DIR"
 TURN_CALL_LOG_ENABLED_VALUES = frozenset({"1", "true", "yes", "on"})
 
 log = structlog.get_logger(__name__)
+
+_PROGRESS_INTERVAL_SECONDS = 1.0
+_PROGRESS_PREVIEW_CHARS = 32_000
 
 
 def is_turn_call_log_enabled(diagnostics_state: Any | None = None) -> bool:
@@ -113,6 +118,9 @@ class TurnCallLogger:
         model: str,
         source: dict[str, Any] | None = None,
         log_dir: Path | None = None,
+        started_monotonic: float | None = None,
+        capture_enabled: Callable[[], bool] | None = None,
+        agent_trace_enabled: Callable[[], bool] | None = None,
     ) -> None:
         self.trace_id = trace_id or turn_id
         self.turn_id = turn_id
@@ -124,7 +132,17 @@ class TurnCallLogger:
         self.model = model
         self.source = source or {}
         self.log_dir = log_dir or _default_log_dir()
+        self._capture_enabled = capture_enabled
+        self._agent_trace_enabled = agent_trace_enabled
         self._seq = 0
+        # ``ts`` is wall-clock time and can be coarse or adjusted by the OS.
+        # Keep a monotonic, turn-relative clock as an additive field so the
+        # timeline can reconstruct exact ordering without inferring spans from
+        # rounded response timestamps.
+        self._started_monotonic = (
+            time.monotonic() if started_monotonic is None else started_monotonic
+        )
+        self._clock_origin = "logger_start" if started_monotonic is None else "turn_runner_start"
 
     def write(self, kind: str, payload: dict[str, Any]) -> Path | None:
         """Append one call-log record.
@@ -134,14 +152,21 @@ class TurnCallLogger:
         """
 
         try:
+            if self._capture_enabled is not None and not self._capture_enabled():
+                return None
             self.log_dir.mkdir(parents=True, exist_ok=True)
             day = datetime.now(UTC).strftime("%Y%m%d")
             path = self.log_dir / f"turn-calls-{day}.jsonl"
             self._seq += 1
             record = {
                 "schema_version": SCHEMA_VERSION,
-                "ts": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                # Millisecond precision keeps same-second context checkpoints
+                # distinguishable in the timeline while remaining compact JSONL.
+                "ts": datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                 "privacy": "raw",
+                "agent_trace": (
+                    self._agent_trace_enabled() if self._agent_trace_enabled is not None else False
+                ),
                 "trace_id": self.trace_id,
                 "seq": self._seq,
                 "turn_id": self.turn_id,
@@ -153,6 +178,8 @@ class TurnCallLogger:
                 "model": self.model,
                 "source": self.source,
                 "kind": kind,
+                "clock_origin": self._clock_origin,
+                "elapsed_ms": max(0, int((time.monotonic() - self._started_monotonic) * 1000)),
                 "payload": payload,
             }
             with path.open("a", encoding="utf-8") as fh:
@@ -161,3 +188,86 @@ class TurnCallLogger:
         except Exception as exc:  # pragma: no cover - observability must not break turns
             log.debug("turn_call_log.write_failed", kind=kind, error=str(exc))
             return None
+
+
+class TurnCallProgress:
+    """Bounded, rate-limited output snapshots for one already captured LLM call."""
+
+    def __init__(
+        self,
+        logger: TurnCallLogger,
+        *,
+        call_id: str,
+        iteration: int,
+        attempt: int,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._logger = logger
+        self._identity = {"call_id": call_id, "iteration": iteration, "attempt": attempt}
+        self._clock = clock
+        self._last_write: float | None = None
+        self._text = ""
+        self._reasoning = ""
+        self._text_chars = 0
+        self._reasoning_chars = 0
+        self._tools: dict[str, dict[str, Any]] = {}
+
+    def append(self, *, text: str = "", reasoning: str = "") -> None:
+        if not text and not reasoning:
+            return
+        self._text_chars += len(text)
+        self._reasoning_chars += len(reasoning)
+        self._text = (self._text + text)[-_PROGRESS_PREVIEW_CHARS:]
+        self._reasoning = (self._reasoning + reasoning)[-_PROGRESS_PREVIEW_CHARS:]
+        self._maybe_write()
+
+    def tool_delta(self, tool_use_id: str, name: str, arguments_delta: str) -> None:
+        # Bound both the number of pending calls and their combined preview.
+        if tool_use_id not in self._tools and len(self._tools) >= 64:
+            return
+        tool = self._tools.setdefault(
+            tool_use_id,
+            {"tool_use_id": tool_use_id, "name": name, "arguments_text": "", "arguments_chars": 0},
+        )
+        tool["arguments_chars"] += len(arguments_delta)
+        per_tool_limit = _PROGRESS_PREVIEW_CHARS // max(1, len(self._tools))
+        tool["arguments_text"] = (tool["arguments_text"] + arguments_delta)[-per_tool_limit:]
+        for item in self._tools.values():
+            item["arguments_text"] = item["arguments_text"][-per_tool_limit:]
+            item["arguments_offset"] = item["arguments_chars"] - len(item["arguments_text"])
+            item["arguments_truncated"] = item["arguments_offset"] > 0
+        self._maybe_write()
+
+    def _maybe_write(self) -> None:
+        now = self._clock()
+        if self._last_write is None or now - self._last_write >= _PROGRESS_INTERVAL_SECONDS:
+            self._write(now)
+
+    def reset(self) -> None:
+        """Replace a discarded generation's preview at the same logical call."""
+
+        self._text = ""
+        self._reasoning = ""
+        self._text_chars = 0
+        self._reasoning_chars = 0
+        self._tools.clear()
+        self._write(self._clock())
+
+    def _write(self, now: float) -> None:
+        self._last_write = now
+        self._logger.write(
+            "llm_progress",
+            {
+                **self._identity,
+                "partial": True,
+                "text": self._text,
+                "reasoning_content": self._reasoning or None,
+                "text_chars": self._text_chars,
+                "reasoning_chars": self._reasoning_chars,
+                "text_offset": self._text_chars - len(self._text),
+                "reasoning_offset": self._reasoning_chars - len(self._reasoning),
+                "text_truncated": self._text_chars > len(self._text),
+                "reasoning_truncated": self._reasoning_chars > len(self._reasoning),
+                "tool_calls": [dict(tool) for tool in self._tools.values()],
+            },
+        )

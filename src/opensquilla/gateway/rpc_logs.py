@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 
 from opensquilla.application.observability import (
@@ -15,9 +16,14 @@ from opensquilla.gateway.adapters.observability_contract import (
     register_observability_contract,
 )
 from opensquilla.gateway.guest_rpc_policy import is_guest_rpc_method_allowed
-from opensquilla.gateway.log_status_runtime import find_log_file
+from opensquilla.gateway.log_status_runtime import _configured_trace_log_dir, find_log_file
 from opensquilla.gateway.rpc import RpcContext, RpcHandlerError, get_dispatcher
-from opensquilla.observability.trace import load_trace_events
+from opensquilla.observability.trace import is_agent_trace_enabled, load_trace_events
+from opensquilla.observability.trace_details import build_trace_details, load_turn_call_records
+from opensquilla.observability.trace_lookup import find_turn_traces
+from opensquilla.observability.trace_projection import build_trace_projection
+from opensquilla.observability.turn_call_log import resolve_turn_call_log_dir_with_source
+from opensquilla.safety.secret_redaction import redact_secret_value
 
 _d = get_dispatcher()
 
@@ -50,24 +56,195 @@ async def _logs_status_contract(params: dict | None, ctx: RpcContext) -> dict[st
 
 @_d.method("logs.trace", scope="operator.read")
 async def _handle_logs_trace(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
-    """Return safe trace events for one trace id."""
+    """Return safe trace events, or the UI projection, for one trace id.
+
+    ``view=projection`` is additive to the original response contract.  A
+    dedicated ``logs.trace_projection`` alias below makes the intent explicit
+    for new clients while preserving old clients that consume ``events``.
+    """
 
     p = params or {}
     trace_id = str(p.get("trace_id") or "").strip()
+    view = str(p.get("view") or "").lower()
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        if view in {"projection", "timeline"}:
+            return build_trace_projection([], trace_id=trace_id)
+        return {"trace_id": trace_id, "events": [], "count": 0, "total": 0}
     try:
         limit = max(1, min(int(p.get("limit", 1000)), 5000))
     except (TypeError, ValueError):
         limit = 1000
     if not trace_id:
+        if str(p.get("view") or "").lower() in {"projection", "timeline"}:
+            return build_trace_projection([], trace_id="")
         return {"trace_id": "", "events": [], "count": 0, "total": 0}
 
-    events = load_trace_events(trace_id)
+    events = await asyncio.to_thread(load_trace_events, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        if view in {"projection", "timeline"}:
+            return build_trace_projection([], trace_id=trace_id)
+        return {"trace_id": trace_id, "events": [], "count": 0, "total": 0}
+    if view in {"projection", "timeline"}:
+        after_seq = _optional_non_negative_int(p.get("after_seq"))
+        projection = build_trace_projection(
+            events, trace_id=trace_id, after_seq=after_seq, limit=limit
+        )
+        projection["source"] = "trace_events"
+        return projection
     limited = events[-limit:]
     return {
         "trace_id": trace_id,
         "events": [event.to_dict() for event in limited],
         "count": len(limited),
         "total": len(events),
+    }
+
+
+@_d.method("logs.turn_traces", scope="operator.read")
+async def _handle_logs_turn_traces(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Resolve all trace attempts for one chat turn, including an active turn."""
+
+    p = params or {}
+    session_key = str(p.get("session_key") or "").strip()
+    turn_id = str(p.get("turn_id") or "").strip()
+    trace_enabled = is_agent_trace_enabled(getattr(ctx, "config", None))
+    traces: list[dict[str, Any]] = []
+    if trace_enabled and session_key and turn_id:
+        trace_dir, _ = _configured_trace_log_dir()
+        raw_dir = resolve_turn_call_log_dir_with_source()[0]
+        traces = await asyncio.to_thread(
+            find_turn_traces,
+            session_key,
+            turn_id,
+            trace_dir=trace_dir,
+            raw_dir=raw_dir,
+        )
+    trace_enabled = is_agent_trace_enabled(getattr(ctx, "config", None))
+    if not trace_enabled:
+        traces = []
+    return {
+        "session_key": session_key,
+        "turn_id": turn_id,
+        "traces": traces,
+        "count": len(traces),
+        "raw_enabled": trace_enabled,
+    }
+
+
+def _optional_non_negative_int(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, parsed)
+
+
+def _trace_limit(value: Any) -> int:
+    try:
+        return max(1, min(int(value), 5000))
+    except (TypeError, ValueError):
+        return 1000
+
+
+@_d.method("logs.trace_projection", scope="operator.read")
+async def _handle_logs_trace_projection(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Return the privacy-preserving timeline projection for one trace id."""
+
+    p = params or {}
+    trace_id = str(p.get("trace_id") or "").strip()
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return build_trace_projection([], trace_id=trace_id)
+    if not trace_id:
+        return build_trace_projection([], trace_id="")
+    events = await asyncio.to_thread(load_trace_events, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return build_trace_projection([], trace_id=trace_id)
+    projection = build_trace_projection(
+        events,
+        trace_id=trace_id,
+        after_seq=_optional_non_negative_int(p.get("after_seq")),
+        limit=_trace_limit(p.get("limit", 1000)),
+    )
+    projection["source"] = "trace_events"
+    return projection
+
+
+@_d.method("logs.trace_details", scope="operator.admin")
+async def _handle_logs_trace_details(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Return the replay-oriented model/tool input-output rows for one trace.
+
+    Full payloads are available only while agent trace is enabled. The durable
+    ``turn-calls`` file is never rewritten by this endpoint; the response is a
+    bounded, redacted projection for the UI.
+    """
+
+    p = params or {}
+    trace_id = str(p.get("trace_id") or "").strip()
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return {
+            "trace_id": trace_id,
+            "available": False,
+            "source": "turn_call_log",
+            "reason": "trace_disabled",
+            "rows": [],
+            "count": 0,
+            "total": 0,
+        }
+    if not trace_id:
+        return build_trace_details([], trace_id="")
+    try:
+        limit = max(1, min(int(p.get("limit", 500)), 1000))
+    except (TypeError, ValueError):
+        limit = 500
+    records = await asyncio.to_thread(load_turn_call_records, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return {
+            "trace_id": trace_id,
+            "available": False,
+            "source": "turn_call_log",
+            "reason": "trace_disabled",
+            "rows": [],
+            "count": 0,
+            "total": 0,
+        }
+    return build_trace_details(
+        records,
+        trace_id=trace_id,
+        after_seq=_optional_non_negative_int(p.get("after_seq")),
+        limit=limit,
+    )
+
+
+@_d.method("logs.trace_payload", scope="operator.admin")
+async def _handle_logs_trace_payload(params: dict | None, ctx: RpcContext) -> dict[str, Any]:
+    """Fetch one complete redacted turn-call payload by trace and sequence."""
+
+    p = params or {}
+    trace_id = str(p.get("trace_id") or "").strip()
+    if not trace_id or not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return {"trace_id": trace_id, "available": False, "payload": None}
+    try:
+        raw_seq = p.get("seq")
+        if raw_seq is None:
+            raise ValueError("seq is required")
+        seq = int(raw_seq)
+    except (TypeError, ValueError):
+        return {"trace_id": trace_id, "available": False, "payload": None}
+    records = await asyncio.to_thread(load_turn_call_records, trace_id)
+    if not is_agent_trace_enabled(getattr(ctx, "config", None)):
+        return {"trace_id": trace_id, "available": False, "payload": None}
+    record = next(
+        (item for item in records if int(item.get("seq") or -1) == seq),
+        None,
+    )
+    if record is None:
+        return {"trace_id": trace_id, "available": False, "payload": None}
+    return {
+        "trace_id": trace_id,
+        "available": True,
+        "payload": redact_secret_value(record),
     }
 
 

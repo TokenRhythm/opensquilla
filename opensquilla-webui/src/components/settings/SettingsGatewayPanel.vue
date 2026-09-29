@@ -6,8 +6,10 @@ import DesktopLogLocationButton from '@/components/settings/DesktopLogLocationBu
 import SettingsUpdatePanel from '@/components/settings/SettingsUpdatePanel.vue'
 import SupportBundleButton from '@/components/SupportBundleButton.vue'
 import GatewayLogViewer from '@/components/GatewayLogViewer.vue'
+import TraceInspectorDialog from '@/components/trace/TraceInspectorDialog.vue'
+import { agentTraceEnabled } from '@/modules/agentTracePreference'
 
-defineProps<{ isDesktop: boolean }>()
+defineProps<{ isDesktop: boolean; initialTraceId?: string }>()
 
 const { t } = useI18n()
 </script>
@@ -28,6 +30,7 @@ const { t } = useI18n()
       <h4 id="settings-gateway-support-title" class="gateway-support__title">{{ t('monitorSupport.title') }}</h4>
       <div class="gateway-support__actions">
         <GatewayLogViewer />
+        <TraceInspectorDialog v-if="agentTraceEnabled" :initial-trace-id="initialTraceId" />
         <DesktopLogLocationButton v-if="isDesktop" />
         <SupportBundleButton />
       </div>

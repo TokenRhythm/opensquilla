@@ -132,9 +132,10 @@ SESSIONS_LIST_GATEWAY_ADAPTER = PACKAGE_ROOT / "gateway" / "adapters" / "session
 # Retire 19 generated MetaSkill methods and nine legacy workflow methods.
 # Retire router learning status and training feedback (two generated methods).
 # Retire the three advanced agent administration methods.
-RUNTIME_RPC_METHOD_BASELINE = 269
-RUNTIME_RPC_METHOD_DIGEST = "0a318497edc7647e3feedc807972b62622e74403386b1aaf1c166278b58c31d9"
-STATIC_RPC_DECORATOR_BASELINE = 63
+# Add four opt-in Agent Trace inspection methods.
+RUNTIME_RPC_METHOD_BASELINE = 273
+RUNTIME_RPC_METHOD_DIGEST = "42fb82776e580752fadeee6654bc5b5138ddb2e1d38f535b46424cafa3386841"
+STATIC_RPC_DECORATOR_BASELINE = 67
 
 # Physical lines in the sessions/runtime slice remain tracked for the final
 # closure measurement below.  The temporary S2a cumulative growth budget was

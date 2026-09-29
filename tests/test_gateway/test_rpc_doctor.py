@@ -7,6 +7,7 @@ import pytest
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.scopes import METHOD_SCOPES, READ_SCOPE
+from opensquilla.observability.trace import TraceContext, TraceEvent, write_trace_event
 
 
 async def _ready_memory(params: dict[str, Any], **_runtime: Any) -> dict[str, Any]:
@@ -119,6 +120,27 @@ def _reset_router_strategy_cache():
 @pytest.mark.asyncio
 async def test_doctor_status_is_read_scoped() -> None:
     assert METHOD_SCOPES["doctor.status"] == READ_SCOPE
+
+
+def test_doctor_logs_status_hides_trace_metadata_when_disabled(tmp_path, monkeypatch) -> None:
+    import opensquilla.gateway.rpc_doctor as rpc_doctor
+
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    write_trace_event(
+        TraceEvent(kind="turn_start", context=TraceContext.new(trace_id="trace-1")),
+        log_dir=tmp_path,
+    )
+    config = GatewayConfig()
+    ctx = RpcContext(conn_id="test", config=config)
+
+    assert "trace_log" not in rpc_doctor._build_logs_status(ctx)
+
+    config.privacy.agent_trace_enabled = True
+    enabled = rpc_doctor._build_logs_status(ctx)
+    assert enabled["trace_log"]["file_count"] == 1
+
+    config.privacy.agent_trace_enabled = False
+    assert "trace_log" not in rpc_doctor._build_logs_status(ctx)
 
 
 @pytest.mark.asyncio

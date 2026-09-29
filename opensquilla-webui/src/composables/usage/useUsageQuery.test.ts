@@ -22,6 +22,7 @@ describe('usage query presentation boundary', () => {
     const unused = async (): Promise<never> => { throw new Error('Unexpected observation') }
     const observability: Observability = {
       usage, tailLogs: unused, updateNotice: unused, downloadSupportBundle: unused,
+      turnTraces: unused, traceProjection: unused, traceDetails: unused, tracePayload: unused,
     }
     const options = {
       signal: new AbortController().signal,

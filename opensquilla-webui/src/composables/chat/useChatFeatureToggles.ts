@@ -29,12 +29,14 @@ export interface UseChatFeatureTogglesOptions {
   readOptions?: { readonly signal?: AbortSignal }
   connectionEpoch?: Readonly<Ref<unknown>>
   connectionAvailable?: Readonly<Ref<boolean>>
+  onConfigLoaded?: (config: ChatFeatureConfig) => void
   setGlobalElevatedMode: (mode: string) => void
   loadCurrentSessionUsage: () => void | Promise<void>
 }
 
 interface ChatFeatureConfig {
   llm?: { model?: string; provider?: string }
+  privacy?: { agent_trace_enabled?: boolean }
   agents?: readonly { id?: string; model?: string | null; enabled?: boolean }[]
   squilla_router?: {
     enabled?: boolean
@@ -304,6 +306,10 @@ export function useChatFeatureToggles(options: UseChatFeatureTogglesOptions) {
     try {
       cfg = await options.appSettings.readAll({ signal: options.readOptions?.signal }) as ChatFeatureConfig
       if (requestGeneration !== modelRoutingRequestGeneration) return
+      if (
+        defaultModelGeneration === defaultModelConfigGeneration
+        && options.connectionAvailable?.value !== false
+      ) options.onConfigLoaded?.(cfg)
       applyDefaultModelConfig(cfg, defaultModelGeneration)
       await applyFeatureConfig(cfg, { refreshUsage: true })
       if (requestGeneration !== modelRoutingRequestGeneration) return

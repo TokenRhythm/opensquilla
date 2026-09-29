@@ -7,14 +7,16 @@ from typing import Any
 
 import pytest
 
-from opensquilla.engine import Agent, AgentConfig
+from opensquilla.engine import Agent, AgentConfig, ToolResult
 from opensquilla.engine.agent import _provider_retry_delay_seconds
+from opensquilla.engine.pipeline import TurnContext
 from opensquilla.engine.routing.health import ProviderHealthLedger
 from opensquilla.engine.runtime import (
     _SELECTOR_REASONING_TRUNCATED_NOTICE,
     _report_credential_pool_failure,
     _SelectorFallbackProvider,
     _SelectorPreTextBuffer,
+    _trace_routing_decision_payload,
 )
 from opensquilla.engine.types import ErrorEvent as EngineErrorEvent
 from opensquilla.engine.types import ProviderActivityEvent, ThinkingEvent
@@ -26,6 +28,8 @@ from opensquilla.provider import (
     ProviderFailureKind,
     ReasoningDeltaEvent,
     TextDeltaEvent,
+    ToolDefinition,
+    ToolInputSchema,
     ToolUseDeltaEvent,
     ToolUseEndEvent,
     ToolUseStartEvent,
@@ -67,6 +71,136 @@ class _CapturingTurnLog:
         self.records.append({"kind": kind, "payload": payload})
 
 
+@pytest.mark.asyncio
+async def test_call_duration_excludes_context_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time
+
+    now = [10.0]
+    monkeypatch.setattr(
+        "opensquilla.engine.agent.time",
+        SimpleNamespace(
+            monotonic=lambda: now[0], time=time.time, time_ns=time.time_ns,
+            perf_counter=time.perf_counter,
+        ),
+    )
+
+    class TimedLog(_CapturingTurnLog):
+        def write(self, kind: str, payload: dict[str, Any]) -> None:
+            if kind == "context_stage" and payload.get("stage") == "stream:context":
+                now[0] += 2.0
+            super().write(kind, payload)
+
+    class TimedProvider(_SequenceProvider):
+        async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+            now[0] += 0.25
+            async for event in super()._stream(events):
+                yield event
+
+    turn_log = TimedLog()
+    agent = Agent(
+        provider=TimedProvider([[TextDeltaEvent(text="done"), DoneEvent(stop_reason="stop")]]),
+        config=AgentConfig(max_provider_retries=0),
+        turn_call_logger=turn_log,  # type: ignore[arg-type]
+    )
+    _ = [event async for event in agent.run_turn("hello")]
+    response = next(row for row in turn_log.records if row["kind"] == "llm_response")
+    assert now[0] == 12.25
+    assert response["payload"]["duration_ms"] == 250
+
+
+@pytest.mark.asyncio
+async def test_agent_persists_bounded_progress_before_provider_finishes(monkeypatch) -> None:
+    import time
+
+    now = [20.0]
+    synthetic_time = SimpleNamespace(**vars(time))
+    synthetic_time.monotonic = lambda: now[0]
+    monkeypatch.setattr("opensquilla.engine.agent.time", synthetic_time)
+    turn_log = _CapturingTurnLog()
+
+    class LiveProvider(_SequenceProvider):
+        async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+            yield ReasoningDeltaEvent(text="inspect")
+            assert [row["kind"] for row in turn_log.records].count("llm_progress") == 1
+            now[0] += 0.25
+            yield TextDeltaEvent(text="first")
+            assert [row["kind"] for row in turn_log.records].count("llm_progress") == 1
+            now[0] += 1.0
+            yield TextDeltaEvent(text=" second")
+            assert not any(row["kind"] == "llm_response" for row in turn_log.records)
+            progress = [row for row in turn_log.records if row["kind"] == "llm_progress"]
+            assert len(progress) == 2
+            assert progress[-1]["payload"]["text"] == "first second"
+            assert progress[-1]["payload"]["reasoning_content"] == "inspect"
+            assert "messages" not in progress[-1]["payload"]
+            yield DoneEvent(stop_reason="stop", reasoning_content="inspect")
+
+    agent = Agent(
+        provider=LiveProvider([[]]),
+        config=AgentConfig(max_provider_retries=0),
+        turn_call_logger=turn_log,  # type: ignore[arg-type]
+    )
+    _ = [event async for event in agent.run_turn("hello")]
+    call_rows = [row for row in turn_log.records if row["kind"].startswith("llm_")]
+    assert [row["kind"] for row in call_rows] == [
+        "llm_request", "llm_progress", "llm_progress", "llm_response",
+    ]
+    assert len({row["payload"]["call_id"] for row in call_rows}) == 1
+    assert call_rows[-1]["payload"]["text"] == "first second"
+    assert call_rows[-1]["payload"]["reasoning_content"] == "inspect"
+
+
+@pytest.mark.asyncio
+async def test_agent_captures_tool_arguments_while_model_is_still_generating(monkeypatch) -> None:
+    import time
+
+    now = [30.0]
+    synthetic_time = SimpleNamespace(**vars(time))
+    synthetic_time.monotonic = lambda: now[0]
+    monkeypatch.setattr("opensquilla.engine.agent.time", synthetic_time)
+    turn_log = _CapturingTurnLog()
+
+    class LiveToolProvider(_SequenceProvider):
+        async def _stream(self, events: list[Any]) -> AsyncIterator[Any]:
+            if self.calls > 1:
+                yield TextDeltaEvent(text="done")
+                yield DoneEvent(stop_reason="stop")
+                return
+            yield ToolUseStartEvent(tool_use_id="tool-a", tool_name="echo")
+            now[0] += 1.0
+            yield ToolUseDeltaEvent(tool_use_id="tool-a", json_fragment='{"value": "par')
+            partial = [row for row in turn_log.records if row["kind"] == "llm_progress"][-1]
+            assert partial["payload"]["tool_calls"][0]["arguments_text"] == '{"value": "par'
+            assert not any(
+                row["kind"] in {"llm_response", "tool_request"} for row in turn_log.records
+            )
+            yield ToolUseDeltaEvent(tool_use_id="tool-a", json_fragment='tial"}')
+            yield ToolUseEndEvent(
+                tool_use_id="tool-a", tool_name="echo", arguments={"value": "partial"}
+            )
+            yield DoneEvent(stop_reason="tool_use")
+
+    async def tool_handler(call: Any) -> ToolResult:
+        return ToolResult(tool_use_id=call.tool_use_id, tool_name=call.tool_name, content="ok")
+
+    agent = Agent(
+        provider=LiveToolProvider([[]]),
+        config=AgentConfig(max_provider_retries=0),
+        tool_definitions=[ToolDefinition(
+            name="echo", description="Echo a value.",
+            input_schema=ToolInputSchema(
+                properties={"value": {"type": "string"}}, required=["value"]
+            ),
+        )],
+        tool_handler=tool_handler,
+        turn_call_logger=turn_log,  # type: ignore[arg-type]
+    )
+    _ = [event async for event in agent.run_turn("use echo")]
+    final = next(row for row in turn_log.records if row["kind"] == "llm_response")
+    assert final["payload"]["tool_calls"][0]["arguments"] == {"value": "partial"}
+
+
+
 @pytest.fixture
 async def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     loop = asyncio.get_running_loop()
@@ -82,6 +216,65 @@ async def retry_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     monkeypatch.setattr(loop, "time", lambda: now[0])
     monkeypatch.setattr("opensquilla.engine.agent.asyncio.sleep", fake_sleep)
     return sleeps
+
+
+@pytest.mark.parametrize(
+    ("router_enabled", "ensemble_enabled", "metadata", "requested", "effective"),
+    [
+        (False, False, {}, "direct", "direct"),
+        (True, False, {"routing_applied": True, "routing_source": "classifier"},
+         "router", "router"),
+        (True, True, {"routing_applied": True, "ensemble_enabled": True},
+         "ensemble", "ensemble"),
+        (True, True, {"routing_applied": True,
+                     "ensemble_wrap_skipped_reason": "no_eligible_members"},
+         "ensemble", "direct"),
+    ],
+)
+def test_trace_route_keeps_requested_mode_and_actual_execution_separate(
+    router_enabled: bool,
+    ensemble_enabled: bool,
+    metadata: dict[str, Any],
+    requested: str,
+    effective: str,
+) -> None:
+    config = SimpleNamespace(
+        squilla_router=SimpleNamespace(enabled=router_enabled, rollout_phase="full"),
+        llm_ensemble=SimpleNamespace(enabled=ensemble_enabled),
+    )
+    turn = TurnContext(
+        message="synthetic", session_key="synthetic", config=config, provider=None,
+        model="selected-model", tool_defs=[], system_prompt="", metadata=metadata,
+    )
+    payload = _trace_routing_decision_payload(
+        turn, config, requested_mode=requested, requested_model="requested-model",
+        selected_model="selected-model", provider="synthetic-provider",
+    )
+    assert payload["requested_mode"] == requested
+    assert payload["effective_mode"] == effective
+    assert payload["requested_model"] == "requested-model"
+    assert payload["selected_model"] == "selected-model"
+    assert payload["router_enabled"] is router_enabled
+    assert "duration_ms" not in payload
+    if "ensemble_wrap_skipped_reason" in metadata:
+        assert payload["reason"] == "no_eligible_members"
+
+
+def test_trace_disabled_router_is_a_direct_selection_without_classifier_evidence() -> None:
+    config = SimpleNamespace(squilla_router=SimpleNamespace(enabled=False))
+    turn = TurnContext(
+        message="synthetic", session_key="synthetic", config=config, provider=None,
+        model="fixed-model", tool_defs=[], system_prompt="",
+    )
+    payload = _trace_routing_decision_payload(
+        turn, config, requested_mode=None, requested_model=None,
+        selected_model="fixed-model", provider="synthetic-provider",
+    )
+    assert payload["requested_mode"] == payload["effective_mode"] == "direct"
+    assert payload["reason"] == "router_disabled"
+    assert payload["routing_applied"] is False
+    assert "routing_confidence" not in payload
+    assert "routed_tier" not in payload
 
 
 def test_provider_retry_delay_uses_larger_provider_hint() -> None:
@@ -201,8 +394,10 @@ async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
             [TextDeltaEvent(text="ok"), DoneEvent(stop_reason="stop")],
         ]
     )
+    turn_log = _CapturingTurnLog()
     agent = Agent(
         provider=provider,
+        turn_call_logger=turn_log,  # type: ignore[arg-type]
         config=AgentConfig(
             max_provider_retries=1,
             retry_base_backoff_ms=1_000,
@@ -226,6 +421,14 @@ async def test_agent_retries_rate_limit_on_same_deployment_after_provider_wait(
     assert activity[1].retry_attempt == activity[1].retry_limit == 1
     assert not any(isinstance(event, EngineErrorEvent) for event in events)
     assert not any("synthetic rate limit" in repr(event) for event in activity)
+
+    boundaries = [row for row in turn_log.records if row["kind"] == "provider_retry"]
+    assert [row["payload"]["phase"] for row in boundaries] == ["retry_wait", "retrying"]
+    assert boundaries[0]["payload"]["retry_after_ms"] == 8_000
+    kinds = [row["kind"] for row in turn_log.records]
+    assert kinds.index("llm_error") < kinds.index("provider_retry")
+    assert kinds.index("provider_retry") < kinds.index("llm_response")
+    assert all("duration_ms" not in row["payload"] for row in boundaries)
 
 
 @pytest.mark.asyncio

@@ -10,8 +10,9 @@ entry. JSON artifacts are scrubbed as objects and validated before writing;
 free text passes ``scrub_text``. An invalid manifest fails the bundle.
 
 Excluded always: desktop-credential.json, .env files, raw decision mirrors.
-Excluded at the default tier: turn-calls-*.jsonl (raw prompt/response capture)
-— included only with ``include_content=True``.
+Excluded at the default tier: turn-calls-*.jsonl (raw prompt/response capture).
+The content tier includes only records explicitly marked for Agent Trace when
+Trace is enabled.
 """
 
 from __future__ import annotations
@@ -178,6 +179,30 @@ def _add_tail(
         )
         data = (marker + "\n").encode() + data
     _write_text(archive, entry_name, data.decode("utf-8", errors="replace"))
+
+
+def _add_agent_trace_turn_calls(
+    archive: zipfile.ZipFile,
+    entry_name: str,
+    path: Path,
+    truncations: list[dict[str, Any]],
+    cap: int = _TAIL_CAP,
+) -> None:
+    """Export only marked Trace rows from a bounded raw-log tail."""
+    data, truncated = _tail_bytes(path, cap)
+    selected: list[str] = []
+    for number, line in enumerate(_jsonl_lines(data.decode("utf-8", errors="replace")), start=1):
+        try:
+            record = _parse_json(line)
+        except ValueError as exc:
+            raise ValueError(f"Invalid JSONL at line {number}: {exc}") from None
+        if isinstance(record, dict) and record.get("agent_trace") is True:
+            selected.append(line)
+    if not selected:
+        return
+    _write_text(archive, entry_name, "\n".join(selected) + "\n")
+    if truncated:
+        truncations.append({"entry": entry_name, "source": str(path), "cap_bytes": cap})
 
 
 def _recent_day_files(directory: Path, prefix: str, days: int) -> list[Path]:
@@ -400,16 +425,20 @@ def _add_day_files(
     log_dir: Path,
     days: int,
     include_content: bool,
+    agent_trace_enabled: bool,
     attempt: _Attempt,
     truncations: list[dict[str, Any]],
 ) -> None:
-    groups = [("decisions", "decisions"), ("traces", "traces")]
-    if include_content:
-        groups.append(("turn-calls", "content"))
+    groups = [("decisions", "decisions")]
+    if agent_trace_enabled:
+        groups.append(("traces", "traces"))
+        if include_content:
+            groups.append(("turn-calls", "content"))
     for prefix, folder in groups:
         for path in _recent_day_files(log_dir, prefix, days):
             entry_name = f"{folder}/{path.name}"
-            attempt(entry_name, partial(_add_tail, archive, entry_name, path, truncations))
+            add_file = _add_agent_trace_turn_calls if prefix == "turn-calls" else _add_tail
+            attempt(entry_name, partial(add_file, archive, entry_name, path, truncations))
 
 
 def _add_extra_blob(archive: zipfile.ZipFile, key: str, value: Any) -> None:
@@ -461,6 +490,7 @@ def collect_bundle(
     days: int = 3,
     session_id: str | None = None,
     include_content: bool = False,
+    agent_trace_enabled: bool | None = None,
     home_dir: Path | None = None,
     log_dir: Path | None = None,
     extra: dict[str, Any] | None = None,
@@ -471,6 +501,7 @@ def collect_bundle(
     collection_errors: list[dict[str, str]] = []
     truncations: list[dict[str, Any]] = []
     config_meta: dict[str, str | None] = {"path": None, "source": None}
+    trace_enabled = agent_trace_enabled is True
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -483,7 +514,13 @@ def collect_bundle(
                 collection_errors.append({"artifact": artifact, "error": str(exc)})
 
         def _config() -> None:
+            nonlocal trace_enabled
             data, path_str, source = _collect_config()
+            if agent_trace_enabled is None and isinstance(data, dict):
+                privacy = data.get("privacy")
+                trace_enabled = (
+                    isinstance(privacy, dict) and privacy.get("agent_trace_enabled") is True
+                )
             config_meta["path"], config_meta["source"] = path_str, source
             _write_json(archive, "config.redacted.json", data)
 
@@ -507,7 +544,9 @@ def collect_bundle(
         )
         _add_log_artifacts(archive, home, logs_dir, _attempt, truncations)
         _add_desktop_logs(archive, home, _attempt, truncations)
-        _add_day_files(archive, logs_dir, days, include_content, _attempt, truncations)
+        _add_day_files(
+            archive, logs_dir, days, include_content, trace_enabled, _attempt, truncations
+        )
         for key, value in (extra or {}).items():
             _attempt(f"live/{key}.json", partial(_add_extra_blob, archive, key, value))
         manifest = _build_manifest(

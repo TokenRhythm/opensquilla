@@ -20,8 +20,14 @@ TracePrivacy = Literal["operational", "diagnostic", "raw"]
 _VALID_PRIVACY: frozenset[str] = frozenset({"operational", "diagnostic", "raw"})
 
 
+def is_agent_trace_enabled(config: Any | None) -> bool:
+    """Return the persisted opt-in for local agent run trace capture."""
+
+    return bool(getattr(getattr(config, "privacy", None), "agent_trace_enabled", False))
+
+
 def _utc_ts() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _default_log_dir() -> Path:
@@ -132,6 +138,12 @@ class TraceEvent:
     payload: dict[str, Any] = field(default_factory=dict)
     ts: str = field(default_factory=_utc_ts)
     schema_version: int = TRACE_SCHEMA_VERSION
+    # Optional span metadata is additive to the original event envelope.  It
+    # lets newer producers provide a real execution graph while old producers
+    # continue to emit point events that the projection layer can normalize.
+    span_id: str | None = None
+    parent_span_id: str | None = None
+    phase: str | None = None
 
     def __post_init__(self) -> None:
         if self.schema_version != TRACE_SCHEMA_VERSION:
@@ -140,6 +152,10 @@ class TraceEvent:
             raise ValueError("trace event kind must be non-empty")
         if self.privacy not in _VALID_PRIVACY:
             raise ValueError(f"invalid trace privacy: {self.privacy}")
+        for field_name in ("span_id", "parent_span_id", "phase"):
+            value = getattr(self, field_name)
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ValueError(f"{field_name} must be non-empty when provided")
 
     @property
     def trace_id(self) -> str:
@@ -155,6 +171,9 @@ class TraceEvent:
             "seq": self.seq,
             "attrs": self.attrs,
             "payload": self.payload,
+            "span_id": self.span_id,
+            "parent_span_id": self.parent_span_id,
+            "phase": self.phase,
         }
 
 
@@ -266,4 +285,7 @@ def _trace_event_from_payload(payload: dict[str, Any]) -> TraceEvent:
         payload=payload.get("payload") or {},
         ts=str(payload.get("ts") or _utc_ts()),
         schema_version=int(payload.get("schema_version", TRACE_SCHEMA_VERSION)),
+        span_id=payload.get("span_id"),
+        parent_span_id=payload.get("parent_span_id"),
+        phase=payload.get("phase"),
     )

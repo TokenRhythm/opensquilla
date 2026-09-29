@@ -11,6 +11,7 @@ from opensquilla.observability.trace import (
     load_trace_events,
     write_trace_event,
 )
+from opensquilla.observability.trace_projection import build_trace_projection
 
 
 def test_trace_context_child_inherits_parent_identity() -> None:
@@ -63,6 +64,112 @@ def test_trace_event_serializes_required_contract_fields() -> None:
     assert payload["seq"] == 7
     assert payload["attrs"] == {"source": "test"}
     assert payload["payload"] == {"message_hash": "abc123"}
+
+
+def test_trace_projection_groups_phases_without_exposing_payload() -> None:
+    context = TraceContext.new(trace_id="trace-projection", turn_id="turn-1", run_id="run-1")
+    events = [
+        TraceEvent(kind="turn_start", context=context, seq=1),
+        TraceEvent(
+            kind="route.resolved",
+            context=context,
+            seq=2,
+            attrs={"requested_mode": "router", "effective_mode": "ensemble", "model": "m"},
+        ),
+        TraceEvent(
+            kind="tool_call",
+            context=context,
+            seq=3,
+            attrs={"tool_name": "search", "status": "completed"},
+            payload={"secret_prompt": "must not be projected"},
+        ),
+        TraceEvent(kind="turn_end", context=context, seq=4),
+    ]
+
+    projection = build_trace_projection(events)
+
+    assert projection["trace_id"] == "trace-projection"
+    assert projection["status"] == "success"
+    assert projection["complete"] is True
+    assert projection["requested_mode"] == "router"
+    assert projection["effective_mode"] == "ensemble"
+    assert [phase["phase"] for phase in projection["phases"]] == [
+        "intake",
+        "routing",
+        "tool_execution",
+        "finalize",
+    ]
+    tool_row = projection["spans"][2]
+    assert tool_row["tool_name"] == "search"
+    assert tool_row["payload_keys"] == ["secret_prompt"]
+    assert "secret_prompt" not in tool_row
+
+
+def test_trace_projection_after_seq_returns_only_new_rows() -> None:
+    context = TraceContext.new(trace_id="trace-cursor")
+    events = [
+        TraceEvent(kind="turn_start", context=context, seq=1),
+        TraceEvent(kind="model_start", context=context, seq=2),
+        TraceEvent(kind="turn_end", context=context, seq=3),
+    ]
+
+    projection = build_trace_projection(events, after_seq=1, limit=1)
+
+    assert projection["current_seq"] == 3
+    assert [row["seq"] for row in projection["spans"]] == [2]
+    assert projection["total"] == 3
+    assert projection["has_more"] is True
+
+
+def test_trace_projection_keeps_elapsed_position_separate_from_duration() -> None:
+    context = TraceContext.new(trace_id="trace-timing-units")
+    events = [
+        TraceEvent(
+            kind="context_stage",
+            context=context,
+            seq=1,
+            attrs={"elapsed_ms": 1250},
+        ),
+        TraceEvent(
+            kind="tool_response",
+            context=context,
+            seq=2,
+            attrs={"elapsed_ms": 4300, "duration_ms": 87},
+        ),
+    ]
+
+    rows = build_trace_projection(events)["spans"]
+
+    # A turn-relative elapsed position is useful for ordering but must not be
+    # rendered as a 1.25-second interval. Only duration_ms supplies width.
+    assert rows[0]["elapsed_ms"] == 1250
+    assert rows[0]["duration_ms"] is None
+    assert rows[1]["elapsed_ms"] == 4300
+    assert rows[1]["duration_ms"] == 87
+
+
+@pytest.mark.parametrize(
+    ("kind", "phase"),
+    [
+        ("routing_decision", "routing"),
+        ("provider_retry", "routing"),
+        ("provider_thinking_fallback", "routing"),
+        ("provider_generation_reset", "routing"),
+        ("tool_approval_resolved", "approval_sandbox"),
+        ("context_compaction_completed", "compaction_maintenance"),
+        ("subagent_tool_completed", "subagent"),
+    ],
+)
+def test_trace_projection_classifies_boundaries_before_model_and_tool_names(
+    kind: str, phase: str,
+) -> None:
+    event = TraceEvent(kind=kind, context=TraceContext.new(trace_id="trace-boundary"), seq=1)
+
+    [row] = build_trace_projection([event])["spans"]
+
+    assert row["phase"] == phase
+    assert row["status"] == "success"
+    assert row["duration_ms"] is None
 
 
 def test_privacy_guard_blocks_raw_events_by_default() -> None:

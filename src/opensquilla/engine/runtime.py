@@ -212,7 +212,12 @@ from opensquilla.observability.network_policy import (
     provider_request_correlation_disabled,
 )
 from opensquilla.observability.prompt_report import PromptReport, build_prompt_report
-from opensquilla.observability.trace import TraceContext, TraceEvent, write_trace_event
+from opensquilla.observability.trace import (
+    TraceContext,
+    TraceEvent,
+    is_agent_trace_enabled,
+    write_trace_event,
+)
 from opensquilla.observability.turn_call_log import TurnCallLogger, is_turn_call_log_enabled
 from opensquilla.paths import media_root_from_config
 from opensquilla.process_tree import task_process_scope
@@ -624,6 +629,61 @@ def _hooks_mode_from_env() -> str:
 
     raw = os.environ.get(_HOOKS_FEATURE_ENV, "").strip().lower()
     return "legacy" if raw == "legacy" else "new"
+
+
+def _trace_routing_decision_payload(
+    turn: TurnContext,
+    config: Any,
+    *,
+    requested_mode: str | None,
+    requested_model: str | None,
+    selected_model: str,
+    provider: str,
+) -> dict[str, Any]:
+    router = getattr(config, "squilla_router", None)
+    ensemble = getattr(config, "llm_ensemble", None)
+    router_enabled = bool(getattr(router, "enabled", False))
+    ensemble_enabled = bool(getattr(ensemble, "enabled", False))
+    rollout_phase = str(getattr(router, "rollout_phase", "observe") or "observe")
+    configured_mode = (
+        "ensemble" if ensemble_enabled else "router"
+        if router_enabled and rollout_phase != "observe" else "direct"
+    )
+    effective_mode = (
+        "ensemble" if turn.metadata.get("ensemble_enabled") else "router"
+        if turn.metadata.get("routing_applied") is True
+        and not turn.metadata.get("ensemble_wrap_skipped_reason") else "direct"
+    )
+    reason = str(
+        turn.metadata.get("ensemble_wrap_skipped_reason")
+        or turn.metadata.get("routing_source")
+        or ("router_disabled" if not router_enabled else "configured_model")
+    )
+    payload: dict[str, Any] = {
+        "status": "success",
+        "requested_mode": requested_mode or configured_mode,
+        "effective_mode": effective_mode,
+        "requested_model": requested_model or str(turn.metadata.get("baseline_model") or ""),
+        "selected_model": selected_model,
+        "provider": provider,
+        "router_enabled": router_enabled,
+        "routing_applied": bool(turn.metadata.get("routing_applied")),
+        "reason": reason,
+        "rollout_phase": rollout_phase,
+    }
+    for key in (
+        "routed_tier", "routed_model", "routing_confidence", "routing_extra",
+        "ensemble_selection_mode", "ensemble_activation_source", "ensemble_fallback_reason",
+        "routed_provider_fallback_reason", "router_fallback_reason",
+    ):
+        if key in turn.metadata:
+            payload[key] = turn.metadata[key]
+    plan = getattr(turn, "route_plan", None)
+    if plan is not None:
+        payload["route_plan"] = plan.as_dict()
+    elif isinstance(turn.metadata.get("route_plan"), Mapping):
+        payload["route_plan"] = turn.metadata["route_plan"]
+    return payload
 
 
 def _is_deepseek_model_id(model: str) -> bool:
@@ -6125,6 +6185,35 @@ class TurnRunner:
             },
         )
         try:
+            legacy_raw_for_turn = is_turn_call_log_enabled(self._diagnostics_state)
+            if is_agent_trace_enabled(self._config) or legacy_raw_for_turn:
+                turn_call_logger = TurnCallLogger(
+                    trace_id=trace_context.trace_id,
+                    turn_id=turn_id,
+                    session_key=session_key,
+                    session_intent=session_intent,
+                    agent_id=agent_id,
+                    provider="",
+                    model="",
+                    source=self._build_turn_call_source(
+                        tool_context,
+                        input_provenance,
+                        run_kind=run_kind,
+                    ),
+                    started_monotonic=turn_started_at,
+                    capture_enabled=lambda: legacy_raw_for_turn
+                    or is_agent_trace_enabled(self._config),
+                    agent_trace_enabled=lambda: is_agent_trace_enabled(self._config),
+                )
+                turn_call_logger.write(
+                    "turn_start",
+                    {
+                        "boundary": "turn_runner_entry",
+                        "input_mode": input_mode,
+                        "message": message,
+                        "attachment_count": len(attachments),
+                    },
+                )
             # Resolve the durable identity before any pipeline stage can make
             # an auxiliary provider call. This lookup is independent from the
             # optional usage sink and never falls back to the external
@@ -6267,6 +6356,15 @@ class TurnRunner:
                 # yield, return).
                 provider_error_event = cast(ErrorEvent, pt_outcome.require_early_yield())
                 log.error("turn_runner.no_provider", session_key=session_key)
+                if turn_call_logger is not None:
+                    turn_call_logger.write(
+                        "turn_error",
+                        {
+                            "error_type": "ProviderResolutionError",
+                            "error_code": provider_error_event.code,
+                            "error_chars": len(provider_error_event.message),
+                        },
+                    )
                 self._emit_turn_event(
                     "turn_error",
                     trace_context,
@@ -6531,32 +6629,15 @@ class TurnRunner:
                     else pa_out.trace_context_session_id
                 ),
             )
-            if is_turn_call_log_enabled(self._diagnostics_state):
-                turn_call_logger = TurnCallLogger(
-                    trace_id=trace_context.trace_id,
-                    turn_id=turn_id,
-                    session_key=session_key,
-                    session_id=session_id_for_log,
-                    session_intent=session_intent,
-                    agent_id=agent_id,
-                    provider=provider_name,
-                    model=resolved_model,
-                    source=self._build_turn_call_source(
-                        tool_context,
-                        input_provenance,
-                        run_kind=run_kind,
-                    ),
-                )
+            if turn_call_logger is not None:
+                turn_call_logger.session_id = session_id_for_log
+                turn_call_logger.provider = provider_name
+                turn_call_logger.model = resolved_model
                 turn_call_logger.write(
                     "prompt_report",
-                    asdict(prompt_report_for_log),
-                )
-                turn_call_logger.write(
-                    "turn_start",
                     {
-                        "input_mode": input_mode,
-                        "message": effective_runtime_message,
-                        "attachment_count": len(attachments),
+                        **asdict(prompt_report_for_log),
+                        "effective_runtime_message": effective_runtime_message,
                         "tool_names": [getattr(td, "name", "") for td in turn.tool_defs],
                     },
                 )
@@ -6678,6 +6759,17 @@ class TurnRunner:
             if router_event is not None:
                 yield router_event
             if turn_call_logger is not None:
+                turn_call_logger.write(
+                    "router_decision",
+                    _trace_routing_decision_payload(
+                        turn,
+                        self._turn_config(),
+                        requested_mode=getattr(_ACCEPTED_TURN_CONFIG.get(), "session_mode", None),
+                        requested_model=model,
+                        selected_model=resolved_model,
+                        provider=active_provider_id,
+                    ),
+                )
                 turn_call_logger.write(
                     "agent_runtime_budget",
                     {
@@ -8228,13 +8320,14 @@ class TurnRunner:
         if context is None:
             return
         if _hooks_mode_from_env() == "legacy":
-            self._write_trace_event(
-                kind,
-                context,
-                seq=seq,
-                attrs=attrs,
-                payload=payload,
-            )
+            if is_agent_trace_enabled(self._config):
+                self._write_trace_event(
+                    kind,
+                    context,
+                    seq=seq,
+                    attrs=attrs,
+                    payload=payload,
+                )
             return
         hook_ctx = TurnHookContext(
             session_key=session_key,
@@ -8251,6 +8344,10 @@ class TurnRunner:
             payload=dict(payload or {}),
         )
         for hook in self._turn_hooks:
+            if isinstance(hook, DefaultTraceEmitterHook) and not is_agent_trace_enabled(
+                self._config
+            ):
+                continue
             try:
                 hook.on_event(hook_ctx, event)
             except Exception as exc:  # noqa: BLE001 - hooks must not break turns

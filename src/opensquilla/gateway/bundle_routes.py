@@ -34,6 +34,7 @@ from opensquilla.gateway.origin_guard import (
 from opensquilla.gateway.origin_guard import (
     request_principal_is_owner as _request_principal_is_owner,
 )
+from opensquilla.observability.trace import is_agent_trace_enabled
 
 log = structlog.get_logger(__name__)
 
@@ -82,12 +83,18 @@ def register_bundle_routes(app: Starlette, *, config: GatewayConfig) -> None:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
         try:
-            await asyncio.to_thread(
-                bundle_module.collect_bundle,
-                dest,
-                days=days,
-                include_content=include_content,
-            )
+            def _collect(trace_enabled: bool) -> None:
+                bundle_module.collect_bundle(
+                    dest,
+                    days=days,
+                    include_content=include_content,
+                    agent_trace_enabled=trace_enabled,
+                )
+
+            trace_enabled = is_agent_trace_enabled(config)
+            await asyncio.to_thread(_collect, trace_enabled)
+            if trace_enabled and not is_agent_trace_enabled(config):
+                await asyncio.to_thread(_collect, False)
         except Exception as exc:
             # Full traceback goes to the server log only — never the response.
             log.error("bundle_route.generation_failed", error=str(exc), exc_info=True)

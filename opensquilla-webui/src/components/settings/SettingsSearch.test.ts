@@ -49,6 +49,16 @@ describe('SettingsSearch', () => {
     expect(select).toHaveBeenCalledExactlyOnceWith('interface', 'settings.appearance.themeLabel')
   })
 
+  it('finds the trace switch under Security & Privacy', async () => {
+    const { input, host, select } = mountSearch('zh-Hans')
+    await search(input, 'Trace')
+    const result = Array.from(host.querySelectorAll<HTMLButtonElement>('.settings-search__result'))
+      .find(button => button.querySelector('strong')?.textContent === zh.settings.rail.securityPrivacy)!
+    expect(result).toBeTruthy()
+    result.click()
+    expect(select).toHaveBeenLastCalledWith('securityPrivacy', 'settings.securityPrivacy.agentTraceLabel')
+  })
+
   it('keeps a result mounted while pointer focus moves from the input to its button', async () => {
     const { input, host, select } = mountSearch()
     // Chromium reports body as activeElement during focusout, before the

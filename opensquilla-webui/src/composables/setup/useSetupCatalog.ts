@@ -47,6 +47,7 @@ import { useSettingsPromotedForm, DEFAULT_LLM_TIMEOUT_SECONDS } from '@/composab
 import { useSettingsSection } from '@/composables/setup/useSettingsSection'
 import { SETTINGS_SECTIONS, type SettingsSectionId } from '@/composables/setup/settingsSections'
 import { GATEWAY_ACCESS_KEY } from '@/modules/gatewayAccess'
+import { notifyAgentTracePreferenceChanged, registerAgentTracePreferenceReader, setAgentTraceEnabled } from '@/modules/agentTracePreference'
 import { useToasts } from '@/composables/useToasts'
 import { useConfirm } from '@/composables/useConfirm'
 import { chooseRouterConflictAction, submitPrimaryProviderTransition } from '@/composables/setup/primaryProviderTransition'
@@ -435,6 +436,7 @@ interface ConfigData {
     providers?: Record<string, { api_key?: string; api_key_env?: string; base_url?: string }>
   }
   privacy?: {
+    agent_trace_enabled?: boolean
     disable_network_observability?: boolean
     network_observability_disabled_effective?: boolean
     reliability_diagnostics_enabled?: boolean | null
@@ -470,6 +472,19 @@ const gatewayAccess = injectedGatewayAccess
 const injectedAppSettings = inject(APP_SETTINGS_KEY)
 if (!injectedAppSettings) throw new Error('AppSettings was not provided')
 const appSettings: AppSettings = injectedAppSettings
+const unregisterAgentTracePreferenceReader = registerAgentTracePreferenceReader(
+  appSettings,
+  () => gatewayAccess.isAvailable,
+  enabled => {
+    if (!catalogMounted) return
+    const draftWasDirty = agentTraceDraft.value !== currentAgentTraceEnabled.value
+    config.value = {
+      ...config.value,
+      privacy: { ...config.value.privacy, agent_trace_enabled: enabled },
+    }
+    if (!draftWasDirty) agentTraceDraft.value = enabled
+  },
+)
 const injectedSetupWorkflow = inject(SETUP_WORKFLOW_KEY)
 if (!injectedSetupWorkflow) throw new Error('SetupWorkflow was not provided')
 const setupWorkflow: SetupWorkflow = injectedSetupWorkflow
@@ -490,6 +505,7 @@ const effectiveConfig = ref<EffectiveConfigData>({})
 const loaded = ref(false)
 const { section, setSection } = useSettingsSection('provider')
 const disableNetworkObservability = ref(false)
+const agentTraceDraft = ref(false)
 const capabilityResetPending = ref<CapabilityId | ''>('')
 const saveAllPending = ref(false)
 const providerSavePending = ref(false)
@@ -833,7 +849,41 @@ watch(() => gatewayAccess.isAvailable, available => {
   if (available) void loadInitialData()
 })
 
+let traceSettingsGeneration = 0
+watch(
+  [() => gatewayAccess.isAvailable, () => gatewayAccess.subscriptionEpoch],
+  ([available, epoch]) => {
+    const generation = ++traceSettingsGeneration
+    setAgentTraceEnabled(false)
+    agentTraceDraft.value = false
+    config.value = {
+      ...config.value,
+      privacy: { ...config.value.privacy, agent_trace_enabled: false },
+    }
+    if (!available) return
+    if (!loaded.value) {
+      void loadInitialData()
+      return
+    }
+    void appSettings.read('privacy.agent_trace_enabled').then(value => {
+      if (
+        generation !== traceSettingsGeneration || !catalogMounted
+        || !gatewayAccess.isAvailable || gatewayAccess.subscriptionEpoch !== epoch
+      ) return
+      const enabled = value === true
+      config.value = {
+        ...config.value,
+        privacy: { ...config.value.privacy, agent_trace_enabled: enabled },
+      }
+      agentTraceDraft.value = enabled
+      setAgentTraceEnabled(enabled)
+    }).catch(() => {})
+  },
+  { flush: 'sync' },
+)
+
 onUnmounted(() => {
+  unregisterAgentTracePreferenceReader()
   catalogMounted = false
   providerForm.cancelProbe()
   for (const run of configuredProviderProbeRuns.values()) run.controller.abort()
@@ -853,6 +903,8 @@ async function loadData(options: {
   resetProviderConnection?: boolean
   throwOnError?: boolean
 } = {}) {
+  const traceConnectionEpoch = gatewayAccess.subscriptionEpoch
+  const traceConnectionGeneration = traceSettingsGeneration
   try {
     const [cat, st, cfg, effective] = await Promise.all([
       setupWorkflow.catalog(),
@@ -862,6 +914,14 @@ async function loadData(options: {
       // settings surface or provider saves.
       appSettings.readEffective().catch(() => ({ fields: {} })),
     ])
+    if (
+      !gatewayAccess.isAvailable
+      || gatewayAccess.subscriptionEpoch !== traceConnectionEpoch
+      || traceSettingsGeneration !== traceConnectionGeneration
+    ) {
+      throw new Error('Gateway changed while loading settings')
+    }
+    traceSettingsGeneration += 1
     // A Provider save owns only the Provider editor. Snapshot every other form
     // after the network round trip but before replacing the config refs. This
     // also catches a draft created in another section while the save was in
@@ -887,6 +947,7 @@ async function loadData(options: {
     catalog.value = (cat || {}) as OnboardingCatalog
     status.value = (st || {}) as OnboardingStatus
     config.value = (cfg || {}) as ConfigData
+    setAgentTraceEnabled(config.value.privacy?.agent_trace_enabled)
     modelCapacity.invalidate()
     effectiveConfig.value = (effective || {}) as EffectiveConfigData
     // A probe result describes one exact saved deployment. Any successful
@@ -975,6 +1036,7 @@ async function loadData(options: {
       if (!preserve?.audio) promotedForm.initAudioFromConfig(config.value)
       if (!preserve?.privacy) {
         disableNetworkObservability.value = currentDisableNetworkObservability.value
+        agentTraceDraft.value = currentAgentTraceEnabled.value
       }
     }
     // Model listing is an optional UI accelerator and may involve an external
@@ -987,6 +1049,10 @@ async function loadData(options: {
     // hot-applied config may have changed readiness.
     invalidateReadiness()
   } catch (err) {
+    if (
+      gatewayAccess.subscriptionEpoch === traceConnectionEpoch
+      && traceSettingsGeneration === traceConnectionGeneration
+    ) setAgentTraceEnabled(false)
     if (options.throwOnError) throw err
     pushToast(t('setup.toast.loadFailed', { error: err instanceof Error ? err.message : String(err) }), { tone: 'danger' })
   }
@@ -1429,6 +1495,7 @@ const behaviorStatusText = computed(() => {
     : t('setup.behavior.statusOff')
 })
 const currentDisableNetworkObservability = computed(() => config.value.privacy?.disable_network_observability === true)
+const currentAgentTraceEnabled = computed(() => config.value.privacy?.agent_trace_enabled === true)
 const currentEffectiveNetworkObservabilityDisabled = computed(() => (
   config.value.privacy?.network_observability_disabled_effective === true
 ))
@@ -1438,6 +1505,7 @@ const networkObservabilityDisabledByEnvironment = computed(() => (
 
 const privacyDirty = computed(() => (
   disableNetworkObservability.value !== currentDisableNetworkObservability.value
+  || agentTraceDraft.value !== currentAgentTraceEnabled.value
 ))
 
 
@@ -1971,6 +2039,7 @@ const behaviorPanel = behaviorForm.createPanel({
 })
 
 const privacyPanel = computed(() => ({
+  agentTraceEnabled: agentTraceDraft.value,
   networkReportingEnabled: !(
     disableNetworkObservability.value || networkObservabilityDisabledByEnvironment.value
   ),
@@ -2448,7 +2517,9 @@ async function saveDirtySections() {
 
     const selectedProviderId = normalizeProviderId(providerForm.selectedProvider.value)
     const restoreProfileSelection = providerSelectionKind.value !== 'primary'
-    if (work.privacy && !(await savePrivacy(disableNetworkObservability.value, { reload: false }))) return
+    if (work.privacy && !(await savePrivacy(
+      disableNetworkObservability.value, agentTraceDraft.value, { reload: false },
+    ))) return
     if (work.memoryCapture && !(await saveMemoryAutoCapture({ reload: false }))) return
     if (work.behavior && !(await saveBehavior({ reload: false }))) return
     if (work.modelStrategy && !(await saveModelStrategy({
@@ -2899,6 +2970,10 @@ function setDisableNetworkObservability(enabled: boolean) {
 function setNetworkReportingEnabled(enabled: boolean) {
   if (networkObservabilityDisabledByEnvironment.value) return
   setDisableNetworkObservability(!enabled)
+}
+
+function setAgentTraceDraft(enabled: boolean) {
+  agentTraceDraft.value = enabled
 }
 
 function setMemoryAutoCapture(enabled: boolean) {
@@ -4186,15 +4261,33 @@ async function saveBehavior(options: SaveOptions = {}): Promise<boolean> {
 
 async function savePrivacy(
   value = disableNetworkObservability.value,
+  traceEnabled = agentTraceDraft.value,
   options: { reload?: boolean } = {},
 ): Promise<boolean> {
+  const traceConnectionEpoch = gatewayAccess.subscriptionEpoch
+  const traceConnectionGeneration = traceSettingsGeneration
   try {
     const nextPrivacy = { ...(config.value.privacy || {}) }
-    if (value === currentDisableNetworkObservability.value) return true
-    const restart = await safePatchConfig({
-      'privacy.disable_network_observability': value,
-    })
+    const patches: Record<string, boolean> = {}
+    if (value !== currentDisableNetworkObservability.value) {
+      patches['privacy.disable_network_observability'] = value
+    }
+    if (traceEnabled !== currentAgentTraceEnabled.value) {
+      patches['privacy.agent_trace_enabled'] = traceEnabled
+    }
+    if (!Object.keys(patches).length) return true
+    const restart = await safePatchConfig(patches)
+    if ('privacy.agent_trace_enabled' in patches) notifyAgentTracePreferenceChanged()
+    if (
+      !gatewayAccess.isAvailable
+      || gatewayAccess.subscriptionEpoch !== traceConnectionEpoch
+      || traceSettingsGeneration !== traceConnectionGeneration
+    ) {
+      throw new Error('Gateway changed while saving privacy settings')
+    }
+    traceSettingsGeneration += 1
     nextPrivacy.disable_network_observability = value
+    nextPrivacy.agent_trace_enabled = traceEnabled
     nextPrivacy.network_observability_disabled_effective = (
       value || networkObservabilityDisabledByEnvironment.value
     )
@@ -4205,6 +4298,10 @@ async function savePrivacy(
         privacy: nextPrivacy,
       }
       disableNetworkObservability.value = value
+      agentTraceDraft.value = traceEnabled
+      if (gatewayAccess.subscriptionEpoch === traceConnectionEpoch) {
+        setAgentTraceEnabled(gatewayAccess.availability === 'available' && traceEnabled)
+      }
     } else {
       await loadData()
     }
@@ -4639,6 +4736,7 @@ async function copyConfigPath() {
     setAutoSessionTitles,
     setDisableNetworkObservability,
     setNetworkReportingEnabled,
+    setAgentTraceDraft,
     setMemoryAutoCapture,
     setProviderImageGenerationOptIn,
     setModelStrategy,

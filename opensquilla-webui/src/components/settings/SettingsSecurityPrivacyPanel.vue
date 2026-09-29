@@ -6,6 +6,7 @@ import SandboxSettingsPanel from '@/components/settings/SandboxSettingsPanel.vue
 import SettingsPrivacyPanel from '@/components/settings/SettingsPrivacyPanel.vue'
 
 interface PrivacyPanelContract {
+  agentTraceEnabled: boolean
   networkReportingEnabled: boolean
   networkReportingForcedOff: boolean
 }
@@ -17,6 +18,7 @@ defineProps<{
 }>()
 
 const emit = defineEmits<{
+  updateAgentTraceEnabled: [enabled: boolean]
   updateNetworkReportingEnabled: [enabled: boolean]
 }>()
 
@@ -33,6 +35,7 @@ const { t } = useI18n()
     <SettingsPrivacyPanel
       v-if="loaded"
       :panel="panel"
+      @update-agent-trace-enabled="emit('updateAgentTraceEnabled', $event)"
       @update-network-reporting-enabled="emit('updateNetworkReportingEnabled', $event)"
     />
     <div v-else class="security-loading" role="status">

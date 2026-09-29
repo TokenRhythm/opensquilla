@@ -1,12 +1,198 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import threading
+
 import pytest
 
+import opensquilla.gateway.rpc_logs as rpc_logs
+from opensquilla.gateway.auth import Principal
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.diagnostics import DiagnosticsState
 from opensquilla.gateway.rpc import RpcContext, get_dispatcher
 from opensquilla.gateway.rpc_logs import _handle_logs_status, _handle_logs_tail
+from opensquilla.gateway.scopes import (
+    ADMIN_SCOPE,
+    METHOD_SCOPES,
+    READ_SCOPE,
+    REMOTE_OPERATOR_SCOPES,
+    WRITE_SCOPE,
+    authorize_call,
+)
 from opensquilla.observability.trace import TraceContext, TraceEvent, write_trace_event
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "loader_name", "params"),
+    [
+        ("logs.trace", "load_trace_events", {"trace_id": "trace-worker"}),
+        ("logs.trace_projection", "load_trace_events", {"trace_id": "trace-worker"}),
+        ("logs.trace_details", "load_turn_call_records", {"trace_id": "trace-worker"}),
+        (
+            "logs.trace_payload",
+            "load_turn_call_records",
+            {"trace_id": "trace-worker", "seq": 1},
+        ),
+    ],
+)
+async def test_trace_rpc_file_reads_use_worker_thread(
+    method, loader_name, params, monkeypatch,
+) -> None:
+    event_loop_thread = threading.get_ident()
+    loader_threads: list[int] = []
+
+    def fake_loader(trace_id: str) -> list:
+        assert trace_id == "trace-worker"
+        loader_threads.append(threading.get_ident())
+        return []
+
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    monkeypatch.setattr(rpc_logs, loader_name, fake_loader)
+    response = await get_dispatcher().dispatch(
+        "req-worker",
+        method,
+        params,
+        RpcContext(
+            conn_id="test",
+            config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+            principal=Principal(
+                role="operator",
+                scopes=frozenset({ADMIN_SCOPE}),
+                is_owner=True,
+                authenticated=True,
+            ),
+        ),
+    )
+
+    assert response.ok is True
+    assert loader_threads and all(thread != event_loop_thread for thread in loader_threads)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        ("logs.trace", {"trace_id": "existing-trace"}),
+        ("logs.trace", {"trace_id": "existing-trace", "view": "projection"}),
+        ("logs.trace_projection", {"trace_id": "existing-trace"}),
+        ("logs.turn_traces", {"session_key": "session-a", "turn_id": "turn-a"}),
+        ("logs.trace_details", {"trace_id": "existing-trace"}),
+        ("logs.trace_payload", {"trace_id": "existing-trace", "seq": 1}),
+    ],
+)
+async def test_trace_rpc_disabled_before_any_file_read(method, params, monkeypatch) -> None:
+    def fail_read(*args, **kwargs):
+        raise AssertionError("trace files must not be read while disabled")
+
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    for loader in ("load_trace_events", "find_turn_traces", "load_turn_call_records"):
+        monkeypatch.setattr(rpc_logs, loader, fail_read)
+    response = await get_dispatcher().dispatch(
+        "req-disabled",
+        method,
+        params,
+        RpcContext(
+            conn_id="test",
+            config=GatewayConfig(),
+            principal=Principal(
+                role="operator",
+                scopes=frozenset({ADMIN_SCOPE}),
+                is_owner=True,
+                authenticated=True,
+            ),
+        ),
+    )
+
+    assert response.ok is True
+    if method == "logs.turn_traces":
+        assert response.payload["traces"] == []
+    else:
+        assert response.payload["trace_id"] == "existing-trace"
+    if method == "logs.trace_details":
+        assert response.payload["reason"] == "trace_disabled"
+    if method == "logs.turn_traces":
+        assert response.payload["raw_enabled"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "loader_name", "params", "result_key"),
+    [
+        ("logs.trace", "load_trace_events", {"trace_id": "trace-race"}, "events"),
+        (
+            "logs.trace",
+            "load_trace_events",
+            {"trace_id": "trace-race", "view": "projection"},
+            "spans",
+        ),
+        ("logs.trace_projection", "load_trace_events", {"trace_id": "trace-race"}, "spans"),
+        (
+            "logs.turn_traces",
+            "find_turn_traces",
+            {"session_key": "session-race", "turn_id": "turn-race"},
+            "traces",
+        ),
+        ("logs.trace_details", "load_turn_call_records", {"trace_id": "trace-race"}, "rows"),
+        (
+            "logs.trace_payload",
+            "load_turn_call_records",
+            {"trace_id": "trace-race", "seq": 1},
+            "payload",
+        ),
+    ],
+)
+async def test_trace_rpc_discards_inflight_read_after_switch_off(
+    method, loader_name, params, result_key, monkeypatch
+) -> None:
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    release = threading.Event()
+    context = TraceContext.new(trace_id="trace-race", turn_id="turn-race")
+
+    def blocked_loader(*args, **kwargs):
+        loop.call_soon_threadsafe(started.set)
+        if not release.wait(timeout=5):
+            raise TimeoutError("trace file read was not released")
+        if loader_name == "load_trace_events":
+            return [TraceEvent(kind="turn_start", context=context, seq=1)]
+        if loader_name == "find_turn_traces":
+            return [{"trace_id": "trace-race", "complete": True}]
+        return [{"trace_id": "trace-race", "seq": 1, "kind": "turn_start", "payload": {}}]
+
+    monkeypatch.setattr(rpc_logs, loader_name, blocked_loader)
+    config = GatewayConfig(privacy={"agent_trace_enabled": True})
+    response_task = asyncio.create_task(
+        get_dispatcher().dispatch(
+            "req-race",
+            method,
+            params,
+            RpcContext(
+                conn_id="test",
+                config=config,
+                principal=Principal(
+                    role="operator",
+                    scopes=frozenset({ADMIN_SCOPE}),
+                    is_owner=True,
+                    authenticated=True,
+                ),
+            ),
+        )
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=5)
+        config.privacy.agent_trace_enabled = False
+    finally:
+        release.set()
+    response = await asyncio.wait_for(response_task, timeout=5)
+
+    assert response.ok is True
+    assert response.payload[result_key] == ([] if result_key != "payload" else None)
+    if method == "logs.turn_traces":
+        assert response.payload["raw_enabled"] is False
+    if method == "logs.trace_details":
+        assert response.payload["reason"] == "trace_disabled"
 
 
 @pytest.mark.asyncio
@@ -169,7 +355,13 @@ async def test_logs_status_reports_trace_log_directory(tmp_path, monkeypatch) ->
         log_dir=tmp_path,
     )
 
-    result = await _handle_logs_status({}, RpcContext(conn_id="test", config=GatewayConfig()))
+    result = await _handle_logs_status(
+        {},
+        RpcContext(
+            conn_id="test",
+            config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+        ),
+    )
 
     assert result["trace_log"] == {
         "directory": {
@@ -180,6 +372,29 @@ async def test_logs_status_reports_trace_log_directory(tmp_path, monkeypatch) ->
         "file_count": 1,
         "latest_path": str(next(tmp_path.glob("traces-*.jsonl"))),
     }
+
+
+@pytest.mark.asyncio
+async def test_logs_status_hides_existing_trace_log_when_disabled(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    write_trace_event(
+        TraceEvent(kind="turn_start", context=TraceContext.new(trace_id="trace-1")),
+        log_dir=tmp_path,
+    )
+    config = GatewayConfig()
+    ctx = RpcContext(conn_id="test", config=config)
+
+    result = await _handle_logs_status({}, ctx)
+
+    assert "trace_log" not in result
+    assert result["gateway_file_log"]["path"] == str(tmp_path / "debug.log")
+    assert result["raw_turn_call_log"]["directory"]["path"] == str(tmp_path)
+
+    config.privacy.agent_trace_enabled = True
+    assert (await _handle_logs_status({}, ctx))["trace_log"]["file_count"] == 1
+
+    config.privacy.agent_trace_enabled = False
+    assert "trace_log" not in await _handle_logs_status({}, ctx)
 
 
 @pytest.mark.asyncio
@@ -197,7 +412,9 @@ async def test_logs_trace_returns_persisted_trace_events(tmp_path, monkeypatch) 
         ),
         log_dir=tmp_path,
     )
-    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+    ctx = RpcContext(
+        conn_id="test", config=GatewayConfig(privacy={"agent_trace_enabled": True})
+    )
 
     response = await get_dispatcher().dispatch(
         "req-1", "logs.trace", {"trace_id": "trace-1"}, ctx
@@ -211,6 +428,138 @@ async def test_logs_trace_returns_persisted_trace_events(tmp_path, monkeypatch) 
 
 
 @pytest.mark.asyncio
+async def test_logs_trace_projection_returns_cursorable_safe_projection(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    context = TraceContext.new(trace_id="trace-projection", turn_id="turn-1")
+    write_trace_event(TraceEvent(kind="turn_start", context=context, seq=1), log_dir=tmp_path)
+    write_trace_event(
+        TraceEvent(
+            kind="route.resolved",
+            context=context,
+            seq=2,
+            attrs={"requested_mode": "router", "effective_mode": "direct"},
+        ),
+        log_dir=tmp_path,
+    )
+    write_trace_event(TraceEvent(kind="turn_end", context=context, seq=3), log_dir=tmp_path)
+
+    response = await get_dispatcher().dispatch(
+        "req-1",
+        "logs.trace_projection",
+        {"trace_id": "trace-projection", "after_seq": 1},
+        RpcContext(
+            conn_id="test", config=GatewayConfig(privacy={"agent_trace_enabled": True})
+        ),
+    )
+
+    assert response.ok is True
+    assert response.payload["status"] == "success"
+    assert response.payload["requested_mode"] == "router"
+    assert [row["seq"] for row in response.payload["spans"]] == [2, 3]
+
+
+@pytest.mark.asyncio
+async def test_logs_trace_projection_view_is_additive_to_logs_trace(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    write_trace_event(
+        TraceEvent(kind="turn_start", context=TraceContext.new(trace_id="trace-view"), seq=1),
+        log_dir=tmp_path,
+    )
+
+    response = await get_dispatcher().dispatch(
+        "req-1",
+        "logs.trace",
+        {"trace_id": "trace-view", "view": "projection"},
+        RpcContext(
+            conn_id="test", config=GatewayConfig(privacy={"agent_trace_enabled": True})
+        ),
+    )
+
+    assert response.ok is True
+    assert response.payload["trace_id"] == "trace-view"
+    assert "spans" in response.payload
+    assert "events" not in response.payload
+
+
+@pytest.mark.asyncio
+async def test_logs_turn_traces_resolves_running_and_historical_turn(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("OPENSQUILLA_TURN_CALL_LOG", raising=False)
+    context = TraceContext.new(
+        trace_id="trace-chat", session_key="session-chat", turn_id="turn-chat"
+    )
+    ctx = RpcContext(
+        conn_id="test", config=GatewayConfig(privacy={"agent_trace_enabled": True})
+    )
+    params = {"session_key": "session-chat", "turn_id": "turn-chat"}
+
+    empty = await get_dispatcher().dispatch("req-empty", "logs.turn_traces", params, ctx)
+    assert empty.ok is True
+    assert empty.payload["traces"] == []
+
+    write_trace_event(TraceEvent(kind="turn_start", context=context, seq=1), log_dir=tmp_path)
+    active = await get_dispatcher().dispatch("req-active", "logs.turn_traces", params, ctx)
+    assert active.ok is True
+    assert active.payload["raw_enabled"] is True
+    assert active.payload["traces"][0]["trace_id"] == "trace-chat"
+    assert active.payload["traces"][0]["complete"] is False
+
+    write_trace_event(TraceEvent(kind="turn_end", context=context, seq=2), log_dir=tmp_path)
+    historical = await get_dispatcher().dispatch("req-history", "logs.turn_traces", params, ctx)
+    assert historical.payload["traces"][0]["complete"] is True
+    assert historical.payload["traces"][0]["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_logs_turn_traces_obeys_agent_trace_gate(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
+    monkeypatch.delenv("OPENSQUILLA_TURN_CALL_LOG", raising=False)
+    (tmp_path / "turn-calls-20260101.jsonl").write_text(
+        json.dumps({
+            "trace_id": "raw-trace",
+            "turn_id": "turn-raw",
+            "session_key": "session-raw",
+            "kind": "turn_start",
+            "agent_trace": True,
+            "ts": "2026-01-01T00:00:00Z",
+        }),
+        encoding="utf-8",
+    )
+    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+    params = {"session_key": "session-raw", "turn_id": "turn-raw"}
+    disabled = await get_dispatcher().dispatch("req-off", "logs.turn_traces", params, ctx)
+    assert disabled.payload["traces"] == []
+    assert disabled.payload["raw_enabled"] is False
+
+    ctx.config.privacy.agent_trace_enabled = True
+    enabled = await get_dispatcher().dispatch("req-on", "logs.turn_traces", params, ctx)
+    assert enabled.payload["raw_enabled"] is True
+    assert enabled.payload["traces"][0]["trace_id"] == "raw-trace"
+    assert enabled.payload["traces"][0]["raw_available"] is True
+
+
+@pytest.mark.asyncio
+async def test_logs_turn_traces_requires_operator_read() -> None:
+    response = await get_dispatcher().dispatch(
+        "req-scope",
+        "logs.turn_traces",
+        {"session_key": "session-test", "turn_id": "turn-test"},
+        RpcContext(
+            conn_id="test",
+            principal=Principal(
+                role="operator", scopes=frozenset(), is_owner=False, authenticated=True
+            ),
+        ),
+    )
+    assert response.ok is False
+    assert response.error is not None
+    assert "Insufficient scope" in response.error.message
+
+
+@pytest.mark.asyncio
 async def test_logs_status_is_mounted_on_dispatcher(monkeypatch) -> None:
     monkeypatch.delenv("OPENSQUILLA_TURN_CALL_LOG", raising=False)
     ctx = RpcContext(conn_id="test", config=GatewayConfig())
@@ -220,3 +569,113 @@ async def test_logs_status_is_mounted_on_dispatcher(monkeypatch) -> None:
     assert response.ok is True
     assert isinstance(response.payload, dict)
     assert response.payload["raw_turn_call_log"]["enabled"] is False
+
+
+@pytest.mark.asyncio
+async def test_logs_trace_details_exposes_redacted_boundary_payload_with_trace_gate(
+    tmp_path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "0")
+    record = {
+        "trace_id": "trace-routing", "seq": 1, "kind": "routing_decision", "elapsed_ms": 30,
+        "agent_trace": True,
+        "payload": {
+            "requested_mode": "smart", "effective_mode": "direct",
+            "selected_model": "test-model", "api_key": "synthetic-key-for-redaction",
+        },
+    }
+    (tmp_path / "turn-calls-20260101.jsonl").write_text(json.dumps(record), encoding="utf-8")
+    ctx = RpcContext(conn_id="test", config=GatewayConfig())
+    params = {"trace_id": "trace-routing"}
+
+    disabled = await get_dispatcher().dispatch("req-off", "logs.trace_details", params, ctx)
+    assert disabled.ok is True
+    assert disabled.payload["available"] is False
+    assert disabled.payload["rows"] == []
+
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    still_disabled = await get_dispatcher().dispatch(
+        "req-still-off", "logs.trace_details", params, ctx
+    )
+    assert still_disabled.payload["available"] is False
+
+    ctx.config.privacy.agent_trace_enabled = True
+    enabled = await get_dispatcher().dispatch("req-on", "logs.trace_details", params, ctx)
+    assert enabled.ok is True
+    [row] = enabled.payload["rows"]
+    assert row["kind"] == "routing_decision"
+    assert row["status"] == "success"
+    assert row["output"]["selected_model"] == "test-model"
+    assert row["output"]["api_key"] == "[redacted]"
+    assert "duration_ms" not in row
+
+    raw = await get_dispatcher().dispatch(
+        "req-full", "logs.trace_payload", {**params, "seq": 1}, ctx,
+    )
+    assert raw.ok is True
+    assert raw.payload["payload"]["payload"]["api_key"] == "[REDACTED]"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["logs.trace_details", "logs.trace_payload"])
+async def test_raw_trace_rpc_requires_admin_scope(method, tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG_DIR", str(tmp_path))
+    monkeypatch.setenv("OPENSQUILLA_TURN_CALL_LOG", "1")
+    record = {
+        "trace_id": "trace-admin-scope",
+        "seq": 1,
+        "kind": "routing_decision",
+        "agent_trace": True,
+        "elapsed_ms": 1,
+        "payload": {"selected_model": "synthetic-model"},
+    }
+    (tmp_path / "turn-calls-20260101.jsonl").write_text(json.dumps(record), encoding="utf-8")
+    dispatcher = get_dispatcher()
+    entry = dispatcher.get_entry(method)
+    assert entry is not None
+    assert METHOD_SCOPES[method] == entry.required_scope == ADMIN_SCOPE
+
+    params = {"trace_id": "trace-admin-scope", "seq": 1}
+    for scopes in (
+        frozenset({READ_SCOPE}),
+        frozenset({WRITE_SCOPE}),
+        REMOTE_OPERATOR_SCOPES,
+    ):
+        assert authorize_call(method, ADMIN_SCOPE, "operator", scopes) == (False, ADMIN_SCOPE)
+        denied = await dispatcher.dispatch(
+            "req-denied",
+            method,
+            params,
+            RpcContext(
+                conn_id="remote-test",
+                config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+                principal=Principal(
+                    role="operator",
+                    scopes=scopes,
+                    is_owner=False,
+                    authenticated=True,
+                ),
+            ),
+        )
+        assert denied.ok is False
+        assert denied.error is not None
+        assert denied.error.code == "UNAUTHORIZED"
+
+    allowed = await dispatcher.dispatch(
+        "req-admin",
+        method,
+        params,
+        RpcContext(
+            conn_id="admin-test",
+            config=GatewayConfig(privacy={"agent_trace_enabled": True}),
+            principal=Principal(
+                role="operator",
+                scopes=frozenset({ADMIN_SCOPE}),
+                is_owner=False,
+                authenticated=True,
+            ),
+        ),
+    )
+    assert allowed.ok is True
+    assert allowed.payload["available"] is True

@@ -112,12 +112,12 @@ describe('route hubs', () => {
       ],
     })
     if (existingRoute) await memoryRouter.push('/chat')
-    await memoryRouter.push('/logs?token=synthetic-link-token&other=preserved#old-detail')
+    await memoryRouter.push('/logs?token=synthetic-link-token&traceId=linked-123#old-detail')
 
     expect(memoryRouter.currentRoute.value.path).toBe('/settings/gateway')
     expect(memoryRouter.currentRoute.value.hash).toBe('#logs')
     expect(memoryRouter.currentRoute.value.query).toEqual({
-      token: 'synthetic-link-token', other: 'preserved',
+      token: 'synthetic-link-token', traceId: 'linked-123',
     })
   })
 
