@@ -86,6 +86,7 @@ interface SessionReadV4Transport {
   acknowledgeDelivery?(receipt: SnapshotDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: SnapshotInstalledReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
+  snapshotInstalled?(key: string, version: string): void
   waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
   failProtocol?(generation: number): void
 }

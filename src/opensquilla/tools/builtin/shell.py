@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import dataclasses
 import hashlib
 import json
@@ -15,10 +16,12 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -6803,6 +6806,53 @@ def _create_windows_host_shell_process(command: str, **kwargs: Any) -> Any:
     return create_owned_popen(_windows_direct_powershell_argv(command), **kwargs)
 
 
+async def _start_blocking_host_process(launch: Callable[..., Any]) -> Any:
+    """Keep launch I/O off-loop without abandoning a process on cancellation."""
+
+    # Unlike a to_thread Task, this Future survives asyncio.run cancelling all
+    # Tasks. Keep the caller's pipes open until the worker has finished with them.
+    cancel_event = threading.Event()
+    worker = asyncio.get_running_loop().run_in_executor(
+        None, partial(contextvars.copy_context().run, launch, cancel_event=cancel_event),
+    )
+    try:
+        result = await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancel_event.set()
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        try:
+            result = worker.result()
+        except PtyBackendError as exc:
+            result = exc.handle
+        except Exception:
+            result = None
+        if result is not None:
+            proc = result.raw if isinstance(result, PtyHandle) else result
+            owner = capture_process_tree_owner(proc, isolated=True)
+            owner.start_completion_monitor()
+            # Retain cleanup in this task: shutdown must not cancel a detached
+            # cleanup Task before it retires the exact process and owner row.
+            while True:
+                try:
+                    if isinstance(result, PtyHandle):
+                        await terminate_pty(result)
+                    else:
+                        await _terminate_exec_process_tree(proc, owner)
+                    break
+                except asyncio.CancelledError:
+                    continue
+        raise
+    proc = result.raw if isinstance(result, PtyHandle) else result
+    capture_process_tree_owner(proc, isolated=True).start_completion_monitor()
+    return result
+
+
 def _terminate_windows_host_shell_process(
     proc: Any,
     process_tree: ProcessTreeOwner,
@@ -6885,10 +6935,11 @@ async def _run_windows_host_shell_command_with_stdin(
             with os.fdopen(write_fd, "wb", buffering=0) as writer:
                 output_reader = _NonblockingOutputPipe(reader.fileno())
                 creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                proc = _create_windows_host_shell_process(
+                proc = await _start_blocking_host_process(partial(
+                    _create_windows_host_shell_process,
                     command, stdin=subprocess.PIPE, stdout=writer, stderr=subprocess.STDOUT,
                     cwd=cwd, env=env, creationflags=creationflags,
-                )
+                ))
             if on_process_started is not None:
                 on_process_started()
             process_tree = capture_process_tree_owner(proc, isolated=os.name == "nt")
@@ -7684,10 +7735,15 @@ async def _start_host_background_process(
     actual_io_mode = io_mode
     if io_mode == "pty":
         try:
-            pty_handle = spawn_pty(command, cwd=cwd, env=host_env)
+            pty_handle = await _start_blocking_host_process(partial(
+                spawn_pty, command, cwd=cwd, env=host_env,
+            ))
         except PtyBackendError as exc:
             if exc.started:
                 if exc.handle is not None:
+                    capture_process_tree_owner(
+                        exc.handle.raw, isolated=True,
+                    ).start_completion_monitor()
                     with contextlib.suppress(Exception):
                         await terminate_pty(exc.handle)
                     with contextlib.suppress(Exception):

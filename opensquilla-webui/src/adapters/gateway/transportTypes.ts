@@ -17,7 +17,8 @@ export type TransportConsumptionHandler = (
   payload: unknown, meta: Record<string, unknown>,
 ) => 'applied' | 'dirty' | Promise<'applied' | 'dirty'>
 
-export type TransportGapHandler = (detail: unknown) => Promise<boolean>
+export type TransportRecoveryResult = boolean | { readonly retryable: false }
+export type TransportGapHandler = (detail: unknown) => Promise<TransportRecoveryResult>
 
 /** Request lifecycle policy shared only between the private transport and its Adapters. */
 export interface TransportCallOptions {
@@ -25,8 +26,8 @@ export interface TransportCallOptions {
   signal?: AbortSignal
   timeoutAction?: TransportTerminationAction
   abortAction?: TransportTerminationAction
-  /** Missing values fail closed as mutations while wake recovery is active. */
-  recoveryClass?: 'safe-read' | 'read' | 'mutation' | 'ephemeral'
+  /** Missing values fail closed; task-control requires an exact Stop and generation. */
+  recoveryClass?: 'safe-read' | 'read' | 'mutation' | 'ephemeral' | 'task-control'
   cancelOnAbort?: boolean
   expectedGeneration?: number
   onSent?: (socketGeneration: number) => void

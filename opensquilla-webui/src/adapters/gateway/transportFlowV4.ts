@@ -12,6 +12,7 @@ import { validateTransportFlowDirtyPayload } from '@/contracts/generated/v4/tran
 import type {
   TransportCallOptions, TransportConsumptionHandler, TransportDeliveryReceipt,
   TransportEventHandler, TransportInstalledReceipt,
+  TransportRecoveryResult,
 } from './transportTypes'
 
 interface FlowSource {
@@ -20,7 +21,7 @@ interface FlowSource {
   on(event: string, handler: TransportEventHandler): () => void
   enableConsumptionFlow(): void
   consumeEvent: (event: string, ...args: Parameters<TransportConsumptionHandler>) => Promise<'applied' | 'dirty'>
-  recoverGap(detail: unknown): Promise<boolean>
+  recoverGap(detail: unknown): Promise<TransportRecoveryResult>
   supportsRecovery?(): boolean
   failProtocol?(generation: number): void
 }
@@ -62,6 +63,9 @@ export class TransportFlowV4 {
   private recovery: Promise<boolean> | null = null
   private recoveryKeys = new Set<string>()
   private recoveryJobs = new Map<string, Promise<boolean>>()
+  // These are existing unowned receipts, not a permanent session blacklist.
+  // A later verified snapshot can cover them; terminal failure alone cannot.
+  private suspendedRecoveries = new Map<string, { version: string; receipts: TransportDeliveryReceipt[] }>()
   private invalidations = new Map<string, number>()
   private globalInvalidation = 0
   private consumedCursors = new Map<string, { generation: string; sequence: number }>()
@@ -135,6 +139,7 @@ export class TransportFlowV4 {
     this.recovery = null
     this.recoveryKeys.clear()
     this.recoveryJobs.clear()
+    this.suspendedRecoveries.clear()
     this.invalidations.clear()
     this.globalInvalidation = 0
     this.consumers.clear()
@@ -244,7 +249,15 @@ export class TransportFlowV4 {
     const receipt = this.receipt(value)
     if (!receipt || receipt.delivery_id <= this.ack) return
     this.pending.delete(receipt.delivery_id)
+    const unowned = this.unowned.get(receipt.delivery_id)
     this.unowned.delete(receipt.delivery_id)
+    if (unowned?.key) {
+      const suspended = this.suspendedRecoveries.get(unowned.key)
+      if (suspended) {
+        suspended.receipts = suspended.receipts.filter(item => item.delivery_id !== receipt.delivery_id)
+        if (!suspended.receipts.length) this.suspendedRecoveries.delete(unowned.key)
+      }
+    }
     const timer = this.observations.get(receipt.delivery_id)
     if (timer !== undefined) clearTimeout(timer)
     this.observations.delete(receipt.delivery_id)
@@ -302,6 +315,24 @@ export class TransportFlowV4 {
     return `${this.generation}:${this.globalInvalidation}:${this.invalidations.get(key) ?? 0}`
   }
 
+  snapshotInstalled(key: string, version: string): void {
+    const suspended = this.suspendedRecoveries.get(key)
+    // Pausing advances this key's invalidation. A current install therefore
+    // began after the pause, including after a bounded-map global rollover.
+    if (!suspended || this.recoveryVersion(key) !== version) return
+    this.suspendedRecoveries.delete(key)
+    for (const receipt of suspended.receipts) this.markComplete(receipt)
+  }
+
+  private suspendRecovery(key: string, receipts: TransportDeliveryReceipt[], version: string): void {
+    const outstanding = receipts.filter(receipt => this.unowned.get(receipt.delivery_id)?.receipt === receipt)
+    if (!key || !outstanding.length || this.recoveryVersion(key) !== version) return
+    if (this.suspendedRecoveries.get(key)?.version === version) return
+    // Fence a snapshot that began before this terminal recovery completed.
+    this.invalidations.set(key, (this.invalidations.get(key) ?? 0) + 1)
+    this.suspendedRecoveries.set(key, { version: this.recoveryVersion(key), receipts: outstanding })
+  }
+
   async waitForConsumption(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void> {
     // The FIFO proof follows its tail events. Capture the consumers already
     // dispatched at that point, never an unrelated session's pending consumer.
@@ -342,9 +373,14 @@ export class TransportFlowV4 {
         reason: 'transport_flow_dirty', keys: scopeGlobal ? [] : [key], global: scopeGlobal,
       })).catch(() => false).then(ok => {
         if (!this.current(revision)) return false
-        if (ok && capturedVersion === this.recoveryVersion(key)) {
+        if (ok === true && capturedVersion === this.recoveryVersion(key)) {
+          this.suspendedRecoveries.delete(key)
           if (!scopeGlobal) for (const entry of owned) this.markComplete(entry.receipt)
           return true
+        }
+        if (typeof ok === 'object' && ok.retryable === false && capturedVersion === this.recoveryVersion(key)) {
+          this.suspendRecovery(key, owned.map(entry => entry.receipt), capturedVersion)
+          return false
         }
         if (scopeGlobal) this.recoveryGlobal = true
         else this.recoveryKeys.add(key)
@@ -403,7 +439,10 @@ export class TransportFlowV4 {
         if (entry.key !== null && coveredKeys.has(entry.key)) this.markComplete(entry.receipt)
       }
     }
-    const recover = async (scopeKeys: string[], scopeGlobal: boolean): Promise<boolean> => {
+    const versions = new Map([...requestedKeys].map(key => [key, this.recoveryVersion(key)]))
+    const suspend = (key: string) => this.suspendRecovery(key,
+      ownedByThisRecovery.filter(entry => entry.key === key).map(entry => entry.receipt), versions.get(key)!)
+    const recover = async (scopeKeys: string[], scopeGlobal: boolean): Promise<TransportRecoveryResult> => {
       if (!this.current(revision)) return false
       try {
         return await this.source.recoverGap({ reason: 'transport_flow_dirty', keys: scopeKeys, global: scopeGlobal })
@@ -413,7 +452,7 @@ export class TransportFlowV4 {
       const scopeKeys = [...requestedKeys]
       const ok = await recover(scopeKeys, requestedGlobal)
       if (!this.current(revision)) return false
-      if (ok) {
+      if (ok === true) {
         complete(requestedKeys)
         return true
       }
@@ -423,9 +462,13 @@ export class TransportFlowV4 {
       if (scopeKeys.length > 1 || (requestedGlobal && scopeKeys.length > 0)) {
         for (const key of scopeKeys) {
           if (!this.current(revision)) return false
-          if (await recover([key], false)) complete(new Set([key]))
+          const result = await recover([key], false)
+          if (result === true) complete(new Set([key]))
+          else if (typeof result === 'object' && result.retryable === false) suspend(key)
           else failedKeys.push(key)
         }
+      } else if (typeof ok === 'object' && ok.retryable === false) {
+        for (const key of scopeKeys) suspend(key)
       } else failedKeys.push(...scopeKeys)
       if (this.current(revision)) {
         for (const key of failedKeys) {
@@ -434,7 +477,7 @@ export class TransportFlowV4 {
         }
         // A genuinely global failure remains global; a keyed failure never
         // becomes a global retry merely because it joined another read.
-        this.recoveryGlobal ||= requestedGlobal
+        this.recoveryGlobal ||= requestedGlobal && ok === false
       }
       return false
     }).finally(() => {

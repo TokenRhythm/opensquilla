@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import sqlite3
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
@@ -75,6 +77,76 @@ def _item(event_id: str = "event-1") -> UsageEventItem:
         estimated_cost_nanos=9_200_000,
         cost_source="estimate",
     )
+
+
+@pytest.mark.asyncio
+async def test_cancelling_queued_usage_reservation_does_not_reach_caller_boundary(tmp_path):
+    storage = await SessionStorage.open(str(tmp_path / "sessions.db"))
+    queued = asyncio.Event()
+    caller_reached = []
+    await storage._operation_lock.acquire()
+
+    async def reserve_then_continue():
+        queued.set()
+        await storage.start_usage_event(_start())
+        caller_reached.append("reserved")
+
+    pending = asyncio.create_task(reserve_then_continue())
+    try:
+        await asyncio.wait_for(queued.wait(), timeout=2)
+        pending.cancel()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert not caller_reached
+        async with storage.conn.execute("SELECT count(*) FROM usage_events") as cursor:
+            assert (await cursor.fetchone())[0] == 0
+        storage._operation_lock.release()
+        await reserve_then_continue()
+        assert caller_reached == ["reserved"]
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(pending, return_exceptions=True)
+        await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_queued_usage_reservations_are_committed_before_returning(tmp_path):
+    path = tmp_path / "sessions.db"
+    storage = await SessionStorage.open(str(path))
+    queued = [asyncio.Event() for _ in range(12)]
+    returned = []
+    await storage._operation_lock.acquire()
+
+    async def reserve_then_check(index):
+        queued[index].set()
+        event = _start(f"event-{index}", execution_id=f"execution-{index}")
+        await storage.start_usage_event(event)
+        # This verifies storage's return contract, not a real provider dispatch.
+        reader = sqlite3.connect(path)
+        try:
+            row = reader.execute(
+                "SELECT status FROM usage_events WHERE event_id = ?", (event.event_id,),
+            ).fetchone()
+            assert row == ("started",)
+        finally:
+            reader.close()
+        returned.append(event.event_id)
+
+    pending = [asyncio.create_task(reserve_then_check(i)) for i in range(len(queued))]
+    try:
+        await asyncio.wait_for(asyncio.gather(*(event.wait() for event in queued)), timeout=2)
+        assert not returned
+        storage._operation_lock.release()
+        await asyncio.gather(*pending)
+        assert len(set(returned)) == len(queued)
+        assert not storage.conn.in_transaction
+    finally:
+        if storage._operation_lock.locked():
+            storage._operation_lock.release()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await storage.close()
 
 
 def test_nano_usd_conversion_is_decimal_and_bounded() -> None:

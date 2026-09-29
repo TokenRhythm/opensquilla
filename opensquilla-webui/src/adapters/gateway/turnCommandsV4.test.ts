@@ -117,6 +117,32 @@ describe('read-only delivery receipt adapter', () => {
 })
 
 describe('v4 TurnCommands Adapter', () => {
+  it('fences an exact task Stop to the current generation and preserves an explicit older fence', async () => {
+    const request = vi.fn().mockResolvedValue({ aborted: true })
+    const commands = createV4TurnCommands({ request, generation: 7 })
+    const stop = { sessionKey: 'session-1', taskId: 'task-1', scope: 'task' }
+    await commands.cancel(stop)
+    await commands.cancel(stop, { expectedGeneration: 6 })
+    expect(request).toHaveBeenNthCalledWith(1, CHAT_ABORT_METHOD, stop, {
+      expectedGeneration: 7, recoveryClass: 'task-control',
+    })
+    expect(request).toHaveBeenNthCalledWith(2, CHAT_ABORT_METHOD, stop, {
+      expectedGeneration: 6, recoveryClass: 'task-control',
+    })
+  })
+
+  it.each([
+    { sessionKey: 'session-1' },
+    { sessionKey: 'session-1', scope: 'task' },
+    { sessionKey: 'session-1', taskId: 'task-1' },
+    { sessionKey: 'session-1', taskId: ' ', scope: 'task' },
+  ])('does not bypass recovery for an unscoped or unknown Stop %j', async stop => {
+    const request = vi.fn().mockResolvedValue({ aborted: false })
+    const commands = createV4TurnCommands({ request, generation: 7 })
+    await commands.cancel(stop)
+    expect(request).toHaveBeenCalledExactlyOnceWith(CHAT_ABORT_METHOD, stop)
+  })
+
   it('maps semantic admission to chat.send without changing the payload', async () => {
     const request = vi.fn(async <T = unknown>() => (
       {

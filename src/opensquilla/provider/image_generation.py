@@ -936,39 +936,46 @@ async def _download_generated_image(
 ) -> tuple[str, bytes]:
     """Download one signed generated-image URL without exposing it in failures."""
 
+    from opensquilla.tools.fetch_work import run_blocking_fetch_work
     from opensquilla.tools.ssrf import (
         environment_proxy_url,
         pinned_transport,
         validate_http_url_for_fetch,
     )
 
+    def prepare_client(current_url: str) -> dict[str, object]:
+        parsed = urlsplit(current_url)
+        if (
+            parsed.scheme.lower() != "https"
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.fragment
+        ):
+            raise ValueError("unsafe generated image URL")
+        vetted_ips = validate_http_url_for_fetch(current_url)
+
+        transport_kwargs: dict[str, object] = {}
+        if _trust_env():
+            proxy_url = environment_proxy_url(current_url)
+            if proxy_url is not None:
+                transport_kwargs["proxy"] = proxy_url
+        transport = pinned_transport(current_url, vetted_ips, **transport_kwargs)
+        client_kwargs: dict[str, object] = {
+            "timeout": timeout_seconds,
+            "follow_redirects": False,
+            "trust_env": _trust_env(),
+        }
+        if transport is not None:
+            client_kwargs["transport"] = transport
+
+        return client_kwargs
+
     current_url = image_url
     for redirect_count in range(_GENERATED_IMAGE_REDIRECT_LIMIT + 1):
         try:
-            parsed = urlsplit(current_url)
-            if (
-                parsed.scheme.lower() != "https"
-                or not parsed.hostname
-                or parsed.username is not None
-                or parsed.password is not None
-                or parsed.fragment
-            ):
-                raise ValueError("unsafe generated image URL")
-            vetted_ips = validate_http_url_for_fetch(current_url)
-
-            transport_kwargs: dict[str, object] = {}
-            if _trust_env():
-                proxy_url = environment_proxy_url(current_url)
-                if proxy_url is not None:
-                    transport_kwargs["proxy"] = proxy_url
-            transport = pinned_transport(current_url, vetted_ips, **transport_kwargs)
-            client_kwargs: dict[str, object] = {
-                "timeout": timeout_seconds,
-                "follow_redirects": False,
-                "trust_env": _trust_env(),
-            }
-            if transport is not None:
-                client_kwargs["transport"] = transport
+            async with asyncio.timeout(timeout_seconds):
+                client_kwargs = await run_blocking_fetch_work(prepare_client, current_url)
 
             async with httpx.AsyncClient(**client_kwargs) as client:  # type: ignore[arg-type]
                 async with client.stream("GET", current_url) as response:

@@ -100,7 +100,7 @@ function fixture(options = {}) {
     windowsUpdateCacheRestoreAttempted: true,
     windowsUpdateCoordinator: new WindowsUpdateCoordinator(1000),
     windowsUpdateRecoveryGeneration: 0,
-    updateApplying: false, isQuitting: false, appExitPhase: 'running',
+    updateApplying: false, isQuitting: false, appExitPhase: 'running', gatewayLateReadyObservation: null,
     updateInstallHandoffReady: false, updateDownloadInProgress: false,
     manualInstallerActionInProgress: false, updateGatewayShutdownProcess: null,
     downloadedUpdateVersion: null, quitRequestedDuringUpdateDrain: false,

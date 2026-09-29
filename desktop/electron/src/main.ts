@@ -7,6 +7,7 @@ import { access, constants, open, readFile, readdir, rename, rm, stat, unlink, w
 import net from 'node:net'
 import { homedir, tmpdir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
+import { performance } from 'node:perf_hooks'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { NativeAttachmentSelections } from './native-attachments.js'
 import { chooseLocalFilePaths } from './native-path-picker.js'
@@ -25,6 +26,11 @@ import {
   type DesktopProfilePaths,
 } from './desktop-profile-context.js'
 import { DesktopWriterAdmission } from './desktop-writer-admission.js'
+import {
+  acknowledgeDesktopActivation, clearDesktopActivationAcknowledgements,
+  createDesktopActivationRequest, disposeDesktopActivationRequest,
+  hasDesktopActivationAcknowledgement,
+} from './desktop-single-instance.js'
 import { terminateWindowsProcessTree } from './windows-process-tree.js'
 import {
   createDesktopGatewayInstanceNonce,
@@ -42,6 +48,7 @@ import {
 } from './desktop-gateway-ownership-verification.js'
 import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
+  GatewayReadinessTimeoutError,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
@@ -835,12 +842,14 @@ const gatewayProcessTreeTerminations = new WeakMap<
 const gatewayHardTerminatedProcesses = new WeakSet<ChildProcessWithoutNullStreams>()
 const desktopWriters = new DesktopWriterAdmission()
 let desktopOpenFlowRevision = 0
+let gatewayLateReadyObservation: { isCurrent: () => boolean; resumeIfCurrent: () => void } | null = null
 let desktopOpenFlowPromise: Promise<void> | null = null
 let bootResumePromise: Promise<{ ok: boolean; error?: string }> | null = null
 let gatewayConnectionRevision = 0
 let gatewayConnectionInstanceId: string | null = null
 
 function invalidateDesktopOpenFlow(): number {
+  gatewayLateReadyObservation = null
   cancelGatewayUnexpectedExitRestart('desktop open flow invalidated')
   desktopOpenFlowRevision += 1
   return desktopOpenFlowRevision
@@ -4992,6 +5001,7 @@ function focusMainWindow(): boolean {
 }
 
 function setAppExitPhase(next: DesktopExitPhase, reason: string): void {
+  if (next !== 'running') gatewayLateReadyObservation = null
   if (appExitPhase === next) return
   const connectionWasSuspended = desktopGatewayConnectionSuspendedForExit()
   desktopLog('desktop_exit_phase', { from: appExitPhase, to: next, reason })
@@ -8828,7 +8838,7 @@ async function waitForGateway(
     return
   }
   if (result.status === 'exited') throw new Error(result.message)
-  throw new Error(`Gateway did not become ready at ${url}`)
+  throw new GatewayReadinessTimeoutError(url)
 }
 
 function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null): boolean {
@@ -8836,6 +8846,7 @@ function hasGatewayProcessExited(process: ChildProcessWithoutNullStreams | null)
 }
 
 function trackStoppingGatewayProcess(child: ChildProcessWithoutNullStreams): void {
+  if (child === gatewayProcess) gatewayLateReadyObservation = null
   if (hasGatewayProcessExited(child) || gatewayStoppingProcesses.has(child)) return
   gatewayStoppingProcesses.add(child)
   // The close handler classifies the child's final status. Keep the explicit
@@ -9002,6 +9013,10 @@ async function resumeOwnedGatewayStartup(
     throw new Error(childExitMessage() || 'Desktop gateway changed during ownership verification.')
   }
 
+  return publishResumedOwnedGateway(child)
+}
+
+function publishResumedOwnedGateway(child: ChildProcessWithoutNullStreams): GatewayState {
   gatewayState.status = 'ready'
   gatewayState.error = undefined
   desktopStartupLog('gateway_ready', { operation: 'resume', pid: child.pid })
@@ -9009,6 +9024,82 @@ async function resumeOwnedGatewayStartup(
   sendBootStatus('control')
   publishGatewayConnection()
   return gatewayState
+}
+
+// Foreground startup still ends at 120 seconds. A live owned child can finish
+// necessary profile work later; observe it without restarting or killing it.
+const GATEWAY_LATE_READY_OBSERVATION_MS = 10 * 60_000
+
+function observeLateOwnedGatewayReadiness(
+  deadline = performance.now() + GATEWAY_LATE_READY_OBSERVATION_MS,
+): void {
+  if (gatewayLateReadyObservation?.isCurrent()) return
+  const remainingMs = deadline - performance.now()
+  if (remainingMs <= 0) return
+  const authority = currentBootResumeAuthority()
+  if (!authority) return
+  const launch = gatewayProcessOwnershipContexts.get(authority.child)
+  if (!launch || !gatewayState.url || gatewayState.status === 'ready') return
+  const url = gatewayState.url
+  const port = gatewayState.port
+  const instanceId = gatewayConnectionInstanceId
+  const authorityIsCurrent = (): boolean => (
+    bootResumeAuthorityIsCurrent(authority)
+    && gatewayState.status !== 'ready'
+    && gatewayState.url === url
+    && gatewayState.port === port
+    && gatewayConnectionInstanceId === instanceId
+    && gatewayProcessOwnershipContexts.get(authority.child) === launch
+  )
+  const observation = {
+    isCurrent: (): boolean => (
+      gatewayLateReadyObservation === observation
+      && authorityIsCurrent()
+    ),
+    // A failed update preparation may resume this exact launch. Create a new
+    // observation so canceled callbacks stay invalid, retaining the old budget.
+    resumeIfCurrent: (): void => {
+      if (gatewayLateReadyObservation && gatewayLateReadyObservation !== observation) return
+      if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+      if (authorityIsCurrent()) observeLateOwnedGatewayReadiness(deadline)
+    },
+  }
+  gatewayLateReadyObservation = observation
+  const isCurrent = observation.isCurrent
+  if (!isCurrent()) {
+    // The foreground deadline can expire while update verification is still
+    // running. Retain only this timeout's intent and budget; do not probe yet.
+    if (updateApplying && appExitPhase === 'deferred' && !isQuitting) return
+    gatewayLateReadyObservation = null
+    return
+  }
+  void waitForGatewayReadiness({
+    probe: async remainingMs => {
+      if (!isCurrent() || !await readinessCheck(url, remainingMs)) return false
+      if (!isCurrent() || !await verifyOwnedGatewayLaunch(authority.child)) return false
+      return isCurrent()
+    },
+    exitMessage: () => isCurrent() ? null : 'Late Gateway readiness was superseded.',
+    primaryTimeoutMs: remainingMs,
+    lateGraceMs: 0,
+    pollIntervalMs: 2_000,
+  }).then(async result => {
+    if (result.status !== 'ready' || !isCurrent()) return
+    // Explicit Resume may have restored boot.html before timing out again.
+    // The existing helper is a no-op when the local renderer is already open.
+    await loadDesktopRendererIntoCurrentWindow()
+    if (!isCurrent()) return
+    bootError = null
+    publishResumedOwnedGateway(authority.child)
+    sendBootStatus('ready')
+    finishAppStartSuccess()
+  }).catch(error => {
+    if (isCurrent()) desktopLog('gateway_late_readiness_failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+  }).finally(() => {
+    if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+  })
 }
 
 const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS = 80_000
@@ -10198,6 +10289,7 @@ async function openOrResumeDesktopApp(): Promise<void> {
           if (operationIsCurrent()) {
             if (currentMainWindow()) sendBootError(error)
             finishAppStartFailure(error)
+            if (error instanceof GatewayReadinessTimeoutError) observeLateOwnedGatewayReadiness()
           }
         }
       }
@@ -12179,6 +12271,7 @@ async function applyWindowsInstaller(): Promise<void> {
   const profileKey = desktopProfileKey()
   let recoveryGeneration = 0
   let telemetryStartedAt = 0
+  let resumeLateReadinessAfterFailure: (() => void) | null = null
   const assertCanHandoff = () => {
     if (liveLifecycleOwnedGatewayProcesses().length > 0 || !writerAdmissionToken
       || desktopWriters.hasOtherOwner(writerAdmissionToken) || desktopWriters.activeCount !== 0) {
@@ -12189,6 +12282,9 @@ async function applyWindowsInstaller(): Promise<void> {
     canStart: () => windowsInstallerActionsSupported() && !isQuitting && appExitPhase === 'running'
       && !updateApplying && !updateDownloadInProgress && !manualInstallerActionInProgress && !desktopWriters.closed,
     started: () => {
+      if (gatewayLateReadyObservation?.isCurrent()) {
+        resumeLateReadinessAfterFailure = gatewayLateReadyObservation.resumeIfCurrent
+      }
       recoveryGeneration = ++windowsUpdateRecoveryGeneration
       telemetryStartedAt = Date.now()
       updateApplying = true
@@ -12291,7 +12387,14 @@ async function applyWindowsInstaller(): Promise<void> {
             : desktopUpdateErrorMessage(errorCode),
       })
       desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
-      if (quitResumed || !gatewayStopStarted || !previouslyOwned) return
+      if (quitResumed) return
+      if (!gatewayStopStarted) {
+        const resumeLateReadiness = gatewayLateReadyObservation?.resumeIfCurrent
+          ?? resumeLateReadinessAfterFailure
+        resumeLateReadiness?.()
+        return
+      }
+      if (!previouslyOwned) return
       // If termination timed out, wait for these exact children. Never start a
       // second Gateway or resurrect a profile after another lifecycle action.
       const resume = () => {
@@ -15048,6 +15151,10 @@ function currentBootResumeAuthority(): BootResumeAuthority | null {
 
 function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
   return !isQuitting
+    && !updateApplying
+    && !desktopWriters.closed
+    && appExitPhase === 'running'
+    && !gatewayStoppingProcesses.has(authority.child)
     && gatewayProcess === authority.child
     && !hasGatewayProcessExited(authority.child)
     && gatewayState.owned
@@ -15057,6 +15164,9 @@ function bootResumeAuthorityIsCurrent(authority: BootResumeAuthority): boolean {
 }
 
 async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?: BootErrorCode }> {
+  // The explicit Resume flow owns readiness publication from this point; an
+  // in-flight background probe may finish, but can no longer adopt its result.
+  gatewayLateReadyObservation = null
   invalidateSecretStorageBackendCache()
   const pendingStart = gatewayStartPromise
   const initialAuthority = pendingStart ? null : currentBootResumeAuthority()
@@ -15125,6 +15235,7 @@ async function resumeBootStartup(): Promise<{ ok: boolean; error?: string; code?
       error: message,
     })
     sendBootError(message)
+    if (error instanceof GatewayReadinessTimeoutError) observeLateOwnedGatewayReadiness()
     return { ok: false, error: message }
   }
 }
@@ -15508,37 +15619,54 @@ const initialDesktopDeepLinkArguments = process.platform === 'win32' || process.
 // held. Without a retry the new process silently quits and no window appears
 // (issue #446). Retry synchronously for a short window, then — if still
 // unavailable — surface an explicit error instead of exiting silently.
+let existingDesktopActivationAccepted = false
 function acquireSingleInstanceLockWithRetry(): boolean {
   const deadline = Date.now() + 5_000
   // Atomics.wait blocks this thread without an event loop (app.whenReady has not
-  // fired) and, unlike a Date.now() spin, does not peg a CPU core. Larger sleep
-  // slices also cut the retry count — each failed requestSingleInstanceLock
-  // notifies the running instance (firing its second-instance handler).
+  // fired) without pegging a CPU core. Lock retries remain 400 ms apart because
+  // every failed request notifies the primary; receipt polls do not notify it.
   const sleepSignal = new Int32Array(new SharedArrayBuffer(4))
+  const activationRequest = initialDesktopDeepLinkArguments.length === 0
+    ? createDesktopActivationRequest() : null
+  const userData = app.getPath('userData')
   let attempt = 0
-  for (;;) {
-    attempt += 1
-    if (app.requestSingleInstanceLock()) {
-      desktopLog('single_instance_lock_acquired', {
-        elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
-        attempt,
-      })
-      return true
+  const acceptActivation = (): boolean => {
+    if (!activationRequest || !hasDesktopActivationAcknowledgement(userData, activationRequest)) return false
+    existingDesktopActivationAccepted = true
+    desktopLog('single_instance_activation_accepted', { attempt })
+    return true
+  }
+  try {
+    for (;;) {
+      if (attempt > 0 && acceptActivation()) return false
+      attempt += 1
+      if (app.requestSingleInstanceLock(activationRequest ? { desktopActivation: activationRequest } : undefined)) {
+        desktopLog('single_instance_lock_acquired', {
+          elapsedMs: Math.max(0, Date.now() - desktopProcessStartedAt),
+          attempt,
+        })
+        return true
+      }
+      // Protocol launches already hand their target to the existing instance.
+      // Keep their one-delivery behavior, including compatibility with old apps.
+      if (initialDesktopDeepLinkArguments.length > 0) {
+        desktopLog('single_instance_deep_link_forwarded', { attempt })
+        return false
+      }
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) {
+        desktopLog('single_instance_lock_unavailable', { attempt })
+        return false
+      }
+      const nextAttemptAt = Date.now() + Math.min(400, remaining)
+      do {
+        if (acceptActivation()) return false
+        // A healthy primary normally acknowledges before a second activation.
+        Atomics.wait(sleepSignal, 0, 0, Math.min(50, Math.max(0, nextAttemptAt - Date.now())))
+      } while (Date.now() < nextAttemptAt)
     }
-    // A Windows/Linux protocol launch targets the current instance and does not need
-    // the normal close/relaunch race retry. The failed lock request has already
-    // delivered its command line through second-instance; exit the forwarding
-    // process immediately instead of sending the same deep link for five seconds.
-    if (initialDesktopDeepLinkArguments.length > 0) {
-      desktopLog('single_instance_deep_link_forwarded', { attempt })
-      return false
-    }
-    const remaining = deadline - Date.now()
-    if (remaining <= 0) {
-      desktopLog('single_instance_lock_unavailable', { attempt })
-      return false
-    }
-    Atomics.wait(sleepSignal, 0, 0, Math.min(400, remaining))
+  } finally {
+    if (activationRequest) disposeDesktopActivationRequest(userData, activationRequest)
   }
 }
 
@@ -15559,10 +15687,10 @@ if (!gotSingleInstanceLock) {
   // to surface its window (the second-instance handler calls
   // openOrResumeDesktopApp), show an explicit dialog so the launch is never a
   // silent no-op, then quit.
-  desktopLog('launch_aborted_lock_held', {
+  desktopLog(existingDesktopActivationAccepted ? 'launch_forwarded_to_existing_instance' : 'launch_aborted_lock_held', {
     deepLinkHandoff: initialDesktopDeepLinkArguments.length > 0,
   })
-  if (initialDesktopDeepLinkArguments.length === 0) {
+  if (initialDesktopDeepLinkArguments.length === 0 && !existingDesktopActivationAccepted) {
     try {
       // This runs before app.whenReady, so app.getLocale() is unreliable; fall back
       // to the persisted onboarding locale (a plain file read) for this dialog.
@@ -15601,11 +15729,18 @@ if (!gotSingleInstanceLock) {
   })
   handleDeepLinksFromCommandLine(initialDesktopDeepLinkArguments, 'initial-argv')
 
-  app.on('second-instance', (_event, commandLine) => {
+  app.once('will-quit', clearDesktopActivationAcknowledgements)
+  app.on('second-instance', (_event, commandLine, _workingDirectory, additionalData) => {
     const hadDeepLink = handleDeepLinksFromCommandLine(commandLine, 'second-instance')
     desktopLog('second_instance', { hadDeepLink })
     if (hadDeepLink) return
     revealDesktopApp()
+    if (!canRevealDesktopApp(appExitPhase) || isQuitting) return
+    const revealed = currentOnboardingWindow() ?? currentMainWindow()
+    if (revealed && !revealed.isDestroyed() && revealed.isVisible()
+      && !revealed.isMinimized() && revealed.isFocused()) {
+      acknowledgeDesktopActivation(app.getPath('userData'), additionalData)
+    }
   })
 
   void app.whenReady().then(async () => {

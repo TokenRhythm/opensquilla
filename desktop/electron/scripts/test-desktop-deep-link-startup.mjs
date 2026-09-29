@@ -21,13 +21,14 @@ const startup = between('const initialDesktopDeepLinkArguments =', '    void app
 const sessionKey = 'agent:main:webchat:synthetic-startup'
 const link = `opensquilla://open/session/${encodeURIComponent(sessionKey)}`
 
-function launch(platform, argv, lockResults = [true]) {
+function launch(platform, argv, lockResults = [true], options = {}) {
   const app = new EventEmitter()
   const calls = { lock: 0, waits: [], quit: 0, dialogs: 0, activations: [], delivered: [], reveals: 0 }
   let now = 0
-  app.requestSingleInstanceLock = () => {
+  app.requestSingleInstanceLock = additionalData => {
     const result = lockResults[Math.min(calls.lock, lockResults.length - 1)]
     calls.lock++
+    if (!result) options.onLockRequest?.(additionalData)
     return result
   }
   app.quit = () => { calls.quit++ }
@@ -51,7 +52,22 @@ function launch(platform, argv, lockResults = [true]) {
       calls.delivered.push(runInContext('pendingDesktopSessionKey', context))
     },
     revealDesktopApp: () => { calls.reveals++ },
+    appExitPhase: options.exitPhase ?? 'running', isQuitting: false,
+    currentOnboardingWindow: () => null,
+    currentMainWindow: () => ({
+      isDestroyed: () => false, isVisible: () => true, isMinimized: () => false,
+      isFocused: () => options.windowFocused !== false,
+    }),
+    createDesktopActivationRequest: () => ({ version: 1, nonce: 'a'.repeat(32), expiresAt: 5_000 }),
+    hasDesktopActivationAcknowledgement: () => Boolean(options.acknowledged?.()),
+    acknowledgeDesktopActivation: (_directory, additionalData) => {
+      if (additionalData?.desktopActivation?.nonce === 'a'.repeat(32)) options.acknowledge?.()
+    },
+    disposeDesktopActivationRequest() {},
+    clearDesktopActivationAcknowledgements() {},
+    canRevealDesktopApp: phase => phase === 'running',
   })
+  app.getPath = () => 'synthetic-user-data'
   runInContext(`
     let pendingDesktopSessionKey = null
     let pendingDesktopDeepLinkOpen = false
@@ -91,10 +107,56 @@ for (const platform of ['linux', 'win32']) {
   running.app.emit('second-instance', {}, ['OpenSquilla'])
   assert.equal(running.calls.reveals, 1, `${platform}: normal relaunch still reveals`)
 
+  let acknowledged = false
+  const visibleOwner = launch(platform, ['OpenSquilla'], [true], {
+    acknowledge: () => { acknowledged = true },
+  })
+  const activated = launch(platform, ['OpenSquilla'], [false], {
+    onLockRequest: additionalData => visibleOwner.app.emit(
+      'second-instance', {}, ['OpenSquilla'], 'synthetic-cwd', additionalData,
+    ),
+    acknowledged: () => acknowledged,
+  })
+  assert.equal(visibleOwner.calls.reveals, 1, `${platform}: the running owner activates once`)
+  assert.equal(activated.calls.lock, 1, `${platform}: accepted activation does not repeat lock delivery`)
+  assert.equal(activated.calls.waits.length, 0, `${platform}: accepted activation skips the five-second retry`)
+  assert.equal(activated.calls.dialogs, 0, `${platform}: accepted activation is not an error`)
+  assert.equal(activated.calls.quit, 1)
+
   const relaunch = launch(platform, ['OpenSquilla'], [false, false, true])
   assert.equal(relaunch.calls.lock, 3, `${platform}: keep close/relaunch race recovery`)
-  assert.deepEqual(relaunch.calls.waits, [400, 400])
+  assert.equal(relaunch.calls.waits.reduce((sum, value) => sum + value, 0), 800)
   assert.equal(relaunch.calls.quit, 0)
+
+  for (const exitPhase of ['deferred', 'draining', 'committed']) {
+    let wronglyAcknowledged = false
+    const exiting = launch(platform, ['OpenSquilla'], [true], {
+      exitPhase, acknowledge: () => { wronglyAcknowledged = true },
+    })
+    const replacement = launch(platform, ['OpenSquilla'], [false, false, true], {
+      onLockRequest: additionalData => exiting.app.emit(
+        'second-instance', {}, ['OpenSquilla'], 'synthetic-cwd', additionalData,
+      ),
+      acknowledged: () => wronglyAcknowledged,
+    })
+    assert.equal(wronglyAcknowledged, false, `${platform}/${exitPhase}: shutdown cannot accept activation`)
+    assert.equal(replacement.calls.lock, 3, `${platform}/${exitPhase}: replacement still acquires the released lock`)
+    assert.equal(replacement.calls.quit, 0)
+    assert.equal(replacement.calls.dialogs, 0)
+  }
+
+  let unfocusedAcknowledged = false
+  const unfocusedOwner = launch(platform, ['OpenSquilla'], [true], {
+    windowFocused: false, acknowledge: () => { unfocusedAcknowledged = true },
+  })
+  const unaccepted = launch(platform, ['OpenSquilla'], [false], {
+    onLockRequest: additionalData => unfocusedOwner.app.emit(
+      'second-instance', {}, ['OpenSquilla'], 'synthetic-cwd', additionalData,
+    ),
+    acknowledged: () => unfocusedAcknowledged,
+  })
+  assert.equal(unfocusedAcknowledged, false, `${platform}: an unrevealed window cannot accept activation`)
+  assert.equal(unaccepted.calls.dialogs, 1, `${platform}: failed activation remains actionable`)
 
   const blocked = launch(platform, ['OpenSquilla'], [false])
   assert.equal(blocked.calls.waits.reduce((sum, value) => sum + value, 0), 5_000)

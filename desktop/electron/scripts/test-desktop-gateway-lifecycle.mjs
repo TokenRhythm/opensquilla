@@ -4,11 +4,17 @@ import { createContext, runInContext } from 'node:vm'
 
 import {
   DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
+  GatewayReadinessTimeoutError,
   lifecycleAllowsProcessSpawn,
   stopAndJoinLifecycleProcesses,
   waitForGatewayReadiness,
 } from '../dist/gateway-lifecycle.js'
 import { DesktopRoutingConfigurationError } from '../dist/desktop-router-profiles.js'
+import { DesktopWriterAdmission } from '../dist/desktop-writer-admission.js'
+import { WindowsUpdateCoordinator, WindowsUpdatePreparationError } from '../dist/windows-update-coordinator.js'
+import { WindowsUpdateSecurityError } from '../dist/windows-update-security.js'
+import { WindowsUpdateHandoffError } from '../dist/windows-update-handoff.js'
+import { UpdateChannelError } from '../dist/update-channel.js'
 
 // Run the actual main-process startup wiring with profile inspection held open.
 // Readiness helpers alone do not cover the descriptor seen by the first renderer.
@@ -66,6 +72,7 @@ function mainStartupHarness() {
   const snapshot = () => runInContext('desktopGatewayConnectionSnapshot()', context)
   const context = createContext({
     Error,
+    GatewayReadinessTimeoutError,
     DesktopRoutingConfigurationError,
     isQuitting: false,
     appExitPhase: 'running',
@@ -342,6 +349,433 @@ function fakeClock() {
   }
 }
 
+function lateReadyHarness() {
+  let now = 0
+  const sleepers = []
+  const child = { pid: 101, exitCode: null, signalCode: null }
+  const launch = { nonce: 'launch-101', port: 18791 }
+  const calls = { published: [], ready: 0, probes: 0, ownership: 0, starts: 0, failures: [], rendererLoads: [] }
+  const rendererUrl = 'opensquilla-app://desktop'
+  const window = {
+    documentUrl: rendererUrl,
+    loadFile: async () => { window.documentUrl = 'file://synthetic-boot.html' },
+    loadURL: async url => { calls.rendererLoads.push(url); window.documentUrl = url },
+  }
+  const handlers = new Map()
+  const context = createContext({
+    Error, Date, setTimeout, clearTimeout, performance: { now: () => now },
+    DesktopRoutingConfigurationError,
+    DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS, GatewayReadinessTimeoutError,
+    isQuitting: false, updateApplying: false, appExitPhase: 'running',
+    desktopWriters: { closed: false },
+    gatewayProcess: child, gatewayProfileKey: 'profile-a',
+    profileKey: 'profile-a',
+    gatewayStoppingProcesses: new Set(),
+    gatewayProcessOwnershipContexts: new Map([[child, launch]]),
+    forceOnboardingOnNextStartup: false, onboardingPromptProfileKey: null,
+    onboardingFlows: { active: null }, bootError: null,
+    gatewayStartPromise: null, gatewayStartTelemetryAttempt: null,
+    invalidateSecretStorageBackendCache() {},
+    createGatewayStartTelemetryAttempt: () => ({}), finishGatewayStartTelemetry() {},
+    DesktopStartupError: class extends Error {},
+    bootPagePath: () => 'synthetic-boot.html',
+    ipcMain: { handle: (name, handler) => handlers.set(name, handler) },
+    activeDesktopProfile: () => ({ home: context.profileKey }),
+    desktopProfileFingerprint: () => 'profile-fingerprint',
+    desktopProfileKey: () => context.profileKey,
+    cancelGatewayUnexpectedExitRestart() {},
+    createMainWindow: async () => {}, focusMainWindow() {},
+    inspectActiveProfileBeforeStartup: async () => true,
+    syncDesktopConsentMirror: async () => {}, desktopTelemetryRuntimeGate: { close() {} },
+    desktopLog() {}, desktopStartupLog() {}, beginGatewayStartTelemetry() {},
+    advanceGatewayStartTelemetry() {}, markGatewayProcessReady() {},
+    sendBootStatus() {},
+    DESKTOP_RENDERER_URL: rendererUrl,
+    isCurrentWindowAtDesktopRenderer: candidate => candidate.documentUrl === rendererUrl,
+    currentMainWindow: () => window,
+    sendBootError: error => { context.bootError = error },
+    finishAppStartFailure: error => calls.failures.push(error.message),
+    finishAppStartSuccess: () => { calls.ready += 1 },
+    publishGatewayConnection: () => {
+      calls.published.push(runInContext('({ ...gatewayState })', context))
+    },
+    readinessCheck: async () => { calls.probes += 1; return now >= 126_000 },
+    verifyOwnedGatewayLaunch: async () => { calls.ownership += 1; return true },
+    waitForGatewayReadiness: async options => {
+      if (now === 0) {
+        now = 120_000
+        return { status: 'timeout' }
+      }
+      return await waitForGatewayReadiness({
+        ...options,
+        now: () => now,
+        sleep: milliseconds => new Promise(resolve => sleepers.push({ at: now + milliseconds, resolve })),
+      })
+    },
+  })
+  runInContext([
+    mainSection('let desktopOpenFlowRevision =', 'function beginDesktopWriterOperation('),
+    mainSection('const gatewayState =', 'let sandboxUpgradeRefreshInFlight ='),
+    mainSection('async function waitForGateway(', 'function trackStoppingGatewayProcess('),
+    mainSection('async function resumeOwnedGatewayStartup(', 'function publishResumedOwnedGateway('),
+    mainSection('function currentBootResumeAuthority(', 'async function resumeBootStartup('),
+    mainSection('async function resumeBootStartup(', "ipcMain.handle('desktop:boot:retry'"),
+    mainSection('function publishResumedOwnedGateway(', '// Foreground startup still ends'),
+    mainSection('function setAppExitPhase(', 'function destroyWindowsTray('),
+    mainSection('async function loadDesktopRendererIntoCurrentWindow(', '// The old boot document'),
+    mainSection('async function openOrResumeDesktopApp(', '// SIGKILL deadline'),
+    // The baseline has no late observer. Keep the regression runnable against
+    // that baseline so it fails on the missing ready publication, not parsing.
+    main.includes('const GATEWAY_LATE_READY_OBSERVATION_MS =')
+      ? mainSection('const GATEWAY_LATE_READY_OBSERVATION_MS =', 'const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS =')
+      : '',
+    `gatewayState.url = 'http://127.0.0.1:18791'; gatewayState.port = 18791;
+     gatewayState.owned = true; gatewayState.status = 'starting';
+     gatewayConnectionInstanceId = 'instance-a';`,
+  ].join('\n'), context)
+  context.desktopGatewayConnectionSuspendedForExit = () => false
+  context.rebuildWindowsTrayMenu = () => {}
+  context.reuseHealthyGatewayState = async () => null
+  context.ensureGatewayStarted = async () => {
+    calls.starts += 1
+    await runInContext('waitForGateway(gatewayState.url)', context)
+    return runInContext('gatewayState', context)
+  }
+  const flush = async () => { for (let index = 0; index < 30; index += 1) await Promise.resolve() }
+  return {
+    context, calls, child, launch, window,
+    open: () => runInContext('openOrResumeDesktopApp()', context),
+    state: () => runInContext('({ ...gatewayState, bootError })', context),
+    resume: () => handlers.get('desktop:boot:resume')(),
+    advance: async milliseconds => {
+      now += milliseconds
+      const due = sleepers.splice(0).filter(item => {
+        if (item.at <= now) { item.resolve(); return false }
+        return true
+      })
+      sleepers.push(...due)
+      await flush()
+    },
+    flush,
+  }
+}
+
+async function runReadinessAfterForegroundTimeoutCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  assert.equal(harness.state().status, 'error', 'the existing 120 second foreground deadline remains visible')
+  assert.equal(harness.calls.failures.length, 1)
+  await harness.advance(6_000)
+  assert.equal(harness.state().status, 'ready', 'the same owned child becoming ready after 120 seconds must reconnect')
+  assert.equal(harness.state().bootError, null, 'late readiness clears the startup error')
+  assert.equal(harness.calls.starts, 1, 'late recovery cannot spawn a replacement')
+  assert.equal(harness.calls.ownership, 1, 'readiness alone cannot grant ownership')
+  assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1)
+  assert.equal(harness.calls.rendererLoads.length, 0, 'an existing renderer must not reload on late readiness')
+}
+
+async function runManualResumeTimeoutThenLateReadinessCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  let ready = false
+  harness.context.readinessCheck = async () => { harness.calls.probes += 1; return ready }
+  const manual = harness.resume()
+  await harness.flush()
+  await harness.advance(120_000)
+  assert.equal((await manual).ok, false, 'manual Resume retains its own foreground deadline')
+  assert.equal(harness.state().status, 'error')
+  assert.equal(harness.window.documentUrl, 'file://synthetic-boot.html')
+  await harness.flush()
+  ready = true
+  await harness.advance(2_000)
+  assert.equal(harness.state().status, 'ready')
+  assert.equal(harness.window.documentUrl, 'opensquilla-app://desktop', 'late recovery after manual Resume must leave the boot page')
+  assert.equal(harness.calls.rendererLoads.length, 1)
+  assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1)
+  assert.equal(harness.state().bootError, null)
+}
+
+async function runLateReadinessNavigationAuthorityCase(label, invalidate) {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  const error = harness.state().bootError
+  const navigation = deferred()
+  harness.window.documentUrl = 'file://synthetic-boot.html'
+  harness.window.loadURL = async url => {
+    harness.calls.rendererLoads.push(url)
+    await navigation.promise
+    harness.window.documentUrl = url
+  }
+  await harness.advance(6_000)
+  assert.equal(harness.calls.rendererLoads.length, 1, 'hold the real renderer loader at its navigation await')
+  assert.equal(harness.calls.ready, 0, 'ready cannot be published before renderer restoration finishes')
+  invalidate(harness)
+  navigation.resolve()
+  await harness.flush()
+  assert.equal(harness.calls.ready, 0, `${label}: finishing navigation cannot restore superseded readiness`)
+  assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 0)
+  assert.equal(harness.state().bootError, error, 'a stale navigation cannot clear the current startup error')
+}
+
+async function runLateReadinessAuthorityCase(label, invalidate) {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  const verification = deferred()
+  harness.context.verifyOwnedGatewayLaunch = async () => {
+    harness.calls.ownership += 1
+    return await verification.promise
+  }
+  await harness.advance(6_000)
+  assert.equal(harness.calls.ownership, 1, 'hold the probe at the asynchronous ownership boundary')
+  invalidate(harness)
+  verification.resolve(true)
+  await harness.flush()
+  assert.equal(harness.calls.ready, 0, `${label}: a late callback cannot publish app readiness`)
+  assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 0, label)
+  assert.equal(harness.calls.starts, 1, `${label}: observation never spawns a successor`)
+}
+
+async function runLateReadinessDeadlineCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  const error = harness.state().bootError
+  await harness.advance(10 * 60_000)
+  assert.equal(harness.state().status, 'error', 'the observation window is finite')
+  assert.equal(harness.state().bootError, error, 'expiry preserves the original actionable error')
+  assert.equal(runInContext('gatewayLateReadyObservation', harness.context), null)
+  assert.equal(harness.calls.starts, 1)
+  assert.equal((await harness.resume()).ok, true, 'manual Resume remains available after observation expires')
+  assert.equal(harness.state().status, 'ready')
+}
+
+async function runForeignLateListenerCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  harness.context.verifyOwnedGatewayLaunch = async () => {
+    harness.calls.ownership += 1
+    return false
+  }
+  await harness.advance(6_000)
+  assert.equal(harness.calls.ownership, 1)
+  assert.equal(harness.state().status, 'error', 'a healthy foreign listener is never adopted')
+  assert.equal(harness.calls.ready, 0)
+  assert.equal(harness.calls.starts, 1, 'the background observer has no port recovery or kill path')
+  await harness.advance(10 * 60_000)
+}
+
+async function runLateReadinessManualResumeCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  const backgroundVerification = deferred()
+  harness.context.verifyOwnedGatewayLaunch = async () => {
+    harness.calls.ownership += 1
+    return harness.calls.ownership === 1 ? await backgroundVerification.promise : true
+  }
+  await harness.advance(6_000)
+  const first = harness.resume()
+  const repeated = harness.resume()
+  assert.equal((await first).ok, true)
+  assert.equal((await repeated).ok, true)
+  backgroundVerification.resolve(true)
+  await harness.flush()
+  assert.equal(harness.calls.ownership, 2, 'repeated Resume shares one foreground attempt')
+  assert.equal(harness.calls.ready, 1, 'manual Resume supersedes the in-flight background callback')
+  assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1)
+  assert.equal(harness.state().bootError, null)
+}
+
+async function runLateReadinessSingleObserverCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  runInContext('observeLateOwnedGatewayReadiness()', harness.context)
+  await harness.flush()
+  assert.equal(harness.calls.probes, 1, 'duplicate observation requests share the existing bounded attempt')
+  await harness.advance(6_000)
+  assert.equal(harness.calls.ready, 1)
+}
+
+function installFailedUpdateHarness(harness) {
+  const verification = deferred()
+  const calls = { stops: 0, launches: 0, quits: 0, verifies: 0 }
+  Object.assign(harness.context, {
+    WindowsUpdateCoordinator, WindowsUpdatePreparationError, WindowsUpdateSecurityError,
+    WindowsUpdateHandoffError, UpdateChannelError, setImmediate,
+    app: { getVersion: () => 'synthetic-old', quit: () => { calls.quits += 1 } },
+    restoreWindowsUpdateCache: async () => {},
+    desktopUpdateCandidate: { version: 'synthetic-new', tag: 'synthetic-new' },
+    desktopUpdateStatus: 'downloaded', verifiedManualInstallerPath: 'synthetic-installer',
+    windowsUpdateCoordinator: new WindowsUpdateCoordinator(), windowsUpdateRecoveryGeneration: 0,
+    updateInstallHandoffReady: false, updateDownloadInProgress: false,
+    manualInstallerActionInProgress: false, quitRequestedDuringUpdateDrain: false,
+    downloadedUpdateVersion: null, desktopWriters: new DesktopWriterAdmission(),
+    windowsInstallerActionsSupported: () => true, desktopUpdateInstallMode: () => 'manual',
+    liveLifecycleOwnedGatewayProcesses: () => [harness.context.gatewayProcess].filter(Boolean),
+    revalidateReadyWindowsInstaller: async () => { calls.verifies += 1; return await verification.promise },
+    assertUnambiguousWindowsInstallation: async () => {},
+    stopOwnedGatewaysForUpdate: async () => { calls.stops += 1; return true },
+    launchWindowsInstaller: async () => { calls.launches += 1 },
+    desktopReliabilityTelemetry: { clearUpdateHandoff() {}, recordUpdateResult() {} },
+    classifyDesktopUpdateError: () => 'install_failed',
+    classifyDesktopUpdateTelemetryError: () => 'install_failed',
+    desktopUpdateErrorMessage: () => 'Synthetic installer verification failure',
+    createWindowsTray() {}, createApplicationMenu() {}, setDesktopUpdateState() {},
+  })
+  runInContext([
+    mainSection('function restoreDownloadedUpdateRetryState(', 'async function stopOwnedGatewaysForUpdate('),
+    mainSection('async function applyWindowsInstaller(', '// Stop the owned gateway child'),
+  ].join('\n'), harness.context)
+  return {
+    calls,
+    start: () => runInContext('applyWindowsInstaller()', harness.context),
+    fail: () => verification.reject(new Error('Synthetic installer verification failure')),
+  }
+}
+
+async function runLateReadinessAfterFailedUpdateCase() {
+  const harness = lateReadyHarness()
+  await harness.open()
+  await harness.flush()
+  const oldVerification = deferred()
+  const resumedVerification = deferred()
+  harness.context.verifyOwnedGatewayLaunch = async () => {
+    harness.calls.ownership += 1
+    return await (harness.calls.ownership === 1 ? oldVerification.promise : resumedVerification.promise)
+  }
+  await harness.advance(6_000)
+  assert.equal(harness.calls.ownership, 1, 'hold the original observer at its ownership check')
+  const update = installFailedUpdateHarness(harness)
+  const applying = update.start()
+  await harness.flush()
+  assert.equal(harness.context.appExitPhase, 'deferred')
+  assert.equal(runInContext('gatewayLateReadyObservation', harness.context), null)
+  update.fail()
+  await applying
+  await harness.flush()
+  assert.equal(harness.calls.ownership, 2, 'failed verification starts a fresh ownership probe')
+  const resumedObservation = runInContext('gatewayLateReadyObservation', harness.context)
+  oldVerification.resolve(true)
+  await harness.flush()
+  assert.equal(harness.calls.ready, 0, 'the pre-update callback remains canceled after recovery')
+  assert.equal(runInContext('gatewayLateReadyObservation', harness.context), resumedObservation,
+    'the canceled callback cannot clear the resumed observation')
+  resumedVerification.resolve(true)
+  await harness.flush()
+  assert.equal(harness.calls.ready, 1, 'failed verification must resume observation of the same live child')
+  assert.equal(harness.state().bootError, null)
+  assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1,
+    'the canceled pre-update callback cannot publish a second descriptor')
+  assert.equal(harness.calls.starts, 1, 'update recovery must not spawn another Gateway')
+  assert.equal(update.calls.stops, 0, 'verification failed before Gateway stop')
+  assert.equal(update.calls.launches, 0, 'failed verification never reaches installer handoff')
+}
+
+async function runForegroundTimeoutDuringUpdateCase(label, invalidate = null, timeout = true) {
+  const harness = lateReadyHarness()
+  const foreground = deferred()
+  const originalWait = harness.context.waitForGatewayReadiness
+  let firstWait = true
+  harness.context.waitForGatewayReadiness = options => {
+    if (!firstWait) return originalWait(options)
+    firstWait = false
+    return foreground.promise
+  }
+  const opening = harness.open()
+  await harness.flush()
+  const update = installFailedUpdateHarness(harness)
+  const applying = update.start()
+  await harness.flush()
+  assert.equal(harness.context.appExitPhase, 'deferred')
+  await harness.advance(120_000)
+  if (timeout) foreground.resolve({ status: 'timeout' })
+  else foreground.reject(new Error('Synthetic unrelated startup failure'))
+  await opening
+  const originalError = harness.state().bootError
+  assert.equal(harness.state().status, 'error')
+  await harness.advance(6_000)
+  assert.equal(harness.calls.probes, 0, `${label}: update verification cannot start a background readiness probe`)
+  assert.equal(harness.calls.ready, 0, `${label}: update verification owns readiness publication`)
+  await invalidate?.(harness)
+  update.fail()
+  await applying
+  await harness.flush()
+  await harness.advance(2_000)
+  if (!invalidate && timeout) {
+    assert.equal(harness.state().status, 'ready',
+      'a foreground timeout during failed update verification must resume the same launch')
+    assert.equal(harness.calls.ready, 1)
+    assert.equal(harness.state().bootError, null)
+    assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1)
+  } else {
+    assert.equal(harness.calls.ready, 0, `${label}: canceled or unrelated startup must not recover`)
+    assert.equal(harness.calls.probes, 0, `${label}: canceled or unrelated startup must not start a new probe`)
+    assert.equal(harness.state().bootError, originalError)
+  }
+  assert.equal(harness.calls.starts, 1, `${label}: update failure cannot spawn another Gateway`)
+  assert.equal(update.calls.stops, 0, `${label}: verification failed before Gateway stop`)
+  assert.equal(update.calls.launches, 0, `${label}: verification failed before installer launch`)
+}
+
+async function runFailedUpdateKeepsLateReadinessDeadlineCase() {
+  const harness = lateReadyHarness()
+  harness.context.readinessCheck = async () => false
+  await harness.open()
+  const originalError = harness.state().bootError
+  const first = installFailedUpdateHarness(harness)
+  const firstApplying = first.start()
+  await harness.flush()
+  await harness.advance(590_000)
+  first.fail()
+  await firstApplying
+  assert.ok(runInContext('gatewayLateReadyObservation', harness.context),
+    'verification failure with time remaining resumes observation')
+  const second = installFailedUpdateHarness(harness)
+  const secondApplying = second.start()
+  await harness.flush()
+  await harness.advance(5_000)
+  second.fail()
+  await secondApplying
+  assert.ok(runInContext('gatewayLateReadyObservation', harness.context))
+  await harness.advance(5_001)
+  assert.equal(runInContext('gatewayLateReadyObservation', harness.context), null,
+    'repeated update failures cannot extend the original ten-minute deadline')
+  harness.context.readinessCheck = async () => true
+  await harness.advance(2_000)
+  assert.equal(harness.calls.ready, 0)
+  assert.equal(harness.state().bootError, originalError)
+  assert.equal(harness.calls.starts, 1)
+  assert.equal((await harness.resume()).ok, true, 'manual Resume remains available after the original deadline')
+  assert.equal(harness.calls.ready, 1)
+}
+
+async function runFailedUpdateInvalidatesLateReadinessCase(label, invalidate) {
+  const harness = lateReadyHarness()
+  await harness.open()
+  const update = installFailedUpdateHarness(harness)
+  const applying = update.start()
+  await harness.flush()
+  await invalidate(harness)
+  update.fail()
+  await applying
+  await harness.advance(6_000)
+  assert.equal(harness.calls.ready, 0, `${label}: failed update cannot revive superseded startup`)
+  assert.equal(runInContext('gatewayLateReadyObservation', harness.context), null, label)
+  assert.equal(harness.calls.starts, 1, `${label}: no successor is spawned`)
+  assert.equal(update.calls.stops, 0, `${label}: verification failed before stop`)
+  assert.equal(update.calls.launches, 0, label)
+  if (label === 'queued Quit') {
+    await new Promise(setImmediate)
+    assert.equal(update.calls.quits, 1, 'the queued Quit retains ownership of recovery')
+  }
+}
+
 async function runReadinessBeforePrimaryDeadlineCase() {
   const clock = fakeClock()
   let probes = 0
@@ -599,5 +1033,63 @@ await runReadinessExitDuringSuccessfulProbeCase()
 await runProbeCrossesDeadlineCase()
 await runNeverResolvingProbeCase()
 await runSlowColdStartReadinessCase()
+await runReadinessAfterForegroundTimeoutCase()
+await runLateReadinessSingleObserverCase()
+await runLateReadinessAfterFailedUpdateCase()
+await runForegroundTimeoutDuringUpdateCase('same launch')
+await runForegroundTimeoutDuringUpdateCase('unrelated startup error', null, false)
+for (const [label, invalidate] of [
+  ['replacement child', harness => { harness.context.gatewayProcess = { ...harness.child, pid: 202 } }],
+  ['profile change', harness => { harness.context.profileKey = 'profile-b' }],
+  ['new open revision', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
+  ['queued Quit', harness => { harness.context.quitRequestedDuringUpdateDrain = true }],
+  ['another writer owner', harness => { harness.context.desktopWriters.close('synthetic cleanup') }],
+  ['expired observation', harness => harness.advance(600_001)],
+  ['stopping child', harness => harness.context.gatewayStoppingProcesses.add(harness.child)],
+  ['child exit', harness => { harness.child.exitCode = 0 }],
+  ['endpoint change', harness => runInContext("gatewayState.url = 'http://127.0.0.1:18792'", harness.context)],
+  ['port change', harness => runInContext('gatewayState.port = 18792', harness.context)],
+  ['instance change', harness => runInContext("gatewayConnectionInstanceId = 'instance-b'", harness.context)],
+  ['launch context change', harness => harness.context.gatewayProcessOwnershipContexts.set(harness.child, { ...harness.launch })],
+]) await runForegroundTimeoutDuringUpdateCase(label, invalidate)
+await runFailedUpdateKeepsLateReadinessDeadlineCase()
+for (const [label, invalidate] of [
+  ['expired observation', harness => harness.advance(600_001)],
+  ['replacement child', harness => { harness.context.gatewayProcess = { ...harness.child, pid: 202 } }],
+  ['profile change', harness => { harness.context.profileKey = 'profile-b' }],
+  ['new open revision', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
+  ['queued Quit', harness => { harness.context.quitRequestedDuringUpdateDrain = true }],
+  ['another writer owner', harness => { harness.context.desktopWriters.close('synthetic cleanup') }],
+  ['stopping child', harness => harness.context.gatewayStoppingProcesses.add(harness.child)],
+  ['child exit', harness => { harness.child.exitCode = 0 }],
+  ['endpoint change', harness => runInContext("gatewayState.url = 'http://127.0.0.1:18792'", harness.context)],
+  ['port change', harness => runInContext('gatewayState.port = 18792', harness.context)],
+  ['instance change', harness => runInContext("gatewayConnectionInstanceId = 'instance-b'", harness.context)],
+  ['launch context change', harness => harness.context.gatewayProcessOwnershipContexts.set(harness.child, { ...harness.launch })],
+]) await runFailedUpdateInvalidatesLateReadinessCase(label, invalidate)
+for (const [label, invalidate] of [
+  ['replacement child', harness => { harness.context.gatewayProcess = { ...harness.child, pid: 202 } }],
+  ['profile change', harness => { harness.context.profileKey = 'profile-b' }],
+  ['new open revision', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
+  ['quit', harness => { harness.context.isQuitting = true }],
+  ['writer admission', harness => { harness.context.desktopWriters.closed = true }],
+  ['update', harness => { harness.context.updateApplying = true }],
+  ['update then failure', harness => runInContext("setAppExitPhase('deferred', 'update'); setAppExitPhase('running', 'update failed')", harness.context)],
+  ['stopping child', harness => harness.context.gatewayStoppingProcesses.add(harness.child)],
+  ['child exit', harness => { harness.child.exitCode = 0 }],
+  ['endpoint change', harness => runInContext("gatewayState.url = 'http://127.0.0.1:18792'", harness.context)],
+  ['port change', harness => runInContext('gatewayState.port = 18792', harness.context)],
+  ['instance change', harness => runInContext("gatewayConnectionInstanceId = 'instance-b'", harness.context)],
+  ['launch context change', harness => harness.context.gatewayProcessOwnershipContexts.set(harness.child, { ...harness.launch })],
+]) await runLateReadinessAuthorityCase(label, invalidate)
+await runForeignLateListenerCase()
+await runLateReadinessDeadlineCase()
+await runLateReadinessManualResumeCase()
+await runManualResumeTimeoutThenLateReadinessCase()
+for (const [label, invalidate] of [
+  ['quit during renderer restoration', harness => { harness.context.isQuitting = true }],
+  ['update during renderer restoration', harness => { harness.context.updateApplying = true }],
+  ['new open during renderer restoration', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
+]) await runLateReadinessNavigationAuthorityCase(label, invalidate)
 
 console.log('desktop gateway lifecycle tests passed')

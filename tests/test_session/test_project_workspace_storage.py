@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -11,7 +13,7 @@ from opensquilla.persistence.router_decision_writer import (
     open_router_decision_writer,
 )
 from opensquilla.persistence.turn_error_writer import open_turn_error_writer
-from opensquilla.project_workspaces import ProjectWorkspaceGuard
+from opensquilla.project_workspaces import ProjectWorkspaceGuard, project_path_key
 from opensquilla.session.models import (
     AgentTaskRecord,
     MemoryDurableReceipt,
@@ -561,6 +563,94 @@ async def test_project_history_delete_attempts_every_cleanup_after_failure(
         assert sentinel.read_text(encoding="utf-8") == "project data"
     finally:
         await storage.close()
+
+
+@pytest.mark.asyncio
+async def test_project_history_cleanup_survives_cancellation_of_all_loop_tasks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from opensquilla.artifacts import ArtifactStore
+    from opensquilla.attachment_refs import transcript_material_dir, write_transcript_material
+    from opensquilla.gateway.boot import build_session_material_cleanup
+    from opensquilla.session import material_cleanup
+
+    project_path = tmp_path / "project"
+    project_path.mkdir()
+    media_root = tmp_path / "media"
+    config = SimpleNamespace(
+        attachments=SimpleNamespace(media_root=str(media_root)),
+        workspace_dir=str(project_path), agents=[], state_dir=None, config_path=None,
+    )
+    started = [threading.Event(), threading.Event()]
+    release = [threading.Event(), threading.Event()]
+    attempted: list[str] = []
+    completed: list[str] = []
+    original_delete = ArtifactStore.delete_session_artifacts
+
+    def slow_delete(store, session_id):
+        index = len(attempted)
+        attempted.append(session_id)
+        started[index].set()
+        if not release[index].wait(timeout=5):
+            raise TimeoutError("test did not release project material cleanup")
+        result = original_delete(store, session_id)
+        completed.append(session_id)
+        return result
+
+    async def isolated_loop():
+        async with SessionStorage(tmp_path / "sessions.db") as storage:
+            project = await storage.create_or_restore_project_workspace(
+                path=str(project_path.resolve()), path_key=project_path_key(project_path),
+                display_name="project", trusted_at=100, now_ms=100,
+            )
+            sessions = [SessionNode(
+                session_key=f"agent:main:webchat:shutdown-{i}", session_id=f"shutdown-{i}",
+                workspace_id=project.workspace_id, created_at=i + 1, updated_at=i + 1,
+            ) for i in range(2)]
+            for session in sessions:
+                await storage.upsert_session(session)
+                write_transcript_material(
+                    media_root=media_root, session_id=session.session_id, payload=b"material",
+                )
+                ArtifactStore(media_root).publish_bytes(
+                    b"artifact", session_id=session.session_id, session_key=session.session_key,
+                    name="test.txt", mime="text/plain", source="test",
+                )
+            deleting = asyncio.create_task(
+                storage.delete_project_workspace_sessions(project.workspace_id),
+            )
+            tasks = set()
+            try:
+                assert await asyncio.to_thread(started[0].wait, 3)
+                for session in sessions:
+                    assert await storage.get_session(session.session_key) is None
+                for index in range(2):
+                    if index:
+                        assert await asyncio.to_thread(started[index].wait, 3)
+                    # Runner cancels the public wrapper and its private child,
+                    # not just the original caller. Never cancel pytest's loop.
+                    tasks |= asyncio.all_tasks() - {asyncio.current_task()}
+                    for task in tasks:
+                        task.cancel("event loop shutdown")
+                    await asyncio.wait(tasks, timeout=0.05)
+                    assert not deleting.done()
+                    release[index].set()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                assert deleting.cancelled()
+                assert set(completed) == {session.session_id for session in sessions}
+                assert not list((media_root / "artifacts").rglob("meta.json"))
+                for session in sessions:
+                    assert not transcript_material_dir(media_root, session.session_id).exists()
+                assert await storage.get_project_workspace(project.workspace_id) is not None
+                assert project_path.is_dir()
+            finally:
+                for gate in release:
+                    gate.set()
+                await asyncio.gather(*tasks, deleting, return_exceptions=True)
+
+    monkeypatch.setattr(material_cleanup, "_hook", build_session_material_cleanup(config))
+    monkeypatch.setattr(ArtifactStore, "delete_session_artifacts", slow_delete)
+    await asyncio.to_thread(lambda: asyncio.run(isolated_loop()))
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import multiprocessing
 import os
@@ -10,6 +11,84 @@ from typing import Any
 import pytest
 import typer
 from typer.testing import CliRunner
+
+
+@pytest.mark.parametrize("fail_at", [None, "profile_lock", "inspect", "legacy_lock", "body"])
+@pytest.mark.parametrize("broken_stderr", [False, True])
+def test_startup_timing_preserves_writer_guard_order_and_original_failure(
+    monkeypatch, tmp_path, capsys, fail_at, broken_stderr,
+) -> None:
+    from types import SimpleNamespace
+
+    from opensquilla import startup_timing
+    from opensquilla.recovery import engine
+
+    monkeypatch.setattr(startup_timing, "_ENABLED", True)
+    events = []
+    sentinel = RuntimeError("private writer failure")
+
+    @contextlib.contextmanager
+    def lock(name):
+        events.append(name + ".enter")
+        if fail_at == name:
+            raise sentinel
+        try:
+            yield
+        finally:
+            events.append(name + ".exit")
+
+    def inspect(*_args, **_kwargs):
+        events.append("inspect")
+        if fail_at == "inspect":
+            raise sentinel
+        return SimpleNamespace(outcome="ready")
+
+    monkeypatch.setattr(engine, "_resolved_home_path", lambda _home: tmp_path)
+    monkeypatch.setattr(engine, "_profile_kind", lambda *_args, **_kwargs: "desktop-primary")
+    monkeypatch.setattr(
+        engine, "ProfileOperationLock", lambda *_args, **_kwargs: lock("profile_lock"),
+    )
+    monkeypatch.setattr(engine, "LegacyGatewayLock", lambda *_args, **_kwargs: lock("legacy_lock"))
+    monkeypatch.setattr(engine, "inspect_profile", inspect)
+
+    def run():
+        with engine.guarded_desktop_profile(tmp_path):
+            events.append("body")
+            if fail_at == "body":
+                raise sentinel
+
+    if broken_stderr:
+        def write(_text):
+            raise OSError("private diagnostic failure")
+
+        monkeypatch.setattr(startup_timing.sys, "stderr", SimpleNamespace(write=write))
+
+    if fail_at:
+        with pytest.raises(RuntimeError) as caught:
+            run()
+        assert caught.value is sentinel
+    else:
+        run()
+
+    expected = {
+        "profile_lock": ["profile_lock.enter"],
+        "inspect": ["profile_lock.enter", "inspect", "profile_lock.exit"],
+        "legacy_lock": [
+            "profile_lock.enter", "inspect", "legacy_lock.enter", "profile_lock.exit",
+        ],
+    }.get(fail_at, [
+        "profile_lock.enter", "inspect", "legacy_lock.enter", "body",
+        "legacy_lock.exit", "profile_lock.exit",
+    ])
+    assert events == expected
+    if not broken_stderr:
+        records = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
+        complete = [item["phase"] for item in records if item["status"] == "complete"]
+        assert complete == {
+            "profile_lock": [],
+            "inspect": ["profile_lock"],
+            "legacy_lock": ["profile_lock", "profile_inspect"],
+        }.get(fail_at, ["profile_lock", "profile_inspect", "legacy_lock"])
 
 
 def _hold_runtime_writer(
