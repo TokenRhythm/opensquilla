@@ -4132,6 +4132,10 @@
         "generic": "La réorientation n'est pas disponible pour la tâche actuelle. Le message reste en file d'attente."
       },
       "clearQueue": "Vider la file",
+      "autoSendPaused": "Envoi automatique en pause",
+      "resumeQueue": "Reprendre la file",
+      "sendOne": "Envoyer ce message",
+      "pauseSaveFailed": "Impossible d’enregistrer la pause de la file. L’envoi automatique est suspendu dans cette fenêtre. Vérifiez le stockage du navigateur et réessayez.",
       "removeMessage": "Supprimer le message en attente {index}",
       "offlineRejected": "Le message n’a pas été accepté. Modifiez-le pour réessayer, ou supprimez-le.",
       "offlineQueued": "Enregistré localement. Le message sera envoyé au rétablissement de la connexion.",

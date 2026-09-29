@@ -5899,12 +5899,7 @@ class TestSessionsAbort:
                 {
                     "schema_version": 1,
                     "key": session.session_key,
-                    "reason": "task_terminal",
-                    "run_status": "cancelled",
-                    "last_task": {
-                        "status": "cancelled",
-                        "terminal_reason": "user_abort",
-                    },
+                    "reason": "cancellation_completed",
                 },
             )
         ]
