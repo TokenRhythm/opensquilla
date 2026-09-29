@@ -198,6 +198,49 @@ async def test_terminal_lifecycle_settles_before_session_lane_cleanup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_projects_terminal_claim_before_durable_settlement() -> None:
+    """Hydration must not resurrect SQLite RUNNING during terminal persistence."""
+
+    storage = _make_storage()
+    terminal_persist_started = asyncio.Event()
+    release_terminal_persist = asyncio.Event()
+    update_agent_task = storage.update_agent_task
+
+    async def delayed_update(task_id: str, **kwargs: Any) -> None:
+        if kwargs.get("status") in {
+            AgentTaskStatus.SUCCEEDED,
+            AgentTaskStatus.FAILED,
+            AgentTaskStatus.CANCELLED,
+            AgentTaskStatus.TIMEOUT,
+            AgentTaskStatus.ABANDONED,
+        }:
+            terminal_persist_started.set()
+            await release_terminal_persist.wait()
+        await update_agent_task(task_id, **kwargs)
+
+    storage.update_agent_task = delayed_update
+    rt = TaskRuntime(
+        storage=storage,
+        turn_handler=lambda _run: asyncio.sleep(0),
+        max_concurrency=1,
+    )
+    envelope = _make_envelope("agent-1::sess-terminal-hydrate")
+    handle = await rt.enqueue(envelope, "hello")
+
+    await asyncio.wait_for(terminal_persist_started.wait(), timeout=2.0)
+    snapshot = await rt.session_task_snapshot(envelope.session_key)
+
+    assert snapshot.running_task_id is None
+    assert snapshot.queued_task_ids == ()
+    assert [record.task_id for record in snapshot.terminal_tasks] == [handle.task_id]
+    assert snapshot.terminal_tasks[0].status is AgentTaskStatus.SUCCEEDED
+
+    release_terminal_persist.set()
+    settled = await rt.wait(handle.task_id, timeout=2.0)
+    assert settled.status is AgentTaskStatus.SUCCEEDED
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("followup_api", ["send", "send_with_envelope"])
 async def test_guest_runtime_send_materializes_fresh_profile_per_task(
     tmp_path,
