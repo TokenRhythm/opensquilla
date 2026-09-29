@@ -1919,8 +1919,29 @@ jobs:
           set -euo pipefail
           # This probe fails when the recommended backend is absent; the
           # optional-dependency skip in the core pytest suite cannot mask it.
+          pty_probe_log="${CI_REPORT_DIR}/pty-capability.log"
+          set +e
           uv run --no-sync python desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
-            2>&1 | tee "${CI_REPORT_DIR}/pty-capability.log"
+            2>&1 | tee "${pty_probe_log}"
+          pty_probe_statuses=("${PIPESTATUS[@]}")
+          set -e
+          if [[ "${pty_probe_statuses[1]}" -ne 0 ]]; then
+            exit "${pty_probe_statuses[1]}"
+          fi
+          if [[ "${pty_probe_statuses[0]}" -ne 0 ]]; then
+            expected_pty_timeout='{"probe": "opensquilla-desktop-pty", "available": false, "ioMode": "error", "reason": "PTY probe timed out"}'
+            mapfile -t pty_probe_lines < "${pty_probe_log}"
+            first_pty_line="${pty_probe_lines[0]-}"
+            if [[ "${RUNNER_OS}" != "Windows" ]] ||
+               [[ "${#pty_probe_lines[@]}" -ne 1 ]] ||
+               [[ "${first_pty_line%$'\r'}" != "${expected_pty_timeout}" ]]; then
+              exit "${pty_probe_statuses[0]}"
+            fi
+            printf '%s\n' 'Retrying the transient Windows PTY timeout once.'
+            uv run --no-sync python \
+              desktop/electron/scripts/gateway-entry.py --_desktop-pty-probe \
+              2>&1 | tee "${CI_REPORT_DIR}/pty-capability-attempt-2.log"
+          fi
           uv run --no-sync pytest \
             tests/test_tools/test_shell_process_isolation.py::test_unified_exec_real_pty_reports_tty_and_accepts_input \
             -vv --tb=short \

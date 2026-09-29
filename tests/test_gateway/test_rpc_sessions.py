@@ -2509,6 +2509,10 @@ class TestSessionsList:
 
 
 class TestSessionsSend:
+    # This background-turn lifecycle contract waits on a real two-second
+    # terminal-event budget. Keep it out of the xdist pool so saturated
+    # Windows workers cannot starve the durable runner before it emits.
+    @pytest.mark.ci_serial
     @pytest.mark.asyncio
     async def test_direct_send_rejects_dropping_durable_runner(
         self,

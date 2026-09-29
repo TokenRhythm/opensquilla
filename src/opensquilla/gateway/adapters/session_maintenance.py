@@ -314,6 +314,11 @@ class GatewaySessionMaintenancePorts(
             retained_tail_messages=effective_protected_recent_messages(config),
             summary_output_tokens=(target.plan.primary.max_output_tokens if target.plan else 1024),
         )
+        config.attachment_media_root = media_root_from_config(self._context.config)
+        config.preserve_historical_images = (
+            consumer_agent.config.preserve_historical_images
+            if consumer_agent is not None else False
+        )
         config.deadline_at_monotonic = operation_deadline
         arm_compaction_deadline(config, operation_id=compaction_id)
         if (

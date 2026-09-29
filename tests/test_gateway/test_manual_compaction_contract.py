@@ -312,6 +312,10 @@ async def test_cancel_running_summary_closes_provider_and_preserves_history(
         await asyncio.gather(*remaining, return_exceptions=True)
 
 
+# The one-second deadline is the contract under test. Keep this out of the
+# xdist worker pool so host scheduling cannot consume that budget before the
+# synthetic provider generator is first advanced.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_absolute_deadline_closes_provider_and_emits_one_failed_terminal(
     manual_compaction, monkeypatch,

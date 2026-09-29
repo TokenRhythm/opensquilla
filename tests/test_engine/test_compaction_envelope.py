@@ -76,6 +76,7 @@ def test_manual_envelope_has_real_prompt_and_tools_without_invocation(
     assert agent.config.provider_request_proof_max_chars == 700_000
     assert agent.config.compaction_profile == "coding"
     assert agent.config.compaction_protected_recent_messages == 5
+    assert agent.config.preserve_historical_images is True
     assert agent.config.thinking == "high"
     assert bool(agent.config.cache_breakpoints) is (cache_mode == "auto")
     assert agent.tool_handler is None

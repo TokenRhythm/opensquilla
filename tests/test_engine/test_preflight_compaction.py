@@ -10,14 +10,20 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import base64
+import io
+import json
 import threading
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
+from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.engine import runtime as runtime_module
 from opensquilla.engine.runtime import TurnRunner
 from opensquilla.gateway.config import GatewayConfig
@@ -25,7 +31,7 @@ from opensquilla.provider import DoneEvent as ProviderDone
 from opensquilla.provider import Message, ModelInfo
 from opensquilla.provider import TextDeltaEvent as ProviderText
 from opensquilla.provider.model_catalog import ModelCatalog
-from opensquilla.session.compaction import CompactionConfig
+from opensquilla.session.compaction import CompactionConfig, estimate_entry_model_replay_tokens
 from opensquilla.session.manager import SessionManager
 from opensquilla.session.models import TranscriptEntry
 from opensquilla.session.storage import SessionStorage
@@ -336,7 +342,7 @@ async def test_preflight_measures_history_once_without_blocking_event_loop(monke
     loop = asyncio.get_running_loop()
     measured = []
 
-    def estimate(entry):
+    def estimate(entry, **_kwargs):
         loop.call_soon_threadsafe(entered.set)
         assert release.wait(5)
         measured.append(entry)
@@ -701,6 +707,91 @@ async def test_preflight_under_threshold_does_not_compact() -> None:
     await runner._maybe_preflight_compact("user:session", 200_000)
 
     mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_base64", [False, True])
+async def test_preflight_opaque_attachment_uses_projected_size(
+    invalid_base64: bool,
+) -> None:
+    payload = (
+        "invalid***" + "A" * 200_000
+        if invalid_base64
+        else base64.b64encode(b"opaque zip payload" * 12_000).decode("ascii")
+    )
+    envelope = json.dumps(
+        {
+            "text": "inspect this archive",
+            "attachments": [{"type": "application/zip", "name": "bundle.zip", "data": payload}],
+        },
+        separators=(",", ":"),
+    )
+    entries = [_make_entry(envelope)]
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock()
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+    await runner._maybe_preflight_compact("user:session", 1_000)
+
+    mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_text_route_omits_historical_image_reserve() -> None:
+    stream = io.BytesIO()
+    with Image.new("RGB", (1, 1), "#2468ac") as image:
+        image.save(stream, format="PNG")
+    data = base64.b64encode(stream.getvalue()).decode("ascii")
+    envelope = json.dumps({
+        "text": "Earlier image request.",
+        "attachments": [{"type": "image/png", "data": data} for _ in range(10)],
+    })
+    entries = [_make_entry(envelope) for _ in range(10)]
+    omitted = sum(
+        estimate_entry_model_replay_tokens(entry, preserve_images=False)
+        for entry in entries
+    )
+    retained = sum(estimate_entry_model_replay_tokens(entry) for entry in entries)
+    assert omitted < 17_000 < retained
+
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock()
+    mock_sm.get_transcript = AsyncMock(return_value=entries)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm)
+    await runner._maybe_preflight_compact(
+        "user:session", 20_000, preserve_historical_images=False,
+    )
+    mock_sm.compact.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_preflight_retained_ref_uses_verified_pixel_reserve(tmp_path: Path) -> None:
+    stream = io.BytesIO()
+    with Image.new("1", (2048, 2048), 1) as image:
+        image.save(stream, format="PNG")
+    media_root = tmp_path / "media"
+    raw = stream.getvalue()
+    sha, _path, _written = write_transcript_material(
+        media_root=media_root, session_id="test-session-id", payload=raw,
+    )
+    entry = _make_entry(json.dumps({"text": "Inspect.", "attachments": [{
+        "type": "image/png", "sha256_ref": sha, "size": len(raw),
+    }]}))
+    assert estimate_entry_model_replay_tokens(
+        entry, media_root=media_root, session_id="test-session-id",
+    ) >= 4_096
+
+    mock_sm = MagicMock()
+    mock_sm.compact = AsyncMock(return_value="summary")
+    mock_sm.get_transcript = AsyncMock(return_value=[entry])
+    config = GatewayConfig()
+    config.attachments.media_root = str(media_root)
+    runner = TurnRunner(provider_selector=MagicMock(), session_manager=mock_sm, config=config)
+    await runner._maybe_preflight_compact(
+        "user:session", 3_500, preserve_historical_images=True,
+    )
+    mock_sm.compact.assert_called_once()
 
 
 @pytest.mark.asyncio
