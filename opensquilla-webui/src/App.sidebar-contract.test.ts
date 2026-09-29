@@ -89,8 +89,8 @@ describe('App sidebar chrome contract', () => {
     const ledgerEnd = appSource.indexOf('watch(allSessions', ledgerStart)
     const ledger = appSource.slice(ledgerStart, ledgerEnd)
     expect(ledger).toContain('optimisticCurrentSessionTitle')
-    expect(ledger).toContain('chatRouteHeaderSessionKey.value !== key')
-    expect(ledger).toContain('chatRouteHeaderTitle.value.trim()')
+    expect(ledger).toContain('chatRouteHeaderOptimisticTitle.value')
+    expect(ledger).toContain('chatRouteHeaderTitle.value')
     expect(ledger).toContain("t('chat.chatWithSuffix', { suffix })")
     expect(ledger).toContain('flush: \'sync\'')
 
