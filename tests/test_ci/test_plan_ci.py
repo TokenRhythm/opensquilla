@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import runpy
 import subprocess
 from pathlib import Path
@@ -56,8 +57,12 @@ def test_native_acceptance_tracks_dependency_and_probe_changes_without_running_f
     assert "windows-nsis-regression" not in docs["required_suites"]
 
 
-def test_native_acceptance_evidence_covers_the_actual_complete_reusable_matrix(
-    tmp_path: Path, suite_config: dict[str, Any],
+@pytest.mark.parametrize(("profile", "paths", "count"), [
+    ("smoke", ("uv.lock", "opensquilla-webui/package-lock.json"), 4),
+    ("full", ("desktop/electron/package-lock.json", ".ci/run-all"), 14),
+])
+def test_native_acceptance_evidence_covers_the_actual_reusable_matrix(
+    tmp_path: Path, suite_config: dict[str, Any], profile: str, paths: tuple[str, ...], count: int,
 ) -> None:
     import itertools
 
@@ -67,23 +72,80 @@ def test_native_acceptance_evidence_covers_the_actual_complete_reusable_matrix(
         encoding="utf-8",
     ))["jobs"]
     matrix = jobs["upgrade-and-start"]["strategy"]["matrix"]
+
+    def axis(name: str) -> list[str]:
+        expression = re.fullmatch(
+            r"\$\{\{ fromJSON\(inputs.acceptance_profile == 'smoke' && '(.*)' \|\| '(.*)'\) \}\}",
+            matrix[name],
+        )
+        assert expression is not None
+        return json.loads(expression[1 if profile == "smoke" else 2])
+
     cases = {
         f"{baseline}-{install_path}-{scenario}"
         for baseline, install_path, scenario in itertools.product(
-            matrix["baseline"], matrix["install-path"], matrix["scenario"],
+            axis("baseline"), matrix["install-path"], axis("scenario"),
         )
     } | {f"{item['baseline']}-{item['install-path']}-{item['scenario']}"
          for item in matrix["include"]}
-    assert len(cases) == 14
+    assert len(cases) == count
     assert {"fresh-default-fresh", "fresh-custom-fresh"} <= cases
     expected = {(jobs["build"]["runs-on"], "build")}
     expected.update((jobs["wheelhouse-security"]["runs-on"], f"wheelhouse-{profile}")
                     for profile in jobs["wheelhouse-security"]["strategy"]["matrix"]["profile"])
     expected.update((jobs["upgrade-and-start"]["runs-on"], case) for case in cases)
-    assert len(expected) == 17
-    for path in ("uv.lock", ".ci/run-all"):
+    probes = yaml.safe_load(Path(".github/workflows/windows-candidate-probes.yml").read_text(
+        encoding="utf-8",
+    ))["jobs"]["candidate-probe"]
+    expected.update((probes["runs-on"], f"candidate-{probe}")
+                    for probe in probes["strategy"]["matrix"]["probe"])
+    assert len(expected) == count + 7
+    for path in paths:
         plan = _plan(tmp_path, suite_config, path)
+        assert plan["windows_nsis_profile"] == profile
         assert _platform_cells(plan, "windows-nsis-regression") == expected
+
+
+@pytest.mark.parametrize("path", [
+    "desktop/electron/scripts/nsis/legacy-uninstaller-temp.nsh",
+    "desktop/electron/scripts/test-nsis-upgrade.mjs",
+    "desktop/electron/scripts/prepare-installer-tooling.mjs",
+    "desktop/electron/src/windows-update-handoff.ts",
+    ".github/scripts/verify-release-windows-upgrade.ps1",
+    "src/opensquilla/migration/sandbox.py",
+    "src/opensquilla/persistence/schema.py",
+    "src/opensquilla/recovery/profile.py",
+    "src/opensquilla/uninstall/profile.py",
+    "src/opensquilla/profile.py",
+    "migrations/9999-fixture.sql",
+    "tests/fixtures/upgrade-v054/sessions.sql",
+])
+def test_installer_and_historical_data_changes_keep_all_upgrade_cases(
+    tmp_path: Path, suite_config: dict[str, Any], path: str,
+) -> None:
+    plan = _plan(tmp_path, suite_config, "opensquilla-webui/package-lock.json", path)
+    assert plan["windows_nsis_profile"] == "full"
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 21
+
+
+@pytest.mark.parametrize("paths", [(), (".ci/run-all",), ("unclassified.file",), ("../unsafe",)])
+def test_uncertain_and_explicit_full_plans_never_downgrade_native_acceptance(
+    tmp_path: Path, suite_config: dict[str, Any], paths: tuple[str, ...],
+) -> None:
+    plan = _plan(tmp_path, suite_config, *paths)
+    assert plan["full_fallback"] is True
+    assert plan["windows_nsis_profile"] == "full"
+    assert len(_platform_cells(plan, "windows-nsis-regression")) == 21
+
+
+def test_nsis_smoke_keeps_exactly_the_two_upgrade_and_two_fresh_cases() -> None:
+    assert MODULE["windows_nsis_upgrade_cells"]("smoke") == [
+        {"baseline": baseline, "install-path": path, "scenario": scenario}
+        for baseline, scenario in (("0.5.4", "baseline"), ("fresh", "fresh"))
+        for path in ("default", "custom")
+    ]
+    with pytest.raises(ValueError, match="unknown Windows NSIS acceptance profile"):
+        MODULE["windows_nsis_upgrade_cells"]("smkoe")
 
 
 @pytest.fixture
