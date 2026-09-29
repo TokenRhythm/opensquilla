@@ -823,6 +823,10 @@ let bootStatus: BootStatus = {
 let bootError: BootError | null = null
 let forceOnboardingOnNextStartup = false
 let onboardingPromptProfileKey: string | null = null
+// A fresh profile is offered onboarding before its first Gateway spawn. Keep
+// this separate from onboardingPromptProfileKey, which also covers migration
+// and reset flows that must retain the existing ready-before-invitation path.
+let freshOnboardingProfileKey: string | null = null
 let recoveryInspection: RecoveryProtocolResult | null = null
 let primaryRecoveryInspection: RecoveryProtocolResult | null = null
 let recoveryOperationBusy = false
@@ -7186,7 +7190,8 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
   // An explicit empty primary prevents provider defaults or inherited API keys
   // from silently configuring a fresh profile. The config also records that the
   // first-run invitation has been offered; later launches use Settings instead.
-  if (!(await pathExists(desktopConfigPath()))) {
+  const configExists = await pathExists(desktopConfigPath())
+  if (!configExists) {
     const finishWriter = beginDesktopWriterOperation('initialize unconfigured desktop profile')
     const profile = activeDesktopProfile()
     try {
@@ -7202,6 +7207,9 @@ async function prepareDesktopStartupConnection(): Promise<DesktopConnection | nu
       }
       if (initialized.stable_code === 'unconfigured_profile_initialized') {
         onboardingPromptProfileKey = desktopProfileKey(profile)
+        if (!pendingProviderSetup && !forceOnboardingOnNextStartup && existing === null) {
+          freshOnboardingProfileKey = desktopProfileKey(profile)
+        }
       }
     } finally {
       finishWriter()
@@ -9286,15 +9294,51 @@ async function startGateway(): Promise<GatewayState> {
   sendBootStatus('profile')
   const connection = await prepareDesktopStartupConnection()
   if (!isCurrent()) throw new Error('Desktop startup was superseded during profile setup.')
+  let startupConnection = connection
+  const shouldRunFreshOnboarding = (
+    startupConnection === null
+    && freshOnboardingProfileKey === startupProfileKey
+    && !forceOnboardingOnNextStartup
+  )
+  if (shouldRunFreshOnboarding) {
+    // Consume the fresh marker before opening the window. A successful save or
+    // an explicit skip/close must never cause the ready path to invite twice.
+    freshOnboardingProfileKey = null
+    onboardingPromptProfileKey = null
+    try {
+      startupConnection = await runOnboarding()
+      // Closing the window while a save is already admitted resolves the flow
+      // immediately, while the atomic write continues in the coordinator.
+      // Never spawn a Gateway against a profile that is still being written.
+      await onboardingFlows.waitForAbandonedSave()
+      if (startupConnection === null) startupConnection = await loadDesktopCredential()
+    } catch (error) {
+      // The invitation is optional. A renderer/load failure must not turn a
+      // usable unconfigured Gateway into a boot failure; leave the prompt key
+      // for the ready path so the user can retry after the client is up.
+      desktopLog('onboarding_preboot_unavailable', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      startupConnection = await loadDesktopCredential()
+      if (startupConnection === null) onboardingPromptProfileKey = startupProfileKey
+    }
+    if (!isCurrent()) {
+      if (startupConnection === null && !forceOnboardingOnNextStartup) {
+        freshOnboardingProfileKey = startupProfileKey
+        onboardingPromptProfileKey = startupProfileKey
+      }
+      throw new Error('Desktop startup was superseded during fresh onboarding.')
+    }
+  }
   forceOnboardingOnNextStartup = false
-  const apiKey = connection ? decryptApiKey(connection) : ''
+  const apiKey = startupConnection ? decryptApiKey(startupConnection) : ''
   // Keyless providers (e.g. Ollama) ship requiresApiKey=false and are accepted
   // by onboarding without a key, so only treat a missing key as fatal when the
   // provider actually needs one — otherwise every keyless credential wedges boot.
-  if (connection && providerDefaults(connection.provider).requiresApiKey && !apiKey) {
+  if (startupConnection && providerDefaults(startupConnection.provider).requiresApiKey && !apiKey) {
     throw new Error('Saved desktop API key could not be read.')
   }
-  const searchApiKey = connection ? decryptSearchApiKey(connection) : ''
+  const searchApiKey = startupConnection ? decryptSearchApiKey(startupConnection) : ''
   // Config is seeded (when missing) inside runOnboarding / the onboarding save,
   // and is otherwise the RPC-owned source of truth — so it is intentionally NOT
   // regenerated here on every boot.
@@ -9383,8 +9427,8 @@ async function startGateway(): Promise<GatewayState> {
   const childEnv = desktopChildEnvironment(activeProfile, {
     PATH: childPath,
     ...(process.platform === 'win32' ? { Path: childPath } : {}),
-    ...(connection?.apiKeyEnv && apiKey ? { [connection.apiKeyEnv]: apiKey } : {}),
-    ...(connection?.searchApiKeyEnv && searchApiKey ? { [connection.searchApiKeyEnv]: searchApiKey } : {}),
+    ...(startupConnection?.apiKeyEnv && apiKey ? { [startupConnection.apiKeyEnv]: apiKey } : {}),
+    ...(startupConnection?.searchApiKeyEnv && searchApiKey ? { [startupConnection.searchApiKeyEnv]: searchApiKey } : {}),
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_NONCE: gatewayInstanceNonce,
     OPENSQUILLA_DESKTOP_GATEWAY_INSTANCE_ID: gatewayConnectionInstanceId,
     OPENSQUILLA_DESKTOP_GATEWAY_OWNERSHIP_DIR: gatewayOwnershipDir,
@@ -9393,7 +9437,7 @@ async function startGateway(): Promise<GatewayState> {
     // desktopChildEnvironment pins OPENSQUILLA_STATE_DIR to H. RC4's Python
     // recovery engine has already validated/reconciled the historical nested
     // layout before this writer is admitted.
-    ...(connection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
+    ...(startupConnection?.disableNetworkObservability ? { OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1' } : {}),
     PYTHONUNBUFFERED: '1',
     PYTHONUTF8: '1',
     PYTHONIOENCODING: 'utf-8:replace',
