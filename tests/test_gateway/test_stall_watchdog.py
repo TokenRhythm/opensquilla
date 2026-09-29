@@ -81,4 +81,3 @@ def test_stall_watchdog_does_not_emit_stalls_after_heartbeat_failure(tmp_path) -
     events = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert any(event["type"] == "heartbeat_failed" for event in events)
     assert not any(event["type"] == "stall_started" for event in events)
-

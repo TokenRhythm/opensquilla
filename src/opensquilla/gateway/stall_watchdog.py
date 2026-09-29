@@ -262,4 +262,3 @@ class GatewayStallWatchdog:
                 return
             self._event_count += 1
             self._bytes_written += len(encoded)
-
