@@ -1834,7 +1834,14 @@ class _PosixGroupAnchor:
                 self._capture_reports.put_nowait(False)
                 owner = self._owner
                 if owner is not None:
-                    await owner._close_empty_posix_owner()
+                    try:
+                        await owner._close_empty_posix_owner()
+                    except BaseException:
+                        # EMPTY proves the target tree has finished. Reap the
+                        # released anchor and close its pipes before propagating.
+                        with contextlib.suppress(Exception):
+                            await _finish_launch_cleanup_step(self.process.wait, [])
+                        raise
             elif marker == _POSIX_ANCHOR_EMPTY_INCOMPLETE:
                 # No tracked process remains, but a failed census means that
                 # the anchor cannot prove that every descendant was tracked.
@@ -1950,6 +1957,7 @@ class ProcessTreeOwner:
     _closed: bool = False
     _terminate_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     _completion_monitor: asyncio.Task[None] | None = field(default=None, repr=False)
+    _owner_deletion: asyncio.Future[None] | None = field(default=None, repr=False)
 
     @property
     def durable(self) -> bool:
@@ -1989,23 +1997,42 @@ class ProcessTreeOwner:
     async def _mark_closed(self) -> None:
         persisted_owner = self._take_persisted_owner()
         if persisted_owner is not None:
-            await asyncio.to_thread(_delete_owner_record, persisted_owner)
+            self._owner_deletion = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(contextvars.copy_context().run, _delete_owner_record, persisted_owner),
+            )
+        if self._owner_deletion is not None:
+            cancellations: list[asyncio.CancelledError] = []
+            await _finish_launch_cleanup_step(
+                partial(asyncio.shield, self._owner_deletion), cancellations,
+            )
+            if cancellations:
+                raise cancellations[0]
 
     async def _close_empty_posix_owner(self) -> None:
-        if self._closed or self.posix_anchor is None:
+        if self.posix_anchor is None:
             return
-        await self._mark_closed()
-        self.posix_anchor.release()
+        try:
+            await self._mark_closed()
+        finally:
+            self.posix_anchor.release()
 
     def start_completion_monitor(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self.posix_anchor is not None:
+            anchor = self.posix_anchor
+            if anchor._monitor_task is None:
+                anchor._monitor_task = loop.create_task(
+                    anchor._watch_empty(anchor.process.stdout)
+                )
+            return
         if (
             not isinstance(self.windows_job, _WindowsJob)
             or self._completion_monitor is not None
         ):
-            return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
             return
         self._completion_monitor = loop.create_task(self._watch_windows_job_empty())
 
@@ -2520,6 +2547,7 @@ def create_owned_popen(
     argv: list[str] | tuple[str, ...],
     *,
     process_factory: Callable[..., Any] | None = None,
+    cancel_event: threading.Event | None = None,
     **kwargs: Any,
 ) -> Any:
     """Synchronous Windows controlled-helper launcher for blocking pipe I/O."""
@@ -2567,6 +2595,8 @@ def create_owned_popen(
                 platform="windows",
                 controller_pid=int(process.pid),
             )
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessTreeOwnershipError("Windows process launch cancelled before release")
         owner = ProcessTreeOwner(
             process=process,
             pid=int(process.pid),
@@ -2578,19 +2608,21 @@ def create_owned_popen(
         owner.start_completion_monitor()
         return process
     except BaseException as exc:
-        if persisted_owner is not None:
-            _delete_owner_record(persisted_owner)
-        if process is not None and process.poll() is None:
-            with contextlib.suppress(OSError):
-                process.terminate()
-            try:
-                process.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
+        try:
+            if process is not None and process.poll() is None:
                 with contextlib.suppress(OSError):
-                    process.kill()
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    process.wait(timeout=1.0)
-        job.close()
+                    process.terminate()
+                try:
+                    process.wait(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        process.kill()
+                    with contextlib.suppress(subprocess.TimeoutExpired):
+                        process.wait(timeout=1.0)
+        finally:
+            job.close()
+            if persisted_owner is not None:
+                _delete_owner_record(persisted_owner)
         raise ProcessTreeOwnershipError(
             "Windows controlled process launch failed closed"
         ) from exc
@@ -2664,11 +2696,11 @@ class _PtyAnchorProcess:
 
 
 def create_owned_posix_pty(
-    argv: list[str], process_factory: Callable[..., Any], **kwargs: Any,
+    argv: list[str], process_factory: Callable[..., Any], *,
+    cancel_event: threading.Event | None = None, **kwargs: Any,
 ) -> Any:
     """Run the existing group anchor as PTY leader, with private control pipes."""
 
-    loop = asyncio.get_running_loop()
     owner_id = uuid.uuid4().hex
     scope = _current_task_process_scope()
     database_path = _owner_database_path(scope.state_dir) if scope is not None else None
@@ -2705,6 +2737,8 @@ def create_owned_posix_pty(
                 scope, owner_id=owner_id, platform=_platform_kind(),
                 controller_pid=int(process.pid),
             )
+        if cancel_event is not None and cancel_event.is_set():
+            raise ProcessTreeOwnershipError("PTY process launch cancelled before release")
         control = _PtyAnchorProcess(
             process, _PtyControlPipe(control_write, "wb"), _PtyControlPipe(status_read, "rb"),
         )
@@ -2716,7 +2750,9 @@ def create_owned_posix_pty(
         )
         anchor.bind(owner)
         _attach_owner(process, owner)
-        anchor._monitor_task = loop.create_task(anchor._watch_empty(control.stdout))
+        # Async callers may prepare this launch in a worker, then attach the
+        # status reader to their event loop before using or cleaning the tree.
+        owner.start_completion_monitor()
         control.stdin.write(_POSIX_ANCHOR_ARM)
         return process
     except BaseException:
