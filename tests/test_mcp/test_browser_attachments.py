@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,20 +12,24 @@ import pytest
 
 from opensquilla.attachment_refs import write_transcript_material
 from opensquilla.browser import DesktopBrowserClient
+from opensquilla.mcp import discovery
 from opensquilla.mcp.desktop_browser import DesktopBrowserMCPClient
-from opensquilla.mcp.types import MCPCallContext, current_mcp_call_context
+from opensquilla.mcp.types import MCPCallContext, MCPToolDef, current_mcp_call_context
 from opensquilla.session.attachment_manifest import (
     MATERIAL_AVAILABLE,
     AttachmentManifest,
     AttachmentOccurrence,
     manifest_context_state,
 )
+from opensquilla.tool_boundary import ToolCall
 from opensquilla.tools.browser_attachments import (
     MAX_BROWSER_UPLOAD_BYTES,
     BrowserAttachmentError,
     browser_upload_descriptors,
     resolve_browser_upload,
 )
+from opensquilla.tools.dispatch import build_tool_handler
+from opensquilla.tools.registry import ToolRegistry
 from opensquilla.tools.types import CallerKind, ToolContext, current_tool_context
 
 
@@ -221,7 +226,39 @@ async def test_observation_exposes_only_path_free_attachment_descriptors(attachm
         assert result.structured_content["availableUploads"][0]["fileId"] == item.attachment_id
         assert str(path) not in result.content
         assert base64.b64encode(payload).decode() not in result.content
-        assert result.content_blocks[-1]["type"] == "text"
+        assert result.content == "page"
+        assert result.content_blocks == [{"type": "text", "text": "page"}]
     finally:
         current_tool_context.reset(context_token)
         current_mcp_call_context.reset(call_token)
+
+
+async def test_registered_observation_projects_upload_descriptors_once(attachment, monkeypatch):
+    context, item, path, payload = attachment
+    client = DesktopBrowserMCPClient(context.desktop_browser)
+    client._attachment_uploads = True
+    monkeypatch.setattr(client, "connect", AsyncMock())
+    monkeypatch.setattr(client, "list_tools", AsyncMock(return_value=[MCPToolDef(
+        "browser_inspect", "Inspect the page", {
+            "type": "object", "properties": {"targetRef": {"type": "string"}},
+            "required": ["targetRef"],
+        },
+    )]))
+    monkeypatch.setattr(client, "_request", AsyncMock(return_value={"result": {
+        "content": [{"type": "text", "text": "page"}], "structuredContent": {"ok": True},
+    }}))
+    registry = ToolRegistry()
+    try:
+        await discovery.register_client_tools(client, registry)
+        result = await build_tool_handler(registry, context)(ToolCall(
+            "inspect-call", "mcp__desktop-browser__browser_inspect", {"targetRef": "page"},
+        ))
+        assert not result.is_error
+        text, structured = result.content.split("\n", 1)
+        assert text == "page"
+        assert json.loads(structured)["availableUploads"][0]["fileId"] == item.attachment_id
+        assert result.content.count("availableUploads") == 1
+        assert str(path) not in result.content
+        assert base64.b64encode(payload).decode() not in result.content
+    finally:
+        await discovery.close_active_clients(owner="desktop-browser")

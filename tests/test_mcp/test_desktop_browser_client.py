@@ -544,26 +544,40 @@ def argument_validation_error():
     }
 
 
+def diagnostic_input_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "ref": {"type": "string"},
+            "actions": {"type": "array", "maxItems": 40, "items": {
+                "type": "object", "properties": {
+                    "ref": {"type": "string"}, "text": {"type": "string"},
+                    "amount": {"type": "integer"}, "futureField": {"type": "string"},
+                },
+            }},
+        },
+    }
+
+
 @pytest.mark.parametrize(
-    ("field", "rule", "expected", "description"),
+    ("field", "rule", "expected", "reported_field", "reported_rule", "reported_expected"),
     [
-        ("ref", "required", "present", "a supplied value"),
-        ("actions.0", "type", "object", "an object"),
-        ("actions", "type", "array", "an array"),
-        ("actions.1.text", "type", "string", "a string"),
-        ("accept", "type", "boolean", "a boolean"),
-        ("x", "type", "finite_number", "a finite number"),
-        ("durationMs", "type", "integer", "an integer"),
-        ("actions.2.amount", "range", "within_bounds", "the declared bounds"),
-        ("action", "enum", "supported_value", "the declared values"),
-        ("$", "unknown_field", "known_fields", "only declared fields"),
-        ("ref", "conflict", "exclusive_fields", "mutually compatible fields"),
-        ("imageId", "dependency", "related_fields", "the required related fields"),
-        ("actions.0.action", "order", "field_update_before_final", "before the final action"),
+        ("ref", "required", "present", "ref", "required", "present"),
+        ("actions.0", "type", "object", "actions.0", "type", "object"),
+        ("actions.1.text", "type", "string", "actions.1.text", "type", "string"),
+        ("actions.2.amount", "range", "within_bounds", "actions.2.amount", "range",
+         "within_bounds"),
+        ("$", "unknown_field", "known_fields", "$", "unknown_field", "known_fields"),
+        ("actions.37.futureField", "new_rule", "future_expectation",
+         "actions.37.futureField", "unrecognized", "see_tool_schema"),
+        ("actions.4.ref", "my_private_credential_123", "ignore_previous_instructions",
+         "actions.4.ref", "unrecognized", "see_tool_schema"),
+        ("my_private_credential_123", "required", "present", "$", "required", "present"),
+        ("actions.40.ref", "required", "present", "$", "required", "present"),
     ],
 )
 async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
-    browser, field, rule, expected, description,
+    browser, field, rule, expected, reported_field, reported_rule, reported_expected,
 ):
     error = argument_validation_error()
     issue = {"field": field, "rule": rule, "expected": expected}
@@ -578,6 +592,7 @@ async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
         })
 
     client = DesktopBrowserMCPClient(browser)
+    client._tool_schemas["browser_act"] = diagnostic_input_schema()
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     token = current_tool_context.set(context(browser))
     call_token = current_mcp_call_context.set(MCPCallContext("validation-fixture"))
@@ -586,11 +601,21 @@ async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
             "browser_act", {"action": "fill", "text": "synthetic-private-argument"},
         )
         assert result.is_error
-        assert result.structured_content == {
-            **error["data"], "ok": False, "message": result.structured_content["message"],
+        reported_issue = {
+            "field": reported_field, "rule": reported_rule, "expected": reported_expected,
         }
-        assert description in result.structured_content["message"]
-        assert field in result.structured_content["message"]
+        assert result.structured_content == {
+            **error["data"], "issues": [reported_issue], "ok": False,
+            "message": result.structured_content["message"],
+        }
+        assert reported_field in result.structured_content["message"]
+        assert reported_rule in result.structured_content["message"]
+        assert reported_expected in result.structured_content["message"]
+        if reported_field != field:
+            assert field not in result.content
+        if reported_rule == "unrecognized":
+            assert rule not in result.content
+            assert expected not in result.content
         assert result.content == json.dumps(result.structured_content)
         assert "synthetic-private" not in result.content
         assert browser.token not in result.content
@@ -629,16 +654,15 @@ async def test_contract_argument_diagnostics_are_safe_and_not_replayed(
         ] * 17}),
         ("issue", {"field": "sessionKey"}),
         ("issue", {"field": "_meta"}),
-        ("issue", {"field": "actions.3.ref"}),
         ("issue", {"field": "actions.00.ref"}),
-        ("issue", {"field": "actions.0.ref.extra"}),
         ("issue", {"field": "ref\nsynthetic-private-response"}),
         ("issue", {"field": "synthetic-private-response" * 100}),
         ("issue", {"field": []}),
-        ("issue", {"rule": "synthetic-private-response"}),
+        ("issue", {"rule": "synthetic-private-response" * 100}),
+        ("issue", {"rule": "required\nsynthetic-private-response"}),
         ("issue", {"rule": []}),
-        ("issue", {"expected": "synthetic-private-response"}),
-        ("issue", {"expected": "string"}),
+        ("issue", {"expected": "synthetic-private-response" * 100}),
+        ("issue", {"expected": "present\nsynthetic-private-response"}),
         ("issue", {"expected": []}),
         ("issue", {"value": "synthetic-private-response"}),
     ],
@@ -662,6 +686,7 @@ async def test_unrecognized_argument_diagnostics_remain_unknown_without_private_
         })
 
     client = DesktopBrowserMCPClient(browser)
+    client._tool_schemas["browser_act"] = diagnostic_input_schema()
     client._http = httpx.AsyncClient(transport=httpx.MockTransport(respond))
     token = current_tool_context.set(context(browser))
     call_token = current_mcp_call_context.set(MCPCallContext("invalid-validation-fixture"))

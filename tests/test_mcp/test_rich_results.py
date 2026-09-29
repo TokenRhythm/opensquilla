@@ -16,6 +16,7 @@ from PIL import Image
 from opensquilla.engine.tool_result_store import ToolResultStore
 from opensquilla.mcp import discovery
 from opensquilla.mcp.client import MCPClient
+from opensquilla.mcp.desktop_browser import _project_browser_error_summary
 from opensquilla.mcp.sse import MCPSSEClient
 from opensquilla.mcp.stdio import MCPStdioClient
 from opensquilla.mcp.types import (
@@ -239,6 +240,10 @@ async def test_structured_result_only_and_legacy_text_have_compatible_projection
     assert json.loads(await registered.handler()) == {"status": "ready"}
     client.result = MCPToolResult('{"status":"ready"}', structured_content={"status": "ready"})
     assert await registered.handler() == '{"status":"ready"}'
+    client.result = MCPToolResult(
+        '{"status":"ready"}', structured_content={"status": "ready", "epoch": 2},
+    )
+    assert json.loads(await registered.handler()) == {"status": "ready", "epoch": 2}
     client.result = MCPToolResult("Legacy text result")
     assert await registered.handler() == "Legacy text result"
     client.result = MCPToolResult("", content_blocks=[_image()])
@@ -262,6 +267,47 @@ class _BrowserFailureClient(_ResultClient):
 
     async def list_tools(self) -> list[MCPToolDef]:
         return [MCPToolDef("browser_batch", "Operate the browser", {"properties": {}})]
+
+    def project_error_summary(self, summary, structured, *, serialize, max_chars):
+        return _project_browser_error_summary(
+            summary, structured, serialize=serialize, max_chars=max_chars,
+        )
+
+
+async def test_error_projection_uses_client_capability_not_server_name():
+    client = _ResultClient(MCPToolResult(
+        "Long server error " * 300,
+        is_error=True,
+        structured_content={"observation": {"refs": [{"ref": "synthetic-ref"}]}},
+    ))
+    client.config.name = "desktop-browser"
+    registry = ToolRegistry()
+    await discovery.register_client_tools(client, registry)
+    result = await build_tool_handler(registry)(
+        ToolCall("call", "mcp__desktop-browser__capture", {}),
+    )
+    summary = json.loads(json.loads(result.content)["user_message"])
+    assert "preview" in summary
+    assert "result" not in summary
+    assert "browser_observe" not in summary["guidance"]
+
+
+async def test_oversized_client_error_projection_falls_back_to_generic_summary():
+    class OversizedProjectionClient(_ResultClient):
+        def project_error_summary(self, summary, structured, *, serialize, max_chars):
+            summary["result"] = {"value": "x" * (max_chars + 1)}
+            return True
+
+    client = OversizedProjectionClient(MCPToolResult(
+        "Long server error " * 300, is_error=True, structured_content={"code": "STALE"},
+    ))
+    registry = ToolRegistry()
+    await discovery.register_client_tools(client, registry)
+    result = await build_tool_handler(registry)(ToolCall("call", "mcp__images__capture", {}))
+    summary = json.loads(json.loads(result.content)["user_message"])
+    assert len(json.loads(result.content)["user_message"]) <= 1800
+    assert "preview" in summary
+    assert "result" not in summary
 
 
 @pytest.mark.parametrize("ref_count,duplicate_text", [(2, True), (60, True), (2, False)])

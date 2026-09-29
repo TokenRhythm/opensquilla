@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
+from collections.abc import Callable
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -40,26 +43,19 @@ _AUTHORITY_ARGUMENTS = frozenset(
         "uploadFile",
     }
 )
-# Versioned diagnostic vocabulary, not a second browser argument validator.
-# Never expose a Desktop error's free-form message or supplied argument values.
-_VALIDATION_FIELDS = frozenset({
-    "operation", "targetRef", "url", "contextTargetRef", "ref", "maxChars", "downloadId",
-    "observationMode", "actions", "dialogId", "accept", "promptText", "tabAction", "action",
-    "text", "key", "direction", "amount", "button", "durationMs", "endRef", "fileId",
-    "chooserId", "observationId", "imageId", "x", "y", "toX", "toY",
-})
+_VALIDATION_FIELD = re.compile(
+    r"(?:\$|[A-Za-z_][A-Za-z0-9_$]*(?:\.(?:[A-Za-z_][A-Za-z0-9_$]*|[0-9]+))*)"
+)
+_VALIDATION_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,63}")
 _VALIDATION_EXPECTATIONS = {
-    "required": {"present": "a supplied value"},
-    "type": {
-        "object": "an object", "array": "an array", "string": "a string",
-        "boolean": "a boolean", "finite_number": "a finite number", "integer": "an integer",
-    },
-    "range": {"within_bounds": "a value within the declared bounds"},
-    "enum": {"supported_value": "one of the declared values"},
-    "unknown_field": {"known_fields": "only declared fields"},
-    "conflict": {"exclusive_fields": "mutually compatible fields"},
-    "dependency": {"related_fields": "the required related fields"},
-    "order": {"field_update_before_final": "only fill/select before the final action"},
+    "required": frozenset({"present"}),
+    "type": frozenset({"object", "array", "string", "boolean", "finite_number", "integer"}),
+    "range": frozenset({"within_bounds"}),
+    "enum": frozenset({"supported_value"}),
+    "unknown_field": frozenset({"known_fields"}),
+    "conflict": frozenset({"exclusive_fields"}),
+    "dependency": frozenset({"related_fields"}),
+    "order": frozenset({"field_update_before_final"}),
 }
 log = structlog.get_logger(__name__)
 
@@ -114,17 +110,46 @@ def _coordinate_unavailable(code: str, message: str, recovery: str) -> MCPToolRe
     )
 
 
-def _validation_field_known(field: str) -> bool:
-    if field == "$" or field in _VALIDATION_FIELDS:
-        return True
+def _safe_validation_field(field: Any) -> bool:
+    if not isinstance(field, str) or len(field) > 128 or not _VALIDATION_FIELD.fullmatch(field):
+        return False
     parts = field.split(".")
-    return (
-        len(parts) in (2, 3) and parts[0] == "actions" and parts[1] in {"0", "1", "2"}
-        and (len(parts) == 2 or parts[2] in _VALIDATION_FIELDS)
-    )
+    if any(part in _AUTHORITY_ARGUMENTS for part in parts):
+        return False
+    # Keep array paths canonical so a server cannot smuggle arbitrary syntax
+    # into the model-facing diagnostic while still accepting future indexes.
+    return not any(part.isdigit() and len(part) > 1 and part.startswith("0") for part in parts)
 
 
-def _argument_validation_result(error: Any) -> dict[str, Any] | None:
+def _safe_validation_token(value: Any) -> bool:
+    return isinstance(value, str) and bool(_VALIDATION_TOKEN.fullmatch(value))
+
+
+def _field_in_schema(field: str, schema: dict[str, Any] | None) -> bool:
+    if field == "$":
+        return True
+    node: Any = schema
+    for part in field.split("."):
+        if not isinstance(node, dict):
+            return False
+        if part.isdigit():
+            maximum = node.get("maxItems")
+            if node.get("type") != "array" or (
+                type(maximum) is int and int(part) >= maximum
+            ):
+                return False
+            node = node.get("items")
+        else:
+            properties = node.get("properties")
+            if not isinstance(properties, dict) or part not in properties:
+                return False
+            node = properties[part]
+    return True
+
+
+def _argument_validation_result(
+    error: Any, schema: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Decode only the bounded, value-free contract validation error format."""
     if (
         not isinstance(error, dict) or type(error.get("code")) is not int
@@ -149,14 +174,16 @@ def _argument_validation_result(error: Any) -> dict[str, Any] | None:
         if not isinstance(issue, dict) or set(issue) != {"field", "rule", "expected"}:
             return None
         field, rule, expected = issue["field"], issue["rule"], issue["expected"]
-        if (
-            not isinstance(field, str) or len(field) > 64 or not _validation_field_known(field)
-            or not isinstance(rule, str) or rule not in _VALIDATION_EXPECTATIONS
-            or not isinstance(expected, str) or expected not in _VALIDATION_EXPECTATIONS[rule]
-        ):
+        if not _safe_validation_field(field) or not _safe_validation_token(rule):
             return None
+        if not _safe_validation_token(expected):
+            return None
+        if not _field_in_schema(field, schema):
+            field = "$"
+        if expected not in _VALIDATION_EXPECTATIONS.get(rule, ()):
+            rule, expected = "unrecognized", "see_tool_schema"
         issues.append({"field": field, "rule": rule, "expected": expected})
-        descriptions.append(f"{field}: {rule}; expected {_VALIDATION_EXPECTATIONS[rule][expected]}")
+        descriptions.append(f"{field}: {rule}; expected {expected}")
     result = {
         "ok": False, "code": "INVALID_REQUEST", "phase": "argument_validation",
         "contractVersion": 1, "outcome": "not_started", "retryable": False,
@@ -189,6 +216,62 @@ def _transport_failure_result(error: RuntimeError) -> MCPToolResult:
     )
 
 
+def _project_browser_error_summary(
+    summary: dict[str, Any],
+    structured: dict[str, Any],
+    *,
+    serialize: Callable[[Any], str],
+    max_chars: int,
+) -> bool:
+    observation = structured.get("observation")
+    refs = observation.get("refs") if isinstance(observation, dict) else None
+    current: dict[str, Any] = {"refsOmitted": len(refs)} if isinstance(refs, list) else {}
+    details: dict[str, Any] = {"observation": current} if isinstance(observation, dict) else {}
+    summary["result"] = details
+    summary["guidance"] = (
+        "Observation replaces previous refs. Retrieve omitted refs or call browser_observe "
+        "before acting. Inspect unknown outcomes before retrying."
+    )
+
+    def put(target: dict[str, Any], key: str, value: Any) -> bool:
+        target[key] = value
+        if len(serialize(summary)) <= max_chars:
+            return True
+        del target[key]
+        return False
+
+    for key in ("code", "outcome", "retryable", "recovery", "targetRef", "causeCode"):
+        if key in structured:
+            put(details, key, structured[key])
+    execution = structured.get("execution")
+    if isinstance(execution, dict):
+        compact = {key: execution[key] for key in ("state",) if key in execution}
+        actions = execution.get("actions")
+        if isinstance(actions, list):
+            compact["actions"] = [{
+                key: action[key]
+                for key in ("index", "state", "code", "outcome", "performed") if key in action
+            } for action in actions[:3] if isinstance(action, dict)]
+        put(details, "execution", compact)
+    if isinstance(observation, dict):
+        for key in (
+            "observationId", "consistency", "imageStatus", "image", "viewport", "browserState",
+        ):
+            if key in observation:
+                put(current, key, observation[key])
+        if isinstance(refs, list):
+            retained: list[Any] = []
+            for ref in refs:
+                # Keep each retained ref intact; an abbreviated identity cannot be acted on.
+                if not put(current, "refs", [*retained, ref]):
+                    if retained:
+                        current["refs"] = retained
+                    break
+                retained.append(ref)
+                current["refsOmitted"] = len(refs) - len(retained)
+    return True
+
+
 def browser_tool_policy(definition: MCPToolDef, spec: ToolSpec) -> ToolSpec:
     return browser_tool_spec(definition.name, spec)
 
@@ -199,6 +282,18 @@ class DesktopBrowserMCPClient(MCPClient):
     The endpoint and bearer token never appear in model-facing configuration.
     Reuses the Desktop's in-memory capability rather than spawning a browser.
     """
+
+    def project_error_summary(
+        self,
+        summary: dict[str, Any],
+        structured: dict[str, Any],
+        *,
+        serialize: Callable[[Any], str],
+        max_chars: int,
+    ) -> bool:
+        return _project_browser_error_summary(
+            summary, structured, serialize=serialize, max_chars=max_chars,
+        )
 
     def __init__(self, browser: DesktopBrowserClient) -> None:
         super().__init__(
@@ -213,6 +308,7 @@ class DesktopBrowserMCPClient(MCPClient):
         self._http: httpx.AsyncClient | None = None
         self._next_id = 0
         self._available_tools = BROWSER_MCP_REQUIRED_TOOLS
+        self._tool_schemas: dict[str, dict[str, Any]] = {}
         self._coordinate_authority = False
         self._attachment_uploads = False
 
@@ -248,6 +344,7 @@ class DesktopBrowserMCPClient(MCPClient):
             await self._http.aclose()
             self._http = None
         self._available_tools = BROWSER_MCP_REQUIRED_TOOLS
+        self._tool_schemas = {}
         self._coordinate_authority = False
         self._attachment_uploads = False
 
@@ -308,7 +405,9 @@ class DesktopBrowserMCPClient(MCPClient):
                 )
             if "error" in parsed:
                 error = parsed["error"]
-                validation = _argument_validation_result(error) if method == "tools/call" else None
+                name = params.get("name") if method == "tools/call" else None
+                schema = self._tool_schemas.get(name) if isinstance(name, str) else None
+                validation = _argument_validation_result(error, schema) if name else None
                 if validation is not None:
                     return {"jsonrpc": "2.0", "id": request_id, "result": validation}
                 code = error.get("code") if isinstance(error, dict) else None
@@ -367,6 +466,7 @@ class DesktopBrowserMCPClient(MCPClient):
         if not BROWSER_MCP_REQUIRED_TOOLS <= names:
             raise RuntimeError("Incomplete Desktop browser tool catalog")
         self._available_tools = frozenset(names)
+        self._tool_schemas = {tool.name: deepcopy(tool.input_schema) for tool in definitions}
         return definitions
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> MCPToolResult:
@@ -484,11 +584,12 @@ class DesktopBrowserMCPClient(MCPClient):
 
             uploads = await browser_upload_descriptors(context)
             if uploads:
-                descriptor_text = json.dumps({"availableUploads": uploads}, ensure_ascii=False)
-                result.content += "\n" + descriptor_text
-                result.content_blocks.append({"type": "text", "text": descriptor_text})
                 if result.structured_content is not None:
                     result.structured_content["availableUploads"] = uploads
+                else:
+                    descriptor_text = json.dumps({"availableUploads": uploads}, ensure_ascii=False)
+                    result.content += "\n" + descriptor_text
+                    result.content_blocks.append({"type": "text", "text": descriptor_text})
         log.info(
             "desktop_browser.tool_result", tool=name, operation_id=operation_id,
             image_block_count=sum(block.get("type") == "image" for block in result.content_blocks),

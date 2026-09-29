@@ -159,18 +159,28 @@ def create_client(config: MCPServerConfig) -> MCPClient:
         raise ValueError(f"Unknown MCP transport: {config.transport!r}")
 
 
+def _result_text_parts(result: MCPToolResult) -> list[str]:
+    if result.structured_content is None:
+        return [result.content] if result.content else []
+    structured = json.dumps(result.structured_content, ensure_ascii=False)
+    try:
+        legacy = json.loads(result.content)
+    except (ValueError, TypeError):
+        legacy = None
+    if legacy == result.structured_content:
+        return [result.content]
+    # Some servers extend structuredContent after producing a legacy JSON text
+    # block. The extension should not cause the earlier object to appear twice.
+    repeated = isinstance(legacy, dict) and all(
+        key in result.structured_content and result.structured_content[key] == value
+        for key, value in legacy.items()
+    )
+    return [structured] if not result.content or repeated else [result.content, structured]
+
+
 def _project_tool_result(result: MCPToolResult, tool_use_id: str) -> str:
     """Project text and validated images without leaking binary data into text."""
-    parts = [result.content] if result.content else []
-    if result.structured_content is not None:
-        structured = json.dumps(result.structured_content, ensure_ascii=False)
-        # Modern servers may also include a serialized copy for old clients.
-        try:
-            duplicated = json.loads(result.content) == result.structured_content
-        except (ValueError, TypeError):
-            duplicated = False
-        if not duplicated:
-            parts.append(structured)
+    parts = _result_text_parts(result)
 
     context = current_tool_context.get()
     images: list[dict[str, Any]] = []
@@ -230,75 +240,21 @@ def _error_json(value: Any) -> str:
     )
 
 
-def _browser_error_summary(summary: dict[str, Any], structured: dict[str, Any]) -> None:
-    """Keep executable recovery identities ahead of large page text and ref lists."""
-    observation = structured.get("observation")
-    refs = observation.get("refs") if isinstance(observation, dict) else None
-    current: dict[str, Any] = {"refsOmitted": len(refs)} if isinstance(refs, list) else {}
-    details: dict[str, Any] = {"observation": current} if isinstance(observation, dict) else {}
-    summary["result"] = details
-    summary["guidance"] = (
-        "If an observation is returned, it replaces previous refs. Do not reuse earlier refs. "
-        "If fresh refs or metadata are omitted, retrieve the full result or call browser_observe "
-        "before acting. Do not repeat an action with unknown outcome."
-    )
-
-    def put(target: dict[str, Any], key: str, value: Any) -> bool:
-        target[key] = value
-        if len(_error_json(summary)) <= _MCP_ERROR_SUMMARY_MAX_CHARS:
-            return True
-        del target[key]
-        return False
-
-    for key in ("code", "outcome", "retryable", "recovery", "targetRef", "causeCode"):
-        if key in structured:
-            put(details, key, structured[key])
-    execution = structured.get("execution")
-    if isinstance(execution, dict):
-        compact = {key: execution[key] for key in ("state",) if key in execution}
-        actions = execution.get("actions")
-        if isinstance(actions, list):
-            compact["actions"] = [{
-                key: action[key]
-                for key in ("index", "state", "code", "outcome", "performed") if key in action
-            } for action in actions[:3] if isinstance(action, dict)]
-        put(details, "execution", compact)
-    if not isinstance(observation, dict):
-        return
-    for key in ("observationId", "consistency", "imageStatus", "image", "viewport", "browserState"):
-        if key in observation:
-            put(current, key, observation[key])
-    if isinstance(refs, list):
-        retained: list[Any] = []
-        for ref in refs:
-            # Refs remain exact records: never truncate an identifier, label, or URL.
-            if not put(current, "refs", [*retained, ref]):
-                if retained:
-                    current["refs"] = retained
-                break
-            retained.append(ref)
-            current["refsOmitted"] = len(refs) - len(retained)
-
-
 async def _recoverable_error_content(
-    result: MCPToolResult, content: str, tool_name: str, tool_use_id: str,
+    client: MCPClient,
+    result: MCPToolResult,
+    content: str,
+    tool_name: str,
+    tool_use_id: str,
 ) -> str:
     """Use the existing result store instead of silently clipping MCP error recovery data."""
     if len(content) <= _MCP_ERROR_SUMMARY_MAX_CHARS:
         return content
-    try:
-        duplicated = json.loads(result.content) == result.structured_content
-    except (ValueError, TypeError):
-        duplicated = False
     if result.structured_content is not None:
-        original_prefix = result.content
+        original_prefix = "\n".join(_result_text_parts(result))
         safe_prefix = _error_json(result.structured_content)
-        if not duplicated:
-            original_parts = [result.content] if result.content else []
-            original_parts.append(json.dumps(result.structured_content, ensure_ascii=False))
-            original_prefix = "\n".join(original_parts)
-            if result.content:
-                safe_prefix = redact_secret_text(result.content) + "\n" + safe_prefix
+        if len(_result_text_parts(result)) > 1:
+            safe_prefix = redact_secret_text(result.content) + "\n" + safe_prefix
         content = safe_prefix + redact_secret_text(content[len(original_prefix):])
     else:
         content = redact_secret_text(content)
@@ -330,9 +286,22 @@ async def _recoverable_error_content(
         "isError": True, "truncated": True, "originalChars": len(content),
         "content_recovery": recovery,
     }
-    if tool_name.startswith("mcp__desktop-browser__") and result.structured_content is not None:
-        _browser_error_summary(summary, result.structured_content)
-    else:
+    generic_summary = deepcopy(summary)
+    projected = False
+    if result.structured_content is not None:
+        try:
+            projected = client.project_error_summary(
+                summary,
+                result.structured_content,
+                serialize=_error_json,
+                max_chars=_MCP_ERROR_SUMMARY_MAX_CHARS,
+            )
+        except Exception:
+            log.warning("mcp.error_projection_failed", tool=tool_name)
+    if projected and len(_error_json(summary)) > _MCP_ERROR_SUMMARY_MAX_CHARS:
+        projected = False
+    if not projected:
+        summary = generic_summary
         summary["preview"] = content[:600]
         summary["guidance"] = (
             "Retrieve the complete error before using omitted result data."
@@ -418,7 +387,7 @@ def _make_tool_handler(
         content = _project_tool_result(result, _tool_use_id)
         if result.is_error:
             content = await _recoverable_error_content(
-                result, content, spec.name, _tool_use_id,
+                client, result, content, spec.name, _tool_use_id,
             )
             raise SafeToolError(content or f"MCP tool '{tool_name}' failed")
         return content
