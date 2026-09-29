@@ -168,7 +168,7 @@ export interface RpcConnectionIntent {
 export type RpcLifecycle = 'stopped' | 'connecting' | 'connected' | 'recovering' | 'blocked';
 export type RpcConsumptionResult = 'applied' | 'dirty';
 export type RpcRecoveryResult = boolean | { readonly retryable: false };
-export type RecoveryClass = 'safe-read' | 'read' | 'mutation' | 'ephemeral';
+export type RecoveryClass = 'safe-read' | 'read' | 'mutation' | 'ephemeral' | 'task-control';
 export type RpcRecoveryClass = RecoveryClass;
 export type RpcConsumptionHandler = (
   payload: unknown, meta: Record<string, unknown>,
@@ -182,7 +182,8 @@ export interface RpcCallOptions {
   /**
    * Whether a request is safe to issue while wake recovery is in progress.
    * Missing values fail closed as mutations once the transport is checking
-   * or suspect; adapters may explicitly opt a bounded read in.
+   * or suspect; adapters may opt a bounded read in. Exact-task controls require
+   * expectedGeneration and are sent once on that socket, never queued.
    */
   recoveryClass?: RpcRecoveryClass;
   /** Send a capability-gated cancellation frame before rejecting on abort. */
@@ -547,7 +548,14 @@ export class RpcClient {
         reject(new RpcAbortError(method));
         return;
       }
-      if (this._phase !== 'healthy') {
+      const recoveryControl = options.recoveryClass === 'task-control'
+        && options.expectedGeneration !== undefined
+        && method === 'chat.abort'
+        && params.scope === 'task'
+        && typeof params.taskId === 'string' && params.taskId.trim().length > 0
+        && typeof params.sessionKey === 'string' && params.sessionKey.trim().length > 0
+        && (this._phase === 'checking' || this._phase === 'suspect');
+      if (this._phase !== 'healthy' && !recoveryControl) {
         if (!isSafeReadRecoveryClass(options.recoveryClass)) {
           reject(new RpcTransportError(
             this._phase === 'checking'
@@ -626,7 +634,7 @@ export class RpcClient {
       }
 
       const recoveryTimeoutMs = this._phase !== 'healthy'
-        && isSafeReadRecoveryClass(options.recoveryClass)
+        && (isSafeReadRecoveryClass(options.recoveryClass) || recoveryControl)
         ? Math.min(options.timeoutMs ?? SAFE_READ_TIMEOUT_MS, SAFE_READ_TIMEOUT_MS)
         : options.timeoutMs;
       if (
