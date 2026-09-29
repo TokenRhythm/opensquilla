@@ -176,6 +176,7 @@ def _anthropic_collector(*, tools: list[ToolDefinition] | None = None) -> Collec
 
 def _ollama_collector(*, tools: list[ToolDefinition] | None = None) -> Collector:
     async def collect(monkeypatch: pytest.MonkeyPatch, body: bytes) -> list[Any]:
+        _patch_uuid4(monkeypatch, "opensquilla.provider.ollama")
         _patch_transport(monkeypatch, "opensquilla.provider.ollama", body, "application/x-ndjson")
         provider = OllamaProvider(model="test-model")
         return await _collect_events(provider, tools)

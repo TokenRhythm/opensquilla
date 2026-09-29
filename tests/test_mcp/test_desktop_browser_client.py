@@ -15,6 +15,8 @@ from opensquilla.mcp.desktop_browser import (
 from opensquilla.mcp.discovery import close_active_clients, register_client_tools
 from opensquilla.mcp.types import MCPCallContext, MCPToolDef, current_mcp_call_context
 from opensquilla.observability.log_privacy import log_metadata
+from opensquilla.provider.ollama import OllamaProvider
+from opensquilla.provider.types import ChatConfig, Message, ToolUseEndEvent
 from opensquilla.sandbox.integration import sandbox_policy_scope
 from opensquilla.sandbox.policy_models import NetworkPolicySettings, SandboxPolicy
 from opensquilla.tool_boundary import ToolCall
@@ -126,6 +128,57 @@ async def test_managed_discovery_dispatch_and_trusted_call_context(browser, mock
     finally:
         await close_active_clients(owner="desktop-browser")
     assert all(registry.get(name) is None for name in BROWSER_MCP_TOOL_NAMES)
+
+
+async def test_ollama_browser_calls_keep_distinct_operations_and_stable_retries(
+    browser, monkeypatch, request,
+):
+    responses = iter([
+        ("browser_open", {"url": "https://example.test"}),
+        ("browser_act", {"targetRef": "page-a", "action": "click", "ref": "element-1"}),
+    ])
+
+    def respond_ollama(http_request):
+        name, arguments = next(responses)
+        chunks = [
+            {"message": {"tool_calls": [{"function": {
+                "name": f"mcp__desktop-browser__{name}", "arguments": arguments,
+            }}]}},
+            {"message": {}, "done": True},
+        ]
+        return httpx.Response(200, content="".join(json.dumps(c) + "\n" for c in chunks))
+
+    original = httpx.AsyncClient
+    calls = []
+    with monkeypatch.context() as provider_patch:
+        provider_patch.setattr(
+            httpx, "AsyncClient",
+            lambda **kwargs: original(**kwargs, transport=httpx.MockTransport(respond_ollama)),
+        )
+        provider = OllamaProvider(model="test-model")
+        for _ in range(2):
+            events = [event async for event in provider.chat(
+                [Message(role="user", content="continue")], config=ChatConfig(),
+            )]
+            event = next(event for event in events if isinstance(event, ToolUseEndEvent))
+            calls.append(ToolCall(event.tool_use_id, event.tool_name, event.arguments))
+
+    # Install the Browser transport only after restoring the provider transport.
+    mock_http = request.getfixturevalue("mock_http")
+    registry = ToolRegistry()
+    client = DesktopBrowserMCPClient(browser)
+    try:
+        await register_client_tools(client, registry, spec_transform=browser_tool_policy)
+        handler = build_tool_handler(registry, context(browser))
+        operations = []
+        for call in calls:
+            assert not (await handler(call)).is_error
+            operations.append(mock_http[-1][1]["params"]["_meta"]["operationId"])
+        assert operations[0] != operations[1]
+        assert not (await handler(calls[1])).is_error
+        assert mock_http[-1][1]["params"]["_meta"]["operationId"] == operations[1]
+    finally:
+        await close_active_clients(owner="desktop-browser")
 
 
 @pytest.mark.parametrize(
