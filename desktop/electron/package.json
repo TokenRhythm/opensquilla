@@ -90,18 +90,18 @@
   "dependencies": {
     "electron-updater": "^6.6.2",
     "playwright-core": "1.63.0",
-    "smol-toml": "1.8.0"
+    "smol-toml": "1.9.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.1",
+    "@types/node": "^26.6.3",
     "@typescript/typescript6": "6.0.2",
-    "electron": "^42.11.4",
+    "electron": "^42.11.8",
     "electron-builder": "^26.15.3",
     "gsap": "^3.15.0",
     "lottie-web": "^5.13.0",
     "playwright": "~1.63.0",
     "typescript": "7.0.2",
-    "ws": "^8.21.3"
+    "ws": "^8.22.0"
   },
   "build": {
     "appId": "ai.opensquilla.desktop",
