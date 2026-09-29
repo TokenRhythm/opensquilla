@@ -57,3 +57,16 @@ Use fresh Windows CI as the integration gate. Track first-attempt results; a
 rerun is not stability evidence. Do not generalize this pilot to remaining
 telemetry shutdown cases or other suites until those contracts and their
 failure/cleanup paths have been audited separately.
+
+## Queue-discovered authority-test follow-up
+
+Queue run `36544294774` failed in the project-child restart authority test,
+outside the telemetry pilot: its test-only one-second stream-idle override
+expired during a real filesystem/persistence scenario. The two matching
+restart-authority tests now retain the production stream wrapper and default
+idle budget, with a separate 60-second asyncio guard around each dispatch.
+Product defaults, real storage/reopen, authority assertions, and stream-timeout
+unit tests are unchanged. A 1.1-second injected write delay reproduces the old
+failure and must still pass all authority and removed-project assertions.
+This guard covers cooperative dispatch, not cancellation-resistant cleanup;
+the telemetry process watchdog is not generalized to these tests.
