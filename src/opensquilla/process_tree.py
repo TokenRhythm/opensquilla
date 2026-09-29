@@ -29,6 +29,7 @@ import sys
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -51,6 +52,12 @@ _CONTROL_READY_TIMEOUT_SECONDS = 2.0
 _WINDOWS_FROZEN_READY_TIMEOUT_SECONDS = 5.0
 _WINDOWS_FROZEN_READY_RETRY_DELAY_SECONDS = 0.25
 _WINDOWS_FROZEN_READY_ATTEMPTS = 2
+_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_DEFAULT = 2
+_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_MAX = 8
+_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_ENV = (
+    "OPENSQUILLA_WINDOWS_PROCESS_LAUNCH_CONCURRENCY"
+)
+_WINDOWS_LAUNCH_DIAGNOSTICS_ENV = "OPENSQUILLA_STALL_DIAGNOSTICS"
 _POSIX_ANCHOR_READY = b"Y"
 _POSIX_ANCHOR_ARM = b"A"
 _POSIX_ANCHOR_EMPTY = b"E"
@@ -86,6 +93,44 @@ _WINDOWS_REGISTRY_RETRY_DELAYS_SECONDS = (0.03, 0.08, 0.18)
 _WINDOWS_TRANSIENT_FILE_ERRORS = frozenset({5, 32, 33})
 _POSIX_DESCENDANT_CAPTURE_LIMIT = 1024
 _DARWIN_PROC_PIDTBSDINFO = 3
+
+_windows_launch_semaphores: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, tuple[asyncio.Semaphore, int]
+] = weakref.WeakKeyDictionary()
+_windows_launch_semaphores_lock = threading.Lock()
+
+
+def _windows_process_launch_limit() -> int:
+    """Return the bounded Windows helper-launch admission limit."""
+
+    raw = os.environ.get(_WINDOWS_PROCESS_LAUNCH_CONCURRENCY_ENV, "")
+    try:
+        value = int(raw)
+    except ValueError:
+        value = _WINDOWS_PROCESS_LAUNCH_CONCURRENCY_DEFAULT
+    return min(max(value, 1), _WINDOWS_PROCESS_LAUNCH_CONCURRENCY_MAX)
+
+
+def _windows_launch_diagnostics_enabled() -> bool:
+    return os.environ.get(_WINDOWS_LAUNCH_DIAGNOSTICS_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _windows_launch_semaphore() -> tuple[asyncio.Semaphore, int]:
+    """Get one admission gate per event loop, without cross-loop sharing."""
+
+    loop = asyncio.get_running_loop()
+    with _windows_launch_semaphores_lock:
+        admission = _windows_launch_semaphores.get(loop)
+        if admission is None:
+            limit = _windows_process_launch_limit()
+            admission = (asyncio.Semaphore(limit), limit)
+            _windows_launch_semaphores[loop] = admission
+    return admission
 
 
 def _process_tree_child_argv(*args: str) -> tuple[str, ...]:
@@ -2455,76 +2500,136 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
     task_scope = _current_task_process_scope()
 
     if os.name == "nt":
-        gate = _WindowsLaunchGate.create()
-        job = (
-            _WindowsJob.create(f"{_WINDOWS_JOB_PREFIX}{owner_id}")
-            if task_scope is not None
-            else _WindowsJob.create()
+        # CreateProcess and the helper/Job handshake are intentionally kept on
+        # the Proactor loop: moving them to a worker would break asyncio pipe
+        # ownership and cancellation.  Admission control only prevents a
+        # burst of launches from stacking those synchronous Windows phases.
+        semaphore, launch_limit = _windows_launch_semaphore()
+        diagnostics = _windows_launch_diagnostics_enabled()
+        launch_started = time.perf_counter()
+        admission_started = launch_started
+        timings: dict[str, int] = {}
+        await semaphore.acquire()
+        timings["admission_wait_ms"] = round(
+            (time.perf_counter() - admission_started) * 1000
         )
-        child_kwargs = dict(kwargs)
-        child_kwargs.pop("start_new_session", None)
-        child_kwargs["creationflags"] = (
-            int(child_kwargs.get("creationflags", 0))
-            | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
-        )
-        child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
-        helper_argv = _process_tree_child_argv(
-            "--windows-owned-launch",
-            gate.gate_name,
-            gate.ready_name,
-            "--",
-            *argv,
-        )
+        gate: _WindowsLaunchGate | None = None
+        job: _WindowsJob | None = None
         windows_process: Any | None = None
         persisted_owner = None
         registration = None
+        launch_succeeded = False
         try:
-            windows_process = await asyncio.create_subprocess_exec(
-                *helper_argv,
-                **child_kwargs,
+            phase_started = time.perf_counter()
+            gate = _WindowsLaunchGate.create()
+            timings["gate_create_ms"] = round((time.perf_counter() - phase_started) * 1000)
+            phase_started = time.perf_counter()
+            job = (
+                _WindowsJob.create(f"{_WINDOWS_JOB_PREFIX}{owner_id}")
+                if task_scope is not None
+                else _WindowsJob.create()
             )
-            job.assign_pid(int(windows_process.pid))
-            await asyncio.to_thread(
-                _wait_for_windows_helper_ready,
-                gate,
+            timings["job_create_ms"] = round((time.perf_counter() - phase_started) * 1000)
+            child_kwargs = dict(kwargs)
+            child_kwargs.pop("start_new_session", None)
+            child_kwargs["creationflags"] = (
+                int(child_kwargs.get("creationflags", 0))
+                | _WINDOWS_CREATE_BREAKAWAY_FROM_JOB
             )
-            if task_scope is not None:
-                registration = asyncio.get_running_loop().run_in_executor(
-                    None, partial(
-                        contextvars.copy_context().run,
-                        _insert_owner_record,
-                        task_scope,
-                        owner_id=owner_id,
-                        platform="windows",
-                        controller_pid=int(windows_process.pid),
-                    )
+            child_kwargs["env"] = _windows_helper_env(child_kwargs.get("env"))
+            helper_argv = _process_tree_child_argv(
+                "--windows-owned-launch",
+                gate.gate_name,
+                gate.ready_name,
+                "--",
+                *argv,
+            )
+            try:
+                phase_started = time.perf_counter()
+                windows_process = await asyncio.create_subprocess_exec(
+                    *helper_argv,
+                    **child_kwargs,
                 )
-                persisted_owner = await asyncio.shield(registration)
-            owner = ProcessTreeOwner(
-                process=windows_process,
-                pid=int(windows_process.pid),
-                windows_job=job,
-                persisted_owner=persisted_owner,
-            )
-            _attach_owner(windows_process, owner)
-            gate.release()
-            owner.start_completion_monitor()
-            return windows_process
-        except BaseException as exc:
-            cancellation = await _cleanup_failed_windows_launch(
-                registration=registration,
-                process=windows_process,
-                job=job,
-            )
-            if isinstance(exc, asyncio.CancelledError):
-                raise
-            if cancellation is not None:
-                raise cancellation
-            raise ProcessTreeOwnershipError(
-                "Windows controlled process launch failed closed"
-            ) from exc
+                timings["helper_spawn_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                phase_started = time.perf_counter()
+                job.assign_pid(int(windows_process.pid))
+                timings["job_assign_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                phase_started = time.perf_counter()
+                await asyncio.to_thread(
+                    _wait_for_windows_helper_ready,
+                    gate,
+                )
+                timings["helper_ready_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                if task_scope is not None:
+                    phase_started = time.perf_counter()
+                    registration = asyncio.get_running_loop().run_in_executor(
+                        None, partial(
+                            contextvars.copy_context().run,
+                            _insert_owner_record,
+                            task_scope,
+                            owner_id=owner_id,
+                            platform="windows",
+                            controller_pid=int(windows_process.pid),
+                        )
+                    )
+                    persisted_owner = await asyncio.shield(registration)
+                    timings["owner_register_ms"] = round(
+                        (time.perf_counter() - phase_started) * 1000
+                    )
+                if gate is None or job is None:
+                    raise ProcessTreeOwnershipError(
+                        "Windows controlled process launch lost ownership state"
+                    )
+                owner = ProcessTreeOwner(
+                    process=windows_process,
+                    pid=int(windows_process.pid),
+                    windows_job=job,
+                    persisted_owner=persisted_owner,
+                )
+                _attach_owner(windows_process, owner)
+                phase_started = time.perf_counter()
+                gate.release()
+                timings["gate_release_ms"] = round(
+                    (time.perf_counter() - phase_started) * 1000
+                )
+                owner.start_completion_monitor()
+                launch_succeeded = True
+                return windows_process
+            except BaseException as exc:
+                if job is None:
+                    raise ProcessTreeOwnershipError(
+                        "Windows controlled process launch lost Job ownership"
+                    ) from exc
+                cancellation = await _cleanup_failed_windows_launch(
+                    registration=registration,
+                    process=windows_process,
+                    job=job,
+                )
+                if isinstance(exc, asyncio.CancelledError):
+                    raise
+                if cancellation is not None:
+                    raise cancellation
+                raise ProcessTreeOwnershipError(
+                    "Windows controlled process launch failed closed"
+                ) from exc
         finally:
-            gate.close()
+            if gate is not None:
+                gate.close()
+            semaphore.release()
+            if diagnostics:
+                timings["total_ms"] = round((time.perf_counter() - launch_started) * 1000)
+                timings["concurrency_limit"] = launch_limit
+                timings["succeeded"] = int(launch_succeeded)
+                log.info(
+                    "windows_process_tree_launch_timing",
+                    extra={"_opensquilla_log_metadata": {"timings": timings}},
+                )
 
     raise ProcessTreeOwnershipError(f"unsupported process-tree platform: {os.name}")
 

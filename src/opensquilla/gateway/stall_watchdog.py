@@ -74,9 +74,13 @@ class GatewayStallWatchdog:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._write_lock = threading.Lock()
+        self._heartbeat_lock = threading.Lock()
+        self._heartbeat_seq = 0
+        self._heartbeat_alive = True
         self._event_count = 0
         self._bytes_written = 0
         self._stall_started_at: float | None = None
+        self._stall_detected_lag_ms: int | None = None
         self._last_stack_at = 0.0
 
     @classmethod
@@ -107,14 +111,14 @@ class GatewayStallWatchdog:
             ),
         )
 
-    def start(self) -> None:
+    def start(self) -> bool:
         if self._thread is not None:
-            return
+            return True
         try:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             log.warning("gateway.stall_diagnostics_unavailable", error=str(exc))
-            return
+            return False
         self._thread = threading.Thread(
             target=self._run,
             name="opensquilla-gateway-stall-watchdog",
@@ -126,39 +130,105 @@ class GatewayStallWatchdog:
             "threshold_ms": round(self.threshold_s * 1000),
             "sample_interval_ms": round(self.sample_interval_s * 1000),
         })
+        return True
 
     def beat(self) -> None:
         """Record progress from the event-loop task."""
 
-        self._heartbeat_at = time.monotonic()
+        with self._heartbeat_lock:
+            self._heartbeat_at = time.monotonic()
+            self._heartbeat_seq += 1
+
+    def heartbeat_failed(self, error: BaseException) -> None:
+        """Stop diagnostics when their own heartbeat can no longer run.
+
+        A dead heartbeat cannot distinguish a loop stall from a monitoring
+        failure. Stopping here prevents the watchdog thread from emitting a
+        misleading stall sample with a frozen sequence number.
+        """
+
+        with self._heartbeat_lock:
+            self._heartbeat_alive = False
+            heartbeat_seq = self._heartbeat_seq
+        self._write({
+            "type": "heartbeat_failed",
+            "heartbeat_seq": heartbeat_seq,
+            "error_type": type(error).__name__,
+        })
+        self._stop.set()
 
     def stop(self) -> None:
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=max(1.0, self.sample_interval_s * 4))
-        self._write({"type": "watchdog_stopped"})
+        now = time.monotonic()
+        with self._heartbeat_lock:
+            heartbeat_at = self._heartbeat_at
+            heartbeat_seq = self._heartbeat_seq
+            heartbeat_alive = self._heartbeat_alive
+        payload: dict[str, Any] = {
+            "type": "watchdog_stopped",
+            "heartbeat_seq": heartbeat_seq,
+            "heartbeat_alive": heartbeat_alive,
+        }
+        if self._stall_started_at is not None:
+            observed_duration_ms = round((now - self._stall_started_at) * 1000)
+            heartbeat_age_ms = round((now - heartbeat_at) * 1000)
+            payload.update({
+                "stall_active": True,
+                "heartbeat_age_ms": heartbeat_age_ms,
+                "observed_duration_ms": observed_duration_ms,
+                "stale_heartbeat_window_lower_bound_ms": (
+                    (self._stall_detected_lag_ms or 0) + observed_duration_ms
+                ),
+            })
+        self._write(payload)
 
     def _run(self) -> None:
         while not self._stop.wait(self.sample_interval_s):
             now = time.monotonic()
-            lag_s = now - self._heartbeat_at
+            with self._heartbeat_lock:
+                heartbeat_at = self._heartbeat_at
+                heartbeat_seq = self._heartbeat_seq
+            lag_s = now - heartbeat_at
             if lag_s < self.threshold_s:
                 if self._stall_started_at is not None:
+                    observed_duration_ms = round((now - self._stall_started_at) * 1000)
                     self._write({
                         "type": "stall_ended",
-                        "duration_ms": round((now - self._stall_started_at) * 1000),
+                        # Keep duration_ms for existing consumers. It is the
+                        # time observed after detection, while the lower bound
+                        # includes the stale-heartbeat age at detection.
+                        "duration_ms": observed_duration_ms,
+                        "observed_duration_ms": observed_duration_ms,
+                        "stale_heartbeat_window_lower_bound_ms": (
+                            (self._stall_detected_lag_ms or 0) + observed_duration_ms
+                        ),
+                        "heartbeat_alive": True,
+                        "heartbeat_seq": heartbeat_seq,
                     })
                     self._stall_started_at = None
+                    self._stall_detected_lag_ms = None
                 continue
             if self._stall_started_at is None:
                 self._stall_started_at = now
-                self._write({"type": "stall_started", "lag_ms": round(lag_s * 1000)})
+                self._stall_detected_lag_ms = round(lag_s * 1000)
+                self._write({
+                    "type": "stall_started",
+                    "lag_ms": self._stall_detected_lag_ms,
+                    "heartbeat_age_ms": self._stall_detected_lag_ms,
+                    "heartbeat_alive": True,
+                    "heartbeat_seq": heartbeat_seq,
+                })
             if now - self._last_stack_at >= self.stack_interval_s:
                 self._last_stack_at = now
                 self._write({
                     "type": "stack_sample",
                     "lag_ms": round(lag_s * 1000),
+                    "heartbeat_age_ms": round(lag_s * 1000),
+                    "heartbeat_alive": True,
+                    "heartbeat_seq": heartbeat_seq,
                     "stack": self._main_stack(),
                 })
 

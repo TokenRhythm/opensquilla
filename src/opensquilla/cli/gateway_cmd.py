@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import signal
@@ -387,24 +388,42 @@ def run_gateway(
         )
 
     stall_watchdog = None
+    stall_heartbeat_task: asyncio.Task[None] | None = None
 
-    async def _run() -> bool:
-        nonlocal stall_watchdog
+    async def _run_inner() -> bool:
+        nonlocal stall_watchdog, stall_heartbeat_task
         from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
 
         # This is deliberately opt-in.  The diagnostic thread is the only
         # component that can sample the Gateway while its event loop is
         # synchronously blocked; normal clients pay no thread or file cost.
         stall_watchdog = GatewayStallWatchdog.from_environment()
-        if stall_watchdog is not None:
-            stall_watchdog.start()
+        if stall_watchdog is not None and stall_watchdog.start():
 
             async def _stall_heartbeat() -> None:
                 while True:
                     stall_watchdog.beat()
                     await asyncio.sleep(0.1)
 
-            asyncio.create_task(_stall_heartbeat(), name="gateway-stall-heartbeat")
+            stall_heartbeat_task = asyncio.create_task(
+                _stall_heartbeat(), name="gateway-stall-heartbeat"
+            )
+
+            def _stall_heartbeat_done(task: asyncio.Task[None]) -> None:
+                if task.cancelled():
+                    return
+                try:
+                    error = task.exception()
+                except asyncio.CancelledError:
+                    return
+                if error is not None:
+                    stall_watchdog.heartbeat_failed(error)
+                    log.error(
+                        "gateway.stall_heartbeat_failed",
+                        error_type=type(error).__name__,
+                    )
+
+            stall_heartbeat_task.add_done_callback(_stall_heartbeat_done)
 
         # Subscription manager is gateway-specific (WS event routing)
         from opensquilla.gateway.websocket import SubscriptionManager
@@ -550,6 +569,20 @@ def run_gateway(
         if explicit_shutdown:
             console.print("\n[yellow]Gateway stopped.[/yellow]")
         return explicit_shutdown
+
+    async def _run() -> bool:
+        """Run the Gateway and always retire the diagnostic heartbeat task."""
+
+        nonlocal stall_heartbeat_task
+        try:
+            return await _run_inner()
+        finally:
+            task = stall_heartbeat_task
+            stall_heartbeat_task = None
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
 
     try:
         explicit_shutdown = asyncio.run(_run())
