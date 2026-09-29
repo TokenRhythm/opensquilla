@@ -42,6 +42,7 @@ function owner(title: string): {
       sessionKey: ref(`session-${title}`),
       visible: ref(true),
       title: ref(title),
+      optimisticTitle: ref(''),
       copyState: ref(null),
       copyIcon: ref('copy'),
       copyLiveText: ref(''),

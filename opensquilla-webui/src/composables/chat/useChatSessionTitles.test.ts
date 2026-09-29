@@ -5,10 +5,12 @@ import {
   isSensibleChatTitle,
   looksLikeRawSessionId,
   resolveChatHeaderTitle,
+  resolveOptimisticChatTitle,
   type ChatHeaderMessage,
 } from './useChatSessionTitles'
 
 const labels = {
+  currentTask: 'Current task',
   newChat: 'Localized new chat',
   chatWithSuffix: (suffix: string) => `Localized chat ${suffix}`,
 }
@@ -88,5 +90,53 @@ describe('resolveChatHeaderTitle', () => {
       stripTimePrefix,
       labels,
     )).toBe('Localized chat sandbox')
+  })
+})
+
+describe('resolveOptimisticChatTitle', () => {
+  const key = 'agent:main:webchat:abc'
+
+  it('uses a key-scoped first-message title during response handoff', () => {
+    expect(resolveOptimisticChatTitle(
+      key,
+      key,
+      'Generate a travel presentation',
+      'Current task',
+      false,
+      labels,
+    )).toBe('Generate a travel presentation')
+  })
+
+  it('rejects a title from a previous session key', () => {
+    expect(resolveOptimisticChatTitle(
+      key,
+      'agent:main:webchat:other',
+      'Generate a travel presentation',
+      'Generate a travel presentation',
+      true,
+      labels,
+    )).toBe('Current task')
+  })
+
+  it('falls back to the resolved header title after the handoff guard clears', () => {
+    expect(resolveOptimisticChatTitle(
+      key,
+      key,
+      '',
+      'Resolved session title',
+      true,
+      labels,
+    )).toBe('Resolved session title')
+  })
+
+  it('lets a formal session title take over the first-message title', () => {
+    expect(resolveOptimisticChatTitle(
+      key,
+      key,
+      'Generate a travel presentation',
+      'Formal generated title',
+      true,
+      labels,
+    )).toBe('Formal generated title')
   })
 })

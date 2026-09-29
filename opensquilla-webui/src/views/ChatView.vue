@@ -1383,6 +1383,8 @@ const { enabled: composerFxEnabled } = useComposerFloatingPreference()
 /* ── State ─────────────────────────────────────────────────────────── */
 
 const sessionKey = ref('')
+const optimisticSessionTitle = ref<{ key: string; title: string } | null>(null)
+const draftHandoffSourceKey = ref<string | null>(null)
 function clearPendingComposerScrollIntent() {
   pendingComposerScrollIntent = null
   if (composerScrollIntentTimer !== null) {
@@ -3635,13 +3637,21 @@ const chatSend = useChatSend({
   normalizeElevatedMode,
   adoptResponseSession: async (key, ownerRequestId) => {
     const sourceKey = sessionKey.value
+    const optimisticTitle = draftHandoffSourceKey.value === sourceKey
+      ? firstUserTitleForResponseHandoff(sourceKey)
+      : ''
     const workspaceId = freshTaskDraft.materializedWorkspaceBySession.value[sourceKey]
       || boundWorkspaceId.value
     if (workspaceId && key !== sourceKey) {
       freshTaskDraft.bindMaterializedProjectTask(key, workspaceId)
       freshTaskDraft.forgetMaterializedProjectTask(sourceKey)
     }
-    return adoptResponseSession(key, ownerRequestId)
+    const adoption = await adoptResponseSession(key, ownerRequestId)
+    if (optimisticTitle && key) {
+      optimisticSessionTitle.value = { key, title: optimisticTitle }
+    }
+    if (draftHandoffSourceKey.value === sourceKey) draftHandoffSourceKey.value = null
+    return adoption
   },
   recoverPendingQueueHandoff,
   failPendingQueueHandoff,
@@ -3687,6 +3697,9 @@ async function onSend(
   sendOptions?: Parameters<typeof dispatchCurrentInput>[0],
 ): Promise<void> {
   if (browserUseSelectionPending.value) return
+  if (pendingSessionIntent.value === 'new_chat') {
+    draftHandoffSourceKey.value = sessionKey.value
+  }
   if (pendingAutoSendSessionKey.value === sessionKey.value) {
     pendingAutoSend.value = ''
     pendingAutoSendSessionKey.value = ''
@@ -4684,18 +4697,36 @@ function setCollaborationMode(mode: CollaborationMode) {
 }
 
 const sessionTitles = useChatSessionTitles()
-const currentChatTitle = computed(() => {
-  return resolveChatHeaderTitle(
-    sessionKey.value,
-    sessionTitles.value,
+function chatHeaderTitleLabels() {
+  return {
+    newChat: t('chat.newChat'),
+    chatWithSuffix: (suffix: string) => t('chat.chatWithSuffix', { suffix }),
+  }
+}
+
+function firstUserTitleForResponseHandoff(sourceKey: string): string {
+  const title = resolveChatHeaderTitle(
+    sourceKey,
+    {},
     messages.value,
     stripTimePrefix,
-    {
-      newChat: t('chat.newChat'),
-      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
-    },
+    chatHeaderTitleLabels(),
   )
-})
+  const suffix = sourceKey.split(':').pop() || ''
+  const genericTitles = new Set([
+    t('chat.newChat'),
+    t('chat.chatWithSuffix', { suffix }),
+  ])
+  return genericTitles.has(title) ? '' : title
+}
+
+const currentChatTitle = computed(() => resolveChatHeaderTitle(
+  sessionKey.value,
+  sessionTitles.value,
+  messages.value,
+  stripTimePrefix,
+  chatHeaderTitleLabels(),
+))
 
 const chatMarkdownExport = useChatMarkdownExport({
   messages: renderedMessages,
@@ -5724,6 +5755,11 @@ const chatRouteHeaderRegistration = chatRouteHeader.register({
   sessionKey,
   visible: computed(() => !isNewChatLanding.value),
   title: currentChatTitle,
+  optimisticTitle: computed(() => (
+    optimisticSessionTitle.value?.key === sessionKey.value
+      ? optimisticSessionTitle.value.title
+      : ''
+  )),
   copyState: sessionCopyState,
   copyIcon: sessionCopyIcon,
   copyLiveText: sessionCopyLiveText,
