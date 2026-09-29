@@ -41,7 +41,7 @@ def _emit(stage: str, status: str, at_ns: int, started_ns: int) -> None:
         elapsed_us = max(0, (at_ns - started_ns) // 1000)
         wall_ms = _wall_ns() // 1_000_000
         sys.stderr.write(
-            '{"event":"gateway.startup_early","stage":"' + stage
+            '{"event":"gateway.startup_early","phase":"' + stage
             + '","status":"' + status
             + f'","pid":{os.getpid()},"at_unix_ms":{wall_ms},'
             + f'"monotonic_ns":{at_ns},"duration_us":{elapsed_us}}}\n'

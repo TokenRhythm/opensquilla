@@ -83,7 +83,7 @@ def test_startup_timing_preserves_writer_guard_order_and_original_failure(
     assert events == expected
     if not broken_stderr:
         records = [json.loads(line) for line in capsys.readouterr().err.splitlines()]
-        complete = [item["stage"] for item in records if item["status"] == "complete"]
+        complete = [item["phase"] for item in records if item["status"] == "complete"]
         assert complete == {
             "profile_lock": [],
             "inspect": ["profile_lock"],

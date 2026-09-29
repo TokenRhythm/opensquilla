@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import runpy
 import sys
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -62,12 +64,30 @@ def test_fixed_private_safe_schema_and_process_local_duration(enabled, monkeypat
     assert [item["duration_us"] for item in events] == [0, 1250]
     assert [item["monotonic_ns"] for item in events] == [2_000_000, 3_250_000]
     assert all(set(item) == {
-        "event", "stage", "status", "pid", "at_unix_ms", "monotonic_ns", "duration_us",
+        "event", "phase", "status", "pid", "at_unix_ms", "monotonic_ns", "duration_us",
     } for item in events)
     assert all(item["event"] == "gateway.startup_early" for item in events)
-    assert all(item["stage"] == "profile_lock" for item in events)
+    assert all(item["phase"] == "profile_lock" for item in events)
     assert all(item["pid"] == timing.os.getpid() for item in events)
     assert all(item["at_unix_ms"] == 42 for item in events)
+
+
+def test_startup_phase_survives_private_support_bundle_export(enabled, capsys) -> None:
+    from opensquilla.observability.bundle import _write_text
+
+    start = timing.startup_phase_start("cli_import")
+    timing.startup_phase_end("cli_import", start)
+    emitted = capsys.readouterr().err
+    archive_bytes = io.BytesIO()
+    with zipfile.ZipFile(archive_bytes, "w") as archive:
+        _write_text(archive, "desktop/gateway.log", emitted)
+    with zipfile.ZipFile(io.BytesIO(archive_bytes.getvalue())) as archive:
+        records = [json.loads(line) for line in archive.read("desktop/gateway.log").splitlines()]
+
+    assert [(item["phase"], item["status"]) for item in records] == [
+        ("cli_import", "start"), ("cli_import", "complete"),
+    ]
+    assert records == [json.loads(line) for line in emitted.splitlines()]
 
 
 @pytest.mark.parametrize("clock", ["_monotonic_ns", "_wall_ns"])
@@ -115,7 +135,7 @@ def test_ca_hook_records_original_work_once(enabled, monkeypatch, capsys) -> Non
     runpy.run_path(str(HOOK))
     assert calls == ["ca"]
     events = _events(capsys)
-    assert [(item["stage"], item["status"]) for item in events] == [
+    assert [(item["phase"], item["status"]) for item in events] == [
         ("diagnostic_setup", "complete"),
         ("frozen_hook_imports", "start"),
         ("frozen_hook_imports", "complete"),
@@ -138,7 +158,7 @@ def test_ca_failure_remains_packaging_error_and_is_not_logged(enabled, monkeypat
     with pytest.raises(RuntimeError, match="could not initialize its packaged TLS trust store"):
         runpy.run_path(str(HOOK))
     events = _events(capsys)
-    assert events[-1]["stage"] == "frozen_ca_trust"
+    assert events[-1]["phase"] == "frozen_ca_trust"
     assert events[-1]["status"] == "failed"
 
 
@@ -169,7 +189,7 @@ def test_packaged_entry_brackets_real_cli_import_without_running_gateway(
         runpy.run_path(str(ENTRY), run_name="__main__")
         assert calls == ["import", "app"]
     events = _events(capsys)
-    assert [(item["stage"], item["status"]) for item in events] == [
+    assert [(item["phase"], item["status"]) for item in events] == [
         ("cli_import", "start"),
         ("cli_import", "failed" if import_fails else "complete"),
     ]
