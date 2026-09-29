@@ -1,5 +1,5 @@
 import type { Page } from '@playwright/test'
-import { helloOkResponse } from './gateway-fixture'
+import { helloOkResponse, type HelloOkOverrides } from './gateway-fixture'
 import {
   chatHistoryPayload,
   sessionMessagesHydratePayload,
@@ -32,7 +32,11 @@ type RpcFrame = {
 }
 
 /** Synthetic, offline gateway shared by interaction tests and visual checks. */
-export async function installSidebarFixture(page: Page, rpcPayloads: Record<string, unknown> = {}) {
+export async function installSidebarFixture(
+  page: Page,
+  rpcPayloads: Record<string, unknown> = {},
+  helloOverrides: HelloOkOverrides = {},
+) {
   await page.addInitScript(() => {
     localStorage.setItem('opensquilla-locale', 'en')
   })
@@ -62,6 +66,7 @@ export async function installSidebarFixture(page: Page, rpcPayloads: Record<stri
             principal: { isOwner: true, authenticated: true, authState: 'authenticated' },
             runModePolicy: { allowedRunModes: ['safe', 'full'], defaultRunMode: 'full' },
           },
+          ...helloOverrides,
         }))
         return
       }

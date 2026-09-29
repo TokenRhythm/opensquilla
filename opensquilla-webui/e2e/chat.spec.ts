@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test'
+import { installSidebarFixture, SIDEBAR_SESSIONS } from './support/sidebar-fixture'
 
 const CONTROL_URL = '/control/'
 const LIVE = process.env.OPENSQUILLA_E2E_LIVE === '1'
@@ -24,7 +25,7 @@ test.describe('Chat Page', () => {
     // row (its own class) rather than a destination.
     await expect(core.locator('> .sidebar-new-session')).toHaveText(/New task/)
     await expect(core.locator('> .sidebar-fn-item .sidebar-fn-label')).toHaveText(
-      ['Overview', 'Skills & Channels', 'Cron'],
+      ['Skills & Channels', 'Cron', 'View usage'],
     )
     await expect(core.getByText('Sessions', { exact: true })).toHaveCount(0)
     await expect(core.getByText('Agents', { exact: true })).toHaveCount(0)
@@ -32,6 +33,14 @@ test.describe('Chat Page', () => {
   })
 
   test('command palette opens on recent tasks, not on a list of destinations', async ({ page }) => {
+    const recent = SIDEBAR_SESSIONS[0]!
+    await installSidebarFixture(page, {
+      'sessions.list': { sessions: [recent], count: 1, ts: 1_800_000_000, has_more: false },
+    })
+    await page.goto(CONTROL_URL)
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator(`.sidebar-history-row[data-session-key="${recent.key}"]`)).toBeVisible()
+
     await page.locator('.sidebar-cmd-btn').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
@@ -39,19 +48,26 @@ test.describe('Chat Page', () => {
     // Untyped state answers "which task?" — the button promises task search, so
     // destinations must not be the resting content.
     await expect(palette.locator('.cmdp-group-label')).toHaveText(['Recent tasks'])
-    for (const name of ['Overview', 'Skills & Channels', 'Cron']) {
+    await expect(palette.locator('.cmdp-option__label')).toHaveText([recent.title])
+    for (const name of ['View usage', 'Skills & Channels', 'Cron']) {
       await expect(palette.getByRole('option', { name, exact: true })).toHaveCount(0)
     }
   })
 
   test('command palette keeps the Skills & Channels hub together in Work', async ({ page }) => {
+    await expect(page.locator('.conn-pill.connected')).toBeVisible()
+    await expect(page.locator('.chat-textarea')).toBeFocused()
     await page.locator('.sidebar-cmd-btn').click()
     const palette = page.getByRole('dialog', { name: 'Search and go to' })
     await expect(palette).toBeVisible()
+    const search = palette.getByRole('combobox')
+    await expect(search).toBeFocused()
 
     // Destinations surface by name rather than by default, so the grouping
     // contract is asserted against a query that matches the whole hub.
-    await palette.getByRole('combobox').fill('channels')
+    await search.fill('channels')
+    await expect(search).toHaveValue('channels')
+    await expect(search).toBeFocused()
     for (const name of ['Skills & Channels', 'Channels']) {
       await expect(palette.getByRole('option', { name, exact: true })).toBeVisible()
     }
@@ -60,26 +76,34 @@ test.describe('Chat Page', () => {
     await expect(palette.getByRole('option', { name: 'Agents', exact: true })).toHaveCount(0)
     await expect(palette.locator('.cmdp-group-label', { hasText: /^Build$/ })).toHaveCount(0)
 
-    // Usage and Logs stay reachable from their own band despite being off the rail.
-    await palette.getByRole('combobox').fill('usage')
-    await expect(palette.locator('.cmdp-group-label', { hasText: /^Overview$/ })).toBeVisible()
-    await expect(palette.getByRole('option', { name: 'Usage', exact: true })).toBeVisible()
+    // Usage remains a Work destination after the diagnostic pages retire.
+    await search.fill('usage')
+    await expect(search).toHaveValue('usage')
+    await expect(palette.locator('.cmdp-group-label', { hasText: /^Work$/ })).toBeVisible()
+    await expect(palette.getByRole('option', { name: 'View usage', exact: true })).toBeVisible()
+
+    for (const name of ['Overview', 'Logs']) {
+      await search.fill(name)
+      await expect(search).toHaveValue(name)
+      await expect(palette.getByRole('option', { name, exact: true })).toHaveCount(0)
+    }
   })
 
-  test('Overview and Skills & Channels own disjoint route families', async ({ page }) => {
-    const overview = page.locator('.sidebar-core').getByRole('link', { name: 'Overview' })
+  test('Usage and Skills & Channels own disjoint route families', async ({ page }) => {
+    const usage = page.locator('.sidebar-core').getByRole('link', { name: 'View usage' })
     const skillsChannels = page.locator('.sidebar-core').getByRole('link', { name: 'Skills & Channels' })
-    for (const path of ['overview', 'usage', 'logs']) {
+    for (const path of ['overview', 'health', 'usage']) {
       await page.goto(CONTROL_URL + path)
-      await expect(overview).toHaveClass(/is-active/)
-      await expect(overview).toHaveAttribute('aria-current', 'page')
+      await expect(page).toHaveURL(/\/usage$/)
+      await expect(usage).toHaveClass(/is-active/)
+      await expect(usage).toHaveAttribute('aria-current', 'page')
       await expect(skillsChannels).not.toHaveClass(/is-active/)
     }
     for (const path of ['skills', 'channels']) {
       await page.goto(CONTROL_URL + path)
       await expect(skillsChannels).toHaveClass(/is-active/)
       await expect(skillsChannels).toHaveAttribute('aria-current', 'page')
-      await expect(overview).not.toHaveClass(/is-active/)
+      await expect(usage).not.toHaveClass(/is-active/)
     }
   })
 
@@ -105,33 +129,27 @@ test.describe('Chat Page', () => {
       .toHaveAttribute('aria-current', 'page')
   })
 
-  test('Overview exposes only Status and Usage while keeping Logs directly reachable', async ({ page }) => {
-    await page.goto(CONTROL_URL + 'overview')
-    const hub = page.getByRole('navigation', { name: 'Overview' })
-    const status = hub.getByRole('link', { name: 'Status', exact: true })
-    const usage = hub.getByRole('link', { name: 'Usage', exact: true })
-
-    await expect(hub.getByRole('link')).toHaveCount(2)
-    await expect(status).toHaveAttribute('aria-current', 'page')
-    await expect(hub.getByRole('link', { name: 'Logs', exact: true })).toHaveCount(0)
-    await usage.click()
+  test('Usage is a standalone destination through reload and history', async ({ page }) => {
+    await page.goto(CONTROL_URL + 'usage')
     await expect(page).toHaveURL(/\/usage$/)
-    await expect(usage).toHaveAttribute('aria-current', 'page')
+    await expect(page.getByRole('heading', { name: 'Usage', exact: true })).toBeVisible()
+    await expect(page.locator('.route-hub__tabs')).toHaveCount(0)
+    await expect(page.locator('.ov-stage, .lg-stage')).toHaveCount(0)
 
+    await page.locator('.sidebar-core').getByRole('link', { name: 'Skills & Channels' }).click()
+    await expect(page).toHaveURL(/\/skills$/)
     await page.goBack()
-    await expect(page).toHaveURL(/\/overview$/)
-    await expect(status).toHaveAttribute('aria-current', 'page')
-
-    await page.goto(CONTROL_URL + 'logs')
-    await expect(page).toHaveURL(/\/logs$/)
-    await expect(page.getByRole('heading', { name: 'Logs', level: 1 })).toBeVisible()
+    await expect(page).toHaveURL(/\/usage$/)
+    await page.reload()
+    await expect(page.getByRole('heading', { name: 'Usage', exact: true })).toBeVisible()
+    await expect(page.locator('.route-hub__tabs')).toHaveCount(0)
   })
 
   test('can navigate between views', async ({ page }) => {
     const core = page.locator('.sidebar-core')
 
-    await core.getByText('Overview', { exact: true }).click()
-    await expect(page).toHaveURL(/\/overview/)
+    await core.getByText('View usage', { exact: true }).click()
+    await expect(page).toHaveURL(/\/usage/)
 
     await core.getByText('Skills & Channels', { exact: true }).click()
     await expect(page).toHaveURL(/\/skills/)
@@ -240,14 +258,17 @@ test.describe('Chat Interaction', () => {
   test('keeps slash selection visible and closes the menu on outside pointerdown', async ({ page }) => {
     const textarea = page.locator('.chat-textarea')
     const menu = page.locator('.chat-slash')
+    const scrollList = menu.locator('.chat-slash-list')
 
     await textarea.fill('/')
     await expect(menu).toBeVisible()
+    await expect(menu.locator('.chat-slash-name--command').first()).toBeVisible()
+    await expect(menu.locator('.chat-slash-empty[role="status"]')).toHaveCount(0)
 
     const items = menu.locator('.chat-slash-item')
     const itemCount = await items.count()
     expect(itemCount).toBeGreaterThan(1)
-    await expect.poll(() => menu.evaluate(element => element.scrollHeight > element.clientHeight))
+    await expect.poll(() => scrollList.evaluate(element => element.scrollHeight > element.clientHeight))
       .toBe(true)
 
     for (let index = 1; index < itemCount; index += 1) {
@@ -256,19 +277,21 @@ test.describe('Chat Interaction', () => {
 
     const activeItem = menu.locator('.chat-slash-item--active')
     await expect(activeItem).toHaveCount(1)
-    await expect.poll(() => menu.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
-    expect(await menu.evaluate(element => {
+    await expect(items.last()).toHaveClass(/chat-slash-item--active/)
+    await expect.poll(() => scrollList.evaluate(element => element.scrollTop)).toBeGreaterThan(0)
+    await expect.poll(() => scrollList.evaluate(element => {
       const active = element.querySelector<HTMLElement>('.chat-slash-item--active')
       if (!active) return false
       const menuRect = element.getBoundingClientRect()
       const activeRect = active.getBoundingClientRect()
-      return activeRect.top >= menuRect.top && activeRect.bottom <= menuRect.bottom
+      // Chromium rounds scroll offsets while these rectangles retain subpixels.
+      return activeRect.top >= menuRect.top - 1 && activeRect.bottom <= menuRect.bottom + 1
     })).toBe(true)
 
     await activeItem.dispatchEvent('pointerdown', { pointerType: 'mouse', button: 0 })
     await expect(menu).toBeVisible()
 
-    await page.locator('.chat-thread').click({ position: { x: 8, y: 8 } })
+    await page.locator('.chat-thread').click({ position: { x: 32, y: 8 } })
     await expect(menu).toHaveCount(0)
     await expect(textarea).toHaveValue('/')
   })

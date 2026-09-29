@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createV4GatewayAccess } from './gatewayAccessV4'
 
 function memoryStorage(): Storage {
@@ -21,6 +21,7 @@ function source() {
     resumeSource: null as 'desktop-resume' | null,
     error: null as string | null,
     isLocalOwner: false,
+    getConnectionEndpoint: vi.fn((): string | null => 'ws://gateway.example/ws'),
     canManageProjectWorkspaces: false,
     canChooseProject: false,
     auth: null as Record<string, unknown> | null,
@@ -37,6 +38,120 @@ function source() {
 describe('createV4GatewayAccess', () => {
   beforeEach(() => {
     vi.stubGlobal('localStorage', memoryStorage())
+    vi.stubGlobal('location', new URL('http://gateway.example/control/usage'))
+  })
+  afterEach(() => vi.unstubAllGlobals())
+
+  it.each([
+    ['ws://gateway.example:18791/ws', 'gateway.example:18791'],
+    ['wss://user:secret@remote.example:9443/private/path?token=secret#secret', 'remote.example:9443'],
+    ['ws://[::1]:18791/ws', '[::1]:18791'],
+    ['not a websocket URL', null],
+    ['https://gateway.example/ws', null],
+    ['file:///gateway.log', null],
+    [null, null],
+  ] as const)('exposes only the connected WebSocket host for %s', (endpoint, host) => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.getConnectionEndpoint.mockReturnValue(endpoint)
+    expect(createV4GatewayAccess(raw).connectedGatewayHost).toBe(host)
+  })
+
+  it('uses the actual connected host instead of the saved endpoint', () => {
+    const raw = source()
+    raw.state = 'connected'
+    const access = createV4GatewayAccess(raw)
+    localStorage.setItem('opensquilla.wsUrl', 'ws://saved-draft.example:3210/ws')
+    expect(access.connectedGatewayHost).toBe('gateway.example')
+    raw.getConnectionEndpoint.mockReturnValue('wss://replacement.example:9443/ws')
+    expect(access.connectedGatewayHost).toBe('replacement.example:9443')
+  })
+
+  it('does not expose a stale host while disconnected or recovering', () => {
+    const raw = source()
+    const access = createV4GatewayAccess(raw)
+    expect(access.connectedGatewayHost).toBeNull()
+    raw.state = 'connecting'
+    expect(access.connectedGatewayHost).toBeNull()
+    raw.state = 'connected'
+    expect(access.connectedGatewayHost).toBe('gateway.example')
+    raw.health = 'suspect'
+    expect(access.connectedGatewayHost).toBeNull()
+    raw.health = 'healthy'
+    raw.isResuming = true
+    expect(access.connectedGatewayHost).toBeNull()
+    expect(createV4GatewayAccess({ ...raw, isResuming: false, phase: 'checking' }).connectedGatewayHost).toBeNull()
+    raw.isResuming = false
+    raw.state = 'disconnected'
+    expect(access.connectedGatewayHost).toBeNull()
+  })
+
+  it.each([
+    ['ws://gateway.example/ws', null],
+    ['ws://gateway.example:80/ws', null],
+    ['ws://gateway.example:18791/ws', 'differentGateway'],
+    ['wss://gateway.example/ws', 'differentGateway'],
+    ['ws://remote.example/ws', 'differentGateway'],
+    ['not a websocket URL', 'differentGateway'],
+    ['https://gateway.example/ws', 'differentGateway'],
+    ['ws://name:secret@gateway.example/ws', 'differentGateway'],
+    ['ws://gateway.example/ws#fragment', 'differentGateway'],
+    [null, 'differentGateway'],
+  ] as const)('binds support-bundle HTTP to the current endpoint %s', (endpoint, reason) => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.isLocalOwner = true
+    raw.getConnectionEndpoint.mockReturnValue(endpoint)
+    expect(createV4GatewayAccess(raw).supportBundleUnavailableReason).toBe(reason)
+  })
+
+  it('allows same-origin HTTPS and the authoritative Desktop proxy', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.isLocalOwner = true
+    raw.getConnectionEndpoint.mockReturnValue('wss://gateway.example/ws')
+    const access = createV4GatewayAccess(raw)
+    vi.stubGlobal('location', new URL('https://gateway.example/control/'))
+    expect(access.supportBundleUnavailableReason).toBeNull()
+    vi.stubGlobal('location', new URL('opensquilla-app://desktop/usage'))
+    raw.getConnectionEndpoint.mockReturnValue('ws://127.0.0.1:23456/ws')
+    expect(access.supportBundleUnavailableReason).toBeNull()
+    raw.getConnectionEndpoint.mockReturnValue('wss://remote.example:23456/ws')
+    expect(access.supportBundleUnavailableReason).toBeNull()
+    raw.getConnectionEndpoint.mockReturnValue('malformed')
+    expect(access.supportBundleUnavailableReason).toBe('differentGateway')
+    raw.getConnectionEndpoint.mockReturnValue('ws://127.0.0.1:23456/ws')
+    vi.stubGlobal('location', new URL('opensquilla-app://other/usage'))
+    expect(access.supportBundleUnavailableReason).toBe('differentGateway')
+  })
+
+  it('requires a healthy connection and owner authority on every access check', () => {
+    const raw = source()
+    const access = createV4GatewayAccess(raw)
+    expect(access.supportBundleUnavailableReason).toBe('disconnected')
+    raw.state = 'connected'
+    expect(access.supportBundleUnavailableReason).toBe('permission')
+    raw.isLocalOwner = true
+    expect(access.supportBundleUnavailableReason).toBeNull()
+    raw.health = 'suspect'
+    expect(access.supportBundleUnavailableReason).toBe('disconnected')
+    raw.health = 'healthy'
+    raw.isResuming = true
+    expect(access.supportBundleUnavailableReason).toBe('disconnected')
+    const checking = { ...raw, isResuming: false, phase: 'checking' as const }
+    expect(createV4GatewayAccess(checking).supportBundleUnavailableReason).toBe('disconnected')
+  })
+
+  it('ignores saved endpoint drift and follows the actual connection target', () => {
+    const raw = source()
+    raw.state = 'connected'
+    raw.isLocalOwner = true
+    const access = createV4GatewayAccess(raw)
+    localStorage.setItem('opensquilla.wsUrl', 'ws://remote.example/ws')
+    expect(access.supportBundleUnavailableReason).toBeNull()
+    raw.getConnectionEndpoint.mockReturnValue('ws://remote.example/ws')
+    localStorage.setItem('opensquilla.wsUrl', 'ws://gateway.example/ws')
+    expect(access.supportBundleUnavailableReason).toBe('differentGateway')
   })
 
   it('projects transport and hello data into semantic capabilities', () => {

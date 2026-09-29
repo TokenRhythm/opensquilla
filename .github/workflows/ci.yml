@@ -872,6 +872,9 @@ jobs:
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
           retired-bgm-upgrade.spec.ts
+          support-bundle.spec.ts
+          console-clarity.spec.ts
+          mobile-tabs.spec.ts
           header-responsive.spec.ts
           topbar-global-controls.spec.ts
           topbar-visual.spec.ts
@@ -898,7 +901,6 @@ jobs:
           chat-virtualization.spec.ts
           conversation-minimap.spec.ts
           floating-composer.spec.ts
-          virtualized-logs.spec.ts
           long-task-resilience.spec.ts
           native-gateway.spec.ts
           sidebar-drag.spec.ts
