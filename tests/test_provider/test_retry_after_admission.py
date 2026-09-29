@@ -50,7 +50,10 @@ from opensquilla.session.compaction_deployment import (
 
 class Clock:
     def __init__(self) -> None:
-        self.now = time.monotonic()
+        # Keep synthetic integer waits exactly representable while remaining
+        # aligned with asyncio deadlines, at most one second ahead of its clock.
+        # Real deadline-expiration tests use an independent real-clock registry.
+        self.now = float(math.ceil(time.monotonic()))
         self.sleeps: list[float] = []
 
     def __call__(self) -> float:
