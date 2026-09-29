@@ -1333,6 +1333,28 @@ async def dispatch_task_runtime_turn(
                 )
 
 
+async def _run_material_cleanup_worker(function: Callable[..., Any], *args: Any) -> None:
+    # A Future survives shutdown's cancellation of all asyncio Tasks. Deletion
+    # has already committed: keep ownership until the disk worker finishes.
+    context = contextvars.copy_context()
+    operation = asyncio.get_running_loop().run_in_executor(
+        None, partial(context.run, function, *args),
+    )
+    try:
+        await asyncio.shield(operation)
+    except asyncio.CancelledError:
+        while not operation.done():
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not operation.cancelled():
+            operation.exception()
+        raise
+
+
 def build_session_material_cleanup(config: Any) -> Any:
     """Build the session-material cleanup that runs on ``delete_session``.
 
@@ -1356,6 +1378,11 @@ def build_session_material_cleanup(config: Any) -> Any:
     from opensquilla.sandbox.run_context import RUN_CONTEXT_ORIGIN_KEY, get_run_context
     from opensquilla.session.keys import parse_agent_id
     from opensquilla.session.material_cleanup import rmtree_scoped
+
+    def _check_material_workspace(workspace: Path, segment: str) -> None:
+        if not workspace.is_dir():
+            raise ValueError("session workspace is unavailable")
+        checked_path(workspace, f".opensquilla/attachments/{segment}")
 
     async def _prepare(session: Any, project: Any) -> Any:
         session_id = session.session_id
@@ -1383,35 +1410,17 @@ def build_session_material_cleanup(config: Any) -> Any:
                     saved_root = session.origin[RUN_CONTEXT_ORIGIN_KEY].get("workspace")
                     if Path(saved_root).expanduser().absolute() != workspace:
                         raise ValueError("saved workspace path changed")
-            if not workspace.is_dir():
-                raise ValueError("session workspace is unavailable")
-            checked_path(workspace, f".opensquilla/attachments/{segment}")
+            # Only inspect the captured root and generation here. A cancelled
+            # read-only check can finish later without starting any cleanup.
+            await asyncio.to_thread(_check_material_workspace, workspace, segment)
         except (OSError, RuntimeError, TypeError, ValueError):
             log.warning("session_material_cleanup.workspace_unavailable", session_id=session_id)
             workspace = None
 
         async def _cleanup() -> None:
-            # A Future survives shutdown's cancellation of all asyncio Tasks.
-            context = contextvars.copy_context()
-            operation = asyncio.get_running_loop().run_in_executor(
-                None, partial(context.run, _remove_material,
-                              session_id, media_root, workspace, segment),
+            await _run_material_cleanup_worker(
+                _remove_material, session_id, media_root, workspace, segment,
             )
-            try:
-                await asyncio.shield(operation)
-            except asyncio.CancelledError:
-                # Cancelling the await cannot stop filesystem deletion. Keep
-                # ownership until the worker finishes, even after another cancel.
-                while not operation.done():
-                    try:
-                        await asyncio.shield(operation)
-                    except asyncio.CancelledError:
-                        continue
-                    except Exception:
-                        break
-                if not operation.cancelled():
-                    operation.exception()
-                raise
 
         return _cleanup
 
@@ -1447,7 +1456,8 @@ def build_session_artifact_cleanup(config: Any) -> Any:
     from opensquilla.paths import media_root_from_config
 
     async def _cleanup(session_id: str, _session_key: str) -> None:
-        ArtifactStore(media_root_from_config(config)).delete_session_internal_artifacts(session_id)
+        store = ArtifactStore(media_root_from_config(config))
+        await _run_material_cleanup_worker(store.delete_session_internal_artifacts, session_id)
 
     return _cleanup
 

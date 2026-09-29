@@ -204,6 +204,78 @@ async def test_material_cleanup_does_not_block_gateway_event_loop(
             await deletion
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_slow_material_preparation_leaves_loop_responsive_and_cancel_does_not_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    from opensquilla.artifact_session import working_files
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    media_root = tmp_path / "media"
+    node = SessionNode(session_key="agent:main:webchat:prepare", session_id="prepare-target")
+    listed, internal = await _seed_material(media_root, workspace, node.session_id)
+    sibling, _ = await _seed_material(media_root, workspace, "prepare-sibling")
+    started, release, completed = asyncio.Event(), threading.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    original_check = working_files.checked_path
+
+    def slow_check(root, relative):
+        assert threading.get_ident() != loop_thread
+        loop.call_soon_threadsafe(started.set)
+        try:
+            assert release.wait(5), "loop did not release read-only workspace check"
+            return original_check(root, relative)
+        finally:
+            completed.set()
+
+    monkeypatch.setattr(working_files, "checked_path", slow_check)
+    set_session_material_cleanup(build_session_material_cleanup(_config(media_root, workspace)))
+    store = ArtifactStore(media_root)
+    async with SessionStorage(tmp_path / "sessions.db") as storage:
+        await storage.upsert_session(node)
+        task = asyncio.create_task(storage.delete_session(node.session_key))
+        try:
+            await asyncio.wait_for(started.wait(), 3)
+            await asyncio.wait_for(asyncio.sleep(0.01), 0.5)
+            assert not task.done()
+            # Preparation intentionally remains within the existing transaction.
+            assert storage._operation_lock.locked()
+            assert transcript_material_dir(media_root, node.session_id).exists()
+            if cancel:
+                task.cancel("cancel preparation")
+                with pytest.raises(asyncio.CancelledError, match="cancel preparation"):
+                    await asyncio.wait_for(task, 1)
+                assert not completed.is_set()
+                assert await storage.get_session(node.session_key) is not None
+            release.set()
+            if not cancel:
+                await task
+            async with asyncio.timeout(2):
+                while not completed.is_set():
+                    await asyncio.sleep(0.005)
+            current = await storage.get_session(node.session_key)
+            assert (current is not None) is cancel
+            assert transcript_material_dir(media_root, node.session_id).exists() is cancel
+            assert _workspace_attachment_dir(workspace, node.session_id).exists() is cancel
+            if cancel:
+                assert store.get_ref(session_id=node.session_id, artifact_id=listed).id == listed
+                assert store.get_ref(
+                    session_id=node.session_id, artifact_id=internal,
+                ).id == internal
+            else:
+                with pytest.raises(ArtifactNotFoundError):
+                    store.get_ref(session_id=node.session_id, artifact_id=listed)
+            assert store.get_ref(session_id="prepare-sibling", artifact_id=sibling).id == sibling
+        finally:
+            release.set()
+            await asyncio.gather(task, return_exceptions=True)
+            async with asyncio.timeout(2):
+                while not completed.is_set():
+                    await asyncio.sleep(0.005)
+
+
 @pytest.mark.parametrize("worker_fails", [False, True])
 async def test_material_cleanup_settles_worker_before_propagating_cancellation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, worker_fails: bool,
