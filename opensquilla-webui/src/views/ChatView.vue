@@ -1151,7 +1151,7 @@ import {
 interface ChatComposerHandle {
   composerElement: () => HTMLElement | null
   canCollapse: () => boolean
-  focusTextarea: () => void
+  focusTextarea: (options?: { preserveFocus?: boolean }) => void
   isTextareaFocused: () => boolean
   resizeTextarea: () => void
 }
@@ -6681,7 +6681,9 @@ function enterDraft() {
     && agentIdFromSessionKey(sessionKey.value) === agentId
   if (!isFreshDraft) startDraftSession(agentId)
   consumeDraftPrefill()
-  if (isDesktopViewport.value) composerRef.value?.focusTextarea()
+  if (isDesktopViewport.value) {
+    composerRef.value?.focusTextarea({ preserveFocus: !landingPrefilled.value })
+  }
 }
 
 let chatViewActive = false
@@ -6844,9 +6846,9 @@ onMounted(async () => {
     publishComposerDockHeight()
   }
 
-  // Focus textarea on desktop
+  // Automatic entry preserves focus in overlays and their invoking controls.
   if (isDesktopViewport.value) {
-    composerRef.value?.focusTextarea()
+    composerRef.value?.focusTextarea({ preserveFocus: !explicitFreshTask })
   }
 
   if (initialDraftProjectGeneration !== null) {

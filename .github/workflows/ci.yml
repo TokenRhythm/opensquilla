@@ -186,6 +186,7 @@ jobs:
       desktop_matrix: ${{ steps.plan.outputs.desktop_matrix }}
       python_matrix: ${{ steps.plan.outputs.python_matrix }}
       platform_matrix: ${{ steps.plan.outputs.platform_matrix }}
+      windows_nsis_profile: ${{ steps.plan.outputs.windows_nsis_profile }}
       python_targets: ${{ steps.plan.outputs.python_targets }}
       full_fallback: ${{ steps.plan.outputs.full_fallback }}
       reason_codes: ${{ steps.plan.outputs.reason_codes }}
@@ -276,6 +277,7 @@ jobs:
                   "desktop_matrix",
                   "python_matrix",
                   "platform_matrix",
+                  "windows_nsis_profile",
                   "python_targets",
                   "full_fallback",
                   "reason_codes",
@@ -301,6 +303,7 @@ jobs:
           DESKTOP_MATRIX: ${{ steps.plan.outputs.desktop_matrix }}
           PYTHON_MATRIX: ${{ steps.plan.outputs.python_matrix }}
           PLATFORM_MATRIX: ${{ steps.plan.outputs.platform_matrix }}
+          WINDOWS_NSIS_PROFILE: ${{ steps.plan.outputs.windows_nsis_profile }}
           FULL_FALLBACK: ${{ steps.plan.outputs.full_fallback }}
           REASON_CODES: ${{ steps.plan.outputs.reason_codes }}
         shell: bash
@@ -324,6 +327,7 @@ jobs:
           print(f"- Python matrix: `{json.dumps(python_matrix, separators=(',', ':'))}`")
           print(f"- Desktop matrix: `{json.dumps(desktop_matrix, separators=(',', ':'))}`")
           print(f"- Suite cells: `{len(platform_matrix)}`")
+          print(f"- Windows NSIS profile: `{os.environ['WINDOWS_NSIS_PROFILE']}`")
           PY
 
       - name: Summarize merge-group fallback decision
@@ -872,6 +876,9 @@ jobs:
           modern-session-recovery.spec.ts
           provider-error-experience.spec.ts
           retired-bgm-upgrade.spec.ts
+          support-bundle.spec.ts
+          console-clarity.spec.ts
+          mobile-tabs.spec.ts
           header-responsive.spec.ts
           topbar-global-controls.spec.ts
           topbar-visual.spec.ts
@@ -898,7 +905,6 @@ jobs:
           chat-virtualization.spec.ts
           conversation-minimap.spec.ts
           floating-composer.spec.ts
-          virtualized-logs.spec.ts
           long-task-resilience.spec.ts
           native-gateway.spec.ts
           sidebar-drag.spec.ts
@@ -2828,6 +2834,8 @@ jobs:
     needs: plan-ci
     if: ${{ !cancelled() && needs.plan-ci.result == 'success' && contains(fromJSON(needs.plan-ci.outputs.required_suites), 'windows-nsis-regression') }}
     uses: ./.github/workflows/windows-nsis-upgrade-regression.yml
+    with:
+      acceptance_profile: ${{ needs.plan-ci.outputs.windows_nsis_profile }}
 
   ci-result:
     name: CI result

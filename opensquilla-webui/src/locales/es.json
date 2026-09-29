@@ -392,11 +392,8 @@
     "cron": "Cron",
     "skills": "Habilidades",
     "skillsChannels": "Habilidades y canales",
-    "overview": "Resumen",
-    "status": "Estado",
     "usage": "Uso",
     "viewUsage": "Ver uso",
-    "logs": "Registros",
     "settings": "Ajustes",
     "groupBuild": "Construir",
     "groupMonitor": "Resumen",
@@ -460,7 +457,8 @@
       "results": "Resultados de ajustes",
       "empty": "No hay ajustes coincidentes",
       "defaultModel": "Modelo predeterminado",
-      "permissions": "Permisos"
+      "permissions": "Permisos",
+      "supportBundle": "Descargar paquete de soporte"
     },
     "appearance": {
       "title": "Interfaz",
@@ -725,7 +723,8 @@
     },
     "gateway": {
       "title": "Puerta de enlace",
-      "desc": "Conecta con la puerta de enlace y, en escritorio, gestiona el entorno local."
+      "desc": "Gestiona la conexión de este navegador al Gateway.",
+      "desktopDesc": "Gestiona la conexión al Gateway y el servicio local."
     },
     "general": {
       "title": "General",
@@ -1630,12 +1629,12 @@
       "languageCode": "Código de idioma"
     },
     "connection": {
-      "title": "Conexión",
-      "desc": "Apunta este navegador a una puerta de enlace. La conexión se aplica de inmediato; no es necesario guardar.",
+      "title": "Conexión al Gateway",
+      "desc": "Edita los campos y pulsa Conectar o Reconectar para aplicar los cambios.",
       "connected": "Conectado",
       "connecting": "Conectando",
       "disconnected": "Desconectado",
-      "reasonConnected": "Enlace en vivo con el socket de la puerta de enlace.",
+      "reasonConnected": "Conectado al Gateway.",
       "reasonConnecting": "Contactando con la puerta de enlace…",
       "reasonFailed": "El último intento falló: {error}",
       "reasonDisconnected": "Sin conexión. Comprueba la URL del WebSocket e inténtalo con Conectar.",
@@ -1647,8 +1646,11 @@
       "tokenRequired": "Se requiere un token",
       "reasonTokenRequired": "La autenticación falló. Los reintentos automáticos están en pausa. Introduce un token de pasarela válido y selecciona Conectar.",
       "reconnect": "Reconectar",
+      "editConnection": "Modificar conexión",
       "connect": "Conectar",
-      "disconnect": "Desconectar"
+      "disconnect": "Desconectar",
+      "actions": "Acciones de conexión",
+      "reasonManagedDisconnected": "El cliente no está conectado al Gateway local. Intenta volver a conectarte."
     },
     "runtime": {
       "title": "Tiempo de ejecución",
@@ -1826,7 +1828,15 @@
       "migrationCompleteIndependent": "Esta instalación de Desktop ahora es independiente y no se sincronizará con el origen.",
       "migrationCompleteReplacement": "Los datos anteriores de Desktop están en una copia completa. Se sustituyeron como una unidad; los archivos y chats nunca se combinaron.",
       "migrationCompleteShowBackup": "Mostrar copia completa",
-      "migrationCompleteDismiss": "Cerrar"
+      "migrationCompleteDismiss": "Cerrar",
+      "localGatewayTitle": "Gateway local",
+      "localGatewayDescription": "Gestiona el Gateway local iniciado por la aplicación de escritorio.",
+      "processStatus": "Estado del proceso",
+      "restartLocalGateway": "Reiniciar Gateway local",
+      "details": "Dirección y ubicación de registros",
+      "address": "Dirección del Gateway",
+      "refreshStatus": "Actualizar estado",
+      "openLocalLogLocation": "Abrir ubicación de registros locales"
     },
     "keyboard": {
       "title": "Atajos",
@@ -1860,9 +1870,6 @@
       "dataMaintenanceDesc": "Revisa importaciones y copias. En escritorio también puedes restablecer o eliminar los datos del perfil local.",
       "dataMaintenanceAction": "Gestionar",
       "dataMaintenanceAria": "Abrir el mantenimiento de datos",
-      "runTraceLabel": "Panel de traza de ejecución en Registros",
-      "runTraceDesc": "Hace que las líneas de registro sean interactivas y abre un panel de detalle de pasos por nodo para cada línea en la vista de Registros.",
-      "runTraceAria": "Panel de traza de ejecución en Registros (surte efecto tras recargar)",
       "configFileLabel": "Archivo de configuración",
       "configFileDesc": "Puedes ajustar más opciones en el archivo de configuración."
     },
@@ -2364,110 +2371,6 @@
       "abortDone": "Ejecución abortada.",
       "abortNone": "No hay ninguna ejecución activa que abortar.",
       "abortFailed": "Error al abortar."
-    },
-    "overview": {
-      "title": "Estado",
-      "subtitle": "Preparación, uso y estado de ejecución.",
-      "totalTokens": "Total de tokens",
-      "totalSessions": "Total de sesiones",
-      "totalSessionsTitle": "Total de sesiones en todos los estados",
-      "viewAll": "ver todas →",
-      "provider": "Proveedor",
-      "manageAgents": "gestionar agentes →",
-      "jumpToReadiness": "Ir al informe de preparación",
-      "health": "Estado",
-      "uptime": "Tiempo en funcionamiento",
-      "healthSummary": "Resumen del estado",
-      "readiness": "Preparación",
-      "healthContext": "Contexto del informe de estado",
-      "ctxGateway": "Puerta de enlace",
-      "ctxConfig": "Configuración",
-      "ctxRequestedConfig": "Configuración solicitada",
-      "ctxAgent": "Agente",
-      "needsAction": "Requiere acción",
-      "degraded": "Degradado",
-      "optional": "Opcional",
-      "ready": "Listo",
-      "healthFindings": "Hallazgos del estado",
-      "loadingHealth": "Cargando informe de estado",
-      "noFindings": "No se devolvieron hallazgos.",
-      "recoveryRestart": "La recuperación requiere reiniciar",
-      "openSettings": "Abrir ajustes",
-      "findingDetails": "Detalles",
-      "findingFallback": "Hallazgo {n}",
-      "copyCommand": "Copiar comando",
-      "step": "Paso",
-      "checking": "Comprobando",
-      "waitingDoctor": "Esperando doctor.status",
-      "healthUnavailable": "Informe de estado de la puerta de enlace no disponible",
-      "impact": {
-        "blocksReady": "Bloquea la preparación",
-        "degrades": "Degrada",
-        "optional": "Opcional",
-        "reference": "Referencia"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "Listo con advertencias",
-        "ready": "Listo",
-        "actionRequired": "Acción requerida",
-        "degraded": "Degradado",
-        "unavailable": "No disponible"
-      },
-      "badge": {
-        "diagnostic": "Diagnósticos incompletos",
-        "repair": "Reparación pendiente",
-        "config": "Discrepancia de configuración"
-      },
-      "dotStatus": {
-        "active": "Activo",
-        "ready": "Listo",
-        "ok": "OK",
-        "paused": "Pausado",
-        "degraded": "Degradado",
-        "warn": "Advertencia",
-        "error": "Error",
-        "failed": "Falló",
-        "closed": "Cerrado",
-        "ended": "Finalizado",
-        "offline": "Sin conexión",
-        "unknown": "Desconocido"
-      },
-      "group": {
-        "action": {
-          "title": "Requiere acción",
-          "note": "Corrige esto primero para que OpenSquilla esté listo."
-        },
-        "degraded": {
-          "title": "Capacidades degradadas",
-          "note": "OpenSquilla puede ejecutarse, pero estas capacidades requieren atención."
-        },
-        "optional": {
-          "title": "Configuración opcional",
-          "note": "Estas mejoran la capacidad o la postura, pero no bloquean la preparación."
-        },
-        "ready": {
-          "title": "Comprobaciones listas",
-          "note": "Estas superficies ya están funcionando."
-        }
-      },
-      "gw": {
-        "cannotLoad": "No se puede cargar doctor.status desde {url}. {reason}",
-        "inspectRemote": "Inspeccionar puerta de enlace remota",
-        "repairRemote": "Reparar despliegue remoto",
-        "repairRemoteDetail": "Inicia o repara el despliegue remoto de la puerta de enlace de OpenSquilla y, a continuación, actualiza el estado.",
-        "runLocalDoctor": "Ejecutar doctor local",
-        "runLocalDoctorDetail": "Comprueba la configuración local y la incorporación antes de reiniciar la puerta de enlace.",
-        "startLocal": "Iniciar puerta de enlace local",
-        "inspectLocal": "Inspeccionar puerta de enlace local"
-      },
-      "checkedAgo": "Comprobado {time}",
-      "rerunChecks": "Volver a comprobar",
-      "copyDiagnostics": "Copiar el JSON de diagnóstico",
-      "copiedDiagnostics": "JSON de diagnóstico copiado",
-      "diagnoseWithAgent": "Diagnosticar con el agente",
-      "diagnosePrompt": "Diagnostica esta configuración de OpenSquilla usando el contexto del cliente y el informe de doctor siguientes. Da prioridad a los ajustes aplicables dentro de la app. Cuando hasTerminalWorkflow sea false, no sugieras comandos opensquilla sin adaptar; un gateway propio de Desktop lo gestiona la app. La transferencia de datos implica copia de seguridad y sustitución completa, nunca fusión. Una migración opcional no es un fallo y puede seguir visible después. Limítate a explicar y orientar: no migres datos, reinicies el gateway, escribas ajustes ni afirmes haber realizado cambios.",
-      "environment": "Entorno",
-      "latency": "Latencia"
     }
   },
   "console": {
@@ -2707,12 +2610,6 @@
         "botIdCopied": "ID del bot copiado",
         "eventSubscriptionTitle": "Comprobar la suscripción de eventos de Feishu"
       }
-    },
-    "overview": {
-      "channelsChip": "Canales",
-      "channelsChipConnected": "{connected} conectado(s)",
-      "channelsChipFailed": "{failed} con error",
-      "channelsChipPending": "{pending} esperando aprobación"
     }
   },
   "cronSkills": {
@@ -3252,17 +3149,23 @@
       "tileNotDeclaredHint": "sin manifiesto"
     }
   },
+  "gatewayLogs": {
+    "viewLogs": "Ver registros recientes",
+    "title": "Registros del Gateway",
+    "description": "Últimas 200 líneas del Gateway conectado. Actualiza manualmente para obtener los datos más recientes.",
+    "refresh": "Actualizar",
+    "loading": "Cargando registros…",
+    "empty": "No hay registros recientes.",
+    "failed": "No se pudieron leer los registros. Comprueba la conexión y los permisos del Gateway e inténtalo de nuevo.",
+    "connectionRequired": "Conéctate al Gateway para ver los registros.",
+    "authenticationRequired": "Autentícate en el Gateway para ver los registros.",
+    "saveCurrentLogs": "Guardar registros actuales",
+    "saveFailed": "No se pudieron guardar los registros. Inténtalo de nuevo."
+  },
   "monitorSupport": {
     "title": "Soporte y diagnóstico",
-    "menuLabel": "Acciones de soporte y diagnóstico",
-    "viewLogs": "Ver registros de ejecución",
-    "viewLogsDescription": "Revisar la salida reciente y los errores de la puerta de enlace",
-    "copyReport": "Copiar informe actual de disponibilidad",
-    "copyReportDescription": "Compartir el estado actual de conexión, configuración y ejecución",
-    "copySuccess": "Informe de disponibilidad copiado",
-    "copyFailed": "No se pudo copiar el informe de disponibilidad: {error}",
     "downloadBundle": "Descargar paquete de soporte con datos confidenciales ocultos",
-    "downloadBundleDescription": "Incluye registros, un resumen de configuración y resultados del diagnóstico",
+    "downloadBundleDescription": "Incluye registros, un resumen de configuración y resultados de diagnóstico del Gateway conectado.",
     "privacySummary": "El contenido de las conversaciones se excluye de forma predeterminada y se ocultan las credenciales conocidas",
     "bundleTitle": "Descargar paquete de soporte con datos confidenciales ocultos",
     "bundleSubtitle": "Crea un archivo ZIP para compartir con el soporte de OpenSquilla.",
@@ -3280,7 +3183,10 @@
     "bundleConfirm": "Generar y descargar",
     "bundleCancel": "Cancelar",
     "bundleFailed": "No se pudo descargar el paquete de soporte",
-    "bundleReady": "Paquete de soporte descargado"
+    "bundleReady": "Paquete de soporte descargado",
+    "bundleConnectionRequired": "Conéctese al Gateway para descargar un paquete de soporte.",
+    "bundleOwnerRequired": "Solo el propietario local del Gateway puede descargar un paquete de soporte.",
+    "bundleDifferentGateway": "Abra la WebUI del Gateway conectado para descargar su paquete de soporte."
   },
   "usageLogs": {
     "tasks": {
@@ -3424,51 +3330,6 @@
     },
     "errors": {
       "loadFailed": "No se pudo cargar el uso"
-    },
-    "logs": {
-      "breadcrumbLabel": "Ruta de navegación",
-      "title": "Registros",
-      "subtitle": "Flujo de registros en vivo de la puerta de enlace: filtra y sigue.",
-      "statusUnavailable": "Estado de los registros no disponible",
-      "statusUnavailableAria": "Estado de los registros no disponible; el seguimiento de registros aún puede funcionar.",
-      "statusUnavailableTitle": "logs.status no está disponible; el seguimiento de registros aún puede funcionar.",
-      "fileLogOn": "Registro en archivo activado",
-      "fileLogOff": "Registro en archivo desactivado",
-      "fileLogTitle": "El registro en archivo de la puerta de enlace es configurable mediante log_file_enabled, log_level, los ajustes de rotation y OPENSQUILLA_LOG_DIR. Ruta: {path}.",
-      "fileLogOffTitle": "Los registros no se escriben en disco; los paquetes de diagnóstico carecerán de historial. Activa log_file_enabled en la configuración. Ruta: {path}.",
-      "rawOn": "Captura cruda activada",
-      "rawOff": "Captura cruda desactivada",
-      "rawRecordingPill": "Captura cruda grabando",
-      "rawTitle": "La captura cruda registra las solicitudes y respuestas completas del modelo, incluido el contenido de la conversación. Actívala con OPENSQUILLA_TURN_CALL_LOG=1 o con opensquilla diagnostics on --raw; desactívala con opensquilla diagnostics off. Origen: {source}. Directorio: {path}.",
-      "bundleButton": "Paquete de diagnóstico",
-      "bundleButtonTitle": "Descargar un paquete de diagnóstico depurado",
-      "bundleTitle": "Descargar paquete de diagnóstico",
-      "bundleBody": "Reúne los registros de la puerta de enlace, los registros de errores y la configuración depurada en un único zip que puedes adjuntar a un informe de errores. Los secretos y las claves de API se eliminan; el contenido de las conversaciones queda excluido salvo que lo actives abajo.",
-      "bundleIncludeContent": "Incluir el contenido de las conversaciones (prompts y respuestas)",
-      "bundleConfirm": "Descargar",
-      "bundleCancel": "Cancelar",
-      "bundleFailed": "Error al descargar el diagnóstico",
-      "bundleReady": "Paquete de diagnóstico descargado",
-      "inView": "En vista",
-      "ofLoaded": "de {total} cargadas",
-      "errors": "Errores",
-      "reviewNeeded": "requiere revisión",
-      "allClear": "todo en orden",
-      "warnings": "Advertencias",
-      "recentAdvisories": "avisos recientes",
-      "none": "ninguno",
-      "infoDebug": "Información / Depuración",
-      "routineOutput": "salida rutinaria",
-      "levels": "Niveles",
-      "filterPlaceholder": "Filtrar mensajes…",
-      "autoFollow": "Seguimiento automático",
-      "loading": "Cargando registros…",
-      "empty": "Aún no hay registros de ejecución.",
-      "loadFailed": "No se pudieron cargar los registros de ejecución.",
-      "retry": "Reintentar",
-      "noMatch": "Ninguna línea coincide con el filtro actual.",
-      "lineDetail": "Detalle de la línea de registro",
-      "ofLoadedFoot": "{visible} visibles · {total} en búfer"
     }
   },
   "chat": {

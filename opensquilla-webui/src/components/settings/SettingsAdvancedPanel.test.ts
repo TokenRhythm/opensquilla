@@ -13,6 +13,7 @@ afterEach(() => {
 
 describe('SettingsAdvancedPanel data maintenance entry', () => {
   it('keeps memory controls in Advanced and maintenance last', async () => {
+    localStorage.setItem('opensquilla.logs.runTrace', '1')
     vi.resetModules()
     vi.doMock('@/components/settings/MemoryDreamSettings.vue', () => ({
       default: { template: '<div data-testid="memory-dream-settings" />' },
@@ -55,6 +56,15 @@ describe('SettingsAdvancedPanel data maintenance entry', () => {
     expect(updateAutoCapture).toHaveBeenCalledWith(false)
 
     expect(el.textContent).not.toContain('Agent configuration')
+    expect(el.querySelector('[name="labs_run_trace"]')).toBeNull()
+    expect(el.textContent).not.toContain('Run-trace drawer in Logs')
+
+    const approvalPoll = el.querySelector<HTMLInputElement>('input[name="labs_approval_poll"]')!
+    expect(approvalPoll.checked).toBe(false)
+    approvalPoll.checked = true
+    approvalPoll.dispatchEvent(new Event('change', { bubbles: true }))
+    await nextTick()
+    expect(localStorage.getItem('opensquilla.chat.approvalPoll')).toBe('1')
 
     const rows = el.querySelectorAll('.control-row')
     const maintenance = el.querySelector<HTMLElement>('[data-testid="advanced-data-maintenance"]')!

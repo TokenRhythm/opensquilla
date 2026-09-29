@@ -75,10 +75,10 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
 <template>
   <div class="control-row control-row--stack settings-update">
     <div class="control-row__label-block">
-      <span class="control-row__label">
+      <h3 id="settings-gateway-updates-title" class="control-row__label settings-update__title">
         {{ t('updates.desktop.settingsTitle') }}
         <span class="control-pill" :class="statusTone">{{ statusLabel }}</span>
-      </span>
+      </h3>
       <span class="control-row__desc">{{ description }}</span>
     </div>
 
@@ -159,6 +159,11 @@ const showLater = computed(() => state.value.canCheck && (status.value === 'avai
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp-2);
+}
+
+.settings-update__title {
+  font-size: var(--fs-md);
+  margin: 0;
 }
 
 .settings-update__meta {

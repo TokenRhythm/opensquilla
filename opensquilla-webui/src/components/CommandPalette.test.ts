@@ -90,6 +90,13 @@ describe('CommandPalette navigation and conversation search', () => {
     expect(el.querySelector('.cmdp-group-label')?.textContent).toBe('Work')
   })
 
+  it.each(['logs', 'overview', 'health'])('does not advertise the retired %s page', async (query) => {
+    const { el } = await mountPalette()
+    await search(el, query)
+    await settleSearch()
+    expect(el.querySelectorAll('.cmdp-option')).toHaveLength(0)
+  })
+
   it('debounces search by 180ms and sends the domain request', async () => {
     const searchCall = vi.fn().mockResolvedValue(emptySearch())
     const { directory, el } = await mountPalette(fakeDirectory(searchCall))

@@ -232,6 +232,7 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
     call = jobs["windows-nsis-regression"]
     assert call["uses"] == "./.github/workflows/windows-nsis-upgrade-regression.yml"
     assert call["needs"] == "plan-ci"
+    assert call["with"]["acceptance_profile"] == "${{ needs.plan-ci.outputs.windows_nsis_profile }}"
     assert "needs.plan-ci.result == 'success'" in call["if"]
     assert "'windows-nsis-regression'" in call["if"]
     assert not call.get("continue-on-error")
@@ -242,6 +243,22 @@ def test_windows_acceptance_is_required_through_the_caller_and_all_native_jobs()
 
     native = _workflow("windows-nsis-upgrade-regression.yml")
     assert _trigger_keys(native) == {"workflow_call", "workflow_dispatch"}
+    triggers = native.get("on", native.get(True))
+    profile = triggers["workflow_call"]["inputs"]["acceptance_profile"]
+    assert profile == {
+        "description": (
+            "smoke: current legacy baseline and fresh installs; full: all historical fault cases"
+        ),
+        "type": "string", "default": "full",
+    }
+    # Standalone diagnostics deliberately expose no smoke override.
+    assert triggers["workflow_dispatch"] is None
+    profile_guard = native["jobs"]["build"]["steps"][0]
+    assert profile_guard["env"]["ACCEPTANCE_PROFILE"] == (
+        "${{ inputs.acceptance_profile || 'full' }}"
+    )
+    assert "-cnotin @('smoke', 'full')" in profile_guard["run"]
+    assert "throw" in profile_guard["run"]
     assert "concurrency" not in native  # Caller owns cancellation, never cancel the caller.
     result = native["jobs"]["acceptance-result"]
     assert result["if"] == "always()"
@@ -774,6 +791,7 @@ def test_ci_fast_paths_keep_the_required_check_and_fail_closed() -> None:
         "desktop_matrix",
         "python_matrix",
         "platform_matrix",
+        "windows_nsis_profile",
         "python_targets",
         "full_fallback",
         "reason_codes",
@@ -2447,6 +2465,9 @@ def test_webui_chat_recovery_runs_the_verified_dist_through_gateway() -> None:
         "task-progress.spec.ts",
         "provider-error-experience.spec.ts",
         "retired-bgm-upgrade.spec.ts",
+        "support-bundle.spec.ts",
+        "console-clarity.spec.ts",
+        "mobile-tabs.spec.ts",
         "header-responsive.spec.ts",
         "topbar-global-controls.spec.ts",
         "topbar-visual.spec.ts",
@@ -2480,7 +2501,6 @@ def test_webui_virtualization_contracts_run_isolated_without_retries() -> None:
         "chat-virtualization.spec.ts",
         "conversation-minimap.spec.ts",
         "floating-composer.spec.ts",
-        "virtualized-logs.spec.ts",
         "long-task-resilience.spec.ts",
         "native-gateway.spec.ts",
         "sidebar-drag.spec.ts",

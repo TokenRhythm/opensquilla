@@ -51,6 +51,8 @@ from opensquilla.session.storage import SessionStorage, TurnAcceptanceResult
 
 SESSION_KEY = "agent:main:webchat:atomic-ingress"
 CLIENT_REQUEST_ID = "client-request-atomic-1"
+# Harness readiness/commit guards, not product latency or cancellation contracts.
+_DURABLE_PHASE_GUARD_SECONDS = 30.0
 
 _PRINCIPAL = Principal(
     role="operator",
@@ -74,7 +76,17 @@ class _RealIngressStack:
     received_runs: list[Any]
 
     async def wait_until_running(self) -> None:
-        await asyncio.wait_for(self.handler_started.wait(), timeout=2.0)
+        # Activation persists task status and transcript context before calling
+        # the handler. SQLite I/O is setup, not a two-second functional contract.
+        try:
+            await asyncio.wait_for(
+                self.handler_started.wait(), timeout=_DURABLE_PHASE_GUARD_SECONDS,
+            )
+        except TimeoutError as exc:
+            states = {key: task.status for key, task in self.runtime._tasks.items()}
+            raise TimeoutError(
+                f"durable handler readiness timed out; task_states={states}"
+            ) from exc
 
 
 @asynccontextmanager
@@ -154,6 +166,18 @@ def _table_counts(db_path: Path) -> dict[str, int]:
         }
     finally:
         connection.close()
+
+
+@pytest.mark.asyncio
+async def test_handler_readiness_still_times_out_when_never_started(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async with _open_real_stack(tmp_path / "never-started.db") as stack:
+        monkeypatch.setitem(globals(), "_DURABLE_PHASE_GUARD_SECONDS", 0.01)
+        with pytest.raises(TimeoutError, match="durable handler readiness timed out"):
+            await stack.wait_until_running()
+        assert not stack.handler_started.is_set()
+        assert stack.received_runs == []
 
 
 def _assert_no_runtime_acceptance_state(runtime: TaskRuntime) -> None:
@@ -2340,10 +2364,22 @@ async def test_collect_mode_atomically_merges_message_and_receipt_into_queued_ta
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("activation_delay_seconds", [0.0, 2.1])
 async def test_concurrent_first_collects_share_one_admission_and_task(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    activation_delay_seconds: float,
 ) -> None:
     async with _open_real_stack(tmp_path / "sessions.db") as stack:
+        original_update = stack.runtime._update_transcript_turn_context
+
+        async def delayed_activation(*args: Any, **kwargs: Any) -> Any:
+            # Fault injection, not synchronization: durable activation may take
+            # longer than the former two-second handler-readiness guard.
+            await asyncio.sleep(activation_delay_seconds)
+            return await original_update(*args, **kwargs)
+
+        monkeypatch.setattr(stack.runtime, "_update_transcript_turn_context", delayed_activation)
         blocker = await get_dispatcher().dispatch(
             "rpc-concurrent-collect-blocker",
             "sessions.send",
@@ -2359,7 +2395,19 @@ async def test_concurrent_first_collects_share_one_admission_and_task(
         original_reserve = stack.runtime.reserve
         first_reserved = asyncio.Event()
         release_first = asyncio.Event()
+        second_admission_attempted = asyncio.Event()
         pause_next_collect = True
+
+        original_admission = stack.runtime.collect_admission
+
+        @asynccontextmanager
+        async def observed_admission(session_key: str) -> AsyncIterator[None]:
+            if first_reserved.is_set():
+                second_admission_attempted.set()
+            async with original_admission(session_key):
+                yield
+
+        monkeypatch.setattr(stack.runtime, "collect_admission", observed_admission)
 
         async def _pause_first_collect_reservation(
             *args: Any,
@@ -2387,25 +2435,41 @@ async def test_concurrent_first_collects_share_one_admission_and_task(
                 stack.context,
             )
         )
-        await asyncio.wait_for(first_reserved.wait(), timeout=2.0)
-        second_request = asyncio.create_task(
-            get_dispatcher().dispatch(
-                "rpc-concurrent-collect-second",
-                "sessions.send",
-                {
-                    "key": SESSION_KEY,
-                    "message": "collect second",
-                    "queueMode": "collect",
-                    "clientRequestId": "concurrent-collect-second",
-                },
-                stack.context,
+        requests = [first_request]
+        try:
+            await asyncio.wait_for(first_reserved.wait(), timeout=_DURABLE_PHASE_GUARD_SECONDS)
+            second_request = asyncio.create_task(
+                get_dispatcher().dispatch(
+                    "rpc-concurrent-collect-second",
+                    "sessions.send",
+                    {
+                        "key": SESSION_KEY,
+                        "message": "collect second",
+                        "queueMode": "collect",
+                        "clientRequestId": "concurrent-collect-second",
+                    },
+                    stack.context,
+                )
             )
-        )
-        await asyncio.sleep(0.05)
-
-        assert second_request.done() is False
-        release_first.set()
-        first, second = await asyncio.gather(first_request, second_request)
+            requests.append(second_request)
+            await asyncio.wait_for(
+                second_admission_attempted.wait(), timeout=_DURABLE_PHASE_GUARD_SECONDS,
+            )
+            assert second_request.done() is False
+            release_first.set()
+            first, second = await asyncio.wait_for(
+                asyncio.gather(*requests), timeout=_DURABLE_PHASE_GUARD_SECONDS,
+            )
+        finally:
+            release_first.set()
+            for request in requests:
+                if not request.done():
+                    request.cancel()
+            done, pending = await asyncio.wait(requests, timeout=5.0)
+            for request in done:
+                if not request.cancelled():
+                    request.exception()
+            assert not pending, "collect request cleanup exceeded its separate guard"
 
         assert blocker.ok is True
         assert first.ok is True

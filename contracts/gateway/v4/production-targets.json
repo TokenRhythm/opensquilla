@@ -407,13 +407,6 @@
     },
     {
       "kind": "method",
-      "wireName": "doctor.status",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
       "wireName": "documents.import",
       "roles": [
         "result"
@@ -513,13 +506,6 @@
       "wireName": "goals.status",
       "roles": [
         "params",
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "logs.status",
-      "roles": [
         "result"
       ]
     },
@@ -1154,13 +1140,6 @@
     {
       "kind": "method",
       "wireName": "skills.uninstall",
-      "roles": [
-        "result"
-      ]
-    },
-    {
-      "kind": "method",
-      "wireName": "status",
       "roles": [
         "result"
       ]

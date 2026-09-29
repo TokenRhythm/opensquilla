@@ -67,6 +67,7 @@ function accessFromRpc(rpc: ReturnType<typeof useRpcStore>): GatewayAccess {
     detachedSessionHydration: false,
     turnCommittedEvents: false,
     subscriptionEpoch: 0,
+    supportBundleUnavailableReason: null,
     loadConnectionEndpoint: () => 'ws://example.invalid/ws',
     connect: async () => undefined,
     disconnect: () => undefined,

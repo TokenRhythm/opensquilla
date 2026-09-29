@@ -175,6 +175,7 @@ import {
 } from './native-workbench-annotation-contract.js'
 import { DesktopBrowserServer, DESKTOP_BROWSER_URL_ENV, DESKTOP_BROWSER_TOKEN_ENV } from './desktop-browser.js'
 import { installDesktopZoomShortcuts } from './desktop-zoom-shortcuts.js'
+import { installDesktopReloadShortcuts } from './desktop-reload-shortcuts.js'
 import {
   buildRendererConsoleLogEntry,
   isLiveMainFrameConsoleMessage,
@@ -9560,6 +9561,13 @@ async function createMainWindow(): Promise<BrowserWindow> {
     window.webContents,
     () => nativeWorkbenchSurfaces.refreshBounds(window),
   )
+  if (process.platform !== 'darwin') {
+    installDesktopReloadShortcuts(
+      window.webContents,
+      window.webContents,
+      () => currentOnboardingWindow() === null,
+    )
+  }
   installEditingContextMenu(window)
 
   const rendererConsoleLogLimiter = new RendererConsoleLogLimiter()

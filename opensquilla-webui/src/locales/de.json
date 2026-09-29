@@ -392,11 +392,8 @@
     "cron": "Cron",
     "skills": "Fähigkeiten",
     "skillsChannels": "Fähigkeiten & Kanäle",
-    "overview": "Übersicht",
-    "status": "Status",
     "usage": "Nutzung",
     "viewUsage": "Nutzung anzeigen",
-    "logs": "Protokolle",
     "settings": "Einstellungen",
     "groupBuild": "Erstellen",
     "groupMonitor": "Übersicht",
@@ -460,7 +457,8 @@
       "results": "Gefundene Einstellungen",
       "empty": "Keine passenden Einstellungen",
       "defaultModel": "Standardmodell",
-      "permissions": "Berechtigungen"
+      "permissions": "Berechtigungen",
+      "supportBundle": "Support-Paket herunterladen"
     },
     "appearance": {
       "title": "Oberfläche",
@@ -725,7 +723,8 @@
     },
     "gateway": {
       "title": "Gateway",
-      "desc": "Mit dem Gateway verbinden und auf dem Desktop die lokale Laufzeit verwalten."
+      "desc": "Gateway-Verbindung dieses Browsers verwalten.",
+      "desktopDesc": "Gateway-Verbindung und lokalen Dienst verwalten."
     },
     "general": {
       "title": "Allgemein",
@@ -1630,12 +1629,12 @@
       "languageCode": "Sprachcode"
     },
     "connection": {
-      "title": "Verbindung",
-      "desc": "Richten Sie diesen Browser auf ein Gateway aus. Das Verbinden wird sofort übernommen — kein Speichern nötig.",
+      "title": "Gateway-Verbindung",
+      "desc": "Felder bearbeiten und mit „Verbinden“ oder „Erneut verbinden“ übernehmen.",
       "connected": "Verbunden",
       "connecting": "Wird verbunden",
       "disconnected": "Getrennt",
-      "reasonConnected": "Live-Verbindung zum Gateway-Socket.",
+      "reasonConnected": "Mit dem Gateway verbunden.",
       "reasonConnecting": "Gateway wird erreicht…",
       "reasonFailed": "Letzter Versuch fehlgeschlagen: {error}",
       "reasonDisconnected": "Nicht verbunden. Prüfen Sie die WebSocket-URL und versuchen Sie es mit Verbinden.",
@@ -1647,8 +1646,11 @@
       "tokenRequired": "Token erforderlich",
       "reasonTokenRequired": "Authentifizierung fehlgeschlagen. Automatische Versuche sind pausiert. Geben Sie ein gültiges Gateway-Token ein und wählen Sie Verbinden.",
       "reconnect": "Erneut verbinden",
+      "editConnection": "Verbindung bearbeiten",
       "connect": "Verbinden",
-      "disconnect": "Trennen"
+      "disconnect": "Trennen",
+      "actions": "Verbindungsaktionen",
+      "reasonManagedDisconnected": "Der Client ist nicht mit dem lokalen Gateway verbunden. Versuche, die Verbindung erneut herzustellen."
     },
     "runtime": {
       "title": "Laufzeit",
@@ -1826,7 +1828,15 @@
       "migrationCompleteIndependent": "Diese Desktop-Installation ist jetzt unabhängig und wird nicht mit der Quelle synchronisiert.",
       "migrationCompleteReplacement": "Die vorherigen Desktop-Daten liegen als vollständige Sicherung vor. Sie wurden als Ganzes ersetzt; Dateien und Chats wurden nie zusammengeführt.",
       "migrationCompleteShowBackup": "Vollständige Sicherung anzeigen",
-      "migrationCompleteDismiss": "Ausblenden"
+      "migrationCompleteDismiss": "Ausblenden",
+      "localGatewayTitle": "Lokales Gateway",
+      "localGatewayDescription": "Das von der Desktop-App gestartete lokale Gateway verwalten.",
+      "processStatus": "Prozessstatus",
+      "restartLocalGateway": "Lokales Gateway neu starten",
+      "details": "Adresse und Log-Speicherort",
+      "address": "Gateway-Adresse",
+      "refreshStatus": "Status aktualisieren",
+      "openLocalLogLocation": "Lokalen Log-Speicherort öffnen"
     },
     "keyboard": {
       "title": "Tastenkürzel",
@@ -1860,9 +1870,6 @@
       "dataMaintenanceDesc": "Importe und Sicherungen prüfen. Auf dem Desktop können lokale Profildaten auch zurückgesetzt oder gelöscht werden.",
       "dataMaintenanceAction": "Verwalten",
       "dataMaintenanceAria": "Datenpflege öffnen",
-      "runTraceLabel": "Run-Trace-Schublade in Protokollen",
-      "runTraceDesc": "Macht Protokollzeilen interaktiv und öffnet eine zeilenweise Detailschublade für Knotenschritte in der Protokollansicht.",
-      "runTraceAria": "Run-Trace-Schublade in Protokollen (wird nach dem Neuladen wirksam)",
       "configFileLabel": "Konfigurationsdatei",
       "configFileDesc": "Weitere Optionen lassen sich in der Konfigurationsdatei anpassen."
     },
@@ -2364,110 +2371,6 @@
       "abortDone": "Lauf abgebrochen.",
       "abortNone": "Kein aktiver Lauf zum Abbrechen.",
       "abortFailed": "Abbruch fehlgeschlagen."
-    },
-    "overview": {
-      "title": "Status",
-      "subtitle": "Bereitschaft, Nutzung und Laufzeitzustand.",
-      "totalTokens": "Tokens gesamt",
-      "totalSessions": "Sitzungen gesamt",
-      "totalSessionsTitle": "Sitzungen gesamt über alle Status",
-      "viewAll": "alle anzeigen →",
-      "provider": "Anbieter",
-      "manageAgents": "Agenten verwalten →",
-      "jumpToReadiness": "Zum Bereitschaftsbericht springen",
-      "health": "Zustand",
-      "uptime": "Betriebszeit",
-      "healthSummary": "Zustandszusammenfassung",
-      "readiness": "Bereitschaft",
-      "healthContext": "Kontext des Zustandsberichts",
-      "ctxGateway": "Gateway",
-      "ctxConfig": "Konfiguration",
-      "ctxRequestedConfig": "Angeforderte Konfiguration",
-      "ctxAgent": "Agent",
-      "needsAction": "Aktion erforderlich",
-      "degraded": "Eingeschränkt",
-      "optional": "Optional",
-      "ready": "Bereit",
-      "healthFindings": "Zustandsbefunde",
-      "loadingHealth": "Zustandsbericht wird geladen",
-      "noFindings": "Keine Befunde zurückgegeben.",
-      "recoveryRestart": "Wiederherstellung erfordert Neustart",
-      "openSettings": "Einstellungen öffnen",
-      "findingDetails": "Details",
-      "findingFallback": "Befund {n}",
-      "copyCommand": "Befehl kopieren",
-      "step": "Schritt",
-      "checking": "Wird geprüft",
-      "waitingDoctor": "Warte auf doctor.status",
-      "healthUnavailable": "Gateway-Zustandsbericht nicht verfügbar",
-      "impact": {
-        "blocksReady": "Blockiert Bereitschaft",
-        "degrades": "Schränkt ein",
-        "optional": "Optional",
-        "reference": "Referenz"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "Bereit mit Warnungen",
-        "ready": "Bereit",
-        "actionRequired": "Aktion erforderlich",
-        "degraded": "Eingeschränkt",
-        "unavailable": "Nicht verfügbar"
-      },
-      "badge": {
-        "diagnostic": "Diagnose unvollständig",
-        "repair": "Reparatur ausstehend",
-        "config": "Konfigurationskonflikt"
-      },
-      "dotStatus": {
-        "active": "Aktiv",
-        "ready": "Bereit",
-        "ok": "OK",
-        "paused": "Pausiert",
-        "degraded": "Eingeschränkt",
-        "warn": "Warnung",
-        "error": "Fehler",
-        "failed": "Fehlgeschlagen",
-        "closed": "Geschlossen",
-        "ended": "Beendet",
-        "offline": "Offline",
-        "unknown": "Unbekannt"
-      },
-      "group": {
-        "action": {
-          "title": "Aktion erforderlich",
-          "note": "Beheben Sie diese zuerst, um OpenSquilla einsatzbereit zu machen."
-        },
-        "degraded": {
-          "title": "Eingeschränkte Fähigkeiten",
-          "note": "OpenSquilla kann laufen, aber diese Fähigkeiten erfordern Aufmerksamkeit."
-        },
-        "optional": {
-          "title": "Optionale Einrichtung",
-          "note": "Diese verbessern Fähigkeit oder Sicherheit, blockieren aber die Bereitschaft nicht."
-        },
-        "ready": {
-          "title": "Bereitschaftsprüfungen",
-          "note": "Diese Bereiche funktionieren bereits."
-        }
-      },
-      "gw": {
-        "cannotLoad": "doctor.status kann nicht von {url} geladen werden. {reason}",
-        "inspectRemote": "Remote-Gateway prüfen",
-        "repairRemote": "Remote-Bereitstellung reparieren",
-        "repairRemoteDetail": "Starten oder reparieren Sie die Remote-OpenSquilla-Gateway-Bereitstellung und aktualisieren Sie dann den Zustand.",
-        "runLocalDoctor": "Lokalen Doctor ausführen",
-        "runLocalDoctorDetail": "Prüft lokale Konfiguration und Onboarding vor dem Neustart des Gateways.",
-        "startLocal": "Lokales Gateway starten",
-        "inspectLocal": "Lokales Gateway prüfen"
-      },
-      "checkedAgo": "Geprüft {time}",
-      "rerunChecks": "Prüfungen erneut ausführen",
-      "copyDiagnostics": "Diagnose-JSON kopieren",
-      "copiedDiagnostics": "Diagnose-JSON kopiert",
-      "diagnoseWithAgent": "Mit dem Agenten diagnostizieren",
-      "diagnosePrompt": "Bitte analysieren Sie diese OpenSquilla-Konfiguration anhand des folgenden Client-Kontexts und doctor-Berichts. Bevorzugen Sie passende Einstellungen in der App. Wenn hasTerminalWorkflow false ist, schlagen Sie keine bloßen opensquilla-Befehle vor; ein eigener Desktop-Gateway wird von der App verwaltet. Eine Datenübertragung bedeutet Sicherung und anschließenden vollständigen Ersatz, niemals Zusammenführung. Ein optionaler Migrationseintrag ist kein Fehler und kann nach der Übertragung sichtbar bleiben. Erklären und leiten Sie nur an: Migrieren Sie keine Daten, starten Sie den Gateway nicht neu, schreiben Sie keine Einstellungen und behaupten Sie nicht, Änderungen ausgeführt zu haben.",
-      "environment": "Umgebung",
-      "latency": "Latenz"
     }
   },
   "console": {
@@ -2707,12 +2610,6 @@
         "botIdCopied": "Bot-ID kopiert",
         "eventSubscriptionTitle": "Feishu-Ereignisabonnement prüfen"
       }
-    },
-    "overview": {
-      "channelsChip": "Kanäle",
-      "channelsChipConnected": "{connected} verbunden",
-      "channelsChipFailed": "{failed} fehlgeschlagen",
-      "channelsChipPending": "{pending} warten auf Freigabe"
     }
   },
   "cronSkills": {
@@ -3252,17 +3149,23 @@
       "tileNotDeclaredHint": "kein Manifest"
     }
   },
+  "gatewayLogs": {
+    "viewLogs": "Aktuelle Logs anzeigen",
+    "title": "Gateway-Protokolle",
+    "description": "Die letzten 200 Zeilen des verbundenen Gateways. Zum Aktualisieren manuell neu laden.",
+    "refresh": "Aktualisieren",
+    "loading": "Protokolle werden geladen…",
+    "empty": "Keine aktuellen Protokolle.",
+    "failed": "Protokolle konnten nicht gelesen werden. Verbindung und Gateway-Berechtigungen prüfen und erneut versuchen.",
+    "connectionRequired": "Zum Anzeigen der Protokolle mit dem Gateway verbinden.",
+    "authenticationRequired": "Zum Anzeigen der Protokolle beim Gateway anmelden.",
+    "saveCurrentLogs": "Angezeigte Logs speichern",
+    "saveFailed": "Logs konnten nicht gespeichert werden. Bitte erneut versuchen."
+  },
   "monitorSupport": {
     "title": "Support und Diagnose",
-    "menuLabel": "Support- und Diagnoseaktionen",
-    "viewLogs": "Laufzeitprotokolle anzeigen",
-    "viewLogsDescription": "Letzte Gateway-Ausgaben und Fehler prüfen",
-    "copyReport": "Aktuellen Bereitschaftsbericht kopieren",
-    "copyReportDescription": "Aktuellen Verbindungs-, Konfigurations- und Laufzeitstatus teilen",
-    "copySuccess": "Bereitschaftsbericht kopiert",
-    "copyFailed": "Bereitschaftsbericht konnte nicht kopiert werden: {error}",
     "downloadBundle": "Bereinigtes Support-Paket herunterladen",
-    "downloadBundleDescription": "Enthält Protokolle, eine Konfigurationsübersicht und Diagnoseergebnisse",
+    "downloadBundleDescription": "Enthält Protokolle, eine Konfigurationsübersicht und Diagnoseergebnisse des verbundenen Gateways.",
     "privacySummary": "Unterhaltungsinhalte sind standardmäßig ausgeschlossen und bekannte Zugangsdaten werden geschwärzt",
     "bundleTitle": "Bereinigtes Support-Paket herunterladen",
     "bundleSubtitle": "Erstellen Sie eine ZIP-Datei zum Teilen mit dem OpenSquilla-Support.",
@@ -3280,7 +3183,10 @@
     "bundleConfirm": "Erstellen und herunterladen",
     "bundleCancel": "Abbrechen",
     "bundleFailed": "Support-Paket konnte nicht heruntergeladen werden",
-    "bundleReady": "Support-Paket heruntergeladen"
+    "bundleReady": "Support-Paket heruntergeladen",
+    "bundleConnectionRequired": "Verbinden Sie sich mit dem Gateway, um ein Support-Paket herunterzuladen.",
+    "bundleOwnerRequired": "Nur der lokale Eigentümer des Gateways kann ein Support-Paket herunterladen.",
+    "bundleDifferentGateway": "Öffnen Sie die eigene WebUI des verbundenen Gateways, um dessen Support-Paket herunterzuladen."
   },
   "usageLogs": {
     "tasks": {
@@ -3424,51 +3330,6 @@
     },
     "errors": {
       "loadFailed": "Nutzung konnte nicht geladen werden"
-    },
-    "logs": {
-      "breadcrumbLabel": "Brotkrumennavigation",
-      "title": "Protokolle",
-      "subtitle": "Live-Stream der Gateway-Protokolle — filtern und verfolgen.",
-      "statusUnavailable": "Protokollstatus nicht verfügbar",
-      "statusUnavailableAria": "Protokollstatus nicht verfügbar; das Verfolgen von Protokollen kann dennoch funktionieren.",
-      "statusUnavailableTitle": "logs.status ist nicht verfügbar; das Verfolgen von Protokollen kann dennoch funktionieren.",
-      "fileLogOn": "Dateiprotokoll ein",
-      "fileLogOff": "Dateiprotokoll aus",
-      "fileLogTitle": "Die Dateiprotokollierung des Gateways ist über log_file_enabled, log_level, Rotationseinstellungen und OPENSQUILLA_LOG_DIR konfigurierbar. Pfad: {path}.",
-      "fileLogOffTitle": "Protokolle werden nicht auf die Festplatte geschrieben; Diagnosepaketen wird der Verlauf fehlen. Aktivieren Sie log_file_enabled in der Konfiguration. Pfad: {path}.",
-      "rawOn": "Roherfassung ein",
-      "rawOff": "Roherfassung aus",
-      "rawRecordingPill": "Roherfassung läuft",
-      "rawTitle": "Die Roherfassung zeichnet vollständige Modellanfragen und -antworten auf, einschließlich Gesprächsinhalten. Aktivieren mit OPENSQUILLA_TURN_CALL_LOG=1 oder opensquilla diagnostics on --raw; deaktivieren mit opensquilla diagnostics off. Quelle: {source}. Verzeichnis: {path}.",
-      "bundleButton": "Diagnosepaket",
-      "bundleButtonTitle": "Ein bereinigtes Diagnosepaket herunterladen",
-      "bundleTitle": "Diagnosepaket herunterladen",
-      "bundleBody": "Sammelt Gateway-Protokolle, Fehlereinträge und bereinigte Konfiguration in einer Zip-Datei, die Sie einem Fehlerbericht anhängen können. Geheimnisse und API-Schlüssel werden entfernt; Unterhaltungsinhalte bleiben ausgeschlossen, sofern Sie sie unten nicht ausdrücklich einbeziehen.",
-      "bundleIncludeContent": "Unterhaltungsinhalte einbeziehen (Prompts und Antworten)",
-      "bundleConfirm": "Herunterladen",
-      "bundleCancel": "Abbrechen",
-      "bundleFailed": "Diagnose-Download fehlgeschlagen",
-      "bundleReady": "Diagnosepaket heruntergeladen",
-      "inView": "In Ansicht",
-      "ofLoaded": "von {total} geladen",
-      "errors": "Fehler",
-      "reviewNeeded": "Überprüfung erforderlich",
-      "allClear": "alles in Ordnung",
-      "warnings": "Warnungen",
-      "recentAdvisories": "aktuelle Hinweise",
-      "none": "keine",
-      "infoDebug": "Info / Debug",
-      "routineOutput": "Routineausgabe",
-      "levels": "Stufen",
-      "filterPlaceholder": "Nachrichten filtern…",
-      "autoFollow": "Automatisch folgen",
-      "loading": "Protokolle werden geladen…",
-      "empty": "Noch keine Laufzeitprotokolle.",
-      "loadFailed": "Laufzeitprotokolle konnten nicht geladen werden.",
-      "retry": "Erneut versuchen",
-      "noMatch": "Keine Zeilen entsprechen dem aktuellen Filter.",
-      "lineDetail": "Protokollzeilendetail",
-      "ofLoadedFoot": "{visible} sichtbar · {total} gepuffert"
     }
   },
   "chat": {

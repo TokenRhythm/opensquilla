@@ -17,8 +17,9 @@ test.describe('Chat topbar global controls', () => {
       sessionKey: `${TOPBAR_SESSION_KEY}-non-chat`,
       locale: 'en',
     })
-    await page.goto('/control/overview')
+    await page.goto('/control/usage')
     await expect(page.getByTestId('route-header-host').locator('.chat-header')).toHaveCount(0)
+    await expect(page.locator('.topbar').getByRole('link', { name: /^(Overview|Logs)$/ })).toHaveCount(0)
 
     const language = page.getByTestId('language-switcher-trigger')
     const theme = page.getByRole('button', { name: 'Theme', exact: true })
@@ -106,7 +107,8 @@ test.describe('Chat topbar global controls', () => {
     await expectTopbarGeometry(page, { minimumTargetSize: 44 })
 
     await page.getByTestId('chat-system-update').click()
-    await expect(page).toHaveURL(/\/settings\/gateway#runtime$/)
+    await expect(page).toHaveURL(/\/settings\/gateway#updates$/)
+    await expect(page.locator('#settings-gateway-updates')).toBeFocused()
   })
 
   test('Desktop update lifecycle preserves wide layout and focused control', async ({ page }) => {

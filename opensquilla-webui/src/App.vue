@@ -233,7 +233,7 @@
           :can-manage-connection="webConfigEnabled"
           @open-connection="openConnectionSettings"
           @open-approval="openBlockedApprovalSession"
-          @open-update="openDesktopRuntimeSettings"
+          @open-update="openDesktopUpdateSettings"
         />
         <template v-else>
           <button
@@ -353,7 +353,7 @@
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
-       Chat, Overview, then More for the sidebar drawer with session history,
+       Chat, Usage, then More for the sidebar drawer with session history,
        navigation, and Settings. -->
   <nav
     class="mobile-tabbar"
@@ -371,13 +371,13 @@
       <span class="mobile-tab__label">{{ t('nav.chat') }}</span>
     </router-link>
     <router-link
-      to="/overview"
+      to="/usage"
       class="mobile-tab"
-      :class="{ 'is-active': isOverviewNavActive }"
+      :class="{ 'is-active': isNavActive('/usage') }"
       @click="handleNavClick"
     >
-      <Icon name="home" :size="20" />
-      <span class="mobile-tab__label">{{ t('nav.overview') }}</span>
+      <Icon name="usage" :size="20" />
+      <span class="mobile-tab__label">{{ t('nav.usage') }}</span>
     </router-link>
     <button
       type="button"
@@ -918,19 +918,14 @@ function isNavActive(path: string): boolean {
   return $route.path === path
 }
 
-// Overview owns the Status/Usage hub plus its diagnostic Logs route, while
-// Skills fronts the Skills/Channels hub. Keep those active families disjoint so
-// diagnostic routes never light an unrelated primary destination.
-const OVERVIEW_NAV_PATHS = new Set(['/overview', '/usage', '/logs'])
+// Skills fronts the Skills/Channels hub; Usage is a standalone destination.
 const SKILLS_CHANNELS_HUB_PATHS = new Set(['/skills', '/channels'])
 const MOBILE_MORE_PATHS = new Set(['/skills', '/channels', '/cron'])
-const isOverviewNavActive = computed(() => OVERVIEW_NAV_PATHS.has($route.path))
 const isSkillsChannelsHubActive = computed(() => SKILLS_CHANNELS_HUB_PATHS.has($route.path))
 const isMobileMoreActive = computed(() =>
   appStore.sidebarOpen || MOBILE_MORE_PATHS.has($route.path))
 
 function isPrimaryNavActive(path: string): boolean {
-  if (path === '/usage') return isOverviewNavActive.value
   if (path === '/skills') return isSkillsChannelsHubActive.value
   return isNavActive(path)
 }
@@ -1733,8 +1728,8 @@ function openConnectionSettings() {
 
 // Compact chat headers hand off to the complete Desktop update workflow rather
 // than recreating update actions inside the status summary.
-function openDesktopRuntimeSettings() {
-  router.push('/settings/gateway#runtime')
+function openDesktopUpdateSettings() {
+  router.push('/settings/gateway#updates')
 }
 
 function scheduleSessionRefresh() {
