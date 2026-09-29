@@ -73,7 +73,31 @@ if TYPE_CHECKING:
 log = structlog.get_logger(__name__)
 
 
-class FlowDeliveryStaleError(ValueError):
+_FLOW_ADMISSION_REASON_CODES = frozenset({
+    "response_wire_limit", "snapshot_epoch_mismatch", "snapshot_delivery_id_invalid",
+    "snapshot_delivery_missing", "snapshot_delivery_kind_invalid",
+    "snapshot_reservation_rejected", "frame_wire_limit", "control_buffer_limit",
+    "transport_reservation_rejected", "flow_admission_unclassified",
+})
+
+
+class _FlowAdmissionError(ValueError):
+    """Producer-owned diagnostics; never derive a reason from exception text."""
+
+    def __init__(
+        self, message: str, *, reason_code: str = "flow_admission_unclassified",
+        wire_bytes: int | None = None, requested_bytes: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = (
+            reason_code if reason_code in _FLOW_ADMISSION_REASON_CODES
+            else "flow_admission_unclassified"
+        )
+        self.wire_bytes = wire_bytes
+        self.requested_bytes = requested_bytes
+
+
+class FlowDeliveryStaleError(_FlowAdmissionError):
     """A flow receipt no longer belongs to the current connection state.
 
     This is a connection-local recovery condition.  It must not be treated as
@@ -1646,6 +1670,29 @@ class WsConnection:
                 self._flow_control_frames -= 1
             frame.budget_bytes = 0
 
+    def _flow_failure_diagnostics(self) -> dict[str, int | bool]:
+        """Failure-time ledger counters, not RSS or payload/queue inspection."""
+        budget = get_transport_budget()
+        flow = self._flow
+        return {
+            "queue_depth": self._outbox.qsize() if self._outbox is not None else 0,
+            "queue_capacity": self._writer_queue_maxsize,
+            "transport_reserved_bytes": self._transport_bytes,
+            "connection_transport_limit_bytes": CONNECTION_BUFFER_BYTES,
+            "global_transport_reserved_bytes": budget.used,
+            "global_transport_limit_bytes": budget.limit,
+            "flow_reserved_frames": len(flow.deliveries) if flow is not None else 0,
+            "flow_reserved_bytes": (
+                sum(item.size for item in flow.deliveries.values()) if flow else 0
+            ),
+            "control_reserved_frames": self._flow_control_frames,
+            "control_reserved_bytes": self._flow_control_bytes,
+            "control_limit_frames": CONTROL_BUFFER_FRAMES,
+            "control_limit_bytes": CONTROL_BUFFER_BYTES,
+            "wire_limit_bytes": MAX_PAYLOAD_BYTES,
+            "connection_closing": self._closing,
+        }
+
     def _encode_flow_dirty_notice(self, frame: _OutboundFrame) -> str:
         """Refresh one notice without allowing long keys to consume the control lane.
 
@@ -1754,20 +1801,41 @@ class WsConnection:
             size = len(encoded.encode("utf-8"))
             wire_size = size
             if wire_size > MAX_PAYLOAD_BYTES:
-                raise ValueError("Outbound frame exceeds the wire limit")
+                raise _FlowAdmissionError(
+                    "Outbound frame exceeds the wire limit",
+                    reason_code="response_wire_limit", wire_bytes=wire_size,
+                )
             receipt = _payload_field(frame.res_frame.payload, "delivery")
             if isinstance(receipt, dict) and _is_snapshot_delivery_payload(frame.res_frame.payload):
                 if receipt.get("delivery_epoch") != self._flow.epoch:
-                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
+                    raise FlowDeliveryStaleError(
+                        "Snapshot delivery reservation is not current",
+                        reason_code="snapshot_epoch_mismatch", wire_bytes=wire_size,
+                    )
                 delivery_id = receipt.get("delivery_id")
                 if not isinstance(delivery_id, int) or isinstance(delivery_id, bool):
-                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
+                    raise FlowDeliveryStaleError(
+                        "Snapshot delivery reservation is not current",
+                        reason_code="snapshot_delivery_id_invalid", wire_bytes=wire_size,
+                    )
                 delivery = self._flow.deliveries.get(delivery_id)
-                if delivery is None or not delivery.recovery:
-                    raise FlowDeliveryStaleError("Snapshot delivery reservation is not current")
+                if delivery is None:
+                    raise FlowDeliveryStaleError(
+                        "Snapshot delivery reservation is not current",
+                        reason_code="snapshot_delivery_missing", wire_bytes=wire_size,
+                    )
+                if not delivery.recovery:
+                    raise FlowDeliveryStaleError(
+                        "Snapshot delivery reservation is not current",
+                        reason_code="snapshot_delivery_kind_invalid", wire_bytes=wire_size,
+                    )
                 extra = max(0, size - delivery.size)
                 if extra and not self.reserve_transport_bytes(extra, kind="recovery"):
-                    raise ValueError("Snapshot response exceeds the transport budget")
+                    raise _FlowAdmissionError(
+                        "Snapshot response exceeds the transport budget",
+                        reason_code="snapshot_reservation_rejected", wire_bytes=wire_size,
+                        requested_bytes=extra,
+                    )
                 delivery.size += extra
                 if self._recovery_enabled and not self._flow.claim(delivery_id, "original"):
                     # ``claim`` can lose a race with a cancellation/tombstone
@@ -1791,15 +1859,24 @@ class WsConnection:
         else:
             return False
         if wire_size > MAX_PAYLOAD_BYTES:
-            raise ValueError("Outbound frame exceeds the wire limit")
+            raise _FlowAdmissionError(
+                "Outbound frame exceeds the wire limit",
+                reason_code="frame_wire_limit", wire_bytes=wire_size,
+            )
         if frame.is_control and (
             self._flow_control_frames >= CONTROL_BUFFER_FRAMES
             or self._flow_control_bytes + size > CONTROL_BUFFER_BYTES
         ):
-            raise ValueError("Control buffer is full")
+            raise _FlowAdmissionError(
+                "Control buffer is full", reason_code="control_buffer_limit",
+                wire_bytes=wire_size, requested_bytes=size,
+            )
         frame.budget_kind = "control" if frame.is_control else None
         if not self.reserve_transport_bytes(size, kind=frame.budget_kind):
-            raise ValueError("Connection transport budget is full")
+            raise _FlowAdmissionError(
+                "Connection transport budget is full", reason_code="transport_reservation_rejected",
+                wire_bytes=wire_size, requested_bytes=size,
+            )
         frame.budget_bytes = size
         if frame.is_control:
             self._flow_control_frames += 1
@@ -1941,6 +2018,14 @@ class WsConnection:
                 if not self._prepare_flow_frame(frame):
                     return
             except Exception as exc:
+                # Capture before cleanup, but diagnostics must never replace
+                # the original failure or bypass its resource/recovery path.
+                diagnostics: dict[str, int | bool] = {"diagnostics_available": False}
+                try:
+                    diagnostics = self._flow_failure_diagnostics()
+                    diagnostics["diagnostics_available"] = True
+                except Exception:
+                    pass
                 # Admission may have reserved bytes before a later flow
                 # validation/encoding step failed.  The frame will never
                 # enter the outbox, so release that reservation here before
@@ -1950,10 +2035,19 @@ class WsConnection:
                     "gateway.ws_flow_encode_or_budget_failed",
                     conn_id=self.conn_id,
                     exception_type=type(exc).__name__,
-                    failure_class=(
+                    failure_kind=(
                         "stale_delivery" if isinstance(exc, FlowDeliveryStaleError)
                         else "flow_admission"
                     ),
+                    reason_code=(
+                        exc.reason_code if isinstance(exc, _FlowAdmissionError)
+                        else "flow_admission_unclassified"
+                    ),
+                    wire_bytes=exc.wire_bytes if isinstance(exc, _FlowAdmissionError) else None,
+                    requested_bytes=(
+                        exc.requested_bytes if isinstance(exc, _FlowAdmissionError) else None
+                    ),
+                    **diagnostics,
                     exc_info=True,
                 )
                 if isinstance(exc, FlowDeliveryStaleError):

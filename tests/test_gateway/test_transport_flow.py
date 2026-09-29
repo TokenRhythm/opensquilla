@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from starlette.websockets import WebSocketState
@@ -187,6 +188,106 @@ class _FastSocket:
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.closed.append(code)
+
+
+@pytest.mark.parametrize("reason_code", [
+    "response_wire_limit", "snapshot_epoch_mismatch", "snapshot_delivery_id_invalid",
+    "snapshot_delivery_missing", "snapshot_delivery_kind_invalid",
+    "snapshot_reservation_rejected", "frame_wire_limit", "control_buffer_limit",
+    "transport_reservation_rejected",
+])
+def test_flow_admission_preserves_fixed_reason_and_existing_failure_type(monkeypatch, reason_code):
+    before = get_transport_budget().used
+    conn = WsConnection("flow-admission-reason", _FastSocket())  # type: ignore[arg-type]
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    frame = _OutboundFrame(
+        kind="raw", classification="control", payload=None, event_name=None,
+        res_frame=None, raw_text='{"type":"pong"}',
+    )
+    try:
+        if reason_code.startswith("snapshot_"):
+            recovery = reason_code != "snapshot_delivery_kind_invalid"
+            size = 1 if reason_code == "snapshot_reservation_rejected" else 1000
+            delivery_id = conn._flow.admit(size, recovery=recovery)
+            receipt = {"delivery_epoch": conn._flow.epoch, "delivery_id": delivery_id}
+            if reason_code == "snapshot_epoch_mismatch":
+                receipt["delivery_epoch"] = "old-epoch"
+            elif reason_code == "snapshot_delivery_id_invalid":
+                receipt["delivery_id"] = True
+            elif reason_code == "snapshot_delivery_missing":
+                receipt["delivery_id"] = delivery_id + 1
+            elif reason_code == "snapshot_reservation_rejected":
+                monkeypatch.setattr(get_transport_budget(), "limit", get_transport_budget().used)
+            frame = _OutboundFrame(
+                kind="res", classification="control", payload=None, event_name=None,
+                res_frame=ResFrame(id="snapshot", ok=True, payload={
+                    "key": "s", "snapshot_id": "snapshot", "sync_revision": "revision",
+                    "data": "payload", "segment_index": 0, "delivery": receipt,
+                }),
+            )
+        elif reason_code == "response_wire_limit":
+            frame = _OutboundFrame(
+                kind="res", classification="control", payload=None, event_name=None,
+                res_frame=ResFrame(id="response", ok=True, payload={"content": "payload"}),
+            )
+        if reason_code.endswith("wire_limit"):
+            monkeypatch.setattr(websocket_module, "MAX_PAYLOAD_BYTES", 1)
+        elif reason_code == "control_buffer_limit":
+            conn._flow_control_frames = websocket_module.CONTROL_BUFFER_FRAMES
+        elif reason_code == "transport_reservation_rejected":
+            # A closing connection is not necessarily out of memory.
+            conn._closing = True
+        reserved = conn._transport_bytes
+        with pytest.raises(ValueError) as failure:
+            conn._prepare_flow_frame(frame)
+        assert getattr(failure.value, "reason_code", None) == reason_code
+        stale = (
+            reason_code.startswith("snapshot_") and reason_code != "snapshot_reservation_rejected"
+        )
+        assert isinstance(failure.value, websocket_module.FlowDeliveryStaleError) is stale
+        assert conn._transport_bytes == reserved
+        assert frame.delivery_id is None
+        assert getattr(failure.value, "wire_bytes", 0) > 0
+        if reason_code.endswith("reservation_rejected"):
+            assert failure.value.requested_bytes > 0
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
+
+
+async def test_unclassified_flow_failure_never_uses_exception_text_or_arbitrary_reason(monkeypatch):
+    class PrivateError(ValueError):
+        reason_code = "PRIVATE_MARKER"
+
+        def __str__(self):
+            raise AssertionError("must not stringify the original error")
+
+    logger = Mock()
+    monkeypatch.setattr(websocket_module, "log", logger)
+    monkeypatch.setattr(
+        websocket_module, "encode_payload_for_protocol",
+        lambda *args, **kwargs: (_ for _ in ()).throw(PrivateError()),
+    )
+    conn = WsConnection("unclassified-flow", _FastSocket())  # type: ignore[arg-type]
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    # Isolate the original event's classification from the dirty-notice encoder.
+    dirty = Mock()
+    monkeypatch.setattr(conn, "_mark_flow_dirty", dirty)
+    try:
+        conn._enqueue_frame(_OutboundFrame(
+            kind="event", classification="reliable", payload={"session_key": "s"},
+            event_name="session.event.text_delta", res_frame=None,
+        ))
+        logged = logger.warning.call_args.kwargs
+        assert logged["reason_code"] == "flow_admission_unclassified"
+        assert logged["failure_kind"] == "flow_admission"
+        assert logged["exception_type"] == "PrivateError"
+        dirty.assert_called_once_with({"session_key": "s"})
+        assert not conn._closing
+    finally:
+        conn._cleanup_transport()
 
 
 @pytest.mark.parametrize("closing", [False, True])

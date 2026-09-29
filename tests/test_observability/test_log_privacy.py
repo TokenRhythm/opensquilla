@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -106,6 +107,76 @@ async def test_default_gateway_files_console_and_rotation_omit_content(private_l
         assert all(row["status_code"] == 401 for row in auth)
         assert all(row["exception_type"] == "HTTPStatusError" for row in auth)
         assert all(row["request_id"] == "synthetic-request" for row in auth)
+
+
+@pytest.mark.parametrize("failure", [
+    "response_wire_limit", "snapshot_delivery_missing", "flow_admission_unclassified",
+])
+async def test_flow_failure_reason_and_counters_survive_private_logging(
+    private_logging, monkeypatch, failure,
+):
+    from opensquilla.gateway import websocket
+    from opensquilla.gateway.protocol import ResFrame
+    from opensquilla.gateway.transport_flow import get_transport_budget
+
+    directory, stream = private_logging
+    before = get_transport_budget().used
+    conn = websocket.WsConnection("synthetic-flow", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    monkeypatch.setattr(conn, "_force_close", AsyncMock())
+    payload = {"content": PRIVATE, "secret": SYSTEM}
+    if failure == "response_wire_limit":
+        monkeypatch.setattr(websocket, "MAX_PAYLOAD_BYTES", 1)
+    elif failure == "snapshot_delivery_missing":
+        payload.update({
+            "key": "synthetic-session", "snapshot_id": "snapshot", "sync_revision": "revision",
+            "data": PRIVATE, "segment_index": 0,
+            "delivery": {"delivery_epoch": conn._flow.epoch, "delivery_id": 1},
+        })
+    else:
+        class PrivateError(ValueError):
+            reason_code = "arbitrary-private-word"
+
+            def __str__(self):
+                raise AssertionError("must not format the original exception")
+
+        def fail_encoding(*args, **kwargs):
+            try:
+                raise RuntimeError(SYSTEM)
+            except RuntimeError as cause:
+                raise PrivateError(PRIVATE) from cause
+
+        monkeypatch.setattr(websocket, "encode_payload_for_protocol", fail_encoding)
+    frame = websocket._OutboundFrame(
+        kind="res", classification="control", payload=None, event_name=None,
+        res_frame=ResFrame(id="synthetic-request", ok=True, payload=payload),
+    )
+    try:
+        conn._enqueue_frame(frame)
+        await asyncio.sleep(0)
+        outputs = [stream.getvalue(), *(path.read_text() for path in directory.glob("debug.log*"))]
+        for output in outputs:
+            assert all(marker not in output for marker in (
+                PRIVATE, SYSTEM, FILE_BODY, "arbitrary-private-word", "Traceback",
+            ))
+            rows = [json.loads(line.split(": ", 1)[1]) for line in output.splitlines()]
+            admission = [row for row in rows
+                         if row.get("event") == "gateway.ws_flow_encode_or_budget_failed"]
+            assert len(admission) == 1
+            row = admission[0]
+            assert row["reason_code"] == failure
+            assert row["failure_kind"] == (
+                "stale_delivery" if failure.startswith("snapshot_") else "flow_admission"
+            )
+            assert row["transport_reserved_bytes"] == 0
+            assert row["global_transport_reserved_bytes"] == before
+            assert row["queue_depth"] == 0
+            if failure != "flow_admission_unclassified":
+                assert row["wire_bytes"] > 0
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
 
 
 @pytest.mark.parametrize("marker", [PRIVATE, "短的私密内容", "oneword", "123456", "a\nb\r\nc"])

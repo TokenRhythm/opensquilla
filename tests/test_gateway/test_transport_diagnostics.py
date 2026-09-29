@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from opensquilla.gateway import websocket
+from opensquilla.gateway.protocol import ResFrame
+from opensquilla.gateway.transport_flow import get_transport_budget
 from opensquilla.gateway.websocket import WsConnection
 
 
@@ -72,6 +74,98 @@ def test_writer_diagnostics_reports_activity_ages_and_redacted_starvation(monkey
     conn._probe_wait_started_at = None
     assert conn.transport_diagnostics()["writer_starvation_reason"] == "writer_task_missing"
     conn._cleanup_transport()
+
+
+@pytest.mark.parametrize("path", ["stale", "dirty", "close"])
+@pytest.mark.parametrize("sample_fails", [False, True])
+async def test_failed_admission_diagnostics_cannot_skip_cleanup_or_original_recovery(
+    monkeypatch, path, sample_fails,
+):
+    before = get_transport_budget().used
+    conn = WsConnection("diagnostic-failure", AsyncMock())
+    conn._enable_flow()
+    conn._outbox = asyncio.Queue()
+    frame = websocket._OutboundFrame(
+        kind="event" if path == "dirty" else "res", classification="control",
+        payload={"session_key": "s"},
+        event_name="session.event.text_delta" if path == "dirty" else None,
+        res_frame=None if path == "dirty" else ResFrame(id="read", ok=True, payload={"key": "s"}),
+    )
+    original = (
+        websocket.FlowDeliveryStaleError("PRIVATE_ORIGINAL")
+        if path == "stale" else ValueError("PRIVATE_ORIGINAL")
+    )
+    prepare = conn._prepare_flow_frame
+
+    def fail_after_reservation(candidate):
+        if candidate is not frame:
+            return prepare(candidate)
+        assert conn.reserve_transport_bytes(17)
+        candidate.budget_bytes = 17
+        raise original
+
+    sample = (
+        Mock(side_effect=RuntimeError("PRIVATE_DIAGNOSTIC")) if sample_fails
+        else Mock(wraps=conn._flow_failure_diagnostics)
+    )
+    logger, dirty, close = Mock(), Mock(), AsyncMock()
+    monkeypatch.setattr(conn, "_prepare_flow_frame", fail_after_reservation)
+    monkeypatch.setattr(conn, "_flow_failure_diagnostics", sample, raising=False)
+    monkeypatch.setattr(conn, "_mark_flow_dirty", dirty)
+    monkeypatch.setattr(conn, "_force_close", close)
+    monkeypatch.setattr(websocket, "log", logger)
+    try:
+        conn._enqueue_frame(frame)
+        await asyncio.sleep(0)
+        sample.assert_called_once_with()
+        assert frame.budget_bytes == 0
+        logged = logger.warning.call_args.kwargs
+        assert logged["exception_type"] == type(original).__name__
+        assert logged["reason_code"] == "flow_admission_unclassified"
+        assert logged["diagnostics_available"] is not sample_fails
+        if not sample_fails:
+            # The log describes the failed admission, not the state after its cleanup.
+            assert logged["transport_reserved_bytes"] == 17
+            assert logged["global_transport_reserved_bytes"] == before + 17
+            assert logged["connection_transport_limit_bytes"] == websocket.CONNECTION_BUFFER_BYTES
+            assert logged["global_transport_limit_bytes"] == get_transport_budget().limit
+        if path == "close":
+            close.assert_awaited_once_with(reason="transport_resource_limit", code=1013)
+            dirty.assert_not_called()
+            assert conn._closing
+        else:
+            close.assert_not_called()
+            dirty.assert_called_once()
+            assert not conn._closing
+            if path == "stale":
+                reply = conn._outbox.get_nowait()
+                assert reply.res_frame.error.code == "SNAPSHOT_STALE"
+                assert reply.res_frame.error.retryable
+                conn._release_outbound_budget(reply)
+        assert conn._transport_bytes == 0
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
+
+
+def test_admission_failure_counters_include_acknowledged_inflight_reservations():
+    before = get_transport_budget().used
+    conn = WsConnection("diagnostic-inflight", AsyncMock())
+    conn._enable_flow()
+    try:
+        delivery_id = conn._flow.admit(123)
+        conn._flow.mark_sending(delivery_id)
+        conn._flow.acknowledge(conn._flow.epoch, delivery_id)
+        assert conn._flow.deliveries[delivery_id].acknowledged
+        sample = conn._flow_failure_diagnostics()
+        assert sample["flow_reserved_frames"] == 1
+        assert sample["flow_reserved_bytes"] == sample["transport_reserved_bytes"] == 123
+        conn._flow.mark_sent(delivery_id)
+        sample = conn._flow_failure_diagnostics()
+        assert sample["flow_reserved_frames"] == sample["flow_reserved_bytes"] == 0
+    finally:
+        conn._cleanup_transport()
+    assert get_transport_budget().used == before
 
 
 async def test_tick_samples_once_per_minute_and_reports_scheduler_delay(monkeypatch):
