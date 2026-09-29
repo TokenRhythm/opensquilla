@@ -4731,7 +4731,9 @@ const localPathPicker = useLocalPathPicker({
   },
   text: () => inputText.value,
   append: appendComposerText,
-  onError: kind => pushToast(t(kind === 'too-long' ? 'chat.localPathTextTooLong' : 'chat.localPathSelectionFailed'),
+  onError: kind => pushToast(t(kind === 'too-long'
+    ? 'chat.localPathTextTooLong'
+    : kind === 'too-many' ? 'chat.localPathTooMany' : 'chat.localPathSelectionFailed'),
     { tone: 'warn' }),
 })
 

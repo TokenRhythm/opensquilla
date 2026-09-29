@@ -3484,6 +3484,7 @@
     "referenceLocalPathsHint": "Insère uniquement des chemins locaux. La lecture dépend des autorisations et de l’environnement d’exécution ; les chemins peuvent être transmis au modèle choisi.",
     "localPathSelectionFailed": "Impossible de sélectionner les chemins locaux. Sélectionnez à nouveau des fichiers ordinaires.",
     "localPathTextTooLong": "Ces chemins dépasseraient la longueur maximale du message. Raccourcissez le message.",
+    "localPathTooMany": "Sélectionnez au maximum 10 fichiers locaux à la fois.",
     "attachFilesTitle": "Joindre des fichiers : tout type de fichier (images, PDF, Office et texte sont lus directement ; les autres vont dans l'espace de travail de l'agent)",
     "dropOverlayTitle": "Déposez pour joindre",
     "dropOverlayHint": "Les fichiers seront ajoutés au compositeur",

@@ -3569,6 +3569,7 @@
     "referenceLocalPathsHint": "Only inserts local paths. Reading depends on tool permissions and the execution environment; paths may be sent to your selected model.",
     "localPathSelectionFailed": "Could not select local paths. Select regular files again.",
     "localPathTextTooLong": "These paths would exceed the message length limit. Shorten the message and try again.",
+    "localPathTooMany": "Select at most 10 local files at a time.",
     "attachFilesTitle": "Attach files: any file type (images, PDF, Office, and text are read directly; other files go to the agent workspace)",
     "dropOverlayTitle": "Drop to attach",
     "dropOverlayHint": "Files will be added to the composer",
