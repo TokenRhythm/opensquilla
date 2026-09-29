@@ -29,10 +29,10 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
@@ -2236,59 +2236,83 @@ def _windows_target_env_from_helper(helper_env: Mapping[str, str]) -> dict[str, 
     return target_env
 
 
+async def _finish_launch_cleanup_step[Result](
+    operation: Callable[[], Awaitable[Result]],
+    cancellations: list[asyncio.CancelledError],
+) -> Result:
+    """Keep cleanup in the launch task, retaining cancellation until it finishes."""
+
+    while True:
+        try:
+            return await operation()
+        except asyncio.CancelledError as exc:
+            if not cancellations:
+                cancellations.append(exc)
+
+
 async def _cleanup_failed_posix_launch(
     *,
     gate: _PosixLaunchGate,
-    registration: asyncio.Task[_PersistedOwnerRef] | None,
+    registration: asyncio.Future[_PersistedOwnerRef] | None,
     process: Any | None,
     anchor: _PosixGroupAnchor,
-) -> None:
+) -> asyncio.CancelledError | None:
+    cancellations: list[asyncio.CancelledError] = []
     persisted_owner = None
     if registration is not None:
         with contextlib.suppress(BaseException):
-            persisted_owner = await registration
+            persisted_owner = await _finish_launch_cleanup_step(
+                partial(asyncio.shield, registration), cancellations,
+            )
     with contextlib.suppress(BaseException):
         gate.close()
     if process is not None:
         with contextlib.suppress(BaseException):
-            await _stop_failed_async_process(process)
+            await _finish_launch_cleanup_step(
+                partial(_stop_failed_async_process, process), cancellations,
+            )
     with contextlib.suppress(BaseException):
-        await _stop_unarmed_posix_anchor(anchor)
+        await _finish_launch_cleanup_step(
+            partial(_stop_unarmed_posix_anchor, anchor), cancellations,
+        )
     if persisted_owner is not None:
         with contextlib.suppress(BaseException):
-            await asyncio.to_thread(_delete_owner_record, persisted_owner)
+            deletion = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(contextvars.copy_context().run, _delete_owner_record, persisted_owner),
+            )
+            await _finish_launch_cleanup_step(partial(asyncio.shield, deletion), cancellations)
+    return cancellations[0] if cancellations else None
 
 
 async def _cleanup_failed_windows_launch(
     *,
-    registration: asyncio.Task[_PersistedOwnerRef] | None,
+    registration: asyncio.Future[_PersistedOwnerRef] | None,
     process: Any | None,
     job: _WindowsJob,
-) -> None:
+) -> asyncio.CancelledError | None:
+    cancellations: list[asyncio.CancelledError] = []
     persisted_owner = None
     if registration is not None:
         with contextlib.suppress(BaseException):
-            persisted_owner = await registration
+            persisted_owner = await _finish_launch_cleanup_step(
+                partial(asyncio.shield, registration), cancellations,
+            )
     if process is not None:
         with contextlib.suppress(BaseException):
-            await _stop_failed_async_process(process)
+            await _finish_launch_cleanup_step(
+                partial(_stop_failed_async_process, process), cancellations,
+            )
     with contextlib.suppress(BaseException):
         job.close()
     if persisted_owner is not None:
         with contextlib.suppress(BaseException):
-            await asyncio.to_thread(_delete_owner_record, persisted_owner)
-
-
-async def _await_cleanup_before_cancellation(cleanup: asyncio.Task[None]) -> None:
-    """Finish an isolated cleanup task despite repeated caller cancellation."""
-
-    while not cleanup.done():
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            continue
-    with contextlib.suppress(BaseException):
-        cleanup.result()
+            deletion = asyncio.get_running_loop().run_in_executor(
+                None,
+                partial(contextvars.copy_context().run, _delete_owner_record, persisted_owner),
+            )
+            await _finish_launch_cleanup_step(partial(asyncio.shield, deletion), cancellations)
+    return cancellations[0] if cancellations else None
 
 
 async def _create_owned_posix_subprocess(
@@ -2305,14 +2329,15 @@ async def _create_owned_posix_subprocess(
     )
     anchor = await _create_posix_anchor(owner_id, control_path=control_path)
     persisted_owner: _PersistedOwnerRef | None = None
-    registration: asyncio.Task[_PersistedOwnerRef] | None = None
+    registration: asyncio.Future[_PersistedOwnerRef] | None = None
     gate = _PosixLaunchGate.create()
     status_read_fd, status_write_fd = os.pipe()
     process: Any | None = None
     try:
         if task_scope is not None:
-            registration = asyncio.create_task(
-                asyncio.to_thread(
+            registration = asyncio.get_running_loop().run_in_executor(
+                None, partial(
+                    contextvars.copy_context().run,
                     _insert_owner_record,
                     task_scope,
                     owner_id=owner_id,
@@ -2320,8 +2345,8 @@ async def _create_owned_posix_subprocess(
                     controller_pid=int(anchor.process.pid),
                 )
             )
-            # Cancellation cannot stop the writer. Cleanup must observe its
-            # final result before retiring the controller and exact owner row.
+            # An executor Future survives asyncio.run cancelling all Tasks.
+            # Cleanup must observe the writer before retiring its exact row.
             persisted_owner = await asyncio.shield(registration)
         child_kwargs = dict(kwargs)
         child_kwargs.pop("start_new_session", None)
@@ -2366,22 +2391,16 @@ async def _create_owned_posix_subprocess(
             raise _PosixTargetExecError(error_number, argv[0])
         return process
     except BaseException as exc:
-        cleanup = asyncio.create_task(
-            _cleanup_failed_posix_launch(
-                gate=gate,
-                registration=registration,
-                process=process,
-                anchor=anchor,
-            )
+        cancellation = await _cleanup_failed_posix_launch(
+            gate=gate,
+            registration=registration,
+            process=process,
+            anchor=anchor,
         )
         if isinstance(exc, asyncio.CancelledError):
-            await _await_cleanup_before_cancellation(cleanup)
             raise
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            await _await_cleanup_before_cancellation(cleanup)
-            raise
+        if cancellation is not None:
+            raise cancellation
         if isinstance(exc, _PosixTargetExecError):
             raise OSError(
                 exc.error_number,
@@ -2443,8 +2462,9 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
                 gate,
             )
             if task_scope is not None:
-                registration = asyncio.create_task(
-                    asyncio.to_thread(
+                registration = asyncio.get_running_loop().run_in_executor(
+                    None, partial(
+                        contextvars.copy_context().run,
                         _insert_owner_record,
                         task_scope,
                         owner_id=owner_id,
@@ -2464,21 +2484,15 @@ async def create_owned_subprocess_exec(*argv: str, **kwargs: Any) -> Any:
             owner.start_completion_monitor()
             return windows_process
         except BaseException as exc:
-            cleanup = asyncio.create_task(
-                _cleanup_failed_windows_launch(
-                    registration=registration,
-                    process=windows_process,
-                    job=job,
-                )
+            cancellation = await _cleanup_failed_windows_launch(
+                registration=registration,
+                process=windows_process,
+                job=job,
             )
             if isinstance(exc, asyncio.CancelledError):
-                await _await_cleanup_before_cancellation(cleanup)
                 raise
-            try:
-                await asyncio.shield(cleanup)
-            except asyncio.CancelledError:
-                await _await_cleanup_before_cancellation(cleanup)
-                raise
+            if cancellation is not None:
+                raise cancellation
             raise ProcessTreeOwnershipError(
                 "Windows controlled process launch failed closed"
             ) from exc

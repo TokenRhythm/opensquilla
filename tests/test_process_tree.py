@@ -1778,6 +1778,7 @@ async def test_slow_owner_registration_keeps_event_loop_responsive(
     heartbeat = threading.Event()
 
     def persist(*_args, **_kwargs):
+        assert process_tree._current_task_process_scope() is not None
         loop.call_soon_threadsafe(started.set)
         heartbeat.wait(1)
         case.events.append("registration-finished")
@@ -1940,6 +1941,168 @@ async def test_failed_launch_cleanup_survives_later_cancellation(
             await launch
     assert case.events.count("row-deleted") == 1
     assert case.events[-1] == "gate-closed"
+
+
+@pytest.mark.parametrize("cleanup_started", [False, True])
+def test_runner_shutdown_reclaims_late_owner_registration(
+    controlled_async_launch, monkeypatch, cleanup_started,
+):
+    case = controlled_async_launch
+    finish_registration = threading.Event()
+    timer = None
+
+    async def main():
+        nonlocal timer
+        loop = asyncio.get_running_loop()
+        started = asyncio.Event()
+        cleaning = asyncio.Event()
+        cleanup_name = f"_cleanup_failed_{case.platform}_launch"
+        original_cleanup = getattr(process_tree, cleanup_name)
+
+        def persist(*_args, **_kwargs):
+            loop.call_soon_threadsafe(started.set)
+            assert finish_registration.wait(5)
+            case.events.append("committed")
+            return case.reference
+
+        async def cleanup(**kwargs):
+            cleaning.set()
+            return await original_cleanup(**kwargs)
+
+        monkeypatch.setattr(process_tree, "_insert_owner_record", persist)
+        monkeypatch.setattr(process_tree, cleanup_name, cleanup)
+        launch = asyncio.create_task(case.launch())
+        await asyncio.wait_for(started.wait(), timeout=3)
+        if cleanup_started:
+            launch.cancel("cancel before runner teardown")
+            await asyncio.wait_for(cleaning.wait(), timeout=3)
+        timer = threading.Timer(0.1, finish_registration.set)
+        timer.start()
+        # Return with a live launch. asyncio.run cancels its actual all_tasks
+        # snapshot and joins the executor; a late commit must still be removed.
+
+    try:
+        asyncio.run(main())
+    finally:
+        finish_registration.set()
+        if timer is not None:
+            timer.join()
+    assert "released" not in case.events
+    assert case.events.count("row-deleted") == 1
+    assert case.events.index("committed") < case.events.index("row-deleted")
+    assert case.events[-1] == "gate-closed"
+    stopped = "job-closed" if case.platform == "windows" else "anchor-stopped"
+    assert case.events.index(stopped) < case.events.index("row-deleted")
+
+
+def test_all_tasks_cancel_at_cleanup_dispatch_keeps_cleanup_owned(
+    controlled_async_launch, monkeypatch,
+):
+    case = controlled_async_launch
+    cleanup_name = f"_cleanup_failed_{case.platform}_launch"
+    original_cleanup = getattr(process_tree, cleanup_name)
+
+    def fail_release():
+        raise OSError("synthetic launch gate failure")
+
+    async def main():
+        loop = asyncio.get_running_loop()
+
+        def cancel_all():
+            for task in asyncio.all_tasks():
+                task.cancel("global cancellation at cleanup dispatch")
+
+        def cleanup(**kwargs):
+            # This callback runs before a newly created cleanup Task's first
+            # step. Inline cleanup instead retains the launch task as owner.
+            loop.call_soon(cancel_all)
+            return original_cleanup(**kwargs)
+
+        monkeypatch.setattr(process_tree, cleanup_name, cleanup)
+        monkeypatch.setattr(case.gate, "release", fail_release)
+        with pytest.raises(asyncio.CancelledError):
+            await case.launch()
+
+    asyncio.run(main())
+    assert "released" not in case.events
+    assert "process-stopped" in case.events
+    assert case.events.count("row-deleted") == 1
+    assert case.events[-1] == "gate-closed"
+    stopped = "job-closed" if case.platform == "windows" else "anchor-stopped"
+    assert case.events.index(stopped) < case.events.index("row-deleted")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("platform", ["windows", "posix"])
+async def test_launch_cleanup_retries_interrupted_controller_stop(tmp_path, monkeypatch, platform):
+    events = []
+    waiting = asyncio.Event()
+    finish_stop = asyncio.Event()
+    reference = _synthetic_owner_reference(tmp_path / "registry.sqlite3", platform=platform)
+    registration = asyncio.get_running_loop().create_future()
+    registration.set_result(reference)
+
+    class Stdin:
+        closed = False
+
+        def is_closing(self):
+            return self.closed
+
+        def close(self):
+            events.append("stdin-closed")
+            self.closed = True
+
+    class Process:
+        returncode = None
+        stdin = Stdin()
+
+        def terminate(self):
+            events.append("terminate")
+
+    async def wait_direct(process, _timeout):
+        waiting.set()
+        await finish_stop.wait()
+        process.returncode = 0
+        events.append("stop-joined")
+        return True
+
+    def delete(ref):
+        assert ref is reference
+        assert "stop-joined" in events
+        events.append("row-deleted")
+
+    monkeypatch.setattr(process_tree, "_wait_direct_process", wait_direct)
+    monkeypatch.setattr(process_tree, "_delete_owner_record", delete)
+    if platform == "windows":
+        cleanup = process_tree._cleanup_failed_windows_launch(
+            registration=registration, process=Process(),
+            job=SimpleNamespace(close=lambda: events.append("job-closed")),
+        )
+    else:
+        cleanup = process_tree._cleanup_failed_posix_launch(
+            registration=registration, process=None,
+            anchor=SimpleNamespace(process=Process()),
+            gate=SimpleNamespace(close=lambda: events.append("gate-closed")),
+        )
+    cleaning = asyncio.create_task(cleanup)
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=3)
+        cleaning.cancel("first stop cancellation")
+        await asyncio.sleep(0)
+        cleaning.cancel("second stop cancellation")
+        await asyncio.sleep(0)
+        assert not cleaning.done()
+        finish_stop.set()
+        cancellation = await cleaning
+    finally:
+        finish_stop.set()
+        await cleaning
+    assert isinstance(cancellation, asyncio.CancelledError)
+    assert cancellation.args == ("first stop cancellation",)
+    assert events.count("stop-joined") == 1
+    assert events.count("row-deleted") == 1
+    if platform == "posix":
+        assert events.count("stdin-closed") == 1
 
 
 @pytest.mark.asyncio
