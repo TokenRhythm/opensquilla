@@ -202,6 +202,46 @@ describe('projectAssistantActivity', () => {
     ])
   })
 
+  it('keeps answer text containing process-like phrases when marked as answer', () => {
+    const answer = 'Now let me examine the flow and explain the result.'
+    const projection = projectAssistantActivity(
+      message({
+        text: `Inspecting the repository.\n\n${answer}`,
+        terminalFailure: true,
+        timelineItems: [
+          {
+            type: 'text',
+            key: 'narration',
+            html: 'Inspecting the repository.',
+            rawText: 'Inspecting the repository.',
+            presentation: 'intermediate',
+          },
+          toolGroup([
+            call('failed', {
+              status: 'error',
+              isError: true,
+              result: 'network error',
+              resultPreview: 'network error',
+            }),
+          ], 'failed-tool-with-natural-language-answer'),
+          {
+            type: 'text',
+            key: 'answer',
+            html: answer,
+            rawText: answer,
+            presentation: 'answer',
+          },
+        ],
+      }),
+      text => `<p>${text}</p>`,
+      [],
+      { lifecycle: 'failed' },
+    )
+
+    expect(projection.answerSource).toBe('explicit-presentation')
+    expect(projection.answerPart?.rawText).toBe(answer)
+  })
+
   it('keeps explicit intermediate-only failure out of the answer body', () => {
     const projection = projectAssistantActivity(
       message({
