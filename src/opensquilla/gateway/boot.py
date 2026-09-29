@@ -1390,11 +1390,28 @@ def build_session_material_cleanup(config: Any) -> Any:
             workspace = None
 
         async def _cleanup() -> None:
-            await _remove_material(session_id, media_root, workspace, segment)
+            operation = asyncio.create_task(asyncio.to_thread(
+                _remove_material, session_id, media_root, workspace, segment,
+            ))
+            try:
+                await asyncio.shield(operation)
+            except asyncio.CancelledError:
+                # Cancelling the await cannot stop filesystem deletion. Keep
+                # ownership until the worker finishes, even after another cancel.
+                while not operation.done():
+                    try:
+                        await asyncio.shield(operation)
+                    except asyncio.CancelledError:
+                        continue
+                    except Exception:
+                        break
+                if not operation.cancelled():
+                    operation.exception()
+                raise
 
         return _cleanup
 
-    async def _remove_material(
+    def _remove_material(
         session_id: str, media_root: Path, workspace: Path | None, segment: str,
     ) -> None:
         # 1. Canonical transcript-material store (keyed by session_id, outside
