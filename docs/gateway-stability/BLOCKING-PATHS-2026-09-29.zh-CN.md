@@ -78,3 +78,17 @@ fetch worker 最多 4 个实际工作线程，独立于 Gateway 默认 executor�
 验证：合并后 Python 相关回归 837 passed、17 skipped、5 failed；五个失败均在主分支已有测试创建符号链接时出现 WinError 1314，独立进程复查相同，未改系统权限或把失败改成 skip。独立复查的前置失败还遗留了 SQLite 测试线程，记录结果后精确结束该测试进程，不算自然退出通过。WebUI 定向 249 项、Desktop lifecycle 与 single-instance 脚本通过；本 session Python 文件 Ruff 与 diff check 通过。小修后的 109 项是定向复验，不能与前述数量相加作为去重总数。证据在 `.cache/review-main-pytest-20260930.log`、`.cache/review-symlink-check-20260930.log`、`.cache/review-fetch-prep-{negative,final}.txt`。
 
 未重新构建安装包；前文 frozen 结果属于前一轮源码。还保留三个明确边界：共享累计 ACK 窗口的阻塞未完全消除；原有 managed/显式代理或部分 IP literal 路径仍会在事件循环构造默认 HTTPX TLS transport；会话 reset 的同步归档与大事务另见 [数据库复核第 11 节](DATABASE-DIAGNOSIS.zh-CN.md#11-主分支复核大历史删除的触发条件与解法)。这些不是本轮发现的新增回归，也没有被声明已全部修复。
+
+## 多会话现场复核（2026-09-30）
+
+用户明确：触发方式是同时启动几个会话对话；Mac 明显比 Windows 稳定，两边均为 0.5.5。不能继续把人工构造的大删除竞争当作该现场的首因。普通 UI 新会话使用新 key 和 `new_chat`，只有明确 reset 意图才进入重置；cron 清理另有独立条件。长对话压缩可能重写历史，但 preflight/rebound 日志不等于执行了压缩删除。
+
+再次只读核查：22:26–22:30 原 bundle 的 46 条日志中有 exec_command，无 delete/reset/prune/archive 的 event/method/operation；22:48–22:54 留存 incident 的 179 条日志中有五次发送、搜索和抓取，同样未发现这些删除事件。后者是筛选快照，日志缺席不能证明操作绝未发生，但没有证据据此归因。22:52 两连接迟滞 140532/136172ms、未确认帧 0/2、web_fetch 总耗时 161719ms，仍将共享事件循环阻塞/调度失时排在删除或 ACK 满窗之前。附近普通读和 usage 写入持锁变慢，不足以解释分钟级 loop lag。
+
+再次只读解析现场旧 EXE 的 PYZ，SHA-256 仍为 `2a009891c2fcad0c92b99cbf2ebd5e279e72975e8ef8e0909c84f7b181a44c3c`：`_prepare_private_directory` 调用 Windows DACL 设置没有 skip 参数，其实现也没有重用已有私有目录权限的分支；async owner 登记仍同步执行。Windows 设置 DACL 可能向已有子对象传播可继承 ACE，见 [Microsoft API 说明](https://learn.microsoft.com/en-us/windows/win32/api/aclapi/nf-aclapi-setsecurityinfo)。这在普通工具子进程登记时也可发生，不局限于 Gateway 启动；Mac 的本目录 chmod 不走同一传播路径。当前代码已有 `skip_if_private_directory=True`，本 session 另补 executor 隔离。审计保存在 `.cache/windows-v055-code-audit.json`。
+
+这是确定的旧版 Windows 特有风险，但不是两平台稳定性差异的完整实证。22:52 主要相关工具是 web_fetch，不能据上述证据指定那次停顿由 ACL 导致。Windows Job/helper、ConPTY/stdin 与 Mac POSIX 路径不同，需要对齐实际工具模式；Defender、磁盘、DNS、系统暂停没有匹配现场证据，不能作为既定原因。HTTPX 正常 verify 路径显式使用 CA 文件，不能误称每次 web_fetch 都枚举 Windows 系统证书库；无 CA 覆盖的 frozen 启动 hook 才可能进入系统证书加载。
+
+下一优先验收改为同机旧/新 frozen 包、隔离相同 profile 下的 1/4/8 会话，分别跑纯对话、命令、网页抓取，再混合。保留相同输入和 Provider stub；不人工制造删除，不把注入慢 DNS/磁盘的机制测试冒充自然故障。同步核对 loop lag、nonce pong、目录/Stop 响应、当前存储 holder、工具具体阶段、进程身份和退出。若自然重现停顿，再在隔离进程捕获停顿栈，区分同步调用、CPU/GIL 与系统调度。Mac 对照还需同源构建及对应平台证据；目前没有 Mac 现场包，不能给平台故障率或唯一根因。
+
+已有 DNS/解析、进程登记、PTY/stdin 的隔离修改直接服务普通多会话稳定性，保留并首先做这组验收。大删除回收协议、reset 长事务及 ACK 专项保留为独立问题，不阻塞当前现场闭环，也不替代它。
