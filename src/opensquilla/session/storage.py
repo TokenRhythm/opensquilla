@@ -5462,9 +5462,15 @@ class SessionStorage:
                 material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
 
+        cancellation: asyncio.CancelledError | None = None
         for session, cleanup in zip(deleted, material_cleanups, strict=True):
             try:
                 await self._cleanup_deleted_session(session, cleanup)
+            except asyncio.CancelledError as exc:
+                # Shutdown can cancel this child directly, bypassing the public
+                # shield. Its current worker has drained; finish the committed
+                # batch before propagating cancellation.
+                cancellation = cancellation or exc
             except Exception:  # noqa: BLE001 - the database commit is authoritative.
                 log.warning(
                     "project_workspace.session_cleanup_failed "
@@ -5473,6 +5479,8 @@ class SessionStorage:
                     session.session_key,
                     exc_info=True,
                 )
+        if cancellation is not None:
+            raise cancellation
         return [session.session_key for session in deleted]
 
     async def delete_project_workspace_sessions(
@@ -6007,8 +6015,17 @@ class SessionStorage:
                 material_cleanups.append(await self._prepare_deleted_session_cleanup(conn, session))
                 await self._delete_session_rows(conn, session)
                 deleted.append(session)
+        cancellation: asyncio.CancelledError | None = None
         for session, cleanup in zip(deleted, material_cleanups, strict=True):
-            await self._cleanup_deleted_session(session, cleanup)
+            try:
+                await self._cleanup_deleted_session(session, cleanup)
+            except asyncio.CancelledError as exc:
+                # The material hook drains its current worker before raising.
+                # Every row in this batch is already deleted; finish the other
+                # cleanup attempts before propagating the first cancellation.
+                cancellation = cancellation or exc
+        if cancellation is not None:
+            raise cancellation
         return deleted
 
     async def prune_stale_sessions(self, before_ms: int) -> int:

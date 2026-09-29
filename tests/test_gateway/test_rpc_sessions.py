@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -7389,6 +7390,114 @@ class TestSessionsDelete:
             "runtime:exit",
             "background:exit",
         ]
+
+    @pytest.mark.asyncio
+    async def test_delete_keeps_admission_fenced_until_material_worker_finishes(
+        self, dispatcher, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from opensquilla.artifacts import ArtifactStore
+        from opensquilla.attachment_refs import write_transcript_material
+        from opensquilla.gateway.agent_tasks import AgentTaskRegistry
+        from opensquilla.gateway.boot import build_session_material_cleanup
+        from opensquilla.gateway.task_runtime import TaskRuntime
+        from opensquilla.session import material_cleanup
+        from opensquilla.session.manager import SessionManager
+
+        config = _ctx_config_with_media_root(tmp_path / "media")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        config.workspace_dir = str(workspace)
+        node = SessionNode(session_key="agent:main:webchat:fenced-cleanup", session_id="old")
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        worker_finished = threading.Event()
+        release_worker = threading.Event()
+        second_delete_started = asyncio.Event()
+        admission_started = asyncio.Event()
+        admitted = asyncio.Event()
+        original_delete_artifacts = ArtifactStore.delete_session_artifacts
+
+        def slow_delete_artifacts(store, session_id):
+            loop.call_soon_threadsafe(worker_started.set)
+            try:
+                if not release_worker.wait(timeout=10):
+                    raise TimeoutError("test did not release material worker")
+                return original_delete_artifacts(store, session_id)
+            finally:
+                worker_finished.set()
+
+        async def unexpected_turn(_run):
+            pytest.fail("this test only exercises the admission boundary")
+
+        registry = AgentTaskRegistry()
+        monkeypatch.setattr(rpc_sessions, "get_agent_task_registry", lambda: registry)
+        monkeypatch.setattr(ArtifactStore, "delete_session_artifacts", slow_delete_artifacts)
+        monkeypatch.setattr(material_cleanup, "_hook", build_session_material_cleanup(config))
+        async with SessionStorage(tmp_path / "sessions.db") as storage:
+            await storage.upsert_session(node)
+            write_transcript_material(
+                media_root=Path(config.attachments.media_root), session_id=node.session_id,
+                payload=b"deleted session material",
+            )
+            runtime = TaskRuntime(
+                storage=storage, turn_handler=unexpected_turn, running_heartbeat_interval_s=None,
+            )
+            original_quiesce = runtime.quiesce_sessions
+            delete_count = 0
+
+            @asynccontextmanager
+            async def observed_quiesce(keys):
+                nonlocal delete_count
+                delete_count += 1
+                if delete_count == 2:
+                    second_delete_started.set()
+                async with original_quiesce(keys):
+                    yield
+
+            monkeypatch.setattr(runtime, "quiesce_sessions", observed_quiesce)
+            ctx = make_ctx(
+                session_manager=SessionManager(storage, inject_time_prefix=False),
+                config=config, task_runtime=runtime,
+                turn_runner=SimpleNamespace(get_session_lock=runtime._get_session_lock_for_turn),
+            )
+
+            async def enter_admission():
+                admission_started.set()
+                async with runtime.collect_admission(node.session_key):
+                    assert worker_finished.is_set()
+                    admitted.set()
+
+            deleting = asyncio.create_task(dispatcher.dispatch(
+                "first-delete", "sessions.delete", {"key": node.session_key}, ctx,
+            ))
+            pending = [deleting]
+            try:
+                await asyncio.wait_for(worker_started.wait(), timeout=5)
+                assert not worker_finished.is_set()
+                assert await storage.get_session(node.session_key) is None
+                admission = asyncio.create_task(enter_admission())
+                second_delete = asyncio.create_task(dispatcher.dispatch(
+                    "second-delete", "sessions.delete", {"key": node.session_key}, ctx,
+                ))
+                pending.extend((admission, second_delete))
+                await asyncio.wait_for(admission_started.wait(), timeout=2)
+                await asyncio.wait_for(second_delete_started.wait(), timeout=2)
+                for _ in range(2):
+                    deleting.cancel()
+                    await asyncio.sleep(0)
+                    assert not deleting.done()
+                    assert not second_delete.done()
+                    assert not admitted.is_set()
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await deleting
+                await asyncio.wait_for(admission, timeout=2)
+                assert (await asyncio.wait_for(second_delete, timeout=2)).ok
+                assert admitted.is_set()
+                assert worker_finished.is_set()
+            finally:
+                release_worker.set()
+                await asyncio.gather(*pending, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_delete_finishes_after_rpc_cancellation(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import os
@@ -1390,9 +1391,12 @@ def build_session_material_cleanup(config: Any) -> Any:
             workspace = None
 
         async def _cleanup() -> None:
-            operation = asyncio.create_task(asyncio.to_thread(
-                _remove_material, session_id, media_root, workspace, segment,
-            ))
+            # A Future survives shutdown's cancellation of all asyncio Tasks.
+            context = contextvars.copy_context()
+            operation = asyncio.get_running_loop().run_in_executor(
+                None, partial(context.run, _remove_material,
+                              session_id, media_root, workspace, segment),
+            )
             try:
                 await asyncio.shield(operation)
             except asyncio.CancelledError:
