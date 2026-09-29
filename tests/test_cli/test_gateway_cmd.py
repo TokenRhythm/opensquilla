@@ -478,7 +478,9 @@ async def test_gateway_early_failure_timeout_closes_owned_upload_without_retry(
                 started_at=gateway_cmd.time.monotonic(),
                 failure=OSError("synthetic-private-path"),
             ),
-            timeout=10,
+            # Cold SQLite schema creation can be delayed by Windows shard
+            # load; keep the guard bounded without making the assertion flaky.
+            timeout=30 if sys.platform == "win32" else 10,
         )
 
     assert len(requests) == 1
