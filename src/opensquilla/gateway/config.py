@@ -224,7 +224,7 @@ class AttachmentsConfig(BaseSettings):
     # into a provider prompt — they are staged into the agent workspace for
     # tool access only. False restores the rendered-types-only admission gate.
     accept_opaque: bool = True
-    opaque_max_bytes: int = 30 * 1024 * 1024
+    opaque_max_bytes: int = 50 * 1024 * 1024
     # Aggregate byte ceiling for the temporary staged-upload store. When
     # reached, new uploads are rejected (HTTP 507 UPLOAD_STORE_FULL) instead
     # of evicting staged entries, preserving the file_uuid TTL promise.

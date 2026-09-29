@@ -158,3 +158,47 @@ test('import rejects a receipt with mismatched actual integrity', async () => fi
   const selected = await broker.select(12, context, path)
   await assert.rejects(broker.import(12, context, selected.token), /integrity mismatch/)
 }, { fetch: async () => Response.json({ file_uuid: 'bad-file', sha256: '0'.repeat(64) }) }))
+
+for (const [label, bytes, mime] of [
+  ['PNG', Buffer.from('89504e470d0a1a0a', 'hex'), 'image/png'],
+  ['JPEG', Buffer.from('ffd8ffe0', 'hex'), 'image/jpeg'],
+  ['GIF', Buffer.from('GIF89a'), 'image/gif'],
+  ['WebP', Buffer.from('RIFF0000WEBP'), 'image/webp'],
+]) {
+  test(`JPG extension with ${label} bytes keeps selection, preview and signed MIME consistent`, async () => fixture(async ({ broker, root, requests }) => {
+    // Header fixtures isolate MIME selection; Python endpoint tests separately
+    // require complete decodable pixels and reject these truncated bodies.
+    const path = join(root, 'renamed.jpg')
+    await writeFile(path, bytes)
+    const selected = await broker.select(12, context, path)
+    assert.equal(selected.mime, mime)
+    assert.ok(selected.previewDataUrl.startsWith(`data:${mime};base64,`))
+    const receipt = await broker.import(12, context, selected.token)
+    assert.equal(receipt.mime, mime)
+    const packet = JSON.parse(Buffer.from(JSON.parse(requests[0].init.body).selection, 'base64url').toString())
+    assert.equal(packet.mime, mime)
+  }))
+}
+
+test('invalid image headers are not silently reclassified as an ordinary file', async () => fixture(async ({ broker, root }) => {
+  const path = join(root, 'invalid.jpg')
+  await writeFile(path, 'not a photograph')
+  assert.equal((await broker.select(12, context, path)).mime, 'image/jpeg')
+}))
+
+test('native errors preserve a safe diagnostic code without byte fallback', async () => fixture(async ({ broker, path, requests }) => {
+  const selected = await broker.select(12, context, path)
+  await assert.rejects(broker.import(12, context, selected.token), /NATIVE_FILE_CHANGED/)
+  assert.equal(requests.length, 1)
+}, { fetch: async () => Response.json({ code: 'NATIVE_FILE_CHANGED' }, { status: 409 }) }))
+
+test('ordinary native files accept 48/50 MiB but reject another byte', async () => fixture(async ({ broker, path }) => {
+  for (const mib of [48, 50]) {
+    await writeFile(path, Buffer.alloc(mib * 1024 * 1024, 0x61))
+    const selected = await broker.select(12, context, path)
+    assert.equal(selected.size, mib * 1024 * 1024)
+    assert.equal((await broker.import(12, context, selected.token)).size, selected.size)
+  }
+  await writeFile(path, Buffer.alloc(50 * 1024 * 1024 + 1))
+  await assert.rejects(broker.select(12, context, path), /size limit/)
+}))

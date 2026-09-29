@@ -29,6 +29,8 @@ const i18n = createI18n({
           browserUse: 'Browser Use',
           browserUseDescription: 'Use the browser to complete a task',
         },
+        referenceLocalPaths: 'Reference local path (no upload)',
+        referenceLocalPathsHint: 'Only inserts paths; permissions still apply.',
         planMode: {
           label: 'Plan mode',
           readOnly: 'Research and discuss before implementation. Tests and builds follow normal permissions.',
@@ -85,6 +87,27 @@ afterEach(() => {
 })
 
 describe('ChatComposerAddMenu', () => {
+  it('offers an independent, accessible local path action only when available', async () => {
+    const referenceLocalPaths = vi.fn()
+    const { host, attachFiles, close } = mountMenu({ localPathsAvailable: true,
+      onReferenceLocalPaths: referenceLocalPaths })
+    await nextTick()
+    const button = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+      .find(item => item.textContent?.includes('Reference local path'))!
+    expect(button.title).toBe('Only inserts paths; permissions still apply.')
+    button.click()
+    expect(referenceLocalPaths).toHaveBeenCalledOnce()
+    expect(attachFiles).not.toHaveBeenCalled()
+    expect(close).toHaveBeenCalledOnce()
+  })
+
+  it('disables the local action while preserving the original attachment action', async () => {
+    const { host } = mountMenu({ localPathsAvailable: true, localPathsDisabled: true })
+    await nextTick()
+    const items = [...host.querySelectorAll<HTMLButtonElement>('[role="menuitem"]')]
+    expect(items[0].disabled).toBe(false)
+    expect(items[1].disabled).toBe(true)
+  })
   it('escapes the Composer stacking context and supports collision-aware placement', () => {
     expect(chatViewStyles).toContain('.chat-composer-dock > .chat-composer')
     expect(chatViewStyles).toContain('z-index: auto')

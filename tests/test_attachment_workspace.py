@@ -11,6 +11,7 @@ from opensquilla.attachment_workspace import (
     AttachmentWorkspaceMaterializer,
     is_materializable_attachment_mime,
 )
+from opensquilla.paths import native_io_path
 from tests.helpers.image_bytes import image_bytes
 
 _MATERIALIZABLE_MIMES = frozenset({"application/pdf", "text/plain"})
@@ -192,7 +193,8 @@ def test_long_extension_and_session_keep_materialized_path_bounded(
     assert len(result.name) <= 180
     assert len(parts[2]) <= 180
     assert len(parts[3]) <= 12 + 1 + 180
-    assert (workspace / result.rel_path).read_bytes() == payload
+    # The materializer already uses the native long-path form on Windows.
+    assert native_io_path(workspace / result.rel_path).read_bytes() == payload
 
 
 def test_existing_materialized_file_is_reused_when_hash_matches(tmp_path: Path) -> None:

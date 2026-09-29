@@ -20,11 +20,18 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from opensquilla.application.artifact_workbench import (
+    AttachmentClaimError,
+    AttachmentOpaqueOversizeError,
+)
 from opensquilla.gateway.config import GatewayConfig
 from opensquilla.gateway.origin_guard import request_origin_allowed
 from opensquilla.gateway.uploads import (
+    UploadOversizeError,
     UploadStore,
     UploadStoreError,
+    UploadStoreFullError,
+    UploadUnsupportedMimeError,
     _authorization_token_matches,
 )
 from opensquilla.sandbox.types import SandboxBackendError
@@ -33,6 +40,14 @@ from opensquilla.workspace_files import probe_file_access, session_workspace_bin
 
 _SIGNING_CONTEXT = b"opensquilla-native-attachment-v1\n"
 _WINDOWS = os.name == "nt"
+
+
+class _NativeSelectionError(ValueError):
+    """A fixed, user-safe diagnostic; never wrap raw paths or capability data."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 def _selected_identity(info: os.stat_result) -> tuple[str, ...]:
@@ -45,37 +60,63 @@ def _selected_identity(info: os.stat_result) -> tuple[str, ...]:
     )
 
 
+def _desktop_identity(info: os.stat_result) -> tuple[str, ...]:
+    identity = _selected_identity(info)
+    # libuv exposes the volume serial's LowPart, while Python >=3.12 exposes
+    # all 64 bits. Normalize only this cross-runtime comparison. Python's own
+    # before/open/after checks must retain the full device and file identity.
+    return (str(info.st_dev & 0xFFFFFFFF), *identity[1:]) if _WINDOWS else identity
+
+
 def _selected_bytes(selection: dict[str, Any], limit: int) -> bytes:
     path = Path(selection["path"])
     if not path.is_absolute() or path.resolve(strict=True) != path:
-        raise ValueError("selected file path changed")
+        raise _NativeSelectionError(
+            "NATIVE_FILE_CHANGED", "Selected file path changed; select the file again."
+        )
     before = path.lstat()
+    identity = _selected_identity(before)
 
     timestamp = "birthtimeNs" if _WINDOWS else "ctimeNs"
     expected = tuple(str(selection[name]) for name in ("dev", "ino", "mtimeNs", timestamp, "size"))
+    if before.st_size > limit:
+        raise _NativeSelectionError(
+            "NATIVE_FILE_TOO_LARGE", "Selected file exceeds the attachment size limit."
+        )
     if (
         not stat.S_ISREG(before.st_mode)
-        or before.st_size > limit
         or getattr(path, "is_junction", lambda: False)()
-        or _selected_identity(before) != expected
+        or _desktop_identity(before) != expected
     ):
-        raise ValueError("selected file changed or exceeds the upload limit")
+        raise _NativeSelectionError(
+            "NATIVE_FILE_CHANGED", "Selected file identity changed; select the file again."
+        )
     descriptor = os.open(
         path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     )
     with os.fdopen(descriptor, "rb") as stream:
         opened = os.fstat(stream.fileno())
-        if not stat.S_ISREG(opened.st_mode) or _selected_identity(opened) != expected:
-            raise ValueError("selected file changed while opening")
+        if not stat.S_ISREG(opened.st_mode) or _selected_identity(opened) != identity:
+            raise _NativeSelectionError(
+                "NATIVE_FILE_CHANGED", "Selected file changed while opening; select it again."
+            )
         payload = stream.read(limit + 1)
-        if _selected_identity(os.fstat(stream.fileno())) != expected:
-            raise ValueError("selected file changed while reading")
-    if path.resolve(strict=True) != path or _selected_identity(path.lstat()) != expected:
-        raise ValueError("selected file path changed while reading")
+        if _selected_identity(os.fstat(stream.fileno())) != identity:
+            raise _NativeSelectionError(
+                "NATIVE_FILE_CHANGED", "Selected file changed while reading; select it again."
+            )
+    if path.resolve(strict=True) != path or _selected_identity(path.lstat()) != identity:
+        raise _NativeSelectionError(
+            "NATIVE_FILE_CHANGED", "Selected file path changed while reading; select it again."
+        )
     if len(payload) > limit or len(payload) != before.st_size:
-        raise ValueError("selected file size changed")
+        raise _NativeSelectionError(
+            "NATIVE_FILE_CHANGED", "Selected file size changed; select the file again."
+        )
     if not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), selection["sha256"]):
-        raise ValueError("selected file content changed")
+        raise _NativeSelectionError(
+            "NATIVE_FILE_CHANGED", "Selected file content changed; select the file again."
+        )
     return payload
 
 
@@ -133,10 +174,26 @@ def register_native_attachment_routes(
             or not _authorization_token_matches(config, request)
             or not request_origin_allowed(request, config)
         ):
-            return JSONResponse({"code": "NATIVE_SELECTION_FORBIDDEN"}, status_code=403)
+            return JSONResponse(
+                {
+                    "code": "NATIVE_SELECTION_FORBIDDEN",
+                    "error": "Attachment selection is not authorized for this Gateway.",
+                },
+                status_code=403,
+            )
         if session_manager is None:
-            return JSONResponse({"code": "NATIVE_SESSION_UNAVAILABLE"}, status_code=503)
+            return JSONResponse(
+                {
+                    "code": "NATIVE_SESSION_UNAVAILABLE",
+                    "error": "Attachment session is unavailable; reconnect and try again.",
+                },
+                status_code=503,
+            )
         owner_identity = (owner.instance_id, owner.instance_nonce)
+        failure = (
+            "NATIVE_SELECTION_INVALID",
+            "Invalid attachment selection; select the file again.",
+        )
         try:
             body = bytearray()
             async for chunk in request.stream():
@@ -171,21 +228,32 @@ def register_native_attachment_routes(
                 or type(selection["size"]) is not int
                 or selection["size"] < 0
             ):
-                raise ValueError("selected file capability expired or binding changed")
+                raise _NativeSelectionError(
+                    "NATIVE_SELECTION_EXPIRED",
+                    "Attachment selection expired or its Gateway changed; select the file again.",
+                )
             for identity, until in list(spent.items()):
                 if until <= now:
                     del spent[identity]
             if selection["id"] in spent or len(spent) >= 2048:
-                raise ValueError("selected file capability was consumed")
+                raise _NativeSelectionError(
+                    "NATIVE_SELECTION_CONSUMED",
+                    "Attachment selection was already used or too many selections are pending; "
+                    "select it again.",
+                )
             spent[selection["id"]] = expiry
             key = selection["sessionKey"]
+            failure = (
+                "NATIVE_SESSION_CHANGED",
+                "Attachment session changed or is unavailable; select the file again.",
+            )
             session, storage, context = await native_selection_context(config, session_manager, key)
             if (
                 selection.get("sessionId") != session.session_id
                 or type(selection.get("sessionEpoch")) is not int
                 or selection["sessionEpoch"] != session.epoch
             ):
-                raise ValueError("selected file session generation changed")
+                raise _NativeSelectionError(*failure)
             snapshot = (
                 session.session_id,
                 session.epoch,
@@ -194,6 +262,10 @@ def register_native_attachment_routes(
                 deepcopy(session.origin),
             )
             path = Path(selection["path"])
+            failure = (
+                "NATIVE_FILE_UNAVAILABLE",
+                "Selected file is unavailable or could not be read; select it again.",
+            )
             await probe_file_access(path, context)
             payload = await asyncio.to_thread(_selected_bytes, selection, store.max_file_bytes)
 
@@ -211,25 +283,43 @@ def register_native_attachment_routes(
                     != owner_identity
                     or time.time() * 1000 >= expiry
                 ):
-                    raise ValueError("selected file session or gateway changed")
+                    raise _NativeSelectionError(
+                        "NATIVE_SESSION_CHANGED",
+                        "Attachment session or Gateway changed; select the file again.",
+                    )
 
             await check_binding()
             from opensquilla.contracts.attachments import (
                 IMAGE_ATTACHMENT_MIMES,
+                attachment_category,
                 attachment_size_limit_for_mime,
+                can_stage_attachment_mime,
                 normalize_attachment_mime,
             )
             from opensquilla.contracts.image_validation import validate_image_bytes
 
             mime = normalize_attachment_mime(selection["mime"])
-            if len(payload) > attachment_size_limit_for_mime(mime):
-                raise ValueError("selected file exceeds format size limit")
             if mime in IMAGE_ATTACHMENT_MIMES:
-                validate_image_bytes(payload, mime)
+                if len(payload) > attachment_size_limit_for_mime(mime):
+                    raise _NativeSelectionError(
+                        "NATIVE_FILE_TOO_LARGE", "Selected image exceeds the image size limit."
+                    )
+                try:
+                    validate_image_bytes(payload, mime)
+                except ValueError as exc:
+                    raise _NativeSelectionError(
+                        "NATIVE_IMAGE_INVALID",
+                        "Selected image is corrupt, unreadable, or does not match its format; "
+                        "choose a valid image.",
+                    ) from exc
             # Project inputs retain live identity, including current-value semantics.
             if session.workspace_id or session.execution_workspace is not None:
                 from opensquilla.workspace_files import validate_workspace_files
 
+                failure = (
+                    "NATIVE_WORKSPACE_CHANGED",
+                    "Attachment workspace changed or is unavailable; select the file again.",
+                )
                 identity, root = await session_workspace_binding(session, storage)
                 if path.is_relative_to(root):
                     ref = {
@@ -247,6 +337,17 @@ def register_native_attachment_routes(
                     )
                     await check_binding()
                     return JSONResponse({"workspaceFile": ref})
+            # Match UploadStore's snapshot policy. Strict deployments retain
+            # the legacy stageable set; text/email must not gain a larger cap.
+            # Authorized live references above are not copies and do not use
+            # accept_opaque as a filesystem permission switch.
+            staged_mime = can_stage_attachment_mime(mime) and (
+                store.accept_opaque or attachment_category(mime) in {"pdf", "image", "office"}
+            )
+            if len(payload) > attachment_size_limit_for_mime(mime, staged=staged_mime):
+                raise _NativeSelectionError(
+                    "NATIVE_FILE_TOO_LARGE", "Selected file exceeds the size limit for its format."
+                )
             from opensquilla.application.artifact_workbench import (
                 AttachmentStage,
                 AttachmentStagingApplication,
@@ -264,6 +365,10 @@ def register_native_attachment_routes(
                     opaque_max_bytes=config.attachments.opaque_max_bytes,
                 ),
                 GatewayAttachmentMimePolicy(),
+            )
+            failure = (
+                "NATIVE_STAGING_FAILED",
+                "Attachment could not be prepared; select the file and try again.",
             )
             staged = await staging.stage(
                 AttachmentStage(selection["name"], selection["mime"], payload)
@@ -284,9 +389,42 @@ def register_native_attachment_routes(
                     "ttl_seconds": store.ttl_seconds,
                 }
             )
+        except _NativeSelectionError as exc:
+            return JSONResponse({"code": exc.code, "error": str(exc)}, status_code=409)
         except (PermissionError, SafeToolError, SandboxBackendError):
-            return JSONResponse({"code": "NATIVE_FILE_ACCESS_DENIED"}, status_code=403)
+            return JSONResponse(
+                {
+                    "code": "NATIVE_FILE_ACCESS_DENIED",
+                    "error": "File access was denied by the current permissions.",
+                },
+                status_code=403,
+            )
+        except (AttachmentOpaqueOversizeError, UploadOversizeError):
+            return JSONResponse(
+                {
+                    "code": "NATIVE_FILE_TOO_LARGE",
+                    "error": "Selected file exceeds the configured attachment size limit.",
+                },
+                status_code=409,
+            )
+        except (AttachmentClaimError, UploadUnsupportedMimeError):
+            return JSONResponse(
+                {
+                    "code": "NATIVE_FORMAT_UNSUPPORTED",
+                    "error": "Selected file format is not supported by the attachment policy.",
+                },
+                status_code=409,
+            )
+        except UploadStoreFullError:
+            return JSONResponse(
+                {
+                    "code": "NATIVE_UPLOAD_STORE_FULL",
+                    "error": "Attachment storage is full; wait for earlier uploads to expire "
+                    "and try again.",
+                },
+                status_code=409,
+            )
         except (KeyError, TypeError, ValueError, OSError, UploadStoreError):
-            return JSONResponse({"code": "NATIVE_SELECTION_INVALID"}, status_code=409)
+            return JSONResponse({"code": failure[0], "error": failure[1]}, status_code=409)
 
     app.router.routes.append(Route("/api/v1/files/native-import", native_import, methods=["POST"]))

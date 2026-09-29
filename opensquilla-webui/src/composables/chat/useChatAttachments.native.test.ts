@@ -49,6 +49,23 @@ describe('native chat attachment intake', () => {
     expect(uploadAttachment).not.toHaveBeenCalled()
   })
 
+  it('accepts native MIME correction when selection and receipt agree', async () => {
+    const correctedSelection = { ...selection, name: 'photo.jpg', mime: 'image/png' }
+    const correctedReceipt = { ...receipt, name: correctedSelection.name, mime: correctedSelection.mime }
+    const { attachments, native } = fixture({
+      selectAttachmentFile: vi.fn(async () => correctedSelection),
+      importAttachmentSelection: vi.fn(async () => correctedReceipt),
+    })
+    const rendererFile = new File(['data'], correctedSelection.name, { type: 'image/jpeg' })
+
+    await attachments.addAttachment(rendererFile)
+
+    expect(native.selectAttachmentFile).toHaveBeenCalledExactlyOnceWith(context, rendererFile)
+    expect(attachments.pendingAttachments.value).toMatchObject([{
+      kind: 'staged', name: 'photo.jpg', mime: 'image/png', file_uuid: correctedReceipt.file_uuid,
+    }])
+  })
+
   it('blocks immediate send while picker and native import are pending', async () => {
     const picker = deferred<typeof selection[]>()
     const imported = deferred<NativeAttachmentReceipt>()
@@ -141,6 +158,22 @@ describe('native chat attachment intake', () => {
     expect(attachments.pendingAttachments.value[0].file).toBeUndefined()
     expect(await attachments.prepareAttachmentsForSend()).toBe(true)
     expect(uploadAttachment).not.toHaveBeenCalled()
+  })
+
+  it('keeps an unclassified native selection on the conservative payload budget', async () => {
+    const largeSelection = { ...selection, size: 50 * 1024 * 1024 }
+    const { attachments, native } = fixture({ chooseAttachments: vi.fn(async () => [largeSelection]) })
+    attachments.pendingAttachments.value = [{ kind: 'staged', local_id: 1, name: 'existing.bin',
+      mime: 'application/octet-stream', size: 11 * 1024 * 1024, file_uuid: 'existing-file' }]
+
+    await attachments.chooseAttachments()
+
+    expect(native.importAttachmentSelection).not.toHaveBeenCalled()
+    expect(attachments.pendingAttachments.value).toHaveLength(1)
+    expect(pushToast).toHaveBeenCalledWith(
+      `Attachments too large: ${largeSelection.name} would exceed 60 MiB total`,
+      { tone: 'danger' },
+    )
   })
   it('automatically prepares restored browser Blob bytes without restoring native authority', async () => {
     const native = { selectAttachmentFile: vi.fn(async () => null),

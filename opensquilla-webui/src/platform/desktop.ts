@@ -660,6 +660,10 @@ export function createDesktopPlatform(): Platform {
         : {}),
     },
     files: {
+      ...(typeof window.opensquillaDesktop?.chooseLocalFilePaths === 'function'
+        ? { chooseLocalFilePaths: request => requireDesktopApi().chooseLocalFilePaths!(request) } : {}),
+      ...(typeof window.opensquillaDesktop?.resolveNativeFilePath === 'function'
+        ? { resolveNativeFilePath: file => requireDesktopApi().resolveNativeFilePath!(file) } : {}),
       ...(typeof window.opensquillaDesktop?.chooseAttachments === 'function'
         ? { chooseAttachments: request => requireDesktopApi().chooseAttachments!(request) } : {}),
       ...(typeof window.opensquillaDesktop?.selectAttachmentFile === 'function'

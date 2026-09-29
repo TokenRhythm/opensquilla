@@ -24,6 +24,23 @@
           <strong>{{ t('chat.attachFiles') }}</strong>
         </span>
       </button>
+      <button
+        v-if="localPathsAvailable"
+        type="button"
+        class="composer-add-menu__item"
+        role="menuitem"
+        :disabled="localPathsDisabled"
+        :title="t('chat.referenceLocalPathsHint')"
+        @click="referenceLocalPaths"
+      >
+        <span class="composer-add-menu__icon" aria-hidden="true">
+          <Icon name="paperclip" :size="17" />
+        </span>
+        <span class="composer-add-menu__copy">
+          <strong>{{ t('chat.referenceLocalPaths') }}</strong>
+          <span>{{ t('chat.referenceLocalPathsHint') }}</span>
+        </span>
+      </button>
     </div>
     <div
       v-if="browserUseAvailable || planModeAvailable || goalModeAvailable"
@@ -107,6 +124,8 @@ const props = defineProps<{
   avoidElement?: HTMLElement | null
   attachmentsDisabled?: boolean
   browserUseAvailable?: boolean
+  localPathsAvailable?: boolean
+  localPathsDisabled?: boolean
   goalModeActive: boolean
   goalModeAvailable: boolean
   goalModeBusy: boolean
@@ -121,6 +140,7 @@ const emit = defineEmits<{
   activatePlanMode: []
   attachFiles: []
   selectBrowserUse: []
+  referenceLocalPaths: []
   close: []
 }>()
 
@@ -173,6 +193,11 @@ function attachFiles() {
 
 function selectBrowserUse() {
   emit('selectBrowserUse')
+  emit('close')
+}
+
+function referenceLocalPaths() {
+  emit('referenceLocalPaths')
   emit('close')
 }
 
