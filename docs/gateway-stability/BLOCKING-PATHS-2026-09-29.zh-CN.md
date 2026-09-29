@@ -70,3 +70,11 @@ fetch worker 最多 4 个实际工作线程，独立于 Gateway 默认 executor�
 4. **非常大的网络正文**：HTTPX 缓冲/解压、部分结果整理仍有随输入增加的成本；本轮没有引入新的大小截断策略或进程级解析服务。
 
 数据库下一步应单独验证长事务处理方案，而非扩大 2 秒预算、降低同步持久化、关闭 FTS 或拆分账本预约。需要保留单一原子删除契约，或先明确设计可恢复的逻辑删除协议及所有读取/写入的 owner 边界，再讨论分批物理回收。两者不能混在本轮连接修补中宣称已完成。
+
+## 2026-09-30 主分支 review
+
+已合入 `origin/main=c4b1dd836`，三路复核覆盖 Desktop/WebUI、runtime 阻塞与数据库。保留有生命周期依据的 Future、取消收尾和有界 worker，未为减少行数删除这些保护。修复一个遗漏：`web_fetch` 每个 HTTP hop 的 DNS、代理和 TLS 准备共享 30 秒等待预算，初始 SSRF 检查不变；新增初始/重定向的超时、取消回归。原实现两个超时负控制失败，修后相关 109 项通过。未修改工具结果成功/失败分类。
+
+验证：合并后 Python 相关回归 837 passed、17 skipped、5 failed；五个失败均在主分支已有测试创建符号链接时出现 WinError 1314，独立进程复查相同，未改系统权限或把失败改成 skip。独立复查的前置失败还遗留了 SQLite 测试线程，记录结果后精确结束该测试进程，不算自然退出通过。WebUI 定向 249 项、Desktop lifecycle 与 single-instance 脚本通过；本 session Python 文件 Ruff 与 diff check 通过。小修后的 109 项是定向复验，不能与前述数量相加作为去重总数。证据在 `.cache/review-main-pytest-20260930.log`、`.cache/review-symlink-check-20260930.log`、`.cache/review-fetch-prep-{negative,final}.txt`。
+
+未重新构建安装包；前文 frozen 结果属于前一轮源码。还保留三个明确边界：共享累计 ACK 窗口的阻塞未完全消除；原有 managed/显式代理或部分 IP literal 路径仍会在事件循环构造默认 HTTPX TLS transport；会话 reset 的同步归档与大事务另见 [数据库复核第 11 节](DATABASE-DIAGNOSIS.zh-CN.md#11-主分支复核大历史删除的触发条件与解法)。这些不是本轮发现的新增回归，也没有被声明已全部修复。

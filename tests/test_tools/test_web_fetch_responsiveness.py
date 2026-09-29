@@ -125,7 +125,7 @@ async def test_abandoned_dns_never_starts_request_or_populates_cache(monkeypatch
 
     monkeypatch.setattr(fetch, "_check_ssrf", resolve)
     if action == "timeout":
-        monkeypatch.setattr(fetch, "_DNS_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(fetch, "_FETCH_PREPARATION_TIMEOUT_SECONDS", 0.05)
     task = asyncio.create_task(fetch.run_web_fetch_payload("https://public.test/cancel"))
     try:
         await _wait_entered(entered)
@@ -143,6 +143,50 @@ async def test_abandoned_dns_never_starts_request_or_populates_cache(monkeypatch
         await _wait_entered(ended)
     await asyncio.sleep(0.01)
     assert requests == []
+    assert len(fetch._cache) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hop", ["initial", "redirect"])
+@pytest.mark.parametrize("action", ["cancel", "timeout"])
+async def test_abandoned_client_preparation_never_sends_hop(monkeypatch, network, hop, action):
+    requests, responses = network
+    source, target = "https://public.test/start", "https://public.test/redirect"
+    blocked_url = target if hop == "redirect" else source
+    entered, release, ended = threading.Event(), threading.Event(), threading.Event()
+    if hop == "redirect":
+        responses[source] = httpx.Response(302, headers={"location": target})
+
+    def prepare(url, *_args):
+        if url != blocked_url:
+            return {}
+        entered.set()
+        try:
+            assert release.wait(3)
+            return {}
+        finally:
+            ended.set()
+
+    monkeypatch.setattr(fetch, "_web_fetch_httpx_client_kwargs", prepare)
+    monkeypatch.setattr(fetch, "_FETCH_PREPARATION_TIMEOUT_SECONDS", 0.05)
+    task = asyncio.create_task(fetch.run_web_fetch_payload(source))
+    try:
+        await _wait_entered(entered)
+        if action == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 0.5)
+        else:
+            result = await asyncio.wait_for(task, 0.5)
+            assert result["error"] == "timed_out"
+        assert not ended.is_set()
+        assert requests == ([source] if hop == "redirect" else [])
+    finally:
+        release.set()
+        await _wait_entered(ended)
+        await asyncio.gather(task, return_exceptions=True)
+    await asyncio.sleep(0)
+    assert requests == ([source] if hop == "redirect" else [])
     assert len(fetch._cache) == 0
 
 

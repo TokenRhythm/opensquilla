@@ -63,7 +63,7 @@ _RETRY_DELAY_SECONDS = 0.25
 _WEB_FETCH_DEFAULT_MAX_CHARS = 20_000
 _WEB_FETCH_MAX_CHARS_ENV = "OPENSQUILLA_WEB_FETCH_MAX_CHARS"
 _MAX_REDIRECTS = 5
-_DNS_TIMEOUT_SECONDS = 30.0
+_FETCH_PREPARATION_TIMEOUT_SECONDS = 30.0
 _XML_ATTR_ESCAPES = {
     "<": "&lt;",
     ">": "&gt;",
@@ -76,7 +76,7 @@ _RAW_TOOL_RESULT_KEY = "_raw_tool_result"
 
 
 async def _check_ssrf_async(url: str) -> list[str]:
-    async with asyncio.timeout(_DNS_TIMEOUT_SECONDS):
+    async with asyncio.timeout(_FETCH_PREPARATION_TIMEOUT_SECONDS):
         return await _run_blocking(_check_ssrf, url)
 
 
@@ -368,14 +368,15 @@ async def run_web_fetch_payload(
         managed_kwargs = managed_network_httpx_kwargs()
         current_url = url
         for _redirect_count in range(_MAX_REDIRECTS + 1):
-            vetted = await _check_ssrf_async(current_url)
-            marker = _sensitive_url_marker(current_url)
-            if marker is not None:
-                raise ValueError("Blocked redirect URL containing sensitive data")
+            async with asyncio.timeout(_FETCH_PREPARATION_TIMEOUT_SECONDS):
+                vetted = await _run_blocking(_check_ssrf, current_url)
+                marker = _sensitive_url_marker(current_url)
+                if marker is not None:
+                    raise ValueError("Blocked redirect URL containing sensitive data")
 
-            client_kwargs = await _run_blocking(
-                _web_fetch_httpx_client_kwargs, current_url, vetted, headers, managed_kwargs
-            )
+                client_kwargs = await _run_blocking(
+                    _web_fetch_httpx_client_kwargs, current_url, vetted, headers, managed_kwargs
+                )
             async with httpx.AsyncClient(**client_kwargs) as client:
                 response = await client.get(current_url)
             if response.status_code not in {301, 302, 303, 307, 308}:
