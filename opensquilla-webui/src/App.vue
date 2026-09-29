@@ -357,9 +357,6 @@
       />
       <ArtifactImageLightbox />
     </div>
-    <!-- Keep recovery actions in normal flow, clear of the floating console
-         topbar. The main shell already reserves the mobile tab-bar inset. -->
-    <DeliveryRecoveryNotice @open-session="switchToSession" />
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
@@ -481,7 +478,6 @@ import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
-import DeliveryRecoveryNotice from './components/DeliveryRecoveryNotice.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
