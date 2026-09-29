@@ -276,6 +276,31 @@ describe('App automatic RPC lifecycle with the real directory adapter', () => {
     app.lifecycle.dispose()
   })
 
+  it('refreshes a stale running row when transport health recovers', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {})
+    const app = setup(true)
+    app.request.mockResolvedValueOnce(page('Active task', 'running'))
+    await app.lifecycle.mount()
+    await vi.advanceTimersByTimeAsync(0)
+    app.request.mockRejectedValue(new Error('Transport suspect'))
+    app.lifecycle.schedule()
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(app.request).toHaveBeenCalledTimes(5)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('running')
+
+    app.request.mockResolvedValue(page('Stopped task', 'killed'))
+    app.lifecycle.connectionHealthChanged('suspect')
+    await vi.advanceTimersByTimeAsync(150)
+    expect(app.request).toHaveBeenCalledTimes(5)
+    app.lifecycle.connectionHealthChanged('healthy')
+    await vi.advanceTimersByTimeAsync(150)
+
+    expect(app.request).toHaveBeenCalledTimes(6)
+    expect(app.sessions.sessionsList.value[0]?.runStatus).toBe('cancelled')
+    expect(app.sessions.sessionListError.value).toBe(false)
+    app.lifecycle.dispose()
+  })
+
   it('recovers a missed invalidation on foreground while respecting chat admission', async () => {
     const app = setup(true)
     app.request.mockResolvedValueOnce(page('Active task', 'running'))
