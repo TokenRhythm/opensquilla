@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream } from 'node:fs'
-import { mkdir, readFile, realpath, stat, writeFile } from 'node:fs/promises'
+import { lstat, mkdir, open, readFile, realpath, stat, unlink, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
@@ -34,6 +34,10 @@ export function historyTurn(index) {
     answer: syntheticText(marker, HISTORY_ANSWER_BYTES) }
 }
 const FLOW_CAPS = ['transport.flow.v1', 'transport.recovery.v1']
+const REPO_ROOT = fileURLToPath(new URL('../../../', import.meta.url))
+export const ORDINARY_PROFILE_ROOT = join(REPO_ROOT, '.cache', 'perf-ordinary-profile')
+export const ORDINARY_RUNS_ROOT = join(REPO_ROOT, '.cache', 'perf-ordinary-runs')
+const ORDINARY_PROFILE_MARKER = 'opensquilla-synthetic-ordinary-performance-v1'
 const METHODS = new Set(['connect', 'chat.send', 'chat.history', 'sessions.list',
   'sessions.subscribe', 'sessions.unsubscribe',
   'sessions.messages.snapshot.read', 'sessions.messages.snapshot.release',
@@ -73,6 +77,9 @@ const SAFE_FAILURE_REASONS = new Set([
   'Timed out: native onboarding window', 'Timed out: main renderer document', 'Timed out: native onboarding save',
   'Timed out: onboarding ready after save', 'Timed out: synthetic stream started', 'Timed out: Gateway shutdown request',
   'Timed out: long history recovery', 'Timed out: synthetic history answer', 'Timed out: completed UI turn',
+  'Timed out: composer usable', 'Timed out: initial session directory', 'Timed out: settled new draft',
+  'Repeated profile must not perform first-run migrations', 'Ordinary run must add exactly one sidebar session',
+  'Existing log was replaced or truncated', 'Repeated profile configuration changed', 'Repeated profile credential changed',
 ])
 
 export function safeFailureReason(error) {
@@ -84,9 +91,10 @@ export function parseArguments(args) {
   const options = {}
   for (let i = 0; i < args.length; i += 1) {
     const key = args[i]
-    assert.ok(['--executable', '--workdir', '--output', '--scenario', '--disable-gpu', '--startup-timing'].includes(key), 'Unknown argument')
+    assert.ok(['--executable', '--workdir', '--output', '--scenario', '--disable-gpu', '--startup-timing',
+      '--repeat-profile', '--initialize-repeat-profile'].includes(key), 'Unknown argument')
     assert.ok(!(key in options), 'Duplicate argument')
-    if (key === '--disable-gpu' || key === '--startup-timing') options[key] = true
+    if (key === '--disable-gpu' || key === '--startup-timing' || key === '--initialize-repeat-profile') options[key] = true
     else {
       assert.ok(args[i + 1] && !args[i + 1].startsWith('--'), `Missing value for ${key}`)
       options[key] = args[++i]
@@ -95,9 +103,61 @@ export function parseArguments(args) {
   for (const key of ['--executable', '--workdir', '--output', '--scenario']) assert.ok(options[key], `Missing ${key}`)
   assert.ok(['restart', 'late-ready', 'configuration', 'fresh-onboarding', 'history-streaming-restart'].includes(options['--scenario']),
     'Supported scenarios: restart, late-ready, configuration, fresh-onboarding, history-streaming-restart. Nothing was launched.')
-  return { executable: resolve(options['--executable']), workdir: resolve(options['--workdir']),
+  const result = { executable: resolve(options['--executable']), workdir: resolve(options['--workdir']),
     output: resolve(options['--output']), scenario: options['--scenario'], disableGpu: Boolean(options['--disable-gpu']),
     startupTiming: Boolean(options['--startup-timing']) }
+  if (options['--repeat-profile']) {
+    assert.equal(result.scenario, 'restart', 'Repeat profiles only support restart')
+    assert.ok(['main', 'candidate'].includes(options['--repeat-profile']), 'Unknown repeat profile')
+    assert.ok(inside(ORDINARY_RUNS_ROOT, result.workdir) && inside(result.workdir, result.output),
+      'Repeat reports require an isolated ordinary run directory')
+    result.repeatProfile = options['--repeat-profile']
+    result.initializeRepeatProfile = Boolean(options['--initialize-repeat-profile'])
+  } else assert.equal(Boolean(options['--initialize-repeat-profile']), false, 'Initialization requires a repeat profile')
+  return result
+}
+
+export function validateOrdinaryProfileMarker(value) {
+  assert.equal(value?.kind, ORDINARY_PROFILE_MARKER, 'Not a synthetic ordinary profile')
+  assert.equal(value.clean, true, 'Previous ordinary profile run did not finish cleanly')
+  assert.ok(Number.isSafeInteger(value.completedRuns) && value.completedRuns >= 1, 'Missing profile preparation')
+  assert.ok(Number.isInteger(value.providerPort) && value.providerPort > 1024 && value.providerPort < 65536, 'Invalid synthetic provider port')
+  for (const key of ['configSha256', 'credentialSha256', 'executableSha256']) assert.match(value[key] || '', /^[a-f0-9]{64}$/, 'Missing profile binding')
+  assert.ok(typeof value.executablePath === 'string' && isAbsolute(value.executablePath), 'Missing profile executable')
+  return value
+}
+
+export function appendOnlyLogSuffix(before, after) {
+  assert.ok(after.startsWith(before), 'Existing log was replaced or truncated')
+  return after.slice(before.length)
+}
+
+export function ordinaryMigrationEvidence(text, expectedStarts) {
+  const ready = structuredLogRecords(text).filter(item => item.event === 'build_services.migrations_ready')
+  return { observedStarts: ready.length, appliedCounts: ready.map(item => item.count),
+    alreadyMigrated: expectedStarts > 0 && ready.length === expectedStarts && ready.every(item => item.count === 0) }
+}
+
+export function ordinaryPerformanceMetrics(phases) {
+  const time = name => {
+    const matches = phases.filter(value => value.phase === name)
+    assert.equal(matches.length, 1, `Missing or repeated performance boundary: ${name}`)
+    return matches[0].ms
+  }
+  const duration = (from, to) => {
+    const ms = time(to) - time(from)
+    assert.ok(Number.isFinite(ms) && ms >= 0, 'Invalid performance boundary order')
+    return ms
+  }
+  return {
+    launchToConnectedMs: duration('launch', 'initial-ui-connected'),
+    launchToComposerUsableMs: duration('launch', 'initial-ui-connected-composer-usable'),
+    restartToConnectedMs: duration('runtime-restart-click', 'runtime-restart-connected'),
+    restartToComposerUsableMs: duration('runtime-restart-click', 'runtime-restart-connected-composer-usable'),
+    firstSendToAnswerVisibleMs: duration('single-ui-send-click', 'single-ui-answer-visible'),
+    firstSendToCompletedMs: duration('single-ui-send-click', 'single-ui-send-complete'),
+    historyClickToReadAndVisibleMs: duration('history-reread-click', 'history-reread-complete'),
+  }
 }
 
 export function inside(root, path) {
@@ -345,10 +405,15 @@ export function inspectSyntheticSidebar(targetKey) {
   const sidebar = document.querySelector('#sidebar-nav')
   const loaded = Number(list?.getAttribute('data-sidebar-loaded-count'))
   const current = new URL(location.href)
+  const composer = document.querySelector('.chat-textarea')
   return {
     routeIsDraft: current.pathname === '/chat/new', routeIsChat: current.pathname === '/chat',
     routeHasSession: current.searchParams.has('session'),
     routeMatchesTarget: Boolean(targetKey && current.searchParams.get('session') === targetKey),
+    draftLanding: Boolean(document.querySelector('.chat.chat--new-landing')),
+    messageRowsEmpty: document.querySelectorAll('.msg-user-bubble, .msg-ai').length === 0,
+    composerEditable: Boolean(composer && !composer.disabled && !composer.readOnly),
+    composerVisible: Boolean(composer && composer.getClientRects().length > 0 && getComputedStyle(composer).visibility !== 'hidden'),
     sidebarHidden: !sidebar || sidebar.getAttribute('aria-hidden') === 'true' || sidebar.hasAttribute('inert'),
     rows: rows.length, sessionAttributes: attributes.length,
     historyButtons: document.querySelectorAll('.sidebar-history-item').length,
@@ -366,33 +431,97 @@ export function inspectSyntheticSidebar(targetKey) {
   }
 }
 
+export function isSettledDraft(value) {
+  return value?.routeIsDraft === true && value.routeHasSession === false && value.draftLanding === true && value.messageRowsEmpty === true
+    && value.composerEditable === true && value.composerVisible === true
+}
+
 async function fileHash(path) {
   const hash = createHash('sha256')
   for await (const chunk of createReadStream(path)) hash.update(chunk)
   return hash.digest('hex')
 }
 
+async function readOptional(path) {
+  try { return await readFile(path, 'utf8') } catch (error) {
+    if (error.code === 'ENOENT') return ''
+    throw error
+  }
+}
+
+async function rejectLinkedPath(path) {
+  assert.ok(inside(REPO_ROOT, path), 'Ordinary profile path must stay in this checkout')
+  let current = REPO_ROOT
+  for (const part of relative(REPO_ROOT, path).split(/[\\/]/)) {
+    current = join(current, part)
+    try { assert.equal((await lstat(current)).isSymbolicLink(), false, 'Ordinary profile paths must not be links') }
+    catch (error) { if (error.code !== 'ENOENT') throw error }
+  }
+}
+
 async function run(options) {
   assert.equal(process.platform, 'win32', 'Native Windows only')
   assert.equal(options.disableGpu, true, 'Native probes require --disable-gpu')
   assert.ok((await stat(options.executable)).isFile(), 'Missing packaged executable')
+  if (options.repeatProfile) await rejectLinkedPath(options.workdir)
   await mkdir(dirname(options.workdir), { recursive: true })
-  await mkdir(options.workdir) // Never accept an existing profile/evidence root.
+  await mkdir(options.workdir) // Evidence is always new, including repeat-profile runs.
   const root = await realpath(options.workdir)
-  const userData = join(root, 'user-data')
+  const profileRoot = options.repeatProfile ? join(ORDINARY_PROFILE_ROOT, options.repeatProfile) : root
+  let repeatMarker, repeatLock
+  const markerPath = join(profileRoot, 'ordinary-performance.json')
+  const lockPath = join(profileRoot, '.ordinary-performance.lock')
+  if (options.repeatProfile) {
+    await rejectLinkedPath(profileRoot)
+    if (options.initializeRepeatProfile) {
+      await mkdir(ORDINARY_PROFILE_ROOT, { recursive: true })
+      await mkdir(profileRoot) // Initialization never adopts an existing directory.
+    }
+    repeatLock = await open(lockPath, 'wx')
+    await repeatLock.writeFile(JSON.stringify({ pid: process.pid, run: root }) + '\n')
+    // A failed or interrupted run keeps its lock and marker for inspection.
+    if (!options.initializeRepeatProfile) {
+      await rejectLinkedPath(markerPath)
+      repeatMarker = validateOrdinaryProfileMarker(JSON.parse(await readFile(markerPath, 'utf8')))
+      assert.equal(repeatMarker.executablePath, options.executable, 'Repeat profile belongs to another executable')
+    }
+  }
+  const userData = join(profileRoot, 'user-data')
   const profile = join(userData, 'opensquilla')
   const longHistory = options.scenario === 'history-streaming-restart'
-  const env = isolatedEnvironment(process.env, root, { ...options, longHistory })
+  const env = isolatedEnvironment(process.env, profileRoot, { ...options, longHistory })
   for (const path of [userData, profile, env.HOME, env.APPDATA, env.LOCALAPPDATA, env.TEMP, env.OPENSQUILLA_USER_STATE_DIR]) {
-    assert.ok(inside(root, path)); await mkdir(path, { recursive: true })
+    assert.ok(inside(profileRoot, path))
+    if (options.repeatProfile) await rejectLinkedPath(path)
+    await mkdir(path, { recursive: true })
   }
-  const report = { schemaVersion: 1, scenario: options.scenario, ok: false,
+  const configPath = join(profile, 'config.toml')
+  const credentialPath = join(userData, 'desktop-credential.json')
+  const desktopLogPath = join(userData, 'logs', 'desktop.log')
+  const gatewayLogPath = join(userData, 'logs', 'gateway.log')
+  if (options.repeatProfile) {
+    for (const path of [configPath, credentialPath, desktopLogPath, gatewayLogPath,
+      join(profile, 'state', 'sessions.db'), join(profile, 'workspace'), join(userData, 'gateway-ownership')]) await rejectLinkedPath(path)
+  }
+  if (repeatMarker) {
+    assert.equal(await fileHash(configPath), repeatMarker.configSha256, 'Repeated profile configuration changed')
+    assert.equal(await fileHash(credentialPath), repeatMarker.credentialSha256, 'Repeated profile credential changed')
+  }
+  const desktopLogBefore = await readOptional(desktopLogPath)
+  const gatewayLogBefore = await readOptional(gatewayLogPath)
+  const report = { schemaVersion: 1, scenario: options.scenario, ok: false, startedAt: new Date().toISOString(),
     disableGpu: options.disableGpu, startupTiming: options.startupTiming, executableSha256: await fileHash(options.executable),
     harnessSha256: await fileHash(fileURLToPath(import.meta.url)),
     provenanceBoundary: 'Outer EXE hash only. Require the separate Electron/WebUI/Gateway build manifest.',
     fixture: { synthetic: true, modelContextWindowTokens: longHistory ? 1048576 : 131072,
       ...(longHistory ? { modelMaxOutputTokens: 262144 } : {}), namingDisabled: true, mockKeychain: true, autoUpdateDisabled: true },
     phases: [], owners: [], sockets: [], descriptorTransitions: [], consoleClasses: {}, cleanup: { verified: false } }
+  if (options.repeatProfile) {
+    report.repeatProfile = { variant: options.repeatProfile, preparation: !repeatMarker,
+      completedRunsBefore: repeatMarker?.completedRuns ?? 0,
+      boundary: 'One synthetic session added per run; version-specific prepared profiles grow equally, not identical database snapshots.' }
+    if (repeatMarker) assert.equal(report.executableSha256, repeatMarker.executableSha256, 'Repeated profile executable changed')
+  }
   await mkdir(dirname(options.output), { recursive: true })
   await writeFile(options.output, JSON.stringify(report, null, 2) + '\n', { flag: 'wx' })
   const started = performance.now()
@@ -410,6 +539,10 @@ async function run(options) {
   report.harnessOwnershipHelperSha256 = await fileHash(fileURLToPath(new URL('../dist/desktop-gateway-ownership.js', import.meta.url)))
   const fingerprint = ownership.desktopProfileFingerprint(profile)
   const ownershipDir = join(userData, 'gateway-ownership', fingerprint)
+  if (options.repeatProfile) {
+    await rejectLinkedPath(ownershipDir)
+    assert.equal(ownership.loadDesktopGatewayOwnershipRecord(ownershipDir).status, 'missing', 'Previous profile owner remains')
+  }
   const records = new Map()
   let app, processIdentity, page, provider, alternateProvider, sse, monitor
   let stopped = false, monitorError = false, failure = false
@@ -484,18 +617,25 @@ async function run(options) {
         readinessTimeout: typeof value.error === 'string' && value.error.startsWith('Gateway did not become ready at ') } : null
     }).catch(() => null), 3_000)
   }
-  async function startServer(handler, label) {
+  async function startServer(handler, label, port = 0) {
     const server = createServer(handler)
     const sockets = shutdown.trackHttpServerConnections(server)
-    await new Promise((yes, no) => { server.once('error', no); server.listen(0, '127.0.0.1', yes) })
+    await new Promise((yes, no) => { server.once('error', no); server.listen(port, '127.0.0.1', yes) })
     return { url: `http://127.0.0.1:${server.address().port}`,
       close: () => shutdown.closeHttpServerWithDeadline(server, sockets, { label, timeoutMs: 5_000 }) }
   }
-  async function ready(connectedPhase) {
-    await until(async () => (await descriptor())?.status === 'ready', 'Gateway ready', 210_000)
+  async function ready(connectedPhase, replacement) {
+    await until(async () => {
+      const value = await descriptor()
+      return value?.status === 'ready' && (!replacement || (value.instanceId && value.instanceId !== replacement.instanceId
+        && report.sockets.slice(replacement.socketCount).some(socket => !socket.closed && socket.hello?.stateDirMatches)))
+    }, 'Gateway ready', 210_000)
     await page.locator('.conn-pill.connected').waitFor({ state: 'visible', timeout: 45_000 })
-    await page.locator('.chat-textarea').waitFor({ state: 'visible', timeout: 45_000 })
     if (connectedPhase) mark(connectedPhase)
+    const composer = page.locator('.chat-textarea')
+    await composer.waitFor({ state: 'visible', timeout: 45_000 })
+    await until(async () => await composer.isEnabled() && await composer.isEditable(), 'composer usable', 45_000)
+    if (connectedPhase) mark(`${connectedPhase}-composer-usable`)
     observeOwner()
     const record = currentOwner()
     assert.ok(record && records.has(ownerKey(record)), 'Ready requires an observed owner')
@@ -511,23 +651,32 @@ async function run(options) {
     assert.equal((await page.locator('.msg-ai-text').allTextContents()).filter(text => text.includes(ANSWER)).length, 1,
       'Exactly one synthetic answer must render')
   }
-  const desktopLogText = () => readFile(join(userData, 'logs', 'desktop.log'), 'utf8')
+  const desktopLogText = async () => appendOnlyLogSuffix(desktopLogBefore, await readFile(desktopLogPath, 'utf8'))
+  const gatewayLogText = async () => appendOnlyLogSuffix(gatewayLogBefore, await readFile(gatewayLogPath, 'utf8'))
   async function gatewayShutdownCount() {
-    const text = await readFile(join(userData, 'logs', 'gateway.log'), 'utf8')
+    const text = await gatewayLogText()
     return gatewayShutdownCountFromLog(text)
   }
+  let restartConnection
   async function beginRuntimeRestart() {
     await page.locator('.sidebar-foot button[data-icon="settings"]').click()
     await page.locator('#settings-rail-gateway').click()
     const control = await runtimeRestartControl(page)
     report.runtimeControlLayout = control.layout
+    if (options.repeatProfile) {
+      restartConnection = { instanceId: (await descriptor())?.instanceId, socketCount: report.sockets.length }
+      assert.ok(restartConnection.instanceId, 'Restart must begin from an identified connection')
+    }
     mark('runtime-restart-click')
     await control.button.click()
   }
   async function finishRuntimeRestart(before, sentinel) {
-    await until(() => { observeOwner(); const next = currentOwner(); return next && !ownership.sameDesktopGatewayOwnershipInstance(before, next) }, 'replacement owner', 180_000)
+    if (!options.repeatProfile) {
+      await until(() => { observeOwner(); const next = currentOwner(); return next && !ownership.sameDesktopGatewayOwnershipInstance(before, next) }, 'replacement owner', 180_000)
+    }
     await page.locator('.settings-modal__close').click()
-    const after = await ready('runtime-restart-connected')
+    const after = await ready('runtime-restart-connected', restartConnection)
+    assert.ok(!ownership.sameDesktopGatewayOwnershipInstance(before, after), 'Exactly one runtime replacement')
     assert.equal(records.size, 2, 'Exactly one runtime replacement')
     assert.equal(shutdown.gatewayProcessSnapshot(before).alive, false, 'Old Gateway must actually exit')
     assert.equal(await bounded(page.evaluate(() => window.__gatewayReliabilityDocument), 5_000), sentinel, 'Restart must preserve the original renderer document')
@@ -547,6 +696,18 @@ async function run(options) {
     await until(async () => await page.locator('.chat-stop-btn').count() === 0
       && await page.locator('.chat-send-btn.btn--primary').count() === 1, 'completed UI turn', 45_000)
     await page.locator('.msg-ai').last().locator('.msg-meta__more-btn').waitFor({ state: 'visible', timeout: 45_000 })
+  }
+  async function enterSettledDraft() {
+    await page.locator('.sidebar-new-session').click()
+    await until(async () => isSettledDraft(await bounded(page.evaluate(inspectSyntheticSidebar, readProbe.key), 5_000)),
+      'settled new draft', 15_000)
+  }
+  async function persistedHistoryRow(key) {
+    // CSS.escape keeps the identity literal; the locator resolves it again at click time.
+    const escapedKey = await bounded(page.evaluate(value => CSS.escape(value), key), 5_000)
+    const row = page.locator(`.sidebar-history-row[data-session-key=${escapedKey}]`)
+    await until(async () => await row.count() === 1, 'persisted sidebar row', 30_000)
+    return row
   }
   try {
     const providerHandler = alternate => (request, response) => {
@@ -574,7 +735,7 @@ async function run(options) {
         })
       } else { request.resume(); response.writeHead(404); response.end() }
     }
-    provider = await startServer(providerHandler(false), 'synthetic provider')
+    provider = await startServer(providerHandler(false), 'synthetic provider', repeatMarker?.providerPort ?? 0)
     if (options.scenario === 'configuration') alternateProvider = await startServer(providerHandler(true), 'alternate synthetic provider')
     if (options.scenario === 'late-ready') {
       sse = await startServer((request, response) => {
@@ -589,11 +750,16 @@ async function run(options) {
     if (options.scenario === 'fresh-onboarding') {
       report.fixture.freshUnconfiguredProfile = true
       report.fixture.onboardingEndpointInjection = 'Existing hidden baseUrl field only; provider/model/save use real UI; no IPC replacement.'
-    } else {
-      await writeFile(join(profile, 'config.toml'), syntheticConfig(profile, provider.url, sse && `${sse.url}/sse`, { longHistory }), { flag: 'wx' })
+    } else if (!repeatMarker) {
+      await writeFile(configPath, syntheticConfig(profile, provider.url, sse && `${sse.url}/sse`, { longHistory }), { flag: 'wx' })
       await smoke.writeSyntheticCredential(userData, { baseUrl: provider.url, model: MODEL, disableNetworkObservability: true })
     }
-    mark('launch')
+    if (options.repeatProfile) {
+      repeatMarker = { kind: ORDINARY_PROFILE_MARKER, clean: false, completedRuns: repeatMarker?.completedRuns ?? 0,
+        providerPort: Number(new URL(provider.url).port), executablePath: options.executable, executableSha256: report.executableSha256,
+        configSha256: await fileHash(configPath), credentialSha256: await fileHash(credentialPath) }
+      await writeFile(markerPath, JSON.stringify(repeatMarker, null, 2) + '\n', { flag: options.initializeRepeatProfile ? 'wx' : 'w' })
+    }
     monitor = (async () => {
       while (!stopped) {
         try {
@@ -609,6 +775,7 @@ async function run(options) {
         await delay(250)
       }
     })()
+    mark('launch')
     app = await electron.launch({ executablePath: options.executable,
       args: ['--use-mock-keychain', `--user-data-dir=${userData}`, ...(options.disableGpu ? ['--disable-gpu'] : [])],
       env, timeout: 150_000 })
@@ -682,6 +849,10 @@ async function run(options) {
       mark('late-ready-recovered')
     } else if (options.scenario === 'restart') {
       const before = await ready('initial-ui-connected')
+      if (options.repeatProfile) {
+        await until(() => report.sockets.some(socket => socket.responses?.['sessions.list']?.ok > 0), 'initial session directory', 30_000)
+        report.repeatProfile.sidebarRowsBefore = (await bounded(page.evaluate(inspectSyntheticSidebar, null), 5_000)).loadedCount
+      }
       const sentinel = randomUUID()
       await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
       mark('runtime-restart')
@@ -692,8 +863,7 @@ async function run(options) {
       const before = await ready()
       const sentinel = randomUUID()
       await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
-      await page.locator('.sidebar-new-session').click()
-      await until(() => new URL(page.url()).pathname === '/chat/new', 'new draft route', 15_000)
+      await enterSettledDraft()
       mark('build-long-history-through-ui')
       for (let index = 0; index < HISTORY_TURNS; index += 1) {
         const turn = historyTurn(index)
@@ -719,20 +889,14 @@ async function run(options) {
       // the still-streaming session creates an actual multi-segment active base;
       // its large history is independently checked through chat.history below.
       mark('reopen-live-multisegment-snapshot')
-      await page.locator('.sidebar-new-session').click()
-      await until(() => new URL(page.url()).pathname === '/chat/new', 'new draft route', 15_000)
-      const historyRows = page.locator('.sidebar-history-row')
-      let historyIndex = -1
-      await until(async () => {
-        historyIndex = await bounded(historyRows.evaluateAll((elements, key) => elements.findIndex(element => element.getAttribute('data-session-key') === key), historicalKey), 5_000)
-        return historyIndex >= 0
-      }, 'persisted sidebar row', 30_000)
+      await enterSettledDraft()
+      const historyRow = await persistedHistoryRow(historicalKey)
       readProbe.key = historicalKey
       readProbe.armed = true
       readProbe.revision++
       readProbe.historyPhase = 'capture'
       readProbe.historyIds = null
-      await historyRows.nth(historyIndex).locator('.sidebar-history-item').click()
+      await historyRow.locator('.sidebar-history-item').click()
       await until(async () => report.sockets.some(socket => socket.targetMultiSegmentCompleted > 0 && socket.targetResumeCompleted > 0
         && socket.targetSyntheticHistoryCaptured > 0)
         && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(STREAM_ANSWER)), 'long history recovery', 60_000)
@@ -800,14 +964,14 @@ async function run(options) {
     // /chat may be the default main session, which is not necessarily a
     // normal recents row. Use the real New task action to create the webchat
     // this probe will reopen later, preserving the current document.
-    await page.locator('.sidebar-new-session').click()
-    await until(() => new URL(page.url()).pathname === '/chat/new', 'new draft route', 15_000)
+    await enterSettledDraft()
     await page.locator('.chat-textarea').fill(MESSAGE)
     const send = page.locator('.chat-send-btn.btn--primary')
     await until(async () => await send.count() === 1 && !await send.isDisabled(), 'send enabled', 45_000)
     mark('single-ui-send-click')
     await send.click()
     await until(async () => (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(ANSWER)), 'visible answer', 45_000)
+    mark('single-ui-answer-visible')
     await until(async () => !await send.isDisabled(), 'turn finished', 45_000)
     await page.locator('.msg-ai').last().locator('.msg-meta__more-btn').waitFor({ state: 'visible', timeout: 45_000 })
     mark('single-ui-send-complete')
@@ -827,32 +991,36 @@ async function run(options) {
     readProbe.revision++
     report.sidebarBeforeLeave = await bounded(page.evaluate(inspectSyntheticSidebar, sessionKey), 5_000)
     mark('history-session-captured')
-    await page.locator('.sidebar-new-session').click()
-    await until(() => new URL(page.url()).pathname === '/chat/new', 'new draft route', 15_000)
+    await enterSettledDraft()
     report.sidebarAfterLeave = await bounded(page.evaluate(inspectSyntheticSidebar, sessionKey), 5_000)
     mark('history-new-draft')
-    const row = page.locator('.sidebar-history-row').filter({ has: page.locator('.sidebar-history-item') })
-    // Compare the attribute in the page; never interpolate an untrusted session
-    // identifier into a CSS selector or persist it in the report.
-    let index = -1
-    await until(async () => {
-      index = await bounded(row.evaluateAll((elements, key) => elements.findIndex(element => element.getAttribute('data-session-key') === key), sessionKey), 5_000)
-      return index >= 0
-    }, 'persisted sidebar row', 30_000)
-    assert.ok(index >= 0, 'Persisted session must appear in the real sidebar')
+    const row = await persistedHistoryRow(sessionKey)
     mark('history-sidebar-ready')
     // Arm only after the draft navigation finishes. Unrelated draft reads,
     // earlier pending responses and cached text cannot satisfy this proof.
     const readsBefore = report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0)
     readProbe.armed = true
     readProbe.revision++
-    await row.nth(index).locator('.sidebar-history-item').click()
+    readProbe.readsBefore = readsBefore
+    readProbe.requestsBefore = report.sockets.reduce((sum, socket) => sum + (socket.targetReadRequests || 0), 0)
+    mark('history-reread-click')
+    await row.locator('.sidebar-history-item').click()
     await until(async () => report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0) > readsBefore
+      && new URL(page.url()).searchParams.get('session') === sessionKey
       && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(ANSWER)), 'history re-read and visible answer', 45_000)
+    mark('history-reread-complete')
     await verifySingleRenderedTurn()
     assert.equal(chats, expectedChats, 'Reopening history must not replay the turn')
     report.historyRereadVerified = true
-    checkpoint = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8')
+    if (options.repeatProfile) {
+      report.repeatProfile.sidebarRowsAfter = (await bounded(page.evaluate(inspectSyntheticSidebar, null), 5_000)).loadedCount
+      assert.ok(Number.isSafeInteger(report.repeatProfile.sidebarRowsBefore)
+        && report.repeatProfile.sidebarRowsAfter === report.repeatProfile.sidebarRowsBefore + 1,
+      'Ordinary run must add exactly one sidebar session')
+      report.performance = ordinaryPerformanceMetrics(report.phases)
+      report.performanceBoundary = 'Host monotonic observations include Playwright and 100ms polling latency. First send follows Restart; local synthetic provider and warm OS cache, not model/network latency.'
+    }
+    checkpoint = await desktopLogText()
     mark('verified-before-cleanup')
   } catch (error) {
     failure = true
@@ -861,6 +1029,14 @@ async function run(options) {
     report.failure = { phase, kind: error?.name === 'AssertionError' ? 'assertion' : 'operation-failed', reason: safeFailureReason(error) }
     if (page && readProbe.key) {
       report.sidebarAtFailure = await bounded(page.evaluate(inspectSyntheticSidebar, readProbe.key), 5_000).catch(() => ({ unavailable: true }))
+      report.historyAtFailure = {
+        targetReadRequestedSinceArm: Number.isSafeInteger(readProbe.requestsBefore)
+          ? report.sockets.reduce((sum, socket) => sum + (socket.targetReadRequests || 0), 0) > readProbe.requestsBefore : null,
+        targetReadCompletedSinceArm: Number.isSafeInteger(readProbe.readsBefore)
+          ? report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0) > readProbe.readsBefore : null,
+        answerVisible: await bounded(page.locator('.msg-ai-text').allTextContents()
+          .then(values => values.some(text => text.includes(ANSWER))), 5_000).catch(() => null),
+      }
     }
   } finally {
     mark('cleanup')
@@ -876,7 +1052,7 @@ async function run(options) {
       assert.ok(records.size > 0, 'No child identity captured; cleanup remains unproven')
       for (const record of records.values()) assert.equal(shutdown.gatewayProcessSnapshot(record).alive, false, 'Owned child still present')
       assert.equal(ownership.loadDesktopGatewayOwnershipRecord(ownershipDir).status, 'missing')
-      const log = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8')
+      const log = await desktopLogText()
       const spawned = []
       for (const line of log.split(/\r?\n/)) {
         let item
@@ -907,11 +1083,37 @@ async function run(options) {
     report.observationFailed = monitorError
     report.conversationFailures = report.sockets.reduce((sum, socket) => sum + (socket.conversationFailures || 0), 0)
     try {
-      report.gatewayFlowFailures = gatewayFlowFailureEvidence(await readFile(join(userData, 'logs', 'gateway.log'), 'utf8'), records.size)
+      const log = await gatewayLogText()
+      report.gatewayFlowFailures = gatewayFlowFailureEvidence(log, records.size)
+      if (options.repeatProfile) {
+        report.repeatProfile.migrations = ordinaryMigrationEvidence(log, records.size)
+        if (!report.repeatProfile.preparation) assert.equal(report.repeatProfile.migrations.alreadyMigrated, true,
+          'Repeated profile must not perform first-run migrations')
+      }
     } catch { failure = true; report.gatewayFlowFailures = { available: false } }
     report.ok = !failure && !monitorError && pageErrors === 0 && report.conversationFailures === 0 && chats === expectedChats && report.cleanup.verified
       && hasCleanGatewayFlowEvidence(report.gatewayFlowFailures)
       && report.sockets.every(socket => !socket.responseObservationOverflow)
+    if (options.repeatProfile && report.ok) {
+      try {
+        const configSha256 = await fileHash(configPath)
+        const credentialSha256 = await fileHash(credentialPath)
+        // Preparation may normalize settings; warm samples may not rewrite them.
+        if (!report.repeatProfile.preparation) {
+          assert.equal(configSha256, repeatMarker.configSha256, 'Repeated profile configuration changed')
+          assert.equal(credentialSha256, repeatMarker.credentialSha256, 'Repeated profile credential changed')
+        }
+        repeatMarker.configSha256 = configSha256
+        repeatMarker.credentialSha256 = credentialSha256
+        repeatMarker.clean = true
+        repeatMarker.completedRuns++
+        report.repeatProfile.completedRunsAfter = repeatMarker.completedRuns
+        await writeFile(markerPath, JSON.stringify(repeatMarker, null, 2) + '\n')
+        await repeatLock.close()
+        await unlink(lockPath)
+      } catch { report.ok = false; report.repeatProfile.finalizationFailed = true }
+    }
+    if (repeatLock) await repeatLock.close() // On failure retain the lock file, never automatically adopt dirty state.
     await persist()
   }
   console.log(JSON.stringify({ event: 'gateway_reliability_result', scenario: options.scenario, ok: report.ok,
@@ -921,5 +1123,5 @@ async function run(options) {
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try { await run(parseArguments(process.argv.slice(2))) }
-  catch (error) { console.error(error?.code === 'ERR_ASSERTION' ? error.message : 'Gateway reliability harness setup failed; no existing profile is reused.'); process.exitCode = 1 }
+  catch (error) { console.error(error?.code === 'ERR_ASSERTION' ? error.message : 'Gateway reliability harness setup failed; inspect the isolated fixture.'); process.exitCode = 1 }
 }

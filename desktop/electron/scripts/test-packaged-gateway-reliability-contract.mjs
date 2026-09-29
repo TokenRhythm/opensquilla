@@ -6,8 +6,10 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
-import { HISTORY_ANSWER_BYTES, HISTORY_TURNS, gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, hasNaturalGatewayExits, historyTurn, inside, isolatedEnvironment,
-  observeFrame, onboardingSaveEvidence, parseArguments, runtimeRestartControl, safeFailureReason, syntheticConfig } from './test-packaged-gateway-reliability.mjs'
+import { HISTORY_ANSWER_BYTES, HISTORY_TURNS, ORDINARY_RUNS_ROOT, appendOnlyLogSuffix,
+  gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, hasNaturalGatewayExits, historyTurn, inside, isSettledDraft, isolatedEnvironment,
+  observeFrame, onboardingSaveEvidence, ordinaryMigrationEvidence, ordinaryPerformanceMetrics, parseArguments, runtimeRestartControl,
+  safeFailureReason, syntheticConfig, validateOrdinaryProfileMarker } from './test-packaged-gateway-reliability.mjs'
 
 const script = fileURLToPath(new URL('./test-packaged-gateway-reliability.mjs', import.meta.url))
 const options = ['--executable', process.execPath, '--workdir', join(tmpdir(), 'synthetic-reliability'), '--output', join(tmpdir(), 'synthetic-report.json')]
@@ -36,6 +38,68 @@ test('startup timing is opt-in after inherited environment scrubbing', () => {
   assert.equal(isolatedEnvironment(source, root).OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS, '131072')
   assert.equal(isolatedEnvironment(source, root, { longHistory: true }).OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS, '1048576')
   assert.equal(isolatedEnvironment(source, root, { longHistory: true }).OPENSQUILLA_LLM_MAX_TOKENS, '262144')
+})
+
+test('repeat profiles are explicit fixed variants with new evidence under the bounded run root', () => {
+  const root = join(ORDINARY_RUNS_ROOT, 'contract-no-launch')
+  const args = ['--executable', process.execPath, '--workdir', root, '--output', join(root, 'report.json'),
+    '--scenario', 'restart', '--repeat-profile', 'main']
+  assert.equal(parseArguments(args).repeatProfile, 'main')
+  assert.equal(parseArguments(args).initializeRepeatProfile, false)
+  assert.equal(parseArguments([...args, '--initialize-repeat-profile']).initializeRepeatProfile, true)
+  assert.throws(() => parseArguments([...options, '--scenario', 'restart', '--repeat-profile', 'main']), /isolated ordinary run/)
+  assert.throws(() => parseArguments(args.map(value => value === 'main' ? '../../real-profile' : value)), /Unknown repeat profile/)
+  assert.throws(() => parseArguments(args.map(value => value === 'restart' ? 'configuration' : value)), /only support restart/)
+  assert.throws(() => parseArguments(args.map(value => value === join(root, 'report.json') ? join(ORDINARY_RUNS_ROOT, 'outside.json') : value)), /isolated ordinary run/)
+  assert.throws(() => parseArguments([...options, '--scenario', 'restart', '--initialize-repeat-profile']), /requires a repeat profile/)
+})
+
+test('repeat markers must prove completed preparation, clean exit and exact config bindings', () => {
+  const marker = { kind: 'opensquilla-synthetic-ordinary-performance-v1', clean: true, completedRuns: 2,
+    providerPort: 12345, configSha256: 'a'.repeat(64), credentialSha256: 'b'.repeat(64),
+    executableSha256: 'c'.repeat(64), executablePath: process.execPath }
+  assert.equal(validateOrdinaryProfileMarker(marker), marker)
+  for (const update of [{ kind: 'real-profile' }, { clean: false }, { completedRuns: 0 }, { completedRuns: 1.5 },
+    { providerPort: 80 }, { providerPort: 65536 }, { configSha256: '' }, { credentialSha256: 'short' },
+    { executableSha256: undefined }, { executablePath: 'relative.exe' }]) {
+    assert.throws(() => validateOrdinaryProfileMarker({ ...marker, ...update }))
+  }
+})
+
+test('only current-run log suffix can establish lifecycle, migrations or clean flow', () => {
+  const previous = '{"event":"gateway.started"}\n{"event":"gateway.stopped"}\n'
+  const current = '{"event":"gateway.started"}\n'
+  assert.equal(appendOnlyLogSuffix(previous, previous + current), current)
+  assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(appendOnlyLogSuffix(previous, previous + current))), false)
+  for (const replaced of ['', current, 'rotation\n' + previous]) assert.throws(() => appendOnlyLogSuffix(previous, replaced), /replaced or truncated/)
+  const migrations = count => JSON.stringify({ event: 'build_services.migrations_ready', count }) + '\n'
+  assert.equal(ordinaryMigrationEvidence(migrations(0).repeat(2), 2).alreadyMigrated, true)
+  for (const log of ['', migrations(0), migrations(1) + migrations(0), migrations(null).repeat(2)]) {
+    assert.equal(ordinaryMigrationEvidence(log, 2).alreadyMigrated, false)
+  }
+})
+
+test('performance metrics require distinct connected, usable, answer, terminal and history boundaries', () => {
+  const phases = [
+    ['launch', 10], ['initial-ui-connected', 50], ['initial-ui-connected-composer-usable', 60],
+    ['runtime-restart-click', 100], ['runtime-restart-connected', 190], ['runtime-restart-connected-composer-usable', 205],
+    ['single-ui-send-click', 220], ['single-ui-answer-visible', 270], ['single-ui-send-complete', 285],
+    ['history-reread-click', 300], ['history-reread-complete', 330],
+  ].map(([phase, ms]) => ({ phase, ms }))
+  assert.deepEqual(ordinaryPerformanceMetrics(phases), { launchToConnectedMs: 40, launchToComposerUsableMs: 50,
+    restartToConnectedMs: 90, restartToComposerUsableMs: 105, firstSendToAnswerVisibleMs: 50,
+    firstSendToCompletedMs: 65, historyClickToReadAndVisibleMs: 30 })
+  assert.throws(() => ordinaryPerformanceMetrics(phases.filter(item => item.phase !== 'history-reread-complete')))
+  assert.throws(() => ordinaryPerformanceMetrics([...phases, phases[0]]))
+  assert.throws(() => ordinaryPerformanceMetrics(phases.map(item => item.phase === 'launch' ? { ...item, ms: 99 } : item)))
+})
+
+test('a draft URL alone cannot prove the previous session was left before reopening history', () => {
+  const ready = { routeIsDraft: true, routeHasSession: false, draftLanding: true, messageRowsEmpty: true, composerEditable: true, composerVisible: true }
+  assert.equal(isSettledDraft(ready), true)
+  for (const [key, value] of Object.entries(ready)) assert.equal(isSettledDraft({ ...ready, [key]: !value }), false, key)
+  assert.equal(isSettledDraft({ routeIsDraft: true }), false)
+  assert.equal(isSettledDraft(undefined), false)
 })
 
 test('runtime restart selector accepts the explicit control or only the verified legacy layout', async () => {

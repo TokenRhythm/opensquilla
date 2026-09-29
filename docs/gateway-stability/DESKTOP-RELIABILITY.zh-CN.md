@@ -30,6 +30,31 @@ node desktop/electron/scripts/test-packaged-gateway-reliability.mjs `
 
 `history-streaming-restart` 中的多段快照在重启前完成安装；它不证明“快照传输中断后恢复”。持久历史由 `chat.history` 读取，活动 turn 快照由 `sessions.messages.snapshot.read` 读取，两者不能混称。
 
+## 普通小 profile 的重复性能对照
+
+固定版本的实测、失败记录和结论边界见 [2026-09-29 Windows 性能对照](PERFORMANCE-2026-09-29.zh-CN.md)。
+
+`restart` 可显式增加 `--repeat-profile main` 或 `--repeat-profile candidate`，分别使用本仓库 `.cache/perf-ordinary-profile/main`、`candidate` 下的合成 profile。首次还需 `--initialize-repeat-profile`，且对应目录必须不存在。每次 `--workdir` 必须是 `.cache/perf-ordinary-runs/` 下的新目录，`--output` 必须在该次目录内。固定端口由首次合成 Provider 分配并记录；复用时不改配置或凭据，端口占用即失败，不换端点继续测量。
+
+先为每版独立运行一次初始化、一次预热，随后至少 **10 对交错样本**，按 main→candidate、candidate→main 交替顺序串行执行。初始化和预热不计入正式样本。例如首次准备 main：
+
+```powershell
+node desktop/electron/scripts/test-packaged-gateway-reliability.mjs `
+  --executable .cache/perf-main-source/dist/desktop-electron/win-unpacked/OpenSquilla.exe `
+  --workdir .cache/perf-ordinary-runs/main-prepare `
+  --output .cache/perf-ordinary-runs/main-prepare/report.json `
+  --scenario restart --disable-gpu `
+  --repeat-profile main --initialize-repeat-profile
+```
+
+后续去掉初始化参数、使用新 run 目录；candidate 换用当前 `dist/desktop-electron/win-unpacked/OpenSquilla.exe` 和对应 variant。两套 profile 各自迁移，避免在同一数据库上来回升降级。正式样本要求本轮两个 Gateway 的迁移计数都为零；小库的 schema/index 首次准备也应留在初始化与预热中，不能据此声称验证过大型历史库的全部布局。
+
+`performance` 分别记录进程启动→页面已连接、→输入框可编辑，实际 Restart 点击→新实例连接、→输入恢复，重启后的首条发送→回答可见、→任务完成，以及侧栏点击→目标历史读取且显示成功。计时采用宿主单调时钟，包含 Playwright 调度和 100ms 轮询误差；此处的首条发送发生在重启之后。新连接须具有新的 descriptor instanceId 和实际 WebSocket Hello，旧连接外观不能满足重启测量。
+
+每轮通过 UI 新增一个合成会话。`repeatProfile` 记录运行前后完成轮数及实际侧栏行数，并要求只增加一行。**配对时还必须检查两版的 `completedRunsBefore` 和 `sidebarRowsBefore` 相同**；数量不同、缺少阶段、配置变化、日志截断或任何业务/清理失败，都应停止批次并调查，不能仅剔除慢样本后继续。此方案是逐渐累积几十条历史的小 profile，不是每轮字节相同的数据库，也不代表真实模型、远程网络或冷磁盘启动。
+
+脚本拒绝链接路径，以排他锁和已干净退出的合成标记控制复用，只用本轮日志后缀验证进程退出及 flow 故障。失败会保留锁和资料供检查，不自动删 profile 或绕过标记。执行前固定两版全部组件的构建来源；外层 EXE 哈希不等于 Gateway/WebUI 内容证明。两组采用同一 harness、GPU 和计时设置，并在没有其他构建或重负载时串行运行。性能批次关闭可选启动计时；开启计时的定位运行单独报告。结果保留全部样本、中位数、范围、每对 candidate−main 差值及改善对数。配对差值中位数不等于两组中位数之差；十对样本不能支持可靠 p95、产品失败率或普遍提速结论。
+
 ## 启动前段计时
 
 启动进程环境中显式设置 `OPENSQUILLA_STARTUP_TIMING=1` 才会输出早期阶段计时。上述 harness 的 `--startup-timing` 会在隔离环境中设置它。默认关闭；profile 内 dotenv 不能迟到启用这个开关。
