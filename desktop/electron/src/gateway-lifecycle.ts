@@ -28,6 +28,13 @@ export type GatewayReadinessWaitResult =
 
 export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000
 
+export class GatewayReadinessTimeoutError extends Error {
+  constructor(url: string) {
+    super(`Gateway did not become ready at ${url}`)
+    this.name = 'GatewayReadinessTimeoutError'
+  }
+}
+
 /**
  * Wait for a spawned Gateway without turning the first readiness deadline into
  * an irreversible failure. The late window remains bounded, and child exit is
