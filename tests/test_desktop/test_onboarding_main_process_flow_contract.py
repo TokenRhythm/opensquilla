@@ -130,7 +130,7 @@ def test_onboarding_save_preserves_recovery_and_writer_ordering() -> None:
     assert "throw error" in save
 
 
-def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() -> None:
+def test_fresh_onboarding_runs_before_gateway_without_changing_existing_prompt_path() -> None:
     source = _main_source()
     startup = _section(
         source,
@@ -140,7 +140,10 @@ def test_onboarding_does_not_wait_for_configuration_before_starting_gateway() ->
     run = _section(source, "async function runOnboarding", "async function pathExists")
 
     assert "await prepareDesktopStartupConnection()" in startup
-    assert "await runOnboarding()" not in startup
+    assert "const shouldRunFreshOnboarding" in startup
+    assert "await runOnboarding()" in startup
+    assert "await onboardingFlows.waitForAbandonedSave()" in startup
+    assert startup.index("await runOnboarding()") < startup.index("sendBootStatus('gateway-start')")
     assert "void runOnboarding()" in source
     assert "Promise<DesktopConnection | null>" in run
     assert "modal: true" not in run
