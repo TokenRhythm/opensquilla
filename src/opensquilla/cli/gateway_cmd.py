@@ -386,7 +386,26 @@ def run_gateway(
             "self-disable that pill.[/yellow]"
         )
 
+    stall_watchdog = None
+
     async def _run() -> bool:
+        nonlocal stall_watchdog
+        from opensquilla.gateway.stall_watchdog import GatewayStallWatchdog
+
+        # This is deliberately opt-in.  The diagnostic thread is the only
+        # component that can sample the Gateway while its event loop is
+        # synchronously blocked; normal clients pay no thread or file cost.
+        stall_watchdog = GatewayStallWatchdog.from_environment()
+        if stall_watchdog is not None:
+            stall_watchdog.start()
+
+            async def _stall_heartbeat() -> None:
+                while True:
+                    stall_watchdog.beat()
+                    await asyncio.sleep(0.1)
+
+            asyncio.create_task(_stall_heartbeat(), name="gateway-stall-heartbeat")
+
         # Subscription manager is gateway-specific (WS event routing)
         from opensquilla.gateway.websocket import SubscriptionManager
 
@@ -580,6 +599,9 @@ def run_gateway(
         raise typer.Exit(code=1) from exc
     except KeyboardInterrupt:
         console.print("\n[yellow]Gateway stopped.[/yellow]")
+    finally:
+        if stall_watchdog is not None:
+            stall_watchdog.stop()
 
 
 def _resolve_lifecycle_host(*, bind: str, listen: str) -> str:
