@@ -677,6 +677,52 @@ async function runLateReadinessAfterFailedUpdateCase() {
   assert.equal(update.calls.launches, 0, 'failed verification never reaches installer handoff')
 }
 
+async function runForegroundTimeoutDuringUpdateCase(label, invalidate = null, timeout = true) {
+  const harness = lateReadyHarness()
+  const foreground = deferred()
+  const originalWait = harness.context.waitForGatewayReadiness
+  let firstWait = true
+  harness.context.waitForGatewayReadiness = options => {
+    if (!firstWait) return originalWait(options)
+    firstWait = false
+    return foreground.promise
+  }
+  const opening = harness.open()
+  await harness.flush()
+  const update = installFailedUpdateHarness(harness)
+  const applying = update.start()
+  await harness.flush()
+  assert.equal(harness.context.appExitPhase, 'deferred')
+  await harness.advance(120_000)
+  if (timeout) foreground.resolve({ status: 'timeout' })
+  else foreground.reject(new Error('Synthetic unrelated startup failure'))
+  await opening
+  const originalError = harness.state().bootError
+  assert.equal(harness.state().status, 'error')
+  await harness.advance(6_000)
+  assert.equal(harness.calls.probes, 0, `${label}: update verification cannot start a background readiness probe`)
+  assert.equal(harness.calls.ready, 0, `${label}: update verification owns readiness publication`)
+  await invalidate?.(harness)
+  update.fail()
+  await applying
+  await harness.flush()
+  await harness.advance(2_000)
+  if (!invalidate && timeout) {
+    assert.equal(harness.state().status, 'ready',
+      'a foreground timeout during failed update verification must resume the same launch')
+    assert.equal(harness.calls.ready, 1)
+    assert.equal(harness.state().bootError, null)
+    assert.equal(harness.calls.published.filter(state => state.status === 'ready').length, 1)
+  } else {
+    assert.equal(harness.calls.ready, 0, `${label}: canceled or unrelated startup must not recover`)
+    assert.equal(harness.calls.probes, 0, `${label}: canceled or unrelated startup must not start a new probe`)
+    assert.equal(harness.state().bootError, originalError)
+  }
+  assert.equal(harness.calls.starts, 1, `${label}: update failure cannot spawn another Gateway`)
+  assert.equal(update.calls.stops, 0, `${label}: verification failed before Gateway stop`)
+  assert.equal(update.calls.launches, 0, `${label}: verification failed before installer launch`)
+}
+
 async function runFailedUpdateKeepsLateReadinessDeadlineCase() {
   const harness = lateReadyHarness()
   harness.context.readinessCheck = async () => false
@@ -990,6 +1036,22 @@ await runSlowColdStartReadinessCase()
 await runReadinessAfterForegroundTimeoutCase()
 await runLateReadinessSingleObserverCase()
 await runLateReadinessAfterFailedUpdateCase()
+await runForegroundTimeoutDuringUpdateCase('same launch')
+await runForegroundTimeoutDuringUpdateCase('unrelated startup error', null, false)
+for (const [label, invalidate] of [
+  ['replacement child', harness => { harness.context.gatewayProcess = { ...harness.child, pid: 202 } }],
+  ['profile change', harness => { harness.context.profileKey = 'profile-b' }],
+  ['new open revision', harness => runInContext('invalidateDesktopOpenFlow()', harness.context)],
+  ['queued Quit', harness => { harness.context.quitRequestedDuringUpdateDrain = true }],
+  ['another writer owner', harness => { harness.context.desktopWriters.close('synthetic cleanup') }],
+  ['expired observation', harness => harness.advance(600_001)],
+  ['stopping child', harness => harness.context.gatewayStoppingProcesses.add(harness.child)],
+  ['child exit', harness => { harness.child.exitCode = 0 }],
+  ['endpoint change', harness => runInContext("gatewayState.url = 'http://127.0.0.1:18792'", harness.context)],
+  ['port change', harness => runInContext('gatewayState.port = 18792', harness.context)],
+  ['instance change', harness => runInContext("gatewayConnectionInstanceId = 'instance-b'", harness.context)],
+  ['launch context change', harness => harness.context.gatewayProcessOwnershipContexts.set(harness.child, { ...harness.launch })],
+]) await runForegroundTimeoutDuringUpdateCase(label, invalidate)
 await runFailedUpdateKeepsLateReadinessDeadlineCase()
 for (const [label, invalidate] of [
   ['expired observation', harness => harness.advance(600_001)],

@@ -9056,14 +9056,17 @@ function observeLateOwnedGatewayReadiness(
     // A failed update preparation may resume this exact launch. Create a new
     // observation so canceled callbacks stay invalid, retaining the old budget.
     resumeIfCurrent: (): void => {
-      if (!gatewayLateReadyObservation && authorityIsCurrent()) {
-        observeLateOwnedGatewayReadiness(deadline)
-      }
+      if (gatewayLateReadyObservation && gatewayLateReadyObservation !== observation) return
+      if (gatewayLateReadyObservation === observation) gatewayLateReadyObservation = null
+      if (authorityIsCurrent()) observeLateOwnedGatewayReadiness(deadline)
     },
   }
   gatewayLateReadyObservation = observation
   const isCurrent = observation.isCurrent
   if (!isCurrent()) {
+    // The foreground deadline can expire while update verification is still
+    // running. Retain only this timeout's intent and budget; do not probe yet.
+    if (updateApplying && appExitPhase === 'deferred' && !isQuitting) return
     gatewayLateReadyObservation = null
     return
   }
@@ -12383,7 +12386,9 @@ async function applyWindowsInstaller(): Promise<void> {
       desktopLog('update_windows_installer_failed', { version: candidate.version, errorCode, error: String(error) })
       if (quitResumed) return
       if (!gatewayStopStarted) {
-        resumeLateReadinessAfterFailure?.()
+        const resumeLateReadiness = gatewayLateReadyObservation?.resumeIfCurrent
+          ?? resumeLateReadinessAfterFailure
+        resumeLateReadiness?.()
         return
       }
       if (!previouslyOwned) return
