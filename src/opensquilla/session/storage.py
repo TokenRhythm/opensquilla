@@ -2571,9 +2571,11 @@ class SessionStorage:
             if self._usage_backfill_indexes_ready:
                 return
             statements = (
+                # Live provider reservations also use this identity lookup.
+                # Keep it usable if a later historical index is interrupted.
+                _CREATE_IDX_SESSIONS_ID_KEY,
                 _CREATE_IDX_TRANSCRIPT_USAGE_BACKFILL,
                 _CREATE_IDX_COMPACTED_USAGE_BACKFILL,
-                _CREATE_IDX_SESSIONS_ID_KEY,
             )
             if self._db_path == ":memory:":
                 async with self._operation_lock:
