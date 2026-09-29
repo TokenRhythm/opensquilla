@@ -383,9 +383,15 @@ def test_nsis_matrix_adds_only_two_fresh_cells_with_shared_candidate_binding():
     workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
     job = workflow["jobs"]["upgrade-and-start"]
     matrix = job["strategy"]["matrix"]
-    assert matrix["baseline"] == ["0.5.3", "0.5.4"]
+    assert matrix["baseline"] == (
+        "${{ fromJSON(inputs.acceptance_profile == 'smoke' && '[\"0.5.4\"]' || "
+        "'[\"0.5.3\",\"0.5.4\"]') }}"
+    )
     assert matrix["install-path"] == ["default", "custom"]
-    assert matrix["scenario"] == ["baseline", "readlock", "longpath"]
+    assert matrix["scenario"] == (
+        "${{ fromJSON(inputs.acceptance_profile == 'smoke' && '[\"baseline\"]' || "
+        "'[\"baseline\",\"readlock\",\"longpath\"]') }}"
+    )
     assert matrix["include"] == [
         {"baseline": "fresh", "install-path": path, "scenario": "fresh"}
         for path in ("default", "custom")
