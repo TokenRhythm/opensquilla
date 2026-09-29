@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import subprocess
 from collections.abc import AsyncIterator
@@ -2181,6 +2182,142 @@ async def test_discarded_empty_attempt_counts_usage_but_skips_cache_check(
     assert tracked.output_tokens == 1
     assert len(cache_checks) == 1
     assert len([msg for msg in agent._history if msg.role == "assistant"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_precommit_provider_protocol_error_retries_once_without_public_error() -> None:
+    provider = _SequenceProvider(
+        [
+            [ProviderError(message="invalid tool stream", code="provider_protocol_error")],
+            [
+                ProviderText(text="recovered"),
+                ProviderDone(stop_reason="stop", input_tokens=4, output_tokens=1),
+            ],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert [event.text for event in events if event.kind == "text_delta"] == ["recovered"]
+    assert not any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )
+    assert any(event.kind == "done" and event.text == "recovered" for event in events)
+    assert [event.phase for event in events if event.kind == "provider_activity"] == [
+        "requesting",
+        "retry_wait",
+        "retrying",
+        "requesting",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_visible_provider_protocol_error_does_not_replay_attempt() -> None:
+    provider = _SequenceProvider(
+        [
+            [
+                ProviderText(text="partial"),
+                ProviderError(message="invalid tool stream", code="provider_protocol_error"),
+            ],
+            [ProviderText(text="must not replay"), ProviderDone(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 1
+    assert [event.text for event in events if event.kind == "text_delta"] == ["partial"]
+    assert any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )
+    assert not any(event.kind == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_protocol_recovery_respects_remaining_provider_retry_budget() -> None:
+    provider = _SequenceProvider(
+        [
+            [ProviderError(message="gateway 503", code="503")],
+            [ProviderError(message="invalid tool stream", code="provider_protocol_error")],
+            [ProviderText(text="must not replay"), ProviderDone(stop_reason="stop")],
+        ]
+    )
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=0,
+            retry_max_backoff_ms=0,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert len(provider.calls) == 2
+    assert [event.phase for event in events if event.kind == "provider_activity"] == [
+        "requesting",
+        "retry_wait",
+        "retrying",
+        "requesting",
+    ]
+    assert any(
+        event.kind == "error" and event.code == "provider_protocol_error"
+        for event in events
+    )
+    assert not any(event.kind == "done" for event in events)
+
+
+@pytest.mark.asyncio
+async def test_protocol_recovery_wait_respects_turn_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = _SequenceProvider(
+        [
+            [ProviderError(message="invalid tool stream", code="provider_protocol_error")],
+            [ProviderText(text="must not reach"), ProviderDone(stop_reason="stop")],
+        ]
+    )
+    sleep_calls: list[float] = []
+
+    async def blocking_retry_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr("opensquilla.engine.agent.sleep_before_retry", blocking_retry_sleep)
+    agent = Agent(
+        provider=provider,
+        config=AgentConfig(
+            max_provider_retries=1,
+            retry_base_backoff_ms=100,
+            retry_max_backoff_ms=100,
+            timeout=0.01,
+        ),
+    )
+
+    events = [event async for event in agent.run_turn("hello")]
+
+    assert sleep_calls == [0.1]
+    assert len(provider.calls) == 1
+    assert any(event.kind == "error" and event.code == "agent_runtime_timeout" for event in events)
 
 
 @pytest.mark.asyncio

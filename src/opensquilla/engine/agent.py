@@ -6235,6 +6235,10 @@ class Agent:
         post_tool_empty_recovery_attempted = False
         reasoning_prefill_recovery_attempted = False
         runtime_recovery_scaffolding_pending = False
+        # Bound protocol recovery across the logical turn, not just one
+        # provider iteration.  A successful tool round must not reset this
+        # guard and turn a repeated malformed stream into an unbounded loop.
+        protocol_recovery_used = False
         runtime_recovery_mode: RuntimeRecoveryMode = getattr(
             self.config, "runtime_recovery_mode", "log"
         )
@@ -9811,6 +9815,60 @@ class Agent:
                             failure_kind.value,
                         )
                         kind = failure_kind
+                        if (
+                            provider_error.code == "provider_protocol_error"
+                            and not protocol_recovery_used
+                            and not attempt_irreversible_output_emitted
+                            and _retry_attempt < _fallback.max_retries
+                            and getattr(self.provider, "retry_failed_call_safe", True)
+                            is not False
+                        ):
+                            protocol_recovery_used = True
+                            recovery_attempt = _retry_attempt + 1
+                            self._write_turn_call_log(
+                                "turn_policy_decision",
+                                action="provider_protocol_recovery",
+                                reason="precommit_protocol_error",
+                                iteration=iterations,
+                                old_attempt=_call_attempt,
+                                new_attempt=_call_attempt + 1,
+                                recovery_attempt=recovery_attempt,
+                                dropped_pending_tool_buffers=True,
+                                visible_output_committed=False,
+                                provider=getattr(self.provider, "provider_name", ""),
+                                model=self.config.model_id or "",
+                            )
+                            delay = backoff_sleep(
+                                _retry_attempt,
+                                _fallback.base_backoff_ms,
+                                _fallback.max_backoff_ms,
+                                _fake=True,
+                            )
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retry_wait",
+                                reason="invalid_response",
+                                retry_attempt=recovery_attempt,
+                                retry_limit=_fallback.max_retries,
+                                retry_after_ms=math.ceil(delay * 1000),
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            async with asyncio.timeout_at(_total_deadline):
+                                await sleep_before_retry(delay)
+                            _retry_attempt += 1
+                            next_provider_activity_reason = "invalid_response"
+                            yield ProviderActivityEvent(
+                                activity_id=provider_activity_id,
+                                model=self._provider_activity_model(),
+                                phase="retrying",
+                                reason="invalid_response",
+                                retry_attempt=recovery_attempt,
+                                retry_limit=_fallback.max_retries,
+                                started_at=time.time_ns() // 1_000_000,
+                            )
+                            _call_attempt += 1
+                            continue
                         if (
                             image_failure.is_unsupported
                             and (
