@@ -3,6 +3,8 @@ import type { ChatRenderedMessage } from '@/types/chat'
 import { downloadText } from '@/utils/browser'
 import { artifactMeta, artifactName } from '@/utils/chat/artifacts'
 import { sanitizeAssistantPresentationText } from '@/utils/chat/silentSentinels'
+import { resolveAssistantAnswer } from '@/utils/chat/assistantActivity'
+import { turnOutcomePresentation } from '@/utils/chat/turnOutcome'
 
 export interface UseChatMarkdownExportOptions {
   messages: Readonly<Ref<ChatRenderedMessage[]>>
@@ -46,6 +48,18 @@ function subagentCompletionMarkdown(text: string): string {
   }
 }
 
+function assistantMarkdownText(message: ChatRenderedMessage): string {
+  const outcome = turnOutcomePresentation(message.turnOutcome)
+  const lifecycle = outcome === 'stopped' || outcome === 'interrupted' || message.interrupted
+    ? 'interrupted' as const
+    : outcome === 'timeout' || outcome === 'failed' || message.terminalFailure
+      ? 'failed' as const
+      : message.isStreaming
+        ? 'working' as const
+        : 'settled' as const
+  return resolveAssistantAnswer(message, message.timelineItems ?? [], lifecycle).text
+}
+
 export function buildChatMarkdown(options: BuildChatMarkdownOptions): string {
   const lines: string[] = [
     `# ${options.title || 'OpenSquilla chat'}`,
@@ -66,7 +80,7 @@ export function buildChatMarkdown(options: BuildChatMarkdownOptions): string {
     lines.push(`## ${message.roleLabel || message.displayRole || message.role}`)
     if (message.timeStr) lines.push(`_${message.timeStr}_`)
     const presentationText = message.displayRole === 'assistant'
-      ? sanitizeAssistantPresentationText(message.text, {
+      ? sanitizeAssistantPresentationText(assistantMarkdownText(message), {
           inputMode: message.turnInputMode,
           runKind: message.turnRunKind,
         })

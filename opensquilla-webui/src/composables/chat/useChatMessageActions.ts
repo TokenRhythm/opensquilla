@@ -99,7 +99,8 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // activity must also be what Copy returns. Otherwise the compact completed
     // state would silently copy the entire execution narration.
     if (
-      answer.source === 'terminal-control-boundary'
+      answer.source === 'explicit-presentation'
+      || answer.source === 'terminal-control-boundary'
       || answer.source === 'terminal-timeline-boundary'
     ) {
       return options.sanitizeCopyText(answer.text, { provenance })
