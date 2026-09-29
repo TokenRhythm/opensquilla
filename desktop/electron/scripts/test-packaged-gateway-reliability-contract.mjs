@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
-import { inside, isolatedEnvironment, observeFrame, parseArguments, safeFailureReason, syntheticConfig } from './test-packaged-gateway-reliability.mjs'
+import { HISTORY_ANSWER_BYTES, HISTORY_TURNS, gatewayFlowFailureEvidence, gatewayShutdownCountFromLog, hasCleanGatewayFlowEvidence, historyTurn, inside, isolatedEnvironment,
+  observeFrame, onboardingSaveEvidence, parseArguments, runtimeRestartControl, safeFailureReason, syntheticConfig } from './test-packaged-gateway-reliability.mjs'
 
 const script = fileURLToPath(new URL('./test-packaged-gateway-reliability.mjs', import.meta.url))
 const options = ['--executable', process.execPath, '--workdir', join(tmpdir(), 'synthetic-reliability'), '--output', join(tmpdir(), 'synthetic-report.json')]
@@ -17,6 +18,116 @@ test('reject missing/unknown/duplicate arguments before any launch; GPU flag is 
   assert.throws(() => parseArguments([...options, '--scenario', 'restart', '--scenario', 'restart']), /Duplicate/)
   assert.equal(parseArguments([...options, '--scenario', 'configuration']).disableGpu, false)
   assert.equal(parseArguments([...options, '--scenario', 'late-ready', '--disable-gpu']).disableGpu, true)
+  for (const scenario of ['fresh-onboarding', 'history-streaming-restart']) {
+    assert.equal(parseArguments([...options, '--scenario', scenario, '--disable-gpu']).scenario, scenario)
+  }
+  assert.equal(parseArguments([...options, '--scenario', 'restart']).startupTiming, false)
+  assert.equal(parseArguments([...options, '--scenario', 'restart', '--startup-timing']).startupTiming, true)
+})
+
+test('startup timing is opt-in after inherited environment scrubbing', () => {
+  const source = {}
+  Object.defineProperty(source, 'OPENSQUILLA_STARTUP_TIMING', { enumerable: true,
+    get() { throw new Error('must not inherit the caller setting') } })
+  const root = join(tmpdir(), 'synthetic-timing-env')
+  assert.equal(isolatedEnvironment(source, root).OPENSQUILLA_STARTUP_TIMING, undefined)
+  assert.equal(isolatedEnvironment(source, root, { startupTiming: true }).OPENSQUILLA_STARTUP_TIMING, '1')
+  assert.equal(isolatedEnvironment(source, root).OPENSQUILLA_NAMING_ENABLED, 'false')
+  assert.equal(isolatedEnvironment(source, root).OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS, '131072')
+  assert.equal(isolatedEnvironment(source, root, { longHistory: true }).OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS, '1048576')
+  assert.equal(isolatedEnvironment(source, root, { longHistory: true }).OPENSQUILLA_LLM_MAX_TOKENS, '262144')
+})
+
+test('runtime restart selector accepts the explicit control or only the verified legacy layout', async () => {
+  function pageWith(modernCount, legacyCount) {
+    const button = { fixed: true }
+    const modern = { count: async () => modernCount }
+    return { button, modern, page: { locator: selector => selector.startsWith('[data-testid=')
+      ? modern : { count: async () => legacyCount, last: () => button } } }
+  }
+  const modern = pageWith(1, 2)
+  assert.deepEqual(await runtimeRestartControl(modern.page), { button: modern.modern, layout: 'explicit-test-id' })
+  const old = pageWith(0, 3)
+  assert.deepEqual(await runtimeRestartControl(old.page), { button: old.button, layout: 'legacy-three-button' })
+  await assert.rejects(runtimeRestartControl(pageWith(0, 2).page), /Known real runtime controls required/)
+  await assert.rejects(runtimeRestartControl(pageWith(2, 3).page), /Known real runtime controls required/)
+})
+
+test('native save proof requires real successful persistence, not window closure or a started write', () => {
+  const lines = [
+    { event: 'onboarding_save_started', privateText: 'PRIVATE' },
+    { event: 'onboarding_save_finished', outcome: 'threw', writerAdmitted: true, settingsPersistedConfirmed: true },
+    { event: 'onboarding_save_finished', outcome: 'ok', writerAdmitted: true, settingsPersistedConfirmed: false },
+  ]
+  assert.deepEqual(onboardingSaveEvidence(lines.map(row => JSON.stringify(row)).join('\n')), { successfulSaves: 0 })
+  lines.push({ event: 'onboarding_save_finished', outcome: 'ok', writerAdmitted: true, settingsPersistedConfirmed: true, privateText: 'PRIVATE' })
+  const proof = onboardingSaveEvidence('not json\n' + lines.map(row => JSON.stringify(row)).join('\n'))
+  assert.deepEqual(proof, { successfulSaves: 1 })
+  assert.equal(JSON.stringify(proof).includes('PRIVATE'), false)
+})
+
+test('Gateway log parser counts actual structured events through the frozen logger prefix', () => {
+  const lines = [
+    '2026-09-29T00:00:00Z [INFO] opensquilla.cli.gateway_cmd: {"event":"gateway.shutdown_requested","reason":"PRIVATE"}',
+    '{"event":"gateway.shutdown_requested"}',
+    'gateway.shutdown_requested without structured evidence',
+    '{"event":"unrelated","body":"gateway.shutdown_requested"}',
+  ].join('\n')
+  assert.equal(gatewayShutdownCountFromLog(lines), 2)
+})
+
+test('Gateway flow evidence preserves only closed reason classifications, never arbitrary error text', () => {
+  const input = [
+    { event: 'gateway.ws_flow_encode_or_budget_failed', reason_code: 'snapshot_delivery_missing', exception_type: 'FlowDeliveryStaleError', token: 'PRIVATE' },
+    { event: 'gateway.ws_flow_encode_or_budget_failed', reason_code: 'PRIVATE', exception_type: 'PRIVATE', exception: 'PRIVATE' },
+    { event: 'unrelated', reason_code: 'control_buffer_limit' },
+  ].map(row => 'prefix logger: ' + JSON.stringify(row)).join('\n')
+  const result = gatewayFlowFailureEvidence(input)
+  assert.equal(result.failures, 2)
+  assert.deepEqual(result.reasonCodes, { snapshot_delivery_missing: 1, unclassified: 1 })
+  assert.deepEqual(result.exceptionTypes, { FlowDeliveryStaleError: 1, 'other-or-unavailable': 1 })
+  assert.equal(JSON.stringify(result).includes('PRIVATE'), false)
+})
+
+test('clean flow acceptance rejects a recovered error and unavailable evidence', () => {
+  const healthy = 'prefix logger: {"event":"gateway.ready"}\n'
+  assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(healthy)), true)
+  for (const reason of ['snapshot_delivery_missing', 'control_buffer_limit', 'PRIVATE']) {
+    const error = 'prefix logger: ' + JSON.stringify({ event: 'gateway.ws_flow_encode_or_budget_failed', reason_code: reason })
+    // A later healthy connection cannot erase an earlier encoding/budget fault.
+    assert.equal(hasCleanGatewayFlowEvidence(gatewayFlowFailureEvidence(error + '\n' + healthy)), false)
+  }
+  for (const unavailable of [undefined, null, {}, { available: false, failures: 0 }, { available: true }]) {
+    assert.equal(hasCleanGatewayFlowEvidence(unavailable), false)
+  }
+})
+
+test('long history fixture is bounded and contains distinct real UI turn markers', () => {
+  assert.equal(HISTORY_TURNS, 12)
+  const messages = new Set()
+  for (let index = 0; index < HISTORY_TURNS; index += 1) {
+    const turn = historyTurn(index)
+    messages.add(turn.message)
+    assert.equal(Buffer.byteLength(turn.answer), HISTORY_ANSWER_BYTES)
+    assert.ok(turn.answer.startsWith(`Synthetic retained history answer ${index + 1}.`))
+    const completeBlocks = turn.answer.split('\n').slice(1, -1)
+    assert.equal(new Set(completeBlocks).size, completeBlocks.length)
+    assert.equal(turn.answer, historyTurn(index).answer)
+  }
+  assert.equal(messages.size, HISTORY_TURNS)
+  assert.ok(HISTORY_TURNS * HISTORY_ANSWER_BYTES > 192 * 1024)
+  assert.throws(() => historyTurn(-1))
+  assert.throws(() => historyTurn(HISTORY_TURNS))
+})
+
+test('partial visible output cannot hide a real failed or cancelled turn', () => {
+  const summary = { methods: {}, requestedCaps: [] }
+  for (const event of ['session.event.error', 'task.failed', 'task.timeout', 'task.cancelled', 'task.abandoned']) {
+    observeFrame(summary, 'received', JSON.stringify({ type: 'event', event,
+      payload: { error: 'PRIVATE', message: 'PRIVATE' } }), tmpdir())
+  }
+  assert.equal(summary.conversationFailures, 5)
+  assert.equal(JSON.stringify(summary).includes('PRIVATE'), false)
 })
 
 test('drop sensitive and override names before reading their values; isolate every writable environment root', () => {
@@ -95,9 +206,46 @@ test('history proof ignores earlier, unrelated, failed and incomplete reads', ()
   request('failed', probe.key); response('failed', false)
   request('first-segment', probe.key); response('first-segment', true, 0, 2)
   assert.equal(summary.targetReadCompleted, undefined)
+  assert.equal(summary.targetReadMaxSegments, 2)
+  assert.equal(summary.targetMultiSegmentCompleted, undefined)
   request('last-segment', probe.key); response('last-segment', true, 1, 2)
   assert.equal(summary.targetReadCompleted, 1)
+  assert.equal(summary.targetMultiSegmentCompleted, 1)
   assert.equal(JSON.stringify(summary).includes(probe.key), false)
+})
+
+test('old probe replies cannot prove a later history/restart phase; target resume needs its own successful response', () => {
+  const summary = { methods: {}, requestedCaps: [] }
+  const probe = { key: 'target', armed: true, revision: 1 }
+  const send = (id, method, key = probe.key) => observeFrame(summary, 'sent', JSON.stringify({ type: 'req', id, method, params: { key } }), tmpdir(), probe)
+  const receive = (id, ok, payload = {}) => observeFrame(summary, 'received', JSON.stringify({ type: 'res', id, ok, payload }), tmpdir(), probe)
+  send('old-history', 'chat.history')
+  send('old-resume', 'sessions.messages.resume')
+  probe.revision++
+  receive('old-history', true, { messages: ['PRIVATE'] })
+  receive('old-resume', true)
+  send('wrong-resume', 'sessions.messages.resume', 'other'); receive('wrong-resume', true)
+  send('failed-resume', 'sessions.messages.resume'); receive('failed-resume', false)
+  assert.equal(summary.targetHistoryCompleted, undefined)
+  assert.equal(summary.targetResumeCompleted, undefined)
+  send('history', 'chat.history'); receive('history', true, { messages: ['PRIVATE', 'PRIVATE'] })
+  send('resume', 'sessions.messages.resume'); receive('resume', true)
+  assert.equal(summary.targetHistoryCompleted, 1)
+  assert.equal(summary.targetHistoryMaxMessages, 2)
+  assert.ok(summary.targetHistoryMaxWireBytes > 0)
+  assert.equal(summary.targetResumeCompleted, 1)
+  assert.equal(JSON.stringify(summary).includes('PRIVATE'), false)
+})
+
+test('unrelated or failed large snapshots cannot prove multi-segment target recovery', () => {
+  const summary = { methods: {}, requestedCaps: [] }
+  const probe = { key: 'target', armed: true }
+  for (const [id, key, ok] of [['other', 'other-key', true], ['failed', 'target', false]]) {
+    observeFrame(summary, 'sent', JSON.stringify({ type: 'req', id, method: 'sessions.messages.snapshot.read', params: { key } }), tmpdir(), probe)
+    observeFrame(summary, 'received', JSON.stringify({ type: 'res', id, ok, payload: { segment_index: 0, segment_count: 100 } }), tmpdir(), probe)
+  }
+  assert.equal(summary.targetReadMaxSegments, undefined)
+  assert.equal(summary.targetReadCompleted, undefined)
 })
 
 test('no-argument CLI fails without creating evidence or importing a packaged runtime', () => {
@@ -110,7 +258,7 @@ test('existing workdir is rejected before any packaged launch or file overwrite'
   const root = await mkdtemp(join(tmpdir(), 'osq-reliability-contract-'))
   try {
     const result = spawnSync(process.execPath, [script, '--executable', process.execPath,
-      '--workdir', root, '--output', join(root, 'report.json'), '--scenario', 'restart'], { encoding: 'utf8', timeout: 5_000 })
+      '--workdir', root, '--output', join(root, 'report.json'), '--scenario', 'restart', '--disable-gpu'], { encoding: 'utf8', timeout: 5_000 })
     assert.equal(result.status, 1)
     assert.deepEqual(await readdir(root), [])
   } finally {

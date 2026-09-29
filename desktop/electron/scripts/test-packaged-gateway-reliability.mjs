@@ -13,6 +13,26 @@ import { fileURLToPath } from 'node:url'
 const MODEL = 'opensquilla-gateway-reliability'
 const ANSWER = 'Synthetic gateway reliability response.'
 const MESSAGE = 'Synthetic gateway reliability request.'
+const STREAM_MESSAGE = 'Synthetic request that crosses Gateway restart.'
+const STREAM_ANSWER = 'Synthetic response started before Gateway restart.'
+const STREAM_CONTENT = syntheticText(STREAM_ANSWER, 256 * 1024)
+export const HISTORY_TURNS = 12
+export const HISTORY_ANSWER_BYTES = 32 * 1024
+function syntheticText(marker, bytes) {
+  // Repeated padding trips the real model repetition guard. Distinct,
+  // deterministic blocks keep that guard enabled without creating secrets.
+  let content = marker + '\n'
+  for (let block = 0; content.length < bytes; block += 1) {
+    content += createHash('sha256').update(`${marker}:${block}`).digest('hex') + '\n'
+  }
+  return content.slice(0, bytes)
+}
+export function historyTurn(index) {
+  assert.ok(Number.isInteger(index) && index >= 0 && index < HISTORY_TURNS)
+  const marker = `Synthetic retained history answer ${index + 1}.`
+  return { message: `Synthetic retained history request ${index + 1}.`,
+    answer: syntheticText(marker, HISTORY_ANSWER_BYTES) }
+}
 const FLOW_CAPS = ['transport.flow.v1', 'transport.recovery.v1']
 const METHODS = new Set(['connect', 'chat.send', 'chat.history', 'sessions.list',
   'sessions.subscribe', 'sessions.unsubscribe',
@@ -42,6 +62,16 @@ const SAFE_FAILURE_REASONS = new Set([
   'No child identity captured; cleanup remains unproven', 'Owned child still present',
   'A child missed by ownership observation leaves cleanup unproven',
   'Exactly one synthetic user message must render', 'Exactly one synthetic answer must render',
+  'Gateway child count must reflect the actual save outcome', 'Onboarding save must preserve the original renderer document',
+  'Fresh onboarding must be an actual trusted setup window', 'Fresh onboarding must save the synthetic provider',
+  'Fresh onboarding must finish a real persisted save', 'No hidden model calls during onboarding',
+  'Synthetic stream must remain active until shutdown begins', 'Stream must finish only after shutdown was observed',
+  'Long history must require multiple snapshot segments', 'Long history recovery must use the original session',
+  'Synthetic turns must not fail after displaying partial text',
+  'Exactly one provider request for each submitted UI turn', 'No prior Gateway shutdown in the streaming fixture',
+  'Timed out: native onboarding window', 'Timed out: main renderer document', 'Timed out: native onboarding save',
+  'Timed out: onboarding ready after save', 'Timed out: synthetic stream started', 'Timed out: Gateway shutdown request',
+  'Timed out: long history recovery', 'Timed out: synthetic history answer', 'Timed out: completed UI turn',
 ])
 
 export function safeFailureReason(error) {
@@ -53,19 +83,20 @@ export function parseArguments(args) {
   const options = {}
   for (let i = 0; i < args.length; i += 1) {
     const key = args[i]
-    assert.ok(['--executable', '--workdir', '--output', '--scenario', '--disable-gpu'].includes(key), 'Unknown argument')
+    assert.ok(['--executable', '--workdir', '--output', '--scenario', '--disable-gpu', '--startup-timing'].includes(key), 'Unknown argument')
     assert.ok(!(key in options), 'Duplicate argument')
-    if (key === '--disable-gpu') options[key] = true
+    if (key === '--disable-gpu' || key === '--startup-timing') options[key] = true
     else {
       assert.ok(args[i + 1] && !args[i + 1].startsWith('--'), `Missing value for ${key}`)
       options[key] = args[++i]
     }
   }
   for (const key of ['--executable', '--workdir', '--output', '--scenario']) assert.ok(options[key], `Missing ${key}`)
-  assert.ok(['restart', 'late-ready', 'configuration'].includes(options['--scenario']),
-    'Supported scenarios: restart, late-ready, configuration. Nothing was launched.')
+  assert.ok(['restart', 'late-ready', 'configuration', 'fresh-onboarding', 'history-streaming-restart'].includes(options['--scenario']),
+    'Supported scenarios: restart, late-ready, configuration, fresh-onboarding, history-streaming-restart. Nothing was launched.')
   return { executable: resolve(options['--executable']), workdir: resolve(options['--workdir']),
-    output: resolve(options['--output']), scenario: options['--scenario'], disableGpu: Boolean(options['--disable-gpu']) }
+    output: resolve(options['--output']), scenario: options['--scenario'], disableGpu: Boolean(options['--disable-gpu']),
+    startupTiming: Boolean(options['--startup-timing']) }
 }
 
 export function inside(root, path) {
@@ -73,7 +104,7 @@ export function inside(root, path) {
   return rel !== '' && rel !== '..' && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`) && !isAbsolute(rel)
 }
 
-export function isolatedEnvironment(source, root) {
+export function isolatedEnvironment(source, root, { startupTiming = false, longHistory = false } = {}) {
   const env = {}
   for (const key of Object.keys(source)) {
     // Check names before accessing values, including getter-backed secrets.
@@ -89,13 +120,75 @@ export function isolatedEnvironment(source, root) {
     OPENSQUILLA_USER_STATE_DIR: join(root, 'user-state'), OPENSQUILLA_TEST_PROFILE_LOCK_ROOT: '1',
     OPENSQUILLA_DESKTOP_SECRET_STORAGE: 'plain', OPENSQUILLA_DESKTOP_DISABLE_AUTO_UPDATE: '1',
     OPENSQUILLA_OPENROUTER_LIVE_PRICING: '0', OPENSQUILLA_TELEMETRY_DISABLED: '1',
+    OPENSQUILLA_NAMING_ENABLED: 'false', OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: 'true',
+    // This synthetic model has no catalog entry. Match syntheticConfig's
+    // declared model capacity even before a fresh wizard writes its config.
+    OPENSQUILLA_LLM_CONTEXT_WINDOW_TOKENS: longHistory ? '1048576' : '131072',
+    ...(longHistory ? { OPENSQUILLA_LLM_MAX_TOKENS: '262144' } : {}),
+    ...(startupTiming ? { OPENSQUILLA_STARTUP_TIMING: '1' } : {}),
     OPENSQUILLA_TESTING: '0', GITHUB_ACTIONS: '0',
     HTTP_PROXY: 'http://127.0.0.1:1', HTTPS_PROXY: 'http://127.0.0.1:1', ALL_PROXY: 'http://127.0.0.1:1',
     http_proxy: 'http://127.0.0.1:1', https_proxy: 'http://127.0.0.1:1', all_proxy: 'http://127.0.0.1:1',
     NO_PROXY: '127.0.0.1,localhost,::1', no_proxy: '127.0.0.1,localhost,::1' }
 }
 
-export function syntheticConfig(profile, providerUrl, sseUrl) {
+// Prefer the explicit post-#1851 control. The legacy fallback matches the
+// verified three-button layout only, never a positional guess on another UI.
+export async function runtimeRestartControl(page) {
+  const modern = page.locator('[data-testid="runtime-restart-gateway"]')
+  if (await modern.count() === 1) return { button: modern, layout: 'explicit-test-id' }
+  const legacy = page.locator('#settings-gateway-runtime .runtime-actions > button')
+  assert.equal(await modern.count(), 0, 'Known real runtime controls required')
+  assert.equal(await legacy.count(), 3, 'Known real runtime controls required')
+  return { button: legacy.last(), layout: 'legacy-three-button' }
+}
+
+// JSON log input is kept local. Reports only receive these fixed booleans.
+function structuredLogRecords(text) {
+  const records = []
+  for (const line of text.split(/\r?\n/)) {
+    // Desktop is JSONL; the frozen Gateway prefixes its JSON with timestamp,
+    // level and logger. Never return that arbitrary prefix to a report.
+    const start = line.indexOf('{')
+    if (start < 0) continue
+    try { records.push(JSON.parse(line.slice(start))) } catch { /* Non-structured diagnostic line. */ }
+  }
+  return records
+}
+export function gatewayShutdownCountFromLog(text) {
+  return structuredLogRecords(text).filter(item => item.event === 'gateway.shutdown_requested').length
+}
+export function gatewayFlowFailureEvidence(text) {
+  const allowed = new Set(['response_wire_limit', 'snapshot_epoch_mismatch', 'snapshot_delivery_id_invalid',
+    'snapshot_delivery_missing', 'snapshot_delivery_kind_invalid', 'snapshot_reservation_rejected',
+    'frame_wire_limit', 'control_buffer_limit', 'transport_reservation_rejected', 'flow_admission_unclassified'])
+  const result = { available: true, failures: 0, reasonCodes: {}, exceptionTypes: {} }
+  for (const item of structuredLogRecords(text)) {
+    if (item.event !== 'gateway.ws_flow_encode_or_budget_failed') continue
+    result.failures++
+    const reason = allowed.has(item.reason_code) ? item.reason_code : 'unclassified'
+    const type = ['ValueError', '_FlowAdmissionError', 'FlowDeliveryStaleError'].includes(item.exception_type)
+      ? item.exception_type : 'other-or-unavailable'
+    result.reasonCodes[reason] = (result.reasonCodes[reason] || 0) + 1
+    result.exceptionTypes[type] = (result.exceptionTypes[type] || 0) + 1
+  }
+  return result
+}
+export function hasCleanGatewayFlowEvidence(evidence) {
+  // None of the supported scenarios injects flow encoding or budget failures.
+  // Even a recovered connection must not hide an observed failure in `ok`.
+  return evidence?.available === true && evidence.failures === 0
+}
+export function onboardingSaveEvidence(text) {
+  let successful = 0
+  for (const item of structuredLogRecords(text)) {
+    if (item.event === 'onboarding_save_finished' && item.outcome === 'ok'
+      && item.writerAdmitted === true && item.settingsPersistedConfirmed === true) successful += 1
+  }
+  return { successfulSaves: successful }
+}
+
+export function syntheticConfig(profile, providerUrl, sseUrl, { longHistory = false } = {}) {
   for (const value of [providerUrl, sseUrl].filter(Boolean)) {
     const url = new URL(value)
     assert.equal(url.protocol, 'http:'); assert.equal(url.hostname, '127.0.0.1')
@@ -104,7 +197,8 @@ export function syntheticConfig(profile, providerUrl, sseUrl) {
   return ['config_version = 1', `state_dir = ${JSON.stringify(join(profile, 'state'))}`,
     `workspace_dir = ${JSON.stringify(join(profile, 'workspace'))}`,
     '[llm]', 'provider = "ollama"', `model = ${JSON.stringify(MODEL)}`,
-    `base_url = ${JSON.stringify(providerUrl)}`, 'context_window_tokens = 131072',
+    `base_url = ${JSON.stringify(providerUrl)}`, `context_window_tokens = ${longHistory ? 1048576 : 131072}`,
+    ...(longHistory ? ['max_tokens = 262144'] : []),
     '[squilla_router]', 'enabled = false', '[llm_ensemble]', 'enabled = false',
     '[naming]', 'enabled = false', '[privacy]', 'disable_network_observability = true',
     ...(sseUrl ? ['[mcp]', 'enabled = true', 'connect_timeout_seconds = 135',
@@ -121,12 +215,15 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
     if (METHODS.has(frame.method)) summary.methods[frame.method] = (summary.methods[frame.method] || 0) + 1
     if (frame.method === 'connect') summary.requestedCaps = FLOW_CAPS.filter(cap => Array.isArray(frame.params?.caps) && frame.params.caps.includes(cap))
     if (['onboarding.provider.configure', 'sessions.list', 'sessions.subscribe', 'sessions.unsubscribe',
-      'sessions.messages.snapshot.read', 'chat.history'].includes(frame.method) && typeof frame.id === 'string') {
+      'sessions.messages.snapshot.read', 'sessions.messages.resume', 'chat.history'].includes(frame.method) && typeof frame.id === 'string') {
       if (!Object.hasOwn(summary, '_requests')) Object.defineProperty(summary, '_requests', { value: new Map() })
       const targetRead = Boolean(readProbe.armed && readProbe.key
         && ['sessions.messages.snapshot.read', 'chat.history'].includes(frame.method)
         && (frame.params?.key ?? frame.params?.sessionKey) === readProbe.key)
-      if (summary._requests.size < 64) summary._requests.set(frame.id, { method: frame.method, targetRead })
+      const targetResume = Boolean(readProbe.armed && readProbe.key && frame.method === 'sessions.messages.resume'
+        && frame.params?.key === readProbe.key)
+      if (summary._requests.size < 64) summary._requests.set(frame.id, { method: frame.method, targetRead, targetResume,
+        probeRevision: readProbe.revision ?? 0 })
       else summary.responseObservationOverflow = true
       if (targetRead) summary.targetReadRequests = (summary.targetReadRequests || 0) + 1
     }
@@ -135,6 +232,7 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
     const request = summary._requests.get(frame.id)
     summary._requests.delete(frame.id)
     const ok = frame.ok === true
+    const currentProbe = Boolean(readProbe.armed && request.probeRevision === (readProbe.revision ?? 0))
     summary.responses ??= {}
     summary.responses[request.method] ??= { ok: 0, failed: 0 }
     summary.responses[request.method][ok ? 'ok' : 'failed'] += 1
@@ -146,16 +244,36 @@ export function observeFrame(summary, direction, payload, expectedStateDir, read
       const rows = frame.payload?.sessions ?? frame.payload?.keys
       summary.lastListRows = Array.isArray(rows) ? rows.length : null
     }
-    if (request.targetRead && ok && (request.method === 'chat.history'
+    if (currentProbe && request.targetRead && ok && (request.method === 'chat.history'
       || (Number.isInteger(frame.payload?.segment_count) && frame.payload.segment_count > 0
         && frame.payload.segment_index === frame.payload.segment_count - 1))) {
       summary.targetReadCompleted = (summary.targetReadCompleted || 0) + 1
+      if (request.method === 'sessions.messages.snapshot.read' && frame.payload.segment_count > 1) {
+        summary.targetMultiSegmentCompleted = (summary.targetMultiSegmentCompleted || 0) + 1
+      }
+    }
+    if (currentProbe && request.targetRead && ok && request.method === 'chat.history') {
+      summary.targetHistoryCompleted = (summary.targetHistoryCompleted || 0) + 1
+      summary.targetHistoryMaxWireBytes = Math.max(summary.targetHistoryMaxWireBytes || 0, Buffer.byteLength(payload))
+      summary.targetHistoryMaxMessages = Math.max(summary.targetHistoryMaxMessages || 0,
+        Array.isArray(frame.payload?.messages) ? frame.payload.messages.length : 0)
+    }
+    if (currentProbe && request.targetResume && ok) {
+      summary.targetResumeCompleted = (summary.targetResumeCompleted || 0) + 1
+    }
+    if (currentProbe && request.targetRead && ok && request.method === 'sessions.messages.snapshot.read'
+      && Number.isSafeInteger(frame.payload?.segment_count) && frame.payload.segment_count > 0) {
+      summary.targetReadMaxSegments = Math.max(summary.targetReadMaxSegments || 0, frame.payload.segment_count)
     }
   }
   if (direction === 'received' && frame?.type === 'event'
     && ['sessions.changed', 'transport.flow.dirty'].includes(frame.event)) {
     summary.events ??= {}
     summary.events[frame.event] = (summary.events[frame.event] || 0) + 1
+  }
+  if (direction === 'received' && frame?.type === 'event'
+    && ['session.event.error', 'task.failed', 'task.timeout', 'task.cancelled', 'task.abandoned'].includes(frame.event)) {
+    summary.conversationFailures = (summary.conversationFailures || 0) + 1
   }
   const hello = frame?.type === 'hello-ok' ? frame : frame?.payload?.type === 'hello-ok' ? frame.payload : null
   if (direction !== 'received' || !hello) return
@@ -213,21 +331,24 @@ async function fileHash(path) {
 
 async function run(options) {
   assert.equal(process.platform, 'win32', 'Native Windows only')
+  assert.equal(options.disableGpu, true, 'Native probes require --disable-gpu')
   assert.ok((await stat(options.executable)).isFile(), 'Missing packaged executable')
   await mkdir(dirname(options.workdir), { recursive: true })
   await mkdir(options.workdir) // Never accept an existing profile/evidence root.
   const root = await realpath(options.workdir)
   const userData = join(root, 'user-data')
   const profile = join(userData, 'opensquilla')
-  const env = isolatedEnvironment(process.env, root)
+  const longHistory = options.scenario === 'history-streaming-restart'
+  const env = isolatedEnvironment(process.env, root, { ...options, longHistory })
   for (const path of [userData, profile, env.HOME, env.APPDATA, env.LOCALAPPDATA, env.TEMP, env.OPENSQUILLA_USER_STATE_DIR]) {
     assert.ok(inside(root, path)); await mkdir(path, { recursive: true })
   }
   const report = { schemaVersion: 1, scenario: options.scenario, ok: false,
-    disableGpu: options.disableGpu, executableSha256: await fileHash(options.executable),
+    disableGpu: options.disableGpu, startupTiming: options.startupTiming, executableSha256: await fileHash(options.executable),
     harnessSha256: await fileHash(fileURLToPath(import.meta.url)),
     provenanceBoundary: 'Outer EXE hash only. Require the separate Electron/WebUI/Gateway build manifest.',
-    fixture: { synthetic: true, namingDisabled: true, mockKeychain: true, autoUpdateDisabled: true },
+    fixture: { synthetic: true, modelContextWindowTokens: longHistory ? 1048576 : 131072,
+      ...(longHistory ? { modelMaxOutputTokens: 262144 } : {}), namingDisabled: true, mockKeychain: true, autoUpdateDisabled: true },
     phases: [], owners: [], sockets: [], descriptorTransitions: [], consoleClasses: {}, cleanup: { verified: false } }
   await mkdir(dirname(options.output), { recursive: true })
   await writeFile(options.output, JSON.stringify(report, null, 2) + '\n', { flag: 'wx' })
@@ -251,9 +372,11 @@ async function run(options) {
   let stopped = false, monitorError = false, failure = false
   let checkpoint = ''
   let chats = 0, alternateChats = 0, sseRequests = 0, sseClosed = 0
+  const expectedChats = options.scenario === 'history-streaming-restart' ? HISTORY_TURNS + 2 : 1
+  let streamResponse = null, streamEnded = false
   const pages = new Set()
   let pageErrors = 0
-  const readProbe = { key: null, armed: false } // Never serialized.
+  const readProbe = { key: null, armed: false, revision: 0 } // Never serialized.
   const bounded = async (operation, timeoutMs) => {
     let timer
     try {
@@ -344,6 +467,42 @@ async function run(options) {
     assert.equal((await page.locator('.msg-ai-text').allTextContents()).filter(text => text.includes(ANSWER)).length, 1,
       'Exactly one synthetic answer must render')
   }
+  const desktopLogText = () => readFile(join(userData, 'logs', 'desktop.log'), 'utf8')
+  async function gatewayShutdownCount() {
+    const text = await readFile(join(userData, 'logs', 'gateway.log'), 'utf8')
+    return gatewayShutdownCountFromLog(text)
+  }
+  async function beginRuntimeRestart() {
+    await page.locator('.sidebar-foot button[data-icon="settings"]').click()
+    await page.locator('#settings-rail-gateway').click()
+    const control = await runtimeRestartControl(page)
+    report.runtimeControlLayout = control.layout
+    await control.button.click()
+  }
+  async function finishRuntimeRestart(before, sentinel) {
+    await until(() => { observeOwner(); const next = currentOwner(); return next && !ownership.sameDesktopGatewayOwnershipInstance(before, next) }, 'replacement owner', 180_000)
+    await page.locator('.settings-modal__close').click()
+    const after = await ready()
+    assert.equal(records.size, 2, 'Exactly one runtime replacement')
+    assert.equal(shutdown.gatewayProcessSnapshot(before).alive, false, 'Old Gateway must actually exit')
+    assert.equal(await bounded(page.evaluate(() => window.__gatewayReliabilityDocument), 5_000), sentinel, 'Restart must preserve the original renderer document')
+    assert.notEqual(before.instance_nonce, after.instance_nonce, 'Each launch needs new control authority')
+    report.originalDocumentPreserved = true
+    return after
+  }
+  async function submitUiTurn(message) {
+    await page.locator('.chat-textarea').fill(message)
+    const send = page.locator('.chat-send-btn.btn--primary')
+    await until(async () => await send.count() === 1 && !await send.isDisabled(), 'send enabled', 45_000)
+    await send.click()
+  }
+  async function waitCompletedUiTurn() {
+    // A stream stop button must disappear; finding an old answer is not proof
+    // that the newest turn reached terminal state.
+    await until(async () => await page.locator('.chat-stop-btn').count() === 0
+      && await page.locator('.chat-send-btn.btn--primary').count() === 1, 'completed UI turn', 45_000)
+    await page.locator('.msg-ai').last().locator('.msg-meta__more-btn').waitFor({ state: 'visible', timeout: 45_000 })
+  }
   try {
     const providerHandler = alternate => (request, response) => {
       const path = new URL(request.url || '/', 'http://127.0.0.1').pathname
@@ -353,13 +512,20 @@ async function run(options) {
           digest: 'synthetic', modified_at: '2026-01-01T00:00:00Z', details: {} }] } : { version: '0.0.0-synthetic' }))
       } else if (request.method === 'POST' && path === '/api/chat') {
         chats += 1; if (alternate) alternateChats += 1; request.resume()
+        const ordinal = chats
         request.once('end', () => {
           response.setHeader('content-type', 'application/x-ndjson')
-          response.end(JSON.stringify({ model: MODEL, created_at: '2026-01-01T00:00:00Z',
-            message: { role: 'assistant', content: ANSWER }, done: false }) + '\n'
-            + JSON.stringify({ model: MODEL, created_at: '2026-01-01T00:00:00Z',
-              message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop',
-              prompt_eval_count: 8, eval_count: 3 }) + '\n')
+          const history = options.scenario === 'history-streaming-restart'
+          const content = history && ordinal <= HISTORY_TURNS ? historyTurn(ordinal - 1).answer
+            : history && ordinal === HISTORY_TURNS + 1 ? STREAM_CONTENT : ANSWER
+          response.write(JSON.stringify({ model: MODEL, created_at: '2026-01-01T00:00:00Z',
+            message: { role: 'assistant', content }, done: false }) + '\n')
+          const finish = () => response.end(JSON.stringify({ model: MODEL, created_at: '2026-01-01T00:00:00Z',
+            message: { role: 'assistant', content: '' }, done: true, done_reason: 'stop',
+            prompt_eval_count: 8, eval_count: 3 }) + '\n')
+          if (history && ordinal === HISTORY_TURNS + 1) {
+            streamResponse = { response, finish: () => { streamEnded = true; finish() } }
+          } else finish()
         })
       } else { request.resume(); response.writeHead(404); response.end() }
     }
@@ -375,8 +541,13 @@ async function run(options) {
         // No endpoint event: product discovery's own 135s budget must expire.
       }, 'synthetic delayed MCP')
     }
-    await writeFile(join(profile, 'config.toml'), syntheticConfig(profile, provider.url, sse && `${sse.url}/sse`), { flag: 'wx' })
-    await smoke.writeSyntheticCredential(userData, { baseUrl: provider.url, model: MODEL, disableNetworkObservability: true })
+    if (options.scenario === 'fresh-onboarding') {
+      report.fixture.freshUnconfiguredProfile = true
+      report.fixture.onboardingEndpointInjection = 'Existing hidden baseUrl field only; provider/model/save use real UI; no IPC replacement.'
+    } else {
+      await writeFile(join(profile, 'config.toml'), syntheticConfig(profile, provider.url, sse && `${sse.url}/sse`, { longHistory }), { flag: 'wx' })
+      await smoke.writeSyntheticCredential(userData, { baseUrl: provider.url, model: MODEL, disableNetworkObservability: true })
+    }
     mark('launch')
     monitor = (async () => {
       while (!stopped) {
@@ -402,10 +573,55 @@ async function run(options) {
     const actual = await bounded(app.evaluate(({ app }) => ({ version: app.getVersion(), userData: app.getPath('userData') })), 5_000)
     assert.equal(resolve(actual.userData).toLowerCase(), userData.toLowerCase())
     report.version = actual.version
-    page = await app.firstWindow({ timeout: 30_000 }); attachPage(page)
+    if (options.scenario === 'fresh-onboarding') {
+      await until(async () => {
+        page = app.windows().find(candidate => candidate.url().startsWith('opensquilla-app://desktop/'))
+        return Boolean(page)
+      }, 'main renderer document', 165_000)
+    } else page = await app.firstWindow({ timeout: 30_000 })
+    attachPage(page)
     page.setDefaultTimeout(30_000)
     await page.setViewportSize({ width: 1440, height: 900 })
-    if (options.scenario === 'late-ready') {
+    if (options.scenario === 'fresh-onboarding') {
+      let wizard
+      await until(async () => {
+        for (const candidate of app.windows()) {
+          if (!candidate.isClosed() && await candidate.locator('#setup-form').count() === 1) { wizard = candidate; return true }
+        }
+        return false
+      }, 'native onboarding window', 165_000)
+      assert.ok(wizard !== page && wizard.url().startsWith('data:text/html'), 'Fresh onboarding must be an actual trusted setup window')
+      report.onboardingEntry = { trustedDataDocument: true, separateWindow: true, automaticFreshProfile: true }
+      const before = await ready()
+      const sentinel = randomUUID()
+      await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
+      await wizard.locator('#providerSelectToggle').click()
+      await wizard.locator('[data-provider-option="ollama"]').click()
+      // The native wizard hides the endpoint. Inject only fixture routing into
+      // its existing input; the real finish event creates the IPC payload.
+      await wizard.locator('#baseUrl').evaluate((input, value) => { input.value = value }, provider.url)
+      if (!await wizard.locator('#model').isVisible()) await wizard.locator('#modelEditToggle').click()
+      await wizard.locator('#model').fill(MODEL)
+      assert.equal(chats, 0, 'No hidden model calls during onboarding')
+      mark('native-onboarding-save')
+      await wizard.locator('#finish').click()
+      await until(() => wizard.isClosed(), 'native onboarding save', 120_000)
+      const saved = JSON.parse(await readFile(join(userData, 'desktop-credential.json'), 'utf8'))
+      assert.ok(saved.provider === 'ollama' && saved.model === MODEL && saved.baseUrl === provider.url,
+        'Fresh onboarding must save the synthetic provider')
+      assert.equal(onboardingSaveEvidence(await desktopLogText()).successfulSaves, 1,
+        'Fresh onboarding must finish a real persisted save')
+      const after = await ready()
+      const replaced = !ownership.sameDesktopGatewayOwnershipInstance(before, after)
+      assert.equal(records.size, replaced ? 2 : 1, 'Gateway child count must reflect the actual save outcome')
+      if (replaced) assert.equal(shutdown.gatewayProcessSnapshot(before).alive, false, 'Old Gateway must actually exit')
+      assert.equal(await bounded(page.evaluate(() => window.__gatewayReliabilityDocument), 5_000), sentinel,
+        'Onboarding save must preserve the original renderer document')
+      report.onboardingSave = { settingsPersisted: true, successfulSaves: 1, childReplaced: replaced,
+        ownerCount: records.size, originalDocumentPreserved: true }
+      report.originalDocumentPreserved = true
+      mark('native-onboarding-recovered')
+    } else if (options.scenario === 'late-ready') {
       mark('waiting-for-foreground-timeout')
       await until(() => report.descriptorTransitions.some(value => value.status === 'error' && value.readinessTimeout), 'foreground readiness timeout', 165_000)
       assert.ok(report.descriptorTransitions.find(value => value.status === 'error' && value.readinessTimeout).ms
@@ -424,20 +640,83 @@ async function run(options) {
       const sentinel = randomUUID()
       await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
       mark('runtime-restart')
-      await page.locator('.sidebar-foot button[data-icon="settings"]').click()
-      await page.locator('#settings-rail-gateway').click()
-      const actions = page.locator('#settings-gateway-runtime .runtime-actions > button')
-      assert.equal(await actions.count(), 3, 'Known real runtime controls required')
-      await actions.last().click()
-      await until(() => { observeOwner(); const next = currentOwner(); return next && !ownership.sameDesktopGatewayOwnershipInstance(before, next) }, 'replacement owner', 180_000)
-      await page.locator('.settings-modal__close').click()
-      const after = await ready()
-      assert.equal(records.size, 2, 'Exactly one runtime replacement')
-      assert.equal(shutdown.gatewayProcessSnapshot(before).alive, false, 'Old Gateway must actually exit')
-      assert.equal(await bounded(page.evaluate(() => window.__gatewayReliabilityDocument), 5_000), sentinel, 'Restart must preserve the original renderer document')
-      assert.notEqual(before.instance_nonce, after.instance_nonce, 'Each launch needs new control authority')
-      report.originalDocumentPreserved = true
+      await beginRuntimeRestart()
+      await finishRuntimeRestart(before, sentinel)
       mark('runtime-restart-recovered')
+    } else if (options.scenario === 'history-streaming-restart') {
+      const before = await ready()
+      const sentinel = randomUUID()
+      await bounded(page.evaluate(value => { window.__gatewayReliabilityDocument = value }, sentinel), 5_000)
+      await page.locator('.sidebar-new-session').click()
+      await until(() => new URL(page.url()).pathname === '/chat/new', 'new draft route', 15_000)
+      mark('build-long-history-through-ui')
+      for (let index = 0; index < HISTORY_TURNS; index += 1) {
+        const turn = historyTurn(index)
+        await submitUiTurn(turn.message)
+        await until(async () => (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(`Synthetic retained history answer ${index + 1}.`)),
+          'synthetic history answer', 45_000)
+        await waitCompletedUiTurn()
+        assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.conversationFailures || 0), 0), 0,
+          'Synthetic turns must not fail after displaying partial text')
+        assert.equal(chats, index + 1, 'Exactly one provider request for each submitted UI turn')
+      }
+      const historicalKey = new URL(page.url()).searchParams.get('session')
+      assert.ok(historicalKey, 'The submitted session must materialize')
+      report.longHistory = { turns: HISTORY_TURNS, answerBytes: HISTORY_TURNS * HISTORY_ANSWER_BYTES,
+        generatedThroughRealUi: true, boundary: 'Synthetic bounded history, not the 2.25M-file profile or an interrupted snapshot transfer.' }
+      assert.equal(await gatewayShutdownCount(), 0, 'No prior Gateway shutdown in the streaming fixture')
+      await submitUiTurn(STREAM_MESSAGE)
+      await until(async () => streamResponse && !streamResponse.response.destroyed
+        && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(STREAM_ANSWER)), 'synthetic stream started', 45_000)
+      await page.locator('.chat-stop-btn').waitFor({ state: 'visible', timeout: 15_000 })
+      assert.equal(streamEnded, false, 'Synthetic stream must remain active until shutdown begins')
+      // Durable history and live snapshot are different read paths. Reopening
+      // the still-streaming session creates an actual multi-segment active base;
+      // its large history is independently checked through chat.history below.
+      mark('reopen-live-multisegment-snapshot')
+      await page.locator('.sidebar-new-session').click()
+      await until(() => new URL(page.url()).pathname === '/chat/new', 'new draft route', 15_000)
+      const historyRows = page.locator('.sidebar-history-row')
+      let historyIndex = -1
+      await until(async () => {
+        historyIndex = await bounded(historyRows.evaluateAll((elements, key) => elements.findIndex(element => element.getAttribute('data-session-key') === key), historicalKey), 5_000)
+        return historyIndex >= 0
+      }, 'persisted sidebar row', 30_000)
+      readProbe.key = historicalKey
+      readProbe.armed = true
+      readProbe.revision++
+      await historyRows.nth(historyIndex).locator('.sidebar-history-item').click()
+      await until(async () => report.sockets.some(socket => socket.targetMultiSegmentCompleted > 0 && socket.targetResumeCompleted > 0)
+        && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(STREAM_ANSWER)), 'long history recovery', 60_000)
+      await page.locator('.chat-stop-btn').waitFor({ state: 'visible', timeout: 15_000 })
+      report.longHistory.multiSegmentActiveSnapshotBeforeRestart = true
+      report.longHistory.maxSnapshotSegments = Math.max(...report.sockets.map(socket => socket.targetReadMaxSegments || 0))
+      const historyReadsBeforeRestart = report.sockets.reduce((sum, socket) => sum + (socket.targetHistoryCompleted || 0), 0)
+      const socketCountBeforeRestart = report.sockets.length
+      readProbe.revision++ // Pre-restart in-flight replies cannot satisfy recovery.
+      mark('restart-during-provider-stream')
+      await beginRuntimeRestart()
+      await until(async () => await gatewayShutdownCount() === 1, 'Gateway shutdown request', 20_000)
+      assert.ok(!streamEnded && !streamResponse.response.destroyed, 'Synthetic stream must remain active until shutdown begins')
+      report.streamingCrossedShutdown = true
+      mark('provider-finished-after-shutdown-request')
+      streamResponse.finish()
+      assert.equal(streamEnded, true, 'Stream must finish only after shutdown was observed')
+      await finishRuntimeRestart(before, sentinel)
+      await until(async () => report.sockets.reduce((sum, socket) => sum + (socket.targetHistoryCompleted || 0), 0) > historyReadsBeforeRestart
+        && report.sockets.slice(socketCountBeforeRestart).some(socket => socket.targetHistoryCompleted > 0 && socket.targetResumeCompleted > 0)
+        && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(STREAM_ANSWER)), 'long history recovery', 60_000)
+      assert.equal(new URL(page.url()).searchParams.get('session'), historicalKey, 'Long history recovery must use the original session')
+      assert.ok(report.longHistory.maxSnapshotSegments > 1, 'Long history must require multiple snapshot segments')
+      assert.equal(chats, HISTORY_TURNS + 1, 'Exactly one provider request for each submitted UI turn')
+      report.longHistory.recoveredAfterRestart = true
+      report.longHistory.recoveredHistoryWireBytes = Math.max(...report.sockets.slice(socketCountBeforeRestart).map(socket => socket.targetHistoryMaxWireBytes || 0))
+      report.longHistory.recoveredHistoryMessages = Math.max(...report.sockets.slice(socketCountBeforeRestart).map(socket => socket.targetHistoryMaxMessages || 0))
+      assert.ok(report.longHistory.recoveredHistoryWireBytes >= HISTORY_TURNS * HISTORY_ANSWER_BYTES,
+        'Long history recovery must use the original session')
+      readProbe.armed = false
+      readProbe.revision++
+      mark('long-history-streaming-recovered')
     } else {
       const before = await ready()
       const sentinel = randomUUID()
@@ -468,7 +747,7 @@ async function run(options) {
       mark('configuration-saved')
     }
     mark('single-ui-send')
-    assert.equal(chats, 0, 'Fixture must not make hidden model requests before user submission')
+    assert.equal(chats, expectedChats - 1, 'Fixture must not make hidden model requests before user submission')
     // /chat may be the default main session, which is not necessarily a
     // normal recents row. Use the real New task action to create the webchat
     // this probe will reopen later, preserving the current document.
@@ -482,16 +761,19 @@ async function run(options) {
     await until(async () => !await send.isDisabled(), 'turn finished', 45_000)
     await page.locator('.msg-ai').last().locator('.msg-meta__more-btn').waitFor({ state: 'visible', timeout: 45_000 })
     await verifySingleRenderedTurn()
-    assert.equal(chats, 1, 'One UI submission must produce exactly one provider chat request')
+    assert.equal(chats, expectedChats, 'One UI submission must produce exactly one provider chat request')
     if (options.scenario === 'configuration') assert.equal(alternateChats, 1, 'The edited endpoint must serve the actual user turn')
-    assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0), 0), 1, 'No repeated chat.send')
+    assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.methods['chat.send'] || 0), 0), expectedChats, 'No repeated chat.send')
     assert.equal(pageErrors, 0, 'Renderer must not raise page errors')
+    assert.equal(report.sockets.reduce((sum, socket) => sum + (socket.conversationFailures || 0), 0), 0,
+      'Synthetic turns must not fail after displaying partial text')
     report.singleSendVerified = true
     mark('history-reread')
     await until(() => Boolean(new URL(page.url()).searchParams.get('session')), 'materialized session route', 15_000)
     const sessionKey = new URL(page.url()).searchParams.get('session')
     assert.ok(sessionKey, 'The submitted session must materialize')
     readProbe.key = sessionKey
+    readProbe.revision++
     report.sidebarBeforeLeave = await bounded(page.evaluate(inspectSyntheticSidebar, sessionKey), 5_000)
     mark('history-session-captured')
     await page.locator('.sidebar-new-session').click()
@@ -510,12 +792,14 @@ async function run(options) {
     mark('history-sidebar-ready')
     // Arm only after the draft navigation finishes. Unrelated draft reads,
     // earlier pending responses and cached text cannot satisfy this proof.
+    const readsBefore = report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0)
     readProbe.armed = true
+    readProbe.revision++
     await row.nth(index).locator('.sidebar-history-item').click()
-    await until(async () => report.sockets.some(socket => socket.targetReadCompleted > 0)
+    await until(async () => report.sockets.reduce((sum, socket) => sum + (socket.targetReadCompleted || 0), 0) > readsBefore
       && (await page.locator('.msg-ai-text').allTextContents()).some(text => text.includes(ANSWER)), 'history re-read and visible answer', 45_000)
     await verifySingleRenderedTurn()
-    assert.equal(chats, 1, 'Reopening history must not replay the turn')
+    assert.equal(chats, expectedChats, 'Reopening history must not replay the turn')
     report.historyRereadVerified = true
     checkpoint = await readFile(join(userData, 'logs', 'desktop.log'), 'utf8')
     mark('verified-before-cleanup')
@@ -529,6 +813,10 @@ async function run(options) {
     }
   } finally {
     mark('cleanup')
+    if (streamResponse && !streamEnded && !streamResponse.response.destroyed) {
+      streamResponse.response.destroy()
+      report.fixture.pendingProviderClosedForCleanup = true
+    }
     try {
       await cleanup.cleanupPackagedFirstSend({ app, processIdentity,
         diagnostics: () => ({ scenario: options.scenario, ownerCount: records.size, pageErrors }),
@@ -559,11 +847,17 @@ async function run(options) {
       if (fixture) try { await fixture.close() } catch { failure = true; report.cleanup.fixtureFailure = true }
     }
     report.providerChatRequests = chats
+    report.expectedProviderChatRequests = expectedChats
     report.alternateProviderChatRequests = alternateChats
     report.sse = { requests: sseRequests, closed: sseClosed }
     report.pageErrors = pageErrors
     report.observationFailed = monitorError
-    report.ok = !failure && !monitorError && pageErrors === 0 && chats === 1 && report.cleanup.verified
+    report.conversationFailures = report.sockets.reduce((sum, socket) => sum + (socket.conversationFailures || 0), 0)
+    try {
+      report.gatewayFlowFailures = gatewayFlowFailureEvidence(await readFile(join(userData, 'logs', 'gateway.log'), 'utf8'))
+    } catch { failure = true; report.gatewayFlowFailures = { available: false } }
+    report.ok = !failure && !monitorError && pageErrors === 0 && report.conversationFailures === 0 && chats === expectedChats && report.cleanup.verified
+      && hasCleanGatewayFlowEvidence(report.gatewayFlowFailures)
       && report.sockets.every(socket => !socket.responseObservationOverflow)
     await persist()
   }
