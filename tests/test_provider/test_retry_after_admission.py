@@ -686,7 +686,8 @@ async def test_summary_failed_aggregator_cooldown_survives_fresh_ensemble_adapte
 
 @pytest.mark.parametrize("mode", ["unaffordable", "expires", "parent", "internal"])
 async def test_pending_candidate_cooling_has_correct_deadline_owner(monkeypatch, mode):
-    registry = ProviderRetryAfterCooldowns()
+    cooling_now = time.monotonic()
+    registry = ProviderRetryAfterCooldowns(clock=lambda: cooling_now)
     monkeypatch.setattr(retry_after, "_provider_retry_after_cooldowns", registry)
     provider = PhysicalProvider()
     sink = Sink()
@@ -701,10 +702,20 @@ async def test_pending_candidate_cooling_has_correct_deadline_owner(monkeypatch,
         runtime.config.timeout = 0.025
 
     def stage(**_kwargs):
+        nonlocal cooling_now
+        install_deadline = time.monotonic() + (10 if mode == "parent" else 0.025)
+        request_context = runtime._compaction_request_context
+        assert request_context is not None
+        parent_deadline = request_context.chat_config.turn_deadline_at_monotonic
+        assert parent_deadline is not None
+        # Freeze only cooldown bookkeeping inside the intended admission window;
+        # scheduling must not expire the 5ms hint before the gate is exercised.
+        # asyncio.timeout_at still enforces the unmodified real owner deadline.
+        cooling_now = min(parent_deadline, install_deadline) - 0.025
         runtime._pending_durable_compaction_event = CompactionEvent(
             compaction_id="existing-operation",
             summary="Completed but uninstalled checkpoint",
-            compaction_deadline_at_monotonic=time.monotonic() + (10 if mode == "parent" else 0.025),
+            compaction_deadline_at_monotonic=install_deadline,
         )
         record_provider_retry_after(
             provider,
@@ -714,7 +725,10 @@ async def test_pending_candidate_cooling_has_correct_deadline_owner(monkeypatch,
             ),
         )
 
-    async def wait(_seconds):
+    waits = []
+
+    async def wait(seconds):
+        waits.append(seconds)
         if mode == "internal":
             raise TimeoutError("independent wait failure")
         await asyncio.Event().wait()
@@ -732,6 +746,7 @@ async def test_pending_candidate_cooling_has_correct_deadline_owner(monkeypatch,
         }[mode]
     ]
     assert not provider.calls and not sink.starts and not sink.unknown
+    assert len(waits) == (0 if mode == "unaffordable" else 1)
     assert not any(isinstance(e, CompactionEvent) for e in events)
     assert runtime._pending_durable_compaction_event is None
     terminal = [e for e in notifications if e.get("status") in {"failed", "timed_out"}]
