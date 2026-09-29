@@ -12885,6 +12885,8 @@ class TurnRunner:
         policy: tuple[Any, ...],
     ) -> tuple[Any, ...]:
         """Identify the physical responder and effective summary controls without I/O."""
+        from opensquilla.session.compaction_deployment import compaction_deployment_fingerprint
+
         physical = provider
         bound = provider_config
         config = chat_config or ChatConfig()
@@ -12895,6 +12897,12 @@ class TurnRunner:
         metadata = provider_metadata(physical)
         connection = provider_connection_config(physical)
         credential = connection.api_key or str(getattr(bound, "api_key", "") or "")
+        provider_id = (
+            metadata.provider_id or metadata.provider_kind
+            or str(getattr(bound, "provider", "") or "")
+        )
+        model = metadata.model or str(getattr(bound, "model", "") or "")
+        base_url = connection.base_url or str(getattr(bound, "base_url", "") or "")
         controls = {
             name: getattr(config, name, None)
             for name in (
@@ -12909,11 +12917,12 @@ class TurnRunner:
             # history when moving between idle/manual and ordinary requests.
             controls["provider_request_max_chars"] = config.provider_request_max_chars_explicit_cap
         return (
-            metadata.provider_id or metadata.provider_kind
-            or str(getattr(bound, "provider", "") or ""),
-            metadata.model or str(getattr(bound, "model", "") or ""),
-            connection.base_url or str(getattr(bound, "base_url", "") or ""),
-            hashlib.sha256(credential.encode("utf-8")).hexdigest() if credential else "",
+            provider_id,
+            model,
+            base_url,
+            compaction_deployment_fingerprint(
+                provider=provider_id, model=model, base_url=base_url, api_key=credential,
+            ) if credential else "",
             json.dumps(controls, sort_keys=True, default=str),
             *policy,
         )

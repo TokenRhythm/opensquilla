@@ -1,6 +1,7 @@
 """Mandatory live state, parent deadlines, and physical deployment circuit scope."""
 
 import asyncio
+import hashlib
 import json
 import time
 from unittest.mock import AsyncMock, MagicMock
@@ -487,3 +488,52 @@ def test_same_model_credential_rotation_changes_circuit_identity_without_exposin
     assert identities[0] != identities[1]
     assert "synthetic-old-credential" not in repr(identities)
     assert "synthetic-new-credential" not in repr(identities)
+
+
+@pytest.mark.parametrize("credential", ["synthetic-shared-credential", ""])
+def test_fresh_adapter_preserves_cooldown_until_credential_rotation(credential):
+    runner = TurnRunner(provider_selector=None)
+    session_key = "synthetic-credential-circuit"
+
+    def identity(key):
+        return runner._compaction_failure_identity(
+            provider=OpenAIProvider(api_key=key, model="synthetic"),
+            provider_config=None, chat_config=ChatConfig(max_tokens=1024), policy=(),
+        )
+
+    original = identity(credential)
+    assert len(original) == 5
+    if not credential:
+        assert original[3] == ""
+    runner._bind_compaction_failure_scope(session_key, original)
+    runner._record_compaction_failure(session_key, failure_kind="operation_timeout")
+    runner._bind_compaction_failure_scope(session_key, identity(credential))
+    assert runner._compaction_circuit_open(session_key)
+    runner._bind_compaction_failure_scope(session_key, identity("synthetic-rotated-credential"))
+    assert not runner._compaction_circuit_open(session_key)
+
+
+@pytest.mark.parametrize("credential_source", ["connection", "bound_config"])
+def test_compaction_credential_identity_is_opaque_and_process_keyed(monkeypatch, credential_source):
+    credential = "synthetic-process-local-credential"
+    provider = OpenAIProvider(
+        api_key=credential if credential_source == "connection" else "", model="synthetic",
+    )
+    bound = ProviderConfig(provider="openai", model="synthetic", api_key=credential)
+
+    def identity():
+        return TurnRunner._compaction_failure_identity(
+            provider=provider, provider_config=bound, chat_config=ChatConfig(), policy=(),
+        )
+
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment._DEPLOYMENT_FINGERPRINT_KEY", b"a" * 32,
+    )
+    first = identity()
+    assert first == identity()
+    assert credential not in repr(first)
+    assert hashlib.sha256(credential.encode("utf-8")).hexdigest() not in repr(first)
+    monkeypatch.setattr(
+        "opensquilla.session.compaction_deployment._DEPLOYMENT_FINGERPRINT_KEY", b"b" * 32,
+    )
+    assert first != identity()
