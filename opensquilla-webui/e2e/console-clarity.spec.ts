@@ -35,54 +35,47 @@ test.describe('Console clarity', () => {
     await expect(settingsRow).toHaveAttribute('data-icon', 'settings')
     await expect(page.locator('.sidebar-nav-group-toggle')).toHaveCount(0)
     await expect(page.locator('.sidebar-core .sidebar-fn-label')).toHaveText([
-      'Overview', 'Skills & Channels', 'Cron',
+      'Skills & Channels', 'Cron', 'View usage',
     ])
+    await expect(page.locator('.sidebar-core').getByRole('link', { name: /^(Overview|Logs)$/ })).toHaveCount(0)
   })
 
-  test('/health deep link redirects to /overview with the readiness report inline', async ({ page }) => {
-    await openControl(page, 'health')
+  for (const path of ['overview', 'health']) {
+    test(`/${path} compatibility link opens standalone Usage`, async ({ page }) => {
+      await openControl(page, path)
+      await expect(page).toHaveURL(/\/usage$/)
+      await expect(page.getByRole('heading', { name: 'Usage', exact: true })).toBeVisible()
+      await expect(page.locator('.route-hub__tabs, .ov-stage, .lg-stage')).toHaveCount(0)
+    })
+  }
 
-    await expect(page).toHaveURL(/\/overview$/)
-    await expect(page.locator('#overview-health')).toBeVisible()
-    await expect(page.locator('section[aria-label="Health findings"]')).toBeVisible()
+  test('a cold /logs link focuses the on-demand log entry and closes without reopening Settings', async ({ page }) => {
+    await openControl(page, 'logs')
+    await expect(page).toHaveURL(/\/settings\/gateway#logs$/)
+    const dialog = settingsDialog(page)
+    await expect(dialog).toBeVisible()
+    await expect(dialog.locator('#settings-gateway-logs')).toBeInViewport()
+    await expect(dialog.locator('#settings-gateway-logs')).toBeFocused()
+    await expect(dialog.getByTestId('support-download-bundle')).toBeVisible()
+    await expect(dialog.getByTestId('support-view-logs')).toBeVisible()
+    await expect(page.getByRole('dialog', { name: 'Gateway logs', exact: true })).toHaveCount(0)
+    await expect(page.getByTestId('support-copy-readiness')).toHaveCount(0)
+    await expect(page.locator('.lg-stage')).toHaveCount(0)
+
+    await page.keyboard.press('Escape')
+    await expect(dialog).toHaveCount(0)
+    await expect(page).toHaveURL(/\/chat$/)
+    await page.reload()
+    await expect(dialog).toHaveCount(0)
+    await expect(page.locator('.chat-textarea')).toBeVisible()
   })
 
-  test('Overview stays focused on status and routes runtime logs through diagnostics', async ({ page }) => {
-    await openControl(page, 'overview')
-
-    const hub = page.getByRole('navigation', { name: 'Overview' })
-    await expect(hub.getByRole('link')).toHaveText(['Status', 'Usage'])
-    await expect(page.locator('.ov-grid')).toHaveCount(0)
-    await expect(page.locator('.ov-recent')).toHaveCount(0)
-    await expect(page.locator('.ov-event-log')).toHaveCount(0)
-
-    await page.getByRole('button', { name: 'Support & diagnostics' }).click()
-    await page.getByRole('menuitem', { name: /View runtime logs/ }).click()
-    await expect(page).toHaveURL(/\/logs$/)
-    await expect(page.getByRole('heading', { name: 'Logs', level: 1 })).toBeVisible()
-    await expect(page.locator('.sidebar-core').getByRole('link', { name: 'Overview' }))
-      .toHaveClass(/is-active/)
-
-    const breadcrumb = page.getByRole('navigation', { name: 'Breadcrumb' })
-    await expect(breadcrumb.getByRole('link', { name: 'Overview', exact: true }))
-      .toHaveAttribute('href', '/control/overview')
-    await breadcrumb.getByRole('link', { name: 'Overview', exact: true }).click()
-    await expect(page).toHaveURL(/\/overview$/)
-    await page.goBack()
-    await expect(page).toHaveURL(/\/logs$/)
-
-    await page.getByRole('button', { name: 'Support & diagnostics' }).click()
-    await expect(page.getByRole('menuitem', { name: /View runtime logs/ })).toHaveCount(0)
-    await page.goBack()
-    await expect(page).toHaveURL(/\/overview$/)
-  })
-
-  test('Overview and Logs stay within the target responsive viewports', async ({ page }) => {
+  test('Usage and Gateway support stay within the target responsive viewports', async ({ page }) => {
     const scenarios = [
-      { width: 320, height: 800, locale: 'zh-Hans', path: 'overview' },
+      { width: 320, height: 800, locale: 'zh-Hans', path: 'usage' },
       { width: 390, height: 844, locale: 'en', path: 'logs' },
       { width: 768, height: 900, locale: 'zh-Hans', path: 'logs' },
-      { width: 1440, height: 1000, locale: 'en', path: 'overview' },
+      { width: 1440, height: 1000, locale: 'en', path: 'usage' },
     ] as const
 
     for (const scenario of scenarios) {
@@ -97,12 +90,10 @@ test.describe('Console clarity', () => {
         document.documentElement.scrollWidth - document.documentElement.clientWidth)
       expect(overflow).toBeLessThanOrEqual(0)
 
-      if (scenario.path === 'overview' && scenario.width <= 320) {
-        const tabs = await page.locator('.route-hub__tabs').boundingBox()
-        const actions = await page.locator('.route-hub__actions').boundingBox()
-        expect(tabs).not.toBeNull()
-        expect(actions).not.toBeNull()
-        expect(tabs!.x + tabs!.width).toBeLessThanOrEqual(actions!.x)
+      if (scenario.path === 'logs') {
+        await expect(page.getByTestId('support-download-bundle')).toBeInViewport()
+      } else {
+        await expect(page.locator('.route-hub__tabs')).toHaveCount(0)
       }
     }
   })
@@ -134,19 +125,9 @@ test.describe('Console clarity', () => {
     }
   })
 
-  test('Status impact count jumps to the inline readiness report', async ({ page }) => {
-    await openControl(page, 'overview')
-
-    await page.locator('.ov-count').first().click()
-    // Still on Overview — the card scrolls instead of navigating away.
-    await expect(page).toHaveURL(/\/overview$/)
-    await expect(page.locator('#overview-health')).toBeInViewport()
-  })
-
-  test('Agents header link opens the Settings modal', async ({ page }) => {
-    await openControl(page, 'agents')
-
-    await page.locator('.ag-stage__actions').getByRole('button', { name: 'open settings' }).click()
+  test('the sidebar Settings entry remains available from Usage', async ({ page }) => {
+    await openControl(page, 'usage')
+    await page.locator('.sidebar-foot .sidebar-fn-item').click()
     await expect(settingsDialog(page)).toBeVisible()
   })
 })

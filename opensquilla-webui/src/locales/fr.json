@@ -392,11 +392,8 @@
     "cron": "Cron",
     "skills": "Compétences",
     "skillsChannels": "Compétences et canaux",
-    "overview": "Vue d'ensemble",
-    "status": "État",
     "usage": "Utilisation",
     "viewUsage": "Voir l’utilisation",
-    "logs": "Journaux",
     "settings": "Paramètres",
     "groupBuild": "Construire",
     "groupMonitor": "Vue d'ensemble",
@@ -460,7 +457,8 @@
       "results": "Résultats des paramètres",
       "empty": "Aucun paramètre correspondant",
       "defaultModel": "Modèle par défaut",
-      "permissions": "Autorisations"
+      "permissions": "Autorisations",
+      "supportBundle": "Télécharger le paquet d’assistance"
     },
     "appearance": {
       "title": "Interface",
@@ -725,7 +723,8 @@
     },
     "gateway": {
       "title": "Passerelle",
-      "desc": "Connectez-vous à la passerelle et, sur ordinateur, gérez l'environnement local."
+      "desc": "Gérez la connexion de ce navigateur au Gateway.",
+      "desktopDesc": "Gérez la connexion au Gateway et le service local."
     },
     "general": {
       "title": "Général",
@@ -1630,12 +1629,12 @@
       "languageCode": "Code de langue"
     },
     "connection": {
-      "title": "Connexion",
-      "desc": "Dirigez ce navigateur vers une passerelle. La connexion s'applique immédiatement — aucun enregistrement nécessaire.",
+      "title": "Connexion au Gateway",
+      "desc": "Modifiez les champs, puis cliquez sur Connecter ou Reconnecter pour appliquer.",
       "connected": "Connecté",
       "connecting": "Connexion en cours",
       "disconnected": "Déconnecté",
-      "reasonConnected": "Lien en direct vers le socket de la passerelle.",
+      "reasonConnected": "Connecté au Gateway.",
       "reasonConnecting": "Connexion à la passerelle…",
       "reasonFailed": "La dernière tentative a échoué : {error}",
       "reasonDisconnected": "Non connecté. Vérifiez l'URL WebSocket et essayez Connecter.",
@@ -1647,8 +1646,11 @@
       "tokenRequired": "Jeton requis",
       "reasonTokenRequired": "Échec de l’authentification. Les tentatives automatiques sont suspendues. Saisissez un jeton de passerelle valide, puis choisissez Connecter.",
       "reconnect": "Reconnecter",
+      "editConnection": "Modifier la connexion",
       "connect": "Connecter",
-      "disconnect": "Déconnecter"
+      "disconnect": "Déconnecter",
+      "actions": "Actions de connexion",
+      "reasonManagedDisconnected": "Le client n’est pas connecté au Gateway local. Essayez de vous reconnecter."
     },
     "runtime": {
       "title": "Environnement d'exécution",
@@ -1826,7 +1828,15 @@
       "migrationCompleteIndependent": "Cette installation Desktop est maintenant indépendante et ne sera pas synchronisée avec la source.",
       "migrationCompleteReplacement": "Les anciennes données Desktop sont disponibles dans une sauvegarde complète. Elles ont été remplacées en bloc ; aucun fichier ni conversation n’a été fusionné.",
       "migrationCompleteShowBackup": "Afficher la sauvegarde complète",
-      "migrationCompleteDismiss": "Fermer"
+      "migrationCompleteDismiss": "Fermer",
+      "localGatewayTitle": "Gateway local",
+      "localGatewayDescription": "Gérez le Gateway local démarré par l’application de bureau.",
+      "processStatus": "État du processus",
+      "restartLocalGateway": "Redémarrer le Gateway local",
+      "details": "Adresse et emplacement des journaux",
+      "address": "Adresse du Gateway",
+      "refreshStatus": "Actualiser l’état",
+      "openLocalLogLocation": "Ouvrir l’emplacement des journaux locaux"
     },
     "keyboard": {
       "title": "Raccourcis",
@@ -1860,9 +1870,6 @@
       "dataMaintenanceDesc": "Consultez les imports et sauvegardes. Sur ordinateur, vous pouvez aussi réinitialiser ou supprimer les données du profil local.",
       "dataMaintenanceAction": "Gérer",
       "dataMaintenanceAria": "Ouvrir la maintenance des données",
-      "runTraceLabel": "Tiroir de trace d'exécution dans les Journaux",
-      "runTraceDesc": "Rend les lignes de journal interactives et ouvre un tiroir de détail par étape de nœud dans la vue Journaux.",
-      "runTraceAria": "Tiroir de trace d'exécution dans les Journaux (prend effet après rechargement)",
       "configFileLabel": "Fichier de configuration",
       "configFileDesc": "D’autres options sont disponibles dans le fichier de configuration."
     },
@@ -2364,110 +2371,6 @@
       "abortDone": "Exécution abandonnée.",
       "abortNone": "Aucune exécution active à abandonner.",
       "abortFailed": "Échec de l'abandon."
-    },
-    "overview": {
-      "title": "État",
-      "subtitle": "Préparation, utilisation et santé d'exécution.",
-      "totalTokens": "Total des jetons",
-      "totalSessions": "Total des sessions",
-      "totalSessionsTitle": "Total des sessions tous statuts confondus",
-      "viewAll": "tout voir →",
-      "provider": "Fournisseur",
-      "manageAgents": "gérer les agents →",
-      "jumpToReadiness": "Aller au rapport de préparation",
-      "health": "Santé",
-      "uptime": "Disponibilité",
-      "healthSummary": "Résumé de santé",
-      "readiness": "Préparation",
-      "healthContext": "Contexte du rapport de santé",
-      "ctxGateway": "Passerelle",
-      "ctxConfig": "Configuration",
-      "ctxRequestedConfig": "Configuration demandée",
-      "ctxAgent": "Agent",
-      "needsAction": "Action requise",
-      "degraded": "Dégradé",
-      "optional": "Facultatif",
-      "ready": "Prêt",
-      "healthFindings": "Constats de santé",
-      "loadingHealth": "Chargement du rapport de santé",
-      "noFindings": "Aucun constat retourné.",
-      "recoveryRestart": "La récupération nécessite un redémarrage",
-      "openSettings": "Ouvrir les paramètres",
-      "findingDetails": "Détails",
-      "findingFallback": "Constat {n}",
-      "copyCommand": "Copier la commande",
-      "step": "Étape",
-      "checking": "Vérification",
-      "waitingDoctor": "En attente de doctor.status",
-      "healthUnavailable": "Rapport de santé de la passerelle indisponible",
-      "impact": {
-        "blocksReady": "Bloque la préparation",
-        "degrades": "Dégrade",
-        "optional": "Facultatif",
-        "reference": "Référence"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "Prêt avec avertissements",
-        "ready": "Prêt",
-        "actionRequired": "Action requise",
-        "degraded": "Dégradé",
-        "unavailable": "Indisponible"
-      },
-      "badge": {
-        "diagnostic": "Diagnostics incomplets",
-        "repair": "Réparation en attente",
-        "config": "Incompatibilité de configuration"
-      },
-      "dotStatus": {
-        "active": "Actif",
-        "ready": "Prêt",
-        "ok": "OK",
-        "paused": "En pause",
-        "degraded": "Dégradé",
-        "warn": "Avertissement",
-        "error": "Erreur",
-        "failed": "Échec",
-        "closed": "Fermé",
-        "ended": "Terminé",
-        "offline": "Hors ligne",
-        "unknown": "Inconnu"
-      },
-      "group": {
-        "action": {
-          "title": "Action requise",
-          "note": "Corrigez ces points en premier pour rendre OpenSquilla prêt."
-        },
-        "degraded": {
-          "title": "Capacités dégradées",
-          "note": "OpenSquilla peut fonctionner, mais ces capacités nécessitent votre attention."
-        },
-        "optional": {
-          "title": "Configuration facultative",
-          "note": "Ces points améliorent les capacités ou la posture mais ne bloquent pas la préparation."
-        },
-        "ready": {
-          "title": "Vérifications prêtes",
-          "note": "Ces surfaces fonctionnent déjà."
-        }
-      },
-      "gw": {
-        "cannotLoad": "Impossible de charger doctor.status depuis {url}. {reason}",
-        "inspectRemote": "Inspecter la passerelle distante",
-        "repairRemote": "Réparer le déploiement distant",
-        "repairRemoteDetail": "Démarrez ou réparez le déploiement de la passerelle OpenSquilla distante, puis actualisez la santé.",
-        "runLocalDoctor": "Exécuter le doctor local",
-        "runLocalDoctorDetail": "Vérifie la configuration locale et l'intégration avant de redémarrer la passerelle.",
-        "startLocal": "Démarrer la passerelle locale",
-        "inspectLocal": "Inspecter la passerelle locale"
-      },
-      "checkedAgo": "Vérifié {time}",
-      "rerunChecks": "Relancer les vérifications",
-      "copyDiagnostics": "Copier le JSON de diagnostic",
-      "copiedDiagnostics": "JSON de diagnostic copié",
-      "diagnoseWithAgent": "Diagnostiquer avec l'agent",
-      "diagnosePrompt": "Veuillez diagnostiquer cette configuration OpenSquilla à l'aide du contexte client et du rapport doctor ci-dessous. Privilégiez les réglages applicables dans l'app. Lorsque hasTerminalWorkflow vaut false, ne proposez pas de commandes opensquilla brutes ; un gateway Desktop détenu est géré par l'app. Un transfert de données signifie une sauvegarde suivie d'un remplacement complet, jamais une fusion. Une migration facultative n'est pas une panne et peut rester visible après le transfert. Contentez-vous d'expliquer et de guider : ne migrez pas les données, ne redémarrez pas le gateway, n'écrivez pas de réglages et ne prétendez pas avoir effectué des changements.",
-      "environment": "Environnement",
-      "latency": "Latence"
     }
   },
   "console": {
@@ -2707,12 +2610,6 @@
         "botIdCopied": "ID du bot copié",
         "eventSubscriptionTitle": "Vérifier l'abonnement aux événements Feishu"
       }
-    },
-    "overview": {
-      "channelsChip": "Canaux",
-      "channelsChipConnected": "{connected} connecté(s)",
-      "channelsChipFailed": "{failed} en échec",
-      "channelsChipPending": "{pending} en attente d'approbation"
     }
   },
   "cronSkills": {
@@ -3252,17 +3149,23 @@
       "tileNotDeclaredHint": "aucun manifeste"
     }
   },
+  "gatewayLogs": {
+    "viewLogs": "Voir les journaux récents",
+    "title": "Journaux du Gateway",
+    "description": "Les 200 dernières lignes du Gateway connecté. Actualisez manuellement pour les mettre à jour.",
+    "refresh": "Actualiser",
+    "loading": "Chargement des journaux…",
+    "empty": "Aucun journal récent.",
+    "failed": "Impossible de lire les journaux. Vérifiez la connexion et les autorisations du Gateway, puis réessayez.",
+    "connectionRequired": "Connectez-vous au Gateway pour consulter les journaux.",
+    "authenticationRequired": "Authentifiez-vous auprès du Gateway pour consulter les journaux.",
+    "saveCurrentLogs": "Enregistrer les journaux affichés",
+    "saveFailed": "Impossible d’enregistrer les journaux. Réessayez."
+  },
   "monitorSupport": {
     "title": "Assistance et diagnostic",
-    "menuLabel": "Actions d’assistance et de diagnostic",
-    "viewLogs": "Voir les journaux d'exécution",
-    "viewLogsDescription": "Examiner les sorties récentes et les erreurs de la passerelle",
-    "copyReport": "Copier le rapport d’état actuel",
-    "copyReportDescription": "Partager l’état actuel de la connexion, de la configuration et de l’exécution",
-    "copySuccess": "Rapport d’état copié",
-    "copyFailed": "Impossible de copier le rapport d’état : {error}",
     "downloadBundle": "Télécharger le paquet d’assistance expurgé",
-    "downloadBundleDescription": "Inclut les journaux, un résumé de la configuration et les résultats du diagnostic",
+    "downloadBundleDescription": "Contient les journaux, un résumé de la configuration et les résultats de diagnostic de la Gateway connectée.",
     "privacySummary": "Le contenu des conversations est exclu par défaut et les identifiants connus sont masqués",
     "bundleTitle": "Télécharger le paquet d’assistance expurgé",
     "bundleSubtitle": "Créez un fichier ZIP à partager avec l’assistance OpenSquilla.",
@@ -3280,7 +3183,10 @@
     "bundleConfirm": "Générer et télécharger",
     "bundleCancel": "Annuler",
     "bundleFailed": "Échec du téléchargement du paquet d’assistance",
-    "bundleReady": "Paquet d’assistance téléchargé"
+    "bundleReady": "Paquet d’assistance téléchargé",
+    "bundleConnectionRequired": "Connectez-vous à la Gateway pour télécharger un dossier de diagnostic.",
+    "bundleOwnerRequired": "Seul le propriétaire local de la Gateway peut télécharger un dossier de diagnostic.",
+    "bundleDifferentGateway": "Ouvrez la WebUI de la Gateway connectée pour télécharger son dossier de diagnostic."
   },
   "usageLogs": {
     "tasks": {
@@ -3424,51 +3330,6 @@
     },
     "errors": {
       "loadFailed": "Échec du chargement de l'utilisation"
-    },
-    "logs": {
-      "breadcrumbLabel": "Fil d’Ariane",
-      "title": "Journaux",
-      "subtitle": "Flux de journaux de passerelle en direct — filtrez et suivez.",
-      "statusUnavailable": "État des journaux indisponible",
-      "statusUnavailableAria": "État des journaux indisponible ; le suivi des journaux peut toujours fonctionner.",
-      "statusUnavailableTitle": "logs.status est indisponible ; le suivi des journaux peut toujours fonctionner.",
-      "fileLogOn": "Journal fichier activé",
-      "fileLogOff": "Journal fichier désactivé",
-      "fileLogTitle": "La journalisation fichier de la passerelle est configurable via log_file_enabled, log_level, les paramètres de rotation et OPENSQUILLA_LOG_DIR. Chemin : {path}.",
-      "fileLogOffTitle": "Les journaux ne sont pas écrits sur le disque ; les paquets de diagnostic manqueront d'historique. Activez log_file_enabled dans la configuration. Chemin : {path}.",
-      "rawOn": "Capture brute activée",
-      "rawOff": "Capture brute désactivée",
-      "rawRecordingPill": "Capture brute en cours",
-      "rawTitle": "La capture brute enregistre l'intégralité des requêtes et réponses du modèle, y compris le contenu des conversations. Activez-la avec OPENSQUILLA_TURN_CALL_LOG=1 ou opensquilla diagnostics on --raw ; désactivez-la avec opensquilla diagnostics off. Source : {source}. Répertoire : {path}.",
-      "bundleButton": "Paquet de diagnostic",
-      "bundleButtonTitle": "Télécharger un paquet de diagnostic expurgé",
-      "bundleTitle": "Télécharger le paquet de diagnostic",
-      "bundleBody": "Rassemble les journaux de la passerelle, les erreurs enregistrées et la configuration expurgée dans un zip que vous pouvez joindre à un rapport de bug. Les secrets et les clés API sont supprimés ; le contenu des conversations est exclu, sauf si vous l'incluez ci-dessous.",
-      "bundleIncludeContent": "Inclure le contenu des conversations (prompts et réponses)",
-      "bundleConfirm": "Télécharger",
-      "bundleCancel": "Annuler",
-      "bundleFailed": "Échec du téléchargement du diagnostic",
-      "bundleReady": "Paquet de diagnostic téléchargé",
-      "inView": "Affichées",
-      "ofLoaded": "sur {total} chargées",
-      "errors": "Erreurs",
-      "reviewNeeded": "examen requis",
-      "allClear": "tout est en ordre",
-      "warnings": "Avertissements",
-      "recentAdvisories": "avis récents",
-      "none": "aucun",
-      "infoDebug": "Info / Débogage",
-      "routineOutput": "sortie de routine",
-      "levels": "Niveaux",
-      "filterPlaceholder": "Filtrer les messages…",
-      "autoFollow": "Suivi automatique",
-      "loading": "Chargement des journaux…",
-      "empty": "Aucun journal d'exécution pour le moment.",
-      "loadFailed": "Impossible de charger les journaux d'exécution.",
-      "retry": "Réessayer",
-      "noMatch": "Aucune ligne ne correspond au filtre actuel.",
-      "lineDetail": "Détail de la ligne de journal",
-      "ofLoadedFoot": "{visible} affichées · {total} en mémoire"
     }
   },
   "chat": {

@@ -393,11 +393,8 @@
     "cron": "Cron",
     "skills": "Skills",
     "skillsChannels": "Skills & Channels",
-    "overview": "Overview",
-    "status": "Status",
     "usage": "Usage",
     "viewUsage": "View usage",
-    "logs": "Logs",
     "settings": "Settings",
     "groupBuild": "Build",
     "groupMonitor": "Overview",
@@ -461,7 +458,8 @@
       "results": "Settings results",
       "empty": "No matching settings",
       "defaultModel": "Default model",
-      "permissions": "Permissions"
+      "permissions": "Permissions",
+      "supportBundle": "Download support bundle"
     },
     "appearance": {
       "title": "Interface",
@@ -808,7 +806,8 @@
     },
     "gateway": {
       "title": "Gateway",
-      "desc": "Connect to the Gateway and, on Desktop, manage the local runtime."
+      "desc": "Manage this browser's Gateway connection.",
+      "desktopDesc": "Manage the Gateway connection and local service."
     },
     "general": {
       "title": "General",
@@ -1713,12 +1712,12 @@
       "languageCode": "Language code"
     },
     "connection": {
-      "title": "Connection",
-      "desc": "Point this browser at a gateway. Connecting applies immediately — no save needed.",
+      "title": "Gateway connection",
+      "desc": "Edit the fields, then click Connect or Reconnect to apply.",
       "connected": "Connected",
       "connecting": "Connecting",
       "disconnected": "Disconnected",
-      "reasonConnected": "Live link to the gateway socket.",
+      "reasonConnected": "Connected to the Gateway.",
       "reasonConnecting": "Reaching the gateway…",
       "reasonFailed": "Last attempt failed: {error}",
       "reasonDisconnected": "Not connected. Check the WebSocket URL and try Connect.",
@@ -1730,8 +1729,11 @@
       "tokenRequired": "Token required",
       "reasonTokenRequired": "Authentication failed. Automatic retries are paused. Enter a valid gateway token and choose Connect.",
       "reconnect": "Reconnect",
+      "editConnection": "Edit connection",
       "connect": "Connect",
-      "disconnect": "Disconnect"
+      "disconnect": "Disconnect",
+      "actions": "Connection actions",
+      "reasonManagedDisconnected": "The client is not connected to the local Gateway. Try reconnecting."
     },
     "runtime": {
       "title": "Runtime",
@@ -1909,7 +1911,15 @@
       "migrationCompleteIndependent": "This Desktop installation is now independent and will not sync with the source.",
       "migrationCompleteReplacement": "The previous Desktop data is available in a complete backup. It was replaced as a whole; files and chats were never merged.",
       "migrationCompleteShowBackup": "Show complete backup",
-      "migrationCompleteDismiss": "Dismiss"
+      "migrationCompleteDismiss": "Dismiss",
+      "localGatewayTitle": "Local Gateway",
+      "localGatewayDescription": "Manage the local Gateway started by the desktop app.",
+      "processStatus": "Process status",
+      "restartLocalGateway": "Restart local Gateway",
+      "details": "Address and log location",
+      "address": "Gateway address",
+      "refreshStatus": "Refresh status",
+      "openLocalLogLocation": "Open local log location"
     },
     "keyboard": {
       "title": "Shortcuts",
@@ -1943,9 +1953,6 @@
       "dataMaintenanceDesc": "Review imports and backups. Desktop can also reset or delete local profile data.",
       "dataMaintenanceAction": "Manage",
       "dataMaintenanceAria": "Open data maintenance",
-      "runTraceLabel": "Run-trace drawer in Logs",
-      "runTraceDesc": "Make log lines interactive and open a per-line node-step detail drawer in the Logs view.",
-      "runTraceAria": "Run-trace drawer in Logs (takes effect after reload)",
       "configFileLabel": "Configuration file",
       "configFileDesc": "More options can be adjusted in the configuration file."
     },
@@ -2447,110 +2454,6 @@
       "abortDone": "Run aborted.",
       "abortNone": "No active run to abort.",
       "abortFailed": "Abort failed."
-    },
-    "overview": {
-      "title": "Status",
-      "subtitle": "Readiness, usage, and runtime health.",
-      "totalTokens": "Total tokens",
-      "totalSessions": "Total sessions",
-      "totalSessionsTitle": "Total sessions across all statuses",
-      "viewAll": "view all →",
-      "provider": "Provider",
-      "manageAgents": "manage agents →",
-      "jumpToReadiness": "Jump to the readiness report",
-      "health": "Health",
-      "uptime": "Uptime",
-      "healthSummary": "Health summary",
-      "readiness": "Readiness",
-      "healthContext": "Health report context",
-      "ctxGateway": "Gateway",
-      "ctxConfig": "Config",
-      "ctxRequestedConfig": "Requested config",
-      "ctxAgent": "Agent",
-      "needsAction": "Needs action",
-      "degraded": "Degraded",
-      "optional": "Optional",
-      "ready": "Ready",
-      "healthFindings": "Health findings",
-      "loadingHealth": "Loading health report",
-      "noFindings": "No findings returned.",
-      "recoveryRestart": "Recovery requires restart",
-      "openSettings": "Open settings",
-      "findingDetails": "Details",
-      "findingFallback": "Finding {n}",
-      "copyCommand": "Copy command",
-      "step": "Step",
-      "checking": "Checking",
-      "waitingDoctor": "Waiting for doctor.status",
-      "healthUnavailable": "Gateway health report unavailable",
-      "impact": {
-        "blocksReady": "Blocks readiness",
-        "degrades": "Degrades",
-        "optional": "Optional",
-        "reference": "Reference"
-      },
-      "statusLabel": {
-        "readyWithWarnings": "Ready with warnings",
-        "ready": "Ready",
-        "actionRequired": "Action required",
-        "degraded": "Degraded",
-        "unavailable": "Unavailable"
-      },
-      "badge": {
-        "diagnostic": "Diagnostics incomplete",
-        "repair": "Repair pending",
-        "config": "Config mismatch"
-      },
-      "dotStatus": {
-        "active": "Active",
-        "ready": "Ready",
-        "ok": "OK",
-        "paused": "Paused",
-        "degraded": "Degraded",
-        "warn": "Warning",
-        "error": "Error",
-        "failed": "Failed",
-        "closed": "Closed",
-        "ended": "Ended",
-        "offline": "Offline",
-        "unknown": "Unknown"
-      },
-      "group": {
-        "action": {
-          "title": "Needs action",
-          "note": "Fix these first to make OpenSquilla ready."
-        },
-        "degraded": {
-          "title": "Degraded capabilities",
-          "note": "OpenSquilla can run, but these capabilities need attention."
-        },
-        "optional": {
-          "title": "Optional setup",
-          "note": "These improve capability or posture but do not block readiness."
-        },
-        "ready": {
-          "title": "Ready checks",
-          "note": "These surfaces are already working."
-        }
-      },
-      "gw": {
-        "cannotLoad": "Cannot load doctor.status from {url}. {reason}",
-        "inspectRemote": "Inspect remote gateway",
-        "repairRemote": "Repair remote deployment",
-        "repairRemoteDetail": "Start or repair the remote OpenSquilla gateway deployment, then refresh health.",
-        "runLocalDoctor": "Run local doctor",
-        "runLocalDoctorDetail": "Checks local config and onboarding before restarting the gateway.",
-        "startLocal": "Start local gateway",
-        "inspectLocal": "Inspect local gateway"
-      },
-      "checkedAgo": "Checked {time}",
-      "rerunChecks": "Re-run checks",
-      "copyDiagnostics": "Copy diagnostics JSON",
-      "copiedDiagnostics": "Diagnostics JSON copied",
-      "diagnoseWithAgent": "Diagnose with agent",
-      "diagnosePrompt": "Please troubleshoot this OpenSquilla configuration using the client context and doctor report below. Prefer applicable in-app Settings. When hasTerminalWorkflow is false, do not suggest bare opensquilla commands; an owned Desktop gateway is managed by the app. Data transfer means backup followed by whole-data replacement, never a merge. An optional migration item is not a fault and may remain visible after transfer. Explain and guide only: do not migrate data, restart the gateway, write settings, or claim changes were performed.",
-      "environment": "Environment",
-      "latency": "Latency"
     }
   },
   "console": {
@@ -2790,12 +2693,6 @@
         "botIdCopied": "Bot ID copied",
         "eventSubscriptionTitle": "Check Feishu event subscription"
       }
-    },
-    "overview": {
-      "channelsChip": "Channels",
-      "channelsChipConnected": "{connected} connected",
-      "channelsChipFailed": "{failed} failed",
-      "channelsChipPending": "{pending} awaiting approval"
     }
   },
   "cronSkills": {
@@ -3335,17 +3232,23 @@
       "tileNotDeclaredHint": "no manifest"
     }
   },
+  "gatewayLogs": {
+    "viewLogs": "View recent logs",
+    "title": "Gateway logs",
+    "description": "Latest 200 lines from the connected Gateway. Refresh manually to update.",
+    "refresh": "Refresh",
+    "loading": "Loading logs…",
+    "empty": "No recent logs.",
+    "failed": "Unable to read logs. Check your connection and Gateway permissions, then retry.",
+    "connectionRequired": "Connect to the Gateway to view logs.",
+    "authenticationRequired": "Sign in to the Gateway to view logs.",
+    "saveCurrentLogs": "Save current logs",
+    "saveFailed": "Could not save logs. Try again."
+  },
   "monitorSupport": {
     "title": "Support & diagnostics",
-    "menuLabel": "Support and diagnostics actions",
-    "viewLogs": "View runtime logs",
-    "viewLogsDescription": "Inspect recent gateway output and errors",
-    "copyReport": "Copy current readiness report",
-    "copyReportDescription": "Share the current connection, configuration, and runtime status",
-    "copySuccess": "Readiness report copied",
-    "copyFailed": "Could not copy readiness report: {error}",
     "downloadBundle": "Download redacted support bundle",
-    "downloadBundleDescription": "Includes logs, a configuration summary, and diagnostic results",
+    "downloadBundleDescription": "Includes logs, a configuration summary, and diagnostic results from the connected Gateway.",
     "privacySummary": "Conversation content is excluded by default and known credentials are redacted",
     "bundleTitle": "Download redacted support bundle",
     "bundleSubtitle": "Create a ZIP to share with OpenSquilla support.",
@@ -3363,7 +3266,10 @@
     "bundleConfirm": "Generate and download",
     "bundleCancel": "Cancel",
     "bundleFailed": "Support bundle download failed",
-    "bundleReady": "Support bundle downloaded"
+    "bundleReady": "Support bundle downloaded",
+    "bundleConnectionRequired": "Connect to the Gateway to download a support bundle.",
+    "bundleOwnerRequired": "Only the Gateway's local owner can download a support bundle.",
+    "bundleDifferentGateway": "Open the connected Gateway's own WebUI to download its support bundle."
   },
   "usageLogs": {
     "tasks": {
@@ -3507,51 +3413,6 @@
     },
     "errors": {
       "loadFailed": "Failed to load usage"
-    },
-    "logs": {
-      "breadcrumbLabel": "Breadcrumb",
-      "title": "Logs",
-      "subtitle": "Live gateway log stream — filter and follow.",
-      "statusUnavailable": "Log status unavailable",
-      "statusUnavailableAria": "Log status unavailable; log tailing can still work.",
-      "statusUnavailableTitle": "logs.status is unavailable; log tailing can still work.",
-      "fileLogOn": "File log on",
-      "fileLogOff": "File log off",
-      "fileLogTitle": "Gateway file logging is configurable via log_file_enabled, log_level, rotation settings, and OPENSQUILLA_LOG_DIR. Path: {path}.",
-      "fileLogOffTitle": "Logs are not written to disk; diagnostic bundles will lack history. Enable log_file_enabled in config. Path: {path}.",
-      "rawOn": "Raw capture on",
-      "rawOff": "Raw capture off",
-      "rawRecordingPill": "Raw capture recording",
-      "rawTitle": "Raw capture records full model requests and responses, including conversation content. Enable with OPENSQUILLA_TURN_CALL_LOG=1 or opensquilla diagnostics on --raw; turn off with opensquilla diagnostics off. Source: {source}. Directory: {path}.",
-      "bundleButton": "Diagnostic bundle",
-      "bundleButtonTitle": "Download a redacted diagnostics bundle",
-      "bundleTitle": "Download diagnostics bundle",
-      "bundleBody": "Collects gateway logs, error records, and redacted configuration into one zip you can attach to a bug report. Secrets and API keys are removed; conversation content is excluded unless you opt in below.",
-      "bundleIncludeContent": "Include conversation content (prompts and responses)",
-      "bundleConfirm": "Download",
-      "bundleCancel": "Cancel",
-      "bundleFailed": "Diagnostics download failed",
-      "bundleReady": "Diagnostics bundle downloaded",
-      "inView": "In view",
-      "ofLoaded": "of {total} loaded",
-      "errors": "Errors",
-      "reviewNeeded": "review needed",
-      "allClear": "all clear",
-      "warnings": "Warnings",
-      "recentAdvisories": "recent advisories",
-      "none": "none",
-      "infoDebug": "Info / Debug",
-      "routineOutput": "routine output",
-      "levels": "Levels",
-      "filterPlaceholder": "Filter messages…",
-      "autoFollow": "Auto-follow",
-      "loading": "Loading logs…",
-      "empty": "No runtime logs yet.",
-      "loadFailed": "Could not load runtime logs.",
-      "retry": "Retry",
-      "noMatch": "No lines match the current filter.",
-      "lineDetail": "Log line detail",
-      "ofLoadedFoot": "{visible} in view · {total} buffered"
     }
   },
   "chat": {

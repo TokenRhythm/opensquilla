@@ -489,6 +489,10 @@ const wantsAutoSection = computed(() => routeParam.value === 'auto')
 const COMPOSITE_HASH_TARGETS: Record<string, string> = {
   '#connection': 'settings-gateway-connection',
   '#runtime': 'settings-gateway-runtime',
+  '#support': 'settings-gateway-support',
+  '#logs': 'settings-gateway-logs',
+  '#local-logs': 'settings-gateway-local-logs',
+  '#updates': 'settings-gateway-updates',
   '#privacy': 'settings-security-privacy',
   '#sandbox': 'settings-security-sandbox',
 }
@@ -510,6 +514,13 @@ const SEARCH_TARGET_IDS: Record<string, string> = {
   'setup.connection.wsUrlLabel': 'conn-ws-url',
   'setup.connection.tokenLabel': 'conn-ws-token',
   'setup.runtime.title': 'settings-gateway-runtime',
+  'setup.runtime.localGatewayTitle': 'settings-gateway-runtime',
+  'setup.runtime.openLocalLogLocation': 'settings-gateway-local-logs',
+  'updates.desktop.settingsTitle': 'settings-gateway-updates',
+  'monitorSupport.title': 'settings-gateway-support',
+  'monitorSupport.downloadBundle': 'settings-gateway-support',
+  'settings.search.supportBundle': 'settings-gateway-support',
+  'gatewayLogs.viewLogs': 'settings-gateway-logs',
   'settings.search.permissions': 'settings-security-sandbox',
   'settings.sandbox.title': 'settings-security-sandbox',
   'settings.sandbox.mode.title': 'settings-security-sandbox',
@@ -535,6 +546,12 @@ async function selectSearchResult(id: string, labelKey: string) {
     ?? row?.querySelector<HTMLElement>('input:not(:disabled), select:not(:disabled), button:not(:disabled)')
     ?? matched
     ?? panel
+  // Search can target fields inside a collapsed connection disclosure. Open
+  // every enclosing details element before scrolling or moving keyboard focus.
+  for (let disclosure = target.closest<HTMLDetailsElement>('details'); disclosure;
+    disclosure = disclosure.parentElement?.closest<HTMLDetailsElement>('details') ?? null) {
+    disclosure.open = true
+  }
   target.scrollIntoView?.({ block: 'nearest', behavior: 'auto' })
   if (!target.matches('input, select, button, [tabindex]')) target.tabIndex = -1
   target.focus({ preventScroll: true })
@@ -749,6 +766,16 @@ const removeLeaveGuard = router.beforeEach(async (to) => {
   return true
 })
 
+function isVisibleInDetails(element: HTMLElement): boolean {
+  for (let disclosure = element.parentElement?.closest('details'); disclosure;
+    disclosure = disclosure.parentElement?.closest('details')) {
+    // Only the first direct summary and its descendants remain visible when
+    // details is closed. An inner summary can still be hidden by an outer one.
+    if (!disclosure.open && !disclosure.querySelector(':scope > summary')?.contains(element)) return false
+  }
+  return true
+}
+
 function onDocumentKeydown(event: KeyboardEvent) {
   if (event.defaultPrevented) return
   // The confirm modal owns the keyboard while it is open; let it handle Escape
@@ -764,6 +791,7 @@ function onDocumentKeydown(event: KeyboardEvent) {
   if (!rootEl) return
   const focusables = Array.from(rootEl.querySelectorAll<HTMLElement>(
     'button:not([disabled]), a[href], input:not([disabled]), textarea:not([disabled]), select:not([disabled]), summary, [tabindex]:not([tabindex="-1"])'))
+    .filter(isVisibleInDetails)
   if (focusables.length === 0) return
   const first = focusables[0]
   const last = focusables[focusables.length - 1]

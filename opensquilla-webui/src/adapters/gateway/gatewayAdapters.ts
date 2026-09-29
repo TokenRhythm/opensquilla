@@ -188,7 +188,9 @@ export function createGatewayAdapters(
     promptCacheLease: createV4PromptCacheLease(transports.rpc),
     clarificationSubmission: createV4ClarificationSubmission(transports.rpc),
     sessionMaintenance: createV4SessionMaintenance(transports.rpc),
-    observability: createV4Observability(transports.rpc, http),
+    observability: createV4Observability(
+      transports.rpc, http, () => gatewayAccess.supportBundleUnavailableReason,
+    ),
     skillCatalog: createV4SkillCatalog(transports.rpc),
     agentCatalog: createV4AgentCatalog(transports.rpc),
     cronScheduler: createV4CronScheduler(transports.rpc, transports.events),

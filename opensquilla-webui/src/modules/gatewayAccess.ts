@@ -4,6 +4,7 @@ import type { DesktopResumeSource } from '@/platform/types'
 export type GatewayAvailability = 'unavailable' | 'preparing' | 'available'
 export type GatewayConnectionHealth = 'healthy' | 'suspect'
 export type GatewayConnectionPhase = 'healthy' | 'checking' | 'suspect' | 'reconnecting'
+export type SupportBundleUnavailableReason = 'disconnected' | 'permission' | 'differentGateway' | null
 
 export interface GatewayRunModePolicy {
   readonly allowedRunModes?: unknown
@@ -34,9 +35,13 @@ export interface GatewayAccess {
   /** The local supervisor is preparing the runtime; no connection has failed. */
   readonly isRuntimeStarting: boolean
   readonly connectionError: string | null
+  /** Host and port of the healthy connection, without credentials or URL suffixes. */
+  readonly connectedGatewayHost?: string | null
   readonly requiresCredential: boolean
   readonly isAvailable: boolean
   readonly isLocalOwner: boolean
+  /** A support bundle requires owner authority and the current HTTP target. */
+  readonly supportBundleUnavailableReason: SupportBundleUnavailableReason
   readonly isAuthenticated: boolean
   /** Current anonymous session namespace, verified from this connection's Hello. */
   readonly guestSessionOwnerId: string | null

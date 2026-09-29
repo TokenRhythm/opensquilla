@@ -29,7 +29,7 @@ async function mountComposer() {
   document.body.appendChild(el)
   const app = createApp(ChatComposer, BASE_PROPS)
   app.use(i18n)
-  const vm = app.mount(el) as unknown as { focusTextarea: () => void }
+  const vm = app.mount(el) as unknown as { focusTextarea: (options?: { preserveFocus?: boolean }) => void }
   await nextTick()
   const textarea = el.querySelector<HTMLTextAreaElement>('.chat-textarea')
   expect(textarea).toBeTruthy()
@@ -42,6 +42,53 @@ afterEach(() => {
 })
 
 describe('ChatComposer focus contract', () => {
+  it('automatically focuses a cold page whose body still owns focus', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    const { app, textarea, vm } = await mountComposer()
+    expect(document.activeElement).toBe(document.body)
+
+    vm.focusTextarea({ preserveFocus: true })
+    await nextTick()
+
+    expect(document.activeElement).toBe(textarea)
+    app.unmount()
+  })
+
+  it('preserves an external control restored by an overlay while allowing explicit composer focus', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    const { app, textarea, vm } = await mountComposer()
+    const settings = document.createElement('button')
+    settings.textContent = 'Settings'
+    document.body.appendChild(settings)
+    settings.focus()
+
+    vm.focusTextarea({ preserveFocus: true })
+    await nextTick()
+    expect(document.activeElement).toBe(settings)
+
+    vm.focusTextarea()
+    await nextTick()
+    expect(document.activeElement).toBe(textarea)
+    app.unmount()
+  })
+
+  it('rechecks an external focus change before automatic focus runs', async () => {
+    vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
+    vi.spyOn(document, 'hasFocus').mockReturnValue(true)
+    const { app, vm } = await mountComposer()
+    const settings = document.createElement('button')
+    document.body.appendChild(settings)
+
+    vm.focusTextarea({ preserveFocus: true })
+    settings.focus()
+    await nextTick()
+
+    expect(document.activeElement).toBe(settings)
+    app.unmount()
+  })
+
   it('focuses the textarea while the page is visible and active', async () => {
     vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('visible')
     vi.spyOn(document, 'hasFocus').mockReturnValue(true)

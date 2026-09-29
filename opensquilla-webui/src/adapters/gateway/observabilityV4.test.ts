@@ -5,7 +5,7 @@ function transport(call: ReturnType<typeof vi.fn>, supports = true) {
   const markUnsupported = vi.fn()
   return {
     value: {
-      request: call,
+      request: call as Parameters<typeof createV4Observability>[0]['request'],
       ready: vi.fn(async () => {}),
       supports: vi.fn(() => supports),
       markUnsupported,
@@ -15,37 +15,69 @@ function transport(call: ReturnType<typeof vi.fn>, supports = true) {
 }
 
 describe('v4 Observability Adapter', () => {
-  it('owns Gateway status', async () => {
-    const call = vi.fn(async (method: string) => {
-      if (method === 'status') {
-        return {
-          status: 'running',
-          version: '1.0.0',
-          uptime_ms: 1,
-          provider: null,
-          active_sessions: 0,
-        }
-      }
-    })
-    const adapter = createV4Observability(
-      transport(call).value as Parameters<typeof createV4Observability>[0],
-      { requestJson: vi.fn(), requestBinary: vi.fn() },
-    )
+  it('reads one bounded snapshot from the connected RPC without the HTTP origin guard', async () => {
+    const entries = ['gateway started', { level: 'warn', message: 'connection interrupted' }]
+    const call = vi.fn(async () => ({ lines: entries, cursor: 4096, has_more: true }))
+    const rpc = transport(call)
+    const http = { requestJson: vi.fn(), requestBinary: vi.fn() }
+    const adapter = createV4Observability(rpc.value, http, () => 'differentGateway')
 
-    await expect(adapter.gatewayStatus()).resolves.toMatchObject({ status: 'running' })
-    expect(call).toHaveBeenNthCalledWith(1, 'status', {}, expect.any(Object))
+    await expect(adapter.tailLogs()).resolves.toEqual({ entries, truncated: true })
+
+    expect(rpc.value.ready).toHaveBeenCalledOnce()
+    expect(call).toHaveBeenCalledExactlyOnceWith('logs.tail', {
+      cursor: 0, limit: 200, level: null,
+    }, { timeoutMs: 15_000, timeoutAction: 'reject', abortAction: 'reject' })
+    expect(http.requestJson).not.toHaveBeenCalled()
+    expect(http.requestBinary).not.toHaveBeenCalled()
   })
 
-  it('rejects a successful response that violates the generated Contract', async () => {
-    const call = vi.fn(async () => ({ ready: true }))
+  it('forwards snapshot cancellation without requesting a connection reset', async () => {
+    const abort = new AbortController()
+    const call = vi.fn(async () => ({ lines: [], cursor: 0, has_more: false }))
+    const rpc = transport(call)
+    const adapter = createV4Observability(rpc.value, { requestJson: vi.fn(), requestBinary: vi.fn() }, () => null)
+
+    await expect(adapter.tailLogs({ signal: abort.signal })).resolves.toEqual({ entries: [], truncated: false })
+
+    expect(rpc.value.ready).toHaveBeenCalledWith({ signal: abort.signal })
+    expect(call).toHaveBeenCalledWith('logs.tail', expect.any(Object), expect.objectContaining({
+      signal: abort.signal, timeoutAction: 'reject', abortAction: 'reject',
+    }))
+  })
+
+  it('does not read logs after waiting for the connection is aborted', async () => {
+    const aborted = new DOMException('The operation was aborted', 'AbortError')
+    const rpc = transport(vi.fn())
+    rpc.value.ready.mockRejectedValue(aborted)
+    const adapter = createV4Observability(rpc.value, { requestJson: vi.fn(), requestBinary: vi.fn() }, () => null)
+
+    await expect(adapter.tailLogs()).rejects.toBe(aborted)
+    expect(rpc.value.request).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    { lines: 'wrong shape', cursor: 0, has_more: false },
+    { lines: [42], cursor: 0, has_more: false },
+    { lines: [], cursor: 0 },
+  ])('rejects a malformed log snapshot before exposing it to the UI: %j', async payload => {
     const adapter = createV4Observability(
-      transport(call).value as Parameters<typeof createV4Observability>[0],
-      { requestJson: vi.fn(), requestBinary: vi.fn() },
+      transport(vi.fn(async () => payload)).value,
+      { requestJson: vi.fn(), requestBinary: vi.fn() }, () => null,
     )
 
-    await expect(adapter.gatewayStatus()).rejects.toThrow(
-      'status returned an invalid response',
-    )
+    await expect(adapter.tailLogs()).rejects.toThrow('logs.tail returned an invalid response')
+  })
+
+  it('preserves a permission failure instead of reporting an empty log snapshot', async () => {
+    const forbidden = Object.assign(new Error('Permission denied'), { code: 'UNAUTHORIZED' })
+    const call = vi.fn().mockRejectedValue(forbidden)
+    const http = { requestJson: vi.fn(), requestBinary: vi.fn() }
+    const adapter = createV4Observability(transport(call).value, http, () => null)
+
+    await expect(adapter.tailLogs()).rejects.toBe(forbidden)
+    expect(call).toHaveBeenCalledOnce()
+    expect(http.requestJson).not.toHaveBeenCalled()
   })
 
   it('projects usage.query and preserves the semantic range request', async () => {
@@ -62,6 +94,7 @@ describe('v4 Observability Adapter', () => {
       requestJson: vi.fn(),
       requestBinary: vi.fn(),
       },
+      () => null,
     )
 
     const snapshot = await adapter.usage('7', { timezone: 'Asia/Shanghai' })
@@ -87,6 +120,7 @@ describe('v4 Observability Adapter', () => {
       requestJson: vi.fn(),
       requestBinary: vi.fn(),
       },
+      () => null,
     )
 
     const snapshot = await adapter.usage('all', { timezone: 'UTC' })
@@ -96,21 +130,8 @@ describe('v4 Observability Adapter', () => {
     expect(snapshot.totals).toMatchObject({ sessions: 4, totalTokens: 9, cost: 0.25 })
   })
 
-  it('owns readiness, log, update, and support-bundle transport details', async () => {
-    const call = vi.fn(async (method: string) => {
-      if (method === 'doctor.status') {
-        return { status: 'ready', ready: true, findings: [], agentId: 'main' }
-      }
-      if (method === 'logs.status') {
-        return {
-          raw_turn_call_log: {},
-          gateway_file_log: { enabled: true },
-          diagnostics_enabled: {},
-        }
-      }
-      if (method === 'logs.tail') return { lines: ['ready'], cursor: 4, has_more: false }
-      throw new Error(`unexpected method ${method}`)
-    })
+  it('owns update and support-bundle transport details without diagnostics RPCs', async () => {
+    const call = vi.fn()
     const http = {
       requestJson: vi.fn(async () => ({
         current: '1.0.0',
@@ -127,11 +148,9 @@ describe('v4 Observability Adapter', () => {
     const adapter = createV4Observability(
       transport(call).value as Parameters<typeof createV4Observability>[0],
       http as Parameters<typeof createV4Observability>[1],
+      () => null,
     )
 
-    await expect(adapter.readiness({ deep: true })).resolves.toMatchObject({ ready: true })
-    await expect(adapter.logStatus()).resolves.toMatchObject({ gateway_file_log: { enabled: true } })
-    await expect(adapter.tailLogs({ cursor: 0 })).resolves.toEqual({ entries: ['ready'], cursor: 4 })
     await expect(adapter.updateNotice()).resolves.toMatchObject({ latest: '1.1.0' })
     const bundle = await adapter.downloadSupportBundle({ includeContent: false })
 
@@ -141,5 +160,29 @@ describe('v4 Observability Adapter', () => {
       json: { include_content: false, days: 1 },
     }))
     expect(bundle.filename).toBe('support.zip')
+    expect(call).not.toHaveBeenCalled()
+  })
+
+  it.each(['disconnected', 'permission', 'differentGateway'] as const)(
+    'rejects %s before sending any HTTP request', async reason => {
+      const http = { requestJson: vi.fn(), requestBinary: vi.fn() }
+      const adapter = createV4Observability(
+        transport(vi.fn()).value as Parameters<typeof createV4Observability>[0], http, () => reason,
+      )
+      await expect(adapter.downloadSupportBundle({ includeContent: false })).rejects.toThrow(reason)
+      expect(http.requestBinary).not.toHaveBeenCalled()
+    },
+  )
+
+  it('rechecks access when a previously permitted download is invoked later', async () => {
+    const http = { requestJson: vi.fn(), requestBinary: vi.fn() }
+    const guard = vi.fn<Parameters<typeof createV4Observability>[2]>(() => null)
+    const adapter = createV4Observability(
+      transport(vi.fn()).value as Parameters<typeof createV4Observability>[0], http, guard,
+    )
+    expect(guard()).toBeNull()
+    guard.mockReturnValue('differentGateway')
+    await expect(adapter.downloadSupportBundle({ includeContent: false })).rejects.toThrow('differentGateway')
+    expect(http.requestBinary).not.toHaveBeenCalled()
   })
 })
