@@ -7,6 +7,7 @@ Only this module's view of the loop is replaced, never the running event loop.
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,8 +15,21 @@ import pytest
 
 from opensquilla.telemetry import runtime as runtime_module
 from opensquilla.telemetry.runtime import ScopedTelemetryRuntime
+from tests.helpers.sqlite_process_probe import run_sqlite_probe
 from tests.helpers.telemetry_runtime import runtime_config
 from tests.helpers.telemetry_shutdown_process import run_shutdown_probe
+
+
+def test_sqlite_watchdog_owns_interpreter_and_preserves_virtualenv(tmp_path: Path) -> None:
+    probe = tmp_path / "identity.py"
+    probe.write_text(
+        "import os, sys\nprint(f'pid={os.getpid()}')\nprint(f'prefix={sys.prefix}')\n",
+        encoding="utf-8",
+    )
+    result = run_sqlite_probe(tmp_path, probe)
+    assert result.timed_out is None and result.returncode == 0, result.output
+    assert f"pid={result.pid}" in result.output.splitlines()
+    assert f"prefix={sys.prefix}" in result.output.splitlines()
 
 
 @pytest.mark.parametrize("budget", [0, -1, float("inf"), float("nan")])

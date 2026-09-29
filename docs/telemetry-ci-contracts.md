@@ -81,3 +81,30 @@ case injects a 2.1-second activation delay (old guard fails), waits for actual
 second-request admission contention rather than sleeping 50 ms, and bounds
 request completion/cleanup. Single-task acceptance and durable row-count
 assertions are retained. Product cancellation/storage deadlines are unchanged.
+
+## Recovery-reader close follow-up
+
+Run `36551841085` reached the final writer connection close, then its two-second
+test guard cancelled `aiosqlite.close()`. There was no observed drain-order
+assertion failure. A controlled 2.1-second close reproduced the old test failure
+even though the real connection closed successfully during cleanup; the CI log
+alone cannot attribute the physical delay to disk, runner load, or scheduling.
+
+That one close/reconnect scenario now uses event-observed drain/close ordering
+and the same 90-second startup / 30-second execution-plus-cleanup process guard
+as telemetry. Both aiosqlite and the sqlite3 fallback retain real connections,
+native blocked reads, admission fencing, physical counts, old-handle closure,
+reconnect and durable-history checks. Slow completion passes; skipping drain,
+claiming a close without doing it, and noncooperative close are negative controls.
+No product deadline is changed, and unrelated recovery timing tests stay intact.
+
+The shared `sqlite_process_probe.py` watchdog is still restricted to one Python
+interpreter plus SQLite threads. On Windows it starts `sys._base_executable`
+with CPython's `__PYVENV_LAUNCHER__` virtualenv identity, avoiding the extra venv
+redirector process. A regression verifies that the probe PID equals the owned
+Popen PID and that `sys.prefix` is unchanged. Arbitrary descendant-process probes
+remain unsupported. Collection checks cover disjoint, complete parallel/serial
+coverage for both probe families.
+
+The virtualenv identity mechanism follows
+[CPython 3.12 path initialization](https://github.com/python/cpython/blob/3.12/Modules/getpath.py).

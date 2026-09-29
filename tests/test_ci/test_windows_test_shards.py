@@ -593,11 +593,24 @@ def test_telemetry_process_probes_are_explicitly_serial(function_name: str) -> N
     )
 
 
-@pytest.mark.ci_serial
-def test_telemetry_pilot_collection_is_complete_and_disjoint() -> None:
-    """Exercise actual pytest collection, not fixture-setup-time marker changes."""
-    target = "tests/test_telemetry/test_client_runtime.py"
+@pytest.mark.parametrize("function_name", [
+    "test_close_drains_native_before_reconnect",
+    "test_close_probe_rejects_broken_resource_contracts",
+    "test_close_probe_watchdog_terminates_noncooperative_close",
+])
+def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_session/test_recovery_reads.py"), function_name,
+    )
 
+
+@pytest.mark.ci_serial
+@pytest.mark.parametrize(("target", "serial_count"), [
+    ("tests/test_telemetry/test_client_runtime.py", 5),
+    ("tests/test_session/test_recovery_reads.py", 9),
+])
+def test_sqlite_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
+    """Exercise actual pytest collection, not fixture-setup-time marker changes."""
     def collect(marker: str | None) -> set[str]:
         command = [sys.executable, "-m", "pytest", target, "--collect-only", "-q"]
         if marker is not None:
@@ -615,7 +628,7 @@ def test_telemetry_pilot_collection_is_complete_and_disjoint() -> None:
     serial = collect("ci_serial")
     assert not parallel & serial
     assert parallel | serial == all_nodes
-    assert len(serial) == 5  # Two real scenarios, two mutations, one teardown hang.
+    assert len(serial) == serial_count
 
 
 def test_real_skill_install_cancellation_is_marked_ci_serial() -> None:
