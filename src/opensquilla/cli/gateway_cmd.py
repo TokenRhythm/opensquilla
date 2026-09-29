@@ -31,13 +31,22 @@ from opensquilla.cli.port_validation import (
     validate_gateway_port,
 )
 from opensquilla.cli.ui import ACCENT_MARKUP, console
-from opensquilla.gateway.boot import (
+from opensquilla.startup_timing import startup_phase_end, startup_phase_start
+
+_boot_import_started = startup_phase_start("gateway_boot_import")
+from opensquilla.gateway.boot import (  # noqa: E402
     gateway_shutdown_deadline,
     start_gateway_server,
 )
-from opensquilla.gateway.config import GatewayConfig, is_public_bind, resolve_listen_address
-from opensquilla.gateway.config_migration import ConfigParseError
-from opensquilla.paths import default_opensquilla_home
+
+startup_phase_end("gateway_boot_import", _boot_import_started)
+from opensquilla.gateway.config import (  # noqa: E402
+    GatewayConfig,
+    is_public_bind,
+    resolve_listen_address,
+)
+from opensquilla.gateway.config_migration import ConfigParseError  # noqa: E402
+from opensquilla.paths import default_opensquilla_home  # noqa: E402
 
 log = structlog.get_logger(__name__)
 
@@ -293,6 +302,7 @@ def run_gateway(
     matching what the field name promises.
     """
     gateway_startup_started_at = time.monotonic()
+    startup_phase_start("gateway_run_enter")
     _check_gateway_port(port, action="run", json_output=False)
     requested_config = config_path or os.environ.get("OPENSQUILLA_GATEWAY_CONFIG_PATH")
     if not desktop_config_path_is_profile_local(requested_config):

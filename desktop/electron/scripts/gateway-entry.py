@@ -330,6 +330,15 @@ if __name__ == "__main__":
 
         raise SystemExit(elevated_setup_helper_main(sys.argv[1:]))
 
-    from opensquilla.cli.main import app
+    from opensquilla.startup_timing import startup_phase_end, startup_phase_start
+
+    _cli_import_started = startup_phase_start("cli_import")
+    try:
+        from opensquilla.cli.main import app
+    except BaseException:
+        startup_phase_end("cli_import", _cli_import_started, failed=True)
+        raise
+    else:
+        startup_phase_end("cli_import", _cli_import_started)
 
     app()

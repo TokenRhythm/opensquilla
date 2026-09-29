@@ -11,6 +11,7 @@ import typer
 from opensquilla.cli.stdio import configure_stdio_for_unicode
 from opensquilla.env import load_env, warn_if_proxy_ignored
 from opensquilla.paths import default_opensquilla_home, is_valid_profile_name
+from opensquilla.startup_timing import startup_phase_end, startup_phase_start
 
 configure_stdio_for_unicode()
 
@@ -127,6 +128,7 @@ if not _RECOVERY_OFFLINE:
     _load_env_for_active_home()
     warn_if_proxy_ignored()
 
+_command_imports_started = startup_phase_start("cli_command_imports")
 from opensquilla.cli.agent_cmd import run_agent_command  # noqa: E402
 from opensquilla.cli.agents_cmd import agents_app  # noqa: E402
 from opensquilla.cli.bundle_cmd import bundle_command  # noqa: E402
@@ -153,6 +155,8 @@ from opensquilla.cli.sessions_cmd import app as sessions_app  # noqa: E402
 from opensquilla.cli.skills_cmd import skills_app  # noqa: E402
 from opensquilla.cli.uninstall_cmd import uninstall_command  # noqa: E402
 from opensquilla.observability.cli_logging import configure_cli_structlog  # noqa: E402
+
+startup_phase_end("cli_command_imports", _command_imports_started)
 
 app = typer.Typer(
     name="opensquilla",
@@ -515,6 +519,7 @@ def gateway_run(
     OPENSQUILLA_GATEWAY_HOST > default (127.0.0.1). Binding to 0.0.0.0 or :: is
     opt-in only — the gateway's default auth assumes loopback scope.
     """
+    gateway_import_started = startup_phase_start("gateway_command_import")
     from opensquilla.cli.gateway_cmd import run_gateway
     from opensquilla.gateway.desktop_ownership import (
         release_active_desktop_gateway_ownership,
@@ -524,6 +529,7 @@ def gateway_run(
         ProfileLockBusyError,
         guarded_desktop_profile,
     )
+    startup_phase_end("gateway_command_import", gateway_import_started)
 
     # The child that owns the gateway retains both the RC4 profile lock and
     # the legacy gateway lease for its complete write-capable lifetime. The
