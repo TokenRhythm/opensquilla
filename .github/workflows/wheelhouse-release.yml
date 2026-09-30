@@ -1438,7 +1438,14 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-          ref: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
+          # Fix verification independently of immutable downloaded candidate bytes.
+          ref: ${{ github.workflow_sha }}
+
+      - name: Record verifier and candidate provenance
+        env:
+          VERIFIER_SHA: ${{ github.workflow_sha }}
+          CANDIDATE_SHA: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
+        run: echo "Verifier ${VERIFIER_SHA}; immutable candidate ${CANDIDATE_SHA}" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1600,6 +1607,18 @@ jobs:
           .github/scripts/verify-release-macos-upgrade.sh \
             "${candidates[0]}" downloaded-preview-asset "${BASELINE_VERSION}"
 
+      - name: Upload failed macOS upgrade diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-diagnostics-macos-${{ matrix.baseline-version }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/opensquilla-real-updater-*/user-data/OpenSquilla/logs/**
+            ${{ runner.temp }}/opensquilla-real-updater-*/user-data/OpenSquilla/opensquilla/logs/**
+            ${{ runner.temp }}/opensquilla-real-updater-*/candidate-*.log
+
   audit-downloaded-windows-release:
     name: Audit downloaded Windows Draft (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }} install)
     if: ${{ always() && !cancelled() && (github.event_name == 'push' || github.event.inputs.tag != '') && needs.prestage-draft-updater-assets.result == 'success' }}
@@ -1620,7 +1639,14 @@ jobs:
         with:
           lfs: false
           persist-credentials: false
-          ref: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
+          ref: ${{ github.workflow_sha }}
+
+      - name: Record verifier and candidate provenance
+        env:
+          VERIFIER_SHA: ${{ github.workflow_sha }}
+          CANDIDATE_SHA: ${{ needs.prestage-draft-updater-assets.outputs.source_sha }}
+        shell: pwsh
+        run: '"Verifier $env:VERIFIER_SHA; immutable candidate $env:CANDIDATE_SHA" >> $env:GITHUB_STEP_SUMMARY'
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -1727,6 +1753,18 @@ jobs:
             -InstallMode $env:INSTALL_MODE `
             -BaselineVersion $env:BASELINE_VERSION
 
+
+      - name: Upload failed Windows upgrade diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-diagnostics-windows-${{ matrix.baseline-version }}-${{ matrix.install-mode }}
+          retention-days: 7
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/opensquilla-release-preservation-*/appdata/OpenSquilla/logs/**
+            ${{ runner.temp }}/opensquilla-release-preservation-*/appdata/OpenSquilla/opensquilla/logs/**
+            ${{ runner.temp }}/opensquilla-release-preservation-*/complete-v054-upgrade.json
 
   audit-internal-windows-artifact:
     name: Audit signed Windows test artifact (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }})

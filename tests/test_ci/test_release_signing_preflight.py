@@ -852,6 +852,19 @@ def test_workflow_checkouts_use_preflight_sha_through_declared_job_outputs() -> 
                 continue
             ref = step["with"]["ref"]
             assert step["with"]["persist-credentials"] is False
+            if job_name in {"audit-downloaded-macos-release", "audit-downloaded-windows-release"}:
+                assert ref == "${{ github.workflow_sha }}"
+                assert job["needs"] == "prestage-draft-updater-assets"
+                assert_provenance(job["needs"], {job_name})
+                evidence = next(
+                    s for s in job["steps"]
+                    if s.get("name") == "Record verifier and candidate provenance"
+                )
+                assert evidence["env"]["CANDIDATE_SHA"] == (
+                    "${{ needs.prestage-draft-updater-assets.outputs.source_sha }}"
+                )
+                checkouts += 1
+                continue
             if job_name in {
                 "release-preflight",
                 "audit-existing-source",

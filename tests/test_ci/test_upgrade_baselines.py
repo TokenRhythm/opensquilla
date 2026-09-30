@@ -604,6 +604,59 @@ def test_packaged_recovery_transport_contract_runs_in_desktop_node_ci() -> None:
         assert native_test.relative_to(ROOT).as_posix() in inputs
 
 
+def test_packaged_gateway_readiness_budget_and_terminal_errors() -> None:
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is required for the packaged readiness contract")
+    result = subprocess.run(
+        [node, "--input-type=module", "-e", r"""
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+const source = readFileSync('desktop/electron/scripts/test-packaged-session-recovery.mjs', 'utf8');
+const start = source.indexOf('  gatewayReadinessStartedAt = performance.now()');
+const end = source.indexOf('  // The preceding release-upgrade launch', start);
+assert.ok(start > 0 && end > start);
+const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+const run = new AsyncFunction('waitFor', 'page', 'assert', 'performance', 'console',
+  'DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS',
+  'let gatewayReadinessStartedAt, lastGatewayConnection;\n' + source.slice(start, end));
+for (const terminal of ['ready', 'error', 'stopped', 'starting']) {
+  let calls = 0;
+  const logs = [];
+  const page = { evaluate: async () => ({
+    status: ++calls === 1 ? 'starting' : terminal,
+    error: terminal === 'error' ? 'synthetic startup failure' : null,
+    authToken: 'must-never-appear-in-evidence',
+  }) };
+  const wait = async (check, label, budget) => {
+    assert.equal(budget, 120_000);
+    assert.equal(label, 'candidate Desktop Gateway readiness');
+    for (let i = 0; i < 3; i++) if (await check()) return;
+    throw new Error('synthetic startup timeout');
+  };
+  const attempt = run(wait, page, assert, performance,
+    { error: value => logs.push(value) }, 120_000);
+  if (terminal === 'ready') {
+    await attempt;
+    assert.equal(calls, 2);
+    assert.equal(JSON.parse(logs[0]).budgetMs, 120_000);
+  } else {
+    await assert.rejects(attempt, error => {
+      assert.ok(!error.message.includes('must-never-appear-in-evidence'));
+      assert.match(error.message, terminal === 'starting'
+        ? /synthetic startup timeout/ : /Candidate Gateway failed/);
+      return true;
+    });
+    assert.equal(calls, terminal === 'starting' ? 3 : 2);
+    assert.deepEqual(logs, []);
+  }
+}
+"""],
+        cwd=ROOT, capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize(
     ("launch_fails", "cleanup_fails"), [(False, False), (False, True), (True, False)]
 )
@@ -622,6 +675,7 @@ def test_packaged_recovery_preserves_original_failure_after_cleanup(
     ):
         shutil.copyfile(scripts / name, tmp_path / name)
     (tmp_path / "packaged-smoke-helpers.mjs").write_text(
+        "export const DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS = 120_000;\n"
         "export function requiredOption(name) {\n"
         "return process.argv[process.argv.indexOf(name) + 1] }\n"
         "export async function waitFor() { throw new Error('Unexpected fixture wait') }\n"

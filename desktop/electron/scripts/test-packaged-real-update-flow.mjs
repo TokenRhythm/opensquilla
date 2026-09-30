@@ -60,6 +60,8 @@ const readyOutput = readyOutputIndex >= 0 ? resolve(process.argv[readyOutputInde
 const installDirIndex = process.argv.indexOf('--install-dir')
 const installDir = installDirIndex >= 0 ? resolve(process.argv[installDirIndex + 1]) : null
 const defaultInstall = process.argv.includes('--default-install')
+const configBaseline = process.argv.includes('--config-baseline')
+  ? resolve(requiredOption('--config-baseline')) : null
 const expectedShaIndex = process.argv.indexOf('--expected-sha256')
 const expectedSha256 = expectedShaIndex >= 0
   ? String(process.argv[expectedShaIndex + 1]).trim().toLowerCase()
@@ -307,6 +309,19 @@ try {
       assert.equal(downloaded.installMode, 'manual')
       assert.equal(downloaded.canInstall, true, 'the signed candidate must pass the production installation gate')
     }
+  }
+
+  // Freeze the running old client's config immediately before handoff, not the
+  // never-started fixture. The Python verifier independently validates this
+  // snapshot against the seed plus the old version's exact known startup writes.
+  if (configBaseline) {
+    assert.equal(signedHandoff, false, 'baseline snapshots are for legacy updater rehearsals')
+    const config = await readFile(resolve(userDataDir, 'opensquilla', 'config.toml'), 'utf8')
+    await writeFile(configBaseline, JSON.stringify({ baselineVersion, config }), {
+      mode: 0o600, flag: 'wx',
+    })
+    console.log(JSON.stringify({ event: 'upgrade_config_baseline_captured', baselineVersion,
+      sha256: createHash('sha256').update(config).digest('hex') }))
   }
 
   const result = {
