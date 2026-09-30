@@ -127,6 +127,8 @@ $updateBannerSmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-upda
 $sessionRecoverySmoke = Join-Path $PWD 'desktop\electron\scripts\test-packaged-session-recovery.mjs'
 $realUpdateDriver = Join-Path $PWD 'desktop\electron\scripts\test-packaged-real-update-flow.mjs'
 $realUpdateResult = Join-Path $sandbox 'real-update-result.json'
+$configBaseline = Join-Path $sandbox 'upgrade-config-baseline.json'
+$configVerificationArguments = @()
 $externalSentinels = Join-Path $sandbox 'synthetic-system-tools'
 $signatureVerifier = Join-Path $PWD '.github\scripts\verify-windows-signatures.ps1'
 $installDir = if ($InstallMode -eq 'custom') {
@@ -239,6 +241,7 @@ try {
       '--baseline-version', $BaselineVersion,
       '--mode', 'manual',
       '--ready-output', $realUpdateResult,
+      '--config-baseline', $configBaseline,
       '--expected-sha256', $candidateSha256
     )
     if ($InstallMode -eq 'default') {
@@ -248,6 +251,7 @@ try {
     }
     & node @driverArguments
     if ($LASTEXITCODE -ne 0) { throw "Official $oldTag real updater rehearsal failed." }
+    $configVerificationArguments = @('--config-baseline', $configBaseline)
     $updateResult = Get-Content -LiteralPath $realUpdateResult -Raw | ConvertFrom-Json
     if (
       -not $updateResult.ok -or
@@ -277,7 +281,7 @@ try {
       throw "Candidate installer failed with exit code $($installed.ExitCode)."
     }
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion @configVerificationArguments
   if ($LASTEXITCODE -ne 0) { throw "Candidate installation changed $oldTag profile data." }
 
   $candidateRuntime = Join-Path $installDir 'resources\runtime'
@@ -376,8 +380,10 @@ try {
   ) {
     throw 'Candidate selected a different state directory after upgrade.'
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
+  if ($RealUpdateChannelManifest) { $configVerificationArguments += '--allow-runtime-config' }
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion @configVerificationArguments
   if ($LASTEXITCODE -ne 0) { throw "Candidate launch changed $oldTag profile data." }
+  $configBeforeUninstall = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $profile 'config.toml')).Hash
 
   $uninstaller = Get-ChildItem -LiteralPath $installDir -Filter 'Uninstall*.exe' -File |
     Select-Object -First 1
@@ -397,8 +403,11 @@ try {
   if (Test-Path -LiteralPath $app -PathType Leaf) {
     throw 'Candidate uninstaller did not remove OpenSquilla.exe.'
   }
-  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion
+  python $probe verify --home $profile --label $Label --external-root $externalSentinels --baseline-version $BaselineVersion @configVerificationArguments
   if ($LASTEXITCODE -ne 0) { throw "Candidate uninstaller changed $oldTag profile data." }
+  if ((Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $profile 'config.toml')).Hash -ne $configBeforeUninstall) {
+    throw 'Candidate uninstaller changed the verified post-runtime config bytes.'
+  }
 } finally {
   Stop-InstalledProcesses
 }

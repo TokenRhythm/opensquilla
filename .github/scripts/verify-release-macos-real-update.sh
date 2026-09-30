@@ -26,6 +26,7 @@ profile="${user_data}/opensquilla"
 probe="${GITHUB_WORKSPACE}/.github/scripts/verify-release-profile-preservation.py"
 driver="${GITHUB_WORKSPACE}/desktop/electron/scripts/test-packaged-real-update-flow.mjs"
 external_sentinels="${sandbox}/synthetic-system-tools"
+config_baseline="${sandbox}/upgrade-config-baseline.json"
 installed_app="/Applications/OpenSquilla.app"
 old_asset="OpenSquilla-${baseline_version}-mac-arm64.dmg"
 expected_version="$(python3 - "${channel_manifest}" "${baseline_version}" <<'PY'
@@ -116,7 +117,7 @@ else
   test -f "${old_runtime}/runtime-pack-catalog.json"
 fi
 python3 "${probe}" seed --home "${profile}" --label "${label}" \
-  --external-root "${external_sentinels}"
+  --external-root "${external_sentinels}" --baseline-version "${baseline_version}"
 
 old_binary="${installed_app}/Contents/MacOS/OpenSquilla"
 test -x "${old_binary}"
@@ -126,6 +127,7 @@ node "${driver}" \
   --channel-manifest "${channel_manifest}" \
   --expected-version "${expected_version}" \
   --baseline-version "${baseline_version}" \
+  --config-baseline "${config_baseline}" \
   --mode native
 
 # quitAndInstall is asynchronous after the old client exits. Require both the
@@ -161,7 +163,8 @@ test ! -e "${candidate_runtime}/developer"
 test -f "${candidate_runtime}/runtime-manifest.json"
 test -f "${candidate_runtime}/runtime-pack-catalog.json"
 python3 "${probe}" verify --home "${profile}" --label "${label}" \
-  --external-root "${external_sentinels}"
+  --external-root "${external_sentinels}" --baseline-version "${baseline_version}" \
+  --config-baseline "${config_baseline}" --allow-runtime-config
 
 # Once the updater proof is complete, boot the slim client without any Runtime
 # Pack and with network-backed recovery disabled. Runtime Pack state must not be
@@ -203,9 +206,13 @@ assert len(configured) == 1, report
 assert Path(configured[0]["path"]).resolve() == home / "state", report
 PY
 python3 "${probe}" verify --home "${profile}" --label "${label}" \
-  --external-root "${external_sentinels}"
+  --external-root "${external_sentinels}" --baseline-version "${baseline_version}" \
+  --config-baseline "${config_baseline}" --allow-runtime-config
 
+cp "${profile}/config.toml" "${sandbox}/before-uninstall-config.toml"
 remove_installed_app
 test ! -e "${installed_app}"
+cmp "${profile}/config.toml" "${sandbox}/before-uninstall-config.toml"
 python3 "${probe}" verify --home "${profile}" --label "${label}" \
-  --external-root "${external_sentinels}"
+  --external-root "${external_sentinels}" --baseline-version "${baseline_version}" \
+  --config-baseline "${config_baseline}" --allow-runtime-config

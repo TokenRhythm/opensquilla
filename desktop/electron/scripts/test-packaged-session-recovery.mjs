@@ -8,6 +8,7 @@ import {
   launchPackagedCandidate,
   requiredOption,
   waitFor,
+  DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
 } from './packaged-smoke-helpers.mjs'
 import { assertConcurrentRecoveryTransport } from './session-recovery-transport-contract.mjs'
 import { createSessionRecoveryEvidence } from './session-recovery-rpc-evidence.mjs'
@@ -44,6 +45,8 @@ let page
 let processIdentity = {}
 let runError
 let recoveryResult
+let gatewayReadinessStartedAt
+let lastGatewayConnection
 let injectHang = false
 let socketCount = 0
 let nextSocketIndex = 0
@@ -174,6 +177,9 @@ async function captureRecoveryFailure() {
     path: resolve(directory, 'failure.png'), timeout: 2_500,
   })) : null
   const evidence = {
+    gateway: lastGatewayConnection ?? null,
+    gatewayReadinessElapsedMs: gatewayReadinessStartedAt === undefined
+      ? null : Math.round(performance.now() - gatewayReadinessStartedAt),
     label, heldHistoryRequests, heldSubscribeRequests, socketCount, nextSocketIndex,
     physicalCloseCount, serverTickCount, faultReleased,
     ui, rpc: rpcEvidence.snapshot(),
@@ -297,12 +303,25 @@ try {
     () => page.url().startsWith('opensquilla-app://desktop/chat'),
     'candidate Desktop renderer',
   )
+  gatewayReadinessStartedAt = performance.now()
   await waitFor(
-    async () => (await page.evaluate(
-      () => window.opensquillaDesktop?.getGatewayConnection?.(),
-    ))?.status === 'ready',
+    async () => {
+      const connection = await page.evaluate(
+        () => window.opensquillaDesktop?.getGatewayConnection?.(),
+      )
+      // Never put the connection's authToken in logs or diagnostic artifacts.
+      lastGatewayConnection = connection
+        ? { status: connection.status, error: connection.error ?? null } : null
+      return ['ready', 'error', 'stopped'].includes(connection?.status)
+    },
     'candidate Desktop Gateway readiness',
+    DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,
   )
+  assert.equal(lastGatewayConnection?.status, 'ready',
+    `Candidate Gateway failed: ${JSON.stringify(lastGatewayConnection)}`)
+  console.error(JSON.stringify({ event: 'packaged_gateway_ready',
+    elapsedMs: Math.round(performance.now() - gatewayReadinessStartedAt),
+    budgetMs: DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS }))
   // The preceding release-upgrade launch can persist this exact chat URL. In
   // that case page.goto() below may not create a new socket, so explicitly
   // reload after installing the context-wide route.
