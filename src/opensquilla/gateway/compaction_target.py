@@ -5,11 +5,17 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any
 
 import structlog
 
 from opensquilla.context_budget import ContextBudgetGovernor
+from opensquilla.gateway.selected_provider import (
+    effective_session_model as effective_session_model,
+)
+from opensquilla.gateway.selected_provider import (
+    resolve_selected_provider as resolve_selected_compaction_provider,
+)
 from opensquilla.provider.deployment import resolve_provider_deployment
 from opensquilla.provider.environment import environment_value
 from opensquilla.provider.model_catalog import (
@@ -33,9 +39,7 @@ from opensquilla.session.compaction_budget import (
 from opensquilla.session.compaction_deployment import (
     DEFAULT_COMPACTION_OUTPUT_TOKENS,
     CompactionExecutionPlan,
-    CompactionExecutionTarget,
     build_compaction_execution_plan_from_provider,
-    build_compaction_execution_plan_from_provider_config,
 )
 
 log = structlog.get_logger(__name__)
@@ -77,6 +81,9 @@ class GatewayConsumerBudget:
     source: str = "unavailable"
     blocked_reason: str = ""
     context_window_known: bool = True
+    # Logical ChatConfig.max_tokens and adapter-projected generation reserve
+    # differ when an adapter includes reasoning in its wire output allowance.
+    generation_reserve_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,20 +101,6 @@ class _NamedAuthProfileDeployment:
     blocked_reason: str = ""
 
 
-@dataclass(frozen=True, slots=True)
-class _GatewayCompactionCandidate:
-    """One ordered target candidate before physical deployment resolution."""
-
-    provider_id: str
-    model: str
-    source: str
-    provider_config: ProviderConfig | None = field(
-        default=None,
-        repr=False,
-        compare=False,
-    )
-
-
 def _qualified_auth_profile_provider(profile_id: str) -> str:
     """Return the provider encoded by a valid ``provider:name`` profile id."""
 
@@ -115,16 +108,6 @@ def _qualified_auth_profile_provider(profile_id: str) -> str:
     if not separator or not prefix or not suffix:
         return ""
     return prefix.lower()
-
-
-def effective_session_model(session: object | None) -> str | None:
-    """Return the session's physical model without guessing its provider."""
-
-    if session is None:
-        return None
-    return _text(getattr(session, "model_override", None)) or _text(
-        getattr(session, "model", None)
-    )
 
 
 def resolve_gateway_consumer_budget(
@@ -140,7 +123,6 @@ def resolve_gateway_consumer_budget(
     session_model = _text(getattr(session, "model", None))
     session_override_model = _text(getattr(session, "model_override", None))
     recorded_provider = _text(getattr(session, "model_provider", None)).lower()
-    recorded_model = session_override_model or session_model
     auth_profile_override = _text(
         getattr(session, "auth_profile_override", None)
     )
@@ -153,20 +135,9 @@ def resolve_gateway_consumer_budget(
         # Never let last-turn provenance reinterpret the same credential as a
         # different provider after a routed/fallback call.
         bound_provider = session_provider or qualified_provider or inherited_provider
-        recorded_matches_boundary = bool(
-            recorded_provider
-            and recorded_model
-            and (not bound_provider or recorded_provider == bound_provider)
-        )
-        expected_provider = (
-            bound_provider
-            or (recorded_provider if recorded_matches_boundary else "")
-            or inherited_provider
-        )
+        expected_provider = bound_provider or inherited_provider
         intended_model = (
-            recorded_model
-            if recorded_matches_boundary
-            else session_model
+            session_model
             or (session_override_model if not recorded_provider else "")
             or (
                 inherited_model
@@ -213,6 +184,7 @@ def resolve_gateway_consumer_budget(
             context_window_tokens,
             physical_context_window_tokens,
             max_output_tokens,
+            generation_reserve_tokens,
             provider_request_max_chars,
             next_request_reserve_tokens,
             next_request_reserve_chars,
@@ -231,6 +203,7 @@ def resolve_gateway_consumer_budget(
             physical_context_window_tokens=physical_context_window_tokens,
             context_window_known=context_window_known,
             max_output_tokens=max_output_tokens,
+            generation_reserve_tokens=generation_reserve_tokens,
             provider_request_max_chars=provider_request_max_chars,
             provider_request_max_chars_explicit_cap=_configured_request_char_cap(
                 ctx, named.provider_id,
@@ -256,6 +229,11 @@ def resolve_gateway_consumer_budget(
         if resolution.ready and resolution.provider_config is not None:
             provider_config = resolution.provider_config
             source = "session_override"
+        else:
+            return GatewayConsumerBudget(
+                provider_id=session_provider, model=session_deployment_model,
+                source="session_override", blocked_reason=resolution.reason,
+            )
 
     if provider_config is None and inherited is not None:
         base_model = session_model or _text(inherited.model)
@@ -270,6 +248,11 @@ def resolve_gateway_consumer_budget(
         if resolution.ready and resolution.provider_config is not None:
             provider_config = resolution.provider_config
             source = "session_model" if session_model else "selector_base"
+        else:
+            return GatewayConsumerBudget(
+                provider_id=_text(inherited.provider).lower(), model=base_model,
+                source="selector_base", blocked_reason=resolution.reason,
+            )
 
     provider: object | None = None
     provider_id = ""
@@ -307,6 +290,7 @@ def resolve_gateway_consumer_budget(
         context_window_tokens,
         physical_context_window_tokens,
         max_output_tokens,
+        generation_reserve_tokens,
         provider_request_max_chars,
         next_request_reserve_tokens,
         next_request_reserve_chars,
@@ -320,6 +304,7 @@ def resolve_gateway_consumer_budget(
         physical_context_window_tokens=physical_context_window_tokens,
         context_window_known=context_window_known,
         max_output_tokens=max_output_tokens,
+        generation_reserve_tokens=generation_reserve_tokens,
         provider_request_max_chars=provider_request_max_chars,
         provider_request_max_chars_explicit_cap=_configured_request_char_cap(ctx, provider_id),
         next_request_reserve_tokens=next_request_reserve_tokens,
@@ -371,7 +356,7 @@ def build_gateway_compaction_budget(
             return None
         return project_provider_final_request(
             budget.provider, messages, [], ChatConfig(
-                max_tokens=max(1, budget.max_output_tokens),
+                max_tokens=max(1, budget.generation_reserve_tokens or budget.max_output_tokens),
                 provider_context_window_tokens=(
                     (budget.physical_context_window_tokens or budget.context_window_tokens)
                     if budget.context_window_known else 0
@@ -389,7 +374,7 @@ def build_gateway_compaction_budget(
         physical_context_window_tokens=(
             budget.physical_context_window_tokens or budget.context_window_tokens
         ),
-        generation_reserve_tokens=budget.max_output_tokens,
+        generation_reserve_tokens=budget.generation_reserve_tokens or budget.max_output_tokens,
         provider_identity=f"{budget.provider_id}/{budget.model}:{budget.deployment_fingerprint}",
         history_limit_tokens=budget.context_window_tokens,
         envelope_reserve_tokens=budget.next_request_reserve_tokens,
@@ -430,457 +415,45 @@ def limit_gateway_consumer_budget(
     )
 
 
-def resolve_selected_compaction_provider(
-    ctx: object,
-    session: object | None,
-    *,
-    model_override: str | None = None,
-) -> object | None:
-    """Compatibility resolver for callers that only consume a provider object.
-
-    Production compaction uses :func:`resolve_gateway_compaction_target`.  This
-    clone-only path remains for auxiliary callers and selector-shaped test
-    doubles that do not expose a complete ``ProviderConfig``.
-    """
-
-    selector = getattr(ctx, "provider_selector", None)
-    if selector is None:
-        return None
-
-    resolved_selector = selector
-    clone = getattr(selector, "clone", None)
-    if callable(clone):
-        try:
-            resolved_selector = clone()
-        except Exception:  # noqa: BLE001
-            resolved_selector = selector
-
-    model = _text(model_override) or effective_session_model(session)
-    if model and resolved_selector is not selector:
-        override = getattr(resolved_selector, "override_model", None)
-        if callable(override):
-            try:
-                override(model)
-            except Exception:  # noqa: BLE001
-                pass
-
-    resolver = getattr(resolved_selector, "resolve", None)
-    if not callable(resolver):
-        return None
-    try:
-        return cast(object | None, resolver())
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def resolve_gateway_compaction_target(
     ctx: object,
     session: object | None,
+    *,
+    consumer_budget: GatewayConsumerBudget | None = None,
 ) -> GatewayCompactionTarget:
-    """Resolve manual/preflight compaction without mutating selector state.
+    """Use the stable idle-session consumer for a manual summary.
 
-    A complete ``compaction.provider`` + ``compaction.model`` pair is explicit.
-    A model-only compaction setting stays on the already selected provider.
-    Unavailable explicit or session-provenance deployments fall through to
-    the selector's current deployment and then its authorized clone fallback.
+    No summary override, previous routed deployment or selector fallback chain
+    participates in this choice. The caller can share its frozen consumer with
+    this resolver so generation and final admission use one physical identity.
     """
-
-    selector = getattr(ctx, "provider_selector", None)
-    inherited = _selector_current_config(selector)
-    gateway_config = getattr(ctx, "config", None)
-    compaction_config = getattr(gateway_config, "compaction", None)
-    configured_provider = _text(getattr(compaction_config, "provider", None)).lower()
-    configured_model = _text(getattr(compaction_config, "model", None))
-    auth_profile_override = _text(
-        getattr(session, "auth_profile_override", None)
-    )
-
-    if configured_provider and not configured_model:
-        log.warning(
-            "compaction_provider_without_model_ignored",
-            provider=configured_provider,
-        )
-        configured_provider = ""
-
-    explicit = bool(configured_provider and configured_model)
-    model_only = bool(configured_model and not configured_provider)
-    recorded_provider = _text(getattr(session, "model_provider", None)).lower()
-    override_provider = _text(getattr(session, "provider_override", None)).lower()
-    selected_model = _text(getattr(session, "model", None))
-    recorded_model = (
-        _text(getattr(session, "model_override", None))
-        or selected_model
-    )
-    inherited_provider = _text(getattr(inherited, "provider", None)).lower()
-    inherited_model = _text(getattr(inherited, "model", None))
-    qualified_profile_provider = _qualified_auth_profile_provider(
-        auth_profile_override
-    )
-    requested_auth_profile_provider = (
-        configured_provider
-        if explicit
-        else inherited_provider if model_only else ""
-    )
-    auth_profile_bound_provider = (
-        override_provider
-        or qualified_profile_provider
-        or requested_auth_profile_provider
-        or inherited_provider
-    )
-    auth_profile_provider_conflict = bool(
-        auth_profile_override
-        and (
-            (
-                qualified_profile_provider
-                and override_provider
-                and qualified_profile_provider != override_provider
-            )
-            or (
-                auth_profile_bound_provider
-                and requested_auth_profile_provider
-                and auth_profile_bound_provider != requested_auth_profile_provider
-            )
-        )
-    )
-
-    candidates: list[_GatewayCompactionCandidate] = []
-    seen_abstract: set[tuple[str, str]] = set()
-    seen_configs: set[int] = set()
-
-    def add_candidate(
-        provider_id: str,
-        model: str,
-        source: str,
-        *,
-        provider_config: ProviderConfig | None = None,
-    ) -> None:
-        provider_id = provider_id.strip().lower()
-        model = model.strip()
-        if not provider_id or not model:
-            return
-        if provider_config is None:
-            identity = (provider_id, model)
-            if identity in seen_abstract:
-                return
-            seen_abstract.add(identity)
-        else:
-            # The exact ProviderConfig is the physical fallback authorization.
-            # Do not collapse credential-, proxy-, or routing-distinct links by
-            # their public provider/model pair. Exact duplicates are removed
-            # after plan construction by the process-keyed deployment HMAC.
-            config_identity = id(provider_config)
-            if config_identity in seen_configs:
-                return
-            seen_configs.add(config_identity)
-        candidates.append(
-            _GatewayCompactionCandidate(
-                provider_id=provider_id,
-                model=model,
-                source=source,
-                provider_config=provider_config,
-            )
-        )
-
-    if explicit:
-        add_candidate(configured_provider, configured_model, "explicit_compaction")
-    elif model_only:
-        # Compatibility contract: compaction.model changes only the model on
-        # the selector's live provider. Persisted session provenance may be
-        # stale after a route/model switch and must not rebind the provider.
-        add_candidate(inherited_provider, configured_model, "selector_current")
-    elif recorded_provider and recorded_model:
-        # The finalizer writes this pair atomically after each physical turn.
-        # Do not combine an older explicit provider intent with a fallback
-        # model that actually ran on another provider.
-        add_candidate(
-            recorded_provider,
-            recorded_model,
-            "session_model_provider",
-        )
-        if override_provider:
-            add_candidate(
-                override_provider,
-                selected_model,
-                "session_provider_override",
-            )
-    elif override_provider:
-        # Legacy sessions without recorded physical provenance may still use
-        # provider_override + model_override as their complete deployment.
-        add_candidate(
-            override_provider,
-            selected_model or recorded_model or inherited_model,
-            "session_provider_override",
-        )
-    else:
-        add_candidate(
-            inherited_provider,
-            recorded_model or selected_model or inherited_model,
-            "selector_current",
-        )
-
-    # A failed explicit/session/model override must not suppress the current
-    # physical deployment. Use its native model for the recovery candidate.
-    add_candidate(inherited_provider, inherited_model, "selector_current")
-    remaining_chain = getattr(selector, "remaining_chain", None)
-    if callable(remaining_chain):
-        try:
-            remaining_configs = list(remaining_chain())
-        except Exception:  # noqa: BLE001 - optional read-only selector view
-            remaining_configs = []
-        for index, fallback_config in enumerate(remaining_configs):
-            if not isinstance(fallback_config, ProviderConfig):
-                continue
-            add_candidate(
-                _text(fallback_config.provider).lower(),
-                _text(fallback_config.model),
-                "selector_current" if index == 0 else "selector_fallback",
-                provider_config=fallback_config,
-            )
-
-    if auth_profile_override and auth_profile_bound_provider:
-        # A named profile's provider is a credential boundary, not routing
-        # provenance.  A previous fallback may contribute its model only when
-        # it ran on that same provider; it may never reinterpret a bare
-        # profile's credential as belonging to a different provider.
-        bound_candidates = [
-            candidate
-            for candidate in candidates
-            if candidate.provider_id == auth_profile_bound_provider
-        ]
-        if not explicit and not model_only:
-            bound_model = (
-                recorded_model
-                if recorded_provider == auth_profile_bound_provider
-                else selected_model
-            )
-            if (
-                not bound_model
-                and inherited_provider == auth_profile_bound_provider
-            ):
-                bound_model = inherited_model
-            if bound_model:
-                bound_identity = (auth_profile_bound_provider, bound_model)
-                bound_candidates = [
-                    _GatewayCompactionCandidate(
-                        provider_id=auth_profile_bound_provider,
-                        model=bound_model,
-                        source="session_auth_profile",
-                    ),
-                    *[
-                        candidate
-                        for candidate in bound_candidates
-                        if (candidate.provider_id, candidate.model)
-                        != bound_identity
-                    ],
-                ]
-        candidates = bound_candidates
-
-    preferred_provider = candidates[0].provider_id if candidates else ""
-    preferred_model = candidates[0].model if candidates else ""
-    preferred_source = (
-        candidates[0].source
-        if candidates
-        else _automatic_source(session, inherited)
-    )
-
-    if auth_profile_override:
-        # A pinned auth profile is part of the physical deployment identity.
-        # Resolve exactly that profile and never fall through to the selector,
-        # inherited credentials, or a provider registry environment key.
-        if auth_profile_provider_conflict:
-            blocked_provider = (
-                requested_auth_profile_provider
-                or auth_profile_bound_provider
-                or preferred_provider
-            )
-            blocked_model = configured_model or preferred_model or selected_model
-            return GatewayCompactionTarget(
-                provider_id=blocked_provider,
-                model=blocked_model,
-                source="auth_profile_unresolved",
-                blocked_reason="named_auth_profile_provider_mismatch",
-            )
-        named = _resolve_named_auth_profile_deployment(
-            gateway_config,
-            auth_profile_override,
-            expected_provider=preferred_provider or auth_profile_bound_provider,
-            model=preferred_model,
-            session_key=_text(getattr(session, "session_key", None)),
-        )
-        named_source = (
-            "explicit_compaction_auth_profile"
-            if explicit
-            else "session_auth_profile"
-        )
-        if named.blocked_reason or named.provider_config is None:
-            log.warning(
-                "compaction_auth_profile_unavailable",
-                provider=named.provider_id or preferred_provider,
-                model=named.model or preferred_model,
-                source=preferred_source,
-                auth_profile_fingerprint=named.profile_fingerprint,
-                reason=(
-                    named.blocked_reason or "named_auth_profile_unavailable"
-                ),
-            )
-            return GatewayCompactionTarget(
-                provider_id=named.provider_id or preferred_provider,
-                model=named.model or preferred_model,
-                source="auth_profile_unresolved",
-                blocked_reason=(
-                    named.blocked_reason or "named_auth_profile_unavailable"
-                ),
-            )
-        try:
-            plan = _build_plan(
-                ctx,
-                named.provider_config,
-                source=named_source,
-            )
-        except Exception as exc:  # noqa: BLE001 - a named target cannot fall back
-            log.warning(
-                "compaction_target_build_failed",
-                provider=named.provider_id,
-                model=named.model,
-                source=named_source,
-                auth_profile_fingerprint=named.profile_fingerprint,
-                error=type(exc).__name__,
-            )
-            return GatewayCompactionTarget(
-                provider_id=named.provider_id,
-                model=named.model,
-                source="auth_profile_unresolved",
-                blocked_reason="named_auth_profile_provider_build_failed",
-            )
+    consumer = consumer_budget or resolve_gateway_consumer_budget(ctx, session)
+    if consumer.blocked_reason or consumer.provider is None:
         return GatewayCompactionTarget(
-            provider=plan.primary.provider,
-            plan=plan,
-            provider_id=plan.primary.provider_id,
-            model=plan.primary.model,
-            source=plan.primary.source,
+            provider_id=consumer.provider_id, model=consumer.model,
+            source=consumer.source,
+            blocked_reason=consumer.blocked_reason or "current_deployment_unavailable",
         )
-
-    resolved_targets: list[CompactionExecutionTarget] = []
-    seen_targets: set[str] = set()
-    for candidate in candidates:
-        from opensquilla.engine.selector_override import acquire_profile_credential
-
-        provider_config = candidate.provider_config
-        resolution = None
-        if provider_config is None:
-            resolution = resolve_provider_deployment(
-                gateway_config,
-                candidate.provider_id,
-                candidate.model,
-                inherited_provider_config=inherited,
-                session_key=_text(getattr(session, "session_key", None)),
-                replay_provider_state=False,
-                credential_pool_acquirer=acquire_profile_credential,
-            )
-            provider_config = resolution.provider_config
-        if provider_config is not None and (
-            resolution is None or resolution.ready
-        ):
-            try:
-                plan = _build_plan(
-                    ctx,
-                    provider_config,
-                    source=candidate.source,
-                )
-            except Exception as exc:  # noqa: BLE001
-                log.warning(
-                    "compaction_target_build_failed",
-                    provider=candidate.provider_id,
-                    model=candidate.model,
-                    source=candidate.source,
-                    error=type(exc).__name__,
-                )
-                continue
-            for target in plan.candidates:
-                if target.deployment_fingerprint in seen_targets:
-                    continue
-                seen_targets.add(target.deployment_fingerprint)
-                resolved_targets.append(target)
-            continue
-        log.warning(
-            "compaction_target_unavailable",
-            provider=candidate.provider_id,
-            model=candidate.model,
-            source=candidate.source,
-            reason=(
-                resolution.reason
-                if resolution is not None
-                else "provider_config_unavailable"
-            ),
-        )
-
-    if resolved_targets:
-        plan = CompactionExecutionPlan(
-            candidates=tuple(resolved_targets),
-        )
-        return GatewayCompactionTarget(
-            provider=plan.primary.provider,
-            plan=plan,
-            provider_id=plan.primary.provider_id,
-            model=plan.primary.model,
-            source=plan.primary.source,
-        )
-
-    # Selector-shaped compatibility doubles may not expose a complete current
-    # ProviderConfig. Preserve their historical session-model override only
-    # when no physical candidate could be formed; after a failed concrete
-    # candidate, resolve the selector's own deployment without stale session
-    # provenance.
-    compat_session = (
-        session
-        if not candidates and not explicit and not model_only
-        else None
-    )
-    provider = resolve_selected_compaction_provider(
-        ctx,
-        compat_session,
-        model_override=configured_model if model_only else None,
-    )
-    if provider is None:
-        return GatewayCompactionTarget(
-            provider_id=preferred_provider,
-            model=preferred_model,
-            source=preferred_source,
-        )
-
-    metadata = provider_metadata(provider)
-    physical_provider = _text(metadata.provider_id or metadata.provider_kind).lower()
-    physical_model = _text(metadata.model) or preferred_model
-    compat_plan = None
     try:
-        context_window, output_tokens, generation_tokens, request_max_chars = _execution_budget(
-            ctx,
-            physical_provider,
-            physical_model,
-            provider=provider,
+        plan = build_compaction_execution_plan_from_provider(
+            consumer.provider,
+            model=consumer.model,
+            context_window_tokens=(
+                consumer.physical_context_window_tokens or 0 if consumer.context_window_known else 0
+            ),
+            max_generation_tokens=consumer.max_output_tokens,
+            provider_request_max_chars=consumer.provider_request_max_chars_explicit_cap or 0,
+            deployment_fingerprint=consumer.deployment_fingerprint,
+            source=consumer.source,
         )
-        compat_plan = build_compaction_execution_plan_from_provider(
-            provider,
-            model=physical_model,
-            context_window_tokens=context_window,
-            max_output_tokens=output_tokens,
-            max_generation_tokens=generation_tokens,
-            provider_request_max_chars=request_max_chars,
-            source="selected_provider_compat",
-        )
-    except Exception as exc:  # noqa: BLE001
-        log.warning(
-            "compaction_compat_plan_build_failed",
-            provider=physical_provider,
-            model=physical_model,
-            error=type(exc).__name__,
-        )
+    except Exception as exc:
+        log.warning("compaction_current_target_unavailable", error=type(exc).__name__)
+        plan = None
     return GatewayCompactionTarget(
-        provider=provider,
-        plan=compat_plan,
-        provider_id=physical_provider,
-        model=physical_model,
-        source="selected_provider_compat",
+        provider=consumer.provider if plan is not None else None,
+        plan=plan, provider_id=consumer.provider_id, model=consumer.model,
+        source=consumer.source,
+        blocked_reason="" if plan is not None else "current_deployment_unavailable",
     )
 
 
@@ -1157,94 +730,6 @@ def validate_gateway_session_deployment_override(
     return ""
 
 
-def _build_plan(
-    ctx: object,
-    provider_config: ProviderConfig,
-    *,
-    source: str,
-) -> CompactionExecutionPlan:
-    provider_id = _text(provider_config.provider).lower()
-    model = _text(provider_config.model)
-    context_window, output_tokens, generation_tokens, request_max_chars = _execution_budget(
-        ctx,
-        provider_id,
-        model,
-        deployment=provider_config,
-    )
-    return build_compaction_execution_plan_from_provider_config(
-        provider_config,
-        context_window_tokens=context_window,
-        max_output_tokens=output_tokens,
-        max_generation_tokens=generation_tokens,
-        provider_request_max_chars=request_max_chars,
-        source=source,
-    )
-
-
-def _execution_budget(
-    ctx: object,
-    provider_id: str,
-    model: str,
-    *,
-    provider: object | None = None,
-    deployment: ProviderConfig | None = None,
-) -> tuple[int, int, int, int]:
-    """Resolve the physical writer's window, body cap and generation allowance."""
-    catalog = shared_catalog()
-    gateway_config = getattr(ctx, "config", None)
-    llm_config = getattr(gateway_config, "llm", None)
-    configured_provider = _text(getattr(llm_config, "provider", None)).lower()
-    global_window = (
-        getattr(llm_config, "context_window_tokens", 0)
-        if configured_provider == provider_id
-        else 0
-    )
-    context_window, context_window_source = resolve_effective_context_window(
-        catalog,
-        model,
-        provider=provider_id,
-        global_override=global_window,
-    )
-    provider_output_limit = int(
-        catalog.resolve_max_tokens(model, user_override=0, provider=provider_id) or 0
-    )
-    resolve_limits = getattr(catalog, "resolve_deployment_limits", None)
-    if (provider is not None or deployment is not None) and callable(resolve_limits):
-        connection = deployment or provider_connection_config(provider)
-        limits = resolve_limits(
-            model, provider=provider_id, api_key=connection.api_key,
-            base_url=connection.base_url,
-        )
-        provider_output_limit = limits.max_output_tokens
-        if context_window_source not in {"override", "config"}:
-            context_window = limits.context_window
-            context_window_source = (
-                "catalog" if getattr(limits, "context_window_known", True) else "default"
-            )
-    output_tokens = min(
-        DEFAULT_COMPACTION_OUTPUT_TOKENS,
-        provider_output_limit or DEFAULT_COMPACTION_OUTPUT_TOKENS,
-    )
-    configured_output = (
-        int(getattr(llm_config, "max_tokens", 0) or 0)
-        if configured_provider == provider_id else 0
-    )
-    generation_tokens = (
-        catalog.resolve_max_tokens(model, user_override=configured_output, provider=provider_id)
-        if configured_output > 0 else provider_output_limit
-    )
-    return (
-        (
-            int(context_window)
-            if context_window_source != "default" or provider_id in LOCAL_RUNTIME_PROVIDERS
-            else 0
-        ),
-        max(1, output_tokens),
-        max(1, int(generation_tokens or output_tokens)),
-        _configured_request_char_cap(ctx, provider_id),
-    )
-
-
 def _configured_request_char_cap(ctx: object, provider_id: str) -> int:
     llm_config = getattr(getattr(ctx, "config", None), "llm", None)
     if _text(getattr(llm_config, "provider", None)).lower() != provider_id:
@@ -1258,7 +743,7 @@ def _consumer_execution_budget(
     model: str,
     *,
     provider: object | None = None,
-) -> tuple[int, int, int, int, int, int, bool]:
+) -> tuple[int, int, int, int, int, int, int, bool]:
     """Bind the durable consumer's window, output reserve, and wire cap."""
 
     catalog = shared_catalog()
@@ -1330,13 +815,13 @@ def _consumer_execution_budget(
         provider_request_max_chars_explicit_cap=explicit_cap,
     )
     projection = project_provider_final_request(provider, [], [], config)
-    output_tokens = (
+    generation_reserve_tokens = (
         projected_generation_budget(projection.payload, config.max_tokens)
         if projection is not None else output_tokens + thinking_budget_tokens
     )
     derived_cap = ContextBudgetGovernor.from_values(
         context_window_tokens=context_window,
-        max_output_tokens=output_tokens,
+        max_output_tokens=generation_reserve_tokens,
         thinking_budget_tokens=0,
         context_overflow_threshold=0.85,
     ).snapshot().provider_request_max_chars
@@ -1348,6 +833,7 @@ def _consumer_execution_budget(
         max(1, history_window),
         max(1, int(context_window)),
         output_tokens,
+        generation_reserve_tokens,
         max(1, int(request_max_chars)),
         next_request_reserve_tokens,
         next_request_reserve_tokens * 4,
@@ -1482,19 +968,6 @@ def _selector_current_config(selector: object | None) -> ProviderConfig | None:
     except Exception:  # noqa: BLE001
         return None
     return current if isinstance(current, ProviderConfig) else None
-
-
-def _automatic_source(
-    session: object | None,
-    inherited: ProviderConfig | None,
-) -> str:
-    if _text(getattr(session, "provider_override", None)):
-        return "session_provider_override"
-    if _text(getattr(session, "model_provider", None)):
-        return "session_model_provider"
-    if inherited is not None:
-        return "selector_current"
-    return "selected_provider_compat"
 
 
 def _text(value: object) -> str:

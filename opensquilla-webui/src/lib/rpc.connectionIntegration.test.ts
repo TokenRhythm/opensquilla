@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createPrivateGatewayTransports } from '@/adapters/gateway/privateTransports'
 import { createV4SessionDirectory } from '@/adapters/gateway/sessionDirectoryV4'
+import { createV4TurnCommands } from '@/adapters/gateway/turnCommandsV4'
 import { RpcClient } from './rpc'
 
 class Socket {
@@ -103,6 +104,125 @@ afterEach(() => {
 })
 
 describe('production connection integration boundaries', () => {
+  it('waits for a probe before sending a directory read once while still rejecting writes', async () => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const directory = createV4SessionDirectory(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    const socket = Socket.instances[0]
+    hello(socket, localOwner, { transport_probe_nonce: true })
+    rpc.notifyResume()
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(rpc.phase).toBe('suspect')
+    const page = directory.listPage({ limit: 10 })
+    await vi.advanceTimersByTimeAsync(0)
+    const lists = () => socket.sent.map(frame => JSON.parse(frame)).filter(frame => frame.method === 'sessions.list')
+    expect(lists()).toHaveLength(0)
+    await expect(transport.rpc.request('chat.send', { message: 'blocked' })).rejects.toMatchObject({ accepted: false })
+    const ping = socket.sent.map(frame => JSON.parse(frame)).reverse().find(frame => frame.type === 'ping')
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(lists()).toHaveLength(1)
+    socket.receive({ type: 'res', id: lists()[0].id, ok: true, payload: { sessions: [], count: 0, ts: 1 } })
+    await expect(page).resolves.toMatchObject({ items: [] })
+    socket.receive({ type: 'pong', nonce: ping.nonce })
+    expect(lists()).toHaveLength(1)
+  })
+
+  it.each(['cancel', 'timeout', 'disconnect'] as const)('discards a queued directory read on %s without sending it after recovery', async cause => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const directory = createV4SessionDirectory(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    const socket = Socket.instances[0]
+    hello(socket, localOwner, { transport_probe_nonce: true })
+    rpc.notifyResume()
+    const controller = new AbortController()
+    const page = directory.listPage({ limit: 10, signal: controller.signal }).catch(error => error)
+    await vi.advanceTimersByTimeAsync(100)
+    const ping = socket.sent.map(frame => JSON.parse(frame)).reverse().find(frame => frame.type === 'ping')
+    if (cause === 'cancel') controller.abort()
+    if (cause === 'timeout') await vi.advanceTimersByTimeAsync(4_900)
+    if (cause === 'disconnect') socket.close()
+    if (cause === 'disconnect') {
+      await vi.advanceTimersByTimeAsync(1_000)
+      hello(Socket.instances[1], localOwner, { transport_probe_nonce: true })
+    } else socket.receive({ type: 'pong', nonce: ping.nonce })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(await page).toMatchObject({ code: cause === 'cancel' ? 'RPC_ABORTED' : cause === 'timeout' ? 'RPC_TIMEOUT' : 'RPC_TRANSPORT_ERROR' })
+    expect(Socket.instances.flatMap(item => item.sent.map(frame => JSON.parse(frame)))
+      .filter(frame => frame.method === 'sessions.list')).toHaveLength(0)
+  })
+
+  it.each(['checking', 'suspect'] as const)('sends an exact task Stop immediately on the %s socket without broadening it', async phase => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const commands = createV4TurnCommands(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    const socket = Socket.instances[0]
+    hello(socket, localOwner, { transport_probe_nonce: true })
+    rpc.notifyResume()
+    if (phase === 'suspect') await vi.advanceTimersByTimeAsync(5_000)
+    const stop = { sessionKey: 'session-1', taskId: 'task-1', scope: 'task', source: 'webui_stop' }
+    const result = commands.cancel(stop)
+    const frames = socket.sent.map(frame => JSON.parse(frame)).filter(frame => frame.method === 'chat.abort')
+    expect(frames).toHaveLength(1)
+    expect(frames[0].params).toEqual(stop)
+    await expect(commands.cancel({ sessionKey: 'session-1', scope: 'task' })).rejects.toMatchObject({ accepted: false })
+    await expect(commands.cancel({ sessionKey: 'session-1' })).rejects.toMatchObject({ accepted: false })
+    socket.receive({ type: 'res', id: frames[0].id, ok: true, payload: { aborted: false, reason: 'task_cancel_unknown' } })
+    await expect(result).resolves.toMatchObject({ aborted: false, reason: 'task_cancel_unknown' })
+  })
+
+  it.each(['timeout', 'disconnect'] as const)('does not replay a sent task Stop after %s', async cause => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const commands = createV4TurnCommands(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    const socket = Socket.instances[0]
+    hello(socket, localOwner, { transport_probe_nonce: true })
+    rpc.notifyResume()
+    const result = commands.cancel({ sessionKey: 'session-1', taskId: 'task-1', scope: 'task' }).catch(error => error)
+    if (cause === 'timeout') await vi.advanceTimersByTimeAsync(5_000)
+    else socket.close()
+    expect(await result).toMatchObject({ kind: cause === 'timeout' ? 'timeout' : 'transport', accepted: cause === 'timeout' ? undefined : null })
+    if (cause === 'disconnect') {
+      await vi.advanceTimersByTimeAsync(1_000)
+      hello(Socket.instances[1])
+    } else {
+      const ping = socket.sent.map(frame => JSON.parse(frame)).reverse().find(frame => frame.type === 'ping')
+      socket.receive({ type: 'pong', nonce: ping.nonce })
+    }
+    await vi.advanceTimersByTimeAsync(0)
+    expect(Socket.instances.flatMap(item => item.sent.map(frame => JSON.parse(frame)))
+      .filter(frame => frame.method === 'chat.abort')).toHaveLength(1)
+  })
+
+  it('rejects controls from an old generation and mutations falsely labelled as controls', async () => {
+    const rpc = client()
+    const { transport } = transports(rpc)
+    const commands = createV4TurnCommands(transport.rpc)
+    rpc.connect('ws://127.0.0.1:18790/ws')
+    hello(Socket.instances[0])
+    const oldGeneration = rpc.connectionGeneration
+    Socket.instances[0].close()
+    await vi.advanceTimersByTimeAsync(1_000)
+    const socket = Socket.instances[1]
+    hello(socket, localOwner, { transport_probe_nonce: true })
+    rpc.notifyResume()
+    const stop = { sessionKey: 'session-1', taskId: 'old-task', scope: 'task' }
+    await expect(commands.cancel(stop, { expectedGeneration: oldGeneration })).rejects.toMatchObject({ accepted: false })
+    const control = { recoveryClass: 'task-control' as const, expectedGeneration: rpc.connectionGeneration }
+    await expect(rpc.call('chat.send', stop, control)).rejects.toMatchObject({ accepted: false })
+    await expect(rpc.call('chat.abort', { ...stop, scope: 'session' }, control)).rejects.toMatchObject({ accepted: false })
+    await expect(rpc.call('chat.abort', { ...stop, taskId: '' }, control)).rejects.toMatchObject({ accepted: false })
+    await expect(rpc.call('chat.abort', stop, { recoveryClass: 'task-control' })).rejects.toMatchObject({ accepted: false })
+    socket.readyState = Socket.CLOSED
+    await expect(commands.cancel(stop)).rejects.toMatchObject({ accepted: false })
+    expect(socket.sent.map(frame => JSON.parse(frame))
+      .filter(frame => frame.method === 'chat.abort' || frame.method === 'chat.send')).toHaveLength(0)
+  })
+
   it.each([false, true])('keeps malformed directory results request-local with flow enabled=%s', async flowEnabled => {
     const rpc = client()
     const { transport } = transports(rpc)

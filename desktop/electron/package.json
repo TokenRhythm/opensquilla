@@ -26,6 +26,9 @@
     "test:bundled-runtimes": "node scripts/test-bundled-runtimes.mjs",
     "test:packaged-session-recovery": "node scripts/test-packaged-session-recovery.mjs",
     "test:packaged-first-send-renderer": "node scripts/test-packaged-first-send-renderer.mjs",
+    "test:packaged-gateway-reliability": "node scripts/test-packaged-gateway-reliability.mjs",
+    "test:packaged-gateway-reliability-contract": "node --test scripts/test-packaged-gateway-reliability-contract.mjs",
+    "test:packaged-single-instance-contract": "node scripts/test-packaged-single-instance-contract.mjs",
     "test:cli-invocation": "npm run build && node scripts/test-cli-invocation.mjs",
     "test:secret-storage": "npm run build && node scripts/test-secret-storage-policy.mjs && node scripts/test-secret-decryption-cache.mjs",
     "test:sandbox-default": "npm run build && node scripts/test-desktop-sandbox-default.mjs",
@@ -41,12 +44,13 @@
     "test:attachment-drafts": "npm run build && node scripts/test-attachment-drafts-electron.mjs",
     "test:native-attachments": "npm run build && node --test scripts/test-native-attachments.mjs && node scripts/test-native-attachments-electron.mjs",
     "test:project-workspace-picker": "npm run build && node scripts/test-project-workspace-picker.mjs",
+    "test:local-path-picker": "npm run build && node --test scripts/test-native-path-picker.mjs",
     "test:gateway-ownership": "npm run build && node scripts/test-desktop-gateway-ownership.mjs",
     "test:gateway-lifecycle": "npm run build && node scripts/test-desktop-gateway-lifecycle.mjs",
     "test:window-lifecycle": "npm run build && node scripts/test-desktop-window-lifecycle.mjs",
     "test:window-background-flow": "npm run build && node scripts/test-desktop-window-background-flow.mjs",
     "test:theme-flow": "npm run build && node scripts/test-desktop-theme-flow.mjs",
-    "test:deep-link": "npm run build && node scripts/test-desktop-deep-link.mjs && node scripts/test-desktop-deep-link-startup.mjs",
+    "test:deep-link": "npm run build && node scripts/test-desktop-single-instance.mjs && node scripts/test-desktop-deep-link.mjs && node scripts/test-desktop-deep-link-startup.mjs",
     "test:gateway-orphan-recovery-flow": "npm run build && node scripts/test-desktop-gateway-orphan-recovery-flow.mjs",
     "test:profile-substrate": "npm run build && node scripts/test-desktop-profile-substrate.mjs && node scripts/test-desktop-profile-consolidation.mjs",
     "test:profile-consolidation-flow": "npm run build && node scripts/test-profile-consolidation-flow.mjs",
@@ -86,18 +90,18 @@
   "dependencies": {
     "electron-updater": "^6.6.2",
     "playwright-core": "1.63.0",
-    "smol-toml": "1.8.0"
+    "smol-toml": "1.9.0"
   },
   "devDependencies": {
-    "@types/node": "^26.6.1",
+    "@types/node": "^26.6.3",
     "@typescript/typescript6": "6.0.2",
-    "electron": "^42.11.4",
+    "electron": "^42.11.8",
     "electron-builder": "^26.15.3",
     "gsap": "^3.15.0",
     "lottie-web": "^5.13.0",
     "playwright": "~1.63.0",
     "typescript": "7.0.2",
-    "ws": "^8.21.3"
+    "ws": "^8.22.0"
   },
   "build": {
     "appId": "ai.opensquilla.desktop",

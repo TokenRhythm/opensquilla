@@ -420,11 +420,11 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
 
 <style scoped>
 .msg-ai-text {
-  font-size: 0.875rem;
-  line-height: 1.6;
+  font-size: var(--fs-md);
+  line-height: 1.7;
   color: var(--text);
   word-break: break-word;
-  margin-bottom: 0.5rem;
+  margin-bottom: var(--sp-3);
 }
 
 .workspace-preview-fallback {

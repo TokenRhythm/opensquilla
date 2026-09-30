@@ -7,6 +7,10 @@ from dataclasses import asdict, dataclass, field, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Literal
 
+from opensquilla.compaction_timing import (
+    DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS,
+    resolve_compaction_total_timeout,
+)
 from opensquilla.contracts.turn_execution import (
     AnswerGenerationResetEvent,
 )
@@ -675,9 +679,12 @@ class AgentConfig:
     # skill context in history so provider KV-cache prefixes stay stable.
     skills_context_prompt: str | None = None
     compaction_profile: Literal["conversation", "coding", "research", "support"] = "conversation"
+    compaction_enabled: bool = True
     compaction_trigger_ratio: float = 0.85
     compaction_protected_recent_messages: int = 0
-    compaction_total_timeout_seconds: float = 120.0
+    # Optional legacy semantic idle override; otherwise inherit request_timeout.
+    compaction_timeout_seconds: float | None = None
+    compaction_total_timeout_seconds: float = DEFAULT_COMPACTION_TOTAL_TIMEOUT_SECONDS
     compaction_heartbeat_interval_seconds: float = 15.0
     # Frozen runtime-only single-deployment chain for auxiliary compaction.
     # Kept opaque here to avoid coupling engine types to session internals.
@@ -692,6 +699,12 @@ class AgentConfig:
         default=None,
         repr=False,
         compare=False,
+    )
+    compaction_circuit_open: Callable[..., bool] | None = field(
+        default=None, repr=False, compare=False,
+    )
+    compaction_outcome_reporter: Callable[[bool], None] | None = field(
+        default=None, repr=False, compare=False,
     )
     model_capabilities: Any | None = None  # ModelCapabilities from provider.types
     # Active-deployment tool capability provenance for diagnostics and routing.
@@ -846,8 +859,9 @@ class AgentConfig:
             0,
             int(self.compaction_protected_recent_messages or 0),
         )
-        if float(self.compaction_total_timeout_seconds or 0) <= 0:
-            self.compaction_total_timeout_seconds = 120.0
+        self.compaction_total_timeout_seconds = resolve_compaction_total_timeout(
+            self.compaction_total_timeout_seconds
+        )
         if float(self.compaction_heartbeat_interval_seconds or 0) <= 0:
             self.compaction_heartbeat_interval_seconds = 15.0
 

@@ -97,6 +97,8 @@ declare global {
     abandonCleanupTransaction?: () => Promise<unknown>
     setNativeTheme?: (payload: { source: 'light' | 'dark' | 'system' }) => Promise<unknown>
     openArtifact: (payload: ArtifactOpenRequest) => Promise<ArtifactNativeOpenResult>
+    chooseLocalFilePaths?: PlatformFilesApi['chooseLocalFilePaths']
+    resolveNativeFilePath?: PlatformFilesApi['resolveNativeFilePath']
     chooseAttachments?: PlatformFilesApi['chooseAttachments']
     selectAttachmentFile?: PlatformFilesApi['selectAttachmentFile']
     importAttachmentSelection?: PlatformFilesApi['importAttachmentSelection']

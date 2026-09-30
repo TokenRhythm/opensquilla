@@ -7,6 +7,7 @@ import {
   type RpcEventHandler,
   type RpcLifecycle,
   type RpcConsumptionHandler,
+  type RpcRecoveryResult,
   type RpcResumeSource,
   type RpcTransportPhase,
 } from '@/lib/rpc'
@@ -514,7 +515,7 @@ export const useRpcStore = defineStore('rpc', () => {
     refreshDesktopConnection()
   }
 
-  function onGap(handler: (detail: unknown) => Promise<boolean>): () => void {
+  function onGap(handler: (detail: unknown) => Promise<RpcRecoveryResult>): () => void {
     return client.value?.onGap(handler) || (() => {})
   }
 
@@ -529,7 +530,7 @@ export const useRpcStore = defineStore('rpc', () => {
     return client.value.consumeEvent(event, payload, meta)
   }
 
-  function recoverGap(detail: unknown): Promise<boolean> {
+  function recoverGap(detail: unknown): Promise<RpcRecoveryResult> {
     return client.value?.recoverGap(detail) || Promise.resolve(false)
   }
 

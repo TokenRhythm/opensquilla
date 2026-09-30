@@ -198,6 +198,8 @@
                 :avoid-element="addMenuAvoidElement"
                 :attachments-disabled="replanActive"
                 :browser-use-available="browserUseAvailable === true"
+                :local-paths-available="localPathsAvailable"
+                :local-paths-disabled="replanActive || inputDisabled || localPathsBusy"
                 :goal-mode-active="goalDraftArmed"
                 :goal-mode-available="goalModeAvailable === true"
                 :goal-mode-busy="goalModeBusy === true"
@@ -209,6 +211,7 @@
                 @activate-plan-mode="emit('setCollaborationMode', 'plan')"
                 @attach-files="onAttachFiles"
                 @select-browser-use="emit('selectBrowserUse')"
+                @reference-local-paths="chooseLocalFilePaths?.()"
                 @close="addMenuOpen = false"
               />
             </div>
@@ -546,6 +549,9 @@ const props = withDefaults(defineProps<{
   selectedSkills?: readonly SelectedSkillRef[]
   attachments: Attachment[]
   chooseAttachments?: () => Promise<boolean>
+  chooseLocalFilePaths?: () => Promise<void>
+  localPathsAvailable?: boolean
+  localPathsBusy?: boolean
   busySendMode: 'queue' | 'steer'
   hasSendContent: boolean
   sendPending?: boolean

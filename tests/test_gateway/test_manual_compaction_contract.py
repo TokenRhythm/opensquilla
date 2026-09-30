@@ -17,7 +17,7 @@ from opensquilla.gateway.adapters.session_maintenance import (
     build_gateway_session_maintenance_adapter,
 )
 from opensquilla.gateway.config import GatewayConfig
-from opensquilla.gateway.rpc.registry import RpcContext, RpcHandlerError
+from opensquilla.gateway.rpc.registry import RpcContext
 from opensquilla.gateway.rpc_sessions import _task_state_summary
 from opensquilla.gateway.session_streams import get_session_streams
 from opensquilla.provider.model_catalog import ModelCatalog
@@ -104,7 +104,7 @@ def _assert_operation_terminal(key, compaction_id, status):
     assert events[-1]["status"] == status
     assert [
         event["status"] for event in events
-        if event["status"] in {"completed", "skipped", "failed"}
+        if event["status"] in {"completed", "skipped", "failed", "cancelled"}
     ] == [status]
 
 
@@ -167,8 +167,8 @@ async def test_summary_does_not_fit_preserves_sqlite_and_returns_idle(manual_com
     result = await case.adapter.compact({"key": key, "contextWindowTokens": 128})
 
     assert case.calls
-    assert result["status"] == "failed"
-    assert result["reason"] == "summary_does_not_fit"
+    assert result["status"] == "skipped"
+    assert result["reason"] == "consumer_admission_failed"
     assert result["applied"] is False
     assert result["durability"] == "none"
     assert await case.manager.get_transcript(key) == before
@@ -176,7 +176,7 @@ async def test_summary_does_not_fit_preserves_sqlite_and_returns_idle(manual_com
     assert await case.storage.get_all_summaries(case.node.session_id) == []
     current = await case.manager.get_session(key)
     assert current.compaction_count == 0
-    _assert_operation_terminal(key, result["compaction_id"], "failed")
+    _assert_operation_terminal(key, result["compaction_id"], "skipped")
     await _assert_idle(case)
 
 
@@ -259,10 +259,11 @@ async def test_provider_failure_never_commits_partial_summary(
     monkeypatch.setattr(OpenAIProvider, "chat", failing_reply)
     result = await case.adapter.compact({"key": case.node.session_key})
 
-    assert result["status"] == "failed"
+    assert result["status"] == "skipped"
     assert result["reason"] == "summary_failed"
     assert len(case.calls) == 1
-    _assert_operation_terminal(case.node.session_key, result["compaction_id"], "failed")
+    assert case.context.turn_runner._compaction_failures[case.node.session_key].count == 1
+    _assert_operation_terminal(case.node.session_key, result["compaction_id"], "skipped")
     await _assert_unchanged(case, before)
 
 
@@ -302,7 +303,7 @@ async def test_cancel_running_summary_closes_provider_and_preserves_history(
             with pytest.raises(asyncio.CancelledError):
                 await task
         assert closed.is_set()
-        _assert_operation_terminal(case.node.session_key, operation_id, "failed")
+        _assert_operation_terminal(case.node.session_key, operation_id, "cancelled")
         assert _operation_events(case.node.session_key, operation_id)[-1]["reason"] == "cancelled"
         await _assert_unchanged(case, before)
     finally:
@@ -317,8 +318,9 @@ async def test_cancel_running_summary_closes_provider_and_preserves_history(
 # synthetic provider generator is first advanced.
 @pytest.mark.ci_serial
 @pytest.mark.asyncio
-async def test_absolute_deadline_closes_provider_and_emits_one_failed_terminal(
-    manual_compaction, monkeypatch,
+@pytest.mark.parametrize("background", [False, True])
+async def test_absolute_deadline_closes_provider_and_emits_one_skipped_terminal(
+    manual_compaction, monkeypatch, background,
 ):
     case = manual_compaction
     case.config.compaction.total_timeout_seconds = 1.0
@@ -335,16 +337,26 @@ async def test_absolute_deadline_closes_provider_and_emits_one_failed_terminal(
             closed.set()
 
     monkeypatch.setattr(OpenAIProvider, "chat", blocked_reply)
-    with pytest.raises(RpcHandlerError) as error:
-        await asyncio.wait_for(case.adapter.compact({"key": case.node.session_key}), timeout=5)
-
-    assert error.value.code == "COMPACTION_TIMEOUT"
+    result = await asyncio.wait_for(case.adapter.compact({
+        "key": case.node.session_key, "wait": not background,
+    }), timeout=5)
+    if background:
+        assert result["status"] == "started"
+        async with asyncio.timeout(5):
+            while active_compaction_ids(case.node.session_key):
+                await asyncio.sleep(0.01)
+    else:
+        assert result["status"] == "skipped"
+        assert result["applied"] is False
+        assert result["durability"] == "none"
     assert started.is_set() and closed.is_set()
-    operation_id = error.value.details["compaction_id"]
+    operation_id = result["compaction_id"]
     events = _operation_events(case.node.session_key, operation_id)
     assert any(event.get("heartbeat") for event in events)
     assert events[-1]["reason"] == "compaction_deadline_exceeded"
-    _assert_operation_terminal(case.node.session_key, operation_id, "failed")
+    assert events[-1]["applied"] is False
+    assert events[-1]["durability"] == "none"
+    _assert_operation_terminal(case.node.session_key, operation_id, "skipped")
     await _assert_unchanged(case, before)
 
 
@@ -493,6 +505,50 @@ async def test_cancel_during_sqlite_commit_reports_actual_durable_outcome(
 
     assert isinstance(outcome, (dict, asyncio.CancelledError))
     _assert_durable_message_ids(case, before[-2:])
+    assert await case.manager.get_canonical_transcript(case.node.session_key) == before
+    assert len(await case.storage.get_all_summaries(case.node.session_id)) == 1
+    _assert_operation_terminal(case.node.session_key, operation_id, "completed")
+    await _assert_idle(case)
+
+
+@pytest.mark.ci_serial
+@pytest.mark.asyncio
+async def test_deadline_during_sqlite_commit_waits_for_actual_durable_outcome(
+    manual_compaction, monkeypatch,
+):
+    case = manual_compaction
+    case.config.compaction.total_timeout_seconds = 1.0
+    before = await case.manager.get_canonical_transcript(case.node.session_key)
+    original_commit = case.storage._commit_transaction
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def delayed_commit(conn, operation, deadline, started):
+        if operation == "rewrite_compacted_session":
+            entered.set()
+            await release.wait()
+        return await original_commit(conn, operation, deadline, started)
+
+    monkeypatch.setattr(case.storage, "_commit_transaction", delayed_commit)
+    task = asyncio.create_task(case.adapter.compact({"key": case.node.session_key}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        operation_id = _latest_operation_id(case)
+        await asyncio.sleep(1.05)
+        assert not task.done(), "The entered atomic commit must settle before reporting a result"
+        assert not any(
+            event["status"] in {"completed", "skipped", "failed", "cancelled"}
+            for event in _operation_events(case.node.session_key, operation_id)
+        )
+        release.set()
+        result = await asyncio.wait_for(task, timeout=5)
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert result["status"] == "completed" and result["applied"] is True
+    assert result["durability"] == "durable"
     assert await case.manager.get_canonical_transcript(case.node.session_key) == before
     assert len(await case.storage.get_all_summaries(case.node.session_id)) == 1
     _assert_operation_terminal(case.node.session_key, operation_id, "completed")

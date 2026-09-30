@@ -357,9 +357,6 @@
       />
       <ArtifactImageLightbox />
     </div>
-    <!-- Keep recovery actions in normal flow, clear of the floating console
-         topbar. The main shell already reserves the mobile tab-bar inset. -->
-    <DeliveryRecoveryNotice @open-session="switchToSession" />
   </div>
 
   <!-- Mobile bottom tab bar (<=768px only; hides while the keyboard is up):
@@ -481,7 +478,6 @@ import UpdateBanner from './components/UpdateBanner.vue'
 import DesktopUpdateIndicator from './components/DesktopUpdateIndicator.vue'
 import ChatSystemStatus from './components/chat/ChatSystemStatus.vue'
 import ChatHeaderActions from './components/chat/ChatHeaderActions.vue'
-import DeliveryRecoveryNotice from './components/DeliveryRecoveryNotice.vue'
 import SidebarConversations from './components/SidebarConversations.vue'
 import SidebarResizer from './components/SidebarResizer.vue'
 import CommandPalette from './components/CommandPalette.vue'
@@ -544,6 +540,7 @@ import {
   buildChatSessionTitles,
   isSensibleChatTitle,
   provideChatSessionTitles,
+  resolveOptimisticChatTitle,
 } from './composables/chat/useChatSessionTitles'
 
 const appStore = useAppStore()
@@ -595,6 +592,7 @@ const {
   sessionKey: chatRouteHeaderSessionKey,
   visible: chatRouteHeaderVisible,
   title: chatRouteHeaderTitle,
+  optimisticTitle: chatRouteHeaderOptimisticTitle,
   copyState: chatRouteHeaderCopyState,
   copyIcon: chatRouteHeaderCopyIcon,
   copyLiveText: chatRouteHeaderCopyLiveText,
@@ -1089,22 +1087,27 @@ const sidebarSessionItems = computed((): SessionItem[] => {
 // sidebar shows the same text immediately. The key guard prevents a title from
 // the previous ChatView instance leaking into the new session during navigation.
 function optimisticCurrentSessionTitle(key: string, allowHeaderTitle = true): string {
-  if (!allowHeaderTitle || chatRouteHeaderSessionKey.value !== key) {
-    return t('shared.sidebar.currentTask')
-  }
-  const title = chatRouteHeaderTitle.value.trim()
-  if (!isSensibleChatTitle(title)) return t('shared.sidebar.currentTask')
-  const suffix = key.split(':').pop() || ''
-  const genericTitles = new Set([
-    t('chat.newChat'),
-    t('chat.chatWithSuffix', { suffix }),
-    t('shared.sidebar.currentTask'),
-  ])
-  return genericTitles.has(title) ? t('shared.sidebar.currentTask') : title
+  return resolveOptimisticChatTitle(
+    key,
+    chatRouteHeaderSessionKey.value,
+    chatRouteHeaderOptimisticTitle.value,
+    chatRouteHeaderTitle.value,
+    allowHeaderTitle,
+    {
+      currentTask: t('shared.sidebar.currentTask'),
+      newChat: t('chat.newChat'),
+      chatWithSuffix: suffix => t('chat.chatWithSuffix', { suffix }),
+    },
+  )
 }
 
 watch(
-  [currentSessionKey, chatRouteHeaderSessionKey, chatRouteHeaderTitle],
+  [
+    currentSessionKey,
+    chatRouteHeaderSessionKey,
+    chatRouteHeaderTitle,
+    chatRouteHeaderOptimisticTitle,
+  ],
   ([key], oldValues) => {
     if (!key || allSessions.value.some(item => item.key === key)) return
     const existing = localChatSessions.value[key]
@@ -1821,6 +1824,16 @@ watch(
   () => gatewayAccess.availability,
   () => {
     void automaticAppRpc.availabilityChanged()
+  },
+  { flush: 'sync' },
+)
+
+watch(
+  () => gatewayAccess.connectionHealth,
+  (health, previous) => {
+    if (health === 'healthy' && previous === 'suspect') {
+      automaticAppRpc.connectionHealthChanged(health)
+    }
   },
   { flush: 'sync' },
 )

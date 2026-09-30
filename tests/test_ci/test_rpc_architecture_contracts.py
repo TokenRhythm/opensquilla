@@ -196,8 +196,10 @@ F2_GATEWAY_COMPOSITION_ROOT = "opensquilla-webui/src/adapters/gateway/gatewayAda
 # on the reviewed #1525 baseline.
 # Connection stability adds 69 reviewed lines at this private seam: one flow
 # owner, consumed/gap hooks, staging/install control and validated orphan-read
-# credit cleanup. Domain recovery stays outside the generic transport seam.
-F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125 + 69
+# credit cleanup. The snapshot-install/recovery result contract adds three
+# further reviewed lines. Domain recovery stays outside the generic transport
+# seam.
+F2_TRANSPORT_FOUNDATION_LOC_CEILING = 1_125 + 72
 
 WEBUI_SOURCE_ROOT = ROOT / "opensquilla-webui" / "src"
 WEBUI_LEGACY_TRANSPORT_IDENTIFIERS = (

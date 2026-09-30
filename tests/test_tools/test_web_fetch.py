@@ -649,15 +649,24 @@ def test_web_fetch_keeps_managed_sandbox_proxy_and_skips_pinning(
     monkeypatch.setattr(
         "opensquilla.tools.builtin.web_fetch._pinned_transport", _must_not_pin
     )
+    captured: dict[str, object] = {}
+
+    class RecordingTransport:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", RecordingTransport)
     kwargs = _web_fetch_httpx_client_kwargs(
         "https://example.test/page",
         ["1.1.1.1"],
         {"User-Agent": "test"},
         {"proxy": "http://127.0.0.1:9", "trust_env": False},
     )
-    assert kwargs["proxy"] == "http://127.0.0.1:9"
+    assert "proxy" not in kwargs
     assert kwargs["trust_env"] is False
-    assert "transport" not in kwargs
+    assert isinstance(kwargs["transport"], RecordingTransport)
+    assert captured["proxy"] == "http://127.0.0.1:9"
+    assert captured["trust_env"] is False
 
 
 @pytest.mark.asyncio

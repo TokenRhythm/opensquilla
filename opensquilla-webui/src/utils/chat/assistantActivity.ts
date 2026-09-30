@@ -202,6 +202,7 @@ export interface AssistantActivityProjection extends AssistantActivityTimelinePr
 
 export type AssistantAnswerSource =
   | 'canonical'
+  | 'explicit-presentation'
   | 'terminal-timeline-boundary'
   | 'terminal-control-boundary'
   | 'explicit-no-answer'
@@ -424,6 +425,24 @@ function isSettledSuccessfulToolGroup(
     )
 }
 
+/**
+ * Presentation-marked history may contain failed tools. The failure belongs
+ * in Activity while the text markers remain authoritative for the answer.
+ * Pending or running groups stay on the compatibility path.
+ */
+function isSettledToolGroup(
+  item: ChatStreamTimelineItem,
+): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
+  return item.type === 'tool-group'
+    && item.group.calls.length > 0
+    && !item.group.isRunning
+    && item.group.status !== ''
+    && item.group.calls.every(call =>
+      !call.isRunning
+      && call.status !== '',
+    )
+}
+
 function isSuccessfulAnswerTransparentControlGroup(
   item: ChatStreamTimelineItem,
 ): item is Extract<ChatStreamTimelineItem, { type: 'tool-group' }> {
@@ -483,6 +502,73 @@ interface TerminalAnswerCandidate {
     AssistantAnswerSource,
     'terminal-timeline-boundary' | 'terminal-control-boundary'
   >
+}
+
+interface ExplicitPresentationAnswerCandidate {
+  indexes: Set<number>
+  text: string
+}
+
+/**
+ * Resolve a gateway-marked answer span independently of tool success. This is
+ * safe only when every text item is classified, every tool group is settled,
+ * and the answer is the terminal text run (apart from successful transparent
+ * controls).
+ */
+function explicitPresentationAnswerCandidate(
+  timeline: ChatStreamTimelineItem[],
+): ExplicitPresentationAnswerCandidate | null {
+  if (timeline.some(item => item.type === 'interrupt')) return null
+  if (timeline.some(item => item.type === 'tool-group' && !isSettledToolGroup(item))) {
+    return null
+  }
+
+  const textItems = timeline.filter(
+    (item): item is Extract<ChatStreamTimelineItem, { type: 'text' }> =>
+      item.type === 'text',
+  )
+  if (
+    !textItems.length
+    || textItems.some(item =>
+      item.presentation !== 'intermediate' && item.presentation !== 'answer',
+    )
+  ) return null
+
+  let index = timeline.length - 1
+  while (
+    index >= 0
+    && timeline[index]?.type === 'tool-group'
+    && isSuccessfulAnswerTransparentControlGroup(timeline[index]!)
+  ) {
+    index -= 1
+  }
+
+  const terminal = timeline[index]
+  if (
+    !terminal
+    || terminal.type !== 'text'
+    || terminal.presentation !== 'answer'
+  ) return null
+
+  const indexes = new Set<number>()
+  const chunks: string[] = []
+  while (index >= 0) {
+    const item = timeline[index]
+    if (!item || item.type !== 'text' || item.presentation !== 'answer') break
+    if (typeof item.rawText !== 'string') return null
+    indexes.add(index)
+    chunks.unshift(item.rawText)
+    index -= 1
+  }
+  // There must be one terminal answer span. An earlier answer marker separated
+  // by a tool is ambiguous and must remain on the legacy fail-open path.
+  if (timeline.some((item, itemIndex) =>
+    item.type === 'text'
+    && !indexes.has(itemIndex)
+    && item.presentation === 'answer',
+  )) return null
+  const text = chunks.join('')
+  return text.trim() ? { indexes, text } : null
 }
 
 /**
@@ -599,17 +685,24 @@ function completedAnswerLifecycle(
     && !message.terminalFailure
 }
 
+function explicitAnswerLifecycle(
+  message: ChatRenderedMessage,
+  lifecycle: AssistantActivityLifecycle,
+): boolean {
+  return !message.isStreaming
+    && !message.interrupted
+    && (lifecycle === 'settled' || lifecycle === 'failed')
+}
+
 /**
  * Resolve the user-facing answer without parsing model prose.
  *
- * Newer runtimes should eventually persist an explicit answer phase. For old
- * PlanRun rows, `message.text` is the concatenation of every narration segment.
- * We may recover the terminal answer only when all of these structural facts
- * agree: the turn settled successfully, every tool settled successfully, the
- * canonical text exactly matches the raw timeline aggregate, and the last text
- * run is structurally bounded by the final tool or followed only by successful
- * answer-transparent control calls. Every uncertain case fails open to the
- * canonical text. Markdown content never participates in this decision.
+ * Newer runtimes persist an explicit answer phase. For old PlanRun rows,
+ * `message.text` is the concatenation of every narration segment. Explicit
+ * presentation markers may therefore project a terminal answer even when a
+ * tool failed, provided the timeline and canonical aggregate agree. Rows that
+ * lack complete markers continue to use the successful-tool structural
+ * heuristic and fail open to canonical text when uncertain.
  */
 export function resolveAssistantAnswer(
   message: ChatRenderedMessage,
@@ -637,13 +730,35 @@ export function resolveAssistantAnswer(
     && textItems.every(item => item.presentation === 'intermediate')
   const hasSemanticActivityBoundary = timeline.some(item => item.type === 'tool-group')
     || Boolean(message.planRevisions?.length)
-  const allToolsSettledSuccessfully = timeline.every(item =>
-    item.type !== 'tool-group' || isSettledSuccessfulToolGroup(item),
+  const allToolsSettled = timeline.every(item =>
+    item.type !== 'tool-group' || isSettledToolGroup(item),
   )
-  const canUseExplicitNoAnswer = completedAnswerLifecycle(message, lifecycle)
+  const explicitAnswerCandidate = explicitPresentationAnswerCandidate(timeline)
+  const hasFailedSettledTool = timeline.some(item =>
+    item.type === 'tool-group'
+    && isSettledToolGroup(item)
+    && !isSettledSuccessfulToolGroup(item),
+  )
+  const canUseExplicitAnswer = explicitAnswerLifecycle(message, lifecycle)
+    && matchedAggregate !== null
+    && explicitAnswerCandidate !== null
+    && (lifecycle === 'failed' || message.terminalFailure || hasFailedSettledTool)
+
+  if (canUseExplicitAnswer && explicitAnswerCandidate) {
+    return {
+      text: explicitAnswerCandidate.text,
+      source: 'explicit-presentation',
+      activityItems: timeline.filter(
+        (item, index) =>
+          !explicitAnswerCandidate.indexes.has(index)
+          && !isSuccessfulAnswerTransparentControlGroup(item),
+      ),
+    }
+  }
+  const canUseExplicitNoAnswer = explicitAnswerLifecycle(message, lifecycle)
     && hasSemanticActivityBoundary
     && hasExplicitIntermediateOnly
-    && allToolsSettledSuccessfully
+    && allToolsSettled
     && (matchedAggregate !== null || !canonical.trim())
 
   if (canUseExplicitNoAnswer) {
@@ -1178,11 +1293,13 @@ export function projectAssistantActivityTimeline(
  * Project a completed assistant message into compact activity and canonical
  * answer surfaces without rewriting the persisted timeline.
  *
- * The terminal `message.text` is the only authoritative answer. A timeline
- * text segment followed by another tool is retained as process narration when
- * it is not already contained in the canonical answer; trailing answer
- * snapshots are excluded. Older rows that lack canonical text keep their
- * original timeline rendering rather than risking hidden content.
+ * Explicit text presentation markers are authoritative when the persisted
+ * aggregate agrees. Otherwise, the terminal `message.text` remains the
+ * compatibility answer. A timeline text segment followed by another tool is
+ * retained as process narration when it is not already contained in the
+ * canonical answer; trailing answer snapshots are excluded. Older rows that
+ * lack canonical text keep their original timeline rendering rather than
+ * risking hidden content.
  */
 export function projectAssistantActivity(
   message: ChatRenderedMessage,
@@ -1217,7 +1334,8 @@ export function projectAssistantActivity(
     || answerResolution.source === 'explicit-no-answer'
     || !hasTimelineText
   const hasStructuralAnswerBoundary =
-    answerResolution.source === 'terminal-control-boundary'
+    answerResolution.source === 'explicit-presentation'
+    || answerResolution.source === 'terminal-control-boundary'
     || answerResolution.source === 'terminal-timeline-boundary'
   const rawActivityItems = canSeparateActivity
     ? hasCanonicalAnswer

@@ -221,6 +221,10 @@ export interface NativeAttachmentReceipt {
 }
 
 export interface PlatformFilesApi {
+  /** Trusted Desktop picker; inserts plain paths without uploading or granting tool access. */
+  chooseLocalFilePaths?: (request: { gatewayInstanceId: string }) => Promise<string[]>
+  /** Resolve an OS-dragged File to its local path without reading its contents. */
+  resolveNativeFilePath?: (file: File) => Promise<string | null>
   chooseAttachments?: (request: NativeAttachmentContext) => Promise<NativeAttachmentSelection[]>
   selectAttachmentFile?: (request: NativeAttachmentContext, file: File) => Promise<NativeAttachmentSelection | null>
   importAttachmentSelection?: (request: NativeAttachmentContext, token: string) => Promise<NativeAttachmentReceipt>

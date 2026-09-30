@@ -24,7 +24,15 @@ def isolated_environment(tmp_path: Path) -> dict[str, str]:
     profile = tmp_path / "profile"
     profile.mkdir()
     config = profile / "config.toml"
-    config.write_text('[auth]\nmode = "none"\n', encoding="utf-8")
+    # These probes exercise Desktop/MCP transport, not semantic memory search.
+    # Keep the fresh-profile startup budget focused on the transport under test
+    # instead of downloading/loading a local embedding backend on Windows CI.
+    config.write_text(
+        '[auth]\nmode = "none"\n'
+        '[memory]\nretrieval_mode = "fts_only"\n'
+        '[memory.embedding]\nprovider = "none"\n',
+        encoding="utf-8",
+    )
     environment = {key: value for key, value in os.environ.items()
                    if not key.startswith("OPENSQUILLA_")}
     environment.update({

@@ -30,7 +30,7 @@ export async function loadNsisTooling() {
 export function isTransientDownloadError(error) {
   // Integrity/configuration errors must never be turned into network retries.
   if (/checksum|integrity|hash mismatch/i.test(error?.message ?? '')) return false
-  return [502, 503, 504].includes(error?.statusCode ?? error?.response?.statusCode)
+  return [500, 502, 503, 504].includes(error?.statusCode ?? error?.response?.statusCode)
     || ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ECONNRESET', 'EAI_AGAIN'].includes(error?.code)
 }
 

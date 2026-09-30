@@ -179,7 +179,9 @@ for (const superseded of [false, true]) {
   let profile = 'original'
   let attempts = 0
   const startup = vm.createContext({
-    Error, DesktopRoutingConfigurationError: routerProfiles.DesktopRoutingConfigurationError,
+    Error,
+    GatewayReadinessTimeoutError: class GatewayReadinessTimeoutError extends Error {},
+    DesktopRoutingConfigurationError: routerProfiles.DesktopRoutingConfigurationError,
     isQuitting: false, desktopOpenFlowPromise: null, desktopOpenFlowRevision: 0,
     forceOnboardingOnNextStartup: false, onboardingPromptProfileKey: null,
     gatewayProfileKey: 'original', gatewayProcess: null,

@@ -72,7 +72,7 @@ log = logging.getLogger(__name__)
 
 _ALLOWED_MIMES: frozenset[str] = ALLOWED_MEDIA_TYPES
 
-_DEFAULT_MAX_FILE_BYTES = 30 * 1024 * 1024
+_DEFAULT_MAX_FILE_BYTES = 50 * 1024 * 1024
 _DEFAULT_MAX_TOTAL_BYTES = 300 * 1024 * 1024
 _DEFAULT_TTL_SECONDS = 10 * 60
 _METADATA_VERSION = 1
@@ -386,7 +386,7 @@ class UploadStore:
         # Email stays non-stageable policy-wise, so its cap resolves to the
         # inline text ceiling even on this staged path. Strict deployments
         # keep the legacy stageable set (pdf/image/office), so text stays at
-        # the 2MB inline cap rather than the 30MiB staged-text ceiling.
+        # the 2MB inline cap rather than the 50MiB staged-text ceiling.
         if self.accept_opaque:
             staged = can_stage_attachment_mime(normalized_mime)
         else:

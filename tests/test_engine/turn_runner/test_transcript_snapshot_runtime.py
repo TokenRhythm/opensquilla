@@ -243,7 +243,7 @@ async def test_normal_turn_reads_transcript_once_before_provider(
 
 
 @pytest.mark.asyncio
-async def test_runtime_prefix_preflight_inherits_current_generation_budget(
+async def test_runtime_preflight_inherits_current_generation_budget(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
 ) -> None:
@@ -306,7 +306,7 @@ async def test_runtime_prefix_preflight_inherits_current_generation_budget(
         assert summaries[0][2].max_tokens == ordinary[0][2].max_tokens == 8192
         assert summaries[0][1] is None
         assert summaries[0][2].system.startswith("You are a conversation compactor.")
-        assert "within 1024 tokens" in summaries[0][2].system
+        assert "1024" not in summaries[0][2].system
         assert len(await manager.get_summaries(key)) == 1
         assert (await manager.get_session(key)).compaction_count == 1
     finally:
@@ -314,7 +314,7 @@ async def test_runtime_prefix_preflight_inherits_current_generation_budget(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["body_cap", "timeout", "circuit"])
+@pytest.mark.parametrize("failure", ["consumer_capacity", "timeout", "circuit"])
 @pytest.mark.parametrize("hard_overflow", [False, True])
 async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     monkeypatch: pytest.MonkeyPatch, tmp_path, failure: str, hard_overflow: bool,
@@ -324,6 +324,12 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
     active_timeouts: list[asyncio.Timeout] = []
     summary_cancelled = False
     if failure == "timeout":
+        from opensquilla.provider import retry_after
+
+        monkeypatch.setattr(
+            retry_after, "_provider_retry_after_cooldowns",
+            retry_after.ProviderRetryAfterCooldowns(clock=lambda: compaction_clock.now),
+        )
         # Expire the shared deadline after the paid call starts. Preparation
         # speed must not turn this into a different, zero-provider-call case.
         monkeypatch.setattr(
@@ -387,7 +393,9 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
                     summary_cancelled = True
                     raise
                 raise AssertionError("expired summary stream must be cancelled")
-            yield ProviderText(text="synthetic oversized summary " * 2_000)
+            # Exceed the complete consumer request's 100k character cap.
+            # A local body cap no longer owns candidate admission.
+            yield ProviderText(text="synthetic oversized summary " * 3_350)
             yield ProviderDone(stop_reason="stop", output_tokens=5_000)
 
     storage = SessionStorage(":memory:")
@@ -425,13 +433,14 @@ async def test_failed_preflight_never_restarts_paid_compaction_in_agent(
             runner._record_compaction_failure(key)
     try:
         events = await _run(runner, key)
-        assert provider.summary_calls == (0 if failure == "circuit" else 1)
+        # The over-capacity checkpoint cannot itself fit a shortening request;
+        # local admission prevents a second paid dispatch. None of these
+        # failures may restart summarization when the ordinary Agent starts.
+        expected_calls = 0 if failure == "circuit" else 1
+        assert provider.summary_calls == expected_calls
         assert summary_cancelled is (failure == "timeout")
-        assert provider.main_calls == (0 if hard_overflow else 1)
-        assert any(isinstance(event, ErrorEvent) for event in events) is hard_overflow
-        if hard_overflow:
-            errors = [event for event in events if isinstance(event, ErrorEvent)]
-            assert errors[-1].code == "provider_request_too_large"
+        assert provider.main_calls == 1
+        assert not any(isinstance(event, ErrorEvent) for event in events)
         assert runner._compaction_failures[key].count == (3 if failure == "circuit" else 1)
         assert key not in runner._turn_compaction_failed_sessions
         current = await manager.get_transcript(key)
@@ -479,7 +488,7 @@ async def test_inline_source_rejects_equal_length_temporary_window_after_append(
 
     async def append_after_local_window(key, *args, transcript_snapshot=None, **kwargs):
         frozen = list(await transcript_snapshot.get_entries())
-        assert await runner._record_emergency_ephemeral_compaction(
+        prepared_window = await runner._prepare_request_window(
             key, frozen, 1000, compaction_id="synthetic-alignment",
             phase="preflight", reason="summary_failed",
             expected_session_id=kwargs.get("expected_session_id"),
@@ -490,6 +499,8 @@ async def test_inline_source_rejects_equal_length_temporary_window_after_append(
                 key, "user" if index % 2 == 0 else "assistant",
                 f"new-{index}", token_count=10,
             )
+        assert prepared_window is not None
+        return prepared_window
 
     monkeypatch.setattr(runner._stream_consumer_stage, "run", observe_stream)
     if request_local_history:

@@ -212,7 +212,9 @@ async def test_compaction_does_not_restore_deleted_url_image_after_write_access_
             "assistant_replay": {"version": 1, "messages": [
                 {"role": "assistant", "content": "Loading image."},
                 {"role": "user", "content": [{
-                    **image, "type": "image", "media_type": image["mime"],
+                    "type": "image", "media_type": image["mime"], "data": image["data"],
+                    "name": image["name"], "local_path": image["local_path"],
+                    "source_url": image["source_url"], "durable_retained": True,
                 }]},
             ]},
         },

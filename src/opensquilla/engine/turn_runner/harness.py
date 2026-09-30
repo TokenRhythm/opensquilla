@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any, cast
 from opensquilla.attachment_workspace import (
     workspace_attachment_budget_from_config,
 )
+from opensquilla.compaction_timing import resolve_compaction_total_timeout
 from opensquilla.contracts.turn_execution import (
     SurfaceCapabilities,
     TurnExecutionContext,
@@ -879,10 +880,9 @@ class _TurnRunnerAgentConfigBuilderAdapter(AgentConfigBuilderPort):
                 "protected_recent_messages",
                 0,
             ),
-            compaction_total_timeout_seconds=getattr(
-                compaction_cfg,
-                "total_timeout_seconds",
-                120.0,
+            compaction_timeout_seconds=getattr(compaction_cfg, "timeout_seconds", None),
+            compaction_total_timeout_seconds=resolve_compaction_total_timeout(
+                getattr(compaction_cfg, "total_timeout_seconds", None),
             ),
             compaction_heartbeat_interval_seconds=getattr(
                 compaction_cfg,
@@ -1095,7 +1095,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
         expected_session_epoch: int | None = None,
-    ) -> None:
+    ) -> Any | None:
         from opensquilla.engine.runtime import _accepts_keyword_arg
 
         correlation_kwargs: dict[str, Any] = {}
@@ -1171,7 +1171,7 @@ class _TurnRunnerPreflightCompactionAdapter(PreflightCompactionPort):
         if expected_session_id is not None or expected_session_epoch is not None:
             correlation_kwargs["expected_session_id"] = expected_session_id
             correlation_kwargs["expected_session_epoch"] = expected_session_epoch
-        await self._runner._maybe_preflight_compact(
+        return await self._runner._maybe_preflight_compact(
             session_key,
             context_window_tokens,
             compaction_provider=compaction_provider,
@@ -1197,6 +1197,7 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
         agent: Agent,
         session_key: str,
         trim_last_user: bool,
+        prepared_window: Any | None = None,
         bound_user_message_id: str | None = None,
         transcript_snapshot: Any | None = None,
         expected_session_id: str | None = None,
@@ -1229,6 +1230,8 @@ class _TurnRunnerHistoryLoaderAdapter(HistoryLoaderPort):
                 raise RuntimeError(
                     "session history reader does not support exact ownership"
                 )
+        if prepared_window is not None:
+            kwargs["prepared_window"] = prepared_window
         return await self._runner._load_history(
             agent,
             session_key,

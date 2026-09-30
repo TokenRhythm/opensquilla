@@ -114,7 +114,10 @@ class DeterministicGoalProvider:
                     or "&quot;progress&quot;: null" in request_context
                 ),
                 "firstReplyInAssistantHistory": expected_first_reply in assistant_history,
-                "requestHasInternalContinuation": "[INTERNAL SYSTEM EVENT]" in message_text,
+                "requestHasInternalContinuation": (
+                    "[GOAL CONTINUATION]" in message_text
+                    or "[INTERNAL SYSTEM EVENT]" in message_text
+                ),
                 "historyHasSilentSentinel": (
                     "NO_REPLY" in assistant_history or "HEARTBEAT_OK" in assistant_history
                 ),
@@ -142,7 +145,7 @@ class DeterministicGoalProvider:
             )
             return
         if call_number == 2:
-            # This first automatic continuation is an internal system event.
+            # This first automatic continuation is an internal Goal context.
             # Hold Done after the raw provider delta so Playwright can prove no
             # marker escapes into either the WebSocket stream or live DOM.
             yield TextDeltaEvent(text=SILENT_MIXED_REPLY)

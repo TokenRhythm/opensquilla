@@ -232,6 +232,7 @@ const resolvedSummaryLabel = computed(() => {
   gap: 0.5rem;
   padding: 0.1875rem 0.25rem;
   border: 0;
+  border-radius: var(--radius-control);
   background: transparent;
   color: color-mix(in srgb, var(--text) 90%, transparent);
   cursor: pointer;
@@ -239,9 +240,11 @@ const resolvedSummaryLabel = computed(() => {
   font-size: 0.875rem;
   line-height: 1.5;
   text-align: left;
+  transition: background-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
 }
 
 .assistant-activity__live-head:hover {
+  background: color-mix(in srgb, var(--bg-hover) 58%, transparent);
   color: var(--text);
 }
 
@@ -341,7 +344,7 @@ const resolvedSummaryLabel = computed(() => {
   gap: 0.375rem;
   padding: 0.1875rem 0.25rem;
   border: 0;
-  border-radius: 0;
+  border-radius: var(--radius-control);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
@@ -349,12 +352,12 @@ const resolvedSummaryLabel = computed(() => {
   font-size: 0.75rem;
   line-height: 1.4;
   text-align: left;
-  transition: color var(--dur-fast) var(--ease-standard);
+  transition: background-color var(--dur-fast) var(--ease-standard), color var(--dur-fast) var(--ease-standard);
 }
 
 .assistant-activity__summary:hover {
+  background: color-mix(in srgb, var(--bg-hover) 58%, transparent);
   color: var(--text);
-  background: transparent;
 }
 
 /* Completed turns use the outer outcome as the visual anchor. The phase rows
@@ -454,6 +457,16 @@ const resolvedSummaryLabel = computed(() => {
   padding: 0 0 0 0.75rem;
   border: 0;
   background: transparent;
+}
+
+/* Touch users need a larger target, while desktop keeps the compact reading
+   rhythm. This changes only the affordance, not the disclosure semantics. */
+@media (pointer: coarse) {
+  .assistant-activity__live-head,
+  .assistant-activity__summary {
+    min-height: 2.75rem;
+    padding-inline: var(--sp-2);
+  }
 }
 
 .assistant-activity__detail {

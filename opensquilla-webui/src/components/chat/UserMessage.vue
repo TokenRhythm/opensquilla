@@ -865,10 +865,10 @@ function activateAttachment(attachment: DisplayAttachment, event: MouseEvent) {
 .msg-user-bubble {
   background: var(--msg-bubble);
   color: var(--text);
-  padding: 0.5625rem 0.875rem;
+  padding: 0.625rem 1rem;
   border-radius: var(--radius-panel);
-  font-size: 0.875rem;
-  line-height: 1.5;
+  font-size: var(--fs-md);
+  line-height: 1.65;
   max-width: 82%;
   white-space: pre-wrap;
   word-break: break-word;

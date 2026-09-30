@@ -53,6 +53,9 @@ _CONTAINERS = frozenset({
 _CLASSIFICATIONS = {
     "image_route_reason": frozenset({"current_turn", "history_context"}),
     "browser_requested_mode": frozenset({"auto", "dom", "invalid"}),
+    "journal_mode": frozenset({
+        "delete", "memory", "off", "persist", "truncate", "wal", "unknown",
+    }),
 }
 _FIELD = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _CONTENT_FIELDS = frozenset({

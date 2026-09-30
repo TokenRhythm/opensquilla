@@ -191,7 +191,7 @@ async def _handle_goals_capabilities(params: dict | None, ctx: RpcContext) -> di
     return {
         "supported": True,
         "executionEnabled": bool(service.execution_enabled),
-        "maxTurns": int(getattr(config, "max_turns", 50)),
+        "maxTurns": int(getattr(config, "max_turns", 256)),
         "runtimeBudgetSeconds": int(getattr(config, "runtime_budget_seconds", 3600)),
         "methods": [
             "goals.set",

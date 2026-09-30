@@ -406,7 +406,7 @@ def test_desktop_boot_resume_waits_for_the_existing_owned_gateway() -> None:
     resume_owned = _section(
         main_ts,
         "async function resumeOwnedGatewayStartup",
-        "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS",
+        "const GATEWAY_LATE_READY_OBSERVATION_MS",
     )
 
     assert "resumeStartup: () => ipcRenderer.invoke('desktop:boot:resume')" in preload
@@ -515,7 +515,7 @@ def test_desktop_boot_resume_fences_stale_async_state_and_ready_events() -> None
     resume_owned = _section(
         main_ts,
         "async function resumeOwnedGatewayStartup",
-        "const VERIFIED_ORPHAN_GATEWAY_RELEASE_TIMEOUT_MS",
+        "const GATEWAY_LATE_READY_OBSERVATION_MS",
     )
     assert resume_owned.rindex("|| !isCurrent()") < resume_owned.index(
         "gatewayState.status = 'ready'"
@@ -2665,7 +2665,7 @@ def test_desktop_network_observability_disable_gates_native_update_and_gateway_e
     )
     assert "else if (desktopUpdateManaged())" in startup
     assert "desktopUpdateCheckScheduler.start(UPDATE_CHECK_INITIAL_DELAY_MS)" in startup
-    assert "connection?.disableNetworkObservability" in start
+    assert "startupConnection?.disableNetworkObservability" in start
     assert "OPENSQUILLA_PRIVACY_DISABLE_NETWORK_OBSERVABILITY: '1'" in start
 
 
@@ -3030,7 +3030,7 @@ def test_desktop_second_launch_retries_lock_and_logs_instead_of_silent_quit() ->
         "desktopLog('launch',",
     )
     assert "Date.now() + 5_000" in retry
-    assert "app.requestSingleInstanceLock()" in retry
+    assert "app.requestSingleInstanceLock(" in retry
     # On give-up: explicit dialog + quit, not a bare silent app.quit().
     giveup = _section(main_ts, "if (!gotSingleInstanceLock) {", "app.on('second-instance'")
     assert "launch_aborted_lock_held" in giveup
@@ -3932,6 +3932,11 @@ def test_desktop_migration_receipt_authority_is_bounded_python_verification() ->
 
 def test_desktop_boot_does_not_run_legacy_typescript_import_recovery() -> None:
     main_ts = _read("desktop/electron/src/main.ts")
+    prepare = _section(
+        main_ts,
+        "async function prepareDesktopStartupConnection",
+        "function dismissOnboardingFlow",
+    )
     start = _section(
         main_ts,
         "async function startGateway",
@@ -3943,7 +3948,22 @@ def test_desktop_boot_does_not_run_legacy_typescript_import_recovery() -> None:
     assert "recoverPendingMigrationReconciliation()" not in start
     assert "relocateLegacyDesktopStateLayout" not in main_ts
     assert "await prepareDesktopStartupConnection()" in start
-    assert "await runOnboarding()" not in start
+    assert "let freshOnboardingProfileKey: string | null = null" in main_ts
+    assert (
+        "if (!pendingProviderSetup && !forceOnboardingOnNextStartup "
+        "&& existing === null)" in prepare
+    )
+    assert "const shouldRunFreshOnboarding" in start
+    assert "await runOnboarding()" in start
+    assert "await onboardingFlows.waitForAbandonedSave()" in start
+    assert "if (!isCurrent())" in start
+    assert "if (startupConnection === null) onboardingPromptProfileKey = startupProfileKey" in start
+    assert start.index("await runOnboarding()") < start.index("sendBootStatus('gateway-start')")
+    assert "freshOnboardingProfileKey === startupProfileKey" in start
+    assert "!pendingProviderSetup" in main_ts
+    assert "startupConnection?.apiKeyEnv" in start
+    assert "startupConnection?.searchApiKeyEnv" in start
+    assert "startupConnection?.disableNetworkObservability" in start
 
 
 def test_desktop_migration_run_requires_valid_report_and_reopens_before_restart() -> None:

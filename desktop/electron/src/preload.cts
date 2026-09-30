@@ -24,6 +24,14 @@ if (process.isMainFrame) contextBridge.exposeInMainWorld('opensquillaDesktop', {
   saveArtifact: (payload: unknown) => ipcRenderer.invoke('desktop:artifact:save', payload),
   sourceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:source-file:action', payload),
   workspaceFileAction: (payload: unknown) => ipcRenderer.invoke('desktop:workspace-file:action', payload),
+  chooseLocalFilePaths: (request: unknown) => ipcRenderer.invoke('desktop:files:choose-paths', request),
+  resolveNativeFilePath: (file: File) => {
+    // OS drags retain their native backing path. Resolving it is metadata-only;
+    // content reads remain in the ordinary attachment path for images and
+    // browser/constructed Files.
+    const path = webUtils.getPathForFile(file)
+    return Promise.resolve(path || null)
+  },
   chooseAttachments: (request: unknown) => ipcRenderer.invoke('desktop:attachments:choose', request),
   selectAttachmentFile: (request: unknown, file: File) => {
     // Electron validates the actual browser File backing store. Constructed

@@ -5,6 +5,7 @@ from typing import Any
 import pytest
 
 from opensquilla.engine import Agent, AgentConfig
+from opensquilla.execution_status import normalize_execution_status
 from opensquilla.provider import (
     ContentBlockImage,
     ContentBlockToolResult,
@@ -116,10 +117,10 @@ async def test_in_turn_entrypoints_bind_shared_physical_budget_and_raw_tail_admi
     kept = [] if entry == "live" else request.entries[protected_start:]
     assert request.consumer_admission("Completed older work", kept)
     assert not request.consumer_admission("huge summary " * window, kept)
-    # Structured tool results are replayed from the original Message objects,
-    # not their flattened summary input. A changed raw tail invalidates live
-    # template identity or refuses the now-oversized candidate.
-    messages[-1].content[0].content = "raw tool result " * window
+    # The current user remains raw even when every completed tool round is
+    # eligible for summarization. Its mutation invalidates the frozen live
+    # template or refuses the now-oversized candidate.
+    active.content = "changed current request " * window
     if entry == "live":
         from opensquilla.session.compaction_lifecycle import ConsumerAdmissionStaleError
 
@@ -291,7 +292,7 @@ async def test_inline_compaction_honors_configured_trigger_and_effective_summary
     assert budget.auto_trigger_tokens == int(budget.history_capacity_tokens * 0.6)
     assert budget.auto_trigger_chars == int(budget.history_capacity_chars * 0.6)
     assert budget.summary_output_tokens == 512
-    assert budget.retained_tail_messages == 12
+    assert budget.retained_tail_messages == 0
     # Being called after a full-request overflow does not grant manual force
     # or a prefix cut: the core still checks actual durable history pressure.
     assert not requests[0].force
@@ -300,7 +301,7 @@ async def test_inline_compaction_honors_configured_trigger_and_effective_summary
 
 @pytest.mark.parametrize("profile", ["coding", "research", "support"])
 @pytest.mark.parametrize("projection_fails", [False, True])
-async def test_live_completed_prefix_keeps_profile_policy_and_external_native_tail(
+async def test_live_completed_prefix_keeps_pending_native_tail_without_profile_quota(
     monkeypatch: pytest.MonkeyPatch, profile: str, projection_fails: bool,
 ) -> None:
     provider = OpenAIProvider(api_key="synthetic", model="synthetic")
@@ -316,13 +317,16 @@ async def test_live_completed_prefix_keeps_profile_policy_and_external_native_ta
             )]),
             Message(role="user", content=[ContentBlockToolResult(
                 tool_use_id=f"native-{index}", content=f"completed native step {index}",
+                execution_status=(normalize_execution_status({
+                    "status": "unknown", "reason": "pending", "source": "runtime",
+                }) if index == 5 else None),
             )]),
         ])
     original = [message.model_copy(deep=True) for message in messages]
     config = agent._build_compaction_config()
     config.budget = resolve_compaction_budget(
         project=lambda _summary, _kept: None, physical_context_window_tokens=64_000,
-        generation_reserve_tokens=4096, retained_tail_messages=12,
+        generation_reserve_tokens=4096, retained_tail_messages=0,
     )
     requests: list[Any] = []
 
@@ -363,16 +367,19 @@ async def test_live_completed_prefix_keeps_profile_policy_and_external_native_ta
         assert fallbacks[0]["compaction_config"] is config
         assert messages == original
         assert config.protect_profile_tail and config.protect_semantic_tail
-        assert effective_protected_recent_messages(config) == 12
+        assert effective_protected_recent_messages(config) == 0
         return
     assert len(requests) == 1
     assert outcome is not None and outcome.ephemeral_only and outcome.compacted
-    assert outcome.messages[2] is messages[0]
-    assert all(left is right for left, right in zip(outcome.messages[-4:], messages[-4:]))
+    assert outcome.messages[0] is messages[0]
+    assert "Tool execution receipts" in str(outcome.messages[1].content)
+    assert all(left is right for left, right in zip(outcome.messages[-2:], messages[-2:]))
+    assert len(requests[0].entries) == 10
     assert messages == original
     assert config.protect_profile_tail and config.protect_semantic_tail
-    assert effective_protected_recent_messages(config) == 12
+    assert effective_protected_recent_messages(config) == 0
     _, restored_error = _validate_forced_prefix_cut(
         requests[0].entries, len(requests[0].entries), config,
     )
-    assert restored_error == "forced_prefix_cut_overlaps_protected_tail"
+    # A profile no longer creates an implicit raw-message quota.
+    assert restored_error is None

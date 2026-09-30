@@ -119,12 +119,54 @@ def iter_window_prefix_cuts(
 ) -> Iterator[int]:
     """Yield oldest-first whole-turn cuts; callers also check native tool pairing."""
 
-    limit = max(0, min(protected_start, len(roles) - 1))
+    limit = max(0, min(protected_start, len(roles)))
     if protected_indexes:
         limit = min(limit, max(0, min(protected_indexes)))
     for cut in range(1, limit + 1):
-        if roles[cut] == "user" and roles[cut - 1] == "assistant":
+        if cut == len(roles) or (
+            roles[cut] == "user" and roles[cut - 1] == "assistant"
+        ):
             yield cut
+
+
+def iter_window_index_candidates(
+    size: int,
+    *,
+    prefix_cuts: Collection[int],
+    protected_indexes: Collection[int] = (),
+    retained_indexes: Collection[int] = (),
+    active_prefix: tuple[int, int] | None = None,
+    round_cuts: Collection[int] = (),
+) -> Iterator[tuple[int, ...]]:
+    """Select recent complete groups around the same mandatory state.
+
+    Callers supply verified protocol boundaries in their source representation.
+    This policy is shared by durable-entry preflight and native-message recovery;
+    neither an old error nor an arbitrary number of completed replies is a hard
+    retention requirement. Exact request admission is deliberately separate.
+    """
+    protected = frozenset(protected_indexes)
+    retained = frozenset(retained_indexes)
+    # Ordered cuts produce progressively smaller sets. Retaining every tuple
+    # would keep quadratic history-sized allocations alive during recovery.
+    previous: tuple[int, ...] | None = None
+    for cut in sorted(set(prefix_cuts)):
+        if not 0 < cut <= size:
+            continue
+        kept = tuple(sorted(retained | set(range(cut, size))))
+        if protected.issubset(kept) and kept != previous and len(kept) < size:
+            previous = kept
+            yield kept
+    if active_prefix is None:
+        return
+    start, end = active_prefix
+    for cut in sorted(set(round_cuts)):
+        if not 0 <= start < end < cut <= size:
+            continue
+        kept = tuple(sorted(retained | set(range(start, end)) | set(range(cut, size))))
+        if protected.issubset(kept) and kept != previous and len(kept) < size:
+            previous = kept
+            yield kept
 
 
 def request_window_notice(omitted_count: int) -> str:
@@ -156,27 +198,25 @@ def iter_request_window_candidates(
     protected_start_index: int,
     protected_indexes: Collection[int] = (),
     retained_indexes: Collection[int] = (),
-    live_boundary: tuple[int, int] | None = None,
+    active_user_index: int | None = None,
 ) -> Iterator[RequestWindowCandidate]:
     """Keep original objects and emit only protocol-balanced smaller windows.
 
-    ``live_boundary`` comes from the existing active-user/recent-round guard.
-    It permits omitting completed rounds inside a still-active user turn while
-    retaining its original request prefix and every protected recent round.
+    ``active_user_index`` permits omitting completed rounds inside a still-active
+    user turn while retaining its original request prefix and protected state.
     Exact provider admission remains the caller's responsibility.
     """
 
     protected = frozenset(protected_indexes)
     retained = frozenset(retained_indexes)
-    seen: set[tuple[int, ...]] = set()
-    def _index_sequences() -> Iterator[tuple[int, ...]]:
+    def _safe_prefix_cuts() -> Iterator[int]:
         for cut in iter_window_prefix_cuts(
             [message.role for message in messages],
             protected_start=protected_start_index,
             protected_indexes=protected - retained,
         ):
             if (
-                isinstance(messages[cut].content, list)
+                cut < len(messages) and isinstance(messages[cut].content, list)
                 and any(
                     isinstance(block, ContentBlockToolResult) for block in messages[cut].content
                 )
@@ -184,20 +224,21 @@ def iter_request_window_candidates(
                 continue
             if repair_tool_pairing(messages[:cut]) != messages[:cut]:
                 continue
-            yield tuple(sorted(retained | set(range(cut, len(messages)))))
-        if live_boundary is not None:
-            active_user, keep_start = live_boundary
-            if protected_start_index <= active_user < keep_start <= len(messages):
-                yield tuple(sorted(
-                    retained
-                    | set(range(protected_start_index, active_user + 1))
-                    | set(range(keep_start, len(messages)))
-                ))
-
-    for kept_indices in _index_sequences():
-        if kept_indices in seen or not protected.issubset(kept_indices):
-            continue
-        seen.add(kept_indices)
+            yield cut
+    active_prefix = None
+    round_cuts: list[int] = []
+    if active_user_index is not None:
+        active_prefix = (protected_start_index, active_user_index + 1)
+        round_cuts = [
+            index for index in range(active_user_index + 2, len(messages))
+            if messages[index].role == "assistant"
+        ]
+        round_cuts.append(len(messages))
+    for kept_indices in iter_window_index_candidates(
+        len(messages), prefix_cuts=tuple(_safe_prefix_cuts()),
+        protected_indexes=protected, retained_indexes=retained,
+        active_prefix=active_prefix, round_cuts=round_cuts,
+    ):
         omitted_count = len(messages) - len(kept_indices)
         if omitted_count <= 0:
             continue

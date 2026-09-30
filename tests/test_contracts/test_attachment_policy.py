@@ -7,6 +7,23 @@ from opensquilla.contracts import attachments
 from opensquilla.gateway import attachment_ingest
 
 
+def test_fifty_mib_staged_policy_keeps_other_limits_separate() -> None:
+    from opensquilla.gateway.config import GatewayConfig
+    from opensquilla.gateway.uploads import UploadStore
+
+    for mime in ("application/pdf", "text/plain", attachments.DOCX_MIME, "application/zip"):
+        assert attachments.attachment_size_limit_for_mime(mime, staged=True) == 50 * 1024 * 1024
+    assert UploadStore(marker_dir=None).max_file_bytes == 50 * 1024 * 1024
+    config = GatewayConfig()
+    assert config.attachments.opaque_max_bytes == 50 * 1024 * 1024
+    assert config.attachments.artifact_max_bytes == 30 * 1024 * 1024
+    assert config.attachments.upload_store_max_total_bytes == 300 * 1024 * 1024
+    assert attachments.IMAGE_ATTACHMENT_BYTES == 5 * 1024 * 1024
+    assert attachments.EMAIL_ATTACHMENT_BYTES == attachments.INLINE_ATTACHMENT_BYTES == 2_000_000
+    assert attachments.MAX_TOTAL_ATTACHMENT_BYTES == 60 * 1024 * 1024
+    assert attachments.MAX_ATTACHMENTS == 16
+
+
 def test_attachment_policy_is_shared_with_gateway_ingest() -> None:
     assert attachment_ingest.ALLOWED_MEDIA_TYPES is attachments.ALLOWED_MEDIA_TYPES
     assert attachment_ingest.MAX_ATTACHMENT_BYTES == attachments.MAX_ATTACHMENT_BYTES

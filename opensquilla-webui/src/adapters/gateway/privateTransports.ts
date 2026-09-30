@@ -6,6 +6,7 @@ import type {
   TransportDeliveryReceipt,
   TransportInstalledReceipt,
   TransportGapHandler,
+  TransportRecoveryResult,
 } from './transportTypes'
 import { TransportFlowV4 } from './transportFlowV4'
 import type { SessionsMessagesSnapshotReadResult } from '@/contracts/generated/v4/sessionsMessagesSnapshotRead'
@@ -31,6 +32,7 @@ export interface RpcTransport {
   acknowledgeDelivery?(receipt: TransportDeliveryReceipt): Promise<void> | void
   resumeFlow?(receipt: TransportInstalledReceipt): Promise<void> | void
   recoveryVersion?(key: string): string
+  snapshotInstalled?(key: string, version: string): void
   waitForConsumption?(key: string, cursor?: { streamGeneration: string; fromSeq: number; toSeq: number }): Promise<void>
   failProtocol?(generation: number): void
   readonly generation: number
@@ -67,7 +69,7 @@ interface RpcStoreTransportSource extends Pick<RpcTransport, 'policy' | 'acknowl
   onGap?(handler: TransportGapHandler): () => void
   enableConsumptionFlow?(): void
   consumeEvent?(event: string, payload: unknown, meta: Record<string, unknown>): Promise<'applied' | 'dirty'>
-  recoverGap?(detail: unknown): Promise<boolean>
+  recoverGap?(detail: unknown): Promise<TransportRecoveryResult>
   recoverConnectionGeneration?(generation: number, reason?: string): boolean
   hasRpcMethod(method: string): boolean
   hasRpcEvent(event: string): boolean
@@ -126,6 +128,7 @@ export function createPrivateGatewayTransports(
   return {
     rpc: {
       recoveryVersion: key => flow?.recoveryVersion(key) ?? String(source.connectionGeneration),
+      snapshotInstalled: (key, version) => flow?.snapshotInstalled(key, version),
       waitForConsumption: (key, cursor) => flow?.waitForConsumption(key, cursor) ?? Promise.resolve(),
       failProtocol: generation => { source.recoverConnectionGeneration?.(generation, 'Invalid snapshot recovery contract') },
       acknowledgeDelivery: deliveryOwner.acknowledgeDelivery?.bind(deliveryOwner),

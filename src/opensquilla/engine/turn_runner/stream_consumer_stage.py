@@ -384,9 +384,9 @@ class StreamConsumerStageInput:
     compaction_source_boundary_entry_id: int | None = None
     expected_session_id: str | None = None
     expected_session_epoch: int | None = None
-    # Original ingress mode.  Internal Goal continuations and heartbeats use
-    # ``system_event``; their text is held until the terminal snapshot can be
-    # canonicalized so silent-reply protocol markers never flash on a client.
+    # Original ingress mode. Internal Goal continuations and heartbeats hold
+    # their text until the terminal snapshot can be canonicalized so
+    # silent-reply protocol markers never flash on a client.
     input_mode: str = "user"
     execution_context: TurnExecutionContext | None = None
 
@@ -908,7 +908,7 @@ class _DoneHandler:
         snapshot_present, terminal_text = done_text_snapshot(event)
         accumulated_text = "".join(state.final_text_parts)
         buffer_system_event_text = (
-            inp.input_mode == "system_event"
+            inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
         # Buffered internal turns may be produced by legacy adapters that leave
@@ -1863,10 +1863,12 @@ class StreamConsumerStage:
 
         state = inp.state
         buffer_system_event_text = (
-            inp.input_mode == "system_event"
+            inp.input_mode in {"system_event", "goal_continuation"}
             and inp.run_kind in {"goal", "heartbeat"}
         )
-        gate_human_silent_reply_prefix = inp.input_mode != "system_event"
+        gate_human_silent_reply_prefix = inp.input_mode not in {
+            "system_event", "goal_continuation"
+        }
         human_silent_reply_prefix_open = gate_human_silent_reply_prefix
         held_human_silent_reply_text = ""
         human_prefix_crossed_public_boundary = False
@@ -1973,8 +1975,8 @@ class StreamConsumerStage:
                 if buffer_system_event_text:
                     if event.text and not buffered_text_observed:
                         log.info(
-                            "system_event_text_buffered_total",
-                            metric="system_event_text_buffered_total",
+                            "internal_turn_text_buffered_total",
+                            metric="internal_turn_text_buffered_total",
                             value=1,
                             run_kind=inp.run_kind,
                         )
@@ -2279,7 +2281,7 @@ class StreamConsumerStage:
                     human_prefix_crossed_public_boundary = False
 
                 human_silent_reply_disallowed = (
-                    inp.input_mode != "system_event"
+                    inp.input_mode not in {"system_event", "goal_continuation"}
                     and transformed.delivery == "suppressed"
                     and transformed.suppression_reason
                     in {"no_reply", "heartbeat_ack"}

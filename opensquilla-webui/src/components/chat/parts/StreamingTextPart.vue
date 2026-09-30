@@ -142,10 +142,10 @@ watch(() => props.rawText, update, { immediate: true })
 
 <style scoped>
 .msg-ai-text {
-  margin-bottom: 0.5rem;
+  margin-bottom: var(--sp-3);
   color: var(--text);
-  font-size: 0.875rem;
-  line-height: 1.6;
+  font-size: var(--fs-md);
+  line-height: 1.7;
   word-break: break-word;
 }
 

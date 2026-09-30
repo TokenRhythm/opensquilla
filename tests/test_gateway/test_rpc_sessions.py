@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -55,7 +56,8 @@ from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.uploads import set_upload_store
 from opensquilla.gateway.websocket import SubscriptionManager, WsConnection, get_registry
 from opensquilla.project_workspaces import ProjectWorkspaceStateError, project_path_key
-from opensquilla.provider.selector import ProviderConfig
+from opensquilla.provider.protocol import provider_connection_config
+from opensquilla.provider.selector import ModelSelector, ProviderConfig, SelectorConfig
 from opensquilla.run_mode import RunMode
 from opensquilla.sandbox.capability_service import CapabilityReport
 from opensquilla.sandbox.guest_profile import (
@@ -7386,6 +7388,114 @@ class TestSessionsDelete:
         ]
 
     @pytest.mark.asyncio
+    async def test_delete_keeps_admission_fenced_until_material_worker_finishes(
+        self, dispatcher, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ):
+        from opensquilla.artifacts import ArtifactStore
+        from opensquilla.attachment_refs import write_transcript_material
+        from opensquilla.gateway.agent_tasks import AgentTaskRegistry
+        from opensquilla.gateway.boot import build_session_material_cleanup
+        from opensquilla.gateway.task_runtime import TaskRuntime
+        from opensquilla.session import material_cleanup
+        from opensquilla.session.manager import SessionManager
+
+        config = _ctx_config_with_media_root(tmp_path / "media")
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        config.workspace_dir = str(workspace)
+        node = SessionNode(session_key="agent:main:webchat:fenced-cleanup", session_id="old")
+        loop = asyncio.get_running_loop()
+        worker_started = asyncio.Event()
+        worker_finished = threading.Event()
+        release_worker = threading.Event()
+        second_delete_started = asyncio.Event()
+        admission_started = asyncio.Event()
+        admitted = asyncio.Event()
+        original_delete_artifacts = ArtifactStore.delete_session_artifacts
+
+        def slow_delete_artifacts(store, session_id):
+            loop.call_soon_threadsafe(worker_started.set)
+            try:
+                if not release_worker.wait(timeout=10):
+                    raise TimeoutError("test did not release material worker")
+                return original_delete_artifacts(store, session_id)
+            finally:
+                worker_finished.set()
+
+        async def unexpected_turn(_run):
+            pytest.fail("this test only exercises the admission boundary")
+
+        registry = AgentTaskRegistry()
+        monkeypatch.setattr(rpc_sessions, "get_agent_task_registry", lambda: registry)
+        monkeypatch.setattr(ArtifactStore, "delete_session_artifacts", slow_delete_artifacts)
+        monkeypatch.setattr(material_cleanup, "_hook", build_session_material_cleanup(config))
+        async with SessionStorage(tmp_path / "sessions.db") as storage:
+            await storage.upsert_session(node)
+            write_transcript_material(
+                media_root=Path(config.attachments.media_root), session_id=node.session_id,
+                payload=b"deleted session material",
+            )
+            runtime = TaskRuntime(
+                storage=storage, turn_handler=unexpected_turn, running_heartbeat_interval_s=None,
+            )
+            original_quiesce = runtime.quiesce_sessions
+            delete_count = 0
+
+            @asynccontextmanager
+            async def observed_quiesce(keys):
+                nonlocal delete_count
+                delete_count += 1
+                if delete_count == 2:
+                    second_delete_started.set()
+                async with original_quiesce(keys):
+                    yield
+
+            monkeypatch.setattr(runtime, "quiesce_sessions", observed_quiesce)
+            ctx = make_ctx(
+                session_manager=SessionManager(storage, inject_time_prefix=False),
+                config=config, task_runtime=runtime,
+                turn_runner=SimpleNamespace(get_session_lock=runtime._get_session_lock_for_turn),
+            )
+
+            async def enter_admission():
+                admission_started.set()
+                async with runtime.collect_admission(node.session_key):
+                    assert worker_finished.is_set()
+                    admitted.set()
+
+            deleting = asyncio.create_task(dispatcher.dispatch(
+                "first-delete", "sessions.delete", {"key": node.session_key}, ctx,
+            ))
+            pending = [deleting]
+            try:
+                await asyncio.wait_for(worker_started.wait(), timeout=5)
+                assert not worker_finished.is_set()
+                assert await storage.get_session(node.session_key) is None
+                admission = asyncio.create_task(enter_admission())
+                second_delete = asyncio.create_task(dispatcher.dispatch(
+                    "second-delete", "sessions.delete", {"key": node.session_key}, ctx,
+                ))
+                pending.extend((admission, second_delete))
+                await asyncio.wait_for(admission_started.wait(), timeout=2)
+                await asyncio.wait_for(second_delete_started.wait(), timeout=2)
+                for _ in range(2):
+                    deleting.cancel()
+                    await asyncio.sleep(0)
+                    assert not deleting.done()
+                    assert not second_delete.done()
+                    assert not admitted.is_set()
+                release_worker.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await deleting
+                await asyncio.wait_for(admission, timeout=2)
+                assert (await asyncio.wait_for(second_delete, timeout=2)).ok
+                assert admitted.is_set()
+                assert worker_finished.is_set()
+            finally:
+                release_worker.set()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    @pytest.mark.asyncio
     async def test_delete_finishes_after_rpc_cancellation(
         self,
         dispatcher,
@@ -7835,11 +7945,11 @@ class TestSessionsContextCompact:
 
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "failed",
+            "cancelled",
         ]
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
-            "failed",
+            "cancelled",
         ]
         assert manager.compact_calls == []
 
@@ -7894,7 +8004,7 @@ class TestSessionsContextCompact:
         ]
         assert [payload["status"] for payload in compaction_events] == [
             "started",
-            "failed",
+            "cancelled",
         ]
         assert {payload["compaction_id"] for payload in compaction_events} == {
             compaction_id
@@ -7982,9 +8092,9 @@ class TestSessionsContextCompact:
             ]
             assert [payload["status"] for payload in operation_events] == [
                 "started",
-                "failed",
+                "cancelled",
             ]
-            assert [payload["status"] for payload in terminal_events] == ["failed"]
+            assert [payload["status"] for payload in terminal_events] == ["cancelled"]
             assert manager.started.is_set() is False
             assert manager.compact_calls == []
 
@@ -7997,7 +8107,7 @@ class TestSessionsContextCompact:
                 and event.payload.get("status")
                 in {"completed", "skipped", "failed", "cancelled", "timed_out"}
             ]
-            assert [payload["status"] for payload in replayed_terminals] == ["failed"]
+            assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
         finally:
             release_started_broadcast.set()
             manager.release.set()
@@ -8173,11 +8283,11 @@ class TestSessionsContextCompact:
             and event.payload.get("status")
             in {"completed", "skipped", "failed", "cancelled", "timed_out"}
         ]
-        assert [payload["status"] for payload in replayed_terminals] == ["failed"]
-        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "failed"
+        assert [payload["status"] for payload in replayed_terminals] == ["cancelled"]
+        assert cache_break_monitor.compaction_terminal_status(compaction_id) == "cancelled"
 
     @pytest.mark.asyncio
-    async def test_context_compact_emits_failed_when_summary_is_empty(
+    async def test_context_compact_emits_skipped_when_summary_is_empty(
         self,
         dispatcher,
         session,
@@ -8199,20 +8309,20 @@ class TestSessionsContextCompact:
         )
 
         assert res.ok is True
-        assert res.payload["status"] == "failed"
+        assert res.payload["status"] == "skipped"
         assert res.payload["reason"] == "empty_summary"
         assert res.payload["compacted"] is False
         assert res.payload["applied"] is False
         assert res.payload["durability"] == "none"
         assert res.payload["skip_reason"] == "empty_summary"
         assert res.payload["user_visible"] is True
-        assert [payload["status"] for _, payload in events] == ["started", "failed"]
+        assert [payload["status"] for _, payload in events] == ["started", "skipped"]
         assert events[-1][1]["applied"] is False
         assert events[-1][1]["durability"] == "none"
         assert events[-1][1]["reason"] == "empty_summary"
         assert [payload["status"] for _, _, payload in emitted] == [
             "started",
-            "failed",
+            "skipped",
         ]
 
     @pytest.mark.asyncio
@@ -8348,12 +8458,18 @@ class TestSessionsContextCompact:
             ctx,
         )
 
-        assert res.ok is False
-        assert res.error.code == "COMPACTION_TIMEOUT"
+        assert res.ok is True
+        assert res.payload["status"] == "skipped"
+        assert res.payload["reason"] == "compaction_deadline_exceeded"
+        assert res.payload["applied"] is False
+        assert res.payload["durability"] == "none"
         assert [payload["status"] for _, payload in events] == [
             "started",
-            "failed",
+            "skipped",
         ]
+        assert {payload["compaction_id"] for _, payload in events} == {
+            res.payload["compaction_id"],
+        }
 
     @pytest.mark.asyncio
     async def test_context_compact_emits_failed_when_compaction_raises(
@@ -8432,7 +8548,11 @@ class TestSessionsContextCompact:
     async def test_context_compact_passes_provider_config(self, dispatcher):
         session = FakeSession(session_key="agent:main:abc123", model="session/model")
         manager = FakeSessionManager([session])
-        selector = _FakeProviderSelector()
+        selected = ProviderConfig(
+            provider="openrouter", model="provider/model", api_key="provider-key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        selector = ModelSelector(SelectorConfig(primary=selected))
         ctx = make_ctx(
             session_manager=manager,
             provider_selector=selector,
@@ -8449,19 +8569,29 @@ class TestSessionsContextCompact:
         assert res.payload["summary_source"] == "fallback"
         config = manager.compact_calls[0][2]
         assert isinstance(config, CompactionConfig)
-        assert config.api_key == "provider-key"
-        assert config.model == "session/model"
-        assert config.base_url == "https://openrouter.ai/api/v1"
+        assert config.llm_plan is not None
+        target = config.llm_plan.deployment
+        connection = provider_connection_config(target.provider)
+        assert target.provider_id == "openrouter"
+        assert target.model == "session/model"
+        assert connection.api_key == "provider-key"
+        assert connection.base_url == "https://openrouter.ai/api/v1"
+        assert config.llm_plan.candidates == (target,)
+        assert selector.current_config == selected
 
     @pytest.mark.asyncio
-    async def test_context_compact_uses_model_override_on_clone_only(self, dispatcher):
+    async def test_context_compact_uses_session_model_without_mutating_selector(self, dispatcher):
         session = FakeSession(
             session_key="agent:main:abc123",
             model="session/model",
             model_override="routed/model",
         )
         manager = FakeSessionManager([session])
-        selector = _FakeProviderSelector()
+        selected = ProviderConfig(
+            provider="openrouter", model="provider/model", api_key="provider-key",
+            base_url="https://openrouter.ai/api/v1",
+        )
+        selector = ModelSelector(SelectorConfig(primary=selected))
         ctx = make_ctx(session_manager=manager, provider_selector=selector)
 
         res = await dispatcher.dispatch(
@@ -8474,9 +8604,13 @@ class TestSessionsContextCompact:
         assert res.ok is True
         config = manager.compact_calls[0][2]
         assert isinstance(config, CompactionConfig)
-        assert config.model == "routed/model"
-        assert selector.override_calls == []
-        assert selector.clone_instance.override_calls == ["routed/model"]
+        assert config.llm_plan is not None
+        assert config.llm_plan.deployment.model == "session/model"
+        assert config.llm_plan.deployment.provider_id == "openrouter"
+        assert selector.current_config == selected
+        assert selector.current_config.model == "provider/model"
+        assert session.model == "session/model"
+        assert session.model_override == "routed/model"
 
     @pytest.mark.asyncio
     async def test_context_compact_legacy_manager_reports_unknown_source(self, dispatcher):

@@ -855,6 +855,11 @@ class _RuntimeTask:
     terminal_emitted: bool = False
     # Final idempotency fence, including observer-failure cleanup paths.
     terminal_settled: bool = False
+    # Terminal claim metadata is published before the durable AgentTask row is
+    # settled.  Hydration can therefore distinguish a task that is settling
+    # from an older SQLite RUNNING projection during that short window.
+    terminal_reason: str | None = None
+    terminal_finished_at: int | None = None
     cancel_requested: bool = False
     cancel_requested_at_monotonic: float | None = None
     execution_started: bool = False
@@ -3010,16 +3015,56 @@ class TaskRuntime:
                 )
                 if task.task_id != excluding_task_id and task.cancel_requested
             )
+            # ``_mark_terminal_claimed`` changes the in-memory status before
+            # terminal persistence.  Project that claim as a terminal row so
+            # an overlapping hydrate cannot resurrect the previous durable
+            # RUNNING row.  Keep queued/running successors in the normal live
+            # projection; the overlay will select them after replacing the
+            # claimed predecessor by task id.
+            live_terminal_tasks: list[AgentTaskRecord] = []
+            candidates = (
+                *((running,) if running is not None else ()),
+                *self._pending_by_session.get(key, ()),
+            )
+            seen_terminal_ids: set[str] = set()
+            for task in candidates:
+                if (
+                    task.task_id == excluding_task_id
+                    or task.task_id in seen_terminal_ids
+                    or not task.terminal_closing
+                    or task.status not in TERMINAL_STATUSES
+                ):
+                    continue
+                record = (
+                    task.record_snapshot.model_copy(deep=True)
+                    if task.record_snapshot is not None
+                    else AgentTaskRecord(
+                        task_id=task.task_id,
+                        session_key=key,
+                        agent_id=task.envelope.agent_id,
+                        source_kind=task.envelope.source_kind.value,
+                        queue_mode=task.queue_mode,
+                        run_kind=task.run_kind,
+                        status=task.status,
+                    )
+                )
+                record.status = task.status
+                record.terminal_reason = task.terminal_reason
+                record.finished_at = task.terminal_finished_at
+                record.updated_at = max(record.updated_at, record.finished_at or 0)
+                live_terminal_tasks.append(record)
+                seen_terminal_ids.add(task.task_id)
+            terminal_tasks = tuple(
+                [*live_terminal_tasks, *self._recent_terminal_records,
+                 *self._terminal_fallback_records.values()]
+            )
         return SessionTaskSnapshot(
             running_task_id=running_task_id,
             queued_task_ids=queued_task_ids,
             cancel_requested_task_ids=cancel_requested_task_ids,
             terminal_tasks=tuple(
                 record.model_copy(deep=True)
-                for record in (
-                    *self._recent_terminal_records,
-                    *self._terminal_fallback_records.values(),
-                )
+                for record in terminal_tasks
                 if record.session_key == key and record.task_id != excluding_task_id
             ),
         )
@@ -4515,7 +4560,7 @@ class TaskRuntime:
                         provider_request_correlation=task.provider_request_correlation,
                         assistant_message_sink=(
                             task.capture_terminal_assistant_message
-                            if task.run_kind in {"channel_turn", "cron_turn"}
+                            if task.run_kind in {"channel_turn", "cron_turn", "goal"}
                             else None
                         ),
 
@@ -6457,6 +6502,8 @@ class TaskRuntime:
                 self._running_by_session.get(task.envelope.session_key) is task
             )
             task.terminal_settling = True
+            task.terminal_reason = terminal_reason
+            task.terminal_finished_at = _epoch_time_ms()
             if task.primary_input_pending:
                 task.primary_input_pending = False
                 record_primary_terminal_disposition = True

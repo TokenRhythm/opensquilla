@@ -469,7 +469,7 @@
         },
         "workspaceFiles": {
           "type": "array",
-          "maxItems": 10,
+          "maxItems": 16,
           "items": {
             "$ref": "#/$defs/ChatSendOriginalWorkspaceFileReference"
           }
@@ -716,7 +716,7 @@
         },
         "workspaceFiles": {
           "type": "array",
-          "maxItems": 10,
+          "maxItems": 16,
           "items": {
             "$ref": "#/$defs/SessionsSendOriginalWorkspaceFileReference"
           }

@@ -99,6 +99,7 @@ function mapTurnCommandError(error: unknown): TurnCommandError {
 
 /** Narrow wire port owned by this Adapter. */
 export interface TurnCommandsTransport {
+  readonly generation?: number
   request<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -490,13 +491,14 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
   }
 }
 
-function requestOptions(options?: TurnCommandRequestOptions): RpcCallOptions | undefined {
-  if (!options?.signal && options?.expectedGeneration === undefined) return undefined
+function requestOptions(options?: RpcCallOptions): RpcCallOptions | undefined {
+  if (!options?.signal && options?.expectedGeneration === undefined && !options?.recoveryClass) return undefined
   return {
     ...(options.signal ? { signal: options.signal } : {}),
     ...(options.expectedGeneration !== undefined
       ? { expectedGeneration: options.expectedGeneration }
       : {}),
+    ...(options.recoveryClass ? { recoveryClass: options.recoveryClass } : {}),
   }
 }
 
@@ -504,7 +506,7 @@ function forward<T>(
   transport: TurnCommandsTransport,
   method: string,
   params: Record<string, unknown>,
-  options?: TurnCommandRequestOptions,
+  options?: RpcCallOptions,
 ): Promise<T> {
   const rpcOptions = requestOptions(options)
   const request = rpcOptions
@@ -537,7 +539,7 @@ function forwardContract<T>(
   method: string,
   params: Record<string, unknown>,
   responseValidator: ContractValidator,
-  options?: TurnCommandRequestOptions,
+  options?: RpcCallOptions,
 ): Promise<T> {
   return forward<unknown>(transport, method, params, options).then(raw => (
     response<T>(method, responseValidator, raw)
@@ -647,12 +649,20 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
       options?: TurnCommandRequestOptions,
     ): Promise<TurnCancelResponse> => {
       const params = request as unknown as ChatAbortParams
+      const generation = options?.expectedGeneration ?? transport.generation
+      // Only a known task may bypass the health gate. Never queue a Stop or
+      // widen an unknown admission/session-tree Stop while recovering.
+      const exactTask = request.scope === 'task'
+        && Boolean(request.taskId?.trim()) && Boolean(request.sessionKey.trim())
+      const cancelOptions: RpcCallOptions | undefined = exactTask && generation !== undefined
+        ? { ...options, expectedGeneration: generation, recoveryClass: 'task-control' }
+        : options
       return forwardContract<ChatAbortResult>(
         transport,
         CHAT_ABORT_METHOD,
         params as unknown as Record<string, unknown>,
         validateChatAbortResult,
-        options,
+        cancelOptions,
       ).then(projectCancelResult)
     },
 
@@ -694,6 +704,7 @@ export function createV4TurnCommands(transport: TurnCommandsTransport): TurnComm
  * tests while production composition uses `createPrivateGatewayTransports`.
  */
 export function createV4TurnCommandsFromRpcClient(client: {
+  readonly connectionGeneration?: number
   call<T = unknown>(
     method: string,
     params?: Record<string, unknown>,
@@ -702,6 +713,7 @@ export function createV4TurnCommandsFromRpcClient(client: {
   hasRpcMethod?(method: string): boolean
 }, hasRpcMethod?: (method: string) => boolean): TurnCommands {
   return createV4TurnCommands({
+    get generation() { return client.connectionGeneration },
     request: (method, params, options) => options
       ? client.call(method, params, options)
       : client.call(method, params),

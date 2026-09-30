@@ -128,7 +128,7 @@ async def test_new_avoids_mid_turn_cut():
 async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     """Turn-boundary cut must match the Agent's flattened tool-use entries."""
     entries = [
-        {"role": "user", "content": "old context", "token_count": 1_000},
+        {"role": "user", "content": "old context " * 200, "token_count": 1_000},
         {"role": "user", "content": "q1", "token_count": 100},
         {"role": "assistant", "content": "[Used tool: read_file]", "token_count": 5},
         {
@@ -142,7 +142,7 @@ async def test_new_avoids_mid_turn_cut_for_agent_flattened_tool_blocks():
     request = CompactionRequest(
         session_id="agent-flattened-boundary-test",
         entries=entries,
-        # Keep q1's complete tool round within the 20% raw-tail target.
+        # Keep q1's complete tool round within the consumer's raw-tail budget.
         context_window_tokens=750,
         config=synthetic_compaction_config(safety_margin=1.0),
     )
@@ -226,9 +226,9 @@ async def test_new_prev_summary_marker_remains_backward_compatible():
     assert "__prev_summary__:" not in result.summary
     assert config.llm_plan is not None
     [(messages, _, chat_config)] = config.llm_plan.primary.provider.calls
-    assert "[Existing portable checkpoint to replace]\nprior context here" in messages[0].content
-    assert "normal instructions" in messages[0].content
-    assert "__prev_summary__:" not in messages[0].content + chat_config.system
+    assert "<previous-summary>\nprior context here\n</previous-summary>" in messages[-1].content
+    assert "normal instructions" in messages[-1].content
+    assert "__prev_summary__:" not in messages[-1].content + chat_config.system
 
 
 @pytest.mark.asyncio

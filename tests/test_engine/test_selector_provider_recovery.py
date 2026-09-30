@@ -190,6 +190,12 @@ async def clock(monkeypatch):
         await real_sleep(0)
 
     monkeypatch.setattr(loop, "time", lambda: now[0])
+    from opensquilla.provider import retry_after
+
+    monkeypatch.setattr(
+        retry_after, "_provider_retry_after_cooldowns",
+        retry_after.ProviderRetryAfterCooldowns(clock=loop.time),
+    )
     monkeypatch.setattr("opensquilla.engine.fallback.asyncio.sleep", sleep)
     return now, delays
 

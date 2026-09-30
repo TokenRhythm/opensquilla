@@ -10,7 +10,7 @@ import { isTransientDownloadError, prepareAttempt, prepareWithRetry } from './pr
 
 const noWait = { sleep: async () => {}, warn: () => {} }
 
-for (const statusCode of [502, 503, 504]) {
+for (const statusCode of [500, 502, 503, 504]) {
   test(`HTTP ${statusCode} retries preparation, not tests`, async () => {
     let calls = 0
     const pauses = []
@@ -51,6 +51,7 @@ test('retry policy recognizes only selected structured network failures', () => 
   for (const code of ['ETIMEDOUT', 'ESOCKETTIMEDOUT', 'ECONNRESET', 'EAI_AGAIN']) {
     assert.equal(isTransientDownloadError({ code }), true)
   }
+  assert.equal(isTransientDownloadError({ statusCode: 500 }), true)
   assert.equal(isTransientDownloadError({ response: { statusCode: 504 } }), true)
   assert.equal(isTransientDownloadError(new Error('504 appears in assertion text')), false)
   assert.equal(isTransientDownloadError({ statusCode: 401 }), false)

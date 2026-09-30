@@ -76,6 +76,13 @@ export function createAppAutomaticRpc(options: AppAutomaticRpcOptions) {
     schedule()
   }
 
+  function connectionHealthChanged(health: 'healthy' | 'suspect') {
+    // A suspect transport can keep availability='available', so the existing
+    // availability watcher does not flush a sidebar read when liveness returns.
+    // Reuse the bounded, coalesced foreground path only on healthy recovery.
+    if (health === 'healthy') foreground()
+  }
+
   async function resume() {
     if (!admitted()) return
     const current = ++generation
@@ -142,5 +149,14 @@ export function createAppAutomaticRpc(options: AppAutomaticRpcOptions) {
     options.cancelSidebar()
   }
 
-  return { mount, load, schedule, foreground, availabilityChanged, admissionChanged, dispose }
+  return {
+    mount,
+    load,
+    schedule,
+    foreground,
+    connectionHealthChanged,
+    availabilityChanged,
+    admissionChanged,
+    dispose,
+  }
 }
