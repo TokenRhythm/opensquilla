@@ -12,6 +12,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - Browser Use (Beta) in Desktop: built-in browser tools and a browser Workbench
   for browsing and interacting with pages during a task.
+- Scoped thinking controls in model configuration.
+
+### Changed
+
+- Manual and automatic compaction share model-aware request budgets, including
+  instructions, tools, and attachments. Failed summaries can fall back to bounded
+  request-local history while preserving the saved transcript and live tool state.
+  Legacy independent compaction capacity and model overrides no longer control it.
+- Large text pastes become text attachments. Gateway diagnostics are consolidated
+  in Settings, and conversation/activity presentation is clearer.
 
 ### Removed
 
@@ -30,6 +40,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 - More reliable Gateway connections, task recovery, Stop/Queue/Steer handling,
   Goal continuation, provider streams, and bounded conversation-history recovery.
+- Bounded database and history work reduces blocking during delivery recovery;
+  Desktop startup, second-instance activation, Windows Safe setup prompts, and
+  macOS terminal descendant cleanup are more reliable.
+- Newly created chats and first-message sidebar labels remain visible; model
+  catalogs remain authoritative and responsive while refreshing.
 - Desktop local-file selection no longer silently loses a selection after an
   unchanged session refresh. Explicit file references display short filenames
   in the composer and sent messages, including after reload or editing, while

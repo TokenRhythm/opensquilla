@@ -325,17 +325,27 @@ async function reportOnboardingFailure(app, phase, error) {
 async function setupWindow(app) {
   let phase = 'setup-window'
   try {
+    const context = onboardingDiagnosticContexts.get(app)
+    const timeoutMs = context ? context.startupDeadline - Date.now() : 60_000
+    if (timeoutMs <= 0) {
+      throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+    }
     // Fresh onboarding opens before its first Gateway spawn. The client
     // renderer is already mounted, while Gateway readiness waits for save,
-    // skip, or close.
-    return await waitFor(async () => {
+    // skip, or close. Profile inspection consumes the same absolute launch
+    // budget as readyDesktopWindow; do not start a separate 60s cutoff here.
+    const page = await waitFor(async () => {
       for (const page of app.windows()) {
         if (page.isClosed()) continue
         await page.waitForLoadState('domcontentloaded', { timeout: 5_000 }).catch(() => {})
         if (await page.locator('#setup-form').count().catch(() => 0)) return page
       }
       return null
-    }, 'desktop onboarding window')
+    }, 'desktop onboarding window', timeoutMs)
+    if (context && Date.now() >= context.startupDeadline) {
+      throw new Error(`Desktop startup exceeded its ${INITIAL_DESKTOP_STARTUP_BUDGET_MS}ms launch budget.`)
+    }
+    return page
   } catch (error) {
     await reportOnboardingFailure(app, phase, error)
     throw error

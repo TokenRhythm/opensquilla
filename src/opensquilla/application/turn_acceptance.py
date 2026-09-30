@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import replace
 from functools import partial
-from typing import Any, cast
+from typing import Any, TypedDict, cast
 
 import structlog
 
@@ -63,6 +63,12 @@ from opensquilla.run_mode import RunMode
 
 log = structlog.get_logger(__name__)
 _SESSION_ROUTING_MODES = frozenset({"direct", "router", "ensemble"})
+
+
+class _TranscriptMetadata(TypedDict, total=False):
+    workspace_files: list[dict[str, Any]]
+    selected_skills: list[dict[str, str]]
+    local_path_references: list[str]
 
 
 class DurableTurnAdmission:
@@ -863,6 +869,14 @@ async def _accept_turn_in_scope(
         display_text = command.message
     provider_message_text = message_text
 
+    transcript_metadata: _TranscriptMetadata = {}
+    if workspace_files:
+        transcript_metadata["workspace_files"] = workspace_files
+    if command.selected_skills:
+        transcript_metadata["selected_skills"] = list(command.selected_skills)
+    if command.local_path_references:
+        transcript_metadata["local_path_references"] = list(command.local_path_references)
+
     prepared_route = await ports.prepare_route(
         command,
         session=session,
@@ -1110,11 +1124,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
-                **({"workspace_files": workspace_files} if workspace_files else {}),
-                **({"selected_skills": list(command.selected_skills)}
-                   if command.selected_skills else {}),
-                **({"local_path_references": list(command.local_path_references)}
-                   if command.local_path_references else {}),
+                **transcript_metadata,
             )
 
         assert callable(prepare_message)
@@ -1919,11 +1929,7 @@ async def _accept_turn_in_scope(
                 persist_enabled=persist_enabled,
                 disk_budget_bytes=disk_budget if isinstance(disk_budget, int) else None,
                 page_context=page_context,
-                **({"workspace_files": workspace_files} if workspace_files else {}),
-                **({"selected_skills": list(command.selected_skills)}
-                   if command.selected_skills else {}),
-                **({"local_path_references": list(command.local_path_references)}
-                   if command.local_path_references else {}),
+                **transcript_metadata,
             )
             legacy_persisted_entry = await session_manager.append_message(
                 key,

@@ -471,7 +471,7 @@ describe('explicit skill send boundaries', () => {
     accepted({ sessionKey: 'agent:main:webchat:test', task_id: 'task-one' })
     await sending
     expect(result.options.consumeAcceptedDraft).toHaveBeenCalledExactlyOnceWith(
-      'agent:main:webchat:test', { text: 'Make a table', selectedSkills: [skill] },
+      'agent:main:webchat:test', { text: 'Make a table', selectedSkills: [skill], localPathReferences: [] },
     )
     expect(result.options.selectedSkills!.value).toEqual([other])
     expect(result.options.inputText.value).toBe('Other session')

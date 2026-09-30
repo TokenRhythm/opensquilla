@@ -104,9 +104,9 @@ class Result(BaseModel):
     pendingInputId: StrictStr
     revision: _JsonInteger = Field(..., ge=1)
     localPathReferences: list[LocalPathReference] = Field(
-        None,
+        None,  # type: ignore[arg-type]
         description='Display-only explicit local paths matching the canonical message suffix; no file access authority.',
-    )  # type: ignore[assignment, arg-type]
+    )  # type: ignore[assignment]
     selectedSkills: list[SelectedSkillRef] = Field(None, max_length=16)  # type: ignore[assignment, arg-type]
 
 

@@ -334,6 +334,8 @@ class GatewaySteeringPrimitives:
             raise TypeError("Durable steering preparation requires a native transcript entry")
         canonical_message = None
         if context.local_path_references:
+            if not isinstance(entry.content, str):
+                raise TypeError("Local-path steering requires a persisted text envelope")
             canonical_message = json.loads(entry.content)["text"]
         return PreparedSteeringInput(entry, epoch, canonical_message)
 

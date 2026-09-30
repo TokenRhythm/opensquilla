@@ -149,6 +149,23 @@ def test_fresh_onboarding_runs_before_gateway_without_changing_existing_prompt_p
     assert "modal: true" not in run
 
 
+def test_onboarding_harness_uses_one_launch_deadline_before_and_after_setup() -> None:
+    source = (ROOT / "desktop/electron/scripts/test-onboarding-flow.mjs").read_text(
+        encoding="utf-8",
+    )
+    setup = _section(source, "async function setupWindow", "async function bootWindow")
+    ready = _section(
+        source, "async function readyDesktopWindow", "async function installPendingSaveStub",
+    )
+    assert "context.startupDeadline - Date.now()" in setup
+    assert "context.startupDeadline - Date.now()" in ready
+    assert "'desktop onboarding window', timeoutMs" in setup
+    assert "if (timeoutMs <= 0)" in setup
+    assert "Date.now() >= context.startupDeadline" in setup
+    assert "startupDeadline:" not in setup
+    assert "startupReady = true" not in setup
+
+
 def test_onboarding_skip_is_trusted_and_does_not_quit_the_client() -> None:
     source = _main_source()
     skip = _section(

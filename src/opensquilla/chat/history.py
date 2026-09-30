@@ -278,7 +278,7 @@ def transcript_entries_to_chat_messages(
         prompt_annotations = None
         page_context = None
         selected_skills = None
-        local_path_references = ()
+        local_path_references: tuple[str, ...] = ()
         if content and content.startswith("{"):
             try:
                 parsed = json.loads(content)
