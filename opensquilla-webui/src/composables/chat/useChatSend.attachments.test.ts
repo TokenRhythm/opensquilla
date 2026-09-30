@@ -14,6 +14,7 @@ import { useChatTaskOwnership } from './useChatTaskOwnership'
 import { useChatMessageActions } from './useChatMessageActions'
 import { useChatAttachments } from './useChatAttachments'
 import { useChatDraftPersistence } from './useChatDraftPersistence'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import { attachmentDraftKey, type AttachmentDraftStore } from '@/utils/chat/attachmentDrafts'
 import type {
   Attachment,
@@ -249,6 +250,159 @@ function usageReplayMessages(): ChatMessage[] {
     },
   ]
 }
+
+describe('useChatSend with explicit local path drafts', () => {
+  it.each(['Compare these files', ''])('sends canonical text once and clears visible text and paths: %s', async body => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = body
+    draft.appendLocalPaths('C:\\项目\\report.pdf\nC:\\Downloads\\comparison.html')
+    const canonical = [body, 'C:\\项目\\report.pdf', 'C:\\Downloads\\comparison.html'].filter(Boolean).join('\n')
+    const paths = [...draft.localPaths.value]
+    const { api, rpc, options } = makeOptions({ inputText: draft.inputText, localPathReferences: draft.localPaths })
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledExactlyOnceWith('chat.send', expect.objectContaining({
+      message: canonical,
+      localPathReferences: paths,
+    }), expect.objectContaining({ expectedGeneration: 1, signal: expect.any(AbortSignal) }))
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('attachments')
+    expect(rpc.call.mock.calls[0]?.[1]).not.toHaveProperty('workspaceFiles')
+    expect(options.messages.value.filter(message => message.role === 'user')).toEqual([
+      expect.objectContaining({ text: canonical, localPathReferences: paths }),
+    ])
+    expect(draft.composerText.value).toBe('')
+    expect(draft.localPaths.value).toEqual([])
+    expect(draft.inputText.value).toBe('')
+  })
+
+  it('keeps the original request snapshot and preserves a newer draft across a delayed ACK', async () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = 'Review the original report'
+    draft.appendLocalPaths('C:\\项目\\original.pdf')
+    const original = draft.inputText.value
+    let accept!: (response: { sessionKey: string }) => void
+    const rpc = { call: vi.fn((_method: string, _params: unknown) => new Promise<{ sessionKey: string }>(resolve => { accept = resolve })) }
+    const { api, options } = makeOptions({ inputText: draft.inputText, localPathReferences: draft.localPaths, rpc })
+    const sending = api.onSend()
+    await vi.waitFor(() => expect(rpc.call).toHaveBeenCalledOnce())
+    expect(rpc.call.mock.calls[0]?.[1]).toMatchObject({ message: original, localPathReferences: ['C:\\项目\\original.pdf'] })
+
+    draft.composerText.value = 'Now compare the next report'
+    draft.appendLocalPaths('C:\\项目\\next.pdf')
+    accept({ sessionKey: options.sessionKey.value })
+    await sending
+
+    expect(rpc.call).toHaveBeenCalledOnce()
+    expect(rpc.call.mock.calls[0]?.[1]).toMatchObject({ message: original })
+    expect(options.messages.value.filter(message => message.role === 'user')).toEqual([
+      expect.objectContaining({ text: original, localPathReferences: ['C:\\项目\\original.pdf'] }),
+    ])
+    expect(draft.composerText.value).toBe('Now compare the next report')
+    expect(draft.localPaths.value).toEqual(['C:\\项目\\next.pdf'])
+    expect(draft.inputText.value).toBe('Now compare the next report\nC:\\项目\\next.pdf')
+  })
+
+  it('forwards the captured references to a busy queue', async () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = 'Review this file'
+    draft.appendLocalPaths('C:\\项目\\queued.pdf')
+    const original = draft.inputText.value
+    const enqueuePendingInput = vi.fn(() => true)
+    const { api, options, rpc } = makeOptions({
+      inputText: draft.inputText,
+      localPathReferences: draft.localPaths,
+      enqueuePendingInput,
+    })
+    options.stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(enqueuePendingInput).toHaveBeenCalledExactlyOnceWith(original, undefined, {
+      localPathReferences: ['C:\\项目\\queued.pdf'],
+    })
+    expect(rpc.call).not.toHaveBeenCalled()
+    api.dispose()
+  })
+
+  it('restores reference chips on known rejection and retries the immutable original metadata', async () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = 'Review this report'
+    draft.appendLocalPaths('C:\\项目\\retry.pdf')
+    const original = draft.inputText.value
+    const send = vi.fn<TurnCommands['send']>()
+      .mockRejectedValueOnce(new TurnCommandError('unavailable', 'Retry this request', 'TEMPORARY', false, true))
+      .mockResolvedValue({ sessionKey: 'agent:main:webchat:test' })
+    const commands: TurnCommands = { send, steer: vi.fn(), cancel: vi.fn(), supports: () => true }
+    const { api } = makeOptions({
+      inputText: draft.inputText, localPathReferences: draft.localPaths, restoreInput: draft.restoreInput,
+      turnCommands: commands,
+    })
+
+    await api.onSend()
+    expect(draft.composerText.value).toBe('Review this report')
+    expect(draft.localPaths.value).toEqual(['C:\\项目\\retry.pdf'])
+    expect(draft.inputText.value).toBe(original)
+    await api.onSend()
+
+    expect(send).toHaveBeenCalledTimes(2)
+    expect(send.mock.calls[1]?.[0]).toEqual(send.mock.calls[0]?.[0])
+    expect(send.mock.calls[1]?.[0]).toMatchObject({ params: {
+      message: original, localPathReferences: ['C:\\项目\\retry.pdf'],
+    } })
+    api.dispose()
+  })
+
+  it('sends queued reference metadata without borrowing references from the current draft', async () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = 'Do not send this draft'
+    draft.appendLocalPaths('C:\\项目\\later.pdf')
+    const { api, rpc, options } = makeOptions({ inputText: draft.inputText, localPathReferences: draft.localPaths })
+    const queuedText = 'Queued report\nC:\\项目\\queued.pdf'
+    const queued: ChatPendingItem = {
+      pendingUiId: 'queued-paths', text: queuedText, attachments: [], intent: null,
+      ownerSessionKey: options.sessionKey.value, localPathReferences: ['C:\\项目\\queued.pdf'],
+    }
+
+    await api.sendQueuedFollowup(queued)
+
+    expect(rpc.call).toHaveBeenCalledWith('chat.send', expect.objectContaining({
+      message: queuedText, localPathReferences: ['C:\\项目\\queued.pdf'],
+    }), expect.anything())
+    expect(options.messages.value.find(message => message.role === 'user')).toMatchObject({
+      text: queuedText, localPathReferences: ['C:\\项目\\queued.pdf'],
+    })
+    expect(draft.localPaths.value).toEqual(['C:\\项目\\later.pdf'])
+    api.dispose()
+  })
+
+  it('retains references on same-turn steer without changing the full message text', async () => {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = 'Also read this report'
+    draft.appendLocalPaths('C:\\项目\\steer.pdf')
+    const original = draft.inputText.value
+    const rpc = { call: vi.fn().mockResolvedValue({
+      accepted: true, replayed: false, turn_id: 'turn-current',
+      user_message_id: 'user-steer-files', disposition: 'steering',
+    }) }
+    const { api, options, stream } = makeOptions({
+      ...sameTurnSteerOptions(), rpc, busySendMode: ref<BusySendMode>('steer'),
+      inputText: draft.inputText, localPathReferences: draft.localPaths,
+    })
+    stream.isStreaming.value = true
+
+    await api.onSend()
+
+    expect(rpc.call).toHaveBeenCalledWith('sessions.steer.v2', expect.objectContaining({
+      message: original, localPathReferences: ['C:\\项目\\steer.pdf'],
+    }), expect.anything())
+    expect(options.messages.value.find(message => message.role === 'user')).toMatchObject({
+      text: original, localPathReferences: ['C:\\项目\\steer.pdf'],
+    })
+    expect(draft.localPaths.value).toEqual([])
+    api.dispose()
+  })
+})
 
 describe('useChatSend durable application lifetime integration', () => {
   it.each([null, 'synthetic-fork-anchor'])('gives an explicitly resent stopped draft fresh IDs, including handoff %s', async fork => {

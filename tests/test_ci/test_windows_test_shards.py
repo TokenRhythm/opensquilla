@@ -491,10 +491,24 @@ def test_task_runtime_leak_smoke_is_marked_ci_serial() -> None:
     )
 
 
+@pytest.mark.parametrize("function_name", [
+    "test_real_node_metadata_imports_unchanged_image_on_python",
+    "test_electron_embedded_node_metadata_imports_unchanged_image",
+])
+def test_native_attachment_runtime_parity_is_marked_ci_serial(function_name: str) -> None:
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_gateway/test_native_attachment_import.py"), function_name,
+    )
+
+
 def test_runner_saturated_subprocess_contracts_are_marked_ci_serial() -> None:
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_desktop/test_gateway_functional_probes.py"),
         "test_mcp_probe_uses_real_stdio_server_and_gateway",
+    )
+    assert "pytest.mark.ci_serial" in _function_decorators(
+        Path("tests/test_live_provider_profile_gateway_e2e.py"),
+        "test_attachment_capacity_runner_reaches_provider_through_real_gateway",
     )
     assert "pytest.mark.ci_serial" in _function_decorators(
         Path("tests/test_live_provider_profile_gateway_e2e.py"),
@@ -624,8 +638,9 @@ def test_recovery_close_probes_are_explicitly_serial(function_name: str) -> None
 @pytest.mark.parametrize(("target", "serial_count"), [
     ("tests/test_telemetry/test_client_runtime.py", 5),
     ("tests/test_session/test_recovery_reads.py", 9),
+    ("tests/test_gateway/test_native_attachment_import.py", 3),
 ])
-def test_sqlite_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
+def test_process_probe_collection_is_complete_and_disjoint(target: str, serial_count: int) -> None:
     """Exercise actual pytest collection, not fixture-setup-time marker changes."""
     def collect(marker: str | None) -> set[str]:
         command = [sys.executable, "-m", "pytest", target, "--collect-only", "-q"]

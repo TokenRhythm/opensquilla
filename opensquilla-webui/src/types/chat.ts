@@ -84,6 +84,7 @@ export interface ChatDocumentContext {
 export interface SessionSteerV2Params {
   key: string
   message: string
+  localPathReferences?: string[]
   expected_turn_id: string
   client_request_id: string
   client_message_id: string
@@ -160,6 +161,7 @@ export interface ChatPendingItem {
   /** Stable local identity for keyed rendering and UI actions across peer edits. */
   pendingUiId: string
   text: string
+  localPathReferences?: string[]
   /** Annotation batch retained when a follow-up is queued behind an active turn. */
   draftIds?: string[]
   /** Upgrade recovery requires the user to select the page again before sending. */
@@ -671,6 +673,8 @@ export interface ChatMaintenanceEvent {
 export interface ChatMessage {
   role: ChatRole
   text: string
+  /** Explicit local selections; presentation only, canonical paths remain in text. */
+  localPathReferences?: string[]
   ts: string | number | null
   /** Stable client-only identity for optimistic rows before the backend assigns messageId. */
   clientId?: string
@@ -786,6 +790,7 @@ export interface ChatRenderedMessage {
   displayRole: string
   roleLabel: string
   text: string
+  localPathReferences?: string[]
   timeStr: string
   /** Raw message timestamp (epoch ms or ISO string) so components can derive a
    *  live relative + absolute label without re-running the renderedMessages map. */

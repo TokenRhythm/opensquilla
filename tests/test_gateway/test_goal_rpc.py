@@ -826,6 +826,35 @@ async def test_set_is_atomic_emits_one_goal_event_and_creates_no_plan_state(
         assert await _plan_row_count(stack.storage, "plan_runs") == 0
 
 
+async def test_goal_set_keeps_local_path_display_metadata_in_history_and_identity(tmp_path):
+    from opensquilla.chat.history import transcript_entries_to_chat_messages
+
+    paths = [r"C:\fixtures\report.pdf"]
+    objective = "Summarize this report\n" + paths[0]
+    runs = []
+
+    async def handler(run):
+        runs.append(run)
+
+    async with _open_goal_rpc_stack(tmp_path / "goal-paths.db", handler=handler) as stack:
+        params = {**_set_params(), "objective": objective, "localPathReferences": paths}
+        response = await _handle_goals_set(params, stack.context)
+        await stack.runtime.wait(response["taskId"], timeout=2.0)
+        replay = await _handle_goals_set(params, stack.context)
+        assert replay["taskId"] == response["taskId"]
+        transcript = await stack.manager.get_transcript(SOURCE_KEY)
+        assert len(transcript) == 1
+        payload = json.loads(transcript[0].content)
+        assert payload["text"] == objective
+        assert payload["local_path_references"] == paths
+        projected = transcript_entries_to_chat_messages(transcript)[0]
+        assert projected["text"] == objective
+        assert projected["localPathReferences"] == paths
+        assert len(runs) == 1 and runs[0].message == objective
+        with pytest.raises(RpcHandlerError):
+            await _handle_goals_set({**params, "localPathReferences": []}, stack.context)
+
+
 @pytest.mark.asyncio
 async def test_set_post_accept_notification_failure_still_activates_durable_task(
     tmp_path: Path,

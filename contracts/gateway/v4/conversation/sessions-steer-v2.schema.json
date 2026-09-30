@@ -32,6 +32,7 @@
       "title": "sessions.steer.v2 params", "type": "object", "additionalProperties": true,
       "required": ["message"],
       "properties": {
+        "localPathReferences": { "type": "array", "items": { "type": "string", "minLength": 1, "maxLength": 32768 } },
         "key": { "type": ["string", "null"] }, "sessionKey": { "type": ["string", "null"] }, "session_key": { "type": ["string", "null"] },
         "message": { "type": "string" }, "expected_turn_id": { "type": ["string", "null"] }, "expectedTurnId": { "type": ["string", "null"] },
         "client_request_id": { "type": ["string", "null"] }, "clientRequestId": { "type": ["string", "null"] },

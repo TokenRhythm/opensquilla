@@ -1,4 +1,5 @@
 import { copySelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { nextTick, type Ref } from 'vue'
 import type {
   ChatMessage,
@@ -18,6 +19,8 @@ import type { AssistantPresentationProvenance } from '@/utils/chat/silentSentine
 export interface UseChatMessageActionsOptions {
   messages: Ref<ChatMessage[]>
   inputText: Ref<string>
+  localPathReferences?: Ref<string[]>
+  restoreInput?: (text: string, paths?: readonly string[]) => void
   selectedSkills?: Ref<SelectedSkillRef[]>
   isStreaming: Ref<boolean>
   sanitizeCopyText: (text: string, opts?: {
@@ -29,6 +32,7 @@ export interface UseChatMessageActionsOptions {
   sendCurrentInput: () => void
   sendUsageBarrierReplay: (payload: {
     selectedSkills?: SelectedSkillRef[]
+    localPathReferences?: string[]
     text: string
     forkBeforeMessageId: string
   }) => Promise<boolean>
@@ -59,6 +63,8 @@ interface EditRestorePoint {
   inputText: string
   /** What edit put in the composer, so cancel can tell it apart from newer text. */
   editedText: string
+  localPathReferences: string[]
+  editedLocalPathReferences: string[]
   selectedSkills: SelectedSkillRef[]
   editedSkills: SelectedSkillRef[]
   /** Ties the restore point to the edit that made it; see `cancelEdit`. */
@@ -67,6 +73,11 @@ interface EditRestorePoint {
 
 export function useChatMessageActions(options: UseChatMessageActionsOptions) {
   let editRestorePoint: EditRestorePoint | null = null
+
+  function restoreInput(text: string, paths?: readonly string[]) {
+    if (options.restoreInput) options.restoreInput(text, paths)
+    else options.inputText.value = text
+  }
 
   function discardEditRestorePoint() {
     editRestorePoint = null
@@ -194,6 +205,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     if (usageBarrierRetry) {
       return options.sendUsageBarrierReplay({
         text: userText,
+        ...(userMessage?.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(userMessage.localPathReferences, userText) } : {}),
         ...(userMessage?.selectedSkills?.length ? { selectedSkills: copySelectedSkills(userMessage.selectedSkills) } : {}),
         forkBeforeMessageId,
       })
@@ -208,7 +220,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, userMsgIndex)
     if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(userMessage?.selectedSkills)
-    options.inputText.value = userText
+    restoreInput(userText, userMessage?.localPathReferences)
     options.autoResizeTextarea()
     nextTick(() => options.sendCurrentInput())
     return true
@@ -245,6 +257,8 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
       messages: continuesEdit ? previous.messages : options.messages.value,
       inputText: continuesEdit ? previous.inputText : options.inputText.value,
       editedText: text,
+      localPathReferences: continuesEdit ? previous.localPathReferences : copyLocalPathReferences(options.localPathReferences?.value, options.inputText.value),
+      editedLocalPathReferences: copyLocalPathReferences(sourceMessage.localPathReferences, text),
       selectedSkills: continuesEdit ? previous.selectedSkills : copySelectedSkills(options.selectedSkills?.value),
       editedSkills: copySelectedSkills(sourceMessage?.selectedSkills),
       forkBeforeMessageId,
@@ -252,7 +266,7 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     options.pendingForkBeforeMessageId.value = forkBeforeMessageId
     options.messages.value = options.messages.value.slice(0, msgIndex)
     if (options.selectedSkills) options.selectedSkills.value = copySelectedSkills(sourceMessage?.selectedSkills)
-    options.inputText.value = text
+    restoreInput(text, sourceMessage.localPathReferences)
     options.autoResizeTextarea()
     options.focusComposer()
   }
@@ -285,8 +299,9 @@ export function useChatMessageActions(options: UseChatMessageActionsOptions) {
     // Anything else in the composer arrived afterwards — a message popped off
     // the pending queue, a draft recovered from a rejected send — and belongs
     // to the user, not to the edit being cancelled.
-    if (options.inputText.value === restore.editedText) {
-      options.inputText.value = restore.inputText
+    if (options.inputText.value === restore.editedText
+      && (!options.localPathReferences || JSON.stringify(options.localPathReferences.value) === JSON.stringify(restore.editedLocalPathReferences))) {
+      restoreInput(restore.inputText, restore.localPathReferences)
     }
     if (options.selectedSkills && sameSelectedSkills(options.selectedSkills.value, restore.editedSkills)) {
       options.selectedSkills.value = copySelectedSkills(restore.selectedSkills)

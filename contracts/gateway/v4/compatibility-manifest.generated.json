@@ -329,13 +329,13 @@
       "lifecycle": "stable",
       "name": "chat.history",
       "schema": "conversation/chat-history.schema.json",
-      "schemaSha256": "002c2ff35590541bd8d41fbad57dc422a8c9944ced6b404381b4b7a70b9a1493"
+      "schemaSha256": "ca3f16ca78871c9faf2dfe85a1513c18dd0651815fa34a7bfe5d252807040b6d"
     },
     {
       "lifecycle": "stable",
       "name": "chat.send",
       "schema": "conversation/chat-send.schema.json",
-      "schemaSha256": "58e58aa6137171e149d1412bf4215a7c3ab10a26443596b9bb080952dc26fc2d"
+      "schemaSha256": "bf864ed2edd2f1db03a39cdfc101c531254d42ac5552beaec75d8d867acef460"
     },
     {
       "lifecycle": "stable",
@@ -512,7 +512,7 @@
       "lifecycle": "stable",
       "name": "goals.set",
       "schema": "goals/goals-set.schema.json",
-      "schemaSha256": "943c4c0924468446aa69d65737785cbcdacc4236b77d98d49e88e452b1618e5e"
+      "schemaSha256": "e53eda1321b6f5ab6fd0cf0f7848bce2007ba08a6464acec19196820cffa04b2"
     },
     {
       "lifecycle": "stable",
@@ -1073,19 +1073,19 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.enqueue",
       "schema": "sessions/sessions-pending-inputs-enqueue.schema.json",
-      "schemaSha256": "041aa01fc8d25bd047e535f12bf38596e77ea2e3f276609dcb091325587cfe88"
+      "schemaSha256": "47896ecf01187a1485d0d5b6b46017d0b1727c9fb04983c986898ad9bfe97ad9"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.list",
       "schema": "sessions/sessions-pending-inputs-list.schema.json",
-      "schemaSha256": "ba6abef01b76b4bd69544864083affab55b961835d4a00a40274d80be6bb657f"
+      "schemaSha256": "0840011aeaed13fe50ca4adc89d0dd3a3273d8f6682ca6c370c705b1ef867c06"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.reorder",
       "schema": "sessions/sessions-pending-inputs-reorder.schema.json",
-      "schemaSha256": "49b3683518f07bacb992b94a7901f7b9a98dd22b078e23e84e9b38068c114e7b"
+      "schemaSha256": "4b9f51b55fe1803433a50add258deeb30d1ed5b823dfcaceade4c8aa47889be3"
     },
     {
       "lifecycle": "stable",
@@ -1097,7 +1097,7 @@
       "lifecycle": "stable",
       "name": "sessions.pending_inputs.update",
       "schema": "sessions/sessions-pending-inputs-update.schema.json",
-      "schemaSha256": "aaed6f71fb06837171afc77da20031a65eb41706fd4593cfa36ce5846ecfe1ac"
+      "schemaSha256": "37f247bc0398b7cad5943e97e20a194e110d9afa85535dac7bc877682cab9c81"
     },
     {
       "lifecycle": "stable",
@@ -1175,13 +1175,13 @@
       "lifecycle": "stable",
       "name": "sessions.send",
       "schema": "conversation/sessions-send.schema.json",
-      "schemaSha256": "64ff9920dcd8cba72d5c8627adc58ea319ac17b0700791f0139269edb2b0e808"
+      "schemaSha256": "c06e5a2c566787c6c99dc92ea9752e1b418d7502cb556f3958acf41b9897d1cd"
     },
     {
       "lifecycle": "stable",
       "name": "sessions.steer.v2",
       "schema": "conversation/sessions-steer-v2.schema.json",
-      "schemaSha256": "41c89c01075b7f6d7661edf098e589c2d8b1a3f42cee74f20fec9b4aa78da415"
+      "schemaSha256": "401d8083f726a85011ca7c660392614b5241201aeb64507edfc4f02572b4d174"
     },
     {
       "lifecycle": "stable",
@@ -1295,7 +1295,7 @@
       "lifecycle": "stable",
       "name": "turns.receipt.get",
       "schema": "conversation/turns-receipt-get.schema.json",
-      "schemaSha256": "faec382d7a2f2ce12b8a6420c5c586aaf7d243392f13332ef02a61f3ce519d41"
+      "schemaSha256": "58fe612c20da401e5aae351b8bb2f066e5d5b66d19c4dd29a27fbbbfd791e548"
     },
     {
       "lifecycle": "stable",
@@ -1385,10 +1385,10 @@
   "protocol": "opensquilla-websocket-json",
   "source": {
     "eventFamilyCount": 10,
-    "generatorSha256": "521611c8df1bbb5c92e18cb16a075e738dc6febcfce44d12bb32b094aceb9c49",
+    "generatorSha256": "882d6080cbd9c4557a5ac8239b13fcc8a4324186348ee9949895699f34bf9f97",
     "methodCount": 202,
     "schemaCount": 212,
-    "schemaTreeSha256": "fe7aa03045d087526596c768575dabed487bde5f24a31193ef1b6e2f98979e1a",
+    "schemaTreeSha256": "31682559ddd0a36d2d72b7a5b89233e97fbf8a1904bd2af66a4e25baeeb1f08d",
     "toolchains": {
       "legacyTypes": {
         "python": {

@@ -77,6 +77,8 @@ def pending_input_payload(turn: AdmitTurn, confirmed_plain_text: bool) -> dict[s
         payload["pageContext"] = turn.page_context
     if turn.selected_skills:
         payload["selectedSkills"] = list(turn.selected_skills)
+    if turn.local_path_references:
+        payload["localPathReferences"] = list(turn.local_path_references)
     return payload
 
 
@@ -131,6 +133,8 @@ def pending_input_projection(
         result["pageContext"] = payload["pageContext"]
     if payload.get("selectedSkills"):
         result["selectedSkills"] = payload["selectedSkills"]
+    if payload.get("localPathReferences"):
+        result["localPathReferences"] = payload["localPathReferences"]
     routing = payload.get("initialRoutingMode")
     if isinstance(routing, str):
         result["initialRoutingMode"] = routing

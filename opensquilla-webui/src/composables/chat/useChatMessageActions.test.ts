@@ -5,6 +5,7 @@ import { nextTick, ref } from 'vue'
 
 import { useChatMessageActions, type UseChatMessageActionsOptions } from './useChatMessageActions'
 import { useChatTextRendering } from './useChatTextRendering'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type {
   ChatMessage,
   ChatRenderedMessage,
@@ -91,6 +92,45 @@ beforeEach(() => {
 })
 
 describe('useChatMessageActions branching edits', () => {
+  it('restores message reference chips for edit, and the prior draft on cancellation', () => {
+    const path = 'C:\\资料\\book.pdf'
+    const draftPath = 'C:\\draft.html'
+    const { options } = makeOptions([{ role: 'user', text: `Read\n${path}`, ts: null,
+      messageId: 'durable', localPathReferences: [path] }])
+    const draft = useLocalPathDraft()
+    draft.restoreInput(`Draft\n${draftPath}`, [draftPath])
+    options.inputText = draft.inputText
+    options.localPathReferences = draft.localPaths
+    options.restoreInput = draft.restoreInput
+    const api = useChatMessageActions(options)
+    api.editMessage(renderedMessage({ sourceIndex: 0 }))
+    expect(draft.composerText.value).toBe('Read')
+    expect(draft.localPaths.value).toEqual([path])
+    expect(draft.inputText.value).toBe(`Read\n${path}`)
+    expect(api.cancelEdit()).toBe(true)
+    expect(draft.composerText.value).toBe('Draft')
+    expect(draft.localPaths.value).toEqual([draftPath])
+  })
+
+  it('regenerates complete canonical text while retaining explicit reference chips', async () => {
+    const path = 'C:\\book.pdf'
+    const { options } = makeOptions([
+      { role: 'user', text: path, ts: null, messageId: 'durable', localPathReferences: [path] },
+      { role: 'assistant', text: 'done', ts: null },
+    ])
+    const draft = useLocalPathDraft()
+    options.inputText = draft.inputText
+    options.localPathReferences = draft.localPaths
+    options.restoreInput = draft.restoreInput
+    const api = useChatMessageActions(options)
+    expect(api.regenerateMessage(renderedMessage({ role: 'assistant', sourceIndex: 1 }))).toBe(true)
+    await nextTick()
+    expect(draft.composerText.value).toBe('')
+    expect(draft.inputText.value).toBe(path)
+    expect(draft.localPaths.value).toEqual([path])
+    expect(options.sendCurrentInput).toHaveBeenCalledOnce()
+  })
+
   it('records the edited user message id before trimming local history', () => {
     const { api, options, pendingForkBeforeMessageId } = makeOptions([
       { role: 'user', text: 'A', ts: null, messageId: 'msg-A' },

@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest'
 
 import { useChatSlashCommands, type UseChatSlashCommandsOptions } from './useChatSlashCommands'
 import { useChatCompaction } from './useChatCompaction'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type { SkillCatalog } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import type { RpcCallOptions } from '@/lib/rpc'
@@ -545,6 +546,69 @@ describe('useChatSlashCommands goal', () => {
 
     expect(goalEdit).toHaveBeenCalledWith('更新迁移目标')
     expect(notify).toHaveBeenCalledWith(expect.stringContaining('next safe boundary'))
+  })
+})
+
+describe('slash commands with explicit local paths', () => {
+  function localDraft(command: string) {
+    const draft = useLocalPathDraft()
+    draft.composerText.value = command
+    draft.appendLocalPaths('C:\\项目\\report.pdf')
+    return draft
+  }
+
+  it('dispatches a Plan prompt with paths exactly once and the canonical submission snapshot', async () => {
+    const draft = localDraft('/plan Compare this report')
+    const original = draft.inputText.value
+    const { api, dispatchPlanPrompt } = harness(true, [], Promise.resolve(), undefined, {
+      inputText: draft.composerText,
+      submissionText: draft.inputText,
+    })
+
+    await expect(api.executeSlashCommand(original)).resolves.toBe(true)
+    await Promise.resolve()
+
+    expect(dispatchPlanPrompt).toHaveBeenCalledExactlyOnceWith('Compare this report\nC:\\项目\\report.pdf', original)
+    // The normal send path, not the slash parser, owns accepted-draft cleanup.
+    expect(draft.composerText.value).toBe('/plan Compare this report')
+    expect(draft.localPaths.value).toEqual(['C:\\项目\\report.pdf'])
+  })
+
+  it('clears both visible text and explicit paths after an accepted Goal command', async () => {
+    const draft = localDraft('/goal Summarize this report')
+    const { api, startGoal } = harness(false, [{ name: '/goal', aliases: [] }], Promise.resolve(), undefined, {
+      inputText: draft.composerText,
+      submissionText: draft.inputText,
+    })
+
+    await api.executeSlashCommand(draft.inputText.value)
+    await Promise.resolve()
+
+    expect(startGoal).toHaveBeenCalledExactlyOnceWith('Summarize this report\nC:\\项目\\report.pdf')
+    expect(draft.composerText.value).toBe('')
+    expect(draft.localPaths.value).toEqual([])
+    expect(draft.inputText.value).toBe('')
+  })
+
+  it('preserves changed path references when an older Goal command finishes accepting', async () => {
+    const draft = localDraft('/goal Summarize this report')
+    const accepted = deferred()
+    const startGoal = vi.fn(() => accepted.promise.then(() => true))
+    const { api } = harness(false, [{ name: '/goal', aliases: [] }], Promise.resolve(), undefined, {
+      inputText: draft.composerText,
+      submissionText: draft.inputText,
+      startGoal,
+    })
+
+    await api.executeSlashCommand(draft.inputText.value)
+    expect(startGoal).toHaveBeenCalledExactlyOnceWith('Summarize this report\nC:\\项目\\report.pdf')
+    draft.localPaths.value = ['C:\\项目\\new-report.pdf']
+    accepted.resolve()
+    await accepted.promise
+    await Promise.resolve()
+
+    expect(draft.composerText.value).toBe('/goal Summarize this report')
+    expect(draft.localPaths.value).toEqual(['C:\\项目\\new-report.pdf'])
   })
 })
 

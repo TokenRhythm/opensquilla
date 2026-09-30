@@ -592,6 +592,7 @@ class PendingInputQueue:
                 SteerTurn(
                     session_key=key,
                     message=message,
+                    local_path_references=row.turn.local_path_references if row else (),
                     expected_turn_id=command.expected_turn_id,
                     client_request_id=request_id,
                     client_message_id=message_id,

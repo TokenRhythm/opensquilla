@@ -67,6 +67,14 @@ it('separates session generations and changed Goal intent', async () => {
   expect(new Set(intents.map(identity => recoverGoalSet(identity).clientRequestId)).size).toBe(3)
 })
 
+it('separates explicit reference intent while preserving unmarked legacy identity', async () => {
+  const { goalSetIdentity } = await import('./goalSetRecovery')
+  const objective = 'Review\nC:\\report.pdf'
+  const plain = goalSetIdentity('source', 1, objective)
+  expect(goalSetIdentity('source', 1, objective, [])).toBe(plain)
+  expect(goalSetIdentity('source', 1, objective, ['C:\\report.pdf'])).not.toBe(plain)
+})
+
 it('retains both ingress identities when storage remains readable but writes fail', async () => {
   const { goalSetIdentity, recoverGoalSet } = await import('./goalSetRecovery')
   vi.spyOn(sessionStorage, 'setItem').mockImplementation(() => {

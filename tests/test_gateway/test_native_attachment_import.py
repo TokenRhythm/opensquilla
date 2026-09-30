@@ -197,6 +197,9 @@ def _image_bytes(format: str = "JPEG") -> bytes:
     return output.getvalue()
 
 
+# Real runtime cold starts must not compete with the parallel Windows worker
+# pool; retain the same subprocess deadline and cross-runtime identity checks.
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mtime_ns", [1_790_643_723_000_000_100, 1_790_643_723_123_456_700])
 async def test_real_node_metadata_imports_unchanged_image_on_python(
@@ -222,6 +225,7 @@ async def test_real_node_metadata_imports_unchanged_image_on_python(
     assert payload == path.read_bytes()
 
 
+@pytest.mark.ci_serial
 @pytest.mark.asyncio
 async def test_electron_embedded_node_metadata_imports_unchanged_image(tmp_path, monkeypatch):
     app, store, _, _, path, selection = _setup(

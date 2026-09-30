@@ -796,8 +796,9 @@ def test_python_renderer_keeps_field_alias_metadata_when_tightening_nullability(
     )
 
 
+@pytest.mark.parametrize("multiline", [False, True])
 def test_python_renderer_keeps_omittable_non_nullable_collection_constraints(
-    tmp_path: Path,
+    tmp_path: Path, multiline: bool,
 ) -> None:
     from pydantic import ValidationError
 
@@ -808,13 +809,24 @@ def test_python_renderer_keeps_omittable_non_nullable_collection_constraints(
     }
     schema = _write_schema(tmp_path, "sessions/sessions-resolve.schema.json", document)
     spec = runner.load_contract(schema, contract_root=tmp_path)
+    field = (
+        "Field(\n        None,\n        max_length=2,\n    )"
+        if multiline else "Field(None, max_length=2)"
+    )
     generated = (
         "from pydantic import BaseModel, Field\n\n"
         "class SessionsResolveResult(BaseModel):\n"
-        "    values: list[str] | None = Field(None, max_length=2)\n"
+        f"    values: list[str] | None = {field}\n"
     )
     rendered = runner._normalise_optional_non_nullable_defaults(spec, generated)
-    assert "list[str] = Field(None, max_length=2)  # type: ignore[assignment, arg-type]" in rendered
+    if multiline:
+        assert "list[str] = Field(\n        None,  # type: ignore[arg-type]\n" in rendered
+        assert "    )  # type: ignore[assignment]" in rendered
+    else:
+        assert (
+            "list[str] = Field(None, max_length=2)  # type: ignore[assignment, arg-type]"
+            in rendered
+        )
     namespace: dict[str, Any] = {}
     exec(rendered, namespace)
     model = namespace["SessionsResolveResult"]

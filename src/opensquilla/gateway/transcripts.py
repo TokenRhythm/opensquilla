@@ -101,6 +101,7 @@ def build_transcript_attachment_envelope(
     page_context: dict[str, Any] | None = None,
     workspace_files: list[dict[str, Any]] | None = None,
     selected_skills: list[dict[str, str]] | None = None,
+    local_path_references: list[str] | None = None,
 ) -> tuple[str, list[dict[str, Any]]]:
     """Build the JSON envelope written to ``transcript_entries.content``.
 
@@ -222,6 +223,12 @@ def build_transcript_attachment_envelope(
         envelope_payload["workspace_files"] = normalize_workspace_files(workspace_files)
     if selected_skills:
         envelope_payload["selected_skills"] = selected_skills
+    if local_path_references:
+        from opensquilla.contracts.local_path_references import normalize_local_path_references
+
+        envelope_payload["local_path_references"] = list(normalize_local_path_references(
+            local_path_references, message=display_text if display_text is not None else text,
+        ))
     envelope = json.dumps(envelope_payload)
     return envelope, disk_writes
 

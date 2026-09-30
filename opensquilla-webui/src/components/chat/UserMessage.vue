@@ -184,8 +184,21 @@
           </span>
         </template>
       </div>
-      <div v-if="message.text" class="msg-user-bubble">
-        {{ stripTimePrefix(message.text) }}
+      <div v-if="localPathDisplay.paths.length" class="msg-attachments" data-testid="sent-local-paths">
+        <span
+          v-for="(path, index) in localPathDisplay.paths"
+          :key="`${index}:${path}`"
+          class="msg-file-chip msg-file-chip--reference msg-local-path"
+          :title="path"
+          :aria-label="path"
+          tabindex="0"
+        >
+          <span class="msg-file-chip__icon" aria-hidden="true"><Icon name="fileText" :size="16" /></span>
+          <span class="msg-file-chip__name">{{ localPathName(path) }}</span>
+        </span>
+      </div>
+      <div v-if="visibleMessageText" class="msg-user-bubble">
+        {{ visibleMessageText }}
       </div>
       <span v-if="isGoalSource" class="msg-user-goal-origin" role="status">
         <Icon name="target" :size="14" aria-hidden="true" />
@@ -253,6 +266,7 @@ import type { PromptAnnotationSnapshot } from '@/types/promptAnnotations'
 import type { WorkbenchResource } from '@/types/workbenchResources'
 import { isImageDisplayAttachment } from '@/utils/chat/attachments'
 import { fileTypeLabel } from '@/utils/fileType'
+import { localPathName, localPathPresentation } from '@/types/localPathReferences'
 import {
   isProcessRestartOutcome,
   turnOutcomePresentation,
@@ -291,6 +305,9 @@ const emit = defineEmits<{
   toggleShare: [messageId: string]
   reusePromptAnnotation: [annotation: PromptAnnotationSnapshot]
 }>()
+
+const localPathDisplay = computed(() => localPathPresentation(props.message.text, props.message.localPathReferences))
+const visibleMessageText = computed(() => props.stripTimePrefix(localPathDisplay.value.text))
 
 const { copyState, copyIconName, copyTitle, copyLiveText, onCopyClick } = useCopyFeedback(
   () => props.copyMessage(props.message),

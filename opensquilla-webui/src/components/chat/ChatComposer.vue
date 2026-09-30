@@ -10,7 +10,7 @@
     }"
   >
     <div class="chat-composer-inner">
-      <div v-if="attachments.length > 0" class="chat-collapse-region">
+      <div v-if="attachments.length > 0 || localPaths.length > 0" class="chat-collapse-region">
         <div class="chat-attachments">
           <div
             v-for="(att, i) in attachments"
@@ -42,6 +42,20 @@
               <Icon name="refresh" :size="12" />
             </button>
             <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="t('chat.remove')" @click="emit('removeAttachment', i)">
+              <Icon name="x" :size="12" />
+            </button>
+          </div>
+          <div
+            v-for="(path, i) in localPaths"
+            :key="path"
+            class="attachment-chip local-path-chip"
+            :title="path"
+          >
+            <span class="attachment-chip__primary" :title="path" :aria-label="path" tabindex="0">
+              <span class="attachment-chip__icon" aria-hidden="true"><Icon name="fileText" :size="15" /></span>
+              <span class="attachment-chip__name">{{ path.split(/[\\/]/).pop() || path }}</span>
+            </span>
+            <button class="attachment-action attachment-remove" :title="t('chat.remove')" :aria-label="`${t('chat.remove')}: ${path}`" @click="emit('removeLocalPath', i)">
               <Icon name="x" :size="12" />
             </button>
           </div>
@@ -548,6 +562,7 @@ interface ChatComposerExpose {
 const props = withDefaults(defineProps<{
   selectedSkills?: readonly SelectedSkillRef[]
   attachments: Attachment[]
+  localPaths?: readonly string[]
   chooseAttachments?: () => Promise<boolean>
   chooseLocalFilePaths?: () => Promise<void>
   localPathsAvailable?: boolean
@@ -624,6 +639,7 @@ const props = withDefaults(defineProps<{
   floating: false,
   promptAnnotations: () => [],
   selectedSkills: () => [],
+  localPaths: () => [],
 })
 
 const emit = defineEmits<{
@@ -634,6 +650,7 @@ const emit = defineEmits<{
   keydown: [event: KeyboardEvent]
   removeSkill: [instanceId: string]
   removeAttachment: [index: number]
+  removeLocalPath: [index: number]
   retryAttachment: [index: number]
   previewImage: [attachment: Attachment]
   send: []
@@ -1420,6 +1437,11 @@ button.attachment-chip__primary:hover {
 }
 
 button.attachment-chip__primary:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.local-path-chip .attachment-chip__primary:focus-visible {
   outline: none;
   box-shadow: var(--focus-ring);
 }

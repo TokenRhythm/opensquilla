@@ -15,6 +15,23 @@ import {
 import type { TurnCommandsTransport } from './turnCommandsV4'
 import type { TurnReceiptRequest } from '@/modules/turnCommands'
 
+describe('explicit local path display metadata', () => {
+  it('copies references without replacing the complete provider text', () => {
+    const paths = ['C:\\资料\\book.pdf']
+    const text = `Summarize\n${paths[0]}`
+    const wire = toWireSendParams({ message: text, sessionKey: 'session', localPathReferences: paths })
+    expect(wire.message).toBe(text)
+    expect(wire.localPathReferences).toEqual(paths)
+    expect(wire.localPathReferences).not.toBe(paths)
+  })
+
+  it('drops mismatched metadata but preserves manually typed text', () => {
+    const text = 'C:\\different.pdf'
+    expect(toWireSendParams({ message: text, sessionKey: 'session', localPathReferences: ['C:\\book.pdf'] }))
+      .toEqual({ message: text, sessionKey: 'session' })
+  })
+})
+
 describe('read-only delivery receipt adapter', () => {
   const send: TurnReceiptRequest = { kind: 'send', request: { kind: 'new-turn', params: {
     message: 'frozen text', sessionKey: 'source', clientRequestId: 'request-1',

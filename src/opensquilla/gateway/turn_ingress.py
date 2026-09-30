@@ -11,6 +11,7 @@ from typing import Any
 from opensquilla.application.turn_admission import AdmitTurnResult
 from opensquilla.application.turn_input import TurnRequestIdentity as TurnRequestIdentity
 from opensquilla.application.turn_input import complete_durable_ingress as complete_durable_ingress
+from opensquilla.contracts.local_path_references import normalize_local_path_references
 from opensquilla.contracts.selected_skills import normalize_selected_skills
 from opensquilla.session.keys import canonicalize_session_key
 from opensquilla.session.storage import TurnAcceptanceResult
@@ -21,6 +22,7 @@ _FINGERPRINT_FIELDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("attachments", ("attachments",)),
     ("workspace_files", ("workspaceFiles",)),
     ("selected_skills", ("selectedSkills",)),
+    ("local_path_references", ("localPathReferences",)),
     ("intent", ("intent",)),
     (
         "initial_collaboration_mode",
@@ -63,6 +65,12 @@ def _canonical_fingerprint_payload(params: Mapping[str, Any]) -> dict[str, Any]:
         for alias in aliases:
             if alias in params:
                 value = params[alias]
+                if canonical_name == "local_path_references":
+                    value = list(normalize_local_path_references(
+                        value, message=params.get("message", ""),
+                    ))
+                    if not value:
+                        break
                 if canonical_name == "selected_skills":
                     value = list(normalize_selected_skills(value))
                     if not value:

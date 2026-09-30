@@ -3,6 +3,21 @@ import { describe, expect, it, vi } from 'vitest'
 import { createV4PendingInputQueue } from './pendingInputQueueV4'
 
 describe('pending input queue v4 adapter', () => {
+  it('round trips explicit reference metadata through enqueue and listing', async () => {
+    const path = 'C:\\book.pdf'
+    const text = `Read\n${path}`
+    const request = vi.fn(async (method: string) => method.endsWith('.list')
+      ? { items: [{ pendingInputId: 'p1', clientRequestId: 'r1', clientMessageId: 'm1', message: text, localPathReferences: [path] }] }
+      : { requestFingerprint: 'fp', revision: 1 })
+    const adapter = createV4PendingInputQueue({
+      request: request as unknown as <T = unknown>(method: string, params?: Record<string, unknown>) => Promise<T>,
+      supports: () => true,
+    })
+    await adapter.enqueue({ key: 's', pendingInputId: 'p1', message: text, localPathReferences: [path], attachments: [] })
+    expect(request).toHaveBeenCalledWith('sessions.pending_inputs.enqueue', expect.objectContaining({ message: text, localPathReferences: [path] }))
+    expect((await adapter.list('s'))[0]).toMatchObject({ message: text, localPathReferences: [path] })
+  })
+
   it('projects domain operations to the four queue RPCs and hides wire names', async () => {
     const request = vi.fn(async (method: string) => {
       if (method.endsWith('.list')) return { items: [{ pendingInputId: 'p1', clientRequestId: 'r1', clientMessageId: 'm1' }] }

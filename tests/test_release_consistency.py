@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-CURRENT_VERSION = "0.5.5"
-CURRENT_DESKTOP_VERSION = "0.5.5"
+CURRENT_VERSION = "0.5.6"
+CURRENT_DESKTOP_VERSION = "0.5.6"
 CURRENT_TAG = f"v{CURRENT_VERSION}"
 HISTORICAL_PREVIEW_VERSION = "0.2.0rc1"
 HISTORICAL_PREVIEW_TAG = f"v{HISTORICAL_PREVIEW_VERSION}"
@@ -1436,7 +1436,8 @@ def test_current_release_notes_cover_upgrade_and_containers() -> None:
     assert "Supported database migrations run automatically" in normalized
     assert f"No Windows Portable assets are published for {CURRENT_VERSION}" in notes
     assert f"{CURRENT_VERSION} Portable zip" in notes
-    assert "## Upgrading from 0.5.4" in notes
+    assert "## Upgrading from 0.5.5" in notes
+    assert "Upgrading from 0.5.4 or earlier" in notes
     assert "must not\n> uninstall that build first" in notes
     assert r"%APPDATA%\OpenSquilla" in notes
     assert f"ghcr.io/tokenrhythm/opensquilla:{CURRENT_TAG}" in notes
@@ -1466,12 +1467,10 @@ def test_docs_index_links_current_release_notes() -> None:
     assert "releases/0.4.0.md" in index
 
 
-def test_current_contributor_ledger_records_055_attribution() -> None:
+def test_historical_contributor_ledger_retains_055_attribution() -> None:
     ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
-    notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
-    section = ledger.split(f"## OpenSquilla {CURRENT_VERSION}", 1)[1].split(
-        "## OpenSquilla 0.5.4", 1
-    )[0]
+    notes = Path("docs/releases/0.5.5.md").read_text(encoding="utf-8")
+    section = ledger.split("## OpenSquilla 0.5.5", 1)[1].split("## OpenSquilla 0.5.4", 1)[0]
 
     expected = {
         "@Elioooon": "#1540",
@@ -1506,3 +1505,23 @@ def test_current_contributor_ledger_records_055_attribution() -> None:
         assert evidence in section
     assert "Codex" not in section
     assert "Claude Code" not in section
+
+
+def test_current_release_records_browser_beta_and_contributors() -> None:
+    notes = Path(f"docs/releases/{CURRENT_VERSION}.md").read_text(encoding="utf-8")
+    ledger = Path("CONTRIBUTORS.md").read_text(encoding="utf-8")
+    section = ledger.split(f"## OpenSquilla {CURRENT_VERSION}", 1)[1].split(
+        "## OpenSquilla 0.5.5",
+        1,
+    )[0]
+    assert "Browser Use (Beta)" in notes
+    assert "Desktop" in notes
+    assert "not a replacement for your system browser" in " ".join(notes.split())
+    for login, evidence in {
+        "@angri450": "#1830",
+        "@lihongguang-0014": "#1823",
+        "@openvictory": "#1855",
+    }.items():
+        assert login in section
+        assert login in notes
+        assert evidence in section

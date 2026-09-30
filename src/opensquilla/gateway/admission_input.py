@@ -9,6 +9,7 @@ from opensquilla.application.turn_input import (
     IncomingTurnSource,
     MemoryCapturePolicy,
 )
+from opensquilla.contracts.local_path_references import normalize_local_path_references
 from opensquilla.contracts.selected_skills import normalize_selected_skills
 from opensquilla.gateway.turn_ingress import request_identity
 from opensquilla.session.keys import canonicalize_session_key
@@ -234,6 +235,9 @@ def decode_admit_turn(
     workspace_files = normalize_workspace_files(params.get("workspaceFiles"))
     page_context = normalize_page_context(params.get("pageContext"))
     selected_skills = normalize_selected_skills(params.get("selectedSkills"))
+    local_path_references = normalize_local_path_references(
+        params.get("localPathReferences"), message=message,
+    )
     attachments = params.get("attachments", [])
     attachments = attachments if isinstance(attachments, list) else []
     if workspace_files:
@@ -308,6 +312,7 @@ def decode_admit_turn(
         attachments=tuple(attachments),
         workspace_files=tuple(workspace_files),
         selected_skills=selected_skills,
+        local_path_references=local_path_references,
         intent=params.get("intent", "continue"),
         intent_was_provided=params.get("intent") is not None,
         fork_before_message_id=_optional_string(

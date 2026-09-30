@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from email.message import Message
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -61,8 +62,8 @@ def test_protocol_retirement_does_not_expand_approved_legacy_compatibility(
     raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
     current = protocol_preflight.manifest_fingerprint(raw)
     # This released pair approved only the optional device-field addition.
-    # Removing event types creates a distinct protocol requiring an exact
-    # collector match; it must not inherit that historical approval.
+    # Removing event types creates a distinct protocol; reporting compatibility
+    # still requires an exact match rather than inheriting historical approval.
     legacy_server = "c05f4afd7bea0c9a3f110698aa2209994348479b45f105f9f80af2b4a2175d18"
     legacy_client = "9e5d0501e6614fdcd4cf78f8a177db94b739fad156a0409f330809e5b2a5719f"
     assert protocol_preflight.COMPATIBLE_PAIRS == {(legacy_server, legacy_client)}
@@ -218,7 +219,7 @@ def test_protocol_transient_failure_retries_then_checks_both_scopes(
 
 
 @pytest.mark.parametrize(("status", "attempts"), [(301, 1), (401, 1), (404, 1), (503, 3)])
-def test_protocol_http_failure_never_allows_publication(
+def test_protocol_http_failure_is_not_reported_as_compatible(
     protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch, status: int, attempts: int,
 ) -> None:
     calls: list[str] = []
@@ -234,7 +235,7 @@ def test_protocol_http_failure_never_allows_publication(
     assert len(calls) == attempts
 
 
-def test_protocol_second_scope_mismatch_blocks_after_first_scope_succeeds(
+def test_protocol_second_scope_mismatch_is_detected_after_first_scope_succeeds(
     protocol_preflight: ModuleType, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def read(url: str) -> object:
@@ -245,6 +246,109 @@ def test_protocol_second_scope_mismatch_blocks_after_first_scope_succeeds(
     monkeypatch.setattr(protocol_preflight, "read_health", read)
     with pytest.raises(ValueError, match="growth: collector protocol"):
         protocol_preflight.check_collectors("a" * 64)
+
+
+def _run_protocol_cli(
+    repo: Path, sha: str, scenario: str, fingerprint: str = "a" * 64,
+) -> subprocess.CompletedProcess[str]:
+    # Exercise the actual entry point and exit status with an offline HTTP
+    # boundary. Even an accidentally reached collector never uses the network.
+    driver = r"""
+import io, json, runpy, sys, time, urllib.request
+from email.message import Message
+from http.client import HTTPResponse
+from urllib.error import URLError
+
+script, repo, sha, scenario, fingerprint = sys.argv[1:]
+class Opener:
+    def open(self, request, timeout):
+        if scenario == "no-network":
+            raise AssertionError("Collector contacted before source validation")
+        if scenario == "unavailable":
+            raise URLError("private-remote-details")
+        if scenario in {"bad-status", "incomplete-chunk"}:
+            raw = (b"private-remote-details\r\n\r\n" if scenario == "bad-status" else
+                   b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                   b"Transfer-Encoding: chunked\r\n\r\n8\r\n{}\r\n")
+            class Socket:
+                def makefile(self, *_args):
+                    return io.BytesIO(raw)
+            response = HTTPResponse(Socket())
+            response.begin()
+            response.geturl = lambda: request.full_url
+            return response
+        scope = request.full_url.split("/")[-2]
+        payload = {"ok": True, "scope": scope, "schema_version": 1,
+                   "protocol_fingerprint": fingerprint if scenario == "match" else "b" * 64}
+        raw = json.dumps(payload).encode() if scenario != "malformed" else b"private-remote-details"
+        response = io.BytesIO(raw)
+        response.status = 200
+        response.headers = Message()
+        response.headers["Content-Type"] = "application/json"
+        response.geturl = lambda: request.full_url
+        return response
+urllib.request.build_opener = lambda *_args: Opener()
+time.sleep = lambda _delay: None
+sys.argv = [script, "--source-repo", repo, "--source-sha", sha]
+runpy.run_path(script, run_name="__main__")
+"""
+    return subprocess.run(
+        [sys.executable, "-B", "-c", driver,
+         str(ROOT / ".github/scripts/release_protocol_preflight.py"),
+         str(repo), sha, scenario, fingerprint],
+        capture_output=True, text=True, encoding="utf-8", timeout=20,
+    )
+
+
+@pytest.mark.parametrize("scenario", [
+    "match", "mismatch", "unavailable", "malformed", "bad-status", "incomplete-chunk",
+])
+def test_protocol_cli_remote_check_is_advisory_after_validating_source(
+    protocol_preflight: ModuleType, local_source: Path, scenario: str,
+) -> None:
+    raw = (ROOT / protocol_preflight.MANIFEST_PATH).read_bytes()
+    path = local_source / protocol_preflight.MANIFEST_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    sha = _commit(local_source)
+    result = _run_protocol_cli(
+        local_source, sha, scenario, protocol_preflight.manifest_fingerprint(raw),
+    )
+    assert result.returncode == 0, result.stderr
+    assert f"Checking release source {sha}; protocol " in result.stdout
+    assert "private-remote-details" not in result.stdout + result.stderr
+    if scenario == "match":
+        assert result.stderr == ""
+        assert "reliability: release protocol accepted" in result.stdout
+        assert "growth: release protocol accepted" in result.stdout
+    else:
+        warning = "::warning::Production collector compatibility could not be verified"
+        assert warning in result.stderr
+        assert "continuing with the validated release source" in result.stderr
+        assert "release protocol accepted" not in result.stdout
+
+
+@pytest.mark.parametrize("raw", [b"{broken", b"{}", b'{"manifest_version":1,"manifest_version":2}'])
+def test_protocol_cli_malformed_source_manifest_remains_fatal(
+    protocol_preflight: ModuleType, local_source: Path, raw: bytes,
+) -> None:
+    path = local_source / protocol_preflight.MANIFEST_PATH
+    path.parent.mkdir(parents=True)
+    path.write_bytes(raw)
+    result = _run_protocol_cli(local_source, _commit(local_source), "no-network")
+    assert result.returncode == 1
+    assert "Release source protocol validation failed; publication is blocked." in result.stderr
+    assert "::warning::" not in result.stderr
+    assert "Collector contacted" not in result.stderr
+
+
+@pytest.mark.parametrize("sha", ["main", "a" * 8, "f" * 40])
+def test_protocol_cli_invalid_source_sha_remains_fatal(local_source: Path, sha: str) -> None:
+    result = _run_protocol_cli(local_source, sha, "no-network")
+    assert result.returncode == 1
+    assert "Release source protocol validation failed; publication is blocked." in result.stderr
+    assert "::warning::" not in result.stderr
+    assert "Collector contacted" not in result.stderr
 
 
 def test_protocol_release_workflow_gates_fixed_source_before_build_and_publication() -> None:

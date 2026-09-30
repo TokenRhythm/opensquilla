@@ -1,4 +1,5 @@
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
 import { normalizePageContext, type ChatPageContext } from '@/types/pageContext'
 import type { Attachment } from '@/types/chat'
@@ -28,6 +29,7 @@ export interface PendingInputWalRecord {
   clientRequestId: string
   clientMessageId: string
   text: string
+  localPathReferences?: string[]
   /** Annotation batch retained across IndexedDB/WAL queue recovery. */
   draftIds?: string[]
   /** Read-only upgrade input; never sent to Gateway. */
@@ -342,6 +344,7 @@ function cloneRecord(record: PendingInputWalRecord): PendingInputWalRecord {
     ...(promptAnnotationIds?.length ? { retiredAnnotationInput: true } : {}),
     ...(record.pageContext ? { pageContext: normalizePageContext(record.pageContext)! } : {}),
     ...(record.selectedSkills ? { selectedSkills: copySelectedSkills(record.selectedSkills) } : {}),
+    ...(record.localPathReferences ? { localPathReferences: copyLocalPathReferences(record.localPathReferences, record.text) } : {}),
     ...(record.draftIds
       ? { draftIds: [...record.draftIds] }
       : {}),

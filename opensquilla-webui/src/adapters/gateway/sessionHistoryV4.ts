@@ -1,4 +1,5 @@
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
 import {
@@ -136,6 +137,7 @@ const MESSAGE_FIELDS = new Set([
   'artifacts', 'tool_calls', 'toolCalls', 'timeline', 'attachments',
   'prompt_annotations', 'promptAnnotations', 'page_context', 'pageContext', 'provenance_kind',
   'selectedSkills', 'selected_skills',
+  'localPathReferences', 'local_path_references',
   'provenance_source_session_key', 'provenance_source_tool', 'turn_context',
   'turnContext', 'usage', 'turn_usage', 'turnUsage', 'model', 'model_id',
   'input', 'input_tokens', 'inputTokens', 'output', 'output_tokens', 'outputTokens',
@@ -155,6 +157,7 @@ function projectMessage(value: ChatHistoryMessage, index: number): SessionReadMe
     transcriptId,
     role: textValue(value.role)?.toLowerCase() ?? 'unknown',
     text: typeof value.text === 'string' ? value.text : '',
+    localPathReferences: copyLocalPathReferences(raw.localPathReferences ?? raw.local_path_references, value.text),
     createdAt: typeof timestamp === 'string' || typeof timestamp === 'number'
       ? timestamp
       : null,

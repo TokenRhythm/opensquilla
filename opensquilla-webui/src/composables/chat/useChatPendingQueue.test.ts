@@ -7,6 +7,7 @@ import {
 } from './useChatPendingQueue'
 import { useChatAttachments } from './useChatAttachments'
 import { useChatCompaction } from './useChatCompaction'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type { ArtifactContentAccess } from '@/modules/artifactWorkbench'
 import { createLegacyPendingInputQueue } from '@/adapters/gateway/pendingInputQueueV4'
 import type { PendingInputQueuePort } from '@/modules/pendingInputQueue'
@@ -94,6 +95,51 @@ function pendingUiId(
 }
 
 describe('manual compaction with the real pending composer queue', () => {
+  it('persists explicit path metadata in the WAL and restores chips without duplicate paths', async () => {
+    const path = 'C:\\资料\\book.pdf'
+    const otherPath = 'C:\\draft.html'
+    const draft = useLocalPathDraft()
+    const wal = memoryWal()
+    const h = makeQueue(undefined, () => false, {
+      inputText: draft.inputText, localPathReferences: draft.localPaths,
+      restoreInput: draft.restoreInput, pendingInputWal: wal.wal,
+    })
+    try {
+      draft.restoreInput(`Read\n${path}`, [path])
+      expect(await h.queue.enqueuePendingInput(draft.inputText.value)).toBe(true)
+      expect(draft.inputText.value).toBe('')
+      expect((await wal.wal.list(h.sessionKey.value))[0]?.localPathReferences).toEqual([path])
+      draft.restoreInput(`Compare\n${otherPath}`, [otherPath])
+      expect(h.queue.popAllPendingIntoComposer()).toBe(true)
+      await vi.waitFor(() => expect(h.queue.pendingQueue.value).toEqual([]))
+      expect(draft.composerText.value).toBe('Compare\nRead')
+      expect(draft.localPaths.value).toEqual([otherPath, path])
+      expect(draft.inputText.value).toBe(`Compare\nRead\n${otherPath}\n${path}`)
+    } finally { h.queue.cleanup() }
+  })
+
+  it('retains path chips across queue hydration and tail editing', async () => {
+    const path = '/tmp/book.pdf'
+    const wal = memoryWal()
+    const first = makeQueue(undefined, () => false, { pendingInputWal: wal.wal })
+    await first.queue.enqueuePendingPayload({ text: `Read\n${path}`, localPathReferences: [path] })
+    first.queue.cleanup()
+    const draft = useLocalPathDraft()
+    const second = makeQueue(undefined, () => false, {
+      inputText: draft.inputText, localPathReferences: draft.localPaths,
+      restoreInput: draft.restoreInput, pendingInputWal: wal.wal,
+    })
+    try {
+      await second.queue.hydratePendingQueue()
+      expect(second.queue.pendingQueue.value[0]?.localPathReferences).toEqual([path])
+      expect(second.queue.popPendingTail()).toBe(true)
+      await vi.waitFor(() => expect(second.queue.pendingQueue.value).toEqual([]))
+      expect(draft.composerText.value).toBe('Read')
+      expect(draft.localPaths.value).toEqual([path])
+      expect(draft.inputText.value).toBe(`Read\n${path}`)
+    } finally { second.queue.cleanup() }
+  })
+
   it.each(['summary_replay_incomplete', 'summary_does_not_fit', 'cancelled', 'compaction_deadline_exceeded', 'gateway_restarted'])(
     'returns queued drafts to the composer after %s without sending them', async reason => {
       let compact: ReturnType<typeof useChatCompaction> | undefined

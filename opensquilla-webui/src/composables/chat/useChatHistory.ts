@@ -1,4 +1,5 @@
 import { copySelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { pageAnnotationSnapshots } from '@/types/pageContext'
 import { nextTick, ref, type Ref } from 'vue'
 import type {
@@ -915,6 +916,7 @@ export function useChatHistory(options: UseChatHistoryOptions) {
       timeline: recordArray<ChatTimelineSegment>(msg.timeline),
       attachments: normalizeDisplayAttachments([...msg.attachments], { messageId }),
       ...(msg.selectedSkills?.length ? { selectedSkills: copySelectedSkills(msg.selectedSkills) } : {}),
+      ...(msg.localPathReferences?.length ? { localPathReferences: copyLocalPathReferences(msg.localPathReferences, msg.text) } : {}),
       promptAnnotations: msg.pageContext
         ? pageAnnotationSnapshots(msg.pageContext)
         : msg.promptAnnotations

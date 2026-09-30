@@ -278,12 +278,23 @@ def transcript_entries_to_chat_messages(
         prompt_annotations = None
         page_context = None
         selected_skills = None
+        local_path_references: tuple[str, ...] = ()
         if content and content.startswith("{"):
             try:
                 parsed = json.loads(content)
                 if isinstance(parsed, dict) and "text" in parsed:
                     display_text = parsed.get("display_text")
                     content = display_text if isinstance(display_text, str) else parsed["text"]
+                    from opensquilla.contracts.local_path_references import (
+                        normalize_local_path_references,
+                    )
+
+                    try:
+                        local_path_references = normalize_local_path_references(
+                            parsed.get("local_path_references"), message=content,
+                        )
+                    except ValueError:
+                        local_path_references = ()
                     attachments = _public_attachment_projection(parsed.get("attachments"))
                     from opensquilla.workspace_files import normalize_workspace_files
 
@@ -399,6 +410,8 @@ def transcript_entries_to_chat_messages(
             msg["pageContext"] = page_context
         if selected_skills:
             msg["selectedSkills"] = list(selected_skills)
+        if local_path_references:
+            msg["localPathReferences"] = list(local_path_references)
         usage = getattr(projected_entry, "turn_usage", None)
         if isinstance(usage, dict):
             msg["usage"] = usage

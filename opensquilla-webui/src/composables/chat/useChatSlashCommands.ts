@@ -73,6 +73,8 @@ export interface UseChatSlashCommandsOptions {
   sessionMaintenance: SessionMaintenance
   catalogCallOptions?: UsageReportingRequestOptions
   inputText: Ref<string>
+  /** Full submission snapshot when the editor also has explicit local references. */
+  submissionText?: Ref<string>
   sessionKey: Ref<string>
   autoResizeTextarea: () => void
   newSession: () => void
@@ -486,10 +488,12 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
       closeSlashMenu()
       const originalInput = options.inputText.value
       const planPrompt = String(args || '').trim()
+      const submissionText = options.submissionText ?? options.inputText
+      const originalSubmission = submissionText.value
       void Promise.resolve(options.activatePlanMode?.() ?? false).then((accepted) => {
-        if (!accepted || options.inputText.value !== originalInput) return
+        if (!accepted || options.inputText.value !== originalInput || submissionText.value !== originalSubmission) return
         if (planPrompt) {
-          options.dispatchPlanPrompt(planPrompt, originalInput)
+          options.dispatchPlanPrompt(planPrompt, originalSubmission)
           return
         }
         options.inputText.value = ''
@@ -513,9 +517,11 @@ export function useChatSlashCommands(options: UseChatSlashCommandsOptions) {
         // A fully specified slash command accepts the Goal immediately. Menu
         // selection still arms the Goal composer through completeSlashCmd.
         const originalInput = options.inputText.value
+        const submissionText = options.submissionText ?? options.inputText
+        const originalSubmission = submissionText.value
         void Promise.resolve(options.startGoal?.(objective) ?? false).then((accepted) => {
-          if (!accepted || options.inputText.value !== originalInput) return
-          options.inputText.value = ''
+          if (!accepted || options.inputText.value !== originalInput || submissionText.value !== originalSubmission) return
+          submissionText.value = ''
           options.autoResizeTextarea()
         })
         return

@@ -41,6 +41,27 @@ async function readRoutingSnapshot(
 }
 
 describe('v4 SessionHistory Adapter', () => {
+  it.each(['localPathReferences', 'local_path_references'])('restores explicit references from %s without inferring unmarked text', async field => {
+    const path = 'C:\\资料\\book.pdf'
+    const result = {
+      messages: [
+        { id: 'one', role: 'user', text: `Read\n${path}`, [field]: [path] },
+        { id: 'two', role: 'user', text: path },
+        { id: 'three', role: 'user', text: 'unrelated', [field]: [path] },
+      ],
+      has_more: false, oldest_cursor: null, newest_cursor: null, history_scope: 'complete',
+      loaded_count: 3, page_size: 100, canonical_available: true, canonical_complete: true,
+      compaction_summaries: [], turn_outcomes: [],
+    }
+    const page = await requestV4SessionHistory({ request: vi.fn().mockResolvedValue(result) }, 'session',
+      { direction: 'latest', limit: 100, signal: new AbortController().signal },
+      { includeSummaries: true, policy: { concurrentHistoryReads: () => true }, contractError: message => new Error(message) })
+    expect(page.messages[0]?.localPathReferences).toEqual([path])
+    expect(page.messages[0]?.text).toBe(`Read\n${path}`)
+    expect(page.messages[1]?.localPathReferences).toEqual([])
+    expect(page.messages[2]?.localPathReferences).toEqual([])
+  })
+
   it.each([
     {
       name: 'canonical routing facts',
