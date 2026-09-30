@@ -810,6 +810,9 @@ def test_attachment_capacity_config_is_single_call_with_configured_vision_c2(
     ("synthetic_vision_capability_override", "expected_tier"),
     [(False, "c0"), (True, "c2")],
 )
+# Keep every real-Gateway capacity case outside the shared CI worker pool
+# while retaining the runner's readiness and end-to-end deadlines.
+@pytest.mark.ci_serial
 def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
     tmp_path: Path,
     synthetic_vision_capability_override: bool,
@@ -875,7 +878,8 @@ def test_attachment_capacity_runner_reaches_provider_through_real_gateway(
         server.server_close()
         thread.join(timeout=5)
 
-    assert result["ok"] is True, result
+    # The runner sanitizes this bounded report; preserve its failure phase in CI.
+    assert result["ok"] is True, json.dumps(result, indent=2, sort_keys=True)
     assert len(requests) == 1, result
     assert requests[0]["model"] == e2e._tokenrhythm_attachment_tiers()[expected_tier]["model"]  # noqa: SLF001
     case = result["cases"][0]
