@@ -15,6 +15,14 @@ on:
         required: false
         type: boolean
         default: false
+      audit_existing_assets:
+        description: Audit existing Draft assets only; no builds, signing, or release uploads
+        type: boolean
+        default: false
+      expected_source_sha:
+        description: Exact existing tag commit required for audit-only mode
+        required: false
+        default: ""
 
 # Dispatched source builds must not populate the default branch's cache scope.
 cache-mode: read
@@ -35,6 +43,7 @@ env:
 
 jobs:
   release-preflight:
+    if: ${{ inputs.audit_existing_assets != true }}
     name: Validate release source before signing
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -64,6 +73,49 @@ jobs:
         env:
           RELEASE_SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
         run: python .github/scripts/release_protocol_preflight.py --source-sha "$RELEASE_SOURCE_SHA"
+
+  audit-existing-source:
+    name: Validate existing Draft without rebuilding
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.audit_existing_assets == true }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      source_sha: ${{ steps.source.outputs.source_sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+      - name: Verify immutable tag and existing Draft
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EXPECTED_SOURCE_SHA: ${{ inputs.expected_source_sha }}
+          INTERNAL_WINDOWS_ONLY: ${{ inputs.internal_windows_only }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GH_REPO}" == "TokenRhythm/opensquilla" ]]
+          [[ "${INTERNAL_WINDOWS_ONLY}" != "true" ]]
+          [[ "${RELEASE_TAG}" =~ ^v(0|[1-9][0-9]*)[.](0|[1-9][0-9]*)[.](0|[1-9][0-9]*)(rc(0|[1-9][0-9]*))?$ ]]
+          [[ "${EXPECTED_SOURCE_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          git fetch --no-tags --depth=1 origin "refs/tags/${RELEASE_TAG}"
+          source_sha="$(git rev-parse 'FETCH_HEAD^{commit}')"
+          [[ "${source_sha}" == "${EXPECTED_SOURCE_SHA}" ]]
+          gh release view "${RELEASE_TAG}" --json tagName,isDraft,isPrerelease > existing-release.json
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          release = json.loads(Path('existing-release.json').read_text())
+          assert release['tagName'] == os.environ['RELEASE_TAG'], release
+          assert release['isDraft'] is True, 'Only existing Draft assets may be audited'
+          assert release['isPrerelease'] == ('rc' in release['tagName']), release
+          PY
+          echo "source_sha=${source_sha}" >> "${GITHUB_OUTPUT}"
+          echo "Audit only: ${RELEASE_TAG} at ${source_sha}; no builds or release writes." >> "${GITHUB_STEP_SUMMARY}"
 
   build-control-ui:
     name: Build verified Web UI artifact
@@ -1159,15 +1211,16 @@ jobs:
 
   prestage-draft-updater-assets:
     name: Prestage immutable Draft updater assets to OSS
-    if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
-    needs: publish-release
+    if: ${{ always() && !cancelled() && (github.event_name == 'push' || github.event.inputs.tag != '') && ((inputs.audit_existing_assets != true && needs.publish-release.result == 'success') || (inputs.audit_existing_assets == true && needs.audit-existing-source.result == 'success')) }}
+    needs: [publish-release, audit-existing-source]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: desktop-release-oss-prestage
     permissions:
-      contents: read
+      # Draft visibility requires push access; no release writes below.
+      contents: write
     outputs:
-      source_sha: ${{ needs.publish-release.outputs.source_sha }}
+      source_sha: ${{ needs.publish-release.outputs.source_sha || needs.audit-existing-source.outputs.source_sha }}
       prerelease: ${{ steps.draft-metadata.outputs.prerelease }}
     env:
       ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
@@ -1183,7 +1236,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           persist-credentials: false
-          ref: ${{ needs.publish-release.outputs.source_sha }}
+          ref: ${{ github.workflow_sha }}
 
       - name: Validate Draft and OSS prestage configuration
         shell: bash
@@ -1362,12 +1415,12 @@ jobs:
 
   audit-downloaded-macos-release:
     name: Audit downloaded macOS Draft (v${{ matrix.baseline-version }} upgrade)
-    if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+    if: ${{ always() && !cancelled() && (github.event_name == 'push' || github.event.inputs.tag != '') && needs.prestage-draft-updater-assets.result == 'success' }}
     needs: prestage-draft-updater-assets
     runs-on: macos-latest
     timeout-minutes: 75
     permissions:
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -1542,13 +1595,13 @@ jobs:
 
   audit-downloaded-windows-release:
     name: Audit downloaded Windows Draft (v${{ matrix.baseline-version }}, ${{ matrix.install-mode }} install)
-    if: ${{ github.event_name == 'push' || github.event.inputs.tag != '' }}
+    if: ${{ always() && !cancelled() && (github.event_name == 'push' || github.event.inputs.tag != '') && needs.prestage-draft-updater-assets.result == 'success' }}
     needs: prestage-draft-updater-assets
     # Match the build-time gate because v0.5.3 remains an upgrade baseline.
     runs-on: windows-2022
     timeout-minutes: 120
     permissions:
-      contents: read
+      contents: write
     strategy:
       fail-fast: false
       matrix:

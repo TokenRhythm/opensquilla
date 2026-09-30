@@ -850,7 +850,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     windows_audit = workflow[workflow.index("  audit-downloaded-windows-release:") :]
     for audit in (mac_audit, windows_audit):
         assert "needs: prestage-draft-updater-assets" in audit
-        assert "contents: read" in audit
+        assert "contents: write" in audit  # Required to read unpublished Drafts.
         assert "gh release download" in audit
         assert "SHA256SUMS" in audit
         assert "isDraft" in audit
@@ -884,7 +884,7 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     )
     workflow = yaml.safe_load(workflow_text)
     prestage = workflow["jobs"]["prestage-draft-updater-assets"]
-    assert prestage["needs"] == "publish-release"
+    assert prestage["needs"] == ["publish-release", "audit-existing-source"]
     assert prestage["environment"] == "desktop-release-oss-prestage"
     assert (
         prestage["env"]["OSS_ACCESS_KEY_ID"]
