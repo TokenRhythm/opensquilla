@@ -899,6 +899,11 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     )["jobs"]["mirror-release-assets"]
     for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"):
         assert prestage["env"][key] == mirror["env"][key]
+    mirror_workflow = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )
+    assert prestage["concurrency"] == mirror_workflow["concurrency"]
+    assert prestage["concurrency"]["cancel-in-progress"] is False
     assert "ALIYUN_OSS_PRESTAGE_ACCESS_KEY" not in workflow_text
     assert 'release["isDraft"] is True' in workflow_text
     assert 'ALIYUN_OSS_BUCKET}" == "opensquilla-releases"' in workflow_text
@@ -910,7 +915,8 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert "--addressing-style virtual" in workflow_text
     assert "decoder.raw_decode" in workflow_text
     assert '{"enabled", "suspended"}' in workflow_text
-    assert "OSS bucket versioning must be unconfigured" in workflow_text
+    assert "existing-object SHA256" in workflow_text
+    assert "post-upload byte verification" in workflow_text
     assert prestage["steps"][-1]["name"] == "Upload loopback-only updater rehearsal manifest"
 
     script = Path(".github/scripts/prestage-release-to-oss.sh").read_text(encoding="utf-8")

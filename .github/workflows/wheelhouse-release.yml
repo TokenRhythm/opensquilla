@@ -1215,6 +1215,11 @@ jobs:
     needs: [publish-release, audit-existing-source]
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # Serialize with the production mirror: versioned buckets ignore the OSS
+    # forbid-overwrite header, so repository writers must share this lock.
+    concurrency:
+      group: oss-release-mirror-latest-aliases
+      cancel-in-progress: false
     environment: desktop-release-oss-prestage
     permissions:
       # Draft visibility requires push access; no release writes below.
@@ -1328,7 +1333,7 @@ jobs:
           unzip -q "${OSSUTIL_ZIP}"
           sudo install -m 0755 "ossutil-${OSSUTIL_VERSION}-linux-amd64/ossutil" /usr/local/bin/ossutil
 
-      - name: Require overwrite-safe OSS bucket versioning state
+      - name: Inspect OSS versioning under the shared release-writer lock
         shell: bash
         run: |
           set -euo pipefail
@@ -1381,9 +1386,9 @@ jobs:
                   for nested in value:
                       yield from statuses(nested)
 
-          # Response envelopes may contain unrelated HTTP status fields. Only
-          # the two OSS versioning states are relevant, and prestage requires
-          # the bucket to be genuinely unconfigured.
+          # Match the production mirror's versioned-bucket handling. The shared
+          # writer lock serializes repository uploads; the prestage helper still
+          # rejects existing bytes with a different SHA256 and verifies each put.
           active = [
               value
               for document in documents
@@ -1391,11 +1396,13 @@ jobs:
               if isinstance(value, str) and value.casefold() in {"enabled", "suspended"}
           ]
           if active:
-              raise SystemExit(
-                  "OSS bucket versioning must be unconfigured because PutObject "
-                  f"forbid-overwrite is not immutable with versioning enabled or suspended: {active}"
+              print(
+                  f"OSS bucket versioning is {active}; forbid-overwrite is advisory. "
+                  "Using the shared release-writer lock, existing-object SHA256 "
+                  "comparison, and post-upload byte verification."
               )
-          print("OSS bucket versioning is not configured.")
+          else:
+              print("OSS bucket versioning is not configured.")
           PY
 
       - name: Prestage version-scoped immutable assets only
