@@ -18,8 +18,8 @@ from opensquilla.search.types import (
 
 CredentialSource = Literal["configured", "configured_env", "spec_env", "none"]
 
-_GENERAL_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa", "duckduckgo")
-_TECHNICAL_TIE_BREAKER = ("exa", "bocha", "brave", "tavily", "iqs", "duckduckgo")
+_GENERAL_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa", "serpdive", "duckduckgo")
+_TECHNICAL_TIE_BREAKER = ("exa", "bocha", "brave", "tavily", "iqs", "serpdive", "duckduckgo")
 _FRESHNESS_TIE_BREAKER = ("bocha", "tavily", "iqs", "brave", "exa")
 
 
@@ -344,6 +344,7 @@ def _ensure_builtin_search_providers() -> None:
     for module_name in (
         "opensquilla.search.providers.bocha",
         "opensquilla.search.providers.iqs",
+        "opensquilla.search.providers.serpdive",
         "opensquilla.search.providers.tavily",
         "opensquilla.search.providers.brave",
         "opensquilla.search.providers.exa",
