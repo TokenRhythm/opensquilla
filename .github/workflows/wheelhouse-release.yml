@@ -1172,8 +1172,8 @@ jobs:
     env:
       ALIYUN_OSS_BUCKET: ${{ vars.ALIYUN_OSS_BUCKET }}
       ALIYUN_OSS_PREFIX: ${{ vars.ALIYUN_OSS_PREFIX }}
-      OSS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID }}
-      OSS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET }}
+      OSS_ACCESS_KEY_ID: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}
       OSS_REGION: ${{ vars.ALIYUN_OSS_REGION }}
       OSS_ENDPOINT: ${{ vars.ALIYUN_OSS_ENDPOINT }}
       OSS_ADDRESSING_STYLE: ${{ vars.ALIYUN_OSS_ADDRESSING_STYLE }}
@@ -1192,8 +1192,8 @@ jobs:
           missing=()
           [[ -n "${ALIYUN_OSS_BUCKET}" ]] || missing+=("vars.ALIYUN_OSS_BUCKET")
           [[ -n "${OSS_REGION}" ]] || missing+=("vars.ALIYUN_OSS_REGION")
-          [[ -n "${OSS_ACCESS_KEY_ID}" ]] || missing+=("secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID")
-          [[ -n "${OSS_ACCESS_KEY_SECRET}" ]] || missing+=("secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET")
+          [[ -n "${OSS_ACCESS_KEY_ID}" ]] || missing+=("secrets.ALIYUN_OSS_ACCESS_KEY_ID")
+          [[ -n "${OSS_ACCESS_KEY_SECRET}" ]] || missing+=("secrets.ALIYUN_OSS_ACCESS_KEY_SECRET")
           if (( ${#missing[@]} )); then
             printf 'Missing required OSS prestage configuration:\n' >&2
             printf '  - %s\n' "${missing[@]}" >&2

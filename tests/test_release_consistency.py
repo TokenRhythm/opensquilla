@@ -888,12 +888,18 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert prestage["environment"] == "desktop-release-oss-prestage"
     assert (
         prestage["env"]["OSS_ACCESS_KEY_ID"]
-        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID }}"
+        == "${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}"
     )
     assert (
         prestage["env"]["OSS_ACCESS_KEY_SECRET"]
-        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET }}"
+        == "${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}"
     )
+    mirror = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )["jobs"]["mirror-release-assets"]
+    for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"):
+        assert prestage["env"][key] == mirror["env"][key]
+    assert "ALIYUN_OSS_PRESTAGE_ACCESS_KEY" not in workflow_text
     assert 'release["isDraft"] is True' in workflow_text
     assert 'ALIYUN_OSS_BUCKET}" == "opensquilla-releases"' in workflow_text
     assert 'OSS_REGION}" == "cn-beijing"' in workflow_text
