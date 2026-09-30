@@ -159,7 +159,7 @@ async def test_local_path_display_metadata_survives_acceptance_and_replay(
 ) -> None:
     from opensquilla.chat.history import transcript_entries_to_chat_messages
 
-    paths = [r"C:\Users\test\report.pdf", "/tmp/report.html"]
+    paths = [r"C:\fixtures\report.pdf", "/tmp/report.html"]
     message = "Compare the files\n" + "\n".join(paths)
     async with _open_real_stack(tmp_path / "local-paths.db") as stack:
         params = {

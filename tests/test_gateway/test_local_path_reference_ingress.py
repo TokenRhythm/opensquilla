@@ -22,7 +22,7 @@ from opensquilla.gateway.transcripts import build_transcript_attachment_envelope
 from opensquilla.gateway.turn_ingress import request_fingerprint
 from opensquilla.gateway.turn_steering import decode_steering_command
 
-PATHS = [r"C:\Users\test\Downloads\报告.pdf", "/tmp/report.html", r"\\host\share\report.txt"]
+PATHS = [r"C:\fixtures\Downloads\报告.pdf", "/tmp/report.html", r"\\host\share\report.txt"]
 MESSAGE = "Compare these files\n" + "\n".join(PATHS)
 PARAMS = {
     "key": "agent:main:local-paths", "message": MESSAGE,

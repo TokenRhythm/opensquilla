@@ -829,7 +829,7 @@ async def test_set_is_atomic_emits_one_goal_event_and_creates_no_plan_state(
 async def test_goal_set_keeps_local_path_display_metadata_in_history_and_identity(tmp_path):
     from opensquilla.chat.history import transcript_entries_to_chat_messages
 
-    paths = [r"C:\Users\test\report.pdf"]
+    paths = [r"C:\fixtures\report.pdf"]
     objective = "Summarize this report\n" + paths[0]
     runs = []
 

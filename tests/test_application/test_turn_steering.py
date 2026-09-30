@@ -272,7 +272,7 @@ async def test_unsupported_input_is_rejected_before_any_persistence(message, non
 
 
 async def test_display_metadata_envelope_is_not_sent_to_steering_runtime(monkeypatch) -> None:
-    paths = (r"C:\Users\test\report.pdf",)
+    paths = (r"C:\fixtures\report.pdf",)
     message = "Read this\n" + paths[0]
     ports = _Ports()
     prepare = ports.prepare
