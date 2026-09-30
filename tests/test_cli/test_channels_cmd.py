@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -444,3 +445,27 @@ def test_pairings_approve_admin_flag_passes_as_admin(tmp_path, monkeypatch):
         )
     ]
     assert "[admin]" in result.stdout
+
+
+def test_channels_describe_json_emits_structured_error_for_unknown_type(tmp_path, monkeypatch):
+    """`channels describe --json` printed a plain "Error: ..." line for an unknown type."""
+    _setenv(monkeypatch, tmp_path)
+
+    result = runner.invoke(app, ["channels", "describe", "qa-does-not-exist", "--json"])
+
+    assert result.exit_code == 2
+    payload = json.loads(result.stderr)
+    assert payload["error"]["code"] == "NOT_FOUND"
+    assert "qa-does-not-exist" in payload["error"]["message"]
+
+
+def test_channels_describe_without_json_keeps_plain_text_error(tmp_path, monkeypatch):
+    """Control: the human path is unchanged."""
+    _setenv(monkeypatch, tmp_path)
+
+    result = runner.invoke(app, ["channels", "describe", "qa-does-not-exist"])
+
+    assert result.exit_code == 2
+    combined = result.stdout + (result.stderr or "")
+    assert "Error: " in combined
+    assert "{" not in combined
