@@ -19,6 +19,8 @@ function fixture() {
   const runMode = ref('safe')
   const revision = ref(0)
   const sendPending = ref(false)
+  const historyState = ref({ loading: false, sessionMissing: false })
+  const activeWorkspace = ref({ id: 'workspace', name: 'Workspace' })
   const text = ref('Please inspect')
   const result = deferred<string[]>()
   const choosePaths = vi.fn(() => result.promise)
@@ -30,11 +32,12 @@ function fixture() {
   const picker = scope.run(() => useLocalPathPicker({
     available: () => available.value,
     scope: () => [session.value, intent.value, connection.value, workspace.value, agent.value,
-      runMode.value, revision.value, sendPending.value],
+      runMode.value, revision.value, sendPending.value, historyState.value.sessionMissing,
+      activeWorkspace.value.id],
     text: () => text.value, getBinding, choosePaths, append, onError,
   }))!
   return { picker, result, choosePaths, getBinding, append, onError, available, session, intent,
-    connection, workspace, agent, runMode, revision, sendPending, text, scope }
+    connection, workspace, agent, runMode, revision, sendPending, historyState, activeWorkspace, text, scope }
 }
 
 describe('explicit local path picker', () => {
@@ -56,6 +59,39 @@ describe('explicit local path picker', () => {
     await f.picker.choose()
     expect(f.getBinding).not.toHaveBeenCalled()
     expect(f.choosePaths).not.toHaveBeenCalled()
+  })
+
+  it('keeps a pending selection when parent objects refresh without a scope value change', async () => {
+    const f = fixture()
+    const pending = f.picker.choose()
+    await Promise.resolve()
+    expect(f.choosePaths).toHaveBeenCalledOnce()
+
+    // Restoring focus after the native dialog can refresh history/workspace data.
+    f.historyState.value = { loading: true, sessionMissing: false }
+    f.activeWorkspace.value = { id: 'workspace', name: 'Updated name' }
+    expect(f.picker.busy.value).toBe(true)
+
+    f.result.resolve(['C:\\file.txt'])
+    await pending
+    expect(f.append).toHaveBeenCalledExactlyOnceWith('C:\\file.txt')
+    expect(f.onError).not.toHaveBeenCalled()
+    expect(f.picker.busy.value).toBe(false)
+  })
+
+  it('discards a selection when a scope value within a replaced parent changes and changes back', async () => {
+    const f = fixture()
+    const pending = f.picker.choose()
+    await Promise.resolve()
+
+    f.historyState.value = { loading: false, sessionMissing: true }
+    f.historyState.value = { loading: false, sessionMissing: false }
+    f.result.resolve(['C:\\file.txt'])
+    await pending
+
+    expect(f.append).not.toHaveBeenCalled()
+    expect(f.onError).not.toHaveBeenCalled()
+    expect(f.picker.busy.value).toBe(false)
   })
 
   it.each(['session', 'intent', 'connection', 'workspace', 'agent', 'runMode', 'revision', 'sendPending', 'available'] as const)(
@@ -180,5 +216,34 @@ describe('explicit local path picker', () => {
     result.resolve('C:\\large.bin')
     await expect(pending).resolves.toBeNull()
     expect(f.append).not.toHaveBeenCalled()
+  })
+
+  it.each([false, true])('only invalidates a resolving native drop for a changed scope value: %s', async changed => {
+    const f = fixture()
+    const result = deferred<string | null>()
+    const picker = f.scope.run(() => useLocalPathPicker({
+      available: () => f.available.value,
+      scope: () => [f.historyState.value.sessionMissing, f.activeWorkspace.value.id],
+      getBinding: f.getBinding,
+      choosePaths: f.choosePaths,
+      resolveNativeFilePath: vi.fn(() => result.promise),
+      text: () => f.text.value,
+      append: f.append,
+      onError: f.onError,
+    }))!
+    const image = new File(['image'], 'photo.jpg', { type: 'image/jpeg' })
+    const pending = picker.appendNativeDrop([image, new File(['x'], 'large.bin')], file => file.type.startsWith('image/'))
+
+    f.historyState.value = { loading: true, sessionMissing: changed }
+    f.historyState.value = { loading: false, sessionMissing: false }
+    f.activeWorkspace.value = { id: 'workspace', name: 'Updated name' }
+    expect(picker.busy.value).toBe(!changed)
+    result.resolve('C:\\large.bin')
+
+    await expect(pending).resolves.toEqual(changed ? null : [image])
+    expect(f.append).toHaveBeenCalledTimes(changed ? 0 : 1)
+    if (!changed) expect(f.append).toHaveBeenCalledWith('C:\\large.bin')
+    expect(f.onError).not.toHaveBeenCalled()
+    expect(picker.busy.value).toBe(false)
   })
 })

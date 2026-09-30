@@ -269,8 +269,13 @@ def _reject_retired_goal_options(params: dict | None) -> None:
 
 
 async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
+    from opensquilla.contracts.local_path_references import normalize_local_path_references
+
     service = _goal_service(ctx)
     objective = _objective_param(params)
+    local_path_references = normalize_local_path_references(
+        (params or {}).get("localPathReferences"), message=objective,
+    )
     _reject_retired_goal_options(params)
     client_request_id = _uuid_v4_param(
         params,
@@ -292,6 +297,7 @@ async def _handle_goals_set(params: dict | None, ctx: RpcContext) -> dict:
             client_request_id=client_request_id,
             client_message_id=client_message_id,
             source_kind=_source_kind(params),
+            **({"local_path_references": local_path_references} if local_path_references else {}),
         ),
         service=service,
     )

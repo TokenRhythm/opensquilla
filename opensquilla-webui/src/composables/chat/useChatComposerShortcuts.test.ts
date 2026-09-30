@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { ref } from 'vue'
 import { useChatComposerShortcuts } from './useChatComposerShortcuts'
+import { useLocalPathDraft } from './useLocalPathDraft'
 import type { ChatSlashCommand } from './useChatSlashCommands'
 import type { ChatMessage, ChatPendingItem } from '@/types/chat'
 
@@ -40,6 +41,7 @@ function field(value: string, caret: 'start' | 'end' | 'middle' | number, end?: 
 
 function harness(over: {
   inputText?: string
+  draft?: ReturnType<typeof useLocalPathDraft>
   messages?: ChatMessage[]
   pendingQueue?: ChatPendingItem[]
   canQueueMore?: boolean
@@ -49,7 +51,7 @@ function harness(over: {
   cancelMessageEdit?: () => boolean
   handleLongPaste?: (text: string) => boolean
 } = {}) {
-  const inputText = ref(over.inputText ?? '')
+  const inputText = over.draft?.inputText ?? ref(over.inputText ?? '')
   const spies = {
     popPendingTail: vi.fn(() => true),
     enqueuePendingInput: vi.fn(() => true),
@@ -63,6 +65,9 @@ function harness(over: {
   }
   const api = useChatComposerShortcuts({
     inputText,
+    localPathReferences: over.draft?.localPaths,
+    restoreInput: over.draft?.restoreInput,
+    textareaText: over.draft?.composerText,
     composing: ref(false),
     messages: ref<ChatMessage[]>(over.messages ?? []),
     pendingQueue: ref<ChatPendingItem[]>(over.pendingQueue ?? []),
@@ -107,6 +112,43 @@ function inputEvent(inputType: string, target: unknown): InputEvent {
 const QUEUE = [{ id: 'q1', text: 'queued' }] as unknown as ChatPendingItem[]
 
 describe('useChatComposerShortcuts', () => {
+  it('recalls explicit path chips with Up/Down while retaining full canonical text exactly once', () => {
+    const draft = useLocalPathDraft()
+    const selected = 'C:\\资料\\book.pdf'
+    const manual = 'C:\\manually-typed.pdf'
+    const { api } = harness({ draft, messages: [
+      { role: 'user', text: manual, ts: null },
+      { role: 'user', text: `Read\n${selected}`, localPathReferences: [selected], ts: null },
+    ] })
+    const press = (key: string) => api.onTextareaKeydown(keydown({ key, target: field(draft.composerText.value, 'start') }))
+    press('ArrowUp')
+    expect(draft.composerText.value).toBe('Read')
+    expect(draft.localPaths.value).toEqual([selected])
+    expect(draft.inputText.value).toBe(`Read\n${selected}`)
+    press('ArrowUp')
+    expect(draft.composerText.value).toBe(manual)
+    expect(draft.localPaths.value).toEqual([])
+    press('ArrowDown')
+    expect(draft.composerText.value).toBe('Read')
+    expect(draft.localPaths.value).toEqual([selected])
+    expect(draft.inputText.value).toBe(`Read\n${selected}`)
+    press('ArrowDown')
+    expect(draft.composerText.value).toBe('')
+    expect(draft.localPaths.value).toEqual([])
+    expect(draft.inputText.value).toBe('')
+  })
+
+  it('does not replace a reference-only draft when Up starts history navigation', () => {
+    const draft = useLocalPathDraft()
+    draft.restoreInput('/tmp/draft.pdf', ['/tmp/draft.pdf'])
+    const { api } = harness({ draft, messages: [{ role: 'user', text: 'previous', ts: null }] })
+    const event = keydown({ key: 'ArrowUp', target: field('', 'start') })
+    api.onTextareaKeydown(event)
+    expect(event.preventDefault).not.toHaveBeenCalled()
+    expect(draft.localPaths.value).toEqual(['/tmp/draft.pdf'])
+    expect(draft.inputText.value).toBe('/tmp/draft.pdf')
+  })
+
   it('lets the post-insertion paste fallback consume a large paste', () => {
     const handleLongPaste = vi.fn(() => true)
     const { api, spies } = harness({ handleLongPaste })
@@ -183,6 +225,20 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('Alt+Arrow queue chords are caret-gated (preserve macOS paragraph nav)', () => {
+    it('queues the full canonical text for a paths-only draft with an empty textarea', () => {
+      const draft = useLocalPathDraft()
+      draft.appendLocalPaths('C:\\Downloads\\report.pdf')
+      const { api, spies } = harness({ draft })
+      const event = keydown({ key: 'ArrowDown', altKey: true, target: field('', 'end') })
+
+      api.onTextareaKeydown(event)
+
+      expect(spies.enqueuePendingInput).toHaveBeenCalledExactlyOnceWith('C:\\Downloads\\report.pdf')
+      expect(event.preventDefault).toHaveBeenCalledOnce()
+      expect(draft.composerText.value).toBe('')
+      expect(draft.localPaths.value).toEqual(['C:\\Downloads\\report.pdf'])
+    })
+
     it('enqueues on Alt+ArrowDown only when the caret is at the end', () => {
       const { api, spies } = harness({ inputText: 'line1\nline2', canQueueMore: true })
 
@@ -215,6 +271,33 @@ describe('useChatComposerShortcuts', () => {
   })
 
   describe('Safari textarea undo guard', () => {
+    it('repairs only the visible body without replacing the canonical draft and dropping local paths', () => {
+      const draft = useLocalPathDraft()
+      draft.composerText.value = 'hello world'
+      draft.appendLocalPaths('C:\\Downloads\\report.pdf')
+      const { api } = harness({ draft, safari: true })
+      const ta = field('hello world', 6, 'hello world'.length)
+
+      api.onTextareaBeforeInput(inputEvent('deleteContentBackward', ta))
+      ta.value = 'hello '
+      ta.setSelectionRange(6, 6)
+      draft.composerText.value = ta.value
+      api.onTextareaInput(inputEvent('deleteContentBackward', ta))
+
+      api.onTextareaBeforeInput(inputEvent('historyUndo', ta))
+      ta.value = ''
+      ta.setSelectionRange(0, 0)
+      draft.composerText.value = ta.value
+      api.onTextareaInput(inputEvent('historyUndo', ta))
+
+      expect(ta.value).toBe('hello world')
+      expect(draft.composerText.value).toBe('hello world')
+      expect(draft.localPaths.value).toEqual(['C:\\Downloads\\report.pdf'])
+      expect(draft.inputText.value).toBe('hello world\nC:\\Downloads\\report.pdf')
+      expect(ta.selectionStart).toBe(6)
+      expect(ta.selectionEnd).toBe('hello world'.length)
+    })
+
     it('repairs Safari historyUndo when undoing a deletion clears the whole draft', () => {
       const { api, inputText } = harness({ inputText: 'hello world', safari: true })
       const ta = field('hello world', 6, 'hello world'.length)

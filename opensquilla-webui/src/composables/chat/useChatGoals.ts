@@ -4,6 +4,7 @@ import { goalErrorMessage as localizeGoalRpcError } from '@/utils/goalErrorPrese
 import { createClientRequestId } from '@/utils/chat/messageIdentity'
 import { GoalCenterError, normalizeGoalUsageCoverage, type GoalCenter } from '@/modules/goalCenter'
 import type { GoalContinuity, GoalEvent } from '@/modules/goalContinuity'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 
 export type GoalStatus = 'active' | 'paused' | 'blocked' | 'usage_limited' | 'complete'
 export type GoalExecutionState = 'idle' | 'queued' | 'working'
@@ -82,6 +83,7 @@ export interface GoalMutationResponse {
 }
 
 export interface GoalSetAcceptedPayload {
+  localPathReferences?: string[]
   objective: string
   clientMessageId: string
   response: GoalMutationResponse
@@ -96,6 +98,7 @@ export interface GoalContinuityStorage {
 }
 
 export interface UseChatGoalsOptions {
+  localPathReferences?: Ref<string[]>
   /** Domain GoalCenter owns goals.status/set wire mapping. */
   goalCenter: GoalCenter
   /** Domain GoalContinuity owns lease reattachment and Goal event decoding. */
@@ -974,6 +977,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
 
   async function startGoal(text: string): Promise<boolean> {
     const objective = String(text || '').trim()
+    const localPathReferences = copyLocalPathReferences(options.localPathReferences?.value, objective)
     if (!goalObjectiveIsValid(objective)) return false
     if (busy.value || startGoalOwner !== null) return false
     const owner = Symbol('goal-set')
@@ -989,13 +993,14 @@ export function useChatGoals(options: UseChatGoalsOptions) {
       if (owner !== startGoalOwner || key !== options.sessionKey.value) return false
       mutationOwner = owner
       busy.value = true
-      requestIdentity = goalSetIdentity(key, options.currentEpoch?.value ?? 0, objective)
+      requestIdentity = goalSetIdentity(key, options.currentEpoch?.value ?? 0, objective, localPathReferences)
       const { clientRequestId, clientMessageId } = recoverGoalSet(requestIdentity)
       const result = await options.goalCenter.set({
         sessionKey: key,
         objective,
         clientRequestId,
         clientMessageId,
+        ...(localPathReferences.length ? { localPathReferences } : {}),
       })
       if (result.accepted !== true) {
         if (result.accepted === false) forgetGoalSet(requestIdentity)
@@ -1020,7 +1025,7 @@ export function useChatGoals(options: UseChatGoalsOptions) {
         forgetGoalSetsForSession(key)
         rememberContinuityToken(response)
         try {
-          await options.onSetAccepted?.({ objective, clientMessageId, response })
+          await options.onSetAccepted?.({ objective, clientMessageId, response, ...(localPathReferences.length ? { localPathReferences } : {}) })
         } catch (error) {
           // The server has already committed the Goal and its transcript row.
           // A local projection failure must not report a false mutation

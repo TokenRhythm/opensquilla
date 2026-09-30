@@ -609,6 +609,7 @@ export function useChatRenderedMessages(options: UseChatRenderedMessagesOptions)
       const rendered: ChatRenderedMessage = {
         skillLoads: skillLoadsFromSegments(msg.tool_calls),
         selectedSkills: msg.selectedSkills,
+        localPathReferences: msg.localPathReferences,
         id: `${msg.role}-${i}`,
         ...(msg.clientId ? { clientId: msg.clientId } : {}),
         sourceIndex: i,

@@ -354,6 +354,11 @@
             }
           ]
         },
+        "localPathReferences": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1, "maxLength": 32768 },
+          "description": "Display-only explicit local paths matching the canonical message suffix; no file access authority."
+        },
         "selectedSkills": {
           "type": "array",
           "maxItems": 16,

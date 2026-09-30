@@ -9,6 +9,7 @@ export interface PendingInputServerItem {
   readonly clientRequestId: string
   readonly clientMessageId: string
   readonly message?: string
+  readonly localPathReferences?: readonly string[]
   readonly displayText?: string
   readonly attachments?: readonly PendingInputServerAttachment[]
   readonly workspaceFiles?: readonly WorkspaceFileReference[]
@@ -34,6 +35,7 @@ export interface PendingInputEnqueueRequest {
   clientRequestId?: string
   clientMessageId?: string
   message: string
+  localPathReferences?: readonly string[]
   attachments: readonly unknown[]
   workspaceFiles?: readonly WorkspaceFileReference[]
   selectedSkills?: readonly SelectedSkillRef[]

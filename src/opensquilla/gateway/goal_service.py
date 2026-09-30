@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from opensquilla.contracts.local_path_references import normalize_local_path_references
 from opensquilla.engine.start_turn import reserve_turn_via_runtime
 from opensquilla.gateway.routing import (
     RouteEnvelope,
@@ -714,6 +715,7 @@ class GoalService:
         client_request_id: str,
         client_message_id: str,
         source_kind: str,
+        local_path_references: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         key = canonicalize_session_key(session_key)
         async with self._task_runtime.explicit_ingress_intent(key):
@@ -724,6 +726,7 @@ class GoalService:
                 client_request_id=client_request_id,
                 client_message_id=client_message_id,
                 source_kind=source_kind,
+                local_path_references=local_path_references,
             )
 
     async def _set_with_registered_intent(
@@ -735,9 +738,13 @@ class GoalService:
         client_request_id: str,
         client_message_id: str,
         source_kind: str,
+        local_path_references: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         key = canonicalize_session_key(session_key)
         objective = normalize_goal_objective(objective)
+        local_path_references = normalize_local_path_references(
+            local_path_references, message=objective,
+        )
         client_message_id = normalize_client_request_id(client_message_id)
         source_kind = "cli" if source_kind == "cli" else "web"
         source_scope = self.source_scope(ctx, source_kind=source_kind)
@@ -751,6 +758,8 @@ class GoalService:
                 "clientMessageId": client_message_id,
                 "expectedGoalId": None,
                 "expectedStateRevision": None,
+                **({"localPathReferences": list(local_path_references)}
+                   if local_path_references else {}),
             },
         )
         replay = await self._storage.get_goal_command_receipt(command)
@@ -776,10 +785,18 @@ class GoalService:
             raise RuntimeError("Goal set requires atomic transcript preparation")
         task_id = str(uuid.uuid4())
         goal_id = str(uuid.uuid4())
+        content = objective
+        if local_path_references:
+            stamp = getattr(self._session_manager, "stamp_user_text", None)
+            content = json.dumps({
+                "text": stamp(objective) if callable(stamp) else objective,
+                "display_text": objective,
+                "local_path_references": list(local_path_references),
+            })
         entry, expected_epoch = await prepare_message(
             key,
             role="user",
-            content=objective,
+            content=content,
             turn_context={
                 "turn_id": task_id,
                 "client_message_id": client_message_id,

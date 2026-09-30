@@ -444,6 +444,30 @@ class ControlledObjectStore {
 }
 
 describe('BrowserPendingInputWal atomic handoff cancellation', () => {
+  it('copies explicit path metadata and degrades invalid metadata to full editable text', async () => {
+    vi.stubGlobal('IDBKeyRange', { bound: (lower: unknown, upper: unknown) => ({ lower, upper }) })
+    const factory = new ControlledIdbFactory()
+    const wal = createPendingInputWal(factory.idbFactory)!
+    const path = 'C:\\book.pdf'
+    const record: PendingInputWalRecord = {
+      schemaVersion: 1, pendingInputId: 'path-ref', sessionKey: 'session',
+      clientRequestId: 'request', clientMessageId: 'message', text: `Read\n${path}`,
+      localPathReferences: [path], attachments: [], intent: null, state: 'local_only',
+      createdAt: 1, updatedAt: 1,
+    }
+    try {
+      await wal.put(record)
+      record.localPathReferences![0] = 'C:\\changed.pdf'
+      const stored = await wal.list('session')
+      expect(stored[0]?.localPathReferences).toEqual([path])
+      expect(stored[0]?.text).toBe(`Read\n${path}`)
+      await wal.put({ ...record, pendingInputId: 'invalid-ref', text: 'Original manual text' })
+      const invalid = (await wal.list('session')).find(item => item.pendingInputId === 'invalid-ref')
+      expect(invalid?.text).toBe('Original manual text')
+      expect(invalid?.localPathReferences).toEqual([])
+    } finally { wal.close() }
+  })
+
   it('rolls back both stores when the handoff epoch aborts after both writes are queued', async () => {
     const factory = new ControlledIdbFactory()
     const wal = createPendingInputWal(factory.idbFactory)

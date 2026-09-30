@@ -1,5 +1,6 @@
 import { normalizeWorkspaceFileReferences } from '@/utils/chat/attachments'
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
 import { normalizePageContext } from '@/types/pageContext'
 import {
@@ -108,6 +109,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
   const message = typeof value.message === 'string' ? value.message : undefined
   const displayValue = firstValue(value, 'displayText', 'display_text')
   const displayText = typeof displayValue === 'string' ? displayValue : undefined
+  const localPathReferences = copyLocalPathReferences(firstValue(value, 'localPathReferences', 'local_path_references'), displayText ?? message)
   const intentValue = firstValue(value, 'intent')
   const intent = intentValue === null || typeof intentValue === 'string'
     ? intentValue
@@ -124,6 +126,7 @@ function projectPendingInputItem(value: unknown): PendingInputServerItem | null 
     clientMessageId,
     ...(message !== undefined ? { message } : {}),
     ...(displayText !== undefined ? { displayText } : {}),
+    ...(localPathReferences.length ? { localPathReferences } : {}),
     ...(attachments !== undefined ? { attachments } : {}),
     ...(Array.isArray(value.workspaceFiles)
       ? { workspaceFiles: normalizeWorkspaceFileReferences(value.workspaceFiles) } : {}),
@@ -220,6 +223,8 @@ function createRawPendingInputQueuePort(
       return requestPending(source, methods.enqueue, {
         ...request,
         ...(request.selectedSkills?.length ? { selectedSkills: copySelectedSkills(request.selectedSkills) } : {}),
+        ...(request.localPathReferences?.length
+          ? { localPathReferences: copyLocalPathReferences(request.localPathReferences, request.displayText ?? request.message) } : {}),
         attachments: [...request.attachments],
       })
     },

@@ -1,4 +1,5 @@
 import { ref, type Ref } from 'vue'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import type {
   ChatMessage,
   ChatPendingItem,
@@ -7,6 +8,10 @@ import type { ChatSlashCommand } from '@/composables/chat/useChatSlashCommands'
 
 export interface UseChatComposerShortcutsOptions {
   inputText: Ref<string>
+  localPathReferences?: Ref<string[]>
+  restoreInput?: (text: string, paths?: readonly string[]) => void
+  /** Visible textarea body, when local references are kept outside the editor. */
+  textareaText?: Ref<string>
   composing: Ref<boolean>
   messages: Ref<ChatMessage[]>
   pendingQueue: Ref<ChatPendingItem[]>
@@ -61,12 +66,14 @@ const DELETE_INPUT_TYPES = new Set([
 export function useChatComposerShortcuts(options: UseChatComposerShortcutsOptions) {
   const inputHistoryIdx = ref<number | null>(null)
   const inputHistoryDraft = ref('')
+  let inputHistoryDraftPaths: string[] = []
   let deleteUndoSnapshot: TextareaSnapshot | null = null
   let pendingUndoRepair: TextareaSnapshot | null = null
 
   function resetInputHistory() {
     inputHistoryIdx.value = null
     inputHistoryDraft.value = ''
+    inputHistoryDraftPaths = []
     clearTextareaUndoState()
   }
 
@@ -272,7 +279,7 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
 
   function restoreTextarea(field: HTMLTextAreaElement, snap: TextareaSnapshot) {
     field.value = snap.value
-    options.inputText.value = snap.value
+    ;(options.textareaText ?? options.inputText).value = snap.value
     if (typeof field.setSelectionRange === 'function') {
       field.setSelectionRange(snap.selectionStart, snap.selectionEnd)
     }
@@ -286,18 +293,24 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
   function cycleHistory(dir: number): boolean {
     const history = options.messages.value
       .filter(message => message.role === 'user' && typeof message.text === 'string')
-      .map(message => message.text)
     if (history.length === 0) return false
+
+    const restore = (text: string, paths?: readonly string[]) => {
+      if (options.restoreInput) options.restoreInput(text, paths)
+      else options.inputText.value = text
+    }
 
     if (dir < 0) {
       clearTextareaUndoState()
       if (inputHistoryIdx.value === null) {
         inputHistoryDraft.value = options.inputText.value || ''
+        inputHistoryDraftPaths = copyLocalPathReferences(options.localPathReferences?.value, inputHistoryDraft.value)
         inputHistoryIdx.value = history.length - 1
       } else {
         inputHistoryIdx.value = Math.max(0, inputHistoryIdx.value - 1)
       }
-      options.inputText.value = history[inputHistoryIdx.value]
+      const message = history[inputHistoryIdx.value]!
+      restore(message.text, message.localPathReferences)
       options.autoResizeTextarea()
       return true
     }
@@ -307,11 +320,13 @@ export function useChatComposerShortcuts(options: UseChatComposerShortcutsOption
     const next = inputHistoryIdx.value + 1
     if (next >= history.length) {
       inputHistoryIdx.value = null
-      options.inputText.value = inputHistoryDraft.value
+      restore(inputHistoryDraft.value, inputHistoryDraftPaths)
       inputHistoryDraft.value = ''
+      inputHistoryDraftPaths = []
     } else {
       inputHistoryIdx.value = next
-      options.inputText.value = history[next]
+      const message = history[next]!
+      restore(message.text, message.localPathReferences)
     }
     options.autoResizeTextarea()
     return true

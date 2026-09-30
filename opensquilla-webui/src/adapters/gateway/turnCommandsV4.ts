@@ -1,4 +1,5 @@
 import { copySelectedSkills, isSelectedSkills } from '@/types/selectedSkills'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 import { SKILLS_CANDIDATES_METHOD } from '@/contracts/generated/v4/skillsCandidates'
 import { normalizePageContext } from '@/types/pageContext'
 import type { TransportCallOptions as RpcCallOptions } from './transportTypes'
@@ -352,6 +353,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     clientMessageId,
     pageContext,
     selectedSkills,
+    localPathReferences,
     promptAnnotationIds: retiredAnnotationIds,
     documentContext: retiredDocumentContext,
     source,
@@ -384,6 +386,7 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
     initial_provider: legacyInitialProvider,
     fork_before_message_id: legacyForkBeforeMessageId,
     display_text: legacyDisplayText,
+    local_path_references: legacyLocalPathReferences,
     ...extensions
   } = sourceRecord
 
@@ -399,6 +402,8 @@ export function toWireSendParams(request: TurnSendParams): Record<string, unknow
   return {
     ...extensions,
     message,
+    ...(copyLocalPathReferences(localPathReferences ?? legacyLocalPathReferences, String(displayText ?? legacyDisplayText ?? message)).length
+      ? { localPathReferences: copyLocalPathReferences(localPathReferences ?? legacyLocalPathReferences, String(displayText ?? legacyDisplayText ?? message)) } : {}),
     ...(selectedSkills?.length ? { selectedSkills: copySelectedSkills(selectedSkills) } : {}),
     ...(sessionKey !== undefined
       ? { sessionKey }
@@ -466,6 +471,7 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
   const {
     key,
     message,
+    localPathReferences,
     expectedTurnId,
     clientRequestId,
     clientMessageId,
@@ -480,6 +486,8 @@ function toWireSteerParams(request: TurnSteerRequest): Record<string, unknown> {
     ...extensions,
     key,
     message,
+    ...(copyLocalPathReferences(localPathReferences, message).length
+      ? { localPathReferences: copyLocalPathReferences(localPathReferences, message) } : {}),
     ...(expectedTurnId !== undefined ? { expected_turn_id: expectedTurnId } : {}),
     ...(clientRequestId !== undefined ? { client_request_id: clientRequestId } : {}),
     ...(clientMessageId !== undefined ? { client_message_id: clientMessageId } : {}),

@@ -857,6 +857,10 @@ async def _accept_turn_in_scope(
     display_text = command.display_text if command.source.caller_kind == "web" else None
     if display_text is not None and not isinstance(display_text, str):
         display_text = None
+    if command.local_path_references:
+        # Retain the original canonical input, including paths, even when a
+        # client displayText or generated page context changes presentation.
+        display_text = command.message
     provider_message_text = message_text
 
     prepared_route = await ports.prepare_route(
@@ -1091,7 +1095,9 @@ async def _accept_turn_in_scope(
             raw_attachments or workspace_files or display_text is not None
             or page_context is not None or command.selected_skills
         ):
-            if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
+            if (raw_attachments or command.local_path_references) and hasattr(
+                ports.sessions, "stamp_user_text"
+            ):
                 stamped = session_manager.stamp_user_text(message_text)
                 if isinstance(stamped, str):
                     message_text = stamped
@@ -1107,6 +1113,8 @@ async def _accept_turn_in_scope(
                 **({"workspace_files": workspace_files} if workspace_files else {}),
                 **({"selected_skills": list(command.selected_skills)}
                    if command.selected_skills else {}),
+                **({"local_path_references": list(command.local_path_references)}
+                   if command.local_path_references else {}),
             )
 
         assert callable(prepare_message)
@@ -1895,7 +1903,9 @@ async def _accept_turn_in_scope(
             or page_context is not None or command.selected_skills
         ):
             # Stamp up-front so both the stored envelope and the LLM path agree.
-            if raw_attachments and hasattr(ports.sessions, "stamp_user_text"):
+            if (raw_attachments or command.local_path_references) and hasattr(
+                ports.sessions, "stamp_user_text"
+            ):
                 _stamped = session_manager.stamp_user_text(message_text)
                 if isinstance(_stamped, str):
                     message_text = _stamped
@@ -1912,6 +1922,8 @@ async def _accept_turn_in_scope(
                 **({"workspace_files": workspace_files} if workspace_files else {}),
                 **({"selected_skills": list(command.selected_skills)}
                    if command.selected_skills else {}),
+                **({"local_path_references": list(command.local_path_references)}
+                   if command.local_path_references else {}),
             )
             legacy_persisted_entry = await session_manager.append_message(
                 key,

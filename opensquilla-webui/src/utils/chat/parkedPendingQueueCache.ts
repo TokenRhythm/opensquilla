@@ -26,7 +26,7 @@ function persistentFields(item: ChatPendingItem): Record<string, unknown> {
   // UI identity and delivery leases are checked by isPinned, not part of WAL
   // payload equality. Clearing a lease must make a committed row evictable again.
   const keys: (keyof ChatPendingItem)[] = ['text', 'intent', 'attachments', 'pageContext',
-    'selectedSkills', 'draftIds', 'confirmedPlainText', 'ownerSessionKey', 'ownerRequestId',
+    'selectedSkills', 'localPathReferences', 'draftIds', 'confirmedPlainText', 'ownerSessionKey', 'ownerRequestId',
     'pendingInputId', 'pendingClientRequestId', 'pendingClientMessageId', 'pendingPersistenceState',
     'pendingMayHaveServerCopy', 'pendingDeliveryIdentity', 'pendingRetainAfterCancel',
     'pendingRequestFingerprint', 'pendingServerRevision', 'pendingPosition', 'pendingWalRevision',

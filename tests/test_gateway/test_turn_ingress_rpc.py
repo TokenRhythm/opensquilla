@@ -153,6 +153,58 @@ async def _open_real_stack(
         await storage.close()
 
 
+@pytest.mark.parametrize("queued", [False, True])
+async def test_local_path_display_metadata_survives_acceptance_and_replay(
+    tmp_path: Path, queued: bool,
+) -> None:
+    from opensquilla.chat.history import transcript_entries_to_chat_messages
+
+    paths = [r"C:\Users\test\report.pdf", "/tmp/report.html"]
+    message = "Compare the files\n" + "\n".join(paths)
+    async with _open_real_stack(tmp_path / "local-paths.db") as stack:
+        params = {
+            "key": SESSION_KEY, "sessionKey": SESSION_KEY,
+            "clientRequestId": "local-path-request", "clientMessageId": "local-path-message",
+            "message": message, "localPathReferences": paths,
+        }
+        method = "chat.send"
+        if not queued:
+            # A client cannot make copy/edit lose paths using display-only text.
+            params["displayText"] = "Compare the files"
+        if queued:
+            params["pendingInputId"] = "local-path-pending"
+            staged = await get_dispatcher().dispatch(
+                "stage", "sessions.pending_inputs.enqueue", params, stack.context,
+            )
+            assert staged.ok, staged.error
+            listed = await get_dispatcher().dispatch(
+                "list", "sessions.pending_inputs.list", {"key": SESSION_KEY}, stack.context,
+            )
+            assert listed.payload["items"][0]["localPathReferences"] == paths
+            params = {
+                "key": SESSION_KEY, "pendingInputId": "local-path-pending",
+                "clientRequestId": "local-path-request",
+                "requestFingerprint": staged.payload["requestFingerprint"],
+            }
+            method = "sessions.pending_inputs.dispatch"
+        accepted = await get_dispatcher().dispatch("accept", method, params, stack.context)
+        assert accepted.ok, accepted.error
+        await stack.wait_until_running()
+        replay = await get_dispatcher().dispatch("replay", method, params, stack.context)
+        assert replay.ok, replay.error
+        assert replay.payload["replayed"] is True
+        entries = await stack.storage.get_canonical_transcript(stack.session_id)
+        users = [entry for entry in entries if entry.role == "user"]
+        assert len(users) == 1
+        stored = json.loads(users[0].content)
+        assert stored["text"] == message
+        assert stored["local_path_references"] == paths
+        projected = transcript_entries_to_chat_messages(users)[0]
+        assert projected["text"] == message
+        assert projected["localPathReferences"] == paths
+        assert stack.received_runs[0].message == message
+
+
 def _table_counts(db_path: Path) -> dict[str, int]:
     connection = sqlite3.connect(db_path)
     try:

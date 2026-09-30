@@ -23,7 +23,10 @@ export function useLocalPathPicker(options: {
   let generation = 0
   const cancel = () => { generation += 1; busy.value = false }
   // Sync invalidation also catches a switch away and back while the OS dialog is open.
-  watch(() => [available.value, nativeDropAvailable.value, ...options.scope()], cancel, { flush: 'sync' })
+  // Parent-object refreshes can rerun this getter without changing any scope value.
+  watch(() => [available.value, nativeDropAvailable.value, ...options.scope()], (next, previous) => {
+    if (next.length !== previous.length || next.some((value, index) => !Object.is(value, previous[index]))) cancel()
+  }, { flush: 'sync' })
   onScopeDispose(cancel)
 
   async function choose() {

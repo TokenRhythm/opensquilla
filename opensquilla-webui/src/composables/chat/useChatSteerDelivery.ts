@@ -9,6 +9,7 @@ import type {
 } from '@/types/chat'
 import type { SessionSteerV2Params } from '@/types/chat'
 import { rehomePromotedSteerRows } from '@/utils/chat/historyMerge'
+import { copyLocalPathReferences } from '@/types/localPathReferences'
 
 export interface SteerDeliveryIdentity {
   clientRequestId: string
@@ -48,7 +49,7 @@ export interface UseChatSteerDeliveryOptions {
   ) => void
   scheduleHistorySync: () => void
   removePendingItem?: (item: ChatPendingItem) => void
-  restoreSteerIntoComposer?: (text: string) => void
+  restoreSteerIntoComposer?: (text: string, localPathReferences?: readonly string[]) => void
   onProjected?: () => void
 }
 
@@ -92,6 +93,9 @@ export function snapshotSteerRequest(
   return Object.freeze({
     key: request.key,
     message: request.message,
+    ...(request.localPathReferences?.length
+      ? { localPathReferences: copyLocalPathReferences(request.localPathReferences, request.message) }
+      : {}),
     expected_turn_id: request.expected_turn_id,
     client_request_id: request.client_request_id,
     client_message_id: request.client_message_id,
@@ -265,12 +269,16 @@ export function useChatSteerDelivery(
   function restoreOnce(item: ChatPendingItem, message?: ChatMessage) {
     const request = item.steerAttempt?.request
     const key = request?.client_request_id || request?.client_message_id || ''
-    restoreTextOnce(key, item.text, message)
+    restoreTextOnce(key, item.text, message, request?.localPathReferences ?? item.localPathReferences)
   }
 
-  function restoreTextOnce(key: string, text: string, message?: ChatMessage) {
+  function restoreTextOnce(key: string, text: string, message?: ChatMessage, localPathReferences?: readonly string[]) {
     if (!key || restoredAttemptIds.has(key) || message?.steerRestored) return
-    if (text) options.restoreSteerIntoComposer?.(text)
+    if (text) {
+      const paths = copyLocalPathReferences(localPathReferences ?? message?.localPathReferences, text)
+      if (paths.length) options.restoreSteerIntoComposer?.(text, paths)
+      else options.restoreSteerIntoComposer?.(text)
+    }
     restoredAttemptIds.add(key)
     if (message) message.steerRestored = true
   }
@@ -326,6 +334,10 @@ export function useChatSteerDelivery(
       message = {
         role: 'user',
         text: pending.text,
+        ...((attempt?.request.localPathReferences ?? pending.localPathReferences)?.length
+          ? { localPathReferences: copyLocalPathReferences(
+            attempt?.request.localPathReferences ?? pending.localPathReferences, pending.text,
+          ) } : {}),
         ts: new Date().toISOString(),
         clientId: identity.clientMessageId || undefined,
         turnId: identity.expectedTurnId || undefined,

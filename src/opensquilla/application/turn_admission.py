@@ -150,6 +150,7 @@ class AdmitTurn:
     attachments: tuple[dict[str, Any], ...] = ()
     workspace_files: tuple[dict[str, Any], ...] = ()
     selected_skills: tuple[dict[str, str], ...] = ()
+    local_path_references: tuple[str, ...] = ()
     intent: str = "continue"
     intent_was_provided: bool = False
     fork_before_message_id: str | None = None
@@ -193,6 +194,7 @@ class SteerTurn:
     is_web_source: bool = True
     has_non_text_input: bool = False
     pending_input: PendingInputGuard | None = None
+    local_path_references: tuple[str, ...] = ()
 
 
 class TurnIngressPort(Protocol):

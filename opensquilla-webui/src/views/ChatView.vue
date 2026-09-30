@@ -618,8 +618,9 @@
     <ChatModelSetupNotice v-if="!shareMode" />
     <ChatComposer
       ref="composerRef"
-      v-model="inputText"
+      v-model="composerText"
       :attachments="pendingAttachments"
+      :local-paths="localPaths"
       :busy-send-mode="busySendMode"
       :has-send-content="composerHasSendContent"
       :send-pending="chatSend.sendPending.value"
@@ -694,6 +695,7 @@
       @input="onTextareaInput"
       @keydown="onTextareaKeydown"
       @remove-attachment="removeAttachment"
+      @remove-local-path="removeLocalPath"
       @remove-skill="selectedSkills = selectedSkills.filter(skill => skill.instanceId !== $event)"
       @retry-attachment="retryAttachment"
       @preview-image="previewPendingImage"
@@ -870,6 +872,7 @@ import {
   useChatGoals,
 } from '@/composables/chat/useChatGoals'
 import { useChatDraftPersistence } from '@/composables/chat/useChatDraftPersistence'
+import { useLocalPathDraft } from '@/composables/chat/useLocalPathDraft'
 import { useChatElevatedMode } from '@/composables/chat/useChatElevatedMode'
 import { useChatFeatureToggles } from '@/composables/chat/useChatFeatureToggles'
 import { useChatSessionRouting } from '@/composables/chat/useChatSessionRouting'
@@ -881,6 +884,7 @@ import { mergeSkillLoad, type SkillLoadReceipt } from '@/types/skillLoads'
 import ChatSlashPalette from '@/components/chat/ChatSlashPalette.vue'
 import { SKILL_CATALOG_KEY } from '@/modules/skillCatalog'
 import type { SelectedSkillRef } from '@/types/selectedSkills'
+import { localPathPresentation } from '@/types/localPathReferences'
 import { readSkillTaskPrefill } from '@/composables/skills/skillTaskPrefill'
 import { COMMAND_CATALOG_KEY, type CommandCatalog } from '@/modules/commandCatalog'
 import { PROMPT_CACHE_LEASE_KEY, type PromptCacheLease } from '@/modules/promptCacheLease'
@@ -1523,7 +1527,7 @@ const promptAnnotationDesktopAvailable = computed(() => (
   && platform.id === 'desktop'
   && platform.capabilities.hasNativeWorkbenchSurfaces === true
 ))
-const inputText = ref('')
+const { inputText, composerText, localPaths, appendLocalPaths, removeLocalPath, restoreInput } = useLocalPathDraft()
 const selectedSkills = ref<SelectedSkillRef[]>([])
 const composerRevision = ref(0)
 const aborted = ref(false)
@@ -1641,7 +1645,7 @@ const chatElevatedMode = useChatElevatedMode({
 })
 // Persist the composer draft per session so a refresh / session switch / crash
 // before the backend accepts a send cannot silently lose typed text (issue 248).
-const draftPersistence = useChatDraftPersistence({ sessionKey, inputText, selectedSkills })
+const draftPersistence = useChatDraftPersistence({ sessionKey, inputText: composerText, localPaths, selectedSkills })
 const {
   elevatedMode,
   loadElevatedMode,
@@ -1968,7 +1972,7 @@ const {
   prepareAttachmentsForSend,
 } = chatAttachments
 watch(
-  [inputText, pendingAttachments, selectedSkills],
+  [inputText, composerText, localPaths, pendingAttachments, selectedSkills],
   () => {
     composerRevision.value += 1
   },
@@ -1979,6 +1983,7 @@ let sendCurrentInput: () => void = () => {}
 let sendAutomaticInput: () => void = () => {}
 let sendUsageBarrierReplay: (payload: {
   text: string
+  localPathReferences?: string[]
   forkBeforeMessageId: string
 }) => Promise<boolean> = async () => false
 let dispatchPlanComposerPrompt: (prompt: string, composerText: string) => void = () => {}
@@ -1994,6 +1999,8 @@ const pendingQueueOwnerContext = ref<PendingQueueOwnerContext | null>(null)
 const pendingInputWal = createPendingInputWal()
 const chatPendingQueue = useChatPendingQueue({
   selectedSkills,
+  localPathReferences: localPaths,
+  restoreInput,
   sessionKey,
   ownerContext: pendingQueueOwnerContext,
   inputText,
@@ -2615,7 +2622,7 @@ const steerDelivery = useChatSteerDelivery({
     chatStream.acknowledgeSteerBoundary?.(boundaryKey, modelCallId, iteration),
   scheduleHistorySync,
   removePendingItem: item => settlePendingDelivery(item, 'accepted'),
-  restoreSteerIntoComposer: text => appendComposerText(text),
+  restoreSteerIntoComposer: (text, paths) => appendComposerText(text, paths),
   onProjected: () => {
     autoScroll.value = true
     scrollToBottom()
@@ -2659,6 +2666,8 @@ const voiceReady = computed(() => voiceCapability.data.value?.audioConfigured ==
 
 const chatMessageActions = useChatMessageActions({
   selectedSkills,
+  localPathReferences: localPaths,
+  restoreInput,
   messages,
   inputText,
   isStreaming,
@@ -3188,6 +3197,7 @@ async function switchToSession(nextSessionKey: string) {
 
 function projectAcceptedGoalMessage({
   objective,
+  localPathReferences,
   clientMessageId,
   response,
 }: GoalSetAcceptedPayload): void {
@@ -3221,6 +3231,7 @@ function projectAcceptedGoalMessage({
       ...current,
       role: 'user',
       text: current.text || objective,
+      ...(localPathReferences?.length ? { localPathReferences: [...localPathReferences] } : {}),
       ts: current.ts ?? timestamp,
       clientId: current.clientId || clientMessageId,
       messageId,
@@ -3230,6 +3241,7 @@ function projectAcceptedGoalMessage({
     messages.value.push({
       role: 'user',
       text: objective,
+      ...(localPathReferences?.length ? { localPathReferences: [...localPathReferences] } : {}),
       ts: timestamp,
       clientId: clientMessageId,
       messageId,
@@ -3243,6 +3255,7 @@ function projectAcceptedGoalMessage({
 }
 
 const chatGoals = useChatGoals({
+  localPathReferences: localPaths,
   connectionEpoch: computed(() => gatewayAccess.subscriptionEpoch),
   connectionAvailable: () => gatewayAccess.isAvailable && gatewayAccess.isAuthenticated,
   goalCenter,
@@ -3394,7 +3407,7 @@ const goalOutcomeHasMessageAnchor = computed(() => (
 const chatSlashCommands = useChatSlashCommands({
   skillCatalog,
   selectedSkills,
-  getCaret: () => composerRef.value?.composerElement()?.querySelector('textarea')?.selectionStart ?? inputText.value.length,
+  getCaret: () => composerRef.value?.composerElement()?.querySelector('textarea')?.selectionStart ?? composerText.value.length,
   setCaret: (position) => { void nextTick(() => {
     composerRef.value?.focusTextarea()
     composerRef.value?.composerElement()?.querySelector('textarea')?.setSelectionRange(position, position)
@@ -3404,7 +3417,8 @@ const chatSlashCommands = useChatSlashCommands({
   usageReporting,
   sessionMaintenance,
   catalogCallOptions: optionalSessionReadOptions,
-  inputText,
+  inputText: composerText,
+  submissionText: inputText,
   sessionKey,
   autoResizeTextarea,
   newSession: () => {
@@ -3499,6 +3513,9 @@ useDocumentEvent('pointerdown', event => {
 
 const chatComposerShortcuts = useChatComposerShortcuts({
   inputText,
+  localPathReferences: localPaths,
+  restoreInput,
+  textareaText: composerText,
   composing,
   messages,
   pendingQueue,
@@ -3533,6 +3550,8 @@ resetComposerInputHistory = chatComposerShortcuts.resetInputHistory
 const chatSend = useChatSend({
   durableDelivery,
   selectedSkills,
+  localPathReferences: localPaths,
+  restoreInput,
   consumeAcceptedDraft: draftPersistence.consumeAcceptedDraft,
   captureAttachmentDraftConsumption: chatAttachments.captureDraftConsumption,
   turnCommands: {
@@ -3797,10 +3816,11 @@ async function onComposerSend() {
   if (goalDraftArmed.value) {
     const goalText = inputText.value.trim()
     if (!goalText) return
+    const submittedRevision = composerRevision.value
     const started = await startGoal(goalText)
     if (!started) return
     disarmGoalMode()
-    inputText.value = ''
+    if (composerRevision.value === submittedRevision) inputText.value = ''
     autoResizeTextarea()
     return
   }
@@ -4825,12 +4845,13 @@ function applyLandingSuggestion(text: string) {
   sendComposerText(text)
 }
 
-function appendComposerText(text: string) {
-  const next = String(text || '').trim()
-  if (!next) return
-  inputText.value = inputText.value.trim()
-    ? `${inputText.value.trimEnd()}\n${next}`
-    : next
+function appendComposerText(text: string, paths?: readonly string[]) {
+  const presentation = localPathPresentation(String(text || '').trim(), paths)
+  const next = presentation.text.trim()
+  if (!next && !presentation.paths.length) return
+  if (next) composerText.value = composerText.value.trim()
+    ? `${composerText.value.trimEnd()}\n${next}` : next
+  if (presentation.paths.length) appendLocalPaths(presentation.paths.join('\n'))
   autoResizeTextarea()
   composerRef.value?.focusTextarea()
 }
@@ -4858,7 +4879,10 @@ const localPathPicker = useLocalPathPicker({
     return platform.files.resolveNativeFilePath(file)
   },
   text: () => inputText.value,
-  append: appendComposerText,
+  append: text => {
+    appendLocalPaths(text)
+    composerRef.value?.focusTextarea()
+  },
   onError: kind => pushToast(t(kind === 'too-long'
     ? 'chat.localPathTextTooLong'
     : kind === 'too-many' ? 'chat.localPathTooMany' : 'chat.localPathSelectionFailed'),
@@ -6465,9 +6489,9 @@ function handleLongPastedInput(text: string, event?: InputEvent): boolean {
     && event.data.length > 0) {
     const caret = event.target.selectionStart
     const start = Math.max(0, caret - event.data.length)
-    inputText.value = `${text.slice(0, start)}${text.slice(caret)}`
+    composerText.value = `${text.slice(0, start)}${text.slice(caret)}`
   } else {
-    inputText.value = ''
+    composerText.value = ''
   }
   autoResizeTextarea()
   const file = new File([pastedText], pastedTextAttachmentName(pastedText), { type: 'text/plain' })

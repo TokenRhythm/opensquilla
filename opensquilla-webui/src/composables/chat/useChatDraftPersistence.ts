@@ -1,11 +1,20 @@
 import { nextTick, watch, type Ref } from 'vue'
 import { copySelectedSkills, isSelectedSkills, sameSelectedSkills, type SelectedSkillRef } from '@/types/selectedSkills'
+import { composeLocalPathText } from './useLocalPathDraft'
 
 const DRAFT_KEY_PREFIX = 'opensquilla.chat.draft:'
 export const RECENT_DRAFT_SESSION_KEY = 'opensquilla.chat.recent-draft-session'
 // Cap what we persist so a giant paste cannot bloat localStorage; the composer
 // itself is unbounded, only the saved copy is capped.
 const MAX_DRAFT_CHARS = 100_000
+const MAX_LOCAL_PATH_CHARS = 32_768
+
+function isDraftLocalPaths(value: unknown, text: string): value is string[] {
+  return Array.isArray(value) && value.length <= MAX_DRAFT_CHARS
+    && value.every(path => typeof path === 'string' && path.length > 0
+      && path.length <= MAX_LOCAL_PATH_CHARS && path.trim() === path && !/[\u0000-\u001f\u007f]/.test(path))
+    && composeLocalPathText(text, value).length <= MAX_DRAFT_CHARS
+}
 
 function draftKey(key: string): string {
   return DRAFT_KEY_PREFIX + key
@@ -62,6 +71,7 @@ export interface UseChatDraftPersistenceOptions {
   sessionKey: Ref<string>
   inputText: Ref<string>
   selectedSkills?: Ref<SelectedSkillRef[]>
+  localPaths?: Ref<string[]>
 }
 
 /**
@@ -71,7 +81,7 @@ export interface UseChatDraftPersistenceOptions {
  * when a session becomes active, and cleared once the composer is emptied
  * (i.e. after the message is sent).
  *
- * Text and explicit skill references travel together. Attachments and the
+ * Text, explicit local paths and skill references travel together. Attachments and the
  * pending queue retain their own persistence. Storage failures are swallowed.
  */
 export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions) {
@@ -86,13 +96,16 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     options.sessionKey.value = key
   }
 
-  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = []): void {
+  function saveDraft(key: string, text: string, selectedSkills: SelectedSkillRef[] = [], localPaths: readonly string[] = []): void {
     if (!key) return
     try {
-      if (text || selectedSkills.length) {
-        const trimmed = text.slice(0, MAX_DRAFT_CHARS)
-        localStorage.setItem(draftKey(key), selectedSkills.length
-          ? JSON.stringify({ version: 1, text: trimmed, selectedSkills }) : trimmed)
+      if (text || selectedSkills.length || localPaths.length) {
+        // Keep the existing capped text fallback if a draft outgrows metadata
+        // limits; never silently drop just its referenced paths.
+        const paths = isDraftLocalPaths(localPaths, text) ? [...localPaths] : []
+        const trimmed = (paths.length ? text : composeLocalPathText(text, localPaths)).slice(0, MAX_DRAFT_CHARS)
+        localStorage.setItem(draftKey(key), selectedSkills.length || paths.length
+          ? JSON.stringify({ version: 1, text: trimmed, selectedSkills, ...(paths.length ? { localPaths: paths } : {}) }) : trimmed)
         localStorage.setItem(RECENT_DRAFT_SESSION_KEY, key)
       } else {
         localStorage.removeItem(draftKey(key))
@@ -107,15 +120,16 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
     return loadDraftPayload(key).text
   }
 
-  function loadDraftPayload(key: string): { text: string; selectedSkills: SelectedSkillRef[] } {
-    const empty = { text: '', selectedSkills: [] as SelectedSkillRef[] }
+  function loadDraftPayload(key: string): { text: string; selectedSkills: SelectedSkillRef[]; localPaths: string[] } {
+    const empty = { text: '', selectedSkills: [] as SelectedSkillRef[], localPaths: [] as string[] }
     if (!key) return empty
     try {
       const raw = localStorage.getItem(draftKey(key)) || ''
       try {
         const value = JSON.parse(raw)
-        if (value?.version === 1 && typeof value.text === 'string' && isSelectedSkills(value.selectedSkills)) {
-          return { text: value.text, selectedSkills: copySelectedSkills(value.selectedSkills) }
+        if (value?.version === 1 && typeof value.text === 'string' && isSelectedSkills(value.selectedSkills)
+          && (value.localPaths === undefined || isDraftLocalPaths(value.localPaths, value.text))) {
+          return { text: value.text, selectedSkills: copySelectedSkills(value.selectedSkills), localPaths: [...(value.localPaths ?? [])] }
         }
       } catch { /* Legacy plain-text draft. */ }
       return { ...empty, text: raw }
@@ -126,20 +140,23 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
 
   function restoreDraft(key: string): void {
     const saved = loadDraftPayload(key)
-    options.inputText.value = saved.text
+    options.inputText.value = options.localPaths ? saved.text : composeLocalPathText(saved.text, saved.localPaths)
     if (options.selectedSkills) options.selectedSkills.value = saved.selectedSkills
+    if (options.localPaths) options.localPaths.value = saved.localPaths
   }
 
   async function consumeAcceptedDraft(
     key: string,
-    accepted: { text: string; selectedSkills: readonly SelectedSkillRef[] },
+    accepted: { text: string; selectedSkills: readonly SelectedSkillRef[]; localPathReferences?: readonly string[] },
   ): Promise<void> {
     // Session switching writes the outgoing composer in a Vue watcher. Wait
     // for that write before consuming an offscreen request's saved snapshot.
     await nextTick()
     if (options.sessionKey.value === key) return
     const saved = loadDraftPayload(key)
-    if (saved.text === accepted.text.slice(0, MAX_DRAFT_CHARS)
+    if (composeLocalPathText(saved.text, saved.localPaths) === accepted.text.slice(0, MAX_DRAFT_CHARS)
+      && (accepted.localPathReferences === undefined
+        || JSON.stringify(saved.localPaths) === JSON.stringify(accepted.localPathReferences))
       && sameSelectedSkills(saved.selectedSkills, accepted.selectedSkills)) clearDraft(key)
   }
 
@@ -176,16 +193,16 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
         // Read text at watcher execution, not at Hello: typing may continue
         // before Vue flushes. In-memory preservation also works without storage.
         clearDraft(previousKey)
-        saveDraft(key, options.inputText.value, options.selectedSkills?.value)
+        saveDraft(key, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value)
         return
       }
       if (previousKey && previousKey !== key) {
-        saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value)
+        saveDraft(previousKey, options.inputText.value, options.selectedSkills?.value, options.localPaths?.value)
         restoreDraft(key)
         return
       }
       if (!key) return
-      if (options.inputText.value || options.selectedSkills?.value.length) return
+      if (options.inputText.value || options.selectedSkills?.value.length || options.localPaths?.value.length) return
       restoreDraft(key)
     },
     { immediate: true },
@@ -194,8 +211,8 @@ export function useChatDraftPersistence(options: UseChatDraftPersistenceOptions)
   // Persist on every composer change for the CURRENT session. Empty text clears
   // the saved draft (the send path empties inputText, so this doubles as the
   // "sent → forget the draft" hook).
-  watch([options.inputText, () => options.selectedSkills?.value], ([text]) => {
-    saveDraft(options.sessionKey.value, text, options.selectedSkills?.value)
+  watch([options.inputText, () => options.selectedSkills?.value, () => options.localPaths?.value], ([text]) => {
+    saveDraft(options.sessionKey.value, text, options.selectedSkills?.value, options.localPaths?.value)
   }, { deep: true })
 
   return { saveDraft, loadDraft, clearDraft, discardRecentDraft, rebindCurrentDraft, consumeAcceptedDraft }

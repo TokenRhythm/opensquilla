@@ -71,6 +71,7 @@ export interface TurnSendAttachment {
  */
 export interface TurnSendParams {
   message: string
+  localPathReferences?: string[]
   sessionKey: string
   /** Stable idempotency key for one logical send attempt. */
   clientRequestId?: string
@@ -135,6 +136,7 @@ export interface PendingInputDispatchRequest {
 export interface TurnSteerRequest {
   key: string
   message: string
+  localPathReferences?: string[]
   expectedTurnId: string
   clientRequestId: string
   clientMessageId: string

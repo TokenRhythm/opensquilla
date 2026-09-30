@@ -120,6 +120,7 @@ export function createV4GoalCenter(transport: GoalCenterTransport): GoalCenter {
       const params: GoalSetParams = {
         sessionKey: input.sessionKey, objective: input.objective,
         clientRequestId: input.clientRequestId, clientMessageId: input.clientMessageId,
+        ...(input.localPathReferences?.length ? { localPathReferences: [...input.localPathReferences] } : {}),
         ...(input.sourceKind ? { sourceKind: input.sourceKind } : {}),
       }
       if (!validateGoalSetParams(params)) throw new GoalCenterError('invalid', 'goals.set params violated Contract')

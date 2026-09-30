@@ -560,6 +560,7 @@ class AdmissionPrimitives(Protocol):
         page_context: dict[str, Any] | None = None,
         workspace_files: list[dict[str, Any]] | None = None,
         selected_skills: list[dict[str, str]] | None = None,
+        local_path_references: list[str] | None = None,
     ) -> tuple[str, Sequence[object]]: ...
 
     def fork_title_allocation(
