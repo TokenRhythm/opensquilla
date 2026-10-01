@@ -210,6 +210,16 @@ def build_draft_rehearsal_manifest(
         raise ManifestError("rehearsal release isDraft must be true")
     published_shape = dict(release)
     published_shape["isDraft"] = False
+    # GitHub gives Drafts a temporary URL even when their tag already exists.
+    # Only normalize this repository's Draft form; published validation stays strict.
+    release_url = release.get("url")
+    roots = (GITHUB_RELEASE_PAGE_ROOT, LEGACY_V1_RELEASE_PAGE_ROOT)
+    if isinstance(release_url, str) and any(
+        re.fullmatch(re.escape(root) + r"/untagged-[0-9a-f]+", release_url) for root in roots
+    ):
+        tag = str(release.get("tagName") or "").strip()
+        parse_release_tag(tag)
+        published_shape["url"] = f"{GITHUB_RELEASE_PAGE_ROOT}/{tag}"
     manifest, _ = build_manifest(published_shape, asset_names)
     return manifest
 

@@ -9,6 +9,8 @@ import sys
 import textwrap
 from pathlib import Path
 
+import pytest
+
 _VERSION = "0.5.4"
 _TAG = f"v{_VERSION}"
 _ASSETS = (
@@ -80,7 +82,7 @@ def _install_fake_ossutil(tmp_path: Path) -> tuple[Path, Path, Path]:
 
             if args[:2] == ["api", "put-object"]:
                 destination = root / option("--bucket") / option("--key")
-                if destination.exists():
+                if destination.exists() and os.environ.get("FAKE_OSS_VERSIONED") != "true":
                     raise SystemExit(9)
                 assert option("--forbid-overwrite") == "true"
                 source = native_path(option("--body").removeprefix("file://"))
@@ -181,7 +183,11 @@ def _run(tmp_path: Path, assets: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
-def test_prestage_is_version_scoped_write_once_and_idempotent(tmp_path: Path) -> None:
+@pytest.mark.parametrize("versioned", [False, True])
+def test_prestage_is_version_scoped_write_once_and_idempotent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, versioned: bool
+) -> None:
+    monkeypatch.setenv("FAKE_OSS_VERSIONED", str(versioned).lower())
     assets = tmp_path / "release-assets"
     _write_release_assets(assets)
 
@@ -208,6 +214,9 @@ def test_prestage_is_version_scoped_write_once_and_idempotent(tmp_path: Path) ->
     changed = _run(tmp_path, assets)
     assert changed.returncode != 0
     assert "Refusing to replace immutable OSS Draft asset" in changed.stderr
+    assert (remote / f"OpenSquilla-{_VERSION}-mac-arm64.dmg").read_bytes() == (
+        f"synthetic-OpenSquilla-{_VERSION}-mac-arm64.dmg".encode()
+    )
 
 
 def test_prestage_rejects_non_exact_release_asset_set(tmp_path: Path) -> None:

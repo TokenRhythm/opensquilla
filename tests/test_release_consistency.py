@@ -358,6 +358,93 @@ def test_release_profile_config_diagnostics_omit_values(
     assert parsed["actual_text_sha256"] != parsed["expected_text_sha256"]
 
 
+@pytest.mark.parametrize("version", ["0.5.3", "0.5.4"])
+@pytest.mark.parametrize("started", [False, True])
+def test_upgrade_config_snapshot_preserves_known_old_startup_only(
+    tmp_path: Path, version: str, started: bool,
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    home = tmp_path / "profile"
+    label = "upgrade-baseline"
+    probe["seed_profile"](home, label)
+    config = probe["_config_text"](home, label)
+    if started:
+        config = probe["_runtime_config_text"](home)
+        if version == "0.5.4":
+            config += '\n[sandbox]\nrun_mode = "full"\n'
+    (home / "config.toml").write_text(config, encoding="utf-8")
+    snapshot = tmp_path / "baseline.json"
+    snapshot.write_text(json.dumps({
+        "baselineVersion": version, "config": config.replace("\n", "\r\n"),
+    }))
+    options = {"config_baseline": snapshot, "baseline_version": version}
+    probe["verify_profile"](home, label, **options)
+    # The candidate's native locale synchronization can persist schema v2.
+    candidate = config.replace("config_version = 1", "config_version = 2")
+    if not started:
+        candidate += '\nconfig_version_unused = 2\n'
+        with pytest.raises(AssertionError):
+            probe["_verify_runtime_config"](config, candidate)
+    else:
+        (home / "config.toml").write_text(candidate, encoding="utf-8")
+        with pytest.raises(AssertionError, match="config.toml changed"):
+            probe["verify_profile"](home, label, **options)
+        probe["verify_profile"](home, label, allow_runtime_config=True, **options)
+    # No config exemption may bypass the existing identity/data checks.
+    (home / "workspace/IDENTITY.md").write_text("corrupted", encoding="utf-8")
+    with pytest.raises(AssertionError, match="IDENTITY.md"):
+        probe["verify_profile"](home, label, allow_runtime_config=True, **options)
+
+
+@pytest.mark.parametrize("mutation", [
+    ('model = "opensquilla-release-session-recovery-smoke"', 'model = "wrong"'),
+    ('run_mode = "full"', 'run_mode = "safe"'),
+    ('default_locale = "en"', 'default_locale = "zh-Hans"'),
+    ("config_version = 1", "config_version = true"),
+    ("config_version = 1", "config_version = 999"),
+    ("config_version = 1\n", ""),
+    ('search_provider = "duckduckgo"', 'search_provider = "changed"'),
+])
+def test_upgrade_baseline_rejects_protected_mutations(
+    tmp_path: Path, mutation: tuple[str, str],
+) -> None:
+    probe = runpy.run_path(".github/scripts/verify-release-profile-preservation.py")
+    home = tmp_path / "profile"
+    label = "upgrade-baseline"
+    original = probe["_runtime_config_text"](home) + '\n[sandbox]\nrun_mode = "full"\n'
+    changed = original.replace(*mutation)
+    with pytest.raises(AssertionError):
+        probe["_verify_runtime_config"](original, changed)
+    if mutation[1] == "":
+        return  # An old client is allowed not to have written its schema stamp yet.
+    snapshot = tmp_path / "baseline.json"
+    snapshot.write_text(json.dumps({"baselineVersion": "0.5.4", "config": changed}))
+    with pytest.raises(AssertionError, match="protected config"):
+        probe["_upgrade_config_baseline"](home, label, snapshot, "0.5.4")
+
+
+def test_downloaded_upgrade_audits_upload_failure_diagnostics_only() -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/wheelhouse-release.yml").read_text())
+    for platform in ("macos", "windows"):
+        steps = workflow["jobs"][f"audit-downloaded-{platform}-release"]["steps"]
+        upload = next(s for s in steps if s.get("uses") == "actions/upload-artifact@v4")
+        assert upload["if"] == "failure()"
+        assert "logs/**" in upload["with"]["path"]
+        assert "config.toml" not in upload["with"]["path"]
+        assert "sessions.db" not in upload["with"]["path"]
+    smoke = Path("desktop/electron/scripts/test-packaged-session-recovery.mjs").read_text()
+    assert (
+        "'candidate Desktop Gateway readiness',\n    DESKTOP_GATEWAY_STARTUP_TIMEOUT_MS,"
+        in smoke
+    )
+    assert "status: connection.status, error: connection.error ?? null" in smoke
+    assert "assert.equal(lastGatewayConnection?.status, 'ready'" in smoke
+    windows = Path(".github/scripts/verify-release-windows-upgrade.ps1").read_text()
+    macos = Path(".github/scripts/verify-release-macos-real-update.sh").read_text()
+    assert "-ne $configBeforeUninstall" in windows
+    assert 'cmp "${profile}/config.toml" "${sandbox}/before-uninstall-config.toml"' in macos
+
+
 @pytest.mark.parametrize("signed_seed", [False, True])
 @pytest.mark.parametrize(
     "variant", ["seed", "migrated", "partial-migration", "comment", "identity", "external"]
@@ -850,7 +937,7 @@ def test_release_workflow_gates_built_and_downloaded_installers_on_profile_reten
     windows_audit = workflow[workflow.index("  audit-downloaded-windows-release:") :]
     for audit in (mac_audit, windows_audit):
         assert "needs: prestage-draft-updater-assets" in audit
-        assert "contents: read" in audit
+        assert "contents: write" in audit  # Required to read unpublished Drafts.
         assert "gh release download" in audit
         assert "SHA256SUMS" in audit
         assert "isDraft" in audit
@@ -884,16 +971,27 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     )
     workflow = yaml.safe_load(workflow_text)
     prestage = workflow["jobs"]["prestage-draft-updater-assets"]
-    assert prestage["needs"] == "publish-release"
+    assert prestage["needs"] == ["publish-release", "audit-existing-source"]
     assert prestage["environment"] == "desktop-release-oss-prestage"
     assert (
         prestage["env"]["OSS_ACCESS_KEY_ID"]
-        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_ID }}"
+        == "${{ secrets.ALIYUN_OSS_ACCESS_KEY_ID }}"
     )
     assert (
         prestage["env"]["OSS_ACCESS_KEY_SECRET"]
-        == "${{ secrets.ALIYUN_OSS_PRESTAGE_ACCESS_KEY_SECRET }}"
+        == "${{ secrets.ALIYUN_OSS_ACCESS_KEY_SECRET }}"
     )
+    mirror = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )["jobs"]["mirror-release-assets"]
+    for key in ("OSS_ACCESS_KEY_ID", "OSS_ACCESS_KEY_SECRET"):
+        assert prestage["env"][key] == mirror["env"][key]
+    mirror_workflow = yaml.safe_load(
+        Path(".github/workflows/mirror-release-to-oss.yml").read_text(encoding="utf-8")
+    )
+    assert prestage["concurrency"] == mirror_workflow["concurrency"]
+    assert prestage["concurrency"]["cancel-in-progress"] is False
+    assert "ALIYUN_OSS_PRESTAGE_ACCESS_KEY" not in workflow_text
     assert 'release["isDraft"] is True' in workflow_text
     assert 'ALIYUN_OSS_BUCKET}" == "opensquilla-releases"' in workflow_text
     assert 'OSS_REGION}" == "cn-beijing"' in workflow_text
@@ -904,7 +1002,8 @@ def test_release_workflow_prestages_draft_without_advancing_channels() -> None:
     assert "--addressing-style virtual" in workflow_text
     assert "decoder.raw_decode" in workflow_text
     assert '{"enabled", "suspended"}' in workflow_text
-    assert "OSS bucket versioning must be unconfigured" in workflow_text
+    assert "existing-object SHA256" in workflow_text
+    assert "post-upload byte verification" in workflow_text
     assert prestage["steps"][-1]["name"] == "Upload loopback-only updater rehearsal manifest"
 
     script = Path(".github/scripts/prestage-release-to-oss.sh").read_text(encoding="utf-8")
