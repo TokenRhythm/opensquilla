@@ -10,6 +10,7 @@ rewritten just to receive the stamp.
 
 from __future__ import annotations
 
+import logging
 import tomllib
 import warnings
 from pathlib import Path
@@ -160,6 +161,40 @@ def test_migrated_config_write_syncs_before_publication(
 
     assert synced_fds, "the migrated config bytes must reach disk before os.replace"
     assert list(tmp_path.glob("config.toml.backup.*"))
+
+
+def test_migrated_config_write_falls_back_when_disk_bytes_moved_on(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    toml_path = tmp_path / "config.toml"
+    raw = (
+        "# keep me\n"
+        "config_version = 1\n"
+        "[gateway]\n"
+        "port = 18795\n"
+        "[sandbox]\n"
+        "auto_setup = true\n"
+    )
+    toml_path.write_text(raw, encoding="utf-8")
+    result = migrate_config_payload(tomllib.loads(raw))
+    assert result.changed
+
+    # An external edit between validation and persist: the on-disk bytes no
+    # longer match ``result.original``, so the lossless patch must refuse and
+    # the write falls back to the full serialization used before it existed.
+    toml_path.write_text(raw.replace("18795", "18801"), encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="opensquilla.gateway.config_migration"):
+        migration_module.rewrite_migrated_config_best_effort(toml_path, result)
+
+    written = toml_path.read_text(encoding="utf-8")
+    assert "# keep me" not in written
+    assert tomllib.loads(written) == result.payload
+    assert list(tmp_path.glob("config.toml.backup.*"))
+    records = [r for r in caplog.records if r.getMessage() == "OpenSquilla config migrated"]
+    assert records
+    assert getattr(records[-1], "rewrite", None) == "full-reserialize"
+    assert "no longer match" in getattr(records[-1], "lossless_error", "")
 
 
 def test_config_backups_keep_only_the_newest_n(tmp_path: Path) -> None:
