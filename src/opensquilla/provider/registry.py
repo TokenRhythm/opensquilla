@@ -193,6 +193,14 @@ for _provider_spec in [
         selectable_model_catalog="verified_live",
     ),
     _spec(
+        "opper",
+        "openai_compat",
+        "opper",
+        "OPPER_API_KEY",
+        "https://api.opper.ai/v3/compat",
+        catalog_source=("opper",),
+    ),
+    _spec(
         "openai",
         "openai_compat",
         "openai",

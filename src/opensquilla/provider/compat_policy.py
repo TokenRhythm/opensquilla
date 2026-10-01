@@ -498,6 +498,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         allow_post_terminal_noop_choice=True,
         post_terminal_metadata_keys=frozenset({"provider"}),
     ),
+    "opper": OpenAICompatPolicy(
+        display_name="Opper",
+        official_host="api.opper.ai",
+    ),
     "azure": OpenAICompatPolicy(display_name="Azure OpenAI"),
     "deepseek": OpenAICompatPolicy(
         display_name="DeepSeek",
