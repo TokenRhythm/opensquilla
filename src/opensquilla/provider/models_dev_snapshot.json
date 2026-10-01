@@ -3157,6 +3157,195 @@
     "out_mtok": 0.59
    }
   },
+  "ionet": {
+   "deepseek-ai/deepseek-r1-0528": {
+    "ctx": 128000,
+    "out": 4096,
+    "reasoning": true,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 2,
+    "out_mtok": 8.75,
+    "cr_mtok": 1,
+    "cw_mtok": 4
+   },
+   "intel/qwen3-coder-480b-a35b-instruct-int4-mixed-ar": {
+    "ctx": 106000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.22,
+    "out_mtok": 0.95,
+    "cr_mtok": 0.11,
+    "cw_mtok": 0.44
+   },
+   "meta-llama/llama-3.2-90b-vision-instruct": {
+    "ctx": 16000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": true,
+    "in_mtok": 0.35,
+    "out_mtok": 0.4,
+    "cr_mtok": 0.175,
+    "cw_mtok": 0.7
+   },
+   "meta-llama/llama-3.3-70b-instruct": {
+    "ctx": 128000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.13,
+    "out_mtok": 0.38,
+    "cr_mtok": 0.065,
+    "cw_mtok": 0.26
+   },
+   "meta-llama/llama-4-maverick-17b-128e-instruct-fp8": {
+    "ctx": 430000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": true,
+    "in_mtok": 0.15,
+    "out_mtok": 0.6,
+    "cr_mtok": 0.075,
+    "cw_mtok": 0.3
+   },
+   "mistralai/devstral-small-2505": {
+    "ctx": 128000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.05,
+    "out_mtok": 0.22,
+    "cr_mtok": 0.025,
+    "cw_mtok": 0.1
+   },
+   "mistralai/magistral-small-2506": {
+    "ctx": 128000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.5,
+    "out_mtok": 1.5,
+    "cr_mtok": 0.25,
+    "cw_mtok": 1
+   },
+   "mistralai/mistral-large-instruct-2411": {
+    "ctx": 128000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": true,
+    "in_mtok": 2,
+    "out_mtok": 6,
+    "cr_mtok": 1,
+    "cw_mtok": 4
+   },
+   "mistralai/mistral-nemo-instruct-2407": {
+    "ctx": 128000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.02,
+    "out_mtok": 0.04,
+    "cr_mtok": 0.01,
+    "cw_mtok": 0.04
+   },
+   "moonshotai/kimi-k2-instruct-0905": {
+    "ctx": 32768,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.39,
+    "out_mtok": 1.9,
+    "cr_mtok": 0.195,
+    "cw_mtok": 0.78
+   },
+   "moonshotai/kimi-k2-thinking": {
+    "ctx": 32768,
+    "out": 4096,
+    "reasoning": true,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.55,
+    "out_mtok": 2.25,
+    "cr_mtok": 0.275,
+    "cw_mtok": 1.1
+   },
+   "openai/gpt-oss-120b": {
+    "ctx": 131072,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.04,
+    "out_mtok": 0.4,
+    "cr_mtok": 0.02,
+    "cw_mtok": 0.08
+   },
+   "openai/gpt-oss-20b": {
+    "ctx": 64000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.03,
+    "out_mtok": 0.14,
+    "cr_mtok": 0.015,
+    "cw_mtok": 0.06
+   },
+   "qwen/qwen2.5-vl-32b-instruct": {
+    "ctx": 32000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": true,
+    "in_mtok": 0.05,
+    "out_mtok": 0.22,
+    "cr_mtok": 0.025,
+    "cw_mtok": 0.1
+   },
+   "qwen/qwen3-235b-a22b-thinking-2507": {
+    "ctx": 262144,
+    "out": 4096,
+    "reasoning": true,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.11,
+    "out_mtok": 0.6,
+    "cr_mtok": 0.055,
+    "cw_mtok": 0.22
+   },
+   "qwen/qwen3-next-80b-a3b-instruct": {
+    "ctx": 262144,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.1,
+    "out_mtok": 0.8,
+    "cr_mtok": 0.05,
+    "cw_mtok": 0.2
+   },
+   "zai-org/glm-4.6": {
+    "ctx": 200000,
+    "out": 4096,
+    "reasoning": false,
+    "tools": true,
+    "vision": false,
+    "in_mtok": 0.4,
+    "out_mtok": 1.75,
+    "cr_mtok": 0.2,
+    "cw_mtok": 0.8
+   }
+  },
   "minimax": {
    "minimax-m2": {
     "ctx": 196608,

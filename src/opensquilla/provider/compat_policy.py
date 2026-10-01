@@ -366,6 +366,11 @@ class OpenAICompatPolicy:
 
     # Thinking-mode tool choice accepts only auto/none on this endpoint.
     thinking_tool_choice_auto_only: bool = False
+    # Endpoint-side default for ``tool_choice`` applied when the request
+    # carries tools but no explicit choice: io.net ("IO Intelligence")
+    # defaults to "none", silently disabling tool calling, so an explicit
+    # "auto" is sent instead.
+    default_tool_choice: str | None = None
     # Models that are reasoning-only upstream even when the endpoint does not
     # accept or emit an explicit enable_thinking toggle.  Their tool selector
     # follows the same auto/none restriction as an explicitly enabled request.
@@ -580,6 +585,10 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
     "mimo": OpenAICompatPolicy(display_name="MiMo"),
     "mistral": OpenAICompatPolicy(display_name="Mistral"),
     "groq": OpenAICompatPolicy(display_name="Groq"),
+    "ionet": OpenAICompatPolicy(
+        display_name="IO Intelligence",
+        default_tool_choice="auto",
+    ),
     "zhipu": OpenAICompatPolicy(
         display_name="Zhipu",
         official_host="open.bigmodel.cn",
