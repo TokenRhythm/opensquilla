@@ -647,3 +647,38 @@ def test_retired_memory_fields_in_inline_table_keep_surviving_source_bytes(
     patched = patch_import_config(raw, original, transformed)
     assert patched == expected
     assert tomllib.loads(patched.decode()) == transformed
+
+
+def test_startup_migration_write_keeps_surviving_source_bytes(tmp_path) -> None:
+    """The write funnel used by startup load patches instead of reserializing."""
+    from opensquilla.gateway.config_migration import (
+        LATEST_CONFIG_VERSION,
+        migrate_config_payload,
+        rewrite_migrated_config_best_effort,
+    )
+
+    raw = (
+        "# keep the file header\n"
+        f"config_version = {LATEST_CONFIG_VERSION}\n"
+        "[gateway]\n"
+        "port = 18795  # inner-net only\n"
+        "\n"
+        "# keep the section note\n"
+        "[sandbox]\n"
+        "auto_setup = true\n"
+    ).encode()
+    path = tmp_path / "config.toml"
+    path.write_bytes(raw)
+    original = tomllib.loads(raw.decode())
+    result = migrate_config_payload(original, emit_diagnostics=False)
+    assert result.changed
+
+    rewrite_migrated_config_best_effort(path, result)
+
+    written = path.read_bytes()
+    assert b"# keep the file header" in written
+    assert b"# inner-net only" in written
+    assert b"# keep the section note" in written
+    assert tomllib.loads(written.decode()) == result.payload
+    assert written == patch_import_config(raw, original, result.payload)
+    assert list(tmp_path.glob("config.toml.backup.*"))

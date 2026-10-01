@@ -19,6 +19,7 @@ import tomli_w
 from pydantic import TypeAdapter
 
 from opensquilla.config_version import LATEST_CONFIG_VERSION as LATEST_CONFIG_VERSION
+from opensquilla.lossless_toml import LosslessTomlPatchError, patch_import_config
 from opensquilla.paths import default_opensquilla_home, native_io_path
 from opensquilla.search.types import MAX_SEARCH_RESULTS
 
@@ -144,6 +145,9 @@ _LEGACY_SKILL_FILTER_WARNED = False
 @dataclass(frozen=True)
 class ConfigMigrationResult:
     payload: dict[str, Any]
+    # Pre-migration payload exactly as validated at load time, so the write
+    # path can patch the on-disk bytes from it to ``payload``.
+    original: dict[str, Any]
     changes: tuple[str, ...] = ()
     warnings: tuple[str, ...] = ()
     removed_fields: tuple[str, ...] = ()
@@ -153,6 +157,7 @@ class ConfigMigrationResult:
 @dataclass
 class _MigrationBuilder:
     payload: dict[str, Any]
+    original: dict[str, Any]
     changes: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     removed_fields: list[str] = field(default_factory=list)
@@ -161,6 +166,7 @@ class _MigrationBuilder:
         changed = bool(self.changes or self.removed_fields)
         return ConfigMigrationResult(
             payload=self.payload,
+            original=self.original,
             changes=tuple(self.changes),
             warnings=tuple(self.warnings),
             removed_fields=tuple(self.removed_fields),
@@ -405,7 +411,7 @@ def migrate_config_payload(
     still reports changes and migration warnings, but no compatibility log,
     process warning, logging record, or process warning sentinel is touched.
     """
-    builder = _MigrationBuilder(payload=copy.deepcopy(data))
+    builder = _MigrationBuilder(payload=copy.deepcopy(data), original=copy.deepcopy(data))
 
     _strip_retired_product_features(builder)
     _strip_removed_sandbox_fields(builder)
@@ -939,8 +945,8 @@ _MIGRATIONS: list[tuple[int, Callable[[_MigrationBuilder], None]]] = [
 ]
 
 
-def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
-    """Atomically replace one TOML config file (same-dir temp, fsync, 0600).
+def atomic_replace_bytes(target: str | Path, data: bytes) -> None:
+    """Atomically replace one config file with exact bytes (same-dir temp, fsync, 0600).
 
     Every writer that replaces ``config.toml`` converges on this helper so the
     crash-durability contract lives in exactly one place. The recovery module
@@ -949,19 +955,19 @@ def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
     there.
     """
 
-    target = Path(path)
+    target_path = Path(target)
     fd, tmp_name = tempfile.mkstemp(
-        prefix=f".{target.name}.",
+        prefix=f".{target_path.name}.",
         suffix=".tmp",
-        dir=os.fspath(native_io_path(target.parent)),
+        dir=os.fspath(native_io_path(target_path.parent)),
     )
     try:
         with os.fdopen(fd, "wb") as fh:
-            tomli_w.dump(payload, fh)
+            fh.write(data)
             fh.flush()
             os.fsync(fh.fileno())
         os.chmod(tmp_name, 0o600)
-        os.replace(tmp_name, native_io_path(target))
+        os.replace(tmp_name, native_io_path(target_path))
     except Exception:
         try:
             os.unlink(tmp_name)
@@ -970,25 +976,62 @@ def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
         raise
 
 
+def atomic_write_config(path: str | Path, payload: dict[str, Any]) -> None:
+    """Atomically replace one TOML config file with serialized ``payload``.
+
+    Serialization stays here; the byte-landing contract lives in
+    :func:`atomic_replace_bytes`, which every writer that replaces
+    ``config.toml`` converges on.
+    """
+    atomic_replace_bytes(path, tomli_w.dumps(payload).encode("utf-8"))
+
+
 def backup_and_write_migrated_config(
     path: str | Path,
     payload: dict[str, Any],
     result: ConfigMigrationResult,
 ) -> Path:
-    """Back up and atomically replace a migrated user config file."""
+    """Back up and atomically replace a migrated user config file.
+
+    The rewrite first patches the exact bytes on disk through the
+    comment-preserving ``patch_import_config``; only when that patcher cannot
+    prove the mapped result does it fall back to serializing the whole payload.
+    Both branches share one backup, and the structured warning records which
+    rewrite ran. Falling back (instead of the fail-closed posture used on the
+    import paths) is deliberate: this helper runs on the startup load path,
+    where the alternative to patching is the previous whole-file rewrite, not
+    a half-migrated import.
+    """
     target = Path(path)
     backup = make_config_backup(target)
-    atomic_write_config(target, payload)
+    rewrite = "comment-preserving"
+    lossless_error: str | None = None
+    try:
+        patched = patch_import_config(
+            native_io_path(target).read_bytes(),
+            result.original,
+            payload,
+        )
+    except LosslessTomlPatchError as exc:
+        rewrite = "full-reserialize"
+        lossless_error = str(exc)
+        atomic_write_config(target, payload)
+    else:
+        atomic_replace_bytes(target, patched)
     os.chmod(native_io_path(target), 0o600)
+    extra: dict[str, Any] = {
+        "path": str(target),
+        "backup": str(backup),
+        "changes": list(result.changes),
+        "removed_fields": list(result.removed_fields),
+        "warnings": list(result.warnings),
+        "rewrite": rewrite,
+    }
+    if lossless_error is not None:
+        extra["lossless_error"] = lossless_error
     logging.getLogger(__name__).warning(
         "OpenSquilla config migrated",
-        extra={
-            "path": str(target),
-            "backup": str(backup),
-            "changes": list(result.changes),
-            "removed_fields": list(result.removed_fields),
-            "warnings": list(result.warnings),
-        },
+        extra=extra,
     )
     return backup
 
