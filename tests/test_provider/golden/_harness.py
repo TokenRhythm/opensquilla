@@ -93,6 +93,7 @@ COMPAT_THINKING_MODELS: dict[str, tuple[str, str]] = {
     # glm-5 prefix in the zai ladder (model_catalog) -> "zai".
     "zhipu": ("glm-5", "zai"),
     "qianfan": (_NEUTRAL_MODEL, "none"),
+    "requesty": (_NEUTRAL_MODEL, "none"),
     "siliconflow": (_NEUTRAL_MODEL, "none"),
     "aihubmix": (_NEUTRAL_MODEL, "none"),
     # doubao-seed-1-6 ladder (model_catalog volcengine branch) ->

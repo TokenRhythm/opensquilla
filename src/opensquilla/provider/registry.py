@@ -201,6 +201,13 @@ for _provider_spec in [
         catalog_source=("openai",),
     ),
     _spec(
+        "requesty",
+        "openai_compat",
+        "requesty",
+        "REQUESTY_API_KEY",
+        "https://router.requesty.ai/v1",
+    ),
+    _spec(
         "openai_responses",
         "openai_responses",
         "openai_responses",

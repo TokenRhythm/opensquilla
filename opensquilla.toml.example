@@ -111,6 +111,7 @@ base_url = "https://tokenrhythm.studio/v1"
 # provider      env var                 default base_url
 # tokenrhythm   TOKENRHYTHM_API_KEY      https://tokenrhythm.studio/v1
 # openrouter    OPENROUTER_API_KEY       https://openrouter.ai/api/v1
+# requesty      REQUESTY_API_KEY         https://router.requesty.ai/v1
 # openai        OPENAI_API_KEY           https://api.openai.com/v1
 # openai_responses OPENAI_API_KEY        https://api.openai.com/v1  (native Responses-API shape; chat+responses)
 # anthropic     ANTHROPIC_API_KEY        https://api.anthropic.com

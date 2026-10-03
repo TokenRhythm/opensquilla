@@ -587,6 +587,7 @@ _POLICIES_BY_KIND: dict[str, OpenAICompatPolicy] = {
         official_reasoning_api_root="https://open.bigmodel.cn/api/paas/v4",
     ),
     "qianfan": OpenAICompatPolicy(display_name="Qianfan"),
+    "requesty": OpenAICompatPolicy(display_name="Requesty"),
     "siliconflow": OpenAICompatPolicy(display_name="SiliconFlow"),
     "aihubmix": OpenAICompatPolicy(display_name="AiHubMix"),
     "volcengine": OpenAICompatPolicy(
