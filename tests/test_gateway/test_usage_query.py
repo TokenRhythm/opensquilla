@@ -130,6 +130,8 @@ def _event(
     output_tokens: int = 10,
     reasoning_tokens: int = 0,
     cache_read_tokens: int = 5,
+    model: str = "model-a",
+    unknown_reason: str | None = None,
 ):
     return SimpleNamespace(
         event_id=event_id,
@@ -139,7 +141,8 @@ def _event(
         session_id=session_id,
         session_epoch=session_epoch,
         provider="test",
-        model="model-a",
+        model=model,
+        unknown_reason=unknown_reason,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         reasoning_tokens=reasoning_tokens,
@@ -161,12 +164,13 @@ def _item(
     input_tokens: int = 100,
     output_tokens: int = 10,
     cache_read_tokens: int = 5,
+    model: str = "model-a",
 ):
     return SimpleNamespace(
         event_id=event_id,
         ordinal=ordinal,
         provider="test",
-        model="model-a",
+        model=model,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         reasoning_tokens=0,
@@ -1219,6 +1223,84 @@ async def test_unknown_usage_is_successful_partial_data() -> None:
     assert payload["coverage"]["status"] == "partial"
     assert "usage_unavailable" in payload["coverage"]["reasonCodes"]
     assert payload["totals"]["missingCostEntries"] == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_unknown_usage_events_do_not_fabricate_model_card_rows() -> None:
+    now = _ms("2026-07-20T12:00:00")
+    storage = _FakeStorage(
+        state=SimpleNamespace(
+            ledger_started_at_ms=_ms("2026-07-20T00:00:00"),
+            backfill_status="complete",
+            anomaly_count=0,
+        ),
+        events=[
+            _event(
+                "failed-call",
+                now - 1,
+                cost_nanos=0,
+                status="unknown",
+                model="ghost-model",
+                unknown_reason="provider_exception",
+            ),
+            _event("real-call", now - 2, cost_nanos=1000, model="real-model"),
+        ],
+        items=[_item("real-call", 1000, model="real-model")],
+        baselines=[],
+    )
+
+    payload = await query_usage_ledger(
+        storage,
+        {"range": {"preset": "today"}, "timezone": "UTC"},
+        now_ms=now,
+    )
+
+    # The failed call is still reflected in totals (event count, coverage)...
+    assert payload["totals"]["eventCount"] == 2
+    # ...but it must not fabricate a zero-usage model-card row: a call that
+    # returned nothing has no usage to attribute to a model.
+    models = payload["models"]
+    assert [m["model"] for m in models] == ["real-model"]
+    assert models[0]["eventCount"] == 1
+
+
+@pytest.mark.asyncio
+async def test_successful_call_without_usage_data_stays_in_model_breakdown() -> None:
+    """Third-party providers (OpenAI-compatible endpoints, Ollama, self-hosted
+    gateways) often complete a call without reporting usage. That is not a
+    failure: the model was used and must remain visible in the breakdown.
+    """
+    now = _ms("2026-07-20T12:00:00")
+    storage = _FakeStorage(
+        state=SimpleNamespace(
+            ledger_started_at_ms=_ms("2026-07-20T00:00:00"),
+            backfill_status="complete",
+            anomaly_count=0,
+        ),
+        events=[
+            _event(
+                "no-usage-call",
+                now - 1,
+                cost_nanos=0,
+                status="unknown",
+                model="third-party-model",
+                unknown_reason="provider_stream_ended_without_usage",
+            ),
+            _event("failed-call", now - 2, cost_nanos=0, status="unknown", model="ghost"),
+        ],
+        items=[],
+        baselines=[],
+    )
+
+    payload = await query_usage_ledger(
+        storage,
+        {"range": {"preset": "today"}, "timezone": "UTC"},
+        now_ms=now,
+    )
+
+    models = payload["models"]
+    assert [m["model"] for m in models] == ["third-party-model"]
+    assert models[0]["eventCount"] == 1
 
 
 @pytest.mark.asyncio
