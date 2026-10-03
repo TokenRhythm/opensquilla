@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -15,6 +17,16 @@ from opensquilla.secrets import clean_header_secret
 
 _ELEVENLABS_DEFAULT_API_KEY_ENV = "ELEVENLABS_API_KEY"
 _ELEVENLABS_DEFAULT_BASE_URL = "https://api.elevenlabs.io"
+_ATLASCLOUD_DEFAULT_API_KEY_ENV = "ATLASCLOUD_API_KEY"
+_ATLASCLOUD_DEFAULT_BASE_URL = "https://api.atlascloud.ai"
+_ATLASCLOUD_AUDIO_OUTPUT_HOSTS = frozenset(
+    {
+        "api.atlascloud.ai",
+        "atlas-media.oss-us-west-1.aliyuncs.com",
+        "static.atlascloud.ai",
+    }
+)
+_ATLASCLOUD_MAX_AUDIO_BYTES = 64 * 1024 * 1024
 
 
 def resolve_elevenlabs_api_key_env(provider_config: object | None) -> str:
@@ -38,11 +50,31 @@ def resolve_elevenlabs_api_key_env(provider_config: object | None) -> str:
     )
 
 
+def resolve_atlascloud_api_key_env(provider_config: object | None) -> str:
+    """Resolve Atlas credentials without moving the default across origins."""
+
+    fields_set = getattr(provider_config, "model_fields_set", None)
+    return credential_env_for_endpoint(
+        configured_env=str(
+            getattr(provider_config, "api_key_env", _ATLASCLOUD_DEFAULT_API_KEY_ENV) or ""
+        ),
+        configured_explicitly=(isinstance(fields_set, set) and "api_key_env" in fields_set),
+        default_env=_ATLASCLOUD_DEFAULT_API_KEY_ENV,
+        default_base_url=_ATLASCLOUD_DEFAULT_BASE_URL,
+        effective_base_url=str(
+            getattr(provider_config, "base_url", _ATLASCLOUD_DEFAULT_BASE_URL)
+            or _ATLASCLOUD_DEFAULT_BASE_URL
+        ),
+    )
+
+
 def _normalize_base_url(base_url: str) -> str:
     return base_url.rstrip("/")
 
 
 def _api_url(base_url: str, path: str) -> str:
+    if base_url.endswith("/api/v1") and path.startswith("/api/v1/"):
+        return f"{base_url}{path[7:]}"
     if base_url.endswith("/v1") and path.startswith("/v1/"):
         return f"{base_url}{path[3:]}"
     return f"{base_url}{path}"
@@ -70,6 +102,16 @@ def _audio_mime_type(content_type: str | None, response_format: str) -> str:
         return _FORMAT_MIME_TYPES[normalized_format]
     prefix = normalized_format.split("_", 1)[0]
     return _FORMAT_MIME_TYPES.get(prefix, "application/octet-stream")
+
+
+def _response_format_for_mime(mime_type: str, fallback: str) -> str:
+    return {
+        "audio/flac": "flac",
+        "audio/mpeg": "mp3",
+        "audio/opus": "opus",
+        "audio/wav": "wav",
+        "audio/x-wav": "wav",
+    }.get(mime_type, fallback)
 
 
 def _response_error_body(response: httpx.Response) -> str:
@@ -301,6 +343,204 @@ class ElevenLabsSharedVoicesResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+def _atlas_prediction_data(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Atlas Cloud audio provider returned an invalid payload")
+    data = payload.get("data")
+    if isinstance(data, dict):
+        return data
+    return payload
+
+
+def _atlas_output_format_parts(output_format: str) -> tuple[str, int, int]:
+    parts = output_format.lower().split("_")
+    audio_format = parts[0] if parts[0] in {"mp3", "wav", "pcm"} else "mp3"
+    sample_rate = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 44100
+    bitrate_kbps = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 256
+    if sample_rate not in {16000, 24000, 32000, 44100}:
+        sample_rate = 44100
+    if bitrate_kbps not in {32, 64, 128, 256}:
+        bitrate_kbps = 256
+    return audio_format, sample_rate, bitrate_kbps * 1000
+
+
+class AtlasCloudAudioProductionProvider:
+    """Atlas Cloud asynchronous audio generation adapter."""
+
+    provider_id = "atlascloud"
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        api_key_env: str = _ATLASCLOUD_DEFAULT_API_KEY_ENV,
+        base_url: str = _ATLASCLOUD_DEFAULT_BASE_URL,
+        poll_interval_seconds: float = 1.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
+        self._api_key = api_key
+        self._api_key_env = api_key_env
+        self._base_url = _normalize_base_url(base_url)
+        self._poll_interval_seconds = max(float(poll_interval_seconds), 0.0)
+        self._transport = transport
+
+    def _resolve_api_key(self) -> str:
+        return clean_header_secret(
+            self._api_key or os.environ.get(self._api_key_env, ""),
+            label="Atlas Cloud API key",
+        )
+
+    def _headers(self, api_key: str) -> dict[str, str]:
+        return {"Authorization": f"Bearer {api_key}"}
+
+    def _api_url(self, path: str) -> str:
+        return _api_url(self._base_url, path)
+
+    @staticmethod
+    def _validated_output_url(raw_url: Any) -> str:
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            raise RuntimeError("Atlas Cloud audio provider returned no output URL")
+        parsed = urlparse(raw_url.strip())
+        if parsed.scheme != "https" or parsed.hostname not in _ATLASCLOUD_AUDIO_OUTPUT_HOSTS:
+            raise RuntimeError("Atlas Cloud audio provider returned an unsafe output URL")
+        if parsed.username or parsed.password:
+            raise RuntimeError("Atlas Cloud audio provider returned an unsafe output URL")
+        return raw_url.strip()
+
+    async def _generate(
+        self,
+        *,
+        payload: dict[str, Any],
+        timeout_seconds: float,
+    ) -> tuple[bytes, str, str | None]:
+        api_key = self._resolve_api_key()
+        if not api_key:
+            raise RuntimeError(f"{self._api_key_env} is not set")
+
+        deadline = asyncio.get_running_loop().time() + max(timeout_seconds, 0.1)
+        async with httpx.AsyncClient(
+            timeout=timeout_seconds,
+            trust_env=_trust_env(),
+            transport=self._transport,
+        ) as client:
+            response = await client.post(
+                self._api_url("/api/v1/model/generateAudio"),
+                headers=self._headers(api_key),
+                json=payload,
+            )
+            _raise_provider_http_error(response, "Atlas Cloud audio generation")
+            try:
+                prediction = _atlas_prediction_data(response.json())
+            except ValueError as exc:
+                raise RuntimeError("Atlas Cloud audio provider returned invalid JSON") from exc
+
+            generation_id = prediction.get("id")
+            status = str(prediction.get("status") or "").lower()
+            while status not in {"completed", "failed", "timeout"}:
+                if not isinstance(generation_id, str) or not generation_id.strip():
+                    raise RuntimeError("Atlas Cloud audio provider returned no prediction id")
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise RuntimeError("Atlas Cloud audio generation timed out")
+                await asyncio.sleep(self._poll_interval_seconds)
+                response = await client.get(
+                    self._api_url(f"/api/v1/model/prediction/{generation_id.strip()}"),
+                    headers=self._headers(api_key),
+                )
+                _raise_provider_http_error(response, "Atlas Cloud audio prediction")
+                try:
+                    prediction = _atlas_prediction_data(response.json())
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "Atlas Cloud audio provider returned invalid prediction JSON"
+                    ) from exc
+                status = str(prediction.get("status") or "").lower()
+
+            if status != "completed":
+                note = prediction.get("error") or prediction.get("message") or status
+                raise RuntimeError(f"Atlas Cloud audio generation failed: {note}")
+            outputs = prediction.get("outputs")
+            output_url = self._validated_output_url(
+                outputs[0] if isinstance(outputs, list) and outputs else None
+            )
+
+        async with httpx.AsyncClient(
+            timeout=timeout_seconds,
+            trust_env=_trust_env(),
+            transport=self._transport,
+            follow_redirects=False,
+        ) as download_client:
+            response = await download_client.get(output_url)
+            _raise_provider_http_error(response, "Atlas Cloud audio download")
+            declared_size = response.headers.get("Content-Length")
+            if declared_size:
+                try:
+                    if int(declared_size) > _ATLASCLOUD_MAX_AUDIO_BYTES:
+                        raise RuntimeError("Atlas Cloud audio output exceeds the 64 MiB limit")
+                except ValueError:
+                    pass
+            audio_bytes = response.content
+            if not audio_bytes:
+                raise RuntimeError("Atlas Cloud audio provider returned empty audio")
+            if len(audio_bytes) > _ATLASCLOUD_MAX_AUDIO_BYTES:
+                raise RuntimeError("Atlas Cloud audio output exceeds the 64 MiB limit")
+            mime_type = _audio_mime_type(response.headers.get("Content-Type"), "mp3")
+        return audio_bytes, mime_type, generation_id if isinstance(generation_id, str) else None
+
+    async def text_to_speech(
+        self, request: ElevenLabsTextToSpeechRequest
+    ) -> AudioGenerationResult:
+        payload: dict[str, Any] = {
+            "model": request.model_id,
+            "text": request.text,
+            "voice": request.voice,
+        }
+        if request.language_code:
+            payload["language_code"] = request.language_code.split("-", 1)[0]
+        stability = (request.voice_settings or {}).get("stability")
+        if isinstance(stability, (int, float)):
+            payload["stability"] = float(stability)
+        audio_bytes, mime_type, generation_id = await self._generate(
+            payload=payload,
+            timeout_seconds=request.timeout_seconds,
+        )
+        return AudioGenerationResult(
+            audio_bytes=audio_bytes,
+            provider=self.provider_id,
+            model=request.model_id,
+            voice=request.voice,
+            response_format=_response_format_for_mime(mime_type, request.output_format),
+            mime_type=mime_type,
+            generation_id=generation_id,
+        )
+
+    async def generate_music(
+        self, request: MusicGenerationRequest
+    ) -> MusicGenerationResult:
+        audio_format, sample_rate, bitrate = _atlas_output_format_parts(request.output_format)
+        payload: dict[str, Any] = {
+            "model": request.model_id,
+            "prompt": request.prompt,
+            "is_instrumental": bool(request.force_instrumental),
+            "format": audio_format,
+            "sample_rate": sample_rate,
+            "bitrate": bitrate,
+        }
+        if request.lyrics:
+            payload["lyrics"] = request.lyrics
+        audio_bytes, mime_type, generation_id = await self._generate(
+            payload=payload,
+            timeout_seconds=request.timeout_seconds,
+        )
+        return MusicGenerationResult(
+            audio_bytes=audio_bytes,
+            provider=self.provider_id,
+            model=request.model_id,
+            response_format=request.output_format,
+            mime_type=mime_type,
+            generation_id=generation_id,
+        )
+
+
 class ElevenLabsAudioProductionProvider:
     provider_id = "elevenlabs"
 
@@ -329,9 +569,7 @@ class ElevenLabsAudioProductionProvider:
     def _headers(self, api_key: str) -> dict[str, str]:
         return {"xi-api-key": api_key}
 
-    async def text_to_speech(
-        self, request: ElevenLabsTextToSpeechRequest
-    ) -> AudioGenerationResult:
+    async def text_to_speech(self, request: ElevenLabsTextToSpeechRequest) -> AudioGenerationResult:
         api_key = self._resolve_api_key()
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")
@@ -623,9 +861,7 @@ class ElevenLabsAudioProductionProvider:
             mime_type=_audio_mime_type(response.headers.get("Content-Type"), "mp3"),
         )
 
-    async def generate_music(
-        self, request: MusicGenerationRequest
-    ) -> MusicGenerationResult:
+    async def generate_music(self, request: MusicGenerationRequest) -> MusicGenerationResult:
         api_key = self._resolve_api_key()
         if not api_key:
             raise RuntimeError(f"{self._api_key_env} is not set")

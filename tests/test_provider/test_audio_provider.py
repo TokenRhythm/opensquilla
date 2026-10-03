@@ -6,6 +6,7 @@ import httpx
 import pytest
 
 from opensquilla.provider.audio import (
+    AtlasCloudAudioProductionProvider,
     ElevenLabsAudioProductionProvider,
     ElevenLabsSharedVoicesRequest,
     ElevenLabsSpeechToTextRequest,
@@ -13,6 +14,108 @@ from opensquilla.provider.audio import (
     MusicGenerationRequest,
     VoiceCloneRequest,
 )
+
+
+@pytest.mark.anyio
+async def test_atlascloud_text_to_speech_polls_and_downloads_without_key() -> None:
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/v1/model/generateAudio":
+            assert request.headers["Authorization"] == "Bearer atlas-test"
+            assert json.loads(request.content) == {
+                "model": "elevenlabs/v3/text-to-speech",
+                "text": "你好，OpenSquilla",
+                "voice": "IKne3meq5aSn9XLyUdCD",
+                "language_code": "zh",
+                "stability": 0.6,
+            }
+            return httpx.Response(
+                200,
+                json={"code": 200, "data": {"id": "audio_123", "status": "created"}},
+            )
+        if request.url.path == "/api/v1/model/prediction/audio_123":
+            assert request.headers["Authorization"] == "Bearer atlas-test"
+            return httpx.Response(
+                200,
+                json={
+                    "code": 200,
+                    "data": {
+                        "id": "audio_123",
+                        "status": "completed",
+                        "outputs": ["https://static.atlascloud.ai/media/speech.wav"],
+                    },
+                },
+            )
+        assert request.url == "https://static.atlascloud.ai/media/speech.wav"
+        assert "Authorization" not in request.headers
+        return httpx.Response(200, content=b"RIFFspeech", headers={"Content-Type": "audio/wav"})
+
+    provider = AtlasCloudAudioProductionProvider(
+        api_key="atlas-test",
+        poll_interval_seconds=0,
+        transport=httpx.MockTransport(handler),
+    )
+    result = await provider.text_to_speech(
+        ElevenLabsTextToSpeechRequest(
+            text="你好，OpenSquilla",
+            voice="IKne3meq5aSn9XLyUdCD",
+            model_id="elevenlabs/v3/text-to-speech",
+            output_format="wav",
+            language_code="zh-CN",
+            voice_settings={"stability": 0.6, "speed": 1.0},
+        )
+    )
+
+    assert len(requests) == 3
+    assert result.audio_bytes == b"RIFFspeech"
+    assert result.provider == "atlascloud"
+    assert result.generation_id == "audio_123"
+    assert result.mime_type == "audio/wav"
+    assert result.response_format == "wav"
+
+
+@pytest.mark.anyio
+async def test_atlascloud_music_maps_output_format_and_downloads_audio() -> None:
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/v1/model/generateAudio":
+            assert json.loads(request.content) == {
+                "model": "minimax/music-2.6",
+                "prompt": "cinematic product intro",
+                "is_instrumental": True,
+                "format": "mp3",
+                "sample_rate": 44100,
+                "bitrate": 256000,
+            }
+            return httpx.Response(
+                200,
+                json={
+                    "id": "music_123",
+                    "status": "completed",
+                    "outputs": ["https://static.atlascloud.ai/media/music.mp3"],
+                },
+            )
+        assert request.url == "https://static.atlascloud.ai/media/music.mp3"
+        assert "Authorization" not in request.headers
+        return httpx.Response(200, content=b"ID3music", headers={"Content-Type": "audio/mpeg"})
+
+    provider = AtlasCloudAudioProductionProvider(
+        api_key="atlas-test",
+        poll_interval_seconds=0,
+        transport=httpx.MockTransport(handler),
+    )
+    result = await provider.generate_music(
+        MusicGenerationRequest(
+            prompt="cinematic product intro",
+            model_id="minimax/music-2.6",
+            output_format="mp3_44100_256",
+        )
+    )
+
+    assert result.audio_bytes == b"ID3music"
+    assert result.provider == "atlascloud"
+    assert result.generation_id == "music_123"
 
 
 @pytest.mark.anyio

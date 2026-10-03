@@ -26,11 +26,69 @@ def _audio_config(*, enabled: bool = True, api_key: str = "el-test") -> AudioCon
     return config
 
 
+def _atlas_audio_config() -> AudioConfig:
+    config = AudioConfig(enabled=True, provider="atlascloud")
+    config.providers.atlascloud.api_key = "atlas-test"
+    config.providers.atlascloud.api_key_env = "ATLASCLOUD_API_KEY"
+    config.tts.model = "elevenlabs/v3/text-to-speech"
+    config.tts.voice = "IKne3meq5aSn9XLyUdCD"
+    return config
+
+
 def _tool_context(tmp_path: Path) -> ToolContext:
     return ToolContext(
         caller_kind=CallerKind.AGENT,
         workspace_dir=str(tmp_path / "workspace"),
     )
+
+
+@pytest.mark.anyio
+async def test_atlascloud_routes_tts_and_music_tools(monkeypatch, tmp_path: Path) -> None:
+    from opensquilla.tools.builtin import media
+
+    captured: dict[str, object] = {}
+
+    class FakeProvider:
+        def __init__(self, **_kwargs):
+            return None
+
+        async def text_to_speech(self, request):
+            captured["tts"] = request
+            return AudioGenerationResult(
+                audio_bytes=b"atlas-speech",
+                provider="atlascloud",
+                model=request.model_id,
+                voice=request.voice,
+                response_format=request.output_format,
+                mime_type="audio/mpeg",
+            )
+
+        async def generate_music(self, request):
+            captured["music"] = request
+            return MusicGenerationResult(
+                audio_bytes=b"atlas-music",
+                provider="atlascloud",
+                model=request.model_id,
+                response_format=request.output_format,
+                mime_type="audio/mpeg",
+            )
+
+    monkeypatch.setattr(media, "AtlasCloudAudioProductionProvider", FakeProvider)
+    media.configure_audio(_atlas_audio_config())
+    token = current_tool_context.set(_tool_context(tmp_path))
+    try:
+        speech = json.loads(await media.tts(text="你好", output_path="speech.mp3"))
+        music = json.loads(
+            await media.music_generate(prompt="cinematic intro", output_path="music.mp3")
+        )
+    finally:
+        current_tool_context.reset(token)
+        media.configure_audio(None)
+
+    assert speech["provider"] == "atlascloud"
+    assert music["provider"] == "atlascloud"
+    assert getattr(captured["tts"], "model_id") == "elevenlabs/v3/text-to-speech"
+    assert getattr(captured["music"], "model_id") == "minimax/music-2.6"
 
 
 def test_audio_default_env_does_not_cross_endpoint_origin(monkeypatch) -> None:
