@@ -65,6 +65,9 @@ import {
   type WorkspacePreviewLink,
 } from '@/utils/chat/workspacePreviews'
 import { copyTextWithFallback, downloadBlob, isMacPlatform } from '@/utils/browser'
+import { decorateCodeBlocks } from '@/utils/chat/codeBlockChrome'
+import { decorateMarkdownImages } from '@/utils/markdown/imageLightbox'
+import { renderMermaidBlocks } from '@/utils/markdown/mermaidRenderer'
 import { usePlatform } from '@/platform'
 import { requestBrowserWorkbenchOpen } from '@/workbench/browserItems'
 import { useWorkbenchStore } from '@/workbench/store'
@@ -252,97 +255,54 @@ function labelFor(sourceId: number): string {
   return source ? source.title || source.domain : ''
 }
 
-function codeText(pre: HTMLPreElement): string {
-  const code = pre.querySelector('code')
-  return code?.textContent || ''
-}
-
-function hasCodeCopyButton(pre: HTMLPreElement): boolean {
-  return Array.from(pre.children).some(child => child.classList.contains('code-copy-btn'))
-}
-
-function setCodeCopyButtonState(button: HTMLButtonElement, state: 'idle' | 'copied' | 'error') {
-  const label = state === 'copied'
-    ? t('chat.copied')
-    : state === 'error'
-      ? t('chat.toast.copyFailed')
-      : t('chat.copy')
-  button.replaceChildren(createCodeCopyIcon(state))
-  button.title = label
-  button.setAttribute('aria-label', label)
-}
-
-function createCodeCopyIcon(state: 'idle' | 'copied' | 'error'): SVGSVGElement {
-  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
-  svg.setAttribute('viewBox', '0 0 24 24')
-  svg.setAttribute('width', '15')
-  svg.setAttribute('height', '15')
-  svg.setAttribute('aria-hidden', 'true')
-  svg.setAttribute('focusable', 'false')
-  svg.setAttribute('fill', 'none')
-  svg.setAttribute('stroke', 'currentColor')
-  svg.setAttribute('stroke-width', '2')
-  svg.setAttribute('stroke-linecap', 'round')
-  svg.setAttribute('stroke-linejoin', 'round')
-
-  if (state === 'copied') {
-    svg.appendChild(svgNode('polyline', { points: '20 6 9 17 4 12' }))
-    return svg
+function mermaidLabels() {
+  return {
+    zoomIn: t('chat.mermaid.zoomIn'),
+    zoomOut: t('chat.mermaid.zoomOut'),
+    reset: t('chat.mermaid.reset'),
+    copyCode: t('chat.mermaid.copyCode'),
+    copied: t('chat.copied'),
+    copyFailed: t('chat.toast.copyFailed'),
+    exportPng: t('chat.mermaid.exportPng'),
+    loadFailed: t('chat.mermaid.loadFailed'),
+    viewSource: t('chat.mermaid.viewSource'),
+    syntaxErrorAt: (line: number, excerpt: string) => t('chat.mermaid.syntaxErrorAt', { line, excerpt }),
   }
-  if (state === 'error') {
-    svg.appendChild(svgNode('path', { d: 'M18 6 6 18' }))
-    svg.appendChild(svgNode('path', { d: 'm6 6 12 12' }))
-    return svg
-  }
-
-  svg.appendChild(svgNode('rect', { width: '14', height: '14', x: '8', y: '8', rx: '2', ry: '2' }))
-  svg.appendChild(svgNode('path', { d: 'M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2' }))
-  return svg
 }
 
-function svgNode(tag: string, attrs: Record<string, string>): SVGElement {
-  const node = document.createElementNS('http://www.w3.org/2000/svg', tag)
-  for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value)
-  return node
-}
-
-function decorateCodeBlocks() {
+// After `v-html` has applied the sanitized body, upgrade any `[n]` that maps to
+// a real source into a focusable citation pill. The pass works on already-clean
+// text nodes only (createElement/textContent — never innerHTML), so it adds no
+// HTML sink and re-runs idempotently when the body re-renders during streaming.
+function decorate() {
   const root = rootEl.value
-  if (!root) return
-  for (const pre of root.querySelectorAll<HTMLPreElement>('pre')) {
-    if (hasCodeCopyButton(pre)) continue
-    const text = codeText(pre)
-    if (!text) continue
-
-    pre.classList.add('code-block')
-    const button = document.createElement('button')
-    button.type = 'button'
-    button.className = 'code-copy-btn'
-    setCodeCopyButtonState(button, 'idle')
-    button.addEventListener('click', async event => {
-      event.preventDefault()
-      event.stopPropagation()
-      try {
-        await copyTextWithFallback(codeText(pre))
-        setCodeCopyButtonState(button, 'copied')
-        button.classList.add('is-copied')
-        window.setTimeout(() => {
-          if (!button.isConnected) return
-          setCodeCopyButtonState(button, 'idle')
-          button.classList.remove('is-copied')
-        }, 1600)
-      } catch {
-        setCodeCopyButtonState(button, 'error')
-        button.classList.add('is-error')
-        window.setTimeout(() => {
-          if (!button.isConnected) return
-          setCodeCopyButtonState(button, 'idle')
-          button.classList.remove('is-error')
-        }, 1600)
-      }
-    })
-    pre.appendChild(button)
+  if (!root) {
+    mentionedPreviewIds.value = []
+    return
   }
+  clearWorkspaceFileLinks(root)
+  mentionedPreviewIds.value = decorateWorkspacePreviewLinks(
+    root, props.workspacePreviews, preview => emit('workspacePreview', preview), previewLabel, showFileMenu,
+  )
+  missingCitationIds.value = []
+  decorateCitations(root, props.sources, {
+    onActivate: n => emit('citation', n),
+    labelFor,
+    onMissingCitations: ids => {
+      missingCitationIds.value = props.sources.length > 0 ? ids : []
+    },
+  })
+  decorateCodeBlocks(root, {
+    copy: t('chat.copy'),
+    copied: t('chat.copied'),
+    copyFailed: t('chat.toast.copyFailed'),
+  })
+  decorateMarkdownImages(root, t('chat.closePreview'))
+  if (root.querySelector('code.language-mermaid')) {
+    void renderMermaidBlocks(root, mermaidLabels()).catch(() => { /* failed fences keep their source */ })
+  }
+  decorateBrowserLinks()
+  decorateWorkspaceFiles(root)
 }
 
 function decorateBrowserLinks() {
@@ -370,33 +330,6 @@ function decorateBrowserLinks() {
     })
     anchor.insertAdjacentElement('afterend', button)
   }
-}
-
-// After `v-html` has applied the sanitized body, upgrade any `[n]` that maps to
-// a real source into a focusable citation pill. The pass works on already-clean
-// text nodes only (createElement/textContent — never innerHTML), so it adds no
-// HTML sink and re-runs idempotently when the body re-renders during streaming.
-function decorate() {
-  const root = rootEl.value
-  if (!root) {
-    mentionedPreviewIds.value = []
-    return
-  }
-  clearWorkspaceFileLinks(root)
-  mentionedPreviewIds.value = decorateWorkspacePreviewLinks(
-    root, props.workspacePreviews, preview => emit('workspacePreview', preview), previewLabel, showFileMenu,
-  )
-  missingCitationIds.value = []
-  decorateCitations(root, props.sources, {
-    onActivate: n => emit('citation', n),
-    labelFor,
-    onMissingCitations: ids => {
-      missingCitationIds.value = props.sources.length > 0 ? ids : []
-    },
-  })
-  decorateCodeBlocks()
-  decorateBrowserLinks()
-  decorateWorkspaceFiles(root)
 }
 
 onMounted(decorate)
@@ -526,42 +459,10 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--text) 4%, transparent);
 }
 .msg-ai-text :deep(pre.code-block) {
+  /* Chrome for fenced code (header gradient, language label, copy button)
+     lives in styles/chat-markdown.css so streaming blocks and artifact
+     previews render the identical surface. */
   position: relative;
-  padding-top: 2.375rem;
-  background: linear-gradient(
-    to bottom,
-    var(--code-block-header-bg) 0,
-    var(--code-block-header-bg) 1.75rem,
-    var(--code-block-bg) 1.75rem,
-    var(--code-block-bg) 100%
-  );
-}
-
-.msg-ai-text :deep(pre.code-block > .code-lang) {
-  top: 0.375rem;
-  right: 2.5rem;
-  line-height: 1rem;
-  background: transparent;
-  color: var(--text-dim);
-}
-
-.msg-ai-text :deep(.code-copy-btn) {
-  position: absolute;
-  top: 0;
-  right: 0.25rem;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 1.75rem;
-  height: 1.75rem;
-  padding: 0;
-  border: 0;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text);
-  opacity: 0.78;
-  cursor: pointer;
-  transition: color var(--transition), background var(--transition), opacity var(--transition);
 }
 
 .msg-ai-text :deep(.link-side-browser-btn) {
@@ -588,32 +489,6 @@ onBeforeUnmount(() => { fileRequest?.abort(); fileActionRequest?.abort() })
   color: var(--accent);
 }
 
-.msg-ai-text :deep(.code-copy-btn svg) {
-  display: block;
-  width: 0.9375rem;
-  height: 0.9375rem;
-}
-
-.msg-ai-text :deep(.code-copy-btn:hover) {
-  color: var(--text);
-  opacity: 1;
-  background: var(--bg-hover);
-}
-
-.msg-ai-text :deep(.code-copy-btn:focus-visible) {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.msg-ai-text :deep(.code-copy-btn.is-copied) {
-  color: var(--ok);
-  opacity: 1;
-}
-
-.msg-ai-text :deep(.code-copy-btn.is-error) {
-  color: var(--danger);
-  opacity: 1;
-}
 .msg-ai-text :deep(pre code) {
   background: transparent;
   padding: 0;

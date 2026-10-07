@@ -834,49 +834,8 @@
   font-family: var(--font-mono);
 }
 
-/* Highlight token mapping — values from the --syntax-* family in base.css */
-:deep(.hljs-comment), :deep(.hljs-quote) {
-  color: var(--syntax-comment);
-  font-style: italic;
-}
-
-:deep(.hljs-meta), :deep(.hljs-doctag) {
-  color: var(--syntax-comment);
-}
-
-:deep(.hljs-keyword), :deep(.hljs-selector-tag), :deep(.hljs-built_in), :deep(.hljs-template-tag) {
-  color: var(--syntax-keyword);
-}
-
-:deep(.hljs-string), :deep(.hljs-regexp), :deep(.hljs-addition) {
-  color: var(--syntax-string);
-}
-
-:deep(.hljs-number), :deep(.hljs-literal), :deep(.hljs-symbol), :deep(.hljs-bullet) {
-  color: var(--syntax-literal);
-}
-
-:deep(.hljs-title), :deep(.hljs-section), :deep(.hljs-name) {
-  color: var(--syntax-title);
-}
-
-:deep(.hljs-attr), :deep(.hljs-attribute), :deep(.hljs-variable), :deep(.hljs-template-variable),
-:deep(.hljs-type), :deep(.hljs-property), :deep(.hljs-selector-id), :deep(.hljs-selector-class),
-:deep(.hljs-selector-attr), :deep(.hljs-selector-pseudo) {
-  color: var(--syntax-attr);
-}
-
-:deep(.hljs-deletion) {
-  color: var(--danger);
-}
-
-:deep(.hljs-emphasis) {
-  font-style: italic;
-}
-
-:deep(.hljs-strong) {
-  font-weight: 600;
-}
+/* Highlight token colors moved to styles/chat-markdown.css — one palette for
+   chat, streaming, session inspect, and the artifact preview. */
 
 :deep(code) {
   background: var(--bg-hover);

@@ -3585,6 +3585,16 @@
     "videoUnsupported": "このブラウザーでは動画を再生できません。代わりにダウンロードしてください。",
     "previewOf": "プレビュー: {title}",
     "closePreview": "プレビューを閉じる",
+    "mermaid": {
+      "zoomIn": "拡大",
+      "zoomOut": "縮小",
+      "reset": "表示をリセット",
+      "copyCode": "ソースをコピー",
+      "exportPng": "PNG を書き出し",
+      "loadFailed": "mermaid モジュールの読み込みに失敗しました",
+      "viewSource": "ソースを表示",
+      "syntaxErrorAt": "{line} 行目に構文エラー：{excerpt}"
+    },
     "previousImage": "前の画像",
     "nextImage": "次の画像",
     "loadingPreview": "プレビューを読み込み中",

@@ -3585,6 +3585,16 @@
     "videoUnsupported": "Este navegador no puede reproducir este vídeo. Descárgalo en su lugar.",
     "previewOf": "Vista previa: {title}",
     "closePreview": "Cerrar vista previa",
+    "mermaid": {
+      "zoomIn": "Acercar",
+      "zoomOut": "Alejar",
+      "reset": "Restablecer vista",
+      "copyCode": "Copiar código fuente",
+      "exportPng": "Exportar PNG",
+      "loadFailed": "No se pudo cargar el módulo de mermaid",
+      "viewSource": "Ver código fuente",
+      "syntaxErrorAt": "Error de sintaxis en la línea {line}: {excerpt}"
+    },
     "previousImage": "Imagen anterior",
     "nextImage": "Imagen siguiente",
     "loadingPreview": "Cargando vista previa",

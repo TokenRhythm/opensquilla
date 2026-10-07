@@ -3670,6 +3670,16 @@
     "videoUnsupported": "This browser cannot play this video. Download it instead.",
     "previewOf": "Preview: {title}",
     "closePreview": "Close preview",
+    "mermaid": {
+      "zoomIn": "Zoom in",
+      "zoomOut": "Zoom out",
+      "reset": "Reset view",
+      "copyCode": "Copy source",
+      "exportPng": "Export PNG",
+      "loadFailed": "The mermaid module failed to load",
+      "viewSource": "View source",
+      "syntaxErrorAt": "Syntax error on line {line}: {excerpt}"
+    },
     "previousImage": "Previous image",
     "nextImage": "Next image",
     "loadingPreview": "Loading preview",

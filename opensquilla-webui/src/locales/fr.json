@@ -3585,6 +3585,16 @@
     "videoUnsupported": "Ce navigateur ne peut pas lire cette vidéo. Téléchargez-la à la place.",
     "previewOf": "Aperçu : {title}",
     "closePreview": "Fermer l'aperçu",
+    "mermaid": {
+      "zoomIn": "Zoom avant",
+      "zoomOut": "Zoom arrière",
+      "reset": "Réinitialiser la vue",
+      "copyCode": "Copier le code source",
+      "exportPng": "Exporter en PNG",
+      "loadFailed": "Échec du chargement du module mermaid",
+      "viewSource": "Voir le code source",
+      "syntaxErrorAt": "Erreur de syntaxe à la ligne {line} : {excerpt}"
+    },
     "previousImage": "Image précédente",
     "nextImage": "Image suivante",
     "loadingPreview": "Chargement de l'aperçu",

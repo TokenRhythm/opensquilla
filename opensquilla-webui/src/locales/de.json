@@ -3585,6 +3585,16 @@
     "videoUnsupported": "Dieser Browser kann dieses Video nicht wiedergeben. Laden Sie es stattdessen herunter.",
     "previewOf": "Vorschau: {title}",
     "closePreview": "Vorschau schließen",
+    "mermaid": {
+      "zoomIn": "Vergrößern",
+      "zoomOut": "Verkleinern",
+      "reset": "Ansicht zurücksetzen",
+      "copyCode": "Quellcode kopieren",
+      "exportPng": "PNG exportieren",
+      "loadFailed": "Das mermaid-Modul konnte nicht geladen werden",
+      "viewSource": "Quelltext anzeigen",
+      "syntaxErrorAt": "Syntaxfehler in Zeile {line}: {excerpt}"
+    },
     "previousImage": "Vorheriges Bild",
     "nextImage": "Nächstes Bild",
     "loadingPreview": "Vorschau wird geladen",
