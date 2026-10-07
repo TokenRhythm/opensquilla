@@ -3669,6 +3669,16 @@
     "videoUnsupported": "此浏览器无法播放该视频。请改为下载。",
     "previewOf": "预览：{title}",
     "closePreview": "关闭预览",
+    "mermaid": {
+      "zoomIn": "放大",
+      "zoomOut": "缩小",
+      "reset": "重置视图",
+      "copyCode": "复制源码",
+      "exportPng": "导出 PNG",
+      "loadFailed": "mermaid 模块加载失败",
+      "viewSource": "查看源码",
+      "syntaxErrorAt": "第 {line} 行语法错误：{excerpt}"
+    },
     "previousImage": "上一张图片",
     "nextImage": "下一张图片",
     "loadingPreview": "正在加载预览",

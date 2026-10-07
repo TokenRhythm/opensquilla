@@ -2,6 +2,7 @@
 
 import { createApp, defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createI18n } from 'vue-i18n'
 import StreamingTextPart from './StreamingTextPart.vue'
 
 const apps: ReturnType<typeof createApp>[] = []
@@ -10,6 +11,12 @@ afterEach(() => {
   apps.splice(0).forEach(app => app.unmount())
   document.body.innerHTML = ''
 })
+
+// The component pulls decoration labels (copy buttons, mermaid chrome) from
+// vue-i18n; the host app must install it before mount.
+function mountI18n(app: ReturnType<typeof createApp>): void {
+  app.use(createI18n({ legacy: false, missingWarn: false, messages: {} }))
+}
 
 describe('StreamingTextPart', () => {
   it('keeps the growing tail as text and renders each closed block once', async () => {
@@ -22,6 +29,7 @@ describe('StreamingTextPart', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(root)
+    mountI18n(app)
     app.mount(host)
     apps.push(app)
 
@@ -33,10 +41,12 @@ describe('StreamingTextPart', () => {
     raw.value += '\n\n'
     await nextTick()
     expect(renderMarkdown).toHaveBeenCalledTimes(1)
+    // A committed block renders exactly once, fully rich: highlighting and
+    // math are paid per block at commit time, not deferred to settle.
     expect(renderMarkdown).toHaveBeenLastCalledWith('A growing paragraph\n\n', {
-      highlight: false,
+      highlight: true,
       cache: 'none',
-      math: 'defer',
+      math: 'full',
     })
 
     raw.value += 'Second block still open'
@@ -55,6 +65,7 @@ describe('StreamingTextPart', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(root)
+    mountI18n(app)
     app.mount(host)
     apps.push(app)
     await nextTick()
@@ -74,6 +85,7 @@ describe('StreamingTextPart', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(root)
+    mountI18n(app)
     app.mount(host)
     apps.push(app)
     await nextTick()
@@ -95,6 +107,7 @@ describe('StreamingTextPart', () => {
     const host = document.createElement('div')
     document.body.appendChild(host)
     const app = createApp(root)
+    mountI18n(app)
     app.mount(host)
     apps.push(app)
     await nextTick()

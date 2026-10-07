@@ -1,5 +1,5 @@
 <template>
-  <div class="msg-ai-text streaming-text-part">
+  <div ref="rootEl" class="msg-ai-text streaming-text-part">
     <template v-for="block in committedBlocks" :key="block.key">
       <div
         v-if="block.kind === 'rich'"
@@ -13,8 +13,12 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch } from 'vue'
+import { onMounted, ref, watch } from 'vue'
+import { useI18n } from 'vue-i18n'
 import type { RenderMarkdownOptions } from '@/composables/chat/useChatTextRendering'
+import { decorateCodeBlocks } from '@/utils/chat/codeBlockChrome'
+import { decorateMarkdownImages } from '@/utils/markdown/imageLightbox'
+import { preloadMermaid, renderMermaidBlocks } from '@/utils/markdown/mermaidRenderer'
 
 const OPEN_BLOCK_LIMIT = 16 * 1024
 const PLAIN_CHUNK_SIZE = 8 * 1024
@@ -23,6 +27,8 @@ const props = defineProps<{
   rawText: string
   renderMarkdown: (text: string, opts?: RenderMarkdownOptions) => string
 }>()
+
+const { t } = useI18n()
 
 interface RichBlock {
   key: string
@@ -44,6 +50,7 @@ type CommittedBlock = RichBlock | PlainBlock
 // ahead of its already-displayed prefix.
 const committedBlocks = ref<CommittedBlock[]>([])
 const tail = ref('')
+const rootEl = ref<HTMLDivElement | null>(null)
 
 let acceptedRaw = ''
 let committedOffset = 0
@@ -70,10 +77,13 @@ function appendRichBlock(raw: string, endOffset: number): void {
     committedBlocks.value.push({
       key: `rich-${blockSequence++}`,
       kind: 'rich',
+      // A committed block renders exactly once — never re-parsed on later
+      // flushes — so the one-time highlight/math cost is bounded per block
+      // (oversized code falls back to plain text inside the renderer).
       html: props.renderMarkdown(blockText, {
-        highlight: false,
+        highlight: true,
         cache: 'none',
-        math: 'defer',
+        math: 'full',
       }),
     })
   }
@@ -115,6 +125,10 @@ function update(raw: string): void {
   if (!raw.startsWith(acceptedRaw)) resetState()
   acceptedRaw = raw
 
+  // Start loading the mermaid chunk while the fence is still streaming so it
+  // has usually arrived by the time the block commits and renders.
+  if (raw.includes('```mermaid')) preloadMermaid()
+
   while (scanOffset < raw.length) {
     const newline = raw.indexOf('\n', scanOffset)
     if (newline < 0) break
@@ -136,6 +150,44 @@ function update(raw: string): void {
   freezeLongOpenTail(raw)
   tail.value = raw.slice(committedOffset)
 }
+
+// Committed blocks are stable (appended, keyed, never re-rendered), so one
+// idempotent pass after each DOM flush adds the same chrome the settled
+// TextPart gets: copy buttons, mermaid diagrams, click-to-zoom images.
+function mermaidLabels() {
+  return {
+    zoomIn: t('chat.mermaid.zoomIn'),
+    zoomOut: t('chat.mermaid.zoomOut'),
+    reset: t('chat.mermaid.reset'),
+    copyCode: t('chat.mermaid.copyCode'),
+    copied: t('chat.copied'),
+    copyFailed: t('chat.toast.copyFailed'),
+    exportPng: t('chat.mermaid.exportPng'),
+    loadFailed: t('chat.mermaid.loadFailed'),
+    viewSource: t('chat.mermaid.viewSource'),
+    syntaxErrorAt: (line: number, excerpt: string) => t('chat.mermaid.syntaxErrorAt', { line, excerpt }),
+  }
+}
+
+function decorate(): void {
+  const root = rootEl.value
+  if (!root) return
+  const labels = {
+    copy: t('chat.copy'),
+    copied: t('chat.copied'),
+    copyFailed: t('chat.toast.copyFailed'),
+  }
+  for (const block of root.querySelectorAll<HTMLElement>('.streaming-rich-block')) {
+    decorateCodeBlocks(block, labels)
+    decorateMarkdownImages(block, t('chat.closePreview'))
+    if (block.querySelector('code.language-mermaid')) {
+      void renderMermaidBlocks(block, mermaidLabels()).catch(() => { /* failed fences keep their source */ })
+    }
+  }
+}
+
+watch(() => committedBlocks.value.length, decorate, { flush: 'post' })
+onMounted(decorate)
 
 watch(() => props.rawText, update, { immediate: true })
 </script>

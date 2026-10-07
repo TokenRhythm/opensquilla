@@ -1,13 +1,12 @@
-import createDOMPurify from 'dompurify'
-import { marked } from 'marked'
+import { parseMarkdownRaw, renderMarkdownCore } from '@/utils/markdown/renderCore'
 import type { ArtifactPayload } from '@/types/artifacts'
 import { artifactExtension, artifactMime, artifactName } from '@/utils/chat/artifacts'
-import { strictStrikethrough } from '@/utils/markdown/strikethrough'
 
-// `marked` is a shared singleton, so declare the rule here too: a markdown
-// artifact renders the same text as the chat bubble it came from, and must not
-// depend on whether the chat renderer happens to have been imported first.
-marked.use(strictStrikethrough)
+// Markdown artifacts render through the same pipeline as chat bubbles
+// (utils/markdown/renderCore.ts) — one marked/DOMPurify configuration, one
+// feature set (highlight, math, task lists, images, mermaid-ready fences). The
+// previous hand-rolled second sanitizer is gone: keeping two allow-lists in
+// sync was the whole maintenance burden.
 
 export const ARTIFACT_TEXT_PREVIEW_LIMIT = 5 * 1024 * 1024
 export const ARTIFACT_BINARY_PREVIEW_LIMIT = 30 * 1024 * 1024
@@ -26,14 +25,6 @@ const HTML_EXTENSIONS = new Set(['htm', 'html', 'xhtml'])
 const MARKDOWN_EXTENSIONS = new Set(['markdown', 'md', 'mdown', 'mkd'])
 const TEXT_EXTENSIONS = new Set(['log', 'text', 'txt'])
 const IMAGE_EXTENSIONS = new Set(['avif', 'bmp', 'gif', 'ico', 'jpeg', 'jpg', 'png', 'svg', 'webp'])
-const MARKDOWN_ALLOWED_TAGS = new Set([
-  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'EM', 'H1', 'H2', 'H3', 'H4',
-  'H5', 'H6', 'HR', 'LI', 'OL', 'P', 'PRE', 'STRONG', 'TABLE', 'TBODY',
-  'TD', 'TH', 'THEAD', 'TR', 'UL',
-])
-const MARKDOWN_DROP_WITH_CONTENT = new Set([
-  'AUDIO', 'BASE', 'FORM', 'IFRAME', 'OBJECT', 'SCRIPT', 'STYLE', 'SVG', 'VIDEO',
-])
 
 function normalizedMime(value: unknown): string {
   return typeof value === 'string'
@@ -91,30 +82,32 @@ export function responseMatchesArtifactPreviewKind(
 }
 
 export function renderArtifactMarkdown(markdown: string): string {
-  const raw = marked.parse(markdown, {
-    async: false,
-    breaks: true,
-    gfm: true,
-  }) as string
-  if (typeof window === 'undefined') return ''
-  const purifier = createDOMPurify(window)
-  const purified = purifier.sanitize(raw, {
-    ALLOWED_TAGS: [
-      'a', 'blockquote', 'br', 'code', 'del', 'em', 'h1', 'h2', 'h3',
-      'h4', 'h5', 'h6', 'hr', 'li', 'ol', 'p', 'pre', 'strong', 'table',
-      'tbody', 'td', 'th', 'thead', 'tr', 'ul',
-    ],
-    ALLOWED_ATTR: ['href', 'title'],
-    ALLOWED_URI_REGEXP: /^(?:https?|mailto|#):/i,
-  })
-  // DOMPurify is the primary sanitizer. Some lightweight DOM test runtimes do
-  // not fully implement the browser APIs it relies on, so validate its output
-  // and apply the same allow-list with native DOM traversal as defense-in-depth.
-  const candidate = /<(?:script|style|iframe|object|svg|form)\b|javascript:/i.test(purified)
-    ? raw
-    : purified
-  return enforceArtifactMarkdownAllowList(candidate)
+  const purified = renderMarkdownCore(markdown)
+  // DOMPurify is the primary sanitizer. When it cannot run correctly, its
+  // output still contains active content (happy-dom's Node.prototype.nodeName
+  // is the known offender) — re-parse raw and fall back to the native-DOM
+  // allowlist below. A compliant browser never enters that branch, so the
+  // primary pipeline's output (KaTeX classes, MathML markup) passes through
+  // untouched.
+  if (/<(?:script|iframe|object|form|style|svg)\b|javascript:/i.test(purified)) {
+    return enforceArtifactMarkdownAllowList(parseMarkdownRaw(markdown))
+  }
+  return purified
 }
+
+// Degraded-mode mirror of the renderCore sanitizer contract, using only
+// createTextNode/removeAttribute-level DOM that works without DOMPurify. It
+// must never be MORE permissive than the primary pipeline; staying slightly
+// more strict (dropping unknown attributes outright) is fine.
+const MARKDOWN_ALLOWED_TAGS = new Set([
+  'A', 'BLOCKQUOTE', 'BR', 'CODE', 'DEL', 'DIV', 'EM', 'H1', 'H2', 'H3',
+  'H4', 'H5', 'H6', 'HR', 'IMG', 'INPUT', 'LI', 'OL', 'P', 'PRE', 'SPAN',
+  'STRONG', 'SUP', 'TABLE', 'TBODY', 'TD', 'TH', 'THEAD', 'TR', 'UL',
+])
+const MARKDOWN_DROP_WITH_CONTENT = new Set([
+  'AUDIO', 'BASE', 'FORM', 'IFRAME', 'OBJECT', 'SCRIPT', 'STYLE', 'SVG', 'VIDEO',
+])
+const MARKDOWN_CLASS_RE = /^(?:hljs|hljs-[\w-]+|language-[\w#+.-]+|code-lang|katex|math-raw)$/
 
 function enforceArtifactMarkdownAllowList(html: string): string {
   const template = document.createElement('template')
@@ -126,20 +119,47 @@ function enforceArtifactMarkdownAllowList(html: string): string {
       else element.replaceWith(document.createTextNode(element.textContent || ''))
       continue
     }
+    const tag = element.tagName
     for (const attribute of [...element.attributes]) {
-      const allowed = attribute.name === 'title'
-        || (element.tagName === 'A' && attribute.name === 'href')
+      const name = attribute.name.toLowerCase()
+      let allowed = name === 'title' || name === 'class' || name === 'alt' || name === 'align'
+      if (tag === 'A') allowed ||= name === 'href' || name === 'target' || name === 'rel' || name === 'data-workspace-path'
+      if (tag === 'IMG') allowed ||= name === 'src' || name === 'loading' || name === 'decoding'
+      if (tag === 'INPUT') allowed ||= name === 'type' || name === 'checked' || name === 'disabled'
+      if (tag === 'SPAN') allowed ||= name === 'style' || name === 'aria-hidden'
+      if (name === 'class') {
+        const safe = (attribute.value || '').split(/\s+/).filter(cls => MARKDOWN_CLASS_RE.test(cls))
+        if (safe.length === 0) allowed = false
+        else element.setAttribute('class', safe.join(' '))
+      }
       if (!allowed) element.removeAttribute(attribute.name)
     }
-    if (element.tagName === 'A') {
+    if (tag === 'A') {
       const href = element.getAttribute('href') || ''
       if (!/^(?:https?|mailto|#):/i.test(href)) {
         element.removeAttribute('href')
-      } else if (/^https?:/i.test(href)) {
-        element.setAttribute('target', '_blank')
-        element.setAttribute('rel', 'noopener noreferrer')
+      } else {
+        if (/^https?:/i.test(href)) {
+          element.setAttribute('target', '_blank')
+          element.setAttribute('rel', 'noopener noreferrer')
+        }
+        continue
       }
     }
+    if (tag === 'IMG') {
+      const src = element.getAttribute('src') || ''
+      const safeSrc = /^https?:\/\//i.test(src)
+        || /^data:image\/(?:png|jpe?g|webp|gif);base64,[A-Za-z0-9+/=]+$/.test(src)
+      // Mirror the primary pipeline: a blocked image is removed outright, not
+      // left as a broken-image box.
+      if (!safeSrc) {
+        element.remove()
+        continue
+      }
+      element.setAttribute('loading', 'lazy')
+      element.setAttribute('decoding', 'async')
+    }
+    if (tag === 'INPUT') element.setAttribute('disabled', '')
   }
   return template.innerHTML
 }

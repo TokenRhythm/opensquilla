@@ -154,7 +154,7 @@
           class="artifact-preview__markdown chat-markdown"
         >
           <!-- eslint-disable-next-line vue/no-v-html -- output is DOMPurify-sanitized in the resource controller -->
-          <div v-html="preview.markdownHtml.value" />
+          <div ref="markdownPreviewEl" v-html="preview.markdownHtml.value" />
         </div>
         <pre
           v-else-if="preview.kind.value === 'text'"
@@ -206,6 +206,9 @@ import {
   artifactIconName,
 } from '@/utils/chat/artifacts'
 import { ARTIFACT_PREVIEW_ESCAPE_MESSAGE } from '@/utils/workbench/artifactPreview'
+import { decorateCodeBlocks } from '@/utils/chat/codeBlockChrome'
+import { decorateMarkdownImages } from '@/utils/markdown/imageLightbox'
+import { renderMermaidBlocks } from '@/utils/markdown/mermaidRenderer'
 
 const props = withDefaults(defineProps<{
   artifact: ArtifactPayload
@@ -251,7 +254,39 @@ const artifactWorkbench = inject(ARTIFACT_WORKBENCH_KEY)
 if (!artifactWorkbench) throw new Error('ArtifactWorkbench was not provided')
 const previewFrameRef = ref<HTMLIFrameElement | null>(null)
 const htmlFrameGeneration = ref(0)
+const markdownPreviewEl = ref<HTMLDivElement | null>(null)
 let loadedFrame: HTMLIFrameElement | null = null
+
+// Markdown artifacts share the chat decoration passes (copy buttons, mermaid,
+// click-to-zoom images) on top of the shared render pipeline.
+function mermaidPreviewLabels() {
+  return {
+    zoomIn: t('chat.mermaid.zoomIn'),
+    zoomOut: t('chat.mermaid.zoomOut'),
+    reset: t('chat.mermaid.reset'),
+    copyCode: t('chat.mermaid.copyCode'),
+    copied: t('chat.copied'),
+    copyFailed: t('chat.toast.copyFailed'),
+    exportPng: t('chat.mermaid.exportPng'),
+    loadFailed: t('chat.mermaid.loadFailed'),
+    viewSource: t('chat.mermaid.viewSource'),
+    syntaxErrorAt: (line: number, excerpt: string) => t('chat.mermaid.syntaxErrorAt', { line, excerpt }),
+  }
+}
+
+function decorateMarkdownPreview() {
+  const root = markdownPreviewEl.value
+  if (!root) return
+  decorateCodeBlocks(root, {
+    copy: t('chat.copy'),
+    copied: t('chat.copied'),
+    copyFailed: t('chat.toast.copyFailed'),
+  })
+  decorateMarkdownImages(root, t('chat.closePreview'))
+  if (root.querySelector('code.language-mermaid')) {
+    void renderMermaidBlocks(root, mermaidPreviewLabels()).catch(() => { /* failed fences keep their source */ })
+  }
+}
 
 function onHtmlFrameLoad(event: Event) {
   const frame = event.currentTarget as HTMLIFrameElement
@@ -275,6 +310,12 @@ const preview = artifactWorkbench.previews.createResource({
   },
   sessionKey: () => props.sessionKey,
 })
+
+watch(
+  () => preview.markdownHtml.value,
+  () => { if (preview.kind.value === 'markdown') decorateMarkdownPreview() },
+  { flush: 'post' },
+)
 
 const resourceSignature = computed(() => [
   props.artifact.id || '',

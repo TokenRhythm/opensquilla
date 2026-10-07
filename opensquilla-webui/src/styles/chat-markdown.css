@@ -132,3 +132,470 @@
   vertical-align: middle;
   accent-color: var(--accent);
 }
+
+/* ─── Markdown images (rendered again; the sanitizer value-gates sources) ── */
+.msg-ai-text img,
+.inspect-msg__text img,
+.artifact-preview__markdown img {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--radius-md);
+}
+
+/* Click-to-zoom affordance; the lightbox itself is theme-agnostic chrome. */
+.msg-ai-text .md-img,
+.inspect-msg__text .md-img,
+.artifact-preview__markdown .md-img {
+  cursor: zoom-in;
+}
+
+.md-img-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--sp-5);
+  background: color-mix(in srgb, var(--bg) 85%, transparent);
+  cursor: zoom-out;
+}
+
+.md-img-lightbox__image {
+  max-width: min(92vw, 1200px);
+  max-height: 88vh;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  box-shadow: 0 8px 32px color-mix(in srgb, var(--text) 28%, transparent);
+  cursor: default;
+}
+
+.md-img-lightbox__close {
+  position: absolute;
+  top: var(--sp-3);
+  right: var(--sp-3);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2rem;
+  height: 2rem;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--bg-surface);
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+}
+.md-img-lightbox__close:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.md-img-lightbox__close:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+/* ─── Fenced code chrome (shared by chat, streaming, and artifact preview) ──
+ * decorateCodeBlocks() adds .code-block + the copy button on sanitized output;
+ * the streaming renderer and the workbench preview run the same pass, so the
+ * chrome is defined once here instead of per component. */
+.msg-ai-text pre.code-block,
+.inspect-msg__text pre.code-block,
+.artifact-preview__markdown pre.code-block {
+  position: relative;
+  padding-top: 2.375rem;
+  background: linear-gradient(
+    to bottom,
+    var(--code-block-header-bg) 0,
+    var(--code-block-header-bg) 1.75rem,
+    var(--code-block-bg) 1.75rem,
+    var(--code-block-bg) 100%
+  );
+}
+
+.msg-ai-text pre.code-block > .code-lang,
+.inspect-msg__text pre.code-block > .code-lang,
+.artifact-preview__markdown pre.code-block > .code-lang {
+  top: 0.375rem;
+  right: 2.5rem;
+  line-height: 1rem;
+  background: transparent;
+  color: var(--text-dim);
+}
+
+.msg-ai-text .code-copy-btn,
+.inspect-msg__text .code-copy-btn,
+.artifact-preview__markdown .code-copy-btn {
+  position: absolute;
+  top: 0;
+  right: 0.25rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text);
+  opacity: 0.78;
+  cursor: pointer;
+  transition: color var(--transition), background var(--transition), opacity var(--transition);
+}
+.msg-ai-text .code-copy-btn svg,
+.inspect-msg__text .code-copy-btn svg,
+.artifact-preview__markdown .code-copy-btn svg {
+  display: block;
+  width: 0.9375rem;
+  height: 0.9375rem;
+}
+.msg-ai-text .code-copy-btn:hover,
+.inspect-msg__text .code-copy-btn:hover,
+.artifact-preview__markdown .code-copy-btn:hover {
+  color: var(--text);
+  opacity: 1;
+  background: var(--bg-hover);
+}
+.msg-ai-text .code-copy-btn:focus-visible,
+.inspect-msg__text .code-copy-btn:focus-visible,
+.artifact-preview__markdown .code-copy-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+.msg-ai-text .code-copy-btn.is-copied,
+.inspect-msg__text .code-copy-btn.is-copied,
+.artifact-preview__markdown .code-copy-btn.is-copied {
+  color: var(--ok);
+  opacity: 1;
+}
+.msg-ai-text .code-copy-btn.is-error,
+.inspect-msg__text .code-copy-btn.is-error,
+.artifact-preview__markdown .code-copy-btn.is-error {
+  color: var(--danger);
+  opacity: 1;
+}
+
+/* ─── Mermaid diagrams ──────────────────────────────────────────────────────
+ * renderMermaidBlocks() swaps a ```mermaid fence for this wrapper; a failed
+ * render becomes .mermaid-error, which always keeps the source copyable. */
+.msg-ai-text .mermaid-diagram,
+.inspect-msg__text .mermaid-diagram,
+.artifact-preview__markdown .mermaid-diagram {
+  position: relative;
+  margin: var(--sp-2) 0;
+  padding: var(--sp-3);
+  border: 1px solid var(--code-block-border);
+  border-radius: var(--radius-md);
+  background: var(--code-block-bg);
+  overflow: hidden;
+}
+
+.msg-ai-text .mermaid-svg-wrap,
+.inspect-msg__text .mermaid-svg-wrap,
+.artifact-preview__markdown .mermaid-svg-wrap {
+  display: flex;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.msg-ai-text .mermaid-svg-wrap svg,
+.inspect-msg__text .mermaid-svg-wrap svg,
+.artifact-preview__markdown .mermaid-svg-wrap svg {
+  max-width: 100%;
+  height: auto;
+}
+
+.msg-ai-text .mermaid-toolbar,
+.inspect-msg__text .mermaid-toolbar,
+.artifact-preview__markdown .mermaid-toolbar {
+  position: absolute;
+  top: 0.375rem;
+  right: 0.375rem;
+  display: flex;
+  gap: 0.25rem;
+  opacity: 0;
+  transition: opacity var(--transition);
+}
+
+.msg-ai-text .mermaid-diagram:hover .mermaid-toolbar,
+.msg-ai-text .mermaid-diagram:focus-within .mermaid-toolbar,
+.inspect-msg__text .mermaid-diagram:hover .mermaid-toolbar,
+.inspect-msg__text .mermaid-diagram:focus-within .mermaid-toolbar,
+.artifact-preview__markdown .mermaid-diagram:hover .mermaid-toolbar,
+.artifact-preview__markdown .mermaid-diagram:focus-within .mermaid-toolbar {
+  opacity: 1;
+}
+
+.msg-ai-text .mermaid-btn,
+.inspect-msg__text .mermaid-btn,
+.artifact-preview__markdown .mermaid-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 1.5rem;
+  height: 1.5rem;
+  padding: 0 0.35rem;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text);
+  font-size: 0.8125rem;
+  line-height: 1;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.msg-ai-text .mermaid-btn:hover,
+.inspect-msg__text .mermaid-btn:hover,
+.artifact-preview__markdown .mermaid-btn:hover {
+  color: var(--accent);
+}
+.msg-ai-text .mermaid-btn:focus-visible,
+.inspect-msg__text .mermaid-btn:focus-visible,
+.artifact-preview__markdown .mermaid-btn:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.msg-ai-text .mermaid-error,
+.inspect-msg__text .mermaid-error,
+.artifact-preview__markdown .mermaid-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin: var(--sp-2) 0;
+  padding: var(--sp-2) var(--sp-3);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--danger) 8%, var(--bg-surface));
+  color: var(--text);
+  font-size: 0.875rem;
+  overflow-wrap: anywhere;
+}
+
+.msg-ai-text .mermaid-error .mermaid-err-copy,
+.inspect-msg__text .mermaid-error .mermaid-err-copy,
+.artifact-preview__markdown .mermaid-error .mermaid-err-copy {
+  flex-shrink: 0;
+  padding: 0.125rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-hover);
+  color: var(--text);
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition);
+}
+.msg-ai-text .mermaid-error .mermaid-err-copy:hover,
+.inspect-msg__text .mermaid-error .mermaid-err-copy:hover,
+.artifact-preview__markdown .mermaid-error .mermaid-err-copy:hover {
+  color: var(--accent);
+}
+.msg-ai-text .mermaid-error .mermaid-err-copy:focus-visible,
+.inspect-msg__text .mermaid-error .mermaid-err-copy:focus-visible,
+.artifact-preview__markdown .mermaid-error .mermaid-err-copy:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.msg-ai-text .mermaid-error details,
+.inspect-msg__text .mermaid-error details,
+.artifact-preview__markdown .mermaid-error details {
+  flex-basis: 100%;
+}
+
+.msg-ai-text .mermaid-error summary,
+.inspect-msg__text .mermaid-error summary,
+.artifact-preview__markdown .mermaid-error summary {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  cursor: pointer;
+}
+
+.msg-ai-text .mermaid-err-src,
+.inspect-msg__text .mermaid-err-src,
+.artifact-preview__markdown .mermaid-err-src {
+  max-height: 16rem;
+  margin: var(--sp-2) 0 0;
+  padding: var(--sp-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--code-block-bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  overflow: auto;
+  white-space: pre-wrap;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .msg-ai-text .mermaid-toolbar,
+  .inspect-msg__text .mermaid-toolbar,
+  .artifact-preview__markdown .mermaid-toolbar,
+  .msg-ai-text .code-copy-btn,
+  .inspect-msg__text .code-copy-btn,
+  .artifact-preview__markdown .code-copy-btn,
+  .md-img-lightbox__close {
+    transition: none;
+  }
+}
+
+/* ─── Highlight token palette (global; was a ChatView-scoped subset) ────────
+ * Values come from the --syntax-* family so every theme ships its own colors.
+ * Applied to every surface that renders the shared pipeline. */
+.msg-ai-text .hljs-comment,
+.msg-ai-text .hljs-quote,
+.inspect-msg__text .hljs-comment,
+.inspect-msg__text .hljs-quote,
+.artifact-preview__markdown .hljs-comment,
+.artifact-preview__markdown .hljs-quote {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+
+.msg-ai-text .hljs-meta,
+.msg-ai-text .hljs-doctag,
+.inspect-msg__text .hljs-meta,
+.inspect-msg__text .hljs-doctag,
+.artifact-preview__markdown .hljs-meta,
+.artifact-preview__markdown .hljs-doctag {
+  color: var(--syntax-comment);
+}
+
+.msg-ai-text .hljs-keyword,
+.msg-ai-text .hljs-selector-tag,
+.msg-ai-text .hljs-selector-id,
+.msg-ai-text .hljs-selector-class,
+.msg-ai-text .hljs-built_in,
+.msg-ai-text .hljs-template-tag,
+.inspect-msg__text .hljs-keyword,
+.inspect-msg__text .hljs-selector-tag,
+.inspect-msg__text .hljs-selector-id,
+.inspect-msg__text .hljs-selector-class,
+.inspect-msg__text .hljs-built_in,
+.inspect-msg__text .hljs-template-tag,
+.artifact-preview__markdown .hljs-keyword,
+.artifact-preview__markdown .hljs-selector-tag,
+.artifact-preview__markdown .hljs-selector-id,
+.artifact-preview__markdown .hljs-selector-class,
+.artifact-preview__markdown .hljs-built_in,
+.artifact-preview__markdown .hljs-template-tag {
+  color: var(--syntax-keyword);
+}
+
+.msg-ai-text .hljs-string,
+.msg-ai-text .hljs-regexp,
+.msg-ai-text .hljs-addition,
+.inspect-msg__text .hljs-string,
+.inspect-msg__text .hljs-regexp,
+.inspect-msg__text .hljs-addition,
+.artifact-preview__markdown .hljs-string,
+.artifact-preview__markdown .hljs-regexp,
+.artifact-preview__markdown .hljs-addition {
+  color: var(--syntax-string);
+}
+
+.msg-ai-text .hljs-number,
+.msg-ai-text .hljs-literal,
+.msg-ai-text .hljs-symbol,
+.msg-ai-text .hljs-bullet,
+.inspect-msg__text .hljs-number,
+.inspect-msg__text .hljs-literal,
+.inspect-msg__text .hljs-symbol,
+.inspect-msg__text .hljs-bullet,
+.artifact-preview__markdown .hljs-number,
+.artifact-preview__markdown .hljs-literal,
+.artifact-preview__markdown .hljs-symbol,
+.artifact-preview__markdown .hljs-bullet {
+  color: var(--syntax-literal);
+}
+
+.msg-ai-text .hljs-title,
+.msg-ai-text .hljs-section,
+.msg-ai-text .hljs-name,
+.inspect-msg__text .hljs-title,
+.inspect-msg__text .hljs-section,
+.inspect-msg__text .hljs-name,
+.artifact-preview__markdown .hljs-title,
+.artifact-preview__markdown .hljs-section,
+.artifact-preview__markdown .hljs-name {
+  color: var(--syntax-title);
+}
+
+.msg-ai-text .hljs-attr,
+.msg-ai-text .hljs-attribute,
+.msg-ai-text .hljs-variable,
+.msg-ai-text .hljs-template-variable,
+.msg-ai-text .hljs-type,
+.msg-ai-text .hljs-property,
+.msg-ai-text .hljs-selector-attr,
+.msg-ai-text .hljs-selector-pseudo,
+.inspect-msg__text .hljs-attr,
+.inspect-msg__text .hljs-attribute,
+.inspect-msg__text .hljs-variable,
+.inspect-msg__text .hljs-template-variable,
+.inspect-msg__text .hljs-type,
+.inspect-msg__text .hljs-property,
+.inspect-msg__text .hljs-selector-attr,
+.inspect-msg__text .hljs-selector-pseudo,
+.artifact-preview__markdown .hljs-attr,
+.artifact-preview__markdown .hljs-attribute,
+.artifact-preview__markdown .hljs-variable,
+.artifact-preview__markdown .hljs-template-variable,
+.artifact-preview__markdown .hljs-type,
+.artifact-preview__markdown .hljs-property,
+.artifact-preview__markdown .hljs-selector-attr,
+.artifact-preview__markdown .hljs-selector-pseudo {
+  color: var(--syntax-attr);
+}
+
+.msg-ai-text .hljs-operator,
+.msg-ai-text .hljs-punctuation,
+.msg-ai-text .hljs-tag,
+.inspect-msg__text .hljs-operator,
+.inspect-msg__text .hljs-punctuation,
+.inspect-msg__text .hljs-tag,
+.artifact-preview__markdown .hljs-operator,
+.artifact-preview__markdown .hljs-punctuation,
+.artifact-preview__markdown .hljs-tag {
+  color: var(--text-muted);
+}
+
+.msg-ai-text .hljs-subst,
+.msg-ai-text .hljs-params,
+.inspect-msg__text .hljs-subst,
+.inspect-msg__text .hljs-params,
+.artifact-preview__markdown .hljs-subst,
+.artifact-preview__markdown .hljs-params {
+  color: var(--text);
+}
+
+.msg-ai-text .hljs-link,
+.inspect-msg__text .hljs-link,
+.artifact-preview__markdown .hljs-link {
+  color: var(--accent);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+.msg-ai-text .hljs-deletion,
+.inspect-msg__text .hljs-deletion,
+.artifact-preview__markdown .hljs-deletion {
+  color: var(--danger);
+}
+
+.msg-ai-text .hljs-emphasis,
+.inspect-msg__text .hljs-emphasis,
+.artifact-preview__markdown .hljs-emphasis {
+  font-style: italic;
+}
+
+.msg-ai-text .hljs-strong,
+.inspect-msg__text .hljs-strong,
+.artifact-preview__markdown .hljs-strong {
+  font-weight: 600;
+}
