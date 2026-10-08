@@ -26,9 +26,10 @@ Read: [`approvals-and-permissions.md`](approvals-and-permissions.md)
 
 ## Budget
 
-A ceiling checked per turn rather than per request. The six per-turn gates count
-LLM calls, input and output tokens, cost (billed, plus an estimate-backed cousin)
-and tool errors; attachment disk is a separate axis with its own budgets.
+A limit accumulated across a turn, which may include multiple LLM and tool calls.
+The six per-turn gates count LLM calls, input and output tokens, cost (billed,
+plus an estimate-backed cousin), and tool errors; attachment disk is a separate
+axis with its own budgets.
 
 Read: [`providers-and-models.md`](providers-and-models.md)
 
@@ -117,10 +118,9 @@ Read: [`features/squilla-router.md`](features/squilla-router.md)
 
 ## Tier
 
-One of the four text tiers `c0`–`c3` that SquillaRouter routes a turn to. `t0`–`t3`
-are legacy tier names normalizing onto these; `R0`–`R3` are route classes doing the
-same mapping. Separately, `T0`–`T3` also names reasoning levels — same letters,
-another axis.
+The canonical routing tiers are `c0`–`c3` (shown as C0–C3). Lowercase `t0`–`t3`
+are legacy tier aliases, and `R0`–`R3` are route classes mapping onto these tiers.
+Uppercase `T0`–`T3` separately name reasoning levels in the thinking-mode axis.
 
 Read: [`features/squilla-router.md`](features/squilla-router.md)
 
